@@ -1,0 +1,52 @@
+use bevy::prelude::*;
+use crate::economy::agent::EconomicAgent;
+use crate::economy::goods::Good;
+use crate::simulation::goals::AgentGoal;
+use crate::simulation::lod::LodLevel;
+use crate::simulation::person::{AiState, Person, PersonAI};
+use crate::simulation::schedule::{BucketSlot, SimClock};
+use crate::world::spatial::SpatialIndex;
+use crate::world::terrain::TILE_SIZE;
+
+#[derive(Component, Clone, Copy)]
+pub struct GroundItem {
+    pub good: Good,
+    pub qty:  u8,
+}
+
+/// Sequential, after death_system.
+/// Iterates ground items; the first active Working agent with a food goal at the
+/// same tile claims the item.  Only one agent claims each item per frame.
+pub fn item_pickup_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    spatial: Res<SpatialIndex>,
+    item_query: Query<(Entity, &GroundItem, &Transform)>,
+    mut pickers: Query<(
+        &mut PersonAI,
+        &mut EconomicAgent,
+        &AgentGoal,
+        &BucketSlot,
+        &LodLevel,
+    ), With<Person>>,
+) {
+    for (item_e, item, item_transform) in &item_query {
+        let tx = (item_transform.translation.x / TILE_SIZE).floor() as i32;
+        let ty = (item_transform.translation.y / TILE_SIZE).floor() as i32;
+
+        for &candidate in spatial.get(tx, ty) {
+            let Ok((mut ai, mut agent, goal, slot, lod)) = pickers.get_mut(candidate) else {
+                continue;
+            };
+            if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
+            if ai.state != AiState::Working { continue; }
+            if !matches!(goal, AgentGoal::Survive | AgentGoal::Gather) { continue; }
+
+            agent.add_good(item.good, item.qty);
+            commands.entity(item_e).despawn();
+            ai.state = AiState::Idle;
+            ai.job_id = PersonAI::UNEMPLOYED;
+            break;
+        }
+    }
+}

@@ -1,0 +1,136 @@
+use bevy::prelude::*;
+
+pub mod schedule;
+pub mod needs;
+pub mod mood;
+pub mod person;
+pub mod skills;
+pub mod jobs;
+pub mod movement;
+pub mod lod;
+pub mod production;
+pub mod goals;
+pub mod faction;
+pub mod reproduction;
+pub mod combat;
+pub mod animals;
+pub mod raid;
+pub mod items;
+pub mod world_sim;
+pub mod plants;
+
+pub use person::PersonAI;
+pub use needs::Needs;
+pub use mood::Mood;
+pub use skills::Skills;
+pub use lod::LodLevel;
+pub use schedule::{BucketSlot, SimClock};
+
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SimulationSet {
+    Input,
+    ParallelA,
+    ParallelB,
+    Sequential,
+    Economy,
+}
+
+pub struct SimulationPlugin;
+
+impl Plugin for SimulationPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(SimClock::default())
+            .insert_resource(faction::FactionRegistry::default())
+            .insert_resource(reproduction::MaleCandidates::default())
+            .insert_resource(production::TileDepletion::default())
+            .insert_resource(plants::PlantMap::default())
+            .insert_resource(plants::PlantSpriteIndex::default())
+            .insert_resource(plants::PlantMaterials::default())
+            .insert_resource(plants::PlantMeshHandle::default())
+            .configure_sets(
+                Update,
+                (
+                    SimulationSet::ParallelA,
+                    SimulationSet::ParallelB.after(SimulationSet::ParallelA),
+                    SimulationSet::Sequential.after(SimulationSet::ParallelB),
+                    SimulationSet::Economy.after(SimulationSet::Sequential),
+                ),
+            )
+            .add_systems(PostStartup, (person::spawn_population, animals::spawn_animals.after(person::spawn_population)))
+            .add_systems(
+                Update,
+                (
+                    needs::tick_needs_system,
+                    mood::derive_mood_system,
+                    lod::update_lod_levels_system,
+                )
+                    .in_set(SimulationSet::ParallelA),
+            )
+            .add_systems(
+                Update,
+                (
+                    production::consumption_system
+                        .after(needs::tick_needs_system),
+                    goals::goal_update_system
+                        .after(needs::tick_needs_system),
+                    animals::animal_sense_system,
+                )
+                    .in_set(SimulationSet::ParallelA),
+            )
+            .add_systems(
+                Update,
+                (jobs::job_dispatch_system,)
+                    .in_set(SimulationSet::ParallelB),
+            )
+            .add_systems(
+                Update,
+                (
+                    plants::plant_harvest_system
+                        .before(production::production_system),
+                    movement::movement_system,
+                    animals::animal_movement_system,
+                    movement::update_spatial_index_system
+                        .after(movement::movement_system)
+                        .after(animals::animal_movement_system),
+                    combat::hunting_system
+                        .after(movement::update_spatial_index_system),
+                    combat::combat_system
+                        .after(movement::update_spatial_index_system)
+                        .after(combat::hunting_system),
+                    combat::death_system
+                        .after(combat::combat_system),
+                    items::item_pickup_system
+                        .after(combat::death_system),
+                    plants::deer_graze_system
+                        .after(movement::update_spatial_index_system),
+                    production::production_system
+                        .after(movement::movement_system),
+                    faction::bonding_system
+                        .after(movement::update_spatial_index_system),
+                    production::tile_regen_system,
+                    schedule::advance_sim_clock,
+                    crate::world::seasons::advance_calendar_system,
+                )
+                    .in_set(SimulationSet::Sequential),
+            )
+            .add_systems(
+                Update,
+                (
+                    plants::plant_growth_system,
+                    plants::seed_scatter_system
+                        .after(plants::plant_growth_system),
+                    faction::social_fill_system,
+                    faction::faction_camp_system,
+                    reproduction::collect_male_candidates,
+                    reproduction::reproduction_system
+                        .after(reproduction::collect_male_candidates),
+                    raid::faction_decision_system,
+                    raid::raid_execution_system
+                        .after(raid::faction_decision_system),
+                    world_sim::world_sim_system,
+                    world_sim::agent_exploration_system,
+                )
+                    .in_set(SimulationSet::Economy),
+            );
+    }
+}

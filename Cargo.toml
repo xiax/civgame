@@ -1,0 +1,30 @@
+[package]
+name = "civgame"
+version = "0.1.0"
+edition = "2021"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[dependencies]
+bevy = { version = "0.15", features = [
+    "bevy_render",
+    "bevy_sprite",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_asset",
+    "bevy_winit",
+    "multi_threaded",
+] }
+bevy_egui = "0.31"
+noise = "0.9"
+rand = "0.8"
+fastrand = "2"
+ahash = "0.8"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
