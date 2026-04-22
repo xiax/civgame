@@ -1,4 +1,5 @@
 /target
+/.cargo
 world.bin
 screenshot.png
 crash.txt
