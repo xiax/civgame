@@ -2,7 +2,8 @@ use bevy::prelude::*;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::simulation::animals::{AnimalAI, AnimalState, Deer, Wolf};
-use crate::simulation::faction::{FactionMember, FactionRegistry};
+use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
+use crate::simulation::technology::ActivityKind;
 use crate::simulation::items::{GroundItem, Equipment, EquipmentSlot, WeaponStats, ArmorStats};
 use crate::simulation::jobs::JobKind;
 use crate::simulation::lod::LodLevel;
@@ -123,6 +124,7 @@ pub fn combat_system(
         Option<&Equipment>,
         Option<&mut CombatCooldown>,
         Option<&mut ActivePlan>,
+        Option<&FactionMember>,
     )>,
     mut health_query: Query<&mut Health>,
     mut body_query: Query<&mut Body>,
@@ -131,6 +133,7 @@ pub fn combat_system(
     mut ai_query: Query<&mut PersonAI>,
     mut animal_ai_query: Query<(&mut AnimalAI, Option<&Deer>)>,
     mut rel_query: Query<Option<&mut RelationshipMemory>>,
+    mut faction_registry: ResMut<FactionRegistry>,
     clock: Res<SimClock>,
     mut combat_events: EventWriter<CombatEvent>,
 ) {
@@ -140,8 +143,10 @@ pub fn combat_system(
     let mut health_damage_events: Vec<(Entity, Entity, u8)> = Vec::new();
     // (target, attacker, part, damage)
     let mut body_damage_events: Vec<(Entity, Entity, BodyPart, u8)> = Vec::new();
+    // (faction_id) — attackers whose faction logs a combat event this frame
+    let mut combat_activity_factions: Vec<u32> = Vec::new();
 
-    for (attacker, mut combat_target, transform, lod, slot, attacker_eq, mut cd, mut active_plan_opt) in &mut attacker_query {
+    for (attacker, mut combat_target, transform, lod, slot, attacker_eq, mut cd, mut active_plan_opt, attacker_fm) in &mut attacker_query {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -210,6 +215,15 @@ pub fn combat_system(
                     }
                 }
             }
+            // Apply faction tech combat bonus
+            if let Some(fm) = attacker_fm {
+                if fm.faction_id != SOLO {
+                    if let Some(fd) = faction_registry.factions.get(&fm.faction_id) {
+                        damage = damage.saturating_add(fd.combat_damage_bonus());
+                    }
+                    combat_activity_factions.push(fm.faction_id);
+                }
+            }
 
             // Apply cooldown
             if let Some(ref mut cd) = cd {
@@ -256,7 +270,7 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
+        if let Ok((_, mut target_combat, _, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
             if target_combat.0.is_none() {
                 if let Ok(mut target_ai) = ai_query.get_mut(target) {
                     target_combat.0 = Some(attacker);
@@ -283,7 +297,7 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
+        if let Ok((_, mut target_combat, _, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
             if target_combat.0.is_none() {
                 if let Ok(mut target_ai) = ai_query.get_mut(target) {
                     target_combat.0 = Some(attacker);
@@ -296,6 +310,13 @@ pub fn combat_system(
                     }
                 }
             }
+        }
+    }
+
+    // Record combat activity for attacking factions
+    for faction_id in combat_activity_factions {
+        if let Some(fd) = faction_registry.factions.get_mut(&faction_id) {
+            fd.activity_log.increment(ActivityKind::Combat);
         }
     }
 }
