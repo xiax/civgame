@@ -354,6 +354,13 @@ fn resolve_target(
                 return find_nearest_plant(plant_map, pos, 30, plant_query, true, filter);
             }
 
+            if *kind == MemoryKind::Wood {
+                // Prioritize trees for woodcutting
+                if let Some(tree_pos) = find_nearest_plant(plant_map, pos, 30, plant_query, true, Some(PlantKind::Tree)) {
+                    return Some(tree_pos);
+                }
+            }
+
             // Fallback: nearest tile by kind for other resources
             let fallback_tiles: &[TileKind] = match kind {
                 MemoryKind::Food  => &[], // Handled above

@@ -146,6 +146,15 @@ pub fn spawn_chunk_plants(
                         );
                     }
                 }
+                TileKind::Forest => {
+                    if h % 100 < 10 {
+                        spawn_plant_at(
+                            commands, plant_map, plant_sprite_index,
+                            textures,
+                            global_tx, global_ty, PlantKind::Tree, initial_stage(h),
+                        );
+                    }
+                }
                 _ => {}
             }
         }

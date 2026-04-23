@@ -11,6 +11,8 @@ pub struct EntityTextures {
     pub plant_seed: Handle<Image>,
     pub plant_seedling: Handle<Image>,
     pub plant_mature: Handle<Image>,
+    pub tree_seedling: Handle<Image>,
+    pub tree_mature: Handle<Image>,
 }
 
 #[derive(Clone, Copy)]
@@ -255,6 +257,52 @@ pub fn setup_pixel_art(
         ('e', e), ('l', e_l), ('v', e_d), ('d', d_b), ('.', _t)
     ]);
 
+    // Tree Seedling: 16x16
+    let tree_seedling_ascii = &[
+        "................",
+        "................",
+        "................",
+        "................",
+        "......eee.......",
+        ".....eeeee......",
+        "....eeeeeee.....",
+        "....eeeeeee.....",
+        ".....eeeee......",
+        "......eee.......",
+        ".......d........",
+        ".......d........",
+        ".......d........",
+        ".......d........",
+        ".......d........",
+        ".......d........",
+    ];
+    let tree_seedling_img = ascii_to_image(tree_seedling_ascii, &[
+        ('e', e), ('d', d_b), ('.', _t)
+    ]);
+
+    // Tree Mature: 16x16
+    let tree_mature_ascii = &[
+        "......eee.......",
+        "....eeeeeee.....",
+        "...eeeeeeeee....",
+        "..eeeeeeeeeee...",
+        "..eeeeeeeeeee...",
+        "..eeeeeeeeeee...",
+        "...eeeeeeeee....",
+        "....eeeeeee.....",
+        ".....eeeee......",
+        "......eee.......",
+        ".......d........",
+        ".......d........",
+        ".......d........",
+        ".......d........",
+        ".......d........",
+        ".......d........",
+    ];
+    let tree_mature_img = ascii_to_image(tree_mature_ascii, &[
+        ('e', e), ('d', d_b), ('.', _t)
+    ]);
+
     commands.insert_resource(EntityTextures {
         wolf: images.add(wolf_img),
         deer: images.add(deer_img),
@@ -263,5 +311,7 @@ pub fn setup_pixel_art(
         plant_seed: images.add(plant_seed_img),
         plant_seedling: images.add(plant_seedling_img),
         plant_mature: images.add(plant_mature_img),
+        tree_seedling: images.add(tree_seedling_img),
+        tree_mature: images.add(tree_mature_img),
     });
 }
