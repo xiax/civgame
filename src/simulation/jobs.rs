@@ -301,6 +301,10 @@ pub fn goal_dispatch_system(
                 }
             }
 
+            AgentGoal::Sleep => {
+                ai.state = AiState::Sleeping;
+            }
+
             // Survive and Gather are handled by plan_execution_system
             AgentGoal::Survive | AgentGoal::Gather => {}
         }

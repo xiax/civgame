@@ -77,6 +77,7 @@ pub struct ActivePlan {
     pub started_tick: u64,
     pub max_ticks:    u64,
     pub reward_acc:   f32,
+    pub reward_scale: f32,
     pub dispatched:   bool,
 }
 
@@ -171,14 +172,14 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             target: StepTarget::FromMemory(MemoryKind::Food),
             preconditions: StepPreconditions::none(),
             memory_kind: Some(MemoryKind::Food),
-            reward_scale: 0.5,
+            reward_scale: 1.0,
         },
         StepDef { // 1: FarmFarmland — memory-guided, falls back to nearest farmland
             id: 1, job: JobKind::Farmer,
             target: StepTarget::FromMemory(MemoryKind::Food),
             preconditions: StepPreconditions::none(),
             memory_kind: Some(MemoryKind::Food),
-            reward_scale: 0.6,
+            reward_scale: 1.0,
         },
         StepDef { // 2: ChopForest
             id: 2, job: JobKind::Woodcutter,
@@ -206,7 +207,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             target: StepTarget::HuntPrey,
             preconditions: StepPreconditions::none(),
             memory_kind: Some(MemoryKind::Food),
-            reward_scale: 0.7,
+            reward_scale: 1.0,
         },
     ];
 }
@@ -243,7 +244,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         },
         PlanDef { id: 5, name: "HuntFood",
             steps: PLAN_STEPS_5,
-            feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.3],
+            feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 1.0],
             serves_goals: SURVIVE_GOALS,
         },
     ];
@@ -317,7 +318,7 @@ fn resolve_target(
         StepTarget::HuntPrey => {
             let mut best: Option<(Entity, i16, i16)> = None;
             let mut best_dist = i32::MAX;
-            let radius = 20i32;
+            let radius = 50i32;
 
             for dy in -radius..=radius {
                 for dx in -radius..=radius {
@@ -346,17 +347,30 @@ fn resolve_target(
             if from_mem.is_some() { return from_mem; }
 
             if *kind == MemoryKind::Food {
-                let filter = if step.job == JobKind::Forager {
-                    Some(PlantKind::FruitBush)
-                } else {
-                    None
+                let filter = match step.job {
+                    JobKind::Forager => Some(PlantKind::FruitBush),
+                    JobKind::Farmer  => Some(PlantKind::Grain), // Farmers can also do FruitBush, but let's prioritize Grain for now or handle both
+                    _ => None,
                 };
-                return find_nearest_plant(plant_map, pos, 30, plant_query, true, filter);
+                
+                // If farmer, we might want to check both Grain and FruitBush. 
+                // For simplicity, let's allow foragers to also check Trees (they gather branches for wood, but here it's for food?) 
+                // Wait, foragers DON'T get food from trees in plant_harvest_system.
+                
+                let radius = 60;
+                if step.job == JobKind::Farmer {
+                    if let Some(pos) = find_nearest_plant(plant_map, pos, radius, plant_query, true, Some(PlantKind::Grain)) {
+                        return Some(pos);
+                    }
+                    return find_nearest_plant(plant_map, pos, radius, plant_query, true, Some(PlantKind::FruitBush));
+                }
+                
+                return find_nearest_plant(plant_map, pos, radius, plant_query, true, filter);
             }
 
             if *kind == MemoryKind::Wood {
                 // Prioritize trees for woodcutting
-                if let Some(tree_pos) = find_nearest_plant(plant_map, pos, 30, plant_query, true, Some(PlantKind::Tree)) {
+                if let Some(tree_pos) = find_nearest_plant(plant_map, pos, 60, plant_query, true, Some(PlantKind::Tree)) {
                     return Some(tree_pos);
                 }
             }
@@ -368,17 +382,17 @@ fn resolve_target(
                 MemoryKind::Stone => STONE_TILES,
                 MemoryKind::Seed  => FARMLAND_TILES,
             };
-            find_nearest_tile(chunk_map, pos, 30, fallback_tiles)
+            find_nearest_tile(chunk_map, pos, 60, fallback_tiles)
         }
         StepTarget::NearestTile(_tiles) => {
             if step.job == JobKind::Planter {
-                find_nearest_unplanted_farmland(chunk_map, plant_map, pos, 15)
+                find_nearest_unplanted_farmland(chunk_map, plant_map, pos, 30)
             } else {
-                find_nearest_tile(chunk_map, pos, 30, _tiles)
+                find_nearest_tile(chunk_map, pos, 60, _tiles)
             }
         }
         StepTarget::NearestItem(_good) => {
-            find_nearest_item(spatial, pos, 10, item_check)
+            find_nearest_item(spatial, pos, 40, item_check)
         }
         StepTarget::FactionCamp => {
             faction_registry.home_tile(faction_id)
@@ -495,6 +509,7 @@ pub fn plan_execution_system(
                 started_tick: clock.tick,
                 max_ticks:    5000,
                 reward_acc:   0.0,
+                reward_scale: 0.0,
                 dispatched:   false,
             });
             continue;
@@ -533,7 +548,12 @@ pub fn plan_execution_system(
         };
 
         if active_plan.current_step as usize >= plan_def.steps.len() {
-            if let Some(ref mut net) = net_opt { net.learn(active_plan.reward_acc); }
+            if let Some(ref mut net) = net_opt {
+                let ticks = clock.tick.saturating_sub(active_plan.started_tick);
+                let time_penalty = (ticks as f32 * 0.0005).min(0.8);
+                let decayed_reward = active_plan.reward_acc * (1.0 - time_penalty);
+                net.learn(decayed_reward);
+            }
             commands.entity(entity).remove::<ActivePlan>();
             combat_target.0 = None;
             continue;
@@ -550,7 +570,12 @@ pub fn plan_execution_system(
             active_plan.dispatched = false;
 
             if active_plan.current_step as usize >= plan_def.steps.len() {
-                if let Some(ref mut net) = net_opt { net.learn(active_plan.reward_acc); }
+                if let Some(ref mut net) = net_opt {
+                    let ticks = clock.tick.saturating_sub(active_plan.started_tick);
+                    let time_penalty = (ticks as f32 * 0.0005).min(0.8);
+                    let decayed_reward = active_plan.reward_acc * (1.0 - time_penalty);
+                    net.learn(decayed_reward);
+                }
                 commands.entity(entity).remove::<ActivePlan>();
                 combat_target.0 = None;
             }
@@ -579,6 +604,7 @@ pub fn plan_execution_system(
             ) {
                 assign_job_with_routing(&mut ai, cur_chunk, target, step_def.job, &chunk_graph, &chunk_map);
                 active_plan.dispatched = true;
+                active_plan.reward_scale = step_def.reward_scale;
             } else {
                 // No valid target — abandon plan
                 commands.entity(entity).remove::<ActivePlan>();

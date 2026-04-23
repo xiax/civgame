@@ -22,6 +22,13 @@ impl Plugin for EconomyPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(Market::default())
             .insert_resource(CommandPools::default())
-            .insert_resource(EconomicMode::default());
+            .insert_resource(EconomicMode::default())
+            .add_systems(
+                FixedUpdate,
+                (
+                    market::price_update_system,
+                )
+                    .in_set(SimulationSet::Economy),
+            );
     }
 }

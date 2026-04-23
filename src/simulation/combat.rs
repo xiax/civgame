@@ -9,6 +9,7 @@ use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::RelationshipMemory;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, Person, PersonAI};
+use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
@@ -113,7 +114,16 @@ const BASE_ATTACK_COOLDOWN: f32 = 1.0;
 pub fn combat_system(
     time: Res<Time>,
     spatial: Res<SpatialIndex>,
-    mut attacker_query: Query<(Entity, &mut CombatTarget, &Transform, &LodLevel, &BucketSlot, Option<&Equipment>, Option<&mut CombatCooldown>)>,
+    mut attacker_query: Query<(
+        Entity,
+        &mut CombatTarget,
+        &Transform,
+        &LodLevel,
+        &BucketSlot,
+        Option<&Equipment>,
+        Option<&mut CombatCooldown>,
+        Option<&mut ActivePlan>,
+    )>,
     mut health_query: Query<&mut Health>,
     mut body_query: Query<&mut Body>,
     equipment_query: Query<&Equipment>,
@@ -131,7 +141,7 @@ pub fn combat_system(
     // (target, attacker, part, damage)
     let mut body_damage_events: Vec<(Entity, Entity, BodyPart, u8)> = Vec::new();
 
-    for (attacker, mut combat_target, transform, lod, slot, attacker_eq, mut cd) in &mut attacker_query {
+    for (attacker, mut combat_target, transform, lod, slot, attacker_eq, mut cd, mut active_plan_opt) in &mut attacker_query {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -246,7 +256,7 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _)) = attacker_query.get_mut(target) {
+        if let Ok((_, mut target_combat, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
             if target_combat.0.is_none() {
                 if let Ok(mut target_ai) = ai_query.get_mut(target) {
                     target_combat.0 = Some(attacker);
@@ -273,7 +283,7 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _)) = attacker_query.get_mut(target) {
+        if let Ok((_, mut target_combat, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
             if target_combat.0.is_none() {
                 if let Ok(mut target_ai) = ai_query.get_mut(target) {
                     target_combat.0 = Some(attacker);

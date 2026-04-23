@@ -49,6 +49,7 @@ pub enum AgentGoal {
     Reproduce  = 4,
     Raid       = 5,
     Defend     = 6,
+    Sleep      = 7,
 }
 
 impl AgentGoal {
@@ -61,6 +62,7 @@ impl AgentGoal {
             AgentGoal::Reproduce  => "Reproduce",
             AgentGoal::Raid       => "Raid",
             AgentGoal::Defend     => "Defend",
+            AgentGoal::Sleep      => "Sleep",
         }
     }
 }
@@ -118,9 +120,11 @@ pub fn goal_update_system(
             registry.food_stock(member.faction_id) < cap
         };
 
-        let new_goal = if needs.hunger > 160.0 {
+        let new_goal = if needs.hunger > 120.0 || agent.quantity_of(Good::Food) < 3 {
             AgentGoal::Survive
-        } else if agent.quantity_of(Good::Food) > 2 && can_return_camp {
+        } else if needs.sleep > 180.0 {
+            AgentGoal::Sleep
+        } else if agent.quantity_of(Good::Food) > 6 && can_return_camp {
             AgentGoal::ReturnCamp
         } else if needs.reproduction > reproduce_threshold {
             AgentGoal::Reproduce

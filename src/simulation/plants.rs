@@ -308,18 +308,31 @@ pub fn plant_harvest_system(
 
         let plant_entity = match plant_map.0.get(&(tx, ty)).copied() {
             Some(e) => e,
-            None    => continue,
+            None    => {
+                // No plant here — give up
+                ai.state = AiState::Idle;
+                ai.job_id = PersonAI::UNEMPLOYED;
+                continue;
+            }
         };
 
         let mut plant = match plant_query.get_mut(plant_entity) {
             Ok(p) => p,
             Err(_) => {
                 plant_map.0.remove(&(tx, ty));
+                ai.state = AiState::Idle;
+                ai.job_id = PersonAI::UNEMPLOYED;
                 continue;
             }
         };
 
         if plant.stage != GrowthStage::Mature {
+            // Wait for it to grow or give up? 
+            // For now, let's wait but only for a certain time? 
+            // Actually, if it's not mature, we might be stuck here.
+            // Let's give up for now to be safe.
+            ai.state = AiState::Idle;
+            ai.job_id = PersonAI::UNEMPLOYED;
             continue;
         }
 
@@ -327,12 +340,18 @@ pub fn plant_harvest_system(
         // Woodcutters can only harvest Trees.
         // Farmers can harvest Grain or FruitBush.
         if is_woodcutter && plant.kind != PlantKind::Tree {
+            ai.state = AiState::Idle;
+            ai.job_id = PersonAI::UNEMPLOYED;
             continue;
         }
         if is_forager && plant.kind == PlantKind::Grain {
+            ai.state = AiState::Idle;
+            ai.job_id = PersonAI::UNEMPLOYED;
             continue;
         }
         if is_farmer && plant.kind == PlantKind::Tree {
+            ai.state = AiState::Idle;
+            ai.job_id = PersonAI::UNEMPLOYED;
             continue;
         }
 
@@ -367,7 +386,7 @@ pub fn plant_harvest_system(
                 mem.record((tx as i16, ty as i16), MemoryKind::Food);
             }
             if let Some(ref mut plan) = active_plan_opt {
-                plan.reward_acc += food_qty as f32 * 0.4;
+                plan.reward_acc += food_qty as f32 * plan.reward_scale;
             }
         }
         if wood_qty > 0 {
@@ -376,7 +395,7 @@ pub fn plant_harvest_system(
                 mem.record((tx as i16, ty as i16), MemoryKind::Wood);
             }
             if let Some(ref mut plan) = active_plan_opt {
-                plan.reward_acc += wood_qty as f32 * 0.4;
+                plan.reward_acc += wood_qty as f32 * plan.reward_scale;
             }
         }
         if seed_qty > 0 {

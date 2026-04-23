@@ -4,6 +4,7 @@ use crate::economy::item::Item;
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, Person, PersonAI};
+use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
@@ -57,6 +58,7 @@ pub fn item_pickup_system(
         &AgentGoal,
         &BucketSlot,
         &LodLevel,
+        Option<&mut ActivePlan>,
     ), With<Person>>,
 ) {
     for (item_e, item, item_transform) in &item_query {
@@ -64,7 +66,7 @@ pub fn item_pickup_system(
         let ty = (item_transform.translation.y / TILE_SIZE).floor() as i32;
 
         for &candidate in spatial.get(tx, ty) {
-            let Ok((mut ai, mut agent, goal, slot, lod)) = pickers.get_mut(candidate) else {
+            let Ok((mut ai, mut agent, goal, slot, lod, active_plan_opt)) = pickers.get_mut(candidate) else {
                 continue;
             };
             if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
@@ -72,6 +74,11 @@ pub fn item_pickup_system(
                         if !matches!(goal, AgentGoal::Survive | AgentGoal::Gather) { continue; }
 
             agent.add_good(item.item.good, item.qty);
+            
+            if let Some(mut plan) = active_plan_opt {
+                plan.reward_acc += item.qty as f32 * plan.reward_scale;
+            }
+
             commands.entity(item_e).despawn();
             ai.state = AiState::Idle;
             ai.job_id = PersonAI::UNEMPLOYED;

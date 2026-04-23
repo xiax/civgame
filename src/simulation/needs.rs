@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use super::person::{AiState, PersonAI};
 use super::schedule::{BucketSlot, SimClock};
 use super::lod::LodLevel;
 
@@ -41,6 +42,7 @@ impl Needs {
 /// Rates in need-units per real second.
 const HUNGER_RATE:       f32 = 0.4;
 const SLEEP_RATE:        f32 = 0.5;
+const SLEEP_RECOVER_RATE: f32 = 2.0;
 const SHELTER_RATE:      f32 = 0.1;
 const SAFETY_RATE:       f32 = 0.1;
 const SOCIAL_RATE:       f32 = 0.2;
@@ -49,19 +51,29 @@ const REPRODUCTION_RATE: f32 = 0.1;
 pub fn tick_needs_system(
     time: Res<Time>,
     clock: Res<SimClock>,
-    mut query: Query<(&BucketSlot, &mut Needs, &LodLevel)>,
+    mut query: Query<(&BucketSlot, &mut Needs, &mut PersonAI, &LodLevel)>,
 ) {
     let dt = time.delta_secs() * clock.scale_factor();
 
-    query.par_iter_mut().for_each(|(slot, mut needs, lod)| {
+    query.par_iter_mut().for_each(|(slot, mut needs, mut ai, lod)| {
         if *lod == LodLevel::Dormant {
             return;
         }
         if !clock.is_active(slot.0) {
             return;
         }
+
         needs.hunger       = (needs.hunger + HUNGER_RATE * dt).clamp(0.0, 255.0);
-        needs.sleep        = (needs.sleep + SLEEP_RATE * dt).clamp(0.0, 255.0);
+
+        if ai.state == AiState::Sleeping {
+            needs.sleep = (needs.sleep - SLEEP_RECOVER_RATE * dt).clamp(0.0, 255.0);
+            if needs.sleep < 10.0 {
+                ai.state = AiState::Idle;
+            }
+        } else {
+            needs.sleep = (needs.sleep + SLEEP_RATE * dt).clamp(0.0, 255.0);
+        }
+
         needs.shelter      = (needs.shelter + SHELTER_RATE * dt).clamp(0.0, 255.0);
         needs.safety       = (needs.safety + SAFETY_RATE * dt).clamp(0.0, 255.0);
         needs.social       = (needs.social + SOCIAL_RATE * dt).clamp(0.0, 255.0);
