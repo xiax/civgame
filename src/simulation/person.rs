@@ -11,9 +11,12 @@ use super::faction::FactionMember;
 use super::goals::{AgentGoal, Personality};
 use super::items::Equipment;
 use super::lod::LodLevel;
+use super::memory::{AgentMemory, RelationshipMemory};
 use super::mood::Mood;
 use super::movement::MovementState;
 use super::needs::Needs;
+use super::neural::UtilityNet;
+use super::plan::{KnownPlans, PlanScoringMethod};
 use super::reproduction::BiologicalSex;
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
@@ -114,6 +117,13 @@ pub fn spawn_population(
                 Body::new_humanoid(),
                 Equipment::default(),
                 CombatTarget::default(),
+            ),
+            (
+                AgentMemory::default(),
+                RelationshipMemory::default(),
+                UtilityNet::new_random(),
+                KnownPlans::with_innate(&[0, 1]),
+                PlanScoringMethod::UtilityNN,
             ),
         ));
 

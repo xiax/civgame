@@ -3,6 +3,7 @@ use bevy::prelude::*;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
 use super::goals::{AgentGoal, Personality};
+use super::memory::RelationshipMemory;
 use super::lod::LodLevel;
 use super::needs::Needs;
 use super::person::{AiState, PersonAI};
@@ -71,6 +72,7 @@ pub fn bonding_system(
     spatial: Res<SpatialIndex>,
     mut registry: ResMut<FactionRegistry>,
     mut query: Query<(Entity, &mut FactionMember, &Personality, &Transform)>,
+    mut rel_query: Query<Option<&mut RelationshipMemory>>,
 ) {
     // Collect solo agents so we can iterate without borrow conflicts
     let solo_agents: Vec<(Entity, (i32, i32))> = query
@@ -145,6 +147,16 @@ pub fn bonding_system(
 
             fm.faction_id = faction_id;
             registry.add_member(faction_id);
+
+            // Bonding builds affinity between the two agents
+            if let Ok([rel1, rel2]) = rel_query.get_many_mut([*entity, nb_entity]) {
+                if let Some(mut r) = rel1 {
+                    r.update(nb_entity, 30);
+                }
+                if let Some(mut r) = rel2 {
+                    r.update(*entity, 30);
+                }
+            }
         }
     }
 }

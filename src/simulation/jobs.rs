@@ -4,17 +4,15 @@ use crate::world::tile::TileKind;
 use crate::world::terrain::{WORLD_CHUNKS_X, WORLD_CHUNKS_Y, TILE_SIZE};
 use crate::world::spatial::SpatialIndex;
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
 use crate::pathfinding::chunk_graph::ChunkGraph;
-use crate::simulation::plants::PlantMap;
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::AgentGoal;
 use super::items::GroundItem;
-use super::needs::Needs;
+use super::memory::RelationshipMemory;
 use super::person::{AiState, PersonAI};
 use super::lod::LodLevel;
 use super::reproduction::BiologicalSex;
-use super::skills::{SkillKind, Skills};
+use super::plants::PlantMap;
 
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +28,7 @@ pub enum JobKind {
     Planter    = 8,
 }
 
-fn find_nearest_tile(
+pub fn find_nearest_tile(
     chunk_map: &ChunkMap,
     from: (i32, i32),
     radius: i32,
@@ -59,7 +57,7 @@ fn find_nearest_tile(
     best
 }
 
-fn find_nearest_item(
+pub fn find_nearest_item(
     spatial: &SpatialIndex,
     from: (i32, i32),
     radius: i32,
@@ -83,7 +81,7 @@ fn find_nearest_item(
     best
 }
 
-fn find_nearest_unplanted_farmland(
+pub fn find_nearest_unplanted_farmland(
     chunk_map: &ChunkMap,
     plant_map: &PlantMap,
     from: (i32, i32),
@@ -113,22 +111,7 @@ fn find_nearest_unplanted_farmland(
     best
 }
 
-fn tile_coord(transform: &Transform) -> (i32, i32) {
-    let pos = transform.translation.truncate();
-    (
-        (pos.x / TILE_SIZE).floor() as i32,
-        (pos.y / TILE_SIZE).floor() as i32,
-    )
-}
-
-fn chunk_of(tx: i32, ty: i32) -> ChunkCoord {
-    ChunkCoord(
-        tx.div_euclid(CHUNK_SIZE as i32),
-        ty.div_euclid(CHUNK_SIZE as i32),
-    )
-}
-
-fn assign_job_with_routing(
+pub fn assign_job_with_routing(
     ai: &mut PersonAI,
     cur_chunk: ChunkCoord,
     target: (i16, i16),
@@ -154,6 +137,7 @@ fn assign_job_with_routing(
 }
 
 /// Find nearest entity of opposite sex in same faction within `radius` tiles.
+/// Prefers partners with higher relationship affinity.
 fn find_nearby_partner(
     spatial: &SpatialIndex,
     from: (i32, i32),
@@ -162,45 +146,52 @@ fn find_nearby_partner(
     my_faction: u32,
     sex_query: &Query<(&BiologicalSex, &FactionMember)>,
     self_entity: Entity,
+    rel: Option<&RelationshipMemory>,
 ) -> Option<(i16, i16)> {
+    let mut best_pos = None;
+    let mut best_affinity = i8::MIN;
+
     for dy in -radius..=radius {
         for dx in -radius..=radius {
             for &other in spatial.get(from.0 + dx, from.1 + dy) {
                 if other == self_entity { continue; }
                 if let Ok((other_sex, other_fm)) = sex_query.get(other) {
                     if *other_sex != my_sex && other_fm.faction_id == my_faction {
-                        return Some(((from.0 + dx) as i16, (from.1 + dy) as i16));
+                        let affinity = rel.map(|r| r.get_affinity(other)).unwrap_or(0);
+                        if best_pos.is_none() || affinity > best_affinity {
+                            best_affinity = affinity;
+                            best_pos = Some(((from.0 + dx) as i16, (from.1 + dy) as i16));
+                        }
                     }
                 }
             }
         }
     }
-    None
+    best_pos
 }
 
-pub fn job_dispatch_system(
+/// Handles goals that don't use the plan system:
+/// Reproduce, Socialize, ReturnCamp, Raid, Defend.
+pub fn goal_dispatch_system(
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
     spatial: Res<SpatialIndex>,
-    plant_map: Res<PlantMap>,
     faction_registry: Res<FactionRegistry>,
     sex_query: Query<(&BiologicalSex, &FactionMember)>,
-    item_check: Query<(), With<GroundItem>>,
     mut query: Query<(
         Entity,
         &mut PersonAI,
-        &Needs,
         &EconomicAgent,
         &AgentGoal,
         &FactionMember,
         &BiologicalSex,
         &Transform,
         &LodLevel,
-        &Skills,
+        Option<&RelationshipMemory>,
     )>,
 ) {
     query.par_iter_mut().for_each(|(
-        entity, mut ai, needs, agent, goal, member, sex, transform, lod, skills
+        entity, mut ai, _agent, goal, member, sex, transform, lod, rel_opt,
     )| {
         if *lod == LodLevel::Dormant {
             return;
@@ -209,39 +200,14 @@ pub fn job_dispatch_system(
             return;
         }
 
-        let (cur_tx, cur_ty) = tile_coord(transform);
-        let cur_chunk = chunk_of(cur_tx, cur_ty);
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
 
         match goal {
-            // ── Survive: find food ────────────────────────────────────────────
-            AgentGoal::Survive => {
-                // Go to camp if faction has food
-                if member.faction_id != SOLO {
-                    if let Some(home) = faction_registry.home_tile(member.faction_id) {
-                        if faction_registry.food_stock(member.faction_id) > 0.0 {
-                            ai.job_id = JobKind::Forager as u16;
-                            assign_job_with_routing(&mut ai, cur_chunk, home, JobKind::Forager, &chunk_graph, &chunk_map);
-                            ai.job_id = JobKind::Forager as u16;
-                            return;
-                        }
-                    }
-                }
-                // Grab nearby dropped food first
-                if let Some(target) = find_nearest_item(&spatial, (cur_tx, cur_ty), 10, &item_check) {
-                    assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Forager, &chunk_graph, &chunk_map);
-                    return;
-                }
-                // Forage food
-                if let Some(target) = find_nearest_tile(&chunk_map, (cur_tx, cur_ty), 20, &[TileKind::Farmland]) {
-                    assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Farmer, &chunk_graph, &chunk_map);
-                    return;
-                }
-                if let Some(target) = find_nearest_tile(&chunk_map, (cur_tx, cur_ty), 10, &[TileKind::Grass]) {
-                    assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Forager, &chunk_graph, &chunk_map);
-                }
-            }
-
-            // ── ReturnCamp: carry food to faction home tile ───────────────────
             AgentGoal::ReturnCamp => {
                 if member.faction_id != SOLO {
                     if let Some(home) = faction_registry.home_tile(member.faction_id) {
@@ -250,9 +216,7 @@ pub fn job_dispatch_system(
                 }
             }
 
-            // ── Socialize: seek nearby agent / faction member ─────────────────
             AgentGoal::Socialize => {
-                // Look for any adjacent agent to walk toward
                 let radius = 15i32;
                 'find: for dy in -radius..=radius {
                     for dx in -radius..=radius {
@@ -260,7 +224,6 @@ pub fn job_dispatch_system(
                         let ty = cur_ty + dy;
                         for &other in spatial.get(tx, ty) {
                             if other == entity { continue; }
-                            ai.job_id = JobKind::Idle as u16;
                             assign_job_with_routing(
                                 &mut ai, cur_chunk,
                                 (tx as i16, ty as i16),
@@ -273,19 +236,17 @@ pub fn job_dispatch_system(
                 }
             }
 
-            // ── Reproduce: seek opposite-sex faction partner ──────────────────
             AgentGoal::Reproduce => {
                 if member.faction_id != SOLO {
                     if let Some(target) = find_nearby_partner(
                         &spatial, (cur_tx, cur_ty), 15, *sex,
-                        member.faction_id, &sex_query, entity,
+                        member.faction_id, &sex_query, entity, rel_opt,
                     ) {
                         assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Idle, &chunk_graph, &chunk_map);
                     }
                 }
             }
 
-            // ── Raid: route to enemy camp ─────────────────────────────────────
             AgentGoal::Raid => {
                 if member.faction_id != SOLO {
                     if let Some(target_id) = faction_registry.raid_target(member.faction_id) {
@@ -299,7 +260,6 @@ pub fn job_dispatch_system(
                 }
             }
 
-            // ── Defend: rally to own camp ─────────────────────────────────────
             AgentGoal::Defend => {
                 if member.faction_id != SOLO {
                     if let Some(home) = faction_registry.home_tile(member.faction_id) {
@@ -311,49 +271,8 @@ pub fn job_dispatch_system(
                 }
             }
 
-            // ── Gather: collect resources ─────────────────────────────────────
-            AgentGoal::Gather => {
-                if needs.hunger <= 100 && agent.has_tool() {
-                    if let Some(target) = find_nearest_tile(&chunk_map, (cur_tx, cur_ty), 30, &[TileKind::Forest]) {
-                        assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Woodcutter, &chunk_graph, &chunk_map);
-                        return;
-                    }
-                    if let Some(target) = find_nearest_tile(&chunk_map, (cur_tx, cur_ty), 30, &[TileKind::Stone]) {
-                        assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Miner, &chunk_graph, &chunk_map);
-                        return;
-                    }
-                }
-                // Plant seeds if agent has seeds and enough farming skill
-                if agent.quantity_of(Good::Seed) > 0 && skills.get(SkillKind::Farming) >= 15 {
-                    if let Some(target) = find_nearest_unplanted_farmland(&chunk_map, &plant_map, (cur_tx, cur_ty), 15) {
-                        assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Planter, &chunk_graph, &chunk_map);
-                        return;
-                    }
-                }
-                if needs.hunger > 80 {
-                    if let Some(target) = find_nearest_item(&spatial, (cur_tx, cur_ty), 10, &item_check) {
-                        assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Forager, &chunk_graph, &chunk_map);
-                        return;
-                    }
-                    if let Some(target) = find_nearest_tile(&chunk_map, (cur_tx, cur_ty), 20, &[TileKind::Farmland]) {
-                        assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Farmer, &chunk_graph, &chunk_map);
-                        return;
-                    }
-                }
-                if !agent.is_inventory_full() {
-                    if let Some(target) = find_nearest_tile(&chunk_map, (cur_tx, cur_ty), 10, &[TileKind::Grass]) {
-                        assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Forager, &chunk_graph, &chunk_map);
-                        return;
-                    }
-                    if let Some(target) = find_nearest_tile(&chunk_map, (cur_tx, cur_ty), 10, &[TileKind::Forest]) {
-                        assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Forager, &chunk_graph, &chunk_map);
-                        return;
-                    }
-                    if let Some(target) = find_nearest_tile(&chunk_map, (cur_tx, cur_ty), 10, &[TileKind::Stone]) {
-                        assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Forager, &chunk_graph, &chunk_map);
-                    }
-                }
-            }
+            // Survive and Gather are handled by plan_execution_system
+            AgentGoal::Survive | AgentGoal::Gather => {}
         }
     });
 }

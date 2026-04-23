@@ -18,6 +18,9 @@ pub mod raid;
 pub mod items;
 pub mod world_sim;
 pub mod plants;
+pub mod memory;
+pub mod neural;
+pub mod plan;
 
 pub use person::PersonAI;
 pub use needs::Needs;
@@ -39,6 +42,11 @@ pub struct SimulationPlugin;
 
 impl Plugin for SimulationPlugin {
     fn build(&self, app: &mut App) {
+        let mut step_registry = plan::StepRegistry::default();
+        let mut plan_registry = plan::PlanRegistry::default();
+        plan::register_builtin_steps(&mut step_registry);
+        plan::register_builtin_plans(&mut plan_registry);
+
         app.insert_resource(SimClock::default())
             .insert_resource(faction::FactionRegistry::default())
             .insert_resource(reproduction::MaleCandidates::default())
@@ -47,6 +55,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(plants::PlantSpriteIndex::default())
             .insert_resource(plants::PlantMaterials::default())
             .insert_resource(plants::PlantMeshHandle::default())
+            .insert_resource(step_registry)
+            .insert_resource(plan_registry)
             .configure_sets(
                 Update,
                 (
@@ -79,7 +89,7 @@ impl Plugin for SimulationPlugin {
             )
             .add_systems(
                 Update,
-                (jobs::job_dispatch_system,)
+                (jobs::goal_dispatch_system,)
                     .in_set(SimulationSet::ParallelB),
             )
             .add_systems(
@@ -105,6 +115,8 @@ impl Plugin for SimulationPlugin {
                         .after(movement::update_spatial_index_system),
                     production::production_system
                         .after(movement::movement_system),
+                    plan::plan_execution_system
+                        .after(production::production_system),
                     faction::bonding_system
                         .after(movement::update_spatial_index_system),
                     production::tile_regen_system,
@@ -119,7 +131,13 @@ impl Plugin for SimulationPlugin {
                     plants::plant_growth_system,
                     plants::seed_scatter_system
                         .after(plants::plant_growth_system),
+                    memory::memory_decay_system,
                     faction::social_fill_system,
+                    memory::conversation_memory_system
+                        .after(faction::social_fill_system),
+                    plan::plan_gossip_system
+                        .after(memory::conversation_memory_system),
+                    plan::plan_decay_system,
                     faction::faction_camp_system,
                     reproduction::collect_male_candidates,
                     reproduction::reproduction_system

@@ -8,9 +8,12 @@ use super::items::Equipment;
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::{AgentGoal, Personality};
 use super::lod::LodLevel;
+use super::memory::{AgentMemory, RelationshipMemory};
 use super::mood::Mood;
 use super::movement::MovementState;
 use super::needs::Needs;
+use super::neural::UtilityNet;
+use super::plan::{KnownPlans, PlanScoringMethod};
 use super::person::{AiState, Person, PersonAI};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
@@ -65,6 +68,7 @@ pub fn reproduction_system(
     candidates: Res<MaleCandidates>,
     mut clock: ResMut<SimClock>,
     mut registry: ResMut<FactionRegistry>,
+    father_net_query: Query<Option<&UtilityNet>>,
     mut query: Query<(
         Entity,
         &mut Needs,
@@ -74,11 +78,12 @@ pub fn reproduction_system(
         &Transform,
         &LodLevel,
         &BucketSlot,
+        Option<&UtilityNet>,
     )>,
 ) {
-    let mut births: Vec<(Transform, u32)> = Vec::new();
+    let mut births: Vec<(Transform, u32, UtilityNet)> = Vec::new();
 
-    for (entity, mut needs, mut member, sex, goal, transform, lod, slot) in query.iter_mut() {
+    for (entity, mut needs, mut member, sex, goal, transform, lod, slot, mother_net) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -95,28 +100,40 @@ pub fn reproduction_system(
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         let faction_id = member.faction_id;
 
-        let mut found_male = false;
+        let mut found_father: Option<Entity> = None;
         'search: for dy in -1..=1i32 {
             for dx in -1..=1i32 {
                 for &other in spatial.get(tx + dx, ty + dy) {
                     if other != entity
                         && candidates.0.get(&other).copied() == Some(faction_id)
                     {
-                        found_male = true;
+                        found_father = Some(other);
                         break 'search;
                     }
                 }
             }
         }
 
-        if found_male && fastrand::u8(..100) < BIRTH_CHANCE {
-            needs.reproduction = 0;
-            member.birth_cooldown = BIRTH_COOLDOWN_TICKS;
-            births.push((*transform, faction_id));
-        }
+        let Some(father_entity) = found_father else { continue };
+
+        if fastrand::u8(..100) >= BIRTH_CHANCE { continue; }
+
+        needs.reproduction = 0;
+        member.birth_cooldown = BIRTH_COOLDOWN_TICKS;
+
+        // Inherit net from both parents
+        let father_net = father_net_query.get(father_entity).ok().flatten();
+        let child_net = match (mother_net, father_net) {
+            (Some(m), Some(f)) => UtilityNet::from_parents(m, f),
+            (Some(p), None)    => UtilityNet::from_parent(p),
+            (None, Some(p))    => UtilityNet::from_parent(p),
+            (None, None)       => UtilityNet::new_random(),
+        };
+
+        births.push((*transform, faction_id, child_net));
     }
 
-    for (parent_transform, faction_id) in births {
+    for (parent_transform, faction_id, child_net) in births {
         let new_slot = clock.population;
         clock.population += 1;
         clock.bucket_size = clock.population.min(10_000);
@@ -155,6 +172,13 @@ pub fn reproduction_system(
                 Body::new_humanoid(),
                 Equipment::default(),
                 CombatTarget::default(),
+            ),
+            (
+                AgentMemory::default(),
+                RelationshipMemory::default(),
+                child_net,
+                KnownPlans::with_innate(&[0, 1]),
+                PlanScoringMethod::UtilityNN,
             ),
         ));
     }

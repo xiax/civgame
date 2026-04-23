@@ -6,6 +6,8 @@ use crate::economy::goods::Good;
 use crate::simulation::animals::Deer;
 use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
+use crate::simulation::memory::{AgentMemory, MemoryKind};
+use crate::simulation::plan::ActivePlan;
 use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
@@ -267,9 +269,11 @@ pub fn plant_harvest_system(
         &mut Skills,
         &BucketSlot,
         &LodLevel,
+        Option<&mut AgentMemory>,
+        Option<&mut ActivePlan>,
     ), With<Person>>,
 ) {
-    for (mut ai, mut agent, mut skills, slot, lod) in agent_query.iter_mut() {
+    for (mut ai, mut agent, mut skills, slot, lod, mut memory_opt, mut active_plan_opt) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
         if ai.state != AiState::Working { continue; }
         if ai.job_id != crate::simulation::jobs::JobKind::Farmer as u16 { continue; }
@@ -305,6 +309,12 @@ pub fn plant_harvest_system(
             agent.add_good(Good::Seed, 1);
         }
         skills.gain_xp(SkillKind::Farming, 3);
+        if let Some(ref mut mem) = memory_opt {
+            mem.record((tx as i16, ty as i16), MemoryKind::Food);
+        }
+        if let Some(ref mut plan) = active_plan_opt {
+            plan.reward_acc += food_qty as f32 * 0.4;
+        }
 
         // Drop a seed nearby on the ground
         let (dx, dy) = adjacent_offset();

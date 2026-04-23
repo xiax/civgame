@@ -11,8 +11,10 @@ use crate::simulation::plants::{
 };
 use super::jobs::JobKind;
 use super::lod::LodLevel;
+use super::memory::{AgentMemory, MemoryKind};
 use super::needs::Needs;
 use super::person::{AiState, PersonAI};
+use super::plan::ActivePlan;
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::{SkillKind, Skills};
 
@@ -22,7 +24,7 @@ const TICKS_FORAGER_STONE: u8 = 120;
 const TICKS_FARMER:        u8 = 30;
 const TICKS_WOODCUTTER:    u8 = 30;
 const TICKS_MINER:         u8 = 30;
-const TICKS_FARMER_PLANT:  u8 = 40;
+pub const TICKS_FARMER_PLANT: u8 = 40;
 
 const HUNGER_EAT_THRESHOLD: u8 = 100;
 const FOOD_NUTRITION:        u8 = 40;
@@ -71,12 +73,14 @@ pub fn production_system(
         &mut Skills,
         &BucketSlot,
         &LodLevel,
+        Option<&mut AgentMemory>,
+        Option<&mut ActivePlan>,
     )>,
 ) {
     let yield_mul = calendar.food_yield_multiplier();
     let food_scale = (1.0 / yield_mul.max(0.01)).clamp(0.5, 8.0);
 
-    for (mut ai, mut agent, mut skills, slot, lod) in query.iter_mut() {
+    for (mut ai, mut agent, mut skills, slot, lod, mut memory_opt, mut active_plan_opt) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
         if ai.state != AiState::Working { continue; }
 
@@ -95,8 +99,13 @@ pub fn production_system(
                             agent.add_good(Good::Food, 1);
                             depletion.deplete(tx, ty);
                             skills.gain_xp(SkillKind::Farming, 1);
+                            if let Some(ref mut mem) = memory_opt {
+                                mem.record((tx as i16, ty as i16), MemoryKind::Food);
+                            }
+                            if let Some(ref mut plan) = active_plan_opt {
+                                plan.reward_acc += 1.0 * 0.5;
+                            }
                         } else {
-                            // Tile exhausted — move on
                             ai.state = AiState::Idle;
                             ai.job_id = PersonAI::UNEMPLOYED;
                         }
@@ -109,6 +118,12 @@ pub fn production_system(
                             agent.add_good(Good::Wood, 1);
                             depletion.deplete(tx, ty);
                             skills.gain_xp(SkillKind::Farming, 1);
+                            if let Some(ref mut mem) = memory_opt {
+                                mem.record((tx as i16, ty as i16), MemoryKind::Wood);
+                            }
+                            if let Some(ref mut plan) = active_plan_opt {
+                                plan.reward_acc += 1.0 * 0.3;
+                            }
                         } else {
                             ai.state = AiState::Idle;
                             ai.job_id = PersonAI::UNEMPLOYED;
@@ -120,6 +135,12 @@ pub fn production_system(
                         ai.work_progress = 0;
                         agent.add_good(Good::Stone, 1);
                         skills.gain_xp(SkillKind::Mining, 1);
+                        if let Some(ref mut mem) = memory_opt {
+                            mem.record((tx as i16, ty as i16), MemoryKind::Stone);
+                        }
+                        if let Some(ref mut plan) = active_plan_opt {
+                            plan.reward_acc += 1.0 * 0.3;
+                        }
                     }
                 }
                 _ => {}
@@ -132,6 +153,12 @@ pub fn production_system(
                     agent.add_good(Good::Food, 2);
                     depletion.deplete(tx, ty);
                     skills.gain_xp(SkillKind::Farming, 2);
+                    if let Some(ref mut mem) = memory_opt {
+                        mem.record((tx as i16, ty as i16), MemoryKind::Food);
+                    }
+                    if let Some(ref mut plan) = active_plan_opt {
+                        plan.reward_acc += 2.0 * 0.5;
+                    }
                 } else {
                     ai.state = AiState::Idle;
                     ai.job_id = PersonAI::UNEMPLOYED;
@@ -144,6 +171,12 @@ pub fn production_system(
                     agent.add_good(Good::Wood, 3);
                     depletion.deplete(tx, ty);
                     skills.gain_xp(SkillKind::Farming, 2);
+                    if let Some(ref mut mem) = memory_opt {
+                        mem.record((tx as i16, ty as i16), MemoryKind::Wood);
+                    }
+                    if let Some(ref mut plan) = active_plan_opt {
+                        plan.reward_acc += 3.0 * 0.3;
+                    }
                 } else {
                     ai.state = AiState::Idle;
                     ai.job_id = PersonAI::UNEMPLOYED;
@@ -154,6 +187,12 @@ pub fn production_system(
                 ai.work_progress = 0;
                 agent.add_good(Good::Stone, 2);
                 skills.gain_xp(SkillKind::Mining, 2);
+                if let Some(ref mut mem) = memory_opt {
+                    mem.record((tx as i16, ty as i16), MemoryKind::Stone);
+                }
+                if let Some(ref mut plan) = active_plan_opt {
+                    plan.reward_acc += 2.0 * 0.3;
+                }
                 let r = fastrand::u8(..100);
                 if r < 5  { agent.add_good(Good::Coal, 1); }
                 else if r < 7 { agent.add_good(Good::Iron, 1); }
