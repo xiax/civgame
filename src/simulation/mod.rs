@@ -21,6 +21,7 @@ pub mod plants;
 pub mod memory;
 pub mod neural;
 pub mod plan;
+pub mod technology;
 
 pub use person::PersonAI;
 pub use needs::Needs;
@@ -147,6 +148,9 @@ impl Plugin for SimulationPlugin {
                         .after(raid::faction_decision_system),
                     world_sim::world_sim_system,
                     world_sim::agent_exploration_system,
+                    technology::tech_discovery_system
+                        .after(faction::faction_camp_system)
+                        .after(raid::raid_execution_system),
                 )
                     .in_set(SimulationSet::Economy),
             );

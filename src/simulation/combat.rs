@@ -1,7 +1,8 @@
 use bevy::prelude::*;
 use crate::economy::goods::Good;
 use crate::simulation::animals::{Deer, Wolf};
-use crate::simulation::faction::{FactionMember, FactionRegistry};
+use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
+use crate::simulation::technology::ActivityKind;
 use crate::simulation::items::{GroundItem, Equipment, EquipmentSlot, WeaponStats, ArmorStats};
 use crate::simulation::jobs::JobKind;
 use crate::simulation::lod::LodLevel;
@@ -101,21 +102,24 @@ const ATTACK_DAMAGE: u8 = 2;
 
 pub fn combat_system(
     spatial: Res<SpatialIndex>,
-    attacker_query: Query<(Entity, &CombatTarget, &Transform, &LodLevel, &BucketSlot, Option<&Equipment>)>,
+    attacker_query: Query<(Entity, &CombatTarget, &Transform, &LodLevel, &BucketSlot, Option<&Equipment>, Option<&FactionMember>)>,
     mut health_query: Query<&mut Health>,
     mut body_query: Query<&mut Body>,
     equipment_query: Query<&Equipment>,
     item_stats_query: Query<(Option<&WeaponStats>, Option<&ArmorStats>)>,
     mut ai_query: Query<&mut PersonAI>,
     mut rel_query: Query<Option<&mut RelationshipMemory>>,
+    mut faction_registry: ResMut<FactionRegistry>,
     clock: Res<SimClock>,
 ) {
     // (target, attacker, damage)
     let mut health_damage_events: Vec<(Entity, Entity, u8)> = Vec::new();
     // (target, attacker, part, damage)
     let mut body_damage_events: Vec<(Entity, Entity, BodyPart, u8)> = Vec::new();
+    // (faction_id) — attackers whose faction logs a combat event this frame
+    let mut combat_activity_factions: Vec<u32> = Vec::new();
 
-    for (attacker, combat_target, transform, lod, slot, attacker_eq) in &attacker_query {
+    for (attacker, combat_target, transform, lod, slot, attacker_eq, attacker_fm) in &attacker_query {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -156,6 +160,15 @@ pub fn combat_system(
                     if let Ok((Some(w_stats), _)) = item_stats_query.get(weapon_ent) {
                         damage += w_stats.damage_bonus;
                     }
+                }
+            }
+            // Apply faction tech combat bonus
+            if let Some(fm) = attacker_fm {
+                if fm.faction_id != SOLO {
+                    if let Some(fd) = faction_registry.factions.get(&fm.faction_id) {
+                        damage = damage.saturating_add(fd.combat_damage_bonus());
+                    }
+                    combat_activity_factions.push(fm.faction_id);
                 }
             }
 
@@ -205,6 +218,13 @@ pub fn combat_system(
         }
         if let Ok(Some(mut rel)) = rel_query.get_mut(target) {
             rel.update(attacker, -20);
+        }
+    }
+
+    // Record combat activity for attacking factions
+    for faction_id in combat_activity_factions {
+        if let Some(fd) = faction_registry.factions.get_mut(&faction_id) {
+            fd.activity_log.increment(ActivityKind::Combat);
         }
     }
 }

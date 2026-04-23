@@ -10,6 +10,9 @@ use super::person::{AiState, PersonAI};
 use super::schedule::{BucketSlot, SimClock};
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
+use crate::simulation::technology::{
+    TechId, ActivityKind, TECH_COUNT, ACTIVITY_COUNT, FIRE_MAKING, tech_def,
+};
 
 pub const SOLO: u32 = 0;
 pub const BOND_THRESHOLD: u8 = 180;
@@ -31,12 +34,39 @@ impl Default for FactionMember {
     }
 }
 
+/// u64 bitset storing which technologies are unlocked (bits 0-42).
+#[derive(Clone, Debug, Default)]
+pub struct FactionTechs(pub u64);
+
+impl FactionTechs {
+    #[inline]
+    pub fn has(&self, id: TechId) -> bool { self.0 & (1u64 << id) != 0 }
+    #[inline]
+    pub fn unlock(&mut self, id: TechId) { self.0 |= 1u64 << id; }
+}
+
+/// Per-season activity counters, reset after each tech discovery pass.
+#[derive(Clone, Debug, Default)]
+pub struct ActivityLog(pub [u32; ACTIVITY_COUNT]);
+
+impl ActivityLog {
+    #[inline]
+    pub fn increment(&mut self, kind: ActivityKind) {
+        self.0[kind as usize] = self.0[kind as usize].saturating_add(1);
+    }
+    #[inline]
+    pub fn get(&self, kind: ActivityKind) -> u32 { self.0[kind as usize] }
+    pub fn reset(&mut self) { self.0 = [0; ACTIVITY_COUNT]; }
+}
+
 pub struct FactionData {
     pub food_stock:   f32,
     pub home_tile:    (i16, i16),
     pub member_count: u32,
     pub raid_target:  Option<u32>,
     pub under_raid:   bool,
+    pub techs:        FactionTechs,
+    pub activity_log: ActivityLog,
 }
 
 #[derive(Resource, Default)]
@@ -49,7 +79,14 @@ impl FactionRegistry {
     pub fn create_faction(&mut self, home_tile: (i16, i16)) -> u32 {
         self.next_id += 1;
         let id = self.next_id;
-        self.factions.insert(id, FactionData { food_stock: 0.0, home_tile, member_count: 0, raid_target: None, under_raid: false });
+        let mut techs = FactionTechs::default();
+        techs.unlock(FIRE_MAKING);
+        self.factions.insert(id, FactionData {
+            food_stock: 0.0, home_tile, member_count: 0,
+            raid_target: None, under_raid: false,
+            techs,
+            activity_log: ActivityLog::default(),
+        });
         id
     }
 
@@ -164,16 +201,17 @@ pub fn bonding_system(
 // ── Social fill system ────────────────────────────────────────────────────────
 
 pub fn social_fill_system(
-    spatial: Res<SpatialIndex>,
-    clock: Res<SimClock>,
+    spatial:      Res<SpatialIndex>,
+    clock:        Res<SimClock>,
+    mut registry: ResMut<FactionRegistry>,
     mut query: Query<(Entity, &mut Needs, &FactionMember, &Transform, &BucketSlot, &LodLevel)>,
 ) {
-    query.par_iter_mut().for_each(|(entity, mut needs, member, transform, slot, lod)| {
+    for (entity, mut needs, member, transform, slot, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
-            return;
+            continue;
         }
         if member.faction_id == SOLO {
-            return;
+            continue;
         }
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
@@ -192,8 +230,11 @@ pub fn social_fill_system(
 
         if nearby > 0 {
             needs.social = needs.social.saturating_sub(nearby.min(10) as u8 * 3);
+            if let Some(fd) = registry.factions.get_mut(&member.faction_id) {
+                fd.activity_log.increment(ActivityKind::Socializing);
+            }
         }
-    });
+    }
 }
 
 // ── Faction camp food system ──────────────────────────────────────────────────
@@ -266,5 +307,34 @@ impl FactionRegistry {
 
     pub fn is_under_raid(&self, faction_id: u32) -> bool {
         self.factions.get(&faction_id).map(|f| f.under_raid).unwrap_or(false)
+    }
+}
+
+impl FactionData {
+    pub fn food_yield_multiplier(&self) -> f32 {
+        1.0 + (0..TECH_COUNT as u16)
+            .filter(|&id| self.techs.has(id))
+            .map(|id| tech_def(id).bonus.food_yield_bonus)
+            .sum::<f32>()
+    }
+
+    pub fn wood_yield_multiplier(&self) -> f32 {
+        1.0 + (0..TECH_COUNT as u16)
+            .filter(|&id| self.techs.has(id))
+            .map(|id| tech_def(id).bonus.wood_yield_bonus)
+            .sum::<f32>()
+    }
+
+    pub fn stone_yield_multiplier(&self) -> f32 {
+        1.0 + (0..TECH_COUNT as u16)
+            .filter(|&id| self.techs.has(id))
+            .map(|id| tech_def(id).bonus.stone_yield_bonus)
+            .sum::<f32>()
+    }
+
+    pub fn combat_damage_bonus(&self) -> u8 {
+        (0..TECH_COUNT as u16)
+            .filter(|&id| self.techs.has(id))
+            .fold(0u8, |acc, id| acc.saturating_add(tech_def(id).bonus.combat_damage_bonus))
     }
 }
