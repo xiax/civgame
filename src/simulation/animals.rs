@@ -117,8 +117,7 @@ pub fn spawn_animals(
     }
 
     clock.population = slot;
-    clock.bucket_size = slot.min(10_000);
-    clock.current_end = clock.bucket_size;
+    clock.current_end = clock.bucket_size.min(slot);
 }
 
 pub fn animal_movement_system(
@@ -128,11 +127,12 @@ pub fn animal_movement_system(
     clock: Res<SimClock>,
 ) {
     let dt = time.delta_secs();
+    let sim_dt = dt * clock.scale_factor();
     let total_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
     let total_y = WORLD_CHUNKS_Y * CHUNK_SIZE as i32;
 
     for (mut transform, mut ai, lod, slot) in query.iter_mut() {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+        if *lod == LodLevel::Dormant {
             continue;
         }
         if ai.state == AnimalState::Attack {
@@ -156,27 +156,30 @@ pub fn animal_movement_system(
             transform.translation.y = target_world.y;
 
             if matches!(ai.state, AnimalState::Wander | AnimalState::Flee) {
-                ai.wander_timer -= dt;
-                if ai.wander_timer <= 0.0 {
-                    ai.wander_timer = WANDER_INTERVAL;
-                    ai.state = AnimalState::Wander;
-                    ai.target_entity = None;
+                // Bucketed wander logic
+                if clock.is_active(slot.0) {
+                    ai.wander_timer -= sim_dt;
+                    if ai.wander_timer <= 0.0 {
+                        ai.wander_timer = WANDER_INTERVAL;
+                        ai.state = AnimalState::Wander;
+                        ai.target_entity = None;
 
-                    let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
-                    let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
+                        let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
+                        let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
 
-                    // Pick random adjacent passable tile
-                    let dirs: [(i32, i32); 8] = [
-                        (-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1),
-                    ];
-                    let start = fastrand::usize(..8);
-                    for i in 0..8 {
-                        let (dx, dy) = dirs[(start + i) % 8];
-                        let ntx = (cur_tx + dx).clamp(0, total_x - 1);
-                        let nty = (cur_ty + dy).clamp(0, total_y - 1);
-                        if chunk_map.is_passable(ntx, nty) {
-                            ai.target_tile = (ntx as i16, nty as i16);
-                            break;
+                        // Pick random adjacent passable tile
+                        let dirs: [(i32, i32); 8] = [
+                            (-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1),
+                        ];
+                        let start = fastrand::usize(..8);
+                        for i in 0..8 {
+                            let (dx, dy) = dirs[(start + i) % 8];
+                            let ntx = (cur_tx + dx).clamp(0, total_x - 1);
+                            let nty = (cur_ty + dy).clamp(0, total_y - 1);
+                            if chunk_map.is_passable(ntx, nty) {
+                                ai.target_tile = (ntx as i16, nty as i16);
+                                break;
+                            }
                         }
                     }
                 }

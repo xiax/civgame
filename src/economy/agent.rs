@@ -1,20 +1,21 @@
 use bevy::prelude::*;
 use super::goods::Good;
+use super::item::Item;
 
 const INVENTORY_SLOTS: usize = 4;
 
-/// 24 bytes — currency + small fixed inventory.
+/// Currency + small fixed inventory.
 #[derive(Component, Clone, Copy)]
 pub struct EconomicAgent {
     pub currency:  f32,
-    pub inventory: [(Good, u8); INVENTORY_SLOTS],
+    pub inventory: [(Item, u8); INVENTORY_SLOTS],
 }
 
 impl Default for EconomicAgent {
     fn default() -> Self {
         Self {
             currency: 50.0,
-            inventory: [(Good::Food, 0); INVENTORY_SLOTS],
+            inventory: [(Item::new_commodity(Good::Food), 0); INVENTORY_SLOTS],
         }
     }
 }
@@ -22,40 +23,47 @@ impl Default for EconomicAgent {
 impl EconomicAgent {
     pub fn quantity_of(&self, good: Good) -> u8 {
         self.inventory.iter()
-            .filter(|(g, _)| *g == good)
+            .filter(|(it, _)| it.good == good)
             .map(|(_, q)| *q)
             .sum()
     }
 
-    pub fn add_good(&mut self, good: Good, qty: u8) {
-        // Find existing slot
-        for (g, q) in self.inventory.iter_mut() {
-            if *g == good {
+    pub fn add_item(&mut self, item: Item, qty: u8) {
+        // Find existing slot with identical item
+        for (it, q) in self.inventory.iter_mut() {
+            if *it == item && *q > 0 {
                 *q = q.saturating_add(qty);
                 return;
             }
         }
         // Find empty slot (qty == 0, treated as empty)
-        for (g, q) in self.inventory.iter_mut() {
+        for (it, q) in self.inventory.iter_mut() {
             if *q == 0 {
-                *g = good;
+                *it = item;
                 *q = qty;
                 return;
             }
         }
-        // Inventory full — drop the item (simplified)
     }
 
-    /// Remove up to `qty` units of `good`. Returns how many were actually removed.
-    pub fn remove_good(&mut self, good: Good, qty: u8) -> u8 {
-        for (g, q) in self.inventory.iter_mut() {
-            if *g == good && *q > 0 {
+    pub fn add_good(&mut self, good: Good, qty: u8) {
+        self.add_item(Item::new_commodity(good), qty);
+    }
+
+    /// Remove up to `qty` units of a specific `item`. Returns how many were actually removed.
+    pub fn remove_item(&mut self, item: Item, qty: u8) -> u8 {
+        for (it, q) in self.inventory.iter_mut() {
+            if *it == item && *q > 0 {
                 let removed = (*q).min(qty);
                 *q -= removed;
                 return removed;
             }
         }
         0
+    }
+
+    pub fn remove_good(&mut self, good: Good, qty: u8) -> u8 {
+        self.remove_item(Item::new_commodity(good), qty)
     }
 
     pub fn has_tool(&self) -> bool {

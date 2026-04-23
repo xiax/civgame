@@ -23,5 +23,6 @@ fn main() {
         .add_plugins(pathfinding::PathfindingPlugin)
         .add_plugins(rendering::RenderingPlugin)
         .add_plugins(ui::UiPlugin)
+        .insert_resource(Time::<Fixed>::from_hz(20.0))
         .run();
 }

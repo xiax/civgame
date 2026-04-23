@@ -2,6 +2,7 @@ use bevy::prelude::*;
 use crate::simulation::SimulationSet;
 
 pub mod goods;
+pub mod item;
 pub mod market;
 pub mod command;
 pub mod agent;
@@ -9,6 +10,7 @@ pub mod mode;
 pub mod transactions;
 
 pub use goods::{Good, GOOD_COUNT};
+pub use item::{Item, ItemMaterial, ItemQuality};
 pub use market::Market;
 pub use command::CommandPools;
 pub use agent::EconomicAgent;

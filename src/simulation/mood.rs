@@ -1,5 +1,7 @@
 use bevy::prelude::*;
 use super::needs::Needs;
+use super::schedule::{BucketSlot, SimClock};
+use super::lod::LodLevel;
 
 /// -128 = despairing, 0 = neutral, 127 = ecstatic.
 #[derive(Component, Clone, Copy, Default)]
@@ -19,8 +21,13 @@ impl Mood {
     }
 }
 
-pub fn derive_mood_system(mut query: Query<(&Needs, &mut Mood)>) {
-    query.par_iter_mut().for_each(|(needs, mut mood)| {
+pub fn derive_mood_system(
+    clock: Res<SimClock>,
+    mut query: Query<(&Needs, &mut Mood, &BucketSlot, &LodLevel)>
+) {
+    query.par_iter_mut().for_each(|(needs, mut mood, slot, lod)| {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { return; }
+        
         // Distress 0..255 → mood 127..-128
         let distress = needs.avg_distress();
         let raw = 127.0 - (distress / 255.0) * 255.0;

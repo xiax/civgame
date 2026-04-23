@@ -22,7 +22,7 @@ impl Default for SimClock {
     fn default() -> Self {
         Self {
             tick:          0,
-            bucket_size:   10_000,
+            bucket_size:   250,
             population:    0,
             current_start: 0,
             current_end:   0,

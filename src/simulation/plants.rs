@@ -3,6 +3,7 @@ use bevy::prelude::*;
 
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
+use crate::economy::item::Item;
 use crate::simulation::animals::Deer;
 use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
@@ -322,7 +323,7 @@ pub fn plant_harvest_system(
         let sy = ty + dy;
         let seed_pos = tile_to_world(sx, sy);
         commands.spawn((
-            GroundItem { good: Good::Seed, qty: 1 },
+            GroundItem { item: Item::new_commodity(Good::Seed), qty: 1 },
             Transform::from_xyz(seed_pos.x, seed_pos.y, 0.3),
             GlobalTransform::default(),
         ));
@@ -401,7 +402,7 @@ pub fn deer_graze_system(
                 let sy = ty + dy;
                 let pos = tile_to_world(sx, sy);
                 commands.spawn((
-                    GroundItem { good: Good::Seed, qty: 1 },
+                    GroundItem { item: Item::new_commodity(Good::Seed), qty: 1 },
                     Transform::from_xyz(pos.x, pos.y, 0.3),
                     GlobalTransform::default(),
                 ));

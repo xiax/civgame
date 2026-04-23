@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
+use crate::economy::item::Item;
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, Person, PersonAI};
@@ -11,7 +11,7 @@ use crate::simulation::combat::BodyPart;
 
 #[derive(Component, Clone, Copy)]
 pub struct GroundItem {
-    pub good: Good,
+    pub item: Item,
     pub qty:  u8,
 }
 
@@ -42,23 +42,6 @@ pub struct ArmorStats {
     pub covered_parts: Vec<BodyPart>,
 }
 
-#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ItemMaterial {
-    Wood,
-    Stone,
-    Iron,
-    Steel,
-    Leather,
-}
-
-#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ItemQuality {
-    Poor,
-    Normal,
-    Fine,
-    Masterwork,
-}
-
 /// Sequential, after death_system.
 /// Iterates ground items; the first active Working agent with a food goal at the
 /// same tile claims the item.  Only one agent claims each item per frame.
@@ -85,9 +68,9 @@ pub fn item_pickup_system(
             };
             if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
             if ai.state != AiState::Working { continue; }
-            if !matches!(goal, AgentGoal::Survive | AgentGoal::Gather) { continue; }
+                        if !matches!(goal, AgentGoal::Survive | AgentGoal::Gather) { continue; }
 
-            agent.add_good(item.good, item.qty);
+            agent.add_good(item.item.good, item.qty);
             commands.entity(item_e).despawn();
             ai.state = AiState::Idle;
             ai.job_id = PersonAI::UNEMPLOYED;

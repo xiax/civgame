@@ -116,9 +116,16 @@ pub fn inspector_panel_system(
             ui.separator();
             ui.label(format!("Currency: {:.1}", agent.currency));
             ui.label("Inventory:");
-            for (good, qty) in &agent.inventory {
+            for (item, qty) in &agent.inventory {
                 if *qty > 0 {
-                    ui.label(format!("  {}: {}", good.name(), qty));
+                    let mut name = item.good.name().to_string();
+                    if let Some(mat) = item.material {
+                        name = format!("{:?} {}", mat, name);
+                    }
+                    if let Some(qual) = item.quality {
+                        name = format!("{} ({:?})", name, qual);
+                    }
+                    ui.label(format!("  {}: {}", name, qty));
                 }
             }
 

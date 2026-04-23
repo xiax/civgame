@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use crate::economy::goods::Good;
+use crate::economy::item::Item;
 use crate::simulation::animals::{Deer, Wolf};
 use crate::simulation::faction::{FactionMember, FactionRegistry};
 use crate::simulation::items::{GroundItem, Equipment, EquipmentSlot, WeaponStats, ArmorStats};
@@ -236,7 +237,7 @@ pub fn death_system(
 
         if let Some(qty) = loot_qty {
             commands.spawn((
-                GroundItem { good: Good::Food, qty },
+                GroundItem { item: Item::new_commodity(Good::Food), qty },
                 *transform,
                 GlobalTransform::default(),
             ));

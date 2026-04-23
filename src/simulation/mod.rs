@@ -58,7 +58,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(step_registry)
             .insert_resource(plan_registry)
             .configure_sets(
-                Update,
+                FixedUpdate,
                 (
                     SimulationSet::ParallelA,
                     SimulationSet::ParallelB.after(SimulationSet::ParallelA),
@@ -68,7 +68,7 @@ impl Plugin for SimulationPlugin {
             )
             .add_systems(PostStartup, (person::spawn_population, animals::spawn_animals.after(person::spawn_population)))
             .add_systems(
-                Update,
+                FixedUpdate,
                 (
                     needs::tick_needs_system,
                     mood::derive_mood_system,
@@ -77,7 +77,7 @@ impl Plugin for SimulationPlugin {
                     .in_set(SimulationSet::ParallelA),
             )
             .add_systems(
-                Update,
+                FixedUpdate,
                 (
                     production::consumption_system
                         .after(needs::tick_needs_system),
@@ -88,12 +88,12 @@ impl Plugin for SimulationPlugin {
                     .in_set(SimulationSet::ParallelA),
             )
             .add_systems(
-                Update,
+                FixedUpdate,
                 (jobs::goal_dispatch_system,)
                     .in_set(SimulationSet::ParallelB),
             )
             .add_systems(
-                Update,
+                FixedUpdate,
                 (
                     plants::plant_harvest_system
                         .before(production::production_system),
@@ -126,7 +126,7 @@ impl Plugin for SimulationPlugin {
                     .in_set(SimulationSet::Sequential),
             )
             .add_systems(
-                Update,
+                FixedUpdate,
                 (
                     plants::plant_growth_system,
                     plants::seed_scatter_system
