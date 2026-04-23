@@ -2,17 +2,15 @@ use ahash::AHashMap;
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
-use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::simulation::animals::Deer;
+use crate::simulation::memory::MemoryKind;
+use crate::simulation::skills::SkillKind;
+use crate::simulation::technology::ActivityKind;
 use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
-use crate::simulation::memory::{AgentMemory, MemoryKind};
-use crate::simulation::plan::ActivePlan;
-use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::schedule::{BucketSlot, SimClock};
-use crate::simulation::skills::{SkillKind, Skills};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use crate::rendering::pixel_art::EntityTextures;
@@ -67,6 +65,75 @@ impl Plant {
                 GrowthStage::Mature   => 648_000, // 180 days
                 GrowthStage::Overripe => 0,
             },
+        }
+    }
+}
+
+impl PlantKind {
+    /// Ticks the agent must spend Working before a harvest triggers.
+    /// Plants are harvested instantly (0); this mirrors how tile-based gathering uses work_ticks.
+    pub fn harvest_work_ticks(self) -> u8 { 0 }
+
+    /// Primary good produced and its base quantity.
+    /// `has_tool` only matters for trees (felling vs branch-gathering).
+    pub fn harvest_yield(self, has_tool: bool) -> (Good, u8) {
+        match self {
+            PlantKind::Grain     => (Good::Food, 3),
+            PlantKind::FruitBush => (Good::Food, 2),
+            PlantKind::Tree      => (Good::Wood, if has_tool { 3 } else { 1 }),
+        }
+    }
+
+    /// Fixed co-yields always added alongside the primary yield (no faction multiplier).
+    pub fn harvest_extra_yields(self) -> &'static [(Good, u8)] {
+        match self {
+            PlantKind::FruitBush => &[(Good::Seed, 1)],
+            _                    => &[],
+        }
+    }
+
+    /// Items spawned as loose ground entities adjacent to the harvest tile.
+    pub fn harvest_ground_drops(self, has_tool: bool) -> &'static [(Good, u8)] {
+        match self {
+            PlantKind::Grain     => &[(Good::Seed, 1)],
+            PlantKind::FruitBush => &[(Good::Seed, 1)],
+            PlantKind::Tree      => if has_tool { &[(Good::Wood, 2)] } else { &[(Good::Wood, 1)] },
+        }
+    }
+
+    /// Skill and XP gained per harvest event.
+    pub fn harvest_skill_xp(self, has_tool: bool) -> (SkillKind, u8) {
+        match self {
+            PlantKind::Grain | PlantKind::FruitBush => (SkillKind::Farming, 3),
+            PlantKind::Tree                         => (SkillKind::Farming, if has_tool { 5 } else { 2 }),
+        }
+    }
+
+    /// Memory kind to record after a successful harvest.
+    pub fn harvest_memory_kind(self) -> MemoryKind {
+        match self {
+            PlantKind::Grain | PlantKind::FruitBush => MemoryKind::Food,
+            PlantKind::Tree                          => MemoryKind::Wood,
+        }
+    }
+
+    /// Plan reward multiplier per unit of primary yield.
+    pub fn harvest_reward_per_unit(self) -> f32 { 0.4 }
+
+    /// Faction activity to log for technology progression.
+    pub fn harvest_activity(self) -> ActivityKind {
+        match self {
+            PlantKind::Grain     => ActivityKind::Farming,
+            PlantKind::FruitBush => ActivityKind::Foraging,
+            PlantKind::Tree      => ActivityKind::WoodGathering,
+        }
+    }
+
+    /// Whether harvesting destroys the plant (true) or reverts it to Seedling (false).
+    pub fn harvest_despawns(self, has_tool: bool) -> bool {
+        match self {
+            PlantKind::Tree => has_tool,
+            _               => true,
         }
     }
 }
@@ -269,176 +336,6 @@ pub fn seed_scatter_system(
             vec.retain(|(e, _)| *e != entity);
         }
         commands.entity(entity).despawn();
-    }
-}
-
-/// Harvest a mature plant when an agent arrives at the target tile.
-pub fn plant_harvest_system(
-    mut commands: Commands,
-    clock: Res<SimClock>,
-    mut plant_map: ResMut<PlantMap>,
-    mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    textures: Res<EntityTextures>,
-    mut plant_query: Query<&mut Plant>,
-    mut sprite_query: Query<&mut Sprite>,
-    mut agent_query: Query<(
-        &mut PersonAI,
-        &mut EconomicAgent,
-        &mut Skills,
-        &BucketSlot,
-        &LodLevel,
-        Option<&mut AgentMemory>,
-        Option<&mut ActivePlan>,
-    ), With<Person>>,
-) {
-    for (mut ai, mut agent, mut skills, slot, lod, mut memory_opt, mut active_plan_opt) in agent_query.iter_mut() {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
-        if ai.state != AiState::Working { continue; }
-        let job = ai.job_id;
-        let is_woodcutter = job == crate::simulation::jobs::JobKind::Woodcutter as u16;
-        let is_farmer = job == crate::simulation::jobs::JobKind::Farmer as u16;
-        let is_forager = job == crate::simulation::jobs::JobKind::Forager as u16;
-
-        if !is_farmer && !is_forager && !is_woodcutter {
-            continue;
-        }
-
-        let tx = ai.target_tile.0 as i32;
-        let ty = ai.target_tile.1 as i32;
-
-        let plant_entity = match plant_map.0.get(&(tx, ty)).copied() {
-            Some(e) => e,
-            None    => {
-                // No plant here — give up
-                ai.state = AiState::Idle;
-                ai.job_id = PersonAI::UNEMPLOYED;
-                continue;
-            }
-        };
-
-        let mut plant = match plant_query.get_mut(plant_entity) {
-            Ok(p) => p,
-            Err(_) => {
-                plant_map.0.remove(&(tx, ty));
-                ai.state = AiState::Idle;
-                ai.job_id = PersonAI::UNEMPLOYED;
-                continue;
-            }
-        };
-
-        if plant.stage != GrowthStage::Mature {
-            // Wait for it to grow or give up? 
-            // For now, let's wait but only for a certain time? 
-            // Actually, if it's not mature, we might be stuck here.
-            // Let's give up for now to be safe.
-            ai.state = AiState::Idle;
-            ai.job_id = PersonAI::UNEMPLOYED;
-            continue;
-        }
-
-        // Foragers can harvest FruitBush or gather branches from Trees.
-        // Woodcutters can only harvest Trees.
-        // Farmers can harvest Grain or FruitBush.
-        if is_woodcutter && plant.kind != PlantKind::Tree {
-            ai.state = AiState::Idle;
-            ai.job_id = PersonAI::UNEMPLOYED;
-            continue;
-        }
-        if is_forager && plant.kind == PlantKind::Grain {
-            ai.state = AiState::Idle;
-            ai.job_id = PersonAI::UNEMPLOYED;
-            continue;
-        }
-        if is_farmer && plant.kind == PlantKind::Tree {
-            ai.state = AiState::Idle;
-            ai.job_id = PersonAI::UNEMPLOYED;
-            continue;
-        }
-
-        let (mut wood_qty, mut food_qty, mut seed_qty, mut despawn_plant) = (0u8, 0u8, 0u8, true);
-
-        match plant.kind {
-            PlantKind::FruitBush => {
-                food_qty = 2;
-                seed_qty = 1;
-            }
-            PlantKind::Grain => {
-                food_qty = 3;
-            }
-            PlantKind::Tree => {
-                if agent.has_tool() {
-                    // Felling: requires tools, despawns tree, higher yield
-                    wood_qty = 3;
-                    despawn_plant = true;
-                    skills.gain_xp(SkillKind::Farming, 5); // Using Farming for woodcutting XP as per original
-                } else {
-                    // Branch gathering: no tools, tree survives as seedling
-                    wood_qty = 1;
-                    despawn_plant = false;
-                    skills.gain_xp(SkillKind::Farming, 2);
-                }
-            }
-        }
-
-        if food_qty > 0 {
-            agent.add_good(Good::Food, food_qty);
-            if let Some(ref mut mem) = memory_opt {
-                mem.record((tx as i16, ty as i16), MemoryKind::Food);
-            }
-            if let Some(ref mut plan) = active_plan_opt {
-                plan.reward_acc += food_qty as f32 * plan.reward_scale;
-            }
-        }
-        if wood_qty > 0 {
-            agent.add_good(Good::Wood, wood_qty);
-            if let Some(ref mut mem) = memory_opt {
-                mem.record((tx as i16, ty as i16), MemoryKind::Wood);
-            }
-            if let Some(ref mut plan) = active_plan_opt {
-                plan.reward_acc += wood_qty as f32 * plan.reward_scale;
-            }
-        }
-        if seed_qty > 0 {
-            agent.add_good(Good::Seed, seed_qty);
-        }
-
-        // Drop some extra on ground
-        let (drop_good, drop_qty) = match plant.kind {
-            PlantKind::FruitBush => (Good::Seed, 1),
-            PlantKind::Grain     => (Good::Seed, 1), // Grain harvest drops a seed too
-            PlantKind::Tree      => (Good::Wood, if despawn_plant { 2 } else { 1 }),
-        };
-
-        for _ in 0..drop_qty {
-            let (dx, dy) = adjacent_offset();
-            let sx = tx + dx;
-            let sy = ty + dy;
-            let drop_pos = tile_to_world(sx, sy);
-            commands.spawn((
-                GroundItem { item: Item::new_commodity(drop_good), qty: 1 },
-                Transform::from_xyz(drop_pos.x, drop_pos.y - 8.0, 0.3),
-                GlobalTransform::default(),
-            ));
-        }
-
-        if despawn_plant {
-            plant_map.0.remove(&(tx, ty));
-            let cx = tx.div_euclid(CHUNK_SIZE as i32);
-            let cy = ty.div_euclid(CHUNK_SIZE as i32);
-            if let Some(vec) = plant_sprite_index.by_chunk.get_mut(&ChunkCoord(cx, cy)) {
-                vec.retain(|(e, _)| *e != plant_entity);
-            }
-            commands.entity(plant_entity).despawn();
-        } else {
-            // Revert to seedling
-            plant.stage = GrowthStage::Seedling;
-            plant.growth_ticks = 0;
-            if let Ok(mut sprite) = sprite_query.get_mut(plant_entity) {
-                sprite.image = get_plant_texture(&textures, plant.kind, plant.stage);
-            }
-        }
-
-        ai.work_progress = 0;
     }
 }
 

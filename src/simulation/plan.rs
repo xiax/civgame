@@ -53,6 +53,9 @@ pub struct StepDef {
     pub preconditions: StepPreconditions,
     pub memory_kind:   Option<MemoryKind>,
     pub reward_scale:  f32,
+    /// When falling back from memory to a plant search (Food memory kind),
+    /// restricts which plant kind is targeted. None = any mature plant.
+    pub plant_filter:  Option<PlantKind>,
 }
 
 #[derive(Clone)]
@@ -167,33 +170,37 @@ static GATHER_GOALS:  &[AgentGoal] = &[AgentGoal::Gather];
 
 pub fn register_builtin_steps(registry: &mut StepRegistry) {
     registry.0 = vec![
-        StepDef { // 0: ForageGrass — memory-guided, falls back to nearest grass
-            id: 0, job: JobKind::Forager,
+        StepDef { // 0: ForageGrass — targets FruitBushes, falls back via memory
+            id: 0, job: JobKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Food),
             preconditions: StepPreconditions::none(),
             memory_kind: Some(MemoryKind::Food),
             reward_scale: 1.0,
+            plant_filter: Some(PlantKind::FruitBush),
         },
-        StepDef { // 1: FarmFarmland — memory-guided, falls back to nearest farmland
-            id: 1, job: JobKind::Farmer,
+        StepDef { // 1: FarmFarmland — targets Grain, falls back via memory
+            id: 1, job: JobKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Food),
             preconditions: StepPreconditions::none(),
             memory_kind: Some(MemoryKind::Food),
             reward_scale: 1.0,
+            plant_filter: Some(PlantKind::Grain),
         },
         StepDef { // 2: ChopForest
-            id: 2, job: JobKind::Woodcutter,
+            id: 2, job: JobKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Wood),
             preconditions: StepPreconditions::none(),
             memory_kind: Some(MemoryKind::Wood),
             reward_scale: 0.3,
+            plant_filter: None,
         },
         StepDef { // 3: MineStone
-            id: 3, job: JobKind::Miner,
+            id: 3, job: JobKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Stone),
             preconditions: StepPreconditions::none(),
             memory_kind: Some(MemoryKind::Stone),
             reward_scale: 0.3,
+            plant_filter: None,
         },
         StepDef { // 4: PlantSeed (requires Seed in inventory)
             id: 4, job: JobKind::Planter,
@@ -201,6 +208,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::needs_good(Good::Seed, 1),
             memory_kind: Some(MemoryKind::Seed),
             reward_scale: 0.2,
+            plant_filter: None,
         },
         StepDef { // 5: Hunt
             id: 5, job: JobKind::Hunter,
@@ -208,6 +216,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             memory_kind: Some(MemoryKind::Food),
             reward_scale: 1.0,
+            plant_filter: None,
         },
     ];
 }
@@ -347,29 +356,10 @@ fn resolve_target(
             if from_mem.is_some() { return from_mem; }
 
             if *kind == MemoryKind::Food {
-                let filter = match step.job {
-                    JobKind::Forager => Some(PlantKind::FruitBush),
-                    JobKind::Farmer  => Some(PlantKind::Grain), // Farmers can also do FruitBush, but let's prioritize Grain for now or handle both
-                    _ => None,
-                };
-                
-                // If farmer, we might want to check both Grain and FruitBush. 
-                // For simplicity, let's allow foragers to also check Trees (they gather branches for wood, but here it's for food?) 
-                // Wait, foragers DON'T get food from trees in plant_harvest_system.
-                
-                let radius = 60;
-                if step.job == JobKind::Farmer {
-                    if let Some(pos) = find_nearest_plant(plant_map, pos, radius, plant_query, true, Some(PlantKind::Grain)) {
-                        return Some(pos);
-                    }
-                    return find_nearest_plant(plant_map, pos, radius, plant_query, true, Some(PlantKind::FruitBush));
-                }
-                
-                return find_nearest_plant(plant_map, pos, radius, plant_query, true, filter);
+                return find_nearest_plant(plant_map, pos, 60, plant_query, true, step.plant_filter);
             }
 
             if *kind == MemoryKind::Wood {
-                // Prioritize trees for woodcutting
                 if let Some(tree_pos) = find_nearest_plant(plant_map, pos, 60, plant_query, true, Some(PlantKind::Tree)) {
                     return Some(tree_pos);
                 }

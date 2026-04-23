@@ -17,16 +17,13 @@ use super::plants::{PlantMap, Plant, GrowthStage, PlantKind};
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
-    Idle       = 0,
-    Farmer     = 1,
-    Woodcutter = 2,
-    Miner      = 3,
-    Trader     = 4,
-    Forager    = 5,
-    Raid       = 6,
-    Defend     = 7,
-    Planter    = 8,
-    Hunter     = 9,
+    Idle    = 0,
+    Gather  = 1,
+    Trader  = 2,
+    Raid    = 3,
+    Defend  = 4,
+    Planter = 5,
+    Hunter  = 6,
 }
 
 pub fn find_nearest_tile(
@@ -241,7 +238,7 @@ pub fn goal_dispatch_system(
             AgentGoal::ReturnCamp => {
                 if member.faction_id != SOLO {
                     if let Some(home) = faction_registry.home_tile(member.faction_id) {
-                        assign_job_with_routing(&mut ai, cur_chunk, home, JobKind::Forager, &chunk_graph, &chunk_map);
+                        assign_job_with_routing(&mut ai, cur_chunk, home, JobKind::Idle, &chunk_graph, &chunk_map);
                     }
                 }
             }

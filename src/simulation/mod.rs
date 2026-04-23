@@ -18,6 +18,7 @@ pub mod raid;
 pub mod items;
 pub mod world_sim;
 pub mod plants;
+pub mod gather;
 pub mod memory;
 pub mod neural;
 pub mod plan;
@@ -95,7 +96,7 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    plants::plant_harvest_system
+                    gather::gather_system
                         .before(production::production_system),
                     movement::movement_system,
                     animals::animal_movement_system,
