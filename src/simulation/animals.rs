@@ -3,7 +3,7 @@ use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::{tile_to_world, TILE_SIZE, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
 use crate::world::tile::TileKind;
 use crate::world::spatial::SpatialIndex;
-use super::combat::{CombatTarget, Health};
+use super::combat::{CombatTarget, Health, CombatCooldown};
 use super::lod::LodLevel;
 use super::person::Person;
 use super::schedule::{BucketSlot, SimClock};
@@ -93,6 +93,7 @@ pub fn spawn_animals(
             },
             Health::new(30),
             CombatTarget::default(),
+            CombatCooldown::default(),
             LodLevel::Full,
             BucketSlot(slot),
         ));
@@ -117,6 +118,7 @@ pub fn spawn_animals(
             },
             Health::new(20),
             CombatTarget::default(),
+            CombatCooldown::default(),
             LodLevel::Full,
             BucketSlot(slot),
             crate::simulation::plants::DeerGrazer {

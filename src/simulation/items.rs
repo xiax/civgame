@@ -33,6 +33,7 @@ pub struct Equipment {
 #[derive(Component, Clone, Copy, Debug)]
 pub struct WeaponStats {
     pub damage_bonus: u8,
+    pub attack_speed: f32,
 }
 
 #[derive(Component, Clone, Debug)]

@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
-use crate::simulation::animals::{Deer, Wolf};
+use crate::simulation::animals::{AnimalAI, AnimalState, Deer, Wolf};
 use crate::simulation::faction::{FactionMember, FactionRegistry};
 use crate::simulation::items::{GroundItem, Equipment, EquipmentSlot, WeaponStats, ArmorStats};
 use crate::simulation::jobs::JobKind;
@@ -104,29 +104,45 @@ pub struct CombatEvent {
     pub target: Entity,
 }
 
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct CombatCooldown(pub f32);
+
 const ATTACK_DAMAGE: u8 = 2;
+const BASE_ATTACK_COOLDOWN: f32 = 1.0;
 
 pub fn combat_system(
+    time: Res<Time>,
     spatial: Res<SpatialIndex>,
-    attacker_query: Query<(Entity, &CombatTarget, &Transform, &LodLevel, &BucketSlot, Option<&Equipment>)>,
+    mut attacker_query: Query<(Entity, &mut CombatTarget, &Transform, &LodLevel, &BucketSlot, Option<&Equipment>, Option<&mut CombatCooldown>)>,
     mut health_query: Query<&mut Health>,
     mut body_query: Query<&mut Body>,
     equipment_query: Query<&Equipment>,
     item_stats_query: Query<(Option<&WeaponStats>, Option<&ArmorStats>)>,
     mut ai_query: Query<&mut PersonAI>,
+    mut animal_ai_query: Query<(&mut AnimalAI, Option<&Deer>)>,
     mut rel_query: Query<Option<&mut RelationshipMemory>>,
     clock: Res<SimClock>,
     mut combat_events: EventWriter<CombatEvent>,
 ) {
+    let dt = time.delta_secs();
+
     // (target, attacker, damage)
     let mut health_damage_events: Vec<(Entity, Entity, u8)> = Vec::new();
     // (target, attacker, part, damage)
     let mut body_damage_events: Vec<(Entity, Entity, BodyPart, u8)> = Vec::new();
 
-    for (attacker, combat_target, transform, lod, slot, attacker_eq) in &attacker_query {
+    for (attacker, mut combat_target, transform, lod, slot, attacker_eq, mut cd) in &mut attacker_query {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
+
+        if let Some(ref mut cd) = cd {
+            cd.0 = (cd.0 - dt * clock.scale_factor()).max(0.0);
+            if cd.0 > 0.0 {
+                continue;
+            }
+        }
+
         let Some(target) = combat_target.0 else { continue };
         if target == attacker { continue; }
 
@@ -135,6 +151,7 @@ pub fn combat_system(
                 ai.state = AiState::Idle;
                 ai.job_id = PersonAI::UNEMPLOYED;
             }
+            combat_target.0 = None;
             continue;
         }
 
@@ -161,12 +178,20 @@ pub fn combat_system(
             combat_events.send(CombatEvent { attacker, target });
 
             let mut damage = ATTACK_DAMAGE;
+            let mut attack_speed_bonus = 1.0;
+
             if let Some(eq) = attacker_eq {
                 if let Some(&weapon_ent) = eq.items.get(&EquipmentSlot::MainHand) {
                     if let Ok((Some(w_stats), _)) = item_stats_query.get(weapon_ent) {
                         damage += w_stats.damage_bonus;
+                        attack_speed_bonus = w_stats.attack_speed;
                     }
                 }
+            }
+
+            // Apply cooldown
+            if let Some(ref mut cd) = cd {
+                cd.0 = BASE_ATTACK_COOLDOWN / attack_speed_bonus;
             }
 
             let target_part = BodyPart::random();
@@ -199,12 +224,30 @@ pub fn combat_system(
         }
     }
 
+    // Process damage and Retaliation
     for (target, attacker, dmg) in health_damage_events {
         if let Ok(mut health) = health_query.get_mut(target) {
             health.current = health.current.saturating_sub(dmg);
         }
         if let Ok(Some(mut rel)) = rel_query.get_mut(target) {
             rel.update(attacker, -20);
+        }
+
+        // Retaliation
+        if let Ok((_, mut target_combat, _, _, _, _, _)) = attacker_query.get_mut(target) {
+            if target_combat.0.is_none() {
+                if let Ok(mut target_ai) = ai_query.get_mut(target) {
+                    target_combat.0 = Some(attacker);
+                    // Setting to Idle with a target will trigger hunting_system to start Seeking
+                    target_ai.state = AiState::Idle;
+                } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target) {
+                    if maybe_deer.is_none() {
+                        target_combat.0 = Some(attacker);
+                        target_animal.target_entity = Some(attacker);
+                        target_animal.state = AnimalState::Chase;
+                    }
+                }
+            }
         }
     }
 
@@ -215,6 +258,22 @@ pub fn combat_system(
         }
         if let Ok(Some(mut rel)) = rel_query.get_mut(target) {
             rel.update(attacker, -20);
+        }
+
+        // Retaliation
+        if let Ok((_, mut target_combat, _, _, _, _, _)) = attacker_query.get_mut(target) {
+            if target_combat.0.is_none() {
+                if let Ok(mut target_ai) = ai_query.get_mut(target) {
+                    target_combat.0 = Some(attacker);
+                    target_ai.state = AiState::Idle;
+                } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target) {
+                    if maybe_deer.is_none() {
+                        target_combat.0 = Some(attacker);
+                        target_animal.target_entity = Some(attacker);
+                        target_animal.state = AnimalState::Chase;
+                    }
+                }
+            }
         }
     }
 }

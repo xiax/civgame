@@ -6,7 +6,7 @@ use crate::world::terrain::{tile_to_world, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
 use crate::world::tile::TileKind;
 use crate::economy::agent::EconomicAgent;
 
-use super::combat::{CombatTarget, Body};
+use super::combat::{CombatTarget, Body, CombatCooldown};
 use super::faction::FactionMember;
 use super::goals::{AgentGoal, Personality};
 use super::items::Equipment;
@@ -125,6 +125,7 @@ pub fn spawn_population(
                 Body::new_humanoid(),
                 Equipment::default(),
                 CombatTarget::default(),
+                CombatCooldown::default(),
             ),
             (
                 AgentMemory::default(),
