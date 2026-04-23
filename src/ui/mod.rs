@@ -6,6 +6,7 @@ pub mod inspector;
 pub mod economy_panel;
 pub mod hud;
 pub mod world_map;
+pub mod hover;
 
 pub use selection::SelectedEntity;
 
@@ -26,6 +27,7 @@ impl Plugin for UiPlugin {
                     economy_panel::economy_panel_system,
                     hud::hud_system,
                     world_map::world_map_system,
+                    hover::hover_info_system,
                 ),
             );
     }

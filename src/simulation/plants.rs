@@ -1,5 +1,6 @@
 use ahash::AHashMap;
 use bevy::prelude::*;
+use bevy::sprite::Anchor;
 
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
@@ -14,21 +15,22 @@ use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
+use crate::rendering::pixel_art::EntityTextures;
 
-const SEED_TO_SEEDLING_TICKS:  u16 = 60;
-const SEEDLING_TO_MATURE_TICKS: u16 = 120;
-const MATURE_TO_OVERRIPE_TICKS: u16 = 300;
+const DEER_GRAZE_INTERVAL: u16 = 120;
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PlantKind {
+    #[default]
     FruitBush = 0,
     Grain     = 1,
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GrowthStage {
+    #[default]
     Seed     = 0,
     Seedling = 1,
     Mature   = 2,
@@ -39,8 +41,27 @@ pub enum GrowthStage {
 pub struct Plant {
     pub kind:         PlantKind,
     pub stage:        GrowthStage,
-    pub growth_ticks: u16,
+    pub growth_ticks: u32,
     pub tile_pos:     (i16, i16),
+}
+
+impl Plant {
+    pub fn duration_for_stage(&self) -> u32 {
+        match self.kind {
+            PlantKind::Grain => match self.stage {
+                GrowthStage::Seed     => 18_000, // 5 days
+                GrowthStage::Seedling => 54_000, // 15 days
+                GrowthStage::Mature   => 36_000, // 10 days
+                GrowthStage::Overripe => 0,
+            },
+            PlantKind::FruitBush => match self.stage {
+                GrowthStage::Seed     => 36_000,  // 10 days
+                GrowthStage::Seedling => 108_000, // 30 days
+                GrowthStage::Mature   => 72_000,  // 20 days
+                GrowthStage::Overripe => 0,
+            },
+        }
+    }
 }
 
 #[derive(Component)]
@@ -56,52 +77,12 @@ pub struct PlantSpriteIndex {
     pub by_chunk: AHashMap<ChunkCoord, Vec<(Entity, (i32, i32))>>,
 }
 
-#[derive(Resource, Default)]
-pub struct PlantMaterials {
-    pub fruit_seed:      Handle<ColorMaterial>,
-    pub fruit_seedling:  Handle<ColorMaterial>,
-    pub fruit_mature:    Handle<ColorMaterial>,
-    pub fruit_overripe:  Handle<ColorMaterial>,
-    pub grain_seed:      Handle<ColorMaterial>,
-    pub grain_seedling:  Handle<ColorMaterial>,
-    pub grain_mature:    Handle<ColorMaterial>,
-    pub grain_overripe:  Handle<ColorMaterial>,
-}
-
-impl PlantMaterials {
-    pub fn handle_for(&self, kind: PlantKind, stage: GrowthStage) -> Handle<ColorMaterial> {
-        match (kind, stage) {
-            (PlantKind::FruitBush, GrowthStage::Seed)     => self.fruit_seed.clone(),
-            (PlantKind::FruitBush, GrowthStage::Seedling) => self.fruit_seedling.clone(),
-            (PlantKind::FruitBush, GrowthStage::Mature)   => self.fruit_mature.clone(),
-            (PlantKind::FruitBush, GrowthStage::Overripe) => self.fruit_overripe.clone(),
-            (PlantKind::Grain,     GrowthStage::Seed)     => self.grain_seed.clone(),
-            (PlantKind::Grain,     GrowthStage::Seedling) => self.grain_seedling.clone(),
-            (PlantKind::Grain,     GrowthStage::Mature)   => self.grain_mature.clone(),
-            (PlantKind::Grain,     GrowthStage::Overripe) => self.grain_overripe.clone(),
-        }
+pub fn get_plant_texture(textures: &EntityTextures, stage: GrowthStage) -> Handle<Image> {
+    match stage {
+        GrowthStage::Seed => textures.plant_seed.clone(),
+        GrowthStage::Seedling => textures.plant_seedling.clone(),
+        _ => textures.plant_mature.clone(),
     }
-}
-
-#[derive(Resource, Default)]
-pub struct PlantMeshHandle(pub Handle<Mesh>);
-
-pub fn setup_plant_materials(
-    mut plant_materials: ResMut<PlantMaterials>,
-    mut plant_mesh: ResMut<PlantMeshHandle>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-    mut meshes:    ResMut<Assets<Mesh>>,
-) {
-    plant_mesh.0 = meshes.add(Rectangle::new(5.0, 5.0));
-
-    plant_materials.fruit_seed     = materials.add(ColorMaterial::from_color(Color::srgb(0.25, 0.15, 0.05)));
-    plant_materials.fruit_seedling = materials.add(ColorMaterial::from_color(Color::srgb(0.40, 0.70, 0.30)));
-    plant_materials.fruit_mature   = materials.add(ColorMaterial::from_color(Color::srgb(0.85, 0.15, 0.15)));
-    plant_materials.fruit_overripe = materials.add(ColorMaterial::from_color(Color::srgb(0.50, 0.10, 0.05)));
-    plant_materials.grain_seed     = materials.add(ColorMaterial::from_color(Color::srgb(0.75, 0.70, 0.45)));
-    plant_materials.grain_seedling = materials.add(ColorMaterial::from_color(Color::srgb(0.60, 0.75, 0.20)));
-    plant_materials.grain_mature   = materials.add(ColorMaterial::from_color(Color::srgb(0.90, 0.80, 0.10)));
-    plant_materials.grain_overripe = materials.add(ColorMaterial::from_color(Color::srgb(0.85, 0.85, 0.55)));
 }
 
 /// Spawn a plant entity at the given tile. No-op if the tile is already occupied.
@@ -109,8 +90,7 @@ pub fn spawn_plant_at(
     commands: &mut Commands,
     plant_map: &mut PlantMap,
     plant_sprite_index: &mut PlantSpriteIndex,
-    plant_materials: &PlantMaterials,
-    plant_mesh: &PlantMeshHandle,
+    textures: &EntityTextures,
     tile_x: i32,
     tile_y: i32,
     kind: PlantKind,
@@ -121,7 +101,10 @@ pub fn spawn_plant_at(
     }
 
     let world_pos = tile_to_world(tile_x, tile_y);
-    let mat = plant_materials.handle_for(kind, stage);
+
+    let mut sprite = Sprite::from_image(get_plant_texture(textures, stage));
+    sprite.custom_size = Some(Vec2::new(24.0, 24.0));
+    sprite.anchor = Anchor::BottomCenter;
 
     let entity = commands.spawn((
         Plant {
@@ -130,12 +113,12 @@ pub fn spawn_plant_at(
             growth_ticks: 0,
             tile_pos: (tile_x as i16, tile_y as i16),
         },
-        Mesh2d(plant_mesh.0.clone()),
-        MeshMaterial2d(mat),
-        Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
+        sprite,
+        Transform::from_xyz(world_pos.x, world_pos.y - 8.0, 0.5),
         GlobalTransform::default(),
         Visibility::Visible,
     )).id();
+
 
     plant_map.0.insert((tile_x, tile_y), entity);
 
@@ -152,14 +135,14 @@ pub fn spawn_plant_at(
 pub fn plant_growth_system(
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
-    plant_materials: Res<PlantMaterials>,
-    mut query: Query<(Entity, &mut Plant, &mut MeshMaterial2d<ColorMaterial>)>,
+    textures: Res<EntityTextures>,
+    mut query: Query<(Entity, &mut Plant, &mut Sprite)>,
 ) {
     if clock.tick % 5 != 0 {
         return;
     }
 
-    for (_entity, mut plant, mut mat) in query.iter_mut() {
+    for (_entity, mut plant, mut sprite) in query.iter_mut() {
         let tx = plant.tile_pos.0 as i32;
         let ty = plant.tile_pos.1 as i32;
 
@@ -173,14 +156,12 @@ pub fn plant_growth_system(
 
         plant.growth_ticks = plant.growth_ticks.saturating_add(5);
 
-        let threshold = match plant.stage {
-            GrowthStage::Seed     => SEED_TO_SEEDLING_TICKS,
-            GrowthStage::Seedling => SEEDLING_TO_MATURE_TICKS,
-            GrowthStage::Mature   => MATURE_TO_OVERRIPE_TICKS,
-            GrowthStage::Overripe => continue,
-        };
+        let threshold = plant.duration_for_stage();
+        if threshold == 0 {
+            continue;
+        }
 
-        let effective = (threshold as f32 * multiplier) as u16;
+        let effective = (threshold as f32 * multiplier) as u32;
         if plant.growth_ticks >= effective {
             plant.growth_ticks = 0;
             plant.stage = match plant.stage {
@@ -189,7 +170,9 @@ pub fn plant_growth_system(
                 GrowthStage::Mature   => GrowthStage::Overripe,
                 GrowthStage::Overripe => GrowthStage::Overripe,
             };
-            mat.0 = plant_materials.handle_for(plant.kind, plant.stage);
+
+            sprite.image = get_plant_texture(&textures, plant.stage);
+            sprite.color = Color::WHITE;
         }
     }
 }
@@ -201,8 +184,7 @@ pub fn seed_scatter_system(
     chunk_map: Res<ChunkMap>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    plant_materials: Res<PlantMaterials>,
-    plant_mesh: Res<PlantMeshHandle>,
+    textures: Res<EntityTextures>,
     query: Query<(Entity, &Plant)>,
 ) {
     if clock.tick % 5 != 0 {
@@ -216,15 +198,13 @@ pub fn seed_scatter_system(
         .collect();
 
     for (entity, (tx, ty), kind) in overripe {
-        // Confirm still in plant_map (avoid double-processing if somehow duplicated)
         if plant_map.0.get(&(tx, ty)) != Some(&entity) {
             continue;
         }
 
-        // Determine scatter count and radius
         let (count, radius): (u8, i32) = match kind {
-            PlantKind::FruitBush => (1 + fastrand::u8(..2), 1),
-            PlantKind::Grain     => (2 + fastrand::u8(..3), 2),
+            PlantKind::FruitBush => (1, 1),
+            PlantKind::Grain     => (1, 2),
         };
 
         for _ in 0..count {
@@ -238,14 +218,13 @@ pub fn seed_scatter_system(
                 if matches!(tile.kind, TileKind::Grass | TileKind::Farmland) {
                     spawn_plant_at(
                         &mut commands, &mut plant_map, &mut plant_sprite_index,
-                        &plant_materials, &plant_mesh,
+                        &textures,
                         nx, ny, kind, GrowthStage::Seed,
                     );
                 }
             }
         }
 
-        // Remove and despawn the overripe plant
         plant_map.0.remove(&(tx, ty));
         let cx = tx.div_euclid(CHUNK_SIZE as i32);
         let cy = ty.div_euclid(CHUNK_SIZE as i32);
@@ -257,7 +236,6 @@ pub fn seed_scatter_system(
 }
 
 /// Harvest a mature plant when an agent arrives at the target tile.
-/// Runs before production_system so we can zero work_progress to prevent double-yield.
 pub fn plant_harvest_system(
     mut commands: Commands,
     clock: Res<SimClock>,
@@ -277,7 +255,10 @@ pub fn plant_harvest_system(
     for (mut ai, mut agent, mut skills, slot, lod, mut memory_opt, mut active_plan_opt) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
         if ai.state != AiState::Working { continue; }
-        if ai.job_id != crate::simulation::jobs::JobKind::Farmer as u16 { continue; }
+        let job = ai.job_id;
+        if job != crate::simulation::jobs::JobKind::Farmer as u16 && job != crate::simulation::jobs::JobKind::Forager as u16 {
+            continue;
+        }
 
         let tx = ai.target_tile.0 as i32;
         let ty = ai.target_tile.1 as i32;
@@ -299,7 +280,11 @@ pub fn plant_harvest_system(
             continue;
         }
 
-        // Harvest
+        // Foragers can only harvest FruitBush
+        if job == crate::simulation::jobs::JobKind::Forager as u16 && plant.kind != PlantKind::FruitBush {
+            continue;
+        }
+
         let (food_qty, give_seed_to_agent) = match plant.kind {
             PlantKind::FruitBush => (2u8, true),
             PlantKind::Grain     => (3u8, false),
@@ -317,7 +302,6 @@ pub fn plant_harvest_system(
             plan.reward_acc += food_qty as f32 * 0.4;
         }
 
-        // Drop a seed nearby on the ground
         let (dx, dy) = adjacent_offset();
         let sx = tx + dx;
         let sy = ty + dy;
@@ -328,7 +312,6 @@ pub fn plant_harvest_system(
             GlobalTransform::default(),
         ));
 
-        // Remove plant from map and despawn
         plant_map.0.remove(&(tx, ty));
         let cx = tx.div_euclid(CHUNK_SIZE as i32);
         let cy = ty.div_euclid(CHUNK_SIZE as i32);
@@ -337,7 +320,6 @@ pub fn plant_harvest_system(
         }
         commands.entity(plant_entity).despawn();
 
-        // Zero progress so production_system doesn't double-yield this tick
         ai.work_progress = 0;
     }
 }
@@ -367,7 +349,6 @@ pub fn deer_graze_system(
         let deer_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let deer_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
 
-        // Scan 7×7 box for a mature FruitBush
         let mut found: Option<(i32, i32, Entity)> = None;
         'search: for dy in -3i32..=3 {
             for dx in -3i32..=3 {
@@ -385,7 +366,6 @@ pub fn deer_graze_system(
         }
 
         if let Some((tx, ty, entity)) = found {
-            // Consume the plant
             plant_map.0.remove(&(tx, ty));
             let cx = tx.div_euclid(CHUNK_SIZE as i32);
             let cy = ty.div_euclid(CHUNK_SIZE as i32);
@@ -394,7 +374,6 @@ pub fn deer_graze_system(
             }
             commands.entity(entity).despawn();
 
-            // Drop 1–2 seeds on adjacent tiles (seeds pass through and spread)
             let count = 1 + fastrand::u8(..2);
             for _ in 0..count {
                 let (dx, dy) = adjacent_offset();
@@ -409,7 +388,7 @@ pub fn deer_graze_system(
             }
         }
 
-        grazer.graze_timer = 120;
+        grazer.graze_timer = DEER_GRAZE_INTERVAL;
     }
 }
 

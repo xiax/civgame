@@ -22,7 +22,7 @@ pub struct FactionMember {
     pub bond_target: Option<Entity>,
     pub bond_timer:  u8,
     /// Cooldown ticks after giving birth before reproduction need resets again.
-    pub birth_cooldown: u8,
+    pub birth_cooldown: u32,
 }
 
 impl Default for FactionMember {

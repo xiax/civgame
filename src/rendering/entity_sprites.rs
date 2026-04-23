@@ -1,63 +1,85 @@
 use bevy::prelude::*;
 use crate::simulation::animals::{Deer, Wolf};
 use crate::simulation::person::Person;
-use crate::simulation::mood::Mood;
+use crate::simulation::reproduction::BiologicalSex;
+use crate::rendering::pixel_art::EntityTextures;
+
+use bevy::sprite::Anchor;
 
 #[derive(Component)]
-pub struct PersonSprite;
+pub struct WolfVisual;
+
+#[derive(Component)]
+pub struct DeerVisual;
+
+#[derive(Component)]
+pub struct PersonVisual;
+
+#[derive(Component)]
+pub struct VisualChild;
 
 pub fn spawn_wolf_sprites(
     mut commands: Commands,
-    query: Query<Entity, (With<Wolf>, Without<Sprite>)>,
+    query: Query<Entity, (With<Wolf>, Without<WolfVisual>)>,
+    textures: Res<EntityTextures>,
 ) {
-    let color = Color::srgb(0.45, 0.25, 0.1);
     for entity in query.iter() {
-        commands.entity(entity).insert((
-            Sprite::from_color(color, Vec2::new(8.0, 8.0)),
-            Visibility::Visible,
-        ));
+        let mut sprite = Sprite::from_image(textures.wolf.clone());
+        sprite.custom_size = Some(Vec2::new(24.0, 24.0));
+        sprite.anchor = Anchor::BottomCenter;
+
+        commands.entity(entity).insert(WolfVisual).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Visibility::Visible,
+            ));
+        });
     }
 }
 
 pub fn spawn_deer_sprites(
     mut commands: Commands,
-    query: Query<Entity, (With<Deer>, Without<Sprite>)>,
+    query: Query<Entity, (With<Deer>, Without<DeerVisual>)>,
+    textures: Res<EntityTextures>,
 ) {
-    let color = Color::srgb(0.8, 0.65, 0.35);
     for entity in query.iter() {
-        commands.entity(entity).insert((
-            Sprite::from_color(color, Vec2::new(6.0, 6.0)),
-            Visibility::Visible,
-        ));
-    }
-}
+        let mut sprite = Sprite::from_image(textures.deer.clone());
+        sprite.custom_size = Some(Vec2::new(24.0, 24.0));
+        sprite.anchor = Anchor::BottomCenter;
 
-/// Sync person entity sprite color with their mood.
-pub fn entity_sprite_sync(
-    mut query: Query<(&Mood, &mut Sprite), With<Person>>,
-) {
-    for (mood, mut sprite) in query.iter_mut() {
-        let t = (mood.0 as f32 + 128.0) / 255.0; // 0..1
-        // Interpolate: red (despairing) → cyan (happy)
-        sprite.color = Color::srgb(
-            1.0 - t * 0.8,
-            0.3 + t * 0.7,
-            t,
-        );
+        commands.entity(entity).insert(DeerVisual).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Visibility::Visible,
+            ));
+        });
     }
 }
 
 /// Spawn visual sprites for newly added Person entities.
 pub fn spawn_person_sprites(
     mut commands: Commands,
-    query: Query<Entity, (With<Person>, Without<Sprite>)>,
+    query: Query<(Entity, Option<&BiologicalSex>), (With<Person>, Without<PersonVisual>)>,
+    textures: Res<EntityTextures>,
 ) {
-    let default_color = Color::srgb(0.0, 0.9, 0.9);
+    for (entity, sex_opt) in query.iter() {
+        let mut sprite = Sprite::default();
+        sprite.image = match sex_opt {
+            Some(BiologicalSex::Female) => textures.person_female.clone(),
+            _ => textures.person_male.clone(),
+        };
+        sprite.color = Color::WHITE;
+        sprite.custom_size = Some(Vec2::new(24.0, 24.0));
+        sprite.anchor = Anchor::BottomCenter;
 
-    for entity in query.iter() {
-        commands.entity(entity).insert((
-            Sprite::from_color(default_color, Vec2::new(6.0, 6.0)),
-            Visibility::Visible,
-        ));
+        commands.entity(entity).insert(PersonVisual).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Visibility::Visible,
+            ));
+        });
     }
 }

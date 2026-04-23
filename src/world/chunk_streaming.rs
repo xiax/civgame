@@ -4,13 +4,14 @@ use noise::{Perlin, Seedable};
 
 use crate::rendering::color_map::tile_color;
 use crate::simulation::plants::{
-    spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantMaterials, PlantMeshHandle,
+    spawn_plant_at, GrowthStage, PlantKind, PlantMap,
     PlantSpriteIndex,
 };
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::globe::{Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 use crate::world::terrain::{generate_chunk_from_globe, TILE_SIZE};
 use crate::world::tile::TileKind;
+use crate::rendering::pixel_art::EntityTextures;
 
 pub const LOAD_RADIUS:   i32 = 12;
 pub const UNLOAD_RADIUS: i32 = 16;
@@ -102,8 +103,7 @@ pub fn spawn_chunk_plants(
     commands: &mut Commands,
     plant_map: &mut PlantMap,
     plant_sprite_index: &mut PlantSpriteIndex,
-    plant_materials: &PlantMaterials,
-    plant_mesh: &PlantMeshHandle,
+    textures: &EntityTextures,
     chunk_map: &ChunkMap,
     coord: ChunkCoord,
 ) {
@@ -123,25 +123,26 @@ pub fn spawn_chunk_plants(
             match tile.kind {
                 TileKind::Farmland => {
                     let pct = h % 100;
-                    let (kind, stage) = if pct < 30 {
+                    let (kind, stage) = if pct < 5 {
                         (PlantKind::FruitBush, initial_stage(h))
-                    } else if pct < 60 {
+                    } else if pct < 15 {
                         (PlantKind::Grain, initial_stage(h))
                     } else {
                         continue;
                     };
                     spawn_plant_at(
                         commands, plant_map, plant_sprite_index,
-                        plant_materials, plant_mesh,
+                        textures,
                         global_tx, global_ty, kind, stage,
                     );
+
                 }
                 TileKind::Grass if tile.fertility > 120 => {
-                    if h % 100 < 10 {
+                    if h % 100 < 2 {
                         spawn_plant_at(
                             commands, plant_map, plant_sprite_index,
-                            plant_materials, plant_mesh,
-                            global_tx, global_ty, PlantKind::FruitBush, GrowthStage::Seed,
+                            textures,
+                            global_tx, global_ty, PlantKind::FruitBush, initial_stage(h),
                         );
                     }
                 }
@@ -152,9 +153,8 @@ pub fn spawn_chunk_plants(
 }
 
 fn initial_stage(h: u32) -> GrowthStage {
-    match h % 3 {
-        0 => GrowthStage::Seed,
-        1 => GrowthStage::Seedling,
+    match h % 2 {
+        0 => GrowthStage::Seedling,
         _ => GrowthStage::Mature,
     }
 }
@@ -169,8 +169,7 @@ pub fn spawn_initial_tile_sprites(
     mut globe: ResMut<Globe>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    plant_materials: Res<PlantMaterials>,
-    plant_mesh: Res<PlantMeshHandle>,
+    textures: Res<EntityTextures>,
 ) {
     let coords: Vec<ChunkCoord> = chunk_map.0.keys().copied().collect();
     for coord in coords {
@@ -193,12 +192,12 @@ pub fn spawn_initial_tile_sprites(
             &mut commands,
             &mut plant_map,
             &mut plant_sprite_index,
-            &plant_materials,
-            &plant_mesh,
+            &textures,
             &chunk_map,
             coord,
         );
     }
+
     info!("Initial tile sprites spawned for {} chunks", sprite_index.by_chunk.len());
 }
 
@@ -212,8 +211,7 @@ pub fn chunk_streaming_system(
     mut globe: ResMut<Globe>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    plant_materials: Res<PlantMaterials>,
-    plant_mesh: Res<PlantMeshHandle>,
+    textures: Res<EntityTextures>,
     camera_q: Query<&Transform, With<Camera>>,
 ) {
     let Ok(cam_transform) = camera_q.get_single() else { return };
@@ -263,13 +261,14 @@ pub fn chunk_streaming_system(
                 &mut commands,
                 &mut plant_map,
                 &mut plant_sprite_index,
-                &plant_materials,
-                &plant_mesh,
+                &textures,
                 &chunk_map,
                 coord,
             );
+
         }
     }
+
 
     // --- Unload chunks beyond UNLOAD_RADIUS ---
     let to_unload: Vec<ChunkCoord> = chunk_map.0.keys()

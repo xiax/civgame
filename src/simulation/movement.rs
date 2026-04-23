@@ -33,8 +33,6 @@ pub fn movement_system(
 ) {
     let dt = time.delta_secs();
     let sim_dt = dt * clock.scale_factor();
-    let total_tiles_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
-    let total_tiles_y = WORLD_CHUNKS_Y * CHUNK_SIZE as i32;
 
     // Movement can't be fully parallel because it writes Transform (position sync)
     // and can read ChunkMap for passability. Run sequentially.
@@ -94,8 +92,8 @@ pub fn movement_system(
                         let shuffled: Vec<_> = right.iter().chain(left.iter()).collect();
 
                         for &&(dx, dy) in &shuffled {
-                            let ntx = (cur_tx + dx).clamp(0, total_tiles_x - 1);
-                            let nty = (cur_ty + dy).clamp(0, total_tiles_y - 1);
+                            let ntx = cur_tx + dx;
+                            let nty = cur_ty + dy;
                             if chunk_map.is_passable(ntx, nty) {
                                 ai.target_tile = (ntx as i16, nty as i16);
                                 break;
@@ -136,7 +134,7 @@ pub fn movement_system(
 
 pub fn update_spatial_index_system(
     mut index: ResMut<SpatialIndex>,
-    query: Query<(Entity, &Transform), Or<(With<Person>, With<Wolf>, With<Deer>)>>,
+    query: Query<(Entity, &Transform), Or<(With<Person>, With<Wolf>, With<Deer>, With<super::plants::Plant>, With<super::items::GroundItem>)>>,
 ) {
     index.0.clear();
     for (entity, transform) in &query {

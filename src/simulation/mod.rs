@@ -47,14 +47,13 @@ impl Plugin for SimulationPlugin {
         plan::register_builtin_steps(&mut step_registry);
         plan::register_builtin_plans(&mut plan_registry);
 
-        app.insert_resource(SimClock::default())
+        app.add_event::<combat::CombatEvent>()
+            .insert_resource(SimClock::default())
             .insert_resource(faction::FactionRegistry::default())
             .insert_resource(reproduction::MaleCandidates::default())
             .insert_resource(production::TileDepletion::default())
             .insert_resource(plants::PlantMap::default())
             .insert_resource(plants::PlantSpriteIndex::default())
-            .insert_resource(plants::PlantMaterials::default())
-            .insert_resource(plants::PlantMeshHandle::default())
             .insert_resource(step_registry)
             .insert_resource(plan_registry)
             .configure_sets(
@@ -128,9 +127,6 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    plants::plant_growth_system,
-                    plants::seed_scatter_system
-                        .after(plants::plant_growth_system),
                     memory::memory_decay_system,
                     faction::social_fill_system,
                     memory::conversation_memory_system

@@ -6,7 +6,7 @@ use crate::world::seasons::Calendar;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::simulation::plants::{
-    spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantMaterials, PlantMeshHandle,
+    spawn_plant_at, GrowthStage, PlantKind, PlantMap,
     PlantSpriteIndex,
 };
 use super::jobs::JobKind;
@@ -17,6 +17,8 @@ use super::person::{AiState, PersonAI};
 use super::plan::ActivePlan;
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::{SkillKind, Skills};
+
+use crate::rendering::pixel_art::EntityTextures;
 
 const TICKS_FORAGER_FOOD:  u8 = 60;
 const TICKS_FORAGER_WOOD:  u8 = 90;
@@ -34,7 +36,7 @@ const FOOD_NUTRITION:        u8 = 40;
 const GRASS_MAX_DEPLETION:    u8 = 10;
 const FARMLAND_MAX_DEPLETION: u8 = 15;
 const FOREST_MAX_DEPLETION:   u8 = 20;
-const REGEN_INTERVAL:         u64 = 200; // ticks between each +1 recovery per tile
+const REGEN_INTERVAL:         u64 = 2000; // ticks between each +1 recovery per tile
 
 #[derive(Resource, Default)]
 pub struct TileDepletion(pub AHashMap<(i32, i32), u8>);
@@ -65,8 +67,7 @@ pub fn production_system(
     mut depletion: ResMut<TileDepletion>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    plant_materials: Res<PlantMaterials>,
-    plant_mesh: Res<PlantMeshHandle>,
+    textures: Res<EntityTextures>,
     mut query: Query<(
         &mut PersonAI,
         &mut EconomicAgent,
@@ -91,26 +92,6 @@ pub fn production_system(
 
         if job == JobKind::Forager as u16 {
             match tile_kind {
-                Some(TileKind::Grass) => {
-                    let threshold = (TICKS_FORAGER_FOOD as f32 * food_scale) as u8;
-                    if ai.work_progress >= threshold {
-                        ai.work_progress = 0;
-                        if !depletion.is_exhausted(tx, ty, GRASS_MAX_DEPLETION) {
-                            agent.add_good(Good::Food, 1);
-                            depletion.deplete(tx, ty);
-                            skills.gain_xp(SkillKind::Farming, 1);
-                            if let Some(ref mut mem) = memory_opt {
-                                mem.record((tx as i16, ty as i16), MemoryKind::Food);
-                            }
-                            if let Some(ref mut plan) = active_plan_opt {
-                                plan.reward_acc += 1.0 * 0.5;
-                            }
-                        } else {
-                            ai.state = AiState::Idle;
-                            ai.job_id = PersonAI::UNEMPLOYED;
-                        }
-                    }
-                }
                 Some(TileKind::Forest) => {
                     if ai.work_progress >= TICKS_FORAGER_WOOD {
                         ai.work_progress = 0;
@@ -146,24 +127,7 @@ pub fn production_system(
                 _ => {}
             }
         } else if job == JobKind::Farmer as u16 {
-            let threshold = (TICKS_FARMER as f32 * food_scale) as u8;
-            if ai.work_progress >= threshold {
-                ai.work_progress = 0;
-                if !depletion.is_exhausted(tx, ty, FARMLAND_MAX_DEPLETION) {
-                    agent.add_good(Good::Food, 2);
-                    depletion.deplete(tx, ty);
-                    skills.gain_xp(SkillKind::Farming, 2);
-                    if let Some(ref mut mem) = memory_opt {
-                        mem.record((tx as i16, ty as i16), MemoryKind::Food);
-                    }
-                    if let Some(ref mut plan) = active_plan_opt {
-                        plan.reward_acc += 2.0 * 0.5;
-                    }
-                } else {
-                    ai.state = AiState::Idle;
-                    ai.job_id = PersonAI::UNEMPLOYED;
-                }
-            }
+            // Direct farmland harvesting removed. Farmers now only harvest via plant_harvest_system.
         } else if job == JobKind::Woodcutter as u16 {
             if ai.work_progress >= TICKS_WOODCUTTER {
                 ai.work_progress = 0;
@@ -207,8 +171,7 @@ pub fn production_system(
                         &mut commands,
                         &mut plant_map,
                         &mut plant_sprite_index,
-                        &plant_materials,
-                        &plant_mesh,
+                        &textures,
                         tx, ty,
                         PlantKind::Grain,
                         GrowthStage::Seed,

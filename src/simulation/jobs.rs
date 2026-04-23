@@ -12,7 +12,7 @@ use super::memory::RelationshipMemory;
 use super::person::{AiState, PersonAI};
 use super::lod::LodLevel;
 use super::reproduction::BiologicalSex;
-use super::plants::PlantMap;
+use super::plants::{PlantMap, Plant, GrowthStage, PlantKind};
 
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,17 +34,48 @@ pub fn find_nearest_tile(
     radius: i32,
     kinds: &[TileKind],
 ) -> Option<(i16, i16)> {
-    let total_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
-    let total_y = WORLD_CHUNKS_Y * CHUNK_SIZE as i32;
     let mut best: Option<(i16, i16)> = None;
     let mut best_dist = i32::MAX;
 
     for dy in -radius..=radius {
         for dx in -radius..=radius {
-            let tx = (from.0 + dx).clamp(0, total_x - 1);
-            let ty = (from.1 + dy).clamp(0, total_y - 1);
+            let tx = from.0 + dx;
+            let ty = from.1 + dy;
             if let Some(tile) = chunk_map.tile_at(tx, ty) {
                 if kinds.contains(&tile.kind) {
+                    let dist = dx.abs() + dy.abs();
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best = Some((tx as i16, ty as i16));
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+pub fn find_nearest_plant(
+    plant_map: &PlantMap,
+    from: (i32, i32),
+    radius: i32,
+    plant_query: &Query<&Plant>,
+    mature_only: bool,
+    kind_filter: Option<PlantKind>,
+) -> Option<(i16, i16)> {
+    let mut best: Option<(i16, i16)> = None;
+    let mut best_dist = i32::MAX;
+
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let tx = from.0 + dx;
+            let ty = from.1 + dy;
+            if let Some(&entity) = plant_map.0.get(&(tx, ty)) {
+                if let Ok(plant) = plant_query.get(entity) {
+                    if mature_only && plant.stage != GrowthStage::Mature { continue; }
+                    if let Some(k) = kind_filter {
+                        if plant.kind != k { continue; }
+                    }
                     let dist = dx.abs() + dy.abs();
                     if dist < best_dist {
                         best_dist = dist;
@@ -87,15 +118,13 @@ pub fn find_nearest_unplanted_farmland(
     from: (i32, i32),
     radius: i32,
 ) -> Option<(i16, i16)> {
-    let total_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
-    let total_y = WORLD_CHUNKS_Y * CHUNK_SIZE as i32;
     let mut best: Option<(i16, i16)> = None;
     let mut best_dist = i32::MAX;
 
     for dy in -radius..=radius {
         for dx in -radius..=radius {
-            let tx = (from.0 + dx).clamp(0, total_x - 1);
-            let ty = (from.1 + dy).clamp(0, total_y - 1);
+            let tx = from.0 + dx;
+            let ty = from.1 + dy;
             if plant_map.0.contains_key(&(tx, ty)) { continue; }
             if let Some(tile) = chunk_map.tile_at(tx, ty) {
                 if tile.kind == TileKind::Farmland {

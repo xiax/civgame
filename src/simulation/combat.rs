@@ -98,6 +98,12 @@ impl Body {
 #[derive(Component, Default, Clone, Copy)]
 pub struct CombatTarget(pub Option<Entity>);
 
+#[derive(Event)]
+pub struct CombatEvent {
+    pub attacker: Entity,
+    pub target: Entity,
+}
+
 const ATTACK_DAMAGE: u8 = 2;
 
 pub fn combat_system(
@@ -110,6 +116,7 @@ pub fn combat_system(
     mut ai_query: Query<&mut PersonAI>,
     mut rel_query: Query<Option<&mut RelationshipMemory>>,
     clock: Res<SimClock>,
+    mut combat_events: EventWriter<CombatEvent>,
 ) {
     // (target, attacker, damage)
     let mut health_damage_events: Vec<(Entity, Entity, u8)> = Vec::new();
@@ -150,6 +157,8 @@ pub fn combat_system(
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
                 ai.state = AiState::Attacking;
             }
+
+            combat_events.send(CombatEvent { attacker, target });
 
             let mut damage = ATTACK_DAMAGE;
             if let Some(eq) = attacker_eq {

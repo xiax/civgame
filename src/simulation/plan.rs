@@ -11,13 +11,13 @@ use crate::economy::goods::Good;
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::AgentGoal;
 use super::items::GroundItem;
-use super::jobs::{JobKind, assign_job_with_routing, find_nearest_tile, find_nearest_item, find_nearest_unplanted_farmland};
+use super::jobs::{JobKind, assign_job_with_routing, find_nearest_tile, find_nearest_item, find_nearest_unplanted_farmland, find_nearest_plant};
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, MemoryKind};
 use super::needs::Needs;
 use super::neural::{UtilityNet, STATE_DIM, PLAN_FEAT_DIM};
 use super::person::{AiState, PersonAI};
-use super::plants::PlantMap;
+use super::plants::{PlantMap, PlantKind, Plant};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
 
@@ -289,6 +289,7 @@ fn resolve_target(
     chunk_map: &ChunkMap,
     spatial: &SpatialIndex,
     plant_map: &PlantMap,
+    plant_query: &Query<&Plant>,
     faction_registry: &FactionRegistry,
     faction_id: u32,
     memory: Option<&AgentMemory>,
@@ -298,19 +299,24 @@ fn resolve_target(
         StepTarget::FromMemory(kind) => {
             let from_mem = memory.and_then(|m| m.best_for(*kind));
             if from_mem.is_some() { return from_mem; }
-            // Fallback: nearest tile by kind
+
+            if *kind == MemoryKind::Food {
+                let filter = if step.job == JobKind::Forager {
+                    Some(PlantKind::FruitBush)
+                } else {
+                    None
+                };
+                return find_nearest_plant(plant_map, pos, 30, plant_query, true, filter);
+            }
+
+            // Fallback: nearest tile by kind for other resources
             let fallback_tiles: &[TileKind] = match kind {
-                MemoryKind::Food  => FARMLAND_TILES,
+                MemoryKind::Food  => &[], // Handled above
                 MemoryKind::Wood  => FOREST_TILES,
                 MemoryKind::Stone => STONE_TILES,
                 MemoryKind::Seed  => FARMLAND_TILES,
             };
-            // Try farmland first for food, grass as secondary
-            let result = find_nearest_tile(chunk_map, pos, 30, fallback_tiles);
-            if result.is_some() || *kind != MemoryKind::Food {
-                return result;
-            }
-            find_nearest_tile(chunk_map, pos, 20, GRASS_TILES)
+            find_nearest_tile(chunk_map, pos, 30, fallback_tiles)
         }
         StepTarget::NearestTile(_tiles) => {
             if step.job == JobKind::Planter {
@@ -346,6 +352,7 @@ pub fn plan_execution_system(
     chunk_graph: Res<ChunkGraph>,
     spatial: Res<SpatialIndex>,
     plant_map: Res<PlantMap>,
+    plant_query: Query<&Plant>,
     plan_registry: Res<PlanRegistry>,
     step_registry: Res<StepRegistry>,
     faction_registry: Res<FactionRegistry>,
@@ -423,7 +430,7 @@ pub fn plan_execution_system(
                 plan_id:      plan_def.id,
                 current_step: 0,
                 started_tick: clock.tick,
-                max_ticks:    500,
+                max_ticks:    5000,
                 reward_acc:   0.0,
                 dispatched:   false,
             });
@@ -497,7 +504,7 @@ pub fn plan_execution_system(
 
             if let Some(target) = resolve_target(
                 step_def, (cur_tx, cur_ty),
-                &chunk_map, &spatial, &plant_map,
+                &chunk_map, &spatial, &plant_map, &plant_query,
                 &faction_registry, member.faction_id,
                 memory_opt, &item_check,
             ) {

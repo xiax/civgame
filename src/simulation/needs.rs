@@ -40,12 +40,12 @@ impl Needs {
 }
 
 /// Rates in need-units per real second.
-const HUNGER_RATE:       f32 = 4.0;
-const SLEEP_RATE:        f32 = 2.0;
-const SHELTER_RATE:      f32 = 0.5;
-const SAFETY_RATE:       f32 = 0.3;
-const SOCIAL_RATE:       f32 = 1.0;
-const REPRODUCTION_RATE: f32 = 0.3;
+const HUNGER_RATE:       f32 = 0.4;
+const SLEEP_RATE:        f32 = 0.5;
+const SHELTER_RATE:      f32 = 0.1;
+const SAFETY_RATE:       f32 = 0.1;
+const SOCIAL_RATE:       f32 = 0.2;
+const REPRODUCTION_RATE: f32 = 0.02;
 
 pub fn tick_needs_system(
     time: Res<Time>,

@@ -40,8 +40,8 @@ impl BiologicalSex {
 
 const REPRODUCE_FEMALE_THRESHOLD: u8 = 180;
 const REPRODUCE_MALE_THRESHOLD:   u8 = 150;
-const BIRTH_CHANCE:                u8 = 5;   // out of 100 per tick
-const BIRTH_COOLDOWN_TICKS:        u8 = 200;
+const BIRTH_CHANCE:                u32 = 5;   // out of 10,000 per tick
+const BIRTH_COOLDOWN_TICKS:        u32 = 324_000; // 90 in-game days
 
 /// Eligible males this tick: entity → faction_id. Updated by collect_male_candidates.
 #[derive(Resource, Default)]
@@ -116,7 +116,7 @@ pub fn reproduction_system(
 
         let Some(father_entity) = found_father else { continue };
 
-        if fastrand::u8(..100) >= BIRTH_CHANCE { continue; }
+        if fastrand::u32(..10_000) >= BIRTH_CHANCE { continue; }
 
         needs.reproduction = 0;
         member.birth_cooldown = BIRTH_COOLDOWN_TICKS;

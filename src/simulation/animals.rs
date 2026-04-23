@@ -43,6 +43,14 @@ pub fn spawn_animals(
     chunk_map: Res<ChunkMap>,
     mut clock: ResMut<SimClock>,
 ) {
+    use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
+
+    let start_cx = (GLOBE_WIDTH  / 2) * GLOBE_CELL_CHUNKS;
+    let start_cy = (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS;
+
+    let start_tx = start_cx * CHUNK_SIZE as i32;
+    let start_ty = start_cy * CHUNK_SIZE as i32;
+
     let total_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
     let total_y = WORLD_CHUNKS_Y * CHUNK_SIZE as i32;
 
@@ -50,8 +58,10 @@ pub fn spawn_animals(
     let mut forest_tiles: Vec<(i32, i32)> = Vec::new();
     let mut grass_tiles:  Vec<(i32, i32)> = Vec::new();
 
-    for ty in 0..total_y {
-        for tx in 0..total_x {
+    for dy in 0..total_y {
+        for dx in 0..total_x {
+            let tx = start_tx + dx;
+            let ty = start_ty + dy;
             if !chunk_map.is_passable(tx, ty) { continue; }
             if let Some(tile) = chunk_map.tile_at(tx, ty) {
                 match tile.kind {
@@ -128,8 +138,6 @@ pub fn animal_movement_system(
 ) {
     let dt = time.delta_secs();
     let sim_dt = dt * clock.scale_factor();
-    let total_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
-    let total_y = WORLD_CHUNKS_Y * CHUNK_SIZE as i32;
 
     for (mut transform, mut ai, lod, slot) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
@@ -174,8 +182,8 @@ pub fn animal_movement_system(
                         let start = fastrand::usize(..8);
                         for i in 0..8 {
                             let (dx, dy) = dirs[(start + i) % 8];
-                            let ntx = (cur_tx + dx).clamp(0, total_x - 1);
-                            let nty = (cur_ty + dy).clamp(0, total_y - 1);
+                            let ntx = cur_tx + dx;
+                            let nty = cur_ty + dy;
                             if chunk_map.is_passable(ntx, nty) {
                                 ai.target_tile = (ntx as i16, nty as i16);
                                 break;
@@ -310,11 +318,15 @@ pub fn animal_sense_system(
         }
 
         if threat_count > 0 {
+            use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
+            let total_tiles_x = GLOBE_WIDTH * GLOBE_CELL_CHUNKS * CHUNK_SIZE as i32;
+            let total_tiles_y = GLOBE_HEIGHT * GLOBE_CELL_CHUNKS * CHUNK_SIZE as i32;
+
             // Flee in opposite direction from average threat position
             let flee_tx = (tx - threat_dx / threat_count)
-                .clamp(0, WORLD_CHUNKS_X * CHUNK_SIZE as i32 - 1);
+                .clamp(0, total_tiles_x - 1);
             let flee_ty = (ty - threat_dy / threat_count)
-                .clamp(0, WORLD_CHUNKS_Y * CHUNK_SIZE as i32 - 1);
+                .clamp(0, total_tiles_y - 1);
             ai.state = AnimalState::Flee;
             ai.target_tile = (flee_tx as i16, flee_ty as i16);
             ai.wander_timer = 1.5; // hold flee direction for 1.5s
