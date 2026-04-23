@@ -40,8 +40,8 @@ impl BiologicalSex {
 
 const REPRODUCE_FEMALE_THRESHOLD: u8 = 180;
 const REPRODUCE_MALE_THRESHOLD:   u8 = 150;
-const BIRTH_CHANCE:                u8 = 5;   // out of 100 per tick
-const BIRTH_COOLDOWN_TICKS:        u8 = 200;
+const BIRTH_CHANCE:                u32 = 5;   // out of 10,000 per tick
+const BIRTH_COOLDOWN_TICKS:        u32 = 324_000; // 90 in-game days
 
 /// Eligible males this tick: entity → faction_id. Updated by collect_male_candidates.
 #[derive(Resource, Default)]
@@ -55,11 +55,25 @@ pub fn collect_male_candidates(
     for (entity, sex, member, needs) in &query {
         if *sex == BiologicalSex::Male
             && member.faction_id != SOLO
-            && needs.reproduction >= REPRODUCE_MALE_THRESHOLD
+            && needs.reproduction >= REPRODUCE_MALE_THRESHOLD as f32
         {
             candidates.0.insert(entity, member.faction_id);
         }
     }
+}
+
+pub fn birth_cooldown_system(
+    clock: Res<SimClock>,
+    mut query: Query<(&mut FactionMember, &BucketSlot, &LodLevel)>,
+) {
+    query.par_iter_mut().for_each(|(mut member, slot, lod)| {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            return;
+        }
+        if member.birth_cooldown > 0 {
+            member.birth_cooldown = member.birth_cooldown.saturating_sub(1);
+        }
+    });
 }
 
 pub fn reproduction_system(
@@ -82,18 +96,19 @@ pub fn reproduction_system(
     )>,
 ) {
     let mut births: Vec<(Transform, u32, UtilityNet)> = Vec::new();
+    let mut resets: Vec<Entity> = Vec::new();
 
-    for (entity, mut needs, mut member, sex, goal, transform, lod, slot, mother_net) in query.iter_mut() {
+    // Use a temporary vector to avoid borrowing query while mutating it via get_mut
+    let mut found_pairs = Vec::new();
+
+    for (entity, needs, member, sex, goal, transform, lod, slot, mother_net) in query.iter() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
         if *sex != BiologicalSex::Female { continue; }
         if *goal != AgentGoal::Reproduce { continue; }
-        if needs.reproduction < REPRODUCE_FEMALE_THRESHOLD { continue; }
-        if member.birth_cooldown > 0 {
-            member.birth_cooldown = member.birth_cooldown.saturating_sub(1);
-            continue;
-        }
+        if needs.reproduction < REPRODUCE_FEMALE_THRESHOLD as f32 { continue; }
+        if member.birth_cooldown > 0 { continue; }
         if member.faction_id == SOLO { continue; }
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
@@ -114,23 +129,32 @@ pub fn reproduction_system(
             }
         }
 
-        let Some(father_entity) = found_father else { continue };
+        if let Some(father_entity) = found_father {
+            found_pairs.push((entity, father_entity, *transform, faction_id, mother_net.cloned()));
+        }
+    }
 
-        if fastrand::u8(..100) >= BIRTH_CHANCE { continue; }
+    for (mother_ent, father_ent, transform, faction_id, mother_net) in found_pairs {
+        // Reset needs for both regardless of birth
+        if let Ok([mut m_needs, mut f_needs]) = query.get_many_mut([mother_ent, father_ent]) {
+            m_needs.1.reproduction = 0.0;
+            f_needs.1.reproduction = 0.0;
+            
+            // Set cooldown on mother
+            m_needs.2.birth_cooldown = BIRTH_COOLDOWN_TICKS;
+        }
 
-        needs.reproduction = 0;
-        member.birth_cooldown = BIRTH_COOLDOWN_TICKS;
-
-        // Inherit net from both parents
-        let father_net = father_net_query.get(father_entity).ok().flatten();
-        let child_net = match (mother_net, father_net) {
-            (Some(m), Some(f)) => UtilityNet::from_parents(m, f),
-            (Some(p), None)    => UtilityNet::from_parent(p),
-            (None, Some(p))    => UtilityNet::from_parent(p),
-            (None, None)       => UtilityNet::new_random(),
-        };
-
-        births.push((*transform, faction_id, child_net));
+        // Roll for birth
+        if fastrand::u32(..10_000) < BIRTH_CHANCE {
+            let father_net = father_net_query.get(father_ent).ok().flatten();
+            let child_net = match (mother_net, father_net) {
+                (Some(m), Some(f)) => UtilityNet::from_parents(&m, f),
+                (Some(p), None)    => UtilityNet::from_parent(&p),
+                (None, Some(p))    => UtilityNet::from_parent(p),
+                (None, None)       => UtilityNet::new_random(),
+            };
+            births.push((transform, faction_id, child_net));
+        }
     }
 
     for (parent_transform, faction_id, child_net) in births {
@@ -149,7 +173,7 @@ pub fn reproduction_system(
                 Person,
                 Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
                 GlobalTransform::default(),
-                Needs::new(0, 0, 0, 0, 0),
+                Needs::new(0.0, 0.0, 0.0, 0.0, 0.0),
                 Mood::default(),
                 Skills::default(),
                 PersonAI {

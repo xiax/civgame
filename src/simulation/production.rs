@@ -6,7 +6,7 @@ use crate::world::seasons::Calendar;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::simulation::plants::{
-    spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantMaterials, PlantMeshHandle,
+    spawn_plant_at, GrowthStage, PlantKind, PlantMap,
     PlantSpriteIndex,
 };
 use super::faction::{FactionMember, FactionRegistry, SOLO};
@@ -20,11 +20,9 @@ use super::schedule::{BucketSlot, SimClock};
 use super::skills::{SkillKind, Skills};
 use crate::simulation::technology::ActivityKind;
 
-const TICKS_FORAGER_FOOD:  u8 = 60;
-const TICKS_FORAGER_WOOD:  u8 = 90;
+use crate::rendering::pixel_art::EntityTextures;
+
 const TICKS_FORAGER_STONE: u8 = 120;
-const TICKS_FARMER:        u8 = 30;
-const TICKS_WOODCUTTER:    u8 = 30;
 const TICKS_MINER:         u8 = 30;
 pub const TICKS_FARMER_PLANT: u8 = 40;
 
@@ -33,10 +31,7 @@ const FOOD_NUTRITION:        u8 = 40;
 
 // Tile depletion — tracks how many times each tile has been harvested recently.
 // Absent from map = fully recovered. Higher value = more depleted.
-const GRASS_MAX_DEPLETION:    u8 = 10;
-const FARMLAND_MAX_DEPLETION: u8 = 15;
-const FOREST_MAX_DEPLETION:   u8 = 20;
-const REGEN_INTERVAL:         u64 = 200; // ticks between each +1 recovery per tile
+const REGEN_INTERVAL:         u64 = 2000; // ticks between each +1 recovery per tile
 
 #[derive(Resource, Default)]
 pub struct TileDepletion(pub AHashMap<(i32, i32), u8>);
@@ -63,12 +58,10 @@ pub fn production_system(
     mut commands: Commands,
     chunk_map: Res<ChunkMap>,
     clock: Res<SimClock>,
-    calendar: Res<Calendar>,
-    mut depletion: ResMut<TileDepletion>,
+    _calendar: Res<Calendar>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    plant_materials: Res<PlantMaterials>,
-    plant_mesh: Res<PlantMeshHandle>,
+    textures: Res<EntityTextures>,
     mut faction_registry: ResMut<FactionRegistry>,
     mut query: Query<(
         &mut PersonAI,
@@ -81,9 +74,6 @@ pub fn production_system(
         Option<&FactionMember>,
     )>,
 ) {
-    let yield_mul = calendar.food_yield_multiplier();
-    let food_scale = (1.0 / yield_mul.max(0.01)).clamp(0.5, 8.0);
-
     for (mut ai, mut agent, mut skills, slot, lod, mut memory_opt, mut active_plan_opt, faction_member) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
         if ai.state != AiState::Working { continue; }
@@ -111,49 +101,6 @@ pub fn production_system(
 
         if job == JobKind::Forager as u16 {
             match tile_kind {
-                Some(TileKind::Grass) => {
-                    let threshold = (TICKS_FORAGER_FOOD as f32 * food_scale) as u8;
-                    if ai.work_progress >= threshold {
-                        ai.work_progress = 0;
-                        if !depletion.is_exhausted(tx, ty, GRASS_MAX_DEPLETION) {
-                            let (food_mul, _, _) = get_multipliers(&mut faction_registry, ActivityKind::Foraging);
-                            let qty = (1.0_f32 * food_mul).round().max(1.0) as u8;
-                            agent.add_good(Good::Food, qty);
-                            depletion.deplete(tx, ty);
-                            skills.gain_xp(SkillKind::Farming, 1);
-                            if let Some(ref mut mem) = memory_opt {
-                                mem.record((tx as i16, ty as i16), MemoryKind::Food);
-                            }
-                            if let Some(ref mut plan) = active_plan_opt {
-                                plan.reward_acc += qty as f32 * 0.5;
-                            }
-                        } else {
-                            ai.state = AiState::Idle;
-                            ai.job_id = PersonAI::UNEMPLOYED;
-                        }
-                    }
-                }
-                Some(TileKind::Forest) => {
-                    if ai.work_progress >= TICKS_FORAGER_WOOD {
-                        ai.work_progress = 0;
-                        if !depletion.is_exhausted(tx, ty, FOREST_MAX_DEPLETION) {
-                            let (_, wood_mul, _) = get_multipliers(&mut faction_registry, ActivityKind::WoodGathering);
-                            let qty = (1.0_f32 * wood_mul).round().max(1.0) as u8;
-                            agent.add_good(Good::Wood, qty);
-                            depletion.deplete(tx, ty);
-                            skills.gain_xp(SkillKind::Farming, 1);
-                            if let Some(ref mut mem) = memory_opt {
-                                mem.record((tx as i16, ty as i16), MemoryKind::Wood);
-                            }
-                            if let Some(ref mut plan) = active_plan_opt {
-                                plan.reward_acc += qty as f32 * 0.3;
-                            }
-                        } else {
-                            ai.state = AiState::Idle;
-                            ai.job_id = PersonAI::UNEMPLOYED;
-                        }
-                    }
-                }
                 Some(TileKind::Stone) => {
                     if ai.work_progress >= TICKS_FORAGER_STONE {
                         ai.work_progress = 0;
@@ -172,46 +119,9 @@ pub fn production_system(
                 _ => {}
             }
         } else if job == JobKind::Farmer as u16 {
-            let threshold = (TICKS_FARMER as f32 * food_scale) as u8;
-            if ai.work_progress >= threshold {
-                ai.work_progress = 0;
-                if !depletion.is_exhausted(tx, ty, FARMLAND_MAX_DEPLETION) {
-                    let (food_mul, _, _) = get_multipliers(&mut faction_registry, ActivityKind::Farming);
-                    let qty = (2.0_f32 * food_mul).round().max(1.0) as u8;
-                    agent.add_good(Good::Food, qty);
-                    depletion.deplete(tx, ty);
-                    skills.gain_xp(SkillKind::Farming, 2);
-                    if let Some(ref mut mem) = memory_opt {
-                        mem.record((tx as i16, ty as i16), MemoryKind::Food);
-                    }
-                    if let Some(ref mut plan) = active_plan_opt {
-                        plan.reward_acc += qty as f32 * 0.5;
-                    }
-                } else {
-                    ai.state = AiState::Idle;
-                    ai.job_id = PersonAI::UNEMPLOYED;
-                }
-            }
+            // Direct farmland harvesting removed. Farmers now only harvest via plant_harvest_system.
         } else if job == JobKind::Woodcutter as u16 {
-            if ai.work_progress >= TICKS_WOODCUTTER {
-                ai.work_progress = 0;
-                if !depletion.is_exhausted(tx, ty, FOREST_MAX_DEPLETION) {
-                    let (_, wood_mul, _) = get_multipliers(&mut faction_registry, ActivityKind::WoodGathering);
-                    let qty = (3.0_f32 * wood_mul).round().max(1.0) as u8;
-                    agent.add_good(Good::Wood, qty);
-                    depletion.deplete(tx, ty);
-                    skills.gain_xp(SkillKind::Farming, 2);
-                    if let Some(ref mut mem) = memory_opt {
-                        mem.record((tx as i16, ty as i16), MemoryKind::Wood);
-                    }
-                    if let Some(ref mut plan) = active_plan_opt {
-                        plan.reward_acc += qty as f32 * 0.3;
-                    }
-                } else {
-                    ai.state = AiState::Idle;
-                    ai.job_id = PersonAI::UNEMPLOYED;
-                }
-            }
+            // Generic woodcutting removed. Woodcutters now harvest trees via plant_harvest_system.
         } else if job == JobKind::Miner as u16 {
             if ai.work_progress >= TICKS_MINER {
                 ai.work_progress = 0;
@@ -252,8 +162,7 @@ pub fn production_system(
                         &mut commands,
                         &mut plant_map,
                         &mut plant_sprite_index,
-                        &plant_materials,
-                        &plant_mesh,
+                        &textures,
                         tx, ty,
                         PlantKind::Grain,
                         GrowthStage::Seed,
@@ -291,9 +200,9 @@ pub fn consumption_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             return;
         }
-        if needs.hunger > HUNGER_EAT_THRESHOLD && agent.quantity_of(Good::Food) > 0 {
+        if needs.hunger > HUNGER_EAT_THRESHOLD as f32 && agent.quantity_of(Good::Food) > 0 {
             agent.remove_good(Good::Food, 1);
-            needs.hunger = needs.hunger.saturating_sub(FOOD_NUTRITION);
+            needs.hunger = (needs.hunger - FOOD_NUTRITION as f32).max(0.0);
         }
     });
 }

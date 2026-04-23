@@ -48,18 +48,17 @@ impl Plugin for SimulationPlugin {
         plan::register_builtin_steps(&mut step_registry);
         plan::register_builtin_plans(&mut plan_registry);
 
-        app.insert_resource(SimClock::default())
+        app.add_event::<combat::CombatEvent>()
+            .insert_resource(SimClock::default())
             .insert_resource(faction::FactionRegistry::default())
             .insert_resource(reproduction::MaleCandidates::default())
             .insert_resource(production::TileDepletion::default())
             .insert_resource(plants::PlantMap::default())
             .insert_resource(plants::PlantSpriteIndex::default())
-            .insert_resource(plants::PlantMaterials::default())
-            .insert_resource(plants::PlantMeshHandle::default())
             .insert_resource(step_registry)
             .insert_resource(plan_registry)
             .configure_sets(
-                Update,
+                FixedUpdate,
                 (
                     SimulationSet::ParallelA,
                     SimulationSet::ParallelB.after(SimulationSet::ParallelA),
@@ -69,7 +68,7 @@ impl Plugin for SimulationPlugin {
             )
             .add_systems(PostStartup, (person::spawn_population, animals::spawn_animals.after(person::spawn_population)))
             .add_systems(
-                Update,
+                FixedUpdate,
                 (
                     needs::tick_needs_system,
                     mood::derive_mood_system,
@@ -78,7 +77,7 @@ impl Plugin for SimulationPlugin {
                     .in_set(SimulationSet::ParallelA),
             )
             .add_systems(
-                Update,
+                FixedUpdate,
                 (
                     production::consumption_system
                         .after(needs::tick_needs_system),
@@ -89,12 +88,12 @@ impl Plugin for SimulationPlugin {
                     .in_set(SimulationSet::ParallelA),
             )
             .add_systems(
-                Update,
+                FixedUpdate,
                 (jobs::goal_dispatch_system,)
                     .in_set(SimulationSet::ParallelB),
             )
             .add_systems(
-                Update,
+                FixedUpdate,
                 (
                     plants::plant_harvest_system
                         .before(production::production_system),
@@ -103,11 +102,8 @@ impl Plugin for SimulationPlugin {
                     movement::update_spatial_index_system
                         .after(movement::movement_system)
                         .after(animals::animal_movement_system),
-                    combat::hunting_system
-                        .after(movement::update_spatial_index_system),
                     combat::combat_system
-                        .after(movement::update_spatial_index_system)
-                        .after(combat::hunting_system),
+                        .after(movement::update_spatial_index_system),
                     combat::death_system
                         .after(combat::combat_system),
                     items::item_pickup_system
@@ -127,11 +123,8 @@ impl Plugin for SimulationPlugin {
                     .in_set(SimulationSet::Sequential),
             )
             .add_systems(
-                Update,
+                FixedUpdate,
                 (
-                    plants::plant_growth_system,
-                    plants::seed_scatter_system
-                        .after(plants::plant_growth_system),
                     memory::memory_decay_system,
                     faction::social_fill_system,
                     memory::conversation_memory_system
@@ -140,6 +133,7 @@ impl Plugin for SimulationPlugin {
                         .after(memory::conversation_memory_system),
                     plan::plan_decay_system,
                     faction::faction_camp_system,
+                    reproduction::birth_cooldown_system,
                     reproduction::collect_male_candidates,
                     reproduction::reproduction_system
                         .after(reproduction::collect_male_candidates),

@@ -24,37 +24,24 @@ pub fn market_sell_system(
             continue;
         }
 
-        // Sell surplus Food (keep reserve)
-        let food_qty = agent.quantity_of(Good::Food);
-        if food_qty > FOOD_KEEP_RESERVE {
-            let sell_qty = food_qty - FOOD_KEEP_RESERVE;
-            let earned = market.sell(Good::Food, sell_qty as f32);
-            agent.remove_good(Good::Food, sell_qty);
-            agent.currency += earned;
-        }
+        // Sell all items except food reserve
+        let inventory = agent.inventory; // Copy to avoid borrow issues while mutably removing
+        for (item, qty) in inventory {
+            if qty == 0 { continue; }
 
-        // Sell all Wood
-        let wood_qty = agent.quantity_of(Good::Wood);
-        if wood_qty > 0 {
-            let earned = market.sell(Good::Wood, wood_qty as f32);
-            agent.remove_good(Good::Wood, wood_qty);
-            agent.currency += earned;
-        }
+            let sell_qty = if item.good == Good::Food {
+                if qty > FOOD_KEEP_RESERVE {
+                    qty - FOOD_KEEP_RESERVE
+                } else {
+                    0
+                }
+            } else {
+                qty
+            };
 
-        // Sell all Stone
-        let stone_qty = agent.quantity_of(Good::Stone);
-        if stone_qty > 0 {
-            let earned = market.sell(Good::Stone, stone_qty as f32);
-            agent.remove_good(Good::Stone, stone_qty);
-            agent.currency += earned;
-        }
-
-        // Sell Coal and Iron
-        for good in [Good::Coal, Good::Iron] {
-            let qty = agent.quantity_of(good);
-            if qty > 0 {
-                let earned = market.sell(good, qty as f32);
-                agent.remove_good(good, qty);
+            if sell_qty > 0 {
+                let earned = market.sell_item(item, sell_qty as u32);
+                agent.remove_item(item, sell_qty);
                 agent.currency += earned;
             }
         }
@@ -72,10 +59,10 @@ pub fn market_buy_system(
         }
 
         // Buy Food when hungry and have no food
-        if needs.hunger > HUNGER_BUY_THRESHOLD && agent.quantity_of(Good::Food) == 0 {
-            let bought = market.try_buy(Good::Food, 1.0, &mut agent.currency);
-            if bought > 0.0 {
-                agent.add_good(Good::Food, 1);
+        if needs.hunger > HUNGER_BUY_THRESHOLD as f32 && agent.quantity_of(Good::Food) == 0 {
+            let (bought_item, qty) = market.try_buy_item(Good::Food, 1, &mut agent.currency);
+            if let Some(it) = bought_item {
+                agent.add_item(it, qty as u8);
                 // Clear Trader job now that the buy was handled
                 if ai.job_id == crate::simulation::jobs::JobKind::Trader as u16 {
                     ai.state = AiState::Idle;
@@ -88,9 +75,9 @@ pub fn market_buy_system(
         if !agent.has_tool() {
             let tool_price = market.prices[Good::Tools as usize];
             if agent.currency >= tool_price * TOOL_BUY_CURRENCY_FACTOR {
-                let bought = market.try_buy(Good::Tools, 1.0, &mut agent.currency);
-                if bought > 0.0 {
-                    agent.add_good(Good::Tools, 1);
+                let (bought_item, qty) = market.try_buy_item(Good::Tools, 1, &mut agent.currency);
+                if let Some(it) = bought_item {
+                    agent.add_item(it, qty as u8);
                 }
             }
         }

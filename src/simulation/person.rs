@@ -6,7 +6,7 @@ use crate::world::terrain::{tile_to_world, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
 use crate::world::tile::TileKind;
 use crate::economy::agent::EconomicAgent;
 
-use super::combat::{CombatTarget, Body};
+use super::combat::{CombatTarget, Body, CombatCooldown};
 use super::faction::FactionMember;
 use super::goals::{AgentGoal, Personality};
 use super::items::Equipment;
@@ -66,17 +66,25 @@ pub fn spawn_population(
     chunk_map: Res<ChunkMap>,
     mut clock: ResMut<SimClock>,
 ) {
+    use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
+
+    let start_cx = (GLOBE_WIDTH  / 2) * GLOBE_CELL_CHUNKS;
+    let start_cy = (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS;
+
     let mut rng = rand::thread_rng();
     let total_tiles_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
     let total_tiles_y = WORLD_CHUNKS_Y * CHUNK_SIZE as i32;
+
+    let start_tx = start_cx * CHUNK_SIZE as i32;
+    let start_ty = start_cy * CHUNK_SIZE as i32;
 
     let mut spawned = 0u32;
     let mut attempts = 0u32;
 
     while spawned < INITIAL_POPULATION && attempts < INITIAL_POPULATION * 20 {
         attempts += 1;
-        let tx = rng.gen_range(0..total_tiles_x);
-        let ty = rng.gen_range(0..total_tiles_y);
+        let tx = start_tx + rng.gen_range(0..total_tiles_x);
+        let ty = start_ty + rng.gen_range(0..total_tiles_y);
 
         if !chunk_map.is_passable(tx, ty) {
             continue;
@@ -94,7 +102,7 @@ pub fn spawn_population(
                 Person,
                 Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
                 GlobalTransform::default(),
-                Needs::new(30, 20, 10, 5, 40),
+                Needs::new(30.0, 20.0, 10.0, 5.0, 40.0),
                 Mood::default(),
                 Skills::default(),
                 PersonAI {
@@ -117,12 +125,13 @@ pub fn spawn_population(
                 Body::new_humanoid(),
                 Equipment::default(),
                 CombatTarget::default(),
+                CombatCooldown::default(),
             ),
             (
                 AgentMemory::default(),
                 RelationshipMemory::default(),
                 UtilityNet::new_random(),
-                KnownPlans::with_innate(&[0, 1]),
+                KnownPlans::with_innate(&[0, 1, 5]),
                 PlanScoringMethod::UtilityNN,
             ),
         ));
@@ -131,8 +140,7 @@ pub fn spawn_population(
     }
 
     clock.population = spawned;
-    clock.bucket_size = spawned.min(10_000);
-    clock.current_end = clock.bucket_size;
+    clock.current_end = clock.bucket_size.min(spawned);
 
     info!("Spawned {} people", spawned);
 }

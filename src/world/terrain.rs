@@ -70,7 +70,7 @@ fn generate_chunk_with_thresholds(
 }
 
 pub fn spawn_world_system(mut chunk_map: ResMut<ChunkMap>) {
-    use crate::world::globe::{Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
+    use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 
     let perlin = Perlin::default().set_seed(42);
 

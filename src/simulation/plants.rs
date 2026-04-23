@@ -1,8 +1,10 @@
 use ahash::AHashMap;
 use bevy::prelude::*;
+use bevy::sprite::Anchor;
 
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
+use crate::economy::item::Item;
 use crate::simulation::animals::Deer;
 use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
@@ -13,21 +15,23 @@ use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
+use crate::rendering::pixel_art::EntityTextures;
 
-const SEED_TO_SEEDLING_TICKS:  u16 = 60;
-const SEEDLING_TO_MATURE_TICKS: u16 = 120;
-const MATURE_TO_OVERRIPE_TICKS: u16 = 300;
+const DEER_GRAZE_INTERVAL: u16 = 120;
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PlantKind {
+    #[default]
     FruitBush = 0,
     Grain     = 1,
+    Tree      = 2,
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GrowthStage {
+    #[default]
     Seed     = 0,
     Seedling = 1,
     Mature   = 2,
@@ -38,8 +42,33 @@ pub enum GrowthStage {
 pub struct Plant {
     pub kind:         PlantKind,
     pub stage:        GrowthStage,
-    pub growth_ticks: u16,
+    pub growth_ticks: u32,
     pub tile_pos:     (i16, i16),
+}
+
+impl Plant {
+    pub fn duration_for_stage(&self) -> u32 {
+        match self.kind {
+            PlantKind::Grain => match self.stage {
+                GrowthStage::Seed     => 18_000, // 5 days
+                GrowthStage::Seedling => 54_000, // 15 days
+                GrowthStage::Mature   => 36_000, // 10 days
+                GrowthStage::Overripe => 0,
+            },
+            PlantKind::FruitBush => match self.stage {
+                GrowthStage::Seed     => 36_000,  // 10 days
+                GrowthStage::Seedling => 108_000, // 30 days
+                GrowthStage::Mature   => 72_000,  // 20 days
+                GrowthStage::Overripe => 0,
+            },
+            PlantKind::Tree => match self.stage {
+                GrowthStage::Seed     => 108_000, // 30 days
+                GrowthStage::Seedling => 324_000, // 90 days
+                GrowthStage::Mature   => 648_000, // 180 days
+                GrowthStage::Overripe => 0,
+            },
+        }
+    }
 }
 
 #[derive(Component)]
@@ -55,52 +84,19 @@ pub struct PlantSpriteIndex {
     pub by_chunk: AHashMap<ChunkCoord, Vec<(Entity, (i32, i32))>>,
 }
 
-#[derive(Resource, Default)]
-pub struct PlantMaterials {
-    pub fruit_seed:      Handle<ColorMaterial>,
-    pub fruit_seedling:  Handle<ColorMaterial>,
-    pub fruit_mature:    Handle<ColorMaterial>,
-    pub fruit_overripe:  Handle<ColorMaterial>,
-    pub grain_seed:      Handle<ColorMaterial>,
-    pub grain_seedling:  Handle<ColorMaterial>,
-    pub grain_mature:    Handle<ColorMaterial>,
-    pub grain_overripe:  Handle<ColorMaterial>,
-}
-
-impl PlantMaterials {
-    pub fn handle_for(&self, kind: PlantKind, stage: GrowthStage) -> Handle<ColorMaterial> {
-        match (kind, stage) {
-            (PlantKind::FruitBush, GrowthStage::Seed)     => self.fruit_seed.clone(),
-            (PlantKind::FruitBush, GrowthStage::Seedling) => self.fruit_seedling.clone(),
-            (PlantKind::FruitBush, GrowthStage::Mature)   => self.fruit_mature.clone(),
-            (PlantKind::FruitBush, GrowthStage::Overripe) => self.fruit_overripe.clone(),
-            (PlantKind::Grain,     GrowthStage::Seed)     => self.grain_seed.clone(),
-            (PlantKind::Grain,     GrowthStage::Seedling) => self.grain_seedling.clone(),
-            (PlantKind::Grain,     GrowthStage::Mature)   => self.grain_mature.clone(),
-            (PlantKind::Grain,     GrowthStage::Overripe) => self.grain_overripe.clone(),
+pub fn get_plant_texture(textures: &EntityTextures, kind: PlantKind, stage: GrowthStage) -> Handle<Image> {
+    match kind {
+        PlantKind::Tree => match stage {
+            GrowthStage::Seed     => textures.plant_seed.clone(),
+            GrowthStage::Seedling => textures.tree_seedling.clone(),
+            _ => textures.tree_mature.clone(),
+        },
+        _ => match stage {
+            GrowthStage::Seed => textures.plant_seed.clone(),
+            GrowthStage::Seedling => textures.plant_seedling.clone(),
+            _ => textures.plant_mature.clone(),
         }
     }
-}
-
-#[derive(Resource, Default)]
-pub struct PlantMeshHandle(pub Handle<Mesh>);
-
-pub fn setup_plant_materials(
-    mut plant_materials: ResMut<PlantMaterials>,
-    mut plant_mesh: ResMut<PlantMeshHandle>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-    mut meshes:    ResMut<Assets<Mesh>>,
-) {
-    plant_mesh.0 = meshes.add(Rectangle::new(5.0, 5.0));
-
-    plant_materials.fruit_seed     = materials.add(ColorMaterial::from_color(Color::srgb(0.25, 0.15, 0.05)));
-    plant_materials.fruit_seedling = materials.add(ColorMaterial::from_color(Color::srgb(0.40, 0.70, 0.30)));
-    plant_materials.fruit_mature   = materials.add(ColorMaterial::from_color(Color::srgb(0.85, 0.15, 0.15)));
-    plant_materials.fruit_overripe = materials.add(ColorMaterial::from_color(Color::srgb(0.50, 0.10, 0.05)));
-    plant_materials.grain_seed     = materials.add(ColorMaterial::from_color(Color::srgb(0.75, 0.70, 0.45)));
-    plant_materials.grain_seedling = materials.add(ColorMaterial::from_color(Color::srgb(0.60, 0.75, 0.20)));
-    plant_materials.grain_mature   = materials.add(ColorMaterial::from_color(Color::srgb(0.90, 0.80, 0.10)));
-    plant_materials.grain_overripe = materials.add(ColorMaterial::from_color(Color::srgb(0.85, 0.85, 0.55)));
 }
 
 /// Spawn a plant entity at the given tile. No-op if the tile is already occupied.
@@ -108,8 +104,7 @@ pub fn spawn_plant_at(
     commands: &mut Commands,
     plant_map: &mut PlantMap,
     plant_sprite_index: &mut PlantSpriteIndex,
-    plant_materials: &PlantMaterials,
-    plant_mesh: &PlantMeshHandle,
+    textures: &EntityTextures,
     tile_x: i32,
     tile_y: i32,
     kind: PlantKind,
@@ -120,7 +115,10 @@ pub fn spawn_plant_at(
     }
 
     let world_pos = tile_to_world(tile_x, tile_y);
-    let mat = plant_materials.handle_for(kind, stage);
+
+    let mut sprite = Sprite::from_image(get_plant_texture(textures, kind, stage));
+    sprite.custom_size = Some(Vec2::new(24.0, 36.0));
+    sprite.anchor = Anchor::BottomCenter;
 
     let entity = commands.spawn((
         Plant {
@@ -129,12 +127,12 @@ pub fn spawn_plant_at(
             growth_ticks: 0,
             tile_pos: (tile_x as i16, tile_y as i16),
         },
-        Mesh2d(plant_mesh.0.clone()),
-        MeshMaterial2d(mat),
-        Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
+        sprite,
+        Transform::from_xyz(world_pos.x, world_pos.y - 8.0, 0.5),
         GlobalTransform::default(),
         Visibility::Visible,
     )).id();
+
 
     plant_map.0.insert((tile_x, tile_y), entity);
 
@@ -151,14 +149,14 @@ pub fn spawn_plant_at(
 pub fn plant_growth_system(
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
-    plant_materials: Res<PlantMaterials>,
-    mut query: Query<(Entity, &mut Plant, &mut MeshMaterial2d<ColorMaterial>)>,
+    textures: Res<EntityTextures>,
+    mut query: Query<(Entity, &mut Plant, &mut Sprite)>,
 ) {
     if clock.tick % 5 != 0 {
         return;
     }
 
-    for (_entity, mut plant, mut mat) in query.iter_mut() {
+    for (_entity, mut plant, mut sprite) in query.iter_mut() {
         let tx = plant.tile_pos.0 as i32;
         let ty = plant.tile_pos.1 as i32;
 
@@ -172,14 +170,12 @@ pub fn plant_growth_system(
 
         plant.growth_ticks = plant.growth_ticks.saturating_add(5);
 
-        let threshold = match plant.stage {
-            GrowthStage::Seed     => SEED_TO_SEEDLING_TICKS,
-            GrowthStage::Seedling => SEEDLING_TO_MATURE_TICKS,
-            GrowthStage::Mature   => MATURE_TO_OVERRIPE_TICKS,
-            GrowthStage::Overripe => continue,
-        };
+        let threshold = plant.duration_for_stage();
+        if threshold == 0 {
+            continue;
+        }
 
-        let effective = (threshold as f32 * multiplier) as u16;
+        let effective = (threshold as f32 * multiplier) as u32;
         if plant.growth_ticks >= effective {
             plant.growth_ticks = 0;
             plant.stage = match plant.stage {
@@ -188,7 +184,9 @@ pub fn plant_growth_system(
                 GrowthStage::Mature   => GrowthStage::Overripe,
                 GrowthStage::Overripe => GrowthStage::Overripe,
             };
-            mat.0 = plant_materials.handle_for(plant.kind, plant.stage);
+
+            sprite.image = get_plant_texture(&textures, plant.kind, plant.stage);
+            sprite.color = Color::WHITE;
         }
     }
 }
@@ -200,30 +198,50 @@ pub fn seed_scatter_system(
     chunk_map: Res<ChunkMap>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    plant_materials: Res<PlantMaterials>,
-    plant_mesh: Res<PlantMeshHandle>,
-    query: Query<(Entity, &Plant)>,
+    textures: Res<EntityTextures>,
+    mut query: Query<(Entity, &mut Plant, &mut Sprite)>,
 ) {
     if clock.tick % 5 != 0 {
         return;
     }
 
-    let overripe: Vec<(Entity, (i32, i32), PlantKind)> = query
-        .iter()
-        .filter(|(_, p)| p.stage == GrowthStage::Overripe)
-        .map(|(e, p)| (e, (p.tile_pos.0 as i32, p.tile_pos.1 as i32), p.kind))
-        .collect();
+    let mut overripe_entities = Vec::new();
+    for (entity, mut plant, mut sprite) in query.iter_mut() {
+        if plant.stage == GrowthStage::Overripe {
+            let tx = plant.tile_pos.0 as i32;
+            let ty = plant.tile_pos.1 as i32;
+            let kind = plant.kind;
 
-    for (entity, (tx, ty), kind) in overripe {
-        // Confirm still in plant_map (avoid double-processing if somehow duplicated)
+            if kind == PlantKind::Tree {
+                // Trees drop branches and return to Mature
+                let (dx, dy) = adjacent_offset();
+                let sx = tx + dx;
+                let sy = ty + dy;
+                let pos = tile_to_world(sx, sy);
+                commands.spawn((
+                    GroundItem { item: Item::new_commodity(Good::Wood), qty: 1 },
+                    Transform::from_xyz(pos.x, pos.y - 8.0, 0.3),
+                    GlobalTransform::default(),
+                ));
+
+                plant.stage = GrowthStage::Mature;
+                plant.growth_ticks = 0;
+                sprite.image = get_plant_texture(&textures, plant.kind, plant.stage);
+            } else {
+                overripe_entities.push((entity, (tx, ty), kind));
+            }
+        }
+    }
+
+    for (entity, (tx, ty), kind) in overripe_entities {
         if plant_map.0.get(&(tx, ty)) != Some(&entity) {
             continue;
         }
 
-        // Determine scatter count and radius
         let (count, radius): (u8, i32) = match kind {
-            PlantKind::FruitBush => (1 + fastrand::u8(..2), 1),
-            PlantKind::Grain     => (2 + fastrand::u8(..3), 2),
+            PlantKind::FruitBush => (1, 1),
+            PlantKind::Grain     => (1, 2),
+            PlantKind::Tree      => (0, 0), // Should not reach here
         };
 
         for _ in 0..count {
@@ -237,14 +255,13 @@ pub fn seed_scatter_system(
                 if matches!(tile.kind, TileKind::Grass | TileKind::Farmland) {
                     spawn_plant_at(
                         &mut commands, &mut plant_map, &mut plant_sprite_index,
-                        &plant_materials, &plant_mesh,
+                        &textures,
                         nx, ny, kind, GrowthStage::Seed,
                     );
                 }
             }
         }
 
-        // Remove and despawn the overripe plant
         plant_map.0.remove(&(tx, ty));
         let cx = tx.div_euclid(CHUNK_SIZE as i32);
         let cy = ty.div_euclid(CHUNK_SIZE as i32);
@@ -256,13 +273,14 @@ pub fn seed_scatter_system(
 }
 
 /// Harvest a mature plant when an agent arrives at the target tile.
-/// Runs before production_system so we can zero work_progress to prevent double-yield.
 pub fn plant_harvest_system(
     mut commands: Commands,
     clock: Res<SimClock>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    plant_query: Query<&Plant>,
+    textures: Res<EntityTextures>,
+    mut plant_query: Query<&mut Plant>,
+    mut sprite_query: Query<&mut Sprite>,
     mut agent_query: Query<(
         &mut PersonAI,
         &mut EconomicAgent,
@@ -276,7 +294,14 @@ pub fn plant_harvest_system(
     for (mut ai, mut agent, mut skills, slot, lod, mut memory_opt, mut active_plan_opt) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
         if ai.state != AiState::Working { continue; }
-        if ai.job_id != crate::simulation::jobs::JobKind::Farmer as u16 { continue; }
+        let job = ai.job_id;
+        let is_woodcutter = job == crate::simulation::jobs::JobKind::Woodcutter as u16;
+        let is_farmer = job == crate::simulation::jobs::JobKind::Farmer as u16;
+        let is_forager = job == crate::simulation::jobs::JobKind::Forager as u16;
+
+        if !is_farmer && !is_forager && !is_woodcutter {
+            continue;
+        }
 
         let tx = ai.target_tile.0 as i32;
         let ty = ai.target_tile.1 as i32;
@@ -286,7 +311,7 @@ pub fn plant_harvest_system(
             None    => continue,
         };
 
-        let plant = match plant_query.get(plant_entity) {
+        let mut plant = match plant_query.get_mut(plant_entity) {
             Ok(p) => p,
             Err(_) => {
                 plant_map.0.remove(&(tx, ty));
@@ -298,45 +323,102 @@ pub fn plant_harvest_system(
             continue;
         }
 
-        // Harvest
-        let (food_qty, give_seed_to_agent) = match plant.kind {
-            PlantKind::FruitBush => (2u8, true),
-            PlantKind::Grain     => (3u8, false),
+        // Foragers can harvest FruitBush or gather branches from Trees.
+        // Woodcutters can only harvest Trees.
+        // Farmers can harvest Grain or FruitBush.
+        if is_woodcutter && plant.kind != PlantKind::Tree {
+            continue;
+        }
+        if is_forager && plant.kind == PlantKind::Grain {
+            continue;
+        }
+        if is_farmer && plant.kind == PlantKind::Tree {
+            continue;
+        }
+
+        let (mut wood_qty, mut food_qty, mut seed_qty, mut despawn_plant) = (0u8, 0u8, 0u8, true);
+
+        match plant.kind {
+            PlantKind::FruitBush => {
+                food_qty = 2;
+                seed_qty = 1;
+            }
+            PlantKind::Grain => {
+                food_qty = 3;
+            }
+            PlantKind::Tree => {
+                if agent.has_tool() {
+                    // Felling: requires tools, despawns tree, higher yield
+                    wood_qty = 3;
+                    despawn_plant = true;
+                    skills.gain_xp(SkillKind::Farming, 5); // Using Farming for woodcutting XP as per original
+                } else {
+                    // Branch gathering: no tools, tree survives as seedling
+                    wood_qty = 1;
+                    despawn_plant = false;
+                    skills.gain_xp(SkillKind::Farming, 2);
+                }
+            }
+        }
+
+        if food_qty > 0 {
+            agent.add_good(Good::Food, food_qty);
+            if let Some(ref mut mem) = memory_opt {
+                mem.record((tx as i16, ty as i16), MemoryKind::Food);
+            }
+            if let Some(ref mut plan) = active_plan_opt {
+                plan.reward_acc += food_qty as f32 * 0.4;
+            }
+        }
+        if wood_qty > 0 {
+            agent.add_good(Good::Wood, wood_qty);
+            if let Some(ref mut mem) = memory_opt {
+                mem.record((tx as i16, ty as i16), MemoryKind::Wood);
+            }
+            if let Some(ref mut plan) = active_plan_opt {
+                plan.reward_acc += wood_qty as f32 * 0.4;
+            }
+        }
+        if seed_qty > 0 {
+            agent.add_good(Good::Seed, seed_qty);
+        }
+
+        // Drop some extra on ground
+        let (drop_good, drop_qty) = match plant.kind {
+            PlantKind::FruitBush => (Good::Seed, 1),
+            PlantKind::Grain     => (Good::Seed, 1), // Grain harvest drops a seed too
+            PlantKind::Tree      => (Good::Wood, if despawn_plant { 2 } else { 1 }),
         };
 
-        agent.add_good(Good::Food, food_qty);
-        if give_seed_to_agent {
-            agent.add_good(Good::Seed, 1);
-        }
-        skills.gain_xp(SkillKind::Farming, 3);
-        if let Some(ref mut mem) = memory_opt {
-            mem.record((tx as i16, ty as i16), MemoryKind::Food);
-        }
-        if let Some(ref mut plan) = active_plan_opt {
-            plan.reward_acc += food_qty as f32 * 0.4;
+        for _ in 0..drop_qty {
+            let (dx, dy) = adjacent_offset();
+            let sx = tx + dx;
+            let sy = ty + dy;
+            let drop_pos = tile_to_world(sx, sy);
+            commands.spawn((
+                GroundItem { item: Item::new_commodity(drop_good), qty: 1 },
+                Transform::from_xyz(drop_pos.x, drop_pos.y - 8.0, 0.3),
+                GlobalTransform::default(),
+            ));
         }
 
-        // Drop a seed nearby on the ground
-        let (dx, dy) = adjacent_offset();
-        let sx = tx + dx;
-        let sy = ty + dy;
-        let seed_pos = tile_to_world(sx, sy);
-        commands.spawn((
-            GroundItem { good: Good::Seed, qty: 1 },
-            Transform::from_xyz(seed_pos.x, seed_pos.y, 0.3),
-            GlobalTransform::default(),
-        ));
-
-        // Remove plant from map and despawn
-        plant_map.0.remove(&(tx, ty));
-        let cx = tx.div_euclid(CHUNK_SIZE as i32);
-        let cy = ty.div_euclid(CHUNK_SIZE as i32);
-        if let Some(vec) = plant_sprite_index.by_chunk.get_mut(&ChunkCoord(cx, cy)) {
-            vec.retain(|(e, _)| *e != plant_entity);
+        if despawn_plant {
+            plant_map.0.remove(&(tx, ty));
+            let cx = tx.div_euclid(CHUNK_SIZE as i32);
+            let cy = ty.div_euclid(CHUNK_SIZE as i32);
+            if let Some(vec) = plant_sprite_index.by_chunk.get_mut(&ChunkCoord(cx, cy)) {
+                vec.retain(|(e, _)| *e != plant_entity);
+            }
+            commands.entity(plant_entity).despawn();
+        } else {
+            // Revert to seedling
+            plant.stage = GrowthStage::Seedling;
+            plant.growth_ticks = 0;
+            if let Ok(mut sprite) = sprite_query.get_mut(plant_entity) {
+                sprite.image = get_plant_texture(&textures, plant.kind, plant.stage);
+            }
         }
-        commands.entity(plant_entity).despawn();
 
-        // Zero progress so production_system doesn't double-yield this tick
         ai.work_progress = 0;
     }
 }
@@ -366,7 +448,6 @@ pub fn deer_graze_system(
         let deer_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let deer_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
 
-        // Scan 7×7 box for a mature FruitBush
         let mut found: Option<(i32, i32, Entity)> = None;
         'search: for dy in -3i32..=3 {
             for dx in -3i32..=3 {
@@ -384,7 +465,6 @@ pub fn deer_graze_system(
         }
 
         if let Some((tx, ty, entity)) = found {
-            // Consume the plant
             plant_map.0.remove(&(tx, ty));
             let cx = tx.div_euclid(CHUNK_SIZE as i32);
             let cy = ty.div_euclid(CHUNK_SIZE as i32);
@@ -393,7 +473,6 @@ pub fn deer_graze_system(
             }
             commands.entity(entity).despawn();
 
-            // Drop 1–2 seeds on adjacent tiles (seeds pass through and spread)
             let count = 1 + fastrand::u8(..2);
             for _ in 0..count {
                 let (dx, dy) = adjacent_offset();
@@ -401,14 +480,14 @@ pub fn deer_graze_system(
                 let sy = ty + dy;
                 let pos = tile_to_world(sx, sy);
                 commands.spawn((
-                    GroundItem { good: Good::Seed, qty: 1 },
-                    Transform::from_xyz(pos.x, pos.y, 0.3),
+                    GroundItem { item: Item::new_commodity(Good::Seed), qty: 1 },
+                    Transform::from_xyz(pos.x, pos.y - 8.0, 0.3),
                     GlobalTransform::default(),
                 ));
             }
         }
 
-        grazer.graze_timer = 120;
+        grazer.graze_timer = DEER_GRAZE_INTERVAL;
     }
 }
 

@@ -21,15 +21,25 @@ pub fn economy_panel_system(
 
             match *mode {
                 EconomicMode::Market | EconomicMode::Mixed => {
-                    ui.label("Market Prices:");
+                    ui.label("Market Prices (Commodities):");
                     for good in Good::all() {
                         let price = market.prices[good as usize];
-                        let supply = market.supply[good as usize];
-                        let demand = market.demand[good as usize];
                         ui.label(format!(
-                            "  {:6}: ${:.2}  S:{:.0} D:{:.0}",
-                            good.name(), price, supply, demand
+                            "  {:6}: ${:.2}",
+                            good.name(), price
                         ));
+                    }
+                    if !market.listings.is_empty() {
+                        ui.separator();
+                        ui.label("Item Listings:");
+                        for (item, stock) in &market.listings {
+                            if *stock > 0 {
+                                let mut name = item.good.name().to_string();
+                                if let Some(mat) = item.material { name = format!("{:?} {}", mat, name); }
+                                if let Some(qual) = item.quality { name = format!("{} ({:?})", name, qual); }
+                                ui.label(format!("  {} x{}: ${:.1}", name, stock, market.calculate_price(item)));
+                            }
+                        }
                     }
                 }
                 EconomicMode::Command => {

@@ -8,8 +8,7 @@ pub mod seasons;
 pub mod globe;
 pub mod chunk_streaming;
 
-pub use chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE};
-pub use tile::{TileData, TileKind};
+pub use chunk::ChunkMap;
 
 fn insert_globe(app: &mut App) {
     app.insert_resource(globe::load_or_generate(42));

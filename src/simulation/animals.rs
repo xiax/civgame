@@ -3,7 +3,7 @@ use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::{tile_to_world, TILE_SIZE, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
 use crate::world::tile::TileKind;
 use crate::world::spatial::SpatialIndex;
-use super::combat::{CombatTarget, Health};
+use super::combat::{CombatTarget, Health, Body, CombatCooldown};
 use super::lod::LodLevel;
 use super::person::Person;
 use super::schedule::{BucketSlot, SimClock};
@@ -43,6 +43,14 @@ pub fn spawn_animals(
     chunk_map: Res<ChunkMap>,
     mut clock: ResMut<SimClock>,
 ) {
+    use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
+
+    let start_cx = (GLOBE_WIDTH  / 2) * GLOBE_CELL_CHUNKS;
+    let start_cy = (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS;
+
+    let start_tx = start_cx * CHUNK_SIZE as i32;
+    let start_ty = start_cy * CHUNK_SIZE as i32;
+
     let total_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
     let total_y = WORLD_CHUNKS_Y * CHUNK_SIZE as i32;
 
@@ -50,8 +58,10 @@ pub fn spawn_animals(
     let mut forest_tiles: Vec<(i32, i32)> = Vec::new();
     let mut grass_tiles:  Vec<(i32, i32)> = Vec::new();
 
-    for ty in 0..total_y {
-        for tx in 0..total_x {
+    for dy in 0..total_y {
+        for dx in 0..total_x {
+            let tx = start_tx + dx;
+            let ty = start_ty + dy;
             if !chunk_map.is_passable(tx, ty) { continue; }
             if let Some(tile) = chunk_map.tile_at(tx, ty) {
                 match tile.kind {
@@ -83,6 +93,7 @@ pub fn spawn_animals(
             },
             Health::new(30),
             CombatTarget::default(),
+            CombatCooldown::default(),
             LodLevel::Full,
             BucketSlot(slot),
         ));
@@ -107,6 +118,7 @@ pub fn spawn_animals(
             },
             Health::new(20),
             CombatTarget::default(),
+            CombatCooldown::default(),
             LodLevel::Full,
             BucketSlot(slot),
             crate::simulation::plants::DeerGrazer {
@@ -117,8 +129,7 @@ pub fn spawn_animals(
     }
 
     clock.population = slot;
-    clock.bucket_size = slot.min(10_000);
-    clock.current_end = clock.bucket_size;
+    clock.current_end = clock.bucket_size.min(slot);
 }
 
 pub fn animal_movement_system(
@@ -128,11 +139,10 @@ pub fn animal_movement_system(
     clock: Res<SimClock>,
 ) {
     let dt = time.delta_secs();
-    let total_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
-    let total_y = WORLD_CHUNKS_Y * CHUNK_SIZE as i32;
+    let sim_dt = dt * clock.scale_factor();
 
     for (mut transform, mut ai, lod, slot) in query.iter_mut() {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+        if *lod == LodLevel::Dormant {
             continue;
         }
         if ai.state == AnimalState::Attack {
@@ -156,27 +166,30 @@ pub fn animal_movement_system(
             transform.translation.y = target_world.y;
 
             if matches!(ai.state, AnimalState::Wander | AnimalState::Flee) {
-                ai.wander_timer -= dt;
-                if ai.wander_timer <= 0.0 {
-                    ai.wander_timer = WANDER_INTERVAL;
-                    ai.state = AnimalState::Wander;
-                    ai.target_entity = None;
+                // Bucketed wander logic
+                if clock.is_active(slot.0) {
+                    ai.wander_timer -= sim_dt;
+                    if ai.wander_timer <= 0.0 {
+                        ai.wander_timer = WANDER_INTERVAL;
+                        ai.state = AnimalState::Wander;
+                        ai.target_entity = None;
 
-                    let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
-                    let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
+                        let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
+                        let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
 
-                    // Pick random adjacent passable tile
-                    let dirs: [(i32, i32); 8] = [
-                        (-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1),
-                    ];
-                    let start = fastrand::usize(..8);
-                    for i in 0..8 {
-                        let (dx, dy) = dirs[(start + i) % 8];
-                        let ntx = (cur_tx + dx).clamp(0, total_x - 1);
-                        let nty = (cur_ty + dy).clamp(0, total_y - 1);
-                        if chunk_map.is_passable(ntx, nty) {
-                            ai.target_tile = (ntx as i16, nty as i16);
-                            break;
+                        // Pick random adjacent passable tile
+                        let dirs: [(i32, i32); 8] = [
+                            (-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1),
+                        ];
+                        let start = fastrand::usize(..8);
+                        for i in 0..8 {
+                            let (dx, dy) = dirs[(start + i) % 8];
+                            let ntx = cur_tx + dx;
+                            let nty = cur_ty + dy;
+                            if chunk_map.is_passable(ntx, nty) {
+                                ai.target_tile = (ntx as i16, nty as i16);
+                                break;
+                            }
                         }
                     }
                 }
@@ -197,6 +210,7 @@ pub fn animal_sense_system(
     deer_query: Query<(Entity, &Transform, &BucketSlot, &LodLevel), With<Deer>>,
     person_query: Query<&Transform, With<Person>>,
     mut ai_query: Query<(&mut AnimalAI, &mut CombatTarget)>,
+    target_query: Query<(&Transform, Option<&Health>, Option<&Body>)>,
 ) {
     const WOLF_HUNT_RADIUS: i32 = 12;
     const DEER_FLEE_RADIUS: i32 = 8;
@@ -214,22 +228,38 @@ pub fn animal_sense_system(
         // If already chasing/attacking a valid target, keep it
         if let Some(existing) = ai.target_entity {
             if ai.state == AnimalState::Chase || ai.state == AnimalState::Attack {
-                // Update target tile to prey's current position
-                if let Ok(prey_transform) = person_query.get(existing) {
-                    let ptx = (prey_transform.translation.x / TILE_SIZE).floor() as i16;
-                    let pty = (prey_transform.translation.y / TILE_SIZE).floor() as i16;
-                    ai.target_tile = (ptx, pty);
-                }
-                // Check adjacency for attack
-                let target_tile = ai.target_tile;
-                let dist = (target_tile.0 as i32 - tx).abs() + (target_tile.1 as i32 - ty).abs();
-                if dist <= 1 {
-                    ai.state = AnimalState::Attack;
-                    combat_target.0 = Some(existing);
+                if let Ok((prey_transform, health, body)) = target_query.get(existing) {
+                    let is_dead = match (health, body) {
+                        (Some(h), _) if h.is_dead() => true,
+                        (_, Some(b)) if b.is_dead() => true,
+                        _ => false,
+                    };
+                    if is_dead {
+                        ai.state = AnimalState::Wander;
+                        ai.target_entity = None;
+                        combat_target.0 = None;
+                    } else {
+                        // Update target tile to prey's current position
+                        let ptx = (prey_transform.translation.x / TILE_SIZE).floor() as i16;
+                        let pty = (prey_transform.translation.y / TILE_SIZE).floor() as i16;
+                        ai.target_tile = (ptx, pty);
+
+                        // Check adjacency for attack
+                        let target_tile = ai.target_tile;
+                        let dist = (target_tile.0 as i32 - tx).abs() + (target_tile.1 as i32 - ty).abs();
+                        if dist <= 1 {
+                            ai.state = AnimalState::Attack;
+                            combat_target.0 = Some(existing);
+                        } else {
+                            ai.state = AnimalState::Chase;
+                        }
+                        continue;
+                    }
                 } else {
-                    ai.state = AnimalState::Chase;
+                    ai.state = AnimalState::Wander;
+                    ai.target_entity = None;
+                    combat_target.0 = None;
                 }
-                continue;
             }
         }
 
@@ -240,6 +270,14 @@ pub fn animal_sense_system(
             for dx in -WOLF_HUNT_RADIUS..=WOLF_HUNT_RADIUS {
                 for &candidate in spatial.get(tx + dx, ty + dy) {
                     if candidate == wolf_entity { continue; }
+
+                    let Ok((_, health, body)) = target_query.get(candidate) else { continue };
+                    let is_dead = match (health, body) {
+                        (Some(h), _) if h.is_dead() => true,
+                        (_, Some(b)) if b.is_dead() => true,
+                        _ => false,
+                    };
+                    if is_dead { continue; }
 
                     // Prefer deer
                     if deer_query.contains(candidate) {
@@ -307,11 +345,15 @@ pub fn animal_sense_system(
         }
 
         if threat_count > 0 {
+            use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
+            let total_tiles_x = GLOBE_WIDTH * GLOBE_CELL_CHUNKS * CHUNK_SIZE as i32;
+            let total_tiles_y = GLOBE_HEIGHT * GLOBE_CELL_CHUNKS * CHUNK_SIZE as i32;
+
             // Flee in opposite direction from average threat position
             let flee_tx = (tx - threat_dx / threat_count)
-                .clamp(0, WORLD_CHUNKS_X * CHUNK_SIZE as i32 - 1);
+                .clamp(0, total_tiles_x - 1);
             let flee_ty = (ty - threat_dy / threat_count)
-                .clamp(0, WORLD_CHUNKS_Y * CHUNK_SIZE as i32 - 1);
+                .clamp(0, total_tiles_y - 1);
             ai.state = AnimalState::Flee;
             ai.target_tile = (flee_tx as i16, flee_ty as i16);
             ai.wander_timer = 1.5; // hold flee direction for 1.5s

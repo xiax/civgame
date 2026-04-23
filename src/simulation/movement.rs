@@ -4,8 +4,11 @@ use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::{tile_to_world, TILE_SIZE, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
 use crate::world::spatial::SpatialIndex;
 use crate::pathfinding::chunk_graph::ChunkGraph;
-use super::person::{AiState, PersonAI};
+use super::person::{AiState, Person, PersonAI};
+use super::animals::{Wolf, Deer};
+use super::combat::{Health, Body};
 use super::lod::LodLevel;
+use super::schedule::{BucketSlot, SimClock};
 
 const MOVE_SPEED: f32 = 48.0; // pixels per second
 const IDLE_WANDER_INTERVAL: f32 = 2.5; // seconds between random moves
@@ -17,6 +20,7 @@ pub struct MovementState {
 
 pub fn movement_system(
     time: Res<Time>,
+    clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
     mut query: Query<(
@@ -25,15 +29,15 @@ pub fn movement_system(
         &mut PersonAI,
         &LodLevel,
         &mut MovementState,
+        &BucketSlot,
     )>,
 ) {
     let dt = time.delta_secs();
-    let total_tiles_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
-    let total_tiles_y = WORLD_CHUNKS_Y * CHUNK_SIZE as i32;
+    let sim_dt = dt * clock.scale_factor();
 
     // Movement can't be fully parallel because it writes Transform (position sync)
     // and can read ChunkMap for passability. Run sequentially.
-    for (_, mut transform, mut ai, lod, mut mv) in query.iter_mut() {
+    for (_, mut transform, mut ai, lod, mut mv, slot) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -44,7 +48,7 @@ pub fn movement_system(
         let dist = to_target.length();
 
         if dist > 2.0 {
-            // Move toward target
+            // Move toward target — runs EVERY tick for smoothness
             let dir = to_target.normalize();
             let step = dir * MOVE_SPEED * dt;
             let new_pos = pos + step;
@@ -61,8 +65,11 @@ pub fn movement_system(
                     ai.state = AiState::Working;
                 }
                 AiState::Working => {
-                    // Production system handles output; just accumulate progress.
-                    ai.work_progress = ai.work_progress.saturating_add(1);
+                    // Production system handles output; only accumulate progress when bucket is active.
+                    if clock.is_active(slot.0) {
+                        let progress = (sim_dt * 20.0).max(1.0) as u8;
+                        ai.work_progress = ai.work_progress.saturating_add(progress);
+                    }
                 }
                 AiState::Idle => {
                     // Random wander
@@ -86,8 +93,8 @@ pub fn movement_system(
                         let shuffled: Vec<_> = right.iter().chain(left.iter()).collect();
 
                         for &&(dx, dy) in &shuffled {
-                            let ntx = (cur_tx + dx).clamp(0, total_tiles_x - 1);
-                            let nty = (cur_ty + dy).clamp(0, total_tiles_y - 1);
+                            let ntx = cur_tx + dx;
+                            let nty = cur_ty + dy;
                             if chunk_map.is_passable(ntx, nty) {
                                 ai.target_tile = (ntx as i16, nty as i16);
                                 break;
@@ -128,10 +135,16 @@ pub fn movement_system(
 
 pub fn update_spatial_index_system(
     mut index: ResMut<SpatialIndex>,
-    query: Query<(Entity, &Transform)>,
+    query: Query<
+        (Entity, &Transform, Option<&Health>, Option<&Body>),
+        Or<(With<Person>, With<Wolf>, With<Deer>, With<super::plants::Plant>, With<super::items::GroundItem>)>,
+    >,
 ) {
     index.0.clear();
-    for (entity, transform) in &query {
+    for (entity, transform, health, body) in &query {
+        let is_dead = health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead());
+        if is_dead { continue; }
+
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         index.insert(tx, ty, entity);

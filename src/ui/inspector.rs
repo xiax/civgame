@@ -116,9 +116,16 @@ pub fn inspector_panel_system(
             ui.separator();
             ui.label(format!("Currency: {:.1}", agent.currency));
             ui.label("Inventory:");
-            for (good, qty) in &agent.inventory {
+            for (item, qty) in &agent.inventory {
                 if *qty > 0 {
-                    ui.label(format!("  {}: {}", good.name(), qty));
+                    let mut name = item.good.name().to_string();
+                    if let Some(mat) = item.material {
+                        name = format!("{:?} {}", mat, name);
+                    }
+                    if let Some(qual) = item.quality {
+                        name = format!("{} ({:?})", name, qual);
+                    }
+                    ui.label(format!("  {}: {}", name, qty));
                 }
             }
 
@@ -131,10 +138,10 @@ pub fn inspector_panel_system(
         });
 }
 
-fn needs_bar(ui: &mut egui::Ui, label: &str, value: u8) {
+fn needs_bar(ui: &mut egui::Ui, label: &str, value: f32) {
     ui.horizontal(|ui| {
         ui.label(format!("{label:8}"));
-        let progress = value as f32 / 255.0;
+        let progress = value / 255.0;
         let color = egui::Color32::from_rgb(
             (255.0 * progress) as u8,
             (255.0 * (1.0 - progress)) as u8,

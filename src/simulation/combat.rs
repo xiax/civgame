@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use crate::economy::goods::Good;
-use crate::simulation::animals::{Deer, Wolf};
+use crate::economy::item::Item;
+use crate::simulation::animals::{AnimalAI, AnimalState, Deer, Wolf};
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::technology::ActivityKind;
 use crate::simulation::items::{GroundItem, Equipment, EquipmentSlot, WeaponStats, ArmorStats};
@@ -98,20 +99,35 @@ impl Body {
 #[derive(Component, Default, Clone, Copy)]
 pub struct CombatTarget(pub Option<Entity>);
 
+#[derive(Event)]
+pub struct CombatEvent {
+    pub attacker: Entity,
+    pub target: Entity,
+}
+
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct CombatCooldown(pub f32);
+
 const ATTACK_DAMAGE: u8 = 2;
+const BASE_ATTACK_COOLDOWN: f32 = 1.0;
 
 pub fn combat_system(
+    time: Res<Time>,
     spatial: Res<SpatialIndex>,
-    attacker_query: Query<(Entity, &CombatTarget, &Transform, &LodLevel, &BucketSlot, Option<&Equipment>, Option<&FactionMember>)>,
+    mut attacker_query: Query<(Entity, &mut CombatTarget, &Transform, &LodLevel, &BucketSlot, Option<&Equipment>, Option<&mut CombatCooldown>, Option<&FactionMember>)>,
     mut health_query: Query<&mut Health>,
     mut body_query: Query<&mut Body>,
     equipment_query: Query<&Equipment>,
     item_stats_query: Query<(Option<&WeaponStats>, Option<&ArmorStats>)>,
     mut ai_query: Query<&mut PersonAI>,
+    mut animal_ai_query: Query<(&mut AnimalAI, Option<&Deer>)>,
     mut rel_query: Query<Option<&mut RelationshipMemory>>,
     mut faction_registry: ResMut<FactionRegistry>,
     clock: Res<SimClock>,
+    mut combat_events: EventWriter<CombatEvent>,
 ) {
+    let dt = time.delta_secs();
+
     // (target, attacker, damage)
     let mut health_damage_events: Vec<(Entity, Entity, u8)> = Vec::new();
     // (target, attacker, part, damage)
@@ -119,18 +135,39 @@ pub fn combat_system(
     // (faction_id) — attackers whose faction logs a combat event this frame
     let mut combat_activity_factions: Vec<u32> = Vec::new();
 
-    for (attacker, combat_target, transform, lod, slot, attacker_eq, attacker_fm) in &attacker_query {
+    for (attacker, mut combat_target, transform, lod, slot, attacker_eq, mut cd, attacker_fm) in &mut attacker_query {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
+
+        if let Some(ref mut cd) = cd {
+            cd.0 = (cd.0 - dt * clock.scale_factor()).max(0.0);
+            if cd.0 > 0.0 {
+                continue;
+            }
+        }
+
         let Some(target) = combat_target.0 else { continue };
         if target == attacker { continue; }
 
-        if !health_query.contains(target) && !body_query.contains(target) {
+        let target_is_dead = if let Ok(h) = health_query.get(target) {
+            h.is_dead()
+        } else if let Ok(b) = body_query.get(target) {
+            b.is_dead()
+        } else {
+            false
+        };
+
+        if target_is_dead || (!health_query.contains(target) && !body_query.contains(target)) {
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
                 ai.state = AiState::Idle;
                 ai.job_id = PersonAI::UNEMPLOYED;
             }
+            if let Ok((mut animal_ai, _)) = animal_ai_query.get_mut(attacker) {
+                animal_ai.state = AnimalState::Wander;
+                animal_ai.target_entity = None;
+            }
+            combat_target.0 = None;
             continue;
         }
 
@@ -154,11 +191,16 @@ pub fn combat_system(
                 ai.state = AiState::Attacking;
             }
 
+            combat_events.send(CombatEvent { attacker, target });
+
             let mut damage = ATTACK_DAMAGE;
+            let mut attack_speed_bonus = 1.0;
+
             if let Some(eq) = attacker_eq {
                 if let Some(&weapon_ent) = eq.items.get(&EquipmentSlot::MainHand) {
                     if let Ok((Some(w_stats), _)) = item_stats_query.get(weapon_ent) {
                         damage += w_stats.damage_bonus;
+                        attack_speed_bonus = w_stats.attack_speed;
                     }
                 }
             }
@@ -170,6 +212,11 @@ pub fn combat_system(
                     }
                     combat_activity_factions.push(fm.faction_id);
                 }
+            }
+
+            // Apply cooldown
+            if let Some(ref mut cd) = cd {
+                cd.0 = BASE_ATTACK_COOLDOWN / attack_speed_bonus;
             }
 
             let target_part = BodyPart::random();
@@ -202,12 +249,30 @@ pub fn combat_system(
         }
     }
 
+    // Process damage and Retaliation
     for (target, attacker, dmg) in health_damage_events {
         if let Ok(mut health) = health_query.get_mut(target) {
             health.current = health.current.saturating_sub(dmg);
         }
         if let Ok(Some(mut rel)) = rel_query.get_mut(target) {
             rel.update(attacker, -20);
+        }
+
+        // Retaliation
+        if let Ok((_, mut target_combat, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
+            if target_combat.0.is_none() {
+                if let Ok(mut target_ai) = ai_query.get_mut(target) {
+                    target_combat.0 = Some(attacker);
+                    // Setting target will trigger combat_system on next tick
+                    target_ai.state = AiState::Idle;
+                } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target) {
+                    if maybe_deer.is_none() {
+                        target_combat.0 = Some(attacker);
+                        target_animal.target_entity = Some(attacker);
+                        target_animal.state = AnimalState::Chase;
+                    }
+                }
+            }
         }
     }
 
@@ -218,6 +283,22 @@ pub fn combat_system(
         }
         if let Ok(Some(mut rel)) = rel_query.get_mut(target) {
             rel.update(attacker, -20);
+        }
+
+        // Retaliation
+        if let Ok((_, mut target_combat, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
+            if target_combat.0.is_none() {
+                if let Ok(mut target_ai) = ai_query.get_mut(target) {
+                    target_combat.0 = Some(attacker);
+                    target_ai.state = AiState::Idle;
+                } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target) {
+                    if maybe_deer.is_none() {
+                        target_combat.0 = Some(attacker);
+                        target_animal.target_entity = Some(attacker);
+                        target_animal.state = AnimalState::Chase;
+                    }
+                }
+            }
         }
     }
 
@@ -236,11 +317,7 @@ pub fn death_system(
     query: Query<(Entity, Option<&Health>, Option<&Body>, &Transform, Option<&FactionMember>, Option<&Person>, Option<&Wolf>, Option<&Deer>)>,
 ) {
     for (entity, health, body, transform, member, person, wolf, deer) in &query {
-        let is_dead = match (health, body) {
-            (Some(h), _) if h.is_dead() => true,
-            (_, Some(b)) if b.is_dead() => true,
-            _ => false,
-        };
+        let is_dead = health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead());
         if !is_dead { continue; }
 
         if let Some(fm) = member {
@@ -255,72 +332,16 @@ pub fn death_system(
             else { None };
 
         if let Some(qty) = loot_qty {
+            let mut loot_transform = *transform;
+            loot_transform.translation.y -= 8.0;
+            loot_transform.translation.z = 0.3;
             commands.spawn((
-                GroundItem { good: Good::Food, qty },
-                *transform,
+                GroundItem { item: Item::new_commodity(Good::Food), qty },
+                loot_transform,
                 GlobalTransform::default(),
             ));
         }
 
-        commands.entity(entity).despawn();
-    }
-}
-
-const HUNT_RADIUS: i32 = 15;
-const HUNT_HUNGER_THRESHOLD: u8 = 120;
-
-pub fn hunting_system(
-    spatial: Res<SpatialIndex>,
-    clock: Res<SimClock>,
-    prey_transforms: Query<&Transform, Or<(With<Wolf>, With<Deer>)>>,
-    prey_check: Query<(), Or<(With<Wolf>, With<Deer>)>>,
-    mut hunters: Query<(
-        &mut PersonAI,
-        &mut CombatTarget,
-        &Needs,
-        &BucketSlot,
-        &LodLevel,
-        &Transform,
-    ), With<Person>>,
-) {
-    for (mut ai, mut combat_target, needs, slot, lod, transform) in hunters.iter_mut() {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
-            continue;
-        }
-
-        if let Some(prey) = combat_target.0 {
-            if let Ok(prey_t) = prey_transforms.get(prey) {
-                let ptx = (prey_t.translation.x / TILE_SIZE).floor() as i16;
-                let pty = (prey_t.translation.y / TILE_SIZE).floor() as i16;
-                ai.target_tile = (ptx, pty);
-                if ai.state == AiState::Idle {
-                    ai.state = AiState::Seeking;
-                }
-            } else {
-                combat_target.0 = None;
-            }
-            continue;
-        }
-
-        if needs.hunger <= HUNT_HUNGER_THRESHOLD || ai.state != AiState::Idle {
-            continue;
-        }
-
-        let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
-        let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-
-        'find: for dy in -HUNT_RADIUS..=HUNT_RADIUS {
-            for dx in -HUNT_RADIUS..=HUNT_RADIUS {
-                for &candidate in spatial.get(tx + dx, ty + dy) {
-                    if prey_check.get(candidate).is_ok() {
-                        combat_target.0 = Some(candidate);
-                        ai.target_tile = ((tx + dx) as i16, (ty + dy) as i16);
-                        ai.state = AiState::Seeking;
-                        ai.job_id = JobKind::Forager as u16;
-                        break 'find;
-                    }
-                }
-            }
-        }
+        commands.entity(entity).despawn_recursive();
     }
 }

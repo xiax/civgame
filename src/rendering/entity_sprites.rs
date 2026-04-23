@@ -1,79 +1,88 @@
 use bevy::prelude::*;
 use crate::simulation::animals::{Deer, Wolf};
 use crate::simulation::person::Person;
-use crate::simulation::mood::Mood;
+use crate::simulation::reproduction::BiologicalSex;
+use crate::rendering::pixel_art::EntityTextures;
+
+use bevy::sprite::Anchor;
 
 #[derive(Component)]
-pub struct PersonSprite;
+pub struct WolfVisual;
+
+#[derive(Component)]
+pub struct DeerVisual;
+
+#[derive(Component)]
+pub struct PersonVisual;
+
+#[derive(Component)]
+pub struct VisualChild;
 
 pub fn spawn_wolf_sprites(
     mut commands: Commands,
-    query: Query<Entity, (With<Wolf>, Without<Mesh2d>)>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    query: Query<Entity, (With<Wolf>, Without<WolfVisual>)>,
+    textures: Res<EntityTextures>,
 ) {
-    let mesh  = meshes.add(Rectangle::new(8.0, 8.0));
-    let color = materials.add(ColorMaterial::from_color(Color::srgb(0.45, 0.25, 0.1)));
     for entity in query.iter() {
-        commands.entity(entity).insert((
-            Mesh2d(mesh.clone()),
-            MeshMaterial2d(color.clone()),
-            Visibility::Visible,
-        ));
+        let mut sprite = Sprite::from_image(textures.wolf.clone());
+        sprite.custom_size = Some(Vec2::new(24.0, 36.0));
+        sprite.anchor = Anchor::BottomCenter;
+
+        commands.entity(entity).insert(WolfVisual).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                Visibility::Visible,
+            ));
+        });
     }
 }
 
 pub fn spawn_deer_sprites(
     mut commands: Commands,
-    query: Query<Entity, (With<Deer>, Without<Mesh2d>)>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    query: Query<Entity, (With<Deer>, Without<DeerVisual>)>,
+    textures: Res<EntityTextures>,
 ) {
-    let mesh  = meshes.add(Rectangle::new(6.0, 6.0));
-    let color = materials.add(ColorMaterial::from_color(Color::srgb(0.8, 0.65, 0.35)));
     for entity in query.iter() {
-        commands.entity(entity).insert((
-            Mesh2d(mesh.clone()),
-            MeshMaterial2d(color.clone()),
-            Visibility::Visible,
-        ));
-    }
-}
+        let mut sprite = Sprite::from_image(textures.deer.clone());
+        sprite.custom_size = Some(Vec2::new(24.0, 36.0));
+        sprite.anchor = Anchor::BottomCenter;
 
-/// Sync person entity sprite color with their mood.
-pub fn entity_sprite_sync(
-    mut query: Query<(&Mood, &mut MeshMaterial2d<ColorMaterial>), With<Person>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-) {
-    for (mood, material_handle) in query.iter_mut() {
-        let t = (mood.0 as f32 + 128.0) / 255.0; // 0..1
-        // Interpolate: red (despairing) → cyan (happy)
-        let color = Color::srgb(
-            1.0 - t * 0.8,
-            0.3 + t * 0.7,
-            t,
-        );
-        if let Some(mat) = materials.get_mut(material_handle.id()) {
-            mat.color = color;
-        }
+        commands.entity(entity).insert(DeerVisual).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                Visibility::Visible,
+            ));
+        });
     }
 }
 
 /// Spawn visual sprites for newly added Person entities.
 pub fn spawn_person_sprites(
     mut commands: Commands,
-    query: Query<Entity, (With<Person>, Without<Mesh2d>)>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    query: Query<(Entity, Option<&BiologicalSex>), (With<Person>, Without<PersonVisual>)>,
+    textures: Res<EntityTextures>,
 ) {
-    let person_mesh = meshes.add(Rectangle::new(6.0, 6.0));
-    let default_color = materials.add(ColorMaterial::from_color(Color::srgb(0.0, 0.9, 0.9)));
+    for (entity, sex_opt) in query.iter() {
+        let mut sprite = Sprite::default();
+        sprite.image = match sex_opt {
+            Some(BiologicalSex::Female) => textures.person_female.clone(),
+            _ => textures.person_male.clone(),
+        };
+        sprite.color = Color::WHITE;
+        sprite.custom_size = Some(Vec2::new(24.0, 36.0));
+        sprite.anchor = Anchor::BottomCenter;
 
-    for entity in query.iter() {
-        commands.entity(entity).insert((
-            Mesh2d(person_mesh.clone()),
-            MeshMaterial2d(default_color.clone()),
-            Visibility::Visible,
-        ));
+        commands.entity(entity).insert(PersonVisual).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                Visibility::Visible,
+            ));
+        });
     }
 }
