@@ -6,9 +6,10 @@ use crate::world::terrain::{tile_to_world, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
 use crate::world::tile::TileKind;
 use crate::economy::agent::EconomicAgent;
 
-use super::combat::{CombatTarget, Health};
+use super::combat::{CombatTarget, Body};
 use super::faction::FactionMember;
 use super::goals::{AgentGoal, Personality};
+use super::items::Equipment;
 use super::lod::LodLevel;
 use super::mood::Mood;
 use super::movement::MovementState;
@@ -110,7 +111,8 @@ pub fn spawn_population(
                 Personality::random(),
                 AgentGoal::default(),
                 FactionMember::default(),
-                Health::new(100),
+                Body::new_humanoid(),
+                Equipment::default(),
                 CombatTarget::default(),
             ),
         ));

@@ -1,4 +1,4 @@
-pub const GOOD_COUNT: usize = 9;
+pub const GOOD_COUNT: usize = 12;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -13,6 +13,9 @@ pub enum Good {
     Iron   = 6,
     Luxury = 7,
     Seed   = 8,
+    Weapon = 9,
+    Armor  = 10,
+    Shield = 11,
 }
 
 impl Good {
@@ -27,6 +30,9 @@ impl Good {
             Good::Iron   => "Iron",
             Good::Luxury => "Luxury",
             Good::Seed   => "Seed",
+            Good::Weapon => "Weapon",
+            Good::Armor  => "Armor",
+            Good::Shield => "Shield",
         }
     }
 
@@ -34,6 +40,7 @@ impl Good {
         [
             Good::Food, Good::Wood, Good::Stone, Good::Tools,
             Good::Cloth, Good::Coal, Good::Iron, Good::Luxury, Good::Seed,
+            Good::Weapon, Good::Armor, Good::Shield,
         ]
     }
 }

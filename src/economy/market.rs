@@ -19,11 +19,11 @@ impl Default for Market {
         let mut market_stock = [0.0f32; GOOD_COUNT];
         market_stock[Good::Tools as usize] = 500.0;
         Self {
-            prices:        [1.0, 0.8, 0.5, 2.0, 1.5, 1.2, 1.8, 5.0, 0.5],
+            prices:        [1.0, 0.8, 0.5, 2.0, 1.5, 1.2, 1.8, 5.0, 0.5, 3.0, 4.0, 2.5],
             supply:        [0.0; GOOD_COUNT],
             demand:        [0.0; GOOD_COUNT],
             price_floor:   [0.1; GOOD_COUNT],
-            price_ceiling: [50.0, 20.0, 10.0, 100.0, 50.0, 30.0, 80.0, 200.0, 5.0],
+            price_ceiling: [50.0, 20.0, 10.0, 100.0, 50.0, 30.0, 80.0, 200.0, 5.0, 150.0, 180.0, 100.0],
             market_stock,
         }
     }

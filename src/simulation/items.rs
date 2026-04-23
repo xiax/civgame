@@ -7,11 +7,56 @@ use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
+use crate::simulation::combat::BodyPart;
 
 #[derive(Component, Clone, Copy)]
 pub struct GroundItem {
     pub good: Good,
     pub qty:  u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EquipmentSlot {
+    MainHand,
+    OffHand,
+    HeadArmor,
+    TorsoArmor,
+    LegArmor,
+    ArmArmor,
+}
+
+#[derive(Component, Default, Clone)]
+pub struct Equipment {
+    pub items: bevy::utils::HashMap<EquipmentSlot, Entity>,
+}
+
+#[derive(Component, Clone, Copy, Debug)]
+pub struct WeaponStats {
+    pub damage_bonus: u8,
+}
+
+#[derive(Component, Clone, Debug)]
+pub struct ArmorStats {
+    pub damage_reduction: u8,
+    pub coverage: u8,
+    pub covered_parts: Vec<BodyPart>,
+}
+
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemMaterial {
+    Wood,
+    Stone,
+    Iron,
+    Steel,
+    Leather,
+}
+
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemQuality {
+    Poor,
+    Normal,
+    Fine,
+    Masterwork,
 }
 
 /// Sequential, after death_system.

@@ -3,7 +3,8 @@ use ahash::AHashMap;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use crate::economy::agent::EconomicAgent;
-use super::combat::{CombatTarget, Health};
+use super::combat::{CombatTarget, Body};
+use super::items::Equipment;
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::{AgentGoal, Personality};
 use super::lod::LodLevel;
@@ -151,7 +152,8 @@ pub fn reproduction_system(
                 Personality::random(),
                 AgentGoal::default(),
                 FactionMember { faction_id, ..Default::default() },
-                Health::new(100),
+                Body::new_humanoid(),
+                Equipment::default(),
                 CombatTarget::default(),
             ),
         ));

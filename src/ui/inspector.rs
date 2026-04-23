@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::simulation::combat::Health;
+use crate::simulation::combat::{Health, Body, BodyPart};
 use crate::simulation::needs::Needs;
 use crate::simulation::mood::Mood;
 use crate::simulation::skills::{Skills, SkillKind, SKILL_COUNT};
@@ -19,11 +19,11 @@ pub fn inspector_panel_system(
     registry: Res<FactionRegistry>,
     query: Query<(
         &Needs, &Mood, &Skills, &PersonAI, &EconomicAgent,
-        &AgentGoal, &Personality, &BiologicalSex, &FactionMember, &Health,
+        &AgentGoal, &Personality, &BiologicalSex, &FactionMember, Option<&Health>, Option<&Body>
     )>,
 ) {
     let Some(entity) = selected.0 else { return };
-    let Ok((needs, mood, skills, ai, agent, goal, personality, sex, member, health)) =
+    let Ok((needs, mood, skills, ai, agent, goal, personality, sex, member, health, body)) =
         query.get(entity) else { return };
 
     egui::Window::new("Inspector")
@@ -56,18 +56,46 @@ pub fn inspector_panel_system(
             }
 
             ui.separator();
-            // Health bar
-            ui.horizontal(|ui| {
-                ui.label(format!("{:8}", "Health"));
-                let frac = health.fraction();
-                let color = egui::Color32::from_rgb(
-                    (255.0 * (1.0 - frac)) as u8,
-                    (255.0 * frac) as u8,
-                    30,
-                );
-                ui.add(egui::ProgressBar::new(frac).desired_width(140.0).fill(color));
-                ui.label(format!("{}/{}", health.current, health.max));
-            });
+            if let Some(h) = health {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{:8}", "Health"));
+                    let frac = h.fraction();
+                    let color = egui::Color32::from_rgb(
+                        (255.0 * (1.0 - frac)) as u8,
+                        (255.0 * frac) as u8,
+                        30,
+                    );
+                    ui.add(egui::ProgressBar::new(frac).desired_width(140.0).fill(color));
+                    ui.label(format!("{}/{}", h.current, h.max));
+                });
+            } else if let Some(b) = body {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{:8}", "Body Health"));
+                    let frac = b.fraction();
+                    let color = egui::Color32::from_rgb(
+                        (255.0 * (1.0 - frac)) as u8,
+                        (255.0 * frac) as u8,
+                        30,
+                    );
+                    ui.add(egui::ProgressBar::new(frac).desired_width(140.0).fill(color));
+                });
+                egui::CollapsingHeader::new("Limbs").show(ui, |ui| {
+                    for part in BodyPart::ALL {
+                        let limb = b.parts[part as usize];
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{:10}", format!("{:?}", part)));
+                            let frac = limb.current as f32 / limb.max as f32;
+                            let color = egui::Color32::from_rgb(
+                                (255.0 * (1.0 - frac)) as u8,
+                                (255.0 * frac) as u8,
+                                30,
+                            );
+                            ui.add(egui::ProgressBar::new(frac).desired_width(100.0).fill(color));
+                            ui.label(format!("{}/{}", limb.current, limb.max));
+                        });
+                    }
+                });
+            }
 
             ui.separator();
             ui.label("Needs:");

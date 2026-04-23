@@ -2,7 +2,7 @@ use bevy::prelude::*;
 use crate::economy::goods::Good;
 use crate::simulation::animals::{Deer, Wolf};
 use crate::simulation::faction::{FactionMember, FactionRegistry};
-use crate::simulation::items::GroundItem;
+use crate::simulation::items::{GroundItem, Equipment, EquipmentSlot, WeaponStats, ArmorStats};
 use crate::simulation::jobs::JobKind;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
@@ -23,6 +23,76 @@ impl Health {
     pub fn fraction(self) -> f32 { self.current as f32 / self.max as f32 }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BodyPart {
+    Head = 0,
+    Torso = 1,
+    LeftArm = 2,
+    RightArm = 3,
+    LeftLeg = 4,
+    RightLeg = 5,
+}
+
+impl BodyPart {
+    pub const ALL: [BodyPart; 6] = [
+        BodyPart::Head, BodyPart::Torso, BodyPart::LeftArm, 
+        BodyPart::RightArm, BodyPart::LeftLeg, BodyPart::RightLeg
+    ];
+    pub fn random() -> Self {
+        let r = fastrand::u8(0..100);
+        if r < 10 { BodyPart::Head }
+        else if r < 50 { BodyPart::Torso }
+        else if r < 62 { BodyPart::LeftArm }
+        else if r < 74 { BodyPart::RightArm }
+        else if r < 87 { BodyPart::LeftLeg }
+        else { BodyPart::RightLeg }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LimbHealth {
+    pub current: u8,
+    pub max: u8,
+}
+
+impl LimbHealth {
+    pub fn new(max: u8) -> Self { Self { current: max, max } }
+    pub fn is_destroyed(&self) -> bool { self.current == 0 }
+}
+
+#[derive(Component, Clone, Debug)]
+pub struct Body {
+    pub parts: [LimbHealth; 6],
+}
+
+impl Body {
+    pub fn new_humanoid() -> Self {
+        let mut parts = [LimbHealth::new(20); 6];
+        parts[BodyPart::Head as usize] = LimbHealth::new(20);
+        parts[BodyPart::Torso as usize] = LimbHealth::new(40);
+        parts[BodyPart::LeftArm as usize] = LimbHealth::new(20);
+        parts[BodyPart::RightArm as usize] = LimbHealth::new(20);
+        parts[BodyPart::LeftLeg as usize] = LimbHealth::new(30);
+        parts[BodyPart::RightLeg as usize] = LimbHealth::new(30);
+        Self { parts }
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.parts[BodyPart::Head as usize].is_destroyed() || 
+        self.parts[BodyPart::Torso as usize].is_destroyed()
+    }
+    
+    pub fn get_mut(&mut self, part: BodyPart) -> &mut LimbHealth {
+        &mut self.parts[part as usize]
+    }
+    
+    pub fn fraction(&self) -> f32 {
+        let total_current: u32 = self.parts.iter().map(|p| p.current as u32).sum();
+        let total_max: u32 = self.parts.iter().map(|p| p.max as u32).sum();
+        total_current as f32 / total_max as f32
+    }
+}
+
 #[derive(Component, Default, Clone, Copy)]
 pub struct CombatTarget(pub Option<Entity>);
 
@@ -30,21 +100,25 @@ const ATTACK_DAMAGE: u8 = 2;
 
 pub fn combat_system(
     spatial: Res<SpatialIndex>,
-    attacker_query: Query<(Entity, &CombatTarget, &Transform, &LodLevel, &BucketSlot)>,
+    attacker_query: Query<(Entity, &CombatTarget, &Transform, &LodLevel, &BucketSlot, Option<&Equipment>)>,
     mut health_query: Query<&mut Health>,
+    mut body_query: Query<&mut Body>,
+    equipment_query: Query<&Equipment>,
+    item_stats_query: Query<(Option<&WeaponStats>, Option<&ArmorStats>)>,
     mut ai_query: Query<&mut PersonAI>,
     clock: Res<SimClock>,
 ) {
-    let mut damage_events: Vec<(Entity, u8)> = Vec::new();
+    let mut health_damage_events: Vec<(Entity, u8)> = Vec::new();
+    let mut body_damage_events: Vec<(Entity, BodyPart, u8)> = Vec::new();
 
-    for (attacker, combat_target, transform, lod, slot) in &attacker_query {
+    for (attacker, combat_target, transform, lod, slot, attacker_eq) in &attacker_query {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
         let Some(target) = combat_target.0 else { continue };
         if target == attacker { continue; }
 
-        if health_query.get(target).is_err() {
+        if !health_query.contains(target) && !body_query.contains(target) {
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
                 ai.state = AiState::Idle;
                 ai.job_id = PersonAI::UNEMPLOYED;
@@ -68,9 +142,38 @@ pub fn combat_system(
         }
 
         if found {
-            damage_events.push((target, ATTACK_DAMAGE));
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
                 ai.state = AiState::Attacking;
+            }
+            
+            let mut damage = ATTACK_DAMAGE;
+            if let Some(eq) = attacker_eq {
+                if let Some(&weapon_ent) = eq.items.get(&EquipmentSlot::MainHand) {
+                    if let Ok((Some(w_stats), _)) = item_stats_query.get(weapon_ent) {
+                        damage += w_stats.damage_bonus;
+                    }
+                }
+            }
+
+            let target_part = BodyPart::random();
+
+            if body_query.contains(target) {
+                let mut mitigated_damage = damage;
+                if let Ok(target_eq) = equipment_query.get(target) {
+                    for (_slot, &armor_ent) in target_eq.items.iter() {
+                        if let Ok((_, Some(a_stats))) = item_stats_query.get(armor_ent) {
+                            if a_stats.covered_parts.contains(&target_part) {
+                                let roll = fastrand::u8(0..100);
+                                if roll < a_stats.coverage {
+                                    mitigated_damage = mitigated_damage.saturating_sub(a_stats.damage_reduction);
+                                }
+                            }
+                        }
+                    }
+                }
+                body_damage_events.push((target, target_part, mitigated_damage.max(1)));
+            } else {
+                health_damage_events.push((target, damage));
             }
         } else {
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
@@ -82,9 +185,16 @@ pub fn combat_system(
         }
     }
 
-    for (target, dmg) in damage_events {
+    for (target, dmg) in health_damage_events {
         if let Ok(mut health) = health_query.get_mut(target) {
             health.current = health.current.saturating_sub(dmg);
+        }
+    }
+    
+    for (target, part, dmg) in body_damage_events {
+        if let Ok(mut body) = body_query.get_mut(target) {
+            let limb = body.get_mut(part);
+            limb.current = limb.current.saturating_sub(dmg);
         }
     }
 }
@@ -93,10 +203,15 @@ pub fn death_system(
     mut commands: Commands,
     mut registry: ResMut<FactionRegistry>,
     mut clock: ResMut<SimClock>,
-    query: Query<(Entity, &Health, &Transform, Option<&FactionMember>, Option<&Person>, Option<&Wolf>, Option<&Deer>)>,
+    query: Query<(Entity, Option<&Health>, Option<&Body>, &Transform, Option<&FactionMember>, Option<&Person>, Option<&Wolf>, Option<&Deer>)>,
 ) {
-    for (entity, health, transform, member, person, wolf, deer) in &query {
-        if !health.is_dead() { continue; }
+    for (entity, health, body, transform, member, person, wolf, deer) in &query {
+        let is_dead = match (health, body) {
+            (Some(h), _) if h.is_dead() => true,
+            (_, Some(b)) if b.is_dead() => true,
+            _ => false,
+        };
+        if !is_dead { continue; }
 
         if let Some(fm) = member {
             registry.remove_member(fm.faction_id);
