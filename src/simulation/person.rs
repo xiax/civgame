@@ -102,7 +102,7 @@ pub fn spawn_population(
                 Person,
                 Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
                 GlobalTransform::default(),
-                Needs::new(30, 20, 10, 5, 40),
+                Needs::new(30.0, 20.0, 10.0, 5.0, 40.0),
                 Mood::default(),
                 Skills::default(),
                 PersonAI {
@@ -131,7 +131,7 @@ pub fn spawn_population(
                 AgentMemory::default(),
                 RelationshipMemory::default(),
                 UtilityNet::new_random(),
-                KnownPlans::with_innate(&[0, 1]),
+                KnownPlans::with_innate(&[0, 1, 5]),
                 PlanScoringMethod::UtilityNN,
             ),
         ));

@@ -6,6 +6,7 @@ use crate::world::spatial::SpatialIndex;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use super::person::{AiState, Person, PersonAI};
 use super::animals::{Wolf, Deer};
+use super::combat::{Health, Body};
 use super::lod::LodLevel;
 use super::schedule::{BucketSlot, SimClock};
 
@@ -134,10 +135,16 @@ pub fn movement_system(
 
 pub fn update_spatial_index_system(
     mut index: ResMut<SpatialIndex>,
-    query: Query<(Entity, &Transform), Or<(With<Person>, With<Wolf>, With<Deer>, With<super::plants::Plant>, With<super::items::GroundItem>)>>,
+    query: Query<
+        (Entity, &Transform, Option<&Health>, Option<&Body>),
+        Or<(With<Person>, With<Wolf>, With<Deer>, With<super::plants::Plant>, With<super::items::GroundItem>)>,
+    >,
 ) {
     index.0.clear();
-    for (entity, transform) in &query {
+    for (entity, transform, health, body) in &query {
+        let is_dead = health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead());
+        if is_dead { continue; }
+
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         index.insert(tx, ty, entity);

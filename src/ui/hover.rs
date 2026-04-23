@@ -30,12 +30,15 @@ pub fn hover_info_system(
 ) {
     let Ok(window) = windows.get_single() else { return };
     let Ok((camera, cam_transform)) = camera_query.get_single() else { return };
-    let Some(cursor_pos) = window.cursor_position() else { return };
-
-    let Ok(world_pos) = camera.viewport_to_world_2d(cam_transform, cursor_pos) else { return };
-    let (tx, ty) = world_to_tile(world_pos);
 
     let ctx = contexts.ctx_mut();
+    if ctx.is_pointer_over_area() || ctx.wants_pointer_input() {
+        return;
+    }
+
+    let Some(cursor_pos) = window.cursor_position() else { return };
+    let Ok(world_pos) = camera.viewport_to_world_2d(cam_transform, cursor_pos) else { return };
+    let (tx, ty) = world_to_tile(world_pos);
 
     let tooltip_id = egui::Id::new("hover_tooltip");
     egui::show_tooltip_at_pointer(ctx, egui::LayerId::debug(), tooltip_id, |ui: &mut egui::Ui| {

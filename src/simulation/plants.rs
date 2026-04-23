@@ -103,7 +103,7 @@ pub fn spawn_plant_at(
     let world_pos = tile_to_world(tile_x, tile_y);
 
     let mut sprite = Sprite::from_image(get_plant_texture(textures, stage));
-    sprite.custom_size = Some(Vec2::new(24.0, 24.0));
+    sprite.custom_size = Some(Vec2::new(24.0, 36.0));
     sprite.anchor = Anchor::BottomCenter;
 
     let entity = commands.spawn((
@@ -308,7 +308,7 @@ pub fn plant_harvest_system(
         let seed_pos = tile_to_world(sx, sy);
         commands.spawn((
             GroundItem { item: Item::new_commodity(Good::Seed), qty: 1 },
-            Transform::from_xyz(seed_pos.x, seed_pos.y, 0.3),
+            Transform::from_xyz(seed_pos.x, seed_pos.y - 8.0, 0.3),
             GlobalTransform::default(),
         ));
 
@@ -382,7 +382,7 @@ pub fn deer_graze_system(
                 let pos = tile_to_world(sx, sy);
                 commands.spawn((
                     GroundItem { item: Item::new_commodity(Good::Seed), qty: 1 },
-                    Transform::from_xyz(pos.x, pos.y, 0.3),
+                    Transform::from_xyz(pos.x, pos.y - 8.0, 0.3),
                     GlobalTransform::default(),
                 ));
             }

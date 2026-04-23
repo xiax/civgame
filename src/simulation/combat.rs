@@ -146,10 +146,22 @@ pub fn combat_system(
         let Some(target) = combat_target.0 else { continue };
         if target == attacker { continue; }
 
-        if !health_query.contains(target) && !body_query.contains(target) {
+        let target_is_dead = if let Ok(h) = health_query.get(target) {
+            h.is_dead()
+        } else if let Ok(b) = body_query.get(target) {
+            b.is_dead()
+        } else {
+            false
+        };
+
+        if target_is_dead || (!health_query.contains(target) && !body_query.contains(target)) {
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
                 ai.state = AiState::Idle;
                 ai.job_id = PersonAI::UNEMPLOYED;
+            }
+            if let Ok((mut animal_ai, _)) = animal_ai_query.get_mut(attacker) {
+                animal_ai.state = AnimalState::Wander;
+                animal_ai.target_entity = None;
             }
             combat_target.0 = None;
             continue;
@@ -238,7 +250,7 @@ pub fn combat_system(
             if target_combat.0.is_none() {
                 if let Ok(mut target_ai) = ai_query.get_mut(target) {
                     target_combat.0 = Some(attacker);
-                    // Setting to Idle with a target will trigger hunting_system to start Seeking
+                    // Setting target will trigger combat_system on next tick
                     target_ai.state = AiState::Idle;
                 } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target) {
                     if maybe_deer.is_none() {
@@ -285,11 +297,7 @@ pub fn death_system(
     query: Query<(Entity, Option<&Health>, Option<&Body>, &Transform, Option<&FactionMember>, Option<&Person>, Option<&Wolf>, Option<&Deer>)>,
 ) {
     for (entity, health, body, transform, member, person, wolf, deer) in &query {
-        let is_dead = match (health, body) {
-            (Some(h), _) if h.is_dead() => true,
-            (_, Some(b)) if b.is_dead() => true,
-            _ => false,
-        };
+        let is_dead = health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead());
         if !is_dead { continue; }
 
         if let Some(fm) = member {
@@ -304,72 +312,16 @@ pub fn death_system(
             else { None };
 
         if let Some(qty) = loot_qty {
+            let mut loot_transform = *transform;
+            loot_transform.translation.y -= 8.0;
+            loot_transform.translation.z = 0.3;
             commands.spawn((
                 GroundItem { item: Item::new_commodity(Good::Food), qty },
-                *transform,
+                loot_transform,
                 GlobalTransform::default(),
             ));
         }
 
-        commands.entity(entity).despawn();
-    }
-}
-
-const HUNT_RADIUS: i32 = 15;
-const HUNT_HUNGER_THRESHOLD: u8 = 120;
-
-pub fn hunting_system(
-    spatial: Res<SpatialIndex>,
-    clock: Res<SimClock>,
-    prey_transforms: Query<&Transform, Or<(With<Wolf>, With<Deer>)>>,
-    prey_check: Query<(), Or<(With<Wolf>, With<Deer>)>>,
-    mut hunters: Query<(
-        &mut PersonAI,
-        &mut CombatTarget,
-        &Needs,
-        &BucketSlot,
-        &LodLevel,
-        &Transform,
-    ), With<Person>>,
-) {
-    for (mut ai, mut combat_target, needs, slot, lod, transform) in hunters.iter_mut() {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
-            continue;
-        }
-
-        if let Some(prey) = combat_target.0 {
-            if let Ok(prey_t) = prey_transforms.get(prey) {
-                let ptx = (prey_t.translation.x / TILE_SIZE).floor() as i16;
-                let pty = (prey_t.translation.y / TILE_SIZE).floor() as i16;
-                ai.target_tile = (ptx, pty);
-                if ai.state == AiState::Idle {
-                    ai.state = AiState::Seeking;
-                }
-            } else {
-                combat_target.0 = None;
-            }
-            continue;
-        }
-
-        if needs.hunger <= HUNT_HUNGER_THRESHOLD || ai.state != AiState::Idle {
-            continue;
-        }
-
-        let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
-        let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-
-        'find: for dy in -HUNT_RADIUS..=HUNT_RADIUS {
-            for dx in -HUNT_RADIUS..=HUNT_RADIUS {
-                for &candidate in spatial.get(tx + dx, ty + dy) {
-                    if prey_check.get(candidate).is_ok() {
-                        combat_target.0 = Some(candidate);
-                        ai.target_tile = ((tx + dx) as i16, (ty + dy) as i16);
-                        ai.state = AiState::Seeking;
-                        ai.job_id = JobKind::Forager as u16;
-                        break 'find;
-                    }
-                }
-            }
-        }
+        commands.entity(entity).despawn_recursive();
     }
 }

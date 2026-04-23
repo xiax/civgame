@@ -59,7 +59,7 @@ pub fn market_buy_system(
         }
 
         // Buy Food when hungry and have no food
-        if needs.hunger > HUNGER_BUY_THRESHOLD && agent.quantity_of(Good::Food) == 0 {
+        if needs.hunger > HUNGER_BUY_THRESHOLD as f32 && agent.quantity_of(Good::Food) == 0 {
             let (bought_item, qty) = market.try_buy_item(Good::Food, 1, &mut agent.currency);
             if let Some(it) = bought_item {
                 agent.add_item(it, qty as u8);

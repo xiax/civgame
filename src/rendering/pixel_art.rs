@@ -86,15 +86,6 @@ pub fn setup_pixel_art(
     let h = PixelColor::new(85, 60, 40, 255);    // Hair
     let h_l = PixelColor::new(120, 95, 60, 255);  // Hair Highlight
 
-    // Clothing
-    let c = PixelColor::new(60, 110, 210, 255);  // Blue (Shirt)
-    let c_d = PixelColor::new(40, 70, 150, 255);  // Dark Blue
-    let p = PixelColor::new(50, 60, 60, 255);    // Pants
-    let p_d = PixelColor::new(30, 40, 40, 255);  // Pants Shadow
-    let k = PixelColor::new(230, 90, 160, 255);  // Pink (Dress)
-    let k_d = PixelColor::new(170, 50, 110, 255); // Dark Pink
-    let k_l = PixelColor::new(250, 130, 190, 255); // Light Pink
-
     // Nature
     let e = PixelColor::new(50, 160, 50, 255);   // Green (Plant)
     let e_d = PixelColor::new(30, 100, 30, 255);   // Dark Green
@@ -107,100 +98,101 @@ pub fn setup_pixel_art(
     let y = PixelColor::new(255, 240, 40, 255);  // Yellow (Eyes/Gold)
     let x = PixelColor::new(20, 20, 20, 255);    // Black/Darkest
 
-    // Wolf: 16x16 (Bushy tail, snout, shaded fur)
+    // Wolf: 16x16 (Distinct snout, ears, and stalking posture)
     let wolf_ascii = &[
         "................",
-        ".......dd.......",
-        "......dggd...d..",
-        ".....dggygd.gd..",
-        "....dggggddgdd..",
-        "...dlgggggggd...",
-        "..dllgggggggd...",
-        ".dlgggggggggd...",
-        "dlgggggggggwd...",
-        "dlggggggggwwd...",
-        "dggggggggwwwd...",
-        "ddgggggggwwdd...",
-        ".dd..dd...dd..dd",
-        ".xx..xx...xx..xx",
         "................",
-        "................",
+        ".......d...d....",
+        ".......dg.gd....",
+        ".......dgggd....",
+        ".......dgygd.dd.",
+        "....ddddggggdgd.",
+        "...dggggggggggd.",
+        "..dgggggggggggd.",
+        ".dlgggggggggggd.",
+        "dlggggggggggggd.",
+        "dggggggggggggd..",
+        "dggggd..dggggd..",
+        "dgggd....dgggd..",
+        "dddd......dddd..",
+        "xxxx......xxxx..",
     ];
     let wolf_img = ascii_to_image(wolf_ascii, &[
         ('g', g), ('d', d), ('l', l_g), ('y', y), ('w', w), ('x', x), ('.', _t)
     ]);
 
-    // Deer: 16x16 (Majestic antlers, shaded body)
+    // Deer: 16x16 (Graceful neck and branching antlers)
     let deer_ascii = &[
-        "a...a.......a...",
-        "aa...a.....a...a",
-        ".aa...a...a...aa",
-        "..aa...aaa...aa.",
-        "...aaaaaaaaaaa..",
-        "......hlbb......",
-        ".....hxblb......",
-        "....xxhlbb......",
-        "...llllbbbww....",
-        "..bbbbbbbbbww...",
-        ".ddbbbbbbbbww...",
-        "ddddbbbbbbbww...",
-        "dd..dd...dd..dd.",
-        "xx..xx...xx..xx.",
         "................",
-        "................",
+        "...a.a....a.a...",
+        "...aaaa..aaaa...",
+        "....aa.aa.aa....",
+        ".....aaaaaa.....",
+        "......abbb......",
+        "......abxb......",
+        "......abbbbbbb..",
+        ".....bbbbbbbbbb.",
+        "....lbbbbbbbbbb.",
+        "...llbbbbbbbbbb.",
+        "..lllbbbbbbbbbb.",
+        "..ddb......ddb..",
+        "..dd........dd..",
+        "..dd........dd..",
+        "..xx........xx..",
     ];
     let deer_img = ascii_to_image(deer_ascii, &[
         ('l', l_b), ('b', b), ('d', d_b), ('a', a), ('x', x), ('w', w), ('h', l_b), ('.', _t)
     ]);
 
-    // Male: 16x16 (Shirt detail, boots, shaded hair)
+    // Male: 16x16 (Caveman - wild hair, fur loincloth, bare chest)
     let male_ascii = &[
-        "......hhhh......",
-        ".....hlhhlh.....",
-        "....hhsssshh....",
-        "....hswsswsh....",
-        "....hsxsxsxh....",
-        ".....dssssd.....",
-        "...cccllllcc....",
-        "..ccclllcccci...",
-        "..ccccccccccci..",
-        "..sciccccccisi..",
-        "..ssicccccciss..",
-        "...ppppppppp....",
-        "...vpvpvpvpv....",
-        "...ppp...ppp....",
-        "...xxx...xxx....",
         "................",
+        "................",
+        "....h..hh..h....",
+        "...hhhhhhhhhh...",
+        "..hhhhsssshhhh..",
+        "..hhhswsswshhh..",
+        "..hhhhsxsxshhh..",
+        "..hhhhhssshhhh..",
+        "...ssshhhhhss...",
+        "...sbbbbbbbbs...",
+        "..ssbbbbbbbbss..",
+        "..sbuubbuububs..",
+        "....bbbbbbbb....",
+        "....ss....ss....",
+        "....ss....ss....",
+        "....xx....xx....",
     ];
     let male_img = ascii_to_image(male_ascii, &[
-        ('h', h), ('l', h_l), ('s', s), ('d', s_d), ('w', w), ('x', x), ('c', c), ('i', c_d), ('p', p), ('v', p_d), ('.', _t)
+        ('h', h), ('l', h_l), ('s', s), ('d', s_d), ('w', w), ('x', x), ('b', b), ('u', d_b), ('.', _t)
     ]);
 
-    // Female: 16x16 (Flowing hair, shaded dress)
+    // Female: 16x16 (Cavewoman - long wild hair, fur dress)
     let female_ascii = &[
-        ".....hhhhhh.....",
-        "....hlhhhhlh....",
-        "...hhsssssshh...",
-        "...hswsssswsh...",
-        "...hsxsssxsxh...",
-        "...hhdssssdhh...",
-        "...hhkkppkkhh...",
-        "...hkkkppkkkh...",
-        "...skkkkkkkks...",
-        "...sskkikkkss...",
-        "....kkkkikkk....",
-        "...kkkikkkikkk..",
-        "..kkkkkkkkkkkkk.",
-        ".kkikkkkikkkkikk",
+        "................",
+        "....h.hhhh.h....",
+        "...hhhhhhhhhh...",
+        "..hhhhhhhhhhhh..",
+        "..hhhhsssshhhh..",
+        "..hhhswsswshhh..",
+        "..hhhhsxsxshhh..",
+        "..hhhhhdssdhhh..",
+        "..hhhhbbbbhhhh..",
+        "..ssbbbbbbbbss..",
+        "..ssbuubbuubss..",
+        "..sbbbbbbbbbbs..",
+        "..sbuubbuububs..",
+        "....bbbbbbbb....",
         ".....ss..ss.....",
         ".....xx..xx.....",
     ];
     let female_img = ascii_to_image(female_ascii, &[
-        ('h', h), ('l', h_l), ('s', s), ('w', w), ('x', x), ('d', s_d), ('k', k), ('p', k_l), ('i', k_d), ('.', _t)
+        ('h', h), ('l', h_l), ('s', s), ('w', w), ('x', x), ('d', s_d), ('b', b), ('u', d_b), ('.', _t)
     ]);
 
     // Plant Mature: 16x16 (Lush bush with fruit)
     let plant_ascii = &[
+        "................",
         "......lll.......",
         "....lleeeel.....",
         "...leeeveeeel...",
@@ -213,7 +205,6 @@ pub fn setup_pixel_art(
         "...lleeeveell...",
         "....llleeell....",
         ".......d........",
-        "......ddd.......",
         "......ddd.......",
         "......ddd.......",
         "......ddd.......",
@@ -234,15 +225,16 @@ pub fn setup_pixel_art(
         "................",
         "................",
         "................",
-        ".......dd.......",
-        "......dddd......",
-        "......dddd......",
-        ".......dd.......",
         "................",
+        ".......dd.......",
+        "......dddd......",
+        "......dddd......",
+        ".......dd.......",
     ];
     let plant_seed_img = ascii_to_image(plant_seed_ascii, &[('d', d_b), ('.', _t)]);
 
     let plant_seedling_ascii = &[
+        "................",
         "................",
         "................",
         "................",
@@ -258,7 +250,6 @@ pub fn setup_pixel_art(
         ".......ev.......",
         ".......ev.......",
         ".......d........",
-        "................",
     ];
     let plant_seedling_img = ascii_to_image(plant_seedling_ascii, &[
         ('e', e), ('l', e_l), ('v', e_d), ('d', d_b), ('.', _t)

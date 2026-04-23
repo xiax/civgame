@@ -96,14 +96,14 @@ pub fn goal_update_system(
                 *goal = AgentGoal::Defend;
                 return;
             }
-            if registry.raid_target(member.faction_id).is_some() && needs.hunger < 160 {
+            if registry.raid_target(member.faction_id).is_some() && needs.hunger < 160.0 {
                 *goal = AgentGoal::Raid;
                 return;
             }
         }
 
-        let social_threshold    = if *personality == Personality::Socialite { 120 } else { 160 };
-        let reproduce_threshold = if *personality == Personality::Nurturer  { 140 } else { 180 };
+        let social_threshold    = if *personality == Personality::Socialite { 120.0 } else { 160.0 };
+        let reproduce_threshold = if *personality == Personality::Nurturer  { 140.0 } else { 180.0 };
 
         let can_return_camp = member.faction_id != SOLO && {
             let per_member: f32 = match calendar.season {
@@ -118,7 +118,7 @@ pub fn goal_update_system(
             registry.food_stock(member.faction_id) < cap
         };
 
-        let new_goal = if needs.hunger > 160 {
+        let new_goal = if needs.hunger > 160.0 {
             AgentGoal::Survive
         } else if agent.quantity_of(Good::Food) > 2 && can_return_camp {
             AgentGoal::ReturnCamp

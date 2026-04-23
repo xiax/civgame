@@ -25,13 +25,14 @@ pub fn spawn_wolf_sprites(
 ) {
     for entity in query.iter() {
         let mut sprite = Sprite::from_image(textures.wolf.clone());
-        sprite.custom_size = Some(Vec2::new(24.0, 24.0));
+        sprite.custom_size = Some(Vec2::new(24.0, 36.0));
         sprite.anchor = Anchor::BottomCenter;
 
         commands.entity(entity).insert(WolfVisual).with_children(|parent| {
             parent.spawn((
                 VisualChild,
                 sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
                 Visibility::Visible,
             ));
         });
@@ -45,13 +46,14 @@ pub fn spawn_deer_sprites(
 ) {
     for entity in query.iter() {
         let mut sprite = Sprite::from_image(textures.deer.clone());
-        sprite.custom_size = Some(Vec2::new(24.0, 24.0));
+        sprite.custom_size = Some(Vec2::new(24.0, 36.0));
         sprite.anchor = Anchor::BottomCenter;
 
         commands.entity(entity).insert(DeerVisual).with_children(|parent| {
             parent.spawn((
                 VisualChild,
                 sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
                 Visibility::Visible,
             ));
         });
@@ -71,13 +73,14 @@ pub fn spawn_person_sprites(
             _ => textures.person_male.clone(),
         };
         sprite.color = Color::WHITE;
-        sprite.custom_size = Some(Vec2::new(24.0, 24.0));
+        sprite.custom_size = Some(Vec2::new(24.0, 36.0));
         sprite.anchor = Anchor::BottomCenter;
 
         commands.entity(entity).insert(PersonVisual).with_children(|parent| {
             parent.spawn((
                 VisualChild,
                 sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
                 Visibility::Visible,
             ));
         });

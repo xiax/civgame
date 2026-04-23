@@ -1,17 +1,23 @@
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
+use bevy_egui::EguiContexts;
 use crate::simulation::person::Person;
 
 #[derive(Resource, Default)]
 pub struct SelectedEntity(pub Option<Entity>);
 
 pub fn click_to_select_system(
+    mut contexts: EguiContexts,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<Camera>>,
     persons: Query<(Entity, &Transform), With<Person>>,
     mut selected: ResMut<SelectedEntity>,
 ) {
+    if contexts.ctx_mut().is_pointer_over_area() || contexts.ctx_mut().wants_pointer_input() {
+        return;
+    }
+
     if !mouse_buttons.just_pressed(MouseButton::Left) {
         return;
     }

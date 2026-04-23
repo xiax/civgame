@@ -1,8 +1,8 @@
 use bevy::prelude::*;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
-use super::combat::CombatTarget;
-use super::faction::{FactionMember, FactionRegistry, SOLO};
+use super::combat::{CombatTarget, Health, Body};
+use super::faction::{FactionMember, FactionRegistry};
 use super::goals::AgentGoal;
 use super::lod::LodLevel;
 use super::person::{AiState, PersonAI};
@@ -85,7 +85,7 @@ pub fn raid_execution_system(
         &LodLevel,
         &BucketSlot,
     )>,
-    faction_query: Query<&FactionMember>,
+    faction_query: Query<(&FactionMember, Option<&Health>, Option<&Body>)>,
 ) {
     let mut food_steals: Vec<(u32, f32)> = Vec::new();
 
@@ -121,8 +121,15 @@ pub fn raid_execution_system(
                 for dx in -2..=2i32 {
                     for &other in spatial.get(tx + dx, ty + dy) {
                         if other == entity { continue; }
-                        if let Ok(other_fm) = faction_query.get(other) {
+                        if let Ok((other_fm, health, body)) = faction_query.get(other) {
                             if other_fm.faction_id == raid_target_faction {
+                                let is_dead = match (health, body) {
+                                    (Some(h), _) if h.is_dead() => true,
+                                    (_, Some(b)) if b.is_dead() => true,
+                                    _ => false,
+                                };
+                                if is_dead { continue; }
+
                                 combat_target.0 = Some(other);
                                 ai.state = AiState::Attacking;
                                 break 'find;

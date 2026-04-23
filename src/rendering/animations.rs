@@ -56,10 +56,11 @@ pub fn update_animations(
     mut visual_query: Query<(&Parent, &mut Transform, &mut Sprite), With<super::entity_sprites::VisualChild>>,
 ) {
     let dt = time.delta_secs();
+    const BASE_Y: f32 = -8.0;
     
     for (parent, mut transform, mut sprite) in visual_query.iter_mut() {
         if let Ok(mut anim) = anim_query.get_mut(parent.get()) {
-            let mut offset = Vec2::ZERO;
+            let mut offset = Vec2::new(0.0, BASE_Y);
             let mut color = Color::WHITE;
 
             if anim.lunge_timer > 0.0 {
@@ -87,9 +88,9 @@ pub fn update_animations(
             transform.translation.y = offset.y;
             sprite.color = color;
         } else {
-            // Reset if no animations active
+            // Reset if no animations active, but keep the base vertical offset
             transform.translation.x = 0.0;
-            transform.translation.y = 0.0;
+            transform.translation.y = BASE_Y;
             sprite.color = Color::WHITE;
         }
     }

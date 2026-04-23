@@ -6,21 +6,20 @@ use super::lod::LodLevel;
 #[derive(Component, Clone, Copy, Default)]
 #[repr(C)]
 pub struct Needs {
-    pub hunger:       u8,
-    pub sleep:        u8,
-    pub shelter:      u8,
-    pub safety:       u8,
-    pub social:       u8,
-    pub reproduction: u8,
-    _pad: [u8; 2],
+    pub hunger:       f32,
+    pub sleep:        f32,
+    pub shelter:      f32,
+    pub safety:       f32,
+    pub social:       f32,
+    pub reproduction: f32,
 }
 
 impl Needs {
-    pub fn new(hunger: u8, sleep: u8, shelter: u8, safety: u8, social: u8) -> Self {
-        Self { hunger, sleep, shelter, safety, social, reproduction: 0, _pad: [0; 2] }
+    pub fn new(hunger: f32, sleep: f32, shelter: f32, safety: f32, social: f32) -> Self {
+        Self { hunger, sleep, shelter, safety, social, reproduction: 0.0 }
     }
 
-    pub fn worst(&self) -> u8 {
+    pub fn worst(&self) -> f32 {
         self.hunger
             .max(self.sleep)
             .max(self.shelter)
@@ -29,12 +28,12 @@ impl Needs {
     }
 
     pub fn avg_distress(&self) -> f32 {
-        (self.hunger as f32
-            + self.sleep as f32
-            + self.shelter as f32
-            + self.safety as f32
-            + self.social as f32
-            + self.reproduction as f32)
+        (self.hunger
+            + self.sleep
+            + self.shelter
+            + self.safety
+            + self.social
+            + self.reproduction)
             / 6.0
     }
 }
@@ -45,7 +44,7 @@ const SLEEP_RATE:        f32 = 0.5;
 const SHELTER_RATE:      f32 = 0.1;
 const SAFETY_RATE:       f32 = 0.1;
 const SOCIAL_RATE:       f32 = 0.2;
-const REPRODUCTION_RATE: f32 = 0.02;
+const REPRODUCTION_RATE: f32 = 0.1;
 
 pub fn tick_needs_system(
     time: Res<Time>,
@@ -61,12 +60,12 @@ pub fn tick_needs_system(
         if !clock.is_active(slot.0) {
             return;
         }
-        needs.hunger       = needs.hunger.saturating_add((HUNGER_RATE       * dt) as u8);
-        needs.sleep        = needs.sleep.saturating_add((SLEEP_RATE         * dt) as u8);
-        needs.shelter      = needs.shelter.saturating_add((SHELTER_RATE     * dt) as u8);
-        needs.safety       = needs.safety.saturating_add((SAFETY_RATE       * dt) as u8);
-        needs.social       = needs.social.saturating_add((SOCIAL_RATE       * dt) as u8);
-        needs.reproduction = needs.reproduction.saturating_add((REPRODUCTION_RATE * dt) as u8);
+        needs.hunger       = (needs.hunger + HUNGER_RATE * dt).clamp(0.0, 255.0);
+        needs.sleep        = (needs.sleep + SLEEP_RATE * dt).clamp(0.0, 255.0);
+        needs.shelter      = (needs.shelter + SHELTER_RATE * dt).clamp(0.0, 255.0);
+        needs.safety       = (needs.safety + SAFETY_RATE * dt).clamp(0.0, 255.0);
+        needs.social       = (needs.social + SOCIAL_RATE * dt).clamp(0.0, 255.0);
+        needs.reproduction = (needs.reproduction + REPRODUCTION_RATE * dt).clamp(0.0, 255.0);
     });
 }
 

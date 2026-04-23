@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel, MouseMotion};
 use bevy::input::ButtonInput;
+use bevy_egui::EguiContexts;
 use crate::world::chunk::CHUNK_SIZE;
 use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 use crate::world::terrain::TILE_SIZE;
@@ -36,6 +37,7 @@ pub fn setup_camera(mut commands: Commands) {
 }
 
 pub fn camera_input_system(
+    mut contexts: EguiContexts,
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
@@ -45,6 +47,8 @@ pub fn camera_input_system(
     mut camera_query: Query<(&mut Transform, &mut OrthographicProjection), With<Camera>>,
 ) {
     let Ok((mut transform, mut projection)) = camera_query.get_single_mut() else { return };
+
+    let egui_wants_mouse = contexts.ctx_mut().wants_pointer_input() || contexts.ctx_mut().is_pointer_over_area();
 
     let dt = time.delta_secs();
     let speed = PAN_SPEED * projection.scale;
@@ -63,7 +67,7 @@ pub fn camera_input_system(
     }
 
     // Middle-mouse drag
-    if mouse_buttons.pressed(MouseButton::Middle) {
+    if mouse_buttons.pressed(MouseButton::Middle) && !egui_wants_mouse {
         for ev in motion_events.read() {
             transform.translation.x -= ev.delta.x * projection.scale;
             transform.translation.y += ev.delta.y * projection.scale;
@@ -74,6 +78,7 @@ pub fn camera_input_system(
 
     // Scroll zoom
     for ev in scroll_events.read() {
+        if egui_wants_mouse { continue; }
         let scroll = match ev.unit {
             MouseScrollUnit::Line  => ev.y,
             MouseScrollUnit::Pixel => ev.y / 50.0,

@@ -11,6 +11,8 @@ use crate::economy::goods::Good;
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::AgentGoal;
 use super::items::GroundItem;
+use super::combat::{CombatTarget, Health};
+use super::animals::{Wolf, Deer};
 use super::jobs::{JobKind, assign_job_with_routing, find_nearest_tile, find_nearest_item, find_nearest_unplanted_farmland, find_nearest_plant};
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, MemoryKind};
@@ -30,6 +32,7 @@ pub enum StepTarget {
     NearestItem(Good),
     FactionCamp,
     FromMemory(MemoryKind),
+    HuntPrey,
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +159,7 @@ static PLAN_STEPS_1: &[StepId] = &[1];    // FarmFood
 static PLAN_STEPS_2: &[StepId] = &[2];    // GatherWood
 static PLAN_STEPS_3: &[StepId] = &[3];    // GatherStone
 static PLAN_STEPS_4: &[StepId] = &[4, 1]; // PlantAndFarm
+static PLAN_STEPS_5: &[StepId] = &[5];    // HuntFood
 
 static SURVIVE_GOALS: &[AgentGoal] = &[AgentGoal::Survive];
 static GATHER_GOALS:  &[AgentGoal] = &[AgentGoal::Gather];
@@ -197,6 +201,13 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             memory_kind: Some(MemoryKind::Seed),
             reward_scale: 0.2,
         },
+        StepDef { // 5: Hunt
+            id: 5, job: JobKind::Hunter,
+            target: StepTarget::HuntPrey,
+            preconditions: StepPreconditions::none(),
+            memory_kind: Some(MemoryKind::Food),
+            reward_scale: 0.7,
+        },
     ];
 }
 
@@ -228,6 +239,11 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         PlanDef { id: 4, name: "PlantAndFarm",
             steps: PLAN_STEPS_4,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.2, 0.0],
+            serves_goals: SURVIVE_GOALS,
+        },
+        PlanDef { id: 5, name: "HuntFood",
+            steps: PLAN_STEPS_5,
+            feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.3],
             serves_goals: SURVIVE_GOALS,
         },
     ];
@@ -294,8 +310,37 @@ fn resolve_target(
     faction_id: u32,
     memory: Option<&AgentMemory>,
     item_check: &Query<(), With<GroundItem>>,
+    prey_query: &Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
+    combat_target: &mut CombatTarget,
 ) -> Option<(i16, i16)> {
     match &step.target {
+        StepTarget::HuntPrey => {
+            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best_dist = i32::MAX;
+            let radius = 20i32;
+
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    for &candidate in spatial.get(pos.0 + dx, pos.1 + dy) {
+                        if let Ok((_transform, health)) = prey_query.get(candidate) {
+                            if !health.is_dead() {
+                                let dist = dx.abs() + dy.abs();
+                                if dist < best_dist {
+                                    best_dist = dist;
+                                    best = Some((candidate, (pos.0 + dx) as i16, (pos.1 + dy) as i16));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some((entity, tx, ty)) = best {
+                combat_target.0 = Some(entity);
+                return Some((tx, ty));
+            }
+            None
+        }
         StepTarget::FromMemory(kind) => {
             let from_mem = memory.and_then(|m| m.best_for(*kind));
             if from_mem.is_some() { return from_mem; }
@@ -346,6 +391,28 @@ fn chunk_coord(tx: i32, ty: i32) -> ChunkCoord {
 // Handles: plan selection for idle agents, step dispatching,
 // step completion detection, plan completion + NN learning, timeouts.
 
+type AgentQuery<'a> = (
+    Entity,
+    &'a mut PersonAI,
+    &'a EconomicAgent,
+    &'a FactionMember,
+    &'a AgentGoal,
+    &'a Needs,
+    &'a Skills,
+    &'a Transform,
+    &'a LodLevel,
+    &'a BucketSlot,
+    &'a mut CombatTarget,
+);
+
+type OptionalQuery<'a> = (
+    Option<&'a AgentMemory>,
+    Option<&'a mut UtilityNet>,
+    Option<&'a KnownPlans>,
+    Option<&'a PlanScoringMethod>,
+    Option<&'a mut ActivePlan>,
+);
+
 pub fn plan_execution_system(
     mut commands: Commands,
     chunk_map: Res<ChunkMap>,
@@ -359,28 +426,17 @@ pub fn plan_execution_system(
     calendar: Res<Calendar>,
     clock: Res<SimClock>,
     item_check: Query<(), With<GroundItem>>,
-    mut query: Query<(
-        Entity,
-        &mut PersonAI,
-        &EconomicAgent,
-        &FactionMember,
-        &AgentGoal,
-        &Needs,
-        &Skills,
-        &Transform,
-        &LodLevel,
-        &BucketSlot,
-        Option<&AgentMemory>,
-        Option<&mut UtilityNet>,
-        Option<&KnownPlans>,
-        Option<&PlanScoringMethod>,
-        Option<&mut ActivePlan>,
-    )>,
+    prey_query: Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
+    mut query: Query<(AgentQuery, OptionalQuery)>,
 ) {
     for (
-        entity, mut ai, agent, member, goal, needs, skills,
-        transform, lod, slot,
-        memory_opt, mut net_opt, known_plans_opt, scoring_opt, mut active_plan_opt,
+        (
+            entity, mut ai, agent, member, goal, needs, skills,
+            transform, lod, slot, mut combat_target,
+        ),
+        (
+            memory_opt, mut net_opt, known_plans_opt, scoring_opt, mut active_plan_opt,
+        )
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
@@ -401,7 +457,7 @@ pub fn plan_execution_system(
             if plan_registry.0.is_empty() { continue; }
 
             let candidates: Vec<&PlanDef> = plan_registry.0.iter()
-                .filter(|p| p.serves_goals.contains(goal) && known_plans.knows(p.id))
+                .filter(|p| p.serves_goals.contains(&goal) && known_plans.knows(p.id))
                 .collect();
             if candidates.is_empty() { continue; }
 
@@ -442,12 +498,13 @@ pub fn plan_execution_system(
         // ── Abandon if goal changed (no longer served by this plan) ──────────
         let plan_still_valid = plan_registry.0.iter()
             .find(|p| p.id == active_plan.plan_id)
-            .map(|p| p.serves_goals.contains(goal))
+            .map(|p| p.serves_goals.contains(&goal))
             .unwrap_or(false);
         if !plan_still_valid {
             commands.entity(entity).remove::<ActivePlan>();
             ai.state = AiState::Idle;
             ai.job_id = PersonAI::UNEMPLOYED;
+            combat_target.0 = None;
             continue;
         }
 
@@ -459,23 +516,25 @@ pub fn plan_execution_system(
             commands.entity(entity).remove::<ActivePlan>();
             ai.state = AiState::Idle;
             ai.job_id = PersonAI::UNEMPLOYED;
+            combat_target.0 = None;
             continue;
         }
 
         // ── Fetch plan and current step ───────────────────────────────────────
         let plan_def = match plan_registry.0.iter().find(|p| p.id == active_plan.plan_id) {
-            Some(p) => p, None => { commands.entity(entity).remove::<ActivePlan>(); continue; }
+            Some(p) => p, None => { commands.entity(entity).remove::<ActivePlan>(); combat_target.0 = None; continue; }
         };
 
         if active_plan.current_step as usize >= plan_def.steps.len() {
             if let Some(ref mut net) = net_opt { net.learn(active_plan.reward_acc); }
             commands.entity(entity).remove::<ActivePlan>();
+            combat_target.0 = None;
             continue;
         }
 
         let step_id = plan_def.steps[active_plan.current_step as usize];
         let step_def = match step_registry.0.iter().find(|s| s.id == step_id) {
-            Some(s) => s, None => { commands.entity(entity).remove::<ActivePlan>(); continue; }
+            Some(s) => s, None => { commands.entity(entity).remove::<ActivePlan>(); combat_target.0 = None; continue; }
         };
 
         // ── Step completion: dispatched + agent went back to Idle+UNEMPLOYED ──
@@ -486,6 +545,7 @@ pub fn plan_execution_system(
             if active_plan.current_step as usize >= plan_def.steps.len() {
                 if let Some(ref mut net) = net_opt { net.learn(active_plan.reward_acc); }
                 commands.entity(entity).remove::<ActivePlan>();
+                combat_target.0 = None;
             }
             continue;
         }
@@ -498,6 +558,7 @@ pub fn plan_execution_system(
             if let Some((good, qty)) = step_def.preconditions.requires_good {
                 if agent.quantity_of(good) < qty {
                     commands.entity(entity).remove::<ActivePlan>();
+                    combat_target.0 = None;
                     continue;
                 }
             }
@@ -507,12 +568,35 @@ pub fn plan_execution_system(
                 &chunk_map, &spatial, &plant_map, &plant_query,
                 &faction_registry, member.faction_id,
                 memory_opt, &item_check,
+                &prey_query, &mut combat_target,
             ) {
                 assign_job_with_routing(&mut ai, cur_chunk, target, step_def.job, &chunk_graph, &chunk_map);
                 active_plan.dispatched = true;
             } else {
                 // No valid target — abandon plan
                 commands.entity(entity).remove::<ActivePlan>();
+                combat_target.0 = None;
+            }
+        } else {
+            // Update target if hunting
+            if matches!(step_def.target, StepTarget::HuntPrey) {
+                if let Some(target_ent) = combat_target.0 {
+                    if let Ok((target_t, health)) = prey_query.get(target_ent) {
+                        if health.is_dead() {
+                            // Target is dead, step will complete via Idle+UNEMPLOYED in combat_system or similar
+                        } else {
+                            // Update target tile to prey's current position
+                            let ptx = (target_t.translation.x / TILE_SIZE).floor() as i16;
+                            let pty = (target_t.translation.y / TILE_SIZE).floor() as i16;
+                            ai.target_tile = (ptx, pty);
+                        }
+                    } else {
+                        // Target lost
+                        ai.state = AiState::Idle;
+                        ai.job_id = PersonAI::UNEMPLOYED;
+                        combat_target.0 = None;
+                    }
+                }
             }
         }
     }

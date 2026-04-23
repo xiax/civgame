@@ -101,11 +101,8 @@ impl Plugin for SimulationPlugin {
                     movement::update_spatial_index_system
                         .after(movement::movement_system)
                         .after(animals::animal_movement_system),
-                    combat::hunting_system
-                        .after(movement::update_spatial_index_system),
                     combat::combat_system
-                        .after(movement::update_spatial_index_system)
-                        .after(combat::hunting_system),
+                        .after(movement::update_spatial_index_system),
                     combat::death_system
                         .after(combat::combat_system),
                     items::item_pickup_system
@@ -135,6 +132,7 @@ impl Plugin for SimulationPlugin {
                         .after(memory::conversation_memory_system),
                     plan::plan_decay_system,
                     faction::faction_camp_system,
+                    reproduction::birth_cooldown_system,
                     reproduction::collect_male_candidates,
                     reproduction::reproduction_system
                         .after(reproduction::collect_male_candidates),

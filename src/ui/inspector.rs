@@ -138,10 +138,10 @@ pub fn inspector_panel_system(
         });
 }
 
-fn needs_bar(ui: &mut egui::Ui, label: &str, value: u8) {
+fn needs_bar(ui: &mut egui::Ui, label: &str, value: f32) {
     ui.horizontal(|ui| {
         ui.label(format!("{label:8}"));
-        let progress = value as f32 / 255.0;
+        let progress = value / 255.0;
         let color = egui::Color32::from_rgb(
             (255.0 * progress) as u8,
             (255.0 * (1.0 - progress)) as u8,

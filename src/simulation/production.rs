@@ -204,9 +204,9 @@ pub fn consumption_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             return;
         }
-        if needs.hunger > HUNGER_EAT_THRESHOLD && agent.quantity_of(Good::Food) > 0 {
+        if needs.hunger > HUNGER_EAT_THRESHOLD as f32 && agent.quantity_of(Good::Food) > 0 {
             agent.remove_good(Good::Food, 1);
-            needs.hunger = needs.hunger.saturating_sub(FOOD_NUTRITION);
+            needs.hunger = (needs.hunger - FOOD_NUTRITION as f32).max(0.0);
         }
     });
 }

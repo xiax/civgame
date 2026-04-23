@@ -26,6 +26,7 @@ pub enum JobKind {
     Raid       = 6,
     Defend     = 7,
     Planter    = 8,
+    Hunter     = 9,
 }
 
 pub fn find_nearest_tile(

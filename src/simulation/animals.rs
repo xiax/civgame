@@ -3,7 +3,7 @@ use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::{tile_to_world, TILE_SIZE, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
 use crate::world::tile::TileKind;
 use crate::world::spatial::SpatialIndex;
-use super::combat::{CombatTarget, Health, CombatCooldown};
+use super::combat::{CombatTarget, Health, Body, CombatCooldown};
 use super::lod::LodLevel;
 use super::person::Person;
 use super::schedule::{BucketSlot, SimClock};
@@ -210,6 +210,7 @@ pub fn animal_sense_system(
     deer_query: Query<(Entity, &Transform, &BucketSlot, &LodLevel), With<Deer>>,
     person_query: Query<&Transform, With<Person>>,
     mut ai_query: Query<(&mut AnimalAI, &mut CombatTarget)>,
+    target_query: Query<(&Transform, Option<&Health>, Option<&Body>)>,
 ) {
     const WOLF_HUNT_RADIUS: i32 = 12;
     const DEER_FLEE_RADIUS: i32 = 8;
@@ -227,22 +228,38 @@ pub fn animal_sense_system(
         // If already chasing/attacking a valid target, keep it
         if let Some(existing) = ai.target_entity {
             if ai.state == AnimalState::Chase || ai.state == AnimalState::Attack {
-                // Update target tile to prey's current position
-                if let Ok(prey_transform) = person_query.get(existing) {
-                    let ptx = (prey_transform.translation.x / TILE_SIZE).floor() as i16;
-                    let pty = (prey_transform.translation.y / TILE_SIZE).floor() as i16;
-                    ai.target_tile = (ptx, pty);
-                }
-                // Check adjacency for attack
-                let target_tile = ai.target_tile;
-                let dist = (target_tile.0 as i32 - tx).abs() + (target_tile.1 as i32 - ty).abs();
-                if dist <= 1 {
-                    ai.state = AnimalState::Attack;
-                    combat_target.0 = Some(existing);
+                if let Ok((prey_transform, health, body)) = target_query.get(existing) {
+                    let is_dead = match (health, body) {
+                        (Some(h), _) if h.is_dead() => true,
+                        (_, Some(b)) if b.is_dead() => true,
+                        _ => false,
+                    };
+                    if is_dead {
+                        ai.state = AnimalState::Wander;
+                        ai.target_entity = None;
+                        combat_target.0 = None;
+                    } else {
+                        // Update target tile to prey's current position
+                        let ptx = (prey_transform.translation.x / TILE_SIZE).floor() as i16;
+                        let pty = (prey_transform.translation.y / TILE_SIZE).floor() as i16;
+                        ai.target_tile = (ptx, pty);
+
+                        // Check adjacency for attack
+                        let target_tile = ai.target_tile;
+                        let dist = (target_tile.0 as i32 - tx).abs() + (target_tile.1 as i32 - ty).abs();
+                        if dist <= 1 {
+                            ai.state = AnimalState::Attack;
+                            combat_target.0 = Some(existing);
+                        } else {
+                            ai.state = AnimalState::Chase;
+                        }
+                        continue;
+                    }
                 } else {
-                    ai.state = AnimalState::Chase;
+                    ai.state = AnimalState::Wander;
+                    ai.target_entity = None;
+                    combat_target.0 = None;
                 }
-                continue;
             }
         }
 
@@ -253,6 +270,14 @@ pub fn animal_sense_system(
             for dx in -WOLF_HUNT_RADIUS..=WOLF_HUNT_RADIUS {
                 for &candidate in spatial.get(tx + dx, ty + dy) {
                     if candidate == wolf_entity { continue; }
+
+                    let Ok((_, health, body)) = target_query.get(candidate) else { continue };
+                    let is_dead = match (health, body) {
+                        (Some(h), _) if h.is_dead() => true,
+                        (_, Some(b)) if b.is_dead() => true,
+                        _ => false,
+                    };
+                    if is_dead { continue; }
 
                     // Prefer deer
                     if deer_query.contains(candidate) {

@@ -191,7 +191,7 @@ pub fn social_fill_system(
         }
 
         if nearby > 0 {
-            needs.social = needs.social.saturating_sub(nearby.min(10) as u8 * 3);
+            needs.social = (needs.social - (nearby.min(10) * 3) as f32).max(0.0);
         }
     });
 }
@@ -238,7 +238,7 @@ pub fn faction_camp_system(
         }
 
         // Withdraw food if hungry and no personal food
-        if needs.hunger > 100 && agent.quantity_of(Good::Food) == 0 {
+        if needs.hunger > 100.0 && agent.quantity_of(Good::Food) == 0 {
             if let Some(f) = registry.factions.get_mut(&faction_id) {
                 if f.food_stock >= 1.0 {
                     f.food_stock -= 1.0;
