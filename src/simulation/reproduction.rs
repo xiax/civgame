@@ -183,6 +183,7 @@ pub fn reproduction_system(
                     dest_tile: (tx as i16, ty as i16),
                     ticks_idle: 0,
                     work_progress: 0,
+                    last_plan_id: PersonAI::UNEMPLOYED,
                 },
                 EconomicAgent::default(),
             ),

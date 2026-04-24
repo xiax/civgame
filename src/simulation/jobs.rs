@@ -243,7 +243,7 @@ pub fn goal_dispatch_system(
                 if member.faction_id != SOLO {
                     if let Some(home) = faction_registry.home_tile(member.faction_id) {
                         // Already going to camp?
-                        if is_active && ai.job_id == JobKind::Idle as u16 && ai.target_tile == home {
+                        if is_active && ai.job_id == JobKind::Idle as u16 && ai.dest_tile == home {
                             return;
                         }
                         assign_job_with_routing(&mut ai, cur_chunk, home, JobKind::Idle, &chunk_graph, &chunk_map);

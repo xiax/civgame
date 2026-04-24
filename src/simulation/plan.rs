@@ -591,9 +591,14 @@ pub fn plan_execution_system(
                             .map(|p| (p.id, net.score_plan(state, p.feature_vec, p.id)))
                             .collect();
                         
-                        // Apply distance penalties
+                        // Apply distance penalties and persistence bonus
                         let camp_pos = faction_registry.home_tile(member.faction_id);
                         for (plan_id, score) in scores.iter_mut() {
+                            // Bonus for last plan to reduce switching jitter
+                            if *plan_id == ai.last_plan_id {
+                                *score += 0.2;
+                            }
+
                             // Find target memory kind for this plan
                             let mkind = if *plan_id == 5 { Some(MemoryKind::Prey) } // Hunt
                                 else if *plan_id == 0 || *plan_id == 1 || *plan_id == 6 { Some(MemoryKind::Food) }
@@ -619,6 +624,7 @@ pub fn plan_execution_system(
 
                         let idx = UtilityNet::select_plan_idx(&scores);
                         let selected = candidates[idx];
+                        ai.last_plan_id = selected.id;
                         // Re-score selected plan to save correct activations for learning (using unpenalized score for NN internals)
                         net.score_plan(state, selected.feature_vec, selected.id);
                         selected
@@ -747,11 +753,12 @@ pub fn plan_execution_system(
                         if health.is_dead() {
                             // Target is dead, step will complete via Idle+UNEMPLOYED in combat_system or similar
                         } else {
-                            // Update target tile to prey's current position
+                            // Update target tile to prey's current position if it moved
                             let ptx = (target_t.translation.x / TILE_SIZE).floor() as i16;
                             let pty = (target_t.translation.y / TILE_SIZE).floor() as i16;
-                            ai.target_tile = (ptx, pty);
-                            ai.dest_tile = ai.target_tile;
+                            if ai.dest_tile != (ptx, pty) {
+                                assign_job_with_routing(&mut ai, cur_chunk, (ptx, pty), step_def.job, &chunk_graph, &chunk_map);
+                            }
                         }
                     } else {
                         // Target lost

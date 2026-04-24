@@ -50,6 +50,7 @@ pub struct PersonAI {
     pub target_tile:   (i16, i16),
     pub dest_tile:     (i16, i16),
     pub ticks_idle:    u8,
+    pub last_plan_id:  u16,
 }
 
 impl PersonAI {
@@ -213,6 +214,7 @@ pub fn spawn_population(
                         dest_tile: (tx as i16, ty as i16),
                         ticks_idle: 0,
                         work_progress: 0,
+                        last_plan_id: PersonAI::UNEMPLOYED,
                     },
                     EconomicAgent::default(),
                 ),

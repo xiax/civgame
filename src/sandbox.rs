@@ -67,6 +67,7 @@ fn setup_sandbox(
                 dest_tile: (cx as i16, cy as i16),
                 ticks_idle: 0,
                 work_progress: 0,
+                last_plan_id: PersonAI::UNEMPLOYED,
             },
             EconomicAgent::default(),
         ),

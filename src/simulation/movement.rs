@@ -87,7 +87,7 @@ pub fn movement_system(
                             (-1, -1), (1, -1), (-1, 1), (1, 1),
                         ];
                         // Try random adjacent tile
-                        let mut candidates: Vec<_> = dirs.iter().collect();
+                        let candidates: Vec<_> = dirs.iter().collect();
                         // Shuffle by picking random start index
                         let start = rng.gen_range(0..8);
                         let (left, right) = candidates.split_at(start);

@@ -56,8 +56,8 @@ impl ChunkGraph {
                             if !candidates.is_empty() {
                                 // Pick a random edge to avoid clustering all agents on the same tile
                                 let e = candidates[fastrand::usize(..candidates.len())];
-                                let gx = cur.0 * CHUNK_SIZE as i32 + e.exit_local.0 as i32;
-                                let gy = cur.1 * CHUNK_SIZE as i32 + e.exit_local.1 as i32;
+                                let gx = e.neighbor.0 * CHUNK_SIZE as i32 + e.entry_local.0 as i32;
+                                let gy = e.neighbor.1 * CHUNK_SIZE as i32 + e.entry_local.1 as i32;
                                 return Some((gx as i16, gy as i16));
                             }
                         }
