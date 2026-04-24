@@ -13,6 +13,7 @@ pub struct EntityTextures {
     pub plant_mature: Handle<Image>,
     pub tree_seedling: Handle<Image>,
     pub tree_mature: Handle<Image>,
+    pub camp: Handle<Image>,
 }
 
 #[derive(Clone, Copy)]
@@ -303,6 +304,29 @@ pub fn setup_pixel_art(
         ('e', e), ('d', d_b), ('.', _t)
     ]);
 
+    // Camp: 16x16 (Simple hut)
+    let camp_ascii = &[
+        "................",
+        ".......b........",
+        "......bbb.......",
+        ".....bbbbb......",
+        "....bbbbbbb.....",
+        "...bbbbbbbbb....",
+        "..bbbbbbbbbbb...",
+        ".bbbbbbbbbbbbb..",
+        "bbbbbbbbbbbbbbb.",
+        "bbbbbbb..bbbbbbb",
+        "bbbbbb....bbbbbb",
+        "bbbbb......bbbbb",
+        "bbbb........bbbb",
+        "bbb..........bbb",
+        "bb............bb",
+        "xx............xx",
+    ];
+    let camp_img = ascii_to_image(camp_ascii, &[
+        ('b', b), ('x', x), ('.', _t)
+    ]);
+
     commands.insert_resource(EntityTextures {
         wolf: images.add(wolf_img),
         deer: images.add(deer_img),
@@ -313,5 +337,6 @@ pub fn setup_pixel_art(
         plant_mature: images.add(plant_mature_img),
         tree_seedling: images.add(tree_seedling_img),
         tree_mature: images.add(tree_mature_img),
+        camp: images.add(camp_img),
     });
 }

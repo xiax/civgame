@@ -223,9 +223,8 @@ pub fn goal_dispatch_system(
         if *lod == LodLevel::Dormant {
             return;
         }
-        if matches!(ai.state, AiState::Working | AiState::Seeking | AiState::Routing) {
-            return;
-        }
+
+        let is_active = matches!(ai.state, AiState::Working | AiState::Seeking | AiState::Routing);
 
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
@@ -238,12 +237,17 @@ pub fn goal_dispatch_system(
             AgentGoal::ReturnCamp => {
                 if member.faction_id != SOLO {
                     if let Some(home) = faction_registry.home_tile(member.faction_id) {
+                        // Already going to camp?
+                        if is_active && ai.job_id == JobKind::Idle as u16 && ai.target_tile == home {
+                            return;
+                        }
                         assign_job_with_routing(&mut ai, cur_chunk, home, JobKind::Idle, &chunk_graph, &chunk_map);
                     }
                 }
             }
 
             AgentGoal::Socialize => {
+                if is_active && ai.job_id == JobKind::Idle as u16 { return; }
                 let radius = 15i32;
                 'find: for dy in -radius..=radius {
                     for dx in -radius..=radius {
@@ -264,6 +268,7 @@ pub fn goal_dispatch_system(
             }
 
             AgentGoal::Reproduce => {
+                if is_active && ai.job_id == JobKind::Idle as u16 { return; }
                 if member.faction_id != SOLO {
                     if let Some(target) = find_nearby_partner(
                         &spatial, (cur_tx, cur_ty), 15, *sex,
@@ -275,6 +280,7 @@ pub fn goal_dispatch_system(
             }
 
             AgentGoal::Raid => {
+                if is_active && ai.job_id == JobKind::Raid as u16 { return; }
                 if member.faction_id != SOLO {
                     if let Some(target_id) = faction_registry.raid_target(member.faction_id) {
                         if let Some(enemy_home) = faction_registry.home_tile(target_id) {
@@ -288,6 +294,7 @@ pub fn goal_dispatch_system(
             }
 
             AgentGoal::Defend => {
+                if is_active && ai.job_id == JobKind::Defend as u16 { return; }
                 if member.faction_id != SOLO {
                     if let Some(home) = faction_registry.home_tile(member.faction_id) {
                         assign_job_with_routing(

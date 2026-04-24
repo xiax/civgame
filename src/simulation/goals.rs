@@ -2,7 +2,7 @@ use bevy::prelude::*;
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::lod::LodLevel;
 use super::needs::Needs;
-use super::person::{PersonAI, PlayerOrder};
+use super::person::{AiState, PersonAI, PlayerOrder};
 use super::schedule::{BucketSlot, SimClock};
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
@@ -87,8 +87,13 @@ pub fn goal_update_system(
             return;
         }
 
-        // Only update goal when idle — don't interrupt active tasks
-        if ai.job_id != PersonAI::UNEMPLOYED {
+        // Only update goal periodically or when idle to prevent excessive jitter
+        if ai.job_id != PersonAI::UNEMPLOYED && clock.tick % 32 != 0 {
+            return;
+        }
+        
+        // Don't interrupt combat or sleep
+        if matches!(ai.state, AiState::Attacking | AiState::Sleeping) {
             return;
         }
 

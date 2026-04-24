@@ -5,8 +5,8 @@ use super::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE, CHUNK_HEIGHT, Z_MIN,
 use super::globe::{Biome, Globe, WorldCell, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 use super::tile::{TileData, TileKind};
 
-pub const WORLD_CHUNKS_X: i32 = 16;
-pub const WORLD_CHUNKS_Y: i32 = 16;
+pub const WORLD_CHUNKS_X: i32 = 64;
+pub const WORLD_CHUNKS_Y: i32 = 64;
 pub const TILE_SIZE: f32 = 16.0;
 
 const WORLD_SEED: u32 = 42;

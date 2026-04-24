@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use crate::simulation::animals::{Deer, Wolf};
-use crate::simulation::faction::{FactionMember, PlayerFaction};
+use crate::simulation::faction::{FactionMember, PlayerFaction, FactionCenter, PlayerFactionMarker};
 use crate::simulation::person::Person;
 use crate::simulation::reproduction::BiologicalSex;
 use crate::rendering::pixel_art::EntityTextures;
@@ -17,7 +17,36 @@ pub struct DeerVisual;
 pub struct PersonVisual;
 
 #[derive(Component)]
+pub struct FactionCenterVisual;
+
+#[derive(Component)]
 pub struct VisualChild;
+
+pub fn spawn_faction_center_sprites(
+    mut commands: Commands,
+    query: Query<(Entity, Option<&PlayerFactionMarker>), (With<FactionCenter>, Without<FactionCenterVisual>)>,
+    textures: Res<EntityTextures>,
+) {
+    for (entity, player_marker) in query.iter() {
+        let mut sprite = Sprite::from_image(textures.camp.clone());
+        sprite.custom_size = Some(Vec2::new(48.0, 48.0));
+        sprite.anchor = Anchor::Center;
+        
+        // Tint blue if it's the player's faction
+        if player_marker.is_some() {
+            sprite.color = Color::srgb(0.55, 0.85, 1.0);
+        }
+
+        commands.entity(entity).insert(FactionCenterVisual).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, 0.0, 0.1),
+                Visibility::Visible,
+            ));
+        });
+    }
+}
 
 pub fn spawn_wolf_sprites(
     mut commands: Commands,

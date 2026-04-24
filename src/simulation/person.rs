@@ -7,7 +7,7 @@ use crate::world::tile::TileKind;
 use crate::economy::agent::EconomicAgent;
 
 use super::combat::{CombatTarget, Body, CombatCooldown};
-use super::faction::{FactionMember, FactionRegistry, PlayerFaction};
+use super::faction::{FactionMember, FactionRegistry, PlayerFaction, FactionCenter, PlayerFactionMarker};
 use super::goals::{AgentGoal, Personality};
 use super::items::{Equipment, TargetItem};
 use super::lod::LodLevel;
@@ -85,7 +85,7 @@ impl PlayerOrderKind {
 #[derive(Component)]
 pub struct Person;
 
-pub const INITIAL_POPULATION: u32 = 1_000;
+pub const INITIAL_POPULATION: u32 = 200;
 const GROUP_SIZE: u32 = 20;
 const SPAWN_RADIUS: i32 = 12;
 
@@ -110,6 +110,7 @@ pub fn spawn_population(
 
     let num_groups = INITIAL_POPULATION / GROUP_SIZE;
     let mut spawned = 0u32;
+    let mut spawned_homes: Vec<(i32, i32)> = Vec::new();
 
     // Helper: find a valid passable non-stone tile near (cx, cy) within radius, or anywhere in
     // the spawn region as fallback.
@@ -127,28 +128,64 @@ pub fn spawn_population(
     };
 
     for group_idx in 0..num_groups {
-        // Find a home tile for this group anywhere in the spawn region.
+        // Find a home tile for this group anywhere in the spawn region,
+        // ensuring it's at least 300 tiles away from other factions.
         let home = {
             let mut result = None;
-            for _ in 0..500 {
+            for _ in 0..1000 {
                 let tx = start_tx + rng.gen_range(0..total_tiles_x);
                 let ty = start_ty + rng.gen_range(0..total_tiles_y);
+                
                 if chunk_map.is_passable(tx, ty)
                     && !matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
                 {
-                    result = Some((tx, ty));
-                    break;
+                    // Distance check
+                    let too_close = spawned_homes.iter().any(|(hx, hy)| {
+                        let dx = (tx - hx) as f32;
+                        let dy = (ty - hy) as f32;
+                        (dx*dx + dy*dy).sqrt() < 300.0
+                    });
+
+                    if !too_close || spawned_homes.is_empty() {
+                        result = Some((tx, ty));
+                        break;
+                    }
+                }
+            }
+            // Fallback: if we couldn't find a spot 300 tiles away, just take any passable tile.
+            if result.is_none() {
+                for _ in 0..500 {
+                    let tx = start_tx + rng.gen_range(0..total_tiles_x);
+                    let ty = start_ty + rng.gen_range(0..total_tiles_y);
+                    if chunk_map.is_passable(tx, ty)
+                        && !matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
+                    {
+                        result = Some((tx, ty));
+                        break;
+                    }
                 }
             }
             result
         };
 
         let Some((home_tx, home_ty)) = home else { continue };
+        spawned_homes.push((home_tx, home_ty));
 
         let faction_id = registry.create_faction((home_tx as i16, home_ty as i16));
 
         if group_idx == 0 {
             player_faction.faction_id = faction_id;
+
+            // Mark the player's faction center
+            let world_pos = tile_to_world(home_tx, home_ty);
+            commands.spawn((
+                FactionCenter,
+                PlayerFactionMarker,
+                Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ));
         }
 
         for _ in 0..GROUP_SIZE {

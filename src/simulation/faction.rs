@@ -28,6 +28,12 @@ pub struct FactionMember {
     pub birth_cooldown: u32,
 }
 
+#[derive(Component)]
+pub struct FactionCenter;
+
+#[derive(Component)]
+pub struct PlayerFactionMarker;
+
 impl Default for FactionMember {
     fn default() -> Self {
         Self { faction_id: SOLO, bond_target: None, bond_timer: 0, birth_cooldown: 0 }
@@ -248,7 +254,7 @@ pub fn faction_camp_system(
     clock: Res<SimClock>,
     mut registry: ResMut<FactionRegistry>,
     mut query: Query<(
-        &PersonAI,
+        &mut PersonAI,
         &mut EconomicAgent,
         &mut Needs,
         &FactionMember,
@@ -256,7 +262,7 @@ pub fn faction_camp_system(
         &LodLevel,
     )>,
 ) {
-    for (ai, mut agent, mut needs, member, slot, lod) in query.iter_mut() {
+    for (mut ai, mut agent, needs, member, slot, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -292,6 +298,11 @@ pub fn faction_camp_system(
                 }
             }
         }
+
+        // Reset state after camp actions are done
+        ai.state = AiState::Idle;
+        ai.job_id = PersonAI::UNEMPLOYED;
+        ai.work_progress = 0;
     }
 }
 

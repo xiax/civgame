@@ -32,6 +32,7 @@ impl Plugin for RenderingPlugin {
                     chunk_streaming::chunk_streaming_system
                         .after(camera::camera_input_system),
                     entity_sprites::spawn_person_sprites,
+                    entity_sprites::spawn_faction_center_sprites,
                     entity_sprites::update_faction_sprite_colors
                         .after(entity_sprites::spawn_person_sprites),
                     entity_sprites::spawn_wolf_sprites,
