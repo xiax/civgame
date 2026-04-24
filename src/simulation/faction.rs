@@ -16,7 +16,7 @@ use crate::simulation::technology::{
 
 pub const SOLO: u32 = 0;
 pub const BOND_THRESHOLD: u8 = 180;
-const CAMP_KEEP: u8 = 4;
+const CAMP_KEEP: u8 = 0;
 const SOCIAL_RADIUS: i32 = 3;
 
 #[derive(Component, Clone, Copy)]

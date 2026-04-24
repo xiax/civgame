@@ -120,11 +120,16 @@ pub fn goal_update_system(
             registry.food_stock(member.faction_id) < cap
         };
 
-        let new_goal = if needs.hunger > 120.0 || (needs.hunger > 60.0 && agent.quantity_of(Good::Food) < 3) {
+        let faction_has_food = member.faction_id != SOLO && registry.food_stock(member.faction_id) >= 1.0;
+        let is_starving = needs.hunger > 100.0 && agent.quantity_of(Good::Food) == 0;
+
+        let new_goal = if is_starving && faction_has_food {
+            AgentGoal::ReturnCamp
+        } else if needs.hunger > 120.0 || (needs.hunger > 60.0 && agent.quantity_of(Good::Food) < 3) {
             AgentGoal::Survive
         } else if needs.sleep > 180.0 {
             AgentGoal::Sleep
-        } else if agent.quantity_of(Good::Food) > 6 && can_return_camp {
+        } else if agent.quantity_of(Good::Food) > 0 && can_return_camp {
             AgentGoal::ReturnCamp
         } else if needs.reproduction > reproduce_threshold {
             AgentGoal::Reproduce

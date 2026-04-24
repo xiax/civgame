@@ -1,5 +1,6 @@
 use ahash::AHashMap;
 use bevy::prelude::*;
+use rand::Rng;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::Calendar;
@@ -395,7 +396,21 @@ fn resolve_target(
 
             // 2. Check memory
             if let Some(mem) = memory {
-                return mem.best_for_dist_weighted(*kind, pos);
+                if let Some(target) = mem.best_for_dist_weighted(*kind, pos) {
+                    return Some(target);
+                }
+            }
+
+            // 3. Fallback: Explore randomly
+            let mut rng = rand::thread_rng();
+            for _ in 0..10 {
+                let dx = rng.gen_range(-40..=40);
+                let dy = rng.gen_range(-40..=40);
+                let tx = pos.0 + dx;
+                let ty = pos.1 + dy;
+                if chunk_map.is_passable(tx, ty) {
+                    return Some((tx as i16, ty as i16));
+                }
             }
             None
         }
