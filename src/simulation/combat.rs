@@ -13,7 +13,9 @@ use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::world::spatial::SpatialIndex;
+use crate::world::chunk::ChunkMap;
 use crate::world::terrain::TILE_SIZE;
+use crate::simulation::line_of_sight::has_los;
 
 #[derive(Component, Clone, Copy, Debug)]
 pub struct Health {
@@ -115,6 +117,7 @@ const BASE_ATTACK_COOLDOWN: f32 = 1.0;
 pub fn combat_system(
     time: Res<Time>,
     spatial: Res<SpatialIndex>,
+    chunk_map: Res<ChunkMap>,
     mut attacker_query: Query<(
         Entity,
         &mut CombatTarget,
@@ -189,7 +192,7 @@ pub fn combat_system(
         'find: for dy in -1..=1i32 {
             for dx in -1..=1i32 {
                 for &e in spatial.get(tx + dx, ty + dy) {
-                    if e == target {
+                    if e == target && has_los(&chunk_map, (tx, ty), (tx + dx, ty + dy)) {
                         found = true;
                         break 'find;
                     }

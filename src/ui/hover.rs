@@ -3,8 +3,9 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::world::chunk::ChunkMap;
+use crate::world::globe::Globe;
 use crate::world::spatial::SpatialIndex;
-use crate::world::terrain::world_to_tile;
+use crate::world::terrain::{tile_at_3d, world_to_tile, WorldGen};
 use crate::simulation::person::{Person, PersonAI};
 use crate::simulation::needs::Needs;
 use crate::simulation::mood::Mood;
@@ -21,6 +22,8 @@ pub fn hover_info_system(
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<Camera>>,
     chunk_map: Res<ChunkMap>,
+    gen: Res<WorldGen>,
+    globe: Res<Globe>,
     spatial_index: Res<SpatialIndex>,
     person_query: Query<(&PersonAI, &Needs, &Mood, &BiologicalSex, &FactionMember, &EconomicAgent, &Body), With<Person>>,
     animal_query: Query<(&AnimalAI, &Health, Option<&Wolf>, Option<&Deer>)>,
@@ -44,9 +47,11 @@ pub fn hover_info_system(
     egui::show_tooltip_at_pointer(ctx, egui::LayerId::debug(), tooltip_id, |ui: &mut egui::Ui| {
         ui.label(format!("Tile: ({}, {})", tx, ty));
 
-        if let Some(tile) = chunk_map.tile_at(tx, ty) {
+        let surf_z = chunk_map.surface_z_at(tx, ty);
+        if surf_z >= crate::world::chunk::Z_MIN {
+            let tile = tile_at_3d(&chunk_map, &gen, &globe, tx, ty, surf_z);
             ui.label(format!("Kind: {:?}", tile.kind));
-            ui.label(format!("Elevation: {}", tile.elevation));
+            ui.label(format!("Z: {}", surf_z));
             ui.label(format!("Fertility: {}", tile.fertility));
             if tile.has_building() {
                 ui.label("Has Building");

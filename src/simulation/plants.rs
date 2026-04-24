@@ -227,8 +227,8 @@ pub fn plant_growth_system(
         let tx = plant.tile_pos.0 as i32;
         let ty = plant.tile_pos.1 as i32;
 
-        let fertility = match chunk_map.tile_at(tx, ty) {
-            Some(t) => t.fertility,
+        let fertility = match chunk_map.tile_fertility_at(tx, ty) {
+            Some(f) => f,
             None    => continue, // unloaded chunk — pause growth
         };
 
@@ -317,15 +317,13 @@ pub fn seed_scatter_system(
             if dx == 0 && dy == 0 { continue; }
             let nx = tx + dx;
             let ny = ty + dy;
-            if let Some(tile) = chunk_map.tile_at(nx, ny) {
-                use crate::world::tile::TileKind;
-                if matches!(tile.kind, TileKind::Grass | TileKind::Farmland) {
-                    spawn_plant_at(
-                        &mut commands, &mut plant_map, &mut plant_sprite_index,
-                        &textures,
-                        nx, ny, kind, GrowthStage::Seed,
-                    );
-                }
+            use crate::world::tile::TileKind as TK;
+            if matches!(chunk_map.tile_kind_at(nx, ny), Some(TK::Grass | TK::Farmland)) {
+                spawn_plant_at(
+                    &mut commands, &mut plant_map, &mut plant_sprite_index,
+                    &textures,
+                    nx, ny, kind, GrowthStage::Seed,
+                );
             }
         }
 

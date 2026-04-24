@@ -9,6 +9,7 @@ pub mod globe;
 pub mod chunk_streaming;
 
 pub use chunk::ChunkMap;
+pub use terrain::WorldGen;
 
 fn insert_globe(app: &mut App) {
     app.insert_resource(globe::load_or_generate(42));
@@ -22,6 +23,7 @@ impl Plugin for WorldPlugin {
         app.insert_resource(ChunkMap::default())
             .insert_resource(spatial::SpatialIndex::default())
             .insert_resource(seasons::Calendar::default())
+            .insert_resource(terrain::WorldGen::new())
             .add_systems(Startup, terrain::spawn_world_system);
     }
 }

@@ -59,7 +59,7 @@ fn build_flow_field(chunk: &Chunk, coord: ChunkCoord, goal: (u8, u8)) -> FlowFie
                 continue;
             }
             let nidx = ny as usize * CHUNK_SIZE + nx as usize;
-            if chunk.tiles[nidx].is_passable() && dist[nidx] == u16::MAX {
+            if chunk.is_locally_passable(nx as usize, ny as usize) && dist[nidx] == u16::MAX {
                 dist[nidx] = cur_dist + 1;
                 dir[nidx] = d;
                 queue.push_back((nx as u8, ny as u8));

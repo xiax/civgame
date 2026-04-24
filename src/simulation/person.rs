@@ -89,10 +89,8 @@ pub fn spawn_population(
         if !chunk_map.is_passable(tx, ty) {
             continue;
         }
-        if let Some(tile) = chunk_map.tile_at(tx, ty) {
-            if matches!(tile.kind, TileKind::Stone) {
-                continue;
-            }
+        if matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone)) {
+            continue;
         }
 
         let world_pos = tile_to_world(tx, ty);

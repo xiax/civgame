@@ -96,7 +96,7 @@ pub fn movement_system(
                         for &&(dx, dy) in &shuffled {
                             let ntx = cur_tx + dx;
                             let nty = cur_ty + dy;
-                            if chunk_map.is_passable(ntx, nty) {
+                            if chunk_map.passable_step(cur_tx, cur_ty, ntx, nty) {
                                 ai.target_tile = (ntx as i16, nty as i16);
                                 break;
                             }

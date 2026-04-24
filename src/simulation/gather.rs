@@ -142,7 +142,7 @@ pub fn gather_system(
         } else {
             // ── Tile harvest (stone) ─────────────────────────────────────────
 
-            let tile_kind = chunk_map.tile_at(tx, ty).map(|t| t.kind);
+            let tile_kind = chunk_map.tile_kind_at(tx, ty);
             if tile_kind != Some(TileKind::Stone) { continue; }
 
             if ai.work_progress < STONE.work_ticks { continue; }

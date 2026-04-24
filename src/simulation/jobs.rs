@@ -39,8 +39,8 @@ pub fn find_nearest_tile(
         for dx in -radius..=radius {
             let tx = from.0 + dx;
             let ty = from.1 + dy;
-            if let Some(tile) = chunk_map.tile_at(tx, ty) {
-                if kinds.contains(&tile.kind) {
+            if let Some(kind) = chunk_map.tile_kind_at(tx, ty) {
+                if kinds.contains(&kind) {
                     let dist = dx.abs() + dy.abs();
                     if dist < best_dist {
                         best_dist = dist;
@@ -124,13 +124,11 @@ pub fn find_nearest_unplanted_farmland(
             let tx = from.0 + dx;
             let ty = from.1 + dy;
             if plant_map.0.contains_key(&(tx, ty)) { continue; }
-            if let Some(tile) = chunk_map.tile_at(tx, ty) {
-                if tile.kind == TileKind::Farmland {
-                    let dist = dx.abs() + dy.abs();
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best = Some((tx as i16, ty as i16));
-                    }
+            if chunk_map.tile_kind_at(tx, ty) == Some(TileKind::Farmland) {
+                let dist = dx.abs() + dy.abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some((tx as i16, ty as i16));
                 }
             }
         }

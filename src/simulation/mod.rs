@@ -13,6 +13,7 @@ pub mod goals;
 pub mod faction;
 pub mod reproduction;
 pub mod combat;
+pub mod line_of_sight;
 pub mod animals;
 pub mod raid;
 pub mod items;

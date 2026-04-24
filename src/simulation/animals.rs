@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::{tile_to_world, TILE_SIZE, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
+use crate::simulation::line_of_sight::has_los;
 use crate::world::tile::TileKind;
 use crate::world::spatial::SpatialIndex;
 use super::combat::{CombatTarget, Health, Body, CombatCooldown};
@@ -63,12 +64,10 @@ pub fn spawn_animals(
             let tx = start_tx + dx;
             let ty = start_ty + dy;
             if !chunk_map.is_passable(tx, ty) { continue; }
-            if let Some(tile) = chunk_map.tile_at(tx, ty) {
-                match tile.kind {
-                    TileKind::Forest => forest_tiles.push((tx, ty)),
-                    TileKind::Grass  => grass_tiles.push((tx, ty)),
-                    _ => {}
-                }
+            match chunk_map.tile_kind_at(tx, ty) {
+                Some(TileKind::Forest) => forest_tiles.push((tx, ty)),
+                Some(TileKind::Grass)  => grass_tiles.push((tx, ty)),
+                _ => {}
             }
         }
     }
@@ -206,6 +205,7 @@ pub fn animal_movement_system(
 pub fn animal_sense_system(
     spatial: Res<SpatialIndex>,
     clock: Res<SimClock>,
+    chunk_map: Res<ChunkMap>,
     wolf_query: Query<(Entity, &Transform, &BucketSlot, &LodLevel), With<Wolf>>,
     deer_query: Query<(Entity, &Transform, &BucketSlot, &LodLevel), With<Deer>>,
     person_query: Query<&Transform, With<Person>>,
@@ -279,6 +279,9 @@ pub fn animal_sense_system(
                     };
                     if is_dead { continue; }
 
+                    // Terrain must not block sight between wolf and prey.
+                    if !has_los(&chunk_map, (tx, ty), (tx + dx, ty + dy)) { continue; }
+
                     // Prefer deer
                     if deer_query.contains(candidate) {
                         found = Some((candidate, (tx + dx) as i16, (ty + dy) as i16));
@@ -336,9 +339,11 @@ pub fn animal_sense_system(
             for dx in -DEER_FLEE_RADIUS..=DEER_FLEE_RADIUS {
                 for &candidate in spatial.get(tx + dx, ty + dy) {
                     if wolf_query.contains(candidate) || person_query.get(candidate).is_ok() {
-                        threat_dx += dx;
-                        threat_dy += dy;
-                        threat_count += 1;
+                        if has_los(&chunk_map, (tx, ty), (tx + dx, ty + dy)) {
+                            threat_dx += dx;
+                            threat_dy += dy;
+                            threat_count += 1;
+                        }
                     }
                 }
             }
