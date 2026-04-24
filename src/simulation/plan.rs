@@ -375,7 +375,7 @@ fn resolve_target(
     combat_target: &mut CombatTarget,
     target_item: &mut TargetItem,
     bed_map: &BedMap,
-) -> Option<(i16, i16)> {
+) -> Option<(Option<Entity>, i16, i16)> {
     const VIEW_RADIUS: i32 = 15;
 
     match &step.target {
@@ -404,36 +404,39 @@ fn resolve_target(
             }
             if let Some((entity, tx, ty)) = best_v {
                 combat_target.0 = Some(entity);
-                return Some((tx, ty));
+                return Some((Some(entity), tx, ty));
             }
 
             // 2. Check memory
             if let Some(mem) = memory {
                 if let Some((entity, tx, ty)) = mem.best_entity_for_dist_weighted(MemoryKind::Prey, pos) {
                     combat_target.0 = Some(entity);
-                    return Some((tx, ty));
+                    return Some((Some(entity), tx, ty));
                 }
             }
             None
         }
         StepTarget::FromMemory(kind) => {
             // 1. Check vision
-            let vision_target = match kind {
-                MemoryKind::Food => find_nearest_plant(plant_map, pos, VIEW_RADIUS, plant_query, true, step.plant_filter),
-                MemoryKind::Wood => find_nearest_plant(plant_map, pos, VIEW_RADIUS, plant_query, true, Some(PlantKind::Tree)),
-                MemoryKind::Stone => find_nearest_tile(chunk_map, pos, VIEW_RADIUS, STONE_TILES),
+            let vision_target: Option<(Option<Entity>, i16, i16)> = match kind {
+                MemoryKind::Food => find_nearest_plant(plant_map, pos, VIEW_RADIUS, plant_query, true, step.plant_filter).map(|(e, tx, ty)| (Some(e), tx, ty)),
+                MemoryKind::Wood => find_nearest_plant(plant_map, pos, VIEW_RADIUS, plant_query, true, Some(PlantKind::Tree)).map(|(e, tx, ty)| (Some(e), tx, ty)),
+                MemoryKind::Stone => find_nearest_tile(chunk_map, pos, VIEW_RADIUS, STONE_TILES).map(|(tx, ty)| (None, tx, ty)),
                 _ => None,
             };
-            if let Some(target) = vision_target {
-                if super::line_of_sight::has_los(chunk_map, pos, (target.0 as i32, target.1 as i32)) {
-                    return Some(target);
+            if let Some((ent, tx, ty)) = vision_target {
+                if super::line_of_sight::has_los(chunk_map, pos, (tx as i32, ty as i32)) {
+                    return Some((ent, tx, ty));
                 }
             }
 
             // 2. Check memory
             if let Some(mem) = memory {
-                if let Some(target) = mem.best_for_dist_weighted(*kind, pos) {
-                    return Some(target);
+                if let Some((ent, tx, ty)) = mem.best_entity_for_dist_weighted(*kind, pos) {
+                    return Some((Some(ent), tx, ty));
+                }
+                if let Some((tx, ty)) = mem.best_for_dist_weighted(*kind, pos) {
+                    return Some((None, tx, ty));
                 }
             }
 
@@ -445,16 +448,16 @@ fn resolve_target(
                 let tx = pos.0 + dx;
                 let ty = pos.1 + dy;
                 if chunk_map.is_passable(tx, ty) {
-                    return Some((tx as i16, ty as i16));
+                    return Some((None, tx as i16, ty as i16));
                 }
             }
             None
         }
         StepTarget::NearestTile(_tiles) => {
             if step.job == JobKind::Planter {
-                find_nearest_unplanted_farmland(chunk_map, plant_map, pos, VIEW_RADIUS)
+                find_nearest_unplanted_farmland(chunk_map, plant_map, pos, VIEW_RADIUS).map(|(tx, ty)| (None, tx, ty))
             } else {
-                find_nearest_tile(chunk_map, pos, VIEW_RADIUS, _tiles)
+                find_nearest_tile(chunk_map, pos, VIEW_RADIUS, _tiles).map(|(tx, ty)| (None, tx, ty))
             }
         }
         StepTarget::NearestItem(good) => {
@@ -462,7 +465,7 @@ fn resolve_target(
             if let Some((entity, tx, ty)) = find_nearest_item(spatial, pos, VIEW_RADIUS, item_check) {
                 if super::line_of_sight::has_los(chunk_map, pos, (tx as i32, ty as i32)) {
                     target_item.0 = Some(entity);
-                    return Some((tx, ty));
+                    return Some((Some(entity), tx, ty));
                 }
             }
             // 2. Check memory
@@ -476,19 +479,19 @@ fn resolve_target(
                 };
                 if let Some((entity, tx, ty)) = mem.best_entity_for_dist_weighted(mkind, pos) {
                     target_item.0 = Some(entity);
-                    return Some((tx, ty));
+                    return Some((Some(entity), tx, ty));
                 }
             }
             None
         }
         StepTarget::FactionCamp => {
-            faction_registry.home_tile(faction_id)
+            faction_registry.home_tile(faction_id).map(|(tx, ty)| (None, tx, ty))
         }
         StepTarget::NearestBuildSite(kind) => {
             let Some(home) = faction_registry.home_tile(faction_id) else { return None };
             match kind {
-                BuildSiteKind::Wall => find_wall_build_site(chunk_map, home, 20),
-                BuildSiteKind::Bed  => find_bed_build_site(chunk_map, bed_map, home, 15),
+                BuildSiteKind::Wall => find_wall_build_site(chunk_map, home, 20).map(|(tx, ty)| (None, tx, ty)),
+                BuildSiteKind::Bed  => find_bed_build_site(chunk_map, bed_map, home, 15).map(|(tx, ty)| (None, tx, ty)),
             }
         }
     }
@@ -729,7 +732,7 @@ pub fn plan_execution_system(
                 }
             }
 
-            if let Some(target) = resolve_target(
+            if let Some((ent, target_tx, target_ty)) = resolve_target(
                 step_def, (cur_tx, cur_ty),
                 &chunk_map, &spatial, &plant_map, &plant_query,
                 &faction_registry, member.faction_id,
@@ -737,7 +740,7 @@ pub fn plan_execution_system(
                 &prey_query, &mut combat_target,
                 &mut target_item, &bed_map,
             ) {
-                assign_job_with_routing(&mut ai, cur_chunk, target, step_def.job, &chunk_graph, &chunk_map);
+                assign_job_with_routing(&mut ai, cur_chunk, (target_tx, target_ty), step_def.job, ent, &chunk_graph, &chunk_map);
                 active_plan.dispatched = true;
                 active_plan.reward_scale = step_def.reward_scale;
             } else {
@@ -757,13 +760,14 @@ pub fn plan_execution_system(
                             let ptx = (target_t.translation.x / TILE_SIZE).floor() as i16;
                             let pty = (target_t.translation.y / TILE_SIZE).floor() as i16;
                             if ai.dest_tile != (ptx, pty) {
-                                assign_job_with_routing(&mut ai, cur_chunk, (ptx, pty), step_def.job, &chunk_graph, &chunk_map);
+                                assign_job_with_routing(&mut ai, cur_chunk, (ptx, pty), step_def.job, Some(target_ent), &chunk_graph, &chunk_map);
                             }
                         }
                     } else {
                         // Target lost
                         ai.state = AiState::Idle;
                         ai.job_id = PersonAI::UNEMPLOYED;
+                        ai.target_entity = None;
                         combat_target.0 = None;
                     }
                 }

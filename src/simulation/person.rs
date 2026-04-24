@@ -51,6 +51,8 @@ pub struct PersonAI {
     pub dest_tile:     (i16, i16),
     pub ticks_idle:    u8,
     pub last_plan_id:  u16,
+    pub last_goal_eval_tick: u64,
+    pub target_entity: Option<Entity>,
 }
 
 impl PersonAI {
@@ -207,15 +209,17 @@ pub fn spawn_population(
                     Needs::new(30.0, 20.0, 10.0, 5.0, 40.0),
                     Mood::default(),
                     Skills::default(),
-                    PersonAI {
-                        job_id: PersonAI::UNEMPLOYED,
-                        state: AiState::Idle,
-                        target_tile: (tx as i16, ty as i16),
-                        dest_tile: (tx as i16, ty as i16),
-                        ticks_idle: 0,
-                        work_progress: 0,
-                        last_plan_id: PersonAI::UNEMPLOYED,
-                    },
+                        PersonAI {
+                            job_id: PersonAI::UNEMPLOYED,
+                            state: AiState::Idle,
+                            target_tile: (tx as i16, ty as i16),
+                            dest_tile: (tx as i16, ty as i16),
+                            ticks_idle: 0,
+                            work_progress: 0,
+                            last_plan_id: PersonAI::UNEMPLOYED,
+                            last_goal_eval_tick: 0,
+                            target_entity: None,
+                        },
                     EconomicAgent::default(),
                 ),
                 (

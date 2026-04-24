@@ -68,7 +68,10 @@ fn setup_sandbox(
                 ticks_idle: 0,
                 work_progress: 0,
                 last_plan_id: PersonAI::UNEMPLOYED,
+                last_goal_eval_tick: 0,
+                target_entity: None,
             },
+
             EconomicAgent::default(),
         ),
         (

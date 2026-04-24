@@ -81,11 +81,13 @@ pub fn gather_system(
                 plant_map.0.remove(&(tx, ty));
                 ai.state = AiState::Idle;
                 ai.job_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
                 continue;
             };
             if plant.stage != GrowthStage::Mature {
                 ai.state = AiState::Idle;
                 ai.job_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
                 continue;
             }
 
@@ -179,6 +181,7 @@ pub fn gather_system(
                 // Not a stone tile and not a plant -> target is invalid or already harvested
                 ai.state = AiState::Idle;
                 ai.job_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
                 ai.work_progress = 0;
             }
         }
@@ -188,6 +191,7 @@ pub fn gather_system(
         if agent.is_inventory_full() {
             ai.state = AiState::Idle;
             ai.job_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
             ai.work_progress = 0;
         }
     }

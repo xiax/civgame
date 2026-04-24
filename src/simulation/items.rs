@@ -77,6 +77,7 @@ pub fn item_pickup_system(
             // No target, but in scavenge state? Cleanup.
             ai.state = AiState::Idle;
             ai.job_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
             continue;
         };
 
@@ -96,12 +97,14 @@ pub fn item_pickup_system(
                 commands.entity(target_ent).despawn();
                 ai.state = AiState::Idle;
                 ai.job_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
                 target_item.0 = None;
             }
         } else {
             // Targeted item is gone (stolen or rotted)
             ai.state = AiState::Idle;
             ai.job_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
             target_item.0 = None;
         }
     }

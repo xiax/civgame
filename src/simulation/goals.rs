@@ -1,5 +1,9 @@
 use bevy::prelude::*;
 use super::construction::AutonomousBuildingToggle;
+use crate::world::chunk::ChunkMap;
+use crate::simulation::plants::{PlantMap, Plant, GrowthStage};
+use crate::simulation::items::{GroundItem, TargetItem};
+use crate::simulation::jobs::JobKind;
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::lod::LodLevel;
 use super::needs::Needs;
@@ -75,41 +79,98 @@ pub fn goal_update_system(
     registry: Res<FactionRegistry>,
     calendar: Res<Calendar>,
     auto_build: Res<AutonomousBuildingToggle>,
+    chunk_map: Res<ChunkMap>,
+    plant_map: Res<PlantMap>,
+    plant_query: Query<&Plant>,
+    item_query: Query<(), With<GroundItem>>,
     mut query: Query<(
         &mut AgentGoal,
         &Needs,
         &Personality,
         &EconomicAgent,
-        &PersonAI,
+        &mut PersonAI,
         &BucketSlot,
         &LodLevel,
         &FactionMember,
+        &mut TargetItem,
     ), Without<PlayerOrder>>,
 ) {
-    query.par_iter_mut().for_each(|(mut goal, needs, personality, agent, ai, slot, lod, member)| {
+    for (mut goal, needs, personality, agent, mut ai, slot, lod, member, mut target_item) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
-            return;
+            continue;
         }
 
-        // Only update goal periodically or when idle to prevent excessive jitter
-        if ai.job_id != PersonAI::UNEMPLOYED && clock.tick % 32 != 0 {
-            return;
+        // 1. Cooldown & Staggered Update Fix
+        if ai.job_id != PersonAI::UNEMPLOYED && clock.tick.saturating_sub(ai.last_goal_eval_tick) < 32 {
+            continue;
         }
-        
+        ai.last_goal_eval_tick = clock.tick;
+
+        // 2. Target Validation (for moving agents)
+        if matches!(ai.state, AiState::Routing | AiState::Seeking) {
+            let mut invalid = false;
+            let jid = ai.job_id;
+
+            if jid == JobKind::Gather as u16 {
+                // If targeting a plant, check if it still exists and is mature
+                if let Some(ent) = ai.target_entity {
+                    if let Ok(plant) = plant_query.get(ent) {
+                        if plant.stage != GrowthStage::Mature { invalid = true; }
+                    } else {
+                        invalid = true;
+                    }
+                } else {
+                    // Targeting a tile (Stone)
+                    let tx = ai.dest_tile.0 as i32;
+                    let ty = ai.dest_tile.1 as i32;
+                    if !matches!(chunk_map.tile_kind_at(tx, ty), Some(crate::world::tile::TileKind::Stone)) {
+                        invalid = true;
+                    }
+                }
+            } else if jid == JobKind::Planter as u16 {
+                let tx = ai.dest_tile.0 as i32;
+                let ty = ai.dest_tile.1 as i32;
+                if plant_map.0.contains_key(&(tx, ty)) {
+                    invalid = true;
+                }
+            } else if jid == JobKind::Scavenge as u16 {
+                if let Some(ent) = ai.target_entity {
+                    if item_query.get(ent).is_err() { invalid = true; }
+                } else {
+                    invalid = true;
+                }
+            }
+
+            if invalid {
+                ai.state = AiState::Idle;
+                ai.job_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
+                target_item.0 = None;
+            }
+        }
+
         // Don't interrupt combat or sleep
         if matches!(ai.state, AiState::Attacking | AiState::Sleeping) {
-            return;
+            continue;
         }
 
         // Faction war state overrides individual needs
         if member.faction_id != SOLO {
             if registry.is_under_raid(member.faction_id) {
-                *goal = AgentGoal::Defend;
-                return;
+                if *goal != AgentGoal::Defend {
+                    *goal = AgentGoal::Defend;
+                    ai.state = AiState::Idle;
+                    ai.job_id = PersonAI::UNEMPLOYED;
+                }
+                continue;
             }
             if registry.raid_target(member.faction_id).is_some() && needs.hunger < 120.0 {
-                *goal = AgentGoal::Raid;
-                return;
+                if *goal != AgentGoal::Raid {
+                    *goal = AgentGoal::Raid;
+                    ai.state = AiState::Idle;
+                    ai.job_id = PersonAI::UNEMPLOYED;
+                }
+                continue;
             }
         }
 
@@ -150,6 +211,12 @@ pub fn goal_update_system(
             AgentGoal::Gather
         };
 
-        *goal = new_goal;
-    });
+        if *goal != new_goal {
+            *goal = new_goal;
+            ai.state = AiState::Idle;
+            ai.job_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
+            target_item.0 = None;
+        }
+    }
 }

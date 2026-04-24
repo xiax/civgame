@@ -157,6 +157,7 @@ pub fn construction_system(
                 _ => {
                     ai.state = AiState::Idle;
                     ai.job_id = PersonAI::UNEMPLOYED;
+                    ai.target_entity = None;
                     ai.work_progress = 0;
                     continue;
                 }
@@ -191,6 +192,7 @@ pub fn construction_system(
 
             ai.state  = AiState::Idle;
             ai.job_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
 
         // ── Bed building ──────────────────────────────────────────────────────
         } else if ai.job_id == JobKind::ConstructBed as u16 {
@@ -206,6 +208,7 @@ pub fn construction_system(
                 _ => {
                     ai.state = AiState::Idle;
                     ai.job_id = PersonAI::UNEMPLOYED;
+                    ai.target_entity = None;
                     ai.work_progress = 0;
                     continue;
                 }
@@ -241,6 +244,7 @@ pub fn construction_system(
 
             ai.state  = AiState::Idle;
             ai.job_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
         }
     }
 }

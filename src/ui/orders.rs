@@ -147,7 +147,7 @@ pub fn right_click_context_menu_system(
                 PlayerOrderKind::BuildWall => JobKind::Construct,
                 PlayerOrderKind::BuildBed  => JobKind::ConstructBed,
             };
-            assign_job_with_routing(&mut ai, cur_chunk, target_tile, job, &chunk_graph, &chunk_map);
+            assign_job_with_routing(&mut ai, cur_chunk, target_tile, job, None, &chunk_graph, &chunk_map);
         }
         commands.entity(sel_entity).insert(PlayerOrder { order: action, target_tile });
         menu_state.open = false;

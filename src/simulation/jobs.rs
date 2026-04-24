@@ -71,8 +71,8 @@ pub fn find_nearest_plant(
     plant_query: &Query<&Plant>,
     mature_only: bool,
     kind_filter: Option<PlantKind>,
-) -> Option<(i16, i16)> {
-    let mut best: Option<(i16, i16)> = None;
+) -> Option<(Entity, i16, i16)> {
+    let mut best: Option<(Entity, i16, i16)> = None;
     let mut best_dist = i32::MAX;
 
     for dy in -radius..=radius {
@@ -88,7 +88,7 @@ pub fn find_nearest_plant(
                     let dist = dx.abs() + dy.abs();
                     if dist < best_dist {
                         best_dist = dist;
-                        best = Some((tx as i16, ty as i16));
+                        best = Some((entity, tx as i16, ty as i16));
                     }
                 }
             }
@@ -152,6 +152,7 @@ pub fn assign_job_with_routing(
     cur_chunk: ChunkCoord,
     target: (i16, i16),
     job: JobKind,
+    target_entity: Option<Entity>,
     chunk_graph: &ChunkGraph,
     chunk_map: &ChunkMap,
 ) {
@@ -161,6 +162,7 @@ pub fn assign_job_with_routing(
     );
     ai.job_id = job as u16;
     ai.dest_tile = target; // Store final destination
+    ai.target_entity = target_entity;
 
     if dest_chunk == cur_chunk {
         ai.state = AiState::Seeking;
@@ -186,8 +188,8 @@ fn find_nearby_partner(
     sex_query: &Query<(&BiologicalSex, &FactionMember)>,
     self_entity: Entity,
     rel: Option<&RelationshipMemory>,
-) -> Option<(i16, i16)> {
-    let mut best_pos = None;
+) -> Option<(Entity, i16, i16)> {
+    let mut best_res = None;
     let mut best_affinity = i8::MIN;
 
     for dy in -radius..=radius {
@@ -197,16 +199,16 @@ fn find_nearby_partner(
                 if let Ok((other_sex, other_fm)) = sex_query.get(other) {
                     if *other_sex != my_sex && other_fm.faction_id == my_faction {
                         let affinity = rel.map(|r| r.get_affinity(other)).unwrap_or(0);
-                        if best_pos.is_none() || affinity > best_affinity {
+                        if best_res.is_none() || affinity > best_affinity {
                             best_affinity = affinity;
-                            best_pos = Some(((from.0 + dx) as i16, (from.1 + dy) as i16));
+                            best_res = Some((other, (from.0 + dx) as i16, (from.1 + dy) as i16));
                         }
                     }
                 }
             }
         }
     }
-    best_pos
+    best_res
 }
 
 /// Handles goals that don't use the plan system:
@@ -275,7 +277,7 @@ pub fn goal_dispatch_system(
                         if is_active && ai.job_id == JobKind::ReturnCamp as u16 && ai.dest_tile == home {
                             return;
                         }
-                        assign_job_with_routing(&mut ai, cur_chunk, home, JobKind::ReturnCamp, &chunk_graph, &chunk_map);
+                        assign_job_with_routing(&mut ai, cur_chunk, home, JobKind::ReturnCamp, None, &chunk_graph, &chunk_map);
                     }
                 }
             }
@@ -293,6 +295,7 @@ pub fn goal_dispatch_system(
                                 &mut ai, cur_chunk,
                                 (tx as i16, ty as i16),
                                 JobKind::Socialize,
+                                Some(other),
                                 &chunk_graph, &chunk_map,
                             );
                             break 'find;
@@ -304,11 +307,11 @@ pub fn goal_dispatch_system(
             AgentGoal::Reproduce => {
                 if is_active && ai.job_id == JobKind::Reproduce as u16 { return; }
                 if member.faction_id != SOLO {
-                    if let Some(target) = find_nearby_partner(
+                    if let Some((partner, tx, ty)) = find_nearby_partner(
                         &spatial, (cur_tx, cur_ty), 15, *sex,
                         member.faction_id, &sex_query, entity, rel_opt,
                     ) {
-                        assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Reproduce, &chunk_graph, &chunk_map);
+                        assign_job_with_routing(&mut ai, cur_chunk, (tx, ty), JobKind::Reproduce, Some(partner), &chunk_graph, &chunk_map);
                     }
                 }
             }
@@ -320,7 +323,7 @@ pub fn goal_dispatch_system(
                         if let Some(enemy_home) = faction_registry.home_tile(target_id) {
                             assign_job_with_routing(
                                 &mut ai, cur_chunk, enemy_home,
-                                JobKind::Raid, &chunk_graph, &chunk_map,
+                                JobKind::Raid, None, &chunk_graph, &chunk_map,
                             );
                         }
                     }
@@ -333,7 +336,7 @@ pub fn goal_dispatch_system(
                     if let Some(home) = faction_registry.home_tile(member.faction_id) {
                         assign_job_with_routing(
                             &mut ai, cur_chunk, home,
-                            JobKind::Defend, &chunk_graph, &chunk_map,
+                            JobKind::Defend, None, &chunk_graph, &chunk_map,
                         );
                     }
                 }
