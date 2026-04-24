@@ -1,11 +1,15 @@
 use bevy::prelude::*;
 use crate::simulation::animals::{Deer, Wolf};
+use crate::simulation::construction::Bed;
 use crate::simulation::faction::{FactionMember, PlayerFaction, FactionCenter, PlayerFactionMarker};
 use crate::simulation::person::Person;
 use crate::simulation::reproduction::BiologicalSex;
 use crate::rendering::pixel_art::EntityTextures;
 
 use bevy::sprite::Anchor;
+
+#[derive(Component)]
+pub struct BedVisual;
 
 #[derive(Component)]
 pub struct WolfVisual;
@@ -21,6 +25,27 @@ pub struct FactionCenterVisual;
 
 #[derive(Component)]
 pub struct VisualChild;
+
+pub fn spawn_bed_sprites(
+    mut commands: Commands,
+    query: Query<Entity, (With<Bed>, Without<BedVisual>)>,
+    textures: Res<EntityTextures>,
+) {
+    for entity in query.iter() {
+        let mut sprite = Sprite::from_image(textures.bed.clone());
+        sprite.custom_size = Some(Vec2::new(16.0, 10.0));
+        sprite.anchor = Anchor::Center;
+
+        commands.entity(entity).insert(BedVisual).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, 0.0, 0.1),
+                Visibility::Visible,
+            ));
+        });
+    }
+}
 
 pub fn spawn_faction_center_sprites(
     mut commands: Commands,

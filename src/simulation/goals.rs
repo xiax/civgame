@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use super::construction::AutonomousBuildingToggle;
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::lod::LodLevel;
 use super::needs::Needs;
@@ -50,6 +51,7 @@ pub enum AgentGoal {
     Raid       = 5,
     Defend     = 6,
     Sleep      = 7,
+    Build      = 8,
 }
 
 impl AgentGoal {
@@ -63,6 +65,7 @@ impl AgentGoal {
             AgentGoal::Raid       => "Raid",
             AgentGoal::Defend     => "Defend",
             AgentGoal::Sleep      => "Sleep",
+            AgentGoal::Build      => "Build",
         }
     }
 }
@@ -71,6 +74,7 @@ pub fn goal_update_system(
     clock: Res<SimClock>,
     registry: Res<FactionRegistry>,
     calendar: Res<Calendar>,
+    auto_build: Res<AutonomousBuildingToggle>,
     mut query: Query<(
         &mut AgentGoal,
         &Needs,
@@ -136,6 +140,8 @@ pub fn goal_update_system(
             AgentGoal::Sleep
         } else if agent.quantity_of(Good::Food) > 0 && can_return_camp {
             AgentGoal::ReturnCamp
+        } else if needs.shelter > 80.0 && member.faction_id != SOLO && auto_build.0 {
+            AgentGoal::Build
         } else if needs.reproduction > reproduce_threshold {
             AgentGoal::Reproduce
         } else if needs.social > social_threshold {

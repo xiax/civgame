@@ -24,6 +24,7 @@ pub mod memory;
 pub mod neural;
 pub mod plan;
 pub mod technology;
+pub mod construction;
 
 pub use person::PersonAI;
 pub use needs::Needs;
@@ -60,6 +61,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(plants::PlantSpriteIndex::default())
             .insert_resource(step_registry)
             .insert_resource(plan_registry)
+            .insert_resource(construction::AutonomousBuildingToggle(true))
+            .insert_resource(construction::BedMap::default())
             .configure_sets(
                 FixedUpdate,
                 (
@@ -109,6 +112,9 @@ impl Plugin for SimulationPlugin {
                 (
                     gather::gather_system
                         .before(production::production_system),
+                    construction::construction_system
+                        .after(gather::gather_system)
+                        .before(plan::plan_execution_system),
                     movement::movement_system,
                     animals::animal_movement_system,
                     movement::update_spatial_index_system

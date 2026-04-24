@@ -6,11 +6,12 @@ use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::TILE_SIZE;
 use crate::world::tile::TileKind;
 use crate::world::spatial::SpatialIndex;
-use crate::simulation::faction::{FactionMember, PlayerFaction};
+use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
 use crate::simulation::items::GroundItem;
 use crate::simulation::jobs::{JobKind, assign_job_with_routing};
 use crate::simulation::person::{AiState, PersonAI, PlayerOrder, PlayerOrderKind};
 use crate::simulation::plants::PlantMap;
+use crate::simulation::technology::PERM_SETTLEMENT;
 use super::selection::SelectedEntity;
 
 #[derive(Resource, Default)]
@@ -29,6 +30,7 @@ pub fn right_click_context_menu_system(
     selected: Res<SelectedEntity>,
     player_faction: Res<PlayerFaction>,
     faction_q: Query<&FactionMember>,
+    faction_registry: Res<FactionRegistry>,
     mut ai_q: Query<(&mut PersonAI, &Transform)>,
     chunk_map: Res<ChunkMap>,
     plant_map: Res<PlantMap>,
@@ -68,6 +70,18 @@ pub fn right_click_context_menu_system(
                     if let Some(kind) = chunk_map.tile_kind_at(tx, ty) {
                         if matches!(kind, TileKind::Stone | TileKind::Wall) {
                             actions.push(PlayerOrderKind::Mine);
+                        }
+                        if kind.is_passable() {
+                            actions.push(PlayerOrderKind::BuildWall);
+
+                            // Build Bed only if faction has Permanent Settlement tech.
+                            let has_perm = faction_q.get(sel_entity).ok()
+                                .and_then(|m| faction_registry.factions.get(&m.faction_id))
+                                .map(|f| f.techs.has(PERM_SETTLEMENT))
+                                .unwrap_or(false);
+                            if has_perm {
+                                actions.push(PlayerOrderKind::BuildBed);
+                            }
                         }
                     }
                     if plant_map.0.contains_key(&(tx, ty)) {
@@ -126,8 +140,12 @@ pub fn right_click_context_menu_system(
                 cur_ty.div_euclid(CHUNK_SIZE as i32),
             );
             let job = match action {
-                PlayerOrderKind::Move => JobKind::Idle,
-                _ => JobKind::Gather,
+                PlayerOrderKind::Move      => JobKind::Idle,
+                PlayerOrderKind::Mine      => JobKind::Gather,
+                PlayerOrderKind::Gather    => JobKind::Gather,
+                PlayerOrderKind::PickUp    => JobKind::Scavenge,
+                PlayerOrderKind::BuildWall => JobKind::Construct,
+                PlayerOrderKind::BuildBed  => JobKind::ConstructBed,
             };
             assign_job_with_routing(&mut ai, cur_chunk, target_tile, job, &chunk_graph, &chunk_map);
         }

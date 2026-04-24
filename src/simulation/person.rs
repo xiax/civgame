@@ -68,15 +68,19 @@ pub enum PlayerOrderKind {
     Mine,
     Gather,
     PickUp,
+    BuildWall,
+    BuildBed,
 }
 
 impl PlayerOrderKind {
     pub fn label(self) -> &'static str {
         match self {
-            PlayerOrderKind::Move   => "Move here",
-            PlayerOrderKind::Mine   => "Mine",
-            PlayerOrderKind::Gather => "Gather",
-            PlayerOrderKind::PickUp => "Pick up",
+            PlayerOrderKind::Move      => "Move here",
+            PlayerOrderKind::Mine      => "Mine",
+            PlayerOrderKind::Gather    => "Gather",
+            PlayerOrderKind::PickUp    => "Pick up",
+            PlayerOrderKind::BuildWall => "Build Wall",
+            PlayerOrderKind::BuildBed  => "Build Bed",
         }
     }
 }
@@ -228,7 +232,7 @@ pub fn spawn_population(
                     AgentMemory::default(),
                     RelationshipMemory::default(),
                     UtilityNet::new_random(),
-                    KnownPlans::with_innate(&[0, 1, 5, 6]),
+                    KnownPlans::with_innate(&[0, 1, 5, 6, 7, 8]),
                     PlanScoringMethod::UtilityNN,
                 ),
             ));

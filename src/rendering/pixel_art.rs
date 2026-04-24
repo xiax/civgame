@@ -14,6 +14,7 @@ pub struct EntityTextures {
     pub tree_seedling: Handle<Image>,
     pub tree_mature: Handle<Image>,
     pub camp: Handle<Image>,
+    pub bed: Handle<Image>,
 }
 
 #[derive(Clone, Copy)]
@@ -327,6 +328,24 @@ pub fn setup_pixel_art(
         ('b', b), ('x', x), ('.', _t)
     ]);
 
+    // Bed: 16x10 — wooden frame (dark brown), mattress (tan), pillow (white)
+    let p = PixelColor::new(220, 200, 170, 255); // Pillow/light tan
+    let bed_ascii = &[
+        "dddddddddddddddd",
+        "duuuuuuuuuuuuuud",
+        "duppppppuuuuuuud",
+        "duppppppuuuuuuud",
+        "duuuuuuuuuuuuuud",
+        "duuuuuuuuuuuuuud",
+        "duuuuuuuuuuuuuud",
+        "duuuuuuuuuuuuuud",
+        "duuuuuuuuuuuuuud",
+        "dddddddddddddddd",
+    ];
+    let bed_img = ascii_to_image(bed_ascii, &[
+        ('d', d_b), ('u', a), ('p', p), ('.', _t)
+    ]);
+
     commands.insert_resource(EntityTextures {
         wolf: images.add(wolf_img),
         deer: images.add(deer_img),
@@ -338,5 +357,6 @@ pub fn setup_pixel_art(
         tree_seedling: images.add(tree_seedling_img),
         tree_mature: images.add(tree_mature_img),
         camp: images.add(camp_img),
+        bed: images.add(bed_img),
     });
 }

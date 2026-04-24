@@ -9,6 +9,7 @@ use crate::world::terrain::TILE_SIZE;
 use crate::world::tile::TileKind;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
+use super::construction::{BedMap, BuildSiteKind, find_wall_build_site, find_bed_build_site};
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::AgentGoal;
 use super::items::{GroundItem, TargetItem};
@@ -23,6 +24,7 @@ use super::person::{AiState, PersonAI, PlayerOrder};
 use super::plants::{PlantMap, PlantKind, Plant};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
+use super::technology::TechId;
 
 pub type StepId = u8;
 pub type PlanId = u16;
@@ -34,6 +36,7 @@ pub enum StepTarget {
     FactionCamp,
     FromMemory(MemoryKind),
     HuntPrey,
+    NearestBuildSite(BuildSiteKind),
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +69,8 @@ pub struct PlanDef {
     pub steps:        &'static [StepId],
     pub feature_vec:  [f32; PLAN_FEAT_DIM],
     pub serves_goals: &'static [AgentGoal],
+    /// Faction must have unlocked this tech for the plan to be selectable.
+    pub tech_gate:    Option<TechId>,
 }
 
 #[derive(Resource, Default)]
@@ -164,12 +169,15 @@ static PLAN_STEPS_1: &[StepId] = &[1];    // FarmFood
 static PLAN_STEPS_2: &[StepId] = &[2];    // GatherWood
 static PLAN_STEPS_3: &[StepId] = &[3];    // GatherStone
 static PLAN_STEPS_4: &[StepId] = &[4, 1]; // PlantAndFarm
-static PLAN_STEPS_5: &[StepId] = &[5, 6];    // HuntFood
-static PLAN_STEPS_6: &[StepId] = &[6];       // ScavengeFood
+static PLAN_STEPS_5: &[StepId] = &[5, 6]; // HuntFood
+static PLAN_STEPS_6: &[StepId] = &[6];    // ScavengeFood
+static PLAN_STEPS_7: &[StepId] = &[7];    // BuildWoodWall
+static PLAN_STEPS_8: &[StepId] = &[8];    // BuildBed
 
-static SURVIVE_GOALS: &[AgentGoal] = &[AgentGoal::Survive];
-static GATHER_GOALS:  &[AgentGoal] = &[AgentGoal::Gather];
-static SURVIVE_AND_GATHER_GOALS: &[AgentGoal] = &[AgentGoal::Survive, AgentGoal::Gather];
+static SURVIVE_GOALS:             &[AgentGoal] = &[AgentGoal::Survive];
+static GATHER_GOALS:              &[AgentGoal] = &[AgentGoal::Gather];
+static SURVIVE_AND_GATHER_GOALS:  &[AgentGoal] = &[AgentGoal::Survive, AgentGoal::Gather];
+static BUILD_GOALS:               &[AgentGoal] = &[AgentGoal::Build];
 
 pub fn register_builtin_steps(registry: &mut StepRegistry) {
     registry.0 = vec![
@@ -229,6 +237,22 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             reward_scale: 0.4,
             plant_filter: None,
         },
+        StepDef { // 7: BuildWall — go to a wall site and build a wall (costs 2 Wood)
+            id: 7, job: JobKind::Construct,
+            target: StepTarget::NearestBuildSite(BuildSiteKind::Wall),
+            preconditions: StepPreconditions::needs_good(Good::Wood, 2),
+            memory_kind: None,
+            reward_scale: 0.8,
+            plant_filter: None,
+        },
+        StepDef { // 8: BuildBed — place a bed inside an enclosed area (costs 3 Wood)
+            id: 8, job: JobKind::ConstructBed,
+            target: StepTarget::NearestBuildSite(BuildSiteKind::Bed),
+            preconditions: StepPreconditions::needs_good(Good::Wood, 3),
+            memory_kind: None,
+            reward_scale: 1.0,
+            plant_filter: None,
+        },
     ];
 }
 
@@ -240,37 +264,48 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         PlanDef { id: 0, name: "ForageFood",
             steps: PLAN_STEPS_0,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.0],
-            serves_goals: SURVIVE_AND_GATHER_GOALS,
+            serves_goals: SURVIVE_AND_GATHER_GOALS, tech_gate: None,
         },
         PlanDef { id: 1, name: "FarmFood",
             steps: PLAN_STEPS_1,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.0],
-            serves_goals: SURVIVE_GOALS,
+            serves_goals: SURVIVE_GOALS, tech_gate: None,
         },
         PlanDef { id: 2, name: "GatherWood",
             steps: PLAN_STEPS_2,
             feature_vec: [0.0, 1.0, 0.0,  0.0, 0.0, 0.0,  0.1, 0.1],
-            serves_goals: GATHER_GOALS,
+            serves_goals: GATHER_GOALS, tech_gate: None,
         },
         PlanDef { id: 3, name: "GatherStone",
             steps: PLAN_STEPS_3,
             feature_vec: [0.0, 0.0, 1.0,  0.0, 0.0, 0.0,  0.1, 0.1],
-            serves_goals: GATHER_GOALS,
+            serves_goals: GATHER_GOALS, tech_gate: None,
         },
         PlanDef { id: 4, name: "PlantAndFarm",
             steps: PLAN_STEPS_4,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.2, 0.0],
-            serves_goals: SURVIVE_GOALS,
+            serves_goals: SURVIVE_GOALS, tech_gate: None,
         },
         PlanDef { id: 5, name: "HuntFood",
             steps: PLAN_STEPS_5,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.2, 1.0],
-            serves_goals: SURVIVE_GOALS,
+            serves_goals: SURVIVE_GOALS, tech_gate: None,
         },
         PlanDef { id: 6, name: "ScavengeFood",
             steps: PLAN_STEPS_6,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.0],
-            serves_goals: SURVIVE_GOALS,
+            serves_goals: SURVIVE_GOALS, tech_gate: None,
+        },
+        PlanDef { id: 7, name: "BuildWoodWall",
+            steps: PLAN_STEPS_7,
+            feature_vec: [0.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.1, 0.0],
+            serves_goals: BUILD_GOALS, tech_gate: None,
+        },
+        PlanDef { id: 8, name: "BuildBed",
+            steps: PLAN_STEPS_8,
+            feature_vec: [0.0, 0.0, 0.0,  0.0, 0.0, 0.0,  0.1, 0.0],
+            serves_goals: BUILD_GOALS,
+            tech_gate: Some(super::technology::PERM_SETTLEMENT),
         },
     ];
 }
@@ -339,6 +374,7 @@ fn resolve_target(
     prey_query: &Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
     combat_target: &mut CombatTarget,
     target_item: &mut TargetItem,
+    bed_map: &BedMap,
 ) -> Option<(i16, i16)> {
     const VIEW_RADIUS: i32 = 15;
 
@@ -448,6 +484,13 @@ fn resolve_target(
         StepTarget::FactionCamp => {
             faction_registry.home_tile(faction_id)
         }
+        StepTarget::NearestBuildSite(kind) => {
+            let Some(home) = faction_registry.home_tile(faction_id) else { return None };
+            match kind {
+                BuildSiteKind::Wall => find_wall_build_site(chunk_map, home, 20),
+                BuildSiteKind::Bed  => find_bed_build_site(chunk_map, bed_map, home, 15),
+            }
+        }
     }
 }
 
@@ -496,6 +539,7 @@ pub fn plan_execution_system(
     plan_registry: Res<PlanRegistry>,
     step_registry: Res<StepRegistry>,
     faction_registry: Res<FactionRegistry>,
+    bed_map: Res<BedMap>,
     calendar: Res<Calendar>,
     clock: Res<SimClock>,
     item_check: Query<(), With<GroundItem>>,
@@ -515,7 +559,7 @@ pub fn plan_execution_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
 
         // Only handle plan-driven goals
-        if !matches!(goal, AgentGoal::Survive | AgentGoal::Gather) { continue; }
+        if !matches!(goal, AgentGoal::Survive | AgentGoal::Gather | AgentGoal::Build) { continue; }
 
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
@@ -531,6 +575,11 @@ pub fn plan_execution_system(
 
             let candidates: Vec<&PlanDef> = plan_registry.0.iter()
                 .filter(|p| p.serves_goals.contains(&goal) && known_plans.knows(p.id))
+                .filter(|p| p.tech_gate.map_or(true, |tid| {
+                    faction_registry.factions.get(&member.faction_id)
+                        .map(|f| f.techs.has(tid))
+                        .unwrap_or(false)
+                }))
                 .collect();
             if candidates.is_empty() { continue; }
 
@@ -680,7 +729,7 @@ pub fn plan_execution_system(
                 &faction_registry, member.faction_id,
                 memory_opt, &item_check,
                 &prey_query, &mut combat_target,
-                &mut target_item,
+                &mut target_item, &bed_map,
             ) {
                 assign_job_with_routing(&mut ai, cur_chunk, target, step_def.job, &chunk_graph, &chunk_map);
                 active_plan.dispatched = true;

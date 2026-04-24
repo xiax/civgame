@@ -18,14 +18,16 @@ use super::plants::{PlantMap, Plant, GrowthStage, PlantKind};
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
-    Idle    = 0,
-    Gather  = 1,
-    Trader  = 2,
-    Raid    = 3,
-    Defend  = 4,
-    Planter = 5,
-    Hunter  = 6,
-    Scavenge = 7,
+    Idle         = 0,
+    Gather       = 1,
+    Trader       = 2,
+    Raid         = 3,
+    Defend       = 4,
+    Planter      = 5,
+    Hunter       = 6,
+    Scavenge     = 7,
+    Construct    = 8,  // build wall tile
+    ConstructBed = 9,  // spawn bed entity
 }
 
 pub fn find_nearest_tile(
@@ -309,8 +311,8 @@ pub fn goal_dispatch_system(
                 ai.state = AiState::Sleeping;
             }
 
-            // Survive and Gather are handled by plan_execution_system
-            AgentGoal::Survive | AgentGoal::Gather => {}
+            // Survive, Gather, and Build are handled by plan_execution_system
+            AgentGoal::Survive | AgentGoal::Gather | AgentGoal::Build => {}
         }
     });
 }

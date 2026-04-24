@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
+use crate::simulation::construction::AutonomousBuildingToggle;
 use crate::simulation::faction::{FactionRegistry, PlayerFaction};
 use crate::simulation::person::Person;
 use crate::simulation::schedule::SimClock;
@@ -11,6 +12,7 @@ pub fn hud_system(
     mut contexts: EguiContexts,
     mut clock: ResMut<SimClock>,
     mut mode: ResMut<EconomicMode>,
+    mut auto_build: ResMut<AutonomousBuildingToggle>,
     calendar: Res<Calendar>,
     player_faction: Res<PlayerFaction>,
     registry: Res<FactionRegistry>,
@@ -54,6 +56,19 @@ pub fn hud_system(
                         ui.separator();
                         if ui.button(mode.label()).clicked() {
                             *mode = mode.cycle();
+                        }
+
+                        ui.separator();
+                        let build_lbl = if auto_build.0 { "Build: ON" } else { "Build: OFF" };
+                        let build_btn = egui::Button::new(build_lbl).fill(
+                            if auto_build.0 {
+                                egui::Color32::from_rgb(60, 180, 80)
+                            } else {
+                                egui::Color32::from_gray(60)
+                            },
+                        );
+                        if ui.add(build_btn).clicked() {
+                            auto_build.0 = !auto_build.0;
                         }
 
                         ui.separator();
