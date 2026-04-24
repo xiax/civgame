@@ -114,6 +114,8 @@ impl Plugin for SimulationPlugin {
                     movement::update_spatial_index_system
                         .after(movement::movement_system)
                         .after(animals::animal_movement_system),
+                    memory::vision_system
+                        .after(movement::update_spatial_index_system),
                     combat::combat_system
                         .after(movement::update_spatial_index_system),
                     combat::death_system

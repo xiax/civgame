@@ -168,6 +168,7 @@ static PLAN_STEPS_6: &[StepId] = &[6];       // ScavengeFood
 
 static SURVIVE_GOALS: &[AgentGoal] = &[AgentGoal::Survive];
 static GATHER_GOALS:  &[AgentGoal] = &[AgentGoal::Gather];
+static SURVIVE_AND_GATHER_GOALS: &[AgentGoal] = &[AgentGoal::Survive, AgentGoal::Gather];
 
 pub fn register_builtin_steps(registry: &mut StepRegistry) {
     registry.0 = vec![
@@ -216,7 +217,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             target: StepTarget::HuntPrey,
             preconditions: StepPreconditions::none(),
             memory_kind: Some(MemoryKind::Food),
-            reward_scale: 1.0,
+            reward_scale: 0.4,
             plant_filter: None,
         },
         StepDef { // 6: CollectFood
@@ -224,7 +225,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             target: StepTarget::NearestItem(Good::Food),
             preconditions: StepPreconditions::none(),
             memory_kind: None,
-            reward_scale: 1.0,
+            reward_scale: 0.4,
             plant_filter: None,
         },
     ];
@@ -237,8 +238,8 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
     registry.0 = vec![
         PlanDef { id: 0, name: "ForageFood",
             steps: PLAN_STEPS_0,
-            feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.1],
-            serves_goals: SURVIVE_GOALS,
+            feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.0],
+            serves_goals: SURVIVE_AND_GATHER_GOALS,
         },
         PlanDef { id: 1, name: "FarmFood",
             steps: PLAN_STEPS_1,
@@ -338,71 +339,96 @@ fn resolve_target(
     combat_target: &mut CombatTarget,
     target_item: &mut TargetItem,
 ) -> Option<(i16, i16)> {
+    const VIEW_RADIUS: i32 = 15;
+
     match &step.target {
         StepTarget::HuntPrey => {
-            let mut best: Option<(Entity, i16, i16)> = None;
-            let mut best_dist = i32::MAX;
-            let radius = 50i32;
-
-            for dy in -radius..=radius {
-                for dx in -radius..=radius {
-                    for &candidate in spatial.get(pos.0 + dx, pos.1 + dy) {
+            // 1. Check vision
+            let mut best_v: Option<(Entity, i16, i16)> = None;
+            let mut best_dist_v = i32::MAX;
+            for dy in -VIEW_RADIUS..=VIEW_RADIUS {
+                for dx in -VIEW_RADIUS..=VIEW_RADIUS {
+                    if dx*dx + dy*dy > VIEW_RADIUS*VIEW_RADIUS { continue; }
+                    let tx = pos.0 + dx;
+                    let ty = pos.1 + dy;
+                    if !super::line_of_sight::has_los(chunk_map, pos, (tx, ty)) { continue; }
+                    for &candidate in spatial.get(tx, ty) {
                         if let Ok((_transform, health)) = prey_query.get(candidate) {
                             if !health.is_dead() {
                                 let dist = dx.abs() + dy.abs();
-                                if dist < best_dist {
-                                    best_dist = dist;
-                                    best = Some((candidate, (pos.0 + dx) as i16, (pos.1 + dy) as i16));
+                                if dist < best_dist_v {
+                                    best_dist_v = dist;
+                                    best_v = Some((candidate, tx as i16, ty as i16));
                                 }
                             }
                         }
                     }
                 }
             }
-
-            if let Some((entity, tx, ty)) = best {
+            if let Some((entity, tx, ty)) = best_v {
                 combat_target.0 = Some(entity);
                 return Some((tx, ty));
+            }
+
+            // 2. Check memory
+            if let Some(mem) = memory {
+                if let Some((entity, tx, ty)) = mem.best_entity_for_dist_weighted(MemoryKind::Prey, pos) {
+                    combat_target.0 = Some(entity);
+                    return Some((tx, ty));
+                }
             }
             None
         }
         StepTarget::FromMemory(kind) => {
-            let from_mem = memory.and_then(|m| m.best_for(*kind));
-            if from_mem.is_some() { return from_mem; }
-
-            if *kind == MemoryKind::Food {
-                return find_nearest_plant(plant_map, pos, 120, plant_query, true, step.plant_filter);
-            }
-
-            if *kind == MemoryKind::Wood {
-                if let Some(tree_pos) = find_nearest_plant(plant_map, pos, 120, plant_query, true, Some(PlantKind::Tree)) {
-                    return Some(tree_pos);
+            // 1. Check vision
+            let vision_target = match kind {
+                MemoryKind::Food => find_nearest_plant(plant_map, pos, VIEW_RADIUS, plant_query, true, step.plant_filter),
+                MemoryKind::Wood => find_nearest_plant(plant_map, pos, VIEW_RADIUS, plant_query, true, Some(PlantKind::Tree)),
+                MemoryKind::Stone => find_nearest_tile(chunk_map, pos, VIEW_RADIUS, STONE_TILES),
+                _ => None,
+            };
+            if let Some(target) = vision_target {
+                if super::line_of_sight::has_los(chunk_map, pos, (target.0 as i32, target.1 as i32)) {
+                    return Some(target);
                 }
             }
 
-            // Fallback: nearest tile by kind for other resources
-            let fallback_tiles: &[TileKind] = match kind {
-                MemoryKind::Food  => &[], // Handled above
-                MemoryKind::Wood  => FOREST_TILES,
-                MemoryKind::Stone => STONE_TILES,
-                MemoryKind::Seed  => FARMLAND_TILES,
-            };
-            find_nearest_tile(chunk_map, pos, 120, fallback_tiles)
+            // 2. Check memory
+            if let Some(mem) = memory {
+                return mem.best_for_dist_weighted(*kind, pos);
+            }
+            None
         }
         StepTarget::NearestTile(_tiles) => {
             if step.job == JobKind::Planter {
-                find_nearest_unplanted_farmland(chunk_map, plant_map, pos, 60)
+                find_nearest_unplanted_farmland(chunk_map, plant_map, pos, VIEW_RADIUS)
             } else {
-                find_nearest_tile(chunk_map, pos, 120, _tiles)
+                find_nearest_tile(chunk_map, pos, VIEW_RADIUS, _tiles)
             }
         }
-        StepTarget::NearestItem(_good) => {
-            if let Some((entity, tx, ty)) = find_nearest_item(spatial, pos, 120, item_check) {
-                target_item.0 = Some(entity);
-                Some((tx, ty))
-            } else {
-                None
+        StepTarget::NearestItem(good) => {
+            // 1. Check vision
+            if let Some((entity, tx, ty)) = find_nearest_item(spatial, pos, VIEW_RADIUS, item_check) {
+                if super::line_of_sight::has_los(chunk_map, pos, (tx as i32, ty as i32)) {
+                    target_item.0 = Some(entity);
+                    return Some((tx, ty));
+                }
             }
+            // 2. Check memory
+            if let Some(mem) = memory {
+                let mkind = match good {
+                    Good::Food => MemoryKind::Food,
+                    Good::Wood => MemoryKind::Wood,
+                    Good::Stone => MemoryKind::Stone,
+                    Good::Seed => MemoryKind::Seed,
+                    _ => return None,
+                };
+                if let Some((entity, tx, ty)) = mem.best_entity_for_dist_weighted(mkind, pos) {
+                    target_item.0 = Some(entity);
+                    return Some((tx, ty));
+                }
+            }
+            None
         }
         StepTarget::FactionCamp => {
             faction_registry.home_tile(faction_id)
@@ -497,12 +523,39 @@ pub fn plan_execution_system(
                 PlanScoringMethod::UtilityNN => {
                     if let Some(ref mut net) = net_opt {
                         let state = build_state_vec(needs, agent, skills, member, memory_opt, &calendar);
-                        let scores: Vec<(u16, f32)> = candidates.iter()
+                        let mut scores: Vec<(u16, f32)> = candidates.iter()
                             .map(|p| (p.id, net.score_plan(state, p.feature_vec, p.id)))
                             .collect();
+                        
+                        // Apply distance penalties
+                        let camp_pos = faction_registry.home_tile(member.faction_id);
+                        for (plan_id, score) in scores.iter_mut() {
+                            // Find target memory kind for this plan
+                            let mkind = if *plan_id == 5 { Some(MemoryKind::Prey) } // Hunt
+                                else if *plan_id == 0 || *plan_id == 1 || *plan_id == 6 { Some(MemoryKind::Food) }
+                                else if *plan_id == 2 { Some(MemoryKind::Wood) }
+                                else if *plan_id == 3 { Some(MemoryKind::Stone) }
+                                else { None };
+
+                            let target_tile = mkind.and_then(|k| {
+                                memory_opt.and_then(|m| m.best_for_dist_weighted(k, (cur_tx, cur_ty)))
+                            });
+
+                            if let Some(target) = target_tile {
+                                let dist_agent = (target.0 as i32 - cur_tx).abs() + (target.1 as i32 - cur_ty).abs();
+                                let dist_camp = camp_pos.map_or(0, |c| (target.0 as i32 - c.0 as i32).abs() + (target.1 as i32 - c.1 as i32).abs());
+                                
+                                // Penalty: -0.002 per tile of total distance
+                                *score -= (dist_agent + dist_camp) as f32 * 0.002;
+                            } else {
+                                // No known target for this plan — heavy penalty to favor plans with known targets
+                                *score -= 0.5;
+                            }
+                        }
+
                         let idx = UtilityNet::select_plan_idx(&scores);
-                        // Re-score selected plan to save correct activations for learning
                         let selected = candidates[idx];
+                        // Re-score selected plan to save correct activations for learning (using unpenalized score for NN internals)
                         net.score_plan(state, selected.feature_vec, selected.id);
                         selected
                     } else {

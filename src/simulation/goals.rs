@@ -120,7 +120,7 @@ pub fn goal_update_system(
             registry.food_stock(member.faction_id) < cap
         };
 
-        let new_goal = if needs.hunger > 80.0 || agent.quantity_of(Good::Food) < 3 {
+        let new_goal = if needs.hunger > 120.0 || (needs.hunger > 60.0 && agent.quantity_of(Good::Food) < 3) {
             AgentGoal::Survive
         } else if needs.sleep > 180.0 {
             AgentGoal::Sleep
