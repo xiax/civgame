@@ -67,7 +67,13 @@ impl Plugin for SimulationPlugin {
                     SimulationSet::Economy.after(SimulationSet::Sequential),
                 ),
             )
-            .add_systems(PostStartup, (person::spawn_population, animals::spawn_animals.after(person::spawn_population)))
+            .add_systems(PostStartup, (
+                person::spawn_population
+                    .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                animals::spawn_animals
+                    .after(person::spawn_population)
+                    .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+            ))
             .add_systems(
                 FixedUpdate,
                 (

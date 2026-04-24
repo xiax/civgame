@@ -156,7 +156,7 @@ pub fn animal_movement_system(
 
         if dist > 2.0 {
             let dir = to_target.normalize();
-            let step = dir * ANIMAL_SPEED * dt;
+            let step = dir * ANIMAL_SPEED * dt * clock.speed;
             let new_pos = pos + step;
             transform.translation.x = new_pos.x;
             transform.translation.y = new_pos.y;

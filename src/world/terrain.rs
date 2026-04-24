@@ -69,27 +69,35 @@ fn generate_chunk_with_thresholds(
     Chunk::new(tiles)
 }
 
-pub fn spawn_world_system(mut chunk_map: ResMut<ChunkMap>) {
+pub fn spawn_world_system(
+    mut chunk_map: ResMut<ChunkMap>,
+    sandbox: Option<Res<crate::sandbox::SandboxMode>>,
+) {
     use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 
     let perlin = Perlin::default().set_seed(42);
 
-    // Generate the initial area: WORLD_CHUNKS_X×WORLD_CHUNKS_Y chunks
-    // centered on the globe center so agents and population systems have tiles to work with.
     let start_cx = (GLOBE_WIDTH  / 2) * GLOBE_CELL_CHUNKS;
     let start_cy = (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS;
 
-    for dy in 0..WORLD_CHUNKS_Y {
-        for dx in 0..WORLD_CHUNKS_X {
+    let (chunks_x, chunks_y) = if sandbox.is_some() { (5, 5) } else { (WORLD_CHUNKS_X, WORLD_CHUNKS_Y) };
+
+    for dy in 0..chunks_y {
+        for dx in 0..chunks_x {
             let coord = ChunkCoord(start_cx + dx, start_cy + dy);
-            let chunk = generate_chunk(coord, &perlin);
+            // Sandbox uses no-water thresholds for a purely walkable test area.
+            let chunk = if sandbox.is_some() {
+                generate_chunk_with_thresholds(coord, &perlin, -1.0, 0.4, 0.65, 0.85)
+            } else {
+                generate_chunk(coord, &perlin)
+            };
             chunk_map.0.insert(coord, chunk);
         }
     }
 
     info!(
         "Initial area generated: {}x{} chunks at globe center ({},{})",
-        WORLD_CHUNKS_X, WORLD_CHUNKS_Y, start_cx, start_cy
+        chunks_x, chunks_y, start_cx, start_cy
     );
 }
 

@@ -33,6 +33,7 @@ pub fn movement_system(
     )>,
 ) {
     let dt = time.delta_secs();
+    let speed = clock.speed;
     let sim_dt = dt * clock.scale_factor();
 
     // Movement can't be fully parallel because it writes Transform (position sync)
@@ -50,7 +51,7 @@ pub fn movement_system(
         if dist > 2.0 {
             // Move toward target — runs EVERY tick for smoothness
             let dir = to_target.normalize();
-            let step = dir * MOVE_SPEED * dt;
+            let step = dir * MOVE_SPEED * dt * speed;
             let new_pos = pos + step;
             transform.translation.x = new_pos.x;
             transform.translation.y = new_pos.y;
@@ -67,13 +68,13 @@ pub fn movement_system(
                 AiState::Working => {
                     // Production system handles output; only accumulate progress when bucket is active.
                     if clock.is_active(slot.0) {
-                        let progress = (sim_dt * 20.0).max(1.0) as u8;
+                        let progress = (sim_dt * 20.0).max(0.0) as u8;
                         ai.work_progress = ai.work_progress.saturating_add(progress);
                     }
                 }
                 AiState::Idle => {
                     // Random wander
-                    mv.wander_timer -= dt;
+                    mv.wander_timer -= dt * speed;
                     if mv.wander_timer <= 0.0 {
                         mv.wander_timer = IDLE_WANDER_INTERVAL;
 

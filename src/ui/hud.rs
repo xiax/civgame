@@ -34,9 +34,19 @@ pub fn hud_system(
                             egui::RichText::new("Speed:")
                                 .color(egui::Color32::WHITE),
                         );
-                        if ui.button("1×").clicked() { clock.speed = 1.0; }
-                        if ui.button("2×").clicked() { clock.speed = 2.0; }
-                        if ui.button("5×").clicked() { clock.speed = 5.0; }
+
+                        let active_fill = egui::Color32::from_rgb(60, 120, 200);
+                        for (label, target) in [("⏸", 0.0_f32), ("1×", 1.0), ("2×", 2.0), ("5×", 5.0)] {
+                            let btn = egui::Button::new(label);
+                            let btn = if (clock.speed - target).abs() < 0.01 {
+                                btn.fill(active_fill)
+                            } else {
+                                btn
+                            };
+                            if ui.add(btn).clicked() {
+                                clock.speed = target;
+                            }
+                        }
 
                         ui.separator();
                         if ui.button(mode.label()).clicked() {
