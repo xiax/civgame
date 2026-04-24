@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use crate::simulation::animals::{Deer, Wolf};
+use crate::simulation::faction::{FactionMember, PlayerFaction};
 use crate::simulation::person::Person;
 use crate::simulation::reproduction::BiologicalSex;
 use crate::rendering::pixel_art::EntityTextures;
@@ -57,6 +58,30 @@ pub fn spawn_deer_sprites(
                 Visibility::Visible,
             ));
         });
+    }
+}
+
+/// Tint sprites blue for the player's faction, white for everyone else.
+/// Uses Changed<FactionMember> so it only runs when membership actually changes.
+pub fn update_faction_sprite_colors(
+    player_faction: Res<PlayerFaction>,
+    persons: Query<
+        (&FactionMember, &Children),
+        (With<Person>, With<PersonVisual>, Changed<FactionMember>),
+    >,
+    mut sprites: Query<&mut Sprite, With<VisualChild>>,
+) {
+    for (member, children) in persons.iter() {
+        let color = if member.faction_id == player_faction.faction_id {
+            Color::srgb(0.55, 0.85, 1.0)
+        } else {
+            Color::WHITE
+        };
+        for &child in children.iter() {
+            if let Ok(mut sprite) = sprites.get_mut(child) {
+                sprite.color = color;
+            }
+        }
     }
 }
 

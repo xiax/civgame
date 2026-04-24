@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
+use crate::simulation::faction::{FactionRegistry, PlayerFaction};
 use crate::simulation::person::Person;
 use crate::simulation::schedule::SimClock;
 use crate::economy::mode::EconomicMode;
@@ -11,6 +12,8 @@ pub fn hud_system(
     mut clock: ResMut<SimClock>,
     mut mode: ResMut<EconomicMode>,
     calendar: Res<Calendar>,
+    player_faction: Res<PlayerFaction>,
+    registry: Res<FactionRegistry>,
     persons: Query<(), With<Person>>,
 ) {
     let pop = persons.iter().count();
@@ -75,6 +78,21 @@ pub fn hud_system(
                                 .color(egui::Color32::GRAY),
                         );
                     });
+
+                    let fid = player_faction.faction_id;
+                    if fid != 0 {
+                        if let Some(data) = registry.factions.get(&fid) {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Your Faction #{fid}:  food: {:.1}  |  members: {}",
+                                        data.food_stock, data.member_count
+                                    ))
+                                    .color(egui::Color32::from_rgb(140, 215, 255)),
+                                );
+                            });
+                        }
+                    }
                 });
         });
 }

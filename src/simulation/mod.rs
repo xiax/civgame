@@ -53,6 +53,7 @@ impl Plugin for SimulationPlugin {
         app.add_event::<combat::CombatEvent>()
             .insert_resource(SimClock::default())
             .insert_resource(faction::FactionRegistry::default())
+            .insert_resource(faction::PlayerFaction::default())
             .insert_resource(reproduction::MaleCandidates::default())
             .insert_resource(production::TileDepletion::default())
             .insert_resource(plants::PlantMap::default())
@@ -72,6 +73,9 @@ impl Plugin for SimulationPlugin {
                 person::spawn_population
                     .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                 animals::spawn_animals
+                    .after(person::spawn_population)
+                    .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                faction::center_camera_on_player_faction
                     .after(person::spawn_population)
                     .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
             ))

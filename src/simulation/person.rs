@@ -7,7 +7,7 @@ use crate::world::tile::TileKind;
 use crate::economy::agent::EconomicAgent;
 
 use super::combat::{CombatTarget, Body, CombatCooldown};
-use super::faction::FactionMember;
+use super::faction::{FactionMember, FactionRegistry, PlayerFaction};
 use super::goals::{AgentGoal, Personality};
 use super::items::Equipment;
 use super::lod::LodLevel;
@@ -60,11 +60,15 @@ impl PersonAI {
 pub struct Person;
 
 pub const INITIAL_POPULATION: u32 = 1_000;
+const GROUP_SIZE: u32 = 20;
+const SPAWN_RADIUS: i32 = 12;
 
 pub fn spawn_population(
     mut commands: Commands,
     chunk_map: Res<ChunkMap>,
     mut clock: ResMut<SimClock>,
+    mut registry: ResMut<FactionRegistry>,
+    mut player_faction: ResMut<PlayerFaction>,
 ) {
     use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 
@@ -78,67 +82,100 @@ pub fn spawn_population(
     let start_tx = start_cx * CHUNK_SIZE as i32;
     let start_ty = start_cy * CHUNK_SIZE as i32;
 
+    let num_groups = INITIAL_POPULATION / GROUP_SIZE;
     let mut spawned = 0u32;
-    let mut attempts = 0u32;
 
-    while spawned < INITIAL_POPULATION && attempts < INITIAL_POPULATION * 20 {
-        attempts += 1;
-        let tx = start_tx + rng.gen_range(0..total_tiles_x);
-        let ty = start_ty + rng.gen_range(0..total_tiles_y);
-
-        if !chunk_map.is_passable(tx, ty) {
-            continue;
+    // Helper: find a valid passable non-stone tile near (cx, cy) within radius, or anywhere in
+    // the spawn region as fallback.
+    let find_tile = |rng: &mut rand::rngs::ThreadRng, cx: i32, cy: i32| -> Option<(i32, i32)> {
+        for _ in 0..200 {
+            let tx = cx + rng.gen_range(-SPAWN_RADIUS..=SPAWN_RADIUS);
+            let ty = cy + rng.gen_range(-SPAWN_RADIUS..=SPAWN_RADIUS);
+            if chunk_map.is_passable(tx, ty)
+                && !matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
+            {
+                return Some((tx, ty));
+            }
         }
-        if matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone)) {
-            continue;
+        None
+    };
+
+    for group_idx in 0..num_groups {
+        // Find a home tile for this group anywhere in the spawn region.
+        let home = {
+            let mut result = None;
+            for _ in 0..500 {
+                let tx = start_tx + rng.gen_range(0..total_tiles_x);
+                let ty = start_ty + rng.gen_range(0..total_tiles_y);
+                if chunk_map.is_passable(tx, ty)
+                    && !matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
+                {
+                    result = Some((tx, ty));
+                    break;
+                }
+            }
+            result
+        };
+
+        let Some((home_tx, home_ty)) = home else { continue };
+
+        let faction_id = registry.create_faction((home_tx as i16, home_ty as i16));
+
+        if group_idx == 0 {
+            player_faction.faction_id = faction_id;
         }
 
-        let world_pos = tile_to_world(tx, ty);
+        for _ in 0..GROUP_SIZE {
+            let Some((tx, ty)) = find_tile(&mut rng, home_tx, home_ty) else { continue };
 
-        commands.spawn((
-            (
-                Person,
-                Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
-                GlobalTransform::default(),
-                Needs::new(30.0, 20.0, 10.0, 5.0, 40.0),
-                Mood::default(),
-                Skills::default(),
-                PersonAI {
-                    job_id: PersonAI::UNEMPLOYED,
-                    state: AiState::Idle,
-                    target_tile: (tx as i16, ty as i16),
-                    ticks_idle: 0,
-                    work_progress: 0,
-                },
-                EconomicAgent::default(),
-            ),
-            (
-                LodLevel::Full,
-                BucketSlot(spawned),
-                MovementState { wander_timer: (spawned % 100) as f32 * 0.025 },
-                BiologicalSex::random(),
-                Personality::random(),
-                AgentGoal::default(),
-                FactionMember::default(),
-                Body::new_humanoid(),
-                Equipment::default(),
-                CombatTarget::default(),
-                CombatCooldown::default(),
-            ),
-            (
-                AgentMemory::default(),
-                RelationshipMemory::default(),
-                UtilityNet::new_random(),
-                KnownPlans::with_innate(&[0, 1, 5]),
-                PlanScoringMethod::UtilityNN,
-            ),
-        ));
+            let world_pos = tile_to_world(tx, ty);
 
-        spawned += 1;
+            commands.spawn((
+                (
+                    Person,
+                    Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
+                    GlobalTransform::default(),
+                    Needs::new(30.0, 20.0, 10.0, 5.0, 40.0),
+                    Mood::default(),
+                    Skills::default(),
+                    PersonAI {
+                        job_id: PersonAI::UNEMPLOYED,
+                        state: AiState::Idle,
+                        target_tile: (tx as i16, ty as i16),
+                        ticks_idle: 0,
+                        work_progress: 0,
+                    },
+                    EconomicAgent::default(),
+                ),
+                (
+                    LodLevel::Full,
+                    BucketSlot(spawned),
+                    MovementState { wander_timer: (spawned % 100) as f32 * 0.025 },
+                    BiologicalSex::random(),
+                    Personality::random(),
+                    AgentGoal::default(),
+                    FactionMember { faction_id, ..Default::default() },
+                    Body::new_humanoid(),
+                    Equipment::default(),
+                    CombatTarget::default(),
+                    CombatCooldown::default(),
+                ),
+                (
+                    AgentMemory::default(),
+                    RelationshipMemory::default(),
+                    UtilityNet::new_random(),
+                    KnownPlans::with_innate(&[0, 1, 5]),
+                    PlanScoringMethod::UtilityNN,
+                ),
+            ));
+
+            registry.add_member(faction_id);
+            spawned += 1;
+        }
     }
 
     clock.population = spawned;
     clock.current_end = clock.bucket_size.min(spawned);
 
-    info!("Spawned {} people", spawned);
+    info!("Spawned {} people in {} factions of {}", spawned, num_groups, GROUP_SIZE);
 }

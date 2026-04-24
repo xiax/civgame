@@ -1,7 +1,7 @@
 use ahash::AHashMap;
 use bevy::prelude::*;
 use crate::world::spatial::SpatialIndex;
-use crate::world::terrain::TILE_SIZE;
+use crate::world::terrain::{TILE_SIZE, tile_to_world};
 use super::goals::{AgentGoal, Personality};
 use super::memory::RelationshipMemory;
 use super::lod::LodLevel;
@@ -73,6 +73,11 @@ pub struct FactionData {
 pub struct FactionRegistry {
     pub factions: AHashMap<u32, FactionData>,
     pub next_id:  u32,
+}
+
+#[derive(Resource, Default)]
+pub struct PlayerFaction {
+    pub faction_id: u32,
 }
 
 impl FactionRegistry {
@@ -336,5 +341,19 @@ impl FactionData {
         (0..TECH_COUNT as u16)
             .filter(|&id| self.techs.has(id))
             .fold(0u8, |acc, id| acc.saturating_add(tech_def(id).bonus.combat_damage_bonus))
+    }
+}
+
+pub fn center_camera_on_player_faction(
+    player_faction: Res<PlayerFaction>,
+    registry:       Res<FactionRegistry>,
+    mut camera:     Query<&mut Transform, With<Camera>>,
+) {
+    let Some(data) = registry.factions.get(&player_faction.faction_id) else { return };
+    let (htx, hty) = data.home_tile;
+    let world_pos = tile_to_world(htx as i32, hty as i32);
+    for mut transform in camera.iter_mut() {
+        transform.translation.x = world_pos.x;
+        transform.translation.y = world_pos.y;
     }
 }

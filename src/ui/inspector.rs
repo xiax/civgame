@@ -7,7 +7,7 @@ use crate::simulation::mood::Mood;
 use crate::simulation::skills::{Skills, SkillKind, SKILL_COUNT};
 use crate::simulation::person::PersonAI;
 use crate::simulation::goals::{AgentGoal, Personality};
-use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
+use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction, SOLO};
 use crate::simulation::reproduction::BiologicalSex;
 use crate::economy::agent::EconomicAgent;
 
@@ -17,6 +17,7 @@ pub fn inspector_panel_system(
     mut contexts: EguiContexts,
     selected: Res<SelectedEntity>,
     registry: Res<FactionRegistry>,
+    player_faction: Res<PlayerFaction>,
     query: Query<(
         &Needs, &Mood, &Skills, &PersonAI, &EconomicAgent,
         &AgentGoal, &Personality, &BiologicalSex, &FactionMember, Option<&Health>, Option<&Body>
@@ -52,7 +53,20 @@ pub fn inspector_panel_system(
                 } else {
                     String::new()
                 };
-                ui.label(format!("Faction: #{} (food: {:.1}){}", member.faction_id, food_stock, raid_info));
+                let is_player = member.faction_id == player_faction.faction_id;
+                let label = format!(
+                    "{}Faction: #{} (food: {:.1}){}",
+                    if is_player { "[YOUR FACTION] " } else { "" },
+                    member.faction_id,
+                    food_stock,
+                    raid_info
+                );
+                let text = if is_player {
+                    egui::RichText::new(label).color(egui::Color32::from_rgb(140, 215, 255))
+                } else {
+                    egui::RichText::new(label)
+                };
+                ui.label(text);
             }
 
             ui.separator();
