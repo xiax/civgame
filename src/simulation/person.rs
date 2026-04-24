@@ -55,6 +55,32 @@ impl PersonAI {
     pub const UNEMPLOYED: u16 = u16::MAX;
 }
 
+/// Player-issued order that overrides autonomous AI for this entity.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct PlayerOrder {
+    pub order: PlayerOrderKind,
+    pub target_tile: (i16, i16),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayerOrderKind {
+    Move,
+    Mine,
+    Gather,
+    PickUp,
+}
+
+impl PlayerOrderKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            PlayerOrderKind::Move   => "Move here",
+            PlayerOrderKind::Mine   => "Mine",
+            PlayerOrderKind::Gather => "Gather",
+            PlayerOrderKind::PickUp => "Pick up",
+        }
+    }
+}
+
 /// Marker for a person entity.
 #[derive(Component)]
 pub struct Person;

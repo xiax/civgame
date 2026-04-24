@@ -5,7 +5,7 @@ use crate::simulation::combat::{Health, Body, BodyPart};
 use crate::simulation::needs::Needs;
 use crate::simulation::mood::Mood;
 use crate::simulation::skills::{Skills, SkillKind, SKILL_COUNT};
-use crate::simulation::person::PersonAI;
+use crate::simulation::person::{PersonAI, PlayerOrder};
 use crate::simulation::goals::{AgentGoal, Personality};
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction, SOLO};
 use crate::simulation::reproduction::BiologicalSex;
@@ -20,11 +20,12 @@ pub fn inspector_panel_system(
     player_faction: Res<PlayerFaction>,
     query: Query<(
         &Needs, &Mood, &Skills, &PersonAI, &EconomicAgent,
-        &AgentGoal, &Personality, &BiologicalSex, &FactionMember, Option<&Health>, Option<&Body>
+        &AgentGoal, &Personality, &BiologicalSex, &FactionMember, Option<&Health>, Option<&Body>,
+        Option<&PlayerOrder>
     )>,
 ) {
     let Some(entity) = selected.0 else { return };
-    let Ok((needs, mood, skills, ai, agent, goal, personality, sex, member, health, body)) =
+    let Ok((needs, mood, skills, ai, agent, goal, personality, sex, member, health, body, order)) =
         query.get(entity) else { return };
 
     egui::Window::new("Inspector")
@@ -149,6 +150,15 @@ pub fn inspector_panel_system(
                 "Job: {}",
                 if ai.job_id == PersonAI::UNEMPLOYED { "None".to_string() } else { format!("#{}", ai.job_id) }
             ));
+            if let Some(o) = order {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Order: {} \u{2192} ({}, {})",
+                        o.order.label(), o.target_tile.0, o.target_tile.1
+                    ))
+                    .color(egui::Color32::from_rgb(255, 220, 100)),
+                );
+            }
         });
 }
 

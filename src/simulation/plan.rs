@@ -18,7 +18,7 @@ use super::lod::LodLevel;
 use super::memory::{AgentMemory, MemoryKind};
 use super::needs::Needs;
 use super::neural::{UtilityNet, STATE_DIM, PLAN_FEAT_DIM};
-use super::person::{AiState, PersonAI};
+use super::person::{AiState, PersonAI, PlayerOrder};
 use super::plants::{PlantMap, PlantKind, Plant};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
@@ -438,7 +438,7 @@ pub fn plan_execution_system(
     clock: Res<SimClock>,
     item_check: Query<(), With<GroundItem>>,
     prey_query: Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
-    mut query: Query<(AgentQuery, OptionalQuery)>,
+    mut query: Query<(AgentQuery, OptionalQuery), Without<PlayerOrder>>,
 ) {
     for (
         (

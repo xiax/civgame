@@ -6,6 +6,7 @@ use crate::world::spatial::SpatialIndex;
 use crate::economy::agent::EconomicAgent;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use super::faction::{FactionMember, FactionRegistry, SOLO};
+use super::person::PlayerOrder;
 use super::goals::AgentGoal;
 use super::items::GroundItem;
 use super::memory::RelationshipMemory;
@@ -213,7 +214,7 @@ pub fn goal_dispatch_system(
         &Transform,
         &LodLevel,
         Option<&RelationshipMemory>,
-    )>,
+    ), Without<PlayerOrder>>,
 ) {
     query.par_iter_mut().for_each(|(
         entity, mut ai, _agent, goal, member, sex, transform, lod, rel_opt,

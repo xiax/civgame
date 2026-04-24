@@ -2,7 +2,7 @@ use bevy::prelude::*;
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::lod::LodLevel;
 use super::needs::Needs;
-use super::person::PersonAI;
+use super::person::{PersonAI, PlayerOrder};
 use super::schedule::{BucketSlot, SimClock};
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
@@ -80,7 +80,7 @@ pub fn goal_update_system(
         &BucketSlot,
         &LodLevel,
         &FactionMember,
-    )>,
+    ), Without<PlayerOrder>>,
 ) {
     query.par_iter_mut().for_each(|(mut goal, needs, personality, agent, ai, slot, lod, member)| {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {

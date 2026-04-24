@@ -7,6 +7,7 @@ pub mod economy_panel;
 pub mod hud;
 pub mod world_map;
 pub mod hover;
+pub mod orders;
 
 pub use selection::SelectedEntity;
 
@@ -18,11 +19,14 @@ impl Plugin for UiPlugin {
             .insert_resource(SelectedEntity::default())
             .insert_resource(world_map::WorldMapOpen::default())
             .insert_resource(world_map::WorldMapTexture::default())
+            .insert_resource(orders::ContextMenuState::default())
             .add_systems(
                 Update,
                 (
                     world_map::world_map_toggle_system,
                     selection::click_to_select_system,
+                    orders::right_click_context_menu_system,
+                    orders::player_order_completion_system,
                     inspector::inspector_panel_system,
                     economy_panel::economy_panel_system,
                     hud::hud_system,
