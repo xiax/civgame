@@ -751,6 +751,7 @@ pub fn plan_execution_system(
                             let ptx = (target_t.translation.x / TILE_SIZE).floor() as i16;
                             let pty = (target_t.translation.y / TILE_SIZE).floor() as i16;
                             ai.target_tile = (ptx, pty);
+                            ai.dest_tile = ai.target_tile;
                         }
                     } else {
                         // Target lost

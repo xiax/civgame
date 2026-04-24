@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use rand::Rng;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
-use crate::world::terrain::{tile_to_world, TILE_SIZE, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
+use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use crate::world::spatial::SpatialIndex;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use super::person::{AiState, Person, PersonAI};
@@ -98,6 +98,7 @@ pub fn movement_system(
                             let nty = cur_ty + dy;
                             if chunk_map.passable_step(cur_tx, cur_ty, ntx, nty) {
                                 ai.target_tile = (ntx as i16, nty as i16);
+                                ai.dest_tile = ai.target_tile;
                                 break;
                             }
                         }
@@ -110,23 +111,25 @@ pub fn movement_system(
                     let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
                     let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
                     let dest_chunk = ChunkCoord(
-                        (ai.target_tile.0 as i32).div_euclid(CHUNK_SIZE as i32),
-                        (ai.target_tile.1 as i32).div_euclid(CHUNK_SIZE as i32),
+                        (ai.dest_tile.0 as i32).div_euclid(CHUNK_SIZE as i32),
+                        (ai.dest_tile.1 as i32).div_euclid(CHUNK_SIZE as i32),
                     );
                     let cur_chunk = ChunkCoord(
                         cur_tx.div_euclid(CHUNK_SIZE as i32),
                         cur_ty.div_euclid(CHUNK_SIZE as i32),
                     );
+                    
                     if cur_chunk == dest_chunk {
                         ai.state = AiState::Seeking;
+                        ai.target_tile = ai.dest_tile;
                     } else if let Some(next_wp) =
                         chunk_graph.next_waypoint(cur_chunk, dest_chunk, &chunk_map)
                     {
                         ai.target_tile = next_wp;
                     } else {
-                        // No route found — give up
-                        ai.state = AiState::Idle;
-                        ai.job_id = PersonAI::UNEMPLOYED;
+                        // No route found — try to head toward destination anyway
+                        ai.state = AiState::Seeking;
+                        ai.target_tile = ai.dest_tile;
                     }
                 }
             }

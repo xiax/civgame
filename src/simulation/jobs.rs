@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::tile::TileKind;
-use crate::world::terrain::{WORLD_CHUNKS_X, WORLD_CHUNKS_Y, TILE_SIZE};
+use crate::world::terrain::TILE_SIZE;
 use crate::world::spatial::SpatialIndex;
 use crate::economy::agent::EconomicAgent;
 use crate::pathfinding::chunk_graph::ChunkGraph;
@@ -153,6 +153,8 @@ pub fn assign_job_with_routing(
         (target.1 as i32).div_euclid(CHUNK_SIZE as i32),
     );
     ai.job_id = job as u16;
+    ai.dest_tile = target; // Store final destination
+
     if dest_chunk == cur_chunk {
         ai.state = AiState::Seeking;
         ai.target_tile = target;
@@ -160,6 +162,7 @@ pub fn assign_job_with_routing(
         ai.state = AiState::Routing;
         ai.target_tile = wp;
     } else {
+        // Fallback: if no route in chunk graph, try to walk directly (might fail but better than nothing)
         ai.state = AiState::Seeking;
         ai.target_tile = target;
     }

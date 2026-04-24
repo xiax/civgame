@@ -180,6 +180,7 @@ pub fn reproduction_system(
                     job_id: PersonAI::UNEMPLOYED,
                     state: AiState::Idle,
                     target_tile: (tx as i16, ty as i16),
+                    dest_tile: (tx as i16, ty as i16),
                     ticks_idle: 0,
                     work_progress: 0,
                 },

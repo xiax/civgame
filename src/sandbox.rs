@@ -64,6 +64,7 @@ fn setup_sandbox(
                 job_id: PersonAI::UNEMPLOYED,
                 state: AiState::Idle,
                 target_tile: (cx as i16, cy as i16),
+                dest_tile: (cx as i16, cy as i16),
                 ticks_idle: 0,
                 work_progress: 0,
             },

@@ -107,7 +107,7 @@ pub fn goal_update_system(
                 *goal = AgentGoal::Defend;
                 return;
             }
-            if registry.raid_target(member.faction_id).is_some() && needs.hunger < 160.0 {
+            if registry.raid_target(member.faction_id).is_some() && needs.hunger < 120.0 {
                 *goal = AgentGoal::Raid;
                 return;
             }

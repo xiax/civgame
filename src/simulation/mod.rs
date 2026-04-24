@@ -158,8 +158,10 @@ impl Plugin for SimulationPlugin {
                     reproduction::reproduction_system
                         .after(reproduction::collect_male_candidates),
                     raid::faction_decision_system,
-                    raid::raid_execution_system
+                    raid::raid_detection_system
                         .after(raid::faction_decision_system),
+                    raid::raid_execution_system
+                        .after(raid::raid_detection_system),
                     world_sim::world_sim_system,
                     world_sim::agent_exploration_system,
                     technology::tech_discovery_system

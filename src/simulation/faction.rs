@@ -2,7 +2,7 @@ use ahash::AHashMap;
 use bevy::prelude::*;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{TILE_SIZE, tile_to_world};
-use super::goals::{AgentGoal, Personality};
+use super::goals::Personality;
 use super::memory::RelationshipMemory;
 use super::lod::LodLevel;
 use super::needs::Needs;

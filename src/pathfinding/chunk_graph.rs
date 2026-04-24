@@ -49,12 +49,16 @@ impl ChunkGraph {
                         // Trace back to the edge that leaves `cur`
                         let first_step = trace_first_step(&visited, cur, dest);
                         if let Some(edges_from_cur) = self.edges.get(&cur) {
-                            for e in edges_from_cur {
-                                if e.neighbor == first_step {
-                                    let gx = cur.0 * CHUNK_SIZE as i32 + e.exit_local.0 as i32;
-                                    let gy = cur.1 * CHUNK_SIZE as i32 + e.exit_local.1 as i32;
-                                    return Some((gx as i16, gy as i16));
-                                }
+                            let candidates: Vec<_> = edges_from_cur.iter()
+                                .filter(|e| e.neighbor == first_step)
+                                .collect();
+                            
+                            if !candidates.is_empty() {
+                                // Pick a random edge to avoid clustering all agents on the same tile
+                                let e = candidates[fastrand::usize(..candidates.len())];
+                                let gx = cur.0 * CHUNK_SIZE as i32 + e.exit_local.0 as i32;
+                                let gy = cur.1 * CHUNK_SIZE as i32 + e.exit_local.1 as i32;
+                                return Some((gx as i16, gy as i16));
                             }
                         }
                         return None;
