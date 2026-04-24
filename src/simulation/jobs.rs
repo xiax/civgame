@@ -14,7 +14,11 @@ use super::person::{AiState, PersonAI};
 use super::lod::LodLevel;
 use super::reproduction::BiologicalSex;
 use super::plants::{PlantMap, Plant, GrowthStage, PlantKind};
+use super::plan::ActivePlan;
 
+/// Represents the current active task an agent is performing.
+/// Jobs are transient and managed by either the plan system or the goal dispatch system.
+/// An agent is "unemployed" when they are between tasks or idling.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
@@ -28,6 +32,9 @@ pub enum JobKind {
     Scavenge     = 7,
     Construct    = 8,  // build wall tile
     ConstructBed = 9,  // spawn bed entity
+    ReturnCamp   = 10,
+    Socialize    = 11,
+    Reproduce    = 12,
 }
 
 pub fn find_nearest_tile(
@@ -220,13 +227,35 @@ pub fn goal_dispatch_system(
         &Transform,
         &LodLevel,
         Option<&RelationshipMemory>,
+        Option<&ActivePlan>,
     ), Without<PlayerOrder>>,
 ) {
     query.par_iter_mut().for_each(|(
-        entity, mut ai, _agent, goal, member, sex, transform, lod, rel_opt,
+        entity, mut ai, _agent, goal, member, sex, transform, lod, rel_opt, plan_opt,
     )| {
         if *lod == LodLevel::Dormant {
             return;
+        }
+
+        let is_active = matches!(ai.state, AiState::Working | AiState::Seeking | AiState::Routing);
+
+        // If they have an ActivePlan, let plan_execution_system handle their job state.
+        // If not, we are managing their job state based on their non-plan goal.
+        if plan_opt.is_none() && ai.job_id != PersonAI::UNEMPLOYED {
+            let expected_job = match goal {
+                AgentGoal::ReturnCamp => Some(JobKind::ReturnCamp as u16),
+                AgentGoal::Socialize  => Some(JobKind::Socialize as u16),
+                AgentGoal::Reproduce  => Some(JobKind::Reproduce as u16),
+                AgentGoal::Raid       => Some(JobKind::Raid as u16),
+                AgentGoal::Defend     => Some(JobKind::Defend as u16),
+                _                     => None,
+            };
+
+            if Some(ai.job_id) != expected_job {
+                // Goal changed or task is done; drop the current job.
+                ai.state = AiState::Idle;
+                ai.job_id = PersonAI::UNEMPLOYED;
+            }
         }
 
         let is_active = matches!(ai.state, AiState::Working | AiState::Seeking | AiState::Routing);
@@ -243,16 +272,16 @@ pub fn goal_dispatch_system(
                 if member.faction_id != SOLO {
                     if let Some(home) = faction_registry.home_tile(member.faction_id) {
                         // Already going to camp?
-                        if is_active && ai.job_id == JobKind::Idle as u16 && ai.dest_tile == home {
+                        if is_active && ai.job_id == JobKind::ReturnCamp as u16 && ai.dest_tile == home {
                             return;
                         }
-                        assign_job_with_routing(&mut ai, cur_chunk, home, JobKind::Idle, &chunk_graph, &chunk_map);
+                        assign_job_with_routing(&mut ai, cur_chunk, home, JobKind::ReturnCamp, &chunk_graph, &chunk_map);
                     }
                 }
             }
 
             AgentGoal::Socialize => {
-                if is_active && ai.job_id == JobKind::Idle as u16 { return; }
+                if is_active && ai.job_id == JobKind::Socialize as u16 { return; }
                 let radius = 15i32;
                 'find: for dy in -radius..=radius {
                     for dx in -radius..=radius {
@@ -263,7 +292,7 @@ pub fn goal_dispatch_system(
                             assign_job_with_routing(
                                 &mut ai, cur_chunk,
                                 (tx as i16, ty as i16),
-                                JobKind::Idle,
+                                JobKind::Socialize,
                                 &chunk_graph, &chunk_map,
                             );
                             break 'find;
@@ -273,13 +302,13 @@ pub fn goal_dispatch_system(
             }
 
             AgentGoal::Reproduce => {
-                if is_active && ai.job_id == JobKind::Idle as u16 { return; }
+                if is_active && ai.job_id == JobKind::Reproduce as u16 { return; }
                 if member.faction_id != SOLO {
                     if let Some(target) = find_nearby_partner(
                         &spatial, (cur_tx, cur_ty), 15, *sex,
                         member.faction_id, &sex_query, entity, rel_opt,
                     ) {
-                        assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Idle, &chunk_graph, &chunk_map);
+                        assign_job_with_routing(&mut ai, cur_chunk, target, JobKind::Reproduce, &chunk_graph, &chunk_map);
                     }
                 }
             }

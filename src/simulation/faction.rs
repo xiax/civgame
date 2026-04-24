@@ -298,11 +298,6 @@ pub fn faction_camp_system(
                 }
             }
         }
-
-        // Reset state after camp actions are done
-        ai.state = AiState::Idle;
-        ai.job_id = PersonAI::UNEMPLOYED;
-        ai.work_progress = 0;
     }
 }
 

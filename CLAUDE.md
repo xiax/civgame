@@ -39,7 +39,11 @@ Input → ParallelA → ParallelB → Sequential → Economy
 
 ### Key simulation systems
 
-- **Person agents:** Goal-driven via `PersonAI` component. Plans are multi-step sequences scored by a per-agent 3-layer Q-network (`UtilityNet`, 32→16→8→1). Agents are bucketed across 20 fixed time slots to spread CPU load across frames.
+- **Person agents:** Goal-driven via `PersonAI` component.
+  - **Goals:** High-level objectives (e.g., `Survive`, `Gather`, `Defend`) driven by Needs and Faction state.
+  - **Plans:** Multi-step sequences (e.g., "Find Food" -> "Harvest") scored by a per-agent 3-layer Q-network (`UtilityNet`). Used by high-level goals like `Survive` and `Gather`.
+  - **Jobs:** These represent the **current active task** (e.g., `ReturnCamp`, `Defend`, `Gather`). An agent is "Unemployed" when between tasks. The `goal_dispatch_system` monitors job/goal alignment; if a goal changes, the current job is dropped, allowing the agent to transition naturally to a new task.
+  - **Bucketing:** Agents are bucketed across 20 fixed time slots to spread CPU load across frames.
 - **Needs:** 6 tracked f32 needs (hunger, sleep, shelter, safety, social, reproduction) clamped [0, 255] that decay over time and drive job selection.
 - **Factions:** Groups share a technology bitset (`u64`, up to 64 techs, Prehistoric → Bronze Age), camp entity (`FactionCenter`), bonding scores, and raid logic. `SOLO` faction ID = 0 means ungrouped.
 - **LOD:** Entities have `Detail / Aggregate / Dormant` levels by camera distance. Dormant entities skip simulation entirely.

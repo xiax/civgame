@@ -152,6 +152,9 @@ pub fn inspector_panel_system(
                 j if j == JobKind::Planter as u16 => "Planter",
                 j if j == JobKind::Hunter  as u16 => "Hunter",
                 j if j == JobKind::Scavenge as u16 => "Scavenger",
+                j if j == JobKind::ReturnCamp as u16 => "Returning to Camp",
+                j if j == JobKind::Socialize as u16 => "Socializing",
+                j if j == JobKind::Reproduce as u16 => "Reproducing",
                 _ => "Unemployed",
             };
             ui.label(format!("Job: {}", job_name));
