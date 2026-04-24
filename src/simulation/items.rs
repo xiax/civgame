@@ -10,6 +10,9 @@ use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
 use crate::simulation::combat::BodyPart;
 
+#[derive(Component, Clone, Copy, Default, Debug)]
+pub struct TargetItem(pub Option<Entity>);
+
 #[derive(Component, Clone, Copy)]
 pub struct GroundItem {
     pub item: Item,
@@ -44,45 +47,62 @@ pub struct ArmorStats {
     pub covered_parts: Vec<BodyPart>,
 }
 
+use super::jobs::JobKind;
+
 /// Sequential, after death_system.
-/// Iterates ground items; the first active Working agent with a food goal at the
-/// same tile claims the item.  Only one agent claims each item per frame.
+/// Agents explicitly targeting a GroundItem pick it up once they arrive.
 pub fn item_pickup_system(
     mut commands: Commands,
     clock: Res<SimClock>,
-    spatial: Res<SpatialIndex>,
-    item_query: Query<(Entity, &GroundItem, &Transform)>,
+    item_query: Query<&GroundItem>,
     mut pickers: Query<(
+        Entity,
         &mut PersonAI,
         &mut EconomicAgent,
-        &AgentGoal,
+        &mut TargetItem,
         &BucketSlot,
         &LodLevel,
         Option<&mut ActivePlan>,
+        &Transform,
     ), With<Person>>,
 ) {
-    for (item_e, item, item_transform) in &item_query {
-        let tx = (item_transform.translation.x / TILE_SIZE).floor() as i32;
-        let ty = (item_transform.translation.y / TILE_SIZE).floor() as i32;
+    for (
+        entity, mut ai, mut agent, mut target_item, slot, lod,
+        mut active_plan_opt, transform
+    ) in pickers.iter_mut() {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
+        if ai.state != AiState::Working || ai.job_id != JobKind::Scavenge as u16 { continue; }
 
-        for &candidate in spatial.get(tx, ty) {
-            let Ok((mut ai, mut agent, goal, slot, lod, active_plan_opt)) = pickers.get_mut(candidate) else {
-                continue;
-            };
-            if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
-            if ai.state != AiState::Working { continue; }
-                        if !matches!(goal, AgentGoal::Survive | AgentGoal::Gather) { continue; }
-
-            agent.add_good(item.item.good, item.qty);
-            
-            if let Some(mut plan) = active_plan_opt {
-                plan.reward_acc += item.qty as f32 * plan.reward_scale;
-            }
-
-            commands.entity(item_e).despawn();
+        let Some(target_ent) = target_item.0 else {
+            // No target, but in scavenge state? Cleanup.
             ai.state = AiState::Idle;
             ai.job_id = PersonAI::UNEMPLOYED;
-            break;
+            continue;
+        };
+
+        if let Ok(item) = item_query.get(target_ent) {
+            // Check if we are at the target
+            let tx = (transform.translation.x / TILE_SIZE).floor() as i16;
+            let ty = (transform.translation.y / TILE_SIZE).floor() as i16;
+
+            if ai.target_tile == (tx, ty) {
+                // Intentional pickup
+                agent.add_good(item.item.good, item.qty);
+                
+                if let Some(ref mut plan) = active_plan_opt {
+                    plan.reward_acc += item.qty as f32 * plan.reward_scale;
+                }
+
+                commands.entity(target_ent).despawn();
+                ai.state = AiState::Idle;
+                ai.job_id = PersonAI::UNEMPLOYED;
+                target_item.0 = None;
+            }
+        } else {
+            // Targeted item is gone (stolen or rotted)
+            ai.state = AiState::Idle;
+            ai.job_id = PersonAI::UNEMPLOYED;
+            target_item.0 = None;
         }
     }
 }

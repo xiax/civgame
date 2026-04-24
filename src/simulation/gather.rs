@@ -143,38 +143,43 @@ pub fn gather_system(
             // ── Tile harvest (stone) ─────────────────────────────────────────
 
             let tile_kind = chunk_map.tile_kind_at(tx, ty);
-            if tile_kind != Some(TileKind::Stone) { continue; }
+            if tile_kind == Some(TileKind::Stone) {
+                if ai.work_progress < STONE.work_ticks { continue; }
+                ai.work_progress = 0;
 
-            if ai.work_progress < STONE.work_ticks { continue; }
-            ai.work_progress = 0;
+                let (_, _, stone_mul) = faction_muls(&mut faction_registry, faction_id, ActivityKind::StoneMining);
+                let qty = (STONE.base_yield_qty as f32 * stone_mul).round().max(1.0) as u8;
+                agent.add_good(Good::Stone, qty);
 
-            let (_, _, stone_mul) = faction_muls(&mut faction_registry, faction_id, ActivityKind::StoneMining);
-            let qty = (STONE.base_yield_qty as f32 * stone_mul).round().max(1.0) as u8;
-            agent.add_good(Good::Stone, qty);
-
-            for &(good, bonus_qty, chance) in STONE.bonus_yields {
-                if fastrand::u8(..100) < chance {
-                    agent.add_good(good, bonus_qty);
-                    if let Some(id) = faction_id {
-                        if let Some(fd) = faction_registry.factions.get_mut(&id) {
-                            let act = match good {
-                                Good::Coal => Some(ActivityKind::CoalMining),
-                                Good::Iron => Some(ActivityKind::IronMining),
-                                _          => None,
-                            };
-                            if let Some(a) = act { fd.activity_log.increment(a); }
+                for &(good, bonus_qty, chance) in STONE.bonus_yields {
+                    if fastrand::u8(..100) < chance {
+                        agent.add_good(good, bonus_qty);
+                        if let Some(id) = faction_id {
+                            if let Some(fd) = faction_registry.factions.get_mut(&id) {
+                                let act = match good {
+                                    Good::Coal => Some(ActivityKind::CoalMining),
+                                    Good::Iron => Some(ActivityKind::IronMining),
+                                    _          => None,
+                                };
+                                if let Some(a) = act { fd.activity_log.increment(a); }
+                            }
                         }
                     }
                 }
-            }
 
-            skills.gain_xp(SkillKind::Mining, STONE.xp);
+                skills.gain_xp(SkillKind::Mining, STONE.xp);
 
-            if let Some(ref mut mem) = memory_opt {
-                mem.record((tx as i16, ty as i16), MemoryKind::Stone);
-            }
-            if let Some(ref mut plan) = plan_opt {
-                plan.reward_acc += qty as f32 * 0.3;
+                if let Some(ref mut mem) = memory_opt {
+                    mem.record((tx as i16, ty as i16), MemoryKind::Stone);
+                }
+                if let Some(ref mut plan) = plan_opt {
+                    plan.reward_acc += qty as f32 * 0.3;
+                }
+            } else {
+                // Not a stone tile and not a plant -> target is invalid or already harvested
+                ai.state = AiState::Idle;
+                ai.job_id = PersonAI::UNEMPLOYED;
+                ai.work_progress = 0;
             }
         }
 

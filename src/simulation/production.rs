@@ -18,7 +18,7 @@ use crate::rendering::pixel_art::EntityTextures;
 
 pub const TICKS_FARMER_PLANT: u8 = 40;
 
-const HUNGER_EAT_THRESHOLD: u8 = 100;
+const HUNGER_EAT_THRESHOLD: u8 = 40;
 const FOOD_NUTRITION:        u8 = 40;
 
 // Tile depletion — tracks how many times each tile has been harvested recently.

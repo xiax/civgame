@@ -9,7 +9,7 @@ use crate::economy::agent::EconomicAgent;
 use super::combat::{CombatTarget, Body, CombatCooldown};
 use super::faction::{FactionMember, FactionRegistry, PlayerFaction};
 use super::goals::{AgentGoal, Personality};
-use super::items::Equipment;
+use super::items::{Equipment, TargetItem};
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, RelationshipMemory};
 use super::mood::Mood;
@@ -183,6 +183,7 @@ pub fn spawn_population(
                     FactionMember { faction_id, ..Default::default() },
                     Body::new_humanoid(),
                     Equipment::default(),
+                    TargetItem::default(),
                     CombatTarget::default(),
                     CombatCooldown::default(),
                 ),
@@ -190,7 +191,7 @@ pub fn spawn_population(
                     AgentMemory::default(),
                     RelationshipMemory::default(),
                     UtilityNet::new_random(),
-                    KnownPlans::with_innate(&[0, 1, 5]),
+                    KnownPlans::with_innate(&[0, 1, 5, 6]),
                     PlanScoringMethod::UtilityNN,
                 ),
             ));

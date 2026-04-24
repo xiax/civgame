@@ -10,7 +10,7 @@ use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::AgentGoal;
-use super::items::GroundItem;
+use super::items::{GroundItem, TargetItem};
 use super::combat::{CombatTarget, Health};
 use super::animals::{Wolf, Deer};
 use super::jobs::{JobKind, assign_job_with_routing, find_nearest_tile, find_nearest_item, find_nearest_unplanted_farmland, find_nearest_plant};
@@ -163,7 +163,8 @@ static PLAN_STEPS_1: &[StepId] = &[1];    // FarmFood
 static PLAN_STEPS_2: &[StepId] = &[2];    // GatherWood
 static PLAN_STEPS_3: &[StepId] = &[3];    // GatherStone
 static PLAN_STEPS_4: &[StepId] = &[4, 1]; // PlantAndFarm
-static PLAN_STEPS_5: &[StepId] = &[5];    // HuntFood
+static PLAN_STEPS_5: &[StepId] = &[5, 6];    // HuntFood
+static PLAN_STEPS_6: &[StepId] = &[6];       // ScavengeFood
 
 static SURVIVE_GOALS: &[AgentGoal] = &[AgentGoal::Survive];
 static GATHER_GOALS:  &[AgentGoal] = &[AgentGoal::Gather];
@@ -218,6 +219,14 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             reward_scale: 1.0,
             plant_filter: None,
         },
+        StepDef { // 6: CollectFood
+            id: 6, job: JobKind::Scavenge,
+            target: StepTarget::NearestItem(Good::Food),
+            preconditions: StepPreconditions::none(),
+            memory_kind: None,
+            reward_scale: 1.0,
+            plant_filter: None,
+        },
     ];
 }
 
@@ -253,7 +262,12 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         },
         PlanDef { id: 5, name: "HuntFood",
             steps: PLAN_STEPS_5,
-            feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 1.0],
+            feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.2, 1.0],
+            serves_goals: SURVIVE_GOALS,
+        },
+        PlanDef { id: 6, name: "ScavengeFood",
+            steps: PLAN_STEPS_6,
+            feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.0],
             serves_goals: SURVIVE_GOALS,
         },
     ];
@@ -322,6 +336,7 @@ fn resolve_target(
     item_check: &Query<(), With<GroundItem>>,
     prey_query: &Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
     combat_target: &mut CombatTarget,
+    target_item: &mut TargetItem,
 ) -> Option<(i16, i16)> {
     match &step.target {
         StepTarget::HuntPrey => {
@@ -356,11 +371,11 @@ fn resolve_target(
             if from_mem.is_some() { return from_mem; }
 
             if *kind == MemoryKind::Food {
-                return find_nearest_plant(plant_map, pos, 60, plant_query, true, step.plant_filter);
+                return find_nearest_plant(plant_map, pos, 120, plant_query, true, step.plant_filter);
             }
 
             if *kind == MemoryKind::Wood {
-                if let Some(tree_pos) = find_nearest_plant(plant_map, pos, 60, plant_query, true, Some(PlantKind::Tree)) {
+                if let Some(tree_pos) = find_nearest_plant(plant_map, pos, 120, plant_query, true, Some(PlantKind::Tree)) {
                     return Some(tree_pos);
                 }
             }
@@ -372,17 +387,22 @@ fn resolve_target(
                 MemoryKind::Stone => STONE_TILES,
                 MemoryKind::Seed  => FARMLAND_TILES,
             };
-            find_nearest_tile(chunk_map, pos, 60, fallback_tiles)
+            find_nearest_tile(chunk_map, pos, 120, fallback_tiles)
         }
         StepTarget::NearestTile(_tiles) => {
             if step.job == JobKind::Planter {
-                find_nearest_unplanted_farmland(chunk_map, plant_map, pos, 30)
+                find_nearest_unplanted_farmland(chunk_map, plant_map, pos, 60)
             } else {
-                find_nearest_tile(chunk_map, pos, 60, _tiles)
+                find_nearest_tile(chunk_map, pos, 120, _tiles)
             }
         }
         StepTarget::NearestItem(_good) => {
-            find_nearest_item(spatial, pos, 40, item_check)
+            if let Some((entity, tx, ty)) = find_nearest_item(spatial, pos, 120, item_check) {
+                target_item.0 = Some(entity);
+                Some((tx, ty))
+            } else {
+                None
+            }
         }
         StepTarget::FactionCamp => {
             faction_registry.home_tile(faction_id)
@@ -414,6 +434,7 @@ type AgentQuery<'a> = (
     &'a LodLevel,
     &'a BucketSlot,
     &'a mut CombatTarget,
+    &'a mut TargetItem,
 );
 
 type OptionalQuery<'a> = (
@@ -443,7 +464,7 @@ pub fn plan_execution_system(
     for (
         (
             entity, mut ai, agent, member, goal, needs, skills,
-            transform, lod, slot, mut combat_target,
+            transform, lod, slot, mut combat_target, mut target_item,
         ),
         (
             memory_opt, mut net_opt, known_plans_opt, scoring_opt, mut active_plan_opt,
@@ -591,6 +612,7 @@ pub fn plan_execution_system(
                 &faction_registry, member.faction_id,
                 memory_opt, &item_check,
                 &prey_query, &mut combat_target,
+                &mut target_item,
             ) {
                 assign_job_with_routing(&mut ai, cur_chunk, target, step_def.job, &chunk_graph, &chunk_map);
                 active_plan.dispatched = true;

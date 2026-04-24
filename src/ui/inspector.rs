@@ -5,10 +5,14 @@ use crate::simulation::combat::{Health, Body, BodyPart};
 use crate::simulation::needs::Needs;
 use crate::simulation::mood::Mood;
 use crate::simulation::skills::{Skills, SkillKind, SKILL_COUNT};
-use crate::simulation::person::{PersonAI, PlayerOrder};
+use crate::simulation::person::{PersonAI, AiState, PlayerOrder};
 use crate::simulation::goals::{AgentGoal, Personality};
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction, SOLO};
 use crate::simulation::reproduction::BiologicalSex;
+use crate::simulation::jobs::JobKind;
+use crate::simulation::plants::{PlantMap, Plant};
+use crate::world::chunk::ChunkMap;
+use crate::world::tile::TileKind;
 use crate::economy::agent::EconomicAgent;
 
 use super::selection::SelectedEntity;
@@ -18,6 +22,9 @@ pub fn inspector_panel_system(
     selected: Res<SelectedEntity>,
     registry: Res<FactionRegistry>,
     player_faction: Res<PlayerFaction>,
+    chunk_map: Res<ChunkMap>,
+    plant_map: Res<PlantMap>,
+    plants: Query<&Plant>,
     query: Query<(
         &Needs, &Mood, &Skills, &PersonAI, &EconomicAgent,
         &AgentGoal, &Personality, &BiologicalSex, &FactionMember, Option<&Health>, Option<&Body>,
@@ -47,27 +54,17 @@ pub fn inspector_panel_system(
                 }
             } else {
                 let food_stock = registry.food_stock(member.faction_id);
-                let raid_info = if registry.is_under_raid(member.faction_id) {
+                let mut raid_info = if registry.is_under_raid(member.faction_id) {
                     " [UNDER RAID]".to_string()
                 } else if let Some(target) = registry.raid_target(member.faction_id) {
                     format!(" [RAIDING #{}]", target)
                 } else {
                     String::new()
                 };
-                let is_player = member.faction_id == player_faction.faction_id;
-                let label = format!(
-                    "{}Faction: #{} (food: {:.1}){}",
-                    if is_player { "[YOUR FACTION] " } else { "" },
-                    member.faction_id,
-                    food_stock,
-                    raid_info
-                );
-                let text = if is_player {
-                    egui::RichText::new(label).color(egui::Color32::from_rgb(140, 215, 255))
-                } else {
-                    egui::RichText::new(label)
-                };
-                ui.label(text);
+                if member.faction_id == player_faction.faction_id {
+                    raid_info += " [YOU]";
+                }
+                ui.label(format!("Faction: #{} (food: {:.1}){}", member.faction_id, food_stock, raid_info));
             }
 
             ui.separator();
@@ -145,11 +142,57 @@ pub fn inspector_panel_system(
             }
 
             ui.separator();
-            ui.label(format!("State: {:?}", ai.state));
-            ui.label(format!(
-                "Job: {}",
-                if ai.job_id == PersonAI::UNEMPLOYED { "None".to_string() } else { format!("#{}", ai.job_id) }
-            ));
+
+            let job_name = match ai.job_id {
+                j if j == JobKind::Idle    as u16 => "Idle",
+                j if j == JobKind::Gather  as u16 => "Gatherer",
+                j if j == JobKind::Trader  as u16 => "Trader",
+                j if j == JobKind::Raid    as u16 => "Raider",
+                j if j == JobKind::Defend  as u16 => "Defender",
+                j if j == JobKind::Planter as u16 => "Planter",
+                j if j == JobKind::Hunter  as u16 => "Hunter",
+                j if j == JobKind::Scavenge as u16 => "Scavenger",
+                _ => "Unemployed",
+            };
+            ui.label(format!("Job: {}", job_name));
+
+            let state_desc = match ai.state {
+                AiState::Idle => "Idling".to_string(),
+                AiState::Routing => "Traveling (Long Range)".to_string(),
+                AiState::Seeking => "Walking to Target".to_string(),
+                AiState::Sleeping => "Sleeping".to_string(),
+                AiState::Attacking => "In Combat".to_string(),
+                AiState::Working => {
+                    let tx = ai.target_tile.0 as i32;
+                    let ty = ai.target_tile.1 as i32;
+                    let mut work_str = "Working".to_string();
+
+                    if ai.job_id == JobKind::Gather as u16 {
+                        if let Some(&p_entity) = plant_map.0.get(&(tx, ty)) {
+                            if let Ok(plant) = plants.get(p_entity) {
+                                work_str = format!("Harvesting {:?}", plant.kind);
+                            }
+                        } else if let Some(tile_kind) = chunk_map.tile_kind_at(tx, ty) {
+                            if tile_kind == TileKind::Stone {
+                                work_str = "Mining Stone".to_string();
+                            }
+                        }
+                        // Use u32 to avoid u8 overflow during multiplication
+                        work_str = format!("{} ({}%)", work_str, (ai.work_progress as u32 * 100) / 30); // 30 is base stone work_ticks
+                    } else if ai.job_id == JobKind::Planter as u16 {
+                        work_str = format!("Planting Seeds ({}%)", (ai.work_progress as u32 * 100) / 40); // 40 is TICKS_FARMER_PLANT
+                    } else if ai.job_id == JobKind::Raid as u16 {
+                        work_str = "Stealing Food".to_string();
+                    } else if ai.job_id == JobKind::Scavenge as u16 {
+                        work_str = "Picking up item".to_string();
+                    }
+
+                    work_str
+                }
+            };
+            ui.label(format!("State: {}", state_desc));
+            ui.label(format!("Target: {}, {}", ai.target_tile.0, ai.target_tile.1));
+
             if let Some(o) = order {
                 ui.label(
                     egui::RichText::new(format!(

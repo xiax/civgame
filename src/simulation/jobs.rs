@@ -25,6 +25,7 @@ pub enum JobKind {
     Defend  = 4,
     Planter = 5,
     Hunter  = 6,
+    Scavenge = 7,
 }
 
 pub fn find_nearest_tile(
@@ -92,8 +93,8 @@ pub fn find_nearest_item(
     from: (i32, i32),
     radius: i32,
     item_check: &Query<(), With<GroundItem>>,
-) -> Option<(i16, i16)> {
-    let mut best: Option<(i16, i16)> = None;
+) -> Option<(Entity, i16, i16)> {
+    let mut best: Option<(Entity, i16, i16)> = None;
     let mut best_dist = i32::MAX;
     for dy in -radius..=radius {
         for dx in -radius..=radius {
@@ -102,7 +103,7 @@ pub fn find_nearest_item(
                     let dist = dx.abs() + dy.abs();
                     if dist < best_dist {
                         best_dist = dist;
-                        best = Some(((from.0 + dx) as i16, (from.1 + dy) as i16));
+                        best = Some((e, (from.0 + dx) as i16, (from.1 + dy) as i16));
                     }
                 }
             }
