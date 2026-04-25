@@ -4,6 +4,7 @@ use crate::world::tile::TileKind;
 use crate::world::terrain::TILE_SIZE;
 use crate::world::spatial::SpatialIndex;
 use crate::economy::agent::EconomicAgent;
+use crate::economy::goods::Good;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::person::PlayerOrder;
@@ -98,22 +99,26 @@ pub fn find_nearest_plant(
     best
 }
 
+// Bug 2 fix: filter by `good` so agents don't target the wrong item type.
 pub fn find_nearest_item(
     spatial: &SpatialIndex,
     from: (i32, i32),
     radius: i32,
-    item_check: &Query<(), With<GroundItem>>,
+    good: Good,
+    item_query: &Query<&GroundItem>,
 ) -> Option<(Entity, i16, i16)> {
     let mut best: Option<(Entity, i16, i16)> = None;
     let mut best_dist = i32::MAX;
     for dy in -radius..=radius {
         for dx in -radius..=radius {
             for &e in spatial.get(from.0 + dx, from.1 + dy) {
-                if item_check.get(e).is_ok() {
-                    let dist = dx.abs() + dy.abs();
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best = Some((e, (from.0 + dx) as i16, (from.1 + dy) as i16));
+                if let Ok(item) = item_query.get(e) {
+                    if item.item.good == good {
+                        let dist = dx.abs() + dy.abs();
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best = Some((e, (from.0 + dx) as i16, (from.1 + dy) as i16));
+                        }
                     }
                 }
             }
@@ -291,23 +296,32 @@ pub fn goal_dispatch_system(
 
             AgentGoal::Socialize => {
                 if is_active && ai.job_id == JobKind::Socialize as u16 { return; }
+                // Bug 6 fix: find nearest entity in radius, not the first one in scan order.
                 let radius = 15i32;
-                'find: for dy in -radius..=radius {
+                let mut best_target: Option<(i16, i16, Entity)> = None;
+                let mut best_dist = i32::MAX;
+                for dy in -radius..=radius {
                     for dx in -radius..=radius {
                         let tx = cur_tx + dx;
                         let ty = cur_ty + dy;
                         for &other in spatial.get(tx, ty) {
                             if other == entity { continue; }
-                            assign_job_with_routing(
-                                &mut ai, cur_chunk,
-                                (tx as i16, ty as i16),
-                                JobKind::Socialize,
-                                Some(other),
-                                &chunk_graph, &chunk_map,
-                            );
-                            break 'find;
+                            let dist = dx.abs() + dy.abs();
+                            if dist < best_dist {
+                                best_dist = dist;
+                                best_target = Some((tx as i16, ty as i16, other));
+                            }
                         }
                     }
+                }
+                if let Some((tx, ty, other)) = best_target {
+                    assign_job_with_routing(
+                        &mut ai, cur_chunk,
+                        (tx, ty),
+                        JobKind::Socialize,
+                        Some(other),
+                        &chunk_graph, &chunk_map,
+                    );
                 }
             }
 

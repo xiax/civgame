@@ -151,6 +151,35 @@ impl UtilityNet {
         q
     }
 
+    /// Stateless evaluation of a plan's score (does not save activations).
+    pub fn evaluate_plan(
+        &self,
+        state: [f32; STATE_DIM],
+        plan_feat: [f32; PLAN_FEAT_DIM],
+    ) -> f32 {
+        let mut input = [0.0f32; Q_IN];
+        input[..STATE_DIM].copy_from_slice(&state);
+        input[STATE_DIM..].copy_from_slice(&plan_feat);
+
+        let mut h1 = [0.0f32; Q_H1];
+        for i in 0..Q_H1 {
+            let mut s = self.b1[i];
+            for j in 0..Q_IN { s += self.w1[i][j] * input[j]; }
+            h1[i] = s.max(0.0);
+        }
+
+        let mut h2 = [0.0f32; Q_H2];
+        for i in 0..Q_H2 {
+            let mut s = self.b2[i];
+            for j in 0..Q_H1 { s += self.w2[i][j] * h1[j]; }
+            h2[i] = s.max(0.0);
+        }
+
+        let mut q = self.b3;
+        for i in 0..Q_H2 { q += self.w3[i] * h2[i]; }
+        q
+    }
+
     /// ε-greedy plan selection from a slice of (plan_id, score) pairs.
     /// Returns the index into the slice (not the plan_id directly).
     pub fn select_plan_idx(scores: &[(u16, f32)]) -> usize {

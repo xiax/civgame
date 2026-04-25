@@ -74,7 +74,11 @@ impl AgentGoal {
     }
 }
 
+#[derive(Component, Default)]
+pub struct GoalReason(pub &'static str);
+
 pub fn goal_update_system(
+    mut commands: Commands,
     clock: Res<SimClock>,
     registry: Res<FactionRegistry>,
     calendar: Res<Calendar>,
@@ -85,6 +89,7 @@ pub fn goal_update_system(
     plant_query: Query<&Plant>,
     item_query: Query<(), With<GroundItem>>,
     mut query: Query<(
+        Entity,
         &mut AgentGoal,
         &Needs,
         &Personality,
@@ -94,9 +99,10 @@ pub fn goal_update_system(
         &LodLevel,
         &FactionMember,
         &mut TargetItem,
+        Option<&mut GoalReason>,
     ), Without<PlayerOrder>>,
 ) {
-    for (mut goal, needs, personality, agent, mut ai, slot, lod, member, mut target_item) in query.iter_mut() {
+    for (entity, mut goal, needs, personality, agent, mut ai, slot, lod, member, mut target_item, mut reason_opt) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -163,6 +169,7 @@ pub fn goal_update_system(
                     ai.state = AiState::Idle;
                     ai.job_id = PersonAI::UNEMPLOYED;
                 }
+                if let Some(mut r) = reason_opt { r.0 = "Under Raid"; } else { commands.entity(entity).insert(GoalReason("Under Raid")); }
                 continue;
             }
             if registry.raid_target(member.faction_id).is_some() && needs.hunger < 120.0 {
@@ -171,6 +178,7 @@ pub fn goal_update_system(
                     ai.state = AiState::Idle;
                     ai.job_id = PersonAI::UNEMPLOYED;
                 }
+                if let Some(mut r) = reason_opt { r.0 = "Participating in Raid"; } else { commands.entity(entity).insert(GoalReason("Participating in Raid")); }
                 continue;
             }
         }
@@ -200,22 +208,22 @@ pub fn goal_update_system(
             super::construction::find_bed_build_site(&chunk_map, &bed_map, home, 15).is_some()
         };
 
-        let new_goal = if is_starving && faction_has_food {
-            AgentGoal::ReturnCamp
+        let (new_goal, reason) = if is_starving && faction_has_food {
+            (AgentGoal::ReturnCamp, "Starving (Faction has food)")
         } else if needs.hunger > 120.0 || (needs.hunger > 60.0 && agent.quantity_of(Good::Food) < 3) {
-            AgentGoal::Survive
+            (AgentGoal::Survive, "Hungry")
         } else if needs.sleep > 180.0 {
-            AgentGoal::Sleep
+            (AgentGoal::Sleep, "Tired")
         } else if agent.quantity_of(Good::Food) > 0 && can_return_camp {
-            AgentGoal::ReturnCamp
+            (AgentGoal::ReturnCamp, "Returning Surplus Food")
         } else if needs.reproduction > reproduce_threshold {
-            AgentGoal::Reproduce
+            (AgentGoal::Reproduce, "Reproduction Need")
         } else if needs.social > social_threshold {
-            AgentGoal::Socialize
+            (AgentGoal::Socialize, "Social Need")
         } else if member.faction_id != SOLO && auto_build.0 && has_build_site {
-            AgentGoal::Build
+            (AgentGoal::Build, "Building Projects")
         } else {
-            AgentGoal::Gather
+            (AgentGoal::Gather, "General Gathering")
         };
 
         if *goal != new_goal {
@@ -225,5 +233,11 @@ pub fn goal_update_system(
             ai.target_entity = None;
             target_item.0 = None;
         }
+        if let Some(mut r) = reason_opt {
+            r.0 = reason;
+        } else {
+            commands.entity(entity).insert(GoalReason(reason));
+        }
     }
 }
+

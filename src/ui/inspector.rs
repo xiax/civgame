@@ -6,13 +6,18 @@ use crate::simulation::needs::Needs;
 use crate::simulation::mood::Mood;
 use crate::simulation::skills::{Skills, SkillKind, SKILL_COUNT};
 use crate::simulation::person::{PersonAI, AiState, PlayerOrder};
-use crate::simulation::goals::{AgentGoal, Personality};
+use crate::simulation::goals::{AgentGoal, Personality, GoalReason};
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction, SOLO};
 use crate::simulation::reproduction::BiologicalSex;
 use crate::simulation::jobs::JobKind;
 use crate::simulation::plants::{PlantMap, Plant};
+use crate::simulation::plan::{ActivePlan, KnownPlans, PlanRegistry, StepRegistry, build_state_vec};
+use crate::simulation::neural::UtilityNet;
+use crate::simulation::memory::AgentMemory;
+use crate::simulation::construction::AutonomousBuildingToggle;
 use crate::world::chunk::ChunkMap;
 use crate::world::tile::TileKind;
+use crate::world::seasons::Calendar;
 use crate::economy::agent::EconomicAgent;
 
 use super::selection::SelectedEntity;
@@ -24,16 +29,20 @@ pub fn inspector_panel_system(
     player_faction: Res<PlayerFaction>,
     chunk_map: Res<ChunkMap>,
     plant_map: Res<PlantMap>,
+    plan_registry: Res<PlanRegistry>,
+    step_registry: Res<StepRegistry>,
+    calendar: Res<Calendar>,
     plants: Query<&Plant>,
     query: Query<(
-        &Needs, &Mood, &Skills, &PersonAI, &EconomicAgent,
-        &AgentGoal, &Personality, &BiologicalSex, &FactionMember, Option<&Health>, Option<&Body>,
-        Option<&PlayerOrder>
+        (&Needs, &Mood, &Skills, &PersonAI, &EconomicAgent, &AgentGoal, &Personality, &BiologicalSex, &FactionMember),
+        (Option<&Health>, Option<&Body>, Option<&PlayerOrder>, &Transform, Option<&ActivePlan>, Option<&KnownPlans>, Option<&UtilityNet>, Option<&AgentMemory>, Option<&GoalReason>)
     )>,
 ) {
     let Some(entity) = selected.0 else { return };
-    let Ok((needs, mood, skills, ai, agent, goal, personality, sex, member, health, body, order)) =
-        query.get(entity) else { return };
+    let Ok((
+        (needs, mood, skills, ai, agent, goal, personality, sex, member),
+        (health, body, order, transform, active_plan, known_plans, utility_net, memory, goal_reason)
+    )) = query.get(entity) else { return };
 
     egui::Window::new("Inspector")
         .default_pos([10.0, 10.0])
@@ -45,7 +54,12 @@ pub fn inspector_panel_system(
                 ui.label(sex.name());
             });
             ui.label(format!("Personality: {}", personality.name()));
-            ui.label(format!("Goal: {}", goal.name()));
+            ui.horizontal(|ui| {
+                ui.label(format!("Goal: {}", goal.name()));
+                if let Some(reason) = goal_reason {
+                    ui.label(egui::RichText::new(format!(" ({})", reason.0)).small().color(egui::Color32::from_gray(160)));
+                }
+            });
 
             if member.faction_id == SOLO {
                 ui.label("Faction: Solo");
@@ -204,6 +218,77 @@ pub fn inspector_panel_system(
                     ))
                     .color(egui::Color32::from_rgb(255, 220, 100)),
                 );
+            }
+
+            ui.separator();
+            if let Some(ap) = active_plan {
+                if let Some(plan_def) = plan_registry.0.iter().find(|p| p.id == ap.plan_id) {
+                    ui.label(egui::RichText::new(format!("Active Plan: {}", plan_def.name)).strong().color(egui::Color32::LIGHT_BLUE));
+                    ui.label(format!("  Step: {}/{}", ap.current_step + 1, plan_def.steps.len()));
+                    ui.label(format!("  Reward: {:.2}", ap.reward_acc));
+                }
+            } else {
+                ui.label(egui::RichText::new("Active Plan: None").italics().color(egui::Color32::GRAY));
+            }
+
+            if let (Some(kp), Some(net)) = (known_plans, utility_net) {
+                egui::CollapsingHeader::new("Available Plans").show(ui, |ui| {
+                    let state = build_state_vec(needs, agent, skills, member, memory, &calendar);
+                    let cur_tx = (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;
+                    let cur_ty = (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32;
+                    let camp_pos = registry.home_tile(member.faction_id);
+
+                    for plan_def in &plan_registry.0 {
+                        // Viability checks
+                        let serving_goal = plan_def.serves_goals.contains(goal);
+                        let known = kp.knows(plan_def.id);
+                        let tech_unlocked = plan_def.tech_gate.map_or(true, |tid| {
+                            registry.factions.get(&member.faction_id).map(|f| f.techs.has(tid)).unwrap_or(false)
+                        });
+                        let first_step_ready = plan_def.steps.first()
+                            .and_then(|&sid| step_registry.0.iter().find(|s| s.id == sid))
+                            .and_then(|s| s.preconditions.requires_good)
+                            .map_or(true, |(good, qty)| agent.quantity_of(good) >= qty);
+
+                        let mut rejection = None;
+                        if !serving_goal { rejection = Some("Wrong Goal"); }
+                        else if !known { rejection = Some("Not Learned"); }
+                        else if !tech_unlocked { rejection = Some("Tech Locked"); }
+                        else if !first_step_ready { rejection = Some("Missing Materials"); }
+
+                        if let Some(reason) = rejection {
+                            ui.label(egui::RichText::new(format!("{}: Rejected ({})", plan_def.name, reason)).small().color(egui::Color32::from_gray(120)));
+                        } else {
+                            let mut score = net.evaluate_plan(state, plan_def.feature_vec);
+                            let mut bonus_str = String::new();
+                            if plan_def.id == ai.last_plan_id {
+                                score += 0.2;
+                                bonus_str += " (+0.2 persist)";
+                            }
+
+                            let target_tile = plan_def.memory_target_kind.and_then(|k| {
+                                memory.and_then(|m| m.best_for_dist_weighted(k, (cur_tx, cur_ty)))
+                            });
+
+                            if let Some(target) = target_tile {
+                                let dist_agent = (target.0 as i32 - cur_tx).abs() + (target.1 as i32 - cur_ty).abs();
+                                let dist_camp = camp_pos.map_or(0, |c| (target.0 as i32 - c.0 as i32).abs() + (target.1 as i32 - c.1 as i32).abs());
+                                let penalty = (dist_agent + dist_camp) as f32 * 0.002;
+                                score -= penalty;
+                                bonus_str += &format!(" (-{:.2} dist)", penalty);
+                            } else {
+                                score -= 0.5;
+                                bonus_str += " (-0.5 no target)";
+                            }
+
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{}: ", plan_def.name));
+                                ui.label(egui::RichText::new(format!("{:.2}", score)).color(egui::Color32::YELLOW));
+                                ui.label(egui::RichText::new(bonus_str).small().color(egui::Color32::from_gray(160)));
+                            });
+                        }
+                    }
+                });
             }
         });
 }

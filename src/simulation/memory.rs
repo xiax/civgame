@@ -75,12 +75,12 @@ impl AgentMemory {
         self.insert_with_freshness(tile, kind, Some(entity), 255);
     }
 
+    // Bug 4 fix: remove ALL matching entries, not just the first one.
     pub fn forget(&mut self, tile: (i16, i16), kind: MemoryKind) {
         for slot in &mut self.entries {
             if let Some(e) = slot {
                 if e.tile == tile && e.kind == kind {
                     *slot = None;
-                    return;
                 }
             }
         }
@@ -271,7 +271,7 @@ pub fn vision_system(
         for dy in -VIEW_RADIUS..=VIEW_RADIUS {
             for dx in -VIEW_RADIUS..=VIEW_RADIUS {
                 if dx*dx + dy*dy > VIEW_RADIUS*VIEW_RADIUS { continue; }
-                
+
                 let ntx = tx + dx;
                 let nty = ty + dy;
 
@@ -279,7 +279,9 @@ pub fn vision_system(
                     continue;
                 }
 
-                // Check plants
+                // Check plants — Bug 1 fix: record with entity so target_entity is set on
+                // dispatch, allowing goal_update_system to validate via the plant query
+                // instead of falling through to the stone tile check.
                 if let Some(&entity) = plant_map.0.get(&(ntx, nty)) {
                     if let Ok(plant) = plant_query.get(entity) {
                         let kind = match plant.kind {
@@ -287,7 +289,7 @@ pub fn vision_system(
                             crate::simulation::plants::PlantKind::Tree => MemoryKind::Wood,
                         };
                         if plant.stage == crate::simulation::plants::GrowthStage::Mature {
-                            memory.record((ntx as i16, nty as i16), kind);
+                            memory.record_entity((ntx as i16, nty as i16), kind, entity);
                         } else {
                             memory.forget((ntx as i16, nty as i16), kind);
                         }

@@ -54,7 +54,6 @@ pub struct StepDef {
     pub job:           JobKind,
     pub target:        StepTarget,
     pub preconditions: StepPreconditions,
-    pub memory_kind:   Option<MemoryKind>,
     pub reward_scale:  f32,
     /// When falling back from memory to a plant search (Food memory kind),
     /// restricts which plant kind is targeted. None = any mature plant.
@@ -70,6 +69,8 @@ pub struct PlanDef {
     pub serves_goals: &'static [AgentGoal],
     /// Faction must have unlocked this tech for the plan to be selectable.
     pub tech_gate:    Option<TechId>,
+    /// Memory kind used to compute distance penalties during plan scoring.
+    pub memory_target_kind: Option<MemoryKind>,
 }
 
 #[derive(Resource, Default)]
@@ -184,7 +185,6 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: 0, job: JobKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Food),
             preconditions: StepPreconditions::none(),
-            memory_kind: Some(MemoryKind::Food),
             reward_scale: 1.0,
             plant_filter: Some(PlantKind::FruitBush),
         },
@@ -192,7 +192,6 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: 1, job: JobKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Food),
             preconditions: StepPreconditions::none(),
-            memory_kind: Some(MemoryKind::Food),
             reward_scale: 1.0,
             plant_filter: Some(PlantKind::Grain),
         },
@@ -200,7 +199,6 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: 2, job: JobKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Wood),
             preconditions: StepPreconditions::none(),
-            memory_kind: Some(MemoryKind::Wood),
             reward_scale: 0.3,
             plant_filter: None,
         },
@@ -208,7 +206,6 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: 3, job: JobKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Stone),
             preconditions: StepPreconditions::none(),
-            memory_kind: Some(MemoryKind::Stone),
             reward_scale: 0.3,
             plant_filter: None,
         },
@@ -216,7 +213,6 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: 4, job: JobKind::Planter,
             target: StepTarget::NearestTile(GRASS_TILES),
             preconditions: StepPreconditions::needs_good(Good::Seed, 1),
-            memory_kind: Some(MemoryKind::Seed),
             reward_scale: 0.2,
             plant_filter: None,
         },
@@ -224,7 +220,6 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: 5, job: JobKind::Hunter,
             target: StepTarget::HuntPrey,
             preconditions: StepPreconditions::none(),
-            memory_kind: Some(MemoryKind::Food),
             reward_scale: 0.4,
             plant_filter: None,
         },
@@ -232,7 +227,6 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: 6, job: JobKind::Scavenge,
             target: StepTarget::NearestItem(Good::Food),
             preconditions: StepPreconditions::none(),
-            memory_kind: None,
             reward_scale: 0.4,
             plant_filter: None,
         },
@@ -240,7 +234,6 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: 7, job: JobKind::Construct,
             target: StepTarget::NearestBuildSite(BuildSiteKind::Wall),
             preconditions: StepPreconditions::needs_good(Good::Wood, 2),
-            memory_kind: None,
             reward_scale: 0.8,
             plant_filter: None,
         },
@@ -248,7 +241,6 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: 8, job: JobKind::ConstructBed,
             target: StepTarget::NearestBuildSite(BuildSiteKind::Bed),
             preconditions: StepPreconditions::needs_good(Good::Wood, 3),
-            memory_kind: None,
             reward_scale: 1.0,
             plant_filter: None,
         },
@@ -264,47 +256,56 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             steps: PLAN_STEPS_0,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.0],
             serves_goals: SURVIVE_AND_GATHER_GOALS, tech_gate: None,
+            memory_target_kind: Some(MemoryKind::Food),
         },
         PlanDef { id: 1, name: "FarmFood",
             steps: PLAN_STEPS_1,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.0],
             serves_goals: SURVIVE_GOALS, tech_gate: None,
+            memory_target_kind: Some(MemoryKind::Food),
         },
         PlanDef { id: 2, name: "GatherWood",
             steps: PLAN_STEPS_2,
             feature_vec: [0.0, 1.0, 0.0,  0.0, 0.0, 0.0,  0.1, 0.1],
             serves_goals: GATHER_GOALS, tech_gate: None,
+            memory_target_kind: Some(MemoryKind::Wood),
         },
         PlanDef { id: 3, name: "GatherStone",
             steps: PLAN_STEPS_3,
             feature_vec: [0.0, 0.0, 1.0,  0.0, 0.0, 0.0,  0.1, 0.1],
             serves_goals: GATHER_GOALS, tech_gate: None,
+            memory_target_kind: Some(MemoryKind::Stone),
         },
         PlanDef { id: 4, name: "PlantAndFarm",
             steps: PLAN_STEPS_4,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.2, 0.0],
             serves_goals: SURVIVE_GOALS, tech_gate: None,
+            memory_target_kind: Some(MemoryKind::Food),
         },
         PlanDef { id: 5, name: "HuntFood",
             steps: PLAN_STEPS_5,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.2, 1.0],
             serves_goals: SURVIVE_GOALS, tech_gate: None,
+            memory_target_kind: Some(MemoryKind::Prey),
         },
         PlanDef { id: 6, name: "ScavengeFood",
             steps: PLAN_STEPS_6,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.0],
             serves_goals: SURVIVE_GOALS, tech_gate: None,
+            memory_target_kind: Some(MemoryKind::Food),
         },
         PlanDef { id: 7, name: "BuildWoodWall",
             steps: PLAN_STEPS_7,
             feature_vec: [0.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.1, 0.0],
             serves_goals: BUILD_GOALS, tech_gate: None,
+            memory_target_kind: None,
         },
         PlanDef { id: 8, name: "BuildBed",
             steps: PLAN_STEPS_8,
             feature_vec: [0.0, 0.0, 0.0,  0.0, 0.0, 0.0,  0.1, 0.0],
             serves_goals: BUILD_GOALS,
             tech_gate: Some(super::technology::PERM_SETTLEMENT),
+            memory_target_kind: None,
         },
     ];
 }
@@ -369,7 +370,8 @@ fn resolve_target(
     faction_registry: &FactionRegistry,
     faction_id: u32,
     memory: Option<&AgentMemory>,
-    item_check: &Query<(), With<GroundItem>>,
+    // Bug 2 fix: read GroundItem data so find_nearest_item can filter by good type.
+    item_query: &Query<&GroundItem>,
     prey_query: &Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
     combat_target: &mut CombatTarget,
     target_item: &mut TargetItem,
@@ -449,8 +451,8 @@ fn resolve_target(
             }
         }
         StepTarget::NearestItem(good) => {
-            // 1. Check vision
-            if let Some((entity, tx, ty)) = find_nearest_item(spatial, pos, VIEW_RADIUS, item_check) {
+            // 1. Check vision — Bug 2 fix: pass good so only matching items are targeted.
+            if let Some((entity, tx, ty)) = find_nearest_item(spatial, pos, VIEW_RADIUS, *good, item_query) {
                 if super::line_of_sight::has_los(chunk_map, pos, (tx as i32, ty as i32)) {
                     target_item.0 = Some(entity);
                     return Some((Some(entity), tx, ty));
@@ -533,7 +535,8 @@ pub fn plan_execution_system(
     bed_map: Res<BedMap>,
     calendar: Res<Calendar>,
     clock: Res<SimClock>,
-    item_check: Query<(), With<GroundItem>>,
+    // Bug 2 fix: read GroundItem data to allow good-type filtering in find_nearest_item.
+    item_check: Query<&GroundItem>,
     prey_query: Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
     mut query: Query<(AgentQuery, OptionalQuery), Without<PlayerOrder>>,
 ) {
@@ -571,8 +574,16 @@ pub fn plan_execution_system(
                         .map(|f| f.techs.has(tid))
                         .unwrap_or(false)
                 }))
+                // Bug 3 fix: skip plans whose first step has unmet preconditions so we
+                // don't enter a tight pick-then-immediately-abandon loop.
+                .filter(|p| {
+                    p.steps.first()
+                        .and_then(|&sid| step_registry.0.iter().find(|s| s.id == sid))
+                        .and_then(|s| s.preconditions.requires_good)
+                        .map_or(true, |(good, qty)| agent.quantity_of(good) >= qty)
+                })
                 .collect();
-            
+
             if candidates.is_empty() {
                 // FALLBACK: Explore toward a random tile within 3 chunks of home
                 let home = faction_registry.home_tile(member.faction_id).unwrap_or((cur_tx as i16, cur_ty as i16));
@@ -592,30 +603,24 @@ pub fn plan_execution_system(
                         let mut scores: Vec<(u16, f32)> = candidates.iter()
                             .map(|p| (p.id, net.score_plan(state, p.feature_vec, p.id)))
                             .collect();
-                        
-                        // Apply distance penalties and persistence bonus
+
+                        // Bug 5 fix: use PlanDef.memory_target_kind instead of a hard-coded
+                        // plan-ID match, so distance penalties stay correct if plans change.
                         let camp_pos = faction_registry.home_tile(member.faction_id);
-                        for (plan_id, score) in scores.iter_mut() {
+                        for ((_, score), plan_def) in scores.iter_mut().zip(candidates.iter()) {
                             // Bonus for last plan to reduce switching jitter
-                            if *plan_id == ai.last_plan_id {
+                            if plan_def.id == ai.last_plan_id {
                                 *score += 0.2;
                             }
 
-                            // Find target memory kind for this plan
-                            let mkind = if *plan_id == 5 { Some(MemoryKind::Prey) } // Hunt
-                                else if *plan_id == 0 || *plan_id == 1 || *plan_id == 6 { Some(MemoryKind::Food) }
-                                else if *plan_id == 2 { Some(MemoryKind::Wood) }
-                                else if *plan_id == 3 { Some(MemoryKind::Stone) }
-                                else { None };
-
-                            let target_tile = mkind.and_then(|k| {
+                            let target_tile = plan_def.memory_target_kind.and_then(|k| {
                                 memory_opt.and_then(|m| m.best_for_dist_weighted(k, (cur_tx, cur_ty)))
                             });
 
                             if let Some(target) = target_tile {
                                 let dist_agent = (target.0 as i32 - cur_tx).abs() + (target.1 as i32 - cur_ty).abs();
                                 let dist_camp = camp_pos.map_or(0, |c| (target.0 as i32 - c.0 as i32).abs() + (target.1 as i32 - c.1 as i32).abs());
-                                
+
                                 // Penalty: -0.002 per tile of total distance
                                 *score -= (dist_agent + dist_camp) as f32 * 0.002;
                             } else {

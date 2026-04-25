@@ -35,13 +35,13 @@ impl Default for WorldGen {
 pub fn biome_thresholds(biome: Biome) -> (f32, f32, f32, f32) {
     match biome {
         Biome::Ocean     => (0.90, 0.95, 0.97, 0.99),
-        Biome::Tundra    => (0.15, 0.80, 0.85, 0.90),
-        Biome::Taiga     => (0.18, 0.35, 0.40, 0.70),
-        Biome::Temperate => (0.22, 0.45, 0.60, 0.75),
-        Biome::Grassland => (0.18, 0.60, 0.75, 0.82),
-        Biome::Tropical  => (0.20, 0.30, 0.35, 0.78),
-        Biome::Desert    => (0.10, 0.65, 0.68, 0.70),
-        Biome::Mountain  => (0.12, 0.25, 0.28, 0.40),
+        Biome::Tundra    => (0.15, 0.80, 0.85, 0.95),
+        Biome::Taiga     => (0.18, 0.35, 0.40, 0.85),
+        Biome::Temperate => (0.22, 0.45, 0.60, 0.85),
+        Biome::Grassland => (0.18, 0.60, 0.75, 0.88),
+        Biome::Tropical  => (0.20, 0.30, 0.35, 0.88),
+        Biome::Desert    => (0.10, 0.65, 0.68, 0.75),
+        Biome::Mountain  => (0.12, 0.25, 0.28, 0.50),
     }
 }
 

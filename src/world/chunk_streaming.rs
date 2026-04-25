@@ -144,17 +144,24 @@ pub fn spawn_chunk_plants(
                         global_tx, global_ty, kind, stage,
                     );
                 }
-                TileKind::Grass if tile.fertility > 120 => {
-                    if h % 100 < 2 {
+                TileKind::Grass if tile.fertility > 100 => {
+                    let pct = h % 100;
+                    if pct < 2 {
                         spawn_plant_at(
                             commands, plant_map, plant_sprite_index,
                             textures,
                             global_tx, global_ty, PlantKind::FruitBush, initial_stage(h),
                         );
+                    } else if pct < 7 {
+                        spawn_plant_at(
+                            commands, plant_map, plant_sprite_index,
+                            textures,
+                            global_tx, global_ty, PlantKind::Tree, initial_stage(h),
+                        );
                     }
                 }
                 TileKind::Forest => {
-                    if h % 100 < 10 {
+                    if h % 100 < 40 {
                         spawn_plant_at(
                             commands, plant_map, plant_sprite_index,
                             textures,
