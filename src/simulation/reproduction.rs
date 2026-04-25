@@ -205,7 +205,7 @@ pub fn reproduction_system(
                 AgentMemory::default(),
                 RelationshipMemory::default(),
                 child_net,
-                KnownPlans::with_innate(&[0, 1]),
+                KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 8]),
                 PlanScoringMethod::UtilityNN,
             ),
         ));

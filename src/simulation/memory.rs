@@ -75,6 +75,17 @@ impl AgentMemory {
         self.insert_with_freshness(tile, kind, Some(entity), 255);
     }
 
+    pub fn forget(&mut self, tile: (i16, i16), kind: MemoryKind) {
+        for slot in &mut self.entries {
+            if let Some(e) = slot {
+                if e.tile == tile && e.kind == kind {
+                    *slot = None;
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn best_for(&self, kind: MemoryKind) -> Option<(i16, i16)> {
         let mut best_fresh = 0u8;
         let mut best_tile = None;
@@ -271,14 +282,19 @@ pub fn vision_system(
                 // Check plants
                 if let Some(&entity) = plant_map.0.get(&(ntx, nty)) {
                     if let Ok(plant) = plant_query.get(entity) {
+                        let kind = match plant.kind {
+                            crate::simulation::plants::PlantKind::FruitBush | crate::simulation::plants::PlantKind::Grain => MemoryKind::Food,
+                            crate::simulation::plants::PlantKind::Tree => MemoryKind::Wood,
+                        };
                         if plant.stage == crate::simulation::plants::GrowthStage::Mature {
-                            let kind = match plant.kind {
-                                crate::simulation::plants::PlantKind::FruitBush | crate::simulation::plants::PlantKind::Grain => MemoryKind::Food,
-                                crate::simulation::plants::PlantKind::Tree => MemoryKind::Wood,
-                            };
                             memory.record((ntx as i16, nty as i16), kind);
+                        } else {
+                            memory.forget((ntx as i16, nty as i16), kind);
                         }
                     }
+                } else {
+                    memory.forget((ntx as i16, nty as i16), MemoryKind::Food);
+                    memory.forget((ntx as i16, nty as i16), MemoryKind::Wood);
                 }
 
                 // Check spatial for entities (items, prey)
@@ -305,6 +321,8 @@ pub fn vision_system(
                 if let Some(tile_kind) = chunk_map.tile_kind_at(ntx, nty) {
                     if tile_kind == crate::world::tile::TileKind::Stone {
                         memory.record((ntx as i16, nty as i16), MemoryKind::Stone);
+                    } else {
+                        memory.forget((ntx as i16, nty as i16), MemoryKind::Stone);
                     }
                 }
             }

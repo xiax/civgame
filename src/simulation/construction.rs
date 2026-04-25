@@ -74,8 +74,8 @@ pub fn find_wall_build_site(
                 let Some(kind) = chunk_map.tile_kind_at(tx, ty) else { continue };
                 if !kind.is_passable() || kind == TileKind::Wall { continue; }
 
-                // Rings 1-2: take any passable tile.
-                if ring_r <= 2 {
+                // Rings 1-3: take any passable tile to establish a perimeter.
+                if ring_r <= 3 {
                     return Some((tx as i16, ty as i16));
                 }
 
@@ -93,7 +93,7 @@ pub fn find_wall_build_site(
 }
 
 /// Find the closest passable tile within max_radius of camp_home that:
-/// - already has enclosure_score >= 2 (some walls around it)
+/// - already has enclosure_score >= 1 (some walls or terrain around it)
 /// - has no bed placed yet
 pub fn find_bed_build_site(
     chunk_map:  &ChunkMap,
@@ -114,7 +114,7 @@ pub fn find_bed_build_site(
             if !kind.is_passable() { continue; }
             if bed_map.0.contains_key(&(tx as i16, ty as i16)) { continue; }
 
-            if enclosure_score(chunk_map, tx, ty) >= 2 {
+            if enclosure_score(chunk_map, tx, ty) >= 1 {
                 let dist = dx.abs() + dy.abs();
                 if dist < best_dist {
                     best_dist = dist;

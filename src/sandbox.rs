@@ -91,7 +91,7 @@ fn setup_sandbox(
             AgentMemory::default(),
             RelationshipMemory::default(),
             UtilityNet::new_random(),
-            KnownPlans::with_innate(&[0, 1, 5]),
+            KnownPlans::with_innate(&[0, 1, 2, 3, 5]),
             PlanScoringMethod::UtilityNN,
         ),
     ));

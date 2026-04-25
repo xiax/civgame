@@ -79,12 +79,23 @@ pub fn gather_system(
 
             let Ok((mut plant, mut sprite)) = plant_query.get_mut(entity) else {
                 plant_map.0.remove(&(tx, ty));
+                if let Some(ref mut mem) = memory_opt {
+                    mem.forget((tx as i16, ty as i16), MemoryKind::Food);
+                    mem.forget((tx as i16, ty as i16), MemoryKind::Wood);
+                }
                 ai.state = AiState::Idle;
                 ai.job_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
                 continue;
             };
             if plant.stage != GrowthStage::Mature {
+                if let Some(ref mut mem) = memory_opt {
+                    let kind = match plant.kind {
+                        PlantKind::FruitBush | PlantKind::Grain => MemoryKind::Food,
+                        PlantKind::Tree => MemoryKind::Wood,
+                    };
+                    mem.forget((tx as i16, ty as i16), kind);
+                }
                 ai.state = AiState::Idle;
                 ai.job_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
@@ -179,6 +190,11 @@ pub fn gather_system(
                 }
             } else {
                 // Not a stone tile and not a plant -> target is invalid or already harvested
+                if let Some(ref mut mem) = memory_opt {
+                    mem.forget((tx as i16, ty as i16), MemoryKind::Stone);
+                    mem.forget((tx as i16, ty as i16), MemoryKind::Food);
+                    mem.forget((tx as i16, ty as i16), MemoryKind::Wood);
+                }
                 ai.state = AiState::Idle;
                 ai.job_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;

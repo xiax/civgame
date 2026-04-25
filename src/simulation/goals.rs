@@ -79,6 +79,7 @@ pub fn goal_update_system(
     registry: Res<FactionRegistry>,
     calendar: Res<Calendar>,
     auto_build: Res<AutonomousBuildingToggle>,
+    bed_map: Res<super::construction::BedMap>,
     chunk_map: Res<ChunkMap>,
     plant_map: Res<PlantMap>,
     plant_query: Query<&Plant>,
@@ -193,6 +194,12 @@ pub fn goal_update_system(
         let faction_has_food = member.faction_id != SOLO && registry.food_stock(member.faction_id) >= 1.0;
         let is_starving = needs.hunger > 100.0 && agent.quantity_of(Good::Food) == 0;
 
+        let has_build_site = member.faction_id != SOLO && {
+            let home = registry.home_tile(member.faction_id).unwrap_or((0, 0));
+            super::construction::find_wall_build_site(&chunk_map, home, 20).is_some() ||
+            super::construction::find_bed_build_site(&chunk_map, &bed_map, home, 15).is_some()
+        };
+
         let new_goal = if is_starving && faction_has_food {
             AgentGoal::ReturnCamp
         } else if needs.hunger > 120.0 || (needs.hunger > 60.0 && agent.quantity_of(Good::Food) < 3) {
@@ -201,12 +208,12 @@ pub fn goal_update_system(
             AgentGoal::Sleep
         } else if agent.quantity_of(Good::Food) > 0 && can_return_camp {
             AgentGoal::ReturnCamp
-        } else if needs.shelter > 80.0 && member.faction_id != SOLO && auto_build.0 {
-            AgentGoal::Build
         } else if needs.reproduction > reproduce_threshold {
             AgentGoal::Reproduce
         } else if needs.social > social_threshold {
             AgentGoal::Socialize
+        } else if member.faction_id != SOLO && auto_build.0 && has_build_site {
+            AgentGoal::Build
         } else {
             AgentGoal::Gather
         };

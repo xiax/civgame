@@ -1,6 +1,5 @@
 use ahash::AHashMap;
 use bevy::prelude::*;
-use rand::Rng;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::Calendar;
@@ -171,8 +170,8 @@ static PLAN_STEPS_3: &[StepId] = &[3];    // GatherStone
 static PLAN_STEPS_4: &[StepId] = &[4, 1]; // PlantAndFarm
 static PLAN_STEPS_5: &[StepId] = &[5, 6]; // HuntFood
 static PLAN_STEPS_6: &[StepId] = &[6];    // ScavengeFood
-static PLAN_STEPS_7: &[StepId] = &[7];    // BuildWoodWall
-static PLAN_STEPS_8: &[StepId] = &[8];    // BuildBed
+static PLAN_STEPS_7: &[StepId] = &[2, 7]; // GatherWood, BuildWoodWall
+static PLAN_STEPS_8: &[StepId] = &[2, 8]; // GatherWood, BuildBed
 
 static SURVIVE_GOALS:             &[AgentGoal] = &[AgentGoal::Survive];
 static GATHER_GOALS:              &[AgentGoal] = &[AgentGoal::Gather];
@@ -440,17 +439,6 @@ fn resolve_target(
                 }
             }
 
-            // 3. Fallback: Explore randomly
-            let mut rng = rand::thread_rng();
-            for _ in 0..10 {
-                let dx = rng.gen_range(-40..=40);
-                let dy = rng.gen_range(-40..=40);
-                let tx = pos.0 + dx;
-                let ty = pos.1 + dy;
-                if chunk_map.is_passable(tx, ty) {
-                    return Some((None, tx as i16, ty as i16));
-                }
-            }
             None
         }
         StepTarget::NearestTile(_tiles) => {
@@ -584,7 +572,18 @@ pub fn plan_execution_system(
                         .unwrap_or(false)
                 }))
                 .collect();
-            if candidates.is_empty() { continue; }
+            
+            if candidates.is_empty() {
+                // FALLBACK: Explore toward a random tile within 3 chunks of home
+                let home = faction_registry.home_tile(member.faction_id).unwrap_or((cur_tx as i16, cur_ty as i16));
+                let dx = fastrand::i32(-96..=96);
+                let dy = fastrand::i32(-96..=96);
+                let target_tx = (home.0 as i32 + dx).max(0) as i16;
+                let target_ty = (home.1 as i32 + dy).max(0) as i16;
+
+                assign_job_with_routing(&mut ai, cur_chunk, (target_tx, target_ty), JobKind::Explore, None, &chunk_graph, &chunk_map);
+                continue;
+            }
 
             let plan_def = match scoring {
                 PlanScoringMethod::UtilityNN => {
@@ -744,7 +743,14 @@ pub fn plan_execution_system(
                 active_plan.dispatched = true;
                 active_plan.reward_scale = step_def.reward_scale;
             } else {
-                // No valid target — abandon plan
+                // No valid target — explore instead of just failing
+                let home = faction_registry.home_tile(member.faction_id).unwrap_or((cur_tx as i16, cur_ty as i16));
+                let dx = fastrand::i32(-96..=96);
+                let dy = fastrand::i32(-96..=96);
+                let target_tx = (home.0 as i32 + dx).max(0) as i16;
+                let target_ty = (home.1 as i32 + dy).max(0) as i16;
+
+                assign_job_with_routing(&mut ai, cur_chunk, (target_tx, target_ty), JobKind::Explore, None, &chunk_graph, &chunk_map);
                 commands.entity(entity).remove::<ActivePlan>();
                 combat_target.0 = None;
             }

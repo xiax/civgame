@@ -35,6 +35,7 @@ pub enum JobKind {
     ReturnCamp   = 10,
     Socialize    = 11,
     Reproduce    = 12,
+    Explore      = 13,
 }
 
 pub fn find_nearest_tile(
@@ -250,7 +251,13 @@ pub fn goal_dispatch_system(
                 AgentGoal::Reproduce  => Some(JobKind::Reproduce as u16),
                 AgentGoal::Raid       => Some(JobKind::Raid as u16),
                 AgentGoal::Defend     => Some(JobKind::Defend as u16),
-                _                     => None,
+                _                     => {
+                    if ai.job_id == JobKind::Explore as u16 && matches!(goal, AgentGoal::Gather | AgentGoal::Survive | AgentGoal::Build) {
+                         Some(JobKind::Explore as u16)
+                    } else {
+                        None
+                    }
+                }
             };
 
             if Some(ai.job_id) != expected_job {
@@ -347,7 +354,14 @@ pub fn goal_dispatch_system(
             }
 
             // Survive, Gather, and Build are handled by plan_execution_system
-            AgentGoal::Survive | AgentGoal::Gather | AgentGoal::Build => {}
+            AgentGoal::Survive | AgentGoal::Gather | AgentGoal::Build => {
+                if ai.job_id == JobKind::Explore as u16 {
+                    if ai.state == AiState::Working {
+                        ai.state = AiState::Idle;
+                        ai.job_id = PersonAI::UNEMPLOYED;
+                    }
+                }
+            }
         }
     });
 }

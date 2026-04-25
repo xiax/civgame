@@ -240,7 +240,7 @@ pub fn spawn_population(
                     AgentMemory::default(),
                     RelationshipMemory::default(),
                     UtilityNet::new_random(),
-                    KnownPlans::with_innate(&[0, 1, 5, 6, 7, 8]),
+                    KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 8]),
                     PlanScoringMethod::UtilityNN,
                 ),
             ));
