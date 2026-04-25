@@ -63,11 +63,14 @@ pub fn setup_tile_materials(
 }
 
 /// Spawn tile sprites for a single chunk; registers them in TileSpriteIndex.
+use crate::simulation::construction::{Wall, WallMap};
+
 pub fn spawn_chunk_sprites(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     tile_materials: &TileMaterials,
     sprite_index: &mut TileSpriteIndex,
+    wall_map: &mut WallMap,
     chunk_map: &ChunkMap,
     coord: ChunkCoord,
 ) {
@@ -89,6 +92,29 @@ pub fn spawn_chunk_sprites(
 
             let wx = global_tx as f32 * TILE_SIZE + TILE_SIZE * 0.5;
             let wy = global_ty as f32 * TILE_SIZE + TILE_SIZE * 0.5;
+
+            if kind == TileKind::Wall {
+                let tile_pos = (global_tx as i16, global_ty as i16);
+                if !wall_map.0.contains_key(&tile_pos) {
+                    let entity = commands.spawn((
+                        Wall,
+                        Transform::from_xyz(wx, wy, 0.4),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    )).id();
+                    wall_map.0.insert(tile_pos, entity);
+                    entities.push(entity);
+                } else {
+                    // Already has a wall entity (e.g. from construction),
+                    // but we should probably track it in this chunk's entity list
+                    // so it gets despawned when the chunk unloads.
+                    if let Some(&entity) = wall_map.0.get(&tile_pos) {
+                        entities.push(entity);
+                    }
+                }
+                continue;
+            }
 
             let entity = commands.spawn((
                 TileSprite,
@@ -188,6 +214,7 @@ pub fn spawn_initial_tile_sprites(
     mut meshes: ResMut<Assets<Mesh>>,
     tile_materials: Res<TileMaterials>,
     mut sprite_index: ResMut<TileSpriteIndex>,
+    mut wall_map: ResMut<WallMap>,
     chunk_map: Res<ChunkMap>,
     gen: Res<WorldGen>,
     mut globe: ResMut<Globe>,
@@ -207,6 +234,7 @@ pub fn spawn_initial_tile_sprites(
             &mut meshes,
             &tile_materials,
             &mut sprite_index,
+            &mut wall_map,
             &chunk_map,
             coord,
         );
@@ -232,6 +260,7 @@ pub fn chunk_streaming_system(
     mut meshes: ResMut<Assets<Mesh>>,
     tile_materials: Res<TileMaterials>,
     mut sprite_index: ResMut<TileSpriteIndex>,
+    mut wall_map: ResMut<WallMap>,
     mut chunk_map: ResMut<ChunkMap>,
     gen: Res<WorldGen>,
     mut globe: ResMut<Globe>,
@@ -274,6 +303,7 @@ pub fn chunk_streaming_system(
                 &mut meshes,
                 &tile_materials,
                 &mut sprite_index,
+                &mut wall_map,
                 &chunk_map,
                 coord,
             );

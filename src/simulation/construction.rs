@@ -2,6 +2,7 @@ use ahash::AHashMap;
 use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
+use crate::simulation::faction::FactionRegistry;
 use crate::simulation::jobs::JobKind;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, PersonAI};
@@ -14,24 +15,51 @@ use crate::world::tile::{TileKind, TileData};
 
 pub const TICKS_BUILD_WALL: u8 = 60;
 pub const TICKS_BUILD_BED:  u8 = 80;
+pub const MAX_BLUEPRINTS_PER_FACTION: usize = 2;
+pub const WALL_WOOD_COST: u8 = 2;
+pub const BED_WOOD_COST:  u8 = 3;
 
 /// Global toggle: when false, agents skip the Build goal entirely.
 #[derive(Resource)]
 pub struct AutonomousBuildingToggle(pub bool);
 
-/// Maps tile positions to the bed entity placed there.
+/// Maps tile positions to bed entities placed there.
 #[derive(Resource, Default)]
 pub struct BedMap(pub AHashMap<(i16, i16), Entity>);
 
-/// Marker placed on bed entities.
+/// Maps tile positions to wall entities placed there.
+#[derive(Resource, Default)]
+pub struct WallMap(pub AHashMap<(i16, i16), Entity>);
+
+/// Maps tile positions to active Blueprint entities (faction build reservations).
+#[derive(Resource, Default)]
+pub struct BlueprintMap(pub AHashMap<(i16, i16), Entity>);
+
+/// Marker placed on completed bed entities.
 #[derive(Component)]
 pub struct Bed;
 
-/// What kind of structure an agent is trying to build.
+/// Marker placed on completed wall entities.
+#[derive(Component)]
+pub struct Wall;
+
+/// What kind of structure is being built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuildSiteKind {
     Wall,
     Bed,
+}
+
+/// A faction-reserved construction site. Agents converge on Blueprint entities
+/// to deposit wood and contribute build progress. Despawned when construction completes.
+#[derive(Component)]
+pub struct Blueprint {
+    pub faction_id:     u32,
+    pub kind:           BuildSiteKind,
+    pub tile:           (i16, i16),
+    pub wood_needed:    u8,
+    pub wood_deposited: u8,
+    pub build_progress: u8,
 }
 
 /// Count how many of the 4 cardinal directions have a wall (or higher-z terrain)
@@ -54,16 +82,27 @@ pub fn enclosure_score(chunk_map: &ChunkMap, tx: i32, ty: i32) -> u8 {
     score
 }
 
-/// Scan Chebyshev rings outward from `camp_home` and return the first passable
-/// non-wall tile that is a valid place to build a wall.
+/// Find a valid wall build site. Rings 1-3 are a clearance zone; ring 4 bootstraps
+/// the first perimeter; rings 5+ fill gaps adjacent to existing walls.
 pub fn find_wall_build_site(
     chunk_map:  &ChunkMap,
     camp_home:  (i16, i16),
     max_radius: i32,
 ) -> Option<(i16, i16)> {
+    let dummy = BlueprintMap::default();
+    find_wall_build_site_excluding(chunk_map, &dummy, camp_home, max_radius)
+}
+
+/// Like `find_wall_build_site` but also skips tiles already reserved by blueprints.
+pub fn find_wall_build_site_excluding(
+    chunk_map:  &ChunkMap,
+    bp_map:     &BlueprintMap,
+    camp_home:  (i16, i16),
+    max_radius: i32,
+) -> Option<(i16, i16)> {
     let (hx, hy) = (camp_home.0 as i32, camp_home.1 as i32);
 
-    for ring_r in 1..=max_radius {
+    for ring_r in 4..=max_radius {
         for dy in -ring_r..=ring_r {
             for dx in -ring_r..=ring_r {
                 if dx.abs().max(dy.abs()) != ring_r { continue; }
@@ -71,15 +110,17 @@ pub fn find_wall_build_site(
                 let tx = hx + dx;
                 let ty = hy + dy;
 
+                if bp_map.0.contains_key(&(tx as i16, ty as i16)) { continue; }
+
                 let Some(kind) = chunk_map.tile_kind_at(tx, ty) else { continue };
                 if !kind.is_passable() || kind == TileKind::Wall { continue; }
 
-                // Rings 1-3: take any passable tile to establish a perimeter.
-                if ring_r <= 3 {
+                // Ring 4: bootstrap first perimeter ring unconditionally.
+                if ring_r == 4 {
                     return Some((tx as i16, ty as i16));
                 }
 
-                // Outer rings: only take tiles adjacent to an existing wall (gap-fill).
+                // Rings 5+: gap-fill adjacent to an existing wall.
                 let adj_wall = [(-1i32, 0), (1, 0), (0, -1i32), (0, 1)].iter().any(|(ddx, ddy)| {
                     chunk_map.tile_kind_at(tx + ddx, ty + ddy) == Some(TileKind::Wall)
                 });
@@ -92,12 +133,22 @@ pub fn find_wall_build_site(
     None
 }
 
-/// Find the closest passable tile within max_radius of camp_home that:
-/// - already has enclosure_score >= 1 (some walls or terrain around it)
-/// - has no bed placed yet
+/// Find the closest passable enclosed tile near camp for a bed.
 pub fn find_bed_build_site(
     chunk_map:  &ChunkMap,
     bed_map:    &BedMap,
+    camp_home:  (i16, i16),
+    max_radius: i32,
+) -> Option<(i16, i16)> {
+    let dummy = BlueprintMap::default();
+    find_bed_build_site_excluding(chunk_map, bed_map, &dummy, camp_home, max_radius)
+}
+
+/// Like `find_bed_build_site` but also skips blueprint-reserved tiles.
+pub fn find_bed_build_site_excluding(
+    chunk_map:  &ChunkMap,
+    bed_map:    &BedMap,
+    bp_map:     &BlueprintMap,
     camp_home:  (i16, i16),
     max_radius: i32,
 ) -> Option<(i16, i16)> {
@@ -109,6 +160,8 @@ pub fn find_bed_build_site(
         for dx in -max_radius..=max_radius {
             let tx = hx + dx;
             let ty = hy + dy;
+
+            if bp_map.0.contains_key(&(tx as i16, ty as i16)) { continue; }
 
             let Some(kind) = chunk_map.tile_kind_at(tx, ty) else { continue };
             if !kind.is_passable() { continue; }
@@ -126,14 +179,82 @@ pub fn find_bed_build_site(
     best
 }
 
-/// Handles agents building walls (JobKind::Construct) and beds (JobKind::ConstructBed).
+/// Maintains the faction build queue: spawns Blueprint entities for factions that
+/// have fewer than MAX_BLUEPRINTS_PER_FACTION active blueprints.
+/// Runs in Economy set every 60 ticks.
+pub fn faction_blueprint_system(
+    mut commands:     Commands,
+    clock:            Res<SimClock>,
+    auto_build:       Res<AutonomousBuildingToggle>,
+    chunk_map:        Res<ChunkMap>,
+    faction_registry: Res<FactionRegistry>,
+    bed_map:          Res<BedMap>,
+    mut bp_map:       ResMut<BlueprintMap>,
+    bp_query:         Query<&Blueprint>,
+) {
+    if clock.tick % 60 != 0 || !auto_build.0 { return; }
+
+    // Count materialized blueprints per faction.
+    let mut faction_bp_count: AHashMap<u32, usize> = AHashMap::new();
+    for &bp_entity in bp_map.0.values() {
+        if let Ok(bp) = bp_query.get(bp_entity) {
+            *faction_bp_count.entry(bp.faction_id).or_insert(0) += 1;
+        }
+    }
+
+    // Snapshot faction list to avoid borrow conflict.
+    let factions: Vec<(u32, (i16, i16))> = faction_registry.factions.iter()
+        .map(|(&id, fd)| (id, fd.home_tile))
+        .collect();
+
+    for (faction_id, home) in factions {
+        let mut count = faction_bp_count.get(&faction_id).copied().unwrap_or(0);
+
+        while count < MAX_BLUEPRINTS_PER_FACTION {
+            if let Some(tile) = find_wall_build_site_excluding(&chunk_map, &bp_map, home, 30) {
+                let world_pos = tile_to_world(tile.0 as i32, tile.1 as i32);
+                let entity = commands.spawn((
+                    Blueprint { faction_id, kind: BuildSiteKind::Wall, tile,
+                        wood_needed: WALL_WOOD_COST, wood_deposited: 0, build_progress: 0 },
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                )).id();
+                bp_map.0.insert(tile, entity);
+                count += 1;
+            } else if let Some(tile) = find_bed_build_site_excluding(&chunk_map, &bed_map, &bp_map, home, 25) {
+                let world_pos = tile_to_world(tile.0 as i32, tile.1 as i32);
+                let entity = commands.spawn((
+                    Blueprint { faction_id, kind: BuildSiteKind::Bed, tile,
+                        wood_needed: BED_WOOD_COST, wood_deposited: 0, build_progress: 0 },
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                )).id();
+                bp_map.0.insert(tile, entity);
+                count += 1;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Handles agents building at Blueprint entities (JobKind::Construct / ConstructBed).
+/// Multiple agents can contribute wood and labor to the same blueprint each tick.
 /// Runs in Sequential set after gather_system.
 pub fn construction_system(
-    mut commands: Commands,
-    mut chunk_map: ResMut<ChunkMap>,
-    mut bed_map:   ResMut<BedMap>,
-    clock: Res<SimClock>,
-    mut query: Query<(
+    mut commands:    Commands,
+    mut chunk_map:   ResMut<ChunkMap>,
+    mut bed_map:     ResMut<BedMap>,
+    mut wall_map:    ResMut<WallMap>,
+    mut bp_map:      ResMut<BlueprintMap>,
+    clock:           Res<SimClock>,
+    mut bp_query:    Query<&mut Blueprint>,
+    mut agent_query: Query<(
+        Entity,
         &mut PersonAI,
         &mut EconomicAgent,
         &mut Skills,
@@ -142,109 +263,131 @@ pub fn construction_system(
         Option<&mut ActivePlan>,
     )>,
 ) {
-    for (mut ai, mut agent, mut skills, slot, lod, mut plan_opt) in query.iter_mut() {
+    // Pass 1: collect pending contributions from Working agents.
+    // Map: bp_entity → Vec<(agent_entity, wood_available)>
+    let mut bp_pending: AHashMap<Entity, Vec<(Entity, u8)>> = AHashMap::new();
+
+    for (entity, mut ai, agent, mut skills, slot, lod, _) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
         if ai.state != AiState::Working { continue; }
+        if ai.job_id != JobKind::Construct as u16 && ai.job_id != JobKind::ConstructBed as u16 {
+            continue;
+        }
 
-        let tx = ai.target_tile.0 as i32;
-        let ty = ai.target_tile.1 as i32;
+        let Some(bp_entity) = ai.target_entity else {
+            ai.state = AiState::Idle;
+            ai.job_id = PersonAI::UNEMPLOYED;
+            ai.work_progress = 0;
+            continue;
+        };
 
-        // ── Wall building ─────────────────────────────────────────────────────
-        if ai.job_id == JobKind::Construct as u16 {
-            // Abort if target tile is no longer valid (already walled by another agent)
-            match chunk_map.tile_kind_at(tx, ty) {
-                Some(k) if k.is_passable() => {}
-                _ => {
-                    ai.state = AiState::Idle;
-                    ai.job_id = PersonAI::UNEMPLOYED;
-                    ai.target_entity = None;
-                    ai.work_progress = 0;
-                    continue;
+        skills.gain_xp(SkillKind::Building, 1);
+        let wood = agent.quantity_of(Good::Wood);
+        bp_pending.entry(bp_entity).or_default().push((entity, wood));
+    }
+
+    if bp_pending.is_empty() { return; }
+
+    let mut completed_agents: Vec<Entity> = Vec::new();
+    let mut orphaned_agents:  Vec<Entity> = Vec::new();
+    // (agent_entity, wood_to_remove)
+    let mut wood_removals: Vec<(Entity, u8)> = Vec::new();
+
+    // Pass 2: apply contributions to blueprints, check completion.
+    for (bp_entity, workers) in &bp_pending {
+        let Ok(mut bp) = bp_query.get_mut(*bp_entity) else {
+            orphaned_agents.extend(workers.iter().map(|(e, _)| *e));
+            continue;
+        };
+
+        // Greedily deposit wood from workers until blueprint is satisfied.
+        let mut still_needed = bp.wood_needed.saturating_sub(bp.wood_deposited);
+        for &(agent_e, wood_available) in workers {
+            if still_needed == 0 { break; }
+            let give = wood_available.min(still_needed);
+            if give > 0 {
+                wood_removals.push((agent_e, give));
+                bp.wood_deposited += give;
+                still_needed -= give;
+            }
+        }
+
+        // Each worker contributes one tick of build progress.
+        bp.build_progress = bp.build_progress.saturating_add(workers.len() as u8);
+
+        let threshold = match bp.kind {
+            BuildSiteKind::Wall => TICKS_BUILD_WALL,
+            BuildSiteKind::Bed  => TICKS_BUILD_BED,
+        };
+
+        if bp.build_progress >= threshold && bp.wood_deposited >= bp.wood_needed {
+            let tile = bp.tile;
+            let (tx, ty) = (tile.0 as i32, tile.1 as i32);
+
+            match bp.kind {
+                BuildSiteKind::Wall => {
+                    let surf_z = chunk_map.surface_z_at(tx, ty);
+                    chunk_map.set_tile(tx, ty, surf_z + 1, TileData {
+                        kind: TileKind::Wall, elevation: 0, fertility: 0, flags: 0b0001,
+                    });
+
+                    let world_pos = tile_to_world(tx, ty);
+                    let wall_entity = commands.spawn((
+                        Wall,
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    )).id();
+                    wall_map.0.insert(tile, wall_entity);
+                }
+                BuildSiteKind::Bed => {
+                    let world_pos = tile_to_world(tx, ty);
+                    let bed_entity = commands.spawn((
+                        Bed,
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    )).id();
+                    bed_map.0.insert(tile, bed_entity);
                 }
             }
 
-            if ai.work_progress < TICKS_BUILD_WALL { continue; }
+            bp_map.0.remove(&tile);
+            commands.entity(*bp_entity).despawn_recursive();
 
-            if agent.quantity_of(Good::Wood) < 2 {
-                ai.state = AiState::Idle;
-                ai.job_id = PersonAI::UNEMPLOYED;
-                ai.work_progress = 0;
-                continue;
+            completed_agents.extend(workers.iter().map(|(e, _)| *e));
+        }
+    }
+
+    if wood_removals.is_empty() && completed_agents.is_empty() && orphaned_agents.is_empty() {
+        return;
+    }
+
+    // Pass 3: remove wood from assigned agents and reset completed/orphaned agents.
+    for (entity, mut ai, mut agent, _, _, _, mut plan_opt) in agent_query.iter_mut() {
+        // Apply any wood removal from this pass.
+        for &(ae, qty) in &wood_removals {
+            if ae == entity {
+                agent.remove_good(Good::Wood, qty);
+                break;
             }
+        }
 
-            ai.work_progress = 0;
-            agent.remove_good(Good::Wood, 2);
-            skills.gain_xp(SkillKind::Building, 3);
+        let is_completed = completed_agents.contains(&entity);
+        let is_orphaned  = orphaned_agents.contains(&entity);
 
-            // Place wall one z-level above the floor so the floor tile remains
-            // conceptually present (matches the "one z-level higher = wall" convention).
-            let surf_z = chunk_map.surface_z_at(tx, ty);
-            chunk_map.set_tile(tx, ty, surf_z + 1, TileData {
-                kind:      TileKind::Wall,
-                elevation: 0,
-                fertility: 0,
-                flags:     0b0001,  // has_building
-            });
-
-            if let Some(ref mut plan) = plan_opt {
-                plan.reward_acc += 1.0;
-            }
-
-            ai.state  = AiState::Idle;
-            ai.job_id = PersonAI::UNEMPLOYED;
-            ai.target_entity = None;
-
-        // ── Bed building ──────────────────────────────────────────────────────
-        } else if ai.job_id == JobKind::ConstructBed as u16 {
-            // Abort if bed already placed here by another agent
-            if bed_map.0.contains_key(&(tx as i16, ty as i16)) {
-                ai.state = AiState::Idle;
-                ai.job_id = PersonAI::UNEMPLOYED;
-                ai.work_progress = 0;
-                continue;
-            }
-            match chunk_map.tile_kind_at(tx, ty) {
-                Some(k) if k.is_passable() => {}
-                _ => {
-                    ai.state = AiState::Idle;
-                    ai.job_id = PersonAI::UNEMPLOYED;
-                    ai.target_entity = None;
-                    ai.work_progress = 0;
-                    continue;
+        if is_completed || is_orphaned {
+            if is_completed {
+                if let Some(ref mut plan) = plan_opt {
+                    plan.reward_acc += if ai.job_id == JobKind::ConstructBed as u16 { 2.0 } else { 1.0 };
                 }
             }
-
-            if ai.work_progress < TICKS_BUILD_BED { continue; }
-
-            if agent.quantity_of(Good::Wood) < 3 {
-                ai.state = AiState::Idle;
-                ai.job_id = PersonAI::UNEMPLOYED;
-                ai.work_progress = 0;
-                continue;
-            }
-
-            ai.work_progress = 0;
-            agent.remove_good(Good::Wood, 3);
-            skills.gain_xp(SkillKind::Building, 5);
-
-            let world_pos = tile_to_world(tx, ty);
-            let bed_entity = commands.spawn((
-                Bed,
-                Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
-                GlobalTransform::default(),
-                Visibility::Visible,
-                InheritedVisibility::default(),
-            )).id();
-
-            bed_map.0.insert((tx as i16, ty as i16), bed_entity);
-
-            if let Some(ref mut plan) = plan_opt {
-                plan.reward_acc += 2.0;
-            }
-
-            ai.state  = AiState::Idle;
+            ai.state = AiState::Idle;
             ai.job_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
+            ai.work_progress = 0;
         }
     }
 }

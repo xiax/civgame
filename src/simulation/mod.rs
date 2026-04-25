@@ -63,6 +63,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(plan_registry)
             .insert_resource(construction::AutonomousBuildingToggle(true))
             .insert_resource(construction::BedMap::default())
+            .insert_resource(construction::WallMap::default())
+            .insert_resource(construction::BlueprintMap::default())
             .configure_sets(
                 FixedUpdate,
                 (
@@ -164,6 +166,7 @@ impl Plugin for SimulationPlugin {
                         .after(raid::raid_detection_system),
                     world_sim::world_sim_system,
                     world_sim::agent_exploration_system,
+                    construction::faction_blueprint_system,
                     technology::tech_discovery_system
                         .after(faction::faction_camp_system)
                         .after(raid::raid_execution_system),

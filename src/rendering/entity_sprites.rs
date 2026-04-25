@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use crate::simulation::animals::{Deer, Wolf};
-use crate::simulation::construction::Bed;
+use crate::simulation::construction::{Bed, Blueprint, Wall, BuildSiteKind};
 use crate::simulation::faction::{FactionMember, PlayerFaction, FactionCenter, PlayerFactionMarker};
 use crate::simulation::person::Person;
 use crate::simulation::reproduction::BiologicalSex;
@@ -10,6 +10,9 @@ use bevy::sprite::Anchor;
 
 #[derive(Component)]
 pub struct BedVisual;
+
+#[derive(Component)]
+pub struct WallVisual;
 
 #[derive(Component)]
 pub struct WolfVisual;
@@ -47,6 +50,27 @@ pub fn spawn_bed_sprites(
     }
 }
 
+pub fn spawn_wall_sprites(
+    mut commands: Commands,
+    query: Query<Entity, (With<Wall>, Without<WallVisual>)>,
+    textures: Res<EntityTextures>,
+) {
+    for entity in query.iter() {
+        let mut sprite = Sprite::from_image(textures.wall.clone());
+        sprite.custom_size = Some(Vec2::new(16.0, 16.0));
+        sprite.anchor = Anchor::Center;
+
+        commands.entity(entity).insert(WallVisual).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, 0.0, 0.1),
+                Visibility::Visible,
+            ));
+        });
+    }
+}
+
 pub fn spawn_faction_center_sprites(
     mut commands: Commands,
     query: Query<(Entity, Option<&PlayerFactionMarker>), (With<FactionCenter>, Without<FactionCenterVisual>)>,
@@ -54,7 +78,7 @@ pub fn spawn_faction_center_sprites(
 ) {
     for (entity, player_marker) in query.iter() {
         let mut sprite = Sprite::from_image(textures.camp.clone());
-        sprite.custom_size = Some(Vec2::new(48.0, 48.0));
+        sprite.custom_size = Some(Vec2::new(24.0, 24.0));
         sprite.anchor = Anchor::Center;
         
         // Tint blue if it's the player's faction
@@ -136,6 +160,53 @@ pub fn update_faction_sprite_colors(
                 sprite.color = color;
             }
         }
+    }
+}
+
+#[derive(Component)]
+pub struct BlueprintVisual;
+
+/// Spawn visual scaffold sprites for newly placed Blueprint entities.
+pub fn spawn_blueprint_sprites(
+    mut commands: Commands,
+    query: Query<(Entity, &Blueprint), (With<Blueprint>, Without<BlueprintVisual>)>,
+    textures: Res<EntityTextures>,
+) {
+    for (entity, bp) in query.iter() {
+        // Blueprint background (scaffold)
+        let mut scaffold_sprite = Sprite::from_image(textures.blueprint.clone());
+        scaffold_sprite.custom_size = Some(Vec2::new(16.0, 16.0));
+        scaffold_sprite.anchor = Anchor::Center;
+
+        // "Ghost" of the finished product
+        let ghost_image = match bp.kind {
+            BuildSiteKind::Wall => textures.wall.clone(),
+            BuildSiteKind::Bed  => textures.bed.clone(),
+        };
+        let mut ghost_sprite = Sprite::from_image(ghost_image);
+        ghost_sprite.custom_size = match bp.kind {
+            BuildSiteKind::Wall => Some(Vec2::new(16.0, 16.0)),
+            BuildSiteKind::Bed  => Some(Vec2::new(16.0, 10.0)),
+        };
+        ghost_sprite.anchor = Anchor::Center;
+        ghost_sprite.color = Color::srgba(1.0, 1.0, 1.0, 0.4);
+
+        commands.entity(entity).insert(BlueprintVisual).with_children(|parent| {
+            // Scaffold on top
+            parent.spawn((
+                VisualChild,
+                scaffold_sprite,
+                Transform::from_xyz(0.0, 0.0, 0.2),
+                Visibility::Visible,
+            ));
+            // Ghost underneath
+            parent.spawn((
+                VisualChild,
+                ghost_sprite,
+                Transform::from_xyz(0.0, 0.0, 0.1),
+                Visibility::Visible,
+            ));
+        });
     }
 }
 

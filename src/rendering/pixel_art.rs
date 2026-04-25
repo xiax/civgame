@@ -15,6 +15,8 @@ pub struct EntityTextures {
     pub tree_mature: Handle<Image>,
     pub camp: Handle<Image>,
     pub bed: Handle<Image>,
+    pub blueprint: Handle<Image>,
+    pub wall: Handle<Image>,
 }
 
 #[derive(Clone, Copy)]
@@ -346,6 +348,54 @@ pub fn setup_pixel_art(
         ('d', d_b), ('u', a), ('p', p), ('.', _t)
     ]);
 
+    // Blueprint: 16x16 crossed wooden scaffold beams (under-construction marker)
+    let sc  = PixelColor::new(210, 165, 80, 220);  // scaffold wood (golden tan)
+    let sc2 = PixelColor::new(140, 100, 40, 220);  // darker beam shadow
+    let blueprint_ascii = &[
+        "sc............cs",
+        "csc..........csc",
+        ".csc........csc.",
+        "..csc......csc..",
+        "...csc....csc...",
+        "....csc..csc....",
+        ".....csccsc.....",
+        "......scsc......",
+        "......scsc......",
+        ".....csc.csc....",
+        "....csc...csc...",
+        "...csc.....csc..",
+        "..csc.......csc.",
+        ".csc.........csc",
+        "csc...........sc",
+        "sc............cs",
+    ];
+    let blueprint_img = ascii_to_image(blueprint_ascii, &[
+        ('s', sc), ('c', sc2), ('.', _t)
+    ]);
+
+    // Wall: 16x16 (Solid stone block with some texture)
+    let wall_ascii = &[
+        "dddddddddddddddd",
+        "dggggggggggggggd",
+        "dglllllgllllllgd",
+        "dglllllgllllllgd",
+        "dglllllgllllllgd",
+        "dggggggggggggggd",
+        "dgglllllllgllllg",
+        "dgglllllllgllllg",
+        "dgglllllllgllllg",
+        "dggggggggggggggd",
+        "dglllllgllllllgd",
+        "dglllllgllllllgd",
+        "dglllllgllllllgd",
+        "dggggggggggggggd",
+        "dggggggggggggggd",
+        "xxxxxxxxxxxxxxxx",
+    ];
+    let wall_img = ascii_to_image(wall_ascii, &[
+        ('g', g), ('d', d), ('l', l_g), ('x', x), ('.', _t)
+    ]);
+
     commands.insert_resource(EntityTextures {
         wolf: images.add(wolf_img),
         deer: images.add(deer_img),
@@ -358,5 +408,7 @@ pub fn setup_pixel_art(
         tree_mature: images.add(tree_mature_img),
         camp: images.add(camp_img),
         bed: images.add(bed_img),
+        blueprint: images.add(blueprint_img),
+        wall: images.add(wall_img),
     });
 }

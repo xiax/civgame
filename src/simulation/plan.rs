@@ -8,7 +8,7 @@ use crate::world::terrain::TILE_SIZE;
 use crate::world::tile::TileKind;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
-use super::construction::{BedMap, BuildSiteKind, find_wall_build_site, find_bed_build_site};
+use super::construction::{BlueprintMap, Blueprint, BuildSiteKind, find_wall_build_site};
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::AgentGoal;
 use super::items::{GroundItem, TargetItem};
@@ -36,6 +36,8 @@ pub enum StepTarget {
     FromMemory(MemoryKind),
     HuntPrey,
     NearestBuildSite(BuildSiteKind),
+    /// Targets the nearest active Blueprint entity for this agent's faction.
+    NearestBlueprint(BuildSiteKind),
 }
 
 #[derive(Clone, Debug)]
@@ -230,16 +232,16 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             reward_scale: 0.4,
             plant_filter: None,
         },
-        StepDef { // 7: BuildWall — go to a wall site and build a wall (costs 2 Wood)
+        StepDef { // 7: BuildWall — target faction blueprint, deposit wood and labor
             id: 7, job: JobKind::Construct,
-            target: StepTarget::NearestBuildSite(BuildSiteKind::Wall),
+            target: StepTarget::NearestBlueprint(BuildSiteKind::Wall),
             preconditions: StepPreconditions::needs_good(Good::Wood, 2),
             reward_scale: 0.8,
             plant_filter: None,
         },
-        StepDef { // 8: BuildBed — place a bed inside an enclosed area (costs 3 Wood)
+        StepDef { // 8: BuildBed — target faction blueprint, deposit wood and labor
             id: 8, job: JobKind::ConstructBed,
-            target: StepTarget::NearestBuildSite(BuildSiteKind::Bed),
+            target: StepTarget::NearestBlueprint(BuildSiteKind::Bed),
             preconditions: StepPreconditions::needs_good(Good::Wood, 3),
             reward_scale: 1.0,
             plant_filter: None,
@@ -370,12 +372,12 @@ fn resolve_target(
     faction_registry: &FactionRegistry,
     faction_id: u32,
     memory: Option<&AgentMemory>,
-    // Bug 2 fix: read GroundItem data so find_nearest_item can filter by good type.
     item_query: &Query<&GroundItem>,
     prey_query: &Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
     combat_target: &mut CombatTarget,
     target_item: &mut TargetItem,
-    bed_map: &BedMap,
+    bp_map: &BlueprintMap,
+    bp_query: &Query<&Blueprint>,
 ) -> Option<(Option<Entity>, i16, i16)> {
     const VIEW_RADIUS: i32 = 15;
 
@@ -478,11 +480,29 @@ fn resolve_target(
             faction_registry.home_tile(faction_id).map(|(tx, ty)| (None, tx, ty))
         }
         StepTarget::NearestBuildSite(kind) => {
+            // Legacy arm — normal build steps now use NearestBlueprint.
             let Some(home) = faction_registry.home_tile(faction_id) else { return None };
             match kind {
-                BuildSiteKind::Wall => find_wall_build_site(chunk_map, home, 20).map(|(tx, ty)| (None, tx, ty)),
-                BuildSiteKind::Bed  => find_bed_build_site(chunk_map, bed_map, home, 15).map(|(tx, ty)| (None, tx, ty)),
+                BuildSiteKind::Wall => find_wall_build_site(chunk_map, home, 30).map(|(tx, ty)| (None, tx, ty)),
+                // Bed variant requires bed_map which is no longer passed here; unused in practice.
+                BuildSiteKind::Bed  => None,
             }
+        }
+        StepTarget::NearestBlueprint(kind) => {
+            // Find the nearest active Blueprint entity belonging to this agent's faction.
+            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best_dist = i32::MAX;
+            for (&tile, &bp_entity) in &bp_map.0 {
+                let Ok(bp) = bp_query.get(bp_entity) else { continue };
+                if bp.faction_id != faction_id { continue }
+                if &bp.kind != kind { continue }
+                let dist = (tile.0 as i32 - pos.0).abs() + (tile.1 as i32 - pos.1).abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some((bp_entity, tile.0, tile.1));
+                }
+            }
+            best.map(|(e, tx, ty)| (Some(e), tx, ty))
         }
     }
 }
@@ -532,10 +552,10 @@ pub fn plan_execution_system(
     plan_registry: Res<PlanRegistry>,
     step_registry: Res<StepRegistry>,
     faction_registry: Res<FactionRegistry>,
-    bed_map: Res<BedMap>,
+    bp_map: Res<BlueprintMap>,
+    bp_query: Query<&Blueprint>,
     calendar: Res<Calendar>,
     clock: Res<SimClock>,
-    // Bug 2 fix: read GroundItem data to allow good-type filtering in find_nearest_item.
     item_check: Query<&GroundItem>,
     prey_query: Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
     mut query: Query<(AgentQuery, OptionalQuery), Without<PlayerOrder>>,
@@ -742,7 +762,8 @@ pub fn plan_execution_system(
                 &faction_registry, member.faction_id,
                 memory_opt, &item_check,
                 &prey_query, &mut combat_target,
-                &mut target_item, &bed_map,
+                &mut target_item,
+                &bp_map, &bp_query,
             ) {
                 assign_job_with_routing(&mut ai, cur_chunk, (target_tx, target_ty), step_def.job, ent, &chunk_graph, &chunk_map);
                 active_plan.dispatched = true;

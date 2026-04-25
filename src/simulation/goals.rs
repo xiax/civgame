@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use super::construction::AutonomousBuildingToggle;
+use super::construction::{AutonomousBuildingToggle, Blueprint, BlueprintMap};
 use crate::world::chunk::ChunkMap;
 use crate::simulation::plants::{PlantMap, Plant, GrowthStage};
 use crate::simulation::items::{GroundItem, TargetItem};
@@ -83,11 +83,12 @@ pub fn goal_update_system(
     registry: Res<FactionRegistry>,
     calendar: Res<Calendar>,
     auto_build: Res<AutonomousBuildingToggle>,
-    bed_map: Res<super::construction::BedMap>,
     chunk_map: Res<ChunkMap>,
     plant_map: Res<PlantMap>,
     plant_query: Query<&Plant>,
     item_query: Query<(), With<GroundItem>>,
+    bp_map: Res<BlueprintMap>,
+    bp_query: Query<&Blueprint>,
     mut query: Query<(
         Entity,
         &mut AgentGoal,
@@ -146,6 +147,13 @@ pub fn goal_update_system(
                 } else {
                     invalid = true;
                 }
+            } else if jid == JobKind::Construct as u16 || jid == JobKind::ConstructBed as u16 {
+                // Invalidate if the target blueprint entity no longer exists.
+                match ai.target_entity {
+                    Some(ent) if bp_query.get(ent).is_err() => { invalid = true; }
+                    None => { invalid = true; }
+                    _ => {}
+                }
             }
 
             if invalid {
@@ -202,11 +210,11 @@ pub fn goal_update_system(
         let faction_has_food = member.faction_id != SOLO && registry.food_stock(member.faction_id) >= 1.0;
         let is_starving = needs.hunger > 100.0 && agent.quantity_of(Good::Food) == 0;
 
-        let has_build_site = member.faction_id != SOLO && {
-            let home = registry.home_tile(member.faction_id).unwrap_or((0, 0));
-            super::construction::find_wall_build_site(&chunk_map, home, 20).is_some() ||
-            super::construction::find_bed_build_site(&chunk_map, &bed_map, home, 15).is_some()
-        };
+        let has_build_site = member.faction_id != SOLO
+            && auto_build.0
+            && bp_map.0.values().any(|&bp_e|
+                bp_query.get(bp_e).map(|bp| bp.faction_id == member.faction_id).unwrap_or(false)
+            );
 
         let (new_goal, reason) = if is_starving && faction_has_food {
             (AgentGoal::ReturnCamp, "Starving (Faction has food)")
@@ -220,7 +228,7 @@ pub fn goal_update_system(
             (AgentGoal::Reproduce, "Reproduction Need")
         } else if needs.social > social_threshold {
             (AgentGoal::Socialize, "Social Need")
-        } else if member.faction_id != SOLO && auto_build.0 && has_build_site {
+        } else if has_build_site {
             (AgentGoal::Build, "Building Projects")
         } else {
             (AgentGoal::Gather, "General Gathering")
