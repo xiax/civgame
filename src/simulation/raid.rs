@@ -156,7 +156,7 @@ pub fn raid_execution_system(
         // Steal food from enemy camp
         if registry.food_stock(raid_target_faction) >= 1.0 {
             food_steals.push((raid_target_faction, FOOD_STEAL_PER_TICK));
-            agent.add_good(Good::Food, 1);
+            agent.add_good(Good::Fruit, 1);
         }
 
         // Find a defender (enemy faction member) nearby to attack

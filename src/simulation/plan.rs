@@ -14,7 +14,8 @@ use super::goals::AgentGoal;
 use super::items::{GroundItem, TargetItem};
 use super::combat::{CombatTarget, Health};
 use super::animals::{Wolf, Deer};
-use super::jobs::{JobKind, assign_job_with_routing, find_nearest_tile, find_nearest_item, find_nearest_unplanted_farmland, find_nearest_plant};
+use super::jobs::{JobKind, assign_job_with_routing, find_nearest_tile, find_nearest_item, find_nearest_edible, find_nearest_unplanted_farmland, find_nearest_plant};
+
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, MemoryKind};
 use super::needs::Needs;
@@ -32,6 +33,7 @@ pub type PlanId = u16;
 pub enum StepTarget {
     NearestTile(&'static [TileKind]),
     NearestItem(Good),
+    NearestEdible,
     FactionCamp,
     FromMemory(MemoryKind),
     HuntPrey,
@@ -227,7 +229,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef { // 6: CollectFood
             id: 6, job: JobKind::Scavenge,
-            target: StepTarget::NearestItem(Good::Food),
+            target: StepTarget::NearestEdible,
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
@@ -333,7 +335,7 @@ pub fn build_state_vec(
     s[5] = needs.reproduction as f32 / 255.0;
 
     // 6-10: inventory has (Food, Wood, Stone, Seed, Coal)
-    s[6]  = if agent.quantity_of(Good::Food)  > 0 { 1.0 } else { 0.0 };
+    s[6]  = if agent.total_food()  > 0 { 1.0 } else { 0.0 };
     s[7]  = if agent.quantity_of(Good::Wood)  > 0 { 1.0 } else { 0.0 };
     s[8]  = if agent.quantity_of(Good::Stone) > 0 { 1.0 } else { 0.0 };
     s[9]  = if agent.quantity_of(Good::Seed)  > 0 { 1.0 } else { 0.0 };
@@ -463,13 +465,31 @@ fn resolve_target(
             // 2. Check memory
             if let Some(mem) = memory {
                 let mkind = match good {
-                    Good::Food => MemoryKind::Food,
                     Good::Wood => MemoryKind::Wood,
                     Good::Stone => MemoryKind::Stone,
                     Good::Seed => MemoryKind::Seed,
-                    _ => return None,
+                    _ => {
+                        if good.is_edible() { MemoryKind::Food } else { return None }
+                    }
                 };
                 if let Some((entity, tx, ty)) = mem.best_entity_for_dist_weighted(mkind, pos) {
+                    target_item.0 = Some(entity);
+                    return Some((Some(entity), tx, ty));
+                }
+            }
+            None
+        }
+        StepTarget::NearestEdible => {
+            // 1. Check vision
+            if let Some((entity, tx, ty)) = find_nearest_edible(spatial, pos, VIEW_RADIUS, item_query) {
+                if super::line_of_sight::has_los(chunk_map, pos, (tx as i32, ty as i32)) {
+                    target_item.0 = Some(entity);
+                    return Some((Some(entity), tx, ty));
+                }
+            }
+            // 2. Check memory
+            if let Some(mem) = memory {
+                if let Some((entity, tx, ty)) = mem.best_entity_for_dist_weighted(MemoryKind::Food, pos) {
                     target_item.0 = Some(entity);
                     return Some((Some(entity), tx, ty));
                 }

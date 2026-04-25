@@ -29,7 +29,7 @@ pub fn market_sell_system(
         for (item, qty) in inventory {
             if qty == 0 { continue; }
 
-            let sell_qty = if item.good == Good::Food {
+            let sell_qty = if item.good.is_edible() {
                 if qty > FOOD_KEEP_RESERVE {
                     qty - FOOD_KEEP_RESERVE
                 } else {
@@ -59,8 +59,8 @@ pub fn market_buy_system(
         }
 
         // Buy Food when hungry and have no food
-        if needs.hunger > HUNGER_BUY_THRESHOLD as f32 && agent.quantity_of(Good::Food) == 0 {
-            let (bought_item, qty) = market.try_buy_item(Good::Food, 1, &mut agent.currency);
+        if needs.hunger > HUNGER_BUY_THRESHOLD as f32 && agent.total_food() == 0 {
+            let (bought_item, qty) = market.try_buy_item(Good::Fruit, 1, &mut agent.currency);
             if let Some(it) = bought_item {
                 agent.add_item(it, qty as u8);
                 // Clear Trader job now that the buy was handled

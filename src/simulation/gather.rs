@@ -10,7 +10,7 @@ use crate::simulation::memory::{AgentMemory, MemoryKind};
 use crate::simulation::person::{AiState, PersonAI};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::plants::{
-    GrowthStage, PlantKind, PlantMap, PlantSpriteIndex, get_plant_texture,
+    GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
@@ -18,7 +18,6 @@ use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::tile_to_world;
 use crate::world::tile::TileKind;
-use crate::rendering::pixel_art::EntityTextures;
 
 // ── Stone tile harvest profile ────────────────────────────────────────────────
 // Plants carry their own harvest data via PlantKind methods; stone uses this
@@ -44,11 +43,10 @@ pub fn gather_system(
     mut commands: Commands,
     chunk_map:    Res<ChunkMap>,
     clock:        Res<SimClock>,
-    textures:     Res<EntityTextures>,
     mut plant_map:          ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
     mut faction_registry:   ResMut<FactionRegistry>,
-    mut plant_query: Query<(&mut crate::simulation::plants::Plant, &mut Sprite)>,
+    mut plant_query: Query<&mut crate::simulation::plants::Plant>,
     mut agent_query: Query<(
         &mut PersonAI,
         &mut EconomicAgent,
@@ -77,7 +75,7 @@ pub fn gather_system(
         if let Some(entity) = plant_map.0.get(&(tx, ty)).copied() {
             // ── Plant harvest ────────────────────────────────────────────────
 
-            let Ok((mut plant, mut sprite)) = plant_query.get_mut(entity) else {
+            let Ok(mut plant) = plant_query.get_mut(entity) else {
                 plant_map.0.remove(&(tx, ty));
                 if let Some(ref mut mem) = memory_opt {
                     mem.forget((tx as i16, ty as i16), MemoryKind::Food);
@@ -112,10 +110,12 @@ pub fn gather_system(
             let (food_mul, wood_mul, _) = faction_muls(&mut faction_registry, faction_id, kind.harvest_activity());
 
             let (yield_good, base_qty) = kind.harvest_yield(has_tool);
-            let yield_mul = match yield_good {
-                Good::Food => food_mul,
-                Good::Wood => wood_mul,
-                _          => 1.0,
+            let yield_mul = if yield_good.is_edible() {
+                food_mul
+            } else if yield_good == Good::Wood {
+                wood_mul
+            } else {
+                1.0
             };
             let qty = (base_qty as f32 * yield_mul).round().max(1.0) as u8;
             agent.add_good(yield_good, qty);
@@ -145,11 +145,10 @@ pub fn gather_system(
                 if let Some(vec) = plant_sprite_index.by_chunk.get_mut(&ChunkCoord(cx, cy)) {
                     vec.retain(|(e, _)| *e != entity);
                 }
-                commands.entity(entity).despawn();
+                commands.entity(entity).despawn_recursive();
             } else {
                 plant.stage = GrowthStage::Seedling;
                 plant.growth_ticks = 0;
-                sprite.image = get_plant_texture(&textures, kind, plant.stage);
             }
 
         } else {
@@ -234,8 +233,10 @@ fn spawn_ground_drop(commands: &mut Commands, tx: i32, ty: i32, good: Good, qty:
     let pos = tile_to_world(tx + dx, ty + dy);
     commands.spawn((
         GroundItem { item: Item::new_commodity(good), qty },
-        Transform::from_xyz(pos.x, pos.y - 8.0, 0.3),
+        Transform::from_xyz(pos.x, pos.y, 0.3),
         GlobalTransform::default(),
+        Visibility::Visible,
+        InheritedVisibility::default(),
     ));
 }
 

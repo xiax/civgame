@@ -1,27 +1,32 @@
-pub const GOOD_COUNT: usize = 12;
+pub const GOOD_COUNT: usize = 15;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Good {
     #[default]
-    Food   = 0,
-    Wood   = 1,
-    Stone  = 2,
-    Tools  = 3,
-    Cloth  = 4,
-    Coal   = 5,
-    Iron   = 6,
-    Luxury = 7,
-    Seed   = 8,
-    Weapon = 9,
-    Armor  = 10,
-    Shield = 11,
+    Fruit  = 0,
+    Meat   = 1,
+    Grain  = 2,
+    Wood   = 3,
+    Stone  = 4,
+    Tools  = 5,
+    Cloth  = 6,
+    Coal   = 7,
+    Iron   = 8,
+    Luxury = 9,
+    Seed   = 10,
+    Weapon = 11,
+    Armor  = 12,
+    Shield = 13,
+    Skin   = 14,
 }
 
 impl Good {
     pub fn name(self) -> &'static str {
         match self {
-            Good::Food   => "Food",
+            Good::Fruit  => "Fruit",
+            Good::Meat   => "Meat",
+            Good::Grain  => "Grain",
             Good::Wood   => "Wood",
             Good::Stone  => "Stone",
             Good::Tools  => "Tools",
@@ -33,14 +38,19 @@ impl Good {
             Good::Weapon => "Weapon",
             Good::Armor  => "Armor",
             Good::Shield => "Shield",
+            Good::Skin   => "Skin",
         }
+    }
+
+    pub fn is_edible(self) -> bool {
+        matches!(self, Good::Fruit | Good::Meat | Good::Grain)
     }
 
     pub fn all() -> [Good; GOOD_COUNT] {
         [
-            Good::Food, Good::Wood, Good::Stone, Good::Tools,
-            Good::Cloth, Good::Coal, Good::Iron, Good::Luxury, Good::Seed,
-            Good::Weapon, Good::Armor, Good::Shield,
+            Good::Fruit, Good::Meat, Good::Grain, Good::Wood, Good::Stone,
+            Good::Tools, Good::Cloth, Good::Coal, Good::Iron, Good::Luxury,
+            Good::Seed, Good::Weapon, Good::Armor, Good::Shield, Good::Skin,
         ]
     }
 }

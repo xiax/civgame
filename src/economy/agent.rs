@@ -15,12 +15,19 @@ impl Default for EconomicAgent {
     fn default() -> Self {
         Self {
             currency: 50.0,
-            inventory: [(Item::new_commodity(Good::Food), 0); INVENTORY_SLOTS],
+            inventory: [(Item::new_commodity(Good::Fruit), 0); INVENTORY_SLOTS],
         }
     }
 }
 
 impl EconomicAgent {
+    pub fn total_food(&self) -> u8 {
+        self.inventory.iter()
+            .filter(|(it, _)| it.good.is_edible())
+            .map(|(_, q)| *q)
+            .sum()
+    }
+
     pub fn quantity_of(&self, good: Good) -> u8 {
         self.inventory.iter()
             .filter(|(it, _)| it.good == good)

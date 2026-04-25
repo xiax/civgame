@@ -3,7 +3,6 @@ use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
-use crate::rendering::pixel_art::EntityTextures;
 use crate::simulation::animals::{AnimalAI, Deer, Wolf};
 use crate::simulation::combat::{Body, CombatCooldown, CombatTarget, Health};
 use crate::simulation::faction::FactionMember;
@@ -42,7 +41,6 @@ fn setup_sandbox(
     mut clock: ResMut<SimClock>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    textures: Res<EntityTextures>,
 ) {
     let start_cx = (GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS;
     let start_cy = (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS;
@@ -57,6 +55,8 @@ fn setup_sandbox(
             Person,
             Transform::from_xyz(pos.x, pos.y, 1.0),
             GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
             Needs::new(30.0, 20.0, 10.0, 5.0, 40.0),
             Mood::default(),
             Skills::default(),
@@ -102,6 +102,8 @@ fn setup_sandbox(
         Wolf,
         Transform::from_xyz(wolf_pos.x, wolf_pos.y, 1.0),
         GlobalTransform::default(),
+        Visibility::Visible,
+        InheritedVisibility::default(),
         AnimalAI {
             target_tile: ((cx + 5) as i16, cy as i16),
             wander_timer: 0.0,
@@ -120,6 +122,8 @@ fn setup_sandbox(
         Deer,
         Transform::from_xyz(deer_pos.x, deer_pos.y, 1.0),
         GlobalTransform::default(),
+        Visibility::Visible,
+        InheritedVisibility::default(),
         AnimalAI {
             target_tile: ((cx - 4) as i16, (cy + 3) as i16),
             wander_timer: 0.5,
@@ -138,25 +142,29 @@ fn setup_sandbox(
 
     // One of each plant kind, mature, clustered above the entity group.
     // spawn_plant_at is a no-op if the tile is already occupied by a chunk-generated plant.
-    spawn_plant_at(&mut commands, &mut plant_map, &mut plant_sprite_index, &textures,
+    spawn_plant_at(&mut commands, &mut plant_map, &mut plant_sprite_index,
         cx + 2, cy + 5, PlantKind::FruitBush, GrowthStage::Mature);
-    spawn_plant_at(&mut commands, &mut plant_map, &mut plant_sprite_index, &textures,
+    spawn_plant_at(&mut commands, &mut plant_map, &mut plant_sprite_index,
         cx - 2, cy + 5, PlantKind::Grain, GrowthStage::Mature);
-    spawn_plant_at(&mut commands, &mut plant_map, &mut plant_sprite_index, &textures,
+    spawn_plant_at(&mut commands, &mut plant_map, &mut plant_sprite_index,
         cx, cy + 7, PlantKind::Tree, GrowthStage::Mature);
 
     // Ground items near the person
     let food_pos = tile_to_world(cx + 1, cy + 1);
     commands.spawn((
-        GroundItem { item: Item::new_commodity(Good::Food), qty: 5 },
+        GroundItem { item: Item::new_commodity(Good::Fruit), qty: 5 },
         Transform::from_xyz(food_pos.x, food_pos.y, 0.5),
         GlobalTransform::default(),
+        Visibility::Visible,
+        InheritedVisibility::default(),
     ));
     let wood_pos = tile_to_world(cx - 1, cy + 1);
     commands.spawn((
         GroundItem { item: Item::new_commodity(Good::Wood), qty: 3 },
         Transform::from_xyz(wood_pos.x, wood_pos.y, 0.5),
         GlobalTransform::default(),
+        Visibility::Visible,
+        InheritedVisibility::default(),
     ));
 
     info!("Sandbox: 1 person, 1 wolf, 1 deer, 3 plants, 2 ground items at tile ({cx}, {cy})");

@@ -1,12 +1,10 @@
 use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::item::Item;
-use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
-use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
 use crate::simulation::combat::BodyPart;
 

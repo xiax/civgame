@@ -208,7 +208,7 @@ pub fn goal_update_system(
         };
 
         let faction_has_food = member.faction_id != SOLO && registry.food_stock(member.faction_id) >= 1.0;
-        let is_starving = needs.hunger > 100.0 && agent.quantity_of(Good::Food) == 0;
+        let is_starving = needs.hunger > 100.0 && agent.total_food() == 0;
 
         let has_build_site = member.faction_id != SOLO
             && auto_build.0
@@ -218,11 +218,11 @@ pub fn goal_update_system(
 
         let (new_goal, reason) = if is_starving && faction_has_food {
             (AgentGoal::ReturnCamp, "Starving (Faction has food)")
-        } else if needs.hunger > 120.0 || (needs.hunger > 60.0 && agent.quantity_of(Good::Food) < 3) {
+        } else if needs.hunger > 120.0 || (needs.hunger > 60.0 && agent.total_food() < 3) {
             (AgentGoal::Survive, "Hungry")
         } else if needs.sleep > 180.0 {
             (AgentGoal::Sleep, "Tired")
-        } else if agent.quantity_of(Good::Food) > 0 && can_return_camp {
+        } else if agent.total_food() > 0 && can_return_camp {
             (AgentGoal::ReturnCamp, "Returning Surplus Food")
         } else if needs.reproduction > reproduce_threshold {
             (AgentGoal::Reproduce, "Reproduction Need")

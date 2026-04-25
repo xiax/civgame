@@ -280,21 +280,29 @@ pub fn faction_camp_system(
         let faction_id = member.faction_id;
 
         // Deposit surplus food
-        let food_qty = agent.quantity_of(Good::Food);
+        let food_qty = agent.total_food();
         if food_qty > CAMP_KEEP {
-            let deposit = food_qty - CAMP_KEEP;
-            agent.remove_good(Good::Food, deposit);
-            if let Some(f) = registry.factions.get_mut(&faction_id) {
-                f.food_stock += deposit as f32;
+            let mut deposit = food_qty - CAMP_KEEP;
+            // Iterate and remove any edible goods
+            for (it, q) in agent.inventory.iter_mut() {
+                if it.good.is_edible() && *q > 0 {
+                    let to_remove = (*q).min(deposit);
+                    *q -= to_remove;
+                    deposit -= to_remove;
+                    if let Some(f) = registry.factions.get_mut(&faction_id) {
+                        f.food_stock += to_remove as f32;
+                    }
+                }
+                if deposit == 0 { break; }
             }
         }
 
         // Withdraw food if hungry and no personal food
-        if needs.hunger > 100.0 && agent.quantity_of(Good::Food) == 0 {
+        if needs.hunger > 100.0 && agent.total_food() == 0 {
             if let Some(f) = registry.factions.get_mut(&faction_id) {
                 if f.food_stock >= 1.0 {
                     f.food_stock -= 1.0;
-                    agent.add_good(Good::Food, 1);
+                    agent.add_good(Good::Fruit, 1);
                 }
             }
         }

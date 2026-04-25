@@ -5,10 +5,8 @@ use crate::simulation::animals::{AnimalAI, AnimalState, Deer, Wolf};
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::technology::ActivityKind;
 use crate::simulation::items::{GroundItem, Equipment, EquipmentSlot, WeaponStats, ArmorStats};
-use crate::simulation::jobs::JobKind;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::RelationshipMemory;
-use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
@@ -337,22 +335,27 @@ pub fn death_system(
         if let Some(fm) = member {
             registry.remove_member(fm.faction_id);
         }
-        if person.is_some() {
+        if person.is_some() || wolf.is_some() || deer.is_some() {
             clock.population = clock.population.saturating_sub(1);
         }
 
-        let loot_qty: Option<u8> = if wolf.is_some() { Some(1) }
-            else if deer.is_some() { Some(3) }
-            else { None };
+        let drops: Vec<(Good, u8)> = if wolf.is_some() {
+            vec![(Good::Meat, 1), (Good::Skin, 1)]
+        } else if deer.is_some() {
+            vec![(Good::Meat, 3), (Good::Skin, 2)]
+        } else {
+            vec![]
+        };
 
-        if let Some(qty) = loot_qty {
+        for (good, qty) in drops {
             let mut loot_transform = *transform;
-            loot_transform.translation.y -= 8.0;
             loot_transform.translation.z = 0.3;
             commands.spawn((
-                GroundItem { item: Item::new_commodity(Good::Food), qty },
+                GroundItem { item: Item::new_commodity(good), qty },
                 loot_transform,
                 GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
             ));
         }
 

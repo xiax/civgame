@@ -13,8 +13,9 @@ use super::needs::Needs;
 use super::person::{AiState, PersonAI};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::{SkillKind, Skills};
-use crate::simulation::technology::ActivityKind;
-use crate::rendering::pixel_art::EntityTextures;
+use crate::economy::item::Item;
+use crate::simulation::items::GroundItem;
+use crate::simulation::technology::{ActivityKind, CROP_CULTIVATION};
 
 pub const TICKS_FARMER_PLANT: u8 = 40;
 
@@ -51,7 +52,6 @@ pub fn production_system(
     clock: Res<SimClock>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    textures: Res<EntityTextures>,
     mut faction_registry: ResMut<FactionRegistry>,
     mut query: Query<(
         &mut PersonAI,
@@ -79,7 +79,6 @@ pub fn production_system(
                         &mut commands,
                         &mut plant_map,
                         &mut plant_sprite_index,
-                        &textures,
                         tx, ty,
                         PlantKind::Grain,
                         GrowthStage::Seed,
@@ -111,21 +110,63 @@ pub fn production_system(
 }
 
 pub fn consumption_system(
+    mut commands: Commands,
     clock: Res<SimClock>,
+    faction_registry: Res<FactionRegistry>,
     mut query: Query<(
         &mut EconomicAgent,
         &mut Needs,
         &BucketSlot,
         &LodLevel,
+        &Transform,
+        Option<&FactionMember>,
     )>,
 ) {
-    query.par_iter_mut().for_each(|(mut agent, mut needs, slot, lod)| {
+    for (mut agent, mut needs, slot, lod, transform, member) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
-            return;
+            continue;
         }
-        if needs.hunger > HUNGER_EAT_THRESHOLD as f32 && agent.quantity_of(Good::Food) > 0 {
-            agent.remove_good(Good::Food, 1);
-            needs.hunger = (needs.hunger - FOOD_NUTRITION as f32).max(0.0);
+        if needs.hunger > HUNGER_EAT_THRESHOLD as f32 {
+            let mut consumed_fruit = false;
+            let mut found_food = false;
+
+            for (it, q) in agent.inventory.iter_mut() {
+                if it.good.is_edible() && *q > 0 {
+                    *q -= 1;
+                    if it.good == Good::Fruit {
+                        consumed_fruit = true;
+                    }
+                    found_food = true;
+                    break;
+                }
+            }
+
+            if found_food {
+                needs.hunger = (needs.hunger - FOOD_NUTRITION as f32).max(0.0);
+
+                if consumed_fruit {
+                    let knows_farming = if let Some(fm) = member {
+                        faction_registry.factions.get(&fm.faction_id)
+                            .map_or(false, |f| f.techs.has(CROP_CULTIVATION))
+                    } else {
+                        false
+                    };
+
+                    if knows_farming {
+                        agent.add_good(Good::Seed, 1);
+                    } else {
+                        let mut seed_transform = *transform;
+                        seed_transform.translation.z = 0.3;
+                        commands.spawn((
+                            GroundItem { item: Item::new_commodity(Good::Seed), qty: 1 },
+                            seed_transform,
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        ));
+                    }
+                }
+            }
         }
-    });
+    }
 }

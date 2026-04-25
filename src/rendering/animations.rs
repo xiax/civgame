@@ -84,14 +84,22 @@ pub fn update_animations(
                 );
             }
 
-            transform.translation.x = offset.x;
-            transform.translation.y = offset.y;
-            sprite.color = color;
+            if transform.translation.x != offset.x || transform.translation.y != offset.y {
+                transform.translation.x = offset.x;
+                transform.translation.y = offset.y;
+            }
+            if sprite.color != color {
+                sprite.color = color;
+            }
         } else {
             // Reset if no animations active, but keep the base vertical offset
-            transform.translation.x = 0.0;
-            transform.translation.y = BASE_Y;
-            sprite.color = Color::WHITE;
+            if transform.translation.x != 0.0 || transform.translation.y != BASE_Y {
+                transform.translation.x = 0.0;
+                transform.translation.y = BASE_Y;
+            }
+            if sprite.color != Color::WHITE {
+                sprite.color = Color::WHITE;
+            }
         }
     }
 }

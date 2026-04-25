@@ -199,7 +199,7 @@ pub fn inspector_panel_system(
                     } else if ai.job_id == JobKind::Planter as u16 {
                         work_str = format!("Planting Seeds ({}%)", (ai.work_progress as u32 * 100) / 40); // 40 is TICKS_FARMER_PLANT
                     } else if ai.job_id == JobKind::Raid as u16 {
-                        work_str = "Stealing Food".to_string();
+                        work_str = "Stealing Goods".to_string();
                     } else if ai.job_id == JobKind::Scavenge as u16 {
                         work_str = "Picking up item".to_string();
                     }

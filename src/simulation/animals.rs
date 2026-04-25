@@ -85,6 +85,8 @@ pub fn spawn_animals(
             Wolf,
             Transform::from_xyz(pos.x, pos.y, 1.0),
             GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
             AnimalAI {
                 target_tile: (tx as i16, ty as i16),
                 wander_timer: i as f32 * 0.05,
@@ -110,6 +112,8 @@ pub fn spawn_animals(
             Deer,
             Transform::from_xyz(pos.x, pos.y, 1.0),
             GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
             AnimalAI {
                 target_tile: (tx as i16, ty as i16),
                 wander_timer: i as f32 * 0.02,

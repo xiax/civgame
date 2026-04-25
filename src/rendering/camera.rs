@@ -33,6 +33,9 @@ pub fn setup_camera(mut commands: Commands) {
     commands.spawn((
         Camera2d,
         Transform::from_xyz(start_x, start_y, 100.0),
+        GlobalTransform::default(),
+        Visibility::Visible,
+        InheritedVisibility::default(),
     ));
 }
 

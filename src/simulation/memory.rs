@@ -302,17 +302,21 @@ pub fn vision_system(
                 // Check spatial for entities (items, prey)
                 for &entity in spatial.get(ntx, nty) {
                     if let Ok(item) = item_query.get(entity) {
-                        let kind = match item.item.good {
-                            crate::economy::goods::Good::Food => Some(MemoryKind::Food),
-                            crate::economy::goods::Good::Wood => Some(MemoryKind::Wood),
-                            crate::economy::goods::Good::Stone => Some(MemoryKind::Stone),
-                            crate::economy::goods::Good::Seed => Some(MemoryKind::Seed),
-                            _ => None,
+                        let kind = if item.item.good.is_edible() {
+                            Some(MemoryKind::Food)
+                        } else {
+                            match item.item.good {
+                                crate::economy::goods::Good::Wood => Some(MemoryKind::Wood),
+                                crate::economy::goods::Good::Stone => Some(MemoryKind::Stone),
+                                crate::economy::goods::Good::Seed => Some(MemoryKind::Seed),
+                                _ => None,
+                            }
                         };
                         if let Some(k) = kind {
                             memory.record_entity((ntx as i16, nty as i16), k, entity);
                         }
-                    } else if let Ok((e, health)) = prey_query.get(entity) {
+                    }
+ else if let Ok((e, health)) = prey_query.get(entity) {
                         if !health.is_dead() {
                             memory.record_entity((ntx as i16, nty as i16), MemoryKind::Prey, e);
                         }

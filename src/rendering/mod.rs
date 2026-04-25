@@ -36,6 +36,8 @@ impl Plugin for RenderingPlugin {
                     entity_sprites::spawn_bed_sprites,
                     entity_sprites::spawn_wall_sprites,
                     entity_sprites::spawn_blueprint_sprites,
+                    entity_sprites::spawn_plant_sprites,
+                    entity_sprites::update_plant_sprites,
                     entity_sprites::update_faction_sprite_colors
                         .after(entity_sprites::spawn_person_sprites),
                     entity_sprites::spawn_wolf_sprites,

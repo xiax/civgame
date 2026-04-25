@@ -173,6 +173,8 @@ pub fn reproduction_system(
                 Person,
                 Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
                 GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
                 Needs::new(0.0, 0.0, 0.0, 0.0, 0.0),
                 Mood::default(),
                 Skills::default(),

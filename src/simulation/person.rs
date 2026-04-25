@@ -206,6 +206,8 @@ pub fn spawn_population(
                     Person,
                     Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
                     GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
                     Needs::new(30.0, 20.0, 10.0, 5.0, 40.0),
                     Mood::default(),
                     Skills::default(),

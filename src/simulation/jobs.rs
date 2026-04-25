@@ -100,6 +100,32 @@ pub fn find_nearest_plant(
 }
 
 // Bug 2 fix: filter by `good` so agents don't target the wrong item type.
+pub fn find_nearest_edible(
+    spatial: &SpatialIndex,
+    from: (i32, i32),
+    radius: i32,
+    item_query: &Query<&GroundItem>,
+) -> Option<(Entity, i16, i16)> {
+    let mut best: Option<(Entity, i16, i16)> = None;
+    let mut best_dist = i32::MAX;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            for &e in spatial.get(from.0 + dx, from.1 + dy) {
+                if let Ok(item) = item_query.get(e) {
+                    if item.item.good.is_edible() {
+                        let dist = dx.abs() + dy.abs();
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best = Some((e, (from.0 + dx) as i16, (from.1 + dy) as i16));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
 pub fn find_nearest_item(
     spatial: &SpatialIndex,
     from: (i32, i32),

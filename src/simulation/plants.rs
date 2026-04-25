@@ -1,6 +1,5 @@
 use ahash::AHashMap;
 use bevy::prelude::*;
-use bevy::sprite::Anchor;
 
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
@@ -13,7 +12,6 @@ use crate::simulation::lod::LodLevel;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
-use crate::rendering::pixel_art::EntityTextures;
 
 const DEER_GRAZE_INTERVAL: u16 = 120;
 
@@ -78,8 +76,8 @@ impl PlantKind {
     /// `has_tool` only matters for trees (felling vs branch-gathering).
     pub fn harvest_yield(self, has_tool: bool) -> (Good, u8) {
         match self {
-            PlantKind::Grain     => (Good::Food, 3),
-            PlantKind::FruitBush => (Good::Food, 2),
+            PlantKind::Grain     => (Good::Grain, 3),
+            PlantKind::FruitBush => (Good::Fruit, 2),
             PlantKind::Tree      => (Good::Wood, if has_tool { 3 } else { 1 }),
         }
     }
@@ -98,22 +96,6 @@ impl PlantKind {
             PlantKind::Grain     => &[(Good::Seed, 1)],
             PlantKind::FruitBush => &[(Good::Seed, 1)],
             PlantKind::Tree      => if has_tool { &[(Good::Wood, 2)] } else { &[(Good::Wood, 1)] },
-        }
-    }
-
-    /// Skill and XP gained per harvest event.
-    pub fn harvest_skill_xp(self, has_tool: bool) -> (SkillKind, u8) {
-        match self {
-            PlantKind::Grain | PlantKind::FruitBush => (SkillKind::Farming, 3),
-            PlantKind::Tree                         => (SkillKind::Farming, if has_tool { 5 } else { 2 }),
-        }
-    }
-
-    /// Memory kind to record after a successful harvest.
-    pub fn harvest_memory_kind(self) -> MemoryKind {
-        match self {
-            PlantKind::Grain | PlantKind::FruitBush => MemoryKind::Food,
-            PlantKind::Tree                          => MemoryKind::Wood,
         }
     }
 
@@ -136,6 +118,23 @@ impl PlantKind {
             _               => true,
         }
     }
+
+    /// Returns (SkillKind, XP amount) for harvesting this plant.
+    pub fn harvest_skill_xp(self, has_tool: bool) -> (SkillKind, u8) {
+        match self {
+            PlantKind::Tree      => (SkillKind::Building, if has_tool { 10 } else { 2 }),
+            PlantKind::Grain     => (SkillKind::Farming,  5),
+            PlantKind::FruitBush => (SkillKind::Building, 3),
+        }
+    }
+
+    /// Memory category for recording this plant's location.
+    pub fn harvest_memory_kind(self) -> MemoryKind {
+        match self {
+            PlantKind::Tree      => MemoryKind::Wood,
+            _                    => MemoryKind::Food,
+        }
+    }
 }
 
 #[derive(Component)]
@@ -151,27 +150,11 @@ pub struct PlantSpriteIndex {
     pub by_chunk: AHashMap<ChunkCoord, Vec<(Entity, (i32, i32))>>,
 }
 
-pub fn get_plant_texture(textures: &EntityTextures, kind: PlantKind, stage: GrowthStage) -> Handle<Image> {
-    match kind {
-        PlantKind::Tree => match stage {
-            GrowthStage::Seed     => textures.plant_seed.clone(),
-            GrowthStage::Seedling => textures.tree_seedling.clone(),
-            _ => textures.tree_mature.clone(),
-        },
-        _ => match stage {
-            GrowthStage::Seed => textures.plant_seed.clone(),
-            GrowthStage::Seedling => textures.plant_seedling.clone(),
-            _ => textures.plant_mature.clone(),
-        }
-    }
-}
-
 /// Spawn a plant entity at the given tile. No-op if the tile is already occupied.
 pub fn spawn_plant_at(
     commands: &mut Commands,
     plant_map: &mut PlantMap,
     plant_sprite_index: &mut PlantSpriteIndex,
-    textures: &EntityTextures,
     tile_x: i32,
     tile_y: i32,
     kind: PlantKind,
@@ -183,10 +166,6 @@ pub fn spawn_plant_at(
 
     let world_pos = tile_to_world(tile_x, tile_y);
 
-    let mut sprite = Sprite::from_image(get_plant_texture(textures, kind, stage));
-    sprite.custom_size = Some(Vec2::new(24.0, 36.0));
-    sprite.anchor = Anchor::BottomCenter;
-
     let entity = commands.spawn((
         Plant {
             kind,
@@ -194,10 +173,10 @@ pub fn spawn_plant_at(
             growth_ticks: 0,
             tile_pos: (tile_x as i16, tile_y as i16),
         },
-        sprite,
-        Transform::from_xyz(world_pos.x, world_pos.y - 8.0, 0.5),
+        Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
         GlobalTransform::default(),
         Visibility::Visible,
+        InheritedVisibility::default(),
     )).id();
 
 
@@ -216,14 +195,13 @@ pub fn spawn_plant_at(
 pub fn plant_growth_system(
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
-    textures: Res<EntityTextures>,
-    mut query: Query<(Entity, &mut Plant, &mut Sprite)>,
+    mut query: Query<(Entity, &mut Plant)>,
 ) {
     if clock.tick % 5 != 0 {
         return;
     }
 
-    for (_entity, mut plant, mut sprite) in query.iter_mut() {
+    for (_entity, mut plant) in query.iter_mut() {
         let tx = plant.tile_pos.0 as i32;
         let ty = plant.tile_pos.1 as i32;
 
@@ -251,9 +229,6 @@ pub fn plant_growth_system(
                 GrowthStage::Mature   => GrowthStage::Overripe,
                 GrowthStage::Overripe => GrowthStage::Overripe,
             };
-
-            sprite.image = get_plant_texture(&textures, plant.kind, plant.stage);
-            sprite.color = Color::WHITE;
         }
     }
 }
@@ -265,15 +240,14 @@ pub fn seed_scatter_system(
     chunk_map: Res<ChunkMap>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    textures: Res<EntityTextures>,
-    mut query: Query<(Entity, &mut Plant, &mut Sprite)>,
+    mut query: Query<(Entity, &mut Plant)>,
 ) {
     if clock.tick % 5 != 0 {
         return;
     }
 
     let mut overripe_entities = Vec::new();
-    for (entity, mut plant, mut sprite) in query.iter_mut() {
+    for (entity, mut plant) in query.iter_mut() {
         if plant.stage == GrowthStage::Overripe {
             let tx = plant.tile_pos.0 as i32;
             let ty = plant.tile_pos.1 as i32;
@@ -287,13 +261,14 @@ pub fn seed_scatter_system(
                 let pos = tile_to_world(sx, sy);
                 commands.spawn((
                     GroundItem { item: Item::new_commodity(Good::Wood), qty: 1 },
-                    Transform::from_xyz(pos.x, pos.y - 8.0, 0.3),
+                    Transform::from_xyz(pos.x, pos.y, 0.3),
                     GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
                 ));
 
                 plant.stage = GrowthStage::Mature;
                 plant.growth_ticks = 0;
-                sprite.image = get_plant_texture(&textures, plant.kind, plant.stage);
             } else {
                 overripe_entities.push((entity, (tx, ty), kind));
             }
@@ -321,7 +296,6 @@ pub fn seed_scatter_system(
             if matches!(chunk_map.tile_kind_at(nx, ny), Some(TK::Grass | TK::Farmland)) {
                 spawn_plant_at(
                     &mut commands, &mut plant_map, &mut plant_sprite_index,
-                    &textures,
                     nx, ny, kind, GrowthStage::Seed,
                 );
             }
@@ -333,7 +307,7 @@ pub fn seed_scatter_system(
         if let Some(vec) = plant_sprite_index.by_chunk.get_mut(&ChunkCoord(cx, cy)) {
             vec.retain(|(e, _)| *e != entity);
         }
-        commands.entity(entity).despawn();
+        commands.entity(entity).despawn_recursive();
     }
 }
 
@@ -385,7 +359,7 @@ pub fn deer_graze_system(
             if let Some(vec) = plant_sprite_index.by_chunk.get_mut(&ChunkCoord(cx, cy)) {
                 vec.retain(|(e, _)| *e != entity);
             }
-            commands.entity(entity).despawn();
+            commands.entity(entity).despawn_recursive();
 
             let count = 1 + fastrand::u8(..2);
             for _ in 0..count {
@@ -395,8 +369,10 @@ pub fn deer_graze_system(
                 let pos = tile_to_world(sx, sy);
                 commands.spawn((
                     GroundItem { item: Item::new_commodity(Good::Seed), qty: 1 },
-                    Transform::from_xyz(pos.x, pos.y - 8.0, 0.3),
+                    Transform::from_xyz(pos.x, pos.y, 0.3),
                     GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
                 ));
             }
         }
