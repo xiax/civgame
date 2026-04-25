@@ -8,7 +8,7 @@ use crate::world::terrain::TILE_SIZE;
 use crate::world::tile::TileKind;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
-use super::construction::{BlueprintMap, Blueprint, BuildSiteKind, find_wall_build_site};
+use super::construction::{BlueprintMap, Blueprint, BuildSiteKind};
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::AgentGoal;
 use super::items::{GroundItem, TargetItem};
@@ -499,15 +499,7 @@ fn resolve_target(
         StepTarget::FactionCamp => {
             faction_registry.home_tile(faction_id).map(|(tx, ty)| (None, tx, ty))
         }
-        StepTarget::NearestBuildSite(kind) => {
-            // Legacy arm — normal build steps now use NearestBlueprint.
-            let Some(home) = faction_registry.home_tile(faction_id) else { return None };
-            match kind {
-                BuildSiteKind::Wall => find_wall_build_site(chunk_map, home, 30).map(|(tx, ty)| (None, tx, ty)),
-                // Bed variant requires bed_map which is no longer passed here; unused in practice.
-                BuildSiteKind::Bed  => None,
-            }
-        }
+        StepTarget::NearestBuildSite(_) => None, // Legacy; construction is handled via faction_blueprint_system
         StepTarget::NearestBlueprint(kind) => {
             // Find the nearest active Blueprint entity belonging to this agent's faction.
             let mut best: Option<(Entity, i16, i16)> = None;

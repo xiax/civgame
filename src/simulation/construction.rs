@@ -2,20 +2,22 @@ use ahash::AHashMap;
 use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
-use crate::simulation::faction::FactionRegistry;
+use crate::simulation::faction::{FactionRegistry, FactionTechs, SOLO};
 use crate::simulation::jobs::JobKind;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, PersonAI};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
+use crate::simulation::technology::PERM_SETTLEMENT;
 use crate::world::chunk::ChunkMap;
 use crate::world::terrain::tile_to_world;
 use crate::world::tile::{TileKind, TileData};
 
 pub const TICKS_BUILD_WALL: u8 = 60;
 pub const TICKS_BUILD_BED:  u8 = 80;
-pub const MAX_BLUEPRINTS_PER_FACTION: usize = 2;
+/// Safety cap: prevents the blueprint queue growing unbounded due to bugs.
+pub const MAX_BLUEPRINTS_SAFETY_CAP: usize = 20;
 pub const WALL_WOOD_COST: u8 = 2;
 pub const BED_WOOD_COST:  u8 = 3;
 
@@ -82,50 +84,143 @@ pub fn enclosure_score(chunk_map: &ChunkMap, tx: i32, ty: i32) -> u8 {
     score
 }
 
-/// Find a valid wall build site. Rings 1-3 are a clearance zone; ring 4 bootstraps
-/// the first perimeter; rings 5+ fill gaps adjacent to existing walls.
-pub fn find_wall_build_site(
-    chunk_map:  &ChunkMap,
-    camp_home:  (i16, i16),
-    max_radius: i32,
-) -> Option<(i16, i16)> {
-    let dummy = BlueprintMap::default();
-    find_wall_build_site_excluding(chunk_map, &dummy, camp_home, max_radius)
+// ── Construction phase ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstructionPhase {
+    /// Scattered lean-tos near a hearth. No walls.
+    PrehistoricBand,
+    /// Individual walled huts clustering organically, then a palisade wraps them.
+    NeolithicVillage,
+    /// Larger longhouses in rows, heavier outer wall.
+    BronzeAgeTown,
 }
 
-/// Like `find_wall_build_site` but also skips tiles already reserved by blueprints.
-pub fn find_wall_build_site_excluding(
-    chunk_map:  &ChunkMap,
-    bp_map:     &BlueprintMap,
-    camp_home:  (i16, i16),
+fn determine_phase(member_count: u32, techs: &FactionTechs) -> ConstructionPhase {
+    if member_count >= 25 {
+        ConstructionPhase::BronzeAgeTown
+    } else if member_count >= 8 || techs.has(PERM_SETTLEMENT) {
+        ConstructionPhase::NeolithicVillage
+    } else {
+        ConstructionPhase::PrehistoricBand
+    }
+}
+
+// ── Placement helpers ─────────────────────────────────────────────────────────
+
+fn count_beds_near(bed_map: &BedMap, home: (i16, i16), radius: i32) -> usize {
+    let (hx, hy) = (home.0 as i32, home.1 as i32);
+    bed_map.0.keys().filter(|&&pos| {
+        (pos.0 as i32 - hx).abs() <= radius && (pos.1 as i32 - hy).abs() <= radius
+    }).count()
+}
+
+/// Phase 0: place a bed near the camp center with a small gap from existing beds.
+fn find_organic_bed_site(
+    chunk_map: &ChunkMap,
+    bed_map:   &BedMap,
+    bp_map:    &BlueprintMap,
+    camp_home: (i16, i16),
     max_radius: i32,
 ) -> Option<(i16, i16)> {
     let (hx, hy) = (camp_home.0 as i32, camp_home.1 as i32);
-
-    for ring_r in 4..=max_radius {
-        for dy in -ring_r..=ring_r {
-            for dx in -ring_r..=ring_r {
-                if dx.abs().max(dy.abs()) != ring_r { continue; }
-
+    for dist in 1..=max_radius {
+        for dy in -dist..=dist {
+            for dx in -dist..=dist {
+                if dx.abs().max(dy.abs()) != dist { continue; }
                 let tx = hx + dx;
                 let ty = hy + dy;
-
-                if bp_map.0.contains_key(&(tx as i16, ty as i16)) { continue; }
-
+                let pos = (tx as i16, ty as i16);
+                if bp_map.0.contains_key(&pos) { continue; }
+                if bed_map.0.contains_key(&pos) { continue; }
                 let Some(kind) = chunk_map.tile_kind_at(tx, ty) else { continue };
-                if !kind.is_passable() || kind == TileKind::Wall { continue; }
-
-                // Ring 4: bootstrap first perimeter ring unconditionally.
-                if ring_r == 4 {
-                    return Some((tx as i16, ty as i16));
-                }
-
-                // Rings 5+: gap-fill adjacent to an existing wall.
-                let adj_wall = [(-1i32, 0), (1, 0), (0, -1i32), (0, 1)].iter().any(|(ddx, ddy)| {
-                    chunk_map.tile_kind_at(tx + ddx, ty + ddy) == Some(TileKind::Wall)
+                if !kind.is_passable() { continue; }
+                // Keep a 1-tile gap so the scatter feels organic, not wall-to-wall.
+                let adj_bed = [(-1i32,0),(1,0),(0,-1i32),(0,1)].iter().any(|(ddx,ddy)| {
+                    bed_map.0.contains_key(&((tx+ddx) as i16, (ty+ddy) as i16))
                 });
-                if adj_wall {
-                    return Some((tx as i16, ty as i16));
+                if !adj_bed { return Some(pos); }
+            }
+        }
+    }
+    None
+}
+
+/// Returns true if every tile in the half_w × half_h footprint centred at (cx,cy)
+/// is passable, not a wall, and not reserved by an existing bed or blueprint.
+fn is_clear_footprint(
+    chunk_map: &ChunkMap,
+    bed_map:   &BedMap,
+    bp_map:    &BlueprintMap,
+    cx: i32, cy: i32,
+    half_w: i32, half_h: i32,
+) -> bool {
+    for dy in -half_h..=half_h {
+        for dx in -half_w..=half_w {
+            let pos = ((cx + dx) as i16, (cy + dy) as i16);
+            if bp_map.0.contains_key(&pos) { return false; }
+            if bed_map.0.contains_key(&pos) { return false; }
+            let Some(kind) = chunk_map.tile_kind_at(cx + dx, cy + dy) else { return false; };
+            if !kind.is_passable() || kind == TileKind::Wall { return false; }
+        }
+    }
+    true
+}
+
+/// Returns true if any wall tile or bed exists within `radius` tiles of the
+/// expanded bounding box of the footprint — i.e. there is something to attach to.
+fn has_nearby_structure(
+    chunk_map: &ChunkMap,
+    bed_map:   &BedMap,
+    cx: i32, cy: i32,
+    half_w: i32, half_h: i32,
+    radius: i32,
+) -> bool {
+    let outer_w = half_w + radius;
+    let outer_h = half_h + radius;
+    for dy in -outer_h..=outer_h {
+        for dx in -outer_w..=outer_w {
+            if dy.abs() <= half_h && dx.abs() <= half_w { continue; } // skip own footprint
+            let nx = cx + dx;
+            let ny = cy + dy;
+            if bed_map.0.contains_key(&(nx as i16, ny as i16)) { return true; }
+            if chunk_map.tile_kind_at(nx, ny) == Some(TileKind::Wall) { return true; }
+        }
+    }
+    false
+}
+
+/// Phase 1/2: find the center of a clear (2·half_w+1) × (2·half_h+1) footprint.
+/// Returns a site near the camp center for the first few buildings, then expands
+/// outward organically (adjacent to existing structures).
+fn find_building_origin(
+    chunk_map: &ChunkMap,
+    bed_map:   &BedMap,
+    bp_map:    &BlueprintMap,
+    camp_home: (i16, i16),
+    half_w:    i32,
+    half_h:    i32,
+    max_radius: i32,
+) -> Option<(i16, i16)> {
+    let (hx, hy) = (camp_home.0 as i32, camp_home.1 as i32);
+    let min_ring = half_w.max(half_h) + 1;
+    let early_ring = min_ring + 3; // within this ring: always accept a clear footprint
+
+    for ring in min_ring..=max_radius {
+        for dy in -ring..=ring {
+            for dx in -ring..=ring {
+                if dx.abs().max(dy.abs()) != ring { continue; }
+                let cx = hx + dx;
+                let cy = hy + dy;
+                if !is_clear_footprint(chunk_map, bed_map, bp_map, cx, cy, half_w, half_h) {
+                    continue;
+                }
+                if ring <= early_ring {
+                    return Some((cx as i16, cy as i16));
+                }
+                // Beyond the seeding zone, grow organically: require adjacency.
+                if has_nearby_structure(chunk_map, bed_map, cx, cy, half_w, half_h, 2) {
+                    return Some((cx as i16, cy as i16));
                 }
             }
         }
@@ -133,55 +228,128 @@ pub fn find_wall_build_site_excluding(
     None
 }
 
-/// Find the closest passable enclosed tile near camp for a bed.
-pub fn find_bed_build_site(
-    chunk_map:  &ChunkMap,
-    bed_map:    &BedMap,
-    camp_home:  (i16, i16),
-    max_radius: i32,
-) -> Option<(i16, i16)> {
-    let dummy = BlueprintMap::default();
-    find_bed_build_site_excluding(chunk_map, bed_map, &dummy, camp_home, max_radius)
-}
-
-/// Like `find_bed_build_site` but also skips blueprint-reserved tiles.
-pub fn find_bed_build_site_excluding(
-    chunk_map:  &ChunkMap,
-    bed_map:    &BedMap,
-    bp_map:     &BlueprintMap,
-    camp_home:  (i16, i16),
-    max_radius: i32,
-) -> Option<(i16, i16)> {
+/// Phase 1/2: plan all wall and bed blueprints for a single rectangular building.
+/// The perimeter wall tile closest to camp_home becomes the entrance (left open).
+fn plan_building(
+    commands:       &mut Commands,
+    bp_map:         &mut BlueprintMap,
+    cx: i32, cy:    i32,
+    half_w: i32, half_h: i32,
+    faction_id:     u32,
+    camp_home:      (i16, i16),
+    interior_beds:  &[(i32, i32)],
+) {
     let (hx, hy) = (camp_home.0 as i32, camp_home.1 as i32);
-    let mut best: Option<(i16, i16)> = None;
-    let mut best_dist = i32::MAX;
 
-    for dy in -max_radius..=max_radius {
-        for dx in -max_radius..=max_radius {
-            let tx = hx + dx;
-            let ty = hy + dy;
-
-            if bp_map.0.contains_key(&(tx as i16, ty as i16)) { continue; }
-
-            let Some(kind) = chunk_map.tile_kind_at(tx, ty) else { continue };
-            if !kind.is_passable() { continue; }
-            if bed_map.0.contains_key(&(tx as i16, ty as i16)) { continue; }
-
-            if enclosure_score(chunk_map, tx, ty) >= 1 {
-                let dist = dx.abs() + dy.abs();
-                if dist < best_dist {
-                    best_dist = dist;
-                    best = Some((tx as i16, ty as i16));
-                }
+    // The perimeter tile whose world-position is closest to the camp center becomes entrance.
+    let entrance: (i32, i32) = {
+        let mut best = (0i32, half_h);
+        let mut best_dist = i64::MAX;
+        for dy in -half_h..=half_h {
+            for dx in -half_w..=half_w {
+                if dx.abs() < half_w && dy.abs() < half_h { continue; } // interior
+                let d = ((cx+dx-hx) as i64).pow(2) + ((cy+dy-hy) as i64).pow(2);
+                if d < best_dist { best_dist = d; best = (dx, dy); }
             }
         }
+        best
+    };
+
+    // Walls: all perimeter tiles except the entrance.
+    for dy in -half_h..=half_h {
+        for dx in -half_w..=half_w {
+            if dx.abs() < half_w && dy.abs() < half_h { continue; } // interior — beds go here
+            if (dx, dy) == entrance { continue; }
+            let tile = ((cx + dx) as i16, (cy + dy) as i16);
+            if bp_map.0.contains_key(&tile) { continue; }
+            let wp = tile_to_world(cx + dx, cy + dy);
+            let e = commands.spawn((
+                Blueprint { faction_id, kind: BuildSiteKind::Wall, tile,
+                    wood_needed: WALL_WOOD_COST, wood_deposited: 0, build_progress: 0 },
+                Transform::from_xyz(wp.x, wp.y, 0.3),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            )).id();
+            bp_map.0.insert(tile, e);
+        }
     }
-    best
+
+    // Beds: at the specified interior offsets.
+    for &(bdx, bdy) in interior_beds {
+        let tile = ((cx + bdx) as i16, (cy + bdy) as i16);
+        if bp_map.0.contains_key(&tile) { continue; }
+        let wp = tile_to_world(cx + bdx, cy + bdy);
+        let e = commands.spawn((
+            Blueprint { faction_id, kind: BuildSiteKind::Bed, tile,
+                wood_needed: BED_WOOD_COST, wood_deposited: 0, build_progress: 0 },
+            Transform::from_xyz(wp.x, wp.y, 0.3),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
+        )).id();
+        bp_map.0.insert(tile, e);
+    }
 }
 
-/// Maintains the faction build queue: spawns Blueprint entities for factions that
-/// have fewer than MAX_BLUEPRINTS_PER_FACTION active blueprints.
-/// Runs in Economy set every 60 ticks.
+/// Phase 1/2: find a single open slot on the rectangular palisade that wraps the
+/// settlement's bed bounding box plus a buffer. Returns None when the palisade is
+/// complete or no beds exist near camp.
+fn find_palisade_site(
+    chunk_map: &ChunkMap,
+    bed_map:   &BedMap,
+    bp_map:    &BlueprintMap,
+    camp_home: (i16, i16),
+    buffer:    i32,
+) -> Option<(i16, i16)> {
+    let (hx, hy) = (camp_home.0 as i32, camp_home.1 as i32);
+    let search = 25i32;
+
+    let mut min_x = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut min_y = i32::MAX;
+    let mut max_y = i32::MIN;
+    for &pos in bed_map.0.keys() {
+        let (bx, by) = (pos.0 as i32, pos.1 as i32);
+        if (bx - hx).abs() > search || (by - hy).abs() > search { continue; }
+        min_x = min_x.min(bx); max_x = max_x.max(bx);
+        min_y = min_y.min(by); max_y = max_y.max(by);
+    }
+    if min_x == i32::MAX { return None; }
+
+    min_x -= buffer; max_x += buffer;
+    min_y -= buffer; max_y += buffer;
+
+    // Top and bottom rows.
+    for x in min_x..=max_x {
+        for &y in &[min_y, max_y] {
+            let tile = (x as i16, y as i16);
+            if bp_map.0.contains_key(&tile) { continue; }
+            let Some(kind) = chunk_map.tile_kind_at(x, y) else { continue };
+            if !kind.is_passable() || kind == TileKind::Wall { continue; }
+            return Some(tile);
+        }
+    }
+    // Left and right columns (excluding corners already checked).
+    for y in (min_y + 1)..max_y {
+        for &x in &[min_x, max_x] {
+            let tile = (x as i16, y as i16);
+            if bp_map.0.contains_key(&tile) { continue; }
+            let Some(kind) = chunk_map.tile_kind_at(x, y) else { continue };
+            if !kind.is_passable() || kind == TileKind::Wall { continue; }
+            return Some(tile);
+        }
+    }
+    None
+}
+
+// ── Blueprint planning system ─────────────────────────────────────────────────
+
+/// Maintains the faction build queue each 60 ticks. Plans one project at a time:
+///   Phase 0 (prehistoric):  one scattered bed near camp, no walls.
+///   Phase 1 (neolithic):    one 3×3 walled hut (8 walls + 1 bed); once beds
+///                           cover the population, batches of 4 palisade walls.
+///   Phase 2 (bronze age):   5×3 longhouse (11 walls + 2 beds); wider palisade.
 pub fn faction_blueprint_system(
     mut commands:     Commands,
     clock:            Res<SimClock>,
@@ -194,7 +362,6 @@ pub fn faction_blueprint_system(
 ) {
     if clock.tick % 60 != 0 || !auto_build.0 { return; }
 
-    // Count materialized blueprints per faction.
     let mut faction_bp_count: AHashMap<u32, usize> = AHashMap::new();
     for &bp_entity in bp_map.0.values() {
         if let Ok(bp) = bp_query.get(bp_entity) {
@@ -202,41 +369,107 @@ pub fn faction_blueprint_system(
         }
     }
 
-    // Snapshot faction list to avoid borrow conflict.
-    let factions: Vec<(u32, (i16, i16))> = faction_registry.factions.iter()
-        .map(|(&id, fd)| (id, fd.home_tile))
+    let factions: Vec<(u32, (i16, i16), u32, FactionTechs)> = faction_registry.factions.iter()
+        .filter(|(&id, _)| id != SOLO)
+        .map(|(&id, fd)| (id, fd.home_tile, fd.member_count, fd.techs.clone()))
         .collect();
 
-    for (faction_id, home) in factions {
-        let mut count = faction_bp_count.get(&faction_id).copied().unwrap_or(0);
+    for (faction_id, home, member_count, techs) in factions {
+        let count = faction_bp_count.get(&faction_id).copied().unwrap_or(0);
+        if count >= MAX_BLUEPRINTS_SAFETY_CAP || member_count == 0 { continue; }
+        // One project at a time: wait until all current blueprints are built.
+        if count > 0 { continue; }
 
-        while count < MAX_BLUEPRINTS_PER_FACTION {
-            if let Some(tile) = find_wall_build_site_excluding(&chunk_map, &bp_map, home, 30) {
-                let world_pos = tile_to_world(tile.0 as i32, tile.1 as i32);
-                let entity = commands.spawn((
-                    Blueprint { faction_id, kind: BuildSiteKind::Wall, tile,
-                        wood_needed: WALL_WOOD_COST, wood_deposited: 0, build_progress: 0 },
-                    Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
-                    GlobalTransform::default(),
-                    Visibility::Visible,
-                    InheritedVisibility::default(),
-                )).id();
-                bp_map.0.insert(tile, entity);
-                count += 1;
-            } else if let Some(tile) = find_bed_build_site_excluding(&chunk_map, &bed_map, &bp_map, home, 25) {
-                let world_pos = tile_to_world(tile.0 as i32, tile.1 as i32);
-                let entity = commands.spawn((
-                    Blueprint { faction_id, kind: BuildSiteKind::Bed, tile,
-                        wood_needed: BED_WOOD_COST, wood_deposited: 0, build_progress: 0 },
-                    Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
-                    GlobalTransform::default(),
-                    Visibility::Visible,
-                    InheritedVisibility::default(),
-                )).id();
-                bp_map.0.insert(tile, entity);
-                count += 1;
-            } else {
-                break;
+        match determine_phase(member_count, &techs) {
+            ConstructionPhase::PrehistoricBand => {
+                if let Some(tile) = find_organic_bed_site(&chunk_map, &bed_map, &bp_map, home, 4) {
+                    let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
+                    let e = commands.spawn((
+                        Blueprint { faction_id, kind: BuildSiteKind::Bed, tile,
+                            wood_needed: BED_WOOD_COST, wood_deposited: 0, build_progress: 0 },
+                        Transform::from_xyz(wp.x, wp.y, 0.3),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    )).id();
+                    bp_map.0.insert(tile, e);
+                }
+            }
+
+            ConstructionPhase::NeolithicVillage => {
+                let beds_near   = count_beds_near(&bed_map, home, 20);
+                let beds_needed = (member_count as f32 * 0.8) as usize;
+
+                if beds_near < beds_needed {
+                    // Build a 3×3 hut: 8 walls + 1 bed.
+                    if let Some(origin) = find_building_origin(
+                        &chunk_map, &bed_map, &bp_map, home, 1, 1, 15,
+                    ) {
+                        plan_building(&mut commands, &mut bp_map,
+                            origin.0 as i32, origin.1 as i32, 1, 1,
+                            faction_id, home, &[(0, 0)]);
+                    }
+                } else if beds_near > 0 {
+                    // Beds are sufficient; build a segment of the palisade.
+                    let mut planned = 0;
+                    while planned < 4 {
+                        let Some(tile) = find_palisade_site(
+                            &chunk_map, &bed_map, &bp_map, home, 2,
+                        ) else { break };
+                        let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
+                        let e = commands.spawn((
+                            Blueprint { faction_id, kind: BuildSiteKind::Wall, tile,
+                                wood_needed: WALL_WOOD_COST, wood_deposited: 0, build_progress: 0 },
+                            Transform::from_xyz(wp.x, wp.y, 0.3),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        )).id();
+                        bp_map.0.insert(tile, e);
+                        planned += 1;
+                    }
+                }
+            }
+
+            ConstructionPhase::BronzeAgeTown => {
+                let beds_near   = count_beds_near(&bed_map, home, 30);
+                let beds_needed = (member_count as f32 * 0.8) as usize;
+
+                if beds_near < beds_needed {
+                    // Prefer a 5×3 longhouse (11 walls + 2 beds); fall back to 3×3 hut.
+                    if let Some(origin) = find_building_origin(
+                        &chunk_map, &bed_map, &bp_map, home, 2, 1, 20,
+                    ) {
+                        plan_building(&mut commands, &mut bp_map,
+                            origin.0 as i32, origin.1 as i32, 2, 1,
+                            faction_id, home, &[(-1, 0), (1, 0)]);
+                    } else if let Some(origin) = find_building_origin(
+                        &chunk_map, &bed_map, &bp_map, home, 1, 1, 20,
+                    ) {
+                        plan_building(&mut commands, &mut bp_map,
+                            origin.0 as i32, origin.1 as i32, 1, 1,
+                            faction_id, home, &[(0, 0)]);
+                    }
+                } else if beds_near > 0 {
+                    // Build a segment of the heavier outer wall (4-tile buffer).
+                    let mut planned = 0;
+                    while planned < 4 {
+                        let Some(tile) = find_palisade_site(
+                            &chunk_map, &bed_map, &bp_map, home, 4,
+                        ) else { break };
+                        let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
+                        let e = commands.spawn((
+                            Blueprint { faction_id, kind: BuildSiteKind::Wall, tile,
+                                wood_needed: WALL_WOOD_COST, wood_deposited: 0, build_progress: 0 },
+                            Transform::from_xyz(wp.x, wp.y, 0.3),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        )).id();
+                        bp_map.0.insert(tile, e);
+                        planned += 1;
+                    }
+                }
             }
         }
     }
