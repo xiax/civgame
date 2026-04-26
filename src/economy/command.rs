@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use super::goods::GOOD_COUNT;
 
-/// Centrally-held resource pools and job quotas for command economy mode.
+/// Centrally-held resource pools and task quotas for command economy mode.
 #[derive(Resource, Default)]
 pub struct CommandPools {
     pub stockpile: [f32; GOOD_COUNT],

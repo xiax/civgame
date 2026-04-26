@@ -63,10 +63,10 @@ pub fn market_buy_system(
             let (bought_item, qty) = market.try_buy_item(Good::Fruit, 1, &mut agent.currency);
             if let Some(it) = bought_item {
                 agent.add_item(it, qty as u8);
-                // Clear Trader job now that the buy was handled
-                if ai.job_id == crate::simulation::jobs::JobKind::Trader as u16 {
+                // Clear Trader task now that the buy was handled
+                if ai.task_id == crate::simulation::tasks::TaskKind::Trader as u16 {
                     ai.state = AiState::Idle;
-                    ai.job_id = PersonAI::UNEMPLOYED;
+                    ai.task_id = PersonAI::UNEMPLOYED;
                 }
             }
         }
@@ -83,3 +83,4 @@ pub fn market_buy_system(
         }
     }
 }
+

@@ -179,7 +179,7 @@ pub fn reproduction_system(
                 Mood::default(),
                 Skills::default(),
                 PersonAI {
-                    job_id: PersonAI::UNEMPLOYED,
+                    task_id: PersonAI::UNEMPLOYED,
                     state: AiState::Idle,
                     target_tile: (tx as i16, ty as i16),
                     dest_tile: (tx as i16, ty as i16),

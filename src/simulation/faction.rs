@@ -6,18 +6,73 @@ use super::goals::Personality;
 use super::memory::RelationshipMemory;
 use super::lod::LodLevel;
 use super::needs::Needs;
-use super::person::{AiState, PersonAI};
+use super::person::{AiState, PersonAI, Profession};
 use super::schedule::{BucketSlot, SimClock};
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::simulation::technology::{
-    TechId, ActivityKind, TECH_COUNT, ACTIVITY_COUNT, FIRE_MAKING, tech_def,
+    TechId, ActivityKind, TECH_COUNT, ACTIVITY_COUNT, FIRE_MAKING, CROP_CULTIVATION, tech_def,
 };
 
 pub const SOLO: u32 = 0;
 pub const BOND_THRESHOLD: u8 = 180;
 const CAMP_KEEP: u8 = 0;
 const SOCIAL_RADIUS: i32 = 3;
+
+pub fn faction_profession_system(
+    mut registry: ResMut<FactionRegistry>,
+    mut query: Query<(&mut Profession, &FactionMember)>,
+) {
+    for (&faction_id, faction) in registry.factions.iter_mut() {
+        if !faction.techs.has(CROP_CULTIVATION) {
+            continue;
+        }
+
+        // Target: 1 farmer per 5 members if food is low.
+        // Let's keep it simple for now: 20% of the population as farmers if food stock is below 100.
+        let target_farmers = if faction.food_stock < 100.0 {
+            (faction.member_count / 5).max(1)
+        } else {
+            0
+        };
+
+        let mut current_farmers = 0;
+
+        for (prof, member) in query.iter() {
+            if member.faction_id == faction_id {
+                if *prof == Profession::Farmer {
+                    current_farmers += 1;
+                }
+            }
+        }
+
+        if current_farmers < target_farmers {
+            let to_assign = target_farmers - current_farmers;
+            let mut assigned = 0;
+            for (mut prof, member) in query.iter_mut() {
+                if member.faction_id == faction_id && *prof == Profession::None {
+                    *prof = Profession::Farmer;
+                    assigned += 1;
+                    if assigned >= to_assign {
+                        break;
+                    }
+                }
+            }
+        } else if current_farmers > target_farmers {
+            let to_unassign = current_farmers - target_farmers;
+            let mut unassigned = 0;
+            for (mut prof, member) in query.iter_mut() {
+                if member.faction_id == faction_id && *prof == Profession::Farmer {
+                    *prof = Profession::None;
+                    unassigned += 1;
+                    if unassigned >= to_unassign {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[derive(Component, Clone, Copy)]
 pub struct FactionMember {
@@ -67,6 +122,7 @@ impl ActivityLog {
 
 pub struct FactionData {
     pub food_stock:   f32,
+    pub seed_stock:   u32,
     pub home_tile:    (i16, i16),
     pub member_count: u32,
     pub raid_target:  Option<u32>,
@@ -93,7 +149,9 @@ impl FactionRegistry {
         let mut techs = FactionTechs::default();
         techs.unlock(FIRE_MAKING);
         self.factions.insert(id, FactionData {
-            food_stock: 0.0, home_tile, member_count: 0,
+            food_stock: 0.0,
+            seed_stock: 0,
+            home_tile, member_count: 0,
             raid_target: None, under_raid: false,
             techs,
             activity_log: ActivityLog::default(),
@@ -258,26 +316,29 @@ pub fn faction_camp_system(
         &mut EconomicAgent,
         &mut Needs,
         &FactionMember,
+        &Profession,
         &BucketSlot,
         &LodLevel,
     )>,
 ) {
-    for (mut ai, mut agent, needs, member, slot, lod) in query.iter_mut() {
+    for (ai, mut agent, needs, member, profession, slot, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
         if member.faction_id == SOLO {
             continue;
         }
-        let Some(faction) = registry.factions.get(&member.faction_id) else { continue };
-        let home = faction.home_tile;
+        let faction_id = member.faction_id;
+        let (home, has_cultivation) = if let Some(faction) = registry.factions.get(&faction_id) {
+            (faction.home_tile, faction.techs.has(CROP_CULTIVATION))
+        } else {
+            continue;
+        };
 
         // Only act when at the camp tile
         if ai.state != AiState::Working || ai.target_tile != home {
             continue;
         }
-
-        let faction_id = member.faction_id;
 
         // Deposit surplus food
         let food_qty = agent.total_food();
@@ -297,6 +358,22 @@ pub fn faction_camp_system(
             }
         }
 
+        // Deposit seeds if non-farmer and faction has crop cultivation
+        if *profession != Profession::Farmer && has_cultivation {
+            let mut seeds_to_deposit = 0;
+            for (it, q) in agent.inventory.iter_mut() {
+                if it.good == Good::Seed && *q > 0 {
+                    seeds_to_deposit += *q;
+                    *q = 0;
+                }
+            }
+            if seeds_to_deposit > 0 {
+                if let Some(f) = registry.factions.get_mut(&faction_id) {
+                    f.seed_stock += seeds_to_deposit as u32;
+                }
+            }
+        }
+
         // Withdraw food if hungry and no personal food
         if needs.hunger > 100.0 && agent.total_food() == 0 {
             if let Some(f) = registry.factions.get_mut(&faction_id) {
@@ -309,7 +386,7 @@ pub fn faction_camp_system(
     }
 }
 
-// ── Helpers for job dispatch ──────────────────────────────────────────────────
+// ── Helpers for task dispatch ──────────────────────────────────────────────────
 
 impl FactionRegistry {
     pub fn home_tile(&self, faction_id: u32) -> Option<(i16, i16)> {

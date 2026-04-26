@@ -62,7 +62,7 @@ pub fn movement_system(
 
             match ai.state {
                 AiState::Seeking => {
-                    // Arrived at job target — start working
+                    // Arrived at task target — start working
                     ai.state = AiState::Working;
                 }
                 AiState::Working => {

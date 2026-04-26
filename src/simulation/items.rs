@@ -45,7 +45,7 @@ pub struct ArmorStats {
     pub covered_parts: Vec<BodyPart>,
 }
 
-use super::jobs::JobKind;
+use super::tasks::TaskKind;
 
 /// Sequential, after death_system.
 /// Agents explicitly targeting a GroundItem pick it up once they arrive.
@@ -69,12 +69,12 @@ pub fn item_pickup_system(
         mut active_plan_opt, transform
     ) in pickers.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
-        if ai.state != AiState::Working || ai.job_id != JobKind::Scavenge as u16 { continue; }
+        if ai.state != AiState::Working || ai.task_id != TaskKind::Scavenge as u16 { continue; }
 
         let Some(target_ent) = target_item.0 else {
             // No target, but in scavenge state? Cleanup.
             ai.state = AiState::Idle;
-            ai.job_id = PersonAI::UNEMPLOYED;
+            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             continue;
         };
@@ -94,14 +94,14 @@ pub fn item_pickup_system(
 
                 commands.entity(target_ent).despawn();
                 ai.state = AiState::Idle;
-                ai.job_id = PersonAI::UNEMPLOYED;
+                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
                 target_item.0 = None;
             }
         } else {
             // Targeted item is gone (stolen or rotted)
             ai.state = AiState::Idle;
-            ai.job_id = PersonAI::UNEMPLOYED;
+            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             target_item.0 = None;
         }

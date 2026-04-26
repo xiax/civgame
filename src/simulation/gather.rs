@@ -4,7 +4,7 @@ use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::items::GroundItem;
-use crate::simulation::jobs::JobKind;
+use crate::simulation::tasks::TaskKind;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::{AgentMemory, MemoryKind};
 use crate::simulation::person::{AiState, PersonAI};
@@ -63,7 +63,7 @@ pub fn gather_system(
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
         if ai.state != AiState::Working { continue; }
-        if ai.job_id != JobKind::Gather as u16 { continue; }
+        if ai.task_id != TaskKind::Gather as u16 { continue; }
 
         let tx = ai.target_tile.0 as i32;
         let ty = ai.target_tile.1 as i32;
@@ -82,7 +82,7 @@ pub fn gather_system(
                     mem.forget((tx as i16, ty as i16), MemoryKind::Wood);
                 }
                 ai.state = AiState::Idle;
-                ai.job_id = PersonAI::UNEMPLOYED;
+                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
                 continue;
             };
@@ -95,7 +95,7 @@ pub fn gather_system(
                     mem.forget((tx as i16, ty as i16), kind);
                 }
                 ai.state = AiState::Idle;
-                ai.job_id = PersonAI::UNEMPLOYED;
+                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
                 continue;
             }
@@ -195,7 +195,7 @@ pub fn gather_system(
                     mem.forget((tx as i16, ty as i16), MemoryKind::Wood);
                 }
                 ai.state = AiState::Idle;
-                ai.job_id = PersonAI::UNEMPLOYED;
+                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
                 ai.work_progress = 0;
             }
@@ -205,7 +205,7 @@ pub fn gather_system(
 
         if agent.is_inventory_full() {
             ai.state = AiState::Idle;
-            ai.job_id = PersonAI::UNEMPLOYED;
+            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.work_progress = 0;
         }

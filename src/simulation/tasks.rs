@@ -18,11 +18,11 @@ use super::plants::{PlantMap, Plant, GrowthStage, PlantKind};
 use super::plan::ActivePlan;
 
 /// Represents the current active task an agent is performing.
-/// Jobs are transient and managed by either the plan system or the goal dispatch system.
+/// Tasks are transient and managed by either the plan system or the goal dispatch system.
 /// An agent is "unemployed" when they are between tasks or idling.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JobKind {
+pub enum TaskKind {
     Idle         = 0,
     Gather       = 1,
     Trader       = 2,
@@ -179,11 +179,11 @@ pub fn find_nearest_unplanted_farmland(
     best
 }
 
-pub fn assign_job_with_routing(
+pub fn assign_task_with_routing(
     ai: &mut PersonAI,
     cur_chunk: ChunkCoord,
     target: (i16, i16),
-    job: JobKind,
+    task: TaskKind,
     target_entity: Option<Entity>,
     chunk_graph: &ChunkGraph,
     chunk_map: &ChunkMap,
@@ -192,7 +192,7 @@ pub fn assign_job_with_routing(
         (target.0 as i32).div_euclid(CHUNK_SIZE as i32),
         (target.1 as i32).div_euclid(CHUNK_SIZE as i32),
     );
-    ai.job_id = job as u16;
+    ai.task_id = task as u16;
     ai.dest_tile = target; // Store final destination
     ai.target_entity = target_entity;
 
@@ -271,30 +271,26 @@ pub fn goal_dispatch_system(
             return;
         }
 
-        let is_active = matches!(ai.state, AiState::Working | AiState::Seeking | AiState::Routing);
-
-        // If they have an ActivePlan, let plan_execution_system handle their job state.
-        // If not, we are managing their job state based on their non-plan goal.
-        if plan_opt.is_none() && ai.job_id != PersonAI::UNEMPLOYED {
-            let expected_job = match goal {
-                AgentGoal::ReturnCamp => Some(JobKind::ReturnCamp as u16),
-                AgentGoal::Socialize  => Some(JobKind::Socialize as u16),
-                AgentGoal::Reproduce  => Some(JobKind::Reproduce as u16),
-                AgentGoal::Raid       => Some(JobKind::Raid as u16),
-                AgentGoal::Defend     => Some(JobKind::Defend as u16),
+        if plan_opt.is_none() && ai.task_id != PersonAI::UNEMPLOYED {
+            let expected_task = match goal {
+                AgentGoal::ReturnCamp => Some(TaskKind::ReturnCamp as u16),
+                AgentGoal::Socialize  => Some(TaskKind::Socialize as u16),
+                AgentGoal::Reproduce  => Some(TaskKind::Reproduce as u16),
+                AgentGoal::Raid       => Some(TaskKind::Raid as u16),
+                AgentGoal::Defend     => Some(TaskKind::Defend as u16),
                 _                     => {
-                    if ai.job_id == JobKind::Explore as u16 && matches!(goal, AgentGoal::Gather | AgentGoal::Survive | AgentGoal::Build) {
-                         Some(JobKind::Explore as u16)
+                    if ai.task_id == TaskKind::Explore as u16 && matches!(goal, AgentGoal::Gather | AgentGoal::Survive | AgentGoal::Build) {
+                         Some(TaskKind::Explore as u16)
                     } else {
                         None
                     }
                 }
             };
 
-            if Some(ai.job_id) != expected_job {
-                // Goal changed or task is done; drop the current job.
+            if Some(ai.task_id) != expected_task {
+                // Goal changed or task is done; drop the current task.
                 ai.state = AiState::Idle;
-                ai.job_id = PersonAI::UNEMPLOYED;
+                ai.task_id = PersonAI::UNEMPLOYED;
             }
         }
 
@@ -312,16 +308,16 @@ pub fn goal_dispatch_system(
                 if member.faction_id != SOLO {
                     if let Some(home) = faction_registry.home_tile(member.faction_id) {
                         // Already going to camp?
-                        if is_active && ai.job_id == JobKind::ReturnCamp as u16 && ai.dest_tile == home {
+                        if is_active && ai.task_id == TaskKind::ReturnCamp as u16 && ai.dest_tile == home {
                             return;
                         }
-                        assign_job_with_routing(&mut ai, cur_chunk, home, JobKind::ReturnCamp, None, &chunk_graph, &chunk_map);
+                        assign_task_with_routing(&mut ai, cur_chunk, home, TaskKind::ReturnCamp, None, &chunk_graph, &chunk_map);
                     }
                 }
             }
 
             AgentGoal::Socialize => {
-                if is_active && ai.job_id == JobKind::Socialize as u16 { return; }
+                if is_active && ai.task_id == TaskKind::Socialize as u16 { return; }
                 // Bug 6 fix: find nearest entity in radius, not the first one in scan order.
                 let radius = 15i32;
                 let mut best_target: Option<(i16, i16, Entity)> = None;
@@ -341,10 +337,10 @@ pub fn goal_dispatch_system(
                     }
                 }
                 if let Some((tx, ty, other)) = best_target {
-                    assign_job_with_routing(
+                    assign_task_with_routing(
                         &mut ai, cur_chunk,
                         (tx, ty),
-                        JobKind::Socialize,
+                        TaskKind::Socialize,
                         Some(other),
                         &chunk_graph, &chunk_map,
                     );
@@ -352,25 +348,25 @@ pub fn goal_dispatch_system(
             }
 
             AgentGoal::Reproduce => {
-                if is_active && ai.job_id == JobKind::Reproduce as u16 { return; }
+                if is_active && ai.task_id == TaskKind::Reproduce as u16 { return; }
                 if member.faction_id != SOLO {
                     if let Some((partner, tx, ty)) = find_nearby_partner(
                         &spatial, (cur_tx, cur_ty), 15, *sex,
                         member.faction_id, &sex_query, entity, rel_opt,
                     ) {
-                        assign_job_with_routing(&mut ai, cur_chunk, (tx, ty), JobKind::Reproduce, Some(partner), &chunk_graph, &chunk_map);
+                        assign_task_with_routing(&mut ai, cur_chunk, (tx, ty), TaskKind::Reproduce, Some(partner), &chunk_graph, &chunk_map);
                     }
                 }
             }
 
             AgentGoal::Raid => {
-                if is_active && ai.job_id == JobKind::Raid as u16 { return; }
+                if is_active && ai.task_id == TaskKind::Raid as u16 { return; }
                 if member.faction_id != SOLO {
                     if let Some(target_id) = faction_registry.raid_target(member.faction_id) {
                         if let Some(enemy_home) = faction_registry.home_tile(target_id) {
-                            assign_job_with_routing(
+                            assign_task_with_routing(
                                 &mut ai, cur_chunk, enemy_home,
-                                JobKind::Raid, None, &chunk_graph, &chunk_map,
+                                TaskKind::Raid, None, &chunk_graph, &chunk_map,
                             );
                         }
                     }
@@ -378,12 +374,12 @@ pub fn goal_dispatch_system(
             }
 
             AgentGoal::Defend => {
-                if is_active && ai.job_id == JobKind::Defend as u16 { return; }
+                if is_active && ai.task_id == TaskKind::Defend as u16 { return; }
                 if member.faction_id != SOLO {
                     if let Some(home) = faction_registry.home_tile(member.faction_id) {
-                        assign_job_with_routing(
+                        assign_task_with_routing(
                             &mut ai, cur_chunk, home,
-                            JobKind::Defend, None, &chunk_graph, &chunk_map,
+                            TaskKind::Defend, None, &chunk_graph, &chunk_map,
                         );
                     }
                 }
@@ -395,10 +391,10 @@ pub fn goal_dispatch_system(
 
             // Survive, Gather, and Build are handled by plan_execution_system
             AgentGoal::Survive | AgentGoal::Gather | AgentGoal::Build => {
-                if ai.job_id == JobKind::Explore as u16 {
+                if ai.task_id == TaskKind::Explore as u16 {
                     if ai.state == AiState::Working {
                         ai.state = AiState::Idle;
-                        ai.job_id = PersonAI::UNEMPLOYED;
+                        ai.task_id = PersonAI::UNEMPLOYED;
                     }
                 }
             }

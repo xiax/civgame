@@ -40,10 +40,17 @@ pub enum AiState {
     Attacking = 5,
 }
 
+#[derive(Component, Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Profession {
+    #[default]
+    None,
+    Farmer,
+}
+
 /// Core person AI component — 12-16 bytes.
 #[derive(Component, Clone, Copy, Default)]
 pub struct PersonAI {
-    pub job_id:        u16,
+    pub task_id:       u16,
     pub state:         AiState,
     /// Progress ticks toward the next production event.
     pub work_progress: u8,
@@ -212,7 +219,7 @@ pub fn spawn_population(
                     Mood::default(),
                     Skills::default(),
                         PersonAI {
-                            job_id: PersonAI::UNEMPLOYED,
+                            task_id: PersonAI::UNEMPLOYED,
                             state: AiState::Idle,
                             target_tile: (tx as i16, ty as i16),
                             dest_tile: (tx as i16, ty as i16),

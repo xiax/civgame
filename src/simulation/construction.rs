@@ -3,13 +3,13 @@ use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::simulation::faction::{FactionRegistry, FactionTechs, SOLO};
-use crate::simulation::jobs::JobKind;
+use crate::simulation::tasks::TaskKind;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, PersonAI};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
-use crate::simulation::technology::PERM_SETTLEMENT;
+use crate::simulation::technology::{PERM_SETTLEMENT, CITY_STATE_ORG};
 use crate::world::chunk::ChunkMap;
 use crate::world::terrain::tile_to_world;
 use crate::world::tile::{TileKind, TileData};
@@ -96,10 +96,10 @@ enum ConstructionPhase {
     BronzeAgeTown,
 }
 
-fn determine_phase(member_count: u32, techs: &FactionTechs) -> ConstructionPhase {
-    if member_count >= 25 {
+fn determine_phase(_member_count: u32, techs: &FactionTechs) -> ConstructionPhase {
+    if techs.has(CITY_STATE_ORG) {
         ConstructionPhase::BronzeAgeTown
-    } else if member_count >= 8 || techs.has(PERM_SETTLEMENT) {
+    } else if techs.has(PERM_SETTLEMENT) {
         ConstructionPhase::NeolithicVillage
     } else {
         ConstructionPhase::PrehistoricBand
@@ -475,7 +475,7 @@ pub fn faction_blueprint_system(
     }
 }
 
-/// Handles agents building at Blueprint entities (JobKind::Construct / ConstructBed).
+/// Handles agents building at Blueprint entities (TaskKind::Construct / ConstructBed).
 /// Multiple agents can contribute wood and labor to the same blueprint each tick.
 /// Runs in Sequential set after gather_system.
 pub fn construction_system(
@@ -503,13 +503,13 @@ pub fn construction_system(
     for (entity, mut ai, agent, mut skills, slot, lod, _) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
         if ai.state != AiState::Working { continue; }
-        if ai.job_id != JobKind::Construct as u16 && ai.job_id != JobKind::ConstructBed as u16 {
+        if ai.task_id != TaskKind::Construct as u16 && ai.task_id != TaskKind::ConstructBed as u16 {
             continue;
         }
 
         let Some(bp_entity) = ai.target_entity else {
             ai.state = AiState::Idle;
-            ai.job_id = PersonAI::UNEMPLOYED;
+            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             continue;
         };
@@ -614,11 +614,11 @@ pub fn construction_system(
         if is_completed || is_orphaned {
             if is_completed {
                 if let Some(ref mut plan) = plan_opt {
-                    plan.reward_acc += if ai.job_id == JobKind::ConstructBed as u16 { 2.0 } else { 1.0 };
+                    plan.reward_acc += if ai.task_id == TaskKind::ConstructBed as u16 { 2.0 } else { 1.0 };
                 }
             }
             ai.state = AiState::Idle;
-            ai.job_id = PersonAI::UNEMPLOYED;
+            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.work_progress = 0;
         }

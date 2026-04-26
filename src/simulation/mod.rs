@@ -5,7 +5,7 @@ pub mod needs;
 pub mod mood;
 pub mod person;
 pub mod skills;
-pub mod jobs;
+pub mod tasks;
 pub mod movement;
 pub mod lod;
 pub mod production;
@@ -106,7 +106,7 @@ impl Plugin for SimulationPlugin {
             )
             .add_systems(
                 FixedUpdate,
-                (jobs::goal_dispatch_system,)
+                (tasks::goal_dispatch_system,)
                     .in_set(SimulationSet::ParallelB),
             )
             .add_systems(
@@ -154,8 +154,8 @@ impl Plugin for SimulationPlugin {
                     plan::plan_gossip_system
                         .after(memory::conversation_memory_system),
                     plan::plan_decay_system,
-                    faction::faction_camp_system,
-                    reproduction::birth_cooldown_system,
+                    faction::faction_profession_system,
+                    faction::faction_camp_system,                    reproduction::birth_cooldown_system,
                     reproduction::collect_male_candidates,
                     reproduction::reproduction_system
                         .after(reproduction::collect_male_candidates),

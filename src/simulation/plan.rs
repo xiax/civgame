@@ -14,7 +14,7 @@ use super::goals::AgentGoal;
 use super::items::{GroundItem, TargetItem};
 use super::combat::{CombatTarget, Health};
 use super::animals::{Wolf, Deer};
-use super::jobs::{JobKind, assign_job_with_routing, find_nearest_tile, find_nearest_item, find_nearest_edible, find_nearest_unplanted_farmland, find_nearest_plant};
+use super::tasks::{TaskKind, assign_task_with_routing, find_nearest_tile, find_nearest_item, find_nearest_edible, find_nearest_unplanted_farmland, find_nearest_plant};
 
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, MemoryKind};
@@ -55,7 +55,7 @@ impl StepPreconditions {
 #[derive(Clone)]
 pub struct StepDef {
     pub id:            StepId,
-    pub job:           JobKind,
+    pub task:           TaskKind,
     pub target:        StepTarget,
     pub preconditions: StepPreconditions,
     pub reward_scale:  f32,
@@ -186,63 +186,63 @@ static BUILD_GOALS:               &[AgentGoal] = &[AgentGoal::Build];
 pub fn register_builtin_steps(registry: &mut StepRegistry) {
     registry.0 = vec![
         StepDef { // 0: ForageGrass — targets FruitBushes, falls back via memory
-            id: 0, job: JobKind::Gather,
+            id: 0, task: TaskKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Food),
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: Some(PlantKind::FruitBush),
         },
         StepDef { // 1: FarmFarmland — targets Grain, falls back via memory
-            id: 1, job: JobKind::Gather,
+            id: 1, task: TaskKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Food),
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: Some(PlantKind::Grain),
         },
         StepDef { // 2: ChopForest
-            id: 2, job: JobKind::Gather,
+            id: 2, task: TaskKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Wood),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
         },
         StepDef { // 3: MineStone
-            id: 3, job: JobKind::Gather,
+            id: 3, task: TaskKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Stone),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
         },
         StepDef { // 4: PlantSeed (requires Seed in inventory)
-            id: 4, job: JobKind::Planter,
+            id: 4, task: TaskKind::Planter,
             target: StepTarget::NearestTile(GRASS_TILES),
             preconditions: StepPreconditions::needs_good(Good::Seed, 1),
             reward_scale: 0.2,
             plant_filter: None,
         },
         StepDef { // 5: Hunt
-            id: 5, job: JobKind::Hunter,
+            id: 5, task: TaskKind::Hunter,
             target: StepTarget::HuntPrey,
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
         },
         StepDef { // 6: CollectFood
-            id: 6, job: JobKind::Scavenge,
+            id: 6, task: TaskKind::Scavenge,
             target: StepTarget::NearestEdible,
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
         },
         StepDef { // 7: BuildWall — target faction blueprint, deposit wood and labor
-            id: 7, job: JobKind::Construct,
+            id: 7, task: TaskKind::Construct,
             target: StepTarget::NearestBlueprint(BuildSiteKind::Wall),
             preconditions: StepPreconditions::needs_good(Good::Wood, 2),
             reward_scale: 0.8,
             plant_filter: None,
         },
         StepDef { // 8: BuildBed — target faction blueprint, deposit wood and labor
-            id: 8, job: JobKind::ConstructBed,
+            id: 8, task: TaskKind::ConstructBed,
             target: StepTarget::NearestBlueprint(BuildSiteKind::Bed),
             preconditions: StepPreconditions::needs_good(Good::Wood, 3),
             reward_scale: 1.0,
@@ -265,7 +265,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         PlanDef { id: 1, name: "FarmFood",
             steps: PLAN_STEPS_1,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.0],
-            serves_goals: SURVIVE_GOALS, tech_gate: None,
+            serves_goals: SURVIVE_AND_GATHER_GOALS, tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
         },
         PlanDef { id: 2, name: "GatherWood",
@@ -283,32 +283,33 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         PlanDef { id: 4, name: "PlantAndFarm",
             steps: PLAN_STEPS_4,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.2, 0.0],
-            serves_goals: SURVIVE_GOALS, tech_gate: None,
+            serves_goals: SURVIVE_AND_GATHER_GOALS, tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
         },
         PlanDef { id: 5, name: "HuntFood",
             steps: PLAN_STEPS_5,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.2, 1.0],
-            serves_goals: SURVIVE_GOALS, tech_gate: None,
+            serves_goals: SURVIVE_AND_GATHER_GOALS, tech_gate: None,
             memory_target_kind: Some(MemoryKind::Prey),
         },
         PlanDef { id: 6, name: "ScavengeFood",
             steps: PLAN_STEPS_6,
             feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.0],
-            serves_goals: SURVIVE_GOALS, tech_gate: None,
+            serves_goals: SURVIVE_AND_GATHER_GOALS, tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
         },
         PlanDef { id: 7, name: "BuildWoodWall",
             steps: PLAN_STEPS_7,
             feature_vec: [0.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.1, 0.0],
-            serves_goals: BUILD_GOALS, tech_gate: None,
+            serves_goals: BUILD_GOALS,
+            tech_gate: Some(super::technology::PERM_SETTLEMENT),
             memory_target_kind: None,
         },
         PlanDef { id: 8, name: "BuildBed",
             steps: PLAN_STEPS_8,
             feature_vec: [0.0, 0.0, 0.0,  0.0, 0.0, 0.0,  0.1, 0.0],
             serves_goals: BUILD_GOALS,
-            tech_gate: Some(super::technology::PERM_SETTLEMENT),
+            tech_gate: None,
             memory_target_kind: None,
         },
     ];
@@ -448,7 +449,7 @@ fn resolve_target(
             None
         }
         StepTarget::NearestTile(_tiles) => {
-            if step.job == JobKind::Planter {
+            if step.task == TaskKind::Planter {
                 find_nearest_unplanted_farmland(chunk_map, plant_map, pos, VIEW_RADIUS).map(|(tx, ty)| (None, tx, ty))
             } else {
                 find_nearest_tile(chunk_map, pos, VIEW_RADIUS, _tiles).map(|(tx, ty)| (None, tx, ty))
@@ -593,7 +594,7 @@ pub fn plan_execution_system(
 
         if active_plan_opt.is_none() {
             // ── Select and start a new plan ───────────────────────────────────
-            if ai.state != AiState::Idle || ai.job_id != PersonAI::UNEMPLOYED { continue; }
+            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED { continue; }
 
             let Some(known_plans) = known_plans_opt else { continue };
             let Some(scoring) = scoring_opt else { continue };
@@ -624,7 +625,7 @@ pub fn plan_execution_system(
                 let target_tx = (home.0 as i32 + dx).max(0) as i16;
                 let target_ty = (home.1 as i32 + dy).max(0) as i16;
 
-                assign_job_with_routing(&mut ai, cur_chunk, (target_tx, target_ty), JobKind::Explore, None, &chunk_graph, &chunk_map);
+                assign_task_with_routing(&mut ai, cur_chunk, (target_tx, target_ty), TaskKind::Explore, None, &chunk_graph, &chunk_map);
                 continue;
             }
 
@@ -698,7 +699,7 @@ pub fn plan_execution_system(
         if !plan_still_valid {
             commands.entity(entity).remove::<ActivePlan>();
             ai.state = AiState::Idle;
-            ai.job_id = PersonAI::UNEMPLOYED;
+            ai.task_id = PersonAI::UNEMPLOYED;
             combat_target.0 = None;
             continue;
         }
@@ -710,7 +711,7 @@ pub fn plan_execution_system(
             }
             commands.entity(entity).remove::<ActivePlan>();
             ai.state = AiState::Idle;
-            ai.job_id = PersonAI::UNEMPLOYED;
+            ai.task_id = PersonAI::UNEMPLOYED;
             combat_target.0 = None;
             continue;
         }
@@ -738,7 +739,7 @@ pub fn plan_execution_system(
         };
 
         // ── Step completion: dispatched + agent went back to Idle+UNEMPLOYED ──
-        if active_plan.dispatched && ai.state == AiState::Idle && ai.job_id == PersonAI::UNEMPLOYED {
+        if active_plan.dispatched && ai.state == AiState::Idle && ai.task_id == PersonAI::UNEMPLOYED {
             active_plan.current_step += 1;
             active_plan.dispatched = false;
 
@@ -757,7 +758,7 @@ pub fn plan_execution_system(
 
         // ── Dispatch current step if not yet dispatched ───────────────────────
         if !active_plan.dispatched {
-            if ai.state != AiState::Idle || ai.job_id != PersonAI::UNEMPLOYED { continue; }
+            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED { continue; }
 
             // Check preconditions
             if let Some((good, qty)) = step_def.preconditions.requires_good {
@@ -777,7 +778,7 @@ pub fn plan_execution_system(
                 &mut target_item,
                 &bp_map, &bp_query,
             ) {
-                assign_job_with_routing(&mut ai, cur_chunk, (target_tx, target_ty), step_def.job, ent, &chunk_graph, &chunk_map);
+                assign_task_with_routing(&mut ai, cur_chunk, (target_tx, target_ty), step_def.task, ent, &chunk_graph, &chunk_map);
                 active_plan.dispatched = true;
                 active_plan.reward_scale = step_def.reward_scale;
             } else {
@@ -788,7 +789,7 @@ pub fn plan_execution_system(
                 let target_tx = (home.0 as i32 + dx).max(0) as i16;
                 let target_ty = (home.1 as i32 + dy).max(0) as i16;
 
-                assign_job_with_routing(&mut ai, cur_chunk, (target_tx, target_ty), JobKind::Explore, None, &chunk_graph, &chunk_map);
+                assign_task_with_routing(&mut ai, cur_chunk, (target_tx, target_ty), TaskKind::Explore, None, &chunk_graph, &chunk_map);
                 commands.entity(entity).remove::<ActivePlan>();
                 combat_target.0 = None;
             }
@@ -804,13 +805,13 @@ pub fn plan_execution_system(
                             let ptx = (target_t.translation.x / TILE_SIZE).floor() as i16;
                             let pty = (target_t.translation.y / TILE_SIZE).floor() as i16;
                             if ai.dest_tile != (ptx, pty) {
-                                assign_job_with_routing(&mut ai, cur_chunk, (ptx, pty), step_def.job, Some(target_ent), &chunk_graph, &chunk_map);
+                                assign_task_with_routing(&mut ai, cur_chunk, (ptx, pty), step_def.task, Some(target_ent), &chunk_graph, &chunk_map);
                             }
                         }
                     } else {
                         // Target lost
                         ai.state = AiState::Idle;
-                        ai.job_id = PersonAI::UNEMPLOYED;
+                        ai.task_id = PersonAI::UNEMPLOYED;
                         ai.target_entity = None;
                         combat_target.0 = None;
                     }

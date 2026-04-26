@@ -8,7 +8,7 @@ use crate::world::tile::TileKind;
 use crate::world::spatial::SpatialIndex;
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
 use crate::simulation::items::GroundItem;
-use crate::simulation::jobs::{JobKind, assign_job_with_routing};
+use crate::simulation::tasks::{TaskKind, assign_task_with_routing};
 use crate::simulation::person::{AiState, PersonAI, PlayerOrder, PlayerOrderKind};
 use crate::simulation::plants::PlantMap;
 use crate::simulation::technology::PERM_SETTLEMENT;
@@ -72,16 +72,15 @@ pub fn right_click_context_menu_system(
                             actions.push(PlayerOrderKind::Mine);
                         }
                         if kind.is_passable() {
-                            actions.push(PlayerOrderKind::BuildWall);
-
-                            // Build Bed only if faction has Permanent Settlement tech.
                             let has_perm = faction_q.get(sel_entity).ok()
                                 .and_then(|m| faction_registry.factions.get(&m.faction_id))
                                 .map(|f| f.techs.has(PERM_SETTLEMENT))
                                 .unwrap_or(false);
+
                             if has_perm {
-                                actions.push(PlayerOrderKind::BuildBed);
+                                actions.push(PlayerOrderKind::BuildWall);
                             }
+                            actions.push(PlayerOrderKind::BuildBed);
                         }
                     }
                     if plant_map.0.contains_key(&(tx, ty)) {
@@ -139,15 +138,15 @@ pub fn right_click_context_menu_system(
                 cur_tx.div_euclid(CHUNK_SIZE as i32),
                 cur_ty.div_euclid(CHUNK_SIZE as i32),
             );
-            let job = match action {
-                PlayerOrderKind::Move      => JobKind::Idle,
-                PlayerOrderKind::Mine      => JobKind::Gather,
-                PlayerOrderKind::Gather    => JobKind::Gather,
-                PlayerOrderKind::PickUp    => JobKind::Scavenge,
-                PlayerOrderKind::BuildWall => JobKind::Construct,
-                PlayerOrderKind::BuildBed  => JobKind::ConstructBed,
+            let task = match action {
+                PlayerOrderKind::Move      => TaskKind::Idle,
+                PlayerOrderKind::Mine      => TaskKind::Gather,
+                PlayerOrderKind::Gather    => TaskKind::Gather,
+                PlayerOrderKind::PickUp    => TaskKind::Scavenge,
+                PlayerOrderKind::BuildWall => TaskKind::Construct,
+                PlayerOrderKind::BuildBed  => TaskKind::ConstructBed,
             };
-            assign_job_with_routing(&mut ai, cur_chunk, target_tile, job, None, &chunk_graph, &chunk_map);
+            assign_task_with_routing(&mut ai, cur_chunk, target_tile, task, None, &chunk_graph, &chunk_map);
         }
         commands.entity(sel_entity).insert(PlayerOrder { order: action, target_tile });
         menu_state.open = false;
@@ -159,7 +158,7 @@ pub fn player_order_completion_system(
     query: Query<(Entity, &PersonAI), With<PlayerOrder>>,
 ) {
     for (entity, ai) in query.iter() {
-        if ai.state == AiState::Idle && ai.job_id == PersonAI::UNEMPLOYED {
+        if ai.state == AiState::Idle && ai.task_id == PersonAI::UNEMPLOYED {
             commands.entity(entity).remove::<PlayerOrder>();
         }
     }

@@ -7,15 +7,13 @@ use crate::simulation::plants::{
     PlantSpriteIndex,
 };
 use super::faction::{FactionMember, FactionRegistry};
-use super::jobs::JobKind;
+use super::tasks::TaskKind;
 use super::lod::LodLevel;
 use super::needs::Needs;
 use super::person::{AiState, PersonAI};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::{SkillKind, Skills};
-use crate::economy::item::Item;
-use crate::simulation::items::GroundItem;
-use crate::simulation::technology::{ActivityKind, CROP_CULTIVATION};
+use crate::simulation::technology::ActivityKind;
 
 pub const TICKS_FARMER_PLANT: u8 = 40;
 
@@ -68,9 +66,9 @@ pub fn production_system(
 
         let tx = ai.target_tile.0 as i32;
         let ty = ai.target_tile.1 as i32;
-        let job = ai.job_id;
+        let task = ai.task_id;
 
-        if job == JobKind::Planter as u16 {
+        if task == TaskKind::Planter as u16 {
             if ai.work_progress >= TICKS_FARMER_PLANT {
                 ai.work_progress = 0;
                 if !plant_map.0.contains_key(&(tx, ty)) && agent.quantity_of(Good::Seed) > 0 {
@@ -91,28 +89,28 @@ pub fn production_system(
                     }
                 }
                 ai.state = AiState::Idle;
-                ai.job_id = PersonAI::UNEMPLOYED;
+                ai.task_id = PersonAI::UNEMPLOYED;
             } else {
                 // Check if tile is still valid for planting
                 if plant_map.0.contains_key(&(tx, ty)) {
                     ai.state = AiState::Idle;
-                    ai.job_id = PersonAI::UNEMPLOYED;
+                    ai.task_id = PersonAI::UNEMPLOYED;
                 }
             }
         }
 
         if agent.is_inventory_full() {
             ai.state = AiState::Idle;
-            ai.job_id = PersonAI::UNEMPLOYED;
+            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
         }
     }
 }
 
 pub fn consumption_system(
-    mut commands: Commands,
+    _commands: Commands,
     clock: Res<SimClock>,
-    faction_registry: Res<FactionRegistry>,
+    _faction_registry: Res<FactionRegistry>,
     mut query: Query<(
         &mut EconomicAgent,
         &mut Needs,
@@ -122,7 +120,7 @@ pub fn consumption_system(
         Option<&FactionMember>,
     )>,
 ) {
-    for (mut agent, mut needs, slot, lod, transform, member) in query.iter_mut() {
+    for (mut agent, mut needs, slot, lod, _transform, _member) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -145,26 +143,7 @@ pub fn consumption_system(
                 needs.hunger = (needs.hunger - FOOD_NUTRITION as f32).max(0.0);
 
                 if consumed_fruit {
-                    let knows_farming = if let Some(fm) = member {
-                        faction_registry.factions.get(&fm.faction_id)
-                            .map_or(false, |f| f.techs.has(CROP_CULTIVATION))
-                    } else {
-                        false
-                    };
-
-                    if knows_farming {
-                        agent.add_good(Good::Seed, 1);
-                    } else {
-                        let mut seed_transform = *transform;
-                        seed_transform.translation.z = 0.3;
-                        commands.spawn((
-                            GroundItem { item: Item::new_commodity(Good::Seed), qty: 1 },
-                            seed_transform,
-                            GlobalTransform::default(),
-                            Visibility::Visible,
-                            InheritedVisibility::default(),
-                        ));
-                    }
+                    agent.add_good(Good::Seed, 1);
                 }
             }
         }

@@ -61,7 +61,7 @@ fn setup_sandbox(
             Mood::default(),
             Skills::default(),
             PersonAI {
-                job_id: PersonAI::UNEMPLOYED,
+                task_id: PersonAI::UNEMPLOYED,
                 state: AiState::Idle,
                 target_tile: (cx as i16, cy as i16),
                 dest_tile: (cx as i16, cy as i16),

@@ -173,7 +173,7 @@ pub fn combat_system(
         if target_is_dead || (!health_query.contains(target) && !body_query.contains(target)) {
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
                 ai.state = AiState::Idle;
-                ai.job_id = PersonAI::UNEMPLOYED;
+                ai.task_id = PersonAI::UNEMPLOYED;
             }
             if let Ok((mut animal_ai, _)) = animal_ai_query.get_mut(attacker) {
                 animal_ai.state = AnimalState::Wander;
@@ -255,7 +255,7 @@ pub fn combat_system(
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
                 if ai.state == AiState::Attacking {
                     ai.state = AiState::Idle;
-                    ai.job_id = PersonAI::UNEMPLOYED;
+                    ai.task_id = PersonAI::UNEMPLOYED;
                 }
             }
         }

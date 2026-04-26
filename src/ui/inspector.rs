@@ -9,7 +9,7 @@ use crate::simulation::person::{PersonAI, AiState, PlayerOrder};
 use crate::simulation::goals::{AgentGoal, Personality, GoalReason};
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction, SOLO};
 use crate::simulation::reproduction::BiologicalSex;
-use crate::simulation::jobs::JobKind;
+use crate::simulation::tasks::TaskKind;
 use crate::simulation::plants::{PlantMap, Plant};
 use crate::simulation::plan::{ActivePlan, KnownPlans, PlanRegistry, StepRegistry, build_state_vec};
 use crate::simulation::neural::UtilityNet;
@@ -67,7 +67,7 @@ pub fn inspector_panel_system(
                     ui.label(format!("Bonding: {}/180", member.bond_timer));
                 }
             } else {
-                let food_stock = registry.food_stock(member.faction_id);
+                let food_stock = registry.factions.get(&member.faction_id).map_or(0.0, |f| f.food_stock);
                 let mut raid_info = if registry.is_under_raid(member.faction_id) {
                     " [UNDER RAID]".to_string()
                 } else if let Some(target) = registry.raid_target(member.faction_id) {
@@ -157,21 +157,21 @@ pub fn inspector_panel_system(
 
             ui.separator();
 
-            let job_name = match ai.job_id {
-                j if j == JobKind::Idle    as u16 => "Idle",
-                j if j == JobKind::Gather  as u16 => "Gatherer",
-                j if j == JobKind::Trader  as u16 => "Trader",
-                j if j == JobKind::Raid    as u16 => "Raider",
-                j if j == JobKind::Defend  as u16 => "Defender",
-                j if j == JobKind::Planter as u16 => "Planter",
-                j if j == JobKind::Hunter  as u16 => "Hunter",
-                j if j == JobKind::Scavenge as u16 => "Scavenger",
-                j if j == JobKind::ReturnCamp as u16 => "Returning to Camp",
-                j if j == JobKind::Socialize as u16 => "Socializing",
-                j if j == JobKind::Reproduce as u16 => "Reproducing",
+            let task_name = match ai.task_id {
+                j if j == TaskKind::Idle    as u16 => "Idle",
+                j if j == TaskKind::Gather  as u16 => "Gatherer",
+                j if j == TaskKind::Trader  as u16 => "Trader",
+                j if j == TaskKind::Raid    as u16 => "Raider",
+                j if j == TaskKind::Defend  as u16 => "Defender",
+                j if j == TaskKind::Planter as u16 => "Planter",
+                j if j == TaskKind::Hunter  as u16 => "Hunter",
+                j if j == TaskKind::Scavenge as u16 => "Scavenger",
+                j if j == TaskKind::ReturnCamp as u16 => "Returning to Camp",
+                j if j == TaskKind::Socialize as u16 => "Socializing",
+                j if j == TaskKind::Reproduce as u16 => "Reproducing",
                 _ => "Unemployed",
             };
-            ui.label(format!("Job: {}", job_name));
+            ui.label(format!("Task: {}", task_name));
 
             let state_desc = match ai.state {
                 AiState::Idle => "Idling".to_string(),
@@ -184,7 +184,7 @@ pub fn inspector_panel_system(
                     let ty = ai.target_tile.1 as i32;
                     let mut work_str = "Working".to_string();
 
-                    if ai.job_id == JobKind::Gather as u16 {
+                    if ai.task_id == TaskKind::Gather as u16 {
                         if let Some(&p_entity) = plant_map.0.get(&(tx, ty)) {
                             if let Ok(plant) = plants.get(p_entity) {
                                 work_str = format!("Harvesting {:?}", plant.kind);
@@ -196,11 +196,11 @@ pub fn inspector_panel_system(
                         }
                         // Use u32 to avoid u8 overflow during multiplication
                         work_str = format!("{} ({}%)", work_str, (ai.work_progress as u32 * 100) / 30); // 30 is base stone work_ticks
-                    } else if ai.job_id == JobKind::Planter as u16 {
+                    } else if ai.task_id == TaskKind::Planter as u16 {
                         work_str = format!("Planting Seeds ({}%)", (ai.work_progress as u32 * 100) / 40); // 40 is TICKS_FARMER_PLANT
-                    } else if ai.job_id == JobKind::Raid as u16 {
+                    } else if ai.task_id == TaskKind::Raid as u16 {
                         work_str = "Stealing Goods".to_string();
-                    } else if ai.job_id == JobKind::Scavenge as u16 {
+                    } else if ai.task_id == TaskKind::Scavenge as u16 {
                         work_str = "Picking up item".to_string();
                     }
 
