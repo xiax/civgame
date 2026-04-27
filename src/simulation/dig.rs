@@ -42,8 +42,8 @@ pub fn dig_system(
         }
         ai.work_progress = 0;
 
-        let tx = ai.target_tile.0 as i32;
-        let ty = ai.target_tile.1 as i32;
+        let tx = ai.dest_tile.0 as i32;
+        let ty = ai.dest_tile.1 as i32;
         let surf_z = chunk_map.surface_z_at(tx, ty);
         let kind = chunk_map.tile_kind_at(tx, ty).unwrap_or(TileKind::Air);
 

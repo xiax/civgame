@@ -87,8 +87,8 @@ pub fn gather_system(
             continue;
         }
 
-        let tx = ai.target_tile.0 as i32;
-        let ty = ai.target_tile.1 as i32;
+        let tx = ai.dest_tile.0 as i32;
+        let ty = ai.dest_tile.1 as i32;
 
         let faction_id = faction_member
             .map(|fm| fm.faction_id)
@@ -205,7 +205,7 @@ pub fn gather_system(
                 // remains above as ceiling and we keep the Wall entity in
                 // its place visually until rendering rework in Phase 6.
                 if chunk_map.surface_z_at(tx, ty) < target_floor_z + 1 {
-                    if let Some(wall_entity) = wall_map.0.remove(&ai.target_tile) {
+                    if let Some(wall_entity) = wall_map.0.remove(&ai.dest_tile) {
                         commands.entity(wall_entity).despawn_recursive();
                     }
                 }

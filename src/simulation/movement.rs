@@ -3,6 +3,7 @@ use super::combat::{Body, Health};
 use super::construction::Bed;
 use super::items::GroundItem;
 use super::lod::LodLevel;
+use super::memory::RelationshipMemory;
 use super::person::{AiState, Person, PersonAI};
 use super::plants::Plant;
 use super::schedule::{BucketSlot, SimClock};
@@ -37,6 +38,7 @@ pub fn movement_system(
         &LodLevel,
         &mut MovementState,
         &BucketSlot,
+        Option<&RelationshipMemory>,
     )>,
 ) {
     let dt = time.delta_secs();
@@ -47,7 +49,7 @@ pub fn movement_system(
 
     // Movement can't be fully parallel because it writes Transform (position sync)
     // and can read ChunkMap for passability. Run sequentially.
-    for (_, mut transform, mut ai, lod, mut mv, slot) in query.iter_mut() {
+    for (_entity, mut transform, mut ai, lod, mut mv, slot, rel_opt) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -196,7 +198,7 @@ pub fn movement_system(
                     }
                 }
                 AiState::Idle => {
-                    // Random wander
+                    // Random wander, with 35% chance to drift toward the most-liked nearby friend.
                     mv.wander_timer -= dt * speed;
                     if mv.wander_timer <= 0.0 {
                         mv.wander_timer = IDLE_WANDER_INTERVAL;
@@ -205,35 +207,86 @@ pub fn movement_system(
                         let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
                         let cur_z = ai.current_z as i32;
 
-                        let mut rng = rand::thread_rng();
-                        let dirs: [(i32, i32); 8] = [
-                            (-1, 0),
-                            (1, 0),
-                            (0, -1),
-                            (0, 1),
-                            (-1, -1),
-                            (1, -1),
-                            (-1, 1),
-                            (1, 1),
-                        ];
-                        let candidates: Vec<_> = dirs.iter().collect();
-                        let start = rng.gen_range(0..8);
-                        let (left, right) = candidates.split_at(start);
-                        let shuffled: Vec<_> = right.iter().chain(left.iter()).collect();
+                        // Try to step toward a liked friend (35% chance per wander tick).
+                        let mut drifted = false;
+                        if let Some(rel) = rel_opt {
+                            if fastrand::f32() < 0.35 {
+                                let mut best_aff: i8 = 0;
+                                let mut best_dir: Option<(i32, i32)> = None;
+                                for slot in &rel.entries {
+                                    if let Some(entry) = slot {
+                                        if entry.affinity <= 0 {
+                                            continue;
+                                        }
+                                        'scan: for dy in -10i32..=10 {
+                                            for dx in -10i32..=10 {
+                                                for &cand in
+                                                    spatial_index.get(cur_tx + dx, cur_ty + dy)
+                                                {
+                                                    if cand == entry.entity
+                                                        && entry.affinity > best_aff
+                                                    {
+                                                        best_aff = entry.affinity;
+                                                        best_dir =
+                                                            Some((dx.signum(), dy.signum()));
+                                                        break 'scan;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some((dx, dy)) = best_dir {
+                                    let ntx = cur_tx + dx;
+                                    let nty = cur_ty + dy;
+                                    for &dz in &[0, 1, -1] {
+                                        let ntz = cur_z + dz;
+                                        if chunk_map.passable_step_3d(
+                                            (cur_tx, cur_ty, cur_z),
+                                            (ntx, nty, ntz),
+                                        ) && !spatial_index.agent_occupied(ntx, nty, ntz)
+                                        {
+                                            ai.target_tile = (ntx as i16, nty as i16);
+                                            ai.dest_tile = ai.target_tile;
+                                            drifted = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
-                        'outer: for &&(dx, dy) in &shuffled {
-                            let ntx = cur_tx + dx;
-                            let nty = cur_ty + dy;
-                            for &dz in &[0, 1, -1] {
-                                let ntz = cur_z + dz;
-                                if chunk_map.passable_step_3d(
-                                    (cur_tx, cur_ty, cur_z),
-                                    (ntx, nty, ntz),
-                                ) && !spatial_index.agent_occupied(ntx, nty, ntz)
-                                {
-                                    ai.target_tile = (ntx as i16, nty as i16);
-                                    ai.dest_tile = ai.target_tile;
-                                    break 'outer;
+                        if !drifted {
+                            let mut rng = rand::thread_rng();
+                            let dirs: [(i32, i32); 8] = [
+                                (-1, 0),
+                                (1, 0),
+                                (0, -1),
+                                (0, 1),
+                                (-1, -1),
+                                (1, -1),
+                                (-1, 1),
+                                (1, 1),
+                            ];
+                            let candidates: Vec<_> = dirs.iter().collect();
+                            let start = rng.gen_range(0..8);
+                            let (left, right) = candidates.split_at(start);
+                            let shuffled: Vec<_> = right.iter().chain(left.iter()).collect();
+
+                            'outer: for &&(dx, dy) in &shuffled {
+                                let ntx = cur_tx + dx;
+                                let nty = cur_ty + dy;
+                                for &dz in &[0, 1, -1] {
+                                    let ntz = cur_z + dz;
+                                    if chunk_map.passable_step_3d(
+                                        (cur_tx, cur_ty, cur_z),
+                                        (ntx, nty, ntz),
+                                    ) && !spatial_index.agent_occupied(ntx, nty, ntz)
+                                    {
+                                        ai.target_tile = (ntx as i16, nty as i16);
+                                        ai.dest_tile = ai.target_tile;
+                                        break 'outer;
+                                    }
                                 }
                             }
                         }

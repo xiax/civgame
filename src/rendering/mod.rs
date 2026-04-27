@@ -50,6 +50,8 @@ impl Plugin for RenderingPlugin {
                     entity_sprites::update_plant_sprites,
                     entity_sprites::spawn_wolf_sprites,
                     entity_sprites::spawn_deer_sprites,
+                    entity_sprites::animate_wolves_system,
+                    entity_sprites::animate_deer_system,
                     animations::handle_combat_events,
                     animations::update_animations,
                     plants::plant_growth_system,

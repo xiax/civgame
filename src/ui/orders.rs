@@ -176,6 +176,7 @@ pub fn right_click_context_menu_system(
             };
             assign_task_with_routing(
                 &mut ai,
+                (cur_tx as i16, cur_ty as i16),
                 cur_chunk,
                 target_tile,
                 task,

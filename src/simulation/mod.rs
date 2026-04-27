@@ -63,6 +63,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::BedMap::default())
             .insert_resource(construction::WallMap::default())
             .insert_resource(construction::BlueprintMap::default())
+            .insert_resource(plan::RelInfluence::default())
             .configure_sets(
                 FixedUpdate,
                 (
@@ -131,10 +132,13 @@ impl Plugin for SimulationPlugin {
                     production::production_system.after(movement::movement_system),
                     production::eat_task_system.after(movement::movement_system),
                     production::withdraw_food_task_system.after(movement::movement_system),
+                    plan::rel_influence_system
+                        .after(movement::update_spatial_index_system),
                     plan::plan_execution_system
                         .after(production::production_system)
                         .after(production::eat_task_system)
-                        .after(production::withdraw_food_task_system),
+                        .after(production::withdraw_food_task_system)
+                        .after(plan::rel_influence_system),
                     faction::bonding_system.after(movement::update_spatial_index_system),
                     production::tile_regen_system,
                     schedule::advance_sim_clock,

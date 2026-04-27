@@ -85,6 +85,10 @@ impl Default for ClothingVisual {
     }
 }
 
+/// Tracks the previous-frame world position for direction inference on non-person entities.
+#[derive(Component, Default)]
+pub struct LastPos(pub Vec2);
+
 #[derive(Component, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FacingDirection {
     #[default]
@@ -216,7 +220,12 @@ pub fn spawn_wolf_sprites(
         sprite.anchor = Anchor::BottomCenter;
         sprite.color = tint;
 
-        commands.entity(entity).insert((WolfVisual, EntityFogState::default()));
+        commands.entity(entity).insert((
+            WolfVisual,
+            EntityFogState::default(),
+            FacingDirection::South,
+            LastPos::default(),
+        ));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -264,7 +273,12 @@ pub fn spawn_deer_sprites(
         sprite.anchor = Anchor::BottomCenter;
         sprite.color = tint;
 
-        commands.entity(entity).insert((DeerVisual, EntityFogState::default()));
+        commands.entity(entity).insert((
+            DeerVisual,
+            EntityFogState::default(),
+            FacingDirection::South,
+            LastPos::default(),
+        ));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -526,6 +540,82 @@ pub fn animate_person_sprites(
                     VisualLayer::Clothing => cloth_key.as_str(),
                 };
                 if let Some(img) = sprite_lib.get(key) {
+                    if sprite.image != *img {
+                        sprite.image = img.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn animate_wolves_system(
+    time: Res<Time>,
+    art_mode: Res<ArtMode>,
+    sprite_lib: Res<SpriteLibrary>,
+    mut wolves: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Wolf>>,
+    mut child_sprites: Query<&mut Sprite, With<VisualChild>>,
+) {
+    if *art_mode == ArtMode::Ascii {
+        return;
+    }
+    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
+    for (transform, children, mut facing, mut last_pos) in wolves.iter_mut() {
+        let pos = transform.translation.truncate();
+        let diff = pos - last_pos.0;
+        let is_moving = diff.length() > 0.5;
+        if is_moving {
+            *facing = if diff.x.abs() > diff.y.abs() {
+                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+            } else {
+                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+            };
+        }
+        last_pos.0 = pos;
+        let dir = facing.as_str();
+        let frame_str = if is_moving && frame_b { "b" } else { "a" };
+        let key = format!("anim_wolf_{dir}_{frame_str}");
+        for &child in children.iter() {
+            if let Ok(mut sprite) = child_sprites.get_mut(child) {
+                if let Some(img) = sprite_lib.get(&key) {
+                    if sprite.image != *img {
+                        sprite.image = img.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn animate_deer_system(
+    time: Res<Time>,
+    art_mode: Res<ArtMode>,
+    sprite_lib: Res<SpriteLibrary>,
+    mut deer: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Deer>>,
+    mut child_sprites: Query<&mut Sprite, With<VisualChild>>,
+) {
+    if *art_mode == ArtMode::Ascii {
+        return;
+    }
+    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
+    for (transform, children, mut facing, mut last_pos) in deer.iter_mut() {
+        let pos = transform.translation.truncate();
+        let diff = pos - last_pos.0;
+        let is_moving = diff.length() > 0.5;
+        if is_moving {
+            *facing = if diff.x.abs() > diff.y.abs() {
+                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+            } else {
+                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+            };
+        }
+        last_pos.0 = pos;
+        let dir = facing.as_str();
+        let frame_str = if is_moving && frame_b { "b" } else { "a" };
+        let key = format!("anim_deer_{dir}_{frame_str}");
+        for &child in children.iter() {
+            if let Ok(mut sprite) = child_sprites.get_mut(child) {
+                if let Some(img) = sprite_lib.get(&key) {
                     if sprite.image != *img {
                         sprite.image = img.clone();
                     }

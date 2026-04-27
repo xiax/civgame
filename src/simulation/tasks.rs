@@ -224,6 +224,7 @@ pub fn find_nearest_unplanted_farmland(
 
 pub fn assign_task_with_routing(
     ai: &mut PersonAI,
+    cur_tile: (i16, i16),
     cur_chunk: ChunkCoord,
     target: (i16, i16),
     task: TaskKind,
@@ -231,26 +232,45 @@ pub fn assign_task_with_routing(
     chunk_graph: &ChunkGraph,
     chunk_map: &ChunkMap,
 ) {
-    let dest_chunk = ChunkCoord(
-        (target.0 as i32).div_euclid(CHUNK_SIZE as i32),
-        (target.1 as i32).div_euclid(CHUNK_SIZE as i32),
-    );
     ai.task_id = task as u16;
-    ai.dest_tile = target; // Store final destination
+    ai.dest_tile = target;
     ai.target_entity = target_entity;
+    ai.target_z = chunk_map.surface_z_at(target.0 as i32, target.1 as i32) as i8;
 
-    if dest_chunk == cur_chunk {
+    // For tasks where the agent works from beside the target (not on it), route to
+    // the nearest passable adjacent tile so the agent never steps onto the resource.
+    let route_target = if task_interacts_from_adjacent(task as u16) {
+        let (tx, ty) = (target.0 as i32, target.1 as i32);
+        let (ax, ay) = (cur_tile.0 as i32, cur_tile.1 as i32);
+        const ADJ: [(i32, i32); 8] = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1)];
+        ADJ.iter()
+            .map(|&(dx, dy)| (tx + dx, ty + dy))
+            .filter(|&(ntx, nty)| {
+                let nz = chunk_map.surface_z_at(ntx, nty);
+                chunk_map.passable_at(ntx, nty, nz)
+            })
+            .min_by_key(|&(ntx, nty)| (ntx - ax).abs() + (nty - ay).abs())
+            .map(|(ntx, nty)| (ntx as i16, nty as i16))
+            .unwrap_or(target)
+    } else {
+        target
+    };
+
+    let route_chunk = ChunkCoord(
+        (route_target.0 as i32).div_euclid(CHUNK_SIZE as i32),
+        (route_target.1 as i32).div_euclid(CHUNK_SIZE as i32),
+    );
+    if route_chunk == cur_chunk {
         ai.state = AiState::Seeking;
-        ai.target_tile = target;
+        ai.target_tile = route_target;
     } else if let Some(wp) =
-        chunk_graph.next_waypoint(cur_chunk, dest_chunk, ai.current_z, chunk_map)
+        chunk_graph.next_waypoint(cur_chunk, route_chunk, ai.current_z, chunk_map)
     {
         ai.state = AiState::Routing;
         ai.target_tile = wp;
     } else {
-        // Fallback: if no route in chunk graph, try to walk directly (might fail but better than nothing)
         ai.state = AiState::Seeking;
-        ai.target_tile = target;
+        ai.target_tile = route_target;
     }
 }
 
@@ -407,6 +427,7 @@ pub fn goal_dispatch_system(
                             }
                             assign_task_with_routing(
                                 &mut ai,
+                                (cur_tx as i16, cur_ty as i16),
                                 cur_chunk,
                                 storage_tile,
                                 TaskKind::DepositResource,
@@ -422,10 +443,11 @@ pub fn goal_dispatch_system(
                     if is_active && ai.task_id == TaskKind::Socialize as u16 {
                         return;
                     }
-                    // Bug 6 fix: find nearest entity in radius, not the first one in scan order.
+                    // Prefer liked agents over merely nearest: score = affinity*3 - dist.
+                    // Degrades to pure distance when affinity is zero for all candidates.
                     let radius = 15i32;
                     let mut best_target: Option<(i16, i16, Entity)> = None;
-                    let mut best_dist = i32::MAX;
+                    let mut best_score = i32::MIN;
                     for dy in -radius..=radius {
                         for dx in -radius..=radius {
                             let tx = cur_tx + dx;
@@ -435,8 +457,12 @@ pub fn goal_dispatch_system(
                                     continue;
                                 }
                                 let dist = dx.abs() + dy.abs();
-                                if dist < best_dist {
-                                    best_dist = dist;
+                                let affinity = rel_opt
+                                    .map(|r| r.get_affinity(other) as i32)
+                                    .unwrap_or(0);
+                                let score = affinity * 3 - dist;
+                                if score > best_score {
+                                    best_score = score;
                                     best_target = Some((tx as i16, ty as i16, other));
                                 }
                             }
@@ -445,6 +471,7 @@ pub fn goal_dispatch_system(
                     if let Some((tx, ty, other)) = best_target {
                         assign_task_with_routing(
                             &mut ai,
+                            (cur_tx as i16, cur_ty as i16),
                             cur_chunk,
                             (tx, ty),
                             TaskKind::Socialize,
@@ -472,6 +499,7 @@ pub fn goal_dispatch_system(
                         ) {
                             assign_task_with_routing(
                                 &mut ai,
+                                (cur_tx as i16, cur_ty as i16),
                                 cur_chunk,
                                 (tx, ty),
                                 TaskKind::Reproduce,
@@ -492,6 +520,7 @@ pub fn goal_dispatch_system(
                             if let Some(enemy_home) = faction_registry.home_tile(target_id) {
                                 assign_task_with_routing(
                                     &mut ai,
+                                    (cur_tx as i16, cur_ty as i16),
                                     cur_chunk,
                                     enemy_home,
                                     TaskKind::Raid,
@@ -512,6 +541,7 @@ pub fn goal_dispatch_system(
                         if let Some(home) = faction_registry.home_tile(member.faction_id) {
                             assign_task_with_routing(
                                 &mut ai,
+                                (cur_tx as i16, cur_ty as i16),
                                 cur_chunk,
                                 home,
                                 TaskKind::Defend,
@@ -545,6 +575,7 @@ pub fn goal_dispatch_system(
                             let bty = (bed_transform.translation.y / TILE_SIZE).floor() as i16;
                             assign_task_with_routing(
                                 &mut ai,
+                                (cur_tx as i16, cur_ty as i16),
                                 cur_chunk,
                                 (btx, bty),
                                 TaskKind::Sleep,
@@ -571,6 +602,7 @@ pub fn goal_dispatch_system(
                         if dx * dx + dy * dy > 5 * 5 {
                             assign_task_with_routing(
                                 &mut ai,
+                                (cur_tx as i16, cur_ty as i16),
                                 cur_chunk,
                                 home,
                                 TaskKind::Sleep,

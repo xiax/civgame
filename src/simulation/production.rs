@@ -73,8 +73,8 @@ pub fn production_system(
             continue;
         }
 
-        let tx = ai.target_tile.0 as i32;
-        let ty = ai.target_tile.1 as i32;
+        let tx = ai.dest_tile.0 as i32;
+        let ty = ai.dest_tile.1 as i32;
         let task = ai.task_id;
 
         if task == TaskKind::Planter as u16 {

@@ -5,7 +5,7 @@ use crate::economy::agent::EconomicAgent;
 use crate::simulation::combat::{Body, BodyPart, Health};
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction, SOLO};
 use crate::simulation::goals::{AgentGoal, GoalReason, Personality};
-use crate::simulation::memory::AgentMemory;
+use crate::simulation::memory::{AgentMemory, RelEntry, RelationshipMemory};
 use crate::simulation::mood::Mood;
 use crate::simulation::needs::Needs;
 use crate::simulation::neural::UtilityNet;
@@ -34,6 +34,8 @@ pub fn inspector_panel_system(
     step_registry: Res<StepRegistry>,
     calendar: Res<Calendar>,
     plants: Query<&Plant>,
+    rel_query: Query<&RelationshipMemory>,
+    name_query: Query<&Name>,
     query: Query<(
         (
             &Needs,
@@ -78,6 +80,7 @@ pub fn inspector_panel_system(
     else {
         return;
     };
+    let rel_mem = rel_query.get(entity).ok();
 
     egui::Window::new("Inspector")
         .default_pos([10.0, 10.0])
@@ -399,6 +402,51 @@ pub fn inspector_panel_system(
                                 );
                             });
                         }
+                    }
+                });
+            }
+
+            if let Some(rel) = rel_mem {
+                egui::CollapsingHeader::new("Relationships").show(ui, |ui| {
+                    let mut entries: Vec<&RelEntry> =
+                        rel.entries.iter().filter_map(|s| s.as_ref()).collect();
+                    entries.sort_unstable_by(|a, b| b.affinity.cmp(&a.affinity));
+
+                    if entries.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No relationships yet")
+                                .italics()
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
+                    for entry in entries {
+                        let name = name_query
+                            .get(entry.entity)
+                            .map(|n| n.as_str())
+                            .unwrap_or("Unknown");
+                        let normalized = (entry.affinity as f32 + 128.0) / 255.0;
+                        let color = if entry.affinity >= 0 {
+                            egui::Color32::from_rgb(
+                                30,
+                                (normalized * 510.0).min(255.0) as u8,
+                                30,
+                            )
+                        } else {
+                            egui::Color32::from_rgb(
+                                ((1.0 - normalized) * 510.0).min(255.0) as u8,
+                                30,
+                                30,
+                            )
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{:12}", name));
+                            ui.add(
+                                egui::ProgressBar::new(normalized)
+                                    .desired_width(100.0)
+                                    .fill(color),
+                            );
+                            ui.label(format!("{:+}", entry.affinity));
+                        });
                     }
                 });
             }

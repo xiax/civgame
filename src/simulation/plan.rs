@@ -21,10 +21,10 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 use super::lod::LodLevel;
-use super::memory::{AgentMemory, MemoryKind};
+use super::memory::{AgentMemory, MemoryKind, RelationshipMemory};
 use super::needs::Needs;
 use super::neural::{UtilityNet, PLAN_FEAT_DIM, STATE_DIM};
-use super::person::{AiState, PersonAI, PlayerOrder};
+use super::person::{AiState, Person, PersonAI, PlayerOrder};
 use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
@@ -98,6 +98,11 @@ pub struct StepRegistry(pub Vec<StepDef>);
 
 #[derive(Resource, Default)]
 pub struct PlanRegistry(pub Vec<PlanDef>);
+
+/// Maps each agent entity to the plan_id currently running by their most-liked ally.
+/// Written each frame by `rel_influence_system`; consumed by `plan_execution_system`.
+#[derive(Resource, Default)]
+pub struct RelInfluence(pub AHashMap<Entity, u16>);
 
 #[derive(Component)]
 pub struct ActivePlan {
@@ -833,6 +838,7 @@ pub fn plan_execution_system(
     clock: Res<SimClock>,
     item_check: Query<&GroundItem>,
     prey_query: Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
+    rel_influence: Res<RelInfluence>,
     mut query: Query<(AgentQuery, OptionalQuery), Without<PlayerOrder>>,
 ) {
     let PlanRegistries {
@@ -929,6 +935,7 @@ pub fn plan_execution_system(
 
                 assign_task_with_routing(
                     &mut ai,
+                    (cur_tx as i16, cur_ty as i16),
                     cur_chunk,
                     (target_tx, target_ty),
                     TaskKind::Explore,
@@ -956,6 +963,11 @@ pub fn plan_execution_system(
                             // Bonus for last plan to reduce switching jitter
                             if plan_def.id == ai.last_plan_id {
                                 *score += 0.2;
+                            }
+
+                            // Bonus when a liked ally is already running this plan
+                            if rel_influence.0.get(&entity) == Some(&plan_def.id) {
+                                *score += 0.15;
                             }
 
                             let target_tile = plan_def.memory_target_kind.and_then(|k| {
@@ -1127,6 +1139,7 @@ pub fn plan_execution_system(
             ) {
                 assign_task_with_routing(
                     &mut ai,
+                    (cur_tx as i16, cur_ty as i16),
                     cur_chunk,
                     (target_tx, target_ty),
                     step_def.task,
@@ -1148,6 +1161,7 @@ pub fn plan_execution_system(
 
                 assign_task_with_routing(
                     &mut ai,
+                    (cur_tx as i16, cur_ty as i16),
                     cur_chunk,
                     (target_tx, target_ty),
                     TaskKind::Explore,
@@ -1172,6 +1186,7 @@ pub fn plan_execution_system(
                             if ai.dest_tile != (ptx, pty) {
                                 assign_task_with_routing(
                                     &mut ai,
+                                    (cur_tx as i16, cur_ty as i16),
                                     cur_chunk,
                                     (ptx, pty),
                                     step_def.task,
@@ -1249,5 +1264,40 @@ pub fn plan_decay_system(clock: Res<SimClock>, mut query: Query<&mut KnownPlans>
     }
     for mut plans in &mut query {
         plans.decay();
+    }
+}
+
+/// Builds the RelInfluence map: for each agent, record which plan_id their most-liked
+/// ally is currently running. Runs before plan_execution_system to avoid mutable aliasing
+/// on ActivePlan.
+pub fn rel_influence_system(
+    mut influence: ResMut<RelInfluence>,
+    query: Query<(Entity, &RelationshipMemory, Option<&ActivePlan>), With<Person>>,
+) {
+    influence.0.clear();
+
+    // Collect which plan each agent is running.
+    let running: AHashMap<Entity, u16> = query
+        .iter()
+        .filter_map(|(e, _, ap)| ap.map(|p| (e, p.plan_id)))
+        .collect();
+
+    // For each agent, find the highest-affinity ally that has an active plan.
+    for (entity, rel, _) in query.iter() {
+        let mut best_plan: Option<u16> = None;
+        let mut best_aff: i8 = 0;
+        for slot in &rel.entries {
+            if let Some(entry) = slot {
+                if entry.affinity > best_aff {
+                    if let Some(&plan_id) = running.get(&entry.entity) {
+                        best_aff = entry.affinity;
+                        best_plan = Some(plan_id);
+                    }
+                }
+            }
+        }
+        if let Some(plan_id) = best_plan {
+            influence.0.insert(entity, plan_id);
+        }
     }
 }

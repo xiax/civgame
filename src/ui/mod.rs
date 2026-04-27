@@ -7,6 +7,7 @@ pub mod hud;
 pub mod inspector;
 pub mod orders;
 pub mod selection;
+pub mod tech_panel;
 pub mod world_map;
 
 pub use selection::SelectedEntity;
@@ -20,6 +21,7 @@ impl Plugin for UiPlugin {
             .insert_resource(world_map::WorldMapOpen::default())
             .insert_resource(world_map::WorldMapTexture::default())
             .insert_resource(orders::ContextMenuState::default())
+            .insert_resource(tech_panel::TechPanelOpen::default())
             .add_systems(
                 Update,
                 (
@@ -31,6 +33,7 @@ impl Plugin for UiPlugin {
                     economy_panel::economy_panel_system,
                     hud::hud_system,
                     world_map::world_map_system,
+                    tech_panel::tech_panel_system,
                     hover::hover_info_system,
                 ),
             );
