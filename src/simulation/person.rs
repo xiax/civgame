@@ -102,7 +102,26 @@ impl HairColor {
     }
 }
 
-/// Core person AI component — 12-16 bytes.
+const MALE_NAMES: &[&str] = &[
+    "Aldric", "Bram", "Caius", "Davan", "Eryn", "Finn", "Garic", "Holt",
+    "Idris", "Jorn", "Kael", "Lund", "Maren", "Nils", "Orin", "Pell",
+    "Rath", "Soren", "Tor", "Ulric", "Vael", "Wynn", "Xeno", "Yorn", "Zane",
+];
+const FEMALE_NAMES: &[&str] = &[
+    "Asha", "Brea", "Calla", "Dwyn", "Elara", "Faye", "Gara", "Hira",
+    "Inna", "Jova", "Kela", "Lyra", "Mira", "Nara", "Ora", "Pira",
+    "Rhea", "Saya", "Tara", "Una", "Vira", "Wren", "Xara", "Yara", "Zola",
+];
+
+pub fn generate_person_name(sex: BiologicalSex) -> &'static str {
+    let list = match sex {
+        BiologicalSex::Male => MALE_NAMES,
+        BiologicalSex::Female => FEMALE_NAMES,
+    };
+    list[fastrand::usize(..list.len())]
+}
+
+/// Core person AI component.
 #[derive(Component, Clone, Copy, Default)]
 pub struct PersonAI {
     pub task_id: u16,
@@ -115,6 +134,12 @@ pub struct PersonAI {
     pub last_plan_id: u16,
     pub last_goal_eval_tick: u64,
     pub target_entity: Option<Entity>,
+    /// The agent's current foot Z (the floor they stand on). Set at spawn
+    /// to surface_z and updated as they walk over ramps or dig down.
+    pub current_z: i8,
+    /// Destination foot Z when routed across Z slices (e.g. from a
+    /// PlayerOrder targeting underground). Equal to current_z by default.
+    pub target_z: i8,
 }
 
 impl PersonAI {
@@ -126,6 +151,9 @@ impl PersonAI {
 pub struct PlayerOrder {
     pub order: PlayerOrderKind,
     pub target_tile: (i16, i16),
+    /// Foot Z of the target. For surface clicks, equal to the tile's surface_z.
+    /// For underground clicks (CameraViewZ != i32::MAX), this is the camera Z.
+    pub target_z: i8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,8 +199,8 @@ pub fn spawn_population(
     let now = Instant::now();
     use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 
-    let start_cx = (GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS;
-    let start_cy = (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS;
+    let start_cx = ((GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS) - (WORLD_CHUNKS_X / 2);
+    let start_cy = ((GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS) - (WORLD_CHUNKS_Y / 2);
 
     let mut rng = rand::thread_rng();
     let total_tiles_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
@@ -279,6 +307,7 @@ pub fn spawn_population(
             };
 
             let world_pos = tile_to_world(tx, ty);
+            let sex = BiologicalSex::random();
 
             commands.spawn((
                 (
@@ -300,6 +329,8 @@ pub fn spawn_population(
                         last_plan_id: PersonAI::UNEMPLOYED,
                         last_goal_eval_tick: 0,
                         target_entity: None,
+                        current_z: chunk_map.surface_z_at(tx, ty) as i8,
+                        target_z: chunk_map.surface_z_at(tx, ty) as i8,
                     },
                     EconomicAgent::default(),
                 ),
@@ -309,7 +340,7 @@ pub fn spawn_population(
                     MovementState {
                         wander_timer: (spawned % 100) as f32 * 0.025,
                     },
-                    BiologicalSex::random(),
+                    sex,
                     SkinTone::random(),
                     HairColor::random(),
                     Personality::random(),
@@ -331,6 +362,7 @@ pub fn spawn_population(
                     UtilityNet::new_random(),
                     KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 8, 9]),
                     PlanScoringMethod::UtilityNN,
+                    Name::new(generate_person_name(sex)),
                 ),
             ));
 

@@ -23,7 +23,8 @@ pub struct EntityTextures {
     pub person_female_ascii: Handle<Image>,
     pub plant_seed_ascii: Handle<Image>,
     pub plant_seedling_ascii: Handle<Image>,
-    pub plant_mature_ascii: Handle<Image>,
+    pub plant_grain_mature_ascii: Handle<Image>,
+    pub plant_bush_mature_ascii: Handle<Image>,
     pub tree_seedling_ascii: Handle<Image>,
     pub tree_mature_ascii: Handle<Image>,
     pub camp_ascii: Handle<Image>,
@@ -45,6 +46,41 @@ impl PixelColor {
         Self { r, g, b, a }
     }
 }
+
+pub const WARM_PALETTE: &[(char, PixelColor)] = &[
+    ('.', PixelColor::new(0,   0,   0,   0  )), // transparent
+    ('X', PixelColor::new(26,  20,  16,  255)), // near-black outline
+    ('d', PixelColor::new(42,  31,  23,  255)), // very dark brown
+    ('D', PixelColor::new(74,  52,  34,  255)), // dark brown
+    ('b', PixelColor::new(122, 84,  54,  255)), // mid brown
+    ('B', PixelColor::new(168, 114, 70,  255)), // light brown / tan skin
+    ('t', PixelColor::new(212, 165, 116, 255)), // tan / wood highlight
+    ('T', PixelColor::new(240, 213, 168, 255)), // pale tan / parchment
+    ('W', PixelColor::new(255, 243, 214, 255)), // warm cream
+    ('s', PixelColor::new(58,  42,  26,  255)), // dark soil
+    ('S', PixelColor::new(94,  63,  36,  255)), // soil / earth
+    ('e', PixelColor::new(139, 90,  43,  255)), // earth / dirt path
+    ('E', PixelColor::new(192, 136, 85,  255)), // sand / clay
+    ('N', PixelColor::new(232, 193, 137, 255)), // pale sand
+    ('g', PixelColor::new(31,  58,  28,  255)), // deep forest green
+    ('G', PixelColor::new(54,  94,  42,  255)), // mossy green
+    ('m', PixelColor::new(90,  138, 58,  255)), // grass green
+    ('M', PixelColor::new(140, 186, 79,  255)), // bright grass
+    ('L', PixelColor::new(184, 217, 106, 255)), // grass highlight
+    ('n', PixelColor::new(26,  40,  64,  255)), // deep water
+    ('i', PixelColor::new(45,  79,  122, 255)), // water mid
+    ('I', PixelColor::new(74,  130, 184, 255)), // water highlight
+    ('H', PixelColor::new(140, 192, 224, 255)), // water foam / sky
+    ('k', PixelColor::new(68,  74,  82,  255)), // slate dark
+    ('K', PixelColor::new(107, 114, 124, 255)), // slate mid
+    ('l', PixelColor::new(154, 160, 168, 255)), // slate light
+    ('P', PixelColor::new(212, 214, 216, 255)), // stone highlight / snow
+    ('r', PixelColor::new(122, 31,  31,  255)), // blood red / banner
+    ('R', PixelColor::new(200, 74,  42,  255)), // fire / terracotta
+    ('o', PixelColor::new(245, 168, 60,  255)), // flame / gold
+    ('y', PixelColor::new(252, 230, 112, 255)), // bright gold / spark
+    ('p', PixelColor::new(90,  42,  110, 255)), // royal purple / magic
+];
 
 pub fn ascii_to_image(ascii: &[&str], colors: &[(char, PixelColor)]) -> Image {
     let height = ascii.len();
@@ -250,37 +286,45 @@ pub fn setup_pixel_art(
         ],
     );
 
-    // Plant Mature: 16x16
-    let plant_ascii = &[
+    // Plant Mature — Grain (wheat field): 16x16
+    let plant_grain_mature_img = ascii_to_image(&[
+        "...y...y...y....",
+        "..yoy.yoy.yoy...",
+        ".yoyoyoyoyoyoy..",
+        "..yXy.yXy.yXy...",
+        "...X...X...X....",
+        "...X...X...X....",
+        "...X...X...X....",
+        "...y...y...y....",
+        "..yoy.yoy.yoy...",
+        ".yoyoyoyoyoyoy..",
+        "..yXy.yXy.yXy...",
+        "...X...X...X....",
+        "...X...X...X....",
+        "...X...X...X....",
+        "..mLmmMmmLmmMmm.",
+        "..MmmLmmMmmLmMm.",
+    ], WARM_PALETTE);
+
+    // Plant Mature — BerryBush (berry bush): 16x16
+    let plant_bush_mature_img = ascii_to_image(&[
         "................",
-        "......lll.......",
-        "....lleeeel.....",
-        "...leeeveeeel...",
-        "..leeervreeeel..",
-        ".leeeroreeveeeel",
-        "lleeeeeeeeervrel",
-        "leeevreeeeeeeeel",
-        ".leeeeroreeevel.",
-        "..lleeeeeeeell..",
-        "...lleeeveell...",
-        "....llleeell....",
-        ".......d........",
-        "......ddd.......",
-        "......ddd.......",
-        "......ddd.......",
-    ];
-    let plant_mature_img = ascii_to_image(
-        plant_ascii,
-        &[
-            ('e', e),
-            ('l', e_l),
-            ('v', e_d),
-            ('r', r),
-            ('o', r_l),
-            ('d', d_b),
-            ('.', _t),
-        ],
-    );
+        "................",
+        "................",
+        "................",
+        "......GgmG......",
+        ".....GmrRmG.....",
+        "....GgmGgmGm....",
+        "...GmGrRmGmGm...",
+        "..GgrRmGgmGgmG..",
+        "..GmGmrRrGmGmG..",
+        "..GgmGmGmGgrRm..",
+        "...GmGgrRrGmGm..",
+        "....GmGgmGmGm...",
+        ".....GmGmGmG....",
+        "......GmGmG.....",
+        "......XdSdX.....",
+    ], WARM_PALETTE);
 
     let plant_seed_ascii = &[
         "................",
@@ -302,7 +346,8 @@ pub fn setup_pixel_art(
     ];
     let plant_seed_img = ascii_to_image(plant_seed_ascii, &[('d', d_b), ('.', _t)]);
 
-    let plant_seedling_ascii = &[
+    // Plant Seedling (sapling): 16x16
+    let plant_seedling_img = ascii_to_image(&[
         "................",
         "................",
         "................",
@@ -310,62 +355,72 @@ pub fn setup_pixel_art(
         "................",
         "................",
         "................",
-        ".......ll.......",
-        "......leel......",
-        ".....leeeel.....",
-        "....leeeeve.....",
-        "......eeev......",
-        ".......ev.......",
-        ".......ev.......",
-        ".......ev.......",
-        ".......d........",
-    ];
-    let plant_seedling_img = ascii_to_image(
-        plant_seedling_ascii,
-        &[('e', e), ('l', e_l), ('v', e_d), ('d', d_b), ('.', _t)],
-    );
+        "......XGmX......",
+        "....XGmGmG......",
+        "....XmGgmG......",
+        "......XGX.......",
+        "......XGX.......",
+        "......XGX.......",
+        "......XGX.......",
+        "......XdX.......",
+        ".....XdSdX......",
+    ], WARM_PALETTE);
 
-    // Tree Seedling: 16x16
-    let tree_seedling_ascii = &[
+    // Tree Seedling (sapling): 16x16
+    let tree_seedling_img = ascii_to_image(&[
         "................",
         "................",
         "................",
         "................",
-        "......eee.......",
-        ".....eeeee......",
-        "....eeeeeee.....",
-        "....eeeeeee.....",
-        ".....eeeee......",
-        "......eee.......",
-        ".......d........",
-        ".......d........",
-        ".......d........",
-        ".......d........",
-        ".......d........",
-        ".......d........",
-    ];
-    let tree_seedling_img = ascii_to_image(tree_seedling_ascii, &[('e', e), ('d', d_b), ('.', _t)]);
+        "................",
+        "................",
+        "................",
+        "......XGmX......",
+        "....XGmGmG......",
+        "....XmGgmG......",
+        "......XGX.......",
+        "......XGX.......",
+        "......XGX.......",
+        "......XGX.......",
+        "......XdX.......",
+        ".....XdSdX......",
+    ], WARM_PALETTE);
 
-    // Tree Mature: 16x16
-    let tree_mature_ascii = &[
-        "......eee.......",
-        "....eeeeeee.....",
-        "...eeeeeeeee....",
-        "..eeeeeeeeeee...",
-        "..eeeeeeeeeee...",
-        "..eeeeeeeeeee...",
-        "...eeeeeeeee....",
-        "....eeeeeee.....",
-        ".....eeeee......",
-        "......eee.......",
-        ".......d........",
-        ".......d........",
-        ".......d........",
-        ".......d........",
-        ".......d........",
-        ".......d........",
-    ];
-    let tree_mature_img = ascii_to_image(tree_mature_ascii, &[('e', e), ('d', d_b), ('.', _t)]);
+    // Tree Mature (oak): 16x32 tall sprite
+    let tree_mature_img = ascii_to_image(&[
+        "................",
+        "......GgmG......",
+        "....GgmGgmGGm...",
+        "...GmGgmGmGmGg..",
+        "..GmGgmGmGmGgmG.",
+        ".GgmGgmGmGmGgmGg",
+        ".GmGgmGmGmGgmGmG",
+        "GgmGmGmGmGmGmGgm",
+        "GmGgmGmGmGmGgmGm",
+        "GgmGmGmGgmGmGmGg",
+        ".GmGgmGmGmGgmGmG",
+        ".GgmGmGmGmGgmGg.",
+        "..GmGgmGmGgmGmG.",
+        "...GgmGmGgmGmG..",
+        "....GmGgmGgmG...",
+        "......GmGmG.....",
+        ".......XbX......",
+        ".......XbX......",
+        "......XbBX......",
+        "......XbtbX.....",
+        "......XbtbX.....",
+        "......XdSdX.....",
+        ".....XdSSdX.....",
+        "....XdSSSSdX....",
+        "...XSSSSSSSX....",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+    ], WARM_PALETTE);
 
     // Camp: 16x16
     let camp_ascii = &[
@@ -460,7 +515,8 @@ pub fn setup_pixel_art(
         person_female_ascii: images.add(female_img),
         plant_seed_ascii: images.add(plant_seed_img),
         plant_seedling_ascii: images.add(plant_seedling_img),
-        plant_mature_ascii: images.add(plant_mature_img),
+        plant_grain_mature_ascii: images.add(plant_grain_mature_img),
+        plant_bush_mature_ascii: images.add(plant_bush_mature_img),
         tree_seedling_ascii: images.add(tree_seedling_img),
         tree_mature_ascii: images.add(tree_mature_img),
         camp_ascii: images.add(camp_img),

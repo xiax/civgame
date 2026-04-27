@@ -29,6 +29,13 @@ impl TileKind {
     pub fn is_opaque(self) -> bool {
         matches!(self, TileKind::Wall)
     }
+
+    /// Whether this tile can support an agent standing on top of it.
+    /// Anything but Air and Water; Wall counts because it's the ceiling/floor
+    /// of a tunnel below it.
+    pub fn is_floor(self) -> bool {
+        !matches!(self, TileKind::Air | TileKind::Water)
+    }
 }
 
 /// 4 bytes per tile — cache-friendly.

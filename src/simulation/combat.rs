@@ -1,6 +1,7 @@
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::simulation::animals::{AnimalAI, AnimalState, Deer, Wolf};
+use crate::simulation::construction::{Bed, HomeBed};
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::items::{ArmorStats, Equipment, EquipmentSlot, GroundItem, WeaponStats};
 use crate::simulation::line_of_sight::has_los;
@@ -221,12 +222,24 @@ pub fn combat_system(
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        // Attacker may be Person (tracks current_z) or animal (surface-only).
+        let attacker_z = ai_query
+            .get(attacker)
+            .map(|ai| ai.current_z)
+            .unwrap_or_else(|_| chunk_map.surface_z_at(tx, ty) as i8);
 
         let mut found = false;
         'find: for dy in -1..=1i32 {
             for dx in -1..=1i32 {
                 for &e in spatial.get(tx + dx, ty + dy) {
-                    if e == target && has_los(&chunk_map, (tx, ty), (tx + dx, ty + dy)) {
+                    // Combat is adjacent — assume target is at the attacker's Z.
+                    if e == target
+                        && has_los(
+                            &chunk_map,
+                            (tx, ty, attacker_z),
+                            (tx + dx, ty + dy, attacker_z),
+                        )
+                    {
                         found = true;
                         break 'find;
                     }
@@ -365,6 +378,7 @@ pub fn death_system(
     mut commands: Commands,
     mut registry: ResMut<FactionRegistry>,
     mut clock: ResMut<SimClock>,
+    mut bed_query: Query<&mut Bed>,
     query: Query<(
         Entity,
         Option<&Health>,
@@ -374,9 +388,10 @@ pub fn death_system(
         Option<&Person>,
         Option<&Wolf>,
         Option<&Deer>,
+        Option<&HomeBed>,
     )>,
 ) {
-    for (entity, health, body, transform, member, person, wolf, deer) in &query {
+    for (entity, health, body, transform, member, person, wolf, deer, home_bed) in &query {
         let is_dead = health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead());
         if !is_dead {
             continue;
@@ -384,6 +399,13 @@ pub fn death_system(
 
         if let Some(fm) = member {
             registry.remove_member(fm.faction_id);
+        }
+
+        // Release the bed claim so another agent can take it.
+        if let Some(bed_entity) = home_bed.and_then(|h| h.0) {
+            if let Ok(mut bed) = bed_query.get_mut(bed_entity) {
+                bed.owner = None;
+            }
         }
         if person.is_some() || wolf.is_some() || deer.is_some() {
             clock.population = clock.population.saturating_sub(1);

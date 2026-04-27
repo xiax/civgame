@@ -299,17 +299,27 @@ pub fn vision_system(
             With<crate::simulation::animals::Deer>,
         )>,
     >,
-    mut query: Query<(&Transform, &mut AgentMemory, &BucketSlot, &LodLevel), With<Person>>,
+    mut query: Query<
+        (
+            &Transform,
+            &mut AgentMemory,
+            &BucketSlot,
+            &LodLevel,
+            &crate::simulation::person::PersonAI,
+        ),
+        With<Person>,
+    >,
 ) {
     const VIEW_RADIUS: i32 = 15;
 
-    for (transform, mut memory, slot, lod) in query.iter_mut() {
+    for (transform, mut memory, slot, lod, ai) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let from_z = ai.current_z;
 
         for dy in -VIEW_RADIUS..=VIEW_RADIUS {
             for dx in -VIEW_RADIUS..=VIEW_RADIUS {
@@ -319,8 +329,13 @@ pub fn vision_system(
 
                 let ntx = tx + dx;
                 let nty = ty + dy;
+                let to_z = chunk_map.surface_z_at(ntx, nty) as i8;
 
-                if !crate::simulation::line_of_sight::has_los(&chunk_map, (tx, ty), (ntx, nty)) {
+                if !crate::simulation::line_of_sight::has_los(
+                    &chunk_map,
+                    (tx, ty, from_z),
+                    (ntx, nty, to_z),
+                ) {
                     continue;
                 }
 
@@ -330,7 +345,7 @@ pub fn vision_system(
                 if let Some(&entity) = plant_map.0.get(&(ntx, nty)) {
                     if let Ok(plant) = plant_query.get(entity) {
                         let kind = match plant.kind {
-                            crate::simulation::plants::PlantKind::FruitBush
+                            crate::simulation::plants::PlantKind::BerryBush
                             | crate::simulation::plants::PlantKind::Grain => MemoryKind::Food,
                             crate::simulation::plants::PlantKind::Tree => MemoryKind::Wood,
                         };

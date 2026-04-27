@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 
 pub mod animals;
+pub mod carve;
 pub mod combat;
 pub mod construction;
 pub mod dig;
@@ -91,6 +92,7 @@ impl Plugin for SimulationPlugin {
                     mood::derive_mood_system,
                     lod::update_lod_levels_system,
                     faction::update_storage_tile_map_system,
+                    animals::animal_needs_tick_system,
                 )
                     .in_set(SimulationSet::ParallelA),
             )
@@ -155,6 +157,9 @@ impl Plugin for SimulationPlugin {
                     reproduction::birth_cooldown_system,
                     reproduction::collect_male_candidates,
                     reproduction::reproduction_system.after(reproduction::collect_male_candidates),
+                    animals::animal_reproduction_cooldown_system,
+                    animals::animal_reproduction_system
+                        .after(animals::animal_reproduction_cooldown_system),
                     raid::faction_decision_system
                         .after(faction::compute_faction_storage_system),
                     raid::raid_detection_system.after(raid::faction_decision_system),
@@ -164,6 +169,13 @@ impl Plugin for SimulationPlugin {
                     world_sim::world_sim_system,
                     world_sim::agent_exploration_system,
                     construction::faction_blueprint_system,
+                )
+                    .in_set(SimulationSet::Economy),
+            )
+            .add_systems(
+                FixedUpdate,
+                (
+                    construction::assign_beds_system,
                     faction::resource_demand_system
                         .after(construction::faction_blueprint_system)
                         .after(faction::compute_faction_storage_system),

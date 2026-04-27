@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
-use crate::simulation::animals::{AnimalAI, Deer, Wolf};
+use crate::simulation::animals::{AnimalAI, AnimalNeeds, AnimalReproductionCooldown, Deer, Wolf};
 use crate::simulation::combat::{Body, CombatCooldown, CombatTarget, Health};
 use crate::simulation::faction::FactionMember;
 use crate::simulation::goals::{AgentGoal, Personality};
@@ -43,6 +43,7 @@ fn setup_sandbox(
     mut clock: ResMut<SimClock>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
 ) {
     let start_cx = (GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS;
     let start_cy = (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS;
@@ -72,6 +73,8 @@ fn setup_sandbox(
                 last_plan_id: PersonAI::UNEMPLOYED,
                 last_goal_eval_tick: 0,
                 target_entity: None,
+                current_z: chunk_map.surface_z_at(cx, cy) as i8,
+                target_z: chunk_map.surface_z_at(cx, cy) as i8,
             },
             EconomicAgent::default(),
         ),
@@ -115,6 +118,9 @@ fn setup_sandbox(
         CombatCooldown::default(),
         LodLevel::Full,
         BucketSlot(1),
+        AnimalNeeds::default(),
+        AnimalReproductionCooldown(0),
+        BiologicalSex::random(),
     ));
 
     // Deer (4 tiles left, 3 tiles up from person)
@@ -136,6 +142,9 @@ fn setup_sandbox(
         LodLevel::Full,
         BucketSlot(2),
         DeerGrazer { graze_timer: 0 },
+        AnimalNeeds::default(),
+        AnimalReproductionCooldown(0),
+        BiologicalSex::random(),
     ));
 
     clock.population = 3;
@@ -149,7 +158,7 @@ fn setup_sandbox(
         &mut plant_sprite_index,
         cx + 2,
         cy + 5,
-        PlantKind::FruitBush,
+        PlantKind::BerryBush,
         GrowthStage::Mature,
     );
     spawn_plant_at(

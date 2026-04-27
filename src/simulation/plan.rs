@@ -25,7 +25,7 @@ use super::memory::{AgentMemory, MemoryKind};
 use super::needs::Needs;
 use super::neural::{UtilityNet, PLAN_FEAT_DIM, STATE_DIM};
 use super::person::{AiState, PersonAI, PlayerOrder};
-use super::plants::{Plant, PlantKind, PlantMap};
+use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
 use super::technology::TechId;
@@ -225,13 +225,13 @@ static BUILD_GOALS: &[AgentGoal] = &[AgentGoal::Build];
 pub fn register_builtin_steps(registry: &mut StepRegistry) {
     registry.0 = vec![
         StepDef {
-            // 0: ForageGrass — targets FruitBushes, falls back via memory
+            // 0: ForageGrass — targets BerryBushes, falls back via memory
             id: 0,
             task: TaskKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Food),
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
-            plant_filter: Some(PlantKind::FruitBush),
+            plant_filter: Some(PlantKind::BerryBush),
         },
         StepDef {
             // 1: FarmFarmland — targets Grain, falls back via memory
@@ -505,6 +505,7 @@ pub fn build_state_vec(
 fn resolve_target(
     step: &StepDef,
     pos: (i32, i32),
+    pos_z: i8,
     chunk_map: &ChunkMap,
     spatial: &SpatialIndex,
     plant_map: &PlantMap,
@@ -512,6 +513,7 @@ fn resolve_target(
     faction_registry: &FactionRegistry,
     storage_tile_map: &StorageTileMap,
     faction_id: u32,
+    agent_entity: Entity,
     goal: &AgentGoal,
     memory: Option<&AgentMemory>,
     item_query: &Query<&GroundItem>,
@@ -540,7 +542,12 @@ fn resolve_target(
                     }
                     let tx = pos.0 + dx;
                     let ty = pos.1 + dy;
-                    if !super::line_of_sight::has_los(chunk_map, pos, (tx, ty)) {
+                    let to_z = chunk_map.surface_z_at(tx, ty) as i8;
+                    if !super::line_of_sight::has_los(
+                        chunk_map,
+                        (pos.0, pos.1, pos_z),
+                        (tx, ty, to_z),
+                    ) {
                         continue;
                     }
                     for &candidate in spatial.get(tx, ty) {
@@ -598,18 +605,61 @@ fn resolve_target(
                 _ => None,
             };
             if let Some((ent, tx, ty)) = vision_target {
-                if super::line_of_sight::has_los(chunk_map, pos, (tx as i32, ty as i32)) {
+                let to_z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
+                if super::line_of_sight::has_los(
+                    chunk_map,
+                    (pos.0, pos.1, pos_z),
+                    (tx as i32, ty as i32, to_z),
+                ) {
                     return Some((ent, tx, ty));
                 }
             }
 
             // 2. Check memory
             if let Some(mem) = memory {
-                if let Some((ent, tx, ty)) = mem.best_entity_for_dist_weighted(*kind, pos) {
-                    return Some((Some(ent), tx, ty));
+                // Entity memories: skip plants that are no longer Mature (stale after harvest).
+                let best_valid_entity = mem
+                    .entries
+                    .iter()
+                    .filter_map(|slot| slot.as_ref())
+                    .filter(|e| e.kind == *kind)
+                    .filter_map(|e| e.entity.map(|ent| (ent, e.tile, e.freshness)))
+                    .filter(|(ent, _, _)| {
+                        matches!(plant_query.get(*ent), Ok(p) if p.stage == GrowthStage::Mature)
+                    })
+                    .max_by(|a, b| {
+                        let score = |e: &(Entity, (i16, i16), u8)| {
+                            e.2 as f32
+                                / ((e.1.0 as i32 - pos.0).abs() + (e.1.1 as i32 - pos.1).abs())
+                                    .max(1) as f32
+                        };
+                        score(a)
+                            .partial_cmp(&score(b))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+
+                if let Some((ent, tile, _)) = best_valid_entity {
+                    return Some((Some(ent), tile.0, tile.1));
                 }
+
+                // Tile-based fallback: for plant resources require a Mature plant at the tile.
                 if let Some((tx, ty)) = mem.best_for_dist_weighted(*kind, pos) {
-                    return Some((None, tx, ty));
+                    let mut found_ent = None;
+                    let plant_ok = match plant_map.0.get(&(tx as i32, ty as i32)) {
+                        Some(&tile_ent) => {
+                            if matches!(plant_query.get(tile_ent), Ok(p) if p.stage == GrowthStage::Mature) {
+                                found_ent = Some(tile_ent);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        // No plant at tile: valid for Stone, stale for Food/Wood.
+                        None => !matches!(kind, MemoryKind::Food | MemoryKind::Wood),
+                    };
+                    if plant_ok {
+                        return Some((found_ent, tx, ty));
+                    }
                 }
             }
 
@@ -629,7 +679,12 @@ fn resolve_target(
             if let Some((entity, tx, ty)) =
                 find_nearest_item(spatial, pos, VIEW_RADIUS, *good, item_query, storage_tile_map, is_gathering)
             {
-                if super::line_of_sight::has_los(chunk_map, pos, (tx as i32, ty as i32)) {
+                let to_z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
+                if super::line_of_sight::has_los(
+                    chunk_map,
+                    (pos.0, pos.1, pos_z),
+                    (tx as i32, ty as i32, to_z),
+                ) {
                     target_item.0 = Some(entity);
                     return Some((Some(entity), tx, ty));
                 }
@@ -660,7 +715,12 @@ fn resolve_target(
             if let Some((entity, tx, ty)) =
                 find_nearest_edible(spatial, pos, VIEW_RADIUS, item_query, storage_tile_map, is_gathering)
             {
-                if super::line_of_sight::has_los(chunk_map, pos, (tx as i32, ty as i32)) {
+                let to_z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
+                if super::line_of_sight::has_los(
+                    chunk_map,
+                    (pos.0, pos.1, pos_z),
+                    (tx as i32, ty as i32, to_z),
+                ) {
                     target_item.0 = Some(entity);
                     return Some((Some(entity), tx, ty));
                 }
@@ -685,14 +745,19 @@ fn resolve_target(
             .map(|(tx, ty)| (None, tx, ty)),
         StepTarget::NearestBuildSite(_) => None, // Legacy; construction is handled via faction_blueprint_system
         StepTarget::NearestBlueprint(kind) => {
-            // Find the nearest active Blueprint entity belonging to this agent's faction.
+            // Find the nearest active Blueprint this agent is allowed to build.
+            // Personal blueprints are matched by agent_entity; faction blueprints by faction_id.
             let mut best: Option<(Entity, i16, i16)> = None;
             let mut best_dist = i32::MAX;
             for (&tile, &bp_entity) in &bp_map.0 {
                 let Ok(bp) = bp_query.get(bp_entity) else {
                     continue;
                 };
-                if bp.faction_id != faction_id {
+                let allowed = match bp.personal_owner {
+                    Some(owner) => owner == agent_entity,
+                    None => bp.faction_id == faction_id,
+                };
+                if !allowed {
                     continue;
                 }
                 if &bp.kind != kind {
@@ -990,17 +1055,10 @@ pub fn plan_execution_system(
             continue;
         }
 
-        let step_id = plan_def.steps[active_plan.current_step as usize];
-        let step_def = match step_registry.0.iter().find(|s| s.id == step_id) {
-            Some(s) => s,
-            None => {
-                commands.entity(entity).remove::<ActivePlan>();
-                combat_target.0 = None;
-                continue;
-            }
-        };
-
-        // ── Step completion: dispatched + agent went back to Idle+UNEMPLOYED ──
+        // ── Step completion: advance step when agent returned Idle+UNEMPLOYED ──
+        // Intentionally falls through (no `continue`) so the next step is dispatched
+        // in the same tick, eliminating the 1-tick UNEMPLOYED gap that lets
+        // goal_update_system flip the goal between Gather and Eat.
         if active_plan.dispatched && ai.state == AiState::Idle && ai.task_id == PersonAI::UNEMPLOYED
         {
             active_plan.current_step += 1;
@@ -1015,9 +1073,21 @@ pub fn plan_execution_system(
                 }
                 commands.entity(entity).remove::<ActivePlan>();
                 combat_target.0 = None;
+                continue;
             }
-            continue;
+            // Plan has more steps — fall through to dispatch the next one immediately.
         }
+
+        // Fetch step for current_step (may have just been advanced above).
+        let step_id = plan_def.steps[active_plan.current_step as usize];
+        let step_def = match step_registry.0.iter().find(|s| s.id == step_id) {
+            Some(s) => s,
+            None => {
+                commands.entity(entity).remove::<ActivePlan>();
+                combat_target.0 = None;
+                continue;
+            }
+        };
 
         // ── Dispatch current step if not yet dispatched ───────────────────────
         if !active_plan.dispatched {
@@ -1037,6 +1107,7 @@ pub fn plan_execution_system(
             if let Some((ent, target_tx, target_ty)) = resolve_target(
                 step_def,
                 (cur_tx, cur_ty),
+                ai.current_z,
                 &chunk_map,
                 &spatial,
                 &plant_map,
@@ -1044,6 +1115,7 @@ pub fn plan_execution_system(
                 &faction_registry,
                 &storage_tile_map,
                 member.faction_id,
+                entity,
                 goal,
                 memory_opt,
                 &item_check,

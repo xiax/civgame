@@ -1,45 +1,6 @@
 use bevy::prelude::*;
 use ahash::AHashMap;
-use crate::rendering::pixel_art::{ascii_to_image, PixelColor};
-
-// ============================================================
-// WARM EARTH-TONE PALETTE  (matches claude.ai/design export)
-// 32 indexed colors; index 0 is transparent.
-// ============================================================
-const WARM_PALETTE: &[(char, PixelColor)] = &[
-    ('.', PixelColor::new(0,   0,   0,   0  )), // transparent
-    ('X', PixelColor::new(26,  20,  16,  255)), // near-black outline
-    ('d', PixelColor::new(42,  31,  23,  255)), // very dark brown
-    ('D', PixelColor::new(74,  52,  34,  255)), // dark brown
-    ('b', PixelColor::new(122, 84,  54,  255)), // mid brown
-    ('B', PixelColor::new(168, 114, 70,  255)), // light brown / tan skin
-    ('t', PixelColor::new(212, 165, 116, 255)), // tan / wood highlight
-    ('T', PixelColor::new(240, 213, 168, 255)), // pale tan / parchment
-    ('W', PixelColor::new(255, 243, 214, 255)), // warm cream
-    ('s', PixelColor::new(58,  42,  26,  255)), // dark soil
-    ('S', PixelColor::new(94,  63,  36,  255)), // soil / earth
-    ('e', PixelColor::new(139, 90,  43,  255)), // earth / dirt path
-    ('E', PixelColor::new(192, 136, 85,  255)), // sand / clay
-    ('N', PixelColor::new(232, 193, 137, 255)), // pale sand
-    ('g', PixelColor::new(31,  58,  28,  255)), // deep forest green
-    ('G', PixelColor::new(54,  94,  42,  255)), // mossy green
-    ('m', PixelColor::new(90,  138, 58,  255)), // grass green
-    ('M', PixelColor::new(140, 186, 79,  255)), // bright grass
-    ('L', PixelColor::new(184, 217, 106, 255)), // grass highlight
-    ('n', PixelColor::new(26,  40,  64,  255)), // deep water
-    ('i', PixelColor::new(45,  79,  122, 255)), // water mid
-    ('I', PixelColor::new(74,  130, 184, 255)), // water highlight
-    ('H', PixelColor::new(140, 192, 224, 255)), // water foam / sky
-    ('k', PixelColor::new(68,  74,  82,  255)), // slate dark
-    ('K', PixelColor::new(107, 114, 124, 255)), // slate mid
-    ('l', PixelColor::new(154, 160, 168, 255)), // slate light
-    ('P', PixelColor::new(212, 214, 216, 255)), // stone highlight / snow
-    ('r', PixelColor::new(122, 31,  31,  255)), // blood red / banner
-    ('R', PixelColor::new(200, 74,  42,  255)), // fire / terracotta
-    ('o', PixelColor::new(245, 168, 60,  255)), // flame / gold
-    ('y', PixelColor::new(252, 230, 112, 255)), // bright gold / spark
-    ('p', PixelColor::new(90,  42,  110, 255)), // royal purple / magic
-];
+use crate::rendering::pixel_art::{ascii_to_image, WARM_PALETTE};
 
 // ============================================================
 // UTILITIES
@@ -983,40 +944,40 @@ const CREATURE_BANDIT: &[&str] = &[
 // RESOURCE SPRITES
 // ============================================================
 const RESOURCE_WHEAT: &[&str] = &[
-    "................",
-    ".......y........",
-    "......yoy.......",
-    ".....yoyoy......",
-    "....yoyXyoy.....",
-    "....yoXyXoy.....",
-    ".....yXyXy......",
-    "......XyX.......",
-    "......XyX.......",
-    "......XyX.......",
-    "......XyX.......",
-    "......XyX.......",
-    "......XyX.......",
-    "......XyX.......",
-    "......XyX.......",
-    "................",
+    "...y...y...y....",
+    "..yoy.yoy.yoy...",
+    ".yoyoyoyoyoyoy..",
+    "..yXy.yXy.yXy...",
+    "...X...X...X....",
+    "...X...X...X....",
+    "...X...X...X....",
+    "...y...y...y....",
+    "..yoy.yoy.yoy...",
+    ".yoyoyoyoyoyoy..",
+    "..yXy.yXy.yXy...",
+    "...X...X...X....",
+    "...X...X...X....",
+    "...X...X...X....",
+    "..mLmmMmmLmmMmm.",
+    "..MmmLmmMmmLmMm.",
 ];
 const RESOURCE_BERRIES: &[&str] = &[
     "................",
-    "......XX........",
-    ".....XGGX.......",
-    "....XGmGGX..XX..",
-    "...XGGmGGX.XGGX.",
-    "....XGmGGXXGmGX.",
-    ".....XGGGmGGGX..",
-    "......XGmGGGX...",
-    "...XX..XGGGX....",
-    "..XrRX..XGX.....",
-    ".XrRRrXXXX......",
-    "XrRRRRrXrRX.....",
-    "XRRrRRrXRRX.....",
-    "XrRRRRXXrRX.....",
-    ".XrRRrXXrXX.....",
-    "..XrXX.XX.......",
+    "................",
+    "................",
+    "................",
+    "......GgmG......",
+    ".....GmrRmG.....",
+    "....GgmGgmGm....",
+    "...GmGrRmGmGm...",
+    "..GgrRmGgmGgmG..",
+    "..GmGmrRrGmGmG..",
+    "..GgmGmGmGgrRm..",
+    "...GmGgrRrGmGm..",
+    "....GmGgmGmGm...",
+    ".....GmGmGmG....",
+    "......GmGmG.....",
+    "......XdSdX.....",
 ];
 const RESOURCE_MEAT: &[&str] = &[
     "................",
@@ -1215,6 +1176,466 @@ const RESOURCE_APPLE: &[&str] = &[
     "....XrRrRrRX....",
     ".....XrRrRX.....",
     "......XXX.......",
+];
+
+// ============================================================
+// PLANT SPRITES  (from civgame Spritesheet design export)
+// ============================================================
+const PLANT_TREE_OAK: &[&str] = &[
+    "................",
+    "......GgmG......",
+    "....GgmGgmGGm...",
+    "...GmGgmGmGmGg..",
+    "..GmGgmGmGmGgmG.",
+    ".GgmGgmGmGmGgmGg",
+    ".GmGgmGmGmGgmGmG",
+    "GgmGmGmGmGmGmGgm",
+    "GmGgmGmGmGmGgmGm",
+    "GgmGmGmGgmGmGmGg",
+    ".GmGgmGmGmGgmGmG",
+    ".GgmGmGmGmGgmGg.",
+    "..GmGgmGmGgmGmG.",
+    "...GgmGmGgmGmG..",
+    "....GmGgmGgmG...",
+    "......GmGmG.....",
+    ".......XbX......",
+    ".......XbX......",
+    "......XbBX......",
+    "......XbtbX.....",
+    "......XbtbX.....",
+    "......XdSdX.....",
+    ".....XdSSdX.....",
+    "....XdSSSSdX....",
+    "...XSSSSSSSX....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const PLANT_TREE_PINE: &[&str] = &[
+    ".......XX.......",
+    ".......XGX......",
+    "......XGmGX.....",
+    "......XgmGX.....",
+    ".....XGgmGX.....",
+    "....XGmGgmGX....",
+    "....XgmGmGmX....",
+    "...XGgmGmGmGX...",
+    "...XgmGgmGmGX...",
+    "..XGgmGmGmGgmX..",
+    "..XgmGmGgmGmGX..",
+    ".XGgmGmGmGmGgmX.",
+    ".XgmGgmGmGmGmGX.",
+    "XGgmGmGmGmGgmGgX",
+    "XgmGgmGmGgmGgmGX",
+    "XGgmGmGmGmGgmGgX",
+    ".....XdDdX......",
+    ".....XdDdX......",
+    ".....XdSdX......",
+    ".....XdSdX......",
+    ".....XdSdX......",
+    "....XdSSdX......",
+    "....XdSSSdX.....",
+    "...XSSSSSSX.....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const PLANT_TREE_BIRCH: &[&str] = &[
+    "................",
+    "......MmLmM.....",
+    "....MmLmMmLmM...",
+    "...MmMmLmMmLmM..",
+    "..MmLmMmLmMmLmM.",
+    ".MmMmLmMmLmMmLmM",
+    ".MmLmMmLmMmLmMmL",
+    "MmMmLmMmLmMmLmMm",
+    "MmLmMmLmMmLmMmLm",
+    "MmMmLmMmLmMmLmMm",
+    ".MmLmMmLmMmLmMm.",
+    ".MmMmLmMmLmMmLm.",
+    "..MmLmMmLmMmLm..",
+    "...MmMmLmMmLm...",
+    "....MmLmMmLmM...",
+    "......MmLmM.....",
+    ".......XWX......",
+    ".......XWPX.....",
+    "......XWXPX.....",
+    "......XWPXkX....",
+    "......XWXPX.....",
+    "......XWPXkX....",
+    "......XWPX......",
+    ".....XdSSdX.....",
+    "....XdSSSSdX....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const PLANT_TREE_DEAD: &[&str] = &[
+    "...X............",
+    "..XdX.....X.....",
+    "..XdX....XdX....",
+    "..XdDX..XdX.....",
+    "...XdX..XdDX....",
+    "...XdXXXdX......",
+    "....XdXdX.......",
+    "...XdDXdDX......",
+    "...XdXdX..X.....",
+    "....XdXdXdX.....",
+    ".....XdXdX......",
+    "....X.XdX.X.....",
+    "...XdXXdXXdX....",
+    "....XdXdXdX.....",
+    "......XdX.......",
+    "......XdX.......",
+    "......XdDX......",
+    "......XdDX......",
+    "......XdDX......",
+    "......XdDX......",
+    "......XdSX......",
+    "......XdSdX.....",
+    ".....XdSSdX.....",
+    "....XdSSSSdX....",
+    "...XSSSSSSSX....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const PLANT_TREE_APPLE: &[&str] = &[
+    "................",
+    "......GgmG......",
+    "....GgmGmGGmG...",
+    "...GmGrRmGmGmG..",
+    "..GgmGmGmGgmGgmG",
+    ".GmGgrRmGmGgmGmG",
+    ".GgmGmGmGmGgrRmG",
+    "GgmGmGgmGmGmGmGg",
+    "GmGrRmGmGgmGmGmG",
+    "GgmGmGmGmGgrRmGg",
+    ".GmGgmGgrRmGmGmG",
+    ".GgmGmGmGmGgmGm.",
+    "..GmGgmGmGgmGmG.",
+    "...GgrRmGmGmGm..",
+    "....GmGgmGmG....",
+    "......GmGmG.....",
+    ".......XbX......",
+    ".......XbX......",
+    "......XbBX......",
+    "......XbtbX.....",
+    "......XbtbX.....",
+    "......XdSdX.....",
+    ".....XdSSdX.....",
+    "....XdSSSSdX....",
+    "...XSSSSSSSX....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const PLANT_TREE_CHERRY: &[&str] = &[
+    "................",
+    "......PWPW......",
+    "....PWPpWpWPW...",
+    "...PWPpWPpWPpWP.",
+    "..pWPpWPpWPpWPpW",
+    ".PWPpWPpWPpWPpWP",
+    ".WPpWPpWPpWPpWPp",
+    "PpWPpWPyWPpWPpWP",
+    "pWPpWPpyypWPpWPp",
+    "PpWPpWyyWPpWPpWP",
+    ".WPpWPpWPpWPpWP.",
+    ".PpWPpWPpWPpWPp.",
+    "..pWPpWPpWPpWP..",
+    "...PpWPpWPpWP...",
+    "....PWPpWPW.....",
+    "......PWPW......",
+    ".......XbX......",
+    ".......XbX......",
+    "......XbBX......",
+    "......XdSdX.....",
+    "......XdSdX.....",
+    ".....XdSSdX.....",
+    "....XdSSSSdX....",
+    "...XSSSSSSSX....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const PLANT_BUSH_SMALL: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "......GgmG......",
+    ".....GmGgmG.....",
+    "....GgmGmGmG....",
+    "...GmGgmGmGgm...",
+    "...GgmGmGgmGmG..",
+    "..GmGgmGmGmGmG..",
+    "..GgmGmGmGgmGgm.",
+    "...GmGgmGmGmGmG.",
+    "....GmGgmGmGmG..",
+    ".....GgmGmGmG...",
+    "......XdSdX.....",
+];
+const PLANT_BUSH_BERRY: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "......GgmG......",
+    ".....GmrRmG.....",
+    "....GgmGgmGm....",
+    "...GmGrRmGmGm...",
+    "..GgrRmGgmGgmG..",
+    "..GmGmrRrGmGmG..",
+    "..GgmGmGmGgrRm..",
+    "...GmGgrRrGmGm..",
+    "....GmGgmGmGm...",
+    ".....GmGmGmG....",
+    "......GmGmG.....",
+    "......XdSdX.....",
+];
+const PLANT_BUSH_DEAD: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "......XdX.......",
+    ".....XdDX.X.....",
+    "....XddDdXdX....",
+    "...XdDdXdDdX....",
+    "..XdDdXdDdX.....",
+    "..XdDdDdXdDdX...",
+    "...XdDdDdXdDdX..",
+    "....XdDdXdDdX...",
+    ".....XdDdX......",
+    "......XdX.......",
+    "......XdSdX.....",
+];
+const PLANT_WHEAT_FIELD: &[&str] = &[
+    "...y...y...y....",
+    "..yoy.yoy.yoy...",
+    ".yoyoyoyoyoyoy..",
+    "..yXy.yXy.yXy...",
+    "...X...X...X....",
+    "...X...X...X....",
+    "...X...X...X....",
+    "...y...y...y....",
+    "..yoy.yoy.yoy...",
+    ".yoyoyoyoyoyoy..",
+    "..yXy.yXy.yXy...",
+    "...X...X...X....",
+    "...X...X...X....",
+    "...X...X...X....",
+    "..mLmmMmmLmmMmm.",
+    "..MmmLmmMmmLmMm.",
+];
+const PLANT_FLOWERS_RED: &[&str] = &[
+    "................",
+    "................",
+    "...rR..rR..rR...",
+    "..rRrRrRRRrRRr..",
+    "..RyrRRyrRRyrRR.",
+    "..rRrRrRRRrRRr..",
+    "...XmX.XmX.XmX..",
+    "...XmX.XmX.XmX..",
+    "..XGmXXGmXXGmX..",
+    "..XmGXXmGXXmGX..",
+    "..XGmXXGmXXGmX..",
+    "...XmX.XmX.XmX..",
+    "...mLmmMmmLmM...",
+    "..mMmmLmmMmmLm..",
+    "..mmMmmLmmMmmM..",
+    "................",
+];
+const PLANT_FLOWERS_YELLOW: &[&str] = &[
+    "................",
+    "................",
+    "...yo..yo..yo...",
+    "..yoyoyoyoyoyo..",
+    "..oWyooWyooWyo..",
+    "..yoyoyoyoyoyo..",
+    "...XmX.XmX.XmX..",
+    "...XmX.XmX.XmX..",
+    "..XGmXXGmXXGmX..",
+    "..XmGXXmGXXmGX..",
+    "..XGmXXGmXXGmX..",
+    "...XmX.XmX.XmX..",
+    "...mLmmMmmLmM...",
+    "..mMmmLmmMmmLm..",
+    "..mmMmmLmmMmmM..",
+    "................",
+];
+const PLANT_FLOWERS_PURPLE: &[&str] = &[
+    "................",
+    "................",
+    "...pH..pH..pH...",
+    "..pHpHpHpHpHpH..",
+    "..HWpHHWpHHWpH..",
+    "..pHpHpHpHpHpH..",
+    "...XmX.XmX.XmX..",
+    "...XmX.XmX.XmX..",
+    "..XGmXXGmXXGmX..",
+    "..XmGXXmGXXmGX..",
+    "..XGmXXGmXXGmX..",
+    "...XmX.XmX.XmX..",
+    "...mLmmMmmLmM...",
+    "..mMmmLmmMmmLm..",
+    "..mmMmmLmmMmmM..",
+    "................",
+];
+const PLANT_MUSHROOM_RED: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "......XXXX......",
+    "....XrRRRrRX....",
+    "...XrRWRrWRrX...",
+    "..XrRRWrRRRrRX..",
+    "..XrWRrRRRWrRX..",
+    "...XrRrRRrRrX...",
+    "....XXTtTtXX....",
+    "......XTtX......",
+    "......XTtX......",
+    "......XTtX......",
+    "......XTtX......",
+    ".....XTttTX.....",
+    "....XmLmMmLmM...",
+];
+const PLANT_MUSHROOM_BROWN: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "......XXXX......",
+    "....XdDDdDdX....",
+    "...XdDXDdXDdX...",
+    "..XdDDXdDDXdDX..",
+    "..XdXDdDdDdXDX..",
+    "...XdDdDDdDdX...",
+    "....XXTtTtXX....",
+    "......XTtX......",
+    "......XTtX......",
+    "......XTtX......",
+    "......XTtX......",
+    ".....XTttTX.....",
+    "....XmLmMmLmM...",
+];
+const PLANT_CACTUS: &[&str] = &[
+    "................",
+    "................",
+    "......XGmX......",
+    "......XGmX......",
+    "..XGgmGmGmGgmX..",
+    "..XGmGmXXmGmgX..",
+    "..XGmGmXXmGmgX..",
+    "..XGgmGgmGmGgX..",
+    "..XGmGmGmGmGgX..",
+    "......XGmX......",
+    "......XGmX......",
+    "......XGmX......",
+    "......XGmX......",
+    "......XGmX......",
+    "...NEENEEEENEEN.",
+    "..NENENENENENENE",
+];
+const PLANT_PUMPKIN: &[&str] = &[
+    "................",
+    "................",
+    "........XmX.....",
+    ".......XmGX.....",
+    ".....XXX.XX.....",
+    "....XoyoyoyX....",
+    "...XoRoyoRoyX...",
+    "...XoyoRoyoRX...",
+    "...XoRoyXoyoX...",
+    "...XoyoyXoRoX...",
+    "...XoRoyoyoyX...",
+    "...XoyoRoyoRX...",
+    "....XoyoRoyX....",
+    ".....XXXXXX.....",
+    "......mLmM......",
+    "................",
+];
+const PLANT_SAPLING: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "......XGmX......",
+    "....XGmGmG......",
+    "....XmGgmG......",
+    "......XGX.......",
+    "......XGX.......",
+    "......XGX.......",
+    "......XGX.......",
+    "......XdX.......",
+    ".....XdSdX......",
+];
+const PLANT_LILY_PAD: &[&str] = &[
+    "................",
+    "iIiiiiHIiiIiiHii",
+    "iiiHiiiIiHiIiiiI",
+    "iIiXXXXXIiHiiHii",
+    "iiXGmGmGXIiIiiII",
+    "iIXGgmGmGXiHiHii",
+    "iiXGmGmGmGXiIiII",
+    "iIXGgmGrRrGXIiiI",
+    "iiiXGmGgmGXiHIii",
+    "iIiiXGmGmGXIiIIi",
+    "iiiHiXGmGXHiiHII",
+    "iIiiiiXXXIiHiiII",
+    "iiiHiiiHiiHiiHii",
+    "iIiiHiiiIiHiHiII",
+    "iiHiiHiiIiiiHiII",
+    "iIiiiiHiiiHiiiHi",
+];
+const PLANT_CATTAILS: &[&str] = &[
+    "iiHii.iiHii.iiHi",
+    "iIiii.iIiii.iIii",
+    "iIiii.iIiii.iIii",
+    "iI.b.IiI.b.IiI.b",
+    "iI.b.IiI.b.IiI.b",
+    "iIDbDIiIDbDIiIDb",
+    "iIDDDIiIDDDIiIDD",
+    "iIDDDIiIDDDIiIDD",
+    "iIDDDIiIDDDIiIDD",
+    "iI.b.IiI.b.IiI.b",
+    "iI.b.IiI.b.IiI.b",
+    "iIGbGIiIGbGIiIGb",
+    "iIGbGIiIGbGIiIGb",
+    "iIGmGIiIGmGIiIGm",
+    "iIGmGIiIGmGIiIGm",
+    "iIIIIIIIIIIIIIII",
 ];
 
 // ============================================================
@@ -3722,6 +4143,28 @@ pub fn setup_sprite_library(mut commands: Commands, mut images: ResMut<Assets<Im
     add!("resource_gem",         RESOURCE_GEM);
     add!("resource_water_jug",   RESOURCE_WATER_JUG);
     add!("resource_apple",       RESOURCE_APPLE);
+
+    // --- Plants (20) ---
+    add!("plant_tree_oak",       PLANT_TREE_OAK);
+    add!("plant_tree_pine",      PLANT_TREE_PINE);
+    add!("plant_tree_birch",     PLANT_TREE_BIRCH);
+    add!("plant_tree_dead",      PLANT_TREE_DEAD);
+    add!("plant_tree_apple",     PLANT_TREE_APPLE);
+    add!("plant_tree_cherry",    PLANT_TREE_CHERRY);
+    add!("plant_bush_small",     PLANT_BUSH_SMALL);
+    add!("plant_bush_berry",     PLANT_BUSH_BERRY);
+    add!("plant_bush_dead",      PLANT_BUSH_DEAD);
+    add!("plant_wheat_field",    PLANT_WHEAT_FIELD);
+    add!("plant_flowers_red",    PLANT_FLOWERS_RED);
+    add!("plant_flowers_yellow", PLANT_FLOWERS_YELLOW);
+    add!("plant_flowers_purple", PLANT_FLOWERS_PURPLE);
+    add!("plant_mushroom_red",   PLANT_MUSHROOM_RED);
+    add!("plant_mushroom_brown", PLANT_MUSHROOM_BROWN);
+    add!("plant_cactus",         PLANT_CACTUS);
+    add!("plant_pumpkin",        PLANT_PUMPKIN);
+    add!("plant_sapling",        PLANT_SAPLING);
+    add!("plant_lily_pad",       PLANT_LILY_PAD);
+    add!("plant_cattails",       PLANT_CATTAILS);
 
     // --- Items (12) ---
     add!("item_stone_axe",   ITEM_STONE_AXE);

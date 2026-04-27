@@ -274,12 +274,16 @@ pub fn goal_update_system(
             member.faction_id != SOLO && registry.food_stock(member.faction_id) >= 1.0;
         let is_starving = needs.hunger > 120.0 && agent.total_food() == 0;
 
-        let has_build_site = member.faction_id != SOLO
-            && auto_build.0
+        let has_build_site = auto_build.0
             && bp_map.0.values().any(|&bp_e| {
                 bp_query
                     .get(bp_e)
-                    .map(|bp| bp.faction_id == member.faction_id)
+                    .map(|bp| {
+                        bp.personal_owner == Some(entity)
+                            || (member.faction_id != SOLO
+                                && bp.faction_id == member.faction_id
+                                && bp.personal_owner.is_none())
+                    })
                     .unwrap_or(false)
             });
 

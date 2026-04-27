@@ -11,6 +11,7 @@ use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
+use ahash::AHashSet;
 use bevy::prelude::*;
 use rand::Rng;
 
@@ -28,6 +29,7 @@ pub fn movement_system(
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
     spatial_index: Res<SpatialIndex>,
+    mut claimed_this_tick: Local<AHashSet<(i32, i32, i32)>>,
     mut query: Query<(
         Entity,
         &mut Transform,
@@ -40,6 +42,8 @@ pub fn movement_system(
     let dt = time.delta_secs();
     let speed = clock.speed;
     let sim_dt = dt * clock.scale_factor();
+
+    claimed_this_tick.clear();
 
     // Movement can't be fully parallel because it writes Transform (position sync)
     // and can read ChunkMap for passability. Run sequentially.
@@ -63,14 +67,17 @@ pub fn movement_system(
                 continue;
             }
 
-            // Interaction tasks: switch to Working when ≤1 tile (Chebyshev) from dest_tile.
+            // Interaction tasks: switch to Working when ≤1 tile (Chebyshev) from dest_tile
+            // and within the correct Z range (same level or one above — agents can reach
+            // down but not up through a ceiling).
             if ai.state == AiState::Seeking && task_interacts_from_adjacent(ai.task_id) {
                 let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
                 let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
                 let cheb = (cur_tx - ai.dest_tile.0 as i32)
                     .abs()
                     .max((cur_ty - ai.dest_tile.1 as i32).abs());
-                if cheb <= 1 {
+                let dz = ai.current_z as i32 - ai.target_z as i32;
+                if cheb <= 1 && (0..=1).contains(&dz) {
                     ai.state = AiState::Working;
                     continue;
                 }
@@ -82,18 +89,63 @@ pub fn movement_system(
             let new_pos = pos + step;
             transform.translation.x = new_pos.x;
             transform.translation.y = new_pos.y;
+
+            // Eagerly sync current_z when crossing a tile boundary so that
+            // update_entity_z_visibility_system (entity_z == surf_z) never
+            // sees a stale Z during the transit window.
+            let prev_tx = (pos.x / TILE_SIZE).floor() as i32;
+            let prev_ty = (pos.y / TILE_SIZE).floor() as i32;
+            let new_tx = (new_pos.x / TILE_SIZE).floor() as i32;
+            let new_ty = (new_pos.y / TILE_SIZE).floor() as i32;
+            if new_tx != prev_tx || new_ty != prev_ty {
+                let cz = ai.current_z as i32;
+                ai.current_z = (if chunk_map.passable_at(new_tx, new_ty, cz) {
+                    cz
+                } else if chunk_map.passable_at(new_tx, new_ty, cz + 1) {
+                    cz + 1
+                } else if chunk_map.passable_at(new_tx, new_ty, cz - 1) {
+                    cz - 1
+                } else {
+                    chunk_map.surface_z_at(new_tx, new_ty)
+                }) as i8;
+            }
         } else {
             // Arrived at target
             transform.translation.x = target_world.x;
             transform.translation.y = target_world.y;
+
+            // Update foot Z: prefer staying at current_z; otherwise step ±1
+            // (e.g. crossing a ramp). Falls back to surface_z if neither
+            // works (agent is on a surface tile that just changed).
+            let arrived_tx = (target_world.x / TILE_SIZE).floor() as i32;
+            let arrived_ty = (target_world.y / TILE_SIZE).floor() as i32;
+            let cz = ai.current_z as i32;
+            let new_z = if chunk_map.passable_at(arrived_tx, arrived_ty, cz) {
+                cz
+            } else if chunk_map.passable_at(arrived_tx, arrived_ty, cz + 1) {
+                cz + 1
+            } else if chunk_map.passable_at(arrived_tx, arrived_ty, cz - 1) {
+                cz - 1
+            } else {
+                chunk_map.surface_z_at(arrived_tx, arrived_ty)
+            };
+            ai.current_z = new_z as i8;
 
             match ai.state {
                 AiState::Seeking => {
                     // Arrived at task target — start working, unless another agent is here.
                     let tx = (target_world.x / TILE_SIZE).floor() as i32;
                     let ty = (target_world.y / TILE_SIZE).floor() as i32;
-                    let tz = chunk_map.surface_z_at(tx, ty);
-                    if spatial_index.agent_count(tx, ty, tz) > 1 {
+                    let cz = ai.current_z as i32;
+
+                    // Was this agent already here at the start of the frame?
+                    // (prevents self-nudging from the static spatial index)
+                    let was_here = (pos.x / TILE_SIZE).floor() as i32 == tx
+                        && (pos.y / TILE_SIZE).floor() as i32 == ty;
+                    let already_taken = claimed_this_tick.contains(&(tx, ty, cz));
+                    let count_limit = if was_here { 1 } else { 0 };
+
+                    if already_taken || spatial_index.agent_count(tx, ty, cz) > count_limit {
                         // Nudge to an adjacent free tile and stay Seeking.
                         let dirs: [(i32, i32); 8] = [
                             (-1, 0),
@@ -111,13 +163,20 @@ pub fn movement_system(
                         for i in 0..8usize {
                             let (dx, dy) = dirs[(start + i) % 8];
                             let (ntx, nty) = (tx + dx, ty + dy);
-                            if chunk_map.passable_step(tx, ty, ntx, nty) {
-                                let ntz = chunk_map.surface_z_at(ntx, nty);
-                                if !spatial_index.agent_occupied(ntx, nty, ntz) {
+                            // Try same-Z, then Z+1 (ramp up), then Z-1 (ramp down).
+                            for &dz in &[0, 1, -1] {
+                                let ntz = cz + dz;
+                                if chunk_map.passable_step_3d((tx, ty, cz), (ntx, nty, ntz))
+                                    && !spatial_index.agent_occupied(ntx, nty, ntz)
+                                    && !claimed_this_tick.contains(&(ntx, nty, ntz))
+                                {
                                     ai.target_tile = (ntx as i16, nty as i16);
                                     bumped = true;
                                     break;
                                 }
+                            }
+                            if bumped {
+                                break;
                             }
                         }
                         if !bumped {
@@ -125,6 +184,7 @@ pub fn movement_system(
                         }
                         // else: stays Seeking toward the adjacent tile
                     } else {
+                        claimed_this_tick.insert((tx, ty, cz));
                         ai.state = AiState::Working;
                     }
                 }
@@ -143,6 +203,7 @@ pub fn movement_system(
 
                         let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
                         let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
+                        let cur_z = ai.current_z as i32;
 
                         let mut rng = rand::thread_rng();
                         let dirs: [(i32, i32); 8] = [
@@ -155,23 +216,25 @@ pub fn movement_system(
                             (-1, 1),
                             (1, 1),
                         ];
-                        // Try random adjacent tile
                         let candidates: Vec<_> = dirs.iter().collect();
-                        // Shuffle by picking random start index
                         let start = rng.gen_range(0..8);
                         let (left, right) = candidates.split_at(start);
                         let shuffled: Vec<_> = right.iter().chain(left.iter()).collect();
 
-                        for &&(dx, dy) in &shuffled {
+                        'outer: for &&(dx, dy) in &shuffled {
                             let ntx = cur_tx + dx;
                             let nty = cur_ty + dy;
-                            let ntz = chunk_map.surface_z_at(ntx, nty);
-                            if chunk_map.passable_step(cur_tx, cur_ty, ntx, nty)
-                                && !spatial_index.agent_occupied(ntx, nty, ntz)
-                            {
-                                ai.target_tile = (ntx as i16, nty as i16);
-                                ai.dest_tile = ai.target_tile;
-                                break;
+                            for &dz in &[0, 1, -1] {
+                                let ntz = cur_z + dz;
+                                if chunk_map.passable_step_3d(
+                                    (cur_tx, cur_ty, cur_z),
+                                    (ntx, nty, ntz),
+                                ) && !spatial_index.agent_occupied(ntx, nty, ntz)
+                                {
+                                    ai.target_tile = (ntx as i16, nty as i16);
+                                    ai.dest_tile = ai.target_tile;
+                                    break 'outer;
+                                }
                             }
                         }
                     }
@@ -194,9 +257,12 @@ pub fn movement_system(
                     if cur_chunk == dest_chunk {
                         ai.state = AiState::Seeking;
                         ai.target_tile = ai.dest_tile;
-                    } else if let Some(next_wp) =
-                        chunk_graph.next_waypoint(cur_chunk, dest_chunk, &chunk_map)
-                    {
+                    } else if let Some(next_wp) = chunk_graph.next_waypoint(
+                        cur_chunk,
+                        dest_chunk,
+                        ai.current_z,
+                        &chunk_map,
+                    ) {
                         ai.target_tile = next_wp;
                     } else {
                         // No route found — try to head toward destination anyway
@@ -218,6 +284,7 @@ pub fn update_spatial_index_system(
             &Transform,
             Option<&Health>,
             Option<&Body>,
+            Option<&PersonAI>,
             Has<Person>,
             Has<Wolf>,
             Has<Deer>,
@@ -234,7 +301,7 @@ pub fn update_spatial_index_system(
 ) {
     index.map.clear();
     index.agent_counts.clear();
-    for (entity, transform, health, body, is_person, is_wolf, is_deer) in &query {
+    for (entity, transform, health, body, person_ai, is_person, is_wolf, is_deer) in &query {
         let is_dead = health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead());
         if is_dead {
             continue;
@@ -245,7 +312,12 @@ pub fn update_spatial_index_system(
         index.insert(tx, ty, entity);
 
         if is_person || is_wolf || is_deer {
-            let tz = chunk_map.surface_z_at(tx, ty);
+            // Persons track their own Z (may be in a tunnel below surface);
+            // animals always live at surface_z.
+            let tz = match person_ai {
+                Some(ai) if is_person => ai.current_z as i32,
+                _ => chunk_map.surface_z_at(tx, ty),
+            };
             *index.agent_counts.entry((tx, ty, tz)).or_insert(0) += 1;
         }
     }

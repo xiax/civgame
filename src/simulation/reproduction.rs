@@ -1,3 +1,4 @@
+use crate::world::seasons::TICKS_PER_SEASON;
 use super::combat::{Body, CombatTarget, CombatCooldown};
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::{AgentGoal, Personality};
@@ -8,7 +9,7 @@ use super::mood::Mood;
 use super::movement::MovementState;
 use super::needs::Needs;
 use super::neural::UtilityNet;
-use super::person::{AiState, Person, PersonAI, Profession, SkinTone, HairColor};
+use super::person::{AiState, Person, PersonAI, Profession, SkinTone, HairColor, generate_person_name};
 use super::plan::{KnownPlans, PlanScoringMethod};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
@@ -45,7 +46,7 @@ impl BiologicalSex {
 const REPRODUCE_FEMALE_THRESHOLD: u8 = 180;
 const REPRODUCE_MALE_THRESHOLD: u8 = 150;
 const BIRTH_CHANCE: u32 = 5; // out of 10,000 per tick
-const BIRTH_COOLDOWN_TICKS: u32 = 324_000; // 90 in-game days
+const BIRTH_COOLDOWN_TICKS: u32 = TICKS_PER_SEASON * 3; // 3 seasons
 
 /// Eligible males this tick: entity → faction_id. Updated by collect_male_candidates.
 #[derive(Resource, Default)]
@@ -86,6 +87,7 @@ pub fn reproduction_system(
     candidates: Res<MaleCandidates>,
     mut clock: ResMut<SimClock>,
     mut registry: ResMut<FactionRegistry>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
     father_net_query: Query<Option<&UtilityNet>>,
     mut query: Query<(
         Entity,
@@ -185,6 +187,7 @@ pub fn reproduction_system(
         let world_pos = tile_to_world(tx, ty);
 
         registry.add_member(faction_id);
+        let sex = BiologicalSex::random();
 
         commands.spawn((
             (
@@ -206,6 +209,8 @@ pub fn reproduction_system(
                     last_plan_id: PersonAI::UNEMPLOYED,
                     last_goal_eval_tick: 0,
                     target_entity: None,
+                    current_z: chunk_map.surface_z_at(tx, ty) as i8,
+                    target_z: chunk_map.surface_z_at(tx, ty) as i8,
                 },
                 EconomicAgent::default(),
             ),
@@ -213,7 +218,7 @@ pub fn reproduction_system(
                 LodLevel::Full,
                 BucketSlot(new_slot),
                 MovementState { wander_timer: 0.0 },
-                BiologicalSex::random(),
+                sex,
                 SkinTone::random(),
                 HairColor::random(),
                 Personality::random(),
@@ -235,6 +240,7 @@ pub fn reproduction_system(
                 child_net,
                 KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 8]),
                 PlanScoringMethod::UtilityNN,
+                Name::new(generate_person_name(sex)),
             ),
         ));
     }

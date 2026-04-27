@@ -46,6 +46,15 @@ impl Good {
         matches!(self, Good::Fruit | Good::Meat | Good::Grain)
     }
 
+    pub fn nutrition(self) -> u8 {
+        match self {
+            Good::Fruit => 85,
+            Good::Grain => 150,
+            Good::Meat => 255,
+            _ => 0,
+        }
+    }
+
     pub fn all() -> [Good; GOOD_COUNT] {
         [
             Good::Fruit,

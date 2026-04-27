@@ -3,6 +3,7 @@ use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::simulation::combat::BodyPart;
 use crate::simulation::lod::LodLevel;
+use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
@@ -86,12 +87,13 @@ pub fn spawn_or_merge_ground_item(
 pub fn item_pickup_system(
     mut commands: Commands,
     clock: Res<SimClock>,
-    item_query: Query<&GroundItem>,
+    mut item_query: Query<&mut GroundItem>,
     mut pickers: Query<
         (
             Entity,
             &mut PersonAI,
             &mut EconomicAgent,
+            &Needs,
             &mut TargetItem,
             &BucketSlot,
             &LodLevel,
@@ -101,8 +103,17 @@ pub fn item_pickup_system(
         With<Person>,
     >,
 ) {
-    for (_entity, mut ai, mut agent, mut target_item, slot, lod, mut active_plan_opt, transform) in
-        pickers.iter_mut()
+    for (
+        _entity,
+        mut ai,
+        mut agent,
+        needs,
+        mut target_item,
+        slot,
+        lod,
+        mut active_plan_opt,
+        transform,
+    ) in pickers.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
@@ -119,20 +130,39 @@ pub fn item_pickup_system(
             continue;
         };
 
-        if let Ok(item) = item_query.get(target_ent) {
+        if let Ok(mut item) = item_query.get_mut(target_ent) {
             // Check if we are at the target
             let tx = (transform.translation.x / TILE_SIZE).floor() as i16;
             let ty = (transform.translation.y / TILE_SIZE).floor() as i16;
 
             if ai.target_tile == (tx, ty) {
-                // Intentional pickup
-                agent.add_good(item.item.good, item.qty);
+                // For edibles: take only enough to satisfy hunger so the agent
+                // doesn't grab a whole storage stack just to eat one bite.
+                // Non-edibles still take the full stack.
+                let take_qty = if item.item.good.is_edible() {
+                    let nutrition = item.item.good.nutrition();
+                    if nutrition == 0 {
+                        item.qty
+                    } else {
+                        let bites = ((needs.hunger / nutrition as f32).ceil() as u32).max(1);
+                        bites.min(item.qty)
+                    }
+                } else {
+                    item.qty
+                };
+
+                agent.add_good(item.item.good, take_qty);
 
                 if let Some(ref mut plan) = active_plan_opt {
-                    plan.reward_acc += item.qty as f32 * plan.reward_scale;
+                    plan.reward_acc += take_qty as f32 * plan.reward_scale;
                 }
 
-                commands.entity(target_ent).despawn();
+                if take_qty >= item.qty {
+                    commands.entity(target_ent).despawn();
+                } else {
+                    item.qty -= take_qty;
+                }
+
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;

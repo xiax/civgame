@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use crate::rendering::camera::CameraViewZ;
 use crate::rendering::color_map::{shaded_tile_color, z_bucket};
+use crate::rendering::fog::{apply_fog_to_material, FogMap, FogTileMaterials};
 use crate::simulation::construction::{Wall, WallMap};
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
@@ -53,7 +54,7 @@ pub struct TileChangedEvent {
     pub ty: i16,
 }
 
-const RENDERABLE_KINDS: &[TileKind] = &[
+pub const RENDERABLE_KINDS: &[TileKind] = &[
     TileKind::Grass,
     TileKind::Water,
     TileKind::Stone,
@@ -92,6 +93,8 @@ pub fn setup_tile_materials(
 pub fn spawn_chunk_sprites(
     commands: &mut Commands,
     tile_materials: &TileMaterials,
+    fog_tile_materials: &FogTileMaterials,
+    fog_map: &FogMap,
     sprite_index: &mut TileSpriteIndex,
     wall_map: &mut WallMap,
     chunk_map: &ChunkMap,
@@ -144,7 +147,7 @@ pub fn spawn_chunk_sprites(
             }
 
             // Compute the effective render Z and tile for this position
-            let (render_kind, render_z, visibility) = resolve_render_tile(
+            let (render_kind, render_z, base_vis) = resolve_render_tile(
                 chunk_map,
                 gen,
                 globe,
@@ -154,11 +157,24 @@ pub fn spawn_chunk_sprites(
                 camera_view_z,
             );
 
+            let mut initial_mat =
+                MeshMaterial2d(tile_materials.handle_for(render_kind, render_z));
+            let visibility = apply_fog_to_material(
+                fog_map,
+                tile_pos,
+                base_vis,
+                render_kind,
+                render_z,
+                tile_materials,
+                fog_tile_materials,
+                &mut initial_mat,
+            );
+
             let entity = commands
                 .spawn((
                     TileSprite,
                     Mesh2d(tile_materials.tile_mesh.clone()),
-                    MeshMaterial2d(tile_materials.handle_for(render_kind, render_z)),
+                    initial_mat,
                     Transform::from_xyz(wx, wy, 0.0),
                     GlobalTransform::default(),
                     visibility,
@@ -175,7 +191,7 @@ pub fn spawn_chunk_sprites(
 
 /// Determine what to render at a tile given the camera view Z.
 /// Returns (kind, z_for_shading, visibility).
-fn resolve_render_tile(
+pub fn resolve_render_tile(
     chunk_map: &ChunkMap,
     gen: &WorldGen,
     globe: &Globe,
@@ -230,7 +246,7 @@ pub fn spawn_chunk_plants(
                 TileKind::Farmland => {
                     let pct = h % 100;
                     let (kind, stage) = if pct < 5 {
-                        (PlantKind::FruitBush, initial_stage(h))
+                        (PlantKind::BerryBush, initial_stage(h))
                     } else if pct < 15 {
                         (PlantKind::Grain, initial_stage(h))
                     } else {
@@ -255,7 +271,7 @@ pub fn spawn_chunk_plants(
                             plant_sprite_index,
                             global_tx,
                             global_ty,
-                            PlantKind::FruitBush,
+                            PlantKind::BerryBush,
                             initial_stage(h),
                         );
                     } else if pct < 7 {
@@ -301,6 +317,8 @@ pub fn chunk_streaming_system(
     mut has_run: Local<bool>,
     mut commands: Commands,
     tile_materials: Res<TileMaterials>,
+    fog_tile_materials: Res<FogTileMaterials>,
+    fog_map: Res<FogMap>,
     mut sprite_index: ResMut<TileSpriteIndex>,
     mut wall_map: ResMut<WallMap>,
     mut chunk_map: ResMut<ChunkMap>,
@@ -352,6 +370,8 @@ pub fn chunk_streaming_system(
                 spawn_chunk_sprites(
                     &mut commands,
                     &tile_materials,
+                    &fog_tile_materials,
+                    &fog_map,
                     &mut sprite_index,
                     &mut wall_map,
                     &chunk_map,
@@ -432,6 +452,8 @@ pub fn refresh_changed_tiles_system(
     mut wall_map: ResMut<WallMap>,
     chunk_map: Res<ChunkMap>,
     tile_materials: Res<TileMaterials>,
+    fog_tile_materials: Res<FogTileMaterials>,
+    fog_map: Res<FogMap>,
     gen: Res<WorldGen>,
     globe: Res<Globe>,
     camera_view_z: Res<CameraViewZ>,
@@ -492,7 +514,7 @@ pub fn refresh_changed_tiles_system(
                 chunk_entities.push(new_entity);
             }
         } else {
-            let (render_kind, render_z, visibility) = resolve_render_tile(
+            let (render_kind, render_z, base_vis) = resolve_render_tile(
                 &chunk_map,
                 &gen,
                 &globe,
@@ -502,11 +524,24 @@ pub fn refresh_changed_tiles_system(
                 camera_view_z.0,
             );
 
+            let tile_pos = (tx, ty);
+            let mut mat = MeshMaterial2d(tile_materials.handle_for(render_kind, render_z));
+            let visibility = apply_fog_to_material(
+                &fog_map,
+                tile_pos,
+                base_vis,
+                render_kind,
+                render_z,
+                &tile_materials,
+                &fog_tile_materials,
+                &mut mat,
+            );
+
             let new_entity = commands
                 .spawn((
                     TileSprite,
                     Mesh2d(tile_materials.tile_mesh.clone()),
-                    MeshMaterial2d(tile_materials.handle_for(render_kind, render_z)),
+                    mat,
                     Transform::from_xyz(wx, wy, 0.0),
                     GlobalTransform::default(),
                     visibility,
@@ -528,6 +563,8 @@ pub fn update_tile_z_view_system(
     camera_view_z: Res<CameraViewZ>,
     chunk_map: Res<ChunkMap>,
     tile_materials: Res<TileMaterials>,
+    fog_tile_materials: Res<FogTileMaterials>,
+    fog_map: Res<FogMap>,
     gen: Res<WorldGen>,
     globe: Res<Globe>,
     sprite_index: Res<TileSpriteIndex>,
@@ -546,11 +583,20 @@ pub fn update_tile_z_view_system(
         };
 
         let surf_z = chunk_map.surface_z_at(tx as i32, ty as i32);
-        let (render_kind, render_z, new_vis) = resolve_render_tile(
+        let (render_kind, render_z, base_vis) = resolve_render_tile(
             &chunk_map, &gen, &globe, tx as i32, ty as i32, surf_z, view_z,
         );
 
-        material.0 = tile_materials.handle_for(render_kind, render_z);
+        let new_vis = apply_fog_to_material(
+            &fog_map,
+            (tx, ty),
+            base_vis,
+            render_kind,
+            render_z,
+            &tile_materials,
+            &fog_tile_materials,
+            &mut material,
+        );
         *vis = new_vis;
     }
 

@@ -1,6 +1,7 @@
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
+use crate::simulation::carve::{carve_tile, STONE_PER_BLOCK};
 use crate::simulation::construction::WallMap;
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::goals::AgentGoal;
@@ -16,8 +17,8 @@ use crate::simulation::tasks::TaskKind;
 use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::chunk_streaming::TileChangedEvent;
-use crate::world::terrain::tile_to_world;
-use crate::world::tile::{TileData, TileKind};
+use crate::world::terrain::{tile_to_world, TILE_SIZE};
+use crate::world::tile::TileKind;
 use bevy::prelude::*;
 
 // ── Stone tile harvest profile ────────────────────────────────────────────────
@@ -56,6 +57,7 @@ pub fn gather_system(
         &mut Skills,
         &BucketSlot,
         &LodLevel,
+        &Transform,
         Option<&mut AgentMemory>,
         Option<&mut ActivePlan>,
         Option<&FactionMember>,
@@ -68,6 +70,7 @@ pub fn gather_system(
         mut skills,
         slot,
         lod,
+        transform,
         mut memory_opt,
         mut plan_opt,
         faction_member,
@@ -108,7 +111,7 @@ pub fn gather_system(
             if plant.stage != GrowthStage::Mature {
                 if let Some(ref mut mem) = memory_opt {
                     let kind = match plant.kind {
-                        PlantKind::FruitBush | PlantKind::Grain => MemoryKind::Food,
+                        PlantKind::BerryBush | PlantKind::Grain => MemoryKind::Food,
                         PlantKind::Tree => MemoryKind::Wood,
                     };
                     mem.forget((tx as i16, ty as i16), kind);
@@ -178,37 +181,37 @@ pub fn gather_system(
             let tile_kind = chunk_map.tile_kind_at(tx, ty);
 
             if tile_kind == Some(TileKind::Wall) {
-                // ── Wall mining: remove constructed or natural wall → Dirt ────
+                // ── Wall mining: open the target column at the agent's foot Z.
+                // For a tunnel into a hillside, this carves the headspace tile
+                // and reveals the floor below. For a flat Wall on flat ground,
+                // it just converts Wall → Dirt with no headspace change.
                 if ai.work_progress < STONE.work_ticks {
                     continue;
                 }
                 ai.work_progress = 0;
 
-                let surf_z = chunk_map.surface_z_at(tx, ty);
-                agent.add_good(Good::Stone, STONE.base_yield_qty);
+                let target_floor_z = ai.current_z as i32;
+
+                let blocks =
+                    carve_tile(&mut chunk_map, tx, ty, target_floor_z, &mut tile_changed);
+                let stone_yield = (blocks * STONE_PER_BLOCK).max(STONE.base_yield_qty);
+                agent.add_good(Good::Stone, stone_yield);
                 skills.gain_xp(SkillKind::Mining, STONE.xp);
 
-                chunk_map.set_tile(
-                    tx,
-                    ty,
-                    surf_z,
-                    TileData {
-                        kind: TileKind::Dirt,
-                        elevation: 0,
-                        fertility: 0,
-                        flags: 0,
-                    },
-                );
-                if let Some(wall_entity) = wall_map.0.remove(&ai.target_tile) {
-                    commands.entity(wall_entity).despawn_recursive();
+                // Despawn the Wall entity only if the column no longer has
+                // any solid tile at or above the carved Z (i.e. the visible
+                // wall is fully gone). For now: if surface_z dropped below
+                // the carved head, the wall column is open; otherwise rock
+                // remains above as ceiling and we keep the Wall entity in
+                // its place visually until rendering rework in Phase 6.
+                if chunk_map.surface_z_at(tx, ty) < target_floor_z + 1 {
+                    if let Some(wall_entity) = wall_map.0.remove(&ai.target_tile) {
+                        commands.entity(wall_entity).despawn_recursive();
+                    }
                 }
-                tile_changed.send(TileChangedEvent {
-                    tx: ai.target_tile.0,
-                    ty: ai.target_tile.1,
-                });
 
                 if let Some(ref mut plan) = plan_opt {
-                    plan.reward_acc += STONE.base_yield_qty as f32 * 0.3;
+                    plan.reward_acc += stone_yield as f32 * 0.3;
                 }
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
@@ -220,10 +223,14 @@ pub fn gather_system(
                 }
                 ai.work_progress = 0;
 
-                let surf_z = chunk_map.surface_z_at(tx, ty);
+                let target_floor_z = ai.current_z as i32;
+
                 let (_, _, stone_mul) =
                     faction_muls(&mut faction_registry, faction_id, ActivityKind::StoneMining);
-                let qty = (STONE.base_yield_qty as f32 * stone_mul).round().max(1.0) as u32;
+                let blocks =
+                    carve_tile(&mut chunk_map, tx, ty, target_floor_z, &mut tile_changed);
+                let base = (blocks * STONE_PER_BLOCK).max(STONE.base_yield_qty);
+                let qty = (base as f32 * stone_mul).round().max(1.0) as u32;
                 agent.add_good(Good::Stone, qty);
 
                 for &(good, bonus_qty, chance) in STONE.bonus_yields {
@@ -245,22 +252,6 @@ pub fn gather_system(
                 }
 
                 skills.gain_xp(SkillKind::Mining, STONE.xp);
-
-                chunk_map.set_tile(
-                    tx,
-                    ty,
-                    surf_z,
-                    TileData {
-                        kind: TileKind::Dirt,
-                        elevation: 0,
-                        fertility: 0,
-                        flags: 0,
-                    },
-                );
-                tile_changed.send(TileChangedEvent {
-                    tx: ai.target_tile.0,
-                    ty: ai.target_tile.1,
-                });
 
                 if let Some(ref mut mem) = memory_opt {
                     mem.record((tx as i16, ty as i16), MemoryKind::Stone);

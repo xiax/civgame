@@ -75,6 +75,34 @@ impl Chunk {
             .copied()
     }
 
+    /// Tile lookup at arbitrary Z using deltas + surface caches only.
+    /// Doesn't consult procedural cave noise — uncarved underground reads as
+    /// solid Wall. Use `terrain::tile_at_3d` if you need procgen-aware reads.
+    pub fn tile_at_local(&self, lx: usize, ly: usize, z: i32) -> TileData {
+        let z_local = (z - Z_MIN) as usize;
+        if let Some(d) = self.delta(lx, ly, z_local) {
+            return d;
+        }
+        let surf_z = self.surface_z[ly][lx] as i32;
+        if z > surf_z {
+            TileData {
+                kind: TileKind::Air,
+                ..Default::default()
+            }
+        } else if z == surf_z {
+            TileData {
+                kind: self.surface_kind[ly][lx],
+                fertility: self.surface_fertility[ly][lx],
+                ..Default::default()
+            }
+        } else {
+            TileData {
+                kind: TileKind::Wall,
+                ..Default::default()
+            }
+        }
+    }
+
     /// Effective surface tile kind: delta overrides the procedural cache.
     pub fn surface_tile_kind(&self, lx: usize, ly: usize) -> TileKind {
         let surf_z = self.surface_z[ly][lx] as i32;
@@ -180,20 +208,57 @@ impl ChunkMap {
         }
     }
 
-    /// Height-aware passability: target tile passable AND |Δz| ≤ 1.
-    pub fn passable_step(&self, tx: i32, ty: i32, ntx: i32, nty: i32) -> bool {
-        let src_z = self.surface_z_at(tx, ty);
-        let dst_z = self.surface_z_at(ntx, nty);
-        if src_z < Z_MIN || dst_z < Z_MIN {
+    /// Tile lookup at world (tx, ty, tz) using deltas + surface caches.
+    /// Returns Wall if the chunk is unloaded (treat-as-solid for safety).
+    pub fn tile_at(&self, tile_x: i32, tile_y: i32, tz: i32) -> TileData {
+        let (coord, lx, ly) = Self::coord_and_local(tile_x, tile_y);
+        match self.0.get(&coord) {
+            Some(c) => c.tile_at_local(lx, ly, tz),
+            None => TileData {
+                kind: TileKind::Wall,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Is (tx, ty, tz) a tile an agent can stand on (foot-Z convention)?
+    /// The tile at z must be a passable surface (Grass/Dirt/Ramp/etc.)
+    /// AND the tile at z+1 must be empty headspace (Air or Ramp).
+    pub fn passable_at(&self, tile_x: i32, tile_y: i32, tz: i32) -> bool {
+        if tz < Z_MIN || tz > Z_MAX {
             return false;
         }
-        let dz = dst_z - src_z;
-        if dz > 1 || dz < -1 {
+        let here = self.tile_at(tile_x, tile_y, tz);
+        if !here.kind.is_passable() {
             return false;
         }
-        self.tile_kind_at(ntx, nty)
-            .map(|k| k.is_passable())
-            .unwrap_or(false)
+        let head = self.tile_at(tile_x, tile_y, tz + 1);
+        matches!(head.kind, TileKind::Air | TileKind::Ramp)
+    }
+
+    /// 3D step passability for an agent moving from (sx,sy,sz) to (dx,dy,dz).
+    /// 8-connected in XY, |Δz| ≤ 1. Both endpoints must be standable.
+    pub fn passable_step_3d(
+        &self,
+        from: (i32, i32, i32),
+        to: (i32, i32, i32),
+    ) -> bool {
+        let (sx, sy, sz) = from;
+        let (dx, dy, dz) = to;
+        let ddx = dx - sx;
+        let ddy = dy - sy;
+        let ddz = dz - sz;
+        if ddx.abs() > 1 || ddy.abs() > 1 || ddz.abs() > 1 {
+            return false;
+        }
+        if ddx == 0 && ddy == 0 && ddz == 0 {
+            return false;
+        }
+        // Source sanity (skip when source is in unloaded chunk).
+        if sz < Z_MIN || sz > Z_MAX {
+            return false;
+        }
+        self.passable_at(dx, dy, dz)
     }
 
     /// Surface fertility at (tx, ty). Returns 0 if chunk not loaded.
@@ -271,5 +336,125 @@ mod tests {
     #[test]
     fn z_constants_valid() {
         assert_eq!(Z_MAX - Z_MIN + 1, CHUNK_HEIGHT as i32);
+    }
+
+    fn make_map_with_chunk(surf_z: i8) -> ChunkMap {
+        let mut map = ChunkMap::default();
+        map.0.insert(ChunkCoord(0, 0), make_chunk(surf_z));
+        map
+    }
+
+    #[test]
+    fn passable_at_surface_grass() {
+        // Grass surface at z=0, headspace at z=1 is implicitly Air (z>surface).
+        let map = make_map_with_chunk(0);
+        assert!(map.passable_at(5, 5, 0));
+    }
+
+    #[test]
+    fn passable_at_solid_rock_rejects() {
+        // Hill column with surface=5; below the surface, every Z is Wall.
+        // Trying to stand at z=2 inside untunneled rock: foot=Wall (not passable).
+        let map = make_map_with_chunk(5);
+        assert!(!map.passable_at(5, 5, 2));
+    }
+
+    #[test]
+    fn passable_at_carved_tunnel() {
+        // Hill surface=5. Carve a tunnel cell at (x, y, 0):
+        //   z=0 = Dirt (floor), z=1 = Air (headspace).
+        let mut map = make_map_with_chunk(5);
+        map.set_tile(
+            5,
+            5,
+            1,
+            TileData {
+                kind: TileKind::Air,
+                ..Default::default()
+            },
+        );
+        map.set_tile(
+            5,
+            5,
+            0,
+            TileData {
+                kind: TileKind::Dirt,
+                ..Default::default()
+            },
+        );
+        assert!(map.passable_at(5, 5, 0));
+    }
+
+    #[test]
+    fn passable_at_no_headspace_rejects() {
+        // Floor at z=0 (Dirt) but headspace z=1 is solid Wall — agent can't fit.
+        let mut map = make_map_with_chunk(5);
+        map.set_tile(
+            5,
+            5,
+            0,
+            TileData {
+                kind: TileKind::Dirt,
+                ..Default::default()
+            },
+        );
+        // z=1 stays Wall (since surface=5, z=1 < surface defaults to Wall).
+        assert!(!map.passable_at(5, 5, 0));
+    }
+
+    #[test]
+    fn passable_step_3d_rejects_dz_without_ramp() {
+        let map = make_map_with_chunk(0);
+        // Surface tiles at z=0; stepping diagonally to z=1 with no ramp at either end.
+        assert!(!map.passable_step_3d((5, 5, 0), (5, 6, 1)));
+    }
+
+    #[test]
+    fn passable_step_3d_accepts_with_ramp() {
+        let mut map = make_map_with_chunk(0);
+        // Make (5, 6) a Ramp surface at z=1; headspace z=2 is implicit Air.
+        map.set_tile(
+            5,
+            6,
+            1,
+            TileData {
+                kind: TileKind::Ramp,
+                ..Default::default()
+            },
+        );
+        assert!(map.passable_step_3d((5, 5, 0), (5, 6, 1)));
+    }
+
+    #[test]
+    fn carve_below_surface_preserves_surface_z() {
+        let mut map = make_map_with_chunk(5);
+        let surf_before = map.surface_z_at(5, 5);
+        assert_eq!(surf_before, 5);
+        // Carve at z=2 (below surface) — should NOT lower surface_z.
+        map.set_tile(
+            5,
+            5,
+            2,
+            TileData {
+                kind: TileKind::Air,
+                ..Default::default()
+            },
+        );
+        assert_eq!(map.surface_z_at(5, 5), 5);
+    }
+
+    #[test]
+    fn carve_at_surface_lowers_surface_z() {
+        let mut map = make_map_with_chunk(5);
+        map.set_tile(
+            5,
+            5,
+            5,
+            TileData {
+                kind: TileKind::Air,
+                ..Default::default()
+            },
+        );
+        assert_eq!(map.surface_z_at(5, 5), 4);
     }
 }

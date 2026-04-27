@@ -1,4 +1,4 @@
-use super::construction::Bed;
+use super::construction::{Bed, HomeBed};
 use super::faction::{FactionMember, FactionRegistry, StorageTileMap, SOLO};
 use super::goals::AgentGoal;
 use super::items::GroundItem;
@@ -6,7 +6,7 @@ use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::needs::Needs;
 use super::person::PlayerOrder;
-use super::person::{AiState, Person, PersonAI};
+use super::person::{AiState, PersonAI};
 use super::plan::ActivePlan;
 use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
 use super::reproduction::BiologicalSex;
@@ -242,7 +242,9 @@ pub fn assign_task_with_routing(
     if dest_chunk == cur_chunk {
         ai.state = AiState::Seeking;
         ai.target_tile = target;
-    } else if let Some(wp) = chunk_graph.next_waypoint(cur_chunk, dest_chunk, chunk_map) {
+    } else if let Some(wp) =
+        chunk_graph.next_waypoint(cur_chunk, dest_chunk, ai.current_z, chunk_map)
+    {
         ai.state = AiState::Routing;
         ai.target_tile = wp;
     } else {
@@ -297,8 +299,7 @@ pub fn goal_dispatch_system(
     faction_registry: Res<FactionRegistry>,
     storage_tile_map: Res<StorageTileMap>,
     sex_query: Query<(&BiologicalSex, &FactionMember)>,
-    bed_query: Query<(), With<Bed>>,
-    person_marker_query: Query<(), With<Person>>,
+    bed_query: Query<&Transform, With<Bed>>,
     mut query: Query<
         (
             Entity,
@@ -312,12 +313,26 @@ pub fn goal_dispatch_system(
             &LodLevel,
             Option<&RelationshipMemory>,
             Option<&ActivePlan>,
+            Option<&HomeBed>,
         ),
         Without<PlayerOrder>,
     >,
 ) {
     query.par_iter_mut().for_each(
-        |(entity, mut ai, agent, needs, goal, member, sex, transform, lod, rel_opt, plan_opt)| {
+        |(
+            entity,
+            mut ai,
+            agent,
+            needs,
+            goal,
+            member,
+            sex,
+            transform,
+            lod,
+            rel_opt,
+            plan_opt,
+            home_bed_opt,
+        )| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -523,6 +538,27 @@ pub fn goal_dispatch_system(
                         return;
                     }
 
+                    // 1) Persistent claim: route to my own bed if it still exists.
+                    if let Some(bed_entity) = home_bed_opt.and_then(|h| h.0) {
+                        if let Ok(bed_transform) = bed_query.get(bed_entity) {
+                            let btx = (bed_transform.translation.x / TILE_SIZE).floor() as i16;
+                            let bty = (bed_transform.translation.y / TILE_SIZE).floor() as i16;
+                            assign_task_with_routing(
+                                &mut ai,
+                                cur_chunk,
+                                (btx, bty),
+                                TaskKind::Sleep,
+                                Some(bed_entity),
+                                &chunk_graph,
+                                &chunk_map,
+                            );
+                            return;
+                        }
+                    }
+
+                    // 2) No claim yet (or stale): head toward faction home so the
+                    //    next assign_beds_system pass can pair us with a free bed.
+                    //    Sleep on the ground there until that happens.
                     let home_opt = if member.faction_id != SOLO {
                         faction_registry.home_tile(member.faction_id)
                     } else {
@@ -532,9 +568,7 @@ pub fn goal_dispatch_system(
                     if let Some(home) = home_opt {
                         let dx = cur_tx - home.0 as i32;
                         let dy = cur_ty - home.1 as i32;
-                        let dist_sq = dx * dx + dy * dy;
-                        if dist_sq > 15 * 15 {
-                            // Far from home, route to home first
+                        if dx * dx + dy * dy > 5 * 5 {
                             assign_task_with_routing(
                                 &mut ai,
                                 cur_chunk,
@@ -544,57 +578,13 @@ pub fn goal_dispatch_system(
                                 &chunk_graph,
                                 &chunk_map,
                             );
-                        } else {
-                            // Near home, search for an available bed
-                            let mut best_bed = None;
-                            let mut best_dist = i32::MAX;
-
-                            for dy in -10..=10 {
-                                for dx in -10..=10 {
-                                    let tx = cur_tx + dx;
-                                    let ty = cur_ty + dy;
-
-                                    for &nearby_entity in spatial.get(tx, ty) {
-                                        if bed_query.get(nearby_entity).is_ok() {
-                                            // Found a bed! Check if occupied by another person
-                                            let occupied = spatial.get(tx, ty).iter().any(|&e| {
-                                                e != entity && person_marker_query.get(e).is_ok()
-                                            });
-
-                                            if !occupied {
-                                                let dist = dx.abs() + dy.abs();
-                                                if dist < best_dist {
-                                                    best_dist = dist;
-                                                    best_bed =
-                                                        Some((nearby_entity, tx as i16, ty as i16));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if let Some((bed_entity, btx, bty)) = best_bed {
-                                assign_task_with_routing(
-                                    &mut ai,
-                                    cur_chunk,
-                                    (btx, bty),
-                                    TaskKind::Sleep,
-                                    Some(bed_entity),
-                                    &chunk_graph,
-                                    &chunk_map,
-                                );
-                            } else {
-                                // No available bed, just sleep here
-                                ai.state = AiState::Sleeping;
-                                ai.task_id = TaskKind::Sleep as u16;
-                            }
+                            return;
                         }
-                    } else {
-                        // Solo or no home, sleep where you are
-                        ai.state = AiState::Sleeping;
-                        ai.task_id = TaskKind::Sleep as u16;
                     }
+
+                    // Solo, no home, or already at home with no bed yet: sleep here.
+                    ai.state = AiState::Sleeping;
+                    ai.task_id = TaskKind::Sleep as u16;
                 }
 
                 AgentGoal::Survive => {

@@ -1,8 +1,8 @@
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
-use crate::simulation::faction::{FactionRegistry, FactionTechs, SOLO};
+use crate::simulation::faction::{FactionMember, FactionRegistry, FactionTechs, SOLO};
 use crate::simulation::lod::LodLevel;
-use crate::simulation::person::{AiState, PersonAI};
+use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
@@ -11,7 +11,7 @@ use crate::simulation::technology::{CITY_STATE_ORG, PERM_SETTLEMENT};
 use crate::world::chunk::ChunkMap;
 use crate::world::terrain::tile_to_world;
 use crate::world::tile::{TileData, TileKind};
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 pub const TICKS_BUILD_WALL: u8 = 60;
@@ -37,9 +37,18 @@ pub struct WallMap(pub AHashMap<(i16, i16), Entity>);
 #[derive(Resource, Default)]
 pub struct BlueprintMap(pub AHashMap<(i16, i16), Entity>);
 
-/// Marker placed on completed bed entities.
-#[derive(Component)]
-pub struct Bed;
+/// Placed on completed bed entities. `owner` is the person who has claimed
+/// this bed as theirs; cleared when the owner dies (`death_system`) and
+/// reassigned by `assign_beds_system`.
+#[derive(Component, Default)]
+pub struct Bed {
+    pub owner: Option<Entity>,
+}
+
+/// Persistent bed claim on a person. Inserted/updated by `assign_beds_system`.
+/// `None` means the person has no claim (e.g. faction has no beds yet).
+#[derive(Component, Default, Clone, Copy)]
+pub struct HomeBed(pub Option<Entity>);
 
 /// Marker placed on completed wall entities.
 #[derive(Component)]
@@ -52,11 +61,14 @@ pub enum BuildSiteKind {
     Bed,
 }
 
-/// A faction-reserved construction site. Agents converge on Blueprint entities
-/// to deposit wood and contribute build progress. Despawned when construction completes.
+/// A construction site. Agents converge on Blueprint entities to deposit wood
+/// and contribute build progress. Despawned when construction completes.
+/// `personal_owner`: if Some, only that agent builds this (personal commission);
+/// if None, any faction member with matching `faction_id` may contribute.
 #[derive(Component)]
 pub struct Blueprint {
     pub faction_id: u32,
+    pub personal_owner: Option<Entity>,
     pub kind: BuildSiteKind,
     pub tile: (i16, i16),
     pub wood_needed: u8,
@@ -318,6 +330,7 @@ fn plan_building(
                 .spawn((
                     Blueprint {
                         faction_id,
+                        personal_owner: None,
                         kind: BuildSiteKind::Wall,
                         tile,
                         wood_needed: WALL_WOOD_COST,
@@ -345,6 +358,7 @@ fn plan_building(
             .spawn((
                 Blueprint {
                     faction_id,
+                    personal_owner: None,
                     kind: BuildSiteKind::Bed,
                     tile,
                     wood_needed: BED_WOOD_COST,
@@ -479,12 +493,18 @@ pub fn faction_blueprint_system(
 
         match determine_phase(member_count, &techs) {
             ConstructionPhase::PrehistoricBand => {
+                // Cap beds at faction population so we never have more beds than people.
+                let beds_near = count_beds_near(&bed_map, home, 6);
+                if beds_near >= member_count as usize {
+                    continue;
+                }
                 if let Some(tile) = find_organic_bed_site(&chunk_map, &bed_map, &bp_map, home, 4) {
                     let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
                     let e = commands
                         .spawn((
                             Blueprint {
                                 faction_id,
+                                personal_owner: None,
                                 kind: BuildSiteKind::Bed,
                                 tile,
                                 wood_needed: BED_WOOD_COST,
@@ -503,9 +523,9 @@ pub fn faction_blueprint_system(
 
             ConstructionPhase::NeolithicVillage => {
                 let beds_near = count_beds_near(&bed_map, home, 20);
-                let beds_needed = (member_count as f32 * 0.8) as usize;
+                let beds_needed = member_count as usize;
 
-                if beds_near < beds_needed {
+                if beds_near + 1 <= beds_needed {
                     // Build a 3×3 hut: 8 walls + 1 bed.
                     if let Some(origin) =
                         find_building_origin(&chunk_map, &bed_map, &bp_map, home, 1, 1, 15)
@@ -535,6 +555,7 @@ pub fn faction_blueprint_system(
                             .spawn((
                                 Blueprint {
                                     faction_id,
+                                    personal_owner: None,
                                     kind: BuildSiteKind::Wall,
                                     tile,
                                     wood_needed: WALL_WOOD_COST,
@@ -555,9 +576,11 @@ pub fn faction_blueprint_system(
 
             ConstructionPhase::BronzeAgeTown => {
                 let beds_near = count_beds_near(&bed_map, home, 30);
-                let beds_needed = (member_count as f32 * 0.8) as usize;
+                let beds_needed = member_count as usize;
+                let room_for_longhouse = beds_near + 2 <= beds_needed;
+                let room_for_hut = beds_near + 1 <= beds_needed;
 
-                if beds_near < beds_needed {
+                if room_for_longhouse {
                     // Prefer a 5×3 longhouse (11 walls + 2 beds); fall back to 3×3 hut.
                     if let Some(origin) =
                         find_building_origin(&chunk_map, &bed_map, &bp_map, home, 2, 1, 20)
@@ -588,6 +611,23 @@ pub fn faction_blueprint_system(
                             &[(0, 0)],
                         );
                     }
+                } else if room_for_hut {
+                    // Only one bed slot left — pick a hut, never a longhouse.
+                    if let Some(origin) =
+                        find_building_origin(&chunk_map, &bed_map, &bp_map, home, 1, 1, 20)
+                    {
+                        plan_building(
+                            &mut commands,
+                            &mut bp_map,
+                            origin.0 as i32,
+                            origin.1 as i32,
+                            1,
+                            1,
+                            faction_id,
+                            home,
+                            &[(0, 0)],
+                        );
+                    }
                 } else if beds_near > 0 {
                     // Build a segment of the heavier outer wall (4-tile buffer).
                     let mut planned = 0;
@@ -601,6 +641,7 @@ pub fn faction_blueprint_system(
                             .spawn((
                                 Blueprint {
                                     faction_id,
+                                    personal_owner: None,
                                     kind: BuildSiteKind::Wall,
                                     tile,
                                     wood_needed: WALL_WOOD_COST,
@@ -746,7 +787,7 @@ pub fn construction_system(
                     let world_pos = tile_to_world(tx, ty);
                     let bed_entity = commands
                         .spawn((
-                            Bed,
+                            Bed::default(),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -795,6 +836,163 @@ pub fn construction_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.work_progress = 0;
+        }
+    }
+}
+
+/// Assigns each agent a personal bed (`HomeBed`) so they consistently sleep in
+/// the same place. Faction members are paired with the nearest unclaimed bed
+/// inside their faction territory. Solo agents first try to claim any unclaimed
+/// bed within 30 tiles; failing that, they place a personal bed blueprint at
+/// their current position so they can build one themselves.
+pub fn assign_beds_system(
+    mut commands: Commands,
+    mut bed_query: Query<&mut Bed>,
+    person_query: Query<(Entity, &FactionMember, &Transform, Option<&HomeBed>), With<Person>>,
+    bed_map: Res<BedMap>,
+    mut bp_map: ResMut<BlueprintMap>,
+    bp_query: Query<&Blueprint>,
+    faction_registry: Res<FactionRegistry>,
+    clock: Res<SimClock>,
+) {
+    if clock.tick % 30 != 0 {
+        return;
+    }
+
+    let mut claimed_this_pass: AHashSet<Entity> = AHashSet::new();
+
+    // ── Faction pass ─────────────────────────────────────────────────────────
+    let mut homeless_by_faction: AHashMap<u32, Vec<(Entity, (i32, i32))>> = AHashMap::new();
+    for (person, member, transform, home_bed) in &person_query {
+        if member.faction_id == SOLO {
+            continue;
+        }
+        let stale = match home_bed.and_then(|h| h.0) {
+            Some(bed_entity) => bed_query.get(bed_entity).is_err(),
+            None => true,
+        };
+        if !stale {
+            continue;
+        }
+        let x = (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;
+        let y = (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32;
+        homeless_by_faction
+            .entry(member.faction_id)
+            .or_default()
+            .push((person, (x, y)));
+    }
+
+    for (faction_id, homeless) in homeless_by_faction {
+        let Some(fd) = faction_registry.factions.get(&faction_id) else {
+            continue;
+        };
+        let home = fd.home_tile;
+        let mut available: Vec<(Entity, (i16, i16))> = bed_map
+            .0
+            .iter()
+            .filter(|(pos, _)| {
+                (pos.0 as i32 - home.0 as i32).abs() <= 30
+                    && (pos.1 as i32 - home.1 as i32).abs() <= 30
+            })
+            .filter_map(|(pos, &bed_entity)| {
+                if claimed_this_pass.contains(&bed_entity) {
+                    return None;
+                }
+                match bed_query.get(bed_entity) {
+                    Ok(b) if b.owner.is_none() => Some((bed_entity, *pos)),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        for (person, ppos) in homeless {
+            if available.is_empty() {
+                break;
+            }
+            let mut best_idx = 0;
+            let mut best_dist = i32::MAX;
+            for (i, (_, bpos)) in available.iter().enumerate() {
+                let d = (bpos.0 as i32 - ppos.0).abs() + (bpos.1 as i32 - ppos.1).abs();
+                if d < best_dist {
+                    best_dist = d;
+                    best_idx = i;
+                }
+            }
+            let (bed_e, _) = available.swap_remove(best_idx);
+            claimed_this_pass.insert(bed_e);
+            commands.entity(person).insert(HomeBed(Some(bed_e)));
+            if let Ok(mut bed_comp) = bed_query.get_mut(bed_e) {
+                bed_comp.owner = Some(person);
+            }
+        }
+    }
+
+    // ── Solo pass ─────────────────────────────────────────────────────────────
+    // Solo agents claim any nearby unclaimed bed, or place a personal blueprint.
+    for (person, member, transform, home_bed) in &person_query {
+        if member.faction_id != SOLO {
+            continue;
+        }
+        let stale = match home_bed.and_then(|h| h.0) {
+            Some(bed_entity) => bed_query.get(bed_entity).is_err(),
+            None => true,
+        };
+        if !stale {
+            continue;
+        }
+        let tx = (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i16;
+        let ty = (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i16;
+
+        // Try to claim the nearest unclaimed bed within 30 tiles.
+        let mut best_bed: Option<(Entity, i32)> = None;
+        for (&bpos, &bed_entity) in &bed_map.0 {
+            if claimed_this_pass.contains(&bed_entity) {
+                continue;
+            }
+            if bed_query.get(bed_entity).map(|b| b.owner.is_some()).unwrap_or(true) {
+                continue;
+            }
+            let d = (bpos.0 as i32 - tx as i32).abs() + (bpos.1 as i32 - ty as i32).abs();
+            if d <= 30 && best_bed.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best_bed = Some((bed_entity, d));
+            }
+        }
+
+        if let Some((bed_e, _)) = best_bed {
+            claimed_this_pass.insert(bed_e);
+            commands.entity(person).insert(HomeBed(Some(bed_e)));
+            if let Ok(mut bed_comp) = bed_query.get_mut(bed_e) {
+                bed_comp.owner = Some(person);
+            }
+        } else {
+            // No bed nearby — place a personal blueprint if none already exists.
+            let has_personal_bp = bp_map.0.iter().any(|(_, &bp_e)| {
+                bp_query
+                    .get(bp_e)
+                    .map(|bp| bp.personal_owner == Some(person))
+                    .unwrap_or(false)
+            });
+            if !has_personal_bp && !bp_map.0.contains_key(&(tx, ty)) {
+                let wp = tile_to_world(tx as i32, ty as i32);
+                let bp_e = commands
+                    .spawn((
+                        Blueprint {
+                            faction_id: SOLO,
+                            personal_owner: Some(person),
+                            kind: BuildSiteKind::Bed,
+                            tile: (tx, ty),
+                            wood_needed: BED_WOOD_COST,
+                            wood_deposited: 0,
+                            build_progress: 0,
+                        },
+                        Transform::from_xyz(wp.x, wp.y, 0.3),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id();
+                bp_map.0.insert((tx, ty), bp_e);
+            }
         }
     }
 }

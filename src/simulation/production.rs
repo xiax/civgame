@@ -19,7 +19,6 @@ use bevy::prelude::*;
 
 pub const TICKS_FARMER_PLANT: u8 = 40;
 
-const FOOD_NUTRITION: u8 = 255;
 /// `work_progress` units required before the Eat task consumes a food item.
 /// Movement's Working-state tick adds ~1 progress per active sim tick.
 const TICKS_EAT: u8 = 8;
@@ -218,19 +217,28 @@ pub fn eat_task_system(
             continue;
         }
 
-        // Time to consume.
-        let mut consumed_fruit = false;
-        for (it, q) in agent.inventory.iter_mut() {
-            if it.good.is_edible() && *q > 0 {
-                *q -= 1;
-                if it.good == Good::Fruit {
-                    consumed_fruit = true;
+        // Eat one item at a time, looping until hunger is sated or we run out
+        // of edibles. Subtracts each food's own nutrition so mixed inventories
+        // (e.g., low-grade Grain plus Meat) all drain hunger correctly.
+        let mut fruits_consumed: u32 = 0;
+        loop {
+            let mut ate = false;
+            for (it, q) in agent.inventory.iter_mut() {
+                if it.good.is_edible() && *q > 0 {
+                    *q -= 1;
+                    needs.hunger = (needs.hunger - it.good.nutrition() as f32).max(0.0);
+                    if it.good == Good::Fruit {
+                        fruits_consumed += 1;
+                    }
+                    ate = true;
+                    break;
                 }
+            }
+            if !ate || needs.hunger == 0.0 {
                 break;
             }
         }
-        needs.hunger = (needs.hunger - FOOD_NUTRITION as f32).max(0.0);
-        if consumed_fruit {
+        for _ in 0..fruits_consumed {
             agent.add_good(Good::Seed, 1);
         }
 

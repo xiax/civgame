@@ -21,6 +21,13 @@ use bevy::sprite::Anchor;
 ///    a universal Y-offset of -8.0 is applied to the child transform.
 /// This ensures that 16px tall walls and 36px tall people both stand on the same floor.
 
+#[derive(Component, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EntityFogState {
+    #[default]
+    Visible,
+    Explored,
+}
+
 #[derive(Component)]
 pub struct BedVisual;
 
@@ -36,6 +43,10 @@ pub struct DeerVisual;
 #[derive(Component)]
 pub struct PersonVisual;
 
+/// Floating name label Text2d child. Does NOT carry VisualChild — fog-tint and art-mode systems skip it.
+#[derive(Component)]
+pub struct PersonNameLabel;
+
 #[derive(Component)]
 pub struct FactionCenterVisual;
 
@@ -44,6 +55,11 @@ pub struct PlantVisual;
 
 #[derive(Component)]
 pub struct BlueprintVisual;
+
+/// Base tint color on a VisualChild entity — used by the fog system to preserve
+/// sex-based coloring while still applying fog darkening.
+#[derive(Component, Clone, Copy)]
+pub struct AnimalSexTint(pub Color);
 
 #[derive(Component)]
 pub struct VisualChild;
@@ -60,11 +76,12 @@ pub enum VisualLayer {
 #[derive(Component, Clone)]
 pub struct ClothingVisual {
     pub color_key: &'static str,
+    pub visible: bool,
 }
 
 impl Default for ClothingVisual {
     fn default() -> Self {
-        Self { color_key: "tan" }
+        Self { color_key: "tan", visible: false }
     }
 }
 
@@ -99,14 +116,14 @@ pub fn spawn_bed_sprites(
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
-        commands.entity(entity).insert(BedVisual);
+        commands.entity(entity).insert((BedVisual, EntityFogState::default()));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
                 sprite,
                 Transform::from_xyz(0.0, -8.0, 0.1),
                 GlobalTransform::default(),
-                Visibility::Visible,
+                Visibility::Inherited,
                 InheritedVisibility::default(),
             ));
         });
@@ -124,14 +141,14 @@ pub fn spawn_wall_sprites(
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
-        commands.entity(entity).insert(WallVisual);
+        commands.entity(entity).insert((WallVisual, EntityFogState::default()));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
                 sprite,
                 Transform::from_xyz(0.0, -8.0, 0.1),
                 GlobalTransform::default(),
-                Visibility::Visible,
+                Visibility::Inherited,
                 InheritedVisibility::default(),
             ));
         });
@@ -156,14 +173,14 @@ pub fn spawn_faction_center_sprites(
             sprite.color = Color::srgb(0.55, 0.85, 1.0);
         }
 
-        commands.entity(entity).insert(FactionCenterVisual);
+        commands.entity(entity).insert((FactionCenterVisual, EntityFogState::default()));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
                 sprite,
                 Transform::from_xyz(0.0, -8.0, 0.1),
                 GlobalTransform::default(),
-                Visibility::Visible,
+                Visibility::Inherited,
                 InheritedVisibility::default(),
             ));
         });
@@ -172,12 +189,15 @@ pub fn spawn_faction_center_sprites(
 
 pub fn spawn_wolf_sprites(
     mut commands: Commands,
-    query: Query<Entity, (With<Wolf>, Without<WolfVisual>)>,
+    query: Query<
+        (Entity, Option<&crate::simulation::reproduction::BiologicalSex>),
+        (With<Wolf>, Without<WolfVisual>),
+    >,
     textures: Res<EntityTextures>,
     sprite_lib: Res<SpriteLibrary>,
     art_mode: Res<ArtMode>,
 ) {
-    for entity in query.iter() {
+    for (entity, sex_opt) in query.iter() {
         let img = if *art_mode == ArtMode::Ascii {
             textures.wolf_ascii.clone()
         } else {
@@ -186,17 +206,25 @@ pub fn spawn_wolf_sprites(
                 .unwrap_or_else(|| textures.wolf_ascii.clone())
         };
 
+        // Male wolves are slightly grey; females are reference white
+        let tint = match sex_opt {
+            Some(crate::simulation::reproduction::BiologicalSex::Female) => Color::WHITE,
+            _ => Color::srgb(0.75, 0.75, 0.75),
+        };
+
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
+        sprite.color = tint;
 
-        commands.entity(entity).insert(WolfVisual);
+        commands.entity(entity).insert((WolfVisual, EntityFogState::default()));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
+                AnimalSexTint(tint),
                 sprite,
                 Transform::from_xyz(0.0, -8.0, 0.1),
                 GlobalTransform::default(),
-                Visibility::Visible,
+                Visibility::Inherited,
                 InheritedVisibility::default(),
             ));
         });
@@ -205,12 +233,15 @@ pub fn spawn_wolf_sprites(
 
 pub fn spawn_deer_sprites(
     mut commands: Commands,
-    query: Query<Entity, (With<Deer>, Without<DeerVisual>)>,
+    query: Query<
+        (Entity, Option<&crate::simulation::reproduction::BiologicalSex>),
+        (With<Deer>, Without<DeerVisual>),
+    >,
     textures: Res<EntityTextures>,
     sprite_lib: Res<SpriteLibrary>,
     art_mode: Res<ArtMode>,
 ) {
-    for entity in query.iter() {
+    for (entity, sex_opt) in query.iter() {
         let img = if *art_mode == ArtMode::Pixel {
             sprite_lib.get("anim_deer_s_a")
                 .cloned()
@@ -219,17 +250,29 @@ pub fn spawn_deer_sprites(
             textures.deer_ascii.clone()
         };
 
+        // Male deer are warm tan; females are lighter cream
+        let tint = match sex_opt {
+            Some(crate::simulation::reproduction::BiologicalSex::Male) | None => {
+                Color::srgb(0.80, 0.65, 0.48)
+            }
+            Some(crate::simulation::reproduction::BiologicalSex::Female) => {
+                Color::srgb(0.95, 0.88, 0.78)
+            }
+        };
+
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
+        sprite.color = tint;
 
-        commands.entity(entity).insert(DeerVisual);
+        commands.entity(entity).insert((DeerVisual, EntityFogState::default()));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
+                AnimalSexTint(tint),
                 sprite,
                 Transform::from_xyz(0.0, -8.0, 0.1),
                 GlobalTransform::default(),
-                Visibility::Visible,
+                Visibility::Inherited,
                 InheritedVisibility::default(),
             ));
         });
@@ -239,19 +282,28 @@ pub fn spawn_deer_sprites(
 pub fn spawn_person_sprites(
     mut commands: Commands,
     query: Query<
-        (Entity, Option<&BiologicalSex>, Option<&SkinTone>, Option<&HairColor>, Option<&ClothingVisual>),
+        (
+            Entity,
+            Option<&BiologicalSex>,
+            Option<&SkinTone>,
+            Option<&HairColor>,
+            Option<&ClothingVisual>,
+            Option<&Name>,
+            Option<&FactionMember>,
+        ),
         (With<Person>, Without<PersonVisual>),
     >,
     textures: Res<EntityTextures>,
     sprite_lib: Res<SpriteLibrary>,
     art_mode: Res<ArtMode>,
+    player_faction: Res<PlayerFaction>,
 ) {
-    for (entity, sex_opt, tone_opt, hair_opt, clothing_opt) in query.iter() {
+    for (entity, sex_opt, tone_opt, hair_opt, clothing_opt, name_opt, faction_opt) in query.iter() {
         let is_female = matches!(sex_opt, Some(BiologicalSex::Female));
         let sex_str = if is_female { "female" } else { "male" };
 
         let mut entity_cmds = commands.entity(entity);
-        entity_cmds.insert((PersonVisual, FacingDirection::South));
+        entity_cmds.insert((PersonVisual, FacingDirection::South, EntityFogState::default()));
         if clothing_opt.is_none() {
             entity_cmds.insert(ClothingVisual::default());
         }
@@ -272,7 +324,7 @@ pub fn spawn_person_sprites(
                     sprite,
                     Transform::from_xyz(0.0, -8.0, 0.0),
                     GlobalTransform::default(),
-                    Visibility::Visible,
+                    Visibility::Inherited,
                     InheritedVisibility::default(),
                 ));
             });
@@ -296,6 +348,7 @@ pub fn spawn_person_sprites(
             hair_sprite.anchor = Anchor::BottomCenter;
 
             let mut cloth_sprite = Sprite::from_image(cloth_img);
+            cloth_sprite.color = Color::NONE;
             cloth_sprite.anchor = Anchor::BottomCenter;
 
             commands.entity(entity).with_children(|parent| {
@@ -304,7 +357,7 @@ pub fn spawn_person_sprites(
                     body_sprite,
                     Transform::from_xyz(0.0, -8.0, 0.0),
                     GlobalTransform::default(),
-                    Visibility::Visible,
+                    Visibility::Inherited,
                     InheritedVisibility::default(),
                 ));
                 parent.spawn((
@@ -312,7 +365,7 @@ pub fn spawn_person_sprites(
                     cloth_sprite,
                     Transform::from_xyz(0.0, -8.0, 0.1),
                     GlobalTransform::default(),
-                    Visibility::Visible,
+                    Visibility::Inherited,
                     InheritedVisibility::default(),
                 ));
                 parent.spawn((
@@ -320,7 +373,26 @@ pub fn spawn_person_sprites(
                     hair_sprite,
                     Transform::from_xyz(0.0, -8.0, 0.2),
                     GlobalTransform::default(),
-                    Visibility::Visible,
+                    Visibility::Inherited,
+                    InheritedVisibility::default(),
+                ));
+            });
+        }
+
+        let is_player = faction_opt.map_or(false, |m| m.faction_id == player_faction.faction_id);
+        if is_player {
+            let label_text = name_opt.map(|n| n.as_str().to_string()).unwrap_or_default();
+            commands.entity(entity).with_children(|parent| {
+                parent.spawn((
+                    PersonNameLabel,
+                    Text2d::new(label_text),
+                    TextFont { font_size: 8.0, ..default() },
+                    TextColor(Color::WHITE),
+                    TextLayout::default(),
+                    // Sprite is 16px tall, bottom at Y=-8 → top at Y=+8; +3px gap
+                    Transform::from_xyz(0.0, 11.0, 0.5),
+                    GlobalTransform::default(),
+                    Visibility::Inherited,
                     InheritedVisibility::default(),
                 ));
             });
@@ -340,11 +412,17 @@ pub fn get_plant_texture(
             GrowthStage::Harvested => textures.tree_seedling_ascii.clone(),
             _ => textures.tree_mature_ascii.clone(),
         },
+        PlantKind::BerryBush => match stage {
+            GrowthStage::Seed => textures.plant_seed_ascii.clone(),
+            GrowthStage::Seedling => textures.plant_seedling_ascii.clone(),
+            GrowthStage::Harvested => textures.plant_seedling_ascii.clone(),
+            _ => textures.plant_bush_mature_ascii.clone(),
+        },
         _ => match stage {
             GrowthStage::Seed => textures.plant_seed_ascii.clone(),
             GrowthStage::Seedling => textures.plant_seedling_ascii.clone(),
             GrowthStage::Harvested => textures.plant_seedling_ascii.clone(),
-            _ => textures.plant_mature_ascii.clone(),
+            _ => textures.plant_grain_mature_ascii.clone(),
         },
     }
 }
@@ -359,14 +437,14 @@ pub fn spawn_plant_sprites(
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
-        commands.entity(entity).insert(PlantVisual);
+        commands.entity(entity).insert((PlantVisual, EntityFogState::default()));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
                 sprite,
                 Transform::from_xyz(0.0, -8.0, 0.5),
                 GlobalTransform::default(),
-                Visibility::Visible,
+                Visibility::Inherited,
                 InheritedVisibility::default(),
             ));
         });
@@ -435,8 +513,13 @@ pub fn animate_person_sprites(
         let hair_key = format!("hair_{sex_str}_{hair_str}_{dir}_{frame_str}");
         let cloth_key = format!("clothing_{sex_str}_{cloth_str}_{dir}_{frame_str}");
 
+        let clothing_visible = clothing_opt.map(|c| c.visible).unwrap_or(false);
         for &child in children.iter() {
             if let Ok((mut sprite, layer)) = child_sprites.get_mut(child) {
+                if *layer == VisualLayer::Clothing {
+                    sprite.color = if clothing_visible { Color::WHITE } else { Color::NONE };
+                    if !clothing_visible { continue; }
+                }
                 let key = match layer {
                     VisualLayer::Body => body_key.as_str(),
                     VisualLayer::Hair => hair_key.as_str(),
@@ -446,6 +529,121 @@ pub fn animate_person_sprites(
                     if sprite.image != *img {
                         sprite.image = img.clone();
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Hide entities that don't belong on the layer the camera is viewing.
+/// Surface mode (CameraViewZ == i32::MAX): show entities whose Z equals
+/// the surface_z of their tile (i.e. above-ground entities). Underground
+/// mode: show only entities whose Z equals camera_view_z.
+/// Entities in explored-but-not-visible tiles remain visible but get a dim tint
+/// applied by apply_entity_fog_tint_system.
+pub fn update_entity_z_visibility_system(
+    camera_view_z: Res<crate::rendering::camera::CameraViewZ>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    fog_map: Res<crate::rendering::fog::FogMap>,
+    mut q: Query<
+        (
+            &Transform,
+            &mut Visibility,
+            &mut EntityFogState,
+            Option<&PersonAI>,
+            Has<Person>,
+        ),
+        bevy::prelude::Or<(
+            With<Person>,
+            With<Wolf>,
+            With<Deer>,
+            With<Plant>,
+            With<Bed>,
+            With<Wall>,
+            With<FactionCenter>,
+            With<Blueprint>,
+        )>,
+    >,
+) {
+    use crate::world::terrain::TILE_SIZE;
+    let cam_z = camera_view_z.0;
+    for (transform, mut vis, mut fog_state, person_ai, is_person) in q.iter_mut() {
+        let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let surf_z = chunk_map.surface_z_at(tx, ty);
+        let entity_z = match person_ai {
+            Some(ai) if is_person => ai.current_z as i32,
+            _ => surf_z,
+        };
+        let should_show = if cam_z == i32::MAX {
+            entity_z == surf_z
+        } else {
+            entity_z == cam_z
+        };
+        let fog_visible = fog_map.is_visible((tx as i16, ty as i16));
+        let fog_explored = fog_map.is_explored((tx as i16, ty as i16));
+        let new_vis = if should_show && (fog_visible || fog_explored) {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != new_vis {
+            *vis = new_vis;
+        }
+        if should_show {
+            let new_fog_state = if fog_visible {
+                EntityFogState::Visible
+            } else {
+                EntityFogState::Explored
+            };
+            if *fog_state != new_fog_state {
+                *fog_state = new_fog_state;
+            }
+        }
+    }
+}
+
+/// Apply the correct sprite color to each entity based on fog state and faction membership.
+/// Replaces update_faction_sprite_colors by combining fog tinting with faction coloring.
+pub fn apply_entity_fog_tint_system(
+    entities: Query<
+        (&Visibility, &EntityFogState, &Children),
+        bevy::prelude::Or<(
+            With<Person>,
+            With<Wolf>,
+            With<Deer>,
+            With<Plant>,
+            With<Bed>,
+            With<Wall>,
+            With<FactionCenter>,
+            With<Blueprint>,
+        )>,
+    >,
+    mut child_sprites: Query<(&mut Sprite, Option<&AnimalSexTint>), With<VisualChild>>,
+) {
+    for (vis, fog_state, children) in entities.iter() {
+        if *vis == Visibility::Hidden {
+            continue;
+        }
+        let fog_factor = if *fog_state == EntityFogState::Visible {
+            1.0f32
+        } else {
+            0.35
+        };
+        for &child in children.iter() {
+            if let Ok((mut sprite, sex_tint)) = child_sprites.get_mut(child) {
+                let alpha = sprite.color.to_srgba().alpha;
+                let base = sex_tint
+                    .map(|t| t.0.to_srgba())
+                    .unwrap_or(bevy::color::Srgba::WHITE);
+                let new_color = Color::srgba(
+                    base.red * fog_factor,
+                    base.green * fog_factor,
+                    base.blue * fog_factor,
+                    alpha,
+                );
+                if sprite.color != new_color {
+                    sprite.color = new_color;
                 }
             }
         }
@@ -506,27 +704,6 @@ pub fn handle_art_mode_change(
     }
 }
 
-pub fn update_faction_sprite_colors(
-    player_faction: Res<PlayerFaction>,
-    persons: Query<
-        (&FactionMember, &Children),
-        (With<Person>, With<PersonVisual>, Or<(Changed<FactionMember>, Added<PersonVisual>)>),
-    >,
-    mut sprites: Query<(&mut Sprite, &VisualLayer), With<VisualChild>>,
-) {
-    for (member, children) in persons.iter() {
-        let color = if member.faction_id == player_faction.faction_id {
-            Color::srgb(0.55, 0.85, 1.0)
-        } else {
-            Color::WHITE
-        };
-        for &child in children.iter() {
-            if let Ok((mut sprite, _layer)) = sprites.get_mut(child) {
-                sprite.color = color;
-            }
-        }
-    }
-}
 
 /// Updates ClothingVisual color key whenever a person's Equipment changes.
 /// The animate system picks up the new key on the next frame automatically.
@@ -535,13 +712,9 @@ pub fn update_clothing_from_equipment(
 ) {
     for (equip, clothing_opt) in &mut persons {
         if let Some(mut clothing) = clothing_opt {
-            // Derive color from whether TorsoArmor slot is occupied.
-            // Full material-based lookup requires Item to be a Component; extend later.
-            clothing.color_key = if equip.items.contains_key(&EquipmentSlot::TorsoArmor) {
-                "grey"
-            } else {
-                "tan"
-            };
+            let has_armor = equip.items.contains_key(&EquipmentSlot::TorsoArmor);
+            clothing.visible = has_armor;
+            clothing.color_key = if has_armor { "grey" } else { "tan" };
         }
     }
 }
@@ -568,14 +741,14 @@ pub fn spawn_blueprint_sprites(
 
         commands
             .entity(entity)
-            .insert(BlueprintVisual)
+            .insert((BlueprintVisual, EntityFogState::default()))
             .with_children(|parent| {
                 parent.spawn((
                     VisualChild,
                     scaffold_sprite,
                     Transform::from_xyz(0.0, -8.0, 0.2),
                     GlobalTransform::default(),
-                    Visibility::Visible,
+                    Visibility::Inherited,
                     InheritedVisibility::default(),
                 ));
 
@@ -584,7 +757,7 @@ pub fn spawn_blueprint_sprites(
                     ghost_sprite,
                     Transform::from_xyz(0.0, -8.0, 0.1),
                     GlobalTransform::default(),
-                    Visibility::Visible,
+                    Visibility::Inherited,
                     InheritedVisibility::default(),
                 ));
             });

@@ -1,7 +1,8 @@
 use bevy::prelude::*;
 
-const TICKS_PER_DAY: u32 = 3600;
-const DAYS_PER_SEASON: u32 = 30;
+pub const TICKS_PER_DAY: u32 = 3600;
+pub const DAYS_PER_SEASON: u32 = 5; // ← change this to adjust timescale
+pub const TICKS_PER_SEASON: u32 = TICKS_PER_DAY * DAYS_PER_SEASON;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]

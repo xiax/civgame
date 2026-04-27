@@ -1,5 +1,6 @@
 use super::selection::SelectedEntity;
 use crate::pathfinding::chunk_graph::ChunkGraph;
+use crate::rendering::camera::CameraViewZ;
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
 use crate::simulation::items::GroundItem;
 use crate::simulation::person::{AiState, PersonAI, PlayerOrder, PlayerOrderKind};
@@ -19,6 +20,8 @@ pub struct ContextMenuState {
     pub open: bool,
     pub screen_pos: egui::Pos2,
     pub target_tile: (i16, i16),
+    /// Foot Z of the targeted tile at the moment of right-click.
+    pub target_z: i8,
     pub actions: Vec<PlayerOrderKind>,
 }
 
@@ -36,10 +39,11 @@ pub fn right_click_context_menu_system(
     plant_map: Res<PlantMap>,
     spatial: Res<SpatialIndex>,
     ground_item_check: Query<(), With<GroundItem>>,
-    chunk_graph: Res<ChunkGraph>,
+    routing: (Res<ChunkGraph>, Res<CameraViewZ>),
     mut menu_state: ResMut<ContextMenuState>,
     mut commands: Commands,
 ) {
+    let (chunk_graph, camera_view_z) = routing;
     // Require a selected player-faction member.
     let Some(sel_entity) = selected.0 else {
         menu_state.open = false;
@@ -66,12 +70,28 @@ pub fn right_click_context_menu_system(
                     let tx = (world_pos.x / TILE_SIZE).floor() as i32;
                     let ty = (world_pos.y / TILE_SIZE).floor() as i32;
 
+                    // Determine the Z slice this click targets. Surface
+                    // mode (CameraViewZ::MAX) → click targets the tile's
+                    // surface_z. Underground view → click targets the
+                    // camera_view_z slice and the tile read uses tile_at.
+                    let underground = camera_view_z.0 != i32::MAX;
+                    let target_z_i32 = if underground {
+                        camera_view_z.0
+                    } else {
+                        chunk_map.surface_z_at(tx, ty)
+                    };
+                    let target_kind = if underground {
+                        Some(chunk_map.tile_at(tx, ty, target_z_i32).kind)
+                    } else {
+                        chunk_map.tile_kind_at(tx, ty)
+                    };
+
                     let mut actions = vec![PlayerOrderKind::Move];
-                    if let Some(kind) = chunk_map.tile_kind_at(tx, ty) {
+                    if let Some(kind) = target_kind {
                         if matches!(kind, TileKind::Wall | TileKind::Stone) {
                             actions.push(PlayerOrderKind::Mine);
                         }
-                        if kind.is_passable() {
+                        if kind.is_passable() && !underground {
                             actions.push(PlayerOrderKind::DigDown);
                             let has_perm = faction_q
                                 .get(sel_entity)
@@ -86,19 +106,22 @@ pub fn right_click_context_menu_system(
                             actions.push(PlayerOrderKind::BuildBed);
                         }
                     }
-                    if plant_map.0.contains_key(&(tx, ty)) {
+                    if !underground && plant_map.0.contains_key(&(tx, ty)) {
                         actions.push(PlayerOrderKind::Gather);
                     }
-                    for &e in spatial.get(tx, ty) {
-                        if ground_item_check.get(e).is_ok() {
-                            actions.push(PlayerOrderKind::PickUp);
-                            break;
+                    if !underground {
+                        for &e in spatial.get(tx, ty) {
+                            if ground_item_check.get(e).is_ok() {
+                                actions.push(PlayerOrderKind::PickUp);
+                                break;
+                            }
                         }
                     }
 
                     menu_state.open = true;
                     menu_state.screen_pos = egui::pos2(cursor_pos.x, cursor_pos.y);
                     menu_state.target_tile = (tx as i16, ty as i16);
+                    menu_state.target_z = target_z_i32 as i8;
                     menu_state.actions = actions;
                 }
             }
@@ -119,6 +142,7 @@ pub fn right_click_context_menu_system(
 
     let actions = menu_state.actions.clone();
     let target_tile = menu_state.target_tile;
+    let target_z = menu_state.target_z;
     let mut chosen: Option<PlayerOrderKind> = None;
 
     egui::Area::new("context_menu".into())
@@ -159,10 +183,12 @@ pub fn right_click_context_menu_system(
                 &chunk_graph,
                 &chunk_map,
             );
+            ai.target_z = target_z;
         }
         commands.entity(sel_entity).insert(PlayerOrder {
             order: action,
             target_tile,
+            target_z,
         });
         menu_state.open = false;
     }

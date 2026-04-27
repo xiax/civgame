@@ -11,7 +11,7 @@ use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::SkillKind;
 use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
-use crate::world::seasons::{Calendar, Season};
+use crate::world::seasons::{Calendar, Season, TICKS_PER_SEASON};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 
 const DEER_GRAZE_INTERVAL: u16 = 120;
@@ -20,7 +20,7 @@ const DEER_GRAZE_INTERVAL: u16 = 120;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PlantKind {
     #[default]
-    FruitBush = 0,
+    BerryBush = 0,
     Grain = 1,
     Tree = 2,
 }
@@ -48,30 +48,30 @@ impl Plant {
     pub fn duration_for_stage(&self, calendar: &Calendar) -> u32 {
         match self.kind {
             PlantKind::Grain => match self.stage {
-                GrowthStage::Seed => 18_000,     // 5 days
-                GrowthStage::Seedling => 54_000, // 15 days
-                GrowthStage::Harvested => 0,     // N/A
-                GrowthStage::Mature => 36_000,   // 10 days
+                GrowthStage::Seed => TICKS_PER_SEASON / 6,     // 1/6 season
+                GrowthStage::Seedling => TICKS_PER_SEASON / 2, // 1/2 season
+                GrowthStage::Harvested => 0,
+                GrowthStage::Mature => TICKS_PER_SEASON / 3,   // 1/3 season
                 GrowthStage::Overripe => 0,
             },
-            PlantKind::FruitBush => match self.stage {
-                GrowthStage::Seed => 36_000,      // 10 days
-                GrowthStage::Seedling => 108_000, // 30 days
+            PlantKind::BerryBush => match self.stage {
+                GrowthStage::Seed => TICKS_PER_SEASON / 3,      // 1/3 season
+                GrowthStage::Seedling => TICKS_PER_SEASON,       // 1 season
                 GrowthStage::Harvested => {
                     if matches!(calendar.season, Season::Spring | Season::Summer) {
-                        18_000 // 5 days recovery
+                        TICKS_PER_SEASON / 6 // 1/6 season recovery
                     } else {
-                        108_000 // 30 days recovery
+                        TICKS_PER_SEASON // 1 season recovery
                     }
                 }
-                GrowthStage::Mature => 72_000, // 20 days
+                GrowthStage::Mature => TICKS_PER_SEASON * 2 / 3, // 2/3 season
                 GrowthStage::Overripe => 0,
             },
             PlantKind::Tree => match self.stage {
-                GrowthStage::Seed => 108_000,     // 30 days
-                GrowthStage::Seedling => 324_000, // 90 days
-                GrowthStage::Harvested => 0,      // N/A
-                GrowthStage::Mature => 648_000,   // 180 days
+                GrowthStage::Seed => TICKS_PER_SEASON,       // 1 season
+                GrowthStage::Seedling => TICKS_PER_SEASON * 3, // 3 seasons
+                GrowthStage::Harvested => 0,
+                GrowthStage::Mature => TICKS_PER_SEASON * 6,   // 6 seasons
                 GrowthStage::Overripe => 0,
             },
         }
@@ -89,8 +89,8 @@ impl PlantKind {
     /// `has_tool` only matters for trees (felling vs branch-gathering).
     pub fn harvest_yield(self, has_tool: bool) -> (Good, u32) {
         match self {
-            PlantKind::Grain => (Good::Grain, 3),
-            PlantKind::FruitBush => (Good::Fruit, 1),
+            PlantKind::Grain => (Good::Grain, 5),
+            PlantKind::BerryBush => (Good::Fruit, 3),
             PlantKind::Tree => (Good::Wood, if has_tool { 3 } else { 1 }),
         }
     }
@@ -98,7 +98,7 @@ impl PlantKind {
     /// Fixed co-yields always added alongside the primary yield (no faction multiplier).
     pub fn harvest_extra_yields(self) -> &'static [(Good, u32)] {
         match self {
-            PlantKind::FruitBush => &[(Good::Seed, 1)],
+            PlantKind::BerryBush => &[(Good::Seed, 1)],
             _ => &[],
         }
     }
@@ -107,7 +107,7 @@ impl PlantKind {
     pub fn harvest_ground_drops(self, has_tool: bool) -> &'static [(Good, u32)] {
         match self {
             PlantKind::Grain => &[(Good::Seed, 1)],
-            PlantKind::FruitBush => &[(Good::Seed, 1)],
+            PlantKind::BerryBush => &[(Good::Seed, 1)],
             PlantKind::Tree => {
                 if has_tool {
                     &[(Good::Wood, 2)]
@@ -120,14 +120,18 @@ impl PlantKind {
 
     /// Plan reward multiplier per unit of primary yield.
     pub fn harvest_reward_per_unit(self) -> f32 {
-        0.4
+        match self {
+            PlantKind::Grain => 0.24,
+            PlantKind::BerryBush => 0.133,
+            PlantKind::Tree => 0.4,
+        }
     }
 
     /// Faction activity to log for technology progression.
     pub fn harvest_activity(self) -> ActivityKind {
         match self {
             PlantKind::Grain => ActivityKind::Farming,
-            PlantKind::FruitBush => ActivityKind::Foraging,
+            PlantKind::BerryBush => ActivityKind::Foraging,
             PlantKind::Tree => ActivityKind::WoodGathering,
         }
     }
@@ -136,7 +140,7 @@ impl PlantKind {
     pub fn harvest_despawns(self, has_tool: bool) -> bool {
         match self {
             PlantKind::Tree => has_tool,
-            PlantKind::FruitBush => false,
+            PlantKind::BerryBush => false,
             _ => true,
         }
     }
@@ -146,7 +150,7 @@ impl PlantKind {
         match self {
             PlantKind::Tree => (SkillKind::Building, if has_tool { 10 } else { 2 }),
             PlantKind::Grain => (SkillKind::Farming, 5),
-            PlantKind::FruitBush => (SkillKind::Building, 3),
+            PlantKind::BerryBush => (SkillKind::Building, 3),
         }
     }
 
@@ -279,7 +283,7 @@ pub fn seed_scatter_system(
             let ty = plant.tile_pos.1 as i32;
             let kind = plant.kind;
 
-            if kind == PlantKind::Tree || kind == PlantKind::FruitBush {
+            if kind == PlantKind::Tree || kind == PlantKind::BerryBush {
                 // Perennials: return to a previous stage instead of dying
                 if kind == PlantKind::Tree {
                     // Trees drop branches and return to Mature
@@ -300,7 +304,7 @@ pub fn seed_scatter_system(
 
                     plant.stage = GrowthStage::Mature;
                 } else {
-                    // Fruit bushes revert to Harvested (fruit fell off)
+                    // Berry bushes revert to Harvested (fruit fell off)
                     plant.stage = GrowthStage::Harvested;
                 }
                 plant.growth_ticks = 0;
@@ -316,7 +320,7 @@ pub fn seed_scatter_system(
         }
 
         let (count, radius): (u8, i32) = match kind {
-            PlantKind::FruitBush => (1, 1),
+            PlantKind::BerryBush => (1, 1),
             PlantKind::Grain => (1, 2),
             PlantKind::Tree => (0, 0), // Should not reach here
         };
@@ -356,16 +360,25 @@ pub fn seed_scatter_system(
     }
 }
 
-/// Deer graze on mature FruitBush plants in their vicinity.
+/// Deer graze on mature BerryBush plants in their vicinity.
 pub fn deer_graze_system(
     mut commands: Commands,
     clock: Res<SimClock>,
     plant_map: Res<PlantMap>,
     _plant_sprite_index: Res<PlantSpriteIndex>,
     mut plant_query: Query<&mut Plant>,
-    mut deer_query: Query<(&Transform, &mut DeerGrazer, &BucketSlot, &LodLevel), With<Deer>>,
+    mut deer_query: Query<
+        (
+            &Transform,
+            &mut DeerGrazer,
+            &BucketSlot,
+            &LodLevel,
+            Option<&mut crate::simulation::animals::AnimalNeeds>,
+        ),
+        With<Deer>,
+    >,
 ) {
-    for (transform, mut grazer, slot, lod) in deer_query.iter_mut() {
+    for (transform, mut grazer, slot, lod, mut animal_needs) in deer_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -385,7 +398,7 @@ pub fn deer_graze_system(
                 let ty = deer_ty + dy;
                 if let Some(&entity) = plant_map.0.get(&(tx, ty)) {
                     if let Ok(plant) = plant_query.get(entity) {
-                        if plant.kind == PlantKind::FruitBush && plant.stage == GrowthStage::Mature
+                        if plant.kind == PlantKind::BerryBush && plant.stage == GrowthStage::Mature
                         {
                             found = Some((tx, ty, entity));
                             break 'search;
@@ -399,6 +412,11 @@ pub fn deer_graze_system(
             if let Ok(mut plant) = plant_query.get_mut(entity) {
                 plant.stage = GrowthStage::Harvested;
                 plant.growth_ticks = 0;
+            }
+            if let Some(ref mut needs) = animal_needs {
+                needs.hunger =
+                    (needs.hunger - crate::simulation::animals::ANIMAL_HUNGER_RECOVER_DEER)
+                        .max(0.0);
             }
 
             let count = 1 + fastrand::u8(..2);
