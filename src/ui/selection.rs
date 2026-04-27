@@ -1,7 +1,7 @@
+use crate::simulation::person::Person;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::EguiContexts;
-use crate::simulation::person::Person;
 
 #[derive(Resource, Default)]
 pub struct SelectedEntity(pub Option<Entity>);
@@ -22,11 +22,19 @@ pub fn click_to_select_system(
         return;
     }
 
-    let Ok(window) = windows.get_single() else { return };
-    let Ok((camera, cam_transform)) = camera_query.get_single() else { return };
-    let Some(cursor_pos) = window.cursor_position() else { return };
+    let Ok(window) = windows.get_single() else {
+        return;
+    };
+    let Ok((camera, cam_transform)) = camera_query.get_single() else {
+        return;
+    };
+    let Some(cursor_pos) = window.cursor_position() else {
+        return;
+    };
 
-    let Ok(world_pos) = camera.viewport_to_world_2d(cam_transform, cursor_pos) else { return };
+    let Ok(world_pos) = camera.viewport_to_world_2d(cam_transform, cursor_pos) else {
+        return;
+    };
 
     let mut best: Option<(Entity, f32)> = None;
     for (entity, transform) in persons.iter() {

@@ -1,13 +1,13 @@
-use bevy::prelude::*;
+use super::agent::EconomicAgent;
+use super::goods::Good;
+use super::market::Market;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, PersonAI};
 use crate::simulation::schedule::{BucketSlot, SimClock};
-use super::agent::EconomicAgent;
-use super::goods::Good;
-use super::market::Market;
+use bevy::prelude::*;
 
-const FOOD_KEEP_RESERVE: u8 = 2;
+const FOOD_KEEP_RESERVE: u32 = 2;
 const HUNGER_BUY_THRESHOLD: u8 = 130;
 const TOOL_BUY_CURRENCY_FACTOR: f32 = 1.5;
 
@@ -27,7 +27,9 @@ pub fn market_sell_system(
         // Sell all items except food reserve
         let inventory = agent.inventory; // Copy to avoid borrow issues while mutably removing
         for (item, qty) in inventory {
-            if qty == 0 { continue; }
+            if qty == 0 {
+                continue;
+            }
 
             let sell_qty = if item.good.is_edible() {
                 if qty > FOOD_KEEP_RESERVE {
@@ -40,7 +42,7 @@ pub fn market_sell_system(
             };
 
             if sell_qty > 0 {
-                let earned = market.sell_item(item, sell_qty as u32);
+                let earned = market.sell_item(item, sell_qty);
                 agent.remove_item(item, sell_qty);
                 agent.currency += earned;
             }
@@ -51,7 +53,13 @@ pub fn market_sell_system(
 pub fn market_buy_system(
     clock: Res<SimClock>,
     mut market: ResMut<Market>,
-    mut query: Query<(&mut PersonAI, &mut EconomicAgent, &Needs, &BucketSlot, &LodLevel)>,
+    mut query: Query<(
+        &mut PersonAI,
+        &mut EconomicAgent,
+        &Needs,
+        &BucketSlot,
+        &LodLevel,
+    )>,
 ) {
     for (mut ai, mut agent, needs, slot, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -62,7 +70,7 @@ pub fn market_buy_system(
         if needs.hunger > HUNGER_BUY_THRESHOLD as f32 && agent.total_food() == 0 {
             let (bought_item, qty) = market.try_buy_item(Good::Fruit, 1, &mut agent.currency);
             if let Some(it) = bought_item {
-                agent.add_item(it, qty as u8);
+                agent.add_item(it, qty);
                 // Clear Trader task now that the buy was handled
                 if ai.task_id == crate::simulation::tasks::TaskKind::Trader as u16 {
                     ai.state = AiState::Idle;
@@ -77,10 +85,9 @@ pub fn market_buy_system(
             if agent.currency >= tool_price * TOOL_BUY_CURRENCY_FACTOR {
                 let (bought_item, qty) = market.try_buy_item(Good::Tools, 1, &mut agent.currency);
                 if let Some(it) = bought_item {
-                    agent.add_item(it, qty as u8);
+                    agent.add_item(it, qty);
                 }
             }
         }
     }
 }
-

@@ -1,10 +1,10 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::economy::market::Market;
 use crate::economy::command::CommandPools;
+use crate::economy::goods::Good;
+use crate::economy::market::Market;
 use crate::economy::mode::EconomicMode;
-use crate::economy::goods::{Good, GOOD_COUNT};
 
 pub fn economy_panel_system(
     mut contexts: EguiContexts,
@@ -24,10 +24,7 @@ pub fn economy_panel_system(
                     ui.label("Market Prices (Commodities):");
                     for good in Good::all() {
                         let price = market.prices[good as usize];
-                        ui.label(format!(
-                            "  {:6}: ${:.2}",
-                            good.name(), price
-                        ));
+                        ui.label(format!("  {:6}: ${:.2}", good.name(), price));
                     }
                     if !market.listings.is_empty() {
                         ui.separator();
@@ -35,9 +32,18 @@ pub fn economy_panel_system(
                         for (item, stock) in &market.listings {
                             if *stock > 0 {
                                 let mut name = item.good.name().to_string();
-                                if let Some(mat) = item.material { name = format!("{:?} {}", mat, name); }
-                                if let Some(qual) = item.quality { name = format!("{} ({:?})", name, qual); }
-                                ui.label(format!("  {} x{}: ${:.1}", name, stock, market.calculate_price(item)));
+                                if let Some(mat) = item.material {
+                                    name = format!("{:?} {}", mat, name);
+                                }
+                                if let Some(qual) = item.quality {
+                                    name = format!("{} ({:?})", name, qual);
+                                }
+                                ui.label(format!(
+                                    "  {} x{}: ${:.1}",
+                                    name,
+                                    stock,
+                                    market.calculate_price(item)
+                                ));
                             }
                         }
                     }
@@ -49,7 +55,9 @@ pub fn economy_panel_system(
                         let quota = pools.quotas[good as usize];
                         ui.label(format!(
                             "  {:6}: {:.0} units  ({} workers)",
-                            good.name(), stock, quota
+                            good.name(),
+                            stock,
+                            quota
                         ));
                     }
                 }

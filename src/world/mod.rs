@@ -1,15 +1,14 @@
 use bevy::prelude::*;
 
 pub mod chunk;
-pub mod tile;
-pub mod terrain;
-pub mod spatial;
-pub mod seasons;
-pub mod globe;
 pub mod chunk_streaming;
+pub mod globe;
+pub mod seasons;
+pub mod spatial;
+pub mod terrain;
+pub mod tile;
 
 pub use chunk::ChunkMap;
-pub use terrain::WorldGen;
 
 fn insert_globe(app: &mut App) {
     app.insert_resource(globe::load_or_generate(42));
@@ -24,6 +23,8 @@ impl Plugin for WorldPlugin {
             .insert_resource(spatial::SpatialIndex::default())
             .insert_resource(seasons::Calendar::default())
             .insert_resource(terrain::WorldGen::new())
-            .add_systems(Startup, terrain::spawn_world_system);
+            .add_event::<chunk_streaming::TileChangedEvent>()
+            .add_systems(Startup, terrain::spawn_world_system)
+            .add_systems(PostUpdate, chunk_streaming::refresh_changed_tiles_system);
     }
 }

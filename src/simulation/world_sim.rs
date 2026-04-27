@@ -4,15 +4,12 @@ use bevy::prelude::*;
 use crate::simulation::person::Person;
 use crate::simulation::schedule::SimClock;
 use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
-use crate::world::globe::{Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
+use crate::world::globe::{Globe, GLOBE_HEIGHT, GLOBE_WIDTH};
 use crate::world::seasons::{Calendar, Season};
 use crate::world::terrain::TILE_SIZE;
 
 /// Marks globe cells as explored when any agent is present in them.
-pub fn agent_exploration_system(
-    mut globe: ResMut<Globe>,
-    agents: Query<&Transform, With<Person>>,
-) {
+pub fn agent_exploration_system(mut globe: ResMut<Globe>, agents: Query<&Transform, With<Person>>) {
     for transform in agents.iter() {
         let tile_x = (transform.translation.x / TILE_SIZE).floor() as i32;
         let tile_y = (transform.translation.y / TILE_SIZE).floor() as i32;

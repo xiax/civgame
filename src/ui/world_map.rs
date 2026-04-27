@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::world::globe::{Biome, Globe, GLOBE_HEIGHT, GLOBE_WIDTH};
+use crate::world::globe::{Globe, GLOBE_HEIGHT, GLOBE_WIDTH};
 
 #[derive(Resource, Default)]
 pub struct WorldMapOpen(pub bool);
@@ -14,10 +14,7 @@ pub struct WorldMapTexture {
     last_explored: u32,
 }
 
-pub fn world_map_toggle_system(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut open: ResMut<WorldMapOpen>,
-) {
+pub fn world_map_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut open: ResMut<WorldMapOpen>) {
     if keys.just_pressed(KeyCode::Tab) {
         open.0 = !open.0;
     }
@@ -55,7 +52,9 @@ pub fn world_map_system(
         tex_cache.last_explored = explored_count;
     }
 
-    let Some(ref tex) = tex_cache.handle else { return };
+    let Some(ref tex) = tex_cache.handle else {
+        return;
+    };
 
     egui::Window::new("World Map")
         .title_bar(true)
@@ -136,7 +135,7 @@ fn build_globe_image(globe: &Globe) -> Vec<u8> {
                 c
             };
 
-            pixels[idx]     = rgba[0];
+            pixels[idx] = rgba[0];
             pixels[idx + 1] = rgba[1];
             pixels[idx + 2] = rgba[2];
             pixels[idx + 3] = rgba[3];

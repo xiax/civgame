@@ -1,28 +1,28 @@
-use bevy::prelude::*;
-use ahash::AHashMap;
-use crate::world::spatial::SpatialIndex;
-use crate::world::terrain::TILE_SIZE;
-use crate::world::chunk::ChunkMap;
 use super::goals::AgentGoal;
 use super::lod::LodLevel;
-use super::schedule::{BucketSlot, SimClock};
 use super::person::Person;
+use super::schedule::{BucketSlot, SimClock};
+use crate::world::chunk::ChunkMap;
+use crate::world::spatial::SpatialIndex;
+use crate::world::terrain::TILE_SIZE;
+use ahash::AHashMap;
+use bevy::prelude::*;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryKind {
-    Food  = 0,
-    Wood  = 1,
+    Food = 0,
+    Wood = 1,
     Stone = 2,
-    Seed  = 3,
-    Prey  = 4,
+    Seed = 3,
+    Prey = 4,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct MemoryEntry {
-    pub tile:      (i16, i16),
-    pub kind:      MemoryKind,
-    pub entity:    Option<Entity>,
+    pub tile: (i16, i16),
+    pub kind: MemoryKind,
+    pub entity: Option<Entity>,
     pub freshness: u8,
 }
 
@@ -32,7 +32,13 @@ pub struct AgentMemory {
 }
 
 impl AgentMemory {
-    fn insert_with_freshness(&mut self, tile: (i16, i16), kind: MemoryKind, entity: Option<Entity>, freshness: u8) {
+    fn insert_with_freshness(
+        &mut self,
+        tile: (i16, i16),
+        kind: MemoryKind,
+        entity: Option<Entity>,
+        freshness: u8,
+    ) {
         // Update same tile+kind+entity entry
         for slot in &mut self.entries {
             if let Some(e) = slot {
@@ -47,7 +53,12 @@ impl AgentMemory {
         // Find empty slot
         for slot in &mut self.entries {
             if slot.is_none() {
-                *slot = Some(MemoryEntry { tile, kind, entity, freshness });
+                *slot = Some(MemoryEntry {
+                    tile,
+                    kind,
+                    entity,
+                    freshness,
+                });
                 return;
             }
         }
@@ -63,7 +74,12 @@ impl AgentMemory {
             }
         }
         if freshness > min_fresh {
-            self.entries[min_idx] = Some(MemoryEntry { tile, kind, entity, freshness });
+            self.entries[min_idx] = Some(MemoryEntry {
+                tile,
+                kind,
+                entity,
+                freshness,
+            });
         }
     }
 
@@ -100,7 +116,11 @@ impl AgentMemory {
         best_tile
     }
 
-    pub fn best_for_dist_weighted(&self, kind: MemoryKind, from_pos: (i32, i32)) -> Option<(i16, i16)> {
+    pub fn best_for_dist_weighted(
+        &self,
+        kind: MemoryKind,
+        from_pos: (i32, i32),
+    ) -> Option<(i16, i16)> {
         let mut best_score = -1.0f32;
         let mut best_tile = None;
         for slot in &self.entries {
@@ -121,7 +141,11 @@ impl AgentMemory {
         best_tile
     }
 
-    pub fn best_entity_for_dist_weighted(&self, kind: MemoryKind, from_pos: (i32, i32)) -> Option<(Entity, i16, i16)> {
+    pub fn best_entity_for_dist_weighted(
+        &self,
+        kind: MemoryKind,
+        from_pos: (i32, i32),
+    ) -> Option<(Entity, i16, i16)> {
         let mut best_score = -1.0f32;
         let mut best_res = None;
         for slot in &self.entries {
@@ -154,9 +178,7 @@ impl AgentMemory {
     }
 
     pub fn top_entries(&self, n: usize) -> Vec<MemoryEntry> {
-        let mut entries: Vec<MemoryEntry> = self.entries.iter()
-            .filter_map(|s| *s)
-            .collect();
+        let mut entries: Vec<MemoryEntry> = self.entries.iter().filter_map(|s| *s).collect();
         entries.sort_unstable_by(|a, b| b.freshness.cmp(&a.freshness));
         entries.truncate(n);
         entries
@@ -169,9 +191,9 @@ impl AgentMemory {
 
 #[derive(Clone, Copy, Debug)]
 pub struct RelEntry {
-    pub entity:   Entity,
+    pub entity: Entity,
     pub affinity: i8,
-    pub age:      u8,
+    pub age: u8,
 }
 
 #[derive(Component, Clone, Default)]
@@ -192,7 +214,11 @@ impl RelationshipMemory {
         }
         for slot in &mut self.entries {
             if slot.is_none() {
-                *slot = Some(RelEntry { entity, affinity: delta, age: 0 });
+                *slot = Some(RelEntry {
+                    entity,
+                    affinity: delta,
+                    age: 0,
+                });
                 return;
             }
         }
@@ -208,7 +234,11 @@ impl RelationshipMemory {
                 }
             }
         }
-        self.entries[min_idx] = Some(RelEntry { entity, affinity: delta, age: 0 });
+        self.entries[min_idx] = Some(RelEntry {
+            entity,
+            affinity: delta,
+            age: 0,
+        });
     }
 
     pub fn get_affinity(&self, entity: Entity) -> i8 {
@@ -228,8 +258,11 @@ impl RelationshipMemory {
                 e.age = e.age.saturating_add(1);
                 let threshold = e.age / 10;
                 if e.affinity.unsigned_abs() <= threshold {
-                    if e.affinity > 0 { e.affinity -= 1; }
-                    else if e.affinity < 0 { e.affinity += 1; }
+                    if e.affinity > 0 {
+                        e.affinity -= 1;
+                    } else if e.affinity < 0 {
+                        e.affinity += 1;
+                    }
                 }
                 if e.affinity == 0 && e.age > 50 {
                     *slot = None;
@@ -243,7 +276,9 @@ pub fn memory_decay_system(
     clock: Res<SimClock>,
     mut query: Query<(&mut AgentMemory, &mut RelationshipMemory)>,
 ) {
-    if clock.tick % 60 != 0 { return; }
+    if clock.tick % 60 != 0 {
+        return;
+    }
     for (mut memory, mut rel) in query.iter_mut() {
         memory.decay();
         rel.decay();
@@ -257,20 +292,30 @@ pub fn vision_system(
     plant_map: Res<crate::simulation::plants::PlantMap>,
     plant_query: Query<&crate::simulation::plants::Plant>,
     item_query: Query<&crate::simulation::items::GroundItem>,
-    prey_query: Query<(Entity, &crate::simulation::combat::Health), Or<(With<crate::simulation::animals::Wolf>, With<crate::simulation::animals::Deer>)>>,
+    prey_query: Query<
+        (Entity, &crate::simulation::combat::Health),
+        Or<(
+            With<crate::simulation::animals::Wolf>,
+            With<crate::simulation::animals::Deer>,
+        )>,
+    >,
     mut query: Query<(&Transform, &mut AgentMemory, &BucketSlot, &LodLevel), With<Person>>,
 ) {
     const VIEW_RADIUS: i32 = 15;
 
     for (transform, mut memory, slot, lod) in query.iter_mut() {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
 
         for dy in -VIEW_RADIUS..=VIEW_RADIUS {
             for dx in -VIEW_RADIUS..=VIEW_RADIUS {
-                if dx*dx + dy*dy > VIEW_RADIUS*VIEW_RADIUS { continue; }
+                if dx * dx + dy * dy > VIEW_RADIUS * VIEW_RADIUS {
+                    continue;
+                }
 
                 let ntx = tx + dx;
                 let nty = ty + dy;
@@ -285,7 +330,8 @@ pub fn vision_system(
                 if let Some(&entity) = plant_map.0.get(&(ntx, nty)) {
                     if let Ok(plant) = plant_query.get(entity) {
                         let kind = match plant.kind {
-                            crate::simulation::plants::PlantKind::FruitBush | crate::simulation::plants::PlantKind::Grain => MemoryKind::Food,
+                            crate::simulation::plants::PlantKind::FruitBush
+                            | crate::simulation::plants::PlantKind::Grain => MemoryKind::Food,
                             crate::simulation::plants::PlantKind::Tree => MemoryKind::Wood,
                         };
                         if plant.stage == crate::simulation::plants::GrowthStage::Mature {
@@ -315,8 +361,7 @@ pub fn vision_system(
                         if let Some(k) = kind {
                             memory.record_entity((ntx as i16, nty as i16), k, entity);
                         }
-                    }
- else if let Ok((e, health)) = prey_query.get(entity) {
+                    } else if let Ok((e, health)) = prey_query.get(entity) {
                         if !health.is_dead() {
                             memory.record_entity((ntx as i16, nty as i16), MemoryKind::Prey, e);
                         }
@@ -338,21 +383,35 @@ pub fn vision_system(
 
 pub fn conversation_memory_system(
     spatial: Res<SpatialIndex>,
-    mut query: Query<(Entity, &AgentGoal, &Transform, &mut AgentMemory, &mut RelationshipMemory, &LodLevel)>,
+    mut query: Query<(
+        Entity,
+        &AgentGoal,
+        &Transform,
+        &mut AgentMemory,
+        &mut RelationshipMemory,
+        &LodLevel,
+    )>,
 ) {
     // Pass 1: collect memory snapshots from all Socialize agents (immutable borrow, dropped after collect)
-    let snapshots: AHashMap<Entity, Vec<MemoryEntry>> = query.iter()
+    let snapshots: AHashMap<Entity, Vec<MemoryEntry>> = query
+        .iter()
         .filter(|(_, goal, ..)| matches!(goal, AgentGoal::Socialize))
         .filter(|(_, _, _, _, _, lod)| **lod != LodLevel::Dormant)
         .map(|(e, _, _, mem, _, _)| (e, mem.top_entries(8)))
         .collect();
 
-    if snapshots.is_empty() { return; }
+    if snapshots.is_empty() {
+        return;
+    }
 
     // Pass 2: apply gossip to each Socialize agent from nearby agents
     for (entity, goal, transform, mut memory, mut rel, lod) in query.iter_mut() {
-        if *lod == LodLevel::Dormant { continue; }
-        if !matches!(goal, AgentGoal::Socialize) { continue; }
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(goal, AgentGoal::Socialize) {
+            continue;
+        }
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
@@ -360,7 +419,9 @@ pub fn conversation_memory_system(
         for dy in -3i32..=3 {
             for dx in -3i32..=3 {
                 for &other in spatial.get(tx + dx, ty + dy) {
-                    if other == entity { continue; }
+                    if other == entity {
+                        continue;
+                    }
                     if let Some(entries) = snapshots.get(&other) {
                         for &entry in entries {
                             memory.receive_gossip(entry);

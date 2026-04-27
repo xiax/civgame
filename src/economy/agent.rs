@@ -1,14 +1,14 @@
-use bevy::prelude::*;
 use super::goods::Good;
 use super::item::Item;
+use bevy::prelude::*;
 
 const INVENTORY_SLOTS: usize = 4;
 
 /// Currency + small fixed inventory.
 #[derive(Component, Clone, Copy)]
 pub struct EconomicAgent {
-    pub currency:  f32,
-    pub inventory: [(Item, u8); INVENTORY_SLOTS],
+    pub currency: f32,
+    pub inventory: [(Item, u32); INVENTORY_SLOTS],
 }
 
 impl Default for EconomicAgent {
@@ -21,21 +21,21 @@ impl Default for EconomicAgent {
 }
 
 impl EconomicAgent {
-    pub fn total_food(&self) -> u8 {
-        self.inventory.iter()
+    pub fn total_food(&self) -> u32 {
+        self.inventory
+            .iter()
             .filter(|(it, _)| it.good.is_edible())
-            .map(|(_, q)| *q)
-            .sum()
+            .fold(0u32, |acc, (_, q)| acc.saturating_add(*q))
     }
 
-    pub fn quantity_of(&self, good: Good) -> u8 {
-        self.inventory.iter()
+    pub fn quantity_of(&self, good: Good) -> u32 {
+        self.inventory
+            .iter()
             .filter(|(it, _)| it.good == good)
-            .map(|(_, q)| *q)
-            .sum()
+            .fold(0u32, |acc, (_, q)| acc.saturating_add(*q))
     }
 
-    pub fn add_item(&mut self, item: Item, qty: u8) {
+    pub fn add_item(&mut self, item: Item, qty: u32) {
         // Find existing slot with identical item
         for (it, q) in self.inventory.iter_mut() {
             if *it == item && *q > 0 {
@@ -53,12 +53,12 @@ impl EconomicAgent {
         }
     }
 
-    pub fn add_good(&mut self, good: Good, qty: u8) {
+    pub fn add_good(&mut self, good: Good, qty: u32) {
         self.add_item(Item::new_commodity(good), qty);
     }
 
     /// Remove up to `qty` units of a specific `item`. Returns how many were actually removed.
-    pub fn remove_item(&mut self, item: Item, qty: u8) -> u8 {
+    pub fn remove_item(&mut self, item: Item, qty: u32) -> u32 {
         for (it, q) in self.inventory.iter_mut() {
             if *it == item && *q > 0 {
                 let removed = (*q).min(qty);
@@ -69,7 +69,7 @@ impl EconomicAgent {
         0
     }
 
-    pub fn remove_good(&mut self, good: Good, qty: u8) -> u8 {
+    pub fn remove_good(&mut self, good: Good, qty: u32) -> u32 {
         self.remove_item(Item::new_commodity(good), qty)
     }
 

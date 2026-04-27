@@ -1,13 +1,13 @@
 use bevy::prelude::*;
 use bevy_egui::EguiPlugin;
 
-pub mod selection;
-pub mod inspector;
 pub mod economy_panel;
-pub mod hud;
-pub mod world_map;
 pub mod hover;
+pub mod hud;
+pub mod inspector;
 pub mod orders;
+pub mod selection;
+pub mod world_map;
 
 pub use selection::SelectedEntity;
 

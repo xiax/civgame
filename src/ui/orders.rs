@@ -1,18 +1,18 @@
+use super::selection::SelectedEntity;
+use crate::pathfinding::chunk_graph::ChunkGraph;
+use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
+use crate::simulation::items::GroundItem;
+use crate::simulation::person::{AiState, PersonAI, PlayerOrder, PlayerOrderKind};
+use crate::simulation::plants::PlantMap;
+use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
+use crate::simulation::technology::PERM_SETTLEMENT;
+use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
+use crate::world::spatial::SpatialIndex;
+use crate::world::terrain::TILE_SIZE;
+use crate::world::tile::TileKind;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts};
-use crate::pathfinding::chunk_graph::ChunkGraph;
-use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
-use crate::world::terrain::TILE_SIZE;
-use crate::world::tile::TileKind;
-use crate::world::spatial::SpatialIndex;
-use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
-use crate::simulation::items::GroundItem;
-use crate::simulation::tasks::{TaskKind, assign_task_with_routing};
-use crate::simulation::person::{AiState, PersonAI, PlayerOrder, PlayerOrderKind};
-use crate::simulation::plants::PlantMap;
-use crate::simulation::technology::PERM_SETTLEMENT;
-use super::selection::SelectedEntity;
 
 #[derive(Resource, Default)]
 pub struct ContextMenuState {
@@ -68,11 +68,14 @@ pub fn right_click_context_menu_system(
 
                     let mut actions = vec![PlayerOrderKind::Move];
                     if let Some(kind) = chunk_map.tile_kind_at(tx, ty) {
-                        if matches!(kind, TileKind::Stone | TileKind::Wall) {
+                        if matches!(kind, TileKind::Wall | TileKind::Stone) {
                             actions.push(PlayerOrderKind::Mine);
                         }
                         if kind.is_passable() {
-                            let has_perm = faction_q.get(sel_entity).ok()
+                            actions.push(PlayerOrderKind::DigDown);
+                            let has_perm = faction_q
+                                .get(sel_entity)
+                                .ok()
                                 .and_then(|m| faction_registry.factions.get(&m.faction_id))
                                 .map(|f| f.techs.has(PERM_SETTLEMENT))
                                 .unwrap_or(false);
@@ -139,16 +142,28 @@ pub fn right_click_context_menu_system(
                 cur_ty.div_euclid(CHUNK_SIZE as i32),
             );
             let task = match action {
-                PlayerOrderKind::Move      => TaskKind::Idle,
-                PlayerOrderKind::Mine      => TaskKind::Gather,
-                PlayerOrderKind::Gather    => TaskKind::Gather,
-                PlayerOrderKind::PickUp    => TaskKind::Scavenge,
+                PlayerOrderKind::Move => TaskKind::Idle,
+                PlayerOrderKind::Mine => TaskKind::Gather,
+                PlayerOrderKind::Gather => TaskKind::Gather,
+                PlayerOrderKind::PickUp => TaskKind::Scavenge,
                 PlayerOrderKind::BuildWall => TaskKind::Construct,
-                PlayerOrderKind::BuildBed  => TaskKind::ConstructBed,
+                PlayerOrderKind::BuildBed => TaskKind::ConstructBed,
+                PlayerOrderKind::DigDown => TaskKind::Dig,
             };
-            assign_task_with_routing(&mut ai, cur_chunk, target_tile, task, None, &chunk_graph, &chunk_map);
+            assign_task_with_routing(
+                &mut ai,
+                cur_chunk,
+                target_tile,
+                task,
+                None,
+                &chunk_graph,
+                &chunk_map,
+            );
         }
-        commands.entity(sel_entity).insert(PlayerOrder { order: action, target_tile });
+        commands.entity(sel_entity).insert(PlayerOrder {
+            order: action,
+            target_tile,
+        });
         menu_state.open = false;
     }
 }

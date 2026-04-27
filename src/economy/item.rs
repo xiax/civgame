@@ -1,5 +1,5 @@
-use bevy::prelude::*;
 use super::goods::Good;
+use bevy::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ItemMaterial {
@@ -13,10 +13,10 @@ pub enum ItemMaterial {
 impl ItemMaterial {
     pub fn multiplier(&self) -> f32 {
         match self {
-            ItemMaterial::Wood    => 1.0,
-            ItemMaterial::Stone   => 1.5,
-            ItemMaterial::Iron    => 3.0,
-            ItemMaterial::Steel   => 6.0,
+            ItemMaterial::Wood => 1.0,
+            ItemMaterial::Stone => 1.5,
+            ItemMaterial::Iron => 3.0,
+            ItemMaterial::Steel => 6.0,
             ItemMaterial::Leather => 2.5,
         }
     }
@@ -33,9 +33,9 @@ pub enum ItemQuality {
 impl ItemQuality {
     pub fn multiplier(&self) -> f32 {
         match self {
-            ItemQuality::Poor       => 0.5,
-            ItemQuality::Normal     => 1.0,
-            ItemQuality::Fine       => 2.0,
+            ItemQuality::Poor => 0.5,
+            ItemQuality::Normal => 1.0,
+            ItemQuality::Fine => 2.0,
             ItemQuality::Masterwork => 5.0,
         }
     }
@@ -43,18 +43,26 @@ impl ItemQuality {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Item {
-    pub good:     Good,
+    pub good: Good,
     pub material: Option<ItemMaterial>,
-    pub quality:  Option<ItemQuality>,
+    pub quality: Option<ItemQuality>,
 }
 
 impl Item {
     pub fn new_commodity(good: Good) -> Self {
-        Self { good, material: None, quality: None }
+        Self {
+            good,
+            material: None,
+            quality: None,
+        }
     }
 
     pub fn new_manufactured(good: Good, material: ItemMaterial, quality: ItemQuality) -> Self {
-        Self { good, material: Some(material), quality: Some(quality) }
+        Self {
+            good,
+            material: Some(material),
+            quality: Some(quality),
+        }
     }
 
     pub fn is_manufactured(&self) -> bool {

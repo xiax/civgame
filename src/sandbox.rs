@@ -16,7 +16,9 @@ use crate::simulation::needs::Needs;
 use crate::simulation::neural::UtilityNet;
 use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::plan::{KnownPlans, PlanScoringMethod};
-use crate::simulation::plants::{DeerGrazer, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex, spawn_plant_at};
+use crate::simulation::plants::{
+    spawn_plant_at, DeerGrazer, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
+};
 use crate::simulation::reproduction::BiologicalSex;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::Skills;
@@ -71,7 +73,6 @@ fn setup_sandbox(
                 last_goal_eval_tick: 0,
                 target_entity: None,
             },
-
             EconomicAgent::default(),
         ),
         (
@@ -142,17 +143,41 @@ fn setup_sandbox(
 
     // One of each plant kind, mature, clustered above the entity group.
     // spawn_plant_at is a no-op if the tile is already occupied by a chunk-generated plant.
-    spawn_plant_at(&mut commands, &mut plant_map, &mut plant_sprite_index,
-        cx + 2, cy + 5, PlantKind::FruitBush, GrowthStage::Mature);
-    spawn_plant_at(&mut commands, &mut plant_map, &mut plant_sprite_index,
-        cx - 2, cy + 5, PlantKind::Grain, GrowthStage::Mature);
-    spawn_plant_at(&mut commands, &mut plant_map, &mut plant_sprite_index,
-        cx, cy + 7, PlantKind::Tree, GrowthStage::Mature);
+    spawn_plant_at(
+        &mut commands,
+        &mut plant_map,
+        &mut plant_sprite_index,
+        cx + 2,
+        cy + 5,
+        PlantKind::FruitBush,
+        GrowthStage::Mature,
+    );
+    spawn_plant_at(
+        &mut commands,
+        &mut plant_map,
+        &mut plant_sprite_index,
+        cx - 2,
+        cy + 5,
+        PlantKind::Grain,
+        GrowthStage::Mature,
+    );
+    spawn_plant_at(
+        &mut commands,
+        &mut plant_map,
+        &mut plant_sprite_index,
+        cx,
+        cy + 7,
+        PlantKind::Tree,
+        GrowthStage::Mature,
+    );
 
     // Ground items near the person
     let food_pos = tile_to_world(cx + 1, cy + 1);
     commands.spawn((
-        GroundItem { item: Item::new_commodity(Good::Fruit), qty: 5 },
+        GroundItem {
+            item: Item::new_commodity(Good::Fruit),
+            qty: 5,
+        },
         Transform::from_xyz(food_pos.x, food_pos.y, 0.5),
         GlobalTransform::default(),
         Visibility::Visible,
@@ -160,7 +185,10 @@ fn setup_sandbox(
     ));
     let wood_pos = tile_to_world(cx - 1, cy + 1);
     commands.spawn((
-        GroundItem { item: Item::new_commodity(Good::Wood), qty: 3 },
+        GroundItem {
+            item: Item::new_commodity(Good::Wood),
+            qty: 3,
+        },
         Transform::from_xyz(wood_pos.x, wood_pos.y, 0.5),
         GlobalTransform::default(),
         Visibility::Visible,

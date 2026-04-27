@@ -1,16 +1,18 @@
-use bevy::prelude::*;
-use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
-use crate::world::terrain::{tile_to_world, TILE_SIZE, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
-use crate::simulation::line_of_sight::has_los;
-use crate::world::tile::TileKind;
-use crate::world::spatial::SpatialIndex;
-use super::combat::{CombatTarget, Health, Body, CombatCooldown};
+use super::combat::{Body, CombatCooldown, CombatTarget, Health};
 use super::lod::LodLevel;
 use super::person::Person;
 use super::schedule::{BucketSlot, SimClock};
+use crate::simulation::line_of_sight::has_los;
+use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
+use crate::world::spatial::SpatialIndex;
+use crate::world::terrain::{tile_to_world, TILE_SIZE, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
+use crate::world::tile::TileKind;
+use bevy::prelude::*;
+use rand::Rng;
+use std::time::Instant;
 
-const WOLF_COUNT:  u32 = 150;
-const DEER_COUNT:  u32 = 400;
+const WOLF_COUNT: u32 = 150;
+const DEER_COUNT: u32 = 400;
 const ANIMAL_SPEED: f32 = 32.0; // pixels/sec, slower than persons
 
 #[derive(Component)]
@@ -24,17 +26,17 @@ pub struct Deer;
 pub enum AnimalState {
     #[default]
     Wander = 0,
-    Chase  = 1,
-    Flee   = 2,
+    Chase = 1,
+    Flee = 2,
     Attack = 3,
 }
 
 #[derive(Component, Clone, Copy, Default)]
 pub struct AnimalAI {
-    pub state:         AnimalState,
-    pub target_tile:   (i16, i16),
+    pub state: AnimalState,
+    pub target_tile: (i16, i16),
     pub target_entity: Option<Entity>,
-    pub wander_timer:  f32,
+    pub wander_timer: f32,
 }
 
 const WANDER_INTERVAL: f32 = 3.0;
@@ -44,9 +46,10 @@ pub fn spawn_animals(
     chunk_map: Res<ChunkMap>,
     mut clock: ResMut<SimClock>,
 ) {
+    let now = Instant::now();
     use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 
-    let start_cx = (GLOBE_WIDTH  / 2) * GLOBE_CELL_CHUNKS;
+    let start_cx = (GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS;
     let start_cy = (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS;
 
     let start_tx = start_cx * CHUNK_SIZE as i32;
@@ -55,21 +58,46 @@ pub fn spawn_animals(
     let total_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
     let total_y = WORLD_CHUNKS_Y * CHUNK_SIZE as i32;
 
-    // Collect eligible tiles
+    // Use random sampling instead of O(N) full world scan to find spawn tiles.
     let mut forest_tiles: Vec<(i32, i32)> = Vec::new();
-    let mut grass_tiles:  Vec<(i32, i32)> = Vec::new();
+    let mut grass_tiles: Vec<(i32, i32)> = Vec::new();
+    let mut rng = rand::thread_rng();
 
-    for dy in 0..total_y {
-        for dx in 0..total_x {
-            let tx = start_tx + dx;
-            let ty = start_ty + dy;
-            if !chunk_map.is_passable(tx, ty) { continue; }
-            match chunk_map.tile_kind_at(tx, ty) {
-                Some(TileKind::Forest) => forest_tiles.push((tx, ty)),
-                Some(TileKind::Grass)  => grass_tiles.push((tx, ty)),
-                _ => {}
-            }
+    for _ in 0..10000 {
+        let tx = start_tx + rng.gen_range(0..total_x);
+        let ty = start_ty + rng.gen_range(0..total_y);
+        if !chunk_map.is_passable(tx, ty) {
+            continue;
         }
+        match chunk_map.tile_kind_at(tx, ty) {
+            Some(TileKind::Forest) => {
+                if forest_tiles.len() < WOLF_COUNT as usize * 2 {
+                    forest_tiles.push((tx, ty));
+                }
+            }
+            Some(TileKind::Grass) => {
+                if grass_tiles.len() < DEER_COUNT as usize * 2 {
+                    grass_tiles.push((tx, ty));
+                }
+            }
+            _ => {}
+        }
+        if forest_tiles.len() >= WOLF_COUNT as usize * 2
+            && grass_tiles.len() >= DEER_COUNT as usize * 2
+        {
+            break;
+        }
+    }
+
+    info!(
+        "Animal spawn tiles found: {} forest, {} grass in {:?}",
+        forest_tiles.len(),
+        grass_tiles.len(),
+        now.elapsed()
+    );
+
+    if forest_tiles.is_empty() || grass_tiles.is_empty() {
+        warn!("spawn_animals: could not find enough forest or grass tiles via random sampling!");
     }
 
     let mut slot = clock.population;
@@ -78,7 +106,9 @@ pub fn spawn_animals(
     let wolf_step = (forest_tiles.len() / WOLF_COUNT as usize).max(1);
     for i in 0..WOLF_COUNT as usize {
         let idx = (i * wolf_step) % forest_tiles.len().max(1);
-        if idx >= forest_tiles.len() { break; }
+        if idx >= forest_tiles.len() {
+            break;
+        }
         let (tx, ty) = forest_tiles[idx];
         let pos = tile_to_world(tx, ty);
         commands.spawn((
@@ -105,7 +135,9 @@ pub fn spawn_animals(
     let deer_step = (grass_tiles.len() / DEER_COUNT as usize).max(1);
     for i in 0..DEER_COUNT as usize {
         let idx = (i * deer_step) % grass_tiles.len().max(1);
-        if idx >= grass_tiles.len() { break; }
+        if idx >= grass_tiles.len() {
+            break;
+        }
         let (tx, ty) = grass_tiles[idx];
         let pos = tile_to_world(tx, ty);
         commands.spawn((
@@ -138,6 +170,7 @@ pub fn spawn_animals(
 pub fn animal_movement_system(
     time: Res<Time>,
     chunk_map: Res<ChunkMap>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
     mut query: Query<(&mut Transform, &mut AnimalAI, &LodLevel, &BucketSlot), Without<Person>>,
     clock: Res<SimClock>,
 ) {
@@ -180,16 +213,26 @@ pub fn animal_movement_system(
                         let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
                         let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
 
-                        // Pick random adjacent passable tile
+                        // Pick random adjacent passable tile that no other agent occupies.
                         let dirs: [(i32, i32); 8] = [
-                            (-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1),
+                            (-1, 0),
+                            (1, 0),
+                            (0, -1),
+                            (0, 1),
+                            (-1, -1),
+                            (1, -1),
+                            (-1, 1),
+                            (1, 1),
                         ];
                         let start = fastrand::usize(..8);
                         for i in 0..8 {
                             let (dx, dy) = dirs[(start + i) % 8];
                             let ntx = cur_tx + dx;
                             let nty = cur_ty + dy;
-                            if chunk_map.is_passable(ntx, nty) {
+                            let ntz = chunk_map.surface_z_at(ntx, nty);
+                            if chunk_map.is_passable(ntx, nty)
+                                && !spatial.agent_occupied(ntx, nty, ntz)
+                            {
                                 ai.target_tile = (ntx as i16, nty as i16);
                                 break;
                             }
@@ -222,12 +265,16 @@ pub fn animal_sense_system(
 
     // Wolf sense: find deer or lone humans
     for (wolf_entity, transform, slot, lod) in &wolf_query {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
 
-        let Ok((mut ai, mut combat_target)) = ai_query.get_mut(wolf_entity) else { continue };
+        let Ok((mut ai, mut combat_target)) = ai_query.get_mut(wolf_entity) else {
+            continue;
+        };
 
         // If already chasing/attacking a valid target, keep it
         if let Some(existing) = ai.target_entity {
@@ -250,7 +297,8 @@ pub fn animal_sense_system(
 
                         // Check adjacency for attack
                         let target_tile = ai.target_tile;
-                        let dist = (target_tile.0 as i32 - tx).abs() + (target_tile.1 as i32 - ty).abs();
+                        let dist =
+                            (target_tile.0 as i32 - tx).abs() + (target_tile.1 as i32 - ty).abs();
                         if dist <= 1 {
                             ai.state = AnimalState::Attack;
                             combat_target.0 = Some(existing);
@@ -273,18 +321,26 @@ pub fn animal_sense_system(
         'scan: for dy in -WOLF_HUNT_RADIUS..=WOLF_HUNT_RADIUS {
             for dx in -WOLF_HUNT_RADIUS..=WOLF_HUNT_RADIUS {
                 for &candidate in spatial.get(tx + dx, ty + dy) {
-                    if candidate == wolf_entity { continue; }
+                    if candidate == wolf_entity {
+                        continue;
+                    }
 
-                    let Ok((_, health, body)) = target_query.get(candidate) else { continue };
+                    let Ok((_, health, body)) = target_query.get(candidate) else {
+                        continue;
+                    };
                     let is_dead = match (health, body) {
                         (Some(h), _) if h.is_dead() => true,
                         (_, Some(b)) if b.is_dead() => true,
                         _ => false,
                     };
-                    if is_dead { continue; }
+                    if is_dead {
+                        continue;
+                    }
 
                     // Terrain must not block sight between wolf and prey.
-                    if !has_los(&chunk_map, (tx, ty), (tx + dx, ty + dy)) { continue; }
+                    if !has_los(&chunk_map, (tx, ty), (tx + dx, ty + dy)) {
+                        continue;
+                    }
 
                     // Prefer deer
                     if deer_query.contains(candidate) {
@@ -328,12 +384,16 @@ pub fn animal_sense_system(
 
     // Deer sense: flee from wolves
     for (deer_entity, transform, slot, lod) in &deer_query {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
 
-        let Ok((mut ai, _)) = ai_query.get_mut(deer_entity) else { continue };
+        let Ok((mut ai, _)) = ai_query.get_mut(deer_entity) else {
+            continue;
+        };
 
         let mut threat_dx = 0i32;
         let mut threat_dy = 0i32;
@@ -359,10 +419,8 @@ pub fn animal_sense_system(
             let total_tiles_y = GLOBE_HEIGHT * GLOBE_CELL_CHUNKS * CHUNK_SIZE as i32;
 
             // Flee in opposite direction from average threat position
-            let flee_tx = (tx - threat_dx / threat_count)
-                .clamp(0, total_tiles_x - 1);
-            let flee_ty = (ty - threat_dy / threat_count)
-                .clamp(0, total_tiles_y - 1);
+            let flee_tx = (tx - threat_dx / threat_count).clamp(0, total_tiles_x - 1);
+            let flee_ty = (ty - threat_dy / threat_count).clamp(0, total_tiles_y - 1);
             ai.state = AnimalState::Flee;
             ai.target_tile = (flee_tx as i16, flee_ty as i16);
             ai.wander_timer = 1.5; // hold flee direction for 1.5s

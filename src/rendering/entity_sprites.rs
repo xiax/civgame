@@ -1,11 +1,16 @@
-use bevy::prelude::*;
+use crate::rendering::pixel_art::{ArtMode, EntityTextures};
+use crate::rendering::sprite_library::SpriteLibrary;
 use crate::simulation::animals::{Deer, Wolf};
-use crate::simulation::construction::{Bed, Blueprint, Wall, BuildSiteKind};
-use crate::simulation::faction::{FactionMember, PlayerFaction, FactionCenter, PlayerFactionMarker};
-use crate::simulation::person::Person;
-use crate::simulation::plants::{Plant, PlantKind, GrowthStage};
+use crate::simulation::construction::{Bed, Blueprint, BuildSiteKind, Wall};
+use crate::simulation::faction::{
+    FactionCenter, FactionMember, PlayerFaction, PlayerFactionMarker,
+};
+use crate::simulation::items::{Equipment, EquipmentSlot};
+use crate::simulation::person::{HairColor, Person, PersonAI, SkinTone};
+use crate::simulation::plants::{GrowthStage, Plant, PlantKind};
 use crate::simulation::reproduction::BiologicalSex;
-use crate::rendering::pixel_art::EntityTextures;
+use crate::world::terrain::tile_to_world;
+use bevy::prelude::*;
 
 use bevy::sprite::Anchor;
 
@@ -43,19 +48,44 @@ pub struct BlueprintVisual;
 #[derive(Component)]
 pub struct VisualChild;
 
-/// Helper to spawn a visual child with the correct anchor and alignment offset.
-pub fn spawn_visual_child(commands: &mut Commands, entity: Entity, mut sprite: Sprite, z_offset: f32) {
-    sprite.anchor = Anchor::BottomCenter;
-    commands.entity(entity).with_children(|parent| {
-        parent.spawn((
-            VisualChild,
-            sprite,
-            Transform::from_xyz(0.0, -8.0, z_offset),
-            GlobalTransform::default(),
-            Visibility::Visible,
-            InheritedVisibility::default(),
-        ));
-    });
+/// Identifies which rendering layer a VisualChild belongs to.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub enum VisualLayer {
+    Body,
+    Clothing,
+    Hair,
+}
+
+/// Cached clothing color key derived from equipped TorsoArmor material.
+#[derive(Component, Clone)]
+pub struct ClothingVisual {
+    pub color_key: &'static str,
+}
+
+impl Default for ClothingVisual {
+    fn default() -> Self {
+        Self { color_key: "tan" }
+    }
+}
+
+#[derive(Component, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FacingDirection {
+    #[default]
+    South,
+    North,
+    East,
+    West,
+}
+
+impl FacingDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::South => "s",
+            Self::North => "n",
+            Self::East => "e",
+            Self::West => "w",
+        }
+    }
 }
 
 pub fn spawn_bed_sprites(
@@ -64,11 +94,22 @@ pub fn spawn_bed_sprites(
     textures: Res<EntityTextures>,
 ) {
     for entity in query.iter() {
-        let mut sprite = Sprite::from_image(textures.bed.clone());
-        sprite.custom_size = Some(Vec2::new(16.0, 10.0));
-        
+        let img = textures.bed_ascii.clone();
+
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
+
         commands.entity(entity).insert(BedVisual);
-        spawn_visual_child(&mut commands, entity, sprite, 0.1);
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ));
+        });
     }
 }
 
@@ -78,29 +119,54 @@ pub fn spawn_wall_sprites(
     textures: Res<EntityTextures>,
 ) {
     for entity in query.iter() {
-        let mut sprite = Sprite::from_image(textures.wall.clone());
-        sprite.custom_size = Some(Vec2::new(16.0, 16.0));
+        let img = textures.wall_ascii.clone();
+
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
 
         commands.entity(entity).insert(WallVisual);
-        spawn_visual_child(&mut commands, entity, sprite, 0.1);
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ));
+        });
     }
 }
 
 pub fn spawn_faction_center_sprites(
     mut commands: Commands,
-    query: Query<(Entity, Option<&PlayerFactionMarker>), (With<FactionCenter>, Without<FactionCenterVisual>)>,
+    query: Query<
+        (Entity, Option<&PlayerFactionMarker>),
+        (With<FactionCenter>, Without<FactionCenterVisual>),
+    >,
     textures: Res<EntityTextures>,
 ) {
     for (entity, player_marker) in query.iter() {
-        let mut sprite = Sprite::from_image(textures.camp.clone());
-        sprite.custom_size = Some(Vec2::new(24.0, 24.0));
-        
+        let img = textures.camp_ascii.clone();
+
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
+
         if player_marker.is_some() {
             sprite.color = Color::srgb(0.55, 0.85, 1.0);
         }
 
         commands.entity(entity).insert(FactionCenterVisual);
-        spawn_visual_child(&mut commands, entity, sprite, 0.1);
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ));
+        });
     }
 }
 
@@ -108,13 +174,32 @@ pub fn spawn_wolf_sprites(
     mut commands: Commands,
     query: Query<Entity, (With<Wolf>, Without<WolfVisual>)>,
     textures: Res<EntityTextures>,
+    sprite_lib: Res<SpriteLibrary>,
+    art_mode: Res<ArtMode>,
 ) {
     for entity in query.iter() {
-        let mut sprite = Sprite::from_image(textures.wolf.clone());
-        sprite.custom_size = Some(Vec2::new(24.0, 36.0));
+        let img = if *art_mode == ArtMode::Ascii {
+            textures.wolf_ascii.clone()
+        } else {
+            sprite_lib.get("anim_wolf_s_a")
+                .cloned()
+                .unwrap_or_else(|| textures.wolf_ascii.clone())
+        };
+
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
 
         commands.entity(entity).insert(WolfVisual);
-        spawn_visual_child(&mut commands, entity, sprite, 0.1);
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ));
+        });
     }
 }
 
@@ -122,47 +207,145 @@ pub fn spawn_deer_sprites(
     mut commands: Commands,
     query: Query<Entity, (With<Deer>, Without<DeerVisual>)>,
     textures: Res<EntityTextures>,
+    sprite_lib: Res<SpriteLibrary>,
+    art_mode: Res<ArtMode>,
 ) {
     for entity in query.iter() {
-        let mut sprite = Sprite::from_image(textures.deer.clone());
-        sprite.custom_size = Some(Vec2::new(24.0, 36.0));
+        let img = if *art_mode == ArtMode::Pixel {
+            sprite_lib.get("anim_deer_s_a")
+                .cloned()
+                .unwrap_or_else(|| textures.deer_ascii.clone())
+        } else {
+            textures.deer_ascii.clone()
+        };
+
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
 
         commands.entity(entity).insert(DeerVisual);
-        spawn_visual_child(&mut commands, entity, sprite, 0.1);
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ));
+        });
     }
 }
 
 pub fn spawn_person_sprites(
     mut commands: Commands,
-    query: Query<(Entity, Option<&BiologicalSex>), (With<Person>, Without<PersonVisual>)>,
+    query: Query<
+        (Entity, Option<&BiologicalSex>, Option<&SkinTone>, Option<&HairColor>, Option<&ClothingVisual>),
+        (With<Person>, Without<PersonVisual>),
+    >,
     textures: Res<EntityTextures>,
+    sprite_lib: Res<SpriteLibrary>,
+    art_mode: Res<ArtMode>,
 ) {
-    for (entity, sex_opt) in query.iter() {
-        let mut sprite = Sprite::default();
-        sprite.image = match sex_opt {
-            Some(BiologicalSex::Female) => textures.person_female.clone(),
-            _ => textures.person_male.clone(),
-        };
-        sprite.color = Color::WHITE;
-        sprite.custom_size = Some(Vec2::new(24.0, 36.0));
+    for (entity, sex_opt, tone_opt, hair_opt, clothing_opt) in query.iter() {
+        let is_female = matches!(sex_opt, Some(BiologicalSex::Female));
+        let sex_str = if is_female { "female" } else { "male" };
 
-        commands.entity(entity).insert(PersonVisual);
-        spawn_visual_child(&mut commands, entity, sprite, 0.1);
+        let mut entity_cmds = commands.entity(entity);
+        entity_cmds.insert((PersonVisual, FacingDirection::South));
+        if clothing_opt.is_none() {
+            entity_cmds.insert(ClothingVisual::default());
+        }
+
+        if *art_mode == ArtMode::Ascii {
+            let img = if is_female {
+                textures.person_female_ascii.clone()
+            } else {
+                textures.person_male_ascii.clone()
+            };
+            let mut sprite = Sprite::from_image(img);
+            sprite.color = Color::WHITE;
+            sprite.anchor = Anchor::BottomCenter;
+            commands.entity(entity).with_children(|parent| {
+                parent.spawn((
+                    VisualChild,
+                    VisualLayer::Body,
+                    sprite,
+                    Transform::from_xyz(0.0, -8.0, 0.0),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ));
+            });
+        } else {
+            let tone_str = tone_opt.map(|t| t.as_str()).unwrap_or("tan");
+            let hair_str = hair_opt.map(|h| h.as_str()).unwrap_or("brown");
+            let cloth_str = clothing_opt.map(|c| c.color_key).unwrap_or("tan");
+
+            let body_img = sprite_lib.get(&format!("body_{sex_str}_{tone_str}_s_a"))
+                .cloned().unwrap_or_else(|| textures.person_male_ascii.clone());
+            let hair_img = sprite_lib.get(&format!("hair_{sex_str}_{hair_str}_s_a"))
+                .cloned().unwrap_or_else(|| textures.person_male_ascii.clone());
+            let cloth_img = sprite_lib.get(&format!("clothing_{sex_str}_{cloth_str}_s_a"))
+                .cloned().unwrap_or_else(|| textures.person_male_ascii.clone());
+
+            let mut body_sprite = Sprite::from_image(body_img);
+            body_sprite.color = Color::WHITE;
+            body_sprite.anchor = Anchor::BottomCenter;
+
+            let mut hair_sprite = Sprite::from_image(hair_img);
+            hair_sprite.anchor = Anchor::BottomCenter;
+
+            let mut cloth_sprite = Sprite::from_image(cloth_img);
+            cloth_sprite.anchor = Anchor::BottomCenter;
+
+            commands.entity(entity).with_children(|parent| {
+                parent.spawn((
+                    VisualChild, VisualLayer::Body,
+                    body_sprite,
+                    Transform::from_xyz(0.0, -8.0, 0.0),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ));
+                parent.spawn((
+                    VisualChild, VisualLayer::Clothing,
+                    cloth_sprite,
+                    Transform::from_xyz(0.0, -8.0, 0.1),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ));
+                parent.spawn((
+                    VisualChild, VisualLayer::Hair,
+                    hair_sprite,
+                    Transform::from_xyz(0.0, -8.0, 0.2),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ));
+            });
+        }
     }
 }
 
-pub fn get_plant_texture(textures: &EntityTextures, kind: PlantKind, stage: GrowthStage) -> Handle<Image> {
+pub fn get_plant_texture(
+    textures: &EntityTextures,
+    kind: PlantKind,
+    stage: GrowthStage,
+) -> Handle<Image> {
     match kind {
         PlantKind::Tree => match stage {
-            GrowthStage::Seed     => textures.plant_seed.clone(),
-            GrowthStage::Seedling => textures.tree_seedling.clone(),
-            _ => textures.tree_mature.clone(),
+            GrowthStage::Seed => textures.plant_seed_ascii.clone(),
+            GrowthStage::Seedling => textures.tree_seedling_ascii.clone(),
+            GrowthStage::Harvested => textures.tree_seedling_ascii.clone(),
+            _ => textures.tree_mature_ascii.clone(),
         },
         _ => match stage {
-            GrowthStage::Seed => textures.plant_seed.clone(),
-            GrowthStage::Seedling => textures.plant_seedling.clone(),
-            _ => textures.plant_mature.clone(),
-        }
+            GrowthStage::Seed => textures.plant_seed_ascii.clone(),
+            GrowthStage::Seedling => textures.plant_seedling_ascii.clone(),
+            GrowthStage::Harvested => textures.plant_seedling_ascii.clone(),
+            _ => textures.plant_mature_ascii.clone(),
+        },
     }
 }
 
@@ -172,11 +355,21 @@ pub fn spawn_plant_sprites(
     textures: Res<EntityTextures>,
 ) {
     for (entity, plant) in query.iter() {
-        let mut sprite = Sprite::from_image(get_plant_texture(&textures, plant.kind, plant.stage));
-        sprite.custom_size = Some(Vec2::new(24.0, 36.0));
+        let img = get_plant_texture(&textures, plant.kind, plant.stage);
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
 
         commands.entity(entity).insert(PlantVisual);
-        spawn_visual_child(&mut commands, entity, sprite, 0.5);
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.5),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ));
+        });
     }
 }
 
@@ -186,11 +379,129 @@ pub fn update_plant_sprites(
     mut sprites: Query<&mut Sprite, With<VisualChild>>,
 ) {
     for (plant, children) in query.iter() {
-        let texture = get_plant_texture(&textures, plant.kind, plant.stage);
+        let img = get_plant_texture(&textures, plant.kind, plant.stage);
         for &child in children.iter() {
             if let Ok(mut sprite) = sprites.get_mut(child) {
-                sprite.image = texture.clone();
+                sprite.image = img.clone();
             }
+        }
+    }
+}
+
+pub fn animate_person_sprites(
+    time: Res<Time>,
+    art_mode: Res<ArtMode>,
+    sprite_lib: Res<SpriteLibrary>,
+    mut persons: Query<(
+        &PersonAI,
+        Option<&BiologicalSex>,
+        Option<&SkinTone>,
+        Option<&HairColor>,
+        Option<&ClothingVisual>,
+        &Transform,
+        &Children,
+        &mut FacingDirection,
+    ), With<Person>>,
+    mut child_sprites: Query<(&mut Sprite, &VisualLayer), With<VisualChild>>,
+) {
+    if *art_mode == ArtMode::Ascii {
+        return;
+    }
+
+    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
+
+    for (ai, sex_opt, tone_opt, hair_opt, clothing_opt, transform, children, mut facing) in persons.iter_mut() {
+        let target_world = tile_to_world(ai.target_tile.0 as i32, ai.target_tile.1 as i32);
+        let diff = target_world - transform.translation.truncate();
+        let is_moving = diff.length() > 2.0;
+
+        if is_moving {
+            *facing = if diff.x.abs() > diff.y.abs() {
+                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+            } else {
+                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+            };
+        }
+
+        let is_female = matches!(sex_opt, Some(BiologicalSex::Female));
+        let sex_str = if is_female { "female" } else { "male" };
+        let tone_str = tone_opt.map(|t| t.as_str()).unwrap_or("tan");
+        let hair_str = hair_opt.map(|h| h.as_str()).unwrap_or("brown");
+        let cloth_str = clothing_opt.map(|c| c.color_key).unwrap_or("tan");
+        let dir = facing.as_str();
+        let frame_str = if is_moving && frame_b { "b" } else { "a" };
+
+        let body_key = format!("body_{sex_str}_{tone_str}_{dir}_{frame_str}");
+        let hair_key = format!("hair_{sex_str}_{hair_str}_{dir}_{frame_str}");
+        let cloth_key = format!("clothing_{sex_str}_{cloth_str}_{dir}_{frame_str}");
+
+        for &child in children.iter() {
+            if let Ok((mut sprite, layer)) = child_sprites.get_mut(child) {
+                let key = match layer {
+                    VisualLayer::Body => body_key.as_str(),
+                    VisualLayer::Hair => hair_key.as_str(),
+                    VisualLayer::Clothing => cloth_key.as_str(),
+                };
+                if let Some(img) = sprite_lib.get(key) {
+                    if sprite.image != *img {
+                        sprite.image = img.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn toggle_art_mode(keyboard: Res<ButtonInput<KeyCode>>, mut art_mode: ResMut<ArtMode>) {
+    if keyboard.just_pressed(KeyCode::KeyT) {
+        *art_mode = match *art_mode {
+            ArtMode::Ascii => ArtMode::Pixel,
+            ArtMode::Pixel => ArtMode::Ascii,
+        };
+        info!("Art Mode changed to: {:?}", *art_mode);
+    }
+}
+pub fn handle_art_mode_change(
+    mut commands: Commands,
+    art_mode: Res<ArtMode>,
+    people: Query<Entity, With<PersonVisual>>,
+    wolves: Query<Entity, With<WolfVisual>>,
+    deer: Query<Entity, With<DeerVisual>>,
+    walls: Query<Entity, With<WallVisual>>,
+    beds: Query<Entity, With<BedVisual>>,
+    centers: Query<Entity, With<FactionCenterVisual>>,
+    plants: Query<Entity, With<PlantVisual>>,
+    blueprints: Query<Entity, With<BlueprintVisual>>,
+    children: Query<(Entity, &Children)>,
+) {
+    if art_mode.is_changed() && !art_mode.is_added() {
+        let all_visuals = people
+            .iter()
+            .chain(wolves.iter())
+            .chain(deer.iter())
+            .chain(walls.iter())
+            .chain(beds.iter())
+            .chain(centers.iter())
+            .chain(plants.iter())
+            .chain(blueprints.iter());
+
+        for entity in all_visuals {
+            if let Ok((_, children)) = children.get(entity) {
+                for &child in children.iter() {
+                    // Only despawn if it's a visual child to avoid destroying actual game logic children if any
+                    commands.entity(child).despawn_recursive();
+                }
+            }
+            commands.entity(entity).remove::<(
+                PersonVisual,
+                WolfVisual,
+                DeerVisual,
+                WallVisual,
+                BedVisual,
+                FactionCenterVisual,
+                PlantVisual,
+                BlueprintVisual,
+            )>();
         }
     }
 }
@@ -199,9 +510,9 @@ pub fn update_faction_sprite_colors(
     player_faction: Res<PlayerFaction>,
     persons: Query<
         (&FactionMember, &Children),
-        (With<Person>, With<PersonVisual>, Changed<FactionMember>),
+        (With<Person>, With<PersonVisual>, Or<(Changed<FactionMember>, Added<PersonVisual>)>),
     >,
-    mut sprites: Query<&mut Sprite, With<VisualChild>>,
+    mut sprites: Query<(&mut Sprite, &VisualLayer), With<VisualChild>>,
 ) {
     for (member, children) in persons.iter() {
         let color = if member.faction_id == player_faction.faction_id {
@@ -210,9 +521,27 @@ pub fn update_faction_sprite_colors(
             Color::WHITE
         };
         for &child in children.iter() {
-            if let Ok(mut sprite) = sprites.get_mut(child) {
+            if let Ok((mut sprite, _layer)) = sprites.get_mut(child) {
                 sprite.color = color;
             }
+        }
+    }
+}
+
+/// Updates ClothingVisual color key whenever a person's Equipment changes.
+/// The animate system picks up the new key on the next frame automatically.
+pub fn update_clothing_from_equipment(
+    mut persons: Query<(&Equipment, Option<&mut ClothingVisual>), (With<Person>, Changed<Equipment>)>,
+) {
+    for (equip, clothing_opt) in &mut persons {
+        if let Some(mut clothing) = clothing_opt {
+            // Derive color from whether TorsoArmor slot is occupied.
+            // Full material-based lookup requires Item to be a Component; extend later.
+            clothing.color_key = if equip.items.contains_key(&EquipmentSlot::TorsoArmor) {
+                "grey"
+            } else {
+                "tan"
+            };
         }
     }
 }
@@ -223,39 +552,41 @@ pub fn spawn_blueprint_sprites(
     textures: Res<EntityTextures>,
 ) {
     for (entity, bp) in query.iter() {
-        let mut scaffold_sprite = Sprite::from_image(textures.blueprint.clone());
-        scaffold_sprite.custom_size = Some(Vec2::new(16.0, 16.0));
+        let scaffold_img = textures.blueprint_ascii.clone();
+
+        let mut scaffold_sprite = Sprite::from_image(scaffold_img);
         scaffold_sprite.anchor = Anchor::BottomCenter;
 
-        let ghost_image = match bp.kind {
-            BuildSiteKind::Wall => textures.wall.clone(),
-            BuildSiteKind::Bed  => textures.bed.clone(),
+        let ghost_img = match bp.kind {
+            BuildSiteKind::Wall => textures.wall_ascii.clone(),
+            BuildSiteKind::Bed => textures.bed_ascii.clone(),
         };
-        let mut ghost_sprite = Sprite::from_image(ghost_image);
-        ghost_sprite.custom_size = match bp.kind {
-            BuildSiteKind::Wall => Some(Vec2::new(16.0, 16.0)),
-            BuildSiteKind::Bed  => Some(Vec2::new(16.0, 10.0)),
-        };
+
+        let mut ghost_sprite = Sprite::from_image(ghost_img);
         ghost_sprite.anchor = Anchor::BottomCenter;
         ghost_sprite.color = Color::srgba(1.0, 1.0, 1.0, 0.4);
 
-        commands.entity(entity).insert(BlueprintVisual).with_children(|parent| {
-            parent.spawn((
-                VisualChild,
-                scaffold_sprite,
-                Transform::from_xyz(0.0, -8.0, 0.2),
-                GlobalTransform::default(),
-                Visibility::Visible,
-                InheritedVisibility::default(),
-            ));
-            parent.spawn((
-                VisualChild,
-                ghost_sprite,
-                Transform::from_xyz(0.0, -8.0, 0.1),
-                GlobalTransform::default(),
-                Visibility::Visible,
-                InheritedVisibility::default(),
-            ));
-        });
+        commands
+            .entity(entity)
+            .insert(BlueprintVisual)
+            .with_children(|parent| {
+                parent.spawn((
+                    VisualChild,
+                    scaffold_sprite,
+                    Transform::from_xyz(0.0, -8.0, 0.2),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ));
+
+                parent.spawn((
+                    VisualChild,
+                    ghost_sprite,
+                    Transform::from_xyz(0.0, -8.0, 0.1),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ));
+            });
     }
 }

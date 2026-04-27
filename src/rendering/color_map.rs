@@ -1,19 +1,19 @@
-use bevy::prelude::Color;
-use crate::world::tile::TileKind;
 use crate::world::chunk::{CHUNK_HEIGHT, Z_MIN};
+use crate::world::tile::TileKind;
+use bevy::prelude::Color;
 
 pub fn tile_color(kind: TileKind) -> Color {
     match kind {
-        TileKind::Grass    => Color::srgb(0.35, 0.65, 0.25),
-        TileKind::Water    => Color::srgb(0.15, 0.40, 0.75),
-        TileKind::Stone    => Color::srgb(0.50, 0.50, 0.50),
-        TileKind::Forest   => Color::srgb(0.10, 0.40, 0.15),
+        TileKind::Grass => Color::srgb(0.35, 0.65, 0.25),
+        TileKind::Water => Color::srgb(0.15, 0.40, 0.75),
+        TileKind::Stone => Color::srgb(0.50, 0.50, 0.50),
+        TileKind::Forest => Color::srgb(0.10, 0.40, 0.15),
         TileKind::Farmland => Color::srgb(0.70, 0.55, 0.25),
-        TileKind::Road     => Color::srgb(0.55, 0.45, 0.35),
-        TileKind::Air      => Color::srgb(0.00, 0.00, 0.00), // never directly rendered
-        TileKind::Wall     => Color::srgb(0.28, 0.24, 0.22),
-        TileKind::Ramp     => Color::srgb(0.60, 0.50, 0.35),
-        TileKind::Dirt     => Color::srgb(0.45, 0.30, 0.18),
+        TileKind::Road => Color::srgb(0.55, 0.45, 0.35),
+        TileKind::Air => Color::srgb(0.00, 0.00, 0.00), // never directly rendered
+        TileKind::Wall => Color::srgb(0.28, 0.24, 0.22),
+        TileKind::Ramp => Color::srgb(0.60, 0.50, 0.35),
+        TileKind::Dirt => Color::srgb(0.45, 0.30, 0.18),
     }
 }
 

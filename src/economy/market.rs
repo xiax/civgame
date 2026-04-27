@@ -1,20 +1,20 @@
-use bevy::prelude::*;
 use super::goods::{Good, GOOD_COUNT};
 use super::item::Item;
 use super::mode::EconomicMode;
+use bevy::prelude::*;
 
 /// Walrasian market — prices adjust toward supply/demand equilibrium.
 #[derive(Resource)]
 pub struct Market {
-    pub prices:        [f32; GOOD_COUNT],
-    pub supply:        [f32; GOOD_COUNT],
-    pub demand:        [f32; GOOD_COUNT],
-    pub price_floor:   [f32; GOOD_COUNT],
+    pub prices: [f32; GOOD_COUNT],
+    pub supply: [f32; GOOD_COUNT],
+    pub demand: [f32; GOOD_COUNT],
+    pub price_floor: [f32; GOOD_COUNT],
     pub price_ceiling: [f32; GOOD_COUNT],
     /// Physical commodities held in the market (Food, Wood, Iron, etc.)
-    pub market_stock:  [f32; GOOD_COUNT],
+    pub market_stock: [f32; GOOD_COUNT],
     /// Specific manufactured items available for purchase.
-    pub listings:      Vec<(Item, u32)>,
+    pub listings: Vec<(Item, u32)>,
 }
 
 impl Default for Market {
@@ -22,13 +22,18 @@ impl Default for Market {
         let mut market_stock = [0.0f32; GOOD_COUNT];
         market_stock[Good::Tools as usize] = 50.0; // Startup supply of generic tools
         Self {
-            prices:        [1.0, 1.2, 0.8, 0.8, 0.5, 2.0, 1.5, 1.2, 1.8, 5.0, 0.5, 3.0, 4.0, 2.5, 0.7],
-            supply:        [0.0; GOOD_COUNT],
-            demand:        [0.0; GOOD_COUNT],
-            price_floor:   [0.1; GOOD_COUNT],
-            price_ceiling: [50.0, 50.0, 50.0, 20.0, 10.0, 100.0, 50.0, 30.0, 80.0, 200.0, 5.0, 150.0, 180.0, 100.0, 20.0],
+            prices: [
+                1.0, 1.2, 0.8, 0.8, 0.5, 2.0, 1.5, 1.2, 1.8, 5.0, 0.5, 3.0, 4.0, 2.5, 0.7,
+            ],
+            supply: [0.0; GOOD_COUNT],
+            demand: [0.0; GOOD_COUNT],
+            price_floor: [0.1; GOOD_COUNT],
+            price_ceiling: [
+                50.0, 50.0, 50.0, 20.0, 10.0, 100.0, 50.0, 30.0, 80.0, 200.0, 5.0, 150.0, 180.0,
+                100.0, 20.0,
+            ],
             market_stock,
-            listings:      Vec::new(),
+            listings: Vec::new(),
         }
     }
 }
@@ -51,7 +56,7 @@ impl Market {
     pub fn sell_item(&mut self, item: Item, qty: u32) -> f32 {
         let price = self.calculate_price(&item);
         let total_earned = price * qty as f32;
-        
+
         if item.is_manufactured() {
             // Add to specific listings
             if let Some(entry) = self.listings.iter_mut().find(|(it, _)| *it == item) {
@@ -68,12 +73,17 @@ impl Market {
         total_earned
     }
 
-    /// Agent attempts to buy a specific `good` type. 
+    /// Agent attempts to buy a specific `good` type.
     /// If manufactured, searches listings for affordable options.
     /// If commodity, buys from stock.
-    pub fn try_buy_item(&mut self, good: Good, qty: u32, currency: &mut f32) -> (Option<Item>, u32) {
+    pub fn try_buy_item(
+        &mut self,
+        good: Good,
+        qty: u32,
+        currency: &mut f32,
+    ) -> (Option<Item>, u32) {
         let i = good as usize;
-        
+
         // 1. Check specific listings first if it's potentially manufactured
         // In this simple version, we'll try to buy the BEST quality item affordable.
         let mut best_idx: Option<usize> = None;
@@ -97,7 +107,7 @@ impl Market {
             let price = self.calculate_price(&item);
             let buy_qty = qty.min(self.listings[idx].1);
             let total_cost = price * buy_qty as f32;
-            
+
             if total_cost <= *currency {
                 *currency -= total_cost;
                 self.listings[idx].1 -= buy_qty;
@@ -112,7 +122,7 @@ impl Market {
         if available <= 0.0 {
             return (None, 0);
         }
-        
+
         let item = Item::new_commodity(good);
         let price = self.calculate_price(&item);
         let buy_qty = (available.floor() as u32).min(qty);
@@ -144,10 +154,7 @@ impl Market {
     }
 }
 
-pub fn price_update_system(
-    mut market: ResMut<Market>,
-    mode: Res<EconomicMode>,
-) {
+pub fn price_update_system(mut market: ResMut<Market>, mode: Res<EconomicMode>) {
     if matches!(*mode, EconomicMode::Command) {
         return;
     }

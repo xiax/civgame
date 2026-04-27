@@ -1,0 +1,3936 @@
+use bevy::prelude::*;
+use ahash::AHashMap;
+use crate::rendering::pixel_art::{ascii_to_image, PixelColor};
+
+// ============================================================
+// WARM EARTH-TONE PALETTE  (matches claude.ai/design export)
+// 32 indexed colors; index 0 is transparent.
+// ============================================================
+const WARM_PALETTE: &[(char, PixelColor)] = &[
+    ('.', PixelColor::new(0,   0,   0,   0  )), // transparent
+    ('X', PixelColor::new(26,  20,  16,  255)), // near-black outline
+    ('d', PixelColor::new(42,  31,  23,  255)), // very dark brown
+    ('D', PixelColor::new(74,  52,  34,  255)), // dark brown
+    ('b', PixelColor::new(122, 84,  54,  255)), // mid brown
+    ('B', PixelColor::new(168, 114, 70,  255)), // light brown / tan skin
+    ('t', PixelColor::new(212, 165, 116, 255)), // tan / wood highlight
+    ('T', PixelColor::new(240, 213, 168, 255)), // pale tan / parchment
+    ('W', PixelColor::new(255, 243, 214, 255)), // warm cream
+    ('s', PixelColor::new(58,  42,  26,  255)), // dark soil
+    ('S', PixelColor::new(94,  63,  36,  255)), // soil / earth
+    ('e', PixelColor::new(139, 90,  43,  255)), // earth / dirt path
+    ('E', PixelColor::new(192, 136, 85,  255)), // sand / clay
+    ('N', PixelColor::new(232, 193, 137, 255)), // pale sand
+    ('g', PixelColor::new(31,  58,  28,  255)), // deep forest green
+    ('G', PixelColor::new(54,  94,  42,  255)), // mossy green
+    ('m', PixelColor::new(90,  138, 58,  255)), // grass green
+    ('M', PixelColor::new(140, 186, 79,  255)), // bright grass
+    ('L', PixelColor::new(184, 217, 106, 255)), // grass highlight
+    ('n', PixelColor::new(26,  40,  64,  255)), // deep water
+    ('i', PixelColor::new(45,  79,  122, 255)), // water mid
+    ('I', PixelColor::new(74,  130, 184, 255)), // water highlight
+    ('H', PixelColor::new(140, 192, 224, 255)), // water foam / sky
+    ('k', PixelColor::new(68,  74,  82,  255)), // slate dark
+    ('K', PixelColor::new(107, 114, 124, 255)), // slate mid
+    ('l', PixelColor::new(154, 160, 168, 255)), // slate light
+    ('P', PixelColor::new(212, 214, 216, 255)), // stone highlight / snow
+    ('r', PixelColor::new(122, 31,  31,  255)), // blood red / banner
+    ('R', PixelColor::new(200, 74,  42,  255)), // fire / terracotta
+    ('o', PixelColor::new(245, 168, 60,  255)), // flame / gold
+    ('y', PixelColor::new(252, 230, 112, 255)), // bright gold / spark
+    ('p', PixelColor::new(90,  42,  110, 255)), // royal purple / magic
+];
+
+// ============================================================
+// UTILITIES
+// ============================================================
+
+fn design_to_image(pixels: &[&str]) -> Image {
+    ascii_to_image(pixels, WARM_PALETTE)
+}
+
+/// Substitute template-specific chars with palette chars.
+/// Characters not in `subs` pass through unchanged.
+fn apply_subs(template: &[&str], subs: &[(char, char)]) -> Vec<String> {
+    template.iter().map(|row| {
+        row.chars().map(|ch| {
+            subs.iter().find(|(f, _)| *f == ch).map(|(_, t)| *t).unwrap_or(ch)
+        }).collect()
+    }).collect()
+}
+
+fn mirror_h(pixels: &[String]) -> Vec<String> {
+    pixels.iter().map(|row| row.chars().rev().collect()).collect()
+}
+
+fn template_to_image(pixels: Vec<String>) -> Image {
+    let strs: Vec<&str> = pixels.iter().map(String::as_str).collect();
+    ascii_to_image(&strs, WARM_PALETTE)
+}
+
+// ============================================================
+// SPRITE LIBRARY RESOURCE
+// ============================================================
+
+/// Holds handles to all design-system sprites, keyed by name.
+/// Keys: "terrain_grass", "char_hunter_s_a", "anim_wolf_e_b", etc.
+#[derive(Resource, Default)]
+pub struct SpriteLibrary {
+    pub sprites: AHashMap<String, Handle<Image>>,
+}
+
+impl SpriteLibrary {
+    pub fn get(&self, name: &str) -> Option<&Handle<Image>> {
+        self.sprites.get(name)
+    }
+}
+
+// ============================================================
+// TERRAIN SPRITES
+// ============================================================
+const TERRAIN_GRASS: &[&str] = &[
+    "mMmmLMmmMmLmmMmm",
+    "mmMLmmmMmLmmMmmL",
+    "MmmmMmLmmmMmmLmm",
+    "mLmmmMmmMmmLmmMm",
+    "mmMmLmmMmLmmMmmm",
+    "LmmmmMmmmMmmmLMm",
+    "mMmLmmMmLmmMmmmm",
+    "mmmMmmmLmmmMmLmm",
+    "mLmmMmmmMmLmmmMm",
+    "mmMmmLmMmmmMmmLm",
+    "MmmmMmmmLmmMmmmM",
+    "mmLmmMmLmmmMmLmm",
+    "mMmmmLmmMmLmmMmm",
+    "mmmMmmmMmmmMmmmL",
+    "LmmmLmmmMLmmmMmm",
+    "mMmmMmmLmmmMmmLm",
+];
+const TERRAIN_GRASS_DARK: &[&str] = &[
+    "GgGGmGgGGgmGGggm",
+    "gGmgGGgmGgGGmGgG",
+    "GggGGgmGggmGGgGm",
+    "gGGgGGGgGGgmGGgg",
+    "mgGgmGgGmgGGgmGG",
+    "GGgGGgGGgGggmGGg",
+    "gmGGgGmgGmGggGGm",
+    "GggGGgGGgGGgmGGg",
+    "gGGgmGgGGgmGGgGm",
+    "mGgGGgGgmGGgGggG",
+    "GggmGGgmGgmgGGgg",
+    "gGGgGggGGgGmGggm",
+    "GgmGggmgGGgmGGgG",
+    "gGGgmGGgmGGgGgmg",
+    "mGggGGgmGgGGggGg",
+    "GgGmGggGGgmGgmGG",
+];
+const TERRAIN_SAND: &[&str] = &[
+    "NEEENNNEENENENNN",
+    "ENENENNENNENNENE",
+    "NNENNNNENNNENNNE",
+    "EENNENENNNENNNEN",
+    "NENNNNENNENNNENN",
+    "NNNNENNNNENNNNNE",
+    "ENNENNNNENNNENNN",
+    "NNNNNENNNNNNENNN",
+    "NENNNNNNENNENNEN",
+    "NNNNENENNENNNNNN",
+    "NNENNNNNNNNENNNE",
+    "ENNNNENNENNNNENN",
+    "NNNNNNENENNNENNN",
+    "NENNENNNNNENNNEN",
+    "NNNNNNNENENNENNN",
+    "ENNENENNNNNENNNN",
+];
+const TERRAIN_DIRT: &[&str] = &[
+    "eeSeeeeSeeeeeSee",
+    "eSeeeeeeeSeeeeeS",
+    "eeeeSeeeeeeeSeee",
+    "SeeeeeSeeeeeeeeS",
+    "eeeeeeeeeSeeeeee",
+    "eeSeeeeeeeeeSeee",
+    "eeeeeSeeeSeeeeeS",
+    "eeeeeeeeeeeeSeee",
+    "SeeeeeSeeeeeeeee",
+    "eeeeeeeeeeSeeeSe",
+    "eeeSeeeeSeeeeeee",
+    "eeeeeeeeeeeeeSee",
+    "eSeeeeSeeeeeSeee",
+    "eeeeeeeeeSeeeeeS",
+    "eeeSeeeeeeeeeeee",
+    "SeeeeeeeSeeeeSee",
+];
+const TERRAIN_STONE: &[&str] = &[
+    "KKklKkkKlKkKKlkk",
+    "KkkKKkklKkkKKkkK",
+    "lKkkKKlkkKKklKkk",
+    "kKKlkKkKkklKkkKK",
+    "KkkKKkkKlKkkKklk",
+    "kKKkKkKlKkKKkKKl",
+    "KkKlkKkKkKlkKkkK",
+    "kKKkkKKlKKkKKlkk",
+    "KklkKkkKkkKKkkKK",
+    "kKKkKKlkKKkKKlKk",
+    "lKkKkkKKkKKlkKKk",
+    "KkkKlKkKKlKkkKKK",
+    "KKlkkKKlKkkKKkkl",
+    "kKkKKkKkkKKlkKKk",
+    "KklKkKKkKKkKkKKl",
+    "kKKlkKKKlKkKKkkK",
+];
+const TERRAIN_SNOW: &[&str] = &[
+    "WWPWWWPWWPWWWPWW",
+    "WPWWWWWPWWWPWWWP",
+    "WWWWPWWWWWWWPWWW",
+    "PWWWWWPWWWWWWWWP",
+    "WWWWWWWWWPWWWWWW",
+    "WWPWWWWWWWWWPWWW",
+    "WWWWWPWWWPWWWWWP",
+    "WWWWWWWWWWWWPWWW",
+    "PWWWWWPWWWWWWWWW",
+    "WWWWWWWWWWPWWWPW",
+    "WWWPWWWWPWWWWWWW",
+    "WWWWWWWWWWWWWPWW",
+    "WPWWWWPWWWWWPWWW",
+    "WWWWWWWWWPWWWWWP",
+    "WWWPWWWWWWWWWWWW",
+    "PWWWWWWWPWWWWPWW",
+];
+const TERRAIN_WATER: &[&str] = &[
+    "iIiiiiIiiiIiiiii",
+    "iiiIiiiiIiiiiiIi",
+    "IiiiiIiiiiiIiiii",
+    "iiiIiiiHiiiiiIii",
+    "iIiiiIiiIiiiIiii",
+    "iiiHiiiiiiHiiiii",
+    "iiiiiiIiiiiiiIii",
+    "iIiiiIiiiiIiiiii",
+    "iiiiHiiiHiiiiHii",
+    "iiIiiiiiiiiIiiiI",
+    "IiiiiIiiiIiiiiii",
+    "iiiHiiiHiiiiHiii",
+    "iIiiiiiiiiiIiiii",
+    "iiiiIiiIiiiiiIii",
+    "IiiiiiiiiHiiiiii",
+    "iiHiiIiiiiiiIiiH",
+];
+const TERRAIN_WATER_DEEP: &[&str] = &[
+    "niiniinniiniinii",
+    "iniiniiniinniini",
+    "niiniinniiniinii",
+    "iniiniiniiniinin",
+    "niinniiniinniini",
+    "iniiniiniiniinin",
+    "niiniinniiniinii",
+    "iniiniiniinniini",
+    "niinniiniinniini",
+    "iniiniiniiniinin",
+    "niiniinniiniinii",
+    "iniiniiniinniini",
+    "niinniiniinniini",
+    "iniiniiniiniinin",
+    "niiniinniiniinii",
+    "iniiniiniinniini",
+];
+const TERRAIN_WATER_SHORE_N: &[&str] = &[
+    "NNENENENNENNENEN",
+    "NENNENNENNENENNE",
+    "iiNiNiiNNiNiiNiN",
+    "iiiiiIiiiHiiIiii",
+    "IiiiiiiiiiiIiiii",
+    "iiiHiiIiiiHiiiIi",
+    "iIiiiiiiiIiiiiii",
+    "iiiiiHiiiiiiHiii",
+    "iiIiiiiiIiiiiIii",
+    "IiiiiiHiiiiHiiii",
+    "iiiHiiiiIiiiiiIi",
+    "iIiiiiiIiiiiHiii",
+    "iiiiiHiiiiIiiiii",
+    "iiHiiIiiiHiiiiIi",
+    "IiiiiiiiiiiiiHii",
+    "iiiiiiHiiIiiiiii",
+];
+const TERRAIN_FOREST: &[&str] = &[
+    "mMmgGgmmMmgGgmMm",
+    "mGGGgmgGGGgmGGGg",
+    "gGggGgGGggGgGggG",
+    "GgGGgmgGGGgmGgGG",
+    "gmgggmGGgggmgggm",
+    ".gggm..gggm..ggg",
+    ".gDg...gDg...gDg",
+    "mGgGgmgGgGgmgGgG",
+    "gGGGggGGGggGGGgg",
+    "gGggGgGGggGgGggG",
+    "gmgggmGgggmGgggm",
+    ".gggm..gggm..ggg",
+    ".gDg...gDg...gDg",
+    "mLmmMmmLmmmMmmLm",
+    "MmmLmmMmmLmmMmmL",
+    "mmMmmLmmMmmLmmMm",
+];
+const TERRAIN_HILLS: &[&str] = &[
+    "mmmmmMmmmmmmmmmm",
+    "mmmMLLMmmmmmmmmm",
+    "mMLLLLLMmmmMmmmm",
+    "MLLLLLLLMmMLMmmm",
+    "mMLLLLMmMLLLMmmm",
+    "mmMLLMmMLLLLLMmm",
+    "mmmMmmMLLLLLLLMm",
+    "mmmmmMLLLLLLLLLM",
+    "mmmmMLLLLLMLLLLM",
+    "mmmMLLLLMmmMLLLm",
+    "mmMLLMmmmmmmMLmm",
+    "mMLMmmmmmmmmmMmm",
+    "mmMmmmMmmmmmmmmm",
+    "mmmmMLLMmmmmmmmm",
+    "mmmMLLLLMmmmmmmm",
+    "mmMLLMMLLMmmmmmm",
+];
+const TERRAIN_MOUNTAIN: &[&str] = &[
+    "................",
+    ".......XX.......",
+    "......XPPX......",
+    ".....XPWWPX.....",
+    "....XPWWWWPX....",
+    "...XPWWlllPlX...",
+    "..XPWlllKKlllX..",
+    "..XlllKKkkKKllX.",
+    ".XlllKkkkkkKKllX",
+    ".XlKKkkddkkKKllX",
+    "XlKKkkddDDddkKKl",
+    "XlKkddDDDDDDddkK",
+    "XKkdDDD..DDDDdkK",
+    "XKdDD......DDdkX",
+    "XddD........DddX",
+    "XdD..........DdX",
+];
+const TERRAIN_MOUNTAIN_SNOW: &[&str] = &[
+    "................",
+    ".......XX.......",
+    "......XWWX......",
+    ".....XWWWWX.....",
+    "....XWWWWWWX....",
+    "...XWWPPWPPWX...",
+    "..XPWPPlPPPlPX..",
+    "..XPllllKKllPPX.",
+    ".XllKKkKKKkKllPX",
+    ".XKKkkkdkkkkKKlX",
+    "XKKkdkdDdddkkKKl",
+    "XKkddDDDDDDDdkKl",
+    "XkdDDD..DDDDddkK",
+    "XKdDD......DDdkX",
+    "XddD........DddX",
+    "XdD..........DdX",
+];
+const TERRAIN_LAVA: &[&str] = &[
+    "rRroRorRroRorRro",
+    "oRoroRrRoyoRorRo",
+    "RoryRoroRryorRor",
+    "oRorRoyoRoroRorR",
+    "roRorRoroRyoRoro",
+    "oRoroRorRoroRrRo",
+    "rRyorRoroRorRoyR",
+    "oRoroRorRoroRorR",
+    "roRorRoroRyrRoro",
+    "oRoroRorRoroRorR",
+    "rRorRoyorRorRoyo",
+    "oyoRoroRorRoroRr",
+    "roRorRoroRyrRoro",
+    "oRoroRorRoroRorR",
+    "rRorRoroRorRoroR",
+    "oRoroRoyRorRoroR",
+];
+const TERRAIN_SWAMP: &[&str] = &[
+    "gGgmGgmgGgmgGggm",
+    "GgnIniGgGmnIngGm",
+    "gnIIIniGgnIIInGm",
+    "GnIiIInGmIiIInGm",
+    "gniIInGgmnIiInGg",
+    "GgniinGgmgnIngGm",
+    "gGgmGgmgGgmgGggm",
+    "mgGgnIngGggmGggm",
+    "gGmnIIInmGgmgnGm",
+    "GgnIiIInGgnIInGg",
+    "gmnIIIInGmIiIInG",
+    "GgmnIInmgnIIInGg",
+    "gGmgnnGgmgnInGgm",
+    "mgGggmgGgmGgnGgm",
+    "gmnGgmgGgmgGggmG",
+    "GgnIngGgmGgmGgGg",
+];
+const TERRAIN_ROAD: &[&str] = &[
+    "mMmmLmmMmLmmMmmL",
+    "mLmmmMmmMmmLmmMm",
+    "mmEeEeeEeEeeEemm",
+    "LeeNeNNeNNeeNeMm",
+    "mNeENeeENeeENeem",
+    "meNeeeNeNeeeeeNm",
+    "LeeeENeENeENeNeM",
+    "mNeeNeeNeeNeeeem",
+    "meNeENeENeENeNeL",
+    "mLeeeNeNeNeeeeem",
+    "mmEeeNeNNeNeeNeM",
+    "mmEeEeeEeEeeEemm",
+    "mLmmmMmmMmmLmmMm",
+    "mmMmmLmmMmmLmmMm",
+    "LmmmmLmmmMLmmmMm",
+    "mMmmMmmLmmmMmmLm",
+];
+const TERRAIN_BRIDGE: &[&str] = &[
+    "iIiiiHiiiIiiiHii",
+    "IiiiHiiiiiIiiiii",
+    "XdDDdDDdDDdDDdDX",
+    "XbBBbBBbBBbBBbBX",
+    "XbtttttttttttBBX",
+    "XBtTtTtTtTtTtTBX",
+    "XbttttttttttttBX",
+    "XBtTtTtTtTtTtTBX",
+    "XbttttttttttttBX",
+    "XBtTtTtTtTtTtTBX",
+    "XbttttttttttttBX",
+    "XBbBbBbBbBbBbBBX",
+    "XdDDdDDdDDdDDdDX",
+    "iIiiiHiiiIiiiHii",
+    "IiiiiiHiiiIiiiii",
+    "iiHiiiiiiiiHiiii",
+];
+
+// ============================================================
+// BUILDING SPRITES
+// ============================================================
+const BUILDING_TENT: &[&str] = &[
+    "................",
+    "................",
+    ".......X........",
+    "......XBX.......",
+    "......XbX.......",
+    ".....XBbBX......",
+    ".....XBdBX......",
+    "....XBbDbBX.....",
+    "....XBdXdBX.....",
+    "...XBbDXDbBX....",
+    "...XBdDXDdBX....",
+    "..XBbDDXDDbBX...",
+    "..XBdDDXDDdBX...",
+    ".XBbDDDXDDDbBX..",
+    ".XdSSSSSSSSSdX..",
+    ".XSSSSSSSSSSSX..",
+];
+const BUILDING_HUT: &[&str] = &[
+    "................",
+    "......XXXX......",
+    ".....XoooyX.....",
+    "....XooyooyX....",
+    "...XoyooooyoX...",
+    "..XoooyoyooooX..",
+    ".XoyooooooooyoX.",
+    "XooyooyoooyooooX",
+    "XbBbBbBbBbBbBbBX",
+    "XBtTtTtTtTtTtTBX",
+    "XbtttttX..XtttbX",
+    "XBtTtTtX..XtTtBX",
+    "XbtttttX..XtttbX",
+    "XBtTtTtX..XtTtBX",
+    "XbttttbX..XbttbX",
+    "XdSSSSSSSSSSSSdX",
+];
+const BUILDING_LONGHOUSE: &[&str] = &[
+    "................",
+    "...XXXXXXXXXX...",
+    "..XdDDdDDdDDdX..",
+    ".XdDDdDDdDDdDdX.",
+    "XDDdDDdDDdDDdDDX",
+    "XdDDdDDdDDdDDdDX",
+    "XbBbBbBbBbBbBbBX",
+    "XBtTtTtTtX.XtTBX",
+    "XbtttttttX.XtttX",
+    "XBtTtTtTtX.XtTBX",
+    "XbtttttttX.XtttX",
+    "XBtTtTtTtX.XtTBX",
+    "XbttttX..XtttttX",
+    "XBtTtTX..XtTtTBX",
+    "XbtttbX..XbtttbX",
+    "XdSSSSSSSSSSSSdX",
+];
+const BUILDING_FARM: &[&str] = &[
+    "mMmmLmmMmLmmMmmL",
+    "mmMLmmmMmLmmMmmm",
+    "eeeeeeeeeeeeeeee",
+    "eyyeooeyyeooeyye",
+    "eyyeooeyyeooeyye",
+    "eeeeeeeeeeeeeeee",
+    "eooeyyeooeyyeooe",
+    "eooeyyeooeyyeooe",
+    "eeeeeeeeeeeeeeee",
+    "eyyeooeyyeooeyye",
+    "eyyeooeyyeooeyye",
+    "eeeeeeeeeeeeeeee",
+    "eooeyyeooeyyeooe",
+    "eooeyyeooeyyeooe",
+    "eeeeeeeeeeeeeeee",
+    "mLmmMmmLmmMmmLmm",
+];
+const BUILDING_MILL: &[&str] = &[
+    "......XXXXXX....",
+    ".....XdDDdDdX...",
+    "....XdDDdDDdX...",
+    "...XbBbBbBbBX...",
+    "X..XBtTtTtTBX..X",
+    "XX.XbttttttbX.XX",
+    "XbX.XBtTtTBX.XbX",
+    "XBbXXXXXXXXXXBbX",
+    "XbBBBBbBBBbBBbBX",
+    "XBtTtTtX..XtTtBX",
+    "XbtttttX..XtttbX",
+    "XBtTtTtX..XtTtBX",
+    "XbtttttX..XtttbX",
+    "XBtTtTtX..XtTtBX",
+    "XbttttbX..XbttbX",
+    "XdSSSSSSSSSSSSdX",
+];
+const BUILDING_BLACKSMITH: &[&str] = &[
+    "................",
+    "...XX...........",
+    "..XddX.XXXXXX...",
+    ".XdRoX.XdDdDdX..",
+    ".XRoyXXkkkkkkX..",
+    ".XdRdXKKKKKKKKX.",
+    "..XXXXkkkkkkkkX.",
+    "..XKKkkkdddkkkX.",
+    "..XKkkdDDDDDdkX.",
+    "..XkkdDX..XDdkX.",
+    "..XkkdDX..XDdkX.",
+    "..XkkdDX..XDdkX.",
+    "..XKKkdDDDDDdKX.",
+    "..XkkdDdDdDdDdkX",
+    "..XKkkkkkkkkkkKX",
+    "..XdSSSSSSSSSSdX",
+];
+const BUILDING_MARKET: &[&str] = &[
+    "................",
+    ".XXXXXXXXXXXXXX.",
+    ".XrRrRrRrRrRrRX.",
+    "XXrRrRrRrRrRrRXX",
+    "X.XrRrRrRrRrRX.X",
+    "X..............X",
+    "X.XbX.XbX.XbX..X",
+    "X.XBX.XBX.XBX..X",
+    "X.XbX.XBX.XbX..X",
+    "X.X.X.X.X.X.X..X",
+    "XbttbbtttbbttttX",
+    "XBTtTtTtTtTtTtBX",
+    "XbtoyobtRorbtybX",
+    "XBtyobtBtTbtMmBX",
+    "XbttbbtttbbttbbX",
+    "XdSSSSSSSSSSSSdX",
+];
+const BUILDING_WELL: &[&str] = &[
+    "................",
+    "......XX........",
+    ".....XddX.......",
+    "....XdDDdX......",
+    "...XdDdDDdX.....",
+    "...XdSSSSdX.....",
+    "....X....X......",
+    "....X....X......",
+    "XKkKkKkKkKkKKkKK",
+    "XkKKkKKkKkKkKKkK",
+    "XKkiIiIiIiIiIkKK",
+    "XkKIiIiIiIiIikKK",
+    "XKkiIiIiIiIiIkKK",
+    "XkKKkKKkKkKKkkKK",
+    "XKKkkKkKkKkkKkKk",
+    "XSSSSSSSSSSSSSSS",
+];
+const BUILDING_WATCHTOWER: &[&str] = &[
+    "......XXXXXX....",
+    ".....XrRrRrRX...",
+    ".....XRrRrRrX...",
+    "......XKKKKX....",
+    ".....XKKKKKKX...",
+    "....XKKkkkkKKX..",
+    "....XKkXKKXkKX..",
+    "....XKkKKKKkKX..",
+    "....XKKkkkkKKX..",
+    "....XKkXKKXkKX..",
+    "....XKkKKKKkKX..",
+    "....XKKkkkkKKX..",
+    "....XKkXKKXkKX..",
+    "....XKkKkkkkKX..",
+    "....XKKkKkKkKX..",
+    "....XdSSSSSSdX..",
+];
+const BUILDING_WALL_STONE: &[&str] = &[
+    "................",
+    "................",
+    ".XKkKkKkKkKkKkX.",
+    ".XkKKkKKkKKkKKX.",
+    ".XKkKkKkKkKkKkX.",
+    ".XPlKKkKKkKKkKX.",
+    ".XKkKkKkKkKkKkX.",
+    ".XkKKkKKkKKkKKX.",
+    ".XKkKkKkKkKkKkX.",
+    ".XPlKKkKKkKKkKX.",
+    ".XKkKkKkKkKkKkX.",
+    ".XkKKkKKkKKkKKX.",
+    ".XKkKkKkKkKkKkX.",
+    ".XPlKKkKKkKKkKX.",
+    ".XKkKkKkKkKkKkX.",
+    "................",
+];
+const BUILDING_GATE: &[&str] = &[
+    "....XX....XX....",
+    "...XKKX..XKKX...",
+    "..XKkKKXXKKkKX..",
+    ".XKKkKKKKKKkKKX.",
+    ".XPlKkKkKkKkKKX.",
+    ".XKkKKDDDDKKkKX.",
+    ".XKKkDDdDdDKkKX.",
+    ".XPlKDdXddDkKKX.",
+    ".XKkKDdXddDkKKX.",
+    ".XKkKDdXddDkKKX.",
+    ".XPlKDdXddDkKKX.",
+    ".XKkKDdXddDkKKX.",
+    ".XKKkDDdddDKkKX.",
+    ".XPlKDDDDDDKKkX.",
+    ".XKkKKKKKKKkKKX.",
+    ".XKKKKKKKKKKKKX.",
+];
+const BUILDING_CHURCH: &[&str] = &[
+    ".......X........",
+    "......XyX.......",
+    "......XyX.......",
+    "......XXX.......",
+    ".....XPPPX......",
+    "....XPPlPPX.....",
+    "...XPlPPllPX....",
+    "..XPlPPllPlPX...",
+    ".XPlPPllPllPlPX.",
+    "XPlPPllPllPllPlX",
+    "XKkKkKkKkKkKkKkX",
+    "XkKKkXyyyyXkKKkX",
+    "XKkKKXyXXyXKkKKX",
+    "XPlKKXyXXyXKkKKX",
+    "XKkKKXyXXyXKkKKX",
+    "XdSSSSSSSSSSSSdX",
+];
+const BUILDING_CASTLE: &[&str] = &[
+    "XKX..XKX..XKX..X",
+    "XKKKKKKKKKKKKKKX",
+    "XKKkKkKkKkKkKKKX",
+    "XPlKKKKKKKKKkKKX",
+    "XKkKkKkKkKkKkKKX",
+    "XKkXyyXKKXyyXkKX",
+    "XKkXyrXKKXryXkKX",
+    "XPlKKKXKKXKKkKKX",
+    "XKkKkKKKKKKkKkKX",
+    "XKkXyXKKKKXyXkKX",
+    "XKkXrXKKKKXrXkKX",
+    "XPlKKDDddDDKkKKX",
+    "XKkKDDdXdDDKkKKX",
+    "XKkKDdXXXdDKkKKX",
+    "XPlKDdXXXdDKKkKX",
+    "XdSSSSSSSSSSSSdX",
+];
+const BUILDING_TAVERN: &[&str] = &[
+    "................",
+    "....XXXXXXXX....",
+    "...XrRrRrRrRX...",
+    "..XrRrRrRrRrRX..",
+    ".XrRrRrRrRrRrRX.",
+    "XdDDdDDdDDdDDdDX",
+    "XbBbBbBbBbBbBbBX",
+    "XBtoyoyotTtTtTBX",
+    "XbtyoyobtttttybX",
+    "XBtoyoBX..XtTtBX",
+    "XbttttbX..XttobX",
+    "XBtTtTBX..XtTtBX",
+    "XbttttbX..XbttbX",
+    "XBtTtTBX..XtTtBX",
+    "XbttttbX..XbttbX",
+    "XdSSSSSSSSSSSSdX",
+];
+const BUILDING_LUMBER_MILL: &[&str] = &[
+    "................",
+    "...XXXXXXXX.....",
+    "..XdDdDdDdDX....",
+    ".XdDDdDDdDDdX...",
+    "XbBbBbBbBbBBX...",
+    "XBtTtTtTtTtBX...",
+    "XbttttttttbBXdDX",
+    "XBtTtX..XTtBdDDX",
+    "XbtttX..XttbDdDX",
+    "XBtTtX..XTtBKKKX",
+    "XbttbX..XbtbKkKX",
+    "XdSSSSSSSSSSSSSX",
+    "mMmmLmmDdmLmmMmm",
+    "mmMLmmmDDLmmMmmL",
+    "MmmmMmDdmmMmmLmm",
+    "mLmmmMmmMmmLmmMm",
+];
+const BUILDING_STABLE: &[&str] = &[
+    "................",
+    "..XXXXXXXXXXXX..",
+    ".XdDDdDDdDDdDdX.",
+    "XdDDdDDdDDdDDdDX",
+    "XbBbBbBbBbBbBbBX",
+    "XBtX..XbX..XtTBX",
+    "XbtX.BXBX.bXttbX",
+    "XBtXBBXBXBBXTtBX",
+    "XbtXbBXbXBbXttbX",
+    "XBtXddXdXddXTtBX",
+    "XbtXdDXdXDdXttbX",
+    "XBtXdDXdXDdXTtBX",
+    "XbtXddXdXddXttbX",
+    "XBttX..X..XTtTBX",
+    "XbttttttttttttbX",
+    "XdSSSSSSSSSSSSdX",
+];
+const BUILDING_BARRACKS: &[&str] = &[
+    "XXXXXXXXXXXXXXXX",
+    "XdDDdDDdDDdDDdDX",
+    "XbBbBbBbBbBbBbBX",
+    "XBrRrRrRrRrRrRBX",
+    "XbrRrRrRrRrRrRbX",
+    "XBtTX..X..X..XBX",
+    "XbttX..X..X..XbX",
+    "XBtTX..X..X..XBX",
+    "XbttX..X..X..XbX",
+    "XBttttttttttttBX",
+    "XbBbBbBbBbBbBbbX",
+    "XBrRrRrRrRrRrRBX",
+    "XbttX..XX..X..XX",
+    "XBttX..XX..X..XX",
+    "XbttX..XX..X..XX",
+    "XdSSSSSSSSSSSSdX",
+];
+
+// ============================================================
+// STATIC CREATURE SPRITES
+// ============================================================
+const CREATURE_MAMMOTH: &[&str] = &[
+    "................",
+    "...XXXXXXX......",
+    "..XdDDdDDdX.....",
+    ".XdDDdDDdDdX....",
+    "XdDDdDDdDDdDX...",
+    "XdDDXWdDdDdDXXX.",
+    "XdDXWWWdDDdDdXdX",
+    "XdDDXWdDdDDdDXdX",
+    "XdDDdDDdDdDdDXdX",
+    "XDdDDdDdDDdDdXdX",
+    "XddDdDdXXddXdXdX",
+    "XdXXXXXX..XX.XdX",
+    "XdX..XdX..XX.XdX",
+    ".XX...XX..XX..XX",
+    "................",
+    "................",
+];
+const CREATURE_WOLF: &[&str] = &[
+    "................",
+    "................",
+    "..XX............",
+    ".XKkX...........",
+    ".XKkX..XXXXX....",
+    ".XKkXXKkKkKkX...",
+    "..XXKkKKkKKkKX..",
+    "...XlPlKkKkKkX..",
+    "...XKkKKKkKkKX..",
+    "....XKkKkKkKKX..",
+    "....XKkKkKkKkX..",
+    "....XKXXKKXXKX..",
+    "....XKX.XKX.XX..",
+    "................",
+    "................",
+    "................",
+];
+const CREATURE_BEAR: &[&str] = &[
+    "................",
+    "..XX.....XX.....",
+    ".XbBX...XbBX....",
+    ".XbtbX.XbBbX....",
+    "..XbBbXbBbX.....",
+    "..XbBtTtTbX.....",
+    ".XbBtXtXtBbX....",
+    ".XbBtTtTtTbX....",
+    ".XbBtTtTtTbBX...",
+    ".XbBbBtTtBbBbX..",
+    ".XbBbBtTtTBbBbX.",
+    ".XbBXXXXXXXBbX..",
+    ".XbBX.XbX.XBbX..",
+    "..XX..XbX..XX...",
+    "......XX........",
+    "................",
+];
+const CREATURE_DEER: &[&str] = &[
+    "...X..X.........",
+    "..XbX.XbX.......",
+    "..XBXXXBX.......",
+    "..XbtBbBX.......",
+    "...XBbBXXXXXX...",
+    "...XbBtTtTtbbX..",
+    "...XBtTtTtTtbX..",
+    "...XbtTtTtTtbX..",
+    "...XBbtTtTtTBX..",
+    "....XBbtTtBbBX..",
+    "....XBXXXXXBX...",
+    "....XBX.XbXBX...",
+    "....XBX.XbXBX...",
+    "....XX..XX.X....",
+    "................",
+    "................",
+];
+const CREATURE_BOAR: &[&str] = &[
+    "................",
+    "................",
+    "....XX..........",
+    "...XdDX.........",
+    "...XdDXXXXXXX...",
+    "...XdXddDdDdDX..",
+    "..XddDDdDDdDdX..",
+    "..XdDDdDdDDdDX..",
+    "..XdDDDdDdDDdX..",
+    "..XdDdDdXdDDXX..",
+    "...XXXX.XXX.....",
+    "...XdX..XdX.....",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const CREATURE_RABBIT: &[&str] = &[
+    "................",
+    "....XX..........",
+    "...XPXXX........",
+    "...XPlPX........",
+    "....XPlXX.......",
+    "....XPlPlX......",
+    "....XPlPWX......",
+    "...XlPlPlPX.....",
+    "...XPlPlPlX.....",
+    "...XlPXPXlX.....",
+    "....X.X.X.......",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const CREATURE_SHEEP: &[&str] = &[
+    "................",
+    "................",
+    "....XXXXXXX.....",
+    "...XPWWWWWWX....",
+    "..XPWWWWWWWWX...",
+    "..XWWWXX.XWPX...",
+    ".XPWWWXyXWWWX...",
+    ".XWWWWWWWWWWX...",
+    ".XPWWWWWWWWWX...",
+    ".XWWWPWWPWWPX...",
+    "..XbXXXXXXbX....",
+    "..XbX....XbX....",
+    "...X......X.....",
+    "................",
+    "................",
+    "................",
+];
+const CREATURE_COW: &[&str] = &[
+    "................",
+    "................",
+    "....XXXXXXXXX...",
+    "...XWWWWXWWWWX..",
+    "..XWdDWWXWWdDX..",
+    "..XWWWWWXWWWWX..",
+    ".XWWWWXyXWWWWWX.",
+    ".XdDWWWWWWdDWWX.",
+    ".XWWWdDdDWWWWWX.",
+    ".XWWWWWWWWdDWWX.",
+    "..XbXXXXXXbXX...",
+    "..XbX....XbX....",
+    "...XX....XX.....",
+    "................",
+    "................",
+    "................",
+];
+const CREATURE_HORSE: &[&str] = &[
+    "................",
+    "...XX...........",
+    "..XbBX..........",
+    "..XbtbX.........",
+    "..XbtbXXXXXXXX..",
+    "..XbtttttttttX..",
+    "...XbBbtTtTttX..",
+    "....XbBbBbBbBX..",
+    "....XbBbBbBbBX..",
+    "....XbBbBbBbbX..",
+    "....XbXXbXXbbX..",
+    "....XbX.XbX.XX..",
+    "....XbX.XbX.....",
+    "................",
+    "................",
+    "................",
+];
+const CREATURE_CHICKEN: &[&str] = &[
+    "................",
+    "................",
+    "......XX........",
+    "....XXyXX.......",
+    "....XrXX........",
+    "...XWWXX........",
+    "..XWWWWWX.......",
+    ".XWPWWWWWX......",
+    ".XWWWWWWWX......",
+    ".XPWWWWWPX......",
+    "..XyX.XyX.......",
+    "..XyX.XyX.......",
+    "...X...X........",
+    "................",
+    "................",
+    "................",
+];
+const CREATURE_FISH: &[&str] = &[
+    "................",
+    "................",
+    "..........XX....",
+    ".........XiIX...",
+    "..XX....XiIIIX..",
+    ".XiIX..XiIIHIIX.",
+    "XiIIIXXiIIHIIIIX",
+    "XiIIHIIIIIIWXIIX",
+    "XIIIIIHIIIIXXIIX",
+    "XiIIIXXiIIHIIIIX",
+    ".XiIX..XiIIHIIX.",
+    "..XX....XiIIIX..",
+    ".........XiIX...",
+    "..........XX....",
+    "................",
+    "................",
+];
+const CREATURE_DRAGON: &[&str] = &[
+    "...XXX..........",
+    "..XGGmX.........",
+    "..XGmGX....XX...",
+    "...XGGmXX.XGmX..",
+    "....XGGmXXGGmX..",
+    "..XXXmGGGGGmGX..",
+    ".XGmGGyXGGGGmX..",
+    "XGmGGGmGGmGmGGX.",
+    "XGmGGGGmGGGmGGX.",
+    ".XGGmGGGmGGmGmX.",
+    "..XXGmGGGmGGmGX.",
+    "....XGGGmGGGmGX.",
+    "....XGXXGXXGXmX.",
+    "....XGX.XX.XGmX.",
+    "................",
+    "................",
+];
+const CREATURE_GOBLIN: &[&str] = &[
+    "................",
+    "....X.....X.....",
+    "...XGX...XGX....",
+    "....XGGGGGX.....",
+    "...XGmGGmGX.....",
+    "...XGXyXyGX.....",
+    "...XGmoXoGX.....",
+    "....XGmGmGX.....",
+    "....XGGGGmX.....",
+    "...XbBGGmbBX....",
+    "...XbttGGttbX...",
+    "...XbXXmGXXbX...",
+    "....XX.XmX.XX...",
+    ".......XX.......",
+    "................",
+    "................",
+];
+const CREATURE_SKELETON: &[&str] = &[
+    "................",
+    "....XXXXX.......",
+    "...XPWWWPX......",
+    "...XWXWXWX......",
+    "...XWXWXWX......",
+    "....XPWPX.......",
+    "...XX...XX......",
+    "..XPXXXXXPX.....",
+    ".XPXPWWWPXPX....",
+    ".XPXWXXXWXPX....",
+    ".XPXPWWWPXPX....",
+    "..XXXXXXXXXX....",
+    "...XPX.XPX......",
+    "...XPX.XPX......",
+    "...XX..XX.......",
+    "................",
+];
+const CREATURE_BANDIT: &[&str] = &[
+    "................",
+    "...XXXXXX.......",
+    "..XBtTtTBX......",
+    "..XBKKKKBX......",
+    "..XBKXKXBX......",
+    "..XBtoToBX......",
+    "...XBtTBX.......",
+    "..XdDDdDdX......",
+    ".XdDXdDdXdX.....",
+    ".XdXrRrRrXdX....",
+    "..XrRRrRrRX.....",
+    "..XBtRrRtBX.....",
+    "..XBtXXXtBX.....",
+    "..XBX.XBX.......",
+    "..XX..XX........",
+    "................",
+];
+
+// ============================================================
+// RESOURCE SPRITES
+// ============================================================
+const RESOURCE_WHEAT: &[&str] = &[
+    "................",
+    ".......y........",
+    "......yoy.......",
+    ".....yoyoy......",
+    "....yoyXyoy.....",
+    "....yoXyXoy.....",
+    ".....yXyXy......",
+    "......XyX.......",
+    "......XyX.......",
+    "......XyX.......",
+    "......XyX.......",
+    "......XyX.......",
+    "......XyX.......",
+    "......XyX.......",
+    "......XyX.......",
+    "................",
+];
+const RESOURCE_BERRIES: &[&str] = &[
+    "................",
+    "......XX........",
+    ".....XGGX.......",
+    "....XGmGGX..XX..",
+    "...XGGmGGX.XGGX.",
+    "....XGmGGXXGmGX.",
+    ".....XGGGmGGGX..",
+    "......XGmGGGX...",
+    "...XX..XGGGX....",
+    "..XrRX..XGX.....",
+    ".XrRRrXXXX......",
+    "XrRRRRrXrRX.....",
+    "XRRrRRrXRRX.....",
+    "XrRRRRXXrRX.....",
+    ".XrRRrXXrXX.....",
+    "..XrXX.XX.......",
+];
+const RESOURCE_MEAT: &[&str] = &[
+    "................",
+    "......XX........",
+    ".....XdDX.......",
+    "....XdDDdX......",
+    "...XdDDdDdX.....",
+    "...XDDdDDdDX....",
+    "..XDDdrRrRdDX...",
+    "..XDdrRrRrRdX...",
+    "..XDrRrrrrRrX...",
+    "..XDdrRrRrRdX...",
+    "...XdDdRrdDdX...",
+    "....XDdDDdDX....",
+    ".....XdDDdX.....",
+    "......XddX......",
+    "......XdX.......",
+    "................",
+];
+const RESOURCE_FISH: &[&str] = &[
+    "................",
+    "................",
+    "..........XX....",
+    ".........XiIX...",
+    "..XX....XiIIIX..",
+    ".XiIX..XiIIHIIX.",
+    "XiIIIXXiIIHIIIIX",
+    "XiIIHIIIIIIWXIIX",
+    "XIIIIIHIIIIXXIIX",
+    "XiIIIXXiIIHIIIIX",
+    ".XiIX..XiIIHIIX.",
+    "..XX....XiIIIX..",
+    ".........XiIX...",
+    "..........XX....",
+    "................",
+    "................",
+];
+const RESOURCE_WOOD_LOG: &[&str] = &[
+    "................",
+    "................",
+    "...XXXXXXXXXX...",
+    "..XbBBbBBbBBbX..",
+    ".XbBtTtbtTtTbBX.",
+    "XbBtTbtTtbTtTbBX",
+    "XBtTtTbBtTbTtTBX",
+    "XbBbBbBbBbBbBbBX",
+    "XBtTtTbBtTbTtTBX",
+    "XbBtTtbtTtTbtTBX",
+    ".XbBtTbtTtbTbBX.",
+    "..XbBBbBBbBBbX..",
+    "...XXXXXXXXXX...",
+    "................",
+    "................",
+    "................",
+];
+const RESOURCE_PLANK: &[&str] = &[
+    "................",
+    "................",
+    ".XXXXXXXXXXXXXX.",
+    ".XbBtTtTtTtTtbX.",
+    ".XBttttttttttBX.",
+    ".XbtTtTtTtTtTbX.",
+    ".XBttttttttttBX.",
+    ".XbtTtTtTtTtTbX.",
+    ".XBttttttttttBX.",
+    ".XbtTtTtTtTtTbX.",
+    ".XBttttttttttBX.",
+    ".XbtTtTtTtTtTbX.",
+    ".XXXXXXXXXXXXXX.",
+    "................",
+    "................",
+    "................",
+];
+const RESOURCE_STONE_PILE: &[&str] = &[
+    "................",
+    "................",
+    "......XXX.......",
+    "....XXKKkX......",
+    "...XKKkKKkX.....",
+    "..XKkKKKKkKX....",
+    "..XlKkKkKkKX....",
+    "...XKKkKKkX.....",
+    "..XKKkXkKKkX....",
+    ".XKKKKkKKKKkXX..",
+    "XKkKkKkKkKkKKkX.",
+    "XPlKkKkKKkKKkKX.",
+    "XKKKKkKKkKkKKkX.",
+    "XlKkKKkKKKkKKkX.",
+    "XdSSSSSSSSSSSSdX",
+    "................",
+];
+const RESOURCE_IRON_ORE: &[&str] = &[
+    "................",
+    "................",
+    "......XXX.......",
+    ".....XKkKX......",
+    "....XKkKKkX.....",
+    "...XKkKlPlKX....",
+    "..XKkKlPWPlKX...",
+    "..XKkKPWWWPkX...",
+    "..XKkKlPWPlKX...",
+    "..XKkKlPlKKkX...",
+    "...XKkKKkKkKX...",
+    "....XKkKkKKX....",
+    ".....XKKkKX.....",
+    "......XKkX......",
+    "................",
+    "................",
+];
+const RESOURCE_GOLD_ORE: &[&str] = &[
+    "................",
+    "................",
+    "......XXX.......",
+    ".....XKkKX......",
+    "....XKkyKkX.....",
+    "...XKkyooyKX....",
+    "..XKkyoyoyKkX...",
+    "..XKyooyooykX...",
+    "..XKkyooyoykX...",
+    "..XKkyoyoyKkX...",
+    "...XKkyooyKX....",
+    "....XKkyKKX.....",
+    ".....XKKkX......",
+    "......XKkX......",
+    "................",
+    "................",
+];
+const RESOURCE_GOLD_COIN: &[&str] = &[
+    "................",
+    "................",
+    "......XXX.......",
+    ".....XyooX......",
+    "....XyooyoX.....",
+    "...Xyoo..yX.....",
+    "..Xyoy.yyoyX....",
+    "..Xyoy.yooyX....",
+    "..Xyoy.yooyX....",
+    "..Xyoy.yooyX....",
+    "...Xyoo.oyX.....",
+    "....Xyooy.X.....",
+    ".....XyooyX.....",
+    "......XXyX......",
+    "................",
+    "................",
+];
+const RESOURCE_GEM: &[&str] = &[
+    "................",
+    "................",
+    "....XXXXXXXX....",
+    "...XpHpHHpHpX...",
+    "..XHpWHpHWpHpX..",
+    ".XpHHpWWpWpHHpX.",
+    "XpHpWpHHpHpWpHpX",
+    ".XpWHpHpHpHpWHX.",
+    "..XpHpWHHWpHpX..",
+    "...XpHpHHpHpX...",
+    "....XpHWpHpX....",
+    ".....XpHpX......",
+    "......XpX.......",
+    ".......X........",
+    "................",
+    "................",
+];
+const RESOURCE_WATER_JUG: &[&str] = &[
+    "................",
+    "......XXXX......",
+    ".....XdDDdX.....",
+    "....XdSSSSdX....",
+    "....XSeeeeSX....",
+    "XX..XSeEEeSX....",
+    "XSXXXSeeeeSX....",
+    "XSSSSSSeeeSX....",
+    "XSiIiSeEeESX....",
+    "XSIiISSSSSSX....",
+    "XSiIiSiIiSeX....",
+    "XSiIiSIiISeX....",
+    "XSSSSSiIiSeX....",
+    "X.XXXXSSSSSX....",
+    ".....XSSSSSX....",
+    ".....XdSSSdX....",
+];
+const RESOURCE_APPLE: &[&str] = &[
+    "................",
+    "................",
+    ".........gG.....",
+    "........gGm.....",
+    "......XXgX......",
+    "....XXrRrRXX....",
+    "...XrRRrRRrRX...",
+    "..XrRRRrRRRrRX..",
+    "..XrRrRRRrRRrX..",
+    "..XrRRRrRRRrRX..",
+    "..XrRRrRRRrRrX..",
+    "...XrRRRrRRRX...",
+    "...XrRRrRRRrX...",
+    "....XrRrRrRX....",
+    ".....XrRrRX.....",
+    "......XXX.......",
+];
+
+// ============================================================
+// ITEM SPRITES
+// ============================================================
+const ITEM_STONE_AXE: &[&str] = &[
+    "................",
+    "...XKkX.........",
+    "..XlKkKkX.......",
+    "..XlKKkKkX......",
+    "..XKkKKkKKX.....",
+    "..XlKKkKkkX.....",
+    "..XKkKKkXX......",
+    "...XkKkXbX......",
+    "....XXXbBX......",
+    "......XbBX......",
+    ".......XbBX.....",
+    "........XbBX....",
+    ".........XbBX...",
+    "..........XbBX..",
+    "...........XbBX.",
+    "............XXX.",
+];
+const ITEM_BRONZE_AXE: &[&str] = &[
+    "................",
+    "...XRoX.........",
+    "..XrRoRoX.......",
+    "..XrRRoRoX......",
+    "..XRoRRoRRX.....",
+    "..XrRRoRooX.....",
+    "..XRoRRoXX......",
+    "...XoRoXbX......",
+    "....XXXbBX......",
+    "......XbBX......",
+    ".......XbBX.....",
+    "........XbBX....",
+    ".........XbBX...",
+    "..........XbBX..",
+    "...........XbBX.",
+    "............XXX.",
+];
+const ITEM_IRON_SWORD: &[&str] = &[
+    "................",
+    "............XX..",
+    "...........XPPX.",
+    "..........XlPPX.",
+    ".........XlPlPX.",
+    "........XlPlPX..",
+    ".......XlPlPX...",
+    "......XlPlPX....",
+    ".....XlPlPX.....",
+    "....XlPlPX......",
+    "...XlPlPX.......",
+    "..XlPlPX........",
+    ".XKkKkKkkKX.....",
+    "XKkKKDDdDDKkX...",
+    ".XbXbDDdDDbXbX..",
+    "..XX.XdDdX.XX...",
+];
+const ITEM_BOW: &[&str] = &[
+    "................",
+    "..XX............",
+    ".XbBX...........",
+    ".XbtbX..........",
+    "..XBtbX.........",
+    "...XbtbX........",
+    "....XbtbX.......",
+    "....XbXbX.......",
+    "....XbX.bX......",
+    "....XbX.bX......",
+    "....XbtbX.......",
+    "...XbtbX........",
+    "..XBtbX.........",
+    ".XbtbX..........",
+    ".XbBX...........",
+    "..XX............",
+];
+const ITEM_SPEAR: &[&str] = &[
+    "................",
+    "..............XX",
+    ".............XlX",
+    "............XPlX",
+    "...........XPPlX",
+    "..........XPPlXX",
+    ".........XPPlXX.",
+    "........XlPlXX..",
+    ".......XlPlXX...",
+    "......XlllXX....",
+    ".....XbBbXX.....",
+    "....XbBbX.......",
+    "...XbBbX........",
+    "..XbBbX.........",
+    ".XbBbX..........",
+    "XXXX............",
+];
+const ITEM_SHIELD: &[&str] = &[
+    "................",
+    "...XXXXXXXXXX...",
+    "..XdDdDdDdDdDX..",
+    ".XdDrRrRrRrRdDX.",
+    ".XDrRRRRRRRRrDX.",
+    ".XDrRyyyyyyrRDX.",
+    ".XDrRyyooyyrRDX.",
+    ".XDrRyooooyrRDX.",
+    ".XDrRyoyyooyrDX.",
+    ".XDrRyooooyrRDX.",
+    ".XDrRyyooyyrRDX.",
+    ".XDrRyyyyyyrRDX.",
+    "..XDrRRRRRRrDX..",
+    "...XDrRrRrRDX...",
+    "....XDdDdDdDX...",
+    ".....XdDdDdX....",
+];
+const ITEM_HAMMER: &[&str] = &[
+    "................",
+    "...XXXXXXX......",
+    "..XKKkKKkkX.....",
+    "..XKkKKkPlX.....",
+    "..XKKkKkKKX.....",
+    "..XKkKKkkXX.....",
+    "...XXXbXXX......",
+    "......XbX.......",
+    "......XbX.......",
+    "......XbBX......",
+    "......XbBX......",
+    ".......XbX......",
+    ".......XbX......",
+    ".......XbBX.....",
+    "........XbX.....",
+    "........XXX.....",
+];
+const ITEM_PICKAXE: &[&str] = &[
+    "................",
+    "..X..........X..",
+    ".XKX........XKX.",
+    "XKkKX......XKkKX",
+    "XPlKKX....XKKlPX",
+    ".XKkKKkXkKkKkKX.",
+    "..XKkkKkKkKkKX..",
+    "...XKkKkKkKKX...",
+    "......XbBX......",
+    "......XbBX......",
+    ".......XbX......",
+    ".......XbX......",
+    "......XbBX......",
+    "......XbBX......",
+    ".......XbX......",
+    ".......XXX......",
+];
+const ITEM_SCYTHE: &[&str] = &[
+    "................",
+    "............XX..",
+    "..........XlPlX.",
+    "........XlPlPX..",
+    ".......XPlPlX...",
+    ".....XlPlPlX....",
+    "....XPlPlXX.....",
+    "...XPlPXX.......",
+    "...XlPX.........",
+    "...XbX..........",
+    "...XbX..........",
+    "....XbX.........",
+    ".....XbX........",
+    "......XbX.......",
+    ".......XbX......",
+    "........XX......",
+];
+const ITEM_TORCH: &[&str] = &[
+    "................",
+    "......XyX.......",
+    ".....XoyoX......",
+    "....XRoyoRX.....",
+    "....XoRoyRX.....",
+    "....XRoRoRX.....",
+    ".....XoRoX......",
+    "......XRX.......",
+    "......XbX.......",
+    "......XbX.......",
+    "......XbBX......",
+    "......XbBX......",
+    "......XbBX......",
+    "......XbBX......",
+    "......XbBX......",
+    ".......XX.......",
+];
+const ITEM_HELM: &[&str] = &[
+    "................",
+    "...XXXXXXXX.....",
+    "..XKkKKkKKkX....",
+    ".XKkKKkKKkKkX...",
+    ".XKkPlKKKKkKX...",
+    "XKkKKKKKKKkKkX..",
+    "XKkKkKkKkKkKKX..",
+    "XKkKKKKKKKkKkX..",
+    "XKkKkKXXKkKkKX..",
+    "XKkKkKXXKkKkKX..",
+    "XKkKkKKKKkKkKX..",
+    "XKkKKkKkKKkKkX..",
+    ".XKkKKKKKKkKX...",
+    "..XdSSSSSSdX....",
+    "...XdSSSSdX.....",
+    "................",
+];
+const ITEM_POTION: &[&str] = &[
+    "................",
+    "......XdDX......",
+    "......XdDX......",
+    "......XdDX......",
+    "......XddX......",
+    ".....XbBbBX.....",
+    "....XbBbBbBX....",
+    "...XbBpHHpBbX...",
+    "..XbBpHWWHpBbX..",
+    "..XbBpWHWHpBbX..",
+    "..XbBpHWWHpBbX..",
+    "..XbBpHpHpBBbX..",
+    "..XbBpHpHpBBbX..",
+    "...XbBpHpBbX....",
+    "....XbBBbBX.....",
+    ".....XdSSdX.....",
+];
+
+// ============================================================
+// FX SPRITES
+// ============================================================
+const FX_SMOKE_1: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "......XXX.......",
+    ".....XlllX......",
+    ".....XlPlX......",
+    "......XlX.......",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const FX_SMOKE_2: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "......XXX.......",
+    ".....XlPlX......",
+    "....XllPllX.....",
+    "...XlPllPlX.....",
+    "...XllPllPX.....",
+    "....XlPllX......",
+    ".....XllX.......",
+    "......XX........",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const FX_SMOKE_3: &[&str] = &[
+    "................",
+    "....XXX.........",
+    "...XlPlX........",
+    "..XlllPlX..XX...",
+    "..XlPllPlXXlPX..",
+    "..XllPllPllllX..",
+    "...XlPllPlPlPX..",
+    "....XllPlllPX...",
+    ".....XlPlPllX...",
+    "...XX.XllPlX....",
+    "..XlPX.XllX.....",
+    "..XllX..XX......",
+    "...XX...........",
+    "................",
+    "................",
+    "................",
+];
+const FX_SPARKLE_1: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "......XyX.......",
+    "......yWy.......",
+    "......XyX.......",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const FX_SPARKLE_2: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "......XyX.......",
+    "......XyX.......",
+    "......XyX.......",
+    "...XXyyWyyXX....",
+    "...XyyWWWyyX....",
+    "...XXyyWyyXX....",
+    "......XyX.......",
+    "......XyX.......",
+    "......XyX.......",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const FX_SPARKLE_3: &[&str] = &[
+    "......XyX.......",
+    "...XX.XyX.XX....",
+    "....yX.y.Xy.....",
+    ".....yXyXy......",
+    "......yyy.......",
+    "......yWy.......",
+    "..XX.yyWyy.XX...",
+    "XyyyyyWWWyyyyyyX",
+    "..XX.yyWyy.XX...",
+    "......yWy.......",
+    "......yyy.......",
+    ".....yXyXy......",
+    "....yX.y.Xy.....",
+    "...XX.XyX.XX....",
+    "......XyX.......",
+    "................",
+];
+const FX_EXPLOSION_1: &[&str] = &[
+    "................",
+    "................",
+    "......XXX.......",
+    ".....XoyoX......",
+    "....XRyWyRX.....",
+    "....XoyWyoX.....",
+    "....XRoWoRX.....",
+    ".....XoRoX......",
+    "......XRX.......",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const FX_EXPLOSION_2: &[&str] = &[
+    "................",
+    "....XXXXXX......",
+    "...XRorRoRX.....",
+    "..XRoyoyooRX....",
+    "..XoyWyWyoRX....",
+    ".XRoyWWWWyoRX...",
+    ".XRoyWyWWyoRX...",
+    ".XRoyWWWyooRX...",
+    "..XRoyoyoyRX....",
+    "..XRoRoRorRX....",
+    "...XRoRRorRX....",
+    "....XXrRrXX.....",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const FX_EXPLOSION_3: &[&str] = &[
+    "...XX..XXXX...XX",
+    "..XrRX.XRRRX.XrX",
+    ".XrRoRXXRoRXXrRX",
+    ".XRoyoyRoyoyRoX.",
+    "XRoyWyoyoyWyoyXX",
+    "XoyWWyWyWyWWyoXr",
+    "XRoyWWWWWyoyWyoR",
+    "XoyWWyWWWyWyoyoR",
+    "XRoyoyWyoyWWyoXR",
+    "XoyWyoyoyWyoyoXr",
+    "XRoyoRoyoyRoyXX.",
+    ".XRoyoXXRoyoyoX.",
+    ".XrRoXXrRoXrRoX.",
+    "..XrRX.XRRRX.XX.",
+    "...XX..XX.XX....",
+    "................",
+];
+const FX_EXPLOSION_4: &[&str] = &[
+    ".XX..X..X...XX..",
+    "XlX.XlX.XlX.XlX.",
+    "..............XX",
+    "...XlPlX...XlPlX",
+    "XX..XlX....XlX..",
+    "XPlX.XX.XX.X....",
+    "XlPX.XX.XlX.....",
+    "..XX...........X",
+    "..XX..XlX...XlPX",
+    "...XlPX....XlPlX",
+    "...XllX.........",
+    "....XX...XlX....",
+    "XX......XlPlX...",
+    "XlX.....XllX....",
+    ".XX......XX.....",
+    "................",
+];
+const FX_SPLASH: &[&str] = &[
+    "................",
+    "....X......X....",
+    "...XHX....XHX...",
+    "..XHIX....XIHX..",
+    "..XIX......XIX..",
+    "...X........X...",
+    "................",
+    "....HiI..IiH....",
+    "...IiHIIIIHiI...",
+    "..iIIHIIIIHIIi..",
+    "....HIiiiiIH....",
+    "................",
+    "..H..I..i..H..i.",
+    "...i...H...I....",
+    "................",
+    "................",
+];
+const FX_CHOP_HIT: &[&str] = &[
+    "................",
+    "......X..X......",
+    "......yX.y......",
+    ".......XyX......",
+    ".......yWX......",
+    ".X.....XyX.....X",
+    "XyX...XlllX...XW",
+    ".yyXXyWWWWyXXyy.",
+    ".XyyyWWyyWWyyyX.",
+    "XyX..XllllX..XyX",
+    ".X....XlllX....X",
+    ".......XyX......",
+    ".......yWX......",
+    "......XyX.......",
+    "......yX.y......",
+    "......X..X......",
+];
+
+// ============================================================
+// UI SPRITES
+// ============================================================
+const UI_CURSOR: &[&str] = &[
+    "................",
+    "XX..............",
+    "XWX.............",
+    "XWWX............",
+    "XWWWX...........",
+    "XWWWWX..........",
+    "XWWWWWX.........",
+    "XWWWWWWX........",
+    "XWWWWWWWX.......",
+    "XWWWWWWWWX......",
+    "XWWWWWXXXXX.....",
+    "XWWWXX..........",
+    "XWXX............",
+    "XWX.............",
+    "XX..............",
+    "X...............",
+];
+const UI_RETICLE: &[&str] = &[
+    "......XXXX......",
+    "...XXX....XXX...",
+    "..X..........X..",
+    ".X..XXXXXXXX..X.",
+    ".X.X........X.X.",
+    "XX.X..XXXX..X.XX",
+    "X..X.X....X.X..X",
+    "X..X.X.XX.X.X..X",
+    "X..X.X.XX.X.X..X",
+    "X..X.X....X.X..X",
+    "XX.X..XXXX..X.XX",
+    ".X.X........X.X.",
+    ".X..XXXXXXXX..X.",
+    "..X..........X..",
+    "...XXX....XXX...",
+    "......XXXX......",
+];
+const UI_EXCLAMATION: &[&str] = &[
+    "......XXX.......",
+    ".....XyooX......",
+    "....XyooyoX.....",
+    "...XyoXXXyX.....",
+    "...XyoXXXoX.....",
+    "...XyoXXXoX.....",
+    "...XyoXXXoX.....",
+    "...XyoXXXoX.....",
+    "....XyXXXX......",
+    "....XyooyX......",
+    "....XyooyX......",
+    "....XXXXX.......",
+    "....XyooyX......",
+    "....XyooyX......",
+    "....XXXXX.......",
+    "................",
+];
+const UI_QUESTION: &[&str] = &[
+    "......XXXX......",
+    "....XHpHHpHX....",
+    "...XpHpHpHpHX...",
+    "...XHpHXXpHpX...",
+    "...XXXXXpHpX....",
+    "......XpHpX.....",
+    ".....XpHpX......",
+    "....XpHpX.......",
+    "....XpHX........",
+    "....XHpX........",
+    "....XpHX........",
+    "................",
+    "....XpHX........",
+    "....XHpX........",
+    "....XpHX........",
+    "................",
+];
+const UI_HEART: &[&str] = &[
+    "................",
+    "..XXX.....XXX...",
+    ".XrRrX...XrRrX..",
+    "XrRRrRX.XrRRrRX.",
+    "XrRRRRRXRRRRRrX.",
+    "XRRRRRRRRRRRRRX.",
+    "XrRRRRRRRRRRRRX.",
+    ".XRRRRRRRRRRRX..",
+    "..XrRRRRRRRRX...",
+    "...XRRRRRRRX....",
+    "....XrRRRrX.....",
+    ".....XRRRX......",
+    "......XrX.......",
+    ".......X........",
+    "................",
+    "................",
+];
+const UI_COIN: &[&str] = &[
+    "................",
+    "......XXX.......",
+    "....XyooyX......",
+    "...XyooyyoX.....",
+    "..Xyooy.yooX....",
+    "..Xyoy...yoyX...",
+    "..Xyoy...yoyX...",
+    "..Xyoy...yoyX...",
+    "..Xyoy...yoyX...",
+    "..Xyoy...yoyX...",
+    "..Xyooy.yooX....",
+    "...Xyooyyoy.....",
+    "....XyooyX......",
+    "......XXX.......",
+    "................",
+    "................",
+];
+const UI_FOOD: &[&str] = &[
+    "................",
+    "......XXX.......",
+    "....XGmGGX......",
+    "...XGmGGmGX.....",
+    "...XGmGGmGX.....",
+    "....XGmGGX......",
+    ".....XmGX.......",
+    "......XX........",
+    "....XbBbBbX.....",
+    "...XbBtTbBbX....",
+    "..XbBttttbBbX...",
+    "..XbBtTtTtBbX...",
+    "..XbBttttbBbX...",
+    "...XbBttbBbX....",
+    "....XbBbBbX.....",
+    ".....XbXbX......",
+];
+const UI_BANNER: &[&str] = &[
+    "......XXX.......",
+    "......XbX.......",
+    "......XbX.......",
+    "...XXXXbXXXXX...",
+    "..XrRrRrRrRrRX..",
+    "..XrRyooyooyrX..",
+    "..XrRoyXXyyoRX..",
+    "..XrRyXyyXyyRX..",
+    "..XrRyXyyXyyRX..",
+    "..XrRoyXXyyoRX..",
+    "..XrRyooyooyrX..",
+    "..XrRrRrRrRrRX..",
+    "...XrXrXrXrXrX..",
+    "....XrXrXrXrX...",
+    "......XbX.......",
+    "......XX........",
+];
+const UI_ARROW_UP: &[&str] = &[
+    "................",
+    ".......XX.......",
+    "......XPPX......",
+    ".....XPWPlX.....",
+    "....XPWPlPlX....",
+    "...XPWPlPlPlX...",
+    "..XPWPlPlPlPlX..",
+    ".XPWPlPlPlPlPlX.",
+    "XXXXXXXPlXXXXXXX",
+    "......XPlX......",
+    "......XPlX......",
+    "......XPlX......",
+    "......XPlX......",
+    "......XPlX......",
+    "......XPlX......",
+    "......XXXX......",
+];
+const UI_ARROW_DOWN: &[&str] = &[
+    "......XXXX......",
+    "......XPlX......",
+    "......XPlX......",
+    "......XPlX......",
+    "......XPlX......",
+    "......XPlX......",
+    "......XPlX......",
+    "XXXXXXXPlXXXXXXX",
+    ".XPWPlPlPlPlPlX.",
+    "..XPWPlPlPlPlX..",
+    "...XPWPlPlPlX...",
+    "....XPWPlPlX....",
+    ".....XPWPlX.....",
+    "......XPPX......",
+    ".......XX.......",
+    "................",
+];
+const UI_ARROW_LEFT: &[&str] = &[
+    "................",
+    "....X...........",
+    "...XPX..........",
+    "..XPWXX.........",
+    ".XPWPlXX........",
+    "XPWPlPlXXXXXXXXX",
+    "XPWPlPlPlPlPlPlX",
+    "XPWPlPlPlPlPlPlX",
+    "XPWPlPlPlPlPlPlX",
+    "XPWPlPlXXXXXXXXX",
+    ".XPWPlXX........",
+    "..XPWXX.........",
+    "...XPX..........",
+    "....X...........",
+    "................",
+    "................",
+];
+const UI_ARROW_RIGHT: &[&str] = &[
+    "................",
+    "...........X....",
+    "..........XPX...",
+    ".........XXPlX..",
+    "........XXPWPlX.",
+    "XXXXXXXXXXPWPlPl",
+    "XPlPlPlPlPlPWPlX",
+    "XPlPlPlPlPlPWPlX",
+    "XPlPlPlPlPlPWPlX",
+    "XXXXXXXXXXPWPlPl",
+    "........XXPWPlX.",
+    ".........XXPlX..",
+    "..........XPX...",
+    "...........X....",
+    "................",
+    "................",
+];
+
+// ============================================================
+// CHARACTER TEMPLATES
+// Template chars: ~ skin, ^ hair, * primary cloth,
+//                 + secondary cloth, = accent, W/X/. = literal palette
+// ============================================================
+const CHAR_TMPL_S_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X^^^^X.....",
+    "....X^^^^^^X....",
+    "....X~XXXX~X....",
+    "....X~XWXWX~....",
+    "....X~~XX~~X....",
+    "....X~XXXXX~X...",
+    "...X*=****=X....",
+    "...X**==**=*X...",
+    "...X*+++++**X...",
+    "...X+++++++X....",
+    "....X+X.X++X....",
+    "....X~X.X~X.....",
+    "....XX...XX.....",
+];
+const CHAR_TMPL_S_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X^^^^X.....",
+    "....X^^^^^^X....",
+    "....X~XXXX~X....",
+    "....X~XWXWX~....",
+    "....X~~XX~~X....",
+    "....X~XXXXX~X...",
+    "...X*=****=X....",
+    "...X**==**=*X...",
+    "...X*+++++**X...",
+    "....X+++++++X...",
+    "....X++X.X+X....",
+    ".....X~X.X~X....",
+    ".....XX...XX....",
+];
+const CHAR_TMPL_N_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X^^^^X.....",
+    "....X^^^^^^X....",
+    "....X^^^^^^^X...",
+    "....X^^^^^^X....",
+    "....X^^^^^^X....",
+    "....X*****X.....",
+    "...X*=****=X....",
+    "...X**==***X....",
+    "...X*+++++*X....",
+    "...X+++++++X....",
+    "....X+X.X++X....",
+    "....X+X.X+X.....",
+    "....XX...XX.....",
+];
+const CHAR_TMPL_N_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X^^^^X.....",
+    "....X^^^^^^X....",
+    "....X^^^^^^^X...",
+    "....X^^^^^^X....",
+    "....X^^^^^^X....",
+    "....X*****X.....",
+    "...X*=****=X....",
+    "...X**==***X....",
+    "...X*+++++*X....",
+    "....X+++++++X...",
+    "....X++X.X+X....",
+    ".....X+X.X+X....",
+    ".....XX...XX....",
+];
+const CHAR_TMPL_E_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X^^^^X.....",
+    "....X^~~^^X.....",
+    "....X~~XW^X.....",
+    "....X~~~^^X.....",
+    "....X~XXXX......",
+    "...X***==X......",
+    "...X**=***X.....",
+    "...X**+++*X.....",
+    "....X++++X......",
+    "....X++++X......",
+    "....X+X.X++X....",
+    "....X~X.X~X.....",
+    "....XX...XX.....",
+];
+const CHAR_TMPL_E_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X^^^^X.....",
+    "....X^~~^^X.....",
+    "....X~~XW^X.....",
+    "....X~~~^^X.....",
+    "....X~XXXX......",
+    "...X****=X......",
+    "...X**==**X.....",
+    "....X**++*X.....",
+    "....X+++++X.....",
+    "...X++++++X.....",
+    "...X+X.X+X......",
+    "....XX..XX......",
+    "....X....X......",
+];
+
+// [id, skin, hair, primary, secondary, accent]
+const CHARACTER_DEFS: &[(&str, char, char, char, char, char)] = &[
+    ("hunter",     'B', 'D', 'S', 'b', 'l'),
+    ("gatherer",   'B', 'D', 'G', 't', 'r'),
+    ("tribesman",  'B', 'D', 'b', 'r', 'l'),
+    ("shaman",     'B', 'P', 'p', 'D', 'y'),
+    ("farmer",     'T', 'b', 't', 'b', 'y'),
+    ("woodcutter", 'T', 'D', 'b', 'G', 'l'),
+    ("miner",      'T', 'D', 'k', 'D', 'P'),
+    ("fisher",     'T', 'b', 'I', 'b', 'l'),
+    ("blacksmith", 'B', 'D', 'k', 'r', 'l'),
+    ("baker",      'T', 't', 'W', 'r', 'o'),
+    ("merchant",   'T', 'D', 'p', 'y', 'o'),
+    ("monk",       'T', 'D', 'D', 't', 'y'),
+    ("peasant_w",  'T', 'b', 'r', 'b', 'y'),
+    ("child",      'T', 'b', 'm', 't', 'y'),
+    ("archer",     'T', 'D', 'G', 't', 'D'),
+    ("spearman",   'T', 'D', 'r', 'k', 'l'),
+    ("swordsman",  'T', 'D', 'b', 'k', 'l'),
+    ("knight",     'T', 'k', 'l', 'r', 'P'),
+    ("guard",      'T', 'D', 'k', 'r', 'l'),
+    ("king",       'T', 't', 'p', 'y', 'r'),
+    ("queen",      'T', 'y', 'r', 'p', 'y'),
+    ("priest",     'T', 't', 'W', 'y', 'r'),
+    ("scout",      'T', 'D', 'G', 'D', 'l'),
+    ("barbarian",  'B', 'r', 'D', 'b', 'l'),
+];
+
+// ============================================================
+// CREATURE TEMPLATES
+// Color tokens: 1=primary, 2=darker shade, 3=highlight, 4=accent
+// ============================================================
+
+// ---- QUAD_SMALL ----
+const CRTMPL_QUAD_SMALL_E_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "...X1X..........",
+    "...X1X.....XX...",
+    "...X1X....X11X..",
+    "...X11XXXX1141X.",
+    "..XX111111111XX.",
+    "..X11211211111X.",
+    "..X1111111111X..",
+    "..X11111111111X.",
+    "...X1X.X1X.X1X..",
+    "...X1X.X1X.X1X..",
+    "...XX..XX..XX...",
+    "................",
+    "................",
+];
+const CRTMPL_QUAD_SMALL_E_B: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "...X1X..........",
+    "...X1X.....XX...",
+    "...X1X....X11X..",
+    "...X11XXXX1141X.",
+    "..XX111111111XX.",
+    "..X11211211111X.",
+    "..X1111111111X..",
+    "..X11111111111X.",
+    "....X1X.X1X.X1X.",
+    "....X1X.X1X.X1X.",
+    "....XX..XX..XX..",
+    "................",
+    "................",
+];
+const CRTMPL_QUAD_SMALL_S_A: &[&str] = &[
+    "................",
+    "................",
+    "....X1X..X1X....",
+    "....X1X..X1X....",
+    "....X11XX11X....",
+    "...X1144441 X...",
+    "...X11X11X11X...",
+    "...X11X11X11X...",
+    "....X111111X....",
+    ".....X1111X.....",
+    "....X122221X....",
+    "....X111111X....",
+    ".....X1XX1X.....",
+    ".....X1XX1X.....",
+    "......X..X......",
+    "......X..X......",
+];
+const CRTMPL_QUAD_SMALL_S_B: &[&str] = &[
+    "................",
+    "................",
+    "....X1X..X1X....",
+    "....X1X..X1X....",
+    "....X11XX11X....",
+    "...X1144441 X...",
+    "...X11X11X11X...",
+    "...X11X11X11X...",
+    "....X111111X....",
+    ".....X1111X.....",
+    "....X122221X....",
+    "....X111111X....",
+    "......X11X......",
+    "......X11X......",
+    ".....X1XX1X.....",
+    ".....XX..XX.....",
+];
+const CRTMPL_QUAD_SMALL_N_A: &[&str] = &[
+    "................",
+    "................",
+    "....X1X..X1X....",
+    "....X1X..X1X....",
+    "....X11XX11X....",
+    "...X11111111X...",
+    "...X1XX11XX1X...",
+    "...X11111111X...",
+    "....X111111X....",
+    ".....X1111X.....",
+    "....X111111X....",
+    "....X111111X....",
+    ".....X1XX1X.....",
+    ".....X1XX1X.....",
+    "......X..X......",
+    "......X..X......",
+];
+const CRTMPL_QUAD_SMALL_N_B: &[&str] = &[
+    "................",
+    "................",
+    "....X1X..X1X....",
+    "....X1X..X1X....",
+    "....X11XX11X....",
+    "...X11111111X...",
+    "...X1XX11XX1X...",
+    "...X11111111X...",
+    "....X111111X....",
+    ".....X1111X.....",
+    "....X111111X....",
+    "....X111111X....",
+    "......X11X......",
+    "......X11X......",
+    ".....X1XX1X.....",
+    ".....XX..XX.....",
+];
+
+// ---- QUAD_MED ----
+const CRTMPL_QUAD_MED_E_A: &[&str] = &[
+    "................",
+    "................",
+    "..X1X.........XX",
+    "..X1X........X11",
+    "..X1X........X14",
+    "..X11XXXXXXXX111",
+    ".X11111111111111",
+    "X11211221111111X",
+    "X1111111111111X.",
+    "X11111111111111X",
+    ".X1X.X1X.X1X.X1X",
+    ".X1X.X1X.X1X.X1X",
+    ".XX..XX..XX..XX.",
+    "................",
+    "................",
+    "................",
+];
+const CRTMPL_QUAD_MED_E_B: &[&str] = &[
+    "................",
+    "................",
+    "..X1X.........XX",
+    "..X1X........X11",
+    "..X1X........X14",
+    "..X11XXXXXXXX111",
+    ".X11111111111111",
+    "X11211221111111X",
+    "X1111111111111X.",
+    "X11111111111111X",
+    "..X1X.X1X.X1X.X1",
+    "..X1X.X1X.X1X.X1",
+    "..XX..XX..XX..XX",
+    "................",
+    "................",
+    "................",
+];
+const CRTMPL_QUAD_MED_S_A: &[&str] = &[
+    "................",
+    "....X1X..X1X....",
+    "....X1X..X1X....",
+    "....X11XX11X....",
+    "...X1144441X....",
+    "...X11X11X11X...",
+    "...X11X11X11X...",
+    "....X111111X....",
+    "...X11111111X...",
+    "..X1122222211X..",
+    "..X1112222111X..",
+    "..X111111111X...",
+    "...X1X.XX.X1X...",
+    "...X1X.XX.X1X...",
+    "...X1X.XX.X1X...",
+    "....X...X..X....",
+];
+const CRTMPL_QUAD_MED_S_B: &[&str] = &[
+    "................",
+    "....X1X..X1X....",
+    "....X1X..X1X....",
+    "....X11XX11X....",
+    "...X1144441X....",
+    "...X11X11X11X...",
+    "...X11X11X11X...",
+    "....X111111X....",
+    "...X11111111X...",
+    "..X1122222211X..",
+    "..X1112222111X..",
+    "..X111111111X...",
+    "....X11X11X.....",
+    "....X11X11X.....",
+    "...X1X..XX1X....",
+    "...XX....XX.....",
+];
+const CRTMPL_QUAD_MED_N_A: &[&str] = &[
+    "................",
+    "....X1X..X1X....",
+    "....X1X..X1X....",
+    "....X11XX11X....",
+    "...X11111111X...",
+    "...X1XX11XX1X...",
+    "...X11111111X...",
+    "....X111111X....",
+    "...X11111111X...",
+    "..X1111111111X..",
+    "..X11111111111X.",
+    "..X111111111X...",
+    "...X1X.XX.X1X...",
+    "...X1X.XX.X1X...",
+    "...X1X.XX.X1X...",
+    "....X...X..X....",
+];
+const CRTMPL_QUAD_MED_N_B: &[&str] = &[
+    "................",
+    "....X1X..X1X....",
+    "....X1X..X1X....",
+    "....X11XX11X....",
+    "...X11111111X...",
+    "...X1XX11XX1X...",
+    "...X11111111X...",
+    "....X111111X....",
+    "...X11111111X...",
+    "..X1111111111X..",
+    "..X11111111111X.",
+    "..X111111111X...",
+    "....X11X11X.....",
+    "....X11X11X.....",
+    "...X1X..XX1X....",
+    "...XX....XX.....",
+];
+
+// ---- QUAD_LARGE ----
+const CRTMPL_QUAD_LARGE_E_A: &[&str] = &[
+    "................",
+    "..X1X..........X",
+    "..X1X.........X1",
+    "..X1X.........X1",
+    "..X1X.........X4",
+    "..X11XXXXXXXXX11",
+    ".X1111111111111X",
+    "X11221122111111X",
+    "X1111111111111X.",
+    "X11111111111111X",
+    "X11111111111111X",
+    "X1X.X1X.X1X.X1XX",
+    "X1X.X1X.X1X.X1X.",
+    "XX..XX..XX..XX..",
+    "................",
+    "................",
+];
+const CRTMPL_QUAD_LARGE_E_B: &[&str] = &[
+    "................",
+    "..X1X..........X",
+    "..X1X.........X1",
+    "..X1X.........X1",
+    "..X1X.........X4",
+    "..X11XXXXXXXXX11",
+    ".X1111111111111X",
+    "X11221122111111X",
+    "X1111111111111X.",
+    "X11111111111111X",
+    "X11111111111111X",
+    ".X1X.X1X.X1X.X1X",
+    ".X1X.X1X.X1X.X1X",
+    ".XX..XX..XX..XX.",
+    "................",
+    "................",
+];
+const CRTMPL_QUAD_LARGE_S_A: &[&str] = &[
+    "................",
+    "...X11X..X11X...",
+    "...X11X..X11X...",
+    "...X1111111X....",
+    "..X11444441X....",
+    "..X11XX11XX1X...",
+    "..X11XX11XX1X...",
+    "...X11111111X...",
+    "..X1111111111X..",
+    ".X11122222211X..",
+    ".X1112222221X1X.",
+    ".X1111111111X1X.",
+    ".X1X.X11X.X1X...",
+    ".X1X.X11X.X1X...",
+    ".X1X.X11X.X1X...",
+    "..X...XX...X....",
+];
+const CRTMPL_QUAD_LARGE_S_B: &[&str] = &[
+    "................",
+    "...X11X..X11X...",
+    "...X11X..X11X...",
+    "...X1111111X....",
+    "..X11444441X....",
+    "..X11XX11XX1X...",
+    "..X11XX11XX1X...",
+    "...X11111111X...",
+    "..X1111111111X..",
+    ".X11122222211X..",
+    ".X1112222221X1X.",
+    ".X1111111111X1X.",
+    "..X11X..X11X....",
+    "..X11X..X11X....",
+    ".X1X..X.X..X1X..",
+    ".XX...X.X...XX..",
+];
+const CRTMPL_QUAD_LARGE_N_A: &[&str] = &[
+    "................",
+    "...X11X..X11X...",
+    "...X11X..X11X...",
+    "...X1111111X....",
+    "..X111111111X...",
+    "..X1XXX11XXX1X..",
+    "..X111111111X...",
+    "...X11111111X...",
+    "..X1111111111X..",
+    ".X111111111111X.",
+    ".X11111111111X1X",
+    ".X1111111111X1X.",
+    ".X1X.X11X.X1X...",
+    ".X1X.X11X.X1X...",
+    ".X1X.X11X.X1X...",
+    "..X...XX...X....",
+];
+const CRTMPL_QUAD_LARGE_N_B: &[&str] = &[
+    "................",
+    "...X11X..X11X...",
+    "...X11X..X11X...",
+    "...X1111111X....",
+    "..X111111111X...",
+    "..X1XXX11XXX1X..",
+    "..X111111111X...",
+    "...X11111111X...",
+    "..X1111111111X..",
+    ".X111111111111X.",
+    ".X11111111111X1X",
+    ".X1111111111X1X.",
+    "..X11X..X11X....",
+    "..X11X..X11X....",
+    ".X1X..X.X..X1X..",
+    ".XX...X.X...XX..",
+];
+
+// ---- BIRD ----
+const CRTMPL_BIRD_E_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1111X.....",
+    ".....X11X1XX....",
+    ".....X1XX114X...",
+    "....X11111XXX...",
+    "...X1112111111X.",
+    "...X1111111111X.",
+    "....X11111111X..",
+    ".....X111111X...",
+    "......X1XX1X....",
+    "......X4XX4X....",
+    "......X.XX.X....",
+    "................",
+];
+const CRTMPL_BIRD_E_B: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1111X.....",
+    ".....X11X1XX....",
+    ".....X1XX114X...",
+    "....X11111XXX...",
+    "...X1112111111X.",
+    "...X1111111111X.",
+    "....X11111111X..",
+    ".....X111111X...",
+    ".....X1X..X1X...",
+    ".....X4X..X4X...",
+    ".....XX....XX...",
+    "................",
+];
+const CRTMPL_BIRD_S_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1111X.....",
+    ".....X1XX1X.....",
+    "....XX1XX1XX....",
+    "....X14XX41X....",
+    "....X111111X....",
+    "....X122221X....",
+    "...X11222211X...",
+    "...X11111111X...",
+    "....X111111X....",
+    ".....X1XX1X.....",
+    ".....X4XX4X.....",
+    ".....XXXXXX.....",
+    "................",
+];
+const CRTMPL_BIRD_S_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1111X.....",
+    ".....X1XX1X.....",
+    "....XX1XX1XX....",
+    "....X14XX41X....",
+    "....X111111X....",
+    "....X122221X....",
+    "...X11222211X...",
+    "...X11111111X...",
+    "....X111111X....",
+    "....X1X..X1X....",
+    "....X4X..X4X....",
+    "....XXX..XXX....",
+    "................",
+];
+const CRTMPL_BIRD_N_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1111X.....",
+    ".....X1XX1X.....",
+    "....XX1111XX....",
+    "....X111111X....",
+    "....X111111X....",
+    "....X111111X....",
+    "...X11111111X...",
+    "...X11111111X...",
+    "....X111111X....",
+    ".....X1XX1X.....",
+    ".....X4XX4X.....",
+    ".....XXXXXX.....",
+    "................",
+];
+const CRTMPL_BIRD_N_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1111X.....",
+    ".....X1XX1X.....",
+    "....XX1111XX....",
+    "....X111111X....",
+    "....X111111X....",
+    "....X111111X....",
+    "...X11111111X...",
+    "...X11111111X...",
+    "....X111111X....",
+    "....X1X..X1X....",
+    "....X4X..X4X....",
+    "....XXX..XXX....",
+    "................",
+];
+
+// ---- FISH ----
+const CRTMPL_FISH_E_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "..XX............",
+    ".X11XX..........",
+    "X11211XXXX......",
+    "X1111111111XXX..",
+    "X1112111111114X.",
+    "X11111111111111X",
+    ".X11111111111X..",
+    "..XX111111111X..",
+    "....XX111111X...",
+    "......XX111X....",
+    "........XXX.....",
+    "................",
+    "................",
+];
+const CRTMPL_FISH_E_B: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "....XX..........",
+    "...X11XX........",
+    "..X11211XXXX....",
+    "..X1111111111XXX",
+    "..X11121111111X.",
+    "..X1111111111X..",
+    "...X11111111X...",
+    "....XX1111X.....",
+    "......XXXX......",
+    "......X..X......",
+    "......X..X......",
+    "......X..X......",
+    "................",
+];
+const CRTMPL_FISH_S_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1111X.....",
+    "....X122221X....",
+    "....X122221X....",
+    "....X111111X....",
+    "....X14XX41X....",
+    "....X111111X....",
+    ".....X1111X.....",
+    "......X11X......",
+    "......X11X......",
+    ".....X1111X.....",
+    "....X11XX11X....",
+    "....XX....XX....",
+    "................",
+];
+const CRTMPL_FISH_S_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1111X.....",
+    "....X122221X....",
+    "....X122221X....",
+    "....X111111X....",
+    "....X14XX41X....",
+    "....X111111X....",
+    ".....X1111X.....",
+    "......X11X......",
+    ".....X1111X.....",
+    "....X111111X....",
+    "...X11XXXX11X...",
+    "...XX......XX...",
+    "................",
+];
+const CRTMPL_FISH_N_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1111X.....",
+    "....X111111X....",
+    "....X111111X....",
+    "....X1XXXX1X....",
+    "....X111111X....",
+    "....X111111X....",
+    ".....X1111X.....",
+    "......X11X......",
+    "......X11X......",
+    ".....X1111X.....",
+    "....X11XX11X....",
+    "....XX....XX....",
+    "................",
+];
+const CRTMPL_FISH_N_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1111X.....",
+    "....X111111X....",
+    "....X111111X....",
+    "....X1XXXX1X....",
+    "....X111111X....",
+    "....X111111X....",
+    ".....X1111X.....",
+    "......X11X......",
+    ".....X1111X.....",
+    "....X111111X....",
+    "...X11XXXX11X...",
+    "...XX......XX...",
+    "................",
+];
+
+// ---- SLITHER ----
+const CRTMPL_SLITHER_E_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "..XXXX..........",
+    ".X1111XXX...XXX.",
+    ".X14X11111XX111X",
+    ".X11X1112221112X",
+    "..XXX111111111X.",
+    "....X1XX111XX1X.",
+    "....XX..XXX..XX.",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const CRTMPL_SLITHER_E_B: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "..XXXX..........",
+    ".X1111XXX..XXX..",
+    ".X14X11111X111XX",
+    ".X11X11122221112",
+    "..XXX1111111111X",
+    "....XX1X.1X1X11X",
+    ".....XX..XX.XXXX",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const CRTMPL_SLITHER_S_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1441X.....",
+    ".....X1XX1X.....",
+    ".....X1111X.....",
+    "......X11X......",
+    ".....X1111X.....",
+    "....X111111X....",
+    "....X111111X....",
+    ".....X1111X.....",
+    "......X11X......",
+    ".....X1XX1X.....",
+    ".....X.XX.X.....",
+    "................",
+];
+const CRTMPL_SLITHER_S_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1441X.....",
+    ".....X1XX1X.....",
+    ".....X1111X.....",
+    ".....X1111X.....",
+    "....X111111X....",
+    "....X111111X....",
+    ".....X1111X.....",
+    "......X11X......",
+    "......X11X......",
+    ".....X1111X.....",
+    "....X11XX11X....",
+    "....XX....XX....",
+    "................",
+];
+const CRTMPL_SLITHER_N_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1XX1X.....",
+    ".....X1111X.....",
+    ".....X1111X.....",
+    "......X11X......",
+    ".....X1111X.....",
+    "....X111111X....",
+    "....X111111X....",
+    ".....X1111X.....",
+    "......X11X......",
+    ".....X1XX1X.....",
+    ".....X.XX.X.....",
+    "................",
+];
+const CRTMPL_SLITHER_N_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1XX1X.....",
+    ".....X1111X.....",
+    ".....X1111X.....",
+    ".....X1111X.....",
+    "....X111111X....",
+    "....X111111X....",
+    ".....X1111X.....",
+    "......X11X......",
+    "......X11X......",
+    ".....X1111X.....",
+    "....X11XX11X....",
+    "....XX....XX....",
+    "................",
+];
+
+// ---- FROG ----
+const CRTMPL_FROG_E_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X4XX4X.....",
+    "....XX1XX1XX....",
+    "....X111111X....",
+    "....X122221X....",
+    "...X11111111X...",
+    "..X1111111111X..",
+    "..X11X1111X11X..",
+    "..XX.X1XX1X.XX..",
+    ".....XX..XX.....",
+    "................",
+    "................",
+];
+const CRTMPL_FROG_E_B: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X4XX4X.....",
+    "....XX1XX1XX....",
+    "....X111111X....",
+    "....X122221X....",
+    "...X11111111X...",
+    "..X1111111111X..",
+    ".X11X111111X11X.",
+    ".X1X..X11X..X1X.",
+    ".XX...X11X...XX.",
+    "......XX.XX.....",
+    "................",
+    "................",
+];
+const CRTMPL_FROG_S_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X4XX4X.....",
+    "....XX1XX1XX....",
+    "....X111111X....",
+    "....X122221X....",
+    "...X11111111X...",
+    "..X1111111111X..",
+    "..X11X1111X11X..",
+    "..XX.X1XX1X.XX..",
+    ".....XX..XX.....",
+    "................",
+    "................",
+];
+const CRTMPL_FROG_S_B: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X4XX4X.....",
+    "....XX1XX1XX....",
+    "....X111111X....",
+    "....X122221X....",
+    "...X11111111X...",
+    "..X1111111111X..",
+    ".X11X111111X11X.",
+    ".X1X..X11X..X1X.",
+    ".XX...X11X...XX.",
+    "......XX.XX.....",
+    "................",
+    "................",
+];
+const CRTMPL_FROG_N_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1XX1X.....",
+    "....XX1111XX....",
+    "....X111111X....",
+    "....X111111X....",
+    "...X11111111X...",
+    "..X1111111111X..",
+    "..X11X1111X11X..",
+    "..XX.X1XX1X.XX..",
+    ".....XX..XX.....",
+    "................",
+    "................",
+];
+const CRTMPL_FROG_N_B: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1XX1X.....",
+    "....XX1111XX....",
+    "....X111111X....",
+    "....X111111X....",
+    "...X11111111X...",
+    "..X1111111111X..",
+    ".X11X111111X11X.",
+    ".X1X..X11X..X1X.",
+    ".XX...X11X...XX.",
+    "......XX.XX.....",
+    "................",
+    "................",
+];
+
+// ---- TURTLE ----
+const CRTMPL_TURTLE_E_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "..XXXX..........",
+    ".X1111XX........",
+    ".X14X11XXXXXX...",
+    ".X11X1X222221X..",
+    "..XXX12121212X..",
+    "...X1212121212X.",
+    "...X12121212121X",
+    "...XX111X11X111X",
+    "....XX1X.X1X.XX.",
+    ".....XX...XX....",
+    "................",
+    "................",
+];
+const CRTMPL_TURTLE_E_B: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "..XXXX..........",
+    ".X1111XX........",
+    ".X14X11XXXXXX...",
+    ".X11X1X222221X..",
+    "..XXX12121212X..",
+    "...X1212121212X.",
+    "...X12121212121X",
+    "....X111X11X111X",
+    ".....X1X.X1X.XX.",
+    ".....XX...XX....",
+    "................",
+    "................",
+];
+const CRTMPL_TURTLE_S_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1441X.....",
+    "....XX1XX1XX....",
+    "...X122222221X..",
+    "..X1212121212X..",
+    "..X12121212121X.",
+    "..X21212121212X.",
+    "..X12121212121X.",
+    "..X21212121212X.",
+    "..X122222222X1X.",
+    "...XX11XX11XXX..",
+    "....X.X..X.X....",
+    "................",
+    "................",
+];
+const CRTMPL_TURTLE_S_B: &[&str] = &[
+    "................",
+    "......XXXX......",
+    ".....X1441X.....",
+    "....XX1XX1XX....",
+    "...X122222221X..",
+    "..X1212121212X..",
+    "..X12121212121X.",
+    "..X21212121212X.",
+    "..X12121212121X.",
+    "..X21212121212X.",
+    "..X122222222X1X.",
+    "...X11X.X11X1X..",
+    "....X.X..X.X.X..",
+    "....X.X..X.X....",
+    "................",
+    "................",
+];
+const CRTMPL_TURTLE_N_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X1XX1X.....",
+    "....XX1111XX....",
+    "...X122222221X..",
+    "..X1212121212X..",
+    "..X12121212121X.",
+    "..X21212121212X.",
+    "..X12121212121X.",
+    "..X21212121212X.",
+    "..X122222222X1X.",
+    "...XX11XX11XXX..",
+    "....X.X..X.X....",
+    "................",
+    "................",
+];
+const CRTMPL_TURTLE_N_B: &[&str] = &[
+    "................",
+    "......XXXX......",
+    ".....X1XX1X.....",
+    "....XX1111XX....",
+    "...X122222221X..",
+    "..X1212121212X..",
+    "..X12121212121X.",
+    "..X21212121212X.",
+    "..X12121212121X.",
+    "..X21212121212X.",
+    "..X122222222X1X.",
+    "...X11X.X11X1X..",
+    "....X.X..X.X.X..",
+    "....X.X..X.X....",
+    "................",
+    "................",
+];
+
+// ---- BAT ----
+const CRTMPL_BAT_E_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "....X......X....",
+    "...X1XX..XX1X...",
+    "..X1212XX2121X..",
+    "..X12121111212X.",
+    "...X121111121X..",
+    "....X1X4X4X1X...",
+    "....XX1XXX1XX...",
+    "......X.X.X.....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const CRTMPL_BAT_E_B: &[&str] = &[
+    "................",
+    "XX.X........X.XX",
+    "X12X1X....X1X21X",
+    "X1212X....X21212",
+    ".X1212X..X21212X",
+    "..X12121221212X.",
+    "...X121111121X..",
+    "....X1X4X4X1X...",
+    "....XX1XXX1XX...",
+    "......X.X.X.....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const CRTMPL_BAT_S_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "....X......X....",
+    "...X1XX..XX1X...",
+    "..X1212XX2121X..",
+    "..X12121111212X.",
+    "...X121111121X..",
+    "....X1X4X4X1X...",
+    "....XX1XXX1XX...",
+    "......X.X.X.....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const CRTMPL_BAT_S_B: &[&str] = &[
+    "................",
+    "XX.X........X.XX",
+    "X12X1X....X1X21X",
+    "X1212X....X21212",
+    ".X1212X..X21212X",
+    "..X12121221212X.",
+    "...X121111121X..",
+    "....X1X4X4X1X...",
+    "....XX1XXX1XX...",
+    "......X.X.X.....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const CRTMPL_BAT_N_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "....X......X....",
+    "...X1XX..XX1X...",
+    "..X1212XX2121X..",
+    "..X12111111112X.",
+    "...X12111111X...",
+    "....X11XXXX1X...",
+    "....X1XXXXX1X...",
+    "......X..X......",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+const CRTMPL_BAT_N_B: &[&str] = &[
+    "................",
+    "XX.X........X.XX",
+    "X12X1X....X1X21X",
+    "X1212X....X21212",
+    ".X1212X..X21212X",
+    "..X12121221212X.",
+    "...X121111121X..",
+    "....X11XXXX1X...",
+    "....X1XXXXX1X...",
+    "......X..X......",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+// [id, archetype_key, c1, c2, c3, c4]
+const CREATURE_DEFS: &[(&str, &str, char, char, char, char)] = &[
+    ("rabbit_anim",  "quad_small",  'P', 'l', 'W', 'r'),
+    ("fox",          "quad_small",  'R', 'r', 'W', 'X'),
+    ("cat",          "quad_small",  'k', 'K', 'l', 'y'),
+    ("dog",          "quad_small",  'b', 'B', 'T', 'X'),
+    ("squirrel",     "quad_small",  'b', 'D', 'T', 'X'),
+    ("wolf_anim",    "quad_med",    'K', 'k', 'l', 'y'),
+    ("deer_anim",    "quad_med",    'b', 'B', 'T', 'X'),
+    ("boar_anim",    "quad_med",    'd', 'D', 'b', 'W'),
+    ("sheep_anim",   "quad_med",    'W', 'P', 'l', 'X'),
+    ("goat",         "quad_med",    'T', 't', 'D', 'X'),
+    ("pig",          "quad_med",    'r', 'R', 'B', 'X'),
+    ("horse_anim",   "quad_large",  'b', 'B', 'T', 'D'),
+    ("cow_anim",     "quad_large",  'W', 'd', 'D', 'y'),
+    ("bear_anim",    "quad_large",  'b', 'B', 'D', 't'),
+    ("mammoth_anim", "quad_large",  'd', 'D', 'b', 'W'),
+    ("ox",           "quad_large",  'D', 'd', 'b', 'P'),
+    ("donkey",       "quad_large",  'K', 'l', 'k', 'D'),
+    ("chicken_anim", "bird",        'W', 'P', 'y', 'r'),
+    ("eagle",        "bird",        'D', 'd', 'T', 'y'),
+    ("owl",          "bird",        'b', 'B', 'T', 'y'),
+    ("raven",        "bird",        'k', 'K', 'X', 'p'),
+    ("duck",         "bird",        'G', 'g', 'W', 'o'),
+    ("fish_anim",    "fish",        'I', 'i', 'H', 'X'),
+    ("salmon",       "fish",        'R', 'o', 'W', 'X'),
+    ("shark",        "fish",        'k', 'K', 'W', 'X'),
+    ("snake",        "slither",     'G', 'g', 'M', 'y'),
+    ("lizard",       "slither",     'm', 'G', 'M', 'y'),
+    ("frog",         "frog",        'G', 'g', 'M', 'X'),
+    ("turtle",       "turtle",      'G', 'g', 'M', 't'),
+    ("bat",          "bat",         'k', 'K', 'r', 'X'),
+];
+
+fn creature_e_a(archetype: &str) -> &'static [&'static str] {
+    match archetype {
+        "quad_small" => CRTMPL_QUAD_SMALL_E_A,
+        "quad_med"   => CRTMPL_QUAD_MED_E_A,
+        "quad_large" => CRTMPL_QUAD_LARGE_E_A,
+        "bird"       => CRTMPL_BIRD_E_A,
+        "fish"       => CRTMPL_FISH_E_A,
+        "slither"    => CRTMPL_SLITHER_E_A,
+        "frog"       => CRTMPL_FROG_E_A,
+        "turtle"     => CRTMPL_TURTLE_E_A,
+        "bat"        => CRTMPL_BAT_E_A,
+        _            => CRTMPL_QUAD_MED_E_A,
+    }
+}
+fn creature_e_b(archetype: &str) -> &'static [&'static str] {
+    match archetype {
+        "quad_small" => CRTMPL_QUAD_SMALL_E_B,
+        "quad_med"   => CRTMPL_QUAD_MED_E_B,
+        "quad_large" => CRTMPL_QUAD_LARGE_E_B,
+        "bird"       => CRTMPL_BIRD_E_B,
+        "fish"       => CRTMPL_FISH_E_B,
+        "slither"    => CRTMPL_SLITHER_E_B,
+        "frog"       => CRTMPL_FROG_E_B,
+        "turtle"     => CRTMPL_TURTLE_E_B,
+        "bat"        => CRTMPL_BAT_E_B,
+        _            => CRTMPL_QUAD_MED_E_B,
+    }
+}
+fn creature_s_a(archetype: &str) -> &'static [&'static str] {
+    match archetype {
+        "quad_small" => CRTMPL_QUAD_SMALL_S_A,
+        "quad_med"   => CRTMPL_QUAD_MED_S_A,
+        "quad_large" => CRTMPL_QUAD_LARGE_S_A,
+        "bird"       => CRTMPL_BIRD_S_A,
+        "fish"       => CRTMPL_FISH_S_A,
+        "slither"    => CRTMPL_SLITHER_S_A,
+        "frog"       => CRTMPL_FROG_S_A,
+        "turtle"     => CRTMPL_TURTLE_S_A,
+        "bat"        => CRTMPL_BAT_S_A,
+        _            => CRTMPL_QUAD_MED_S_A,
+    }
+}
+fn creature_s_b(archetype: &str) -> &'static [&'static str] {
+    match archetype {
+        "quad_small" => CRTMPL_QUAD_SMALL_S_B,
+        "quad_med"   => CRTMPL_QUAD_MED_S_B,
+        "quad_large" => CRTMPL_QUAD_LARGE_S_B,
+        "bird"       => CRTMPL_BIRD_S_B,
+        "fish"       => CRTMPL_FISH_S_B,
+        "slither"    => CRTMPL_SLITHER_S_B,
+        "frog"       => CRTMPL_FROG_S_B,
+        "turtle"     => CRTMPL_TURTLE_S_B,
+        "bat"        => CRTMPL_BAT_S_B,
+        _            => CRTMPL_QUAD_MED_S_B,
+    }
+}
+fn creature_n_a(archetype: &str) -> &'static [&'static str] {
+    match archetype {
+        "quad_small" => CRTMPL_QUAD_SMALL_N_A,
+        "quad_med"   => CRTMPL_QUAD_MED_N_A,
+        "quad_large" => CRTMPL_QUAD_LARGE_N_A,
+        "bird"       => CRTMPL_BIRD_N_A,
+        "fish"       => CRTMPL_FISH_N_A,
+        "slither"    => CRTMPL_SLITHER_N_A,
+        "frog"       => CRTMPL_FROG_N_A,
+        "turtle"     => CRTMPL_TURTLE_N_A,
+        "bat"        => CRTMPL_BAT_N_A,
+        _            => CRTMPL_QUAD_MED_N_A,
+    }
+}
+fn creature_n_b(archetype: &str) -> &'static [&'static str] {
+    match archetype {
+        "quad_small" => CRTMPL_QUAD_SMALL_N_B,
+        "quad_med"   => CRTMPL_QUAD_MED_N_B,
+        "quad_large" => CRTMPL_QUAD_LARGE_N_B,
+        "bird"       => CRTMPL_BIRD_N_B,
+        "fish"       => CRTMPL_FISH_N_B,
+        "slither"    => CRTMPL_SLITHER_N_B,
+        "frog"       => CRTMPL_FROG_N_B,
+        "turtle"     => CRTMPL_TURTLE_N_B,
+        "bat"        => CRTMPL_BAT_N_B,
+        _            => CRTMPL_QUAD_MED_N_B,
+    }
+}
+
+// ============================================================
+// BODY BASE TEMPLATES  (skin char = '~')
+// ============================================================
+const BODY_MALE_S_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~XX~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    "....X~~~~~~X....",
+    "...X~~~~~~~~X...",
+    "...X~~~~~~~~X...",
+    "...X~~~~~~~~X...",
+    "....X~~~~~~X....",
+    "....X~X..X~X....",
+    "....X~X..X~X....",
+    "....XXX..XXX....",
+];
+const BODY_MALE_S_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~XX~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    "....X~~~~~~X....",
+    "...X~~~~~~~~X...",
+    "...X~~~~~~~~X...",
+    "...X~~~~~~~~X...",
+    "....X~~~~~~X....",
+    "....X~~X.X~X....",
+    ".....X~X.X~X....",
+    ".....XX..XXX....",
+];
+const BODY_MALE_N_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    "....X~~~~~~X....",
+    "...X~~~~~~~~X...",
+    "...X~~~~~~~~X...",
+    "...X~~~~~~~~X...",
+    "....X~~~~~~X....",
+    "....X~X..X~X....",
+    "....X~X..X~X....",
+    "....XXX..XXX....",
+];
+const BODY_MALE_N_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    "....X~~~~~~X....",
+    "...X~~~~~~~~X...",
+    "...X~~~~~~~~X...",
+    "...X~~~~~~~~X...",
+    "....X~~~~~~X....",
+    "....X~~X.X~X....",
+    ".....X~X.X~X....",
+    ".....XX..XXX....",
+];
+const BODY_MALE_E_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~XX~X.....",
+    ".....X~~~~X.....",
+    "....X~~~~~X.....",
+    "...X~~~~~~X.....",
+    "...X~~~~~~X.....",
+    "...X~~~~~~X.....",
+    "....X~~~~X......",
+    "....X~~~~X......",
+    "....X~X..X~X....",
+    "....X~X..X~X....",
+    "....XX...XX.....",
+];
+const BODY_MALE_E_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~XX~X.....",
+    ".....X~~~~X.....",
+    "....X~~~~~X.....",
+    "...X~~~~~~X.....",
+    "...X~~~~~~X.....",
+    "...X~~~~~~X.....",
+    "....X~~~~X......",
+    "....X~~~~X......",
+    "....X~~X.X~X....",
+    ".....X~X.X~X....",
+    ".....XX..XXX....",
+];
+const BODY_FEMALE_S_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~XX~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~X..X~X....",
+    "....X~X..X~X....",
+    "....XXX..XXX....",
+];
+const BODY_FEMALE_S_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~XX~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~X.X~X....",
+    ".....X~X.X~X....",
+    ".....XX..XXX....",
+];
+const BODY_FEMALE_N_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~X..X~X....",
+    "....X~X..X~X....",
+    "....XXX..XXX....",
+];
+const BODY_FEMALE_N_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~~~~~X....",
+    "....X~~X.X~X....",
+    ".....X~X.X~X....",
+    ".....XX..XXX....",
+];
+const BODY_FEMALE_E_A: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~XX~X.....",
+    ".....X~~~~X.....",
+    "....X~~~~~X.....",
+    "....X~~~~~X.....",
+    "....X~~~~~X.....",
+    "....X~~~~~X.....",
+    "....X~~~~X......",
+    "....X~~~~X......",
+    "....X~X..X~X....",
+    "....X~X..X~X....",
+    "....XX...XX.....",
+];
+const BODY_FEMALE_E_B: &[&str] = &[
+    "................",
+    "................",
+    "......XXXX......",
+    ".....X~~~~X.....",
+    ".....X~~~~X.....",
+    ".....X~XX~X.....",
+    ".....X~~~~X.....",
+    "....X~~~~~X.....",
+    "....X~~~~~X.....",
+    "....X~~~~~X.....",
+    "....X~~~~~X.....",
+    "....X~~~~X......",
+    "....X~~~~X......",
+    "....X~~X.X~X....",
+    ".....X~X.X~X....",
+    ".....XX..XXX....",
+];
+
+// ============================================================
+// HAIR OVERLAY TEMPLATES  (^ = hair color placeholder)
+// Rows 0-1 and 8-15 are fully transparent; only head-area rows have pixels.
+// ============================================================
+
+const HAIR_MALE_S: &[&str] = &[
+    "................",
+    "................",
+    "......^^^^......",
+    ".....^....^.....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+const HAIR_MALE_N: &[&str] = &[
+    "................",
+    "................",
+    "......^^^^......",
+    ".....^....^.....",
+    ".....^....^.....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+const HAIR_MALE_E: &[&str] = &[
+    "................",
+    "................",
+    ".....^^^^^......",
+    ".....^^.........",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+const HAIR_FEMALE_S: &[&str] = &[
+    "................",
+    "................",
+    "......^^^^......",
+    "....^^....^^....",
+    "....^^....^^....",
+    "....^^....^^....",
+    "....^^....^^....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+const HAIR_FEMALE_N: &[&str] = &[
+    "................",
+    "................",
+    "......^^^^......",
+    ".....^^^^^^^^...",
+    ".....^^^^^^^^...",
+    "....^^......^^..",
+    "....^^......^^..",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+const HAIR_FEMALE_E: &[&str] = &[
+    "................",
+    "................",
+    ".....^^^^^......",
+    "....^^^.........",
+    "....^^..........",
+    "....^^..........",
+    "....^^..........",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+// ============================================================
+// CLOTHING OVERLAY TEMPLATES  (@ = clothing color placeholder)
+// Rows 0-7 transparent (head shows body sprite); rows 8-15 cover torso/legs.
+// Derived from corresponding BODY templates with ~ replaced by @.
+// ============================================================
+
+const CLOTH_MALE_S_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "....X@@@@@@X....",
+    "...X@@@@@@@@X...",
+    "...X@@@@@@@@X...",
+    "...X@@@@@@@@X...",
+    "....X@@@@@@X....",
+    "....X@X..X@X....",
+    "....X@X..X@X....",
+    "....XXX..XXX....",
+];
+
+const CLOTH_MALE_S_B: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "....X@@@@@@X....",
+    "...X@@@@@@@@X...",
+    "...X@@@@@@@@X...",
+    "...X@@@@@@@@X...",
+    "....X@@@@@@X....",
+    "....X@@X.X@X....",
+    ".....X@X.X@X....",
+    ".....XX..XXX....",
+];
+
+const CLOTH_MALE_E_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "....X@@@@@X.....",
+    "...X@@@@@@X.....",
+    "...X@@@@@@X.....",
+    "...X@@@@@@X.....",
+    "....X@@@@X......",
+    "....X@@@@X......",
+    "....X@X..X@X....",
+    "....X@X..X@X....",
+    "....XX...XX.....",
+];
+
+const CLOTH_MALE_E_B: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "....X@@@@@X.....",
+    "...X@@@@@@X.....",
+    "...X@@@@@@X.....",
+    "...X@@@@@@X.....",
+    "....X@@@@X......",
+    "....X@@@@X......",
+    "....X@@X.X@X....",
+    ".....X@X.X@X....",
+    ".....XX..XXX....",
+];
+
+const CLOTH_FEMALE_S_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "....X@@@@@@X....",
+    "....X@@@@@@X....",
+    "....X@@@@@@X....",
+    "....X@@@@@@X....",
+    "....X@@@@@@X....",
+    "....X@X..X@X....",
+    "....X@X..X@X....",
+    "....XXX..XXX....",
+];
+
+const CLOTH_FEMALE_S_B: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "....X@@@@@@X....",
+    "....X@@@@@@X....",
+    "....X@@@@@@X....",
+    "....X@@@@@@X....",
+    "....X@@@@@@X....",
+    "....X@@X.X@X....",
+    ".....X@X.X@X....",
+    ".....XX..XXX....",
+];
+
+const CLOTH_FEMALE_E_A: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "....X@@@@@X.....",
+    "....X@@@@@X.....",
+    "....X@@@@@X.....",
+    "....X@@@@@X.....",
+    "....X@@@@X......",
+    "....X@@@@X......",
+    "....X@X..X@X....",
+    "....X@X..X@X....",
+    "....XX...XX.....",
+];
+
+const CLOTH_FEMALE_E_B: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "....X@@@@@X.....",
+    "....X@@@@@X.....",
+    "....X@@@@@X.....",
+    "....X@@@@@X.....",
+    "....X@@@@X......",
+    "....X@@@@X......",
+    "....X@@X.X@X....",
+    ".....X@X.X@X....",
+    ".....XX..XXX....",
+];
+
+// (id, gender, skin_palette_char)
+const BODY_PRESETS: &[(&str, &str, char)] = &[
+    ("male_tan",     "male",   'B'),
+    ("male_pale",    "male",   'T'),
+    ("male_dark",    "male",   'b'),
+    ("female_tan",   "female", 'B'),
+    ("female_pale",  "female", 'T'),
+    ("female_dark",  "female", 'b'),
+];
+
+// ============================================================
+// SETUP SYSTEM
+// ============================================================
+
+pub fn setup_sprite_library(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    let mut lib = SpriteLibrary::default();
+
+    macro_rules! add {
+        ($name:expr, $pixels:expr) => {
+            lib.sprites.insert($name.to_string(), images.add(design_to_image($pixels)));
+        };
+    }
+
+    // --- Terrain (17) ---
+    add!("terrain_grass",          TERRAIN_GRASS);
+    add!("terrain_grass_dark",     TERRAIN_GRASS_DARK);
+    add!("terrain_sand",           TERRAIN_SAND);
+    add!("terrain_dirt",           TERRAIN_DIRT);
+    add!("terrain_stone",          TERRAIN_STONE);
+    add!("terrain_snow",           TERRAIN_SNOW);
+    add!("terrain_water",          TERRAIN_WATER);
+    add!("terrain_water_deep",     TERRAIN_WATER_DEEP);
+    add!("terrain_water_shore_n",  TERRAIN_WATER_SHORE_N);
+    add!("terrain_forest",         TERRAIN_FOREST);
+    add!("terrain_hills",          TERRAIN_HILLS);
+    add!("terrain_mountain",       TERRAIN_MOUNTAIN);
+    add!("terrain_mountain_snow",  TERRAIN_MOUNTAIN_SNOW);
+    add!("terrain_lava",           TERRAIN_LAVA);
+    add!("terrain_swamp",          TERRAIN_SWAMP);
+    add!("terrain_road",           TERRAIN_ROAD);
+    add!("terrain_bridge",         TERRAIN_BRIDGE);
+
+    // --- Buildings (17) ---
+    add!("building_tent",          BUILDING_TENT);
+    add!("building_hut",           BUILDING_HUT);
+    add!("building_longhouse",     BUILDING_LONGHOUSE);
+    add!("building_farm",          BUILDING_FARM);
+    add!("building_mill",          BUILDING_MILL);
+    add!("building_blacksmith",    BUILDING_BLACKSMITH);
+    add!("building_market",        BUILDING_MARKET);
+    add!("building_well",          BUILDING_WELL);
+    add!("building_watchtower",    BUILDING_WATCHTOWER);
+    add!("building_wall_stone",    BUILDING_WALL_STONE);
+    add!("building_gate",          BUILDING_GATE);
+    add!("building_church",        BUILDING_CHURCH);
+    add!("building_castle",        BUILDING_CASTLE);
+    add!("building_tavern",        BUILDING_TAVERN);
+    add!("building_lumber_mill",   BUILDING_LUMBER_MILL);
+    add!("building_stable",        BUILDING_STABLE);
+    add!("building_barracks",      BUILDING_BARRACKS);
+
+    // --- Static creatures (15) ---
+    add!("creature_mammoth",   CREATURE_MAMMOTH);
+    add!("creature_wolf",      CREATURE_WOLF);
+    add!("creature_bear",      CREATURE_BEAR);
+    add!("creature_deer",      CREATURE_DEER);
+    add!("creature_boar",      CREATURE_BOAR);
+    add!("creature_rabbit",    CREATURE_RABBIT);
+    add!("creature_sheep",     CREATURE_SHEEP);
+    add!("creature_cow",       CREATURE_COW);
+    add!("creature_horse",     CREATURE_HORSE);
+    add!("creature_chicken",   CREATURE_CHICKEN);
+    add!("creature_fish",      CREATURE_FISH);
+    add!("creature_dragon",    CREATURE_DRAGON);
+    add!("creature_goblin",    CREATURE_GOBLIN);
+    add!("creature_skeleton",  CREATURE_SKELETON);
+    add!("creature_bandit",    CREATURE_BANDIT);
+
+    // --- Resources (13) ---
+    add!("resource_wheat",       RESOURCE_WHEAT);
+    add!("resource_berries",     RESOURCE_BERRIES);
+    add!("resource_meat",        RESOURCE_MEAT);
+    add!("resource_fish",        RESOURCE_FISH);
+    add!("resource_wood_log",    RESOURCE_WOOD_LOG);
+    add!("resource_plank",       RESOURCE_PLANK);
+    add!("resource_stone_pile",  RESOURCE_STONE_PILE);
+    add!("resource_iron_ore",    RESOURCE_IRON_ORE);
+    add!("resource_gold_ore",    RESOURCE_GOLD_ORE);
+    add!("resource_gold_coin",   RESOURCE_GOLD_COIN);
+    add!("resource_gem",         RESOURCE_GEM);
+    add!("resource_water_jug",   RESOURCE_WATER_JUG);
+    add!("resource_apple",       RESOURCE_APPLE);
+
+    // --- Items (12) ---
+    add!("item_stone_axe",   ITEM_STONE_AXE);
+    add!("item_bronze_axe",  ITEM_BRONZE_AXE);
+    add!("item_iron_sword",  ITEM_IRON_SWORD);
+    add!("item_bow",         ITEM_BOW);
+    add!("item_spear",       ITEM_SPEAR);
+    add!("item_shield",      ITEM_SHIELD);
+    add!("item_hammer",      ITEM_HAMMER);
+    add!("item_pickaxe",     ITEM_PICKAXE);
+    add!("item_scythe",      ITEM_SCYTHE);
+    add!("item_torch",       ITEM_TORCH);
+    add!("item_helm",        ITEM_HELM);
+    add!("item_potion",      ITEM_POTION);
+
+    // --- FX (12) ---
+    add!("fx_smoke_1",      FX_SMOKE_1);
+    add!("fx_smoke_2",      FX_SMOKE_2);
+    add!("fx_smoke_3",      FX_SMOKE_3);
+    add!("fx_sparkle_1",    FX_SPARKLE_1);
+    add!("fx_sparkle_2",    FX_SPARKLE_2);
+    add!("fx_sparkle_3",    FX_SPARKLE_3);
+    add!("fx_explosion_1",  FX_EXPLOSION_1);
+    add!("fx_explosion_2",  FX_EXPLOSION_2);
+    add!("fx_explosion_3",  FX_EXPLOSION_3);
+    add!("fx_explosion_4",  FX_EXPLOSION_4);
+    add!("fx_splash",       FX_SPLASH);
+    add!("fx_chop_hit",     FX_CHOP_HIT);
+
+    // --- UI (12) ---
+    add!("ui_cursor",       UI_CURSOR);
+    add!("ui_reticle",      UI_RETICLE);
+    add!("ui_exclamation",  UI_EXCLAMATION);
+    add!("ui_question",     UI_QUESTION);
+    add!("ui_heart",        UI_HEART);
+    add!("ui_coin",         UI_COIN);
+    add!("ui_food",         UI_FOOD);
+    add!("ui_banner",       UI_BANNER);
+    add!("ui_arrow_up",     UI_ARROW_UP);
+    add!("ui_arrow_down",   UI_ARROW_DOWN);
+    add!("ui_arrow_left",   UI_ARROW_LEFT);
+    add!("ui_arrow_right",  UI_ARROW_RIGHT);
+
+    // --- Character sprites: 24 classes × 8 directional frames = 192 ---
+    for &(id, skin, hair, primary, secondary, accent) in CHARACTER_DEFS {
+        let subs = [('~', skin), ('^', hair), ('*', primary), ('+', secondary), ('=', accent)];
+
+        let e_a = apply_subs(CHAR_TMPL_E_A, &subs);
+        let e_b = apply_subs(CHAR_TMPL_E_B, &subs);
+        let w_a = mirror_h(&e_a);
+        let w_b = mirror_h(&e_b);
+
+        let frames: [(&str, Vec<String>); 8] = [
+            ("s_a", apply_subs(CHAR_TMPL_S_A, &subs)),
+            ("s_b", apply_subs(CHAR_TMPL_S_B, &subs)),
+            ("n_a", apply_subs(CHAR_TMPL_N_A, &subs)),
+            ("n_b", apply_subs(CHAR_TMPL_N_B, &subs)),
+            ("e_a", e_a),
+            ("e_b", e_b),
+            ("w_a", w_a),
+            ("w_b", w_b),
+        ];
+        for (dir_frame, pixels) in frames {
+            lib.sprites.insert(
+                format!("char_{id}_{dir_frame}"),
+                images.add(template_to_image(pixels)),
+            );
+        }
+    }
+
+    // --- Animated creature sprites: 30 species × 8 frames = 240 ---
+    for &(id, archetype, c1, c2, c3, c4) in CREATURE_DEFS {
+        let subs = [('1', c1), ('2', c2), ('3', c3), ('4', c4)];
+
+        let e_a = apply_subs(creature_e_a(archetype), &subs);
+        let e_b = apply_subs(creature_e_b(archetype), &subs);
+        let w_a = mirror_h(&e_a);
+        let w_b = mirror_h(&e_b);
+
+        let frames: [(&str, Vec<String>); 8] = [
+            ("s_a", apply_subs(creature_s_a(archetype), &subs)),
+            ("s_b", apply_subs(creature_s_b(archetype), &subs)),
+            ("n_a", apply_subs(creature_n_a(archetype), &subs)),
+            ("n_b", apply_subs(creature_n_b(archetype), &subs)),
+            ("e_a", e_a),
+            ("e_b", e_b),
+            ("w_a", w_a),
+            ("w_b", w_b),
+        ];
+        for (dir_frame, pixels) in frames {
+            lib.sprites.insert(
+                format!("anim_{id}_{dir_frame}"),
+                images.add(template_to_image(pixels)),
+            );
+        }
+    }
+
+    // --- Body base sprites: 6 presets × 8 frames = 48 ---
+    for &(id, gender, skin) in BODY_PRESETS {
+        let subs = [('~', skin)];
+        let (s_a, s_b, n_a, n_b, e_a_tpl, e_b_tpl) = if gender == "male" {
+            (BODY_MALE_S_A, BODY_MALE_S_B, BODY_MALE_N_A, BODY_MALE_N_B,
+             BODY_MALE_E_A, BODY_MALE_E_B)
+        } else {
+            (BODY_FEMALE_S_A, BODY_FEMALE_S_B, BODY_FEMALE_N_A, BODY_FEMALE_N_B,
+             BODY_FEMALE_E_A, BODY_FEMALE_E_B)
+        };
+        let e_a = apply_subs(e_a_tpl, &subs);
+        let e_b = apply_subs(e_b_tpl, &subs);
+        let w_a = mirror_h(&e_a);
+        let w_b = mirror_h(&e_b);
+
+        let frames: [(&str, Vec<String>); 8] = [
+            ("s_a", apply_subs(s_a, &subs)),
+            ("s_b", apply_subs(s_b, &subs)),
+            ("n_a", apply_subs(n_a, &subs)),
+            ("n_b", apply_subs(n_b, &subs)),
+            ("e_a", e_a),
+            ("e_b", e_b),
+            ("w_a", w_a),
+            ("w_b", w_b),
+        ];
+        for (dir_frame, pixels) in frames {
+            lib.sprites.insert(
+                format!("body_{id}_{dir_frame}"),
+                images.add(template_to_image(pixels)),
+            );
+        }
+    }
+
+    // --- Hair sprites: 2 sexes × 4 colors × 8 frames = 64 ---
+    // Colors reuse existing palette: b=brown, d=black, y=blonde, P=white
+    const HAIR_COLORS: &[(&str, char)] = &[
+        ("brown",  'b'),
+        ("black",  'd'),
+        ("blonde", 'y'),
+        ("white",  'P'),
+    ];
+    for sex in ["male", "female"] {
+        let (tmpl_s, tmpl_n, tmpl_e) = if sex == "male" {
+            (HAIR_MALE_S, HAIR_MALE_N, HAIR_MALE_E)
+        } else {
+            (HAIR_FEMALE_S, HAIR_FEMALE_N, HAIR_FEMALE_E)
+        };
+        for &(color_name, color_char) in HAIR_COLORS {
+            let subs = [('^', color_char)];
+            let s = apply_subs(tmpl_s, &subs);
+            let n = apply_subs(tmpl_n, &subs);
+            let e = apply_subs(tmpl_e, &subs);
+            let w = mirror_h(&e);
+            let frames: [(&str, Vec<String>); 8] = [
+                ("s_a", s.clone()),
+                ("s_b", s),
+                ("n_a", n.clone()),
+                ("n_b", n),
+                ("e_a", e.clone()),
+                ("e_b", e),
+                ("w_a", w.clone()),
+                ("w_b", w),
+            ];
+            for (dir_frame, pixels) in frames {
+                lib.sprites.insert(
+                    format!("hair_{sex}_{color_name}_{dir_frame}"),
+                    images.add(template_to_image(pixels)),
+                );
+            }
+        }
+    }
+
+    // --- Clothing sprites: 2 sexes × 3 colors × 8 frames = 48 ---
+    // Colors: B=tan/linen, b=leather-brown, K=iron-grey
+    const CLOTHING_COLORS: &[(&str, char)] = &[
+        ("tan",   'B'),
+        ("brown", 'b'),
+        ("grey",  'K'),
+    ];
+    for sex in ["male", "female"] {
+        let (s_a_tpl, s_b_tpl, e_a_tpl, e_b_tpl) = if sex == "male" {
+            (CLOTH_MALE_S_A, CLOTH_MALE_S_B, CLOTH_MALE_E_A, CLOTH_MALE_E_B)
+        } else {
+            (CLOTH_FEMALE_S_A, CLOTH_FEMALE_S_B, CLOTH_FEMALE_E_A, CLOTH_FEMALE_E_B)
+        };
+        for &(color_name, color_char) in CLOTHING_COLORS {
+            let subs = [('@', color_char)];
+            let s_a = apply_subs(s_a_tpl, &subs);
+            let s_b = apply_subs(s_b_tpl, &subs);
+            let e_a = apply_subs(e_a_tpl, &subs);
+            let e_b = apply_subs(e_b_tpl, &subs);
+            let w_a = mirror_h(&e_a);
+            let w_b = mirror_h(&e_b);
+            // N uses same torso shape as S
+            let frames: [(&str, Vec<String>); 8] = [
+                ("s_a", s_a.clone()),
+                ("s_b", s_b.clone()),
+                ("n_a", s_a),
+                ("n_b", s_b),
+                ("e_a", e_a),
+                ("e_b", e_b),
+                ("w_a", w_a),
+                ("w_b", w_b),
+            ];
+            for (dir_frame, pixels) in frames {
+                lib.sprites.insert(
+                    format!("clothing_{sex}_{color_name}_{dir_frame}"),
+                    images.add(template_to_image(pixels)),
+                );
+            }
+        }
+    }
+
+    commands.insert_resource(lib);
+}

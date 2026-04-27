@@ -1,13 +1,17 @@
 use bevy::prelude::*;
 use rand::Rng;
+use std::time::Instant;
 
+use crate::economy::agent::EconomicAgent;
 use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::{tile_to_world, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
 use crate::world::tile::TileKind;
-use crate::economy::agent::EconomicAgent;
 
-use super::combat::{CombatTarget, Body, CombatCooldown};
-use super::faction::{FactionMember, FactionRegistry, PlayerFaction, FactionCenter, PlayerFactionMarker};
+use super::combat::{Body, CombatCooldown, CombatTarget};
+use super::faction::{
+    FactionCenter, FactionMember, FactionRegistry, FactionStorageTile, PlayerFaction,
+    PlayerFactionMarker,
+};
 use super::goals::{AgentGoal, Personality};
 use super::items::{Equipment, TargetItem};
 use super::lod::LodLevel;
@@ -32,11 +36,11 @@ pub struct GridSize {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum AiState {
     #[default]
-    Idle      = 0,
-    Working   = 1,
-    Seeking   = 2,
-    Sleeping  = 3,
-    Routing   = 4,
+    Idle = 0,
+    Working = 1,
+    Seeking = 2,
+    Sleeping = 3,
+    Routing = 4,
     Attacking = 5,
 }
 
@@ -47,17 +51,68 @@ pub enum Profession {
     Farmer,
 }
 
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SkinTone {
+    Tan,
+    Pale,
+    Dark,
+}
+
+impl SkinTone {
+    pub fn random() -> Self {
+        match fastrand::u8(0..3) {
+            0 => Self::Pale,
+            1 => Self::Dark,
+            _ => Self::Tan,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tan => "tan",
+            Self::Pale => "pale",
+            Self::Dark => "dark",
+        }
+    }
+}
+
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HairColor {
+    Brown,
+    Black,
+    Blonde,
+    White,
+}
+
+impl HairColor {
+    pub fn random() -> Self {
+        match fastrand::u8(0..4) {
+            0 => Self::Black,
+            1 => Self::Blonde,
+            2 => Self::White,
+            _ => Self::Brown,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Brown => "brown",
+            Self::Black => "black",
+            Self::Blonde => "blonde",
+            Self::White => "white",
+        }
+    }
+}
+
 /// Core person AI component — 12-16 bytes.
 #[derive(Component, Clone, Copy, Default)]
 pub struct PersonAI {
-    pub task_id:       u16,
-    pub state:         AiState,
+    pub task_id: u16,
+    pub state: AiState,
     /// Progress ticks toward the next production event.
     pub work_progress: u8,
-    pub target_tile:   (i16, i16),
-    pub dest_tile:     (i16, i16),
-    pub ticks_idle:    u8,
-    pub last_plan_id:  u16,
+    pub target_tile: (i16, i16),
+    pub dest_tile: (i16, i16),
+    pub ticks_idle: u8,
+    pub last_plan_id: u16,
     pub last_goal_eval_tick: u64,
     pub target_entity: Option<Entity>,
 }
@@ -81,17 +136,19 @@ pub enum PlayerOrderKind {
     PickUp,
     BuildWall,
     BuildBed,
+    DigDown,
 }
 
 impl PlayerOrderKind {
     pub fn label(self) -> &'static str {
         match self {
-            PlayerOrderKind::Move      => "Move here",
-            PlayerOrderKind::Mine      => "Mine",
-            PlayerOrderKind::Gather    => "Gather",
-            PlayerOrderKind::PickUp    => "Pick up",
+            PlayerOrderKind::Move => "Move here",
+            PlayerOrderKind::Mine => "Mine",
+            PlayerOrderKind::Gather => "Gather",
+            PlayerOrderKind::PickUp => "Pick up",
             PlayerOrderKind::BuildWall => "Build Wall",
-            PlayerOrderKind::BuildBed  => "Build Bed",
+            PlayerOrderKind::BuildBed => "Build Bed",
+            PlayerOrderKind::DigDown => "Dig Down",
         }
     }
 }
@@ -111,9 +168,10 @@ pub fn spawn_population(
     mut registry: ResMut<FactionRegistry>,
     mut player_faction: ResMut<PlayerFaction>,
 ) {
+    let now = Instant::now();
     use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 
-    let start_cx = (GLOBE_WIDTH  / 2) * GLOBE_CELL_CHUNKS;
+    let start_cx = (GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS;
     let start_cy = (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS;
 
     let mut rng = rand::thread_rng();
@@ -150,7 +208,7 @@ pub fn spawn_population(
             for _ in 0..1000 {
                 let tx = start_tx + rng.gen_range(0..total_tiles_x);
                 let ty = start_ty + rng.gen_range(0..total_tiles_y);
-                
+
                 if chunk_map.is_passable(tx, ty)
                     && !matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
                 {
@@ -158,7 +216,7 @@ pub fn spawn_population(
                     let too_close = spawned_homes.iter().any(|(hx, hy)| {
                         let dx = (tx - hx) as f32;
                         let dy = (ty - hy) as f32;
-                        (dx*dx + dy*dy).sqrt() < 300.0
+                        (dx * dx + dy * dy).sqrt() < 300.0
                     });
 
                     if !too_close || spawned_homes.is_empty() {
@@ -183,20 +241,32 @@ pub fn spawn_population(
             result
         };
 
-        let Some((home_tx, home_ty)) = home else { continue };
+        let Some((home_tx, home_ty)) = home else {
+            continue;
+        };
         spawned_homes.push((home_tx, home_ty));
 
         let faction_id = registry.create_faction((home_tx as i16, home_ty as i16));
+
+        let home_world = tile_to_world(home_tx, home_ty);
+
+        // Spawn a storage tile marker for every faction at its home tile
+        commands.spawn((
+            FactionStorageTile { faction_id },
+            Transform::from_xyz(home_world.x, home_world.y, 0.5),
+            GlobalTransform::default(),
+            Visibility::Hidden,
+            InheritedVisibility::default(),
+        ));
 
         if group_idx == 0 {
             player_faction.faction_id = faction_id;
 
             // Mark the player's faction center
-            let world_pos = tile_to_world(home_tx, home_ty);
             commands.spawn((
                 FactionCenter,
                 PlayerFactionMarker,
-                Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
+                Transform::from_xyz(home_world.x, home_world.y, 0.5),
                 GlobalTransform::default(),
                 Visibility::Visible,
                 InheritedVisibility::default(),
@@ -204,7 +274,9 @@ pub fn spawn_population(
         }
 
         for _ in 0..GROUP_SIZE {
-            let Some((tx, ty)) = find_tile(&mut rng, home_tx, home_ty) else { continue };
+            let Some((tx, ty)) = find_tile(&mut rng, home_tx, home_ty) else {
+                continue;
+            };
 
             let world_pos = tile_to_world(tx, ty);
 
@@ -218,27 +290,35 @@ pub fn spawn_population(
                     Needs::new(30.0, 20.0, 10.0, 5.0, 40.0),
                     Mood::default(),
                     Skills::default(),
-                        PersonAI {
-                            task_id: PersonAI::UNEMPLOYED,
-                            state: AiState::Idle,
-                            target_tile: (tx as i16, ty as i16),
-                            dest_tile: (tx as i16, ty as i16),
-                            ticks_idle: 0,
-                            work_progress: 0,
-                            last_plan_id: PersonAI::UNEMPLOYED,
-                            last_goal_eval_tick: 0,
-                            target_entity: None,
-                        },
+                    PersonAI {
+                        task_id: PersonAI::UNEMPLOYED,
+                        state: AiState::Idle,
+                        target_tile: (tx as i16, ty as i16),
+                        dest_tile: (tx as i16, ty as i16),
+                        ticks_idle: 0,
+                        work_progress: 0,
+                        last_plan_id: PersonAI::UNEMPLOYED,
+                        last_goal_eval_tick: 0,
+                        target_entity: None,
+                    },
                     EconomicAgent::default(),
                 ),
                 (
                     LodLevel::Full,
                     BucketSlot(spawned),
-                    MovementState { wander_timer: (spawned % 100) as f32 * 0.025 },
+                    MovementState {
+                        wander_timer: (spawned % 100) as f32 * 0.025,
+                    },
                     BiologicalSex::random(),
+                    SkinTone::random(),
+                    HairColor::random(),
                     Personality::random(),
                     AgentGoal::default(),
-                    FactionMember { faction_id, ..Default::default() },
+                    Profession::None,
+                    FactionMember {
+                        faction_id,
+                        ..Default::default()
+                    },
                     Body::new_humanoid(),
                     Equipment::default(),
                     TargetItem::default(),
@@ -249,7 +329,7 @@ pub fn spawn_population(
                     AgentMemory::default(),
                     RelationshipMemory::default(),
                     UtilityNet::new_random(),
-                    KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 8]),
+                    KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 8, 9]),
                     PlanScoringMethod::UtilityNN,
                 ),
             ));
@@ -262,5 +342,11 @@ pub fn spawn_population(
     clock.population = spawned;
     clock.current_end = clock.bucket_size.min(spawned);
 
-    info!("Spawned {} people in {} factions of {}", spawned, num_groups, GROUP_SIZE);
+    info!(
+        "Spawned {} people in {} factions of {} in {:?}",
+        spawned,
+        num_groups,
+        GROUP_SIZE,
+        now.elapsed()
+    );
 }

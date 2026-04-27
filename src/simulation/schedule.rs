@@ -8,26 +8,26 @@ pub struct BucketSlot(pub u32);
 /// Each frame processes `bucket_size` entities, cycling through the population.
 #[derive(Resource)]
 pub struct SimClock {
-    pub tick:          u64,
-    pub bucket_size:   u32,
-    pub population:    u32,
+    pub tick: u64,
+    pub bucket_size: u32,
+    pub population: u32,
     pub current_start: u32,
-    pub current_end:   u32,
-    pub speed:         f32,
+    pub current_end: u32,
+    pub speed: f32,
     /// Accumulated time for speed scaling.
-    pub accum:         f32,
+    pub accum: f32,
 }
 
 impl Default for SimClock {
     fn default() -> Self {
         Self {
-            tick:          0,
-            bucket_size:   250,
-            population:    0,
+            tick: 0,
+            bucket_size: 250,
+            population: 0,
             current_start: 0,
-            current_end:   0,
-            speed:         1.0,
-            accum:         0.0,
+            current_end: 0,
+            speed: 1.0,
+            accum: 0.0,
         }
     }
 }

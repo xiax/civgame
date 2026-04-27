@@ -13,13 +13,13 @@ pub fn has_los(chunk_map: &ChunkMap, from: (i32, i32), to: (i32, i32)) -> bool {
     use crate::world::chunk::Z_MIN;
 
     let from_z = chunk_map.surface_z_at(from.0, from.1);
-    let to_z   = chunk_map.surface_z_at(to.0,   to.1);
+    let to_z = chunk_map.surface_z_at(to.0, to.1);
     if from_z < Z_MIN || to_z < Z_MIN {
         return false; // one end in an unloaded chunk
     }
 
     let (mut x0, mut y0) = (from.0, from.1);
-    let (x1, y1)         = (to.0,   to.1);
+    let (x1, y1) = (to.0, to.1);
 
     let dx = (x1 - x0).abs();
     let dy = (y1 - y0).abs();
@@ -28,7 +28,7 @@ pub fn has_los(chunk_map: &ChunkMap, from: (i32, i32), to: (i32, i32)) -> bool {
     let mut err = dx - dy;
 
     let total_dist = (dx.max(dy)).max(1) as f32;
-    let mut steps  = 0i32;
+    let mut steps = 0i32;
 
     loop {
         steps += 1;
@@ -45,16 +45,18 @@ pub fn has_los(chunk_map: &ChunkMap, from: (i32, i32), to: (i32, i32)) -> bool {
             }
         }
 
-        if x0 == x1 && y0 == y1 { break; }
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
 
         let e2 = 2 * err;
         if e2 > -dy {
             err -= dy;
-            x0  += sx;
+            x0 += sx;
         }
         if e2 < dx {
             err += dx;
-            y0  += sy;
+            y0 += sy;
         }
     }
 
@@ -64,16 +66,19 @@ pub fn has_los(chunk_map: &ChunkMap, from: (i32, i32), to: (i32, i32)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ahash::AHashMap;
     use crate::world::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE};
+    use ahash::AHashMap;
 
     fn flat_chunk_map() -> ChunkMap {
         use crate::world::tile::TileKind;
         let mut map = ChunkMap::default();
-        let surface_z         = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
-        let surface_kind      = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_z = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
         let surface_fertility = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
-        map.0.insert(ChunkCoord(0, 0), Chunk::new(surface_z, surface_kind, surface_fertility));
+        map.0.insert(
+            ChunkCoord(0, 0),
+            Chunk::new(surface_z, surface_kind, surface_fertility),
+        );
         map
     }
 

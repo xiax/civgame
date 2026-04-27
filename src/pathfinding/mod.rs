@@ -1,8 +1,8 @@
-use bevy::prelude::*;
 use crate::world::terrain;
+use bevy::prelude::*;
 
-pub mod flow_field;
 pub mod chunk_graph;
+pub mod flow_field;
 
 pub struct PathfindingPlugin;
 
@@ -12,8 +12,7 @@ impl Plugin for PathfindingPlugin {
             .insert_resource(chunk_graph::ChunkGraph::default())
             .add_systems(
                 Startup,
-                chunk_graph::build_chunk_graph_system
-                    .after(terrain::spawn_world_system),
+                chunk_graph::build_chunk_graph_system.after(terrain::spawn_world_system),
             );
     }
 }

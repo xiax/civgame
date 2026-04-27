@@ -35,20 +35,20 @@ impl Season {
 
 #[derive(Resource)]
 pub struct Calendar {
-    pub season:          Season,
-    pub day:             u32,
-    pub ticks_this_day:  u32,
-    pub ticks_per_day:   u32,
+    pub season: Season,
+    pub day: u32,
+    pub ticks_this_day: u32,
+    pub ticks_per_day: u32,
     pub days_per_season: u32,
 }
 
 impl Default for Calendar {
     fn default() -> Self {
         Self {
-            season:          Season::Spring,
-            day:             1,
-            ticks_this_day:  0,
-            ticks_per_day:   TICKS_PER_DAY,
+            season: Season::Spring,
+            day: 1,
+            ticks_this_day: 0,
+            ticks_per_day: TICKS_PER_DAY,
             days_per_season: DAYS_PER_SEASON,
         }
     }

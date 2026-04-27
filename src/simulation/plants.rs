@@ -4,13 +4,14 @@ use bevy::prelude::*;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::simulation::animals::Deer;
-use crate::simulation::memory::MemoryKind;
-use crate::simulation::skills::SkillKind;
-use crate::simulation::technology::ActivityKind;
 use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
+use crate::simulation::memory::MemoryKind;
 use crate::simulation::schedule::{BucketSlot, SimClock};
+use crate::simulation::skills::SkillKind;
+use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
+use crate::world::seasons::{Calendar, Season};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 
 const DEER_GRAZE_INTERVAL: u16 = 120;
@@ -20,47 +21,57 @@ const DEER_GRAZE_INTERVAL: u16 = 120;
 pub enum PlantKind {
     #[default]
     FruitBush = 0,
-    Grain     = 1,
-    Tree      = 2,
+    Grain = 1,
+    Tree = 2,
 }
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GrowthStage {
     #[default]
-    Seed     = 0,
+    Seed = 0,
     Seedling = 1,
-    Mature   = 2,
-    Overripe = 3,
+    Harvested = 2,
+    Mature = 3,
+    Overripe = 4,
 }
 
 #[derive(Component)]
 pub struct Plant {
-    pub kind:         PlantKind,
-    pub stage:        GrowthStage,
+    pub kind: PlantKind,
+    pub stage: GrowthStage,
     pub growth_ticks: u32,
-    pub tile_pos:     (i16, i16),
+    pub tile_pos: (i16, i16),
 }
 
 impl Plant {
-    pub fn duration_for_stage(&self) -> u32 {
+    pub fn duration_for_stage(&self, calendar: &Calendar) -> u32 {
         match self.kind {
             PlantKind::Grain => match self.stage {
-                GrowthStage::Seed     => 18_000, // 5 days
+                GrowthStage::Seed => 18_000,     // 5 days
                 GrowthStage::Seedling => 54_000, // 15 days
-                GrowthStage::Mature   => 36_000, // 10 days
+                GrowthStage::Harvested => 0,     // N/A
+                GrowthStage::Mature => 36_000,   // 10 days
                 GrowthStage::Overripe => 0,
             },
             PlantKind::FruitBush => match self.stage {
-                GrowthStage::Seed     => 36_000,  // 10 days
+                GrowthStage::Seed => 36_000,      // 10 days
                 GrowthStage::Seedling => 108_000, // 30 days
-                GrowthStage::Mature   => 72_000,  // 20 days
+                GrowthStage::Harvested => {
+                    if matches!(calendar.season, Season::Spring | Season::Summer) {
+                        18_000 // 5 days recovery
+                    } else {
+                        108_000 // 30 days recovery
+                    }
+                }
+                GrowthStage::Mature => 72_000, // 20 days
                 GrowthStage::Overripe => 0,
             },
             PlantKind::Tree => match self.stage {
-                GrowthStage::Seed     => 108_000, // 30 days
+                GrowthStage::Seed => 108_000,     // 30 days
                 GrowthStage::Seedling => 324_000, // 90 days
-                GrowthStage::Mature   => 648_000, // 180 days
+                GrowthStage::Harvested => 0,      // N/A
+                GrowthStage::Mature => 648_000,   // 180 days
                 GrowthStage::Overripe => 0,
             },
         }
@@ -70,44 +81,54 @@ impl Plant {
 impl PlantKind {
     /// Ticks the agent must spend Working before a harvest triggers.
     /// Plants are harvested instantly (0); this mirrors how tile-based gathering uses work_ticks.
-    pub fn harvest_work_ticks(self) -> u8 { 0 }
+    pub fn harvest_work_ticks(self) -> u8 {
+        0
+    }
 
     /// Primary good produced and its base quantity.
     /// `has_tool` only matters for trees (felling vs branch-gathering).
-    pub fn harvest_yield(self, has_tool: bool) -> (Good, u8) {
+    pub fn harvest_yield(self, has_tool: bool) -> (Good, u32) {
         match self {
-            PlantKind::Grain     => (Good::Grain, 3),
-            PlantKind::FruitBush => (Good::Fruit, 2),
-            PlantKind::Tree      => (Good::Wood, if has_tool { 3 } else { 1 }),
+            PlantKind::Grain => (Good::Grain, 3),
+            PlantKind::FruitBush => (Good::Fruit, 1),
+            PlantKind::Tree => (Good::Wood, if has_tool { 3 } else { 1 }),
         }
     }
 
     /// Fixed co-yields always added alongside the primary yield (no faction multiplier).
-    pub fn harvest_extra_yields(self) -> &'static [(Good, u8)] {
+    pub fn harvest_extra_yields(self) -> &'static [(Good, u32)] {
         match self {
             PlantKind::FruitBush => &[(Good::Seed, 1)],
-            _                    => &[],
+            _ => &[],
         }
     }
 
     /// Items spawned as loose ground entities adjacent to the harvest tile.
-    pub fn harvest_ground_drops(self, has_tool: bool) -> &'static [(Good, u8)] {
+    pub fn harvest_ground_drops(self, has_tool: bool) -> &'static [(Good, u32)] {
         match self {
-            PlantKind::Grain     => &[(Good::Seed, 1)],
+            PlantKind::Grain => &[(Good::Seed, 1)],
             PlantKind::FruitBush => &[(Good::Seed, 1)],
-            PlantKind::Tree      => if has_tool { &[(Good::Wood, 2)] } else { &[(Good::Wood, 1)] },
+            PlantKind::Tree => {
+                if has_tool {
+                    &[(Good::Wood, 2)]
+                } else {
+                    &[(Good::Wood, 1)]
+                }
+            }
         }
     }
 
     /// Plan reward multiplier per unit of primary yield.
-    pub fn harvest_reward_per_unit(self) -> f32 { 0.4 }
+    pub fn harvest_reward_per_unit(self) -> f32 {
+        0.4
+    }
 
     /// Faction activity to log for technology progression.
     pub fn harvest_activity(self) -> ActivityKind {
         match self {
-            PlantKind::Grain     => ActivityKind::Farming,
+            PlantKind::Grain => ActivityKind::Farming,
             PlantKind::FruitBush => ActivityKind::Foraging,
-            PlantKind::Tree      => ActivityKind::WoodGathering,
+            PlantKind::Tree => ActivityKind::WoodGathering,
         }
     }
 
@@ -115,15 +136,16 @@ impl PlantKind {
     pub fn harvest_despawns(self, has_tool: bool) -> bool {
         match self {
             PlantKind::Tree => has_tool,
-            _               => true,
+            PlantKind::FruitBush => false,
+            _ => true,
         }
     }
 
     /// Returns (SkillKind, XP amount) for harvesting this plant.
-    pub fn harvest_skill_xp(self, has_tool: bool) -> (SkillKind, u8) {
+    pub fn harvest_skill_xp(self, has_tool: bool) -> (SkillKind, u32) {
         match self {
-            PlantKind::Tree      => (SkillKind::Building, if has_tool { 10 } else { 2 }),
-            PlantKind::Grain     => (SkillKind::Farming,  5),
+            PlantKind::Tree => (SkillKind::Building, if has_tool { 10 } else { 2 }),
+            PlantKind::Grain => (SkillKind::Farming, 5),
             PlantKind::FruitBush => (SkillKind::Building, 3),
         }
     }
@@ -131,8 +153,8 @@ impl PlantKind {
     /// Memory category for recording this plant's location.
     pub fn harvest_memory_kind(self) -> MemoryKind {
         match self {
-            PlantKind::Tree      => MemoryKind::Wood,
-            _                    => MemoryKind::Food,
+            PlantKind::Tree => MemoryKind::Wood,
+            _ => MemoryKind::Food,
         }
     }
 }
@@ -166,26 +188,28 @@ pub fn spawn_plant_at(
 
     let world_pos = tile_to_world(tile_x, tile_y);
 
-    let entity = commands.spawn((
-        Plant {
-            kind,
-            stage,
-            growth_ticks: 0,
-            tile_pos: (tile_x as i16, tile_y as i16),
-        },
-        Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
-        GlobalTransform::default(),
-        Visibility::Visible,
-        InheritedVisibility::default(),
-    )).id();
-
+    let entity = commands
+        .spawn((
+            Plant {
+                kind,
+                stage,
+                growth_ticks: 0,
+                tile_pos: (tile_x as i16, tile_y as i16),
+            },
+            Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
+        ))
+        .id();
 
     plant_map.0.insert((tile_x, tile_y), entity);
 
     let chunk_x = tile_x.div_euclid(CHUNK_SIZE as i32);
     let chunk_y = tile_y.div_euclid(CHUNK_SIZE as i32);
     let coord = ChunkCoord(chunk_x, chunk_y);
-    plant_sprite_index.by_chunk
+    plant_sprite_index
+        .by_chunk
         .entry(coord)
         .or_default()
         .push((entity, (tile_x, tile_y)));
@@ -194,6 +218,7 @@ pub fn spawn_plant_at(
 /// Advance plant growth stages based on tile fertility.
 pub fn plant_growth_system(
     clock: Res<SimClock>,
+    calendar: Res<Calendar>,
     chunk_map: Res<ChunkMap>,
     mut query: Query<(Entity, &mut Plant)>,
 ) {
@@ -207,7 +232,7 @@ pub fn plant_growth_system(
 
         let fertility = match chunk_map.tile_fertility_at(tx, ty) {
             Some(f) => f,
-            None    => continue, // unloaded chunk — pause growth
+            None => continue, // unloaded chunk — pause growth
         };
 
         // Higher fertility = faster growth
@@ -215,7 +240,7 @@ pub fn plant_growth_system(
 
         plant.growth_ticks = plant.growth_ticks.saturating_add(5);
 
-        let threshold = plant.duration_for_stage();
+        let threshold = plant.duration_for_stage(&calendar);
         if threshold == 0 {
             continue;
         }
@@ -224,9 +249,10 @@ pub fn plant_growth_system(
         if plant.growth_ticks >= effective {
             plant.growth_ticks = 0;
             plant.stage = match plant.stage {
-                GrowthStage::Seed     => GrowthStage::Seedling,
+                GrowthStage::Seed => GrowthStage::Seedling,
                 GrowthStage::Seedling => GrowthStage::Mature,
-                GrowthStage::Mature   => GrowthStage::Overripe,
+                GrowthStage::Harvested => GrowthStage::Mature,
+                GrowthStage::Mature => GrowthStage::Overripe,
                 GrowthStage::Overripe => GrowthStage::Overripe,
             };
         }
@@ -253,21 +279,30 @@ pub fn seed_scatter_system(
             let ty = plant.tile_pos.1 as i32;
             let kind = plant.kind;
 
-            if kind == PlantKind::Tree {
-                // Trees drop branches and return to Mature
-                let (dx, dy) = adjacent_offset();
-                let sx = tx + dx;
-                let sy = ty + dy;
-                let pos = tile_to_world(sx, sy);
-                commands.spawn((
-                    GroundItem { item: Item::new_commodity(Good::Wood), qty: 1 },
-                    Transform::from_xyz(pos.x, pos.y, 0.3),
-                    GlobalTransform::default(),
-                    Visibility::Visible,
-                    InheritedVisibility::default(),
-                ));
+            if kind == PlantKind::Tree || kind == PlantKind::FruitBush {
+                // Perennials: return to a previous stage instead of dying
+                if kind == PlantKind::Tree {
+                    // Trees drop branches and return to Mature
+                    let (dx, dy) = adjacent_offset();
+                    let sx = tx + dx;
+                    let sy = ty + dy;
+                    let pos = tile_to_world(sx, sy);
+                    commands.spawn((
+                        GroundItem {
+                            item: Item::new_commodity(Good::Wood),
+                            qty: 1,
+                        },
+                        Transform::from_xyz(pos.x, pos.y, 0.3),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ));
 
-                plant.stage = GrowthStage::Mature;
+                    plant.stage = GrowthStage::Mature;
+                } else {
+                    // Fruit bushes revert to Harvested (fruit fell off)
+                    plant.stage = GrowthStage::Harvested;
+                }
                 plant.growth_ticks = 0;
             } else {
                 overripe_entities.push((entity, (tx, ty), kind));
@@ -282,21 +317,31 @@ pub fn seed_scatter_system(
 
         let (count, radius): (u8, i32) = match kind {
             PlantKind::FruitBush => (1, 1),
-            PlantKind::Grain     => (1, 2),
-            PlantKind::Tree      => (0, 0), // Should not reach here
+            PlantKind::Grain => (1, 2),
+            PlantKind::Tree => (0, 0), // Should not reach here
         };
 
         for _ in 0..count {
             let dx = fastrand::i32(-radius..=radius);
             let dy = fastrand::i32(-radius..=radius);
-            if dx == 0 && dy == 0 { continue; }
+            if dx == 0 && dy == 0 {
+                continue;
+            }
             let nx = tx + dx;
             let ny = ty + dy;
             use crate::world::tile::TileKind as TK;
-            if matches!(chunk_map.tile_kind_at(nx, ny), Some(TK::Grass | TK::Farmland)) {
+            if matches!(
+                chunk_map.tile_kind_at(nx, ny),
+                Some(TK::Grass | TK::Farmland)
+            ) {
                 spawn_plant_at(
-                    &mut commands, &mut plant_map, &mut plant_sprite_index,
-                    nx, ny, kind, GrowthStage::Seed,
+                    &mut commands,
+                    &mut plant_map,
+                    &mut plant_sprite_index,
+                    nx,
+                    ny,
+                    kind,
+                    GrowthStage::Seed,
                 );
             }
         }
@@ -315,18 +360,15 @@ pub fn seed_scatter_system(
 pub fn deer_graze_system(
     mut commands: Commands,
     clock: Res<SimClock>,
-    mut plant_map: ResMut<PlantMap>,
-    mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    plant_query: Query<&Plant>,
-    mut deer_query: Query<(
-        &Transform,
-        &mut DeerGrazer,
-        &BucketSlot,
-        &LodLevel,
-    ), With<Deer>>,
+    plant_map: Res<PlantMap>,
+    _plant_sprite_index: Res<PlantSpriteIndex>,
+    mut plant_query: Query<&mut Plant>,
+    mut deer_query: Query<(&Transform, &mut DeerGrazer, &BucketSlot, &LodLevel), With<Deer>>,
 ) {
     for (transform, mut grazer, slot, lod) in deer_query.iter_mut() {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
 
         if grazer.graze_timer > 0 {
             grazer.graze_timer -= 1;
@@ -343,7 +385,8 @@ pub fn deer_graze_system(
                 let ty = deer_ty + dy;
                 if let Some(&entity) = plant_map.0.get(&(tx, ty)) {
                     if let Ok(plant) = plant_query.get(entity) {
-                        if plant.kind == PlantKind::FruitBush && plant.stage == GrowthStage::Mature {
+                        if plant.kind == PlantKind::FruitBush && plant.stage == GrowthStage::Mature
+                        {
                             found = Some((tx, ty, entity));
                             break 'search;
                         }
@@ -353,13 +396,10 @@ pub fn deer_graze_system(
         }
 
         if let Some((tx, ty, entity)) = found {
-            plant_map.0.remove(&(tx, ty));
-            let cx = tx.div_euclid(CHUNK_SIZE as i32);
-            let cy = ty.div_euclid(CHUNK_SIZE as i32);
-            if let Some(vec) = plant_sprite_index.by_chunk.get_mut(&ChunkCoord(cx, cy)) {
-                vec.retain(|(e, _)| *e != entity);
+            if let Ok(mut plant) = plant_query.get_mut(entity) {
+                plant.stage = GrowthStage::Harvested;
+                plant.growth_ticks = 0;
             }
-            commands.entity(entity).despawn_recursive();
 
             let count = 1 + fastrand::u8(..2);
             for _ in 0..count {
@@ -368,7 +408,10 @@ pub fn deer_graze_system(
                 let sy = ty + dy;
                 let pos = tile_to_world(sx, sy);
                 commands.spawn((
-                    GroundItem { item: Item::new_commodity(Good::Seed), qty: 1 },
+                    GroundItem {
+                        item: Item::new_commodity(Good::Seed),
+                        qty: 1,
+                    },
                     Transform::from_xyz(pos.x, pos.y, 0.3),
                     GlobalTransform::default(),
                     Visibility::Visible,

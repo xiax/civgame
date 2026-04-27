@@ -1,37 +1,40 @@
-use bevy::prelude::*;
 use crate::simulation::plants;
 use crate::world::chunk_streaming;
+use bevy::prelude::*;
 
-pub mod camera;
-pub mod tile_render;
-pub mod entity_sprites;
 pub mod animations;
+pub mod camera;
 pub mod color_map;
+pub mod entity_sprites;
 pub mod pixel_art;
+pub mod sprite_library;
+pub mod tile_render;
 
 pub struct RenderingPlugin;
 
 impl Plugin for RenderingPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(camera::CameraState::default())
+            .insert_resource(camera::CameraViewZ::default())
             .insert_resource(chunk_streaming::TileMaterials::default())
             .insert_resource(chunk_streaming::TileSpriteIndex::default())
-            .add_systems(Startup, (camera::setup_camera, pixel_art::setup_pixel_art))
+            .add_systems(Startup, (camera::setup_camera, pixel_art::setup_pixel_art, sprite_library::setup_sprite_library))
+            .add_systems(PostStartup, (chunk_streaming::setup_tile_materials,))
             .add_systems(
-                PostStartup,
+                Update,
                 (
-                    chunk_streaming::setup_tile_materials,
-                    chunk_streaming::spawn_initial_tile_sprites
-                        .after(chunk_streaming::setup_tile_materials),
+                    camera::camera_input_system,
+                    entity_sprites::toggle_art_mode,
+                    entity_sprites::handle_art_mode_change,
+                    chunk_streaming::chunk_streaming_system.after(camera::camera_input_system),
+                    chunk_streaming::update_tile_z_view_system.after(camera::camera_input_system),
                 ),
             )
             .add_systems(
                 Update,
                 (
-                    camera::camera_input_system,
-                    chunk_streaming::chunk_streaming_system
-                        .after(camera::camera_input_system),
                     entity_sprites::spawn_person_sprites,
+                    entity_sprites::animate_person_sprites,
                     entity_sprites::spawn_faction_center_sprites,
                     entity_sprites::spawn_bed_sprites,
                     entity_sprites::spawn_wall_sprites,
@@ -45,9 +48,9 @@ impl Plugin for RenderingPlugin {
                     animations::handle_combat_events,
                     animations::update_animations,
                     plants::plant_growth_system,
-                    plants::seed_scatter_system
-                        .after(plants::plant_growth_system),
+                    plants::seed_scatter_system.after(plants::plant_growth_system),
                 ),
-            );
+            )
+            .add_systems(Update, entity_sprites::update_clothing_from_equipment);
     }
 }

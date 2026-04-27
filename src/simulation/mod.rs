@@ -1,37 +1,33 @@
 use bevy::prelude::*;
 
-pub mod schedule;
-pub mod needs;
+pub mod animals;
+pub mod combat;
+pub mod construction;
+pub mod dig;
+pub mod faction;
+pub mod gather;
+pub mod goals;
+pub mod items;
+pub mod line_of_sight;
+pub mod lod;
+pub mod memory;
 pub mod mood;
+pub mod movement;
+pub mod needs;
+pub mod neural;
 pub mod person;
+pub mod plan;
+pub mod plants;
+pub mod production;
+pub mod raid;
+pub mod reproduction;
+pub mod schedule;
 pub mod skills;
 pub mod tasks;
-pub mod movement;
-pub mod lod;
-pub mod production;
-pub mod goals;
-pub mod faction;
-pub mod reproduction;
-pub mod combat;
-pub mod line_of_sight;
-pub mod animals;
-pub mod raid;
-pub mod items;
-pub mod world_sim;
-pub mod plants;
-pub mod gather;
-pub mod memory;
-pub mod neural;
-pub mod plan;
 pub mod technology;
-pub mod construction;
+pub mod world_sim;
 
-pub use person::PersonAI;
-pub use needs::Needs;
-pub use mood::Mood;
-pub use skills::Skills;
-pub use lod::LodLevel;
-pub use schedule::{BucketSlot, SimClock};
+pub use schedule::SimClock;
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SimulationSet {
@@ -55,6 +51,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(SimClock::default())
             .insert_resource(faction::FactionRegistry::default())
             .insert_resource(faction::PlayerFaction::default())
+            .insert_resource(faction::StorageTileMap::default())
             .insert_resource(reproduction::MaleCandidates::default())
             .insert_resource(production::TileDepletion::default())
             .insert_resource(plants::PlantMap::default())
@@ -74,46 +71,48 @@ impl Plugin for SimulationPlugin {
                     SimulationSet::Economy.after(SimulationSet::Sequential),
                 ),
             )
-            .add_systems(PostStartup, (
-                person::spawn_population
-                    .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
-                animals::spawn_animals
-                    .after(person::spawn_population)
-                    .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
-                faction::center_camera_on_player_faction
-                    .after(person::spawn_population)
-                    .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
-            ))
+            .add_systems(
+                PostStartup,
+                (
+                    person::spawn_population
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    animals::spawn_animals
+                        .after(person::spawn_population)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    faction::center_camera_on_player_faction
+                        .after(person::spawn_population)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                ),
+            )
             .add_systems(
                 FixedUpdate,
                 (
                     needs::tick_needs_system,
                     mood::derive_mood_system,
                     lod::update_lod_levels_system,
+                    faction::update_storage_tile_map_system,
                 )
                     .in_set(SimulationSet::ParallelA),
             )
             .add_systems(
                 FixedUpdate,
                 (
-                    production::consumption_system
-                        .after(needs::tick_needs_system),
-                    goals::goal_update_system
-                        .after(needs::tick_needs_system),
+                    goals::goal_update_system.after(needs::tick_needs_system),
                     animals::animal_sense_system,
                 )
                     .in_set(SimulationSet::ParallelA),
             )
             .add_systems(
                 FixedUpdate,
-                (tasks::goal_dispatch_system,)
-                    .in_set(SimulationSet::ParallelB),
+                (tasks::goal_dispatch_system,).in_set(SimulationSet::ParallelB),
             )
             .add_systems(
                 FixedUpdate,
                 (
-                    gather::gather_system
-                        .before(production::production_system),
+                    gather::gather_system.before(production::production_system),
+                    dig::dig_system
+                        .after(gather::gather_system)
+                        .before(plan::plan_execution_system),
                     construction::construction_system
                         .after(gather::gather_system)
                         .before(plan::plan_execution_system),
@@ -122,22 +121,19 @@ impl Plugin for SimulationPlugin {
                     movement::update_spatial_index_system
                         .after(movement::movement_system)
                         .after(animals::animal_movement_system),
-                    memory::vision_system
-                        .after(movement::update_spatial_index_system),
-                    combat::combat_system
-                        .after(movement::update_spatial_index_system),
-                    combat::death_system
-                        .after(combat::combat_system),
-                    items::item_pickup_system
-                        .after(combat::death_system),
-                    plants::deer_graze_system
-                        .after(movement::update_spatial_index_system),
-                    production::production_system
-                        .after(movement::movement_system),
+                    memory::vision_system.after(movement::update_spatial_index_system),
+                    combat::combat_system.after(movement::update_spatial_index_system),
+                    combat::death_system.after(combat::combat_system),
+                    items::item_pickup_system.after(combat::death_system),
+                    plants::deer_graze_system.after(movement::update_spatial_index_system),
+                    production::production_system.after(movement::movement_system),
+                    production::eat_task_system.after(movement::movement_system),
+                    production::withdraw_food_task_system.after(movement::movement_system),
                     plan::plan_execution_system
-                        .after(production::production_system),
-                    faction::bonding_system
-                        .after(movement::update_spatial_index_system),
+                        .after(production::production_system)
+                        .after(production::eat_task_system)
+                        .after(production::withdraw_food_task_system),
+                    faction::bonding_system.after(movement::update_spatial_index_system),
                     production::tile_regen_system,
                     schedule::advance_sim_clock,
                     crate::world::seasons::advance_calendar_system,
@@ -149,26 +145,30 @@ impl Plugin for SimulationPlugin {
                 (
                     memory::memory_decay_system,
                     faction::social_fill_system,
-                    memory::conversation_memory_system
-                        .after(faction::social_fill_system),
-                    plan::plan_gossip_system
-                        .after(memory::conversation_memory_system),
+                    memory::conversation_memory_system.after(faction::social_fill_system),
+                    plan::plan_gossip_system.after(memory::conversation_memory_system),
                     plan::plan_decay_system,
                     faction::faction_profession_system,
-                    faction::faction_camp_system,                    reproduction::birth_cooldown_system,
+                    faction::drop_items_at_destination_system,
+                    faction::compute_faction_storage_system
+                        .after(faction::drop_items_at_destination_system),
+                    reproduction::birth_cooldown_system,
                     reproduction::collect_male_candidates,
-                    reproduction::reproduction_system
-                        .after(reproduction::collect_male_candidates),
-                    raid::faction_decision_system,
-                    raid::raid_detection_system
-                        .after(raid::faction_decision_system),
+                    reproduction::reproduction_system.after(reproduction::collect_male_candidates),
+                    raid::faction_decision_system
+                        .after(faction::compute_faction_storage_system),
+                    raid::raid_detection_system.after(raid::faction_decision_system),
                     raid::raid_execution_system
-                        .after(raid::raid_detection_system),
+                        .after(raid::raid_detection_system)
+                        .after(faction::compute_faction_storage_system),
                     world_sim::world_sim_system,
                     world_sim::agent_exploration_system,
                     construction::faction_blueprint_system,
+                    faction::resource_demand_system
+                        .after(construction::faction_blueprint_system)
+                        .after(faction::compute_faction_storage_system),
                     technology::tech_discovery_system
-                        .after(faction::faction_camp_system)
+                        .after(faction::compute_faction_storage_system)
                         .after(raid::raid_execution_system),
                 )
                     .in_set(SimulationSet::Economy),

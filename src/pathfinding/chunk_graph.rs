@@ -1,14 +1,15 @@
 use ahash::AHashMap;
 use bevy::prelude::*;
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 
 #[derive(Clone)]
 pub struct ChunkEdge {
-    pub neighbor:    ChunkCoord,
+    pub neighbor: ChunkCoord,
     /// Tile in this chunk that borders the neighbor (local coords 0..CHUNK_SIZE-1).
-    pub exit_local:  (u8, u8),
+    pub exit_local: (u8, u8),
     /// Corresponding tile in the neighbor chunk.
     pub entry_local: (u8, u8),
 }
@@ -49,10 +50,11 @@ impl ChunkGraph {
                         // Trace back to the edge that leaves `cur`
                         let first_step = trace_first_step(&visited, cur, dest);
                         if let Some(edges_from_cur) = self.edges.get(&cur) {
-                            let candidates: Vec<_> = edges_from_cur.iter()
+                            let candidates: Vec<_> = edges_from_cur
+                                .iter()
                                 .filter(|e| e.neighbor == first_step)
                                 .collect();
-                            
+
                             if !candidates.is_empty() {
                                 // Pick a random edge to avoid clustering all agents on the same tile
                                 let e = candidates[fastrand::usize(..candidates.len())];
@@ -86,17 +88,15 @@ fn trace_first_step(
     }
 }
 
-pub fn build_chunk_graph_system(
-    chunk_map: Res<ChunkMap>,
-    mut graph: ResMut<ChunkGraph>,
-) {
+pub fn build_chunk_graph_system(chunk_map: Res<ChunkMap>, mut graph: ResMut<ChunkGraph>) {
+    let now = Instant::now();
     // Cardinal direction offsets and which border row/col to scan
     let borders: [(i32, i32, bool, bool); 4] = [
         // (dx, dy, scan_x_axis, at_max_edge)
-        (0, -1, true,  false), // North (top row, ty=0 in this chunk)
-        (0,  1, true,  true),  // South (bottom row, ty=CHUNK_SIZE-1)
+        (0, -1, true, false),  // North (top row, ty=0 in this chunk)
+        (0, 1, true, true),    // South (bottom row, ty=CHUNK_SIZE-1)
         (-1, 0, false, false), // West  (left col, tx=0)
-        (1,  0, false, true),  // East  (right col, tx=CHUNK_SIZE-1)
+        (1, 0, false, true),   // East  (right col, tx=CHUNK_SIZE-1)
     ];
 
     let mut edge_count = 0usize;
@@ -134,8 +134,8 @@ pub fn build_chunk_graph_system(
 
                 if chunk_map.is_passable(tx, ty) && chunk_map.is_passable(nb_tx, nb_ty) {
                     chunk_edges.push(ChunkEdge {
-                        neighbor:    nb,
-                        exit_local:  (lx as u8, ly as u8),
+                        neighbor: nb,
+                        exit_local: (lx as u8, ly as u8),
                         entry_local: (nb_lx as u8, nb_ly as u8),
                     });
                     edge_count += 1;
@@ -146,5 +146,9 @@ pub fn build_chunk_graph_system(
         graph.edges.insert(*coord, chunk_edges);
     }
 
-    info!("ChunkGraph built: {} edges", edge_count);
+    info!(
+        "ChunkGraph built: {} edges in {:?}",
+        edge_count,
+        now.elapsed()
+    );
 }

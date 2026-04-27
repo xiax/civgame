@@ -1,47 +1,51 @@
-use bevy::prelude::*;
-use ahash::AHashMap;
-use crate::world::spatial::SpatialIndex;
-use crate::world::terrain::{tile_to_world, TILE_SIZE};
-use crate::economy::agent::EconomicAgent;
-use super::combat::{CombatTarget, Body};
-use super::items::Equipment;
+use super::combat::{Body, CombatTarget, CombatCooldown};
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::{AgentGoal, Personality};
+use super::items::{Equipment, TargetItem};
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, RelationshipMemory};
 use super::mood::Mood;
 use super::movement::MovementState;
 use super::needs::Needs;
 use super::neural::UtilityNet;
+use super::person::{AiState, Person, PersonAI, Profession, SkinTone, HairColor};
 use super::plan::{KnownPlans, PlanScoringMethod};
-use super::person::{AiState, Person, PersonAI};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
+use crate::economy::agent::EconomicAgent;
+use crate::world::spatial::SpatialIndex;
+use crate::world::terrain::{tile_to_world, TILE_SIZE};
+use ahash::AHashMap;
+use bevy::prelude::*;
 
 #[repr(u8)]
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BiologicalSex {
-    Male   = 0,
+    Male = 0,
     Female = 1,
 }
 
 impl BiologicalSex {
     pub fn random() -> Self {
-        if fastrand::bool() { BiologicalSex::Male } else { BiologicalSex::Female }
+        if fastrand::bool() {
+            BiologicalSex::Male
+        } else {
+            BiologicalSex::Female
+        }
     }
 
     pub fn name(self) -> &'static str {
         match self {
-            BiologicalSex::Male   => "Male",
+            BiologicalSex::Male => "Male",
             BiologicalSex::Female => "Female",
         }
     }
 }
 
 const REPRODUCE_FEMALE_THRESHOLD: u8 = 180;
-const REPRODUCE_MALE_THRESHOLD:   u8 = 150;
-const BIRTH_CHANCE:                u32 = 5;   // out of 10,000 per tick
-const BIRTH_COOLDOWN_TICKS:        u32 = 324_000; // 90 in-game days
+const REPRODUCE_MALE_THRESHOLD: u8 = 150;
+const BIRTH_CHANCE: u32 = 5; // out of 10,000 per tick
+const BIRTH_COOLDOWN_TICKS: u32 = 324_000; // 90 in-game days
 
 /// Eligible males this tick: entity → faction_id. Updated by collect_male_candidates.
 #[derive(Resource, Default)]
@@ -96,7 +100,7 @@ pub fn reproduction_system(
     )>,
 ) {
     let mut births: Vec<(Transform, u32, UtilityNet)> = Vec::new();
-    let mut resets: Vec<Entity> = Vec::new();
+    let _resets: Vec<Entity> = Vec::new();
 
     // Use a temporary vector to avoid borrowing query while mutating it via get_mut
     let mut found_pairs = Vec::new();
@@ -105,11 +109,21 @@ pub fn reproduction_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if *sex != BiologicalSex::Female { continue; }
-        if *goal != AgentGoal::Reproduce { continue; }
-        if needs.reproduction < REPRODUCE_FEMALE_THRESHOLD as f32 { continue; }
-        if member.birth_cooldown > 0 { continue; }
-        if member.faction_id == SOLO { continue; }
+        if *sex != BiologicalSex::Female {
+            continue;
+        }
+        if *goal != AgentGoal::Reproduce {
+            continue;
+        }
+        if needs.reproduction < REPRODUCE_FEMALE_THRESHOLD as f32 {
+            continue;
+        }
+        if member.birth_cooldown > 0 {
+            continue;
+        }
+        if member.faction_id == SOLO {
+            continue;
+        }
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
@@ -119,9 +133,7 @@ pub fn reproduction_system(
         'search: for dy in -1..=1i32 {
             for dx in -1..=1i32 {
                 for &other in spatial.get(tx + dx, ty + dy) {
-                    if other != entity
-                        && candidates.0.get(&other).copied() == Some(faction_id)
-                    {
+                    if other != entity && candidates.0.get(&other).copied() == Some(faction_id) {
                         found_father = Some(other);
                         break 'search;
                     }
@@ -130,7 +142,13 @@ pub fn reproduction_system(
         }
 
         if let Some(father_entity) = found_father {
-            found_pairs.push((entity, father_entity, *transform, faction_id, mother_net.cloned()));
+            found_pairs.push((
+                entity,
+                father_entity,
+                *transform,
+                faction_id,
+                mother_net.cloned(),
+            ));
         }
     }
 
@@ -139,7 +157,7 @@ pub fn reproduction_system(
         if let Ok([mut m_needs, mut f_needs]) = query.get_many_mut([mother_ent, father_ent]) {
             m_needs.1.reproduction = 0.0;
             f_needs.1.reproduction = 0.0;
-            
+
             // Set cooldown on mother
             m_needs.2.birth_cooldown = BIRTH_COOLDOWN_TICKS;
         }
@@ -149,9 +167,9 @@ pub fn reproduction_system(
             let father_net = father_net_query.get(father_ent).ok().flatten();
             let child_net = match (mother_net, father_net) {
                 (Some(m), Some(f)) => UtilityNet::from_parents(&m, f),
-                (Some(p), None)    => UtilityNet::from_parent(&p),
-                (None, Some(p))    => UtilityNet::from_parent(p),
-                (None, None)       => UtilityNet::new_random(),
+                (Some(p), None) => UtilityNet::from_parent(&p),
+                (None, Some(p)) => UtilityNet::from_parent(p),
+                (None, None) => UtilityNet::new_random(),
             };
             births.push((transform, faction_id, child_net));
         }
@@ -196,12 +214,20 @@ pub fn reproduction_system(
                 BucketSlot(new_slot),
                 MovementState { wander_timer: 0.0 },
                 BiologicalSex::random(),
+                SkinTone::random(),
+                HairColor::random(),
                 Personality::random(),
                 AgentGoal::default(),
-                FactionMember { faction_id, ..Default::default() },
+                Profession::None,
+                FactionMember {
+                    faction_id,
+                    ..Default::default()
+                },
                 Body::new_humanoid(),
                 Equipment::default(),
+                TargetItem::default(),
                 CombatTarget::default(),
+                CombatCooldown::default(),
             ),
             (
                 AgentMemory::default(),

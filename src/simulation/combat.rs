@@ -1,30 +1,36 @@
-use bevy::prelude::*;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::simulation::animals::{AnimalAI, AnimalState, Deer, Wolf};
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
-use crate::simulation::technology::ActivityKind;
-use crate::simulation::items::{GroundItem, Equipment, EquipmentSlot, WeaponStats, ArmorStats};
+use crate::simulation::items::{ArmorStats, Equipment, EquipmentSlot, GroundItem, WeaponStats};
+use crate::simulation::line_of_sight::has_los;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::RelationshipMemory;
 use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
-use crate::world::spatial::SpatialIndex;
+use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::ChunkMap;
+use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
-use crate::simulation::line_of_sight::has_los;
+use bevy::prelude::*;
 
 #[derive(Component, Clone, Copy, Debug)]
 pub struct Health {
     pub current: u8,
-    pub max:     u8,
+    pub max: u8,
 }
 
 impl Health {
-    pub fn new(max: u8) -> Self { Self { current: max, max } }
-    pub fn is_dead(self) -> bool { self.current == 0 }
-    pub fn fraction(self) -> f32 { self.current as f32 / self.max as f32 }
+    pub fn new(max: u8) -> Self {
+        Self { current: max, max }
+    }
+    pub fn is_dead(self) -> bool {
+        self.current == 0
+    }
+    pub fn fraction(self) -> f32 {
+        self.current as f32 / self.max as f32
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,17 +45,28 @@ pub enum BodyPart {
 
 impl BodyPart {
     pub const ALL: [BodyPart; 6] = [
-        BodyPart::Head, BodyPart::Torso, BodyPart::LeftArm,
-        BodyPart::RightArm, BodyPart::LeftLeg, BodyPart::RightLeg
+        BodyPart::Head,
+        BodyPart::Torso,
+        BodyPart::LeftArm,
+        BodyPart::RightArm,
+        BodyPart::LeftLeg,
+        BodyPart::RightLeg,
     ];
     pub fn random() -> Self {
         let r = fastrand::u8(0..100);
-        if r < 10 { BodyPart::Head }
-        else if r < 50 { BodyPart::Torso }
-        else if r < 62 { BodyPart::LeftArm }
-        else if r < 74 { BodyPart::RightArm }
-        else if r < 87 { BodyPart::LeftLeg }
-        else { BodyPart::RightLeg }
+        if r < 10 {
+            BodyPart::Head
+        } else if r < 50 {
+            BodyPart::Torso
+        } else if r < 62 {
+            BodyPart::LeftArm
+        } else if r < 74 {
+            BodyPart::RightArm
+        } else if r < 87 {
+            BodyPart::LeftLeg
+        } else {
+            BodyPart::RightLeg
+        }
     }
 }
 
@@ -60,8 +77,12 @@ pub struct LimbHealth {
 }
 
 impl LimbHealth {
-    pub fn new(max: u8) -> Self { Self { current: max, max } }
-    pub fn is_destroyed(&self) -> bool { self.current == 0 }
+    pub fn new(max: u8) -> Self {
+        Self { current: max, max }
+    }
+    pub fn is_destroyed(&self) -> bool {
+        self.current == 0
+    }
 }
 
 #[derive(Component, Clone, Debug)]
@@ -82,8 +103,8 @@ impl Body {
     }
 
     pub fn is_dead(&self) -> bool {
-        self.parts[BodyPart::Head as usize].is_destroyed() ||
-        self.parts[BodyPart::Torso as usize].is_destroyed()
+        self.parts[BodyPart::Head as usize].is_destroyed()
+            || self.parts[BodyPart::Torso as usize].is_destroyed()
     }
 
     pub fn get_mut(&mut self, part: BodyPart) -> &mut LimbHealth {
@@ -147,7 +168,18 @@ pub fn combat_system(
     // (faction_id) — attackers whose faction logs a combat event this frame
     let mut combat_activity_factions: Vec<u32> = Vec::new();
 
-    for (attacker, mut combat_target, transform, lod, slot, attacker_eq, mut cd, mut active_plan_opt, attacker_fm) in &mut attacker_query {
+    for (
+        attacker,
+        mut combat_target,
+        transform,
+        lod,
+        slot,
+        attacker_eq,
+        mut cd,
+        _active_plan_opt,
+        attacker_fm,
+    ) in &mut attacker_query
+    {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -159,8 +191,12 @@ pub fn combat_system(
             }
         }
 
-        let Some(target) = combat_target.0 else { continue };
-        if target == attacker { continue; }
+        let Some(target) = combat_target.0 else {
+            continue;
+        };
+        if target == attacker {
+            continue;
+        }
 
         let target_is_dead = if let Ok(h) = health_query.get(target) {
             h.is_dead()
@@ -241,7 +277,8 @@ pub fn combat_system(
                             if a_stats.covered_parts.contains(&target_part) {
                                 let roll = fastrand::u8(0..100);
                                 if roll < a_stats.coverage {
-                                    mitigated_damage = mitigated_damage.saturating_sub(a_stats.damage_reduction);
+                                    mitigated_damage =
+                                        mitigated_damage.saturating_sub(a_stats.damage_reduction);
                                 }
                             }
                         }
@@ -277,7 +314,8 @@ pub fn combat_system(
                     target_combat.0 = Some(attacker);
                     // Setting target will trigger combat_system on next tick
                     target_ai.state = AiState::Idle;
-                } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target) {
+                } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target)
+                {
                     if maybe_deer.is_none() {
                         target_combat.0 = Some(attacker);
                         target_animal.target_entity = Some(attacker);
@@ -303,7 +341,8 @@ pub fn combat_system(
                 if let Ok(mut target_ai) = ai_query.get_mut(target) {
                     target_combat.0 = Some(attacker);
                     target_ai.state = AiState::Idle;
-                } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target) {
+                } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target)
+                {
                     if maybe_deer.is_none() {
                         target_combat.0 = Some(attacker);
                         target_animal.target_entity = Some(attacker);
@@ -326,11 +365,22 @@ pub fn death_system(
     mut commands: Commands,
     mut registry: ResMut<FactionRegistry>,
     mut clock: ResMut<SimClock>,
-    query: Query<(Entity, Option<&Health>, Option<&Body>, &Transform, Option<&FactionMember>, Option<&Person>, Option<&Wolf>, Option<&Deer>)>,
+    query: Query<(
+        Entity,
+        Option<&Health>,
+        Option<&Body>,
+        &Transform,
+        Option<&FactionMember>,
+        Option<&Person>,
+        Option<&Wolf>,
+        Option<&Deer>,
+    )>,
 ) {
     for (entity, health, body, transform, member, person, wolf, deer) in &query {
         let is_dead = health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead());
-        if !is_dead { continue; }
+        if !is_dead {
+            continue;
+        }
 
         if let Some(fm) = member {
             registry.remove_member(fm.faction_id);
@@ -339,10 +389,10 @@ pub fn death_system(
             clock.population = clock.population.saturating_sub(1);
         }
 
-        let drops: Vec<(Good, u8)> = if wolf.is_some() {
-            vec![(Good::Meat, 1), (Good::Skin, 1)]
+        let drops: Vec<(Good, u32)> = if wolf.is_some() {
+            vec![(Good::Meat, 3), (Good::Skin, 1)]
         } else if deer.is_some() {
-            vec![(Good::Meat, 3), (Good::Skin, 2)]
+            vec![(Good::Meat, 5), (Good::Skin, 2)]
         } else {
             vec![]
         };
@@ -351,7 +401,10 @@ pub fn death_system(
             let mut loot_transform = *transform;
             loot_transform.translation.z = 0.3;
             commands.spawn((
-                GroundItem { item: Item::new_commodity(good), qty },
+                GroundItem {
+                    item: Item::new_commodity(good),
+                    qty,
+                },
                 loot_transform,
                 GlobalTransform::default(),
                 Visibility::Visible,

@@ -1,51 +1,54 @@
-use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
+use crate::simulation::construction::WallMap;
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
+use crate::simulation::goals::AgentGoal;
 use crate::simulation::items::GroundItem;
-use crate::simulation::tasks::TaskKind;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::{AgentMemory, MemoryKind};
 use crate::simulation::person::{AiState, PersonAI};
 use crate::simulation::plan::ActivePlan;
-use crate::simulation::plants::{
-    GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
-};
+use crate::simulation::plants::{GrowthStage, PlantKind, PlantMap, PlantSpriteIndex};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
+use crate::simulation::tasks::TaskKind;
 use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
+use crate::world::chunk_streaming::TileChangedEvent;
 use crate::world::terrain::tile_to_world;
-use crate::world::tile::TileKind;
+use crate::world::tile::{TileData, TileKind};
+use bevy::prelude::*;
 
 // ── Stone tile harvest profile ────────────────────────────────────────────────
 // Plants carry their own harvest data via PlantKind methods; stone uses this
 // small inline struct until TileKind gets the same treatment.
 
 struct StoneProfile {
-    work_ticks:      u8,
-    base_yield_qty:  u8,
-    bonus_yields:    &'static [(Good, u8, u8)], // (good, qty, percent_chance)
-    xp:              u8,
+    work_ticks: u8,
+    base_yield_qty: u32,
+    bonus_yields: &'static [(Good, u32, u8)], // (good, qty, percent_chance)
+    xp: u32,
 }
 
 const STONE: StoneProfile = StoneProfile {
-    work_ticks:     30,
-    base_yield_qty:  2,
-    bonus_yields:   &[(Good::Coal, 1, 5), (Good::Iron, 1, 2)],
-    xp:              2,
+    work_ticks: 30,
+    base_yield_qty: 2,
+    bonus_yields: &[(Good::Coal, 1, 5), (Good::Iron, 1, 2)],
+    xp: 2,
 };
 
 // ── gather_system ─────────────────────────────────────────────────────────────
 
 pub fn gather_system(
     mut commands: Commands,
-    chunk_map:    Res<ChunkMap>,
-    clock:        Res<SimClock>,
-    mut plant_map:          ResMut<PlantMap>,
+    mut chunk_map: ResMut<ChunkMap>,
+    mut wall_map: ResMut<WallMap>,
+    mut tile_changed: EventWriter<TileChangedEvent>,
+    clock: Res<SimClock>,
+    mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    mut faction_registry:   ResMut<FactionRegistry>,
+    mut faction_registry: ResMut<FactionRegistry>,
     mut plant_query: Query<&mut crate::simulation::plants::Plant>,
     mut agent_query: Query<(
         &mut PersonAI,
@@ -56,14 +59,30 @@ pub fn gather_system(
         Option<&mut AgentMemory>,
         Option<&mut ActivePlan>,
         Option<&FactionMember>,
+        &AgentGoal,
     )>,
 ) {
-    for (mut ai, mut agent, mut skills, slot, lod, mut memory_opt, mut plan_opt, faction_member) in
-        agent_query.iter_mut()
+    for (
+        mut ai,
+        mut agent,
+        mut skills,
+        slot,
+        lod,
+        mut memory_opt,
+        mut plan_opt,
+        faction_member,
+        _goal,
+    ) in agent_query.iter_mut()
     {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
-        if ai.state != AiState::Working { continue; }
-        if ai.task_id != TaskKind::Gather as u16 { continue; }
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        if ai.state != AiState::Working {
+            continue;
+        }
+        if ai.task_id != TaskKind::Gather as u16 {
+            continue;
+        }
 
         let tx = ai.target_tile.0 as i32;
         let ty = ai.target_tile.1 as i32;
@@ -100,14 +119,17 @@ pub fn gather_system(
                 continue;
             }
 
-            let kind     = plant.kind;
+            let kind = plant.kind;
             let has_tool = agent.has_tool();
 
-            if ai.work_progress < kind.harvest_work_ticks() { continue; }
+            if ai.work_progress < kind.harvest_work_ticks() {
+                continue;
+            }
             ai.work_progress = 0;
 
             // Faction multipliers & activity log
-            let (food_mul, wood_mul, _) = faction_muls(&mut faction_registry, faction_id, kind.harvest_activity());
+            let (food_mul, wood_mul, _) =
+                faction_muls(&mut faction_registry, faction_id, kind.harvest_activity());
 
             let (yield_good, base_qty) = kind.harvest_yield(has_tool);
             let yield_mul = if yield_good.is_edible() {
@@ -117,7 +139,7 @@ pub fn gather_system(
             } else {
                 1.0
             };
-            let qty = (base_qty as f32 * yield_mul).round().max(1.0) as u8;
+            let qty = (base_qty as f32 * yield_mul).round().max(1.0) as u32;
             agent.add_good(yield_good, qty);
 
             for &(good, extra_qty) in kind.harvest_extra_yields() {
@@ -147,20 +169,61 @@ pub fn gather_system(
                 }
                 commands.entity(entity).despawn_recursive();
             } else {
-                plant.stage = GrowthStage::Seedling;
+                plant.stage = GrowthStage::Harvested;
                 plant.growth_ticks = 0;
             }
-
         } else {
-            // ── Tile harvest (stone) ─────────────────────────────────────────
+            // ── Tile harvest (stone / wall) ───────────────────────────────────
 
             let tile_kind = chunk_map.tile_kind_at(tx, ty);
-            if tile_kind == Some(TileKind::Stone) {
-                if ai.work_progress < STONE.work_ticks { continue; }
+
+            if tile_kind == Some(TileKind::Wall) {
+                // ── Wall mining: remove constructed or natural wall → Dirt ────
+                if ai.work_progress < STONE.work_ticks {
+                    continue;
+                }
                 ai.work_progress = 0;
 
-                let (_, _, stone_mul) = faction_muls(&mut faction_registry, faction_id, ActivityKind::StoneMining);
-                let qty = (STONE.base_yield_qty as f32 * stone_mul).round().max(1.0) as u8;
+                let surf_z = chunk_map.surface_z_at(tx, ty);
+                agent.add_good(Good::Stone, STONE.base_yield_qty);
+                skills.gain_xp(SkillKind::Mining, STONE.xp);
+
+                chunk_map.set_tile(
+                    tx,
+                    ty,
+                    surf_z,
+                    TileData {
+                        kind: TileKind::Dirt,
+                        elevation: 0,
+                        fertility: 0,
+                        flags: 0,
+                    },
+                );
+                if let Some(wall_entity) = wall_map.0.remove(&ai.target_tile) {
+                    commands.entity(wall_entity).despawn_recursive();
+                }
+                tile_changed.send(TileChangedEvent {
+                    tx: ai.target_tile.0,
+                    ty: ai.target_tile.1,
+                });
+
+                if let Some(ref mut plan) = plan_opt {
+                    plan.reward_acc += STONE.base_yield_qty as f32 * 0.3;
+                }
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
+                ai.work_progress = 0;
+            } else if tile_kind == Some(TileKind::Stone) {
+                if ai.work_progress < STONE.work_ticks {
+                    continue;
+                }
+                ai.work_progress = 0;
+
+                let surf_z = chunk_map.surface_z_at(tx, ty);
+                let (_, _, stone_mul) =
+                    faction_muls(&mut faction_registry, faction_id, ActivityKind::StoneMining);
+                let qty = (STONE.base_yield_qty as f32 * stone_mul).round().max(1.0) as u32;
                 agent.add_good(Good::Stone, qty);
 
                 for &(good, bonus_qty, chance) in STONE.bonus_yields {
@@ -171,9 +234,11 @@ pub fn gather_system(
                                 let act = match good {
                                     Good::Coal => Some(ActivityKind::CoalMining),
                                     Good::Iron => Some(ActivityKind::IronMining),
-                                    _          => None,
+                                    _ => None,
                                 };
-                                if let Some(a) = act { fd.activity_log.increment(a); }
+                                if let Some(a) = act {
+                                    fd.activity_log.increment(a);
+                                }
                             }
                         }
                     }
@@ -181,14 +246,34 @@ pub fn gather_system(
 
                 skills.gain_xp(SkillKind::Mining, STONE.xp);
 
+                chunk_map.set_tile(
+                    tx,
+                    ty,
+                    surf_z,
+                    TileData {
+                        kind: TileKind::Dirt,
+                        elevation: 0,
+                        fertility: 0,
+                        flags: 0,
+                    },
+                );
+                tile_changed.send(TileChangedEvent {
+                    tx: ai.target_tile.0,
+                    ty: ai.target_tile.1,
+                });
+
                 if let Some(ref mut mem) = memory_opt {
                     mem.record((tx as i16, ty as i16), MemoryKind::Stone);
                 }
                 if let Some(ref mut plan) = plan_opt {
                     plan.reward_acc += qty as f32 * 0.3;
                 }
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
+                ai.work_progress = 0;
             } else {
-                // Not a stone tile and not a plant -> target is invalid or already harvested
+                // Not a stone/wall tile and not a plant -> target is invalid or already harvested
                 if let Some(ref mut mem) = memory_opt {
                     mem.forget((tx as i16, ty as i16), MemoryKind::Stone);
                     mem.forget((tx as i16, ty as i16), MemoryKind::Food);
@@ -222,17 +307,24 @@ fn faction_muls(
     if let Some(id) = faction_id {
         if let Some(fd) = registry.factions.get_mut(&id) {
             fd.activity_log.increment(activity);
-            return (fd.food_yield_multiplier(), fd.wood_yield_multiplier(), fd.stone_yield_multiplier());
+            return (
+                fd.food_yield_multiplier(),
+                fd.wood_yield_multiplier(),
+                fd.stone_yield_multiplier(),
+            );
         }
     }
     (1.0, 1.0, 1.0)
 }
 
-fn spawn_ground_drop(commands: &mut Commands, tx: i32, ty: i32, good: Good, qty: u8) {
+fn spawn_ground_drop(commands: &mut Commands, tx: i32, ty: i32, good: Good, qty: u32) {
     let (dx, dy) = adjacent_offset();
     let pos = tile_to_world(tx + dx, ty + dy);
     commands.spawn((
-        GroundItem { item: Item::new_commodity(good), qty },
+        GroundItem {
+            item: Item::new_commodity(good),
+            qty,
+        },
         Transform::from_xyz(pos.x, pos.y, 0.3),
         GlobalTransform::default(),
         Visibility::Visible,

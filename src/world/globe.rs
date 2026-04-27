@@ -4,63 +4,63 @@ use serde::{Deserialize, Serialize};
 
 const SAVE_PATH: &str = "world.bin";
 
-pub const GLOBE_WIDTH:       i32 = 64;
-pub const GLOBE_HEIGHT:      i32 = 32;
+pub const GLOBE_WIDTH: i32 = 64;
+pub const GLOBE_HEIGHT: i32 = 32;
 pub const GLOBE_CELL_CHUNKS: i32 = 16; // one globe cell = 16×16 local chunks = 512×512 tiles
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Biome {
-    Ocean     = 0,
-    Tundra    = 1,
-    Taiga     = 2,
+    Ocean = 0,
+    Tundra = 1,
+    Taiga = 2,
     #[default]
     Temperate = 3,
     Grassland = 4,
-    Tropical  = 5,
-    Desert    = 6,
-    Mountain  = 7,
+    Tropical = 5,
+    Desert = 6,
+    Mountain = 7,
 }
 
 impl Biome {
     pub fn name(self) -> &'static str {
         match self {
-            Biome::Ocean     => "Ocean",
-            Biome::Tundra    => "Tundra",
-            Biome::Taiga     => "Taiga",
+            Biome::Ocean => "Ocean",
+            Biome::Tundra => "Tundra",
+            Biome::Taiga => "Taiga",
             Biome::Temperate => "Temperate",
             Biome::Grassland => "Grassland",
-            Biome::Tropical  => "Tropical",
-            Biome::Desert    => "Desert",
-            Biome::Mountain  => "Mountain",
+            Biome::Tropical => "Tropical",
+            Biome::Desert => "Desert",
+            Biome::Mountain => "Mountain",
         }
     }
 
     /// Base RGBA color for world map rendering.
     pub fn color(self) -> [u8; 4] {
         match self {
-            Biome::Ocean     => [30,  80, 160, 255],
-            Biome::Tundra    => [220, 230, 240, 255],
-            Biome::Taiga     => [60,  100,  60, 255],
-            Biome::Temperate => [80,  150,  60, 255],
-            Biome::Grassland => [150, 190,  80, 255],
-            Biome::Tropical  => [30,  160,  60, 255],
-            Biome::Desert    => [210, 180, 100, 255],
-            Biome::Mountain  => [140, 130, 120, 255],
+            Biome::Ocean => [30, 80, 160, 255],
+            Biome::Tundra => [220, 230, 240, 255],
+            Biome::Taiga => [60, 100, 60, 255],
+            Biome::Temperate => [80, 150, 60, 255],
+            Biome::Grassland => [150, 190, 80, 255],
+            Biome::Tropical => [30, 160, 60, 255],
+            Biome::Desert => [210, 180, 100, 255],
+            Biome::Mountain => [140, 130, 120, 255],
         }
     }
 
     /// Approximate food yield per tick for world-level sim.
     pub fn yield_rate(self) -> f32 {
         match self {
-            Biome::Ocean     => 0.0,
-            Biome::Tundra    => 0.1,
-            Biome::Taiga     => 0.3,
+            Biome::Ocean => 0.0,
+            Biome::Tundra => 0.1,
+            Biome::Taiga => 0.3,
             Biome::Temperate => 0.7,
             Biome::Grassland => 0.6,
-            Biome::Tropical  => 0.8,
-            Biome::Desert    => 0.05,
-            Biome::Mountain  => 0.1,
+            Biome::Tropical => 0.8,
+            Biome::Desert => 0.05,
+            Biome::Mountain => 0.1,
         }
     }
 
@@ -71,22 +71,22 @@ impl Biome {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct WorldCell {
-    pub biome:       Biome,
-    pub elevation:   u8,   // 0–255, normalised
-    pub temperature: i8,   // -50 to 50 (°C approx)
-    pub rainfall:    u8,   // 0–255
-    pub resources:   u8,   // bitflags: 0x01=forest, 0x02=stone, 0x04=ore
-    pub explored:    bool,
+    pub biome: Biome,
+    pub elevation: u8,   // 0–255, normalised
+    pub temperature: i8, // -50 to 50 (°C approx)
+    pub rainfall: u8,    // 0–255
+    pub resources: u8,   // bitflags: 0x01=forest, 0x02=stone, 0x04=ore
+    pub explored: bool,
     // world-level simulation state for off-screen cells
-    pub faction_id:  u32,  // 0 = unclaimed
-    pub population:  u16,
-    pub food_stock:  f32,
+    pub faction_id: u32, // 0 = unclaimed
+    pub population: u16,
+    pub food_stock: f32,
 }
 
 #[derive(Resource, Serialize, Deserialize)]
 pub struct Globe {
     pub cells: Vec<WorldCell>, // GLOBE_WIDTH × GLOBE_HEIGHT, row-major (y-major)
-    pub seed:  u64,
+    pub seed: u64,
 }
 
 impl Globe {
@@ -114,7 +114,10 @@ impl Globe {
 
     /// Which globe cell does a local chunk coordinate belong to?
     pub fn cell_for_chunk(cx: i32, cy: i32) -> (i32, i32) {
-        (cx.div_euclid(GLOBE_CELL_CHUNKS), cy.div_euclid(GLOBE_CELL_CHUNKS))
+        (
+            cx.div_euclid(GLOBE_CELL_CHUNKS),
+            cy.div_euclid(GLOBE_CELL_CHUNKS),
+        )
     }
 
     /// Chunk coordinate range for a globe cell.
@@ -126,24 +129,28 @@ impl Globe {
 }
 
 fn whittaker_biome(elevation_f: f32, temp_f: f32, rainfall_f: f32) -> Biome {
-    if elevation_f > 0.82 { return Biome::Mountain; }
-    if elevation_f < 0.22 { return Biome::Ocean; }
+    if elevation_f > 0.82 {
+        return Biome::Mountain;
+    }
+    if elevation_f < 0.22 {
+        return Biome::Ocean;
+    }
     // temp_f: 0=cold, 1=hot; rainfall_f: 0=dry, 1=wet
     match (temp_f > 0.55, rainfall_f > 0.55, temp_f > 0.3) {
-        _ if temp_f < 0.2                          => Biome::Tundra,
-        _ if temp_f < 0.35 && rainfall_f > 0.45   => Biome::Taiga,
-        (true, true, _)                            => Biome::Tropical,
-        (true, false, _)                           => Biome::Desert,
-        (false, true, true)                        => Biome::Temperate,
-        _                                          => Biome::Grassland,
+        _ if temp_f < 0.2 => Biome::Tundra,
+        _ if temp_f < 0.35 && rainfall_f > 0.45 => Biome::Taiga,
+        (true, true, _) => Biome::Tropical,
+        (true, false, _) => Biome::Desert,
+        (false, true, true) => Biome::Temperate,
+        _ => Biome::Grassland,
     }
 }
 
 pub fn generate_globe(seed: u64) -> Globe {
     let mut globe = Globe::new(seed);
 
-    let elev_noise  = Perlin::default().set_seed(seed as u32);
-    let rain_noise  = Perlin::default().set_seed(seed as u32 ^ 0xDEAD_BEEF);
+    let elev_noise = Perlin::default().set_seed(seed as u32);
+    let rain_noise = Perlin::default().set_seed(seed as u32 ^ 0xDEAD_BEEF);
 
     for gy in 0..GLOBE_HEIGHT {
         for gx in 0..GLOBE_WIDTH {
@@ -152,8 +159,8 @@ pub fn generate_globe(seed: u64) -> Globe {
 
             // Elevation: layered noise
             let ev = elev_noise.get([nx, ny]) * 0.60
-                   + elev_noise.get([nx * 2.0, ny * 2.0]) * 0.30
-                   + elev_noise.get([nx * 4.0, ny * 4.0]) * 0.10;
+                + elev_noise.get([nx * 2.0, ny * 2.0]) * 0.30
+                + elev_noise.get([nx * 4.0, ny * 4.0]) * 0.10;
             let elev_f = ((ev + 1.0) * 0.5) as f32;
 
             // Temperature: warm equator, cold poles, cool mountains
@@ -163,7 +170,7 @@ pub fn generate_globe(seed: u64) -> Globe {
 
             // Rainfall
             let rv = rain_noise.get([nx + 5.0, ny + 5.0]) * 0.70
-                   + rain_noise.get([nx * 3.0, ny * 3.0]) * 0.30;
+                + rain_noise.get([nx * 3.0, ny * 3.0]) * 0.30;
             let rain_f = ((rv + 1.0) * 0.5) as f32;
             // Deserts form in dry high-temp regions; rainfall modulated by temp
             let rain_adj = (rain_f * (0.4 + temp_f * 0.6)).clamp(0.0, 1.0);
@@ -174,9 +181,15 @@ pub fn generate_globe(seed: u64) -> Globe {
             // Resource flags from biome
             let resources = {
                 let mut r = 0u8;
-                if matches!(biome, Biome::Temperate | Biome::Taiga | Biome::Tropical) { r |= 0x01; } // forest
-                if elev_f > 0.65 { r |= 0x02; } // stone
-                if elev_f > 0.70 && biome == Biome::Mountain { r |= 0x04; } // ore
+                if matches!(biome, Biome::Temperate | Biome::Taiga | Biome::Tropical) {
+                    r |= 0x01;
+                } // forest
+                if elev_f > 0.65 {
+                    r |= 0x02;
+                } // stone
+                if elev_f > 0.70 && biome == Biome::Mountain {
+                    r |= 0x04;
+                } // ore
                 r
             };
 
@@ -214,7 +227,8 @@ pub fn generate_globe(seed: u64) -> Globe {
 
     info!(
         "Globe generated: {}×{} = {} cells",
-        GLOBE_WIDTH, GLOBE_HEIGHT,
+        GLOBE_WIDTH,
+        GLOBE_HEIGHT,
         GLOBE_WIDTH * GLOBE_HEIGHT
     );
 

@@ -1,27 +1,31 @@
-use ahash::AHashMap;
-use bevy::prelude::*;
+use super::animals::{Deer, Wolf};
+use super::combat::{CombatTarget, Health};
+use super::construction::{Blueprint, BlueprintMap, BuildSiteKind};
+use super::faction::{FactionMember, FactionRegistry, StorageTileMap, SOLO};
+use super::goals::AgentGoal;
+use super::items::{GroundItem, TargetItem};
+use super::tasks::{
+    assign_task_with_routing, find_nearest_edible, find_nearest_item, find_nearest_plant,
+    find_nearest_tile, find_nearest_unplanted_farmland, TaskKind,
+};
+use crate::economy::agent::EconomicAgent;
+use crate::economy::goods::Good;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::Calendar;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
 use crate::world::tile::TileKind;
-use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
-use super::construction::{BlueprintMap, Blueprint, BuildSiteKind};
-use super::faction::{FactionMember, FactionRegistry, SOLO};
-use super::goals::AgentGoal;
-use super::items::{GroundItem, TargetItem};
-use super::combat::{CombatTarget, Health};
-use super::animals::{Wolf, Deer};
-use super::tasks::{TaskKind, assign_task_with_routing, find_nearest_tile, find_nearest_item, find_nearest_edible, find_nearest_unplanted_farmland, find_nearest_plant};
+use ahash::AHashMap;
+use bevy::ecs::system::SystemParam;
+use bevy::prelude::*;
 
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, MemoryKind};
 use super::needs::Needs;
-use super::neural::{UtilityNet, STATE_DIM, PLAN_FEAT_DIM};
+use super::neural::{UtilityNet, PLAN_FEAT_DIM, STATE_DIM};
 use super::person::{AiState, PersonAI, PlayerOrder};
-use super::plants::{PlantMap, PlantKind, Plant};
+use super::plants::{Plant, PlantKind, PlantMap};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
 use super::technology::TechId;
@@ -40,39 +44,51 @@ pub enum StepTarget {
     NearestBuildSite(BuildSiteKind),
     /// Targets the nearest active Blueprint entity for this agent's faction.
     NearestBlueprint(BuildSiteKind),
+    /// In-place: target resolves to the agent's current tile.
+    SelfPosition,
+    /// Nearest faction storage tile (for withdrawing food from communal stock).
+    NearestFactionStorage,
 }
 
 #[derive(Clone, Debug)]
 pub struct StepPreconditions {
-    pub requires_good: Option<(Good, u8)>,
+    pub requires_good: Option<(Good, u32)>,
 }
 
 impl StepPreconditions {
-    pub fn none() -> Self { Self { requires_good: None } }
-    pub fn needs_good(good: Good, qty: u8) -> Self { Self { requires_good: Some((good, qty)) } }
+    pub fn none() -> Self {
+        Self {
+            requires_good: None,
+        }
+    }
+    pub fn needs_good(good: Good, qty: u32) -> Self {
+        Self {
+            requires_good: Some((good, qty)),
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct StepDef {
-    pub id:            StepId,
-    pub task:           TaskKind,
-    pub target:        StepTarget,
+    pub id: StepId,
+    pub task: TaskKind,
+    pub target: StepTarget,
     pub preconditions: StepPreconditions,
-    pub reward_scale:  f32,
+    pub reward_scale: f32,
     /// When falling back from memory to a plant search (Food memory kind),
     /// restricts which plant kind is targeted. None = any mature plant.
-    pub plant_filter:  Option<PlantKind>,
+    pub plant_filter: Option<PlantKind>,
 }
 
 #[derive(Clone)]
 pub struct PlanDef {
-    pub id:           PlanId,
-    pub name:         &'static str,
-    pub steps:        &'static [StepId],
-    pub feature_vec:  [f32; PLAN_FEAT_DIM],
+    pub id: PlanId,
+    pub name: &'static str,
+    pub steps: &'static [StepId],
+    pub feature_vec: [f32; PLAN_FEAT_DIM],
     pub serves_goals: &'static [AgentGoal],
     /// Faction must have unlocked this tech for the plan to be selectable.
-    pub tech_gate:    Option<TechId>,
+    pub tech_gate: Option<TechId>,
     /// Memory kind used to compute distance penalties during plan scoring.
     pub memory_target_kind: Option<MemoryKind>,
 }
@@ -85,20 +101,20 @@ pub struct PlanRegistry(pub Vec<PlanDef>);
 
 #[derive(Component)]
 pub struct ActivePlan {
-    pub plan_id:      PlanId,
+    pub plan_id: PlanId,
     pub current_step: u8,
     pub started_tick: u64,
-    pub max_ticks:    u64,
-    pub reward_acc:   f32,
+    pub max_ticks: u64,
+    pub reward_acc: f32,
     pub reward_scale: f32,
-    pub dispatched:   bool,
+    pub dispatched: bool,
 }
 
 #[derive(Clone)]
 pub struct KnownPlanEntry {
-    pub plan_id:  PlanId,
+    pub plan_id: PlanId,
     pub freshness: u8,
-    pub innate:   bool,
+    pub innate: bool,
 }
 
 #[derive(Component, Clone)]
@@ -109,9 +125,14 @@ pub struct KnownPlans {
 impl KnownPlans {
     pub fn with_innate(ids: &[PlanId]) -> Self {
         Self {
-            entries: ids.iter().map(|&id| KnownPlanEntry {
-                plan_id: id, freshness: 255, innate: true,
-            }).collect(),
+            entries: ids
+                .iter()
+                .map(|&id| KnownPlanEntry {
+                    plan_id: id,
+                    freshness: 255,
+                    innate: true,
+                })
+                .collect(),
         }
     }
 
@@ -121,9 +142,15 @@ impl KnownPlans {
 
     pub fn add(&mut self, id: PlanId, freshness: u8) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.plan_id == id) {
-            if freshness > e.freshness { e.freshness = freshness; }
+            if freshness > e.freshness {
+                e.freshness = freshness;
+            }
         } else {
-            self.entries.push(KnownPlanEntry { plan_id: id, freshness, innate: false });
+            self.entries.push(KnownPlanEntry {
+                plan_id: id,
+                freshness,
+                innate: false,
+            });
         }
     }
 
@@ -137,7 +164,9 @@ impl KnownPlans {
     }
 
     pub fn top_entries(&self, n: usize) -> Vec<(PlanId, u8)> {
-        let mut sorted: Vec<(PlanId, u8)> = self.entries.iter()
+        let mut sorted: Vec<(PlanId, u8)> = self
+            .entries
+            .iter()
             .map(|e| (e.plan_id, e.freshness))
             .collect();
         sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
@@ -147,9 +176,15 @@ impl KnownPlans {
 
     pub fn receive_gossip(&mut self, id: PlanId, freshness: u8) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.plan_id == id) {
-            if freshness > e.freshness { e.freshness = freshness; }
+            if freshness > e.freshness {
+                e.freshness = freshness;
+            }
         } else {
-            self.entries.push(KnownPlanEntry { plan_id: id, freshness, innate: false });
+            self.entries.push(KnownPlanEntry {
+                plan_id: id,
+                freshness,
+                innate: false,
+            });
         }
     }
 }
@@ -163,89 +198,129 @@ pub enum PlanScoringMethod {
 
 // ── Built-in step and plan definitions ───────────────────────────────────────
 
-static GRASS_TILES:    &[TileKind] = &[TileKind::Grass];
+static GRASS_TILES: &[TileKind] = &[TileKind::Grass];
 static FARMLAND_TILES: &[TileKind] = &[TileKind::Farmland];
-static FOREST_TILES:   &[TileKind] = &[TileKind::Forest];
-static STONE_TILES:    &[TileKind] = &[TileKind::Stone];
+static FOREST_TILES: &[TileKind] = &[TileKind::Forest];
+static STONE_TILES: &[TileKind] = &[TileKind::Stone];
 
-static PLAN_STEPS_0: &[StepId] = &[0];    // ForageFood
-static PLAN_STEPS_1: &[StepId] = &[1];    // FarmFood
-static PLAN_STEPS_2: &[StepId] = &[2];    // GatherWood
-static PLAN_STEPS_3: &[StepId] = &[3];    // GatherStone
-static PLAN_STEPS_4: &[StepId] = &[4, 1]; // PlantAndFarm
-static PLAN_STEPS_5: &[StepId] = &[5, 6]; // HuntFood
-static PLAN_STEPS_6: &[StepId] = &[6];    // ScavengeFood
+// Step 9 = Eat, Step 10 = WithdrawFood (defined in register_builtin_steps)
+static PLAN_STEPS_0: &[StepId] = &[0, 9]; // ForageFood → Eat
+static PLAN_STEPS_1: &[StepId] = &[1, 9]; // FarmFood → Eat
+static PLAN_STEPS_2: &[StepId] = &[2]; // GatherWood
+static PLAN_STEPS_3: &[StepId] = &[3]; // GatherStone
+static PLAN_STEPS_4: &[StepId] = &[4, 1, 9]; // PlantAndFarm → Eat
+static PLAN_STEPS_5: &[StepId] = &[5, 6, 9]; // HuntFood → Eat
+static PLAN_STEPS_6: &[StepId] = &[6, 9]; // ScavengeFood → Eat
 static PLAN_STEPS_7: &[StepId] = &[2, 7]; // GatherWood, BuildWoodWall
 static PLAN_STEPS_8: &[StepId] = &[2, 8]; // GatherWood, BuildBed
+static PLAN_STEPS_9: &[StepId] = &[10, 9]; // WithdrawAndEat: WithdrawFood → Eat
 
-static SURVIVE_GOALS:             &[AgentGoal] = &[AgentGoal::Survive];
-static GATHER_GOALS:              &[AgentGoal] = &[AgentGoal::Gather];
-static SURVIVE_AND_GATHER_GOALS:  &[AgentGoal] = &[AgentGoal::Survive, AgentGoal::Gather];
-static BUILD_GOALS:               &[AgentGoal] = &[AgentGoal::Build];
+static SURVIVE_GOALS: &[AgentGoal] = &[AgentGoal::Survive];
+static GATHER_FOOD_GOALS: &[AgentGoal] = &[AgentGoal::GatherFood];
+static GATHER_WOOD_GOALS: &[AgentGoal] = &[AgentGoal::GatherWood];
+static GATHER_STONE_GOALS: &[AgentGoal] = &[AgentGoal::GatherStone];
+static SURVIVE_AND_GATHER_FOOD_GOALS: &[AgentGoal] = &[AgentGoal::Survive, AgentGoal::GatherFood];
+static BUILD_GOALS: &[AgentGoal] = &[AgentGoal::Build];
 
 pub fn register_builtin_steps(registry: &mut StepRegistry) {
     registry.0 = vec![
-        StepDef { // 0: ForageGrass — targets FruitBushes, falls back via memory
-            id: 0, task: TaskKind::Gather,
+        StepDef {
+            // 0: ForageGrass — targets FruitBushes, falls back via memory
+            id: 0,
+            task: TaskKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Food),
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: Some(PlantKind::FruitBush),
         },
-        StepDef { // 1: FarmFarmland — targets Grain, falls back via memory
-            id: 1, task: TaskKind::Gather,
+        StepDef {
+            // 1: FarmFarmland — targets Grain, falls back via memory
+            id: 1,
+            task: TaskKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Food),
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: Some(PlantKind::Grain),
         },
-        StepDef { // 2: ChopForest
-            id: 2, task: TaskKind::Gather,
+        StepDef {
+            // 2: ChopForest
+            id: 2,
+            task: TaskKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Wood),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
         },
-        StepDef { // 3: MineStone
-            id: 3, task: TaskKind::Gather,
+        StepDef {
+            // 3: MineStone
+            id: 3,
+            task: TaskKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Stone),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
         },
-        StepDef { // 4: PlantSeed (requires Seed in inventory)
-            id: 4, task: TaskKind::Planter,
+        StepDef {
+            // 4: PlantSeed (requires Seed in inventory)
+            id: 4,
+            task: TaskKind::Planter,
             target: StepTarget::NearestTile(GRASS_TILES),
             preconditions: StepPreconditions::needs_good(Good::Seed, 1),
             reward_scale: 0.2,
             plant_filter: None,
         },
-        StepDef { // 5: Hunt
-            id: 5, task: TaskKind::Hunter,
+        StepDef {
+            // 5: Hunt
+            id: 5,
+            task: TaskKind::Hunter,
             target: StepTarget::HuntPrey,
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
         },
-        StepDef { // 6: CollectFood
-            id: 6, task: TaskKind::Scavenge,
+        StepDef {
+            // 6: CollectFood
+            id: 6,
+            task: TaskKind::Scavenge,
             target: StepTarget::NearestEdible,
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
         },
-        StepDef { // 7: BuildWall — target faction blueprint, deposit wood and labor
-            id: 7, task: TaskKind::Construct,
+        StepDef {
+            // 7: BuildWall — target faction blueprint, deposit wood and labor
+            id: 7,
+            task: TaskKind::Construct,
             target: StepTarget::NearestBlueprint(BuildSiteKind::Wall),
             preconditions: StepPreconditions::needs_good(Good::Wood, 2),
             reward_scale: 0.8,
             plant_filter: None,
         },
-        StepDef { // 8: BuildBed — target faction blueprint, deposit wood and labor
-            id: 8, task: TaskKind::ConstructBed,
+        StepDef {
+            // 8: BuildBed — target faction blueprint, deposit wood and labor
+            id: 8,
+            task: TaskKind::ConstructBed,
             target: StepTarget::NearestBlueprint(BuildSiteKind::Bed),
             preconditions: StepPreconditions::needs_good(Good::Wood, 3),
             reward_scale: 1.0,
+            plant_filter: None,
+        },
+        StepDef {
+            // 9: Eat — consume one edible from inventory in place
+            id: 9,
+            task: TaskKind::Eat,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 1.0,
+            plant_filter: None,
+        },
+        StepDef {
+            // 10: WithdrawFood — pull one edible from a faction storage tile
+            id: 10,
+            task: TaskKind::WithdrawFood,
+            target: StepTarget::NearestFactionStorage,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.4,
             plant_filter: None,
         },
     ];
@@ -256,59 +331,93 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
     //               addresses_hunger, addresses_safety, addresses_social,
     //               step_count_norm, risk]
     registry.0 = vec![
-        PlanDef { id: 0, name: "ForageFood",
+        PlanDef {
+            id: 0,
+            name: "ForageFood",
             steps: PLAN_STEPS_0,
-            feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.0],
-            serves_goals: SURVIVE_AND_GATHER_GOALS, tech_gate: None,
+            feature_vec: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.1, 0.0],
+            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
+            tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
         },
-        PlanDef { id: 1, name: "FarmFood",
+        PlanDef {
+            id: 1,
+            name: "FarmFood",
             steps: PLAN_STEPS_1,
-            feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.0],
-            serves_goals: SURVIVE_AND_GATHER_GOALS, tech_gate: None,
+            feature_vec: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.1, 0.0],
+            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
+            tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
         },
-        PlanDef { id: 2, name: "GatherWood",
+        PlanDef {
+            id: 2,
+            name: "GatherWood",
             steps: PLAN_STEPS_2,
-            feature_vec: [0.0, 1.0, 0.0,  0.0, 0.0, 0.0,  0.1, 0.1],
-            serves_goals: GATHER_GOALS, tech_gate: None,
+            feature_vec: [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.1],
+            serves_goals: GATHER_WOOD_GOALS,
+            tech_gate: None,
             memory_target_kind: Some(MemoryKind::Wood),
         },
-        PlanDef { id: 3, name: "GatherStone",
+        PlanDef {
+            id: 3,
+            name: "GatherStone",
             steps: PLAN_STEPS_3,
-            feature_vec: [0.0, 0.0, 1.0,  0.0, 0.0, 0.0,  0.1, 0.1],
-            serves_goals: GATHER_GOALS, tech_gate: None,
+            feature_vec: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.1, 0.1],
+            serves_goals: GATHER_STONE_GOALS,
+            tech_gate: None,
             memory_target_kind: Some(MemoryKind::Stone),
         },
-        PlanDef { id: 4, name: "PlantAndFarm",
+        PlanDef {
+            id: 4,
+            name: "PlantAndFarm",
             steps: PLAN_STEPS_4,
-            feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.2, 0.0],
-            serves_goals: SURVIVE_AND_GATHER_GOALS, tech_gate: None,
+            feature_vec: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.2, 0.0],
+            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
+            tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
         },
-        PlanDef { id: 5, name: "HuntFood",
+        PlanDef {
+            id: 5,
+            name: "HuntFood",
             steps: PLAN_STEPS_5,
-            feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.2, 1.0],
-            serves_goals: SURVIVE_AND_GATHER_GOALS, tech_gate: None,
+            feature_vec: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.2, 1.0],
+            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
+            tech_gate: None,
             memory_target_kind: Some(MemoryKind::Prey),
         },
-        PlanDef { id: 6, name: "ScavengeFood",
+        PlanDef {
+            id: 6,
+            name: "ScavengeFood",
             steps: PLAN_STEPS_6,
-            feature_vec: [1.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.1, 0.0],
-            serves_goals: SURVIVE_AND_GATHER_GOALS, tech_gate: None,
+            feature_vec: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.1, 0.0],
+            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
+            tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
         },
-        PlanDef { id: 7, name: "BuildWoodWall",
+        PlanDef {
+            id: 7,
+            name: "BuildWoodWall",
             steps: PLAN_STEPS_7,
-            feature_vec: [0.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.1, 0.0],
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.1, 0.0],
             serves_goals: BUILD_GOALS,
             tech_gate: Some(super::technology::PERM_SETTLEMENT),
             memory_target_kind: None,
         },
-        PlanDef { id: 8, name: "BuildBed",
+        PlanDef {
+            id: 8,
+            name: "BuildBed",
             steps: PLAN_STEPS_8,
-            feature_vec: [0.0, 0.0, 0.0,  0.0, 0.0, 0.0,  0.1, 0.0],
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0],
             serves_goals: BUILD_GOALS,
+            tech_gate: None,
+            memory_target_kind: None,
+        },
+        PlanDef {
+            id: 9,
+            name: "WithdrawAndEat",
+            steps: PLAN_STEPS_9,
+            feature_vec: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.2, 0.0],
+            serves_goals: SURVIVE_GOALS,
             tech_gate: None,
             memory_target_kind: None,
         },
@@ -328,23 +437,39 @@ pub fn build_state_vec(
     let mut s = [0.0f32; STATE_DIM];
 
     // 0-5: needs
-    s[0] = needs.hunger       as f32 / 255.0;
-    s[1] = needs.sleep        as f32 / 255.0;
-    s[2] = needs.shelter      as f32 / 255.0;
-    s[3] = needs.safety       as f32 / 255.0;
-    s[4] = needs.social       as f32 / 255.0;
+    s[0] = needs.hunger as f32 / 255.0;
+    s[1] = needs.sleep as f32 / 255.0;
+    s[2] = needs.shelter as f32 / 255.0;
+    s[3] = needs.safety as f32 / 255.0;
+    s[4] = needs.social as f32 / 255.0;
     s[5] = needs.reproduction as f32 / 255.0;
 
     // 6-10: inventory has (Food, Wood, Stone, Seed, Coal)
-    s[6]  = if agent.total_food()  > 0 { 1.0 } else { 0.0 };
-    s[7]  = if agent.quantity_of(Good::Wood)  > 0 { 1.0 } else { 0.0 };
-    s[8]  = if agent.quantity_of(Good::Stone) > 0 { 1.0 } else { 0.0 };
-    s[9]  = if agent.quantity_of(Good::Seed)  > 0 { 1.0 } else { 0.0 };
-    s[10] = if agent.quantity_of(Good::Coal)  > 0 { 1.0 } else { 0.0 };
+    s[6] = if agent.total_food() > 0 { 1.0 } else { 0.0 };
+    s[7] = if agent.quantity_of(Good::Wood) > 0 {
+        1.0
+    } else {
+        0.0
+    };
+    s[8] = if agent.quantity_of(Good::Stone) > 0 {
+        1.0
+    } else {
+        0.0
+    };
+    s[9] = if agent.quantity_of(Good::Seed) > 0 {
+        1.0
+    } else {
+        0.0
+    };
+    s[10] = if agent.quantity_of(Good::Coal) > 0 {
+        1.0
+    } else {
+        0.0
+    };
 
     // 11-18: all 8 skills
     for k in 0..8usize {
-        s[11 + k] = skills.0[k] as f32 / 255.0;
+        s[11 + k] = (skills.0[k].min(255) as f32) / 255.0;
     }
 
     // 19: season multiplier
@@ -355,9 +480,21 @@ pub fn build_state_vec(
 
     // 21-23: memory availability
     if let Some(mem) = memory {
-        s[21] = if mem.best_for(MemoryKind::Food).is_some()  { 1.0 } else { 0.0 };
-        s[22] = if mem.best_for(MemoryKind::Wood).is_some()  { 1.0 } else { 0.0 };
-        s[23] = if mem.best_for(MemoryKind::Stone).is_some() { 1.0 } else { 0.0 };
+        s[21] = if mem.best_for(MemoryKind::Food).is_some() {
+            1.0
+        } else {
+            0.0
+        };
+        s[22] = if mem.best_for(MemoryKind::Wood).is_some() {
+            1.0
+        } else {
+            0.0
+        };
+        s[23] = if mem.best_for(MemoryKind::Stone).is_some() {
+            1.0
+        } else {
+            0.0
+        };
     }
 
     s
@@ -373,7 +510,9 @@ fn resolve_target(
     plant_map: &PlantMap,
     plant_query: &Query<&Plant>,
     faction_registry: &FactionRegistry,
+    storage_tile_map: &StorageTileMap,
     faction_id: u32,
+    goal: &AgentGoal,
     memory: Option<&AgentMemory>,
     item_query: &Query<&GroundItem>,
     prey_query: &Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
@@ -384,6 +523,11 @@ fn resolve_target(
 ) -> Option<(Option<Entity>, i16, i16)> {
     const VIEW_RADIUS: i32 = 15;
 
+    let is_gathering = matches!(
+        goal,
+        AgentGoal::GatherFood | AgentGoal::GatherWood | AgentGoal::GatherStone
+    );
+
     match &step.target {
         StepTarget::HuntPrey => {
             // 1. Check vision
@@ -391,10 +535,14 @@ fn resolve_target(
             let mut best_dist_v = i32::MAX;
             for dy in -VIEW_RADIUS..=VIEW_RADIUS {
                 for dx in -VIEW_RADIUS..=VIEW_RADIUS {
-                    if dx*dx + dy*dy > VIEW_RADIUS*VIEW_RADIUS { continue; }
+                    if dx * dx + dy * dy > VIEW_RADIUS * VIEW_RADIUS {
+                        continue;
+                    }
                     let tx = pos.0 + dx;
                     let ty = pos.1 + dy;
-                    if !super::line_of_sight::has_los(chunk_map, pos, (tx, ty)) { continue; }
+                    if !super::line_of_sight::has_los(chunk_map, pos, (tx, ty)) {
+                        continue;
+                    }
                     for &candidate in spatial.get(tx, ty) {
                         if let Ok((_transform, health)) = prey_query.get(candidate) {
                             if !health.is_dead() {
@@ -415,7 +563,9 @@ fn resolve_target(
 
             // 2. Check memory
             if let Some(mem) = memory {
-                if let Some((entity, tx, ty)) = mem.best_entity_for_dist_weighted(MemoryKind::Prey, pos) {
+                if let Some((entity, tx, ty)) =
+                    mem.best_entity_for_dist_weighted(MemoryKind::Prey, pos)
+                {
                     combat_target.0 = Some(entity);
                     return Some((Some(entity), tx, ty));
                 }
@@ -425,9 +575,26 @@ fn resolve_target(
         StepTarget::FromMemory(kind) => {
             // 1. Check vision
             let vision_target: Option<(Option<Entity>, i16, i16)> = match kind {
-                MemoryKind::Food => find_nearest_plant(plant_map, pos, VIEW_RADIUS, plant_query, true, step.plant_filter).map(|(e, tx, ty)| (Some(e), tx, ty)),
-                MemoryKind::Wood => find_nearest_plant(plant_map, pos, VIEW_RADIUS, plant_query, true, Some(PlantKind::Tree)).map(|(e, tx, ty)| (Some(e), tx, ty)),
-                MemoryKind::Stone => find_nearest_tile(chunk_map, pos, VIEW_RADIUS, STONE_TILES).map(|(tx, ty)| (None, tx, ty)),
+                MemoryKind::Food => find_nearest_plant(
+                    plant_map,
+                    pos,
+                    VIEW_RADIUS,
+                    plant_query,
+                    true,
+                    step.plant_filter,
+                )
+                .map(|(e, tx, ty)| (Some(e), tx, ty)),
+                MemoryKind::Wood => find_nearest_plant(
+                    plant_map,
+                    pos,
+                    VIEW_RADIUS,
+                    plant_query,
+                    true,
+                    Some(PlantKind::Tree),
+                )
+                .map(|(e, tx, ty)| (Some(e), tx, ty)),
+                MemoryKind::Stone => find_nearest_tile(chunk_map, pos, VIEW_RADIUS, STONE_TILES)
+                    .map(|(tx, ty)| (None, tx, ty)),
                 _ => None,
             };
             if let Some((ent, tx, ty)) = vision_target {
@@ -450,14 +617,18 @@ fn resolve_target(
         }
         StepTarget::NearestTile(_tiles) => {
             if step.task == TaskKind::Planter {
-                find_nearest_unplanted_farmland(chunk_map, plant_map, pos, VIEW_RADIUS).map(|(tx, ty)| (None, tx, ty))
+                find_nearest_unplanted_farmland(chunk_map, plant_map, pos, VIEW_RADIUS)
+                    .map(|(tx, ty)| (None, tx, ty))
             } else {
-                find_nearest_tile(chunk_map, pos, VIEW_RADIUS, _tiles).map(|(tx, ty)| (None, tx, ty))
+                find_nearest_tile(chunk_map, pos, VIEW_RADIUS, _tiles)
+                    .map(|(tx, ty)| (None, tx, ty))
             }
         }
         StepTarget::NearestItem(good) => {
             // 1. Check vision — Bug 2 fix: pass good so only matching items are targeted.
-            if let Some((entity, tx, ty)) = find_nearest_item(spatial, pos, VIEW_RADIUS, *good, item_query) {
+            if let Some((entity, tx, ty)) =
+                find_nearest_item(spatial, pos, VIEW_RADIUS, *good, item_query, storage_tile_map, is_gathering)
+            {
                 if super::line_of_sight::has_los(chunk_map, pos, (tx as i32, ty as i32)) {
                     target_item.0 = Some(entity);
                     return Some((Some(entity), tx, ty));
@@ -470,7 +641,11 @@ fn resolve_target(
                     Good::Stone => MemoryKind::Stone,
                     Good::Seed => MemoryKind::Seed,
                     _ => {
-                        if good.is_edible() { MemoryKind::Food } else { return None }
+                        if good.is_edible() {
+                            MemoryKind::Food
+                        } else {
+                            return None;
+                        }
                     }
                 };
                 if let Some((entity, tx, ty)) = mem.best_entity_for_dist_weighted(mkind, pos) {
@@ -482,7 +657,9 @@ fn resolve_target(
         }
         StepTarget::NearestEdible => {
             // 1. Check vision
-            if let Some((entity, tx, ty)) = find_nearest_edible(spatial, pos, VIEW_RADIUS, item_query) {
+            if let Some((entity, tx, ty)) =
+                find_nearest_edible(spatial, pos, VIEW_RADIUS, item_query, storage_tile_map, is_gathering)
+            {
                 if super::line_of_sight::has_los(chunk_map, pos, (tx as i32, ty as i32)) {
                     target_item.0 = Some(entity);
                     return Some((Some(entity), tx, ty));
@@ -490,25 +667,37 @@ fn resolve_target(
             }
             // 2. Check memory
             if let Some(mem) = memory {
-                if let Some((entity, tx, ty)) = mem.best_entity_for_dist_weighted(MemoryKind::Food, pos) {
+                if let Some((entity, tx, ty)) =
+                    mem.best_entity_for_dist_weighted(MemoryKind::Food, pos)
+                {
                     target_item.0 = Some(entity);
                     return Some((Some(entity), tx, ty));
                 }
             }
             None
         }
-        StepTarget::FactionCamp => {
-            faction_registry.home_tile(faction_id).map(|(tx, ty)| (None, tx, ty))
-        }
+        StepTarget::FactionCamp => faction_registry
+            .home_tile(faction_id)
+            .map(|(tx, ty)| (None, tx, ty)),
+        StepTarget::SelfPosition => Some((None, pos.0 as i16, pos.1 as i16)),
+        StepTarget::NearestFactionStorage => storage_tile_map
+            .nearest_for_faction(faction_id, pos)
+            .map(|(tx, ty)| (None, tx, ty)),
         StepTarget::NearestBuildSite(_) => None, // Legacy; construction is handled via faction_blueprint_system
         StepTarget::NearestBlueprint(kind) => {
             // Find the nearest active Blueprint entity belonging to this agent's faction.
             let mut best: Option<(Entity, i16, i16)> = None;
             let mut best_dist = i32::MAX;
             for (&tile, &bp_entity) in &bp_map.0 {
-                let Ok(bp) = bp_query.get(bp_entity) else { continue };
-                if bp.faction_id != faction_id { continue }
-                if &bp.kind != kind { continue }
+                let Ok(bp) = bp_query.get(bp_entity) else {
+                    continue;
+                };
+                if bp.faction_id != faction_id {
+                    continue;
+                }
+                if &bp.kind != kind {
+                    continue;
+                }
                 let dist = (tile.0 as i32 - pos.0).abs() + (tile.1 as i32 - pos.1).abs();
                 if dist < best_dist {
                     best_dist = dist;
@@ -525,6 +714,16 @@ fn chunk_coord(tx: i32, ty: i32) -> ChunkCoord {
         tx.div_euclid(CHUNK_SIZE as i32),
         ty.div_euclid(CHUNK_SIZE as i32),
     )
+}
+
+// Bundles registries needed by plan_execution_system; Bevy caps a system at
+// 16 top-level params, and these four would put us over the limit.
+#[derive(SystemParam)]
+pub struct PlanRegistries<'w> {
+    pub plan_registry: Res<'w, PlanRegistry>,
+    pub step_registry: Res<'w, StepRegistry>,
+    pub faction_registry: Res<'w, FactionRegistry>,
+    pub storage_tile_map: Res<'w, StorageTileMap>,
 }
 
 // ── Plan execution system ─────────────────────────────────────────────────────
@@ -562,9 +761,7 @@ pub fn plan_execution_system(
     spatial: Res<SpatialIndex>,
     plant_map: Res<PlantMap>,
     plant_query: Query<&Plant>,
-    plan_registry: Res<PlanRegistry>,
-    step_registry: Res<StepRegistry>,
-    faction_registry: Res<FactionRegistry>,
+    registries: PlanRegistries,
     bp_map: Res<BlueprintMap>,
     bp_query: Query<&Blueprint>,
     calendar: Res<Calendar>,
@@ -573,20 +770,45 @@ pub fn plan_execution_system(
     prey_query: Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
     mut query: Query<(AgentQuery, OptionalQuery), Without<PlayerOrder>>,
 ) {
+    let PlanRegistries {
+        plan_registry,
+        step_registry,
+        faction_registry,
+        storage_tile_map,
+    } = registries;
     for (
         (
-            entity, mut ai, agent, member, goal, needs, skills,
-            transform, lod, slot, mut combat_target, mut target_item,
+            entity,
+            mut ai,
+            agent,
+            member,
+            goal,
+            needs,
+            skills,
+            transform,
+            lod,
+            slot,
+            mut combat_target,
+            mut target_item,
         ),
-        (
-            memory_opt, mut net_opt, known_plans_opt, scoring_opt, mut active_plan_opt,
-        )
+        (memory_opt, mut net_opt, known_plans_opt, scoring_opt, mut active_plan_opt),
     ) in query.iter_mut()
     {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) { continue; }
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
 
         // Only handle plan-driven goals
-        if !matches!(goal, AgentGoal::Survive | AgentGoal::Gather | AgentGoal::Build) { continue; }
+        if !matches!(
+            goal,
+            AgentGoal::Survive
+                | AgentGoal::GatherFood
+                | AgentGoal::GatherWood
+                | AgentGoal::GatherStone
+                | AgentGoal::Build
+        ) {
+            continue;
+        }
 
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
@@ -594,23 +816,36 @@ pub fn plan_execution_system(
 
         if active_plan_opt.is_none() {
             // ── Select and start a new plan ───────────────────────────────────
-            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED { continue; }
+            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+                continue;
+            }
 
-            let Some(known_plans) = known_plans_opt else { continue };
+            let Some(known_plans) = known_plans_opt else {
+                continue;
+            };
             let Some(scoring) = scoring_opt else { continue };
-            if plan_registry.0.is_empty() { continue; }
+            if plan_registry.0.is_empty() {
+                continue;
+            }
 
-            let candidates: Vec<&PlanDef> = plan_registry.0.iter()
+            let candidates: Vec<&PlanDef> = plan_registry
+                .0
+                .iter()
                 .filter(|p| p.serves_goals.contains(&goal) && known_plans.knows(p.id))
-                .filter(|p| p.tech_gate.map_or(true, |tid| {
-                    faction_registry.factions.get(&member.faction_id)
-                        .map(|f| f.techs.has(tid))
-                        .unwrap_or(false)
-                }))
+                .filter(|p| {
+                    p.tech_gate.map_or(true, |tid| {
+                        faction_registry
+                            .factions
+                            .get(&member.faction_id)
+                            .map(|f| f.techs.has(tid))
+                            .unwrap_or(false)
+                    })
+                })
                 // Bug 3 fix: skip plans whose first step has unmet preconditions so we
                 // don't enter a tight pick-then-immediately-abandon loop.
                 .filter(|p| {
-                    p.steps.first()
+                    p.steps
+                        .first()
                         .and_then(|&sid| step_registry.0.iter().find(|s| s.id == sid))
                         .and_then(|s| s.preconditions.requires_good)
                         .map_or(true, |(good, qty)| agent.quantity_of(good) >= qty)
@@ -619,21 +854,33 @@ pub fn plan_execution_system(
 
             if candidates.is_empty() {
                 // FALLBACK: Explore toward a random tile within 3 chunks of home
-                let home = faction_registry.home_tile(member.faction_id).unwrap_or((cur_tx as i16, cur_ty as i16));
+                let home = faction_registry
+                    .home_tile(member.faction_id)
+                    .unwrap_or((cur_tx as i16, cur_ty as i16));
                 let dx = fastrand::i32(-96..=96);
                 let dy = fastrand::i32(-96..=96);
                 let target_tx = (home.0 as i32 + dx).max(0) as i16;
                 let target_ty = (home.1 as i32 + dy).max(0) as i16;
 
-                assign_task_with_routing(&mut ai, cur_chunk, (target_tx, target_ty), TaskKind::Explore, None, &chunk_graph, &chunk_map);
+                assign_task_with_routing(
+                    &mut ai,
+                    cur_chunk,
+                    (target_tx, target_ty),
+                    TaskKind::Explore,
+                    None,
+                    &chunk_graph,
+                    &chunk_map,
+                );
                 continue;
             }
 
             let plan_def = match scoring {
                 PlanScoringMethod::UtilityNN => {
                     if let Some(ref mut net) = net_opt {
-                        let state = build_state_vec(needs, agent, skills, member, memory_opt, &calendar);
-                        let mut scores: Vec<(u16, f32)> = candidates.iter()
+                        let state =
+                            build_state_vec(needs, agent, skills, member, memory_opt, &calendar);
+                        let mut scores: Vec<(u16, f32)> = candidates
+                            .iter()
                             .map(|p| (p.id, net.score_plan(state, p.feature_vec, p.id)))
                             .collect();
 
@@ -647,12 +894,17 @@ pub fn plan_execution_system(
                             }
 
                             let target_tile = plan_def.memory_target_kind.and_then(|k| {
-                                memory_opt.and_then(|m| m.best_for_dist_weighted(k, (cur_tx, cur_ty)))
+                                memory_opt
+                                    .and_then(|m| m.best_for_dist_weighted(k, (cur_tx, cur_ty)))
                             });
 
                             if let Some(target) = target_tile {
-                                let dist_agent = (target.0 as i32 - cur_tx).abs() + (target.1 as i32 - cur_ty).abs();
-                                let dist_camp = camp_pos.map_or(0, |c| (target.0 as i32 - c.0 as i32).abs() + (target.1 as i32 - c.1 as i32).abs());
+                                let dist_agent = (target.0 as i32 - cur_tx).abs()
+                                    + (target.1 as i32 - cur_ty).abs();
+                                let dist_camp = camp_pos.map_or(0, |c| {
+                                    (target.0 as i32 - c.0 as i32).abs()
+                                        + (target.1 as i32 - c.1 as i32).abs()
+                                });
 
                                 // Penalty: -0.002 per tile of total distance
                                 *score -= (dist_agent + dist_camp) as f32 * 0.002;
@@ -672,19 +924,17 @@ pub fn plan_execution_system(
                         candidates[fastrand::usize(..candidates.len())]
                     }
                 }
-                PlanScoringMethod::Random => {
-                    candidates[fastrand::usize(..candidates.len())]
-                }
+                PlanScoringMethod::Random => candidates[fastrand::usize(..candidates.len())],
             };
 
             commands.entity(entity).insert(ActivePlan {
-                plan_id:      plan_def.id,
+                plan_id: plan_def.id,
                 current_step: 0,
                 started_tick: clock.tick,
-                max_ticks:    5000,
-                reward_acc:   0.0,
+                max_ticks: 5000,
+                reward_acc: 0.0,
                 reward_scale: 0.0,
-                dispatched:   false,
+                dispatched: false,
             });
             continue;
         }
@@ -692,7 +942,9 @@ pub fn plan_execution_system(
         let active_plan = active_plan_opt.as_deref_mut().unwrap();
 
         // ── Abandon if goal changed (no longer served by this plan) ──────────
-        let plan_still_valid = plan_registry.0.iter()
+        let plan_still_valid = plan_registry
+            .0
+            .iter()
             .find(|p| p.id == active_plan.plan_id)
             .map(|p| p.serves_goals.contains(&goal))
             .unwrap_or(false);
@@ -718,7 +970,12 @@ pub fn plan_execution_system(
 
         // ── Fetch plan and current step ───────────────────────────────────────
         let plan_def = match plan_registry.0.iter().find(|p| p.id == active_plan.plan_id) {
-            Some(p) => p, None => { commands.entity(entity).remove::<ActivePlan>(); combat_target.0 = None; continue; }
+            Some(p) => p,
+            None => {
+                commands.entity(entity).remove::<ActivePlan>();
+                combat_target.0 = None;
+                continue;
+            }
         };
 
         if active_plan.current_step as usize >= plan_def.steps.len() {
@@ -735,11 +992,17 @@ pub fn plan_execution_system(
 
         let step_id = plan_def.steps[active_plan.current_step as usize];
         let step_def = match step_registry.0.iter().find(|s| s.id == step_id) {
-            Some(s) => s, None => { commands.entity(entity).remove::<ActivePlan>(); combat_target.0 = None; continue; }
+            Some(s) => s,
+            None => {
+                commands.entity(entity).remove::<ActivePlan>();
+                combat_target.0 = None;
+                continue;
+            }
         };
 
         // ── Step completion: dispatched + agent went back to Idle+UNEMPLOYED ──
-        if active_plan.dispatched && ai.state == AiState::Idle && ai.task_id == PersonAI::UNEMPLOYED {
+        if active_plan.dispatched && ai.state == AiState::Idle && ai.task_id == PersonAI::UNEMPLOYED
+        {
             active_plan.current_step += 1;
             active_plan.dispatched = false;
 
@@ -758,7 +1021,9 @@ pub fn plan_execution_system(
 
         // ── Dispatch current step if not yet dispatched ───────────────────────
         if !active_plan.dispatched {
-            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED { continue; }
+            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+                continue;
+            }
 
             // Check preconditions
             if let Some((good, qty)) = step_def.preconditions.requires_good {
@@ -770,26 +1035,54 @@ pub fn plan_execution_system(
             }
 
             if let Some((ent, target_tx, target_ty)) = resolve_target(
-                step_def, (cur_tx, cur_ty),
-                &chunk_map, &spatial, &plant_map, &plant_query,
-                &faction_registry, member.faction_id,
-                memory_opt, &item_check,
-                &prey_query, &mut combat_target,
+                step_def,
+                (cur_tx, cur_ty),
+                &chunk_map,
+                &spatial,
+                &plant_map,
+                &plant_query,
+                &faction_registry,
+                &storage_tile_map,
+                member.faction_id,
+                goal,
+                memory_opt,
+                &item_check,
+                &prey_query,
+                &mut combat_target,
                 &mut target_item,
-                &bp_map, &bp_query,
+                &bp_map,
+                &bp_query,
             ) {
-                assign_task_with_routing(&mut ai, cur_chunk, (target_tx, target_ty), step_def.task, ent, &chunk_graph, &chunk_map);
+                assign_task_with_routing(
+                    &mut ai,
+                    cur_chunk,
+                    (target_tx, target_ty),
+                    step_def.task,
+                    ent,
+                    &chunk_graph,
+                    &chunk_map,
+                );
                 active_plan.dispatched = true;
                 active_plan.reward_scale = step_def.reward_scale;
             } else {
                 // No valid target — explore instead of just failing
-                let home = faction_registry.home_tile(member.faction_id).unwrap_or((cur_tx as i16, cur_ty as i16));
+                let home = faction_registry
+                    .home_tile(member.faction_id)
+                    .unwrap_or((cur_tx as i16, cur_ty as i16));
                 let dx = fastrand::i32(-96..=96);
                 let dy = fastrand::i32(-96..=96);
                 let target_tx = (home.0 as i32 + dx).max(0) as i16;
                 let target_ty = (home.1 as i32 + dy).max(0) as i16;
 
-                assign_task_with_routing(&mut ai, cur_chunk, (target_tx, target_ty), TaskKind::Explore, None, &chunk_graph, &chunk_map);
+                assign_task_with_routing(
+                    &mut ai,
+                    cur_chunk,
+                    (target_tx, target_ty),
+                    TaskKind::Explore,
+                    None,
+                    &chunk_graph,
+                    &chunk_map,
+                );
                 commands.entity(entity).remove::<ActivePlan>();
                 combat_target.0 = None;
             }
@@ -805,7 +1098,15 @@ pub fn plan_execution_system(
                             let ptx = (target_t.translation.x / TILE_SIZE).floor() as i16;
                             let pty = (target_t.translation.y / TILE_SIZE).floor() as i16;
                             if ai.dest_tile != (ptx, pty) {
-                                assign_task_with_routing(&mut ai, cur_chunk, (ptx, pty), step_def.task, Some(target_ent), &chunk_graph, &chunk_map);
+                                assign_task_with_routing(
+                                    &mut ai,
+                                    cur_chunk,
+                                    (ptx, pty),
+                                    step_def.task,
+                                    Some(target_ent),
+                                    &chunk_graph,
+                                    &chunk_map,
+                                );
                             }
                         }
                     } else {
@@ -829,18 +1130,23 @@ pub fn plan_gossip_system(
     mut query: Query<(Entity, &AgentGoal, &Transform, &mut KnownPlans, &LodLevel)>,
 ) {
     // Pass 1: snapshot known plans from Socialize agents
-    let snapshots: AHashMap<Entity, Vec<(PlanId, u8)>> = query.iter()
+    let snapshots: AHashMap<Entity, Vec<(PlanId, u8)>> = query
+        .iter()
         .filter(|(_, goal, _, _, lod)| {
             matches!(goal, AgentGoal::Socialize) && **lod != LodLevel::Dormant
         })
         .map(|(e, _, _, plans, _)| (e, plans.top_entries(8)))
         .collect();
 
-    if snapshots.is_empty() { return; }
+    if snapshots.is_empty() {
+        return;
+    }
 
     // Pass 2: apply gossip to Socialize agents within 3 tiles
     for (entity, goal, transform, mut known_plans, lod) in query.iter_mut() {
-        if *lod == LodLevel::Dormant || !matches!(goal, AgentGoal::Socialize) { continue; }
+        if *lod == LodLevel::Dormant || !matches!(goal, AgentGoal::Socialize) {
+            continue;
+        }
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
@@ -848,7 +1154,9 @@ pub fn plan_gossip_system(
         for dy in -3i32..=3 {
             for dx in -3i32..=3 {
                 for &other in spatial.get(tx + dx, ty + dy) {
-                    if other == entity { continue; }
+                    if other == entity {
+                        continue;
+                    }
                     if let Some(entries) = snapshots.get(&other) {
                         for &(plan_id, freshness) in entries {
                             known_plans.receive_gossip(plan_id, freshness / 2);
@@ -863,11 +1171,10 @@ pub fn plan_gossip_system(
 // ── Plan decay system ─────────────────────────────────────────────────────────
 // Runs in Economy set every 120 ticks.
 
-pub fn plan_decay_system(
-    clock: Res<SimClock>,
-    mut query: Query<&mut KnownPlans>,
-) {
-    if clock.tick % 120 != 0 { return; }
+pub fn plan_decay_system(clock: Res<SimClock>, mut query: Query<&mut KnownPlans>) {
+    if clock.tick % 120 != 0 {
+        return;
+    }
     for mut plans in &mut query {
         plans.decay();
     }

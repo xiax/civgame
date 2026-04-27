@@ -1,20 +1,21 @@
-use bevy::prelude::*;
 use ahash::AHashMap;
+use bevy::prelude::*;
+use std::time::Instant;
 
+use crate::rendering::camera::CameraViewZ;
 use crate::rendering::color_map::{shaded_tile_color, z_bucket};
+use crate::simulation::construction::{Wall, WallMap};
 use crate::simulation::plants::{
-    spawn_plant_at, GrowthStage, PlantKind, PlantMap,
-    PlantSpriteIndex,
+    spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE, Z_MIN};
 use crate::world::globe::{Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 use crate::world::terrain::{generate_chunk_from_globe, tile_at_3d, WorldGen, TILE_SIZE};
 use crate::world::tile::TileKind;
 
-pub const LOAD_RADIUS:   i32 = 12;
+pub const LOAD_RADIUS: i32 = 12;
 pub const UNLOAD_RADIUS: i32 = 16;
 
-// Used only for the deterministic plant hash, not for noise generation.
 const PLANT_HASH_SEED: u32 = 42;
 
 /// One ColorMaterial per (TileKind as u8, z_bucket) pair.
@@ -27,21 +28,41 @@ pub struct TileMaterials {
 
 impl TileMaterials {
     pub fn handle_for(&self, kind: TileKind, z: i32) -> Handle<ColorMaterial> {
-        self.materials.get(&(kind as u8, z_bucket(z))).cloned().unwrap_or_default()
+        self.materials
+            .get(&(kind as u8, z_bucket(z)))
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
 #[derive(Resource, Default)]
 pub struct TileSpriteIndex {
     pub by_chunk: AHashMap<ChunkCoord, Vec<Entity>>,
+    /// Per-tile lookup for TileSprite entities (excludes Wall entities).
+    pub by_tile: AHashMap<(i16, i16), Entity>,
 }
 
 #[derive(Component)]
 pub struct TileSprite;
 
+/// Fired by dig_system when a tile's surface changes. The rendering layer
+/// despawns the old sprite and spawns a new one matching the updated terrain.
+#[derive(Event)]
+pub struct TileChangedEvent {
+    pub tx: i16,
+    pub ty: i16,
+}
+
 const RENDERABLE_KINDS: &[TileKind] = &[
-    TileKind::Grass, TileKind::Water, TileKind::Stone, TileKind::Forest,
-    TileKind::Farmland, TileKind::Road, TileKind::Wall, TileKind::Ramp, TileKind::Dirt,
+    TileKind::Grass,
+    TileKind::Water,
+    TileKind::Stone,
+    TileKind::Forest,
+    TileKind::Farmland,
+    TileKind::Road,
+    TileKind::Wall,
+    TileKind::Ramp,
+    TileKind::Dirt,
 ];
 
 /// PostStartup: create one shaded ColorMaterial per (TileKind, z_bucket) pair.
@@ -50,37 +71,41 @@ pub fn setup_tile_materials(
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    // Shared mesh for all tiles
     tile_materials.tile_mesh = meshes.add(Rectangle::new(TILE_SIZE - 0.5, TILE_SIZE - 0.5));
 
-    // z_bucket range: Z_MIN/4 to Z_MAX/4
     let bucket_min = Z_MIN.div_euclid(4);
     let bucket_max = 15_i32.div_euclid(4);
 
     for &kind in RENDERABLE_KINDS {
         for bucket in bucket_min..=bucket_max {
-            // Representative Z for this bucket — use the midpoint.
             let z = bucket * 4 + 2;
             let color = shaded_tile_color(kind, z);
             let handle = materials.add(ColorMaterial::from_color(color));
-            tile_materials.materials.insert((kind as u8, bucket), handle);
+            tile_materials
+                .materials
+                .insert((kind as u8, bucket), handle);
         }
     }
 }
 
-/// Spawn tile sprites for a single chunk; registers them in TileSpriteIndex.
-use crate::simulation::construction::{Wall, WallMap};
-
+/// Spawn tile sprites for a single chunk; populates both by_chunk and by_tile.
 pub fn spawn_chunk_sprites(
     commands: &mut Commands,
     tile_materials: &TileMaterials,
     sprite_index: &mut TileSpriteIndex,
     wall_map: &mut WallMap,
     chunk_map: &ChunkMap,
+    gen: &WorldGen,
+    globe: &Globe,
     coord: ChunkCoord,
+    camera_view_z: i32,
 ) {
-    let Some(chunk) = chunk_map.0.get(&coord) else { return };
-    if sprite_index.by_chunk.contains_key(&coord) { return; }
+    let Some(chunk) = chunk_map.0.get(&coord) else {
+        return;
+    };
+    if sprite_index.by_chunk.contains_key(&coord) {
+        return;
+    }
 
     let mut entities = Vec::with_capacity(CHUNK_SIZE * CHUNK_SIZE);
 
@@ -89,54 +114,94 @@ pub fn spawn_chunk_sprites(
             let global_tx = coord.0 * CHUNK_SIZE as i32 + tx as i32;
             let global_ty = coord.1 * CHUNK_SIZE as i32 + ty as i32;
             let surf_z = chunk.surface_z[ty][tx] as i32;
-            let kind   = chunk.surface_tile_kind(tx, ty);
+            let kind = chunk.surface_tile_kind(tx, ty);
 
-            // Don't render Air (open sky or void).
-            if kind == TileKind::Air { continue; }
+            if kind == TileKind::Air {
+                continue;
+            }
 
             let wx = global_tx as f32 * TILE_SIZE + TILE_SIZE * 0.5;
             let wy = global_ty as f32 * TILE_SIZE + TILE_SIZE * 0.5;
+            let tile_pos = (global_tx as i16, global_ty as i16);
 
             if kind == TileKind::Wall {
-                let tile_pos = (global_tx as i16, global_ty as i16);
                 if !wall_map.0.contains_key(&tile_pos) {
-                    let entity = commands.spawn((
-                        Wall,
-                        Transform::from_xyz(wx, wy, 0.4),
-                        GlobalTransform::default(),
-                        Visibility::Visible,
-                        InheritedVisibility::default(),
-                    )).id();
+                    let entity = commands
+                        .spawn((
+                            Wall,
+                            Transform::from_xyz(wx, wy, 0.4),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        ))
+                        .id();
                     wall_map.0.insert(tile_pos, entity);
                     entities.push(entity);
-                } else {
-                    // Already has a wall entity (e.g. from construction),
-                    // but we should probably track it in this chunk's entity list
-                    // so it gets despawned when the chunk unloads.
-                    if let Some(&entity) = wall_map.0.get(&tile_pos) {
-                        entities.push(entity);
-                    }
+                } else if let Some(&entity) = wall_map.0.get(&tile_pos) {
+                    entities.push(entity);
                 }
                 continue;
             }
 
-            let entity = commands.spawn((
-                TileSprite,
-                Mesh2d(tile_materials.tile_mesh.clone()),
-                MeshMaterial2d(tile_materials.handle_for(kind, surf_z)),
-                Transform::from_xyz(wx, wy, 0.0),
-                GlobalTransform::default(),
-                Visibility::Visible,
-                InheritedVisibility::default(),
-            )).id();
+            // Compute the effective render Z and tile for this position
+            let (render_kind, render_z, visibility) = resolve_render_tile(
+                chunk_map,
+                gen,
+                globe,
+                global_tx,
+                global_ty,
+                surf_z,
+                camera_view_z,
+            );
+
+            let entity = commands
+                .spawn((
+                    TileSprite,
+                    Mesh2d(tile_materials.tile_mesh.clone()),
+                    MeshMaterial2d(tile_materials.handle_for(render_kind, render_z)),
+                    Transform::from_xyz(wx, wy, 0.0),
+                    GlobalTransform::default(),
+                    visibility,
+                    InheritedVisibility::default(),
+                ))
+                .id();
             entities.push(entity);
+            sprite_index.by_tile.insert(tile_pos, entity);
         }
     }
 
     sprite_index.by_chunk.insert(coord, entities);
 }
 
-/// Deterministically seed initial plants for a chunk using a hash of tile coordinates.
+/// Determine what to render at a tile given the camera view Z.
+/// Returns (kind, z_for_shading, visibility).
+fn resolve_render_tile(
+    chunk_map: &ChunkMap,
+    gen: &WorldGen,
+    globe: &Globe,
+    tx: i32,
+    ty: i32,
+    surf_z: i32,
+    camera_view_z: i32,
+) -> (TileKind, i32, Visibility) {
+    if camera_view_z == i32::MAX || surf_z <= camera_view_z {
+        // Surface tile is at or below the view level — render normally
+        let kind = chunk_map.tile_kind_at(tx, ty).unwrap_or(TileKind::Air);
+        if kind == TileKind::Air {
+            return (TileKind::Grass, surf_z, Visibility::Hidden);
+        }
+        return (kind, surf_z, Visibility::Visible);
+    }
+    // Surface tile is above the view level — show what's at camera_view_z instead
+    let underground_tile = tile_at_3d(chunk_map, gen, globe, tx, ty, camera_view_z);
+    if underground_tile.kind == TileKind::Air {
+        (TileKind::Grass, camera_view_z, Visibility::Hidden)
+    } else {
+        (underground_tile.kind, camera_view_z, Visibility::Visible)
+    }
+}
+
+/// Deterministically seed initial plants for a chunk.
 pub fn spawn_chunk_plants(
     commands: &mut Commands,
     plant_map: &mut PlantMap,
@@ -146,7 +211,9 @@ pub fn spawn_chunk_plants(
     globe: &Globe,
     coord: ChunkCoord,
 ) {
-    let Some(chunk) = chunk_map.0.get(&coord) else { return };
+    let Some(chunk) = chunk_map.0.get(&coord) else {
+        return;
+    };
 
     for ty in 0..CHUNK_SIZE {
         for tx in 0..CHUNK_SIZE {
@@ -155,7 +222,6 @@ pub fn spawn_chunk_plants(
             let surf_z = chunk.surface_z[ty][tx] as i32;
             let tile = tile_at_3d(chunk_map, gen, globe, global_tx, global_ty, surf_z);
 
-            // Deterministic hash for this tile
             let h = (global_tx.wrapping_mul(2_654_435_761_u32 as i32)
                 ^ global_ty.wrapping_mul(2_246_822_519_u32 as i32)
                 ^ PLANT_HASH_SEED as i32) as u32;
@@ -171,29 +237,49 @@ pub fn spawn_chunk_plants(
                         continue;
                     };
                     spawn_plant_at(
-                        commands, plant_map, plant_sprite_index,
-                        global_tx, global_ty, kind, stage,
+                        commands,
+                        plant_map,
+                        plant_sprite_index,
+                        global_tx,
+                        global_ty,
+                        kind,
+                        stage,
                     );
                 }
                 TileKind::Grass if tile.fertility > 100 => {
                     let pct = h % 100;
                     if pct < 2 {
                         spawn_plant_at(
-                            commands, plant_map, plant_sprite_index,
-                            global_tx, global_ty, PlantKind::FruitBush, initial_stage(h),
+                            commands,
+                            plant_map,
+                            plant_sprite_index,
+                            global_tx,
+                            global_ty,
+                            PlantKind::FruitBush,
+                            initial_stage(h),
                         );
                     } else if pct < 7 {
                         spawn_plant_at(
-                            commands, plant_map, plant_sprite_index,
-                            global_tx, global_ty, PlantKind::Tree, initial_stage(h),
+                            commands,
+                            plant_map,
+                            plant_sprite_index,
+                            global_tx,
+                            global_ty,
+                            PlantKind::Tree,
+                            initial_stage(h),
                         );
                     }
                 }
                 TileKind::Forest => {
                     if h % 100 < 40 {
                         spawn_plant_at(
-                            commands, plant_map, plant_sprite_index,
-                            global_tx, global_ty, PlantKind::Tree, initial_stage(h),
+                            commands,
+                            plant_map,
+                            plant_sprite_index,
+                            global_tx,
+                            global_ty,
+                            PlantKind::Tree,
+                            initial_stage(h),
                         );
                     }
                 }
@@ -210,50 +296,9 @@ fn initial_stage(h: u32) -> GrowthStage {
     }
 }
 
-/// PostStartup: spawn sprites for initial chunks (already generated by spawn_world_system).
-pub fn spawn_initial_tile_sprites(
-    mut commands: Commands,
-    tile_materials: Res<TileMaterials>,
-    mut sprite_index: ResMut<TileSpriteIndex>,
-    mut wall_map: ResMut<WallMap>,
-    chunk_map: Res<ChunkMap>,
-    gen: Res<WorldGen>,
-    mut globe: ResMut<Globe>,
-    mut plant_map: ResMut<PlantMap>,
-    mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-) {
-    let coords: Vec<ChunkCoord> = chunk_map.0.keys().copied().collect();
-    for coord in coords {
-        let (gx, gy) = Globe::cell_for_chunk(coord.0, coord.1);
-        if let Some(gc) = globe.cell_mut(gx, gy) {
-            gc.explored = true;
-        }
-
-        spawn_chunk_sprites(
-            &mut commands,
-            &tile_materials,
-            &mut sprite_index,
-            &mut wall_map,
-            &chunk_map,
-            coord,
-        );
-
-        spawn_chunk_plants(
-            &mut commands,
-            &mut plant_map,
-            &mut plant_sprite_index,
-            &chunk_map,
-            &gen,
-            &globe,
-            coord,
-        );
-    }
-
-    info!("Initial tile sprites spawned for {} chunks", sprite_index.by_chunk.len());
-}
-
 /// Update: stream chunks in/out as the camera moves.
 pub fn chunk_streaming_system(
+    mut has_run: Local<bool>,
     mut commands: Commands,
     tile_materials: Res<TileMaterials>,
     mut sprite_index: ResMut<TileSpriteIndex>,
@@ -263,14 +308,18 @@ pub fn chunk_streaming_system(
     mut globe: ResMut<Globe>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
+    camera_view_z: Res<CameraViewZ>,
     camera_q: Query<&Transform, With<Camera>>,
 ) {
-    let Ok(cam_transform) = camera_q.get_single() else { return };
+    let now = Instant::now();
+    let Ok(cam_transform) = camera_q.get_single() else {
+        return;
+    };
 
     let cam_cx = (cam_transform.translation.x / (CHUNK_SIZE as f32 * TILE_SIZE)).floor() as i32;
     let cam_cy = (cam_transform.translation.y / (CHUNK_SIZE as f32 * TILE_SIZE)).floor() as i32;
 
-    let total_cx = GLOBE_WIDTH  * GLOBE_CELL_CHUNKS;
+    let total_cx = GLOBE_WIDTH * GLOBE_CELL_CHUNKS;
     let total_cy = GLOBE_HEIGHT * GLOBE_CELL_CHUNKS;
 
     // --- Load chunks within LOAD_RADIUS ---
@@ -279,44 +328,56 @@ pub fn chunk_streaming_system(
             let cx = cam_cx + dx;
             let cy = cam_cy + dy;
 
-            if cx < 0 || cy < 0 || cx >= total_cx || cy >= total_cy { continue; }
-
-            let coord = ChunkCoord(cx, cy);
-            if chunk_map.0.contains_key(&coord) { continue; }
-
-            let (gx, gy) = Globe::cell_for_chunk(cx, cy);
-            let cell = globe.cell(gx, gy).copied();
-            let Some(c) = cell else { continue };
-            let chunk = generate_chunk_from_globe(coord, &c, &gen);
-            chunk_map.0.insert(coord, chunk);
-
-            if let Some(gc) = globe.cell_mut(gx, gy) {
-                gc.explored = true;
+            if cx < 0 || cy < 0 || cx >= total_cx || cy >= total_cy {
+                continue;
             }
 
-            spawn_chunk_sprites(
-                &mut commands,
-                &tile_materials,
-                &mut sprite_index,
-                &mut wall_map,
-                &chunk_map,
-                coord,
-            );
+            let coord = ChunkCoord(cx, cy);
+            let (gx, gy) = Globe::cell_for_chunk(cx, cy);
 
-            spawn_chunk_plants(
-                &mut commands,
-                &mut plant_map,
-                &mut plant_sprite_index,
-                &chunk_map,
-                &gen,
-                &globe,
-                coord,
-            );
+            // 1. Ensure the chunk data exists in ChunkMap
+            if !chunk_map.0.contains_key(&coord) {
+                let cell = globe.cell(gx, gy).copied();
+                let Some(c) = cell else { continue };
+                let chunk = generate_chunk_from_globe(coord, &c, &gen);
+                chunk_map.0.insert(coord, chunk);
+
+                if let Some(gc) = globe.cell_mut(gx, gy) {
+                    gc.explored = true;
+                }
+            }
+
+            // 2. Lazy-spawn sprites if not already present
+            if !sprite_index.by_chunk.contains_key(&coord) {
+                spawn_chunk_sprites(
+                    &mut commands,
+                    &tile_materials,
+                    &mut sprite_index,
+                    &mut wall_map,
+                    &chunk_map,
+                    &gen,
+                    &globe,
+                    coord,
+                    camera_view_z.0,
+                );
+
+                spawn_chunk_plants(
+                    &mut commands,
+                    &mut plant_map,
+                    &mut plant_sprite_index,
+                    &chunk_map,
+                    &gen,
+                    &globe,
+                    coord,
+                );
+            }
         }
     }
 
     // --- Unload chunks beyond UNLOAD_RADIUS ---
-    let to_unload: Vec<ChunkCoord> = chunk_map.0.keys()
+    let to_unload: Vec<ChunkCoord> = chunk_map
+        .0
+        .keys()
         .copied()
         .filter(|&c| {
             let dx = (c.0 - cam_cx).abs();
@@ -329,10 +390,17 @@ pub fn chunk_streaming_system(
         chunk_map.0.remove(&coord);
 
         let x0 = (coord.0 * CHUNK_SIZE as i32) as i16;
-        let x1 = x0 + CHUNK_SIZE as i16;
         let y0 = (coord.1 * CHUNK_SIZE as i32) as i16;
-        let y1 = y0 + CHUNK_SIZE as i16;
-        wall_map.0.retain(|&(tx, ty), _| tx < x0 || tx >= x1 || ty < y0 || ty >= y1);
+
+        // Optimization: iterate locally over chunk tiles instead of scanning the whole map.
+        for ly in 0..CHUNK_SIZE as i16 {
+            for lx in 0..CHUNK_SIZE as i16 {
+                let tx = x0 + lx;
+                let ty = y0 + ly;
+                wall_map.0.remove(&(tx, ty));
+                sprite_index.by_tile.remove(&(tx, ty));
+            }
+        }
 
         if let Some(entities) = sprite_index.by_chunk.remove(&coord) {
             for e in entities {
@@ -345,5 +413,152 @@ pub fn chunk_streaming_system(
                 commands.entity(e).despawn_recursive();
             }
         }
+    }
+
+    if !*has_run {
+        info!(
+            "First chunk_streaming_system execution took {:?}",
+            now.elapsed()
+        );
+        *has_run = true;
+    }
+}
+
+/// PostUpdate: rebuild tile sprites at positions reported by TileChangedEvent.
+pub fn refresh_changed_tiles_system(
+    mut commands: Commands,
+    mut events: EventReader<TileChangedEvent>,
+    mut sprite_index: ResMut<TileSpriteIndex>,
+    mut wall_map: ResMut<WallMap>,
+    chunk_map: Res<ChunkMap>,
+    tile_materials: Res<TileMaterials>,
+    gen: Res<WorldGen>,
+    globe: Res<Globe>,
+    camera_view_z: Res<CameraViewZ>,
+) {
+    for ev in events.read() {
+        let tx = ev.tx;
+        let ty = ev.ty;
+        let coord = ChunkCoord(
+            (tx as i32).div_euclid(CHUNK_SIZE as i32),
+            (ty as i32).div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Despawn old TileSprite entity for this position
+        if let Some(old_entity) = sprite_index.by_tile.remove(&(tx, ty)) {
+            if let Some(chunk_entities) = sprite_index.by_chunk.get_mut(&coord) {
+                chunk_entities.retain(|&e| e != old_entity);
+            }
+            commands.entity(old_entity).despawn_recursive();
+        }
+
+        // Also clean up any Wall entity at this position (e.g., mined wall)
+        if let Some(wall_entity) = wall_map.0.remove(&(tx, ty)) {
+            if let Some(chunk_entities) = sprite_index.by_chunk.get_mut(&coord) {
+                chunk_entities.retain(|&e| e != wall_entity);
+            }
+            commands.entity(wall_entity).despawn_recursive();
+        }
+
+        // Get the new tile data
+        let surf_z = chunk_map.surface_z_at(tx as i32, ty as i32);
+        if surf_z < Z_MIN {
+            continue;
+        }
+
+        let surface_kind = chunk_map
+            .tile_kind_at(tx as i32, ty as i32)
+            .unwrap_or(TileKind::Air);
+        if surface_kind == TileKind::Air {
+            continue;
+        }
+
+        let wx = tx as f32 * TILE_SIZE + TILE_SIZE * 0.5;
+        let wy = ty as f32 * TILE_SIZE + TILE_SIZE * 0.5;
+
+        if surface_kind == TileKind::Wall {
+            // Spawn a new Wall entity (entity_sprites will attach the visual child)
+            let new_entity = commands
+                .spawn((
+                    Wall,
+                    Transform::from_xyz(wx, wy, 0.4),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            wall_map.0.insert((tx, ty), new_entity);
+            if let Some(chunk_entities) = sprite_index.by_chunk.get_mut(&coord) {
+                chunk_entities.push(new_entity);
+            }
+        } else {
+            let (render_kind, render_z, visibility) = resolve_render_tile(
+                &chunk_map,
+                &gen,
+                &globe,
+                tx as i32,
+                ty as i32,
+                surf_z,
+                camera_view_z.0,
+            );
+
+            let new_entity = commands
+                .spawn((
+                    TileSprite,
+                    Mesh2d(tile_materials.tile_mesh.clone()),
+                    MeshMaterial2d(tile_materials.handle_for(render_kind, render_z)),
+                    Transform::from_xyz(wx, wy, 0.0),
+                    GlobalTransform::default(),
+                    visibility,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            sprite_index.by_tile.insert((tx, ty), new_entity);
+            if let Some(chunk_entities) = sprite_index.by_chunk.get_mut(&coord) {
+                chunk_entities.push(new_entity);
+            }
+        }
+    }
+}
+
+/// Update: when CameraViewZ changes, update all TileSprite materials and visibility
+/// to reflect the new viewing depth.
+pub fn update_tile_z_view_system(
+    mut has_run: Local<bool>,
+    camera_view_z: Res<CameraViewZ>,
+    chunk_map: Res<ChunkMap>,
+    tile_materials: Res<TileMaterials>,
+    gen: Res<WorldGen>,
+    globe: Res<Globe>,
+    sprite_index: Res<TileSpriteIndex>,
+    mut query: Query<(&mut MeshMaterial2d<ColorMaterial>, &mut Visibility), With<TileSprite>>,
+) {
+    if !camera_view_z.is_changed() {
+        return;
+    }
+
+    let now = Instant::now();
+    let view_z = camera_view_z.0;
+
+    for (&(tx, ty), &entity) in &sprite_index.by_tile {
+        let Ok((mut material, mut vis)) = query.get_mut(entity) else {
+            continue;
+        };
+
+        let surf_z = chunk_map.surface_z_at(tx as i32, ty as i32);
+        let (render_kind, render_z, new_vis) = resolve_render_tile(
+            &chunk_map, &gen, &globe, tx as i32, ty as i32, surf_z, view_z,
+        );
+
+        material.0 = tile_materials.handle_for(render_kind, render_z);
+        *vis = new_vis;
+    }
+
+    if !*has_run {
+        info!(
+            "First update_tile_z_view_system execution took {:?}",
+            now.elapsed()
+        );
+        *has_run = true;
     }
 }

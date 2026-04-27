@@ -3,16 +3,16 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TileKind {
     #[default]
-    Grass    = 0,
-    Water    = 1,
-    Stone    = 2,
-    Forest   = 3,
+    Grass = 0,
+    Water = 1,
+    Stone = 2,
+    Forest = 3,
     Farmland = 4,
-    Road     = 5,
-    Air      = 6,  // open space — above ground or underground cavity
-    Wall     = 7,  // solid rock/earth — blocks movement and LOS
-    Ramp     = 8,  // slope — passable, allows ±1 Z movement
-    Dirt     = 9,  // underground floor (carved cave ceiling/floor)
+    Road = 5,
+    Air = 6,  // open space — above ground or underground cavity
+    Wall = 7, // solid rock/earth — blocks movement and LOS
+    Ramp = 8, // slope — passable, allows ±1 Z movement
+    Dirt = 9, // underground floor (carved cave ceiling/floor)
 }
 
 impl TileKind {
@@ -34,7 +34,7 @@ impl TileKind {
 /// 4 bytes per tile — cache-friendly.
 #[derive(Clone, Copy, Default)]
 pub struct TileData {
-    pub kind:      TileKind,
+    pub kind: TileKind,
     pub elevation: u8,
     pub fertility: u8,
     /// bit 0: has_building, bit 1: has_road, bit 2: explored, bit 3: currently_visible
@@ -65,19 +65,28 @@ mod tests {
 
     #[test]
     fn water_not_passable() {
-        let t = TileData { kind: TileKind::Water, ..Default::default() };
+        let t = TileData {
+            kind: TileKind::Water,
+            ..Default::default()
+        };
         assert!(!t.is_passable());
     }
 
     #[test]
     fn grass_passable() {
-        let t = TileData { kind: TileKind::Grass, ..Default::default() };
+        let t = TileData {
+            kind: TileKind::Grass,
+            ..Default::default()
+        };
         assert!(t.is_passable());
     }
 
     #[test]
     fn wall_not_passable() {
-        let t = TileData { kind: TileKind::Wall, ..Default::default() };
+        let t = TileData {
+            kind: TileKind::Wall,
+            ..Default::default()
+        };
         assert!(!t.is_passable());
         assert!(t.kind.is_solid());
         assert!(t.kind.is_opaque());
@@ -85,13 +94,19 @@ mod tests {
 
     #[test]
     fn air_not_passable() {
-        let t = TileData { kind: TileKind::Air, ..Default::default() };
+        let t = TileData {
+            kind: TileKind::Air,
+            ..Default::default()
+        };
         assert!(!t.is_passable());
     }
 
     #[test]
     fn ramp_passable() {
-        let t = TileData { kind: TileKind::Ramp, ..Default::default() };
+        let t = TileData {
+            kind: TileKind::Ramp,
+            ..Default::default()
+        };
         assert!(t.is_passable());
     }
 }

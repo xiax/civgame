@@ -1,12 +1,13 @@
 use bevy::prelude::*;
 use noise::{NoiseFn, Perlin, Seedable};
+use std::time::Instant;
 
-use super::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE, CHUNK_HEIGHT, Z_MIN, Z_MAX};
+use super::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_HEIGHT, CHUNK_SIZE, Z_MAX, Z_MIN};
 use super::globe::{Biome, Globe, WorldCell, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 use super::tile::{TileData, TileKind};
 
-pub const WORLD_CHUNKS_X: i32 = 64;
-pub const WORLD_CHUNKS_Y: i32 = 64;
+pub const WORLD_CHUNKS_X: i32 = 32;
+pub const WORLD_CHUNKS_Y: i32 = 32;
 pub const TILE_SIZE: f32 = 16.0;
 
 const WORLD_SEED: u32 = 42;
@@ -15,33 +16,35 @@ const WORLD_SEED: u32 = 42;
 #[derive(Resource)]
 pub struct WorldGen {
     pub surface: Perlin, // 2D surface height + tile kind (seed WORLD_SEED)
-    pub cave:    Perlin, // 3D cave cavities (seed WORLD_SEED + 1)
+    pub cave: Perlin,    // 3D cave cavities (seed WORLD_SEED + 1)
 }
 
 impl WorldGen {
     pub fn new() -> Self {
         Self {
             surface: Perlin::default().set_seed(WORLD_SEED),
-            cave:    Perlin::default().set_seed(WORLD_SEED + 1),
+            cave: Perlin::default().set_seed(WORLD_SEED + 1),
         }
     }
 }
 
 impl Default for WorldGen {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Return biome tile thresholds: (water_t, grass_t, farm_t, forest_t).
 pub fn biome_thresholds(biome: Biome) -> (f32, f32, f32, f32) {
     match biome {
-        Biome::Ocean     => (0.90, 0.95, 0.97, 0.99),
-        Biome::Tundra    => (0.15, 0.80, 0.85, 0.95),
-        Biome::Taiga     => (0.18, 0.35, 0.40, 0.85),
+        Biome::Ocean => (0.90, 0.95, 0.97, 0.99),
+        Biome::Tundra => (0.15, 0.80, 0.85, 0.95),
+        Biome::Taiga => (0.18, 0.35, 0.40, 0.85),
         Biome::Temperate => (0.22, 0.45, 0.60, 0.85),
         Biome::Grassland => (0.18, 0.60, 0.75, 0.88),
-        Biome::Tropical  => (0.20, 0.30, 0.35, 0.88),
-        Biome::Desert    => (0.10, 0.65, 0.68, 0.75),
-        Biome::Mountain  => (0.12, 0.25, 0.28, 0.50),
+        Biome::Tropical => (0.20, 0.30, 0.35, 0.88),
+        Biome::Desert => (0.10, 0.65, 0.68, 0.75),
+        Biome::Mountain => (0.12, 0.25, 0.28, 0.50),
     }
 }
 
@@ -50,8 +53,8 @@ fn surface_v(tx: i32, ty: i32, surface: &Perlin) -> f32 {
     let nx = tx as f64 * 0.04;
     let ny = ty as f64 * 0.04;
     let v = surface.get([nx, ny]) * 0.6
-          + surface.get([nx * 2.0, ny * 2.0]) * 0.3
-          + surface.get([nx * 4.0, ny * 4.0]) * 0.1;
+        + surface.get([nx * 2.0, ny * 2.0]) * 0.3
+        + surface.get([nx * 4.0, ny * 4.0]) * 0.1;
     ((v + 1.0) * 0.5) as f32
 }
 
@@ -63,26 +66,40 @@ pub fn surface_height(tx: i32, ty: i32, gen: &WorldGen) -> i32 {
 }
 
 fn surface_kind_fn(v: f32, water_t: f32, grass_t: f32, farm_t: f32, forest_t: f32) -> TileKind {
-    if v < water_t       { TileKind::Water }
-    else if v < grass_t  { TileKind::Grass }
-    else if v < farm_t   { TileKind::Farmland }
-    else if v < forest_t { TileKind::Forest }
-    else                 { TileKind::Stone }
+    if v < water_t {
+        TileKind::Water
+    } else if v < grass_t {
+        TileKind::Grass
+    } else if v < farm_t {
+        TileKind::Farmland
+    } else if v < forest_t {
+        TileKind::Forest
+    } else {
+        TileKind::Stone
+    }
 }
 
 /// Deterministically compute the tile at world tile coords (tx, ty, tz).
 /// Pure — no side effects, no allocations. Safe to call from any thread.
 pub fn proc_tile(
-    tx: i32, ty: i32, tz: i32,
+    tx: i32,
+    ty: i32,
+    tz: i32,
     gen: &WorldGen,
-    water_t: f32, grass_t: f32, farm_t: f32, forest_t: f32,
+    water_t: f32,
+    grass_t: f32,
+    farm_t: f32,
+    forest_t: f32,
 ) -> TileData {
     let v = surface_v(tx, ty, &gen.surface);
     let surf_z = (Z_MIN as f32 + v * CHUNK_HEIGHT as f32).round() as i32;
     let surf_z = surf_z.clamp(Z_MIN, Z_MAX);
 
     if tz > surf_z {
-        return TileData { kind: TileKind::Air, ..Default::default() };
+        return TileData {
+            kind: TileKind::Air,
+            ..Default::default()
+        };
     }
 
     if tz == surf_z {
@@ -92,7 +109,12 @@ pub fn proc_tile(
         } else {
             0
         };
-        return TileData { kind, elevation: (v * 255.0) as u8, fertility, flags: 0 };
+        return TileData {
+            kind,
+            elevation: (v * 255.0) as u8,
+            fertility,
+            flags: 0,
+        };
     }
 
     // Below surface — check for cave cavities.
@@ -104,11 +126,21 @@ pub fn proc_tile(
     if cave_v > 0.55 {
         // Carved cavity. The first Air tile above solid rock is the Dirt floor.
         let below_v = gen.cave.get([nx, ny, (tz as f64 - 1.0) * 0.12]);
-        let kind = if below_v <= 0.55 { TileKind::Dirt } else { TileKind::Air };
-        return TileData { kind, ..Default::default() };
+        let kind = if below_v <= 0.55 {
+            TileKind::Dirt
+        } else {
+            TileKind::Air
+        };
+        return TileData {
+            kind,
+            ..Default::default()
+        };
     }
 
-    TileData { kind: TileKind::Wall, ..Default::default() }
+    TileData {
+        kind: TileKind::Wall,
+        ..Default::default()
+    }
 }
 
 /// Surface tile lookup — returns None if the chunk is not loaded.
@@ -116,10 +148,13 @@ pub fn surface_tile_at(
     chunk_map: &ChunkMap,
     gen: &WorldGen,
     globe: &Globe,
-    tx: i32, ty: i32,
+    tx: i32,
+    ty: i32,
 ) -> Option<TileData> {
     let surf_z = chunk_map.surface_z_at(tx, ty);
-    if surf_z < Z_MIN { return None; }
+    if surf_z < Z_MIN {
+        return None;
+    }
     Some(tile_at_3d(chunk_map, gen, globe, tx, ty, surf_z))
 }
 
@@ -128,7 +163,9 @@ pub fn tile_at_3d(
     chunk_map: &ChunkMap,
     gen: &WorldGen,
     globe: &Globe,
-    tx: i32, ty: i32, tz: i32,
+    tx: i32,
+    ty: i32,
+    tz: i32,
 ) -> TileData {
     if let Some(d) = chunk_map.tile_delta_at(tx, ty, tz) {
         return d;
@@ -143,11 +180,15 @@ pub fn tile_at_3d(
 }
 
 /// Build a new Chunk: empty delta map + surface_z and surface_kind caches pre-filled.
-pub fn generate_chunk_from_globe(coord: ChunkCoord, globe_cell: &WorldCell, gen: &WorldGen) -> Chunk {
+pub fn generate_chunk_from_globe(
+    coord: ChunkCoord,
+    globe_cell: &WorldCell,
+    gen: &WorldGen,
+) -> Chunk {
     let (water_t, grass_t, farm_t, forest_t) = biome_thresholds(globe_cell.biome);
 
-    let mut surface_z         = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
-    let mut surface_kind      = Box::new([[TileKind::default(); CHUNK_SIZE]; CHUNK_SIZE]);
+    let mut surface_z = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
+    let mut surface_kind = Box::new([[TileKind::default(); CHUNK_SIZE]; CHUNK_SIZE]);
     let mut surface_fertility = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
 
     for ly in 0..CHUNK_SIZE {
@@ -160,9 +201,11 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe_cell: &WorldCell, gen:
             let kind = surface_kind_fn(v, water_t, grass_t, farm_t, forest_t);
             let fertility = if matches!(kind, TileKind::Farmland | TileKind::Grass) {
                 ((1.0 - (v - 0.45).abs() * 5.0).max(0.0) * 255.0) as u8
-            } else { 0 };
-            surface_z[ly][lx]         = z as i8;
-            surface_kind[ly][lx]      = kind;
+            } else {
+                0
+            };
+            surface_z[ly][lx] = z as i8;
+            surface_kind[ly][lx] = kind;
             surface_fertility[ly][lx] = fertility;
         }
     }
@@ -175,10 +218,18 @@ pub fn spawn_world_system(
     globe: Res<Globe>,
     sandbox: Option<Res<crate::sandbox::SandboxMode>>,
 ) {
-    let start_cx = (GLOBE_WIDTH  / 2) * GLOBE_CELL_CHUNKS;
-    let start_cy = (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS;
+    let now = Instant::now();
+    let globe_center_x = (GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS;
+    let globe_center_y = (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS;
 
-    let (chunks_x, chunks_y) = if sandbox.is_some() { (5, 5) } else { (WORLD_CHUNKS_X, WORLD_CHUNKS_Y) };
+    let (chunks_x, chunks_y) = if sandbox.is_some() {
+        (5, 5)
+    } else {
+        (WORLD_CHUNKS_X, WORLD_CHUNKS_Y)
+    };
+
+    let start_cx = globe_center_x - (chunks_x / 2);
+    let start_cy = globe_center_y - (chunks_y / 2);
 
     for dy in 0..chunks_y {
         for dx in 0..chunks_x {
@@ -191,8 +242,12 @@ pub fn spawn_world_system(
     }
 
     info!(
-        "Initial area generated: {}x{} chunks at globe center ({},{})",
-        chunks_x, chunks_y, start_cx, start_cy
+        "Initial area generated: {}x{} chunks centered at globe ({},{}) in {:?}",
+        chunks_x,
+        chunks_y,
+        globe_center_x,
+        globe_center_y,
+        now.elapsed()
     );
 }
 
@@ -244,7 +299,10 @@ mod tests {
         let gen = WorldGen::new();
         let surf = surface_height(5, 5, &gen);
         let t = proc_tile(5, 5, surf - 5, &gen, 0.22, 0.45, 0.60, 0.75);
-        assert!(matches!(t.kind, TileKind::Wall | TileKind::Air | TileKind::Dirt));
+        assert!(matches!(
+            t.kind,
+            TileKind::Wall | TileKind::Air | TileKind::Dirt
+        ));
     }
 
     #[test]
