@@ -221,6 +221,28 @@ impl ChunkMap {
         }
     }
 
+    /// Standable Z at (tx, ty) closest to `hint_z`. Searches outward
+    /// (hint, hint±1, hint±2, …) within `[Z_MIN, Z_MAX]`. Falls back to
+    /// `surface_z_at(tx, ty)` if no Z slice is standable (e.g. mid-air
+    /// click); callers receive a sensible value either way.
+    pub fn nearest_standable_z(&self, tile_x: i32, tile_y: i32, hint_z: i32) -> i32 {
+        if self.passable_at(tile_x, tile_y, hint_z) {
+            return hint_z;
+        }
+        let max_radius = (Z_MAX - Z_MIN).max(1);
+        for d in 1..=max_radius {
+            let up = hint_z + d;
+            if up <= Z_MAX && self.passable_at(tile_x, tile_y, up) {
+                return up;
+            }
+            let dn = hint_z - d;
+            if dn >= Z_MIN && self.passable_at(tile_x, tile_y, dn) {
+                return dn;
+            }
+        }
+        self.surface_z_at(tile_x, tile_y)
+    }
+
     /// Is (tx, ty, tz) a tile an agent can stand on (foot-Z convention)?
     /// The tile at z must be a passable surface (Grass/Dirt/Ramp/etc.)
     /// AND the tile at z+1 must be empty headspace (Air or Ramp).
@@ -456,5 +478,24 @@ mod tests {
             },
         );
         assert_eq!(map.surface_z_at(5, 5), 4);
+    }
+
+    #[test]
+    fn fill_above_surface_raises_surface_z() {
+        // Inverse of carve_at_surface_lowers_surface_z. fill_tile relies on
+        // set_delta updating surface_z upward when a non-Air tile is written
+        // at z >= cur_surf.
+        let mut map = make_map_with_chunk(5);
+        assert_eq!(map.surface_z_at(5, 5), 5);
+        map.set_tile(
+            5,
+            5,
+            6,
+            TileData {
+                kind: TileKind::Dirt,
+                ..Default::default()
+            },
+        );
+        assert_eq!(map.surface_z_at(5, 5), 6);
     }
 }

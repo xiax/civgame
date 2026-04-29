@@ -80,6 +80,7 @@ const VIEW_RADIUS_SQ: i32 = VIEW_RADIUS * VIEW_RADIUS;
 pub fn fog_update_system(
     player_faction: Res<PlayerFaction>,
     chunk_map: Res<ChunkMap>,
+    door_map: Res<crate::simulation::construction::DoorMap>,
     agent_query: Query<(&Transform, &PersonAI, &FactionMember, &LodLevel)>,
     landmark_query: Query<&Transform, With<PlayerFactionMarker>>,
     mut fog_map: ResMut<FogMap>,
@@ -126,7 +127,7 @@ pub fn fog_update_system(
                 let tz = raw_z.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
 
                 let in_los = dx * dx + dy * dy <= 1
-                    || has_los(&chunk_map, (ax, ay, az), (ttx, tty, tz));
+                    || has_los(&chunk_map, &door_map, (ax, ay, az), (ttx, tty, tz));
                 if in_los {
                     new_visible.insert((ttx as i16, tty as i16));
                 }

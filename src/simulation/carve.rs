@@ -84,3 +84,60 @@ pub fn carve_tile(
 
     blocks_broken
 }
+
+/// Inverse of `carve_tile`. Raises the surface at (tx, ty) by writing
+/// Dirt at `target_floor_z` and clearing headspace at `target_floor_z + 1`.
+/// Returns 1 if anything changed (caller deducts the fill material from
+/// the agent's inventory), 0 if the floor was already filled.
+pub fn fill_tile(
+    chunk_map: &mut ChunkMap,
+    tx: i32,
+    ty: i32,
+    target_floor_z: i32,
+    events: &mut EventWriter<TileChangedEvent>,
+) -> u32 {
+    let mut changed = false;
+    let mut filled = 0u32;
+
+    let floor = chunk_map.tile_at(tx, ty, target_floor_z);
+    match floor.kind {
+        TileKind::Air | TileKind::Water => {
+            chunk_map.set_tile(
+                tx,
+                ty,
+                target_floor_z,
+                TileData {
+                    kind: TileKind::Dirt,
+                    ..Default::default()
+                },
+            );
+            filled = 1;
+            changed = true;
+        }
+        _ => {} // already solid floor
+    }
+
+    let head_z = target_floor_z + 1;
+    let head = chunk_map.tile_at(tx, ty, head_z);
+    if !matches!(head.kind, TileKind::Air | TileKind::Ramp) {
+        chunk_map.set_tile(
+            tx,
+            ty,
+            head_z,
+            TileData {
+                kind: TileKind::Air,
+                ..Default::default()
+            },
+        );
+        changed = true;
+    }
+
+    if changed {
+        events.send(TileChangedEvent {
+            tx: tx as i16,
+            ty: ty as i16,
+        });
+    }
+
+    filled
+}

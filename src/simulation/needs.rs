@@ -1,4 +1,5 @@
-use super::construction::{enclosure_score, BedMap};
+use super::construction::{enclosure_score, BedMap, CampfireMap, ChairMap, TableMap};
+use super::tasks::TaskKind;
 use super::lod::LodLevel;
 use super::person::{AiState, PersonAI};
 use super::schedule::{BucketSlot, SimClock};
@@ -59,6 +60,9 @@ pub fn tick_needs_system(
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
     bed_map: Res<BedMap>,
+    campfire_map: Res<CampfireMap>,
+    table_map: Res<TableMap>,
+    chair_map: Res<ChairMap>,
     mut query: Query<(
         &BucketSlot,
         &mut Needs,
@@ -105,8 +109,43 @@ pub fn tick_needs_system(
             let shelter_fill = enc * SHELTER_FILL_PER_SCORE * dt;
             needs.shelter = (needs.shelter + SHELTER_RATE * dt - shelter_fill).clamp(0.0, 255.0);
 
+            // Campfire warmth: agents within 3 Manhattan tiles of a campfire
+            // gain shelter and safety relief — fire keeps the cold and predators away.
+            const CAMPFIRE_WARMTH: f32 = 0.25;
+            let near_fire = campfire_map.0.keys().any(|&cpos| {
+                (cpos.0 as i32 - cur_tx).abs() + (cpos.1 as i32 - cur_ty).abs() <= 3
+            });
+            if near_fire {
+                needs.shelter = (needs.shelter - CAMPFIRE_WARMTH * dt).clamp(0.0, 255.0);
+                needs.safety = (needs.safety - CAMPFIRE_WARMTH * 0.5 * dt).clamp(0.0, 255.0);
+            }
+
             needs.safety = (needs.safety + SAFETY_RATE * dt).clamp(0.0, 255.0);
             needs.social = (needs.social + SOCIAL_RATE * dt).clamp(0.0, 255.0);
+
+            // Table+Chair social bonus: agents in the Socialize task within
+            // one tile of both a Table and a Chair recover social need 2× faster.
+            if ai.task_id == TaskKind::Socialize as u16 {
+                let tile = (cur_tx as i16, cur_ty as i16);
+                let mut near_table = false;
+                let mut near_chair = false;
+                for dy in -1..=1i16 {
+                    for dx in -1..=1i16 {
+                        let p = (tile.0 + dx, tile.1 + dy);
+                        if !near_table && table_map.0.contains_key(&p) {
+                            near_table = true;
+                        }
+                        if !near_chair && chair_map.0.contains_key(&p) {
+                            near_chair = true;
+                        }
+                    }
+                }
+                if near_table && near_chair {
+                    const SOCIAL_FURNITURE_BONUS: f32 = SOCIAL_RATE * 2.0;
+                    needs.social = (needs.social - SOCIAL_FURNITURE_BONUS * dt).clamp(0.0, 255.0);
+                }
+            }
+
             needs.reproduction = (needs.reproduction + REPRODUCTION_RATE * dt).clamp(0.0, 255.0);
         });
 }

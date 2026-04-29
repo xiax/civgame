@@ -1,8 +1,8 @@
-use super::animals::{Deer, Wolf};
+use super::animals::{Deer, Horse, Tamed, Wolf};
 use super::combat::{CombatTarget, Health};
 use super::construction::{Blueprint, BlueprintMap, BuildSiteKind};
 use super::faction::{FactionMember, FactionRegistry, StorageTileMap, SOLO};
-use super::goals::AgentGoal;
+use super::goals::{AgentGoal, RescueTarget};
 use super::items::{GroundItem, TargetItem};
 use super::tasks::{
     assign_task_with_routing, find_nearest_edible, find_nearest_item, find_nearest_plant,
@@ -11,6 +11,7 @@ use super::tasks::{
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::pathfinding::chunk_graph::ChunkGraph;
+use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::Calendar;
 use crate::world::spatial::SpatialIndex;
@@ -26,6 +27,7 @@ use super::needs::Needs;
 use super::neural::{UtilityNet, PLAN_FEAT_DIM, STATE_DIM};
 use super::person::{AiState, Person, PersonAI, PlayerOrder};
 use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+use super::reproduction::BiologicalSex;
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
 use super::technology::TechId;
@@ -44,10 +46,20 @@ pub enum StepTarget {
     NearestBuildSite(BuildSiteKind),
     /// Targets the nearest active Blueprint entity for this agent's faction.
     NearestBlueprint(BuildSiteKind),
+    /// Targets the nearest active Blueprint entity of any kind for this agent's faction.
+    NearestAnyBlueprint,
     /// In-place: target resolves to the agent's current tile.
     SelfPosition,
     /// Nearest faction storage tile (for withdrawing food from communal stock).
     NearestFactionStorage,
+    /// Nearest wild (untamed) horse entity.
+    NearestWildHorse,
+    /// Nearest opposite-sex same-faction person within view radius. Affinity-weighted via RelationshipMemory.
+    NearestPartner,
+    /// Resolves to the attacker carried by the agent's `RescueTarget` component
+    /// (set by `sound::respond_to_distress_system`). Routes the responder to the
+    /// attacker's current tile and assigns the attacker as `target_entity`.
+    RescueAttacker,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +90,9 @@ pub struct StepDef {
     /// When falling back from memory to a plant search (Food memory kind),
     /// restricts which plant kind is targeted. None = any mature plant.
     pub plant_filter: Option<PlantKind>,
+    /// For Craft steps: the recipe ID in CRAFT_RECIPES to execute.
+    /// Encoded into ai.target_z at dispatch time.
+    pub extra: u8,
 }
 
 #[derive(Clone)]
@@ -103,6 +118,15 @@ pub struct PlanRegistry(pub Vec<PlanDef>);
 /// Written each frame by `rel_influence_system`; consumed by `plan_execution_system`.
 #[derive(Resource, Default)]
 pub struct RelInfluence(pub AHashMap<Entity, u16>);
+
+/// Emitted by `plan_execution_system` when an agent's `ReturnSurplusFood` plan
+/// times out (storage tile unreachable). `drop_abandoned_food_system` consumes
+/// it and dumps the agent's food inventory at their feet so the surplus isn't
+/// permanently bottled up.
+#[derive(Event)]
+pub struct DropAbandonedFoodEvent(pub Entity);
+
+pub const RETURN_SURPLUS_FOOD_PLAN_ID: PlanId = 24;
 
 #[derive(Component)]
 pub struct ActivePlan {
@@ -216,16 +240,41 @@ static PLAN_STEPS_3: &[StepId] = &[3]; // GatherStone
 static PLAN_STEPS_4: &[StepId] = &[4, 1, 9]; // PlantAndFarm → Eat
 static PLAN_STEPS_5: &[StepId] = &[5, 6, 9]; // HuntFood → Eat
 static PLAN_STEPS_6: &[StepId] = &[6, 9]; // ScavengeFood → Eat
-static PLAN_STEPS_7: &[StepId] = &[2, 7]; // GatherWood, BuildWoodWall
-static PLAN_STEPS_8: &[StepId] = &[2, 8]; // GatherWood, BuildBed
+static PLAN_STEPS_7: &[StepId] = &[2, 25]; // GatherWood, BuildAnyBlueprint
 static PLAN_STEPS_9: &[StepId] = &[10, 9]; // WithdrawAndEat: WithdrawFood → Eat
+static PLAN_STEPS_10: &[StepId] = &[11]; // TameHorse: TameAnimal
 
 static SURVIVE_GOALS: &[AgentGoal] = &[AgentGoal::Survive];
 static GATHER_FOOD_GOALS: &[AgentGoal] = &[AgentGoal::GatherFood];
+static TAME_HORSE_GOALS: &[AgentGoal] = &[AgentGoal::TameHorse];
 static GATHER_WOOD_GOALS: &[AgentGoal] = &[AgentGoal::GatherWood];
 static GATHER_STONE_GOALS: &[AgentGoal] = &[AgentGoal::GatherStone];
 static SURVIVE_AND_GATHER_FOOD_GOALS: &[AgentGoal] = &[AgentGoal::Survive, AgentGoal::GatherFood];
 static BUILD_GOALS: &[AgentGoal] = &[AgentGoal::Build];
+static CRAFT_GOALS: &[AgentGoal] = &[AgentGoal::Craft];
+static REPRODUCE_GOALS: &[AgentGoal] = &[AgentGoal::Reproduce];
+static RESCUE_GOALS: &[AgentGoal] = &[AgentGoal::Rescue];
+
+static PLAN_STEPS_22: &[StepId] = &[26]; // FindMate: NearestPartner
+static PLAN_STEPS_23: &[StepId] = &[27]; // RescueAlly: EngageRescue
+static PLAN_STEPS_24: &[StepId] = &[12]; // ReturnSurplusFood: DepositGoods at faction storage
+
+static RETURN_CAMP_GOALS: &[AgentGoal] = &[AgentGoal::ReturnCamp];
+
+// Craft plan step sequences (step IDs match register_builtin_steps above)
+// 12=DepositGoods, 13=CollectSkin
+// 14=CraftStoneTools, 15=CraftSpear, 16=CraftTorch, 17=CraftBow, 18=CraftCloth
+// 19=CraftPottery, 20=CraftShield, 21=CraftLeatherArmor, 22=CraftIronTools, 23=CraftSword
+static PLAN_STEPS_11: &[StepId] = &[2, 3, 14, 12]; // MakeStoneTools
+static PLAN_STEPS_12: &[StepId] = &[2, 3, 15, 12]; // MakeSpear
+static PLAN_STEPS_13: &[StepId] = &[2, 16, 12];    // MakeTorch
+static PLAN_STEPS_14: &[StepId] = &[2, 5, 13, 17, 12]; // MakeBow
+static PLAN_STEPS_15: &[StepId] = &[1, 1, 18, 12]; // MakeCloth
+static PLAN_STEPS_16: &[StepId] = &[3, 2, 19, 12]; // MakePottery
+static PLAN_STEPS_17: &[StepId] = &[2, 2, 20, 12]; // MakeShield
+static PLAN_STEPS_18: &[StepId] = &[5, 13, 5, 13, 21, 12]; // MakeLeatherArmor
+static PLAN_STEPS_19: &[StepId] = &[3, 3, 22, 12]; // MakeIronTools
+static PLAN_STEPS_20: &[StepId] = &[3, 2, 23, 12]; // MakeSword
 
 pub fn register_builtin_steps(registry: &mut StepRegistry) {
     registry.0 = vec![
@@ -237,6 +286,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: Some(PlantKind::BerryBush),
+            extra: 0,
         },
         StepDef {
             // 1: FarmFarmland — targets Grain, falls back via memory
@@ -246,6 +296,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: Some(PlantKind::Grain),
+            extra: 0,
         },
         StepDef {
             // 2: ChopForest
@@ -255,6 +306,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
+            extra: 0,
         },
         StepDef {
             // 3: MineStone
@@ -264,6 +316,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
+            extra: 0,
         },
         StepDef {
             // 4: PlantSeed (requires Seed in inventory)
@@ -273,6 +326,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::needs_good(Good::Seed, 1),
             reward_scale: 0.2,
             plant_filter: None,
+            extra: 0,
         },
         StepDef {
             // 5: Hunt
@@ -282,6 +336,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
+            extra: 0,
         },
         StepDef {
             // 6: CollectFood
@@ -291,24 +346,27 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
+            extra: 0,
         },
         StepDef {
-            // 7: BuildWall — target faction blueprint, deposit wood and labor
+            // 7: (unused — reserved for future use)
             id: 7,
-            task: TaskKind::Construct,
-            target: StepTarget::NearestBlueprint(BuildSiteKind::Wall),
-            preconditions: StepPreconditions::needs_good(Good::Wood, 2),
-            reward_scale: 0.8,
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
+            extra: 0,
         },
         StepDef {
-            // 8: BuildBed — target faction blueprint, deposit wood and labor
+            // 8: (unused — reserved for future use)
             id: 8,
-            task: TaskKind::ConstructBed,
-            target: StepTarget::NearestBlueprint(BuildSiteKind::Bed),
-            preconditions: StepPreconditions::needs_good(Good::Wood, 3),
-            reward_scale: 1.0,
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
+            extra: 0,
         },
         StepDef {
             // 9: Eat — consume one edible from inventory in place
@@ -318,6 +376,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: None,
+            extra: 0,
         },
         StepDef {
             // 10: WithdrawFood — pull one edible from a faction storage tile
@@ -327,6 +386,181 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 11: TameAnimal — work adjacent to a wild horse for ~100 ticks
+            id: 11,
+            task: TaskKind::TameAnimal,
+            target: StepTarget::NearestWildHorse,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 1.5,
+            plant_filter: None,
+            extra: 0,
+        },
+        // ── Crafting steps ────────────────────────────────────────────────────
+        StepDef {
+            // 12: DepositGoods — deposit crafted items at faction storage
+            id: 12,
+            task: TaskKind::DepositResource,
+            target: StepTarget::NearestFactionStorage,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.1,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 13: CollectSkin — pick up Skin from ground (after hunting)
+            id: 13,
+            task: TaskKind::Scavenge,
+            target: StepTarget::NearestItem(Good::Skin),
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.3,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 14: CraftStoneTools (recipe 0)
+            id: 14,
+            task: TaskKind::Craft,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::needs_good(Good::Stone, 2),
+            reward_scale: 0.8,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 15: CraftSpear (recipe 1)
+            id: 15,
+            task: TaskKind::Craft,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::needs_good(Good::Stone, 1),
+            reward_scale: 0.8,
+            plant_filter: None,
+            extra: 1,
+        },
+        StepDef {
+            // 16: CraftTorch (recipe 2)
+            id: 16,
+            task: TaskKind::Craft,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::needs_good(Good::Wood, 2),
+            reward_scale: 0.5,
+            plant_filter: None,
+            extra: 2,
+        },
+        StepDef {
+            // 17: CraftBow (recipe 3)
+            id: 17,
+            task: TaskKind::Craft,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::needs_good(Good::Skin, 1),
+            reward_scale: 0.9,
+            plant_filter: None,
+            extra: 3,
+        },
+        StepDef {
+            // 18: CraftCloth (recipe 4)
+            id: 18,
+            task: TaskKind::Craft,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::needs_good(Good::Grain, 3),
+            reward_scale: 0.7,
+            plant_filter: None,
+            extra: 4,
+        },
+        StepDef {
+            // 19: CraftPottery (recipe 5)
+            id: 19,
+            task: TaskKind::Craft,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::needs_good(Good::Stone, 2),
+            reward_scale: 0.6,
+            plant_filter: None,
+            extra: 5,
+        },
+        StepDef {
+            // 20: CraftShield (recipe 6)
+            id: 20,
+            task: TaskKind::Craft,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::needs_good(Good::Wood, 3),
+            reward_scale: 0.8,
+            plant_filter: None,
+            extra: 6,
+        },
+        StepDef {
+            // 21: CraftLeatherArmor (recipe 7)
+            id: 21,
+            task: TaskKind::Craft,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::needs_good(Good::Skin, 2),
+            reward_scale: 0.9,
+            plant_filter: None,
+            extra: 7,
+        },
+        StepDef {
+            // 22: CraftIronTools (recipe 8)
+            id: 22,
+            task: TaskKind::Craft,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::needs_good(Good::Iron, 2),
+            reward_scale: 1.0,
+            plant_filter: None,
+            extra: 8,
+        },
+        StepDef {
+            // 23: CraftSword (recipe 9)
+            id: 23,
+            task: TaskKind::Craft,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::needs_good(Good::Iron, 2),
+            reward_scale: 1.0,
+            plant_filter: None,
+            extra: 9,
+        },
+        StepDef {
+            // 24: (unused — reserved for future use)
+            id: 24,
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 25: BuildAnyBlueprint — finds the nearest accessible blueprint of any kind
+            // and contributes wood + labor. Requirements come from the blueprint itself.
+            id: 25,
+            task: TaskKind::Construct,
+            target: StepTarget::NearestAnyBlueprint,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 1.2,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 26: FindMate — locate nearest partner; reproduction_system finalizes the birth
+            id: 26,
+            task: TaskKind::Reproduce,
+            target: StepTarget::NearestPartner,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 1.0,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 27: EngageRescue — route to the attacker stored on RescueTarget and engage.
+            // CombatTarget is already set by respond_to_distress_system; combat_system
+            // takes over as soon as the responder is adjacent.
+            id: 27,
+            task: TaskKind::Defend,
+            target: StepTarget::RescueAttacker,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 1.5,
+            plant_filter: None,
+            extra: 0,
         },
     ];
 }
@@ -401,19 +635,19 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         },
         PlanDef {
             id: 7,
-            name: "BuildWoodWall",
+            name: "BuildBlueprint",
             steps: PLAN_STEPS_7,
-            feature_vec: [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.1, 0.0],
+            feature_vec: [0.0, 0.1, 0.0, 0.0, 0.3, 0.2, 0.1, 0.0],
             serves_goals: BUILD_GOALS,
-            tech_gate: Some(super::technology::PERM_SETTLEMENT),
+            tech_gate: None,
             memory_target_kind: None,
         },
         PlanDef {
             id: 8,
             name: "BuildBed",
-            steps: PLAN_STEPS_8,
-            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0],
-            serves_goals: BUILD_GOALS,
+            steps: &[],
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
         },
@@ -423,6 +657,143 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             steps: PLAN_STEPS_9,
             feature_vec: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.2, 0.0],
             serves_goals: SURVIVE_GOALS,
+            tech_gate: None,
+            memory_target_kind: None,
+        },
+        PlanDef {
+            id: 10,
+            name: "TameHorse",
+            steps: PLAN_STEPS_10,
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.1],
+            serves_goals: TAME_HORSE_GOALS,
+            tech_gate: Some(super::technology::HORSE_TAMING),
+            memory_target_kind: None,
+        },
+        // ── Crafting plans ────────────────────────────────────────────────────
+        PlanDef {
+            id: 11,
+            name: "MakeStoneTools",
+            steps: PLAN_STEPS_11,
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.3, 0.0],
+            serves_goals: CRAFT_GOALS,
+            tech_gate: Some(super::technology::FLINT_KNAPPING),
+            memory_target_kind: Some(MemoryKind::Stone),
+        },
+        PlanDef {
+            id: 12,
+            name: "MakeSpear",
+            steps: PLAN_STEPS_12,
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.8, 0.0, 0.3, 0.1],
+            serves_goals: CRAFT_GOALS,
+            tech_gate: Some(super::technology::HUNTING_SPEAR),
+            memory_target_kind: Some(MemoryKind::Stone),
+        },
+        PlanDef {
+            id: 13,
+            name: "MakeTorch",
+            steps: PLAN_STEPS_13,
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.2, 0.0],
+            serves_goals: CRAFT_GOALS,
+            tech_gate: Some(super::technology::FIRE_MAKING),
+            memory_target_kind: Some(MemoryKind::Wood),
+        },
+        PlanDef {
+            id: 14,
+            name: "MakeBow",
+            steps: PLAN_STEPS_14,
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.9, 0.0, 0.4, 0.2],
+            serves_goals: CRAFT_GOALS,
+            tech_gate: Some(super::technology::BOW_AND_ARROW),
+            memory_target_kind: Some(MemoryKind::Prey),
+        },
+        PlanDef {
+            id: 15,
+            name: "MakeCloth",
+            steps: PLAN_STEPS_15,
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.4, 0.0, 0.3, 0.0],
+            serves_goals: CRAFT_GOALS,
+            tech_gate: Some(super::technology::LOOM_WEAVING),
+            memory_target_kind: Some(MemoryKind::Food),
+        },
+        PlanDef {
+            id: 16,
+            name: "MakePottery",
+            steps: PLAN_STEPS_16,
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.3, 0.0],
+            serves_goals: CRAFT_GOALS,
+            tech_gate: Some(super::technology::FIRED_POTTERY),
+            memory_target_kind: Some(MemoryKind::Stone),
+        },
+        PlanDef {
+            id: 17,
+            name: "MakeShield",
+            steps: PLAN_STEPS_17,
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.7, 0.0, 0.3, 0.0],
+            serves_goals: CRAFT_GOALS,
+            tech_gate: None,
+            memory_target_kind: Some(MemoryKind::Wood),
+        },
+        PlanDef {
+            id: 18,
+            name: "MakeLeatherArmor",
+            steps: PLAN_STEPS_18,
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.8, 0.0, 0.5, 0.3],
+            serves_goals: CRAFT_GOALS,
+            tech_gate: None,
+            memory_target_kind: Some(MemoryKind::Prey),
+        },
+        PlanDef {
+            id: 19,
+            name: "MakeIronTools",
+            steps: PLAN_STEPS_19,
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.9, 0.0, 0.4, 0.1],
+            serves_goals: CRAFT_GOALS,
+            tech_gate: Some(super::technology::COPPER_TOOLS),
+            memory_target_kind: Some(MemoryKind::Stone),
+        },
+        PlanDef {
+            id: 20,
+            name: "MakeSword",
+            steps: PLAN_STEPS_20,
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.4, 0.2],
+            serves_goals: CRAFT_GOALS,
+            tech_gate: Some(super::technology::BRONZE_WEAPONS),
+            memory_target_kind: Some(MemoryKind::Stone),
+        },
+        PlanDef {
+            id: 21,
+            name: "BuildCampfire",
+            steps: &[],
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            serves_goals: &[],
+            tech_gate: None,
+            memory_target_kind: None,
+        },
+        PlanDef {
+            id: 22,
+            name: "FindMate",
+            steps: PLAN_STEPS_22,
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.05, 0.0],
+            serves_goals: REPRODUCE_GOALS,
+            tech_gate: None,
+            memory_target_kind: None,
+        },
+        PlanDef {
+            id: 23,
+            name: "RescueAlly",
+            steps: PLAN_STEPS_23,
+            // safety-leaning: high addresses_safety, mild social signal
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 1.0, 0.2, 0.05, 0.5],
+            serves_goals: RESCUE_GOALS,
+            tech_gate: None,
+            memory_target_kind: None,
+        },
+        PlanDef {
+            id: 24,
+            name: "ReturnSurplusFood",
+            steps: PLAN_STEPS_24,
+            feature_vec: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.0],
+            serves_goals: RETURN_CAMP_GOALS,
             tech_gate: None,
             memory_target_kind: None,
         },
@@ -512,6 +883,7 @@ fn resolve_target(
     pos: (i32, i32),
     pos_z: i8,
     chunk_map: &ChunkMap,
+    door_map: &crate::simulation::construction::DoorMap,
     spatial: &SpatialIndex,
     plant_map: &PlantMap,
     plant_query: &Query<&Plant>,
@@ -523,10 +895,15 @@ fn resolve_target(
     memory: Option<&AgentMemory>,
     item_query: &Query<&GroundItem>,
     prey_query: &Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
+    wild_horse_q: &Query<Entity, (With<Horse>, Without<Tamed>)>,
     combat_target: &mut CombatTarget,
     target_item: &mut TargetItem,
     bp_map: &BlueprintMap,
     bp_query: &Query<&Blueprint>,
+    partner_query: &Query<(&Transform, &BiologicalSex, &FactionMember), With<Person>>,
+    my_sex: BiologicalSex,
+    relationships: Option<&RelationshipMemory>,
+    rescue_target: Option<&RescueTarget>,
 ) -> Option<(Option<Entity>, i16, i16)> {
     const VIEW_RADIUS: i32 = 15;
 
@@ -550,6 +927,7 @@ fn resolve_target(
                     let to_z = chunk_map.surface_z_at(tx, ty) as i8;
                     if !super::line_of_sight::has_los(
                         chunk_map,
+                        door_map,
                         (pos.0, pos.1, pos_z),
                         (tx, ty, to_z),
                     ) {
@@ -613,6 +991,7 @@ fn resolve_target(
                 let to_z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
                 if super::line_of_sight::has_los(
                     chunk_map,
+                    door_map,
                     (pos.0, pos.1, pos_z),
                     (tx as i32, ty as i32, to_z),
                 ) {
@@ -687,6 +1066,7 @@ fn resolve_target(
                 let to_z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
                 if super::line_of_sight::has_los(
                     chunk_map,
+                    door_map,
                     (pos.0, pos.1, pos_z),
                     (tx as i32, ty as i32, to_z),
                 ) {
@@ -723,6 +1103,7 @@ fn resolve_target(
                 let to_z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
                 if super::line_of_sight::has_los(
                     chunk_map,
+                    door_map,
                     (pos.0, pos.1, pos_z),
                     (tx as i32, ty as i32, to_z),
                 ) {
@@ -748,6 +1129,69 @@ fn resolve_target(
         StepTarget::NearestFactionStorage => storage_tile_map
             .nearest_for_faction(faction_id, pos)
             .map(|(tx, ty)| (None, tx, ty)),
+        StepTarget::NearestWildHorse => {
+            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best_dist = i32::MAX;
+            for dy in -VIEW_RADIUS..=VIEW_RADIUS {
+                for dx in -VIEW_RADIUS..=VIEW_RADIUS {
+                    for &candidate in spatial.get(pos.0 + dx, pos.1 + dy) {
+                        if wild_horse_q.get(candidate).is_ok() {
+                            let dist = dx.abs() + dy.abs();
+                            if dist < best_dist {
+                                best_dist = dist;
+                                best = Some((
+                                    candidate,
+                                    (pos.0 + dx) as i16,
+                                    (pos.1 + dy) as i16,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            best.map(|(e, tx, ty)| (Some(e), tx, ty))
+        }
+        StepTarget::NearestPartner => {
+            if faction_id == SOLO {
+                return None;
+            }
+            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best_affinity = i8::MIN;
+            for dy in -VIEW_RADIUS..=VIEW_RADIUS {
+                for dx in -VIEW_RADIUS..=VIEW_RADIUS {
+                    let tx = pos.0 + dx;
+                    let ty = pos.1 + dy;
+                    for &candidate in spatial.get(tx, ty) {
+                        if candidate == agent_entity {
+                            continue;
+                        }
+                        let Ok((_t, other_sex, other_fm)) = partner_query.get(candidate) else {
+                            continue;
+                        };
+                        if *other_sex == my_sex || other_fm.faction_id != faction_id {
+                            continue;
+                        }
+                        let affinity = relationships
+                            .map(|r| r.get_affinity(candidate))
+                            .unwrap_or(0);
+                        if best.is_none() || affinity > best_affinity {
+                            best_affinity = affinity;
+                            best = Some((candidate, tx as i16, ty as i16));
+                        }
+                    }
+                }
+            }
+            // Females are the rendezvous anchor (reproduction_system scans the 3x3
+            // around females for males); route her to her own tile so males come
+            // to her, preventing mutual chase between two reproducing agents.
+            best.map(|(e, tx, ty)| {
+                if my_sex == BiologicalSex::Female {
+                    (Some(e), pos.0 as i16, pos.1 as i16)
+                } else {
+                    (Some(e), tx, ty)
+                }
+            })
+        }
         StepTarget::NearestBuildSite(_) => None, // Legacy; construction is handled via faction_blueprint_system
         StepTarget::NearestBlueprint(kind) => {
             // Find the nearest active Blueprint this agent is allowed to build.
@@ -776,6 +1220,38 @@ fn resolve_target(
             }
             best.map(|(e, tx, ty)| (Some(e), tx, ty))
         }
+        StepTarget::RescueAttacker => {
+            // Read the attacker + their last-known tile from the agent's RescueTarget.
+            // sound::respond_to_distress_system snapshots this each time the victim
+            // re-emits a distress event (~every second), so even if the attacker
+            // moves, the responder will be redirected as fresh distress arrives.
+            let rt = rescue_target?;
+            combat_target.0 = Some(rt.attacker);
+            Some((Some(rt.attacker), rt.attacker_tile.0, rt.attacker_tile.1))
+        }
+        StepTarget::NearestAnyBlueprint => {
+            // Find the nearest active Blueprint of any kind this agent is allowed to build.
+            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best_dist = i32::MAX;
+            for (&tile, &bp_entity) in &bp_map.0 {
+                let Ok(bp) = bp_query.get(bp_entity) else {
+                    continue;
+                };
+                let allowed = match bp.personal_owner {
+                    Some(owner) => owner == agent_entity,
+                    None => bp.faction_id == faction_id,
+                };
+                if !allowed {
+                    continue;
+                }
+                let dist = (tile.0 as i32 - pos.0).abs() + (tile.1 as i32 - pos.1).abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some((bp_entity, tile.0, tile.1));
+                }
+            }
+            best.map(|(e, tx, ty)| (Some(e), tx, ty))
+        }
     }
 }
 
@@ -787,13 +1263,17 @@ fn chunk_coord(tx: i32, ty: i32) -> ChunkCoord {
 }
 
 // Bundles registries needed by plan_execution_system; Bevy caps a system at
-// 16 top-level params, and these four would put us over the limit.
+// 16 top-level params, and these would put us over the limit.
 #[derive(SystemParam)]
-pub struct PlanRegistries<'w> {
+pub struct PlanRegistries<'w, 's> {
     pub plan_registry: Res<'w, PlanRegistry>,
     pub step_registry: Res<'w, StepRegistry>,
     pub faction_registry: Res<'w, FactionRegistry>,
     pub storage_tile_map: Res<'w, StorageTileMap>,
+    pub door_map: Res<'w, crate::simulation::construction::DoorMap>,
+    pub chunk_router: Res<'w, ChunkRouter>,
+    pub partner_query: Query<'w, 's, (&'static Transform, &'static BiologicalSex, &'static FactionMember), With<Person>>,
+    pub drop_food_events: EventWriter<'w, DropAbandonedFoodEvent>,
 }
 
 // ── Plan execution system ─────────────────────────────────────────────────────
@@ -814,6 +1294,7 @@ type AgentQuery<'a> = (
     &'a BucketSlot,
     &'a mut CombatTarget,
     &'a mut TargetItem,
+    &'a BiologicalSex,
 );
 
 type OptionalQuery<'a> = (
@@ -822,6 +1303,8 @@ type OptionalQuery<'a> = (
     Option<&'a KnownPlans>,
     Option<&'a PlanScoringMethod>,
     Option<&'a mut ActivePlan>,
+    Option<&'a RelationshipMemory>,
+    Option<&'a RescueTarget>,
 );
 
 pub fn plan_execution_system(
@@ -838,6 +1321,7 @@ pub fn plan_execution_system(
     clock: Res<SimClock>,
     item_check: Query<&GroundItem>,
     prey_query: Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
+    wild_horse_q: Query<Entity, (With<Horse>, Without<Tamed>)>,
     rel_influence: Res<RelInfluence>,
     mut query: Query<(AgentQuery, OptionalQuery), Without<PlayerOrder>>,
 ) {
@@ -846,6 +1330,10 @@ pub fn plan_execution_system(
         step_registry,
         faction_registry,
         storage_tile_map,
+        door_map,
+        chunk_router,
+        partner_query,
+        mut drop_food_events,
     } = registries;
     for (
         (
@@ -861,8 +1349,9 @@ pub fn plan_execution_system(
             slot,
             mut combat_target,
             mut target_item,
+            my_sex,
         ),
-        (memory_opt, mut net_opt, known_plans_opt, scoring_opt, mut active_plan_opt),
+        (memory_opt, mut net_opt, known_plans_opt, scoring_opt, mut active_plan_opt, rel_opt, rescue_target_opt),
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -877,6 +1366,10 @@ pub fn plan_execution_system(
                 | AgentGoal::GatherWood
                 | AgentGoal::GatherStone
                 | AgentGoal::Build
+                | AgentGoal::TameHorse
+                | AgentGoal::Reproduce
+                | AgentGoal::Rescue
+                | AgentGoal::ReturnCamp
         ) {
             continue;
         }
@@ -941,6 +1434,7 @@ pub fn plan_execution_system(
                     TaskKind::Explore,
                     None,
                     &chunk_graph,
+                    &chunk_router,
                     &chunk_map,
                 );
                 continue;
@@ -1038,6 +1532,12 @@ pub fn plan_execution_system(
             if let Some(ref mut net) = net_opt {
                 net.learn(-0.1);
             }
+            // ReturnSurplusFood timeout means the agent couldn't reach storage
+            // for 5000 ticks. Drop the surplus on the ground so it isn't
+            // permanently bottled in inventory and can be picked up by allies.
+            if active_plan.plan_id == RETURN_SURPLUS_FOOD_PLAN_ID {
+                drop_food_events.send(DropAbandonedFoodEvent(entity));
+            }
             commands.entity(entity).remove::<ActivePlan>();
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
@@ -1121,6 +1621,7 @@ pub fn plan_execution_system(
                 (cur_tx, cur_ty),
                 ai.current_z,
                 &chunk_map,
+                &door_map,
                 &spatial,
                 &plant_map,
                 &plant_query,
@@ -1132,10 +1633,15 @@ pub fn plan_execution_system(
                 memory_opt,
                 &item_check,
                 &prey_query,
+                &wild_horse_q,
                 &mut combat_target,
                 &mut target_item,
                 &bp_map,
                 &bp_query,
+                &partner_query,
+                *my_sex,
+                rel_opt,
+                rescue_target_opt,
             ) {
                 assign_task_with_routing(
                     &mut ai,
@@ -1145,8 +1651,13 @@ pub fn plan_execution_system(
                     step_def.task,
                     ent,
                     &chunk_graph,
+                    &chunk_router,
                     &chunk_map,
                 );
+                // For Craft tasks, encode the recipe ID in target_z (unused for in-place crafting).
+                if step_def.task == TaskKind::Craft {
+                    ai.target_z = step_def.extra as i8;
+                }
                 active_plan.dispatched = true;
                 active_plan.reward_scale = step_def.reward_scale;
             } else {
@@ -1167,6 +1678,7 @@ pub fn plan_execution_system(
                     TaskKind::Explore,
                     None,
                     &chunk_graph,
+                    &chunk_router,
                     &chunk_map,
                 );
                 commands.entity(entity).remove::<ActivePlan>();
@@ -1192,6 +1704,7 @@ pub fn plan_execution_system(
                                     step_def.task,
                                     Some(target_ent),
                                     &chunk_graph,
+                                    &chunk_router,
                                     &chunk_map,
                                 );
                             }
@@ -1202,6 +1715,64 @@ pub fn plan_execution_system(
                         ai.task_id = PersonAI::UNEMPLOYED;
                         ai.target_entity = None;
                         combat_target.0 = None;
+                    }
+                }
+            } else if matches!(step_def.target, StepTarget::NearestPartner) {
+                // Mirror HuntPrey: re-route to partner's current tile, drop task if invalid.
+                // Exception: females stay put on their own tile so males converge on
+                // them — without this, both partners chase each other and oscillate.
+                match ai.target_entity {
+                    Some(target_ent) => match partner_query.get(target_ent) {
+                        Ok((target_t, other_sex, other_fm)) => {
+                            if *other_sex == *my_sex || other_fm.faction_id != member.faction_id {
+                                // Partner no longer eligible (sex/faction mismatch); drop task.
+                                ai.state = AiState::Idle;
+                                ai.task_id = PersonAI::UNEMPLOYED;
+                                ai.target_entity = None;
+                            } else if *my_sex == BiologicalSex::Female {
+                                let here = (cur_tx as i16, cur_ty as i16);
+                                if ai.dest_tile != here {
+                                    assign_task_with_routing(
+                                        &mut ai,
+                                        here,
+                                        cur_chunk,
+                                        here,
+                                        step_def.task,
+                                        Some(target_ent),
+                                        &chunk_graph,
+                                        &chunk_router,
+                                        &chunk_map,
+                                    );
+                                }
+                            } else {
+                                let ptx = (target_t.translation.x / TILE_SIZE).floor() as i16;
+                                let pty = (target_t.translation.y / TILE_SIZE).floor() as i16;
+                                if ai.dest_tile != (ptx, pty) {
+                                    assign_task_with_routing(
+                                        &mut ai,
+                                        (cur_tx as i16, cur_ty as i16),
+                                        cur_chunk,
+                                        (ptx, pty),
+                                        step_def.task,
+                                        Some(target_ent),
+                                        &chunk_graph,
+                                        &chunk_router,
+                                        &chunk_map,
+                                    );
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Partner despawned; drop task so the step re-acquires next tick.
+                            ai.state = AiState::Idle;
+                            ai.task_id = PersonAI::UNEMPLOYED;
+                            ai.target_entity = None;
+                        }
+                    },
+                    None => {
+                        // No target on record; drop task so the step re-acquires.
+                        ai.state = AiState::Idle;
+                        ai.task_id = PersonAI::UNEMPLOYED;
                     }
                 }
             }
@@ -1298,6 +1869,45 @@ pub fn rel_influence_system(
         }
         if let Some(plan_id) = best_plan {
             influence.0.insert(entity, plan_id);
+        }
+    }
+}
+
+/// Consumes `DropAbandonedFoodEvent` and dumps the agent's edible inventory at
+/// their current tile. Runs in the Economy set after the existing
+/// `drop_items_at_destination_system` so they share the spatial/ground-item
+/// queries cleanly.
+pub fn drop_abandoned_food_system(
+    mut commands: Commands,
+    mut events: EventReader<DropAbandonedFoodEvent>,
+    spatial: Res<SpatialIndex>,
+    mut ground_items: Query<&mut GroundItem>,
+    mut agents: Query<(&Transform, &mut EconomicAgent)>,
+) {
+    for DropAbandonedFoodEvent(entity) in events.read() {
+        let Ok((transform, mut agent)) = agents.get_mut(*entity) else {
+            continue;
+        };
+        let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+
+        let mut drops: Vec<(Good, u32)> = Vec::new();
+        for (it, q) in agent.inventory.iter_mut() {
+            if it.good.is_edible() && *q > 0 {
+                drops.push((it.good, *q));
+                *q = 0;
+            }
+        }
+        for (good, qty) in drops {
+            crate::simulation::items::spawn_or_merge_ground_item(
+                &mut commands,
+                &spatial,
+                &mut ground_items,
+                tx,
+                ty,
+                good,
+                qty,
+            );
         }
     }
 }

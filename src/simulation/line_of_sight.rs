@@ -1,14 +1,16 @@
+use crate::simulation::construction::DoorMap;
 use crate::world::chunk::ChunkMap;
 
 /// 3D voxel LOS from `from` to `to` (each is `(tx, ty, foot_z)`).
 ///
 /// Walks an integer voxel grid using 2D Bresenham on (x, y) with linearly
 /// interpolated z. At each non-endpoint voxel, queries `chunk_map.tile_at`
-/// and rejects if the tile is opaque (currently: `Wall`). Underground rock
-/// reads as `Wall` via the deltas-only `tile_at`, so an unbroken stretch of
-/// solid earth correctly blocks sight even when no tile is explicitly stored.
+/// and rejects if the tile is opaque (`Wall`, or a closed `Door`). Open doors
+/// are transparent. Underground rock reads as `Wall` via the deltas-only
+/// `tile_at`, so an unbroken stretch of solid earth correctly blocks sight.
 pub fn has_los(
     chunk_map: &ChunkMap,
+    door_map: &DoorMap,
     from: (i32, i32, i8),
     to: (i32, i32, i8),
 ) -> bool {
@@ -35,6 +37,12 @@ pub fn has_los(
             let ray_z = (from_z + t * (to_z - from_z)).round() as i32;
             if chunk_map.tile_at(x0, y0, ray_z).kind.is_opaque() {
                 return false;
+            }
+            // Closed door blocks LOS even though the underlying tile is passable.
+            if let Some(door) = door_map.0.get(&(x0 as i16, y0 as i16)) {
+                if !door.open {
+                    return false;
+                }
             }
         }
 
@@ -77,13 +85,15 @@ mod tests {
     #[test]
     fn same_tile_has_los() {
         let m = flat_chunk_map();
-        assert!(has_los(&m, (0, 0, 0), (0, 0, 0)));
+        let d = DoorMap::default();
+        assert!(has_los(&m, &d, (0, 0, 0), (0, 0, 0)));
     }
 
     #[test]
     fn flat_terrain_always_has_los() {
         let m = flat_chunk_map();
-        assert!(has_los(&m, (0, 0, 0), (10, 5, 0)));
+        let d = DoorMap::default();
+        assert!(has_los(&m, &d, (0, 0, 0), (10, 5, 0)));
     }
 
     #[test]
@@ -104,7 +114,8 @@ mod tests {
             m.set_tile(x, 10, -4, TileData { kind: TileKind::Dirt, ..Default::default() });
         }
         // Two agents inside the tunnel can see each other.
-        assert!(has_los(&m, (0, 10, -4), (9, 10, -4)));
+        let d = DoorMap::default();
+        assert!(has_los(&m, &d, (0, 10, -4), (9, 10, -4)));
     }
 
     #[test]
@@ -119,7 +130,8 @@ mod tests {
             ChunkCoord(0, 0),
             Chunk::new(surface_z, surface_kind, surface_fertility),
         );
-        assert!(!has_los(&m, (0, 0, -4), (9, 0, -4)));
+        let d = DoorMap::default();
+        assert!(!has_los(&m, &d, (0, 0, -4), (9, 0, -4)));
     }
 
     #[test]
@@ -134,6 +146,7 @@ mod tests {
             ChunkCoord(0, 0),
             Chunk::new(surface_z, surface_kind, surface_fertility),
         );
-        assert!(!has_los(&m, (0, 0, 0), (10, 0, -4)));
+        let d = DoorMap::default();
+        assert!(!has_los(&m, &d, (0, 0, 0), (10, 0, -4)));
     }
 }

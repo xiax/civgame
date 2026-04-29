@@ -217,7 +217,7 @@ pub fn reproduction_system(
             (
                 LodLevel::Full,
                 BucketSlot(new_slot),
-                MovementState { wander_timer: 0.0 },
+                MovementState::default(),
                 sex,
                 SkinTone::random(),
                 HairColor::random(),
@@ -238,10 +238,27 @@ pub fn reproduction_system(
                 AgentMemory::default(),
                 RelationshipMemory::default(),
                 child_net,
-                KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 8]),
+                KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 22, 23]),
                 PlanScoringMethod::UtilityNN,
-                Name::new(generate_person_name(sex)),
+                Name::new(child_name_for(faction_id, sex, &registry)),
             ),
         ));
+    }
+}
+
+/// Build a name for a freshly-born child. Children of bonded factions take
+/// "<First> of <LineageRoot>" so the dynasty is visible in the inspector;
+/// SOLO births fall back to the generic name pool.
+fn child_name_for(faction_id: u32, sex: BiologicalSex, registry: &FactionRegistry) -> String {
+    let base = generate_person_name(sex);
+    let root = registry
+        .factions
+        .get(&faction_id)
+        .map(|f| f.lineage.root.as_str())
+        .unwrap_or("");
+    if root.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} of {root}")
     }
 }

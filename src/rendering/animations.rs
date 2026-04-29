@@ -53,36 +53,33 @@ pub fn handle_combat_events(
     }
 }
 
+/// Drives the per-frame transform offsets for combat animations (lunge + hit shake).
+/// Color (hit-flash red, fog tint, clothing alpha) is owned by
+/// `apply_entity_fog_tint_system` — do not write `sprite.color` here.
 pub fn update_animations(
     time: Res<Time>,
     mut anim_query: Query<&mut CombatAnimations>,
     mut visual_query: Query<
-        (&Parent, &mut Transform, &mut Sprite),
+        (&Parent, &mut Transform),
         With<super::entity_sprites::VisualChild>,
     >,
 ) {
     let dt = time.delta_secs();
     const BASE_Y: f32 = -8.0;
 
-    for (parent, mut transform, mut sprite) in visual_query.iter_mut() {
+    for (parent, mut transform) in visual_query.iter_mut() {
         if let Ok(mut anim) = anim_query.get_mut(parent.get()) {
             let mut offset = Vec2::new(0.0, BASE_Y);
-            let mut color = Color::WHITE;
 
             if anim.lunge_timer > 0.0 {
                 anim.lunge_timer = (anim.lunge_timer - dt).max(0.0);
-                let t = (0.2 - anim.lunge_timer) / 0.2; // 0.0 to 1.0
-                                                        // Lunge out and back
+                let t = (0.2 - anim.lunge_timer) / 0.2;
                 let lunge_dist = 12.0 * (1.0 - (t * 2.0 - 1.0).powi(2));
                 offset += anim.lunge_dir * lunge_dist;
             }
 
             if anim.hit_timer > 0.0 {
                 anim.hit_timer = (anim.hit_timer - dt).max(0.0);
-                // Flash red
-                color = Color::srgb(1.0, 0.4, 0.4);
-
-                // Shake
                 let shake_amount = 3.0;
                 offset += Vec2::new(
                     (fastrand::f32() - 0.5) * shake_amount,
@@ -94,18 +91,9 @@ pub fn update_animations(
                 transform.translation.x = offset.x;
                 transform.translation.y = offset.y;
             }
-            if sprite.color != color {
-                sprite.color = color;
-            }
-        } else {
-            // Reset if no animations active, but keep the base vertical offset
-            if transform.translation.x != 0.0 || transform.translation.y != BASE_Y {
-                transform.translation.x = 0.0;
-                transform.translation.y = BASE_Y;
-            }
-            if sprite.color != Color::WHITE {
-                sprite.color = Color::WHITE;
-            }
+        } else if transform.translation.x != 0.0 || transform.translation.y != BASE_Y {
+            transform.translation.x = 0.0;
+            transform.translation.y = BASE_Y;
         }
     }
 }

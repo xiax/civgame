@@ -1,15 +1,20 @@
 use super::selection::SelectedEntity;
 use crate::pathfinding::chunk_graph::ChunkGraph;
+use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::rendering::camera::CameraViewZ;
-use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
+use crate::simulation::construction::{
+    faction_can_build, recipe_for, BedMap, Blueprint, BlueprintMap, BuildSiteKind, CampfireMap,
+    ChairMap, DoorMap, LoomMap, TableMap, WallMaterial, WorkbenchMap,
+};
+use crate::simulation::faction::SOLO;
+use crate::simulation::faction::{FactionMember, FactionRegistry, FactionTechs, PlayerFaction};
 use crate::simulation::items::GroundItem;
 use crate::simulation::person::{AiState, PersonAI, PlayerOrder, PlayerOrderKind};
 use crate::simulation::plants::PlantMap;
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
-use crate::simulation::technology::PERM_SETTLEMENT;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::spatial::SpatialIndex;
-use crate::world::terrain::TILE_SIZE;
+use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use crate::world::tile::TileKind;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -22,7 +27,29 @@ pub struct ContextMenuState {
     pub target_tile: (i16, i16),
     /// Foot Z of the targeted tile at the moment of right-click.
     pub target_z: i8,
+    /// Top-level actions shown directly (Move, Mine, Gather, …).
     pub actions: Vec<PlayerOrderKind>,
+    /// Build options nested under the "Build ▸" submenu. `bool` is whether the
+    /// player faction has the required tech — locked options render greyed-out.
+    pub build_options: Vec<(PlayerOrderKind, bool)>,
+}
+
+/// All build options the player could potentially place on an open tile.
+fn all_build_options() -> [BuildSiteKind; 12] {
+    [
+        BuildSiteKind::Wall(WallMaterial::Palisade),
+        BuildSiteKind::Wall(WallMaterial::WattleDaub),
+        BuildSiteKind::Wall(WallMaterial::Stone),
+        BuildSiteKind::Wall(WallMaterial::Mudbrick),
+        BuildSiteKind::Wall(WallMaterial::CutStone),
+        BuildSiteKind::Door,
+        BuildSiteKind::Bed,
+        BuildSiteKind::Campfire,
+        BuildSiteKind::Workbench,
+        BuildSiteKind::Loom,
+        BuildSiteKind::Table,
+        BuildSiteKind::Chair,
+    ]
 }
 
 pub fn right_click_context_menu_system(
@@ -39,11 +66,36 @@ pub fn right_click_context_menu_system(
     plant_map: Res<PlantMap>,
     spatial: Res<SpatialIndex>,
     ground_item_check: Query<(), With<GroundItem>>,
-    routing: (Res<ChunkGraph>, Res<CameraViewZ>),
+    routing: (
+        Res<ChunkGraph>,
+        Res<ChunkRouter>,
+        Res<CameraViewZ>,
+        Res<BedMap>,
+        Res<CampfireMap>,
+        Res<DoorMap>,
+        Res<TableMap>,
+        Res<ChairMap>,
+        Res<WorkbenchMap>,
+        Res<LoomMap>,
+        ResMut<BlueprintMap>,
+    ),
     mut menu_state: ResMut<ContextMenuState>,
     mut commands: Commands,
 ) {
-    let (chunk_graph, camera_view_z) = routing;
+    let (
+        chunk_graph,
+        chunk_router,
+        camera_view_z,
+        bed_map,
+        campfire_map,
+        door_map,
+        table_map,
+        chair_map,
+        workbench_map,
+        loom_map,
+        mut bp_order_map,
+    ) = routing;
+
     // Require a selected player-faction member.
     let Some(sel_entity) = selected.0 else {
         menu_state.open = false;
@@ -70,10 +122,6 @@ pub fn right_click_context_menu_system(
                     let tx = (world_pos.x / TILE_SIZE).floor() as i32;
                     let ty = (world_pos.y / TILE_SIZE).floor() as i32;
 
-                    // Determine the Z slice this click targets. Surface
-                    // mode (CameraViewZ::MAX) → click targets the tile's
-                    // surface_z. Underground view → click targets the
-                    // camera_view_z slice and the tile read uses tile_at.
                     let underground = camera_view_z.0 != i32::MAX;
                     let target_z_i32 = if underground {
                         camera_view_z.0
@@ -87,24 +135,43 @@ pub fn right_click_context_menu_system(
                     };
 
                     let mut actions = vec![PlayerOrderKind::Move];
+                    let mut build_options: Vec<(PlayerOrderKind, bool)> = Vec::new();
+
+                    let player_techs: FactionTechs = faction_q
+                        .get(sel_entity)
+                        .ok()
+                        .and_then(|m| faction_registry.factions.get(&m.faction_id))
+                        .map(|f| f.techs.clone())
+                        .unwrap_or_default();
+
+                    let pos_tile = (tx as i16, ty as i16);
+                    let already_built = bed_map.0.contains_key(&pos_tile)
+                        || campfire_map.0.contains_key(&pos_tile)
+                        || door_map.0.contains_key(&pos_tile)
+                        || table_map.0.contains_key(&pos_tile)
+                        || chair_map.0.contains_key(&pos_tile)
+                        || workbench_map.0.contains_key(&pos_tile)
+                        || loom_map.0.contains_key(&pos_tile);
+
                     if let Some(kind) = target_kind {
                         if matches!(kind, TileKind::Wall | TileKind::Stone) {
                             actions.push(PlayerOrderKind::Mine);
                         }
                         if kind.is_passable() && !underground {
                             actions.push(PlayerOrderKind::DigDown);
-                            let has_perm = faction_q
-                                .get(sel_entity)
-                                .ok()
-                                .and_then(|m| faction_registry.factions.get(&m.faction_id))
-                                .map(|f| f.techs.has(PERM_SETTLEMENT))
-                                .unwrap_or(false);
-
-                            if has_perm {
-                                actions.push(PlayerOrderKind::BuildWall);
+                            // Build menu: list every option, gating advanced
+                            // ones by tech. Skip if a structure is already on
+                            // this tile.
+                            if !already_built {
+                                for bk in all_build_options() {
+                                    let unlocked = faction_can_build(bk, &player_techs);
+                                    build_options.push((PlayerOrderKind::Build(bk), unlocked));
+                                }
                             }
-                            actions.push(PlayerOrderKind::BuildBed);
                         }
+                    }
+                    if !underground && already_built {
+                        actions.push(PlayerOrderKind::Deconstruct);
                     }
                     if !underground && plant_map.0.contains_key(&(tx, ty)) {
                         actions.push(PlayerOrderKind::Gather);
@@ -120,9 +187,10 @@ pub fn right_click_context_menu_system(
 
                     menu_state.open = true;
                     menu_state.screen_pos = egui::pos2(cursor_pos.x, cursor_pos.y);
-                    menu_state.target_tile = (tx as i16, ty as i16);
+                    menu_state.target_tile = pos_tile;
                     menu_state.target_z = target_z_i32 as i8;
                     menu_state.actions = actions;
+                    menu_state.build_options = build_options;
                 }
             }
         }
@@ -141,6 +209,7 @@ pub fn right_click_context_menu_system(
     }
 
     let actions = menu_state.actions.clone();
+    let build_options = menu_state.build_options.clone();
     let target_tile = menu_state.target_tile;
     let target_z = menu_state.target_z;
     let mut chosen: Option<PlayerOrderKind> = None;
@@ -154,6 +223,22 @@ pub fn right_click_context_menu_system(
                         chosen = Some(*action);
                     }
                 }
+                if !build_options.is_empty() {
+                    ui.menu_button("Build \u{25B8}", |ui| {
+                        for (opt, unlocked) in &build_options {
+                            let label = match opt {
+                                PlayerOrderKind::Build(bk) => recipe_for(*bk).name,
+                                _ => opt.label(),
+                            };
+                            let btn = egui::Button::new(label);
+                            let resp = ui.add_enabled(*unlocked, btn);
+                            if resp.clicked() {
+                                chosen = Some(*opt);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
             });
         });
 
@@ -165,14 +250,46 @@ pub fn right_click_context_menu_system(
                 cur_tx.div_euclid(CHUNK_SIZE as i32),
                 cur_ty.div_euclid(CHUNK_SIZE as i32),
             );
+
+            // For Build orders: spawn a personal Blueprint at the target tile
+            // so the agent has a concrete entity to work toward.
+            let build_bp: Option<Entity> = if let PlayerOrderKind::Build(kind) = action {
+                if !bp_order_map.0.contains_key(&target_tile) {
+                    let faction_id = faction_q
+                        .get(sel_entity)
+                        .map(|m| m.faction_id)
+                        .unwrap_or(SOLO);
+                    let wp = tile_to_world(target_tile.0 as i32, target_tile.1 as i32);
+                    let target_z = chunk_map
+                        .surface_z_at(target_tile.0 as i32, target_tile.1 as i32)
+                        as i8;
+                    let bp_e = commands
+                        .spawn((
+                            Blueprint::new(faction_id, Some(sel_entity), kind, target_tile, target_z),
+                            Transform::from_xyz(wp.x, wp.y, 0.3),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        ))
+                        .id();
+                    bp_order_map.0.insert(target_tile, bp_e);
+                    Some(bp_e)
+                } else {
+                    bp_order_map.0.get(&target_tile).copied()
+                }
+            } else {
+                None
+            };
+
             let task = match action {
                 PlayerOrderKind::Move => TaskKind::Idle,
                 PlayerOrderKind::Mine => TaskKind::Gather,
                 PlayerOrderKind::Gather => TaskKind::Gather,
                 PlayerOrderKind::PickUp => TaskKind::Scavenge,
-                PlayerOrderKind::BuildWall => TaskKind::Construct,
-                PlayerOrderKind::BuildBed => TaskKind::ConstructBed,
+                PlayerOrderKind::Build(BuildSiteKind::Bed) => TaskKind::ConstructBed,
+                PlayerOrderKind::Build(_) => TaskKind::Construct,
                 PlayerOrderKind::DigDown => TaskKind::Dig,
+                PlayerOrderKind::Deconstruct => TaskKind::Deconstruct,
             };
             assign_task_with_routing(
                 &mut ai,
@@ -180,8 +297,9 @@ pub fn right_click_context_menu_system(
                 cur_chunk,
                 target_tile,
                 task,
-                None,
+                build_bp,
                 &chunk_graph,
+                &chunk_router,
                 &chunk_map,
             );
             ai.target_z = target_z;

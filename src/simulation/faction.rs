@@ -88,6 +88,12 @@ pub struct FactionMember {
 #[derive(Component)]
 pub struct FactionCenter;
 
+/// Marks the designated tribal chief of a faction.
+/// Inserted on the faction founder at formation; re-elected by `chief_selection_system`
+/// if the current chief leaves or dies.
+#[derive(Component)]
+pub struct FactionChief;
+
 #[derive(Component)]
 pub struct PlayerFactionMarker;
 
@@ -147,6 +153,137 @@ impl Default for FactionMember {
     }
 }
 
+// ── Faction culture & lineage ─────────────────────────────────────────────────
+
+/// Architectural / strategic style a faction grows into. Picked at faction
+/// creation; drives the settlement planner's zone-placement strategy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutStyle {
+    /// Tight, overlapping zones around a small core.
+    Compact,
+    /// Wide gaps between zones; large outward footprint.
+    Sprawling,
+    /// Single E-W axis with branches.
+    Linear,
+    /// Concentric rings around the center (closest to current Neolithic).
+    Radial,
+    /// Inner residential core walled tightly; agriculture outside.
+    Citadel,
+}
+
+impl LayoutStyle {
+    pub const ALL: [LayoutStyle; 5] = [
+        LayoutStyle::Compact,
+        LayoutStyle::Sprawling,
+        LayoutStyle::Linear,
+        LayoutStyle::Radial,
+        LayoutStyle::Citadel,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LayoutStyle::Compact => "Compact",
+            LayoutStyle::Sprawling => "Sprawling",
+            LayoutStyle::Linear => "Linear",
+            LayoutStyle::Radial => "Radial",
+            LayoutStyle::Citadel => "Citadel",
+        }
+    }
+}
+
+/// Per-faction architectural and behavioural personality. Rolled once at
+/// faction creation from a deterministic seed. Drives the settlement planner,
+/// build-candidate scoring, raid frequency, and ritual cadence.
+#[derive(Clone, Debug)]
+pub struct FactionCulture {
+    pub style: LayoutStyle,
+    /// 0..=255 — low = wide spacing, high = packed footprints.
+    pub density: u8,
+    /// 0..=255 — biases wall priority and ring count.
+    pub defensive: u8,
+    /// 0..=255 — biases shrines, monuments, ritual cadence.
+    pub ceremonial: u8,
+    /// 0..=255 — biases markets and storage.
+    pub mercantile: u8,
+    /// 0..=255 — biases barracks, raid frequency.
+    pub martial: u8,
+    pub seed: u32,
+}
+
+impl FactionCulture {
+    /// Roll a deterministic culture from a seed (typically `home_tile + faction_id`).
+    pub fn roll(seed: u32) -> Self {
+        // Cheap deterministic hash steps — splitmix-ish.
+        let mut s = seed.wrapping_mul(0x9E37_79B9).wrapping_add(0xDEAD_BEEF);
+        let mut next = || {
+            s ^= s >> 16;
+            s = s.wrapping_mul(0x85EB_CA6B);
+            s ^= s >> 13;
+            s = s.wrapping_mul(0xC2B2_AE35);
+            s ^= s >> 16;
+            s
+        };
+        let style = LayoutStyle::ALL[(next() as usize) % LayoutStyle::ALL.len()];
+        // Style template + per-trait jitter ±40.
+        let (mut den, mut def, mut cer, mut mer, mut mar) = match style {
+            LayoutStyle::Compact => (200u8, 140, 110, 110, 110),
+            LayoutStyle::Sprawling => (60, 90, 110, 130, 90),
+            LayoutStyle::Linear => (130, 110, 100, 160, 110),
+            LayoutStyle::Radial => (140, 130, 130, 110, 110),
+            LayoutStyle::Citadel => (180, 220, 100, 90, 170),
+        };
+        let jitter = |base: u8, raw: u32| -> u8 {
+            let delta = (raw % 81) as i32 - 40; // -40..=+40
+            (base as i32 + delta).clamp(0, 255) as u8
+        };
+        den = jitter(den, next());
+        def = jitter(def, next());
+        cer = jitter(cer, next());
+        mer = jitter(mer, next());
+        mar = jitter(mar, next());
+        Self {
+            style,
+            density: den,
+            defensive: def,
+            ceremonial: cer,
+            mercantile: mer,
+            martial: mar,
+            seed,
+        }
+    }
+}
+
+/// Dynastic lineage information for a faction. Successor chiefs inherit a
+/// modulated culture (small drift per generation); child agent names are
+/// derived from `root`.
+#[derive(Clone, Debug, Default)]
+pub struct FactionLineage {
+    /// Naming root (e.g., "Aren") used to generate descendant names.
+    pub root: String,
+    /// Founder's full name. Stable across the faction's lifetime.
+    pub founder: String,
+    /// Number of chief successions since founding.
+    pub generation: u32,
+}
+
+impl FactionLineage {
+    pub fn from_seed(seed: u32) -> Self {
+        const ROOTS: &[&str] = &[
+            "Aren", "Bryn", "Cael", "Doran", "Elin", "Faro", "Garen", "Hela",
+            "Irek", "Joran", "Kael", "Lyr", "Maren", "Nyx", "Oran", "Pyra",
+            "Quinn", "Rhea", "Sora", "Talin", "Uma", "Vale", "Wren", "Yara",
+        ];
+        const SUFFIX: &[&str] = &["", "-tha", "-mir", "-ros", "-vyn", "-dor", "-an", "-eth"];
+        let r = ROOTS[(seed as usize) % ROOTS.len()];
+        let s = SUFFIX[((seed >> 8) as usize) % SUFFIX.len()];
+        Self {
+            root: r.to_string(),
+            founder: format!("{r}{s}"),
+            generation: 0,
+        }
+    }
+}
+
 /// u64 bitset storing which technologies are unlocked (bits 0-42).
 #[derive(Clone, Debug, Default)]
 pub struct FactionTechs(pub u64);
@@ -190,6 +327,16 @@ pub struct FactionData {
     pub activity_log: ActivityLog,
     pub resource_supply: ahash::AHashMap<crate::economy::goods::Good, u32>,
     pub resource_demand: ahash::AHashMap<crate::economy::goods::Good, u32>,
+    /// The current tribal chief of this faction, if one has been designated.
+    pub chief_entity: Option<Entity>,
+    /// Architectural / behavioural personality. Drives planner, selector,
+    /// raids, rituals.
+    pub culture: FactionCulture,
+    /// Dynastic naming + generation count. Updated at chief succession.
+    pub lineage: FactionLineage,
+    /// Tile of the structure currently being torn down for upgrade-replacement.
+    /// `Some` while a deconstruct→rebuild cycle is in flight (one per faction).
+    pub active_upgrade: Option<(i16, i16)>,
 }
 
 #[derive(Resource, Default)]
@@ -209,6 +356,12 @@ impl FactionRegistry {
         let id = self.next_id;
         let mut techs = FactionTechs::default();
         techs.unlock(FIRE_MAKING);
+        // Deterministic per-faction seed: home tile + faction id, packed.
+        let seed = ((home_tile.0 as i32 as u32) << 16)
+            ^ (home_tile.1 as i32 as u32)
+            ^ id.wrapping_mul(0x9E37_79B9);
+        let culture = FactionCulture::roll(seed);
+        let lineage = FactionLineage::from_seed(seed);
         self.factions.insert(
             id,
             FactionData {
@@ -221,6 +374,10 @@ impl FactionRegistry {
                 activity_log: ActivityLog::default(),
                 resource_supply: ahash::AHashMap::default(),
                 resource_demand: ahash::AHashMap::default(),
+                chief_entity: None,
+                culture,
+                lineage,
+                active_upgrade: None,
             },
         );
         id
@@ -331,6 +488,11 @@ pub fn bonding_system(
                     Visibility::Hidden,
                     InheritedVisibility::default(),
                 ));
+                // The initiating agent (outer-loop entity) becomes the founding chief.
+                if let Some(fd) = registry.factions.get_mut(&new_id) {
+                    fd.chief_entity = Some(*entity);
+                }
+                commands.entity(*entity).insert(FactionChief);
                 new_id
             } else {
                 nb_faction
@@ -477,6 +639,51 @@ pub fn drop_items_at_destination_system(
                     seeds,
                 );
             }
+        }
+
+        // Deposit all crafted goods (Tools, Weapon, Armor, Shield, Cloth, Luxury).
+        let mut crafted_drops: Vec<(Good, u32)> = Vec::new();
+        for (it, q) in agent.inventory.iter_mut() {
+            if *q > 0
+                && matches!(
+                    it.good,
+                    Good::Tools
+                        | Good::Weapon
+                        | Good::Armor
+                        | Good::Shield
+                        | Good::Cloth
+                        | Good::Luxury
+                )
+            {
+                crafted_drops.push((it.good, *q));
+                *q = 0;
+            }
+        }
+        for (good, qty) in crafted_drops {
+            spawn_or_merge_ground_item(
+                &mut commands,
+                &spatial,
+                &mut ground_items,
+                deposit_tx,
+                deposit_ty,
+                good,
+                qty,
+            );
+        }
+
+        // Deposit recovered construction materials (Wood from deconstruction).
+        let wood_qty = agent.quantity_of(Good::Wood);
+        if wood_qty > 0 {
+            agent.remove_good(Good::Wood, wood_qty);
+            spawn_or_merge_ground_item(
+                &mut commands,
+                &spatial,
+                &mut ground_items,
+                deposit_tx,
+                deposit_ty,
+                Good::Wood,
+                wood_qty,
+            );
         }
 
         ai.state = AiState::Idle;
@@ -645,16 +852,17 @@ pub fn resource_demand_system(
     }
 
     // 2. Tally demand
-    // Materials from Blueprints
+    // Materials from Blueprints — sum unmet need per ingredient across all deposit slots.
     for &bp_entity in bp_map.0.values() {
         if let Ok(bp) = bp_query.get(bp_entity) {
             if let Some(faction) = registry.factions.get_mut(&bp.faction_id) {
-                let good = match bp.kind {
-                    crate::simulation::construction::BuildSiteKind::Wall => Good::Wood,
-                    crate::simulation::construction::BuildSiteKind::Bed => Good::Wood,
-                };
-                let needed = bp.wood_needed.saturating_sub(bp.wood_deposited) as u32;
-                *faction.resource_demand.entry(good).or_insert(0) += needed;
+                for i in 0..bp.deposit_count as usize {
+                    let need = bp.deposits[i];
+                    let unmet = need.needed.saturating_sub(need.deposited) as u32;
+                    if unmet > 0 {
+                        *faction.resource_demand.entry(need.good).or_insert(0) += unmet;
+                    }
+                }
             }
         }
     }
@@ -666,4 +874,82 @@ pub fn resource_demand_system(
         faction.resource_demand.insert(Good::Meat, food_demand);
         faction.resource_demand.insert(Good::Grain, food_demand);
     }
+}
+
+// ── Chief selection system ────────────────────────────────────────────────────
+
+/// Ensures every non-SOLO faction has a designated tribal chief.
+/// Runs every 60 ticks. If the current chief has left or died, elects any
+/// surviving faction member as the new chief.
+pub fn chief_selection_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    mut registry: ResMut<FactionRegistry>,
+    member_query: Query<(Entity, &FactionMember)>,
+) {
+    if clock.tick % 60 != 0 {
+        return;
+    }
+
+    // Build faction_id → member entities map from the current world state.
+    let mut faction_members: AHashMap<u32, Vec<Entity>> = AHashMap::new();
+    for (entity, member) in member_query.iter() {
+        if member.faction_id != SOLO {
+            faction_members.entry(member.faction_id).or_default().push(entity);
+        }
+    }
+
+    for (&faction_id, faction) in registry.factions.iter_mut() {
+        let members = match faction_members.get(&faction_id) {
+            Some(m) if !m.is_empty() => m,
+            _ => {
+                faction.chief_entity = None;
+                continue;
+            }
+        };
+
+        let chief_valid = faction
+            .chief_entity
+            .map(|e| members.contains(&e))
+            .unwrap_or(false);
+
+        if !chief_valid {
+            let old_chief = faction.chief_entity;
+            let new_chief = members[0];
+            faction.chief_entity = Some(new_chief);
+            commands.entity(new_chief).insert(FactionChief);
+            if let Some(old) = old_chief {
+                if old != new_chief {
+                    commands.entity(old).remove::<FactionChief>();
+                }
+                // Succession drift — only counts as a transition if there was
+                // a prior chief (the founding chief sets generation 0).
+                faction.lineage.generation = faction.lineage.generation.saturating_add(1);
+                drift_culture(&mut faction.culture, faction.lineage.generation);
+            }
+        }
+    }
+}
+
+/// Drift the five culture traits by ±10 deterministically based on the
+/// generation count. Successive chiefs gradually shift settlement personality
+/// without erasing the founder's identity. Layout style is left untouched —
+/// architectural identity persists across generations.
+fn drift_culture(culture: &mut FactionCulture, generation: u32) {
+    let mut s = culture.seed.wrapping_add(generation.wrapping_mul(0x9E37_79B9));
+    let mut next = || {
+        s ^= s >> 16;
+        s = s.wrapping_mul(0x85EB_CA6B);
+        s ^= s >> 13;
+        s
+    };
+    let drift = |val: u8, raw: u32| -> u8 {
+        let delta = (raw % 21) as i32 - 10; // -10..=+10
+        (val as i32 + delta).clamp(0, 255) as u8
+    };
+    culture.density = drift(culture.density, next());
+    culture.defensive = drift(culture.defensive, next());
+    culture.ceremonial = drift(culture.ceremonial, next());
+    culture.mercantile = drift(culture.mercantile, next());
+    culture.martial = drift(culture.martial, next());
 }

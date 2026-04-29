@@ -81,7 +81,7 @@ fn setup_sandbox(
         (
             LodLevel::Full,
             BucketSlot(0),
-            MovementState { wander_timer: 0.0 },
+            MovementState::default(),
             BiologicalSex::random(),
             Personality::random(),
             AgentGoal::default(),
@@ -95,7 +95,7 @@ fn setup_sandbox(
             AgentMemory::default(),
             RelationshipMemory::default(),
             UtilityNet::new_random(),
-            KnownPlans::with_innate(&[0, 1, 2, 3, 5]),
+            KnownPlans::with_innate(&[0, 1, 2, 3, 5, 22, 23]),
             PlanScoringMethod::UtilityNN,
         ),
     ));

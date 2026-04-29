@@ -1,8 +1,8 @@
 use ahash::AHashMap;
 use bevy::prelude::*;
-use std::collections::VecDeque;
 use std::time::Instant;
 
+use crate::pathfinding::tile_cost::{tile_step_cost, IMPASSABLE};
 use crate::world::chunk::{ChunkCoord, ChunkMap, Z_MIN, CHUNK_SIZE};
 
 #[derive(Clone)]
@@ -16,101 +16,18 @@ pub struct ChunkEdge {
     pub entry_local: (u8, u8),
     /// Z slice of the entry tile in the neighbor.
     pub entry_z: i8,
+    /// Cost to traverse this edge (entry tile's `tile_step_cost` plus a
+    /// small Z-change penalty matching A*/flow-field rules). Used by
+    /// `ChunkRouter`'s weighted Dijkstra.
+    pub traverse_cost: u16,
 }
 
 #[derive(Resource, Default)]
 pub struct ChunkGraph {
     pub edges: AHashMap<ChunkCoord, Vec<ChunkEdge>>,
-}
-
-impl ChunkGraph {
-    /// BFS from `cur` to `dest`; returns the global tile coord of the first
-    /// border crossing (the exit tile in `cur`'s chunk), or `None` if no route.
-    /// Prefers edges whose `exit_z` matches the agent's `current_z`; falls
-    /// back to the nearest available Z otherwise (the agent walks up/down to
-    /// it via `passable_step_3d` during movement).
-    pub fn next_waypoint(
-        &self,
-        cur: ChunkCoord,
-        dest: ChunkCoord,
-        current_z: i8,
-        _chunk_map: &ChunkMap,
-    ) -> Option<(i16, i16)> {
-        if cur == dest {
-            return None;
-        }
-
-        // BFS over chunk graph; record first-step edge from `cur`.
-        let mut visited = AHashMap::new();
-        let mut queue: VecDeque<ChunkCoord> = VecDeque::new();
-        visited.insert(cur, cur);
-        queue.push_back(cur);
-
-        while let Some(node) = queue.pop_front() {
-            if let Some(edges) = self.edges.get(&node) {
-                for edge in edges {
-                    let nb = edge.neighbor;
-                    if visited.contains_key(&nb) {
-                        continue;
-                    }
-                    visited.insert(nb, node);
-                    if nb == dest {
-                        // Trace back to the edge that leaves `cur`
-                        let first_step = trace_first_step(&visited, cur, dest);
-                        let edges_from_cur = self.edges.get(&cur)?;
-                        let candidates: Vec<&ChunkEdge> = edges_from_cur
-                            .iter()
-                            .filter(|e| e.neighbor == first_step)
-                            .collect();
-                        if candidates.is_empty() {
-                            return None;
-                        }
-
-                        // Prefer edges at the agent's current Z; otherwise
-                        // pick the closest-Z one (the agent will walk up/
-                        // down to it via passable_step_3d during movement).
-                        let same_z: Vec<&ChunkEdge> = candidates
-                            .iter()
-                            .copied()
-                            .filter(|e| e.exit_z == current_z)
-                            .collect();
-                        let chosen = if !same_z.is_empty() {
-                            same_z[fastrand::usize(..same_z.len())]
-                        } else {
-                            *candidates
-                                .iter()
-                                .min_by_key(|e| {
-                                    (e.exit_z as i32 - current_z as i32).abs()
-                                })
-                                .expect("non-empty candidates")
-                        };
-                        let gx = chosen.neighbor.0 * CHUNK_SIZE as i32
-                            + chosen.entry_local.0 as i32;
-                        let gy = chosen.neighbor.1 * CHUNK_SIZE as i32
-                            + chosen.entry_local.1 as i32;
-                        return Some((gx as i16, gy as i16));
-                    }
-                    queue.push_back(nb);
-                }
-            }
-        }
-        None
-    }
-}
-
-fn trace_first_step(
-    parent: &AHashMap<ChunkCoord, ChunkCoord>,
-    start: ChunkCoord,
-    dest: ChunkCoord,
-) -> ChunkCoord {
-    let mut cur = dest;
-    loop {
-        let p = parent[&cur];
-        if p == start {
-            return cur;
-        }
-        cur = p;
-    }
+    /// Bumped every time the graph rebuilds so dependent caches
+    /// (ChunkRouter, ChunkConnectivity) can invalidate.
+    pub generation: u32,
 }
 
 pub fn build_chunk_graph_system(chunk_map: Res<ChunkMap>, mut graph: ResMut<ChunkGraph>) {
@@ -204,12 +121,25 @@ pub fn build_chunk_graph_system(chunk_map: Res<ChunkMap>, mut graph: ResMut<Chun
                         if !chunk_map.passable_at(nb_tx, nb_ty, nz as i32) {
                             continue;
                         }
+                        let entry_kind =
+                            chunk_map.tile_at(nb_tx, nb_ty, nz as i32).kind;
+                        let base = tile_step_cost(entry_kind);
+                        let traverse_cost = if base == IMPASSABLE {
+                            IMPASSABLE
+                        } else {
+                            let mut c = base as u32;
+                            if (nz as i32 - z as i32).abs() == 1 {
+                                c = c.saturating_add(8);
+                            }
+                            c.min(IMPASSABLE as u32) as u16
+                        };
                         chunk_edges.push(ChunkEdge {
                             neighbor: nb,
                             exit_local: (lx as u8, ly as u8),
                             exit_z: z,
                             entry_local: (nb_lx as u8, nb_ly as u8),
                             entry_z: nz,
+                            traverse_cost,
                         });
                         edge_count += 1;
                     }
@@ -219,6 +149,8 @@ pub fn build_chunk_graph_system(chunk_map: Res<ChunkMap>, mut graph: ResMut<Chun
 
         graph.edges.insert(*coord, chunk_edges);
     }
+
+    graph.generation = graph.generation.wrapping_add(1);
 
     info!(
         "ChunkGraph built: {} edges in {:?}",
@@ -275,67 +207,13 @@ mod tests {
                         exit_z: 0,
                         entry_local: (0, 0),
                         entry_z: 0,
+                        traverse_cost: 100,
                     });
                 }
             }
             graph.edges.insert(*coord, chunk_edges);
         }
         assert!(!graph.edges.is_empty());
-    }
-
-    #[test]
-    fn next_waypoint_prefers_same_z_edge() {
-        let mut graph = ChunkGraph::default();
-        graph.edges.insert(
-            ChunkCoord(0, 0),
-            vec![
-                ChunkEdge {
-                    neighbor: ChunkCoord(1, 0),
-                    exit_local: (31, 5),
-                    exit_z: 0,
-                    entry_local: (0, 5),
-                    entry_z: 0,
-                },
-                ChunkEdge {
-                    neighbor: ChunkCoord(1, 0),
-                    exit_local: (31, 6),
-                    exit_z: -3,
-                    entry_local: (0, 6),
-                    entry_z: -3,
-                },
-            ],
-        );
-        graph.edges.insert(ChunkCoord(1, 0), vec![]);
-
-        let map = ChunkMap::default();
-        // Agent at z=-3 should pick the entry tile at y=6, not y=5.
-        let wp = graph
-            .next_waypoint(ChunkCoord(0, 0), ChunkCoord(1, 0), -3, &map)
-            .unwrap();
-        assert_eq!(wp, ((1 * CHUNK_SIZE as i32) as i16, 6));
-    }
-
-    #[test]
-    fn next_waypoint_falls_back_to_nearest_z() {
-        let mut graph = ChunkGraph::default();
-        graph.edges.insert(
-            ChunkCoord(0, 0),
-            vec![ChunkEdge {
-                neighbor: ChunkCoord(1, 0),
-                exit_local: (31, 5),
-                exit_z: 0,
-                entry_local: (0, 5),
-                entry_z: 0,
-            }],
-        );
-        graph.edges.insert(ChunkCoord(1, 0), vec![]);
-
-        let map = ChunkMap::default();
-        // Agent at z=-3, only z=0 edge exists — falls back to it.
-        let wp = graph
-            .next_waypoint(ChunkCoord(0, 0), ChunkCoord(1, 0), -3, &map)
-            .unwrap();
-        assert_eq!(wp, ((1 * CHUNK_SIZE as i32) as i16, 5));
     }
 
     #[test]

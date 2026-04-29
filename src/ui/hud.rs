@@ -5,6 +5,7 @@ use crate::economy::mode::EconomicMode;
 use crate::rendering::camera::CameraViewZ;
 use crate::simulation::construction::AutonomousBuildingToggle;
 use crate::simulation::faction::{FactionRegistry, PlayerFaction};
+use crate::ui::debug_panel::DebugPanelState;
 use crate::ui::tech_panel::TechPanelOpen;
 use crate::simulation::person::Person;
 use crate::simulation::schedule::SimClock;
@@ -16,6 +17,7 @@ pub fn hud_system(
     mut mode: ResMut<EconomicMode>,
     mut auto_build: ResMut<AutonomousBuildingToggle>,
     mut tech_panel_open: ResMut<TechPanelOpen>,
+    mut debug_state: ResMut<DebugPanelState>,
     camera_view_z: Res<CameraViewZ>,
     calendar: Res<Calendar>,
     player_faction: Res<PlayerFaction>,
@@ -84,6 +86,17 @@ pub fn hud_system(
                         });
                         if ui.add(tech_btn).clicked() {
                             tech_panel_open.0 = !tech_panel_open.0;
+                        }
+
+                        ui.separator();
+                        let dbg_btn =
+                            egui::Button::new("Debug").fill(if debug_state.open {
+                                egui::Color32::from_rgb(200, 100, 60)
+                            } else {
+                                egui::Color32::from_gray(60)
+                            });
+                        if ui.add(dbg_btn).clicked() {
+                            debug_state.open = !debug_state.open;
                         }
 
                         ui.separator();

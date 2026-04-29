@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy_egui::EguiPlugin;
 
+pub mod debug_panel;
 pub mod economy_panel;
 pub mod hover;
 pub mod hud;
@@ -22,6 +23,7 @@ impl Plugin for UiPlugin {
             .insert_resource(world_map::WorldMapTexture::default())
             .insert_resource(orders::ContextMenuState::default())
             .insert_resource(tech_panel::TechPanelOpen::default())
+            .insert_resource(debug_panel::DebugPanelState::default())
             .add_systems(
                 Update,
                 (
@@ -34,6 +36,7 @@ impl Plugin for UiPlugin {
                     hud::hud_system,
                     world_map::world_map_system,
                     tech_panel::tech_panel_system,
+                    debug_panel::debug_panel_system,
                     hover::hover_info_system,
                 ),
             );

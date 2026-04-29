@@ -162,21 +162,40 @@ pub enum PlayerOrderKind {
     Mine,
     Gather,
     PickUp,
-    BuildWall,
-    BuildBed,
+    Build(crate::simulation::construction::BuildSiteKind),
     DigDown,
+    Deconstruct,
 }
 
 impl PlayerOrderKind {
     pub fn label(self) -> &'static str {
+        use crate::simulation::construction::{BuildSiteKind, WallMaterial};
         match self {
             PlayerOrderKind::Move => "Move here",
             PlayerOrderKind::Mine => "Mine",
             PlayerOrderKind::Gather => "Gather",
             PlayerOrderKind::PickUp => "Pick up",
-            PlayerOrderKind::BuildWall => "Build Wall",
-            PlayerOrderKind::BuildBed => "Build Bed",
+            PlayerOrderKind::Build(kind) => match kind {
+                BuildSiteKind::Wall(WallMaterial::Palisade) => "Build Palisade",
+                BuildSiteKind::Wall(WallMaterial::WattleDaub) => "Build Wattle Wall",
+                BuildSiteKind::Wall(WallMaterial::Stone) => "Build Stone Wall",
+                BuildSiteKind::Wall(WallMaterial::Mudbrick) => "Build Mudbrick Wall",
+                BuildSiteKind::Wall(WallMaterial::CutStone) => "Build Cut Stone Wall",
+                BuildSiteKind::Door => "Build Door",
+                BuildSiteKind::Bed => "Build Bed",
+                BuildSiteKind::Campfire => "Build Campfire",
+                BuildSiteKind::Workbench => "Build Workbench",
+                BuildSiteKind::Loom => "Build Loom",
+                BuildSiteKind::Table => "Build Table",
+                BuildSiteKind::Chair => "Build Chair",
+                BuildSiteKind::Granary => "Build Granary",
+                BuildSiteKind::Shrine => "Build Shrine",
+                BuildSiteKind::Market => "Build Market",
+                BuildSiteKind::Barracks => "Build Barracks",
+                BuildSiteKind::Monument => "Build Monument",
+            },
             PlayerOrderKind::DigDown => "Dig Down",
+            PlayerOrderKind::Deconstruct => "Deconstruct",
         }
     }
 }
@@ -339,6 +358,7 @@ pub fn spawn_population(
                     BucketSlot(spawned),
                     MovementState {
                         wander_timer: (spawned % 100) as f32 * 0.025,
+                        ..Default::default()
                     },
                     sex,
                     SkinTone::random(),
@@ -360,7 +380,7 @@ pub fn spawn_population(
                     AgentMemory::default(),
                     RelationshipMemory::default(),
                     UtilityNet::new_random(),
-                    KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 8, 9]),
+                    KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 9, 10, 22, 23, 24]),
                     PlanScoringMethod::UtilityNN,
                     Name::new(generate_person_name(sex)),
                 ),

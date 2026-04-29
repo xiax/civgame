@@ -15,6 +15,11 @@ use std::time::Instant;
 
 const WOLF_COUNT: u32 = 150;
 const DEER_COUNT: u32 = 400;
+const HORSE_COUNT: u32 = 200;
+const HORSE_POP_CAP: usize = 300;
+const HORSE_HP: u8 = 40;
+const HORSE_REPRO_MALE_THRESHOLD: f32 = 160.0;
+const HORSE_REPRO_FEMALE_THRESHOLD: f32 = 190.0;
 const ANIMAL_SPEED: f32 = 32.0; // pixels/sec, slower than persons
 const WANDER_INTERVAL: f32 = 3.0;
 
@@ -42,6 +47,21 @@ pub struct Wolf;
 
 #[derive(Component)]
 pub struct Deer;
+
+#[derive(Component)]
+pub struct Horse;
+
+/// Placed on a horse once tamed by a faction.
+/// The horse stops fleeing from persons and can be ridden.
+#[derive(Component, Clone, Copy)]
+pub struct Tamed {
+    pub owner_faction: u32,
+}
+
+/// Placed on a horse while it is being ridden by a person.
+/// Causes animal_movement_system to skip this entity (position managed by rider sync).
+#[derive(Component, Clone, Copy)]
+pub struct CarriedBy(pub Entity);
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -208,6 +228,43 @@ pub fn spawn_animals(
         slot += 1;
     }
 
+    // Horses: spawn in grassland, staggered offset from deer to avoid overlap
+    let horse_step = (grass_tiles.len() / HORSE_COUNT as usize).max(1);
+    let horse_offset = grass_tiles.len() / 3;
+    for i in 0..HORSE_COUNT as usize {
+        let idx = (horse_offset + i * horse_step) % grass_tiles.len().max(1);
+        if idx >= grass_tiles.len() {
+            break;
+        }
+        let (tx, ty) = grass_tiles[idx];
+        let pos = tile_to_world(tx, ty);
+        commands.spawn((
+            Horse,
+            Transform::from_xyz(pos.x, pos.y, 1.0),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
+            AnimalAI {
+                target_tile: (tx as i16, ty as i16),
+                wander_timer: i as f32 * 0.03,
+                ..Default::default()
+            },
+            Health::new(HORSE_HP),
+            CombatTarget::default(),
+            CombatCooldown::default(),
+            LodLevel::Full,
+            BucketSlot(slot),
+            AnimalNeeds {
+                hunger: fastrand::f32() * 60.0,
+                sleep: fastrand::f32() * 40.0,
+                reproduction: fastrand::f32() * 80.0,
+            },
+            AnimalReproductionCooldown(0),
+            BiologicalSex::random(),
+        ));
+        slot += 1;
+    }
+
     clock.population = slot;
     clock.current_end = clock.bucket_size.min(slot);
 }
@@ -216,14 +273,18 @@ pub fn animal_movement_system(
     time: Res<Time>,
     chunk_map: Res<ChunkMap>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
-    mut query: Query<(&mut Transform, &mut AnimalAI, &LodLevel, &BucketSlot), Without<Person>>,
+    mut query: Query<(&mut Transform, &mut AnimalAI, &LodLevel, &BucketSlot, Option<&CarriedBy>), Without<Person>>,
     clock: Res<SimClock>,
 ) {
     let dt = time.delta_secs();
     let sim_dt = dt * clock.scale_factor();
 
-    for (mut transform, mut ai, lod, slot) in query.iter_mut() {
+    for (mut transform, mut ai, lod, slot, carried) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
+            continue;
+        }
+        // Ridden horses are positioned by horse_position_sync_system
+        if carried.is_some() {
             continue;
         }
         if ai.state == AnimalState::Attack || ai.state == AnimalState::Sleeping {
@@ -294,7 +355,7 @@ pub fn animal_needs_tick_system(
     clock: Res<SimClock>,
     mut query: Query<
         (&BucketSlot, &LodLevel, &mut AnimalNeeds, &mut AnimalAI),
-        bevy::prelude::Or<(With<Wolf>, With<Deer>)>,
+        bevy::prelude::Or<(With<Wolf>, With<Deer>, With<Horse>)>,
     >,
 ) {
     let dt = time.delta_secs() * clock.scale_factor();
@@ -323,14 +384,16 @@ pub fn animal_needs_tick_system(
     });
 }
 
-/// Wolves chase deer/lone humans; deer flee from wolves.
+/// Wolves chase deer/lone humans; deer flee from wolves; horses flee wolves and unknown persons.
 /// Runs in ParallelA — writes only AnimalAI on self.
 pub fn animal_sense_system(
     spatial: Res<SpatialIndex>,
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
+    door_map: Res<crate::simulation::construction::DoorMap>,
     wolf_query: Query<(Entity, &Transform, &BucketSlot, &LodLevel), With<Wolf>>,
     deer_query: Query<(Entity, &Transform, &BucketSlot, &LodLevel), With<Deer>>,
+    horse_query: Query<(Entity, &Transform, &BucketSlot, &LodLevel, Option<&Tamed>), With<Horse>>,
     person_query: Query<&Transform, With<Person>>,
     mut ai_query: Query<(&mut AnimalAI, &mut CombatTarget, Option<&mut AnimalNeeds>)>,
     target_query: Query<(&Transform, Option<&Health>, Option<&Body>)>,
@@ -427,7 +490,7 @@ pub fn animal_sense_system(
 
                     let z_from = chunk_map.surface_z_at(tx, ty) as i8;
                     let z_to = chunk_map.surface_z_at(tx + dx, ty + dy) as i8;
-                    if !has_los(&chunk_map, (tx, ty, z_from), (tx + dx, ty + dy, z_to)) {
+                    if !has_los(&chunk_map, &door_map, (tx, ty, z_from), (tx + dx, ty + dy, z_to)) {
                         continue;
                     }
 
@@ -498,7 +561,7 @@ pub fn animal_sense_system(
                     if wolf_query.contains(candidate) || person_query.get(candidate).is_ok() {
                         let z_from = chunk_map.surface_z_at(tx, ty) as i8;
                         let z_to = chunk_map.surface_z_at(tx + dx, ty + dy) as i8;
-                        if has_los(&chunk_map, (tx, ty, z_from), (tx + dx, ty + dy, z_to)) {
+                        if has_los(&chunk_map, &door_map, (tx, ty, z_from), (tx + dx, ty + dy, z_to)) {
                             threat_dx += dx;
                             threat_dy += dy;
                             threat_count += 1;
@@ -522,6 +585,61 @@ pub fn animal_sense_system(
             ai.state = AnimalState::Wander;
         }
     }
+
+    // Horse sense: flee from wolves always; flee from persons if wild (untamed)
+    for (horse_entity, transform, slot, lod, tamed_opt) in &horse_query {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+
+        let Ok((mut ai, _, _)) = ai_query.get_mut(horse_entity) else {
+            continue;
+        };
+
+        if ai.state == AnimalState::Sleeping {
+            continue;
+        }
+
+        let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+
+        const HORSE_FLEE_RADIUS: i32 = 10;
+        let mut threat_dx = 0i32;
+        let mut threat_dy = 0i32;
+        let mut threat_count = 0i32;
+        let is_wild = tamed_opt.is_none();
+
+        for dy in -HORSE_FLEE_RADIUS..=HORSE_FLEE_RADIUS {
+            for dx in -HORSE_FLEE_RADIUS..=HORSE_FLEE_RADIUS {
+                for &candidate in spatial.get(tx + dx, ty + dy) {
+                    let is_wolf_threat = wolf_query.contains(candidate);
+                    let is_person_threat = is_wild && person_query.get(candidate).is_ok();
+                    if is_wolf_threat || is_person_threat {
+                        let z_from = chunk_map.surface_z_at(tx, ty) as i8;
+                        let z_to = chunk_map.surface_z_at(tx + dx, ty + dy) as i8;
+                        if has_los(&chunk_map, &door_map, (tx, ty, z_from), (tx + dx, ty + dy, z_to)) {
+                            threat_dx += dx;
+                            threat_dy += dy;
+                            threat_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if threat_count > 0 {
+            use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
+            let total_tiles_x = GLOBE_WIDTH * GLOBE_CELL_CHUNKS * CHUNK_SIZE as i32;
+            let total_tiles_y = GLOBE_HEIGHT * GLOBE_CELL_CHUNKS * CHUNK_SIZE as i32;
+            let flee_tx = (tx - threat_dx / threat_count).clamp(0, total_tiles_x - 1);
+            let flee_ty = (ty - threat_dy / threat_count).clamp(0, total_tiles_y - 1);
+            ai.state = AnimalState::Flee;
+            ai.target_tile = (flee_tx as i16, flee_ty as i16);
+            ai.wander_timer = 1.5;
+        } else if ai.state == AnimalState::Flee {
+            ai.state = AnimalState::Wander;
+        }
+    }
 }
 
 /// Counts down reproduction cooldowns. Runs in Economy set.
@@ -529,7 +647,7 @@ pub fn animal_reproduction_cooldown_system(
     clock: Res<SimClock>,
     mut query: Query<
         (&mut AnimalReproductionCooldown, &BucketSlot, &LodLevel),
-        bevy::prelude::Or<(With<Wolf>, With<Deer>)>,
+        bevy::prelude::Or<(With<Wolf>, With<Deer>, With<Horse>)>,
     >,
 ) {
     query.par_iter_mut().for_each(|(mut cd, slot, lod)| {
@@ -550,6 +668,7 @@ pub fn animal_reproduction_system(
     mut clock: ResMut<SimClock>,
     wolf_count: Query<(), With<Wolf>>,
     deer_count: Query<(), With<Deer>>,
+    horse_count: Query<(), With<Horse>>,
     mut animal_query: Query<(
         Entity,
         &Transform,
@@ -560,16 +679,19 @@ pub fn animal_reproduction_system(
         &BucketSlot,
         bevy::prelude::Has<Wolf>,
         bevy::prelude::Has<Deer>,
+        bevy::prelude::Has<Horse>,
     )>,
 ) {
     let wolf_pop = wolf_count.iter().count();
     let deer_pop = deer_count.iter().count();
+    let horse_pop = horse_count.iter().count();
 
     // Phase 1: collect eligible males (immutable pass)
     let mut wolf_males: ahash::AHashSet<Entity> = ahash::AHashSet::default();
     let mut deer_males: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut horse_males: ahash::AHashSet<Entity> = ahash::AHashSet::default();
 
-    for (entity, _, sex, needs, cooldown, lod, slot, is_wolf, is_deer) in animal_query.iter() {
+    for (entity, _, sex, needs, cooldown, lod, slot, is_wolf, is_deer, is_horse) in animal_query.iter() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -580,13 +702,16 @@ pub fn animal_reproduction_system(
             wolf_males.insert(entity);
         } else if is_deer && needs.reproduction >= DEER_REPRO_MALE_THRESHOLD {
             deer_males.insert(entity);
+        } else if is_horse && needs.reproduction >= HORSE_REPRO_MALE_THRESHOLD {
+            horse_males.insert(entity);
         }
     }
 
     // Phase 2: find female-male pairs (immutable pass)
-    let mut found_pairs: Vec<(Entity, Vec2, bool)> = Vec::new(); // (female, birth_pos, is_wolf)
+    // (female, birth_pos, species: 0=wolf 1=deer 2=horse)
+    let mut found_pairs: Vec<(Entity, Vec2, u8)> = Vec::new();
 
-    for (entity, transform, sex, needs, cooldown, lod, slot, is_wolf, _is_deer) in
+    for (entity, transform, sex, needs, cooldown, lod, slot, is_wolf, is_deer, is_horse) in
         animal_query.iter()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -596,17 +721,20 @@ pub fn animal_reproduction_system(
             continue;
         }
 
-        if is_wolf {
-            if needs.reproduction < WOLF_REPRO_FEMALE_THRESHOLD || wolf_pop >= WOLF_POP_CAP {
-                continue;
-            }
+        let (threshold, pop, cap, species, male_set) = if is_wolf {
+            (WOLF_REPRO_FEMALE_THRESHOLD, wolf_pop, WOLF_POP_CAP, 0u8, &wolf_males)
+        } else if is_deer {
+            (DEER_REPRO_FEMALE_THRESHOLD, deer_pop, DEER_POP_CAP, 1u8, &deer_males)
+        } else if is_horse {
+            (HORSE_REPRO_FEMALE_THRESHOLD, horse_pop, HORSE_POP_CAP, 2u8, &horse_males)
         } else {
-            if needs.reproduction < DEER_REPRO_FEMALE_THRESHOLD || deer_pop >= DEER_POP_CAP {
-                continue;
-            }
+            continue;
+        };
+
+        if needs.reproduction < threshold || pop >= cap {
+            continue;
         }
 
-        let male_set = if is_wolf { &wolf_males } else { &deer_males };
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
 
@@ -623,26 +751,26 @@ pub fn animal_reproduction_system(
         }
 
         if found_male {
-            found_pairs.push((entity, transform.translation.truncate(), is_wolf));
+            found_pairs.push((entity, transform.translation.truncate(), species));
         }
     }
 
     // Phase 3: reset female needs, roll birth, spawn offspring
-    let mut births: Vec<(Vec2, bool)> = Vec::new();
+    let mut births: Vec<(Vec2, u8)> = Vec::new();
 
-    for (female_ent, birth_pos, is_wolf) in found_pairs {
-        if let Ok((_, _, _, mut needs, mut cooldown, _, _, _, _)) =
+    for (female_ent, birth_pos, species) in found_pairs {
+        if let Ok((_, _, _, mut needs, mut cooldown, _, _, _, _, _)) =
             animal_query.get_mut(female_ent)
         {
             needs.reproduction = 0.0;
             cooldown.0 = ANIMAL_BIRTH_COOLDOWN;
         }
         if fastrand::u32(..10_000) < ANIMAL_BIRTH_CHANCE {
-            births.push((birth_pos, is_wolf));
+            births.push((birth_pos, species));
         }
     }
 
-    for (pos, is_wolf) in births {
+    for (pos, species) in births {
         let slot = clock.population;
         clock.population += 1;
         clock.bucket_size = clock.population.min(10_000);
@@ -652,49 +780,73 @@ pub fn animal_reproduction_system(
         let world_pos = tile_to_world(tx, ty);
         let sex = BiologicalSex::random();
 
-        if is_wolf {
-            commands.spawn((
-                Wolf,
-                Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
-                GlobalTransform::default(),
-                Visibility::Visible,
-                InheritedVisibility::default(),
-                AnimalAI {
-                    target_tile: (tx as i16, ty as i16),
-                    ..Default::default()
-                },
-                Health::new(30),
-                CombatTarget::default(),
-                CombatCooldown::default(),
-                LodLevel::Full,
-                BucketSlot(slot),
-                AnimalNeeds::default(),
-                AnimalReproductionCooldown(0),
-                sex,
-            ));
-        } else {
-            commands.spawn((
-                Deer,
-                Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
-                GlobalTransform::default(),
-                Visibility::Visible,
-                InheritedVisibility::default(),
-                AnimalAI {
-                    target_tile: (tx as i16, ty as i16),
-                    ..Default::default()
-                },
-                Health::new(20),
-                CombatTarget::default(),
-                CombatCooldown::default(),
-                LodLevel::Full,
-                BucketSlot(slot),
-                crate::simulation::plants::DeerGrazer {
-                    graze_timer: fastrand::u16(0..120),
-                },
-                AnimalNeeds::default(),
-                AnimalReproductionCooldown(0),
-                sex,
-            ));
+        match species {
+            0 => {
+                commands.spawn((
+                    Wolf,
+                    Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                    AnimalAI {
+                        target_tile: (tx as i16, ty as i16),
+                        ..Default::default()
+                    },
+                    Health::new(30),
+                    CombatTarget::default(),
+                    CombatCooldown::default(),
+                    LodLevel::Full,
+                    BucketSlot(slot),
+                    AnimalNeeds::default(),
+                    AnimalReproductionCooldown(0),
+                    sex,
+                ));
+            }
+            1 => {
+                commands.spawn((
+                    Deer,
+                    Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                    AnimalAI {
+                        target_tile: (tx as i16, ty as i16),
+                        ..Default::default()
+                    },
+                    Health::new(20),
+                    CombatTarget::default(),
+                    CombatCooldown::default(),
+                    LodLevel::Full,
+                    BucketSlot(slot),
+                    crate::simulation::plants::DeerGrazer {
+                        graze_timer: fastrand::u16(0..120),
+                    },
+                    AnimalNeeds::default(),
+                    AnimalReproductionCooldown(0),
+                    sex,
+                ));
+            }
+            _ => {
+                commands.spawn((
+                    Horse,
+                    Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                    AnimalAI {
+                        target_tile: (tx as i16, ty as i16),
+                        ..Default::default()
+                    },
+                    Health::new(HORSE_HP),
+                    CombatTarget::default(),
+                    CombatCooldown::default(),
+                    LodLevel::Full,
+                    BucketSlot(slot),
+                    AnimalNeeds::default(),
+                    AnimalReproductionCooldown(0),
+                    sex,
+                ));
+            }
         }
     }
 }

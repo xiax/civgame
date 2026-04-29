@@ -289,6 +289,7 @@ pub fn vision_system(
     spatial: Res<SpatialIndex>,
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
+    door_map: Res<crate::simulation::construction::DoorMap>,
     plant_map: Res<crate::simulation::plants::PlantMap>,
     plant_query: Query<&crate::simulation::plants::Plant>,
     item_query: Query<&crate::simulation::items::GroundItem>,
@@ -333,6 +334,7 @@ pub fn vision_system(
 
                 if !crate::simulation::line_of_sight::has_los(
                     &chunk_map,
+                    &door_map,
                     (tx, ty, from_z),
                     (ntx, nty, to_z),
                 ) {

@@ -7,6 +7,7 @@ pub mod camera;
 pub mod color_map;
 pub mod entity_sprites;
 pub mod fog;
+pub mod path_debug;
 pub mod pixel_art;
 pub mod sprite_library;
 pub mod tile_render;
@@ -19,6 +20,8 @@ impl Plugin for RenderingPlugin {
             .insert_resource(camera::CameraViewZ::default())
             .insert_resource(chunk_streaming::TileMaterials::default())
             .insert_resource(chunk_streaming::TileSpriteIndex::default())
+            .insert_resource(chunk_streaming::ChunkBoundaryOverlay::default())
+            .insert_resource(path_debug::PathDebugOverlay::default())
             .insert_resource(fog::FogMap::default())
             .insert_resource(fog::FogTileMaterials::default())
             .add_systems(Startup, (camera::setup_camera, pixel_art::setup_pixel_art, sprite_library::setup_sprite_library))
@@ -35,6 +38,11 @@ impl Plugin for RenderingPlugin {
                     chunk_streaming::chunk_streaming_system.after(camera::camera_input_system),
                     chunk_streaming::update_tile_z_view_system.after(camera::camera_input_system),
                     fog::fog_update_system.after(chunk_streaming::chunk_streaming_system),
+                    chunk_streaming::toggle_chunk_boundary_overlay_system,
+                    chunk_streaming::chunk_boundary_gizmo_system,
+                    path_debug::selected_agent_path_gizmo_system,
+                    path_debug::flow_field_gizmo_system,
+                    path_debug::chunk_graph_gizmo_system,
                 ),
             )
             .add_systems(
@@ -45,13 +53,26 @@ impl Plugin for RenderingPlugin {
                     entity_sprites::spawn_faction_center_sprites,
                     entity_sprites::spawn_bed_sprites,
                     entity_sprites::spawn_wall_sprites,
+                    entity_sprites::spawn_campfire_sprites,
+                    entity_sprites::spawn_door_sprites,
+                    entity_sprites::spawn_table_sprites,
+                    entity_sprites::spawn_chair_sprites,
+                    entity_sprites::spawn_workbench_sprites,
+                    entity_sprites::spawn_loom_sprites,
                     entity_sprites::spawn_blueprint_sprites,
+                ),
+            )
+            .add_systems(
+                Update,
+                (
                     entity_sprites::spawn_plant_sprites,
                     entity_sprites::update_plant_sprites,
                     entity_sprites::spawn_wolf_sprites,
                     entity_sprites::spawn_deer_sprites,
+                    entity_sprites::spawn_horse_sprites,
                     entity_sprites::animate_wolves_system,
                     entity_sprites::animate_deer_system,
+                    entity_sprites::animate_horses_system,
                     animations::handle_combat_events,
                     animations::update_animations,
                     plants::plant_growth_system,
@@ -61,12 +82,19 @@ impl Plugin for RenderingPlugin {
             .add_systems(Update, entity_sprites::update_clothing_from_equipment)
             .add_systems(
                 Update,
+                crate::simulation::settlement::zone_overlay_gizmo_system,
+            )
+            .add_systems(
+                Update,
                 (
                     entity_sprites::update_entity_z_visibility_system
                         .after(camera::camera_input_system)
                         .after(fog::fog_update_system),
                     entity_sprites::apply_entity_fog_tint_system
-                        .after(entity_sprites::update_entity_z_visibility_system),
+                        .after(entity_sprites::update_entity_z_visibility_system)
+                        .after(entity_sprites::animate_person_sprites)
+                        .after(entity_sprites::update_clothing_from_equipment)
+                        .after(animations::update_animations),
                 ),
             )
             .add_systems(

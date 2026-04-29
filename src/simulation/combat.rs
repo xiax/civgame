@@ -128,6 +128,24 @@ pub struct CombatEvent {
     pub target: Entity,
 }
 
+/// Fired when a Person is struck. Listeners (sound::respond_to_distress_system)
+/// recruit nearby allies to defend. Throttled per-victim by `LastDistressEmit`.
+#[derive(Event, Clone, Copy)]
+pub struct DistressCallEvent {
+    pub victim: Entity,
+    pub attacker: Entity,
+    pub tile: (i32, i32),
+    pub z: i8,
+    pub faction_id: u32,
+}
+
+/// Per-victim throttle so a series of cooldown-bounded swings doesn't re-run
+/// the audible BFS every tick.
+#[derive(Component, Clone, Copy, Default)]
+pub struct LastDistressEmit(pub u64);
+
+pub const DISTRESS_THROTTLE_TICKS: u64 = 20;
+
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct CombatCooldown(pub f32);
 
@@ -138,6 +156,7 @@ pub fn combat_system(
     time: Res<Time>,
     spatial: Res<SpatialIndex>,
     chunk_map: Res<ChunkMap>,
+    door_map: Res<crate::simulation::construction::DoorMap>,
     mut attacker_query: Query<(
         Entity,
         &mut CombatTarget,
@@ -236,6 +255,7 @@ pub fn combat_system(
                     if e == target
                         && has_los(
                             &chunk_map,
+                            &door_map,
                             (tx, ty, attacker_z),
                             (tx + dx, ty + dy, attacker_z),
                         )
@@ -371,6 +391,41 @@ pub fn combat_system(
         if let Some(fd) = faction_registry.factions.get_mut(&faction_id) {
             fd.activity_log.increment(ActivityKind::Combat);
         }
+    }
+}
+
+/// Reads `CombatEvent`s and emits a `DistressCallEvent` whenever a `Person` is
+/// struck. Throttled per-victim by `LastDistressEmit` so a series of cooldown-
+/// bounded swings doesn't re-run the audible BFS every tick. Lives in its own
+/// system to keep `combat_system` under Bevy's 16-param ceiling.
+pub fn distress_emit_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    mut combat_events: EventReader<CombatEvent>,
+    mut distress_events: EventWriter<DistressCallEvent>,
+    person_q: Query<(&Transform, &PersonAI, &FactionMember), With<Person>>,
+    last_emit_q: Query<&LastDistressEmit>,
+) {
+    for ev in combat_events.read() {
+        let Ok((transform, ai, member)) = person_q.get(ev.target) else {
+            continue;
+        };
+        let last = last_emit_q.get(ev.target).map(|l| l.0).unwrap_or(0);
+        if last != 0 && clock.tick.saturating_sub(last) < DISTRESS_THROTTLE_TICKS {
+            continue;
+        }
+        let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        distress_events.send(DistressCallEvent {
+            victim: ev.target,
+            attacker: ev.attacker,
+            tile: (tx, ty),
+            z: ai.current_z,
+            faction_id: member.faction_id,
+        });
+        commands
+            .entity(ev.target)
+            .insert(LastDistressEmit(clock.tick));
     }
 }
 

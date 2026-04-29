@@ -1,3 +1,4 @@
+use super::animals::{Horse, Tamed};
 use super::faction::{FactionMember, FactionRegistry, StorageTileMap, SOLO};
 use super::items::GroundItem;
 use super::lod::LodLevel;
@@ -13,7 +14,7 @@ use crate::world::terrain::TILE_SIZE;
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
-use crate::simulation::technology::ActivityKind;
+use crate::simulation::technology::{ActivityKind, HORSE_TAMING};
 use ahash::AHashMap;
 use bevy::prelude::*;
 
@@ -245,5 +246,69 @@ pub fn eat_task_system(
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
+    }
+}
+
+/// Complete the TameAnimal task after the agent has worked adjacent to a wild horse long enough.
+pub fn tame_task_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    faction_registry: Res<FactionRegistry>,
+    mut query: Query<(
+        &mut PersonAI,
+        &FactionMember,
+        &BucketSlot,
+        &LodLevel,
+    )>,
+    untamed_horses: Query<(), (With<Horse>, Without<Tamed>)>,
+) {
+    const TICKS_TAME: u8 = 100;
+
+    for (mut ai, member, slot, lod) in query.iter_mut() {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        if ai.state != AiState::Working || ai.task_id != TaskKind::TameAnimal as u16 {
+            continue;
+        }
+
+        // Verify the faction still has the tech
+        let has_tech = faction_registry
+            .factions
+            .get(&member.faction_id)
+            .map(|f| f.techs.has(HORSE_TAMING))
+            .unwrap_or(false);
+        if !has_tech {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.work_progress = 0;
+            ai.target_entity = None;
+            continue;
+        }
+
+        // Abort if target horse is gone or already tamed
+        let target_valid = ai
+            .target_entity
+            .map(|e| untamed_horses.get(e).is_ok())
+            .unwrap_or(false);
+        if !target_valid {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.work_progress = 0;
+            ai.target_entity = None;
+            continue;
+        }
+
+        if ai.work_progress >= TICKS_TAME {
+            if let Some(horse_entity) = ai.target_entity {
+                commands.entity(horse_entity).insert(Tamed {
+                    owner_faction: member.faction_id,
+                });
+            }
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.work_progress = 0;
+            ai.target_entity = None;
+        }
     }
 }

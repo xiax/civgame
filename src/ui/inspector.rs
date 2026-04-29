@@ -128,6 +128,26 @@ pub fn inspector_panel_system(
                     "Faction: #{} (food: {:.1}){}",
                     member.faction_id, food_stock, raid_info
                 ));
+                // Lineage + culture style summary
+                if let Some(f) = registry.factions.get(&member.faction_id) {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Lineage: {} (gen {})",
+                            f.lineage.root, f.lineage.generation
+                        ))
+                        .color(egui::Color32::from_gray(180))
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Founder: {} • Style: {}",
+                            f.lineage.founder,
+                            f.culture.style.label()
+                        ))
+                        .color(egui::Color32::from_gray(180))
+                        .size(11.0),
+                    );
+                }
             }
 
             ui.separator();
@@ -232,6 +252,8 @@ pub fn inspector_panel_system(
                 j if j == TaskKind::Reproduce as u16 => "Reproducing",
                 j if j == TaskKind::Eat as u16 => "Eating",
                 j if j == TaskKind::WithdrawFood as u16 => "Withdrawing Food",
+                j if j == TaskKind::Lead as u16 => "Leading",
+                j if j == TaskKind::Terraform as u16 => "Levelling Ground",
                 _ => "Unemployed",
             };
             ui.label(format!("Task: {}", task_name));

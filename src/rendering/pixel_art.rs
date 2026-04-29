@@ -31,6 +31,17 @@ pub struct EntityTextures {
     pub bed_ascii: Handle<Image>,
     pub blueprint_ascii: Handle<Image>,
     pub wall_ascii: Handle<Image>,
+    pub wall_palisade_ascii: Handle<Image>,
+    pub wall_wattle_ascii: Handle<Image>,
+    pub wall_stone_ascii: Handle<Image>,
+    pub wall_mudbrick_ascii: Handle<Image>,
+    pub wall_cutstone_ascii: Handle<Image>,
+    pub door_ascii: Handle<Image>,
+    pub table_ascii: Handle<Image>,
+    pub chair_ascii: Handle<Image>,
+    pub workbench_ascii: Handle<Image>,
+    pub loom_ascii: Handle<Image>,
+    pub campfire_ascii: Handle<Image>,
 }
 
 #[derive(Clone, Copy)]
@@ -482,7 +493,7 @@ pub fn setup_pixel_art(
     ];
     let blueprint_img = ascii_to_image(blueprint_ascii, &[('s', sc), ('c', sc2), ('.', _t)]);
 
-    // Wall: 16x16
+    // Wall: 16x16 (legacy — used as a fallback / blueprint ghost).
     let wall_ascii = &[
         "dddddddddddddddd",
         "dggggggggggggggd",
@@ -506,6 +517,239 @@ pub fn setup_pixel_art(
         &[('g', g), ('d', d), ('l', l_g), ('x', x), ('.', _t)],
     );
 
+    // Stone wall: rough mortared masonry — grey blocks with dark joints.
+    let wall_stone_ascii = &[
+        "kkkkkkkkkkkkkkkk",
+        "klllllklllllllkk",
+        "klllllklllllllkk",
+        "klllllklllllllkk",
+        "kkkkkkkkkkkkkkkk",
+        "kklllllllkllllkk",
+        "kklllllllkllllkk",
+        "kklllllllkllllkk",
+        "kkkkkkkkkkkkkkkk",
+        "klllllklllllllkk",
+        "klllllklllllllkk",
+        "klllllklllllllkk",
+        "kkkkkkkkkkkkkkkk",
+        "kklllllllkllllkk",
+        "kklllllllkllllkk",
+        "kkkkkkkkkkkkkkkk",
+    ];
+    let wall_stone_img = ascii_to_image(wall_stone_ascii, WARM_PALETTE);
+
+    // Palisade: vertical wooden stakes, sharpened tops, dark soil base.
+    let wall_palisade_ascii = &[
+        "..D..D..D..D..D.",
+        ".dBd.dBd.dBd.dBd",
+        ".DBdSdBdSdBdSdBd",
+        ".DBdSdBdSdBdSdBd",
+        ".DbdSdbdSdbdSdbd",
+        ".DbdSdbdSdbdSdbd",
+        ".DBdSdBdSdBdSdBd",
+        ".DBdSdBdSdBdSdBd",
+        ".DBdSdBdSdBdSdBd",
+        ".DbdSdbdSdbdSdbd",
+        ".DbdSdbdSdbdSdbd",
+        ".DBdSdBdSdBdSdBd",
+        ".DBdSdBdSdBdSdBd",
+        ".DBdSdBdSdBdSdBd",
+        ".DBdSdBdSdBdSdBd",
+        "ssssssssssssssss",
+    ];
+    let wall_palisade_img = ascii_to_image(wall_palisade_ascii, WARM_PALETTE);
+
+    // Wattle & daub: woven wood lattice over light plaster.
+    let wall_wattle_ascii = &[
+        "TTTTTTTTTTTTTTTT",
+        "TbTbTbTbTbTbTbTb",
+        "TBTtTTTBTtTTTBTt",
+        "TtTBTTTtTBTTTtTB",
+        "TBTtTTTBTtTTTBTt",
+        "TtTBTTTtTBTTTtTB",
+        "TBTtTTTBTtTTTBTt",
+        "TtTBTTTtTBTTTtTB",
+        "TBTtTTTBTtTTTBTt",
+        "TtTBTTTtTBTTTtTB",
+        "TBTtTTTBTtTTTBTt",
+        "TtTBTTTtTBTTTtTB",
+        "TBTtTTTBTtTTTBTt",
+        "TtTBTTTtTBTTTtTB",
+        "TtTtTtTtTtTtTtTt",
+        "ssssssssssssssss",
+    ];
+    let wall_wattle_img = ascii_to_image(wall_wattle_ascii, WARM_PALETTE);
+
+    // Mudbrick: terracotta bricks bound with dark earth mortar.
+    let wall_mudbrick_ascii = &[
+        "eeeeeeeeeeeeeeee",
+        "eRRRRReeRRRRRRRe",
+        "eRRRRReeRRRRRRRe",
+        "eRRRRReeRRRRRRRe",
+        "eeeeeeeeeeeeeeee",
+        "eeRRRRRRReeRRRRR",
+        "eeRRRRRRReeRRRRR",
+        "eeRRRRRRReeRRRRR",
+        "eeeeeeeeeeeeeeee",
+        "eRRRRReeRRRRRRRe",
+        "eRRRRReeRRRRRRRe",
+        "eRRRRReeRRRRRRRe",
+        "eeeeeeeeeeeeeeee",
+        "eeRRRRRRReeRRRRR",
+        "eeRRRRRRReeRRRRR",
+        "ssssssssssssssss",
+    ];
+    let wall_mudbrick_img = ascii_to_image(wall_mudbrick_ascii, WARM_PALETTE);
+
+    // Cut stone: precision ashlar — light slate with crisp seams.
+    let wall_cutstone_ascii = &[
+        "PPPPPPPPPPPPPPPP",
+        "PllllllPllllllPP",
+        "PllllllPllllllPP",
+        "PllllllPllllllPP",
+        "PllllllPllllllPP",
+        "PPPPPPPPPPPPPPPP",
+        "PPllllllllPlllPP",
+        "PPllllllllPlllPP",
+        "PPllllllllPlllPP",
+        "PPllllllllPlllPP",
+        "PPPPPPPPPPPPPPPP",
+        "PllllllPllllllPP",
+        "PllllllPllllllPP",
+        "PllllllPllllllPP",
+        "PllllllPllllllPP",
+        "PPPPPPPPPPPPPPPP",
+    ];
+    let wall_cutstone_img = ascii_to_image(wall_cutstone_ascii, WARM_PALETTE);
+
+    // Door: wooden plank door with hinges and handle.
+    let door_ascii = &[
+        "................",
+        "...DDDDDDDDDD...",
+        "..DBBBBBBBBBBD..",
+        "..DBdDBBBBdDBD..",
+        "..DBdDBBBBdDBD..",
+        "..DBBBBBBBBBBD..",
+        "..DBBBoBBBBBBD..",
+        "..DBBBoBBBBBBD..",
+        "..DBdDBBBBdDBD..",
+        "..DBdDBBBBdDBD..",
+        "..DBBBBBBBBBBD..",
+        "..DBBBBBBBBBBD..",
+        "..DBdDBBBBdDBD..",
+        "..DBBBBBBBBBBD..",
+        "..DDDDDDDDDDDD..",
+        "ssssssssssssssss",
+    ];
+    let door_img = ascii_to_image(door_ascii, WARM_PALETTE);
+
+    // Table: wooden top with two visible legs.
+    let table_ascii = &[
+        "................",
+        "................",
+        "................",
+        "................",
+        "..DDDDDDDDDDDD..",
+        ".DBBBBBBBBBBBBD.",
+        ".DTTTTTTTTTTTTD.",
+        "..DDDDDDDDDDDD..",
+        "..D..........D..",
+        "..D..........D..",
+        "..D..........D..",
+        "..D..........D..",
+        "..D..........D..",
+        "..D..........D..",
+        "..d..........d..",
+        "ssssssssssssssss",
+    ];
+    let table_img = ascii_to_image(table_ascii, WARM_PALETTE);
+
+    // Chair: small seat with backrest.
+    let chair_ascii = &[
+        "................",
+        "................",
+        "....DDDDDD......",
+        "....DBBBBD......",
+        "....DBBBBD......",
+        "....DBBBBD......",
+        "....DDDDDD......",
+        "...DBBBBBBD.....",
+        "...DTTTTTTD.....",
+        "....DDDDDD......",
+        "....D....D......",
+        "....D....D......",
+        "....D....D......",
+        "....D....D......",
+        "....d....d......",
+        "ssssssssssssssss",
+    ];
+    let chair_img = ascii_to_image(chair_ascii, WARM_PALETTE);
+
+    // Workbench: heavy table with tools laid on top.
+    let workbench_ascii = &[
+        "................",
+        "................",
+        ".......l........",
+        "......lll.......",
+        ".....llklK......",
+        "..DDDDDDDDDDDD..",
+        ".DTTTTTTTTTTTTD.",
+        ".DTBBKKKBBBBBBD.",
+        ".DTBBKKKBBBBBBD.",
+        "..DDDDDDDDDDDD..",
+        "..D..........D..",
+        "..D..........D..",
+        "..D..........D..",
+        "..D..........D..",
+        "..d..........d..",
+        "ssssssssssssssss",
+    ];
+    let workbench_img = ascii_to_image(workbench_ascii, WARM_PALETTE);
+
+    // Loom: vertical wooden frame with woven cloth strands.
+    let loom_ascii = &[
+        "................",
+        ".D............D.",
+        ".DBBBBBBBBBBBBD.",
+        ".DTTTTTTTTTTTTD.",
+        ".DBTBTBTBTBTBTD.",
+        ".DTBTBTBTBTBTBD.",
+        ".DBTBTBTBTBTBTD.",
+        ".DTBTBTBTBTBTBD.",
+        ".DBTBTBTBTBTBTD.",
+        ".DTBTBTBTBTBTBD.",
+        ".DBTBTBTBTBTBTD.",
+        ".DTTTTTTTTTTTTD.",
+        ".DBBBBBBBBBBBBD.",
+        ".D............D.",
+        ".d............d.",
+        "ssssssssssssssss",
+    ];
+    let loom_img = ascii_to_image(loom_ascii, WARM_PALETTE);
+
+    // Campfire: 16x16 — logs with flame (top-down view)
+    // Palette: y=bright gold spark, o=flame/gold, R=fire/terracotta,
+    //          r=blood red deep base, D=dark brown logs, d=very dark charcoal
+    let campfire_ascii = &[
+        "................",
+        "................",
+        ".......y........",
+        "......yoy.......",
+        ".....yoRoy......",
+        ".....oRRRo......",
+        ".....RRrRR......",
+        "...DDoRRRoDD....",
+        "...DDdDdDDDD....",
+        "....ddddddd.....",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+    ];
+    let campfire_img = ascii_to_image(campfire_ascii, WARM_PALETTE);
+
     commands.insert_resource(ArtMode::default());
 
     commands.insert_resource(EntityTextures {
@@ -523,5 +767,16 @@ pub fn setup_pixel_art(
         bed_ascii: images.add(bed_img),
         blueprint_ascii: images.add(blueprint_img),
         wall_ascii: images.add(wall_img),
+        wall_palisade_ascii: images.add(wall_palisade_img),
+        wall_wattle_ascii: images.add(wall_wattle_img),
+        wall_stone_ascii: images.add(wall_stone_img),
+        wall_mudbrick_ascii: images.add(wall_mudbrick_img),
+        wall_cutstone_ascii: images.add(wall_cutstone_img),
+        door_ascii: images.add(door_img),
+        table_ascii: images.add(table_img),
+        chair_ascii: images.add(chair_img),
+        workbench_ascii: images.add(workbench_img),
+        loom_ascii: images.add(loom_img),
+        campfire_ascii: images.add(campfire_img),
     });
 }

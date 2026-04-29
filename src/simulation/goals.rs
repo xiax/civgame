@@ -1,17 +1,35 @@
 use super::construction::{AutonomousBuildingToggle, Blueprint, BlueprintMap};
-use super::faction::{FactionMember, FactionRegistry, SOLO};
+use super::faction::{FactionChief, FactionMember, FactionRegistry, StorageTileMap, SOLO};
 use super::lod::LodLevel;
 use super::needs::Needs;
 use super::person::{AiState, PersonAI, PlayerOrder};
 use super::schedule::{BucketSlot, SimClock};
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
+use crate::pathfinding::chunk_graph::ChunkGraph;
+use crate::pathfinding::chunk_router::ChunkRouter;
+use crate::simulation::animals::{Horse, Tamed};
 use crate::simulation::items::{GroundItem, TargetItem};
 use crate::simulation::plants::{GrowthStage, Plant, PlantMap};
 use crate::simulation::tasks::TaskKind;
-use crate::world::chunk::ChunkMap;
+use crate::simulation::technology::{
+    BOW_AND_ARROW, FIRE_MAKING, FIRED_POTTERY, FLINT_KNAPPING, HORSE_TAMING, HUNTING_SPEAR,
+    LOOM_WEAVING, COPPER_TOOLS, BRONZE_WEAPONS,
+};
+use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::{Calendar, Season};
+use crate::world::terrain::TILE_SIZE;
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
+
+/// Bundles the storage-reachability lookup resources so `goal_update_system`
+/// stays under Bevy's 16-param limit.
+#[derive(SystemParam)]
+pub struct StorageReachability<'w> {
+    pub chunk_graph: Res<'w, ChunkGraph>,
+    pub chunk_router: Res<'w, ChunkRouter>,
+    pub storage_tile_map: Res<'w, StorageTileMap>,
+}
 
 #[repr(u8)]
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -58,6 +76,10 @@ pub enum AgentGoal {
     Defend = 8,
     Sleep = 9,
     Build = 10,
+    TameHorse = 11,
+    Craft = 12,
+    Lead = 13,
+    Rescue = 14,
 }
 
 impl AgentGoal {
@@ -74,8 +96,25 @@ impl AgentGoal {
             AgentGoal::Defend => "Defend",
             AgentGoal::Sleep => "Sleep",
             AgentGoal::Build => "Build",
+            AgentGoal::TameHorse => "TameHorse",
+            AgentGoal::Craft => "Craft",
+            AgentGoal::Lead => "Lead",
+            AgentGoal::Rescue => "Rescue",
         }
     }
+}
+
+/// Set on a responder by `sound::respond_to_distress_system` when they are recruited
+/// to defend a faction-mate (or affinity-bonded ally). Carries the attacker plus
+/// the attacker's last-known tile so the `RescueAlly` plan can route the responder
+/// without re-querying the attacker's `Transform` (avoids borrow conflicts in
+/// `plan_execution_system`). Refreshed on each distress event from the victim;
+/// cleared when the attacker is dead/despawned or after a timeout.
+#[derive(Component, Clone, Copy)]
+pub struct RescueTarget {
+    pub attacker: Entity,
+    pub attacker_tile: (i16, i16),
+    pub set_tick: u64,
 }
 
 #[derive(Component, Default)]
@@ -88,11 +127,15 @@ pub fn goal_update_system(
     calendar: Res<Calendar>,
     auto_build: Res<AutonomousBuildingToggle>,
     chunk_map: Res<ChunkMap>,
+    storage: StorageReachability,
     plant_map: Res<PlantMap>,
     plant_query: Query<&Plant>,
     item_query: Query<(), With<GroundItem>>,
     bp_map: Res<BlueprintMap>,
     bp_query: Query<&Blueprint>,
+    wild_horse_q: Query<(), (With<Horse>, Without<Tamed>)>,
+    rescue_q: Query<&RescueTarget>,
+    attacker_alive_q: Query<Entity, Or<(With<crate::simulation::combat::Health>, With<crate::simulation::combat::Body>)>>,
     mut query: Query<
         (
             Entity,
@@ -104,8 +147,10 @@ pub fn goal_update_system(
             &BucketSlot,
             &LodLevel,
             &FactionMember,
+            &Transform,
             &mut TargetItem,
             Option<&mut GoalReason>,
+            Option<&FactionChief>,
         ),
         Without<PlayerOrder>,
     >,
@@ -120,8 +165,10 @@ pub fn goal_update_system(
         slot,
         lod,
         member,
+        transform,
         mut target_item,
         reason_opt,
+        chief_opt,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -202,6 +249,30 @@ pub fn goal_update_system(
             }
         }
 
+        // Rescue override: if a distress responder still has a live attacker target,
+        // hold the Rescue goal until they engage / it dies / or it times out.
+        if let Ok(rt) = rescue_q.get(entity) {
+            let attacker_alive = attacker_alive_q.get(rt.attacker).is_ok();
+            let timed_out = clock.tick.saturating_sub(rt.set_tick) > 200;
+            if attacker_alive && !timed_out {
+                if *goal != AgentGoal::Rescue {
+                    *goal = AgentGoal::Rescue;
+                    ai.state = AiState::Idle;
+                    ai.task_id = PersonAI::UNEMPLOYED;
+                }
+                if let Some(mut r) = reason_opt {
+                    r.0 = "Helping Ally";
+                } else {
+                    commands.entity(entity).insert(GoalReason("Helping Ally"));
+                }
+                continue;
+            } else {
+                // Attacker is dead or rescue timed out — drop the marker so the
+                // agent re-evaluates a normal goal next tick.
+                commands.entity(entity).remove::<RescueTarget>();
+            }
+        }
+
         // Don't interrupt combat or sleep
         if matches!(ai.state, AiState::Attacking | AiState::Sleeping) {
             continue;
@@ -239,6 +310,27 @@ pub fn goal_update_system(
             }
         }
 
+        // Chief override: tribal chiefs lead when not in crisis or at war.
+        if chief_opt.is_some()
+            && member.faction_id != SOLO
+            && !registry.is_under_raid(member.faction_id)
+            && registry.raid_target(member.faction_id).is_none()
+            && needs.hunger < 150.0
+            && needs.sleep < 170.0
+        {
+            if *goal != AgentGoal::Lead {
+                *goal = AgentGoal::Lead;
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+            }
+            if let Some(mut r) = reason_opt {
+                r.0 = "Leading";
+            } else {
+                commands.entity(entity).insert(GoalReason("Leading"));
+            }
+            continue;
+        }
+
         let social_threshold = if *personality == Personality::Socialite {
             120.0
         } else {
@@ -249,6 +341,14 @@ pub fn goal_update_system(
         } else {
             180.0
         };
+
+        let has_horse_taming = member.faction_id != SOLO
+            && registry
+                .factions
+                .get(&member.faction_id)
+                .map(|f| f.techs.has(HORSE_TAMING))
+                .unwrap_or(false)
+            && !wild_horse_q.is_empty();
 
         let (faction_food_ratio, can_return_camp) = if member.faction_id != SOLO {
             let per_member: f32 = match calendar.season {
@@ -265,7 +365,30 @@ pub fn goal_update_system(
 
             let stock = registry.food_stock(member.faction_id);
             let ratio = if cap > 0.0 { stock / cap } else { 1.0 };
-            (ratio, stock < cap)
+            // Gate ReturnCamp on storage reachability so agents don't gather
+            // food destined for storage they can't actually reach.
+            let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+            let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+            let storage_reachable = storage
+                .storage_tile_map
+                .nearest_for_faction(member.faction_id, (cur_tx, cur_ty))
+                .map(|(stx, sty)| {
+                    let cur_chunk = ChunkCoord(
+                        cur_tx.div_euclid(CHUNK_SIZE as i32),
+                        cur_ty.div_euclid(CHUNK_SIZE as i32),
+                    );
+                    let storage_chunk = ChunkCoord(
+                        (stx as i32).div_euclid(CHUNK_SIZE as i32),
+                        (sty as i32).div_euclid(CHUNK_SIZE as i32),
+                    );
+                    cur_chunk == storage_chunk
+                        || storage
+                            .chunk_router
+                            .first_waypoint(&storage.chunk_graph, cur_chunk, storage_chunk, ai.current_z)
+                            .is_some()
+                })
+                .unwrap_or(false);
+            (ratio, stock < cap && storage_reachable)
         } else {
             (1.0, false)
         };
@@ -349,10 +472,14 @@ pub fn goal_update_system(
             (gather_goal, gather_reason)
         } else if needs.reproduction > reproduce_threshold {
             (AgentGoal::Reproduce, "Reproduction Need")
+        } else if has_horse_taming {
+            (AgentGoal::TameHorse, "Taming Horse")
         } else if needs.social > social_threshold {
             (AgentGoal::Socialize, "Social Need")
         } else if has_build_site {
             (AgentGoal::Build, "Building Projects")
+        } else if should_craft(&registry, member.faction_id, needs) {
+            (AgentGoal::Craft, "Crafting for Faction")
         } else {
             (gather_goal, gather_reason)
         };
@@ -370,4 +497,36 @@ pub fn goal_update_system(
             commands.entity(entity).insert(GoalReason(reason));
         }
     }
+}
+
+/// Returns true when a faction agent should switch to crafting.
+/// Triggers when the faction has at least one craft tech unlocked and is short on
+/// crafted goods (Tools + Weapon + Armor + Shield + Cloth < member_count / 3).
+fn should_craft(registry: &FactionRegistry, faction_id: u32, needs: &Needs) -> bool {
+    if faction_id == SOLO {
+        return false;
+    }
+    // Only craft when not hungry or tired
+    if needs.hunger > 100.0 || needs.sleep > 100.0 {
+        return false;
+    }
+    let Some(faction) = registry.factions.get(&faction_id) else {
+        return false;
+    };
+    let has_craft_tech = faction.techs.has(FLINT_KNAPPING)
+        || faction.techs.has(HUNTING_SPEAR)
+        || faction.techs.has(FIRE_MAKING)
+        || faction.techs.has(BOW_AND_ARROW)
+        || faction.techs.has(LOOM_WEAVING)
+        || faction.techs.has(FIRED_POTTERY)
+        || faction.techs.has(COPPER_TOOLS)
+        || faction.techs.has(BRONZE_WEAPONS);
+    if !has_craft_tech {
+        return false;
+    }
+    let crafted_total: u32 = [Good::Tools, Good::Weapon, Good::Armor, Good::Shield, Good::Cloth]
+        .iter()
+        .map(|g| faction.storage.totals.get(g).copied().unwrap_or(0))
+        .sum();
+    crafted_total < faction.member_count.saturating_div(3).max(1)
 }

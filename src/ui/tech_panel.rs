@@ -89,7 +89,12 @@ pub fn tech_panel_system(
                                 );
                             });
 
-                            row.response.on_hover_ui(|ui| {
+                            let hover_response = ui.interact(
+                                row.response.rect,
+                                egui::Id::new("tech_hover").with(tech.id),
+                                egui::Sense::hover(),
+                            );
+                            hover_response.on_hover_ui(|ui| {
                                 ui.set_max_width(280.0);
 
                                 let status = if unlocked {

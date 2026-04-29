@@ -5,7 +5,7 @@ use std::time::Instant;
 use crate::rendering::camera::CameraViewZ;
 use crate::rendering::color_map::{shaded_tile_color, z_bucket};
 use crate::rendering::fog::{apply_fog_to_material, FogMap, FogTileMaterials};
-use crate::simulation::construction::{Wall, WallMap};
+use crate::simulation::construction::{Wall, WallMap, WallMaterial};
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
@@ -33,6 +33,68 @@ impl TileMaterials {
             .get(&(kind as u8, z_bucket(z)))
             .cloned()
             .unwrap_or_default()
+    }
+}
+
+#[derive(Resource)]
+pub struct ChunkBoundaryOverlay {
+    pub show: bool,
+}
+
+impl Default for ChunkBoundaryOverlay {
+    fn default() -> Self {
+        Self { show: false }
+    }
+}
+
+pub fn toggle_chunk_boundary_overlay_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut overlay: ResMut<ChunkBoundaryOverlay>,
+) {
+    if keys.just_pressed(KeyCode::F3) {
+        overlay.show = !overlay.show;
+    }
+}
+
+pub fn chunk_boundary_gizmo_system(
+    overlay: Res<ChunkBoundaryOverlay>,
+    mut gizmos: Gizmos,
+    camera_query: Query<(&Transform, &OrthographicProjection), With<Camera>>,
+    windows: Query<&Window>,
+) {
+    if !overlay.show {
+        return;
+    }
+    let Ok((transform, projection)) = camera_query.get_single() else {
+        return;
+    };
+    let Ok(window) = windows.get_single() else {
+        return;
+    };
+
+    let chunk_world = CHUNK_SIZE as f32 * TILE_SIZE;
+    let half_w = window.width() * 0.5 * projection.scale;
+    let half_h = window.height() * 0.5 * projection.scale;
+    let cam = transform.translation.truncate();
+    let x_min = cam.x - half_w;
+    let x_max = cam.x + half_w;
+    let y_min = cam.y - half_h;
+    let y_max = cam.y + half_h;
+
+    let cx_min = (x_min / chunk_world).floor() as i32;
+    let cx_max = (x_max / chunk_world).ceil() as i32;
+    let cy_min = (y_min / chunk_world).floor() as i32;
+    let cy_max = (y_max / chunk_world).ceil() as i32;
+
+    let color = Color::srgba(1.0, 0.85, 0.2, 0.55);
+
+    for cx in cx_min..=cx_max {
+        let x = cx as f32 * chunk_world;
+        gizmos.line_2d(Vec2::new(x, y_min), Vec2::new(x, y_max), color);
+    }
+    for cy in cy_min..=cy_max {
+        let y = cy as f32 * chunk_world;
+        gizmos.line_2d(Vec2::new(x_min, y), Vec2::new(x_max, y), color);
     }
 }
 
@@ -131,7 +193,7 @@ pub fn spawn_chunk_sprites(
                 if !wall_map.0.contains_key(&tile_pos) {
                     let entity = commands
                         .spawn((
-                            Wall,
+                            Wall { material: WallMaterial::Stone },
                             Transform::from_xyz(wx, wy, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -502,7 +564,7 @@ pub fn refresh_changed_tiles_system(
             // Spawn a new Wall entity (entity_sprites will attach the visual child)
             let new_entity = commands
                 .spawn((
-                    Wall,
+                    Wall { material: WallMaterial::Stone },
                     Transform::from_xyz(wx, wy, 0.4),
                     GlobalTransform::default(),
                     Visibility::Visible,

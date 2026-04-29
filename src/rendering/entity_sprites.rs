@@ -1,7 +1,9 @@
 use crate::rendering::pixel_art::{ArtMode, EntityTextures};
 use crate::rendering::sprite_library::SpriteLibrary;
-use crate::simulation::animals::{Deer, Wolf};
-use crate::simulation::construction::{Bed, Blueprint, BuildSiteKind, Wall};
+use crate::simulation::animals::{Deer, Horse, Wolf};
+use crate::simulation::construction::{
+    Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, Loom, Table, Wall, WallMaterial, Workbench,
+};
 use crate::simulation::faction::{
     FactionCenter, FactionMember, PlayerFaction, PlayerFactionMarker,
 };
@@ -41,6 +43,9 @@ pub struct WolfVisual;
 pub struct DeerVisual;
 
 #[derive(Component)]
+pub struct HorseVisual;
+
+#[derive(Component)]
 pub struct PersonVisual;
 
 /// Floating name label Text2d child. Does NOT carry VisualChild — fog-tint and art-mode systems skip it.
@@ -55,6 +60,24 @@ pub struct PlantVisual;
 
 #[derive(Component)]
 pub struct BlueprintVisual;
+
+#[derive(Component)]
+pub struct CampfireVisual;
+
+#[derive(Component)]
+pub struct DoorVisual;
+
+#[derive(Component)]
+pub struct TableVisual;
+
+#[derive(Component)]
+pub struct ChairVisual;
+
+#[derive(Component)]
+pub struct WorkbenchVisual;
+
+#[derive(Component)]
+pub struct LoomVisual;
 
 /// Base tint color on a VisualChild entity — used by the fog system to preserve
 /// sex-based coloring while still applying fog darkening.
@@ -136,16 +159,158 @@ pub fn spawn_bed_sprites(
 
 pub fn spawn_wall_sprites(
     mut commands: Commands,
-    query: Query<Entity, (With<Wall>, Without<WallVisual>)>,
+    query: Query<(Entity, &Wall), Without<WallVisual>>,
     textures: Res<EntityTextures>,
 ) {
-    for entity in query.iter() {
-        let img = textures.wall_ascii.clone();
+    for (entity, wall) in query.iter() {
+        let img = match wall.material {
+            WallMaterial::Palisade => textures.wall_palisade_ascii.clone(),
+            WallMaterial::WattleDaub => textures.wall_wattle_ascii.clone(),
+            WallMaterial::Stone => textures.wall_stone_ascii.clone(),
+            WallMaterial::Mudbrick => textures.wall_mudbrick_ascii.clone(),
+            WallMaterial::CutStone => textures.wall_cutstone_ascii.clone(),
+        };
 
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
         commands.entity(entity).insert((WallVisual, EntityFogState::default()));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn spawn_campfire_sprites(
+    mut commands: Commands,
+    query: Query<Entity, (With<Campfire>, Without<CampfireVisual>)>,
+    textures: Res<EntityTextures>,
+) {
+    for entity in query.iter() {
+        let img = textures.campfire_ascii.clone();
+
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
+
+        commands.entity(entity).insert((CampfireVisual, EntityFogState::default()));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn spawn_door_sprites(
+    mut commands: Commands,
+    query: Query<Entity, (With<Door>, Without<DoorVisual>)>,
+    textures: Res<EntityTextures>,
+) {
+    for entity in query.iter() {
+        let mut sprite = Sprite::from_image(textures.door_ascii.clone());
+        sprite.anchor = Anchor::BottomCenter;
+
+        commands.entity(entity).insert((DoorVisual, EntityFogState::default()));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn spawn_table_sprites(
+    mut commands: Commands,
+    query: Query<Entity, (With<Table>, Without<TableVisual>)>,
+    textures: Res<EntityTextures>,
+) {
+    for entity in query.iter() {
+        let mut sprite = Sprite::from_image(textures.table_ascii.clone());
+        sprite.anchor = Anchor::BottomCenter;
+        commands.entity(entity).insert((TableVisual, EntityFogState::default()));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn spawn_chair_sprites(
+    mut commands: Commands,
+    query: Query<Entity, (With<Chair>, Without<ChairVisual>)>,
+    textures: Res<EntityTextures>,
+) {
+    for entity in query.iter() {
+        let mut sprite = Sprite::from_image(textures.chair_ascii.clone());
+        sprite.anchor = Anchor::BottomCenter;
+        commands.entity(entity).insert((ChairVisual, EntityFogState::default()));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn spawn_workbench_sprites(
+    mut commands: Commands,
+    query: Query<Entity, (With<Workbench>, Without<WorkbenchVisual>)>,
+    textures: Res<EntityTextures>,
+) {
+    for entity in query.iter() {
+        let mut sprite = Sprite::from_image(textures.workbench_ascii.clone());
+        sprite.anchor = Anchor::BottomCenter;
+        commands.entity(entity).insert((WorkbenchVisual, EntityFogState::default()));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn spawn_loom_sprites(
+    mut commands: Commands,
+    query: Query<Entity, (With<Loom>, Without<LoomVisual>)>,
+    textures: Res<EntityTextures>,
+) {
+    for entity in query.iter() {
+        let mut sprite = Sprite::from_image(textures.loom_ascii.clone());
+        sprite.anchor = Anchor::BottomCenter;
+        commands.entity(entity).insert((LoomVisual, EntityFogState::default()));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -527,13 +692,8 @@ pub fn animate_person_sprites(
         let hair_key = format!("hair_{sex_str}_{hair_str}_{dir}_{frame_str}");
         let cloth_key = format!("clothing_{sex_str}_{cloth_str}_{dir}_{frame_str}");
 
-        let clothing_visible = clothing_opt.map(|c| c.visible).unwrap_or(false);
         for &child in children.iter() {
             if let Ok((mut sprite, layer)) = child_sprites.get_mut(child) {
-                if *layer == VisualLayer::Clothing {
-                    sprite.color = if clothing_visible { Color::WHITE } else { Color::NONE };
-                    if !clothing_visible { continue; }
-                }
                 let key = match layer {
                     VisualLayer::Body => body_key.as_str(),
                     VisualLayer::Hair => hair_key.as_str(),
@@ -625,6 +785,95 @@ pub fn animate_deer_system(
     }
 }
 
+pub fn spawn_horse_sprites(
+    mut commands: Commands,
+    query: Query<
+        (Entity, Option<&crate::simulation::reproduction::BiologicalSex>),
+        (With<Horse>, Without<HorseVisual>),
+    >,
+    sprite_lib: Res<SpriteLibrary>,
+    art_mode: Res<ArtMode>,
+) {
+    for (entity, sex_opt) in query.iter() {
+        let pixel_key = "anim_horse_anim_s_a";
+        let ascii_key = "creature_horse";
+        let img = if *art_mode == ArtMode::Pixel {
+            sprite_lib
+                .get(pixel_key)
+                .cloned()
+                .or_else(|| sprite_lib.get(ascii_key).cloned())
+        } else {
+            sprite_lib.get(ascii_key).cloned()
+        };
+        let Some(img) = img else { continue };
+
+        let tint = match sex_opt {
+            Some(crate::simulation::reproduction::BiologicalSex::Female) => Color::WHITE,
+            _ => Color::srgb(0.80, 0.65, 0.45),
+        };
+
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
+        sprite.color = tint;
+
+        commands.entity(entity).insert((
+            HorseVisual,
+            EntityFogState::default(),
+            FacingDirection::South,
+            LastPos::default(),
+        ));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                AnimalSexTint(tint),
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn animate_horses_system(
+    time: Res<Time>,
+    art_mode: Res<ArtMode>,
+    sprite_lib: Res<SpriteLibrary>,
+    mut horses: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Horse>>,
+    mut child_sprites: Query<&mut Sprite, With<VisualChild>>,
+) {
+    if *art_mode == ArtMode::Ascii {
+        return;
+    }
+    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
+    for (transform, children, mut facing, mut last_pos) in horses.iter_mut() {
+        let pos = transform.translation.truncate();
+        let diff = pos - last_pos.0;
+        let is_moving = diff.length() > 0.5;
+        if is_moving {
+            *facing = if diff.x.abs() > diff.y.abs() {
+                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+            } else {
+                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+            };
+        }
+        last_pos.0 = pos;
+        let dir = facing.as_str();
+        let frame_str = if is_moving && frame_b { "b" } else { "a" };
+        let key = format!("anim_horse_anim_{dir}_{frame_str}");
+        for &child in children.iter() {
+            if let Ok(mut sprite) = child_sprites.get_mut(child) {
+                if let Some(img) = sprite_lib.get(&key) {
+                    if sprite.image != *img {
+                        sprite.image = img.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Hide entities that don't belong on the layer the camera is viewing.
 /// Surface mode (CameraViewZ == i32::MAX): show entities whose Z equals
 /// the surface_z of their tile (i.e. above-ground entities). Underground
@@ -647,6 +896,7 @@ pub fn update_entity_z_visibility_system(
             With<Person>,
             With<Wolf>,
             With<Deer>,
+            With<Horse>,
             With<Plant>,
             With<Bed>,
             With<Wall>,
@@ -693,15 +943,27 @@ pub fn update_entity_z_visibility_system(
     }
 }
 
-/// Apply the correct sprite color to each entity based on fog state and faction membership.
-/// Replaces update_faction_sprite_colors by combining fog tinting with faction coloring.
+/// Single source of truth for sprite.color on every VisualChild. Combines:
+///   - fog factor (Visible / Explored)
+///   - AnimalSexTint base (animals only)
+///   - ClothingVisual visibility (sets clothing layer alpha to 0 when hidden)
+///   - CombatAnimations hit-flash (red tint while hit_timer > 0)
+/// No other system should write sprite.color on VisualChild — that causes flicker
+/// and layer-to-layer color mismatches.
 pub fn apply_entity_fog_tint_system(
     entities: Query<
-        (&Visibility, &EntityFogState, &Children),
+        (
+            &Visibility,
+            &EntityFogState,
+            &Children,
+            Option<&ClothingVisual>,
+            Option<&crate::rendering::animations::CombatAnimations>,
+        ),
         bevy::prelude::Or<(
             With<Person>,
             With<Wolf>,
             With<Deer>,
+            With<Horse>,
             With<Plant>,
             With<Bed>,
             With<Wall>,
@@ -709,9 +971,12 @@ pub fn apply_entity_fog_tint_system(
             With<Blueprint>,
         )>,
     >,
-    mut child_sprites: Query<(&mut Sprite, Option<&AnimalSexTint>), With<VisualChild>>,
+    mut child_sprites: Query<
+        (&mut Sprite, Option<&AnimalSexTint>, Option<&VisualLayer>),
+        With<VisualChild>,
+    >,
 ) {
-    for (vis, fog_state, children) in entities.iter() {
+    for (vis, fog_state, children, clothing_opt, anim_opt) in entities.iter() {
         if *vis == Visibility::Hidden {
             continue;
         }
@@ -720,18 +985,28 @@ pub fn apply_entity_fog_tint_system(
         } else {
             0.35
         };
+        let clothing_visible = clothing_opt.map(|c| c.visible).unwrap_or(true);
+        let hit_flash = anim_opt.map(|a| a.hit_timer > 0.0).unwrap_or(false);
+
         for &child in children.iter() {
-            if let Ok((mut sprite, sex_tint)) = child_sprites.get_mut(child) {
-                let alpha = sprite.color.to_srgba().alpha;
+            if let Ok((mut sprite, sex_tint, layer_opt)) = child_sprites.get_mut(child) {
                 let base = sex_tint
                     .map(|t| t.0.to_srgba())
                     .unwrap_or(bevy::color::Srgba::WHITE);
-                let new_color = Color::srgba(
-                    base.red * fog_factor,
-                    base.green * fog_factor,
-                    base.blue * fog_factor,
-                    alpha,
-                );
+                let (mut r, mut g, mut b) = (base.red, base.green, base.blue);
+                if hit_flash {
+                    r = 1.0;
+                    g = 0.4;
+                    b = 0.4;
+                }
+                let alpha = if matches!(layer_opt, Some(VisualLayer::Clothing)) && !clothing_visible
+                {
+                    0.0
+                } else {
+                    1.0
+                };
+                let new_color =
+                    Color::srgba(r * fog_factor, g * fog_factor, b * fog_factor, alpha);
                 if sprite.color != new_color {
                     sprite.color = new_color;
                 }
@@ -755,6 +1030,7 @@ pub fn handle_art_mode_change(
     people: Query<Entity, With<PersonVisual>>,
     wolves: Query<Entity, With<WolfVisual>>,
     deer: Query<Entity, With<DeerVisual>>,
+    horses: Query<Entity, With<HorseVisual>>,
     walls: Query<Entity, With<WallVisual>>,
     beds: Query<Entity, With<BedVisual>>,
     centers: Query<Entity, With<FactionCenterVisual>>,
@@ -767,6 +1043,7 @@ pub fn handle_art_mode_change(
             .iter()
             .chain(wolves.iter())
             .chain(deer.iter())
+            .chain(horses.iter())
             .chain(walls.iter())
             .chain(beds.iter())
             .chain(centers.iter())
@@ -784,6 +1061,7 @@ pub fn handle_art_mode_change(
                 PersonVisual,
                 WolfVisual,
                 DeerVisual,
+                HorseVisual,
                 WallVisual,
                 BedVisual,
                 FactionCenterVisual,
@@ -821,8 +1099,24 @@ pub fn spawn_blueprint_sprites(
         scaffold_sprite.anchor = Anchor::BottomCenter;
 
         let ghost_img = match bp.kind {
-            BuildSiteKind::Wall => textures.wall_ascii.clone(),
+            BuildSiteKind::Wall(WallMaterial::Palisade) => textures.wall_palisade_ascii.clone(),
+            BuildSiteKind::Wall(WallMaterial::WattleDaub) => textures.wall_wattle_ascii.clone(),
+            BuildSiteKind::Wall(WallMaterial::Stone) => textures.wall_stone_ascii.clone(),
+            BuildSiteKind::Wall(WallMaterial::Mudbrick) => textures.wall_mudbrick_ascii.clone(),
+            BuildSiteKind::Wall(WallMaterial::CutStone) => textures.wall_cutstone_ascii.clone(),
+            BuildSiteKind::Door => textures.door_ascii.clone(),
             BuildSiteKind::Bed => textures.bed_ascii.clone(),
+            BuildSiteKind::Campfire => textures.campfire_ascii.clone(),
+            BuildSiteKind::Workbench => textures.workbench_ascii.clone(),
+            BuildSiteKind::Loom => textures.loom_ascii.clone(),
+            BuildSiteKind::Table => textures.table_ascii.clone(),
+            BuildSiteKind::Chair => textures.chair_ascii.clone(),
+            // Stub: reuse closest existing sprite until proper art ships.
+            BuildSiteKind::Granary => textures.workbench_ascii.clone(),
+            BuildSiteKind::Shrine => textures.wall_stone_ascii.clone(),
+            BuildSiteKind::Market => textures.table_ascii.clone(),
+            BuildSiteKind::Barracks => textures.wall_stone_ascii.clone(),
+            BuildSiteKind::Monument => textures.wall_cutstone_ascii.clone(),
         };
 
         let mut ghost_sprite = Sprite::from_image(ghost_img);
