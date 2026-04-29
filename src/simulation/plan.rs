@@ -49,6 +49,10 @@ pub enum StepTarget {
     NearestBlueprint(BuildSiteKind),
     /// Targets the nearest active Blueprint entity of any kind for this agent's faction.
     NearestAnyBlueprint,
+    /// Targets the nearest active Blueprint that the agent can usefully deposit
+    /// into right now: at least one deposit slot still needs material AND the
+    /// agent currently carries some of that good. Used by the HaulMaterials step.
+    NearestBlueprintNeedingHeldMaterial,
     /// In-place: target resolves to the agent's current tile.
     SelfPosition,
     /// Nearest faction storage tile (for withdrawing food from communal stock).
@@ -274,7 +278,7 @@ static PLAN_STEPS_3: &[StepId] = &[3]; // GatherStone
 static PLAN_STEPS_4: &[StepId] = &[4, 1, 9]; // PlantAndFarm → Eat
 static PLAN_STEPS_5: &[StepId] = &[5, 6, 9]; // HuntFood → Eat
 static PLAN_STEPS_6: &[StepId] = &[6, 9]; // ScavengeFood → Eat
-static PLAN_STEPS_7: &[StepId] = &[2, 25]; // GatherWood, BuildAnyBlueprint
+static PLAN_STEPS_7: &[StepId] = &[2, 28, 25]; // GatherWood, HaulToBlueprint, BuildAnyBlueprint
 static PLAN_STEPS_9: &[StepId] = &[10, 9]; // WithdrawAndEat: WithdrawFood → Eat
 static PLAN_STEPS_10: &[StepId] = &[11]; // TameHorse: TameAnimal
 
@@ -595,6 +599,18 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             target: StepTarget::RescueAttacker,
             preconditions: StepPreconditions::none(),
             reward_scale: 1.5,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 28: HaulToBlueprint — carry currently-held materials to the nearest
+            // blueprint that still needs them and drop them in. Excess stays in
+            // the hauler's inventory; the step ends as soon as the drop is applied.
+            id: 28,
+            task: TaskKind::HaulMaterials,
+            target: StepTarget::NearestBlueprintNeedingHeldMaterial,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.4,
             plant_filter: None,
             extra: 0,
         },
@@ -952,6 +968,7 @@ fn resolve_target(
     my_sex: BiologicalSex,
     relationships: Option<&RelationshipMemory>,
     rescue_target: Option<&RescueTarget>,
+    agent: &EconomicAgent,
 ) -> Option<(Option<Entity>, i16, i16)> {
     const VIEW_RADIUS: i32 = 15;
 
@@ -1294,6 +1311,41 @@ fn resolve_target(
                     None => bp.faction_id == faction_id,
                 };
                 if !allowed {
+                    continue;
+                }
+                let dist = (tile.0 as i32 - pos.0).abs() + (tile.1 as i32 - pos.1).abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some((bp_entity, tile.0, tile.1));
+                }
+            }
+            best.map(|(e, tx, ty)| (Some(e), tx, ty))
+        }
+        StepTarget::NearestBlueprintNeedingHeldMaterial => {
+            // Nearest blueprint with at least one unmet deposit slot whose good
+            // is currently in the agent's inventory.
+            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best_dist = i32::MAX;
+            for (&tile, &bp_entity) in &bp_map.0 {
+                let Ok(bp) = bp_query.get(bp_entity) else {
+                    continue;
+                };
+                let allowed = match bp.personal_owner {
+                    Some(owner) => owner == agent_entity,
+                    None => bp.faction_id == faction_id,
+                };
+                if !allowed {
+                    continue;
+                }
+                let mut useful = false;
+                for i in 0..bp.deposit_count as usize {
+                    let still = bp.deposits[i].needed.saturating_sub(bp.deposits[i].deposited);
+                    if still > 0 && agent.quantity_of(bp.deposits[i].good) > 0 {
+                        useful = true;
+                        break;
+                    }
+                }
+                if !useful {
                     continue;
                 }
                 let dist = (tile.0 as i32 - pos.0).abs() + (tile.1 as i32 - pos.1).abs();
@@ -1700,6 +1752,7 @@ pub fn plan_execution_system(
                 *my_sex,
                 rel_opt,
                 rescue_target_opt,
+                &agent,
             ) {
                 assign_task_with_routing(
                     &mut ai,

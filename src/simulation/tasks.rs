@@ -49,6 +49,7 @@ pub enum TaskKind {
     Deconstruct = 20, // dismantle placed furniture (e.g. bed) and carry recovered wood to storage
     Lead = 21,        // tribal chief stations at faction home and issues build orders
     Terraform = 22,   // level a footprint tile to a target Z (dig down or fill up by one Z step)
+    HaulMaterials = 23, // carry inventory goods to a blueprint and drop them into its deposit slots
 }
 
 /// Returns true for tasks where the agent works from an adjacent tile rather than
@@ -59,6 +60,7 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::Planter as u16
         || task_id == TaskKind::Construct as u16
         || task_id == TaskKind::ConstructBed as u16
+        || task_id == TaskKind::HaulMaterials as u16
         || task_id == TaskKind::DepositResource as u16
         || task_id == TaskKind::TameAnimal as u16
         || task_id == TaskKind::Deconstruct as u16

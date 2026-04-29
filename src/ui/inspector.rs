@@ -262,6 +262,7 @@ pub fn inspector_panel_system(
                     j if j == TaskKind::Scavenge as u16 => "Scavenger",
                     j if j == TaskKind::Construct as u16 => "Builder",
                     j if j == TaskKind::ConstructBed as u16 => "Building Bed",
+                    j if j == TaskKind::HaulMaterials as u16 => "Hauling Materials",
                     j if j == TaskKind::Deconstruct as u16 => "Deconstructing",
                     j if j == TaskKind::DepositResource as u16 => "Depositing Resources",
                     j if j == TaskKind::Socialize as u16 => "Socializing",

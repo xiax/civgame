@@ -228,7 +228,10 @@ pub fn goal_update_system(
                 } else {
                     invalid = true;
                 }
-            } else if tid == TaskKind::Construct as u16 || tid == TaskKind::ConstructBed as u16 {
+            } else if tid == TaskKind::Construct as u16
+                || tid == TaskKind::ConstructBed as u16
+                || tid == TaskKind::HaulMaterials as u16
+            {
                 // Invalidate if the target blueprint entity no longer exists.
                 match ai.target_entity {
                     Some(ent) if bp_query.get(ent).is_err() => {

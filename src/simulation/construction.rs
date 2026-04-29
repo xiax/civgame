@@ -2229,8 +2229,16 @@ pub fn building_upgrade_system(
     }
 }
 
-/// Handles agents building at Blueprint entities (TaskKind::Construct / ConstructBed).
-/// Multiple agents can contribute wood and labor to the same blueprint each tick.
+/// Handles agents at Blueprint entities. Two roles run in parallel:
+///   • `TaskKind::HaulMaterials` — drops matching goods into the blueprint's
+///     deposit slots and returns to Idle the same tick (excess stays in the
+///     hauler's inventory).
+///   • `TaskKind::Construct` / `ConstructBed` — advances `bp.build_progress`
+///     by one each tick the worker is on-site and earns Building XP. Workers
+///     stay on the task until the structure completes (no longer kicked off
+///     just because they're empty-handed).
+/// Construction completes when both `build_progress >= recipe.work_ticks` AND
+/// `bp.is_satisfied()`.
 /// Runs in Sequential set after gather_system.
 pub fn construction_system(
     mut commands: Commands,
@@ -2252,11 +2260,12 @@ pub fn construction_system(
         Option<&mut ActivePlan>,
     )>,
 ) {
-    // Pass 1: collect pending contributions from Working agents.
-    // For each working agent, snapshot how much of each ingredient (per the
-    // blueprint's deposit slots) they currently carry.
-    // Map: bp_entity → Vec<(agent_entity, snapshot[MAX_BUILD_INPUTS])>
-    let mut bp_pending: AHashMap<Entity, Vec<(Entity, [u32; MAX_BUILD_INPUTS])>> = AHashMap::new();
+    // Pass 1: collect pending contributions from Working agents, classified by
+    // role.
+    //   bp_haulers: bp_entity → Vec<(agent, inventory snapshot per deposit slot)>
+    //   bp_workers: bp_entity → Vec<agent>
+    let mut bp_haulers: AHashMap<Entity, Vec<(Entity, [u32; MAX_BUILD_INPUTS])>> = AHashMap::new();
+    let mut bp_workers: AHashMap<Entity, Vec<Entity>> = AHashMap::new();
 
     for (entity, mut ai, agent, mut skills, slot, lod, _) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -2265,7 +2274,11 @@ pub fn construction_system(
         if ai.state != AiState::Working {
             continue;
         }
-        if ai.task_id != TaskKind::Construct as u16 && ai.task_id != TaskKind::ConstructBed as u16 {
+        let task = ai.task_id;
+        let is_hauler = task == TaskKind::HaulMaterials as u16;
+        let is_worker =
+            task == TaskKind::Construct as u16 || task == TaskKind::ConstructBed as u16;
+        if !is_hauler && !is_worker {
             continue;
         }
 
@@ -2276,7 +2289,8 @@ pub fn construction_system(
             continue;
         };
 
-        // Peek at the blueprint's deposit list (immutable) to know which goods to snapshot.
+        // Peek at the blueprint's deposit list (immutable) so we can snapshot
+        // hauler inventories and validate that the bp still exists.
         let bp_info = bp_query
             .get(bp_entity)
             .ok()
@@ -2289,74 +2303,88 @@ pub fn construction_system(
             continue;
         };
 
-        let mut snap = [0u32; MAX_BUILD_INPUTS];
-        let mut inputs_satisfied = true;
-        let mut useful = false;
-        for i in 0..count as usize {
-            snap[i] = agent.quantity_of(deposits[i].good);
-            let still = deposits[i].needed.saturating_sub(deposits[i].deposited) as u32;
-            if still > 0 {
-                inputs_satisfied = false;
-                if snap[i] > 0 {
-                    useful = true;
+        if is_hauler {
+            // Snapshot only the goods the bp still needs.
+            let mut snap = [0u32; MAX_BUILD_INPUTS];
+            let mut useful = false;
+            for i in 0..count as usize {
+                let still = deposits[i].needed.saturating_sub(deposits[i].deposited) as u32;
+                if still > 0 {
+                    snap[i] = agent.quantity_of(deposits[i].good);
+                    if snap[i] > 0 {
+                        useful = true;
+                    }
                 }
             }
+            if !useful {
+                // Nothing to drop here — release back to plan so it can re-route.
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.work_progress = 0;
+                ai.target_entity = None;
+                continue;
+            }
+            bp_haulers.entry(bp_entity).or_default().push((entity, snap));
+        } else {
+            // Worker: every tick on-site advances work and earns Building XP,
+            // regardless of inventory state or material satisfaction.
+            skills.gain_xp(SkillKind::Building, 1);
+            bp_workers.entry(bp_entity).or_default().push(entity);
         }
-
-        // If the blueprint still needs inputs and this agent has none of them,
-        // standing here only ticks build_progress forever. Drop to Idle so the
-        // plan re-runs (re-gather, re-pick a blueprint).
-        if !inputs_satisfied && !useful {
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
-            ai.work_progress = 0;
-            ai.target_entity = None;
-            continue;
-        }
-
-        skills.gain_xp(SkillKind::Building, 1);
-        bp_pending
-            .entry(bp_entity)
-            .or_default()
-            .push((entity, snap));
     }
 
-    if bp_pending.is_empty() {
+    if bp_haulers.is_empty() && bp_workers.is_empty() {
         return;
     }
 
     let mut completed_agents: Vec<Entity> = Vec::new();
+    let mut hauler_done: Vec<Entity> = Vec::new();
     let mut orphaned_agents: Vec<Entity> = Vec::new();
     // (agent_entity, good, qty_to_remove)
     let mut good_removals: Vec<(Entity, Good, u32)> = Vec::new();
 
-    // Pass 2: apply contributions to blueprints, check completion.
-    for (bp_entity, workers) in &bp_pending {
-        let Ok(mut bp) = bp_query.get_mut(*bp_entity) else {
-            orphaned_agents.extend(workers.iter().map(|(e, _)| *e));
+    // Pass 2: deposit hauler goods, advance worker progress, check completion.
+    let mut bp_entities: Vec<Entity> = bp_haulers
+        .keys()
+        .copied()
+        .chain(bp_workers.keys().copied())
+        .collect();
+    bp_entities.sort_unstable();
+    bp_entities.dedup();
+
+    for bp_entity in bp_entities {
+        let Ok(mut bp) = bp_query.get_mut(bp_entity) else {
+            if let Some(haulers) = bp_haulers.get(&bp_entity) {
+                orphaned_agents.extend(haulers.iter().map(|(e, _)| *e));
+            }
+            if let Some(workers) = bp_workers.get(&bp_entity) {
+                orphaned_agents.extend(workers.iter().copied());
+            }
             continue;
         };
 
-        // For each worker, for each deposit slot, consume what we can.
-        for &(agent_e, snap) in workers {
-            for i in 0..bp.deposit_count as usize {
-                let need = bp.deposits[i];
-                let still = need.needed.saturating_sub(need.deposited) as u32;
-                if still == 0 {
-                    continue;
-                }
-                let take = still.min(snap[i]);
-                if take > 0 {
+        // Deposit hauler goods first.
+        if let Some(haulers) = bp_haulers.get(&bp_entity) {
+            for &(agent_e, snap) in haulers {
+                for i in 0..bp.deposit_count as usize {
+                    let need = bp.deposits[i];
+                    let still = need.needed.saturating_sub(need.deposited) as u32;
+                    if still == 0 || snap[i] == 0 {
+                        continue;
+                    }
+                    let take = still.min(snap[i]);
                     good_removals.push((agent_e, need.good, take));
-                    bp.deposits[i].deposited = bp.deposits[i]
-                        .deposited
-                        .saturating_add(take as u8);
+                    bp.deposits[i].deposited =
+                        bp.deposits[i].deposited.saturating_add(take as u8);
                 }
+                hauler_done.push(agent_e);
             }
         }
 
-        // Each worker contributes one tick of build progress.
-        bp.build_progress = bp.build_progress.saturating_add(workers.len() as u8);
+        // Advance work by one tick per on-site worker.
+        if let Some(workers) = bp_workers.get(&bp_entity) {
+            bp.build_progress = bp.build_progress.saturating_add(workers.len() as u8);
+        }
 
         let recipe = recipe_for(bp.kind);
         if bp.build_progress >= recipe.work_ticks && bp.is_satisfied() {
@@ -2547,7 +2575,7 @@ pub fn construction_system(
             });
 
             bp_map.0.remove(&tile);
-            commands.entity(*bp_entity).despawn_recursive();
+            commands.entity(bp_entity).despawn_recursive();
 
             // Clear `active_upgrade` if the rebuild slot has just been filled.
             if let Some(faction) = registry.factions.get_mut(&bp.faction_id) {
@@ -2559,15 +2587,24 @@ pub fn construction_system(
                 road_carve_queue.0.push((bp.faction_id, tile, faction.home_tile));
             }
 
-            completed_agents.extend(workers.iter().map(|(e, _)| *e));
+            if let Some(workers) = bp_workers.get(&bp_entity) {
+                completed_agents.extend(workers.iter().copied());
+            }
+            if let Some(haulers) = bp_haulers.get(&bp_entity) {
+                completed_agents.extend(haulers.iter().map(|(e, _)| *e));
+            }
         }
     }
 
-    if good_removals.is_empty() && completed_agents.is_empty() && orphaned_agents.is_empty() {
+    if good_removals.is_empty()
+        && completed_agents.is_empty()
+        && hauler_done.is_empty()
+        && orphaned_agents.is_empty()
+    {
         return;
     }
 
-    // Pass 3: remove deposited goods from agents and reset completed/orphaned agents.
+    // Pass 3: remove deposited goods from agents and reset completed/hauler/orphaned agents.
     for (entity, mut ai, mut agent, _, _, _, mut plan_opt) in agent_query.iter_mut() {
         for &(ae, good, qty) in &good_removals {
             if ae == entity {
@@ -2576,13 +2613,16 @@ pub fn construction_system(
         }
 
         let is_completed = completed_agents.contains(&entity);
+        let is_hauler_done = hauler_done.contains(&entity);
         let is_orphaned = orphaned_agents.contains(&entity);
 
-        if is_completed || is_orphaned {
+        if is_completed || is_hauler_done || is_orphaned {
             if is_completed {
                 if let Some(ref mut plan) = plan_opt {
                     plan.reward_acc += if ai.task_id == TaskKind::ConstructBed as u16 {
                         2.0
+                    } else if ai.task_id == TaskKind::HaulMaterials as u16 {
+                        0.4
                     } else {
                         1.0
                     };
