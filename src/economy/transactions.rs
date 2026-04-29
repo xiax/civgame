@@ -8,7 +8,7 @@ use crate::simulation::schedule::{BucketSlot, SimClock};
 use bevy::prelude::*;
 
 const FOOD_KEEP_RESERVE: u32 = 2;
-const HUNGER_BUY_THRESHOLD: u8 = 130;
+const HUNGER_BUY_THRESHOLD: u8 = 170;
 const TOOL_BUY_CURRENCY_FACTOR: f32 = 1.5;
 
 pub fn market_sell_system(

@@ -44,10 +44,10 @@ pub fn find_path_in(
     start: (i32, i32, i8),
     goal: (i32, i32, i8),
     max_nodes: usize,
-) -> AStarResult {
+) -> (AStarResult, u32) {
     scratch.reset();
     if start == goal {
-        return AStarResult::Found(Vec::new());
+        return (AStarResult::Found(Vec::new()), 0);
     }
 
     scratch.g_score.insert(start, 0);
@@ -65,19 +65,22 @@ pub fn find_path_in(
                 path.push(tail);
                 tail = match scratch.came_from.get(&tail) {
                     Some(&p) => p,
-                    None => return AStarResult::Unreachable,
+                    None => return (AStarResult::Unreachable, expansions as u32),
                 };
             }
             path.reverse();
-            return AStarResult::Found(path);
+            return (AStarResult::Found(path), expansions as u32);
         }
 
         expansions += 1;
         if expansions > max_nodes {
             if best_node == start {
-                return AStarResult::Unreachable;
+                return (AStarResult::Unreachable, expansions as u32);
             }
-            return AStarResult::BudgetExhausted { best_so_far: best_node };
+            return (
+                AStarResult::BudgetExhausted { best_so_far: best_node },
+                expansions as u32,
+            );
         }
 
         let cur_g = *scratch.g_score.get(&cur).unwrap_or(&u32::MAX);
@@ -121,27 +124,12 @@ pub fn find_path_in(
         }
     }
 
-    if best_node == start {
+    let result = if best_node == start {
         AStarResult::Unreachable
     } else {
         AStarResult::BudgetExhausted { best_so_far: best_node }
-    }
-}
-
-/// Backwards-compatible wrapper: returns `Some(path)` only on `Found`.
-/// `BudgetExhausted` and `Unreachable` both map to `None`. To be removed in
-/// step (g) once movement.rs migrates to `find_path_in` directly.
-pub fn find_path_toward(
-    chunk_map: &ChunkMap,
-    start: (i32, i32, i8),
-    goal: (i32, i32, i8),
-    max_nodes: usize,
-) -> Option<Vec<(i32, i32, i8)>> {
-    let mut scratch = AStarScratch::default();
-    match find_path_in(&mut scratch, chunk_map, start, goal, max_nodes) {
-        AStarResult::Found(p) if !p.is_empty() => Some(p),
-        _ => None,
-    }
+    };
+    (result, expansions as u32)
 }
 
 #[cfg(test)]
@@ -163,7 +151,7 @@ mod tests {
         map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
         let mut s = AStarScratch::default();
         match find_path_in(&mut s, &map, (5, 5, 0), (8, 5, 0), 500) {
-            AStarResult::Found(path) => {
+            (AStarResult::Found(path), _iters) => {
                 assert!(!path.is_empty());
                 assert_eq!(path.last(), Some(&(8, 5, 0)));
             }
@@ -177,8 +165,8 @@ mod tests {
         map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
         let mut s = AStarScratch::default();
         match find_path_in(&mut s, &map, (5, 5, 0), (8, 5, 10), 200) {
-            AStarResult::Found(_) => panic!("should not find"),
-            AStarResult::Unreachable | AStarResult::BudgetExhausted { .. } => {}
+            (AStarResult::Found(_), _) => panic!("should not find"),
+            (AStarResult::Unreachable, _) | (AStarResult::BudgetExhausted { .. }, _) => {}
         }
     }
 

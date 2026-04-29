@@ -116,6 +116,7 @@ impl Plugin for SimulationPlugin {
                     mood::derive_mood_system,
                     lod::update_lod_levels_system,
                     faction::update_storage_tile_map_system,
+                    faction::sync_faction_center_hotspots_system,
                     animals::animal_needs_tick_system,
                 )
                     .in_set(SimulationSet::ParallelA),

@@ -51,7 +51,16 @@ impl ChunkRouter {
         if cur == dest {
             return None;
         }
-        let mut state = self.state.lock().ok()?;
+        let mut state = match self.state.lock() {
+            Ok(s) => s,
+            Err(poisoned) => {
+                warn!(
+                    "[path] ChunkRouter mutex poisoned (cur={:?} dest={:?}); recovering",
+                    cur, dest
+                );
+                poisoned.into_inner()
+            }
+        };
         maybe_invalidate(&mut state, graph);
 
         // Build (or fetch) the tree for `dest`. We don't hold a ref into the
@@ -74,6 +83,10 @@ impl ChunkRouter {
         }
         let tree = state.trees.get(&dest)?;
         if !tree.dist.contains_key(&cur) {
+            debug!(
+                "[path] router: no dist entry for cur={:?} dest={:?} (disconnected component)",
+                cur, dest
+            );
             return None;
         }
 

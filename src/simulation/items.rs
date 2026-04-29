@@ -8,7 +8,7 @@ use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::world::spatial::SpatialIndex;
-use crate::world::terrain::{tile_to_world, TILE_SIZE};
+use crate::world::terrain::tile_to_world;
 use bevy::prelude::*;
 
 #[derive(Component, Clone, Copy, Default, Debug)]
@@ -98,7 +98,6 @@ pub fn item_pickup_system(
             &BucketSlot,
             &LodLevel,
             Option<&mut ActivePlan>,
-            &Transform,
         ),
         With<Person>,
     >,
@@ -112,7 +111,6 @@ pub fn item_pickup_system(
         slot,
         lod,
         mut active_plan_opt,
-        transform,
     ) in pickers.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -131,43 +129,34 @@ pub fn item_pickup_system(
         };
 
         if let Ok(mut item) = item_query.get_mut(target_ent) {
-            // Check if we are at the target
-            let tx = (transform.translation.x / TILE_SIZE).floor() as i16;
-            let ty = (transform.translation.y / TILE_SIZE).floor() as i16;
-
-            if ai.target_tile == (tx, ty) {
-                // For edibles: take only enough to satisfy hunger so the agent
-                // doesn't grab a whole storage stack just to eat one bite.
-                // Non-edibles still take the full stack.
-                let take_qty = if item.item.good.is_edible() {
-                    let nutrition = item.item.good.nutrition();
-                    if nutrition == 0 {
-                        item.qty
-                    } else {
-                        let bites = ((needs.hunger / nutrition as f32).ceil() as u32).max(1);
-                        bites.min(item.qty)
-                    }
-                } else {
+            let take_qty = if item.item.good.is_edible() {
+                let nutrition = item.item.good.nutrition();
+                if nutrition == 0 {
                     item.qty
-                };
-
-                agent.add_good(item.item.good, take_qty);
-
-                if let Some(ref mut plan) = active_plan_opt {
-                    plan.reward_acc += take_qty as f32 * plan.reward_scale;
-                }
-
-                if take_qty >= item.qty {
-                    commands.entity(target_ent).despawn();
                 } else {
-                    item.qty -= take_qty;
+                    let bites = ((needs.hunger / nutrition as f32).ceil() as u32).max(1);
+                    bites.min(item.qty)
                 }
+            } else {
+                item.qty
+            };
 
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
-                ai.target_entity = None;
-                target_item.0 = None;
+            agent.add_good(item.item.good, take_qty);
+
+            if let Some(ref mut plan) = active_plan_opt {
+                plan.reward_acc += take_qty as f32 * plan.reward_scale;
             }
+
+            if take_qty >= item.qty {
+                commands.entity(target_ent).despawn();
+            } else {
+                item.qty -= take_qty;
+            }
+
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
+            target_item.0 = None;
         } else {
             // Targeted item is gone (stolen or rotted)
             ai.state = AiState::Idle;

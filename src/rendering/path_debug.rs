@@ -2,10 +2,10 @@ use ahash::AHashSet;
 use bevy::prelude::*;
 
 use crate::pathfinding::chunk_graph::ChunkGraph;
-use crate::pathfinding::chunk_router::ChunkRouter;
-use crate::pathfinding::flow_field::FlowFieldCache;
+use crate::pathfinding::connectivity::ChunkConnectivity;
+use crate::pathfinding::hotspots::HotspotFlowFields;
+use crate::pathfinding::path_request::{FailureLog, PathFollow};
 use crate::rendering::camera::CameraViewZ;
-use crate::simulation::movement::MovementState;
 use crate::simulation::person::PersonAI;
 use crate::ui::selection::SelectedEntity;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
@@ -16,6 +16,12 @@ pub struct PathDebugOverlay {
     pub show_selected_path: bool,
     pub show_flow_fields: bool,
     pub show_chunk_graph: bool,
+    /// Red lines for the most recent global PathFailed (start → goal).
+    pub show_recent_failures: bool,
+    /// Tints chunks by their connectivity component id, so islands stand out.
+    pub show_connectivity_components: bool,
+    /// Failure history specific to the currently selected agent.
+    pub show_selected_failures: bool,
 }
 
 /// Maps a flow-field direction byte (0..7) to a unit vector in tile space
@@ -46,9 +52,7 @@ pub fn selected_agent_path_gizmo_system(
     overlay: Res<PathDebugOverlay>,
     selected: Res<SelectedEntity>,
     chunk_map: Res<ChunkMap>,
-    graph: Res<ChunkGraph>,
-    router: Res<ChunkRouter>,
-    agents: Query<(&Transform, &MovementState, &PersonAI)>,
+    agents: Query<(&Transform, &PathFollow, &PersonAI)>,
     mut gizmos: Gizmos,
 ) {
     let _ = chunk_map;
@@ -56,27 +60,27 @@ pub fn selected_agent_path_gizmo_system(
         return;
     }
     let Some(entity) = selected.0 else { return };
-    let Ok((transform, mv, ai)) = agents.get(entity) else { return };
+    let Ok((transform, pf, ai)) = agents.get(entity) else { return };
 
     let agent_pos = transform.translation.truncate();
 
-    // Yellow A* polyline: agent → first cached step → … → final.
+    // Yellow polyline: current PathFollow segment, agent → step 0 → … → segment end.
     let path_color = Color::srgba(1.0, 0.95, 0.2, 0.95);
-    if !mv.astar_path.is_empty() {
-        let cursor = (mv.astar_cursor as usize).min(mv.astar_path.len());
+    if !pf.segment_path.is_empty() {
+        let cursor = (pf.segment_cursor as usize).min(pf.segment_path.len());
         let mut prev = agent_pos;
-        for &(tx, ty, _z) in &mv.astar_path[cursor..] {
+        for &(tx, ty, _z) in &pf.segment_path[cursor..] {
             let p = tile_center(tx as i32, ty as i32);
             gizmos.line_2d(prev, p, path_color);
             gizmos.circle_2d(p, 1.5, path_color);
             prev = p;
         }
-        if let Some(&(tx, ty, _)) = mv.astar_path.last() {
+        if let Some(&(tx, ty, _)) = pf.segment_path.last() {
             gizmos.circle_2d(tile_center(tx as i32, ty as i32), 4.0, path_color);
         }
     }
 
-    // Magenta: line to the immediate sub-goal tile.
+    // Magenta: line to the immediate target tile.
     let target_pos = tile_center(ai.target_tile.0 as i32, ai.target_tile.1 as i32);
     let target_color = Color::srgba(1.0, 0.3, 0.9, 0.85);
     gizmos.line_2d(agent_pos, target_pos, target_color);
@@ -90,28 +94,22 @@ pub fn selected_agent_path_gizmo_system(
         gizmos.circle_2d(dest_pos, 5.0, dest_color);
     }
 
-    // Green X: next chunk-graph waypoint (high-level routing decision).
-    let cur_chunk = ChunkCoord::from_world(agent_pos.x, agent_pos.y, TILE_SIZE);
-    let dest_chunk = ChunkCoord(
-        (ai.dest_tile.0 as i32).div_euclid(CHUNK_SIZE as i32),
-        (ai.dest_tile.1 as i32).div_euclid(CHUNK_SIZE as i32),
-    );
-    if cur_chunk != dest_chunk {
-        if let Some((wx, wy)) =
-            router.first_waypoint(&graph, cur_chunk, dest_chunk, ai.current_z)
-        {
-            let wp = tile_center(wx as i32, wy as i32);
-            let green = Color::srgba(0.2, 1.0, 0.4, 0.95);
-            let r = 4.0;
-            gizmos.line_2d(wp + Vec2::new(-r, -r), wp + Vec2::new(r, r), green);
-            gizmos.line_2d(wp + Vec2::new(-r, r), wp + Vec2::new(r, -r), green);
+    // Green X chain: chunks the worker plans to traverse, in order.
+    let chunk_color = Color::srgba(0.2, 1.0, 0.4, 0.95);
+    let r = 4.0;
+    for (i, coord) in pf.chunk_route.iter().enumerate() {
+        if (i as u8) < pf.route_cursor {
+            continue;
         }
+        let c = chunk_center(*coord);
+        gizmos.line_2d(c + Vec2::new(-r, -r), c + Vec2::new(r, r), chunk_color);
+        gizmos.line_2d(c + Vec2::new(-r, r), c + Vec2::new(r, -r), chunk_color);
     }
 }
 
 pub fn flow_field_gizmo_system(
     overlay: Res<PathDebugOverlay>,
-    cache: Res<FlowFieldCache>,
+    hotspots: Res<HotspotFlowFields>,
     view_z: Res<CameraViewZ>,
     camera_query: Query<(&Transform, &OrthographicProjection), With<Camera>>,
     windows: Query<&Window>,
@@ -136,7 +134,8 @@ pub fn flow_field_gizmo_system(
     let goal_color = Color::srgba(1.0, 0.25, 0.25, 0.95);
     let arrow_len = TILE_SIZE * 0.35;
 
-    for field in cache.fields.values() {
+    for entry in hotspots.entries.values() {
+        let field = &entry.field;
         // View-Z filter: in surface mode (i32::MAX) show fields with goal_z >= 0;
         // when peering underground show fields whose goal_z is within ±1 of view.
         if view_z.0 == i32::MAX {
@@ -205,5 +204,150 @@ pub fn chunk_graph_gizmo_system(
             let b = chunk_center(edge.neighbor);
             gizmos.line_2d(a, b, edge_color);
         }
+    }
+}
+
+/// Cheap deterministic hash → hue mapping for component ids. Same id ⇒
+/// same color across frames, but adjacent ids get visually distinct hues.
+fn component_color(id: u32) -> Color {
+    // Mix the id with golden-ratio constant to spread hues.
+    let h = ((id.wrapping_mul(2654435761)) >> 16) as f32 / 65535.0;
+    let (r, g, b) = hsv_to_rgb(h, 0.65, 0.95);
+    Color::srgba(r, g, b, 0.35)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    let i = (h * 6.0).floor() as i32;
+    let f = h * 6.0 - i as f32;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - f * s);
+    let t = v * (1.0 - (1.0 - f) * s);
+    match i.rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    }
+}
+
+/// Draws each chunk as a filled square (outlined) tinted by its connectivity
+/// component id at the current view-Z (or surface band 0 when peeking).
+pub fn connectivity_component_gizmo_system(
+    overlay: Res<PathDebugOverlay>,
+    conn: Res<ChunkConnectivity>,
+    view_z: Res<CameraViewZ>,
+    camera_query: Query<(&Transform, &OrthographicProjection), With<Camera>>,
+    windows: Query<&Window>,
+    mut gizmos: Gizmos,
+) {
+    if !overlay.show_connectivity_components {
+        return;
+    }
+    let Ok((cam_transform, projection)) = camera_query.get_single() else { return };
+    let Ok(window) = windows.get_single() else { return };
+
+    let view_band = if view_z.0 == i32::MAX {
+        0i8
+    } else {
+        crate::pathfinding::connectivity::z_band(view_z.0 as i8)
+    };
+
+    let half_w = window.width() * 0.5 * projection.scale;
+    let half_h = window.height() * 0.5 * projection.scale;
+    let cam = cam_transform.translation.truncate();
+    let chunk_world = CHUNK_SIZE as f32 * TILE_SIZE;
+    let cx_min = ((cam.x - half_w) / chunk_world).floor() as i32 - 1;
+    let cx_max = ((cam.x + half_w) / chunk_world).ceil() as i32 + 1;
+    let cy_min = ((cam.y - half_h) / chunk_world).floor() as i32 - 1;
+    let cy_max = ((cam.y + half_h) / chunk_world).ceil() as i32 + 1;
+
+    let half = chunk_world * 0.5;
+    for (coord, band, id) in conn.iter() {
+        if band != view_band {
+            continue;
+        }
+        if coord.0 < cx_min || coord.0 > cx_max || coord.1 < cy_min || coord.1 > cy_max {
+            continue;
+        }
+        let c = chunk_center(coord);
+        let color = component_color(id);
+        gizmos.rect_2d(c, Vec2::splat(chunk_world - 2.0), color);
+        // Bright corner ticks make components visually pop even when the
+        // tint is dim against bright terrain.
+        let tick = 4.0;
+        let tl = c + Vec2::new(-half, half);
+        let tr = c + Vec2::new(half, half);
+        let bl = c + Vec2::new(-half, -half);
+        let br = c + Vec2::new(half, -half);
+        let tick_color = Color::srgba(color.to_srgba().red, color.to_srgba().green, color.to_srgba().blue, 0.95);
+        gizmos.line_2d(tl, tl + Vec2::new(tick, 0.0), tick_color);
+        gizmos.line_2d(tr, tr + Vec2::new(-tick, 0.0), tick_color);
+        gizmos.line_2d(bl, bl + Vec2::new(tick, 0.0), tick_color);
+        gizmos.line_2d(br, br + Vec2::new(-tick, 0.0), tick_color);
+    }
+}
+
+/// Red lines from start → goal for each entry in `FailureLog::recent`.
+/// Z-filtered to whatever band the camera is currently looking at.
+pub fn recent_failures_gizmo_system(
+    overlay: Res<PathDebugOverlay>,
+    failures: Res<FailureLog>,
+    view_z: Res<CameraViewZ>,
+    mut gizmos: Gizmos,
+) {
+    if !overlay.show_recent_failures {
+        return;
+    }
+    let viewing_surface = view_z.0 == i32::MAX;
+    let line_color = Color::srgba(1.0, 0.2, 0.2, 0.7);
+    let goal_color = Color::srgba(1.0, 0.2, 0.2, 0.95);
+
+    for rec in failures.recent.iter() {
+        if !viewing_surface {
+            // Show only failures whose start or goal is near the view-Z
+            // band, otherwise the overlay is meaningless underground.
+            let band = crate::pathfinding::connectivity::z_band(view_z.0 as i8);
+            let sb = crate::pathfinding::connectivity::z_band(rec.start.2);
+            let gb = crate::pathfinding::connectivity::z_band(rec.goal.2);
+            if sb != band && gb != band {
+                continue;
+            }
+        }
+        let s = tile_center(rec.start.0, rec.start.1);
+        let g = tile_center(rec.goal.0, rec.goal.1);
+        gizmos.line_2d(s, g, line_color);
+        gizmos.circle_2d(g, 3.0, goal_color);
+        // Small X at the start.
+        let r = 2.5;
+        gizmos.line_2d(s + Vec2::new(-r, -r), s + Vec2::new(r, r), goal_color);
+        gizmos.line_2d(s + Vec2::new(-r, r), s + Vec2::new(r, -r), goal_color);
+    }
+}
+
+/// Like `recent_failures_gizmo_system` but filtered to the selected agent
+/// only and with a brighter highlight color so it reads as "this agent's
+/// recent failure history".
+pub fn selected_agent_failures_gizmo_system(
+    overlay: Res<PathDebugOverlay>,
+    failures: Res<FailureLog>,
+    selected: Res<SelectedEntity>,
+    mut gizmos: Gizmos,
+) {
+    if !overlay.show_selected_failures {
+        return;
+    }
+    let Some(entity) = selected.0 else { return };
+    let highlight = Color::srgba(1.0, 0.85, 0.2, 0.9);
+
+    for rec in failures.for_agent(entity) {
+        let s = tile_center(rec.start.0, rec.start.1);
+        let g = tile_center(rec.goal.0, rec.goal.1);
+        gizmos.line_2d(s, g, highlight);
+        gizmos.circle_2d(g, 4.0, highlight);
+        let r = 3.5;
+        gizmos.line_2d(s + Vec2::new(-r, -r), s + Vec2::new(r, r), highlight);
+        gizmos.line_2d(s + Vec2::new(-r, r), s + Vec2::new(r, -r), highlight);
     }
 }

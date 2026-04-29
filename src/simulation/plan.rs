@@ -12,6 +12,7 @@ use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
+use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::Calendar;
 use crate::world::spatial::SpatialIndex;
@@ -23,7 +24,7 @@ use bevy::prelude::*;
 
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, MemoryKind, RelationshipMemory};
-use super::needs::Needs;
+use super::needs::{Needs, EAT_TRIGGER_HUNGER};
 use super::neural::{UtilityNet, PLAN_FEAT_DIM, STATE_DIM};
 use super::person::{AiState, Person, PersonAI, PlayerOrder};
 use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
@@ -65,18 +66,51 @@ pub enum StepTarget {
 #[derive(Clone, Debug)]
 pub struct StepPreconditions {
     pub requires_good: Option<(Good, u32)>,
+    pub requires_any_edible: bool,
+    pub min_hunger: Option<u8>,
 }
 
 impl StepPreconditions {
     pub fn none() -> Self {
         Self {
             requires_good: None,
+            requires_any_edible: false,
+            min_hunger: None,
         }
     }
     pub fn needs_good(good: Good, qty: u32) -> Self {
         Self {
             requires_good: Some((good, qty)),
+            requires_any_edible: false,
+            min_hunger: None,
         }
+    }
+    /// Eat-style preconditions: agent must hold at least one edible and be at
+    /// or above the given hunger threshold.
+    pub fn eat_when_hungry(min_hunger: u8) -> Self {
+        Self {
+            requires_good: None,
+            requires_any_edible: true,
+            min_hunger: Some(min_hunger),
+        }
+    }
+
+    /// Returns true if the agent currently satisfies these preconditions.
+    pub fn is_satisfied(&self, agent: &EconomicAgent, hunger: f32) -> bool {
+        if let Some((good, qty)) = self.requires_good {
+            if agent.quantity_of(good) < qty {
+                return false;
+            }
+        }
+        if self.requires_any_edible && agent.total_food() == 0 {
+            return false;
+        }
+        if let Some(min) = self.min_hunger {
+            if hunger < min as f32 {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -258,6 +292,7 @@ static RESCUE_GOALS: &[AgentGoal] = &[AgentGoal::Rescue];
 static PLAN_STEPS_22: &[StepId] = &[26]; // FindMate: NearestPartner
 static PLAN_STEPS_23: &[StepId] = &[27]; // RescueAlly: EngageRescue
 static PLAN_STEPS_24: &[StepId] = &[12]; // ReturnSurplusFood: DepositGoods at faction storage
+static PLAN_STEPS_25: &[StepId] = &[9]; // EatFromInventory: Eat (gated by hunger + edible-on-hand)
 
 static RETURN_CAMP_GOALS: &[AgentGoal] = &[AgentGoal::ReturnCamp];
 
@@ -369,11 +404,12 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            // 9: Eat — consume one edible from inventory in place
+            // 9: Eat — consume edibles from inventory in place. Gated on hunger
+            // so plans don't waste food when the agent is already sated.
             id: 9,
             task: TaskKind::Eat,
             target: StepTarget::SelfPosition,
-            preconditions: StepPreconditions::none(),
+            preconditions: StepPreconditions::eat_when_hungry(EAT_TRIGGER_HUNGER),
             reward_scale: 1.0,
             plant_filter: None,
             extra: 0,
@@ -794,6 +830,18 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             steps: PLAN_STEPS_24,
             feature_vec: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.0],
             serves_goals: RETURN_CAMP_GOALS,
+            tech_gate: None,
+            memory_target_kind: None,
+        },
+        PlanDef {
+            // Eat what's already in the agent's inventory. The Eat step's
+            // preconditions gate this on hunger + having edibles, so it only
+            // becomes a candidate when the agent should actually eat.
+            id: 25,
+            name: "EatFromInventory",
+            steps: PLAN_STEPS_25,
+            feature_vec: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.05, 0.0],
+            serves_goals: SURVIVE_GOALS,
             tech_gate: None,
             memory_target_kind: None,
         },
@@ -1272,6 +1320,7 @@ pub struct PlanRegistries<'w, 's> {
     pub storage_tile_map: Res<'w, StorageTileMap>,
     pub door_map: Res<'w, crate::simulation::construction::DoorMap>,
     pub chunk_router: Res<'w, ChunkRouter>,
+    pub chunk_connectivity: Res<'w, ChunkConnectivity>,
     pub partner_query: Query<'w, 's, (&'static Transform, &'static BiologicalSex, &'static FactionMember), With<Person>>,
     pub drop_food_events: EventWriter<'w, DropAbandonedFoodEvent>,
 }
@@ -1332,6 +1381,7 @@ pub fn plan_execution_system(
         storage_tile_map,
         door_map,
         chunk_router,
+        chunk_connectivity,
         partner_query,
         mut drop_food_events,
     } = registries;
@@ -1411,8 +1461,7 @@ pub fn plan_execution_system(
                     p.steps
                         .first()
                         .and_then(|&sid| step_registry.0.iter().find(|s| s.id == sid))
-                        .and_then(|s| s.preconditions.requires_good)
-                        .map_or(true, |(good, qty)| agent.quantity_of(good) >= qty)
+                        .map_or(true, |s| s.preconditions.is_satisfied(&agent, needs.hunger))
                 })
                 .collect();
 
@@ -1436,6 +1485,7 @@ pub fn plan_execution_system(
                     &chunk_graph,
                     &chunk_router,
                     &chunk_map,
+                    &chunk_connectivity,
                 );
                 continue;
             }
@@ -1523,6 +1573,9 @@ pub fn plan_execution_system(
             commands.entity(entity).remove::<ActivePlan>();
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
+            ai.target_tile = (cur_tx as i16, cur_ty as i16);
+            ai.dest_tile = ai.target_tile;
+            ai.target_entity = None;
             combat_target.0 = None;
             continue;
         }
@@ -1541,6 +1594,9 @@ pub fn plan_execution_system(
             commands.entity(entity).remove::<ActivePlan>();
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
+            ai.target_tile = (cur_tx as i16, cur_ty as i16);
+            ai.dest_tile = ai.target_tile;
+            ai.target_entity = None;
             combat_target.0 = None;
             continue;
         }
@@ -1608,12 +1664,10 @@ pub fn plan_execution_system(
             }
 
             // Check preconditions
-            if let Some((good, qty)) = step_def.preconditions.requires_good {
-                if agent.quantity_of(good) < qty {
-                    commands.entity(entity).remove::<ActivePlan>();
-                    combat_target.0 = None;
-                    continue;
-                }
+            if !step_def.preconditions.is_satisfied(&agent, needs.hunger) {
+                commands.entity(entity).remove::<ActivePlan>();
+                combat_target.0 = None;
+                continue;
             }
 
             if let Some((ent, target_tx, target_ty)) = resolve_target(
@@ -1653,6 +1707,7 @@ pub fn plan_execution_system(
                     &chunk_graph,
                     &chunk_router,
                     &chunk_map,
+                    &chunk_connectivity,
                 );
                 // For Craft tasks, encode the recipe ID in target_z (unused for in-place crafting).
                 if step_def.task == TaskKind::Craft {
@@ -1680,6 +1735,7 @@ pub fn plan_execution_system(
                     &chunk_graph,
                     &chunk_router,
                     &chunk_map,
+                    &chunk_connectivity,
                 );
                 commands.entity(entity).remove::<ActivePlan>();
                 combat_target.0 = None;
@@ -1706,6 +1762,7 @@ pub fn plan_execution_system(
                                     &chunk_graph,
                                     &chunk_router,
                                     &chunk_map,
+                                    &chunk_connectivity,
                                 );
                             }
                         }
@@ -1742,6 +1799,7 @@ pub fn plan_execution_system(
                                         &chunk_graph,
                                         &chunk_router,
                                         &chunk_map,
+                                        &chunk_connectivity,
                                     );
                                 }
                             } else {
@@ -1758,6 +1816,7 @@ pub fn plan_execution_system(
                                         &chunk_graph,
                                         &chunk_router,
                                         &chunk_map,
+                                        &chunk_connectivity,
                                     );
                                 }
                             }

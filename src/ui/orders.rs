@@ -1,6 +1,7 @@
 use super::selection::SelectedEntity;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
+use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::rendering::camera::CameraViewZ;
 use crate::simulation::construction::{
     faction_can_build, recipe_for, BedMap, Blueprint, BlueprintMap, BuildSiteKind, CampfireMap,
@@ -69,6 +70,7 @@ pub fn right_click_context_menu_system(
     routing: (
         Res<ChunkGraph>,
         Res<ChunkRouter>,
+        Res<ChunkConnectivity>,
         Res<CameraViewZ>,
         Res<BedMap>,
         Res<CampfireMap>,
@@ -85,6 +87,7 @@ pub fn right_click_context_menu_system(
     let (
         chunk_graph,
         chunk_router,
+        chunk_connectivity,
         camera_view_z,
         bed_map,
         campfire_map,
@@ -301,6 +304,7 @@ pub fn right_click_context_menu_system(
                 &chunk_graph,
                 &chunk_router,
                 &chunk_map,
+                &chunk_connectivity,
             );
             ai.target_z = target_z;
         }

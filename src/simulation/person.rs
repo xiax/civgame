@@ -18,6 +18,7 @@ use super::lod::LodLevel;
 use super::memory::{AgentMemory, RelationshipMemory};
 use super::mood::Mood;
 use super::movement::MovementState;
+use crate::pathfinding::path_request::PathFollow;
 use super::needs::Needs;
 use super::neural::UtilityNet;
 use super::plan::{KnownPlans, PlanScoringMethod};
@@ -380,9 +381,10 @@ pub fn spawn_population(
                     AgentMemory::default(),
                     RelationshipMemory::default(),
                     UtilityNet::new_random(),
-                    KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 9, 10, 22, 23, 24]),
+                    KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 9, 10, 22, 23, 24, 25]),
                     PlanScoringMethod::UtilityNN,
                     Name::new(generate_person_name(sex)),
+                    PathFollow::default(),
                 ),
             ));
 

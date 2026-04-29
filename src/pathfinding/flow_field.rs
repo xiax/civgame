@@ -1,7 +1,5 @@
 use crate::pathfinding::tile_cost::{tile_step_cost, IMPASSABLE};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
-use ahash::AHashMap;
-use bevy::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -14,48 +12,7 @@ pub struct FlowField {
     pub generation: u32,
 }
 
-#[derive(Resource, Default)]
-pub struct FlowFieldCache {
-    pub fields: AHashMap<(ChunkCoord, u8, u8, i8), FlowField>,
-    pub max_cached: usize,
-}
-
-impl FlowFieldCache {
-    /// Build (or fetch) a flow field for `coord`/`goal` at Z slice `goal_z`.
-    /// `extra_cost` lets callers add per-tile penalties (e.g. furniture)
-    /// on top of the base `tile_step_cost`. It receives global tile coords.
-    pub fn get_or_build<F>(
-        &mut self,
-        chunk_map: &ChunkMap,
-        coord: ChunkCoord,
-        goal: (u8, u8),
-        goal_z: i8,
-        extra_cost: F,
-    ) -> &FlowField
-    where
-        F: Fn((i32, i32)) -> u16,
-    {
-        let key = (coord, goal.0, goal.1, goal_z);
-        if !self.fields.contains_key(&key) {
-            if self.max_cached > 0 && self.fields.len() >= self.max_cached {
-                if let Some(victim) = self.fields.keys().next().copied() {
-                    self.fields.remove(&victim);
-                }
-            }
-            let field = build_flow_field(chunk_map, coord, goal, goal_z, &extra_cost);
-            self.fields.insert(key, field);
-        }
-        &self.fields[&key]
-    }
-
-    /// Drop every cached field whose chunk matches `coord`. Call this when a
-    /// tile in `coord` (or one near it) changes so future lookups rebuild.
-    pub fn invalidate_chunk(&mut self, coord: ChunkCoord) {
-        self.fields.retain(|(c, _, _, _), _| *c != coord);
-    }
-}
-
-fn build_flow_field<F>(
+pub fn build_flow_field<F>(
     chunk_map: &ChunkMap,
     coord: ChunkCoord,
     goal: (u8, u8),
@@ -173,6 +130,69 @@ where
     }
 }
 
+/// Direction-byte → (dx, dy) of the BFS expansion that wrote that byte.
+/// Mirrors the `NEIGHBORS` table above: `build_flow_field` stores
+/// `dir[neighbor] = d` where (dx, dy) at index `d` is the offset *from the
+/// parent cell to the neighbor*. To walk back toward the goal from the
+/// neighbor, step in the *opposite* of this offset.
+const DIR_OFFSET: [(i32, i32); 8] = [
+    (0, -1),
+    (-1, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+    (1, 0),
+    (1, -1),
+];
+
+/// Walks the flow field from `start_local` to the field's goal, producing
+/// the same shape of segment path A* would: a list of (global_x, global_y, z)
+/// tiles in step order, goal inclusive. Returns `None` if the start is
+/// unreachable, the walk leaves the chunk, or it exceeds the safety bound.
+///
+/// Z is held at `field.goal_z` for every step — the worker only invokes
+/// this when start.z == goal.z, and the field itself was built for that Z.
+pub fn walk_to_goal(field: &FlowField, start_local: (u8, u8)) -> Option<Vec<(i16, i16, i8)>> {
+    let csz = CHUNK_SIZE;
+    let origin_x = field.chunk.0 * csz as i32;
+    let origin_y = field.chunk.1 * csz as i32;
+    let z = field.goal_z;
+
+    let mut path: Vec<(i16, i16, i8)> = Vec::new();
+    let mut x = start_local.0 as i32;
+    let mut y = start_local.1 as i32;
+    let goal_x = field.goal_tile.0 as i32;
+    let goal_y = field.goal_tile.1 as i32;
+
+    if x == goal_x && y == goal_y {
+        return Some(path);
+    }
+
+    let max_steps = csz * csz;
+    for _ in 0..max_steps {
+        let idx = y as usize * csz + x as usize;
+        let dir = field.directions[idx];
+        if dir == 0xFF || (dir as usize) >= DIR_OFFSET.len() {
+            return None;
+        }
+        // Step against the recorded expansion offset to walk goalward.
+        let (dx, dy) = DIR_OFFSET[dir as usize];
+        x -= dx;
+        y -= dy;
+        if x < 0 || y < 0 || x >= csz as i32 || y >= csz as i32 {
+            return None;
+        }
+        let gx = (origin_x + x) as i16;
+        let gy = (origin_y + y) as i16;
+        path.push((gx, gy, z));
+        if x == goal_x && y == goal_y {
+            return Some(path);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,12 +215,15 @@ mod tests {
         0
     }
 
+    fn build(map: &ChunkMap, coord: ChunkCoord, goal: (u8, u8), goal_z: i8) -> FlowField {
+        build_flow_field(map, coord, goal, goal_z, &no_extra)
+    }
+
     #[test]
     fn flow_field_reaches_corner_at_surface_z() {
         let coord = ChunkCoord(0, 0);
         let map = flat_map_with_chunk(coord, 0);
-        let mut cache = FlowFieldCache::default();
-        let field = cache.get_or_build(&map, coord, (0, 0), 0, no_extra);
+        let field = build(&map, coord, (0, 0), 0);
         let far = (CHUNK_SIZE - 1) * CHUNK_SIZE + (CHUNK_SIZE - 1);
         assert_ne!(field.directions[far], 0xFF);
     }
@@ -209,20 +232,9 @@ mod tests {
     fn flow_field_skips_non_floor_z_slice() {
         let coord = ChunkCoord(0, 0);
         let map = flat_map_with_chunk(coord, 0);
-        let mut cache = FlowFieldCache::default();
-        let field = cache.get_or_build(&map, coord, (0, 0), -5, no_extra);
+        let field = build(&map, coord, (0, 0), -5);
         let far = (CHUNK_SIZE - 1) * CHUNK_SIZE + (CHUNK_SIZE - 1);
         assert_eq!(field.directions[far], 0xFF);
-    }
-
-    #[test]
-    fn flow_field_separate_cache_per_z() {
-        let coord = ChunkCoord(0, 0);
-        let map = flat_map_with_chunk(coord, 0);
-        let mut cache = FlowFieldCache::default();
-        cache.get_or_build(&map, coord, (0, 0), 0, no_extra);
-        cache.get_or_build(&map, coord, (0, 0), 1, no_extra);
-        assert_eq!(cache.fields.len(), 2);
     }
 
     #[test]
@@ -233,8 +245,7 @@ mod tests {
             map.set_tile(x, 5, 1, TileData { kind: TileKind::Air, ..Default::default() });
             map.set_tile(x, 5, 0, TileData { kind: TileKind::Dirt, ..Default::default() });
         }
-        let mut cache = FlowFieldCache::default();
-        let field = cache.get_or_build(&map, coord, (0, 5), 0, no_extra);
+        let field = build(&map, coord, (0, 5), 0);
         let idx = 5 * CHUNK_SIZE + 5;
         assert_ne!(field.directions[idx], 0xFF);
         let idx_rock = 6 * CHUNK_SIZE + 5;
@@ -243,10 +254,8 @@ mod tests {
 
     #[test]
     fn flow_field_routes_around_wall() {
-        // Carve a vertical wall column blocking the direct path from corner to corner.
         let coord = ChunkCoord(0, 0);
         let mut map = flat_map_with_chunk(coord, 0);
-        // Block column x=5 from y=0..CHUNK_SIZE-1 (leave the bottom row open).
         for y in 0..(CHUNK_SIZE as i32 - 1) {
             map.set_tile(
                 5,
@@ -258,21 +267,15 @@ mod tests {
                 },
             );
         }
-        let mut cache = FlowFieldCache::default();
-        let field = cache.get_or_build(&map, coord, (0, 0), 0, no_extra);
-        // A tile on the far side of the wall should still have a path (around it).
+        let field = build(&map, coord, (0, 0), 0);
         let far = 5 * CHUNK_SIZE + 10;
         assert_ne!(field.directions[far], 0xFF);
-        // But the wall tile itself has no path.
         let wall_idx = 5 * CHUNK_SIZE + 5;
         assert_eq!(field.directions[wall_idx], 0xFF);
     }
 
     #[test]
     fn flow_field_routes_over_one_step_ramp() {
-        // Flat z=0 chunk. Block (5, 5) at z=0 with a Wall and place a Ramp
-        // at (5, 5, 1) so the only east-west path through column 5 is up
-        // and over the ramp at z=1.
         let coord = ChunkCoord(0, 0);
         let mut map = flat_map_with_chunk(coord, 0);
         map.set_tile(
@@ -294,21 +297,66 @@ mod tests {
             },
         );
 
-        let mut cache = FlowFieldCache::default();
-        let field = cache.get_or_build(&map, coord, (10, 5), 0, no_extra);
-        // (0, 5) at z=0 must reach the goal — the BFS must climb the ramp.
+        let field = build(&map, coord, (10, 5), 0);
         let idx_far = 5 * CHUNK_SIZE + 0;
         assert_ne!(field.directions[idx_far], 0xFF);
     }
 
     #[test]
-    fn invalidate_chunk_drops_cached_fields() {
+    fn walk_to_goal_reaches_goal_with_unit_steps() {
         let coord = ChunkCoord(0, 0);
         let map = flat_map_with_chunk(coord, 0);
-        let mut cache = FlowFieldCache::default();
-        cache.get_or_build(&map, coord, (0, 0), 0, no_extra);
-        assert_eq!(cache.fields.len(), 1);
-        cache.invalidate_chunk(coord);
-        assert!(cache.fields.is_empty());
+        let goal = (4u8, 7u8);
+        let field = build(&map, coord, goal, 0);
+
+        let start = (12u8, 1u8);
+        // Sanity: the BFS should have reached the start cell on a flat map.
+        let start_idx = start.1 as usize * CHUNK_SIZE + start.0 as usize;
+        assert_ne!(field.directions[start_idx], 0xFF);
+
+        let path = walk_to_goal(&field, start).expect("flat map must produce a path");
+        assert!(!path.is_empty());
+
+        let origin_x = coord.0 * CHUNK_SIZE as i32;
+        let origin_y = coord.1 * CHUNK_SIZE as i32;
+        let last = *path.last().unwrap();
+        assert_eq!(
+            last,
+            (
+                (origin_x + goal.0 as i32) as i16,
+                (origin_y + goal.1 as i32) as i16,
+                0,
+            )
+        );
+
+        let mut prev = (
+            (origin_x + start.0 as i32) as i16,
+            (origin_y + start.1 as i32) as i16,
+        );
+        for &(x, y, _) in &path {
+            let dx = (x as i32 - prev.0 as i32).abs();
+            let dy = (y as i32 - prev.1 as i32).abs();
+            assert!(dx <= 1 && dy <= 1, "non-unit step from {prev:?} to ({x},{y})");
+            prev = (x, y);
+        }
+    }
+
+    #[test]
+    fn walk_to_goal_returns_empty_when_already_at_goal() {
+        let coord = ChunkCoord(0, 0);
+        let map = flat_map_with_chunk(coord, 0);
+        let goal = (3u8, 3u8);
+        let field = build(&map, coord, goal, 0);
+        let path = walk_to_goal(&field, goal).expect("at-goal walk should succeed");
+        assert!(path.is_empty());
+    }
+
+    #[test]
+    fn walk_to_goal_returns_none_when_unreachable() {
+        let coord = ChunkCoord(0, 0);
+        let map = flat_map_with_chunk(coord, 0);
+        let field = build(&map, coord, (0, 0), -5);
+        let path = walk_to_goal(&field, (CHUNK_SIZE as u8 - 1, CHUNK_SIZE as u8 - 1));
+        assert!(path.is_none());
     }
 }

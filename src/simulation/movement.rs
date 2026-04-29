@@ -10,13 +10,13 @@ use super::plants::Plant;
 use super::schedule::{BucketSlot, SimClock};
 use super::tasks::task_interacts_from_adjacent;
 use super::technology::HORSEBACK_RIDING;
-use crate::pathfinding::astar::{find_path_in, AStarResult};
-use crate::pathfinding::chunk_graph::ChunkGraph;
-use crate::pathfinding::chunk_router::ChunkRouter;
-use crate::pathfinding::flow_field::FlowFieldCache;
-use crate::pathfinding::pool::{AStarPool, AStarScratch};
+use crate::pathfinding::path_request::{
+    cooldown_for_streak, FollowStatus, PathDebugFlags, PathFollow, PathKind, PathRequestQueue,
+    DEFAULT_PATH_BUDGET,
+};
+use crate::pathfinding::worker::PathfindingDiagnostics;
 use crate::pathfinding::tile_cost::{furniture_speed_factor, tile_speed_multiplier};
-use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
+use crate::world::chunk::ChunkMap;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use ahash::AHashSet;
@@ -26,62 +26,10 @@ use rand::Rng;
 const MOVE_SPEED: f32 = 48.0; // pixels per second
 const MOUNTED_SPEED: f32 = 80.0; // speed when riding a horse
 const IDLE_WANDER_INTERVAL: f32 = 2.5; // seconds between random moves
-/// Max nodes A* will expand per call when the cheap flow field can't help.
-/// ~500 covers ~10–20 tiles of detour around obstacles; nearby ramps can
-/// be found, far ones can't. The result is cached on `MovementState` so
-/// A* only runs when the path is consumed or the target changes.
-const ASTAR_BUDGET: usize = 500;
 
 #[derive(Component, Default)]
 pub struct MovementState {
     pub wander_timer: f32,
-    /// Cached A* path: each entry is a tile step, in order. Empty when no
-    /// path is cached. Reused across ticks so A* only fires when consumed.
-    pub astar_path: Vec<(i16, i16, i8)>,
-    /// The (target_tile, target_z) the cached path was built for. If the
-    /// agent's target changes, the cache is invalidated and recomputed.
-    pub astar_target: (i16, i16, i8),
-    /// Index of the next step in `astar_path` the agent should head toward.
-    pub astar_cursor: u16,
-}
-
-/// Returns the next tile step the agent should walk toward to follow an
-/// A* path to `(target.0, target.1, target_z)`. Reuses the cached path on
-/// `mv` when valid; otherwise recomputes (capped by `ASTAR_BUDGET`).
-/// `None` means A* couldn't find any path within budget.
-fn astar_next_step(
-    mv: &mut MovementState,
-    scratch: &mut AStarScratch,
-    chunk_map: &ChunkMap,
-    cur: (i32, i32, i8),
-    target: (i32, i32, i8),
-) -> Option<(i32, i32)> {
-    let target_i16 = (target.0 as i16, target.1 as i16, target.2);
-
-    // Reuse the cached path if it's for this target. Advance the cursor
-    // past steps the agent has already crossed (a single tick can pass
-    // multiple short steps if speeds are high or sim_dt is large).
-    if mv.astar_target == target_i16 && !mv.astar_path.is_empty() {
-        while (mv.astar_cursor as usize) < mv.astar_path.len() {
-            let (sx, sy, _) = mv.astar_path[mv.astar_cursor as usize];
-            if (sx as i32, sy as i32) == (cur.0, cur.1) {
-                mv.astar_cursor += 1;
-                continue;
-            }
-            return Some((sx as i32, sy as i32));
-        }
-        // Path consumed — fall through to recompute.
-    }
-
-    let path = match find_path_in(scratch, chunk_map, cur, target, ASTAR_BUDGET) {
-        AStarResult::Found(p) if !p.is_empty() => p,
-        _ => return None,
-    };
-    mv.astar_path = path.iter().map(|&(x, y, z)| (x as i16, y as i16, z)).collect();
-    mv.astar_target = target_i16;
-    mv.astar_cursor = 0;
-    let &(sx, sy, _) = mv.astar_path.first()?;
-    Some((sx as i32, sy as i32))
 }
 
 /// Placed on a person while they are mounted on a horse.
@@ -93,28 +41,49 @@ pub struct MountedOn(pub Entity);
 /// pick them up next tick. Without clearing `task_id` and `target_tile`, the
 /// agent stays Idle but every tick re-walks toward the unreachable target,
 /// hits the same obstacle, and drops to Idle again forever.
-fn release_to_idle(ai: &mut PersonAI, here: (i32, i32)) {
+///
+/// Also resets `PathFollow` and snaps the agent's pixel position to the tile
+/// center: leaving `pf.status = Following` with a stale `segment_path` makes
+/// the debug overlay keep drawing on a frozen agent, and leaving the agent
+/// off-center traps them in the `dist > 2.0 && target_tile == current_tile`
+/// loop where the worker returns an empty path and the agent never moves.
+fn release_to_idle(
+    ai: &mut PersonAI,
+    pf: &mut PathFollow,
+    transform: &mut Transform,
+    here: (i32, i32),
+) {
     ai.state = AiState::Idle;
     ai.task_id = PersonAI::UNEMPLOYED;
     ai.target_tile = (here.0 as i16, here.1 as i16);
     ai.dest_tile = ai.target_tile;
     ai.target_entity = None;
+
+    pf.status = FollowStatus::Idle;
+    pf.segment_path.clear();
+    pf.chunk_route.clear();
+    pf.segment_cursor = 0;
+    pf.route_cursor = 0;
+    pf.goal = (here.0, here.1, ai.current_z);
+
+    let center = tile_to_world(here.0, here.1);
+    transform.translation.x = center.x;
+    transform.translation.y = center.y;
 }
 
 pub fn movement_system(
     time: Res<Time>,
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
-    chunk_graph: Res<ChunkGraph>,
-    chunk_router: Res<ChunkRouter>,
     spatial_index: Res<SpatialIndex>,
     bed_map: Res<BedMap>,
     chair_map: Res<ChairMap>,
     table_map: Res<TableMap>,
     workbench_map: Res<WorkbenchMap>,
     loom_map: Res<LoomMap>,
-    mut flow_field_cache: ResMut<FlowFieldCache>,
-    mut astar_pool: ResMut<AStarPool>,
+    mut path_queue: ResMut<PathRequestQueue>,
+    path_flags: Res<PathDebugFlags>,
+    mut path_diag: ResMut<PathfindingDiagnostics>,
     mut claimed_this_tick: Local<AHashSet<(i32, i32, i32)>>,
     mut query: Query<(
         Entity,
@@ -122,6 +91,7 @@ pub fn movement_system(
         &mut PersonAI,
         &LodLevel,
         &mut MovementState,
+        &mut PathFollow,
         &BucketSlot,
         Option<&RelationshipMemory>,
         Option<&MountedOn>,
@@ -130,19 +100,38 @@ pub fn movement_system(
     let dt = time.delta_secs();
     let speed = clock.speed;
     let sim_dt = dt * clock.scale_factor();
+    let now_ms = time.elapsed().as_millis() as u64;
 
     claimed_this_tick.clear();
 
-    // Borrow one A* scratch buffer for the duration of the tick. Reused
-    // across all agents in the loop — each call to find_path_in resets it.
-    let scratch = astar_pool.scratch(0);
-
     // Movement can't be fully parallel because it writes Transform (position sync)
     // and can read ChunkMap for passability. Run sequentially.
-    for (_entity, mut transform, mut ai, lod, mut mv, slot, rel_opt, mounted_opt) in query.iter_mut() {
+    for (entity, mut transform, mut ai, lod, mut mv, mut pf, slot, rel_opt, mounted_opt) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
+
+        // Snap to tile center if pixel position drifted off-center while the
+        // agent's `target_tile` is their own tile. Without this the agent
+        // re-enters the `dist > 2.0` block, enqueues a path with start==goal,
+        // gets back an empty path, clears to Idle, and loops forever — every
+        // agent that ever hit `release_to_idle` ends up frozen at a tile edge.
+        let cur_tx0 = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty0 = (transform.translation.y / TILE_SIZE).floor() as i32;
+        if (ai.target_tile.0 as i32, ai.target_tile.1 as i32) == (cur_tx0, cur_ty0) {
+            let center = tile_to_world(cur_tx0, cur_ty0);
+            transform.translation.x = center.x;
+            transform.translation.y = center.y;
+        }
+
+        // PathFollow handles cross-chunk traversal. `target_tile` is the
+        // path goal as set by `assign_task_with_routing`: for interact-
+        // from-adjacent tasks it's a passable tile next to `dest_tile`,
+        // otherwise it's `dest_tile` itself. Don't clobber it here —
+        // pathing to an impassable `dest_tile` returns Unreachable from
+        // every adjacent tile and starves the agent. Treat Routing
+        // identically to Seeking; the Routing arm of the arrival match
+        // is a no-op (kept only for callers that still set the variant).
 
         let pos = transform.translation.truncate();
         let target_world = tile_to_world(ai.target_tile.0 as i32, ai.target_tile.1 as i32);
@@ -183,107 +172,149 @@ pub fn movement_system(
                 }
             }
 
-            // Pick the immediate step target. When the agent is in the same
-            // chunk as `target_tile`, follow the cached flow field one tile
-            // at a time (so they route around walls / slow tiles / furniture
-            // instead of walking straight through). Cross-chunk waypoints
-            // (Routing) and same-tile finals fall back to straight-line.
+            // Pick the immediate step target via PathFollow. The path worker
+            // (PreUpdate) populates `pf.segment_path` from PathRequestQueue
+            // entries we enqueue here; while the request is in flight the
+            // agent stays put rather than twitching toward the goal.
             let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
             let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
-            let target_tx = ai.target_tile.0 as i32;
-            let target_ty = ai.target_tile.1 as i32;
-            let csz = CHUNK_SIZE as i32;
-            let target_chunk = ChunkCoord(target_tx.div_euclid(csz), target_ty.div_euclid(csz));
-            let cur_chunk = ChunkCoord(cur_tx.div_euclid(csz), cur_ty.div_euclid(csz));
-            let step_world = if cur_chunk == target_chunk
-                && (cur_tx, cur_ty) != (target_tx, target_ty)
-            {
-                let goal_local = (
-                    (target_tx - target_chunk.0 * csz) as u8,
-                    (target_ty - target_chunk.1 * csz) as u8,
-                );
-                let cur_local = (
-                    (cur_tx - cur_chunk.0 * csz) as u8,
-                    (cur_ty - cur_chunk.1 * csz) as u8,
-                );
-                let bm = &*bed_map;
-                let cm = &*chair_map;
-                let tm = &*table_map;
-                let wm = &*workbench_map;
-                let lm = &*loom_map;
-                let field = flow_field_cache.get_or_build(
-                    &chunk_map,
-                    target_chunk,
-                    goal_local,
-                    ai.target_z,
-                    |(gtx, gty)| {
-                        let p = (gtx as i16, gty as i16);
-                        if bm.0.contains_key(&p)
-                            || cm.0.contains_key(&p)
-                            || tm.0.contains_key(&p)
-                            || wm.0.contains_key(&p)
-                            || lm.0.contains_key(&p)
-                        {
-                            100
-                        } else {
-                            0
-                        }
-                    },
-                );
-                let idx = cur_local.1 as usize * CHUNK_SIZE + cur_local.0 as usize;
-                let dir_byte = field.directions[idx];
-                if dir_byte == 0xFF {
-                    // In-chunk BFS couldn't reach this cell — typically a
-                    // 2-Z cliff with no ramp inside this chunk. Fall back to
-                    // bounded A* over tiles, which CAN route via ramps in
-                    // neighbouring chunks. If A* also fails, release.
-                    match astar_next_step(
-                        &mut mv,
-                        scratch,
-                        &chunk_map,
-                        (cur_tx, cur_ty, ai.current_z),
-                        (target_tx, target_ty, ai.target_z),
-                    ) {
-                        Some((sx, sy)) => tile_to_world(sx, sy),
-                        None => {
-                            release_to_idle(&mut ai, (cur_tx, cur_ty));
-                            continue;
-                        }
-                    }
-                } else {
-                    let (dx, dy) = match dir_byte {
-                        0 => (0, 1),
-                        1 => (1, 1),
-                        2 => (1, 0),
-                        3 => (1, -1),
-                        4 => (0, -1),
-                        5 => (-1, -1),
-                        6 => (-1, 0),
-                        7 => (-1, 1),
-                        _ => (0, 0),
-                    };
-                    tile_to_world(cur_tx + dx, cur_ty + dy)
+            let goal3 = (ai.target_tile.0 as i32, ai.target_tile.1 as i32, ai.target_z);
+            let cur3 = (cur_tx, cur_ty, ai.current_z);
+
+            // The match returns both the world-space step target and the
+            // planner's intended next tile (x, y, z). The planned Z is
+            // carried out so the boundary-cross block below can validate
+            // the move with the same `passable_step_3d` rule A* used.
+            let (step_world, planned_step): (Vec2, (i32, i32, i32)) = match pf.status {
+                FollowStatus::Failed(_) => {
+                    // Worker rejected the request; release so dispatch picks
+                    // a different goal. Re-requesting the same goal would
+                    // just fail again.
+                    release_to_idle(&mut ai, &mut pf, &mut transform, (cur_tx, cur_ty));
+                    continue;
                 }
-            } else if (cur_tx, cur_ty) == (target_tx, target_ty) {
-                // Already at target tile — straight-line "step" is a no-op.
-                target_world
-            } else {
-                // Cross-chunk routing: target_tile is in a different chunk
-                // (typically a chunk-graph waypoint). Use A* so we route
-                // around in-chunk obstacles (e.g. 2-Z cliff between us and
-                // the border tile) rather than straight-lining into them.
-                match astar_next_step(
-                    &mut mv,
-                    scratch,
-                    &chunk_map,
-                    (cur_tx, cur_ty, ai.current_z),
-                    (target_tx, target_ty, ai.target_z),
-                ) {
-                    Some((sx, sy)) => tile_to_world(sx, sy),
-                    None => {
-                        release_to_idle(&mut ai, (cur_tx, cur_ty));
+                FollowStatus::Pending => {
+                    // Worker hasn't run yet — hold position to avoid
+                    // twitching toward a goal we don't have a path to yet.
+                    continue;
+                }
+                FollowStatus::Idle => {
+                    // Cooldown gate: if this exact goal just failed for this
+                    // agent and the cooldown hasn't elapsed, drop the task
+                    // back to dispatch instead of re-enqueueing the same
+                    // request that will fail again. Without this an agent
+                    // assigned an unreachable target loops at the per-tick
+                    // budget forever.
+                    if pf.last_fail_goal == goal3
+                        && now_ms.saturating_sub(pf.last_fail_tick)
+                            < cooldown_for_streak(pf.last_fail_streak)
+                    {
+                        path_diag.path_request_skipped_cooldown += 1;
+                        release_to_idle(&mut ai, &mut pf, &mut transform, (cur_tx, cur_ty));
                         continue;
                     }
+                    path_queue.enqueue(
+                        entity,
+                        cur3,
+                        goal3,
+                        PathKind::BestEffort,
+                        DEFAULT_PATH_BUDGET,
+                    );
+                    pf.status = FollowStatus::Pending;
+                    pf.goal = goal3;
+                    continue;
+                }
+                FollowStatus::Following => {
+                    // Stuck-tick heartbeat: if the agent's tile hasn't changed
+                    // since last frame, count up. ~30 ticks (1.5 s @ 20 Hz)
+                    // means we're wedged — drop the path so the Idle arm
+                    // re-enqueues a fresh request next tick. Catches cases the
+                    // hard-wall guard below misses (another agent camping the
+                    // next tile, sub-tile oscillation, stale segment_path).
+                    const STUCK_LIMIT: u8 = 30;
+                    let here = (cur_tx as i16, cur_ty as i16, ai.current_z);
+                    if pf.recent_tiles[0] == here {
+                        pf.stuck_ticks = pf.stuck_ticks.saturating_add(1);
+                    } else {
+                        pf.recent_tiles[0] = here;
+                        pf.stuck_ticks = 0;
+                    }
+                    if pf.stuck_ticks >= STUCK_LIMIT {
+                        if path_flags.verbose_logs {
+                            debug!(
+                                "[path] stuck-tick clear agent={:?} at=({},{},{}) goal={:?}",
+                                entity, cur_tx, cur_ty, ai.current_z, pf.goal
+                            );
+                        }
+                        pf.segment_path.clear();
+                        pf.chunk_route.clear();
+                        pf.segment_cursor = 0;
+                        pf.route_cursor = 0;
+                        pf.status = FollowStatus::Idle;
+                        pf.stuck_ticks = 0;
+                        pf.recent_tiles[0] = (i16::MIN, i16::MIN, 0);
+                        continue;
+                    }
+
+                    // If the goal moved (new task / new target), force replan.
+                    if pf.goal != goal3 {
+                        if pf.last_fail_goal == goal3
+                            && now_ms.saturating_sub(pf.last_fail_tick)
+                                < cooldown_for_streak(pf.last_fail_streak)
+                        {
+                            path_diag.path_request_skipped_cooldown += 1;
+                            release_to_idle(&mut ai, &mut pf, &mut transform, (cur_tx, cur_ty));
+                            continue;
+                        }
+                        path_queue.enqueue(
+                            entity,
+                            cur3,
+                            goal3,
+                            PathKind::BestEffort,
+                            DEFAULT_PATH_BUDGET,
+                        );
+                        pf.status = FollowStatus::Pending;
+                        pf.goal = goal3;
+                        continue;
+                    }
+                    // Advance the segment cursor past tiles we've already
+                    // crossed (sim_dt may consume multiple short steps in
+                    // one tick).
+                    while (pf.segment_cursor as usize) < pf.segment_path.len() {
+                        let (sx, sy, sz) = pf.segment_path[pf.segment_cursor as usize];
+                        // Only treat a step as consumed when both xy AND the
+                        // planner's Z match — otherwise a planned ramp climb
+                        // (same xy, different z) gets skipped.
+                        if (sx as i32, sy as i32, sz) == (cur_tx, cur_ty, ai.current_z) {
+                            pf.segment_cursor += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    if (pf.segment_cursor as usize) >= pf.segment_path.len() {
+                        // Segment consumed. If we're at the goal tile, the
+                        // arrival branch below will pick this up next tick;
+                        // otherwise we need the next segment of the route.
+                        if (cur_tx, cur_ty) == (goal3.0, goal3.1) {
+                            pf.status = FollowStatus::Idle;
+                            pf.segment_path.clear();
+                            continue;
+                        }
+                        path_queue.enqueue(
+                            entity,
+                            cur3,
+                            goal3,
+                            PathKind::BestEffort,
+                            DEFAULT_PATH_BUDGET,
+                        );
+                        pf.status = FollowStatus::Pending;
+                        continue;
+                    }
+                    let (sx, sy, sz) = pf.segment_path[pf.segment_cursor as usize];
+                    (
+                        tile_to_world(sx as i32, sy as i32),
+                        (sx as i32, sy as i32, sz as i32),
+                    )
                 }
             };
 
@@ -313,47 +344,62 @@ pub fn movement_system(
             let step = dir * effective_speed * dt * speed;
             let new_pos = pos + step;
 
-            // Hard wall block: if stepping into a different tile would land us
-            // on an impassable cell at every reachable Z, refuse the step and
-            // drop back to Idle so a fresh goal/route can be picked. Catches
-            // the case where a wall is built across an agent's straight-line
-            // path within a chunk, or the flow-field cache is one frame stale.
+            // Validate boundary crossings with the same Z tolerance A* used
+            // when expanding neighbours (astar.rs:90 — dz ∈ {0, +1, −1}).
+            // For diagonal+ramp steps, per-frame pixel motion rounds across
+            // one axis a frame before the other; the intermediate axis-
+            // aligned cell is rarely standable at cz alone, so a strict
+            // `target_z = cz` fallback rejects routine ramp-up steps and
+            // snaps the agent back to the previous tile.
             let prev_tx = cur_tx;
             let prev_ty = cur_ty;
             let new_tx = (new_pos.x / TILE_SIZE).floor() as i32;
             let new_ty = (new_pos.y / TILE_SIZE).floor() as i32;
             let crossing_boundary = new_tx != prev_tx || new_ty != prev_ty;
             let cz = ai.current_z as i32;
-            if crossing_boundary
-                && !chunk_map.passable_at(new_tx, new_ty, cz)
-                && !chunk_map.passable_at(new_tx, new_ty, cz + 1)
-                && !chunk_map.passable_at(new_tx, new_ty, cz - 1)
-            {
-                release_to_idle(&mut ai, (cur_tx, cur_ty));
-                continue;
+            if crossing_boundary {
+                let (px, py, pz) = planned_step;
+                // Z candidates in priority order. When entering the planner's
+                // intended cell, prefer pz so a planned ramp climb actually
+                // updates current_z. When rounding into the off-planned
+                // intermediate cell of a diagonal step, prefer cz then ±1.
+                let candidates: [i32; 3] = if px == new_tx && py == new_ty {
+                    [pz, cz + 1, cz - 1]
+                } else {
+                    [cz, cz + 1, cz - 1]
+                };
+                let mut chosen: Option<i32> = None;
+                for tz in candidates {
+                    if chunk_map.passable_step_3d(
+                        (cur_tx, cur_ty, cz),
+                        (new_tx, new_ty, tz),
+                    ) {
+                        chosen = Some(tz);
+                        break;
+                    }
+                }
+                let Some(target_z) = chosen else {
+                    // Path is stale (world changed under us, planner/runtime
+                    // disagree). Drop the segment and re-request next tick;
+                    // the cooldown gate above prevents runaway re-requests
+                    // if the goal is genuinely unreachable.
+                    path_diag.boundary_rejections_per_tick += 1;
+                    path_diag.boundary_rejections_total += 1;
+                    let center = tile_to_world(cur_tx, cur_ty);
+                    transform.translation.x = center.x;
+                    transform.translation.y = center.y;
+                    pf.status = FollowStatus::Idle;
+                    pf.segment_path.clear();
+                    pf.chunk_route.clear();
+                    pf.segment_cursor = 0;
+                    pf.route_cursor = 0;
+                    continue;
+                };
+                ai.current_z = target_z as i8;
             }
 
             transform.translation.x = new_pos.x;
             transform.translation.y = new_pos.y;
-
-            // Eagerly sync current_z when crossing a tile boundary so that
-            // update_entity_z_visibility_system (entity_z == surf_z) never
-            // sees a stale Z during the transit window. If no neighbouring
-            // Z slice is standable, leave current_z alone and drop to Idle
-            // — snapping to surface_z would teleport an underground agent
-            // up onto the surface mid-walk.
-            if crossing_boundary {
-                if chunk_map.passable_at(new_tx, new_ty, cz) {
-                    ai.current_z = cz as i8;
-                } else if chunk_map.passable_at(new_tx, new_ty, cz + 1) {
-                    ai.current_z = (cz + 1) as i8;
-                } else if chunk_map.passable_at(new_tx, new_ty, cz - 1) {
-                    ai.current_z = (cz - 1) as i8;
-                } else {
-                    release_to_idle(&mut ai, (cur_tx, cur_ty));
-                    continue;
-                }
-            }
         } else {
             // Arrived at target
             transform.translation.x = target_world.x;
@@ -375,7 +421,7 @@ pub fn movement_system(
             } else {
                 let prev_tx = (pos.x / TILE_SIZE).floor() as i32;
                 let prev_ty = (pos.y / TILE_SIZE).floor() as i32;
-                release_to_idle(&mut ai, (prev_tx, prev_ty));
+                release_to_idle(&mut ai, &mut pf, &mut transform, (prev_tx, prev_ty));
                 continue;
             }
 
@@ -540,34 +586,12 @@ pub fn movement_system(
                 }
                 AiState::Sleeping | AiState::Attacking => {}
                 AiState::Routing => {
-                    // Arrived at a chunk-border waypoint; advance to next waypoint
-                    // or switch to Seeking once we're in the destination chunk.
-                    let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
-                    let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-                    let dest_chunk = ChunkCoord(
-                        (ai.dest_tile.0 as i32).div_euclid(CHUNK_SIZE as i32),
-                        (ai.dest_tile.1 as i32).div_euclid(CHUNK_SIZE as i32),
-                    );
-                    let cur_chunk = ChunkCoord(
-                        cur_tx.div_euclid(CHUNK_SIZE as i32),
-                        cur_ty.div_euclid(CHUNK_SIZE as i32),
-                    );
-
-                    if cur_chunk == dest_chunk {
-                        ai.state = AiState::Seeking;
-                        ai.target_tile = ai.dest_tile;
-                    } else if let Some(next_wp) = chunk_router.first_waypoint(
-                        &chunk_graph,
-                        cur_chunk,
-                        dest_chunk,
-                        ai.current_z,
-                    ) {
-                        ai.target_tile = next_wp;
-                    } else {
-                        // No route found — try to head toward destination anyway
-                        ai.state = AiState::Seeking;
-                        ai.target_tile = ai.dest_tile;
-                    }
+                    // PathFollow handles cross-chunk routing transparently;
+                    // arriving at target_tile (= dest_tile) means we are at
+                    // the final destination. Promote to Seeking so the
+                    // adjacent-tile claim logic runs next tick.
+                    ai.state = AiState::Seeking;
+                    ai.target_tile = ai.dest_tile;
                 }
             }
         }

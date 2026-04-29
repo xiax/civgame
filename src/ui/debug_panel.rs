@@ -1,3 +1,4 @@
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
@@ -12,7 +13,10 @@ use crate::simulation::terraform::{count_terraform_sites_for, TerraformMap, Terr
 use crate::simulation::skills::{Skills, SKILL_COUNT};
 use crate::simulation::technology::{ActivityKind, Era, ACTIVITY_COUNT, TECH_COUNT, TECH_TREE};
 use crate::pathfinding::chunk_graph::ChunkGraph;
-use crate::pathfinding::flow_field::FlowFieldCache;
+use crate::pathfinding::connectivity::ChunkConnectivity;
+use crate::pathfinding::hotspots::HotspotFlowFields;
+use crate::pathfinding::path_request::{FailureLog, PathDebugFlags};
+use crate::pathfinding::worker::PathfindingDiagnostics;
 use crate::rendering::path_debug::PathDebugOverlay;
 use crate::ui::selection::SelectedEntity;
 
@@ -63,6 +67,17 @@ impl Default for DebugPanelState {
     }
 }
 
+#[derive(SystemParam)]
+pub struct PathPanelParams<'w> {
+    pub path_overlay: ResMut<'w, PathDebugOverlay>,
+    pub path_flags: ResMut<'w, PathDebugFlags>,
+    pub failure_log: ResMut<'w, FailureLog>,
+    pub hotspots: Res<'w, HotspotFlowFields>,
+    pub diag: Res<'w, PathfindingDiagnostics>,
+    pub chunk_graph: Res<'w, ChunkGraph>,
+    pub connectivity: Res<'w, ChunkConnectivity>,
+}
+
 pub fn debug_panel_system(
     mut contexts: EguiContexts,
     mut state: ResMut<DebugPanelState>,
@@ -71,9 +86,7 @@ pub fn debug_panel_system(
     plans: Res<SettlementPlans>,
     rituals: Res<RitualState>,
     mut overlay: ResMut<ZoneOverlayToggle>,
-    mut path_overlay: ResMut<PathDebugOverlay>,
-    flow_cache: Res<FlowFieldCache>,
-    chunk_graph: Res<ChunkGraph>,
+    mut path: PathPanelParams,
     selected: Res<SelectedEntity>,
     mut agents: Query<(&mut Needs, &mut Skills, &mut EconomicAgent), With<Person>>,
     terraform_map: Res<TerraformMap>,
@@ -446,18 +459,130 @@ pub fn debug_panel_system(
                 )
                 .default_open(false)
                 .show(ui, |ui| {
-                    ui.checkbox(&mut path_overlay.show_selected_path, "Selected agent path");
-                    ui.checkbox(&mut path_overlay.show_flow_fields, "Cached flow fields");
-                    ui.checkbox(&mut path_overlay.show_chunk_graph, "Chunk graph");
+                    ui.checkbox(&mut path.path_overlay.show_selected_path, "Selected agent path");
+                    ui.checkbox(&mut path.path_overlay.show_flow_fields, "Hotspot flow fields");
+                    ui.checkbox(&mut path.path_overlay.show_chunk_graph, "Chunk graph");
+                    ui.checkbox(
+                        &mut path.path_overlay.show_recent_failures,
+                        "Recent failures (red)",
+                    );
+                    ui.checkbox(
+                        &mut path.path_overlay.show_connectivity_components,
+                        "Connectivity components",
+                    );
+                    ui.checkbox(
+                        &mut path.path_overlay.show_selected_failures,
+                        "Selected agent failures",
+                    );
+                    ui.separator();
+                    ui.checkbox(&mut path.path_flags.verbose_logs, "Verbose pathfinding logs");
+                    ui.checkbox(&mut path.path_flags.worker_paused, "Pause worker");
+                    let hit_pct = if path.hotspots.lookup_count > 0 {
+                        (path.hotspots.lookup_hits as f32 / path.hotspots.lookup_count as f32) * 100.0
+                    } else {
+                        0.0
+                    };
                     ui.label(
                         egui::RichText::new(format!(
-                            "Cached fields: {}  •  Graph nodes: {}",
-                            flow_cache.fields.len(),
-                            chunk_graph.edges.len(),
+                            "Hotspot fields: {}  •  Graph nodes: {}",
+                            path.hotspots.field_count,
+                            path.chunk_graph.edges.len(),
                         ))
                         .color(egui::Color32::GRAY)
                         .size(11.0),
                     );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Hotspot lookups: {} ({:.0}% hit)",
+                            path.hotspots.lookup_count, hit_pct,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Worker: {} req/tick  •  {} µs  •  queue {}",
+                            path.diag.paths_dispatched_per_tick,
+                            path.diag.worker_us_per_tick,
+                            path.diag.queue_len,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "A*: {} calls  •  {} iters (max single {})",
+                            path.diag.astar_calls_per_tick,
+                            path.diag.astar_iters_last_tick,
+                            path.diag.astar_iters_max_single,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Connectivity: gen {}  •  {} components / {} nodes",
+                            path.connectivity.generation,
+                            path.connectivity.component_count(),
+                            path.connectivity.node_count(),
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Flow-field hits: {}/tick  •  {} total",
+                            path.diag.flow_field_hits_per_tick,
+                            path.diag.flow_field_hits_total,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Fastpath misses: {}  •  Stale ids: {}  •  Missing follow: {}",
+                            path.diag.hotspot_fastpath_misses,
+                            path.diag.stale_id_discards,
+                            path.diag.missing_follow_on_event,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Failures: unreachable {} (conn {} / A* {})  •  budget {}  •  no-route {}",
+                            path.diag.path_failed_unreachable,
+                            path.diag.path_failed_unreachable_connectivity,
+                            path.diag.path_failed_unreachable_astar,
+                            path.diag.path_failed_budget,
+                            path.diag.path_failed_no_route,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Cooldown skips: {}  •  Boundary rejects: {}/tick (total {})",
+                            path.diag.path_request_skipped_cooldown,
+                            path.diag.boundary_rejections_per_tick,
+                            path.diag.boundary_rejections_total,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Failure log: {} entries",
+                            path.failure_log.recent.len()
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Clear failure log").clicked() {
+                            path.failure_log.clear();
+                        }
+                    });
                 });
 
                 ui.add_space(4.0);

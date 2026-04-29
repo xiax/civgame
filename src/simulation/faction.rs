@@ -8,9 +8,11 @@ use super::schedule::{BucketSlot, SimClock};
 use super::tasks::TaskKind;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
+use crate::pathfinding::hotspots::{HotspotFlowFields, HotspotKind};
 use crate::simulation::technology::{
     tech_def, ActivityKind, TechId, ACTIVITY_COUNT, CROP_CULTIVATION, FIRE_MAKING, TECH_COUNT,
 };
+use crate::world::chunk::ChunkMap;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use ahash::AHashMap;
@@ -695,6 +697,8 @@ pub fn drop_items_at_destination_system(
 
 pub fn update_storage_tile_map_system(
     mut map: ResMut<StorageTileMap>,
+    mut hotspots: ResMut<HotspotFlowFields>,
+    chunk_map: Res<ChunkMap>,
     changed_q: Query<
         (),
         Or<(Added<FactionStorageTile>, Changed<Transform>)>,
@@ -705,6 +709,9 @@ pub fn update_storage_tile_map_system(
     if changed_q.is_empty() && removed.is_empty() {
         return;
     }
+    // Snapshot the previous tile set so we can diff hotspot registrations.
+    let prev: ahash::AHashSet<(i16, i16)> = map.tiles.keys().copied().collect();
+
     map.tiles.clear();
     map.by_faction.clear();
     for (tile, transform) in all_q.iter() {
@@ -716,6 +723,67 @@ pub fn update_storage_tile_map_system(
             .or_default()
             .push((tx, ty));
     }
+
+    // Diff: register newly-added storage tiles, unregister removed ones.
+    for &(tx, ty) in map.tiles.keys() {
+        if !prev.contains(&(tx, ty)) {
+            let z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
+            hotspots.register((tx, ty, z), HotspotKind::Storage);
+        }
+    }
+    for (tx, ty) in prev {
+        if !map.tiles.contains_key(&(tx, ty)) {
+            // We don't know the original Z; unregister at every plausible Z
+            // by brute-force unregister at surface_z (the only Z storage
+            // tiles get registered with above).
+            let z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
+            hotspots.unregister((tx, ty, z), HotspotKind::Storage);
+        }
+    }
+}
+
+// ── Faction-center hotspot sync ───────────────────────────────────────────────
+
+/// Maintains `HotspotFlowFields` registrations for `FactionCenter` entities.
+/// Each tribe's center is a high-traffic destination — caching a flow field
+/// for it lets the worker skip per-agent A* on the final leg of a route.
+pub fn sync_faction_center_hotspots_system(
+    mut hotspots: ResMut<HotspotFlowFields>,
+    chunk_map: Res<ChunkMap>,
+    mut last_seen: Local<ahash::AHashMap<Entity, (i16, i16, i8)>>,
+    mut removed: RemovedComponents<FactionCenter>,
+    centers: Query<(Entity, &Transform), With<FactionCenter>>,
+) {
+    let mut current: ahash::AHashMap<Entity, (i16, i16, i8)> = ahash::AHashMap::new();
+    for (entity, transform) in centers.iter() {
+        let tx = (transform.translation.x / TILE_SIZE).floor() as i16;
+        let ty = (transform.translation.y / TILE_SIZE).floor() as i16;
+        let z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
+        current.insert(entity, (tx, ty, z));
+    }
+
+    // Unregister centers that were destroyed entirely.
+    for entity in removed.read() {
+        if let Some(prev) = last_seen.remove(&entity) {
+            hotspots.unregister(prev, HotspotKind::FactionCenter);
+        }
+    }
+
+    // Register newly-spawned centers; re-register if a center moved.
+    for (entity, &tile) in current.iter() {
+        match last_seen.get(entity) {
+            Some(&prev) if prev == tile => {}
+            Some(&prev) => {
+                hotspots.unregister(prev, HotspotKind::FactionCenter);
+                hotspots.register(tile, HotspotKind::FactionCenter);
+            }
+            None => {
+                hotspots.register(tile, HotspotKind::FactionCenter);
+            }
+        }
+    }
+
+    *last_seen = current;
 }
 
 // ── Faction storage totals computation ───────────────────────────────────────

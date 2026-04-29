@@ -10,7 +10,6 @@ use super::tasks::TaskKind;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::world::spatial::SpatialIndex;
-use crate::world::terrain::TILE_SIZE;
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
@@ -119,7 +118,8 @@ pub fn production_system(
 }
 
 /// Withdraw one edible good from a faction storage tile into the agent's inventory.
-/// Driven by `TaskKind::WithdrawFood`. Agent must be standing on the storage tile.
+/// Driven by `TaskKind::WithdrawFood`. Agent works from a tile adjacent to the
+/// storage tile (`ai.dest_tile`) and reaches over to pull one item off the stack.
 pub fn withdraw_food_task_system(
     mut commands: Commands,
     clock: Res<SimClock>,
@@ -130,12 +130,11 @@ pub fn withdraw_food_task_system(
         &mut PersonAI,
         &mut EconomicAgent,
         &FactionMember,
-        &Transform,
         &BucketSlot,
         &LodLevel,
     )>,
 ) {
-    for (mut ai, mut agent, member, transform, slot, lod) in query.iter_mut() {
+    for (mut ai, mut agent, member, slot, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -148,11 +147,10 @@ pub fn withdraw_food_task_system(
             continue;
         }
 
-        let tx = (transform.translation.x / TILE_SIZE).floor() as i16;
-        let ty = (transform.translation.y / TILE_SIZE).floor() as i16;
+        let (tx, ty) = ai.dest_tile;
 
         if storage_tile_map.tiles.get(&(tx, ty)) != Some(&member.faction_id) {
-            // Not actually on a storage tile owned by our faction — abort.
+            // Storage tile is no longer owned by our faction (or never was) — abort.
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             continue;
@@ -218,25 +216,64 @@ pub fn eat_task_system(
             continue;
         }
 
-        // Eat one item at a time, looping until hunger is sated or we run out
-        // of edibles. Subtracts each food's own nutrition so mixed inventories
-        // (e.g., low-grade Grain plus Meat) all drain hunger correctly.
+        // Eat one item at a time. Each iteration: pick the smallest available
+        // edible whose nutrition still covers remaining hunger (avoids using a
+        // 255-nutrition Meat to satisfy 30 hunger). If no single food covers
+        // remaining hunger, fall back to the largest available so we make
+        // progress. Stop early when the next bite would be majority waste —
+        // i.e. remaining hunger is below half the smallest available food's
+        // nutrition. This bounds per-meal waste to <1 unit of the smallest
+        // edible the agent is carrying.
         let mut fruits_consumed: u32 = 0;
         loop {
-            let mut ate = false;
-            for (it, q) in agent.inventory.iter_mut() {
-                if it.good.is_edible() && *q > 0 {
-                    *q -= 1;
-                    needs.hunger = (needs.hunger - it.good.nutrition() as f32).max(0.0);
-                    if it.good == Good::Fruit {
-                        fruits_consumed += 1;
+            if needs.hunger <= 0.0 {
+                break;
+            }
+
+            // Snapshot edible slots in this iteration.
+            let mut min_nut: u32 = u32::MAX;
+            let mut max_nut: u32 = 0;
+            let mut best_cover: Option<(usize, u32)> = None; // (slot_idx, nutrition)
+            let mut best_largest: Option<(usize, u32)> = None;
+            for (idx, (it, q)) in agent.inventory.iter().enumerate() {
+                if !it.good.is_edible() || *q == 0 {
+                    continue;
+                }
+                let nut = it.good.nutrition() as u32;
+                if nut < min_nut {
+                    min_nut = nut;
+                }
+                if nut >= max_nut {
+                    max_nut = nut;
+                    best_largest = Some((idx, nut));
+                }
+                if (nut as f32) >= needs.hunger {
+                    match best_cover {
+                        Some((_, prev)) if nut >= prev => {}
+                        _ => best_cover = Some((idx, nut)),
                     }
-                    ate = true;
-                    break;
                 }
             }
-            if !ate || needs.hunger == 0.0 {
+
+            if min_nut == u32::MAX {
+                break; // No edibles left.
+            }
+
+            // Satiety stop: next bite would be more than 50% waste.
+            if needs.hunger * 2.0 < min_nut as f32 {
                 break;
+            }
+
+            let pick_idx = match best_cover.or(best_largest) {
+                Some((i, _)) => i,
+                None => break,
+            };
+
+            let (it, q) = &mut agent.inventory[pick_idx];
+            *q -= 1;
+            needs.hunger = (needs.hunger - it.good.nutrition() as f32).max(0.0);
+            if it.good == Good::Fruit {
+                fruits_consumed += 1;
             }
         }
         for _ in 0..fruits_consumed {

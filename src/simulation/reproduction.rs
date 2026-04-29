@@ -7,6 +7,7 @@ use super::lod::LodLevel;
 use super::memory::{AgentMemory, RelationshipMemory};
 use super::mood::Mood;
 use super::movement::MovementState;
+use crate::pathfinding::path_request::PathFollow;
 use super::needs::Needs;
 use super::neural::UtilityNet;
 use super::person::{AiState, Person, PersonAI, Profession, SkinTone, HairColor, generate_person_name};
@@ -238,9 +239,10 @@ pub fn reproduction_system(
                 AgentMemory::default(),
                 RelationshipMemory::default(),
                 child_net,
-                KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 22, 23]),
+                KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 22, 23, 25]),
                 PlanScoringMethod::UtilityNN,
                 Name::new(child_name_for(faction_id, sex, &registry)),
+                PathFollow::default(),
             ),
         ));
     }

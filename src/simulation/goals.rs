@@ -458,13 +458,13 @@ pub fn goal_update_system(
 
         let (new_goal, reason) = if is_starving && faction_has_food {
             (AgentGoal::Survive, "Starving (Faction has food)")
-        } else if needs.hunger > 180.0 && agent.total_food() == 0 {
+        } else if needs.hunger > 200.0 && agent.total_food() == 0 {
             (AgentGoal::Survive, "Very Hungry")
-        } else if needs.hunger > 120.0 && agent.total_food() > 0 {
+        } else if needs.hunger > 180.0 && agent.total_food() > 0 {
             (AgentGoal::Survive, "Hungry (Eating)")
         } else if agent.total_food() >= 3 && can_return_camp {
             (AgentGoal::ReturnCamp, "Returning Surplus Food")
-        } else if needs.hunger > 120.0 && agent.total_food() == 0 {
+        } else if needs.hunger > 150.0 && agent.total_food() == 0 {
             (AgentGoal::Survive, "Hungry")
         } else if needs.sleep > 180.0 {
             (AgentGoal::Sleep, "Tired")

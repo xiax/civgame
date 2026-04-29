@@ -37,6 +37,20 @@ impl ChunkConnectivity {
     pub fn node_count(&self) -> usize {
         self.component.len()
     }
+
+    /// Returns the component id for `(chunk, z)`, or `None` if the chunk
+    /// graph hasn't recorded that band yet.
+    pub fn component_of(&self, chunk: ChunkCoord, z: i8) -> Option<u32> {
+        self.component.get(&(chunk, z_band(z))).copied()
+    }
+
+    /// Iterate over every `(chunk, z_band, component_id)` tuple. Used by
+    /// the connectivity-component debug overlay.
+    pub fn iter(&self) -> impl Iterator<Item = (ChunkCoord, ZBand, u32)> + '_ {
+        self.component
+            .iter()
+            .map(|(&(c, b), &id)| (c, b, id))
+    }
 }
 
 fn uf_find(parent: &mut [usize], x: usize) -> usize {
@@ -85,7 +99,6 @@ pub fn rebuild_connectivity_system(graph: Res<ChunkGraph>, mut conn: ResMut<Chun
     };
 
     for (coord, edges) in &graph.edges {
-        intern((*coord, 0), &mut nodes, &mut idx);
         for edge in edges {
             intern((*coord, z_band(edge.exit_z)), &mut nodes, &mut idx);
             intern((edge.neighbor, z_band(edge.entry_z)), &mut nodes, &mut idx);
@@ -142,10 +155,6 @@ mod tests {
         let mut nodes: Vec<(ChunkCoord, ZBand)> = Vec::new();
         let mut idx: AHashMap<(ChunkCoord, ZBand), usize> = AHashMap::new();
         for (coord, edges) in &graph.edges {
-            if !idx.contains_key(&(*coord, 0)) {
-                idx.insert((*coord, 0), nodes.len());
-                nodes.push((*coord, 0));
-            }
             for edge in edges {
                 let k = (*coord, z_band(edge.exit_z));
                 if !idx.contains_key(&k) {
@@ -235,6 +244,25 @@ mod tests {
             .insert(ChunkCoord(1, 0), vec![edge(ChunkCoord(0, 0), -1, 0)]);
         let conn = run(graph);
         assert!(conn.is_reachable((ChunkCoord(0, 0), 0), (ChunkCoord(1, 0), -1)));
+    }
+
+    #[test]
+    fn chunk_with_no_zero_band_edges_does_not_create_orphan_zero_node() {
+        // Chunk has edges only at z_band 1 (z=4..7). The connectivity graph
+        // must not invent an orphan (coord, 0) node — that would inflate the
+        // component count and produce spurious Unreachable rejections for
+        // agents not at z_band 0.
+        let mut graph = ChunkGraph::default();
+        graph
+            .edges
+            .insert(ChunkCoord(0, 0), vec![edge(ChunkCoord(1, 0), 4, 4)]);
+        graph
+            .edges
+            .insert(ChunkCoord(1, 0), vec![edge(ChunkCoord(0, 0), 4, 4)]);
+        let conn = run(graph);
+        assert_eq!(conn.component_of(ChunkCoord(0, 0), 0), None);
+        assert_eq!(conn.component_of(ChunkCoord(1, 0), 0), None);
+        assert!(conn.is_reachable((ChunkCoord(0, 0), 4), (ChunkCoord(1, 0), 4)));
     }
 
     #[test]

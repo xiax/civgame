@@ -43,6 +43,9 @@ impl Plugin for RenderingPlugin {
                     path_debug::selected_agent_path_gizmo_system,
                     path_debug::flow_field_gizmo_system,
                     path_debug::chunk_graph_gizmo_system,
+                    path_debug::connectivity_component_gizmo_system,
+                    path_debug::recent_failures_gizmo_system,
+                    path_debug::selected_agent_failures_gizmo_system,
                 ),
             )
             .add_systems(

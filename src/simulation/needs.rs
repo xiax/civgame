@@ -7,6 +7,12 @@ use crate::world::chunk::ChunkMap;
 use crate::world::terrain::TILE_SIZE;
 use bevy::prelude::*;
 
+/// Hunger at or above this value triggers Survive-driven eating from inventory.
+/// Below this, agents won't interrupt other work to eat — preserves food for
+/// when it's actually needed and prevents over-consumption of high-nutrition
+/// foods at low hunger.
+pub const EAT_TRIGGER_HUNGER: u8 = 180;
+
 /// 6 u8 needs + 2 padding = 8 bytes.
 #[derive(Component, Clone, Copy, Default)]
 #[repr(C)]

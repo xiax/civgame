@@ -15,6 +15,7 @@ use crate::simulation::technology::{
 };
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
+use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::needs::Needs;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::{Calendar, Season};
@@ -2114,6 +2115,7 @@ pub fn building_upgrade_system(
     mut registry: ResMut<FactionRegistry>,
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
     chunk_map: Res<ChunkMap>,
     wall_map: Res<WallMap>,
     wall_query: Query<&Wall>,
@@ -2217,6 +2219,7 @@ pub fn building_upgrade_system(
                 &chunk_graph,
                 &chunk_router,
                 &chunk_map,
+                &chunk_connectivity,
             );
             // Mark the slot as in-flight so the chief and selector know.
             if let Some(faction) = registry.factions.get_mut(&faction_id) {
@@ -2753,6 +2756,7 @@ pub fn deconstruct_system(
     storage_tile_map: Res<StorageTileMap>,
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
     mut chunk_map: ResMut<ChunkMap>,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
 ) {
@@ -2880,6 +2884,7 @@ pub fn deconstruct_system(
                     &chunk_graph,
                     &chunk_router,
                     &chunk_map,
+                    &chunk_connectivity,
                 );
             } else {
                 ai.state = AiState::Idle;

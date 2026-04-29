@@ -13,6 +13,7 @@ use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
+use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
@@ -63,6 +64,58 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::Deconstruct as u16
         || task_id == TaskKind::Reproduce as u16
         || task_id == TaskKind::Terraform as u16
+        || task_id == TaskKind::Scavenge as u16
+        || task_id == TaskKind::WithdrawFood as u16
+        || task_id == TaskKind::Socialize as u16
+        || task_id == TaskKind::Raid as u16
+        || task_id == TaskKind::Defend as u16
+        || task_id == TaskKind::Lead as u16
+}
+
+/// Spiral search outward from `target` for the closest tile that is passable
+/// at its surface Z and reachable (via `ChunkConnectivity`) from
+/// `agent_origin`. Used as a "wander toward target" fallback when the strict
+/// adjacency pick in `assign_task_with_routing` finds no usable tile — the
+/// agent walks toward the goal so the next dispatch tick can retry adjacency
+/// from a closer position.
+pub fn nearest_reachable_tile_near(
+    chunk_map: &ChunkMap,
+    chunk_connectivity: &ChunkConnectivity,
+    target: (i32, i32),
+    agent_origin: (ChunkCoord, i8),
+    radius: i32,
+) -> Option<(i16, i16)> {
+    let csz = CHUNK_SIZE as i32;
+    let mut best: Option<(i16, i16)> = None;
+    let mut best_dist = i32::MAX;
+    for r in 1..=radius {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs() != r && dy.abs() != r {
+                    continue; // ring-only iteration
+                }
+                let tx = target.0 + dx;
+                let ty = target.1 + dy;
+                let tz = chunk_map.surface_z_at(tx, ty);
+                if !chunk_map.passable_at(tx, ty, tz) {
+                    continue;
+                }
+                let n_chunk = ChunkCoord(tx.div_euclid(csz), ty.div_euclid(csz));
+                if !chunk_connectivity.is_reachable(agent_origin, (n_chunk, tz as i8)) {
+                    continue;
+                }
+                let dist = dx.abs() + dy.abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some((tx as i16, ty as i16));
+                }
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+    }
+    best
 }
 
 pub fn find_nearest_tile(
@@ -241,11 +294,8 @@ pub fn assign_task_with_routing(
     chunk_graph: &ChunkGraph,
     chunk_router: &ChunkRouter,
     chunk_map: &ChunkMap,
-) {
-    ai.task_id = task as u16;
-    ai.dest_tile = target;
-    ai.target_entity = target_entity;
-
+    chunk_connectivity: &ChunkConnectivity,
+) -> bool {
     // Resource's standable Z — used to gate which adjacent tiles can actually
     // reach the work tile. The agent's `target_z` is set below to the route
     // tile's Z (where they'll stand), not this — otherwise flow-field seeds
@@ -258,12 +308,18 @@ pub fn assign_task_with_routing(
 
     // For tasks where the agent works from beside the target (not on it), route to
     // the nearest passable adjacent tile within ±1 Z of the resource so the agent
-    // can actually interact once they arrive.
+    // can actually interact once they arrive. Also require the candidate tile to
+    // share a connectivity component with the agent — otherwise the path worker
+    // will reject every request to that tile and the agent will loop forever on
+    // the same unreachable resource.
     let route_target = if task_interacts_from_adjacent(task as u16) {
         let (tx, ty) = (target.0 as i32, target.1 as i32);
         let (ax, ay) = (cur_tile.0 as i32, cur_tile.1 as i32);
         const ADJ: [(i32, i32); 8] = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1)];
-        ADJ.iter()
+        let agent_z = ai.current_z;
+        let csz = CHUNK_SIZE as i32;
+        let picked = ADJ
+            .iter()
             .map(|&(dx, dy)| (tx + dx, ty + dy))
             .filter(|&(ntx, nty)| {
                 let nz = chunk_map.surface_z_at(ntx, nty);
@@ -271,14 +327,51 @@ pub fn assign_task_with_routing(
                     return false;
                 }
                 let dz = nz as i32 - resource_z as i32;
-                (-1..=1).contains(&dz)
+                if !(-1..=1).contains(&dz) {
+                    return false;
+                }
+                let n_chunk = ChunkCoord(ntx.div_euclid(csz), nty.div_euclid(csz));
+                chunk_connectivity.is_reachable((cur_chunk, agent_z), (n_chunk, nz as i8))
             })
             .min_by_key(|&(ntx, nty)| (ntx - ax).abs() + (nty - ay).abs())
-            .map(|(ntx, nty)| (ntx as i16, nty as i16))
-            .unwrap_or(target)
+            .map(|(ntx, nty)| (ntx as i16, nty as i16));
+        match picked {
+            Some(t) => t,
+            None => {
+                // No reachable adjacent tile (camp perimeter blocked, target
+                // sealed in by walls / blueprints, etc.). Fall back to the
+                // nearest passable, reachable tile in a small radius around
+                // the target — agent walks toward it and the next dispatch
+                // tick re-tries adjacency from a closer position. Without
+                // this fallback the agent loops Idle forever on a goal whose
+                // adjacency happens to be temporarily blocked.
+                match nearest_reachable_tile_near(
+                    chunk_map,
+                    chunk_connectivity,
+                    (tx, ty),
+                    (cur_chunk, agent_z),
+                    8,
+                ) {
+                    Some(t) => t,
+                    None => {
+                        // Truly unreachable from this connectivity component.
+                        // Clear target so the inspector reflects reality and
+                        // the caller can mark the goal failed.
+                        ai.target_tile = cur_tile;
+                        ai.dest_tile = cur_tile;
+                        ai.target_entity = None;
+                        return false;
+                    }
+                }
+            }
+        }
     } else {
         target
     };
+
+    ai.task_id = task as u16;
+    ai.dest_tile = target;
+    ai.target_entity = target_entity;
 
     ai.target_z = chunk_map.nearest_standable_z(
         route_target.0 as i32,
@@ -302,6 +395,7 @@ pub fn assign_task_with_routing(
         ai.state = AiState::Seeking;
         ai.target_tile = route_target;
     }
+    true
 }
 
 /// Handles goals that don't yet use the plan system:
@@ -310,6 +404,7 @@ pub fn goal_dispatch_system(
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
     spatial: Res<SpatialIndex>,
     faction_registry: Res<FactionRegistry>,
     bed_query: Query<&Transform, With<Bed>>,
@@ -436,6 +531,7 @@ pub fn goal_dispatch_system(
                             &chunk_graph,
                             &chunk_router,
                             &chunk_map,
+                            &chunk_connectivity,
                         );
                     }
                 }
@@ -457,6 +553,7 @@ pub fn goal_dispatch_system(
                                     &chunk_graph,
                                     &chunk_router,
                                     &chunk_map,
+                                    &chunk_connectivity,
                                 );
                             }
                         }
@@ -479,6 +576,7 @@ pub fn goal_dispatch_system(
                                 &chunk_graph,
                                 &chunk_router,
                                 &chunk_map,
+                                &chunk_connectivity,
                             );
                         }
                     }
@@ -500,6 +598,7 @@ pub fn goal_dispatch_system(
                                 &chunk_graph,
                                 &chunk_router,
                                 &chunk_map,
+                                &chunk_connectivity,
                             );
                         }
                     }
@@ -535,6 +634,7 @@ pub fn goal_dispatch_system(
                                 &chunk_graph,
                                 &chunk_router,
                                 &chunk_map,
+                                &chunk_connectivity,
                             );
                             return;
                         }
@@ -563,6 +663,7 @@ pub fn goal_dispatch_system(
                                 &chunk_graph,
                                 &chunk_router,
                                 &chunk_map,
+                                &chunk_connectivity,
                             );
                             return;
                         }
@@ -573,30 +674,11 @@ pub fn goal_dispatch_system(
                     ai.task_id = TaskKind::Sleep as u16;
                 }
 
-                AgentGoal::Survive => {
-                    // Self-trigger Eat when the agent already has food on hand —
-                    // skip the plan system entirely.
-                    if needs.hunger > 120.0 && agent.total_food() > 0 {
-                        if is_active && ai.task_id == TaskKind::Eat as u16 {
-                            return;
-                        }
-                        let cur_tile = (cur_tx as i16, cur_ty as i16);
-                        ai.task_id = TaskKind::Eat as u16;
-                        ai.state = AiState::Working;
-                        ai.target_tile = cur_tile;
-                        ai.dest_tile = cur_tile;
-                        ai.work_progress = 0;
-                        ai.target_entity = None;
-                        return;
-                    }
-                    if ai.task_id == TaskKind::Explore as u16 && ai.state == AiState::Working {
-                        ai.state = AiState::Idle;
-                        ai.task_id = PersonAI::UNEMPLOYED;
-                    }
-                }
-
-                // Gather, Build, TameHorse, Craft, Reproduce, Rescue, ReturnCamp are handled by plan_execution_system
-                AgentGoal::GatherFood
+                // Survive, Gather, Build, TameHorse, Craft, Reproduce, Rescue, ReturnCamp are
+                // handled by plan_execution_system. Eating runs through the EatFromInventory /
+                // ForageFood / WithdrawAndEat plans whose Eat step is gated on hunger.
+                AgentGoal::Survive
+                | AgentGoal::GatherFood
                 | AgentGoal::GatherWood
                 | AgentGoal::GatherStone
                 | AgentGoal::Build
@@ -666,6 +748,7 @@ mod tests {
 
         let graph = ChunkGraph::default();
         let router = ChunkRouter::default();
+        let conn = ChunkConnectivity::default();
         assign_task_with_routing(
             &mut ai,
             (10, 10),
@@ -676,6 +759,7 @@ mod tests {
             &graph,
             &router,
             &map,
+            &conn,
         );
 
         // target_z must follow the agent's Z (the tunnel floor at z=0),

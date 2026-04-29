@@ -5,6 +5,7 @@ use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
+use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::carve::{carve_tile, fill_tile, STONE_PER_BLOCK};
 use crate::simulation::construction::{Blueprint, BlueprintMap, BuildSiteKind};
 use crate::simulation::faction::{FactionMember, SOLO};
@@ -68,6 +69,7 @@ pub fn terraform_dispatch_system(
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
     terraform_map: Res<TerraformMap>,
     site_query: Query<&TerraformSite>,
     mut agent_query: Query<
@@ -133,6 +135,7 @@ pub fn terraform_dispatch_system(
                 &chunk_graph,
                 &chunk_router,
                 &chunk_map,
+                &chunk_connectivity,
             );
         }
     }
