@@ -12,6 +12,7 @@ use crate::pathfinding::path_request::{
     PathKind, PathReady, PathReadyKind, PathRequest, PathRequestQueue,
 };
 use crate::pathfinding::pool::AStarPool;
+use crate::pathfinding::step::passable_diagonal_step;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 
 /// Maximum number of `PathRequest`s the worker drains in one tick. Sized
@@ -71,6 +72,16 @@ pub struct PathfindingDiagnostics {
     /// the route) — non-zero values are worth investigating.
     pub boundary_rejections_per_tick: u32,
     pub boundary_rejections_total: u64,
+    /// Producer-side: a segment_path returned by A* / flow-field had a
+    /// consecutive pair that failed `passable_step_3d` (e.g. |Δz| > 1).
+    /// Should stay 0 in healthy runs — non-zero indicates a planner bug.
+    pub path_failed_step_continuity: u64,
+    /// Consumer-side: movement saw the next segment tile fail
+    /// `passable_step_3d` against the agent's live `(cur_xy, current_z)`.
+    /// Indicates the agent's z drifted off the planner's intended track
+    /// (e.g. diagonal-ramp rounding) — the path becomes effectively a
+    /// "2-z wall" from the agent's actual position.
+    pub path_drift_rejections_total: u64,
 }
 
 impl PathfindingDiagnostics {
@@ -91,6 +102,40 @@ fn chunk_of(tile: (i32, i32, i8)) -> ChunkCoord {
         tile.0.div_euclid(CHUNK_SIZE as i32),
         tile.1.div_euclid(CHUNK_SIZE as i32),
     )
+}
+
+/// Walks the segment path (prefixed by `start`) and verifies every
+/// consecutive pair is a single passable step under `passable_step_3d`
+/// (|Δxy| ≤ 1 cardinal/diagonal, |Δz| ≤ 1, destination standable). On
+/// failure returns `Some(index)` of the offending pair (0 means the
+/// `start → path[0]` step). This is the same rule the A* expansion and
+/// the movement boundary check use, so a violation here means a planner
+/// emitted a path that movement cannot legally execute.
+fn first_invalid_step(
+    chunk_map: &ChunkMap,
+    start: (i32, i32, i8),
+    path: &[(i16, i16, i8)],
+) -> Option<usize> {
+    let mut prev = start;
+    for (i, &(x, y, z)) in path.iter().enumerate() {
+        let next = (x as i32, y as i32, z);
+        if next != prev {
+            let from = (prev.0, prev.1, prev.2 as i32);
+            let to = (next.0, next.1, next.2 as i32);
+            let dx = (to.0 - from.0).abs();
+            let dy = (to.1 - from.1).abs();
+            let ok = if dx == 1 && dy == 1 {
+                passable_diagonal_step(chunk_map, from, to)
+            } else {
+                chunk_map.passable_step_3d(from, to)
+            };
+            if !ok {
+                return Some(i);
+            }
+        }
+        prev = next;
+    }
+    None
 }
 
 /// Drains up to `PATH_BUDGET_PER_TICK` requests from the queue and writes
@@ -206,16 +251,39 @@ fn process_request(
     };
 
     // Fast path: if the goal is in the start chunk and is a registered
-    // hotspot at the agent's Z, walk the precomputed flow field instead of
-    // running A*. Falls through on miss / Z mismatch / unreachable cell.
-    if chunk_route.len() == 1 && req.start.2 == req.goal.2 {
+    // hotspot whose flow field reached the agent's cell at the agent's
+    // current Z, walk the precomputed field instead of running A*. The
+    // per-cell Z check accepts paths that climb/descend a ramp inside the
+    // chunk — the field's `goal_z` no longer needs to match `start.z`.
+    // Falls through on miss / Z mismatch / unreachable cell.
+    if chunk_route.len() == 1 {
         let goal_tile = (req.goal.0 as i16, req.goal.1 as i16, req.goal.2);
         if let Some(field) = hotspots.lookup_field(goal_tile) {
-            if field.goal_z == req.start.2 {
-                let csz = CHUNK_SIZE as i32;
-                let lx = (req.start.0 - field.chunk.0 * csz) as u8;
-                let ly = (req.start.1 - field.chunk.1 * csz) as u8;
+            let csz = CHUNK_SIZE as i32;
+            let lx = (req.start.0 - field.chunk.0 * csz) as u8;
+            let ly = (req.start.1 - field.chunk.1 * csz) as u8;
+            let cell_idx = ly as usize * CHUNK_SIZE + lx as usize;
+            if field.cell_z[cell_idx] == req.start.2 {
                 if let Some(path) = walk_to_goal(field, (lx, ly)) {
+                    if let Some(bad) = first_invalid_step(chunk_map, req.start, &path) {
+                        diag.path_failed_step_continuity += 1;
+                        diag.path_failed_no_route += 1;
+                        if flags.verbose_logs {
+                            let prev = if bad == 0 {
+                                req.start
+                            } else {
+                                let p = path[bad - 1];
+                                (p.0 as i32, p.1 as i32, p.2)
+                            };
+                            let cur = path[bad];
+                            warn!(
+                                "[path] flow-field emitted bad step agent={:?} prev={:?} -> {:?}",
+                                req.agent, prev, cur
+                            );
+                        }
+                        write_failure(req, FailReason::NoRoute, now_tick, follows, failed_w, failure_log, diag);
+                        return;
+                    }
                     diag.flow_field_hits_per_tick += 1;
                     diag.flow_field_hits_total += 1;
                     write_success(
@@ -315,6 +383,26 @@ fn process_request(
             return;
         }
     };
+
+    if let Some(bad) = first_invalid_step(chunk_map, req.start, &segment_path) {
+        diag.path_failed_step_continuity += 1;
+        diag.path_failed_no_route += 1;
+        if flags.verbose_logs {
+            let prev = if bad == 0 {
+                req.start
+            } else {
+                let p = segment_path[bad - 1];
+                (p.0 as i32, p.1 as i32, p.2)
+            };
+            let cur = segment_path[bad];
+            warn!(
+                "[path] A* emitted bad step agent={:?} prev={:?} -> {:?}",
+                req.agent, prev, cur
+            );
+        }
+        write_failure(req, FailReason::NoRoute, now_tick, follows, failed_w, failure_log, diag);
+        return;
+    }
 
     write_success(
         req,
@@ -499,4 +587,45 @@ fn write_success(
         request_id: req.id,
         kind: ready_kind,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::chunk::{Chunk, ChunkCoord};
+    use crate::world::tile::{TileData, TileKind};
+
+    fn flat_chunk(surf_z: i8) -> Chunk {
+        let surface_z = Box::new([[surf_z; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_fertility = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
+        Chunk::new(surface_z, surface_kind, surface_fertility)
+    }
+
+    #[test]
+    fn first_invalid_step_flags_corner_cut_diagonal() {
+        // Path tries a single diagonal (5,5,0) → (6,6,0) where (6,5) is
+        // walled. The validator must reject so worker drops the path
+        // before movement_system snap-backs at runtime.
+        let mut map = ChunkMap::default();
+        map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
+        for z in 0..=1i32 {
+            map.set_tile(
+                6,
+                5,
+                z,
+                TileData { kind: TileKind::Wall, ..Default::default() },
+            );
+        }
+        let path = vec![(6i16, 6i16, 0i8)];
+        assert_eq!(first_invalid_step(&map, (5, 5, 0), &path), Some(0));
+    }
+
+    #[test]
+    fn first_invalid_step_accepts_clean_diagonal() {
+        let mut map = ChunkMap::default();
+        map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
+        let path = vec![(6i16, 6i16, 0i8)];
+        assert_eq!(first_invalid_step(&map, (5, 5, 0), &path), None);
+    }
 }

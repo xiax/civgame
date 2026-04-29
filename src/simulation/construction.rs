@@ -2289,11 +2289,32 @@ pub fn construction_system(
             continue;
         };
 
-        skills.gain_xp(SkillKind::Building, 1);
         let mut snap = [0u32; MAX_BUILD_INPUTS];
+        let mut inputs_satisfied = true;
+        let mut useful = false;
         for i in 0..count as usize {
             snap[i] = agent.quantity_of(deposits[i].good);
+            let still = deposits[i].needed.saturating_sub(deposits[i].deposited) as u32;
+            if still > 0 {
+                inputs_satisfied = false;
+                if snap[i] > 0 {
+                    useful = true;
+                }
+            }
         }
+
+        // If the blueprint still needs inputs and this agent has none of them,
+        // standing here only ticks build_progress forever. Drop to Idle so the
+        // plan re-runs (re-gather, re-pick a blueprint).
+        if !inputs_satisfied && !useful {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.work_progress = 0;
+            ai.target_entity = None;
+            continue;
+        }
+
+        skills.gain_xp(SkillKind::Building, 1);
         bp_pending
             .entry(bp_entity)
             .or_default()

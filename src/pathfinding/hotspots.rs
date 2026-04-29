@@ -103,8 +103,15 @@ impl HotspotFlowFields {
             }
             let lx = agent_pos.0.rem_euclid(csz) as usize;
             let ly = agent_pos.1.rem_euclid(csz) as usize;
-            let dir = entry.field.directions[ly * CHUNK_SIZE + lx];
+            let cell_idx = ly * CHUNK_SIZE + lx;
+            let dir = entry.field.directions[cell_idx];
             if dir == 0xFF {
+                return None;
+            }
+            // Reject if the BFS reached this cell at a different Z than the
+            // agent is currently on (e.g. the field rolled over a ramp at
+            // Z+1 here, but the agent is on Z).
+            if entry.field.cell_z[cell_idx] != agent_pos.2 {
                 return None;
             }
             return Some(dir);
@@ -212,5 +219,32 @@ mod tests {
     fn lookup_field_misses_when_unregistered() {
         let fields = HotspotFlowFields::default();
         assert!(fields.lookup_field((1, 2, 0)).is_none());
+    }
+
+    #[test]
+    fn lookup_dir_rejects_z_mismatch() {
+        let mut fields = HotspotFlowFields::default();
+        let goal_tile = (5i16, 6i16, 0i8);
+        fields.register(goal_tile, HotspotKind::FactionCenter);
+
+        let coord = ChunkCoord(0, 0);
+        let chunk_map = flat_chunk_map(coord, 0);
+        let dirty: Vec<HotspotKey> = fields.dirty.drain().collect();
+        for key in dirty {
+            let (gx, gy, gz) = key.tile;
+            let csz = CHUNK_SIZE as i32;
+            let chunk = ChunkCoord((gx as i32).div_euclid(csz), (gy as i32).div_euclid(csz));
+            let goal_local = (
+                (gx as i32 - chunk.0 * csz) as u8,
+                (gy as i32 - chunk.1 * csz) as u8,
+            );
+            let field = build_flow_field(&chunk_map, chunk, goal_local, gz, &|_| 0u16);
+            fields.entries.insert(key, HotspotEntry { field });
+        }
+
+        // Same chunk, reachable cell at z=0 should hit.
+        assert!(fields.lookup_dir(goal_tile, (10, 10, 0)).is_some());
+        // Same cell but agent claims z=7 — BFS reached it at z=0, so reject.
+        assert!(fields.lookup_dir(goal_tile, (10, 10, 7)).is_none());
     }
 }

@@ -1,3 +1,4 @@
+use crate::pathfinding::step::passable_diagonal_step;
 use crate::pathfinding::tile_cost::{tile_step_cost, IMPASSABLE};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use std::cmp::Reverse;
@@ -7,6 +8,11 @@ use std::collections::BinaryHeap;
 pub struct FlowField {
     pub chunk: ChunkCoord,
     pub directions: Box<[u8; CHUNK_SIZE * CHUNK_SIZE]>,
+    /// Standable foot-Z reached by the BFS at each cell. `i8::MIN` means
+    /// "unreached" and mirrors `directions[i] == 0xFF`. Lets `walk_to_goal`
+    /// emit the actual Z when the BFS climbed/descended via a ramp inside
+    /// the chunk, instead of pinning every step to `goal_z`.
+    pub cell_z: Box<[i8; CHUNK_SIZE * CHUNK_SIZE]>,
     pub goal_tile: (u8, u8),
     pub goal_z: i8,
     pub generation: u32,
@@ -73,15 +79,21 @@ where
             let global_ty = chunk_origin_y + ny;
 
             // Find a standable Z at (nx, ny) reachable from (x, y, cur_z)
-            // via a single passable_step_3d (|Δz| ≤ 1). Prefer same Z, then
-            // step up, then step down.
+            // via a single passable step (|Δz| ≤ 1). For diagonals, also
+            // require both cardinal corners to be routable so movement
+            // doesn't snap-back when sub-pixel timing rounds the agent
+            // through one of them. Prefer same Z, then step up, then down.
             let mut chosen_nz: Option<i8> = None;
             for &dz in &[0i32, 1, -1] {
                 let nz = cur_z as i32 + dz;
-                if chunk_map.passable_step_3d(
-                    (cur_gx, cur_gy, cur_z as i32),
-                    (global_tx, global_ty, nz),
-                ) {
+                let from3 = (cur_gx, cur_gy, cur_z as i32);
+                let to3 = (global_tx, global_ty, nz);
+                let ok = if diag {
+                    passable_diagonal_step(chunk_map, from3, to3)
+                } else {
+                    chunk_map.passable_step_3d(from3, to3)
+                };
+                if ok {
                     chosen_nz = Some(nz as i8);
                     break;
                 }
@@ -124,6 +136,7 @@ where
     FlowField {
         chunk: coord,
         directions: Box::new(dir),
+        cell_z: Box::new(best_z),
         goal_tile: goal,
         goal_z,
         generation: 0,
@@ -151,13 +164,13 @@ const DIR_OFFSET: [(i32, i32); 8] = [
 /// tiles in step order, goal inclusive. Returns `None` if the start is
 /// unreachable, the walk leaves the chunk, or it exceeds the safety bound.
 ///
-/// Z is held at `field.goal_z` for every step — the worker only invokes
-/// this when start.z == goal.z, and the field itself was built for that Z.
+/// Each step's Z comes from `field.cell_z` — when the BFS routed via a ramp
+/// inside the chunk, the path will follow the ramp's standable Z per cell
+/// instead of pinning every step to `field.goal_z`.
 pub fn walk_to_goal(field: &FlowField, start_local: (u8, u8)) -> Option<Vec<(i16, i16, i8)>> {
     let csz = CHUNK_SIZE;
     let origin_x = field.chunk.0 * csz as i32;
     let origin_y = field.chunk.1 * csz as i32;
-    let z = field.goal_z;
 
     let mut path: Vec<(i16, i16, i8)> = Vec::new();
     let mut x = start_local.0 as i32;
@@ -183,9 +196,10 @@ pub fn walk_to_goal(field: &FlowField, start_local: (u8, u8)) -> Option<Vec<(i16
         if x < 0 || y < 0 || x >= csz as i32 || y >= csz as i32 {
             return None;
         }
+        let next_idx = y as usize * csz + x as usize;
         let gx = (origin_x + x) as i16;
         let gy = (origin_y + y) as i16;
-        path.push((gx, gy, z));
+        path.push((gx, gy, field.cell_z[next_idx]));
         if x == goal_x && y == goal_y {
             return Some(path);
         }
@@ -352,11 +366,88 @@ mod tests {
     }
 
     #[test]
+    fn walk_to_goal_emits_per_cell_z_over_ramp() {
+        let coord = ChunkCoord(0, 0);
+        let mut map = flat_map_with_chunk(coord, 0);
+        map.set_tile(
+            5,
+            5,
+            0,
+            TileData {
+                kind: TileKind::Wall,
+                ..Default::default()
+            },
+        );
+        map.set_tile(
+            5,
+            5,
+            1,
+            TileData {
+                kind: TileKind::Ramp,
+                ..Default::default()
+            },
+        );
+
+        let field = build(&map, coord, (10, 5), 0);
+        let ramp_idx = 5 * CHUNK_SIZE + 5;
+        assert_eq!(
+            field.cell_z[ramp_idx], 1,
+            "ramp cell should be reached at z=1"
+        );
+
+        let path = walk_to_goal(&field, (0, 5)).expect("path over ramp");
+        let ramp_step = path
+            .iter()
+            .find(|s| s.0 == 5 && s.1 == 5)
+            .expect("path should cross ramp cell");
+        assert_eq!(ramp_step.2, 1, "step on the ramp cell must be z=1");
+
+        let goal_step = path.last().expect("path must reach goal");
+        assert_eq!(*goal_step, (10, 5, 0), "goal step is at z=0");
+    }
+
+    #[test]
+    fn flow_field_cell_z_unreached_is_sentinel() {
+        let coord = ChunkCoord(0, 0);
+        let map = flat_map_with_chunk(coord, 0);
+        let field = build(&map, coord, (0, 0), -5);
+        let far = (CHUNK_SIZE - 1) * CHUNK_SIZE + (CHUNK_SIZE - 1);
+        assert_eq!(field.directions[far], 0xFF);
+        assert_eq!(field.cell_z[far], i8::MIN);
+    }
+
+    #[test]
     fn walk_to_goal_returns_none_when_unreachable() {
         let coord = ChunkCoord(0, 0);
         let map = flat_map_with_chunk(coord, 0);
         let field = build(&map, coord, (0, 0), -5);
         let path = walk_to_goal(&field, (CHUNK_SIZE as u8 - 1, CHUNK_SIZE as u8 - 1));
         assert!(path.is_none());
+    }
+
+    #[test]
+    fn flow_field_rejects_one_sided_corner_block() {
+        // Goal at (5,5,0). Wall stack at (6,5) only — corner (5,6) is
+        // open. Without the corner-cut guard, the BFS from goal expanded
+        // diagonally to (6,6) and walk_to_goal returned a 1-step diagonal
+        // that movement_system snap-backs through the blocked corner.
+        // With the guard, BFS must reach (6,6) via the cardinal (5,6).
+        let coord = ChunkCoord(0, 0);
+        let mut map = flat_map_with_chunk(coord, 0);
+        for z in 0..=1i32 {
+            map.set_tile(
+                6,
+                5,
+                z,
+                TileData { kind: TileKind::Wall, ..Default::default() },
+            );
+        }
+        let field = build(&map, coord, (5, 5), 0);
+        let path = walk_to_goal(&field, (6, 6)).expect("(6,6) must reach the goal");
+        assert!(
+            path.len() >= 2,
+            "flow field cut the corner: {:?}",
+            path
+        );
     }
 }

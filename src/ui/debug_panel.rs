@@ -572,6 +572,15 @@ pub fn debug_panel_system(
                     );
                     ui.label(
                         egui::RichText::new(format!(
+                            "Step-continuity: planner bad steps {}  •  agent z-drift rejects {}",
+                            path.diag.path_failed_step_continuity,
+                            path.diag.path_drift_rejections_total,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
                             "Failure log: {} entries",
                             path.failure_log.recent.len()
                         ))

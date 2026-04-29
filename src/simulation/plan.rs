@@ -1159,11 +1159,15 @@ fn resolve_target(
                     return Some((Some(entity), tx, ty));
                 }
             }
-            // 2. Check memory
+            // 2. Check memory — only accept GroundItem entities; mature plants
+            //    (berry bushes, grain) are also recorded under MemoryKind::Food
+            //    but are harvested via ForageFood (TaskKind::Gather), not Scavenge.
             if let Some(mem) = memory {
-                if let Some((entity, tx, ty)) =
-                    mem.best_entity_for_dist_weighted(MemoryKind::Food, pos)
-                {
+                if let Some((entity, tx, ty)) = mem.best_entity_for_dist_weighted_filtered(
+                    MemoryKind::Food,
+                    pos,
+                    |e| item_query.get(e).is_ok(),
+                ) {
                     target_item.0 = Some(entity);
                     return Some((Some(entity), tx, ty));
                 }

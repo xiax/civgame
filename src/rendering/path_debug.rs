@@ -26,17 +26,19 @@ pub struct PathDebugOverlay {
 
 /// Maps a flow-field direction byte (0..7) to a unit vector in tile space
 /// that points *toward* the field's goal. See `flow_field::build_flow_field`
-/// for the encoding (each bit is stored at a neighbor and points back at the
-/// expanding cell, so the resulting arrow at that neighbor points goalward).
+/// for the encoding: byte `d` is stored at a neighbor whose offset from its
+/// parent is `flow_field::DIR_OFFSET[d]`, so walking goalward from that
+/// neighbor means stepping in the *opposite* direction. This table is
+/// `-DIR_OFFSET[d]` element-wise — keep them in sync.
 const DIR_VEC: [(i32, i32); 8] = [
-    (0, -1),
-    (1, -1),
-    (1, 0),
-    (1, 1),
     (0, 1),
-    (-1, 1),
-    (-1, 0),
+    (1, 1),
+    (1, 0),
+    (1, -1),
+    (0, -1),
     (-1, -1),
+    (-1, 0),
+    (-1, 1),
 ];
 
 fn tile_center(tx: i32, ty: i32) -> Vec2 {

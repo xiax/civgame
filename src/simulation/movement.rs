@@ -311,6 +311,33 @@ pub fn movement_system(
                         continue;
                     }
                     let (sx, sy, sz) = pf.segment_path[pf.segment_cursor as usize];
+                    // Step-continuity check: the planner emits each path
+                    // node as a single passable_step_3d hop from the
+                    // previous node. If the agent's live current_z drifted
+                    // off the planner's track (e.g. a diagonal-ramp
+                    // rounding picked cz±1 on an intermediate cell), the
+                    // next planned tile may now be |Δz| ≥ 2 from where we
+                    // actually stand. That's the symptom the user reports
+                    // as a "2-z wall": the boundary block below would
+                    // reject every candidate. Detect it here, drop the
+                    // segment, and re-request from the agent's true
+                    // (xy, current_z).
+                    let cur3i = (cur_tx, cur_ty, ai.current_z as i32);
+                    let next3i = (sx as i32, sy as i32, sz as i32);
+                    if next3i != cur3i
+                        && !chunk_map.passable_step_3d(cur3i, next3i)
+                    {
+                        path_diag.path_drift_rejections_total += 1;
+                        let center = tile_to_world(cur_tx, cur_ty);
+                        transform.translation.x = center.x;
+                        transform.translation.y = center.y;
+                        pf.status = FollowStatus::Idle;
+                        pf.segment_path.clear();
+                        pf.chunk_route.clear();
+                        pf.segment_cursor = 0;
+                        pf.route_cursor = 0;
+                        continue;
+                    }
                     (
                         tile_to_world(sx as i32, sy as i32),
                         (sx as i32, sy as i32, sz as i32),

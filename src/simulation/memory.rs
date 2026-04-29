@@ -165,6 +165,36 @@ impl AgentMemory {
         best_res
     }
 
+    pub fn best_entity_for_dist_weighted_filtered<F: Fn(Entity) -> bool>(
+        &self,
+        kind: MemoryKind,
+        from_pos: (i32, i32),
+        accept: F,
+    ) -> Option<(Entity, i16, i16)> {
+        let mut best_score = -1.0f32;
+        let mut best_res = None;
+        for slot in &self.entries {
+            if let Some(e) = slot {
+                if e.kind == kind {
+                    if let Some(ent) = e.entity {
+                        if !accept(ent) {
+                            continue;
+                        }
+                        let dx = (e.tile.0 as i32 - from_pos.0).abs();
+                        let dy = (e.tile.1 as i32 - from_pos.1).abs();
+                        let dist = (dx + dy).max(1) as f32;
+                        let score = e.freshness as f32 / dist;
+                        if score > best_score {
+                            best_score = score;
+                            best_res = Some((ent, e.tile.0, e.tile.1));
+                        }
+                    }
+                }
+            }
+        }
+        best_res
+    }
+
     pub fn decay(&mut self) {
         for slot in &mut self.entries {
             if let Some(e) = slot {

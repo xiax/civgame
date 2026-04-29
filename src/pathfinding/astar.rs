@@ -1,4 +1,5 @@
 use crate::pathfinding::pool::AStarScratch;
+use crate::pathfinding::step::passable_diagonal_step;
 use crate::pathfinding::tile_cost::{tile_step_cost, IMPASSABLE};
 use crate::world::chunk::ChunkMap;
 use std::cmp::Reverse;
@@ -90,7 +91,20 @@ pub fn find_path_in(
             for &dz in &[0i32, 1, -1] {
                 let nz = cur.2 as i32 + dz;
                 let cur3 = (cur.0, cur.1, cur.2 as i32);
-                if !chunk_map.passable_step_3d(cur3, (nx, ny, nz)) {
+                let to3 = (nx, ny, nz);
+                let ok = if diag {
+                    // Diagonal corner-cut rejection: movement walks pixel-
+                    // by-pixel and rounds through one of the two axis-
+                    // aligned corner cells before reaching the diagonal
+                    // target. Both corners must be routable at some Z
+                    // within ±1 of cur.z that is also a legal step into
+                    // the chosen target Z, otherwise the boundary check
+                    // in movement_system rejects the cross at runtime.
+                    passable_diagonal_step(chunk_map, cur3, to3)
+                } else {
+                    chunk_map.passable_step_3d(cur3, to3)
+                };
+                if !ok {
                     continue;
                 }
                 let kind = chunk_map.tile_at(nx, ny, nz).kind;
@@ -136,7 +150,7 @@ pub fn find_path_in(
 mod tests {
     use super::*;
     use crate::world::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE};
-    use crate::world::tile::TileKind;
+    use crate::world::tile::{TileData, TileKind};
 
     fn flat_chunk(surf_z: i8) -> Chunk {
         let surface_z = Box::new([[surf_z; CHUNK_SIZE]; CHUNK_SIZE]);
@@ -179,5 +193,149 @@ mod tests {
             let _ = find_path_in(&mut s, &map, (0, 0, 0), (10, 10, 0), 500);
         }
         assert!(s.g_score.capacity() > 0); // reused, not freed
+    }
+
+    #[test]
+    fn diagonal_does_not_corner_cut_two_tall_wall() {
+        // Two 2-tall walls flank the diagonal step (5,5,0) → (6,6,0): the
+        // corner cells (6,5) and (5,6) are non-standable at any z within
+        // ±1 of cur.z=0. Without the corner-cut guard, A* returns the
+        // single-step diagonal and movement_system snap-backs at runtime.
+        // With the guard, A* must route physically around the walls.
+        let mut map = ChunkMap::default();
+        map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
+        for &(x, y) in &[(6i32, 5i32), (5, 6)] {
+            for z in 0..=1i32 {
+                map.set_tile(
+                    x,
+                    y,
+                    z,
+                    TileData { kind: TileKind::Wall, ..Default::default() },
+                );
+            }
+        }
+        let mut s = AStarScratch::default();
+        match find_path_in(&mut s, &map, (5, 5, 0), (6, 6, 0), 500) {
+            (AStarResult::Found(path), _) => {
+                assert!(
+                    path.len() >= 3,
+                    "A* corner-cut leaked through: returned 1-step diagonal {:?}",
+                    path
+                );
+            }
+            (AStarResult::Unreachable, _) | (AStarResult::BudgetExhausted { .. }, _) => {}
+        }
+    }
+
+    #[test]
+    fn diagonal_rejected_when_only_one_corner_blocked() {
+        // Wall stack at (6,5) only; (5,6) is open grass. The old guard
+        // accepted the diagonal because it required *both* corners to fail.
+        // Real movement can round through the blocked corner depending on
+        // sub-pixel timing, so the diagonal must be rejected.
+        let mut map = ChunkMap::default();
+        map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
+        for z in 0..=1i32 {
+            map.set_tile(
+                6,
+                5,
+                z,
+                TileData { kind: TileKind::Wall, ..Default::default() },
+            );
+        }
+        let mut s = AStarScratch::default();
+        match find_path_in(&mut s, &map, (5, 5, 0), (6, 6, 0), 500) {
+            (AStarResult::Found(path), _) => {
+                assert_ne!(
+                    path.first(),
+                    Some(&(6, 6, 0)),
+                    "single-sided corner-cut leaked through: {:?}",
+                    path
+                );
+                assert!(path.len() >= 2);
+            }
+            other => panic!("expected Found, got {:?}", other.0.kind()),
+        }
+    }
+
+    #[test]
+    fn diagonal_rejected_when_corner_z_mismatches_target_z() {
+        // Target (6,6,1) sits one step up. Corner (6,5) is standable only
+        // at z=-1 (floor pushed down). cur→corner is fine (|Δz|=1), but
+        // corner→target is |Δz|=2 — impossible. The old guard accepted
+        // because it only checked the cur→corner leg.
+        let mut map = ChunkMap::default();
+        map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
+        // Raise (6,6) to z=1.
+        map.set_tile(
+            6,
+            6,
+            1,
+            TileData { kind: TileKind::Grass, ..Default::default() },
+        );
+        // Make (6,5) standable only at z=-1.
+        map.set_tile(
+            6,
+            5,
+            0,
+            TileData { kind: TileKind::Air, ..Default::default() },
+        );
+        map.set_tile(
+            6,
+            5,
+            -1,
+            TileData { kind: TileKind::Grass, ..Default::default() },
+        );
+        let mut s = AStarScratch::default();
+        match find_path_in(&mut s, &map, (5, 5, 0), (6, 6, 1), 500) {
+            (AStarResult::Found(path), _) => {
+                assert!(
+                    path.first() != Some(&(6, 6, 1)),
+                    "A* took the diagonal despite corner→target |Δz|=2: {:?}",
+                    path
+                );
+                assert!(path.len() >= 2);
+            }
+            other => panic!("expected Found, got {:?}", other.0.kind()),
+        }
+    }
+
+    #[test]
+    fn diagonal_allowed_on_uneven_but_routable_terrain() {
+        // Gentle ramp: target (6,6) at z=1, both corners (6,5) and (5,6)
+        // remain at z=0 grass. Each corner has cz=0 satisfying both legs
+        // (cur→corner |Δz|=0, corner→target |Δz|=1). Diagonal must still
+        // be emitted — the stricter rule must not over-restrict.
+        let mut map = ChunkMap::default();
+        map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
+        map.set_tile(
+            6,
+            6,
+            1,
+            TileData { kind: TileKind::Grass, ..Default::default() },
+        );
+        let mut s = AStarScratch::default();
+        match find_path_in(&mut s, &map, (5, 5, 0), (6, 6, 1), 500) {
+            (AStarResult::Found(path), _) => {
+                assert_eq!(
+                    path.first(),
+                    Some(&(6, 6, 1)),
+                    "expected single-step diagonal, got {:?}",
+                    path
+                );
+                assert_eq!(path.len(), 1);
+            }
+            other => panic!("expected Found, got {:?}", other.0.kind()),
+        }
+    }
+
+    impl AStarResult {
+        fn kind(&self) -> &'static str {
+            match self {
+                AStarResult::Found(_) => "Found",
+                AStarResult::BudgetExhausted { .. } => "BudgetExhausted",
+                AStarResult::Unreachable => "Unreachable",
+            }
+        }
     }
 }
