@@ -1,6 +1,6 @@
 use crate::rendering::pixel_art::{ArtMode, EntityTextures};
 use crate::rendering::sprite_library::SpriteLibrary;
-use crate::simulation::animals::{Deer, Horse, Wolf};
+use crate::simulation::animals::{Cat, Cow, Deer, Fox, Horse, Pig, Rabbit, Wolf};
 use crate::simulation::construction::{
     Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, Loom, Table, Wall, WallMaterial, Workbench,
 };
@@ -44,6 +44,21 @@ pub struct DeerVisual;
 
 #[derive(Component)]
 pub struct HorseVisual;
+
+#[derive(Component)]
+pub struct CowVisual;
+
+#[derive(Component)]
+pub struct RabbitVisual;
+
+#[derive(Component)]
+pub struct PigVisual;
+
+#[derive(Component)]
+pub struct FoxVisual;
+
+#[derive(Component)]
+pub struct CatVisual;
 
 #[derive(Component)]
 pub struct PersonVisual;
@@ -874,6 +889,444 @@ pub fn animate_horses_system(
     }
 }
 
+// ===== Cow / Rabbit / Pig / Fox / Cat sprites =====
+
+pub fn spawn_cow_sprites(
+    mut commands: Commands,
+    query: Query<
+        (Entity, Option<&BiologicalSex>),
+        (With<Cow>, Without<CowVisual>),
+    >,
+    sprite_lib: Res<SpriteLibrary>,
+    art_mode: Res<ArtMode>,
+) {
+    for (entity, sex_opt) in query.iter() {
+        let pixel_key = "anim_cow_anim_s_a";
+        let ascii_key = "creature_cow";
+        let img = if *art_mode == ArtMode::Pixel {
+            sprite_lib
+                .get(pixel_key)
+                .cloned()
+                .or_else(|| sprite_lib.get(ascii_key).cloned())
+        } else {
+            sprite_lib.get(ascii_key).cloned()
+        };
+        let Some(img) = img else { continue };
+
+        // Cows: females cream, males warm tan
+        let tint = match sex_opt {
+            Some(BiologicalSex::Female) => Color::srgb(0.95, 0.90, 0.82),
+            _ => Color::srgb(0.80, 0.65, 0.50),
+        };
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
+        sprite.color = tint;
+        commands.entity(entity).insert((
+            CowVisual,
+            EntityFogState::default(),
+            FacingDirection::South,
+            LastPos::default(),
+        ));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                AnimalSexTint(tint),
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn animate_cows_system(
+    time: Res<Time>,
+    art_mode: Res<ArtMode>,
+    sprite_lib: Res<SpriteLibrary>,
+    mut cows: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Cow>>,
+    mut child_sprites: Query<&mut Sprite, With<VisualChild>>,
+) {
+    if *art_mode == ArtMode::Ascii {
+        return;
+    }
+    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
+    for (transform, children, mut facing, mut last_pos) in cows.iter_mut() {
+        let pos = transform.translation.truncate();
+        let diff = pos - last_pos.0;
+        let is_moving = diff.length() > 0.5;
+        if is_moving {
+            *facing = if diff.x.abs() > diff.y.abs() {
+                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+            } else {
+                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+            };
+        }
+        last_pos.0 = pos;
+        let dir = facing.as_str();
+        let frame_str = if is_moving && frame_b { "b" } else { "a" };
+        let key = format!("anim_cow_anim_{dir}_{frame_str}");
+        for &child in children.iter() {
+            if let Ok(mut sprite) = child_sprites.get_mut(child) {
+                if let Some(img) = sprite_lib.get(&key) {
+                    if sprite.image != *img {
+                        sprite.image = img.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn spawn_rabbit_sprites(
+    mut commands: Commands,
+    query: Query<
+        (Entity, Option<&BiologicalSex>),
+        (With<Rabbit>, Without<RabbitVisual>),
+    >,
+    sprite_lib: Res<SpriteLibrary>,
+    art_mode: Res<ArtMode>,
+) {
+    for (entity, sex_opt) in query.iter() {
+        let pixel_key = "anim_rabbit_anim_s_a";
+        let ascii_key = "creature_rabbit";
+        let img = if *art_mode == ArtMode::Pixel {
+            sprite_lib
+                .get(pixel_key)
+                .cloned()
+                .or_else(|| sprite_lib.get(ascii_key).cloned())
+        } else {
+            sprite_lib.get(ascii_key).cloned()
+        };
+        let Some(img) = img else { continue };
+
+        let tint = match sex_opt {
+            Some(BiologicalSex::Female) => Color::srgb(0.92, 0.88, 0.82),
+            _ => Color::srgb(0.78, 0.72, 0.65),
+        };
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
+        sprite.color = tint;
+        commands.entity(entity).insert((
+            RabbitVisual,
+            EntityFogState::default(),
+            FacingDirection::South,
+            LastPos::default(),
+        ));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                AnimalSexTint(tint),
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn animate_rabbits_system(
+    time: Res<Time>,
+    art_mode: Res<ArtMode>,
+    sprite_lib: Res<SpriteLibrary>,
+    mut rabbits: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Rabbit>>,
+    mut child_sprites: Query<&mut Sprite, With<VisualChild>>,
+) {
+    if *art_mode == ArtMode::Ascii {
+        return;
+    }
+    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
+    for (transform, children, mut facing, mut last_pos) in rabbits.iter_mut() {
+        let pos = transform.translation.truncate();
+        let diff = pos - last_pos.0;
+        let is_moving = diff.length() > 0.5;
+        if is_moving {
+            *facing = if diff.x.abs() > diff.y.abs() {
+                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+            } else {
+                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+            };
+        }
+        last_pos.0 = pos;
+        let dir = facing.as_str();
+        let frame_str = if is_moving && frame_b { "b" } else { "a" };
+        let key = format!("anim_rabbit_anim_{dir}_{frame_str}");
+        for &child in children.iter() {
+            if let Ok(mut sprite) = child_sprites.get_mut(child) {
+                if let Some(img) = sprite_lib.get(&key) {
+                    if sprite.image != *img {
+                        sprite.image = img.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn spawn_pig_sprites(
+    mut commands: Commands,
+    query: Query<
+        (Entity, Option<&BiologicalSex>),
+        (With<Pig>, Without<PigVisual>),
+    >,
+    sprite_lib: Res<SpriteLibrary>,
+    art_mode: Res<ArtMode>,
+) {
+    for (entity, sex_opt) in query.iter() {
+        let pixel_key = "anim_pig_s_a";
+        let ascii_key = "creature_pig";
+        let img = if *art_mode == ArtMode::Pixel {
+            sprite_lib
+                .get(pixel_key)
+                .cloned()
+                .or_else(|| sprite_lib.get(ascii_key).cloned())
+        } else {
+            sprite_lib.get(ascii_key).cloned()
+        };
+        let Some(img) = img else { continue };
+
+        let tint = match sex_opt {
+            Some(BiologicalSex::Female) => Color::srgb(0.95, 0.78, 0.75),
+            _ => Color::srgb(0.85, 0.62, 0.58),
+        };
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
+        sprite.color = tint;
+        commands.entity(entity).insert((
+            PigVisual,
+            EntityFogState::default(),
+            FacingDirection::South,
+            LastPos::default(),
+        ));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                AnimalSexTint(tint),
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn animate_pigs_system(
+    time: Res<Time>,
+    art_mode: Res<ArtMode>,
+    sprite_lib: Res<SpriteLibrary>,
+    mut pigs: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Pig>>,
+    mut child_sprites: Query<&mut Sprite, With<VisualChild>>,
+) {
+    if *art_mode == ArtMode::Ascii {
+        return;
+    }
+    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
+    for (transform, children, mut facing, mut last_pos) in pigs.iter_mut() {
+        let pos = transform.translation.truncate();
+        let diff = pos - last_pos.0;
+        let is_moving = diff.length() > 0.5;
+        if is_moving {
+            *facing = if diff.x.abs() > diff.y.abs() {
+                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+            } else {
+                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+            };
+        }
+        last_pos.0 = pos;
+        let dir = facing.as_str();
+        let frame_str = if is_moving && frame_b { "b" } else { "a" };
+        let key = format!("anim_pig_{dir}_{frame_str}");
+        for &child in children.iter() {
+            if let Ok(mut sprite) = child_sprites.get_mut(child) {
+                if let Some(img) = sprite_lib.get(&key) {
+                    if sprite.image != *img {
+                        sprite.image = img.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn spawn_fox_sprites(
+    mut commands: Commands,
+    query: Query<
+        (Entity, Option<&BiologicalSex>),
+        (With<Fox>, Without<FoxVisual>),
+    >,
+    sprite_lib: Res<SpriteLibrary>,
+    art_mode: Res<ArtMode>,
+) {
+    for (entity, sex_opt) in query.iter() {
+        let pixel_key = "anim_fox_s_a";
+        let ascii_key = "creature_fox";
+        let img = if *art_mode == ArtMode::Pixel {
+            sprite_lib
+                .get(pixel_key)
+                .cloned()
+                .or_else(|| sprite_lib.get(ascii_key).cloned())
+        } else {
+            sprite_lib.get(ascii_key).cloned()
+        };
+        let Some(img) = img else { continue };
+
+        let tint = match sex_opt {
+            Some(BiologicalSex::Female) => Color::srgb(0.95, 0.65, 0.42),
+            _ => Color::srgb(0.85, 0.50, 0.30),
+        };
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
+        sprite.color = tint;
+        commands.entity(entity).insert((
+            FoxVisual,
+            EntityFogState::default(),
+            FacingDirection::South,
+            LastPos::default(),
+        ));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                AnimalSexTint(tint),
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn animate_foxes_system(
+    time: Res<Time>,
+    art_mode: Res<ArtMode>,
+    sprite_lib: Res<SpriteLibrary>,
+    mut foxes: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Fox>>,
+    mut child_sprites: Query<&mut Sprite, With<VisualChild>>,
+) {
+    if *art_mode == ArtMode::Ascii {
+        return;
+    }
+    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
+    for (transform, children, mut facing, mut last_pos) in foxes.iter_mut() {
+        let pos = transform.translation.truncate();
+        let diff = pos - last_pos.0;
+        let is_moving = diff.length() > 0.5;
+        if is_moving {
+            *facing = if diff.x.abs() > diff.y.abs() {
+                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+            } else {
+                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+            };
+        }
+        last_pos.0 = pos;
+        let dir = facing.as_str();
+        let frame_str = if is_moving && frame_b { "b" } else { "a" };
+        let key = format!("anim_fox_{dir}_{frame_str}");
+        for &child in children.iter() {
+            if let Ok(mut sprite) = child_sprites.get_mut(child) {
+                if let Some(img) = sprite_lib.get(&key) {
+                    if sprite.image != *img {
+                        sprite.image = img.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn spawn_cat_sprites(
+    mut commands: Commands,
+    query: Query<
+        (Entity, Option<&BiologicalSex>),
+        (With<Cat>, Without<CatVisual>),
+    >,
+    sprite_lib: Res<SpriteLibrary>,
+    art_mode: Res<ArtMode>,
+) {
+    for (entity, sex_opt) in query.iter() {
+        let pixel_key = "anim_cat_s_a";
+        let ascii_key = "creature_cat";
+        let img = if *art_mode == ArtMode::Pixel {
+            sprite_lib
+                .get(pixel_key)
+                .cloned()
+                .or_else(|| sprite_lib.get(ascii_key).cloned())
+        } else {
+            sprite_lib.get(ascii_key).cloned()
+        };
+        let Some(img) = img else { continue };
+
+        let tint = match sex_opt {
+            Some(BiologicalSex::Female) => Color::srgb(0.85, 0.78, 0.70),
+            _ => Color::srgb(0.55, 0.45, 0.38),
+        };
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
+        sprite.color = tint;
+        commands.entity(entity).insert((
+            CatVisual,
+            EntityFogState::default(),
+            FacingDirection::South,
+            LastPos::default(),
+        ));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                AnimalSexTint(tint),
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn animate_cats_system(
+    time: Res<Time>,
+    art_mode: Res<ArtMode>,
+    sprite_lib: Res<SpriteLibrary>,
+    mut cats: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Cat>>,
+    mut child_sprites: Query<&mut Sprite, With<VisualChild>>,
+) {
+    if *art_mode == ArtMode::Ascii {
+        return;
+    }
+    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
+    for (transform, children, mut facing, mut last_pos) in cats.iter_mut() {
+        let pos = transform.translation.truncate();
+        let diff = pos - last_pos.0;
+        let is_moving = diff.length() > 0.5;
+        if is_moving {
+            *facing = if diff.x.abs() > diff.y.abs() {
+                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+            } else {
+                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+            };
+        }
+        last_pos.0 = pos;
+        let dir = facing.as_str();
+        let frame_str = if is_moving && frame_b { "b" } else { "a" };
+        let key = format!("anim_cat_{dir}_{frame_str}");
+        for &child in children.iter() {
+            if let Ok(mut sprite) = child_sprites.get_mut(child) {
+                if let Some(img) = sprite_lib.get(&key) {
+                    if sprite.image != *img {
+                        sprite.image = img.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Hide entities that don't belong on the layer the camera is viewing.
 /// Surface mode (CameraViewZ == i32::MAX): show entities whose Z equals
 /// the surface_z of their tile (i.e. above-ground entities). Underground
@@ -897,6 +1350,11 @@ pub fn update_entity_z_visibility_system(
             With<Wolf>,
             With<Deer>,
             With<Horse>,
+            With<Cow>,
+            With<Rabbit>,
+            With<Pig>,
+            With<Fox>,
+            With<Cat>,
             With<Plant>,
             With<Bed>,
             With<Wall>,
@@ -964,6 +1422,11 @@ pub fn apply_entity_fog_tint_system(
             With<Wolf>,
             With<Deer>,
             With<Horse>,
+            With<Cow>,
+            With<Rabbit>,
+            With<Pig>,
+            With<Fox>,
+            With<Cat>,
             With<Plant>,
             With<Bed>,
             With<Wall>,
@@ -1031,6 +1494,16 @@ pub fn handle_art_mode_change(
     wolves: Query<Entity, With<WolfVisual>>,
     deer: Query<Entity, With<DeerVisual>>,
     horses: Query<Entity, With<HorseVisual>>,
+    new_animals: Query<
+        Entity,
+        bevy::prelude::Or<(
+            With<CowVisual>,
+            With<RabbitVisual>,
+            With<PigVisual>,
+            With<FoxVisual>,
+            With<CatVisual>,
+        )>,
+    >,
     walls: Query<Entity, With<WallVisual>>,
     beds: Query<Entity, With<BedVisual>>,
     centers: Query<Entity, With<FactionCenterVisual>>,
@@ -1044,6 +1517,7 @@ pub fn handle_art_mode_change(
             .chain(wolves.iter())
             .chain(deer.iter())
             .chain(horses.iter())
+            .chain(new_animals.iter())
             .chain(walls.iter())
             .chain(beds.iter())
             .chain(centers.iter())
@@ -1062,6 +1536,11 @@ pub fn handle_art_mode_change(
                 WolfVisual,
                 DeerVisual,
                 HorseVisual,
+                CowVisual,
+                RabbitVisual,
+                PigVisual,
+                FoxVisual,
+                CatVisual,
                 WallVisual,
                 BedVisual,
                 FactionCenterVisual,

@@ -7,6 +7,7 @@ use crate::simulation::animals::{AnimalAI, AnimalNeeds, AnimalReproductionCooldo
 use crate::simulation::combat::{Body, CombatCooldown, CombatTarget, Health};
 use crate::simulation::faction::FactionMember;
 use crate::simulation::goals::{AgentGoal, Personality};
+use crate::simulation::carry::Carrier;
 use crate::simulation::items::{Equipment, GroundItem};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::{AgentMemory, RelationshipMemory};
@@ -99,6 +100,7 @@ fn setup_sandbox(
             UtilityNet::new_random(),
             KnownPlans::with_innate(&[0, 1, 2, 3, 5, 22, 23, 25]),
             PlanScoringMethod::UtilityNN,
+            Carrier::default(),
         ),
     ));
 

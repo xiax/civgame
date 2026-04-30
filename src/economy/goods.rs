@@ -1,5 +1,16 @@
 pub const GOOD_COUNT: usize = 15;
 
+/// Encumbrance class for carrying a good in hands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bulk {
+    /// Many fit per hand (food, seeds, cloth, tools).
+    Small,
+    /// One stack per hand (single weapons, armor pieces, coal).
+    OneHand,
+    /// Both hands required for one stack (logs, stone blocks, iron ingots).
+    TwoHand,
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Good {
@@ -52,6 +63,42 @@ impl Good {
             Good::Grain => 150,
             Good::Meat => 255,
             _ => 0,
+        }
+    }
+
+    /// Weight of one unit of this good in grams.
+    pub fn unit_weight_g(self) -> u32 {
+        match self {
+            Good::Seed => 20,
+            Good::Luxury => 100,
+            Good::Grain => 200,
+            Good::Fruit => 250,
+            Good::Cloth => 400,
+            Good::Meat => 800,
+            Good::Skin => 900,
+            Good::Tools => 1500,
+            Good::Coal => 2000,
+            Good::Weapon => 2500,
+            Good::Wood => 3000,
+            Good::Shield => 4000,
+            Good::Iron => 4500,
+            Good::Stone => 5000,
+            Good::Armor => 8000,
+        }
+    }
+
+    /// How this good must be held in hands when carried.
+    pub fn bulk(self) -> Bulk {
+        match self {
+            Good::Seed
+            | Good::Luxury
+            | Good::Grain
+            | Good::Fruit
+            | Good::Cloth
+            | Good::Tools
+            | Good::Meat => Bulk::Small,
+            Good::Coal | Good::Skin | Good::Weapon | Good::Shield | Good::Armor => Bulk::OneHand,
+            Good::Wood | Good::Stone | Good::Iron => Bulk::TwoHand,
         }
     }
 

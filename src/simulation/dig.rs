@@ -1,6 +1,8 @@
-use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
+use crate::economy::item::Item;
+use crate::simulation::carry::Carrier;
 use crate::simulation::carve::{carve_tile, STONE_PER_BLOCK};
+use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, PersonAI};
 use crate::simulation::schedule::{BucketSlot, SimClock};
@@ -8,6 +10,7 @@ use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::TaskKind;
 use crate::world::chunk::{ChunkMap, Z_MIN};
 use crate::world::chunk_streaming::TileChangedEvent;
+use crate::world::terrain::tile_to_world;
 use crate::world::tile::TileKind;
 use bevy::prelude::*;
 
@@ -15,18 +18,19 @@ const DIG_WORK_TICKS: u8 = 30;
 const DIG_XP: u32 = 5;
 
 pub fn dig_system(
+    mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,
     mut tile_changed: EventWriter<TileChangedEvent>,
     clock: Res<SimClock>,
     mut agent_query: Query<(
         &mut PersonAI,
-        &mut EconomicAgent,
+        &mut Carrier,
         &mut Skills,
         &BucketSlot,
         &LodLevel,
     )>,
 ) {
-    for (mut ai, mut agent, mut skills, slot, lod) in agent_query.iter_mut() {
+    for (mut ai, mut carrier, mut skills, slot, lod) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -65,7 +69,21 @@ pub fn dig_system(
             &mut tile_changed,
         );
 
-        agent.add_good(Good::Stone, blocks * STONE_PER_BLOCK);
+        let qty = blocks * STONE_PER_BLOCK;
+        if qty > 0 {
+            let item = Item::new_commodity(Good::Stone);
+            let leftover = carrier.try_pick_up(item, qty);
+            if leftover > 0 {
+                let pos = tile_to_world(tx, ty);
+                commands.spawn((
+                    GroundItem { item, qty: leftover },
+                    Transform::from_xyz(pos.x, pos.y, 0.3),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ));
+            }
+        }
         skills.gain_xp(SkillKind::Mining, DIG_XP);
 
         ai.state = AiState::Idle;

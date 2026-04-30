@@ -41,6 +41,11 @@ pub fn build_chunk_graph_system(chunk_map: Res<ChunkMap>, mut graph: ResMut<Chun
         (1, 0, false, true),   // East  (right col, tx=CHUNK_SIZE-1)
     ];
 
+    // Drop stale entries for chunks that have been unloaded since the last
+    // rebuild. Without this, edges to unloaded neighbors would linger and
+    // produce false-positive routes through chunks that no longer exist.
+    graph.edges.retain(|coord, _| chunk_map.0.contains_key(coord));
+
     let mut edge_count = 0usize;
 
     for (coord, chunk) in &chunk_map.0 {

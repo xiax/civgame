@@ -1,11 +1,14 @@
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use std::time::Instant;
 
+use crate::pathfinding::path_request::PathFollow;
 use crate::rendering::camera::CameraViewZ;
 use crate::rendering::color_map::{shaded_tile_color, z_bucket};
 use crate::rendering::fog::{apply_fog_to_material, FogMap, FogTileMaterials};
 use crate::simulation::construction::{Wall, WallMap, WallMaterial};
+use crate::simulation::faction::{FactionCenter, StorageTileMap};
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
@@ -16,6 +19,85 @@ use crate::world::tile::TileKind;
 
 pub const LOAD_RADIUS: i32 = 12;
 pub const UNLOAD_RADIUS: i32 = 16;
+
+/// Chunks that must NOT be unloaded by `chunk_streaming_system` even when
+/// they're outside `UNLOAD_RADIUS` from the camera. Recomputed each tick by
+/// `update_chunk_retention_system` from three sources:
+///   - every `FactionCenter` entity's chunk (so agents can always path home)
+///   - every storage tile's chunk (so `DepositResource` targets stay reachable)
+///   - every chunk in any active agent's `PathFollow.chunk_route` (so a path
+///     home doesn't go stale mid-traversal when the camera pans away)
+///
+/// Without this, `ChunkGraph` and `ChunkConnectivity` drop home chunks the
+/// moment the camera follows a wandering agent past `UNLOAD_RADIUS`, which
+/// the worker reports as `Unreachable` before A* even runs.
+#[derive(Resource, Default)]
+pub struct ChunkRetention {
+    pub pinned: AHashSet<ChunkCoord>,
+}
+
+/// Emitted when `chunk_streaming_system` first inserts a chunk into
+/// `ChunkMap.0`. Pathfinding listens for these to rebuild graph edges and
+/// connectivity for the newly-loaded region.
+#[derive(Event)]
+pub struct ChunkLoadedEvent {
+    pub coord: ChunkCoord,
+}
+
+/// Emitted when `chunk_streaming_system` removes a chunk from `ChunkMap.0`.
+/// Pathfinding listens for these to drop stale graph edges.
+#[derive(Event)]
+pub struct ChunkUnloadedEvent {
+    pub coord: ChunkCoord,
+}
+
+/// Bundles the load/unload event writers so `chunk_streaming_system` stays
+/// under Bevy's 16-parameter system limit.
+#[derive(SystemParam)]
+pub struct ChunkStreamEvents<'w> {
+    pub loaded: EventWriter<'w, ChunkLoadedEvent>,
+    pub unloaded: EventWriter<'w, ChunkUnloadedEvent>,
+}
+
+/// Runs each tick before `chunk_streaming_system`. Rebuilds `ChunkRetention`
+/// from FactionCenter / StorageTileMap / PathFollow. Cheap — bounded by
+/// (factions + storage tiles + active path lengths), well under a millisecond
+/// in practice.
+pub fn update_chunk_retention_system(
+    mut retention: ResMut<ChunkRetention>,
+    storage: Res<StorageTileMap>,
+    centers: Query<&Transform, With<FactionCenter>>,
+    follows: Query<&PathFollow>,
+) {
+    retention.pinned.clear();
+
+    for transform in &centers {
+        let coord = chunk_coord_from_world(transform.translation.x, transform.translation.y);
+        retention.pinned.insert(coord);
+    }
+
+    for &(tx, ty) in storage.tiles.keys() {
+        retention.pinned.insert(ChunkCoord(
+            (tx as i32).div_euclid(CHUNK_SIZE as i32),
+            (ty as i32).div_euclid(CHUNK_SIZE as i32),
+        ));
+    }
+
+    for follow in &follows {
+        for &coord in &follow.chunk_route {
+            retention.pinned.insert(coord);
+        }
+    }
+}
+
+fn chunk_coord_from_world(x: f32, y: f32) -> ChunkCoord {
+    let tx = (x / TILE_SIZE).floor() as i32;
+    let ty = (y / TILE_SIZE).floor() as i32;
+    ChunkCoord(
+        tx.div_euclid(CHUNK_SIZE as i32),
+        ty.div_euclid(CHUNK_SIZE as i32),
+    )
+}
 
 const PLANT_HASH_SEED: u32 = 42;
 
@@ -389,6 +471,8 @@ pub fn chunk_streaming_system(
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
     camera_view_z: Res<CameraViewZ>,
+    retention: Res<ChunkRetention>,
+    mut stream_events: ChunkStreamEvents,
     camera_q: Query<&Transform, With<Camera>>,
 ) {
     let now = Instant::now();
@@ -421,6 +505,7 @@ pub fn chunk_streaming_system(
                 let Some(c) = cell else { continue };
                 let chunk = generate_chunk_from_globe(coord, &c, &gen);
                 chunk_map.0.insert(coord, chunk);
+                stream_events.loaded.send(ChunkLoadedEvent { coord });
 
                 if let Some(gc) = globe.cell_mut(gx, gy) {
                     gc.explored = true;
@@ -457,11 +542,16 @@ pub fn chunk_streaming_system(
     }
 
     // --- Unload chunks beyond UNLOAD_RADIUS ---
+    // Pinned chunks (faction centers, storage tiles, active path routes) are
+    // exempt — see `ChunkRetention` for why.
     let to_unload: Vec<ChunkCoord> = chunk_map
         .0
         .keys()
         .copied()
         .filter(|&c| {
+            if retention.pinned.contains(&c) {
+                return false;
+            }
             let dx = (c.0 - cam_cx).abs();
             let dy = (c.1 - cam_cy).abs();
             dx.max(dy) > UNLOAD_RADIUS
@@ -470,6 +560,7 @@ pub fn chunk_streaming_system(
 
     for coord in to_unload {
         chunk_map.0.remove(&coord);
+        stream_events.unloaded.send(ChunkUnloadedEvent { coord });
 
         let x0 = (coord.0 * CHUNK_SIZE as i32) as i16;
         let y0 = (coord.1 * CHUNK_SIZE as i32) as i16;

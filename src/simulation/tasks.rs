@@ -52,6 +52,41 @@ pub enum TaskKind {
     HaulMaterials = 23, // carry inventory goods to a blueprint and drop them into its deposit slots
 }
 
+/// How many free hands the task requires the agent to have before they can begin
+/// (or continue) work. Hauling and gathering tasks are EXEMPT — the load is the
+/// whole point. Tasks like Sleep/Socialize/Reproduce return 0 because they don't
+/// "use" hands, but we drop hand-held loads at task-entry separately (see
+/// `goal_dispatch_system`).
+pub fn task_requires_free_hands(task_id: u16) -> u8 {
+    match task_id {
+        x if x == TaskKind::Craft as u16 => 2,
+        x if x == TaskKind::Construct as u16
+            || x == TaskKind::ConstructBed as u16
+            || x == TaskKind::Dig as u16
+            || x == TaskKind::Terraform as u16
+            || x == TaskKind::Deconstruct as u16
+            || x == TaskKind::Gather as u16
+            || x == TaskKind::Planter as u16
+            || x == TaskKind::Hunter as u16
+            || x == TaskKind::Raid as u16
+            || x == TaskKind::Defend as u16
+            || x == TaskKind::TameAnimal as u16 =>
+        {
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// Tasks that should drop hand-held loads at entry (the activity is incompatible
+/// with carrying things). Stacks become GroundItems at the agent's tile.
+pub fn task_drops_hand_load(task_id: u16) -> bool {
+    task_id == TaskKind::Sleep as u16
+        || task_id == TaskKind::Socialize as u16
+        || task_id == TaskKind::Reproduce as u16
+        || task_id == TaskKind::Eat as u16
+}
+
 /// Returns true for tasks where the agent works from an adjacent tile rather than
 /// stepping onto the resource tile itself.
 pub fn task_interacts_from_adjacent(task_id: u16) -> bool {

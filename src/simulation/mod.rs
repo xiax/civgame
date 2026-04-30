@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 
 pub mod animals;
+pub mod carry;
 pub mod carve;
 pub mod combat;
 pub mod construction;
@@ -54,6 +55,7 @@ impl Plugin for SimulationPlugin {
 
         app.add_event::<combat::CombatEvent>()
             .add_event::<combat::DistressCallEvent>()
+            .add_event::<combat::HandDropEvent>()
             .add_event::<plan::DropAbandonedFoodEvent>()
             .insert_resource(SimClock::default())
             .insert_resource(faction::FactionRegistry::default())
@@ -114,6 +116,7 @@ impl Plugin for SimulationPlugin {
                 (
                     needs::tick_needs_system,
                     mood::derive_mood_system,
+                    items::recompute_inventory_capacity_system,
                     lod::update_lod_levels_system,
                     faction::update_storage_tile_map_system,
                     faction::sync_faction_center_hotspots_system,
@@ -140,7 +143,10 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    gather::gather_system.before(production::production_system),
+                    carry::enforce_hand_state_system.before(gather::gather_system),
+                    gather::gather_system
+                        .after(carry::enforce_hand_state_system)
+                        .before(production::production_system),
                     dig::dig_system
                         .after(gather::gather_system)
                         .before(plan::plan_execution_system),
@@ -174,10 +180,15 @@ impl Plugin for SimulationPlugin {
                         .after(movement::mount_check_system),
                     memory::vision_system.after(movement::update_spatial_index_system),
                     combat::combat_system.after(movement::update_spatial_index_system),
-                    combat::death_system.after(combat::combat_system),
                     combat::distress_emit_system.after(combat::combat_system),
+                    combat::death_system.after(combat::distress_emit_system),
                     sound::respond_to_distress_system.after(combat::distress_emit_system),
                 )
+                    .in_set(SimulationSet::Sequential),
+            )
+            .add_systems(
+                FixedUpdate,
+                (combat::hand_drop_event_handler.after(combat::combat_system),)
                     .in_set(SimulationSet::Sequential),
             )
             .add_systems(

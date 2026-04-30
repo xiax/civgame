@@ -3,6 +3,9 @@ use bevy::prelude::*;
 
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
+use crate::economy::item::Item;
+use crate::simulation::carry::Carrier;
+use crate::simulation::items::GroundItem;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
@@ -154,12 +157,13 @@ pub fn terraform_system(
     mut agent_query: Query<(
         &mut PersonAI,
         &mut EconomicAgent,
+        &mut Carrier,
         &mut Skills,
         &BucketSlot,
         &LodLevel,
     )>,
 ) {
-    for (mut ai, mut agent, mut skills, slot, lod) in agent_query.iter_mut() {
+    for (mut ai, mut agent, mut carrier, mut skills, slot, lod) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -195,10 +199,27 @@ pub fn terraform_system(
         if surf > target {
             let target_floor = surf - 1;
             let blocks = carve_tile(&mut chunk_map, tx, ty, target_floor, &mut tile_changed);
-            agent.add_good(Good::Stone, blocks * STONE_PER_BLOCK);
+            let qty = blocks * STONE_PER_BLOCK;
+            if qty > 0 {
+                let item = Item::new_commodity(Good::Stone);
+                let leftover = carrier.try_pick_up(item, qty);
+                if leftover > 0 {
+                    let pos = tile_to_world(tx, ty);
+                    commands.spawn((
+                        GroundItem { item, qty: leftover },
+                        Transform::from_xyz(pos.x, pos.y, 0.3),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ));
+                }
+            }
             skills.gain_xp(SkillKind::Mining, TERRAFORM_XP);
         } else if surf < target {
-            if agent.quantity_of(TERRAFORM_FILL_GOOD) < 1 {
+            // Filler can come from hands first (just-mined stone) or personal inventory.
+            let in_hand = carrier.quantity_of_good(TERRAFORM_FILL_GOOD);
+            let in_inv = agent.quantity_of(TERRAFORM_FILL_GOOD);
+            if in_hand + in_inv < 1 {
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
                 continue;
@@ -206,7 +227,11 @@ pub fn terraform_system(
             let target_floor = surf + 1;
             let filled = fill_tile(&mut chunk_map, tx, ty, target_floor, &mut tile_changed);
             if filled > 0 {
-                agent.remove_good(TERRAFORM_FILL_GOOD, 1);
+                if in_hand > 0 {
+                    carrier.remove_good(TERRAFORM_FILL_GOOD, 1);
+                } else {
+                    agent.remove_good(TERRAFORM_FILL_GOOD, 1);
+                }
                 skills.gain_xp(SkillKind::Building, TERRAFORM_XP);
             }
         }

@@ -157,6 +157,7 @@ pub fn combat_system(
     spatial: Res<SpatialIndex>,
     chunk_map: Res<ChunkMap>,
     door_map: Res<crate::simulation::construction::DoorMap>,
+    mut hand_drops: EventWriter<HandDropEvent>,
     mut attacker_query: Query<(
         Entity,
         &mut CombatTarget,
@@ -167,6 +168,7 @@ pub fn combat_system(
         Option<&mut CombatCooldown>,
         Option<&mut ActivePlan>,
         Option<&FactionMember>,
+        Option<&mut crate::simulation::carry::Carrier>,
     )>,
     mut health_query: Query<&mut Health>,
     mut body_query: Query<&mut Body>,
@@ -198,6 +200,7 @@ pub fn combat_system(
         mut cd,
         _active_plan_opt,
         attacker_fm,
+        mut attacker_carrier,
     ) in &mut attacker_query
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -216,6 +219,21 @@ pub fn combat_system(
         };
         if target == attacker {
             continue;
+        }
+
+        // Free at least one hand for the swing; drop the heaviest stack to ground.
+        if let Some(carrier) = attacker_carrier.as_mut() {
+            if carrier.free_hands() == 0 {
+                if let Some(stack) = carrier.drop_one_hand() {
+                    let dtx = (transform.translation.x / TILE_SIZE).floor() as i32;
+                    let dty = (transform.translation.y / TILE_SIZE).floor() as i32;
+                    hand_drops.send(HandDropEvent {
+                        tile: (dtx, dty),
+                        good: stack.item.good,
+                        qty: stack.qty,
+                    });
+                }
+            }
         }
 
         let target_is_dead = if let Ok(h) = health_query.get(target) {
@@ -341,7 +359,7 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
+        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
             if target_combat.0.is_none() {
                 if let Ok(mut target_ai) = ai_query.get_mut(target) {
                     target_combat.0 = Some(attacker);
@@ -369,7 +387,7 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
+        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
             if target_combat.0.is_none() {
                 if let Ok(mut target_ai) = ai_query.get_mut(target) {
                     target_combat.0 = Some(attacker);
@@ -394,6 +412,34 @@ pub fn combat_system(
     }
 }
 
+/// Sent when an agent drops a stack from their hands (combat reflex, etc).
+/// `hand_drop_event_handler` consumes it.
+#[derive(Event, Clone, Copy, Debug)]
+pub struct HandDropEvent {
+    pub tile: (i32, i32),
+    pub good: Good,
+    pub qty: u32,
+}
+
+pub fn hand_drop_event_handler(
+    mut commands: Commands,
+    spatial: Res<SpatialIndex>,
+    mut ground_items: Query<&mut crate::simulation::items::GroundItem>,
+    mut events: EventReader<HandDropEvent>,
+) {
+    for ev in events.read() {
+        crate::simulation::items::spawn_or_merge_ground_item(
+            &mut commands,
+            &spatial,
+            &mut ground_items,
+            ev.tile.0,
+            ev.tile.1,
+            ev.good,
+            ev.qty,
+        );
+    }
+}
+
 /// Reads `CombatEvent`s and emits a `DistressCallEvent` whenever a `Person` is
 /// struck. Throttled per-victim by `LastDistressEmit` so a series of cooldown-
 /// bounded swings doesn't re-run the audible BFS every tick. Lives in its own
@@ -403,13 +449,25 @@ pub fn distress_emit_system(
     clock: Res<SimClock>,
     mut combat_events: EventReader<CombatEvent>,
     mut distress_events: EventWriter<DistressCallEvent>,
-    person_q: Query<(&Transform, &PersonAI, &FactionMember), With<Person>>,
+    person_q: Query<
+        (
+            &Transform,
+            &PersonAI,
+            &FactionMember,
+            Option<&Health>,
+            Option<&Body>,
+        ),
+        With<Person>,
+    >,
     last_emit_q: Query<&LastDistressEmit>,
 ) {
     for ev in combat_events.read() {
-        let Ok((transform, ai, member)) = person_q.get(ev.target) else {
+        let Ok((transform, ai, member, health, body)) = person_q.get(ev.target) else {
             continue;
         };
+        if health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead()) {
+            continue;
+        }
         let last = last_emit_q.get(ev.target).map(|l| l.0).unwrap_or(0);
         if last != 0 && clock.tick.saturating_sub(last) < DISTRESS_THROTTLE_TICKS {
             continue;
@@ -444,9 +502,11 @@ pub fn death_system(
         Option<&Wolf>,
         Option<&Deer>,
         Option<&HomeBed>,
+        Option<&crate::economy::agent::EconomicAgent>,
+        Option<&crate::simulation::carry::Carrier>,
     )>,
 ) {
-    for (entity, health, body, transform, member, person, wolf, deer, home_bed) in &query {
+    for (entity, health, body, transform, member, person, wolf, deer, home_bed, agent, carrier) in &query {
         let is_dead = health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead());
         if !is_dead {
             continue;
@@ -466,13 +526,28 @@ pub fn death_system(
             clock.population = clock.population.saturating_sub(1);
         }
 
-        let drops: Vec<(Good, u32)> = if wolf.is_some() {
+        let mut drops: Vec<(Good, u32)> = if wolf.is_some() {
             vec![(Good::Meat, 3), (Good::Skin, 1)]
         } else if deer.is_some() {
             vec![(Good::Meat, 5), (Good::Skin, 2)]
         } else {
             vec![]
         };
+
+        // Personal inventory spills on death.
+        if let Some(a) = agent {
+            for (item, qty) in &a.inventory {
+                if *qty > 0 {
+                    drops.push((item.good, *qty));
+                }
+            }
+        }
+        // Hand-held loads spill on death.
+        if let Some(c) = carrier {
+            for stack in [c.left, c.right].iter().flatten() {
+                drops.push((stack.item.good, stack.qty));
+            }
+        }
 
         for (good, qty) in drops {
             let mut loot_transform = *transform;

@@ -35,6 +35,8 @@ impl Plugin for RenderingPlugin {
                     camera::camera_input_system,
                     entity_sprites::toggle_art_mode,
                     entity_sprites::handle_art_mode_change,
+                    chunk_streaming::update_chunk_retention_system
+                        .before(chunk_streaming::chunk_streaming_system),
                     chunk_streaming::chunk_streaming_system.after(camera::camera_input_system),
                     chunk_streaming::update_tile_z_view_system.after(camera::camera_input_system),
                     fog::fog_update_system.after(chunk_streaming::chunk_streaming_system),
@@ -80,6 +82,21 @@ impl Plugin for RenderingPlugin {
                     animations::update_animations,
                     plants::plant_growth_system,
                     plants::seed_scatter_system.after(plants::plant_growth_system),
+                ),
+            )
+            .add_systems(
+                Update,
+                (
+                    entity_sprites::spawn_cow_sprites,
+                    entity_sprites::spawn_rabbit_sprites,
+                    entity_sprites::spawn_pig_sprites,
+                    entity_sprites::spawn_fox_sprites,
+                    entity_sprites::spawn_cat_sprites,
+                    entity_sprites::animate_cows_system,
+                    entity_sprites::animate_rabbits_system,
+                    entity_sprites::animate_pigs_system,
+                    entity_sprites::animate_foxes_system,
+                    entity_sprites::animate_cats_system,
                 ),
             )
             .add_systems(Update, entity_sprites::update_clothing_from_equipment)

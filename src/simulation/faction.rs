@@ -10,7 +10,7 @@ use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::pathfinding::hotspots::{HotspotFlowFields, HotspotKind};
 use crate::simulation::technology::{
-    tech_def, ActivityKind, TechId, ACTIVITY_COUNT, CROP_CULTIVATION, FIRE_MAKING, TECH_COUNT,
+    tech_def, ActivityKind, Era, TechId, ACTIVITY_COUNT, CROP_CULTIVATION, TECH_COUNT, TECH_TREE,
 };
 use crate::world::chunk::ChunkMap;
 use crate::world::spatial::SpatialIndex;
@@ -357,7 +357,11 @@ impl FactionRegistry {
         self.next_id += 1;
         let id = self.next_id;
         let mut techs = FactionTechs::default();
-        techs.unlock(FIRE_MAKING);
+        for def in TECH_TREE.iter() {
+            if matches!(def.era, Era::Paleolithic) {
+                techs.unlock(def.id);
+            }
+        }
         // Deterministic per-faction seed: home tile + faction id, packed.
         let seed = ((home_tile.0 as i32 as u32) << 16)
             ^ (home_tile.1 as i32 as u32)
@@ -572,12 +576,13 @@ pub fn drop_items_at_destination_system(
     mut query: Query<(
         &mut PersonAI,
         &mut EconomicAgent,
+        &mut crate::simulation::carry::Carrier,
         &FactionMember,
         &Profession,
         &LodLevel,
     )>,
 ) {
-    for (mut ai, mut agent, member, profession, lod) in query.iter_mut() {
+    for (mut ai, mut agent, mut carrier, member, profession, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -587,6 +592,20 @@ pub fn drop_items_at_destination_system(
 
         let deposit_tx = ai.dest_tile.0 as i32;
         let deposit_ty = ai.dest_tile.1 as i32;
+
+        // First: dump everything in hands. Hauling loads (Wood, Stone, Iron, ...) are
+        // exactly what storage wants; food/tools that ended up in hands also go here.
+        for stack in carrier.drop_all() {
+            spawn_or_merge_ground_item(
+                &mut commands,
+                &spatial,
+                &mut ground_items,
+                deposit_tx,
+                deposit_ty,
+                stack.item.good,
+                stack.qty,
+            );
+        }
 
         let food_qty = agent.total_food();
         if food_qty > CAMP_KEEP {

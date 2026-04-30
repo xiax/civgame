@@ -1,5 +1,5 @@
 use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
-use crate::world::chunk_streaming::TileChangedEvent;
+use crate::world::chunk_streaming::{ChunkLoadedEvent, ChunkUnloadedEvent, TileChangedEvent};
 use crate::world::terrain;
 use bevy::prelude::*;
 
@@ -44,16 +44,29 @@ impl Plugin for PathfindingPlugin {
                 (
                     invalidate_pathing_on_tile_change_system,
                     chunk_graph::build_chunk_graph_system
-                        .run_if(bevy::ecs::schedule::common_conditions::on_event::<TileChangedEvent>)
+                        .run_if(needs_graph_rebuild)
                         .after(invalidate_pathing_on_tile_change_system),
                     connectivity::rebuild_connectivity_system
-                        .run_if(bevy::ecs::schedule::common_conditions::on_event::<TileChangedEvent>)
+                        .run_if(needs_graph_rebuild)
                         .after(chunk_graph::build_chunk_graph_system),
                     hotspots::rebuild_dirty_hotspots_system
                         .after(invalidate_pathing_on_tile_change_system),
                 ),
             );
     }
+}
+
+/// Run condition for `build_chunk_graph_system` and `rebuild_connectivity_system`.
+/// Fires when terrain mutates (`TileChangedEvent`) OR when chunk streaming
+/// loads/unloads a chunk — the graph and connectivity union-find both depend
+/// on which chunks are currently in `ChunkMap`, so a streaming change has to
+/// trigger the same rebuild path as a dig.
+fn needs_graph_rebuild(
+    tile_changes: EventReader<TileChangedEvent>,
+    loads: EventReader<ChunkLoadedEvent>,
+    unloads: EventReader<ChunkUnloadedEvent>,
+) -> bool {
+    !tile_changes.is_empty() || !loads.is_empty() || !unloads.is_empty()
 }
 
 /// Drops hotspot flow fields for any chunk touched by a `TileChangedEvent`

@@ -13,6 +13,7 @@ use super::faction::{
     PlayerFactionMarker,
 };
 use super::goals::{AgentGoal, Personality};
+use super::carry::Carrier;
 use super::items::{Equipment, TargetItem};
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, RelationshipMemory};
@@ -385,6 +386,7 @@ pub fn spawn_population(
                     PlanScoringMethod::UtilityNN,
                     Name::new(generate_person_name(sex)),
                     PathFollow::default(),
+                    Carrier::default(),
                 ),
             ));
 

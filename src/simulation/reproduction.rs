@@ -2,6 +2,7 @@ use crate::world::seasons::TICKS_PER_SEASON;
 use super::combat::{Body, CombatTarget, CombatCooldown};
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::{AgentGoal, Personality};
+use super::carry::Carrier;
 use super::items::{Equipment, TargetItem};
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, RelationshipMemory};
@@ -243,6 +244,7 @@ pub fn reproduction_system(
                 PlanScoringMethod::UtilityNN,
                 Name::new(child_name_for(faction_id, sex, &registry)),
                 PathFollow::default(),
+                Carrier::default(),
             ),
         ));
     }

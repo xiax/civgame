@@ -1,6 +1,7 @@
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
+use crate::simulation::carry::Carrier;
 use crate::simulation::carve::{carve_tile, STONE_PER_BLOCK};
 use crate::simulation::construction::WallMap;
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
@@ -17,7 +18,7 @@ use crate::simulation::tasks::TaskKind;
 use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::chunk_streaming::TileChangedEvent;
-use crate::world::terrain::{tile_to_world, TILE_SIZE};
+use crate::world::terrain::{tile_to_world, world_to_tile};
 use crate::world::tile::TileKind;
 use bevy::prelude::*;
 
@@ -54,6 +55,7 @@ pub fn gather_system(
     mut agent_query: Query<(
         &mut PersonAI,
         &mut EconomicAgent,
+        &mut Carrier,
         &mut Skills,
         &BucketSlot,
         &LodLevel,
@@ -67,6 +69,7 @@ pub fn gather_system(
     for (
         mut ai,
         mut agent,
+        mut carrier,
         mut skills,
         slot,
         lod,
@@ -143,10 +146,19 @@ pub fn gather_system(
                 1.0
             };
             let qty = (base_qty as f32 * yield_mul).round().max(1.0) as u32;
-            agent.add_good(yield_good, qty);
+            let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
+            route_yield(&mut commands, &mut carrier, &mut agent, yield_good, qty, agent_tx, agent_ty);
 
             for &(good, extra_qty) in kind.harvest_extra_yields() {
-                agent.add_good(good, extra_qty);
+                route_yield(
+                    &mut commands,
+                    &mut carrier,
+                    &mut agent,
+                    good,
+                    extra_qty,
+                    agent_tx,
+                    agent_ty,
+                );
             }
 
             let (skill, xp) = kind.harvest_skill_xp(has_tool);
@@ -195,7 +207,16 @@ pub fn gather_system(
                 let blocks =
                     carve_tile(&mut chunk_map, tx, ty, target_floor_z, &mut tile_changed);
                 let stone_yield = (blocks * STONE_PER_BLOCK).max(STONE.base_yield_qty);
-                agent.add_good(Good::Stone, stone_yield);
+                let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
+                route_yield(
+                    &mut commands,
+                    &mut carrier,
+                    &mut agent,
+                    Good::Stone,
+                    stone_yield,
+                    agent_tx,
+                    agent_ty,
+                );
                 skills.gain_xp(SkillKind::Mining, STONE.xp);
 
                 // Despawn the Wall entity only if the column no longer has
@@ -231,11 +252,28 @@ pub fn gather_system(
                     carve_tile(&mut chunk_map, tx, ty, target_floor_z, &mut tile_changed);
                 let base = (blocks * STONE_PER_BLOCK).max(STONE.base_yield_qty);
                 let qty = (base as f32 * stone_mul).round().max(1.0) as u32;
-                agent.add_good(Good::Stone, qty);
+                let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
+                route_yield(
+                    &mut commands,
+                    &mut carrier,
+                    &mut agent,
+                    Good::Stone,
+                    qty,
+                    agent_tx,
+                    agent_ty,
+                );
 
                 for &(good, bonus_qty, chance) in STONE.bonus_yields {
                     if fastrand::u8(..100) < chance {
-                        agent.add_good(good, bonus_qty);
+                        route_yield(
+                            &mut commands,
+                            &mut carrier,
+                            &mut agent,
+                            good,
+                            bonus_qty,
+                            agent_tx,
+                            agent_ty,
+                        );
                         if let Some(id) = faction_id {
                             if let Some(fd) = faction_registry.factions.get_mut(&id) {
                                 let act = match good {
@@ -277,14 +315,44 @@ pub fn gather_system(
             }
         }
 
-        // ── Inventory full → go idle ──────────────────────────────────────────
+        // ── Hands full → go idle so they go deposit / haul ────────────────────
 
-        if agent.is_inventory_full() {
+        if carrier.free_hands() == 0 {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.work_progress = 0;
         }
+    }
+}
+
+/// Pick up `qty` of `good` into the carrier; spill any leftover at `(tx, ty)` as a GroundItem.
+/// Light "personal" goods (Tools, Seeds when farmer-eligible) are not routed here — those
+/// go through the inventory path during Scavenge or production. Gathering loads always go
+/// to hands first.
+fn route_yield(
+    commands: &mut Commands,
+    carrier: &mut Carrier,
+    _agent: &mut EconomicAgent,
+    good: Good,
+    qty: u32,
+    tx: i32,
+    ty: i32,
+) {
+    if qty == 0 {
+        return;
+    }
+    let item = Item::new_commodity(good);
+    let leftover = carrier.try_pick_up(item, qty);
+    if leftover > 0 {
+        let pos = tile_to_world(tx, ty);
+        commands.spawn((
+            GroundItem { item, qty: leftover },
+            Transform::from_xyz(pos.x, pos.y, 0.3),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
+        ));
     }
 }
 

@@ -1,4 +1,4 @@
-use super::animals::{Horse, Tamed};
+use super::animals::{Cat, Cow, Horse, Pig, Tamed};
 use super::faction::{FactionMember, FactionRegistry, StorageTileMap, SOLO};
 use super::items::GroundItem;
 use super::lod::LodLevel;
@@ -13,7 +13,7 @@ use crate::world::spatial::SpatialIndex;
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
-use crate::simulation::technology::{ActivityKind, HORSE_TAMING};
+use crate::simulation::technology::{ActivityKind, ANIMAL_HUSBANDRY, DOG_DOMESTICATION, HORSE_TAMING};
 use ahash::AHashMap;
 use bevy::prelude::*;
 
@@ -286,7 +286,11 @@ pub fn eat_task_system(
     }
 }
 
-/// Complete the TameAnimal task after the agent has worked adjacent to a wild horse long enough.
+/// Complete the TameAnimal task after the agent has worked adjacent to a wild
+/// horse, cow, pig, or cat long enough. Tech requirement varies by species:
+///   horse → HORSE_TAMING
+///   cow / pig → ANIMAL_HUSBANDRY
+///   cat → DOG_DOMESTICATION (companion-animal tech)
 pub fn tame_task_system(
     mut commands: Commands,
     clock: Res<SimClock>,
@@ -298,6 +302,9 @@ pub fn tame_task_system(
         &LodLevel,
     )>,
     untamed_horses: Query<(), (With<Horse>, Without<Tamed>)>,
+    untamed_cows: Query<(), (With<Cow>, Without<Tamed>)>,
+    untamed_pigs: Query<(), (With<Pig>, Without<Tamed>)>,
+    untamed_cats: Query<(), (With<Cat>, Without<Tamed>)>,
 ) {
     const TICKS_TAME: u8 = 100;
 
@@ -309,11 +316,36 @@ pub fn tame_task_system(
             continue;
         }
 
-        // Verify the faction still has the tech
+        // Identify species + required tech for the current target
+        let Some(target) = ai.target_entity else {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.work_progress = 0;
+            continue;
+        };
+        let required_tech = if untamed_horses.get(target).is_ok() {
+            Some(HORSE_TAMING)
+        } else if untamed_cows.get(target).is_ok() || untamed_pigs.get(target).is_ok() {
+            Some(ANIMAL_HUSBANDRY)
+        } else if untamed_cats.get(target).is_ok() {
+            Some(DOG_DOMESTICATION)
+        } else {
+            None
+        };
+
+        let Some(tech_id) = required_tech else {
+            // Target is gone, dead, already tamed, or not a tameable species
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.work_progress = 0;
+            ai.target_entity = None;
+            continue;
+        };
+
         let has_tech = faction_registry
             .factions
             .get(&member.faction_id)
-            .map(|f| f.techs.has(HORSE_TAMING))
+            .map(|f| f.techs.has(tech_id))
             .unwrap_or(false);
         if !has_tech {
             ai.state = AiState::Idle;
@@ -323,25 +355,10 @@ pub fn tame_task_system(
             continue;
         }
 
-        // Abort if target horse is gone or already tamed
-        let target_valid = ai
-            .target_entity
-            .map(|e| untamed_horses.get(e).is_ok())
-            .unwrap_or(false);
-        if !target_valid {
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
-            ai.work_progress = 0;
-            ai.target_entity = None;
-            continue;
-        }
-
         if ai.work_progress >= TICKS_TAME {
-            if let Some(horse_entity) = ai.target_entity {
-                commands.entity(horse_entity).insert(Tamed {
-                    owner_faction: member.faction_id,
-                });
-            }
+            commands.entity(target).insert(Tamed {
+                owner_faction: member.faction_id,
+            });
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;

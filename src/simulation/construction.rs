@@ -2254,6 +2254,7 @@ pub fn construction_system(
         Entity,
         &mut PersonAI,
         &mut EconomicAgent,
+        &mut crate::simulation::carry::Carrier,
         &mut Skills,
         &BucketSlot,
         &LodLevel,
@@ -2267,7 +2268,7 @@ pub fn construction_system(
     let mut bp_haulers: AHashMap<Entity, Vec<(Entity, [u32; MAX_BUILD_INPUTS])>> = AHashMap::new();
     let mut bp_workers: AHashMap<Entity, Vec<Entity>> = AHashMap::new();
 
-    for (entity, mut ai, agent, mut skills, slot, lod, _) in agent_query.iter_mut() {
+    for (entity, mut ai, agent, carrier, mut skills, slot, lod, _) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -2305,12 +2306,16 @@ pub fn construction_system(
 
         if is_hauler {
             // Snapshot only the goods the bp still needs.
+            // Haulers usually carry materials in hand; also count personal inventory
+            // in case they happen to have a useful good stashed.
             let mut snap = [0u32; MAX_BUILD_INPUTS];
             let mut useful = false;
             for i in 0..count as usize {
                 let still = deposits[i].needed.saturating_sub(deposits[i].deposited) as u32;
                 if still > 0 {
-                    snap[i] = agent.quantity_of(deposits[i].good);
+                    let in_hand = carrier.quantity_of_good(deposits[i].good);
+                    let in_inv = agent.quantity_of(deposits[i].good);
+                    snap[i] = in_hand.saturating_add(in_inv);
                     if snap[i] > 0 {
                         useful = true;
                     }
@@ -2605,10 +2610,16 @@ pub fn construction_system(
     }
 
     // Pass 3: remove deposited goods from agents and reset completed/hauler/orphaned agents.
-    for (entity, mut ai, mut agent, _, _, _, mut plan_opt) in agent_query.iter_mut() {
+    for (entity, mut ai, mut agent, mut carrier, _, _, _, mut plan_opt) in agent_query.iter_mut() {
         for &(ae, good, qty) in &good_removals {
             if ae == entity {
-                agent.remove_good(good, qty);
+                // Consume from hands first (where haulers typically carry the load),
+                // fall back to personal inventory.
+                let from_hand = carrier.remove_good(good, qty);
+                let still = qty - from_hand;
+                if still > 0 {
+                    agent.remove_good(good, still);
+                }
             }
         }
 
@@ -2809,6 +2820,7 @@ pub fn deconstruct_system(
         Entity,
         &mut PersonAI,
         &mut EconomicAgent,
+        &mut crate::simulation::carry::Carrier,
         &FactionMember,
         &Transform,
     )>,
@@ -2824,7 +2836,7 @@ pub fn deconstruct_system(
     // Collect agents that just finished deconstruction.
     let mut to_complete: Vec<(Entity, (i16, i16), u32, (i32, i32))> = Vec::new();
 
-    for (entity, mut ai, _, member, transform) in agent_query.iter_mut() {
+    for (entity, mut ai, _, _, member, transform) in agent_query.iter_mut() {
         if ai.state != AiState::Working || ai.task_id != TaskKind::Deconstruct as u16 {
             continue;
         }
@@ -2893,7 +2905,7 @@ pub fn deconstruct_system(
 
         let Some((target_entity, kind, was_bed)) = removed else {
             // Already gone — just idle the agent.
-            if let Ok((_, mut ai, _, _, _)) = agent_query.get_mut(agent_entity) {
+            if let Ok((_, mut ai, _, _, _, _)) = agent_query.get_mut(agent_entity) {
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
             }
@@ -2921,9 +2933,34 @@ pub fn deconstruct_system(
             }
         }
 
-        if let Ok((_, mut ai, mut economic_agent, _, _)) = agent_query.get_mut(agent_entity) {
+        if let Ok((_, mut ai, mut economic_agent, mut carrier, _, _)) =
+            agent_query.get_mut(agent_entity)
+        {
+            // Recovered materials prefer the agent's hands so they can be hauled to
+            // storage; fall back to inventory; spill any remainder at the deconstructed
+            // tile as a GroundItem.
             for &(good, qty) in recipe_for(kind).deconstruct_refund {
-                economic_agent.add_good(good, qty as u32);
+                let qty = qty as u32;
+                let item = crate::economy::item::Item::new_commodity(good);
+                let after_hand = carrier.try_pick_up(item, qty);
+                let after_inv = if after_hand > 0 {
+                    economic_agent.add_item(item, after_hand)
+                } else {
+                    0
+                };
+                if after_inv > 0 {
+                    let pos = tile_to_world(tile.0 as i32, tile.1 as i32);
+                    commands.spawn((
+                        crate::simulation::items::GroundItem {
+                            item,
+                            qty: after_inv,
+                        },
+                        Transform::from_xyz(pos.x, pos.y, 0.3),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ));
+                }
             }
 
             let cur_tile = (cur_x as i16, cur_y as i16);

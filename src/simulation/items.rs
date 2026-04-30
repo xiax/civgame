@@ -1,6 +1,7 @@
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
+use crate::simulation::carry::Carrier;
 use crate::simulation::combat::BodyPart;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
@@ -82,6 +83,47 @@ pub fn spawn_or_merge_ground_item(
     ));
 }
 
+/// Recompute `EconomicAgent.bonus_cap_g` from currently-equipped items. Currently
+/// the only contributing slot is TorsoArmor (e.g. cloth or armor) which grants a
+/// modest pack/pocket bonus. Runs on `Changed<Equipment>`.
+pub fn recompute_inventory_capacity_system(
+    mut q: Query<
+        (&Equipment, &mut EconomicAgent),
+        Changed<Equipment>,
+    >,
+    item_lookup: Query<&GroundItem>,
+) {
+    for (equipment, mut agent) in q.iter_mut() {
+        let mut bonus = 0u32;
+        for (slot, &entity) in equipment.items.iter() {
+            // Only Torso slot grants pack capacity for now.
+            if *slot != EquipmentSlot::TorsoArmor {
+                continue;
+            }
+            // If the equipped entity is a known item (Cloth/Armor/etc), grant the bonus.
+            if let Ok(gi) = item_lookup.get(entity) {
+                bonus = bonus.saturating_add(match gi.item.good {
+                    Good::Cloth => 2_000,
+                    Good::Armor => 1_000,
+                    _ => 0,
+                });
+            }
+        }
+        agent.bonus_cap_g = bonus;
+    }
+}
+
+/// True if this good is "personal" — small enough and useful enough that the agent
+/// keeps it in their personal inventory rather than carrying it in their hands.
+/// Hungry agents personalize edibles too (so they can eat them later).
+fn personal_pickup(good: Good, needs: &Needs) -> bool {
+    match good {
+        Good::Tools | Good::Seed => true,
+        Good::Fruit | Good::Meat | Good::Grain => needs.hunger > 80.0,
+        _ => false,
+    }
+}
+
 /// Sequential, after death_system.
 /// Agents explicitly targeting a GroundItem pick it up once they arrive.
 pub fn item_pickup_system(
@@ -93,6 +135,7 @@ pub fn item_pickup_system(
             Entity,
             &mut PersonAI,
             &mut EconomicAgent,
+            &mut Carrier,
             &Needs,
             &mut TargetItem,
             &BucketSlot,
@@ -106,6 +149,7 @@ pub fn item_pickup_system(
         _entity,
         mut ai,
         mut agent,
+        mut carrier,
         needs,
         mut target_item,
         slot,
@@ -141,16 +185,33 @@ pub fn item_pickup_system(
                 item.qty
             };
 
-            agent.add_good(item.item.good, take_qty);
+            // Personal goods → inventory; hauling goods → hands. Fall back to the other
+            // bucket if the primary is full (e.g. inventory cap exceeded).
+            let leftover = if personal_pickup(item.item.good, needs) {
+                let inv_left = agent.add_item(item.item, take_qty);
+                if inv_left > 0 {
+                    carrier.try_pick_up(item.item, inv_left)
+                } else {
+                    0
+                }
+            } else {
+                let hand_left = carrier.try_pick_up(item.item, take_qty);
+                if hand_left > 0 {
+                    agent.add_item(item.item, hand_left)
+                } else {
+                    0
+                }
+            };
+            let actually_taken = take_qty - leftover;
 
             if let Some(ref mut plan) = active_plan_opt {
-                plan.reward_acc += take_qty as f32 * plan.reward_scale;
+                plan.reward_acc += actually_taken as f32 * plan.reward_scale;
             }
 
-            if take_qty >= item.qty {
+            if actually_taken >= item.qty {
                 commands.entity(target_ent).despawn();
             } else {
-                item.qty -= take_qty;
+                item.qty -= actually_taken;
             }
 
             ai.state = AiState::Idle;

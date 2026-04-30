@@ -4,11 +4,10 @@
 - [ ] **Ramps and Stairs Construction**: Implement UI orders and AI tasks for building ramps and stairs to facilitate vertical navigation beyond ±1 Z-level steps.
 - [ ] **True Underground Mining (Tunneling)**: Support tunneling into terrain with "ceilings," requiring updates to pathfinding, line-of-sight, and rendering systems to handle subterranean movement.
 - [ ] **Multi-Story Buildings**: Allow construction of floors and structures in `Air` tiles, enabling the creation of multi-level towers and bridges.
-- [ ] Add item weights and a carrying system. The inventory starts small, only like 5kg but can be
+- [x] Add item weights and a carrying system. The inventory starts small, only like 5kg but can be
   expanded with equipment and clothing. Humans can also carry stuff with their hands, depending on      
   item size and weight, but they can only carry one or two things this way and if they use up both    
-  hands carrying something then they can't do anything else like build or craft. They should deposit   
-  any resources they aren't using to the faction tile if they need more space to pick up stuff, but     
+  hands carrying something then they can't do anything else like build or craft. Inventory is personal inventory, when hauling stuff for a task or gathering, they should use their hands.    
   make this logic smart and anticipate edge cases
 - [x] I want to improve the building system. Currently the way buildings are placed follows a rigid        
   pattern and doesn't give each settlement a distinct personality. I would like a more fleshed out      
@@ -16,7 +15,7 @@
   the game progresses. one that builds intelligently and can replace old buildings with new ones as     
   new technologies and materials become available
 - terraforming should use mine and fill up task
-- Click dragging to select multiple units and use flow fields for units to reach target
+- Click dragging to select multiple units, there should be an option to draft them (rim world style) that switches them to military mode. In military mode it's right click to move, no harvesting or gathering, and right clicking on hostile entities auto attacks them and right clicking on neutral entities opens a menu for attack or move to. and use flow fields for units to reach target
 
 2. The "Unique Target" Problem
   The weakness of Flow Fields is when every unit wants to go to a different spot (e.g., 100k units each picking a

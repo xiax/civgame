@@ -372,7 +372,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: 5,
             task: TaskKind::Hunter,
             target: StepTarget::HuntPrey,
-            preconditions: StepPreconditions::none(),
+            preconditions: StepPreconditions::needs_good(Good::Weapon, 1),
             reward_scale: 0.4,
             plant_filter: None,
             extra: 0,

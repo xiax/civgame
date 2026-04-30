@@ -71,6 +71,7 @@ pub fn inspector_panel_system(
             Option<&UtilityNet>,
             Option<&AgentMemory>,
             Option<&GoalReason>,
+            Option<&crate::simulation::carry::Carrier>,
         ),
     )>,
 ) {
@@ -87,6 +88,7 @@ pub fn inspector_panel_system(
             utility_net,
             memory,
             goal_reason,
+            carrier,
         ),
     )) = query.get(entity)
     else {
@@ -108,19 +110,23 @@ pub fn inspector_panel_system(
                 ui.label(format!("Profession: {:?}", profession));
                 ui.horizontal(|ui| {
                     ui.label(format!("Goal: {}", goal.name()));
-                    if let Some(reason) = goal_reason {
-                        ui.label(
-                            egui::RichText::new(format!(" ({})", reason.0))
-                                .small()
-                                .color(egui::Color32::from_gray(160)),
-                        );
-                    }
+                    let reason_text = goal_reason.map(|r| r.0).unwrap_or("—");
+                    ui.label(
+                        egui::RichText::new(format!(" ({})", reason_text))
+                            .small()
+                            .color(egui::Color32::from_gray(160)),
+                    );
                 });
 
                 if member.faction_id == SOLO {
                     ui.label("Faction: Solo");
                     if member.bond_timer > 0 {
                         ui.label(format!("Bonding: {}/180", member.bond_timer));
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Bonding: —")
+                                .color(egui::Color32::from_gray(140)),
+                        );
                     }
                 } else {
                     let food_stock = registry
@@ -142,25 +148,33 @@ pub fn inspector_panel_system(
                         member.faction_id, food_stock, raid_info
                     ));
                     // Lineage + culture style summary
-                    if let Some(f) = registry.factions.get(&member.faction_id) {
-                        ui.label(
-                            egui::RichText::new(format!(
+                    let (lineage_text, founder_text) = match registry
+                        .factions
+                        .get(&member.faction_id)
+                    {
+                        Some(f) => (
+                            format!(
                                 "Lineage: {} (gen {})",
                                 f.lineage.root, f.lineage.generation
-                            ))
-                            .color(egui::Color32::from_gray(180))
-                            .size(11.0),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!(
+                            ),
+                            format!(
                                 "Founder: {} • Style: {}",
                                 f.lineage.founder,
                                 f.culture.style.label()
-                            ))
+                            ),
+                        ),
+                        None => ("Lineage: —".to_string(), "Founder: —".to_string()),
+                    };
+                    ui.label(
+                        egui::RichText::new(lineage_text)
                             .color(egui::Color32::from_gray(180))
                             .size(11.0),
-                        );
-                    }
+                    );
+                    ui.label(
+                        egui::RichText::new(founder_text)
+                            .color(egui::Color32::from_gray(180))
+                            .size(11.0),
+                    );
                 }
 
                 ui.separator();
@@ -235,17 +249,96 @@ pub fn inspector_panel_system(
 
                 ui.separator();
                 ui.label(format!("Currency: {:.1}", agent.currency));
-                ui.label("Inventory:");
-                for (item, qty) in &agent.inventory {
-                    if *qty > 0 {
-                        let mut name = item.good.name().to_string();
-                        if let Some(mat) = item.material {
-                            name = format!("{:?} {}", mat, name);
+
+                let cur_g = agent.current_weight_g();
+                let cap_g = agent.capacity_g();
+                ui.label(format!(
+                    "Inventory ({:.1} / {:.1} kg):",
+                    cur_g as f32 / 1000.0,
+                    cap_g as f32 / 1000.0,
+                ));
+                let frac = if cap_g > 0 {
+                    (cur_g as f32 / cap_g as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new(frac).desired_width(180.0).text(format!(
+                        "{:.1} kg",
+                        cur_g as f32 / 1000.0
+                    )),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("inv")
+                    .max_height(100.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (item, qty) in &agent.inventory {
+                            if *qty > 0 {
+                                let mut name = item.good.name().to_string();
+                                if let Some(mat) = item.material {
+                                    name = format!("{:?} {}", mat, name);
+                                }
+                                if let Some(qual) = item.quality {
+                                    name = format!("{} ({:?})", name, qual);
+                                }
+                                ui.label(format!(
+                                    "  {}: {} ({:.2} kg)",
+                                    name,
+                                    qty,
+                                    item.stack_weight_g(*qty) as f32 / 1000.0
+                                ));
+                            }
                         }
-                        if let Some(qual) = item.quality {
-                            name = format!("{} ({:?})", name, qual);
+                    });
+
+                let (free_hands_str, left_slot, right_slot) = match carrier {
+                    Some(c) => (format!("{} free", c.free_hands()), c.left, c.right),
+                    None => ("—".to_string(), None, None),
+                };
+                ui.label(format!("In hands: {}", free_hands_str));
+                let two_handed = left_slot.map_or(false, |s| s.two_handed);
+                match left_slot {
+                    Some(stack) => {
+                        let tag = if stack.two_handed { " [2H]" } else { "" };
+                        ui.label(format!(
+                            "  L: {} ×{}{} ({:.2} kg)",
+                            stack.item.good.name(),
+                            stack.qty,
+                            tag,
+                            stack.weight_g() as f32 / 1000.0,
+                        ));
+                    }
+                    None => {
+                        ui.label(
+                            egui::RichText::new("  L: —")
+                                .color(egui::Color32::from_gray(140)),
+                        );
+                    }
+                }
+                if two_handed {
+                    ui.label(
+                        egui::RichText::new("  R: (held with two hands)")
+                            .color(egui::Color32::from_gray(140)),
+                    );
+                } else {
+                    match right_slot {
+                        Some(stack) => {
+                            let tag = if stack.two_handed { " [2H]" } else { "" };
+                            ui.label(format!(
+                                "  R: {} ×{}{} ({:.2} kg)",
+                                stack.item.good.name(),
+                                stack.qty,
+                                tag,
+                                stack.weight_g() as f32 / 1000.0,
+                            ));
                         }
-                        ui.label(format!("  {}: {}", name, qty));
+                        None => {
+                            ui.label(
+                                egui::RichText::new("  R: —")
+                                    .color(egui::Color32::from_gray(140)),
+                            );
+                        }
                     }
                 }
 
@@ -324,21 +417,36 @@ pub fn inspector_panel_system(
                     ai.target_tile.0, ai.target_tile.1
                 ));
 
-                if let Some(o) = order {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Order: {} \u{2192} ({}, {})",
-                            o.order.label(),
-                            o.target_tile.0,
-                            o.target_tile.1
-                        ))
-                        .color(egui::Color32::from_rgb(255, 220, 100)),
-                    );
+                match order {
+                    Some(o) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Order: {} \u{2192} ({}, {})",
+                                o.order.label(),
+                                o.target_tile.0,
+                                o.target_tile.1
+                            ))
+                            .color(egui::Color32::from_rgb(255, 220, 100)),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            egui::RichText::new("Order: —")
+                                .color(egui::Color32::from_gray(120)),
+                        );
+                    }
                 }
 
                 ui.separator();
-                if let Some(ap) = active_plan {
-                    if let Some(plan_def) = plan_registry.0.iter().find(|p| p.id == ap.plan_id) {
+                let active_pair = active_plan.and_then(|ap| {
+                    plan_registry
+                        .0
+                        .iter()
+                        .find(|p| p.id == ap.plan_id)
+                        .map(|pd| (ap, pd))
+                });
+                match active_pair {
+                    Some((ap, plan_def)) => {
                         ui.label(
                             egui::RichText::new(format!("Active Plan: {}", plan_def.name))
                                 .strong()
@@ -351,12 +459,23 @@ pub fn inspector_panel_system(
                         ));
                         ui.label(format!("  Reward: {:.2}", ap.reward_acc));
                     }
-                } else {
-                    ui.label(
-                        egui::RichText::new("Active Plan: None")
-                            .italics()
-                            .color(egui::Color32::GRAY),
-                    );
+                    None => {
+                        ui.label(
+                            egui::RichText::new("Active Plan: None")
+                                .italics()
+                                .color(egui::Color32::GRAY),
+                        );
+                        ui.label(
+                            egui::RichText::new("  Step: —")
+                                .italics()
+                                .color(egui::Color32::GRAY),
+                        );
+                        ui.label(
+                            egui::RichText::new("  Reward: —")
+                                .italics()
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
                 }
 
                 ui.separator();
@@ -367,6 +486,11 @@ pub fn inspector_panel_system(
                 )
                 .default_open(true)
                 .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("path")
+                        .max_height(180.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
                     let cur_tx =
                         (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;
                     let cur_ty =
@@ -508,10 +632,16 @@ pub fn inspector_panel_system(
                                 .color(egui::Color32::GRAY),
                         );
                     }
+                        });
                 });
 
                 if let (Some(kp), Some(net)) = (known_plans, utility_net) {
                     egui::CollapsingHeader::new("Available Plans").show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("plans")
+                            .max_height(160.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
                         let state = build_state_vec(needs, agent, skills, member, memory, &calendar);
                         let cur_tx =
                             (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;
@@ -597,11 +727,17 @@ pub fn inspector_panel_system(
                                 });
                             }
                         }
+                            });
                     });
                 }
 
                 if let Some(rel) = rel_mem {
                     egui::CollapsingHeader::new("Relationships").show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("rels")
+                            .max_height(140.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
                         let mut entries: Vec<&RelEntry> =
                             rel.entries.iter().filter_map(|s| s.as_ref()).collect();
                         entries.sort_unstable_by(|a, b| b.affinity.cmp(&a.affinity));
@@ -642,6 +778,7 @@ pub fn inspector_panel_system(
                                 ui.label(format!("{:+}", entry.affinity));
                             });
                         }
+                            });
                     });
                 }
             });
