@@ -30,6 +30,15 @@ pub enum EntityFogState {
     Explored,
 }
 
+/// Marker for entities that should remain visible (dimmed) in explored-but-not-
+/// currently-visible tiles. Attach to static structures whose position the player
+/// is expected to remember (walls, beds, plants, blueprints, faction centers,
+/// furniture). Mobile entities (persons, animals) deliberately omit this marker
+/// so they hide entirely outside line of sight — their remembered positions
+/// would be misleading since they move.
+#[derive(Component)]
+pub struct FogPersistent;
+
 #[derive(Component)]
 pub struct BedVisual;
 
@@ -158,7 +167,7 @@ pub fn spawn_bed_sprites(
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
-        commands.entity(entity).insert((BedVisual, EntityFogState::default()));
+        commands.entity(entity).insert((BedVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -189,7 +198,7 @@ pub fn spawn_wall_sprites(
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
-        commands.entity(entity).insert((WallVisual, EntityFogState::default()));
+        commands.entity(entity).insert((WallVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -214,7 +223,7 @@ pub fn spawn_campfire_sprites(
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
-        commands.entity(entity).insert((CampfireVisual, EntityFogState::default()));
+        commands.entity(entity).insert((CampfireVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -237,7 +246,7 @@ pub fn spawn_door_sprites(
         let mut sprite = Sprite::from_image(textures.door_ascii.clone());
         sprite.anchor = Anchor::BottomCenter;
 
-        commands.entity(entity).insert((DoorVisual, EntityFogState::default()));
+        commands.entity(entity).insert((DoorVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -259,7 +268,7 @@ pub fn spawn_table_sprites(
     for entity in query.iter() {
         let mut sprite = Sprite::from_image(textures.table_ascii.clone());
         sprite.anchor = Anchor::BottomCenter;
-        commands.entity(entity).insert((TableVisual, EntityFogState::default()));
+        commands.entity(entity).insert((TableVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -281,7 +290,7 @@ pub fn spawn_chair_sprites(
     for entity in query.iter() {
         let mut sprite = Sprite::from_image(textures.chair_ascii.clone());
         sprite.anchor = Anchor::BottomCenter;
-        commands.entity(entity).insert((ChairVisual, EntityFogState::default()));
+        commands.entity(entity).insert((ChairVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -303,7 +312,7 @@ pub fn spawn_workbench_sprites(
     for entity in query.iter() {
         let mut sprite = Sprite::from_image(textures.workbench_ascii.clone());
         sprite.anchor = Anchor::BottomCenter;
-        commands.entity(entity).insert((WorkbenchVisual, EntityFogState::default()));
+        commands.entity(entity).insert((WorkbenchVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -325,7 +334,7 @@ pub fn spawn_loom_sprites(
     for entity in query.iter() {
         let mut sprite = Sprite::from_image(textures.loom_ascii.clone());
         sprite.anchor = Anchor::BottomCenter;
-        commands.entity(entity).insert((LoomVisual, EntityFogState::default()));
+        commands.entity(entity).insert((LoomVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -357,7 +366,7 @@ pub fn spawn_faction_center_sprites(
             sprite.color = Color::srgb(0.55, 0.85, 1.0);
         }
 
-        commands.entity(entity).insert((FactionCenterVisual, EntityFogState::default()));
+        commands.entity(entity).insert((FactionCenterVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -631,7 +640,7 @@ pub fn spawn_plant_sprites(
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
-        commands.entity(entity).insert((PlantVisual, EntityFogState::default()));
+        commands.entity(entity).insert((PlantVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -1331,8 +1340,9 @@ pub fn animate_cats_system(
 /// Surface mode (CameraViewZ == i32::MAX): show entities whose Z equals
 /// the surface_z of their tile (i.e. above-ground entities). Underground
 /// mode: show only entities whose Z equals camera_view_z.
-/// Entities in explored-but-not-visible tiles remain visible but get a dim tint
-/// applied by apply_entity_fog_tint_system.
+/// Entities marked `FogPersistent` (static structures) remain visible at a dim
+/// tint in explored-but-not-currently-visible tiles. All other fog-tracked
+/// entities (persons, animals) hide entirely outside currently-visible tiles.
 pub fn update_entity_z_visibility_system(
     camera_view_z: Res<crate::rendering::camera::CameraViewZ>,
     chunk_map: Res<crate::world::chunk::ChunkMap>,
@@ -1344,28 +1354,14 @@ pub fn update_entity_z_visibility_system(
             &mut EntityFogState,
             Option<&PersonAI>,
             Has<Person>,
+            Has<FogPersistent>,
         ),
-        bevy::prelude::Or<(
-            With<Person>,
-            With<Wolf>,
-            With<Deer>,
-            With<Horse>,
-            With<Cow>,
-            With<Rabbit>,
-            With<Pig>,
-            With<Fox>,
-            With<Cat>,
-            With<Plant>,
-            With<Bed>,
-            With<Wall>,
-            With<FactionCenter>,
-            With<Blueprint>,
-        )>,
+        With<EntityFogState>,
     >,
 ) {
     use crate::world::terrain::TILE_SIZE;
     let cam_z = camera_view_z.0;
-    for (transform, mut vis, mut fog_state, person_ai, is_person) in q.iter_mut() {
+    for (transform, mut vis, mut fog_state, person_ai, is_person, fog_persistent) in q.iter_mut() {
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         let surf_z = chunk_map.surface_z_at(tx, ty);
@@ -1380,7 +1376,8 @@ pub fn update_entity_z_visibility_system(
         };
         let fog_visible = fog_map.is_visible((tx as i16, ty as i16));
         let fog_explored = fog_map.is_explored((tx as i16, ty as i16));
-        let new_vis = if should_show && (fog_visible || fog_explored) {
+        let fog_ok = fog_visible || (fog_persistent && fog_explored);
+        let new_vis = if should_show && fog_ok {
             Visibility::Visible
         } else {
             Visibility::Hidden
@@ -1417,22 +1414,7 @@ pub fn apply_entity_fog_tint_system(
             Option<&ClothingVisual>,
             Option<&crate::rendering::animations::CombatAnimations>,
         ),
-        bevy::prelude::Or<(
-            With<Person>,
-            With<Wolf>,
-            With<Deer>,
-            With<Horse>,
-            With<Cow>,
-            With<Rabbit>,
-            With<Pig>,
-            With<Fox>,
-            With<Cat>,
-            With<Plant>,
-            With<Bed>,
-            With<Wall>,
-            With<FactionCenter>,
-            With<Blueprint>,
-        )>,
+        With<EntityFogState>,
     >,
     mut child_sprites: Query<
         (&mut Sprite, Option<&AnimalSexTint>, Option<&VisualLayer>),
@@ -1604,7 +1586,7 @@ pub fn spawn_blueprint_sprites(
 
         commands
             .entity(entity)
-            .insert((BlueprintVisual, EntityFogState::default()))
+            .insert((BlueprintVisual, EntityFogState::default(), FogPersistent))
             .with_children(|parent| {
                 parent.spawn((
                     VisualChild,

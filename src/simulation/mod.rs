@@ -14,6 +14,7 @@ pub mod items;
 pub mod line_of_sight;
 pub mod lod;
 pub mod memory;
+pub mod military;
 pub mod mood;
 pub mod movement;
 pub mod needs;
@@ -89,6 +90,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(settlement::SettlementPlans::default())
             .insert_resource(settlement::ZoneOverlayToggle::default())
             .insert_resource(plan::RelInfluence::default())
+            .insert_resource(military::ActiveRallyPoints::default())
             .configure_sets(
                 FixedUpdate,
                 (
@@ -193,6 +195,13 @@ impl Plugin for SimulationPlugin {
             )
             .add_systems(
                 FixedUpdate,
+                (military::military_task_system
+                    .after(movement::movement_system)
+                    .before(combat::combat_system),)
+                    .in_set(SimulationSet::Sequential),
+            )
+            .add_systems(
+                FixedUpdate,
                 (
                     items::item_pickup_system.after(combat::death_system),
                     plants::deer_graze_system.after(movement::update_spatial_index_system),
@@ -268,6 +277,7 @@ impl Plugin for SimulationPlugin {
                         .after(raid::raid_execution_system),
                     plan::drop_abandoned_food_system
                         .after(faction::drop_items_at_destination_system),
+                    military::expire_rally_points_system,
                 )
                     .in_set(SimulationSet::Economy),
             );

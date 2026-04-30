@@ -26,7 +26,7 @@ use super::lod::LodLevel;
 use super::memory::{AgentMemory, MemoryKind, RelationshipMemory};
 use super::needs::{Needs, EAT_TRIGGER_HUNGER};
 use super::neural::{UtilityNet, PLAN_FEAT_DIM, STATE_DIM};
-use super::person::{AiState, Person, PersonAI, PlayerOrder};
+use super::person::{AiState, Drafted, Person, PersonAI, PlayerOrder};
 use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
 use super::reproduction::BiologicalSex;
 use super::schedule::{BucketSlot, SimClock};
@@ -1428,7 +1428,7 @@ pub fn plan_execution_system(
     prey_query: Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
     wild_horse_q: Query<Entity, (With<Horse>, Without<Tamed>)>,
     rel_influence: Res<RelInfluence>,
-    mut query: Query<(AgentQuery, OptionalQuery), Without<PlayerOrder>>,
+    mut query: Query<(AgentQuery, OptionalQuery), (Without<PlayerOrder>, Without<Drafted>)>,
 ) {
     let PlanRegistries {
         plan_registry,

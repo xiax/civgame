@@ -8,8 +8,8 @@ use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::pathfinding::flow_field::walk_to_goal;
 use crate::pathfinding::hotspots::HotspotFlowFields;
 use crate::pathfinding::path_request::{
-    FailReason, FailureLog, FailureRecord, FollowStatus, PathDebugFlags, PathFailed, PathFollow,
-    PathKind, PathReady, PathReadyKind, PathRequest, PathRequestQueue,
+    FailReason, FailSubReason, FailureLog, FailureRecord, FollowStatus, PathDebugFlags, PathFailed,
+    PathFollow, PathKind, PathReady, PathReadyKind, PathRequest, PathRequestQueue,
 };
 use crate::pathfinding::pool::AStarPool;
 use crate::pathfinding::step::passable_diagonal_step;
@@ -227,25 +227,24 @@ fn process_request(
                 req.agent, req.start, req.goal
             );
         }
-        write_failure(req, FailReason::Unreachable, now_tick, follows, failed_w, failure_log, diag);
+        write_failure(req, FailSubReason::UnreachableConnectivity, now_tick, follows, failed_w, failure_log, diag);
         return;
     }
 
     let chunk_route = match build_chunk_route(graph, router, start_chunk, goal_chunk, req.start.2) {
         Ok(r) => r,
-        Err(reason) => {
-            match reason {
-                FailReason::Unreachable => diag.path_failed_unreachable += 1,
-                FailReason::BudgetExhausted => diag.path_failed_budget += 1,
-                FailReason::NoRoute => diag.path_failed_no_route += 1,
-            }
+        Err(_reason) => {
+            // build_chunk_route only ever returns NoRoute today, so the
+            // sub-classification is always NoRouteRouter regardless of which
+            // arm produced it.
+            diag.path_failed_no_route += 1;
             if flags.verbose_logs {
                 info!(
-                    "[path] chunk-route fail reason={:?} agent={:?} start_chunk={:?} goal_chunk={:?}",
-                    reason, req.agent, start_chunk, goal_chunk
+                    "[path] chunk-route fail agent={:?} start_chunk={:?} goal_chunk={:?}",
+                    req.agent, start_chunk, goal_chunk
                 );
             }
-            write_failure(req, reason, now_tick, follows, failed_w, failure_log, diag);
+            write_failure(req, FailSubReason::NoRouteRouter, now_tick, follows, failed_w, failure_log, diag);
             return;
         }
     };
@@ -281,7 +280,7 @@ fn process_request(
                                 req.agent, prev, cur
                             );
                         }
-                        write_failure(req, FailReason::NoRoute, now_tick, follows, failed_w, failure_log, diag);
+                        write_failure(req, FailSubReason::NoRouteStepContinuity, now_tick, follows, failed_w, failure_log, diag);
                         return;
                     }
                     diag.flow_field_hits_per_tick += 1;
@@ -361,7 +360,7 @@ fn process_request(
                         req.agent, req.start, segment_target
                     );
                 }
-                write_failure(req, FailReason::BudgetExhausted, now_tick, follows, failed_w, failure_log, diag);
+                write_failure(req, FailSubReason::BudgetExhausted, now_tick, follows, failed_w, failure_log, diag);
                 return;
             }
             // BestEffort: walk one tile toward `best_so_far`. We don't have
@@ -379,7 +378,7 @@ fn process_request(
                     req.agent, req.start, segment_target
                 );
             }
-            write_failure(req, FailReason::Unreachable, now_tick, follows, failed_w, failure_log, diag);
+            write_failure(req, FailSubReason::UnreachableAstar, now_tick, follows, failed_w, failure_log, diag);
             return;
         }
     };
@@ -400,7 +399,7 @@ fn process_request(
                 req.agent, prev, cur
             );
         }
-        write_failure(req, FailReason::NoRoute, now_tick, follows, failed_w, failure_log, diag);
+        write_failure(req, FailSubReason::NoRouteStepContinuity, now_tick, follows, failed_w, failure_log, diag);
         return;
     }
 
@@ -496,13 +495,14 @@ fn first_segment_target(
 #[allow(clippy::too_many_arguments)]
 fn write_failure(
     req: &PathRequest,
-    reason: FailReason,
+    sub: FailSubReason,
     now_tick: u64,
     follows: &mut Query<&mut PathFollow>,
     failed_w: &mut EventWriter<PathFailed>,
     failure_log: &mut FailureLog,
     diag: &mut PathfindingDiagnostics,
 ) {
+    let reason = sub.to_reason();
     match follows.get_mut(req.agent) {
         Ok(mut follow) => {
             follow.status = FollowStatus::Failed(reason);
@@ -512,8 +512,29 @@ fn write_failure(
             follow.segment_path.clear();
             follow.segment_cursor = 0;
             follow.request_id = req.id;
-            follow.last_fail_reason = Some(reason);
+            follow.last_fail_subreason = Some(sub);
             follow.last_fail_tick = now_tick;
+            match sub {
+                FailSubReason::UnreachableConnectivity => {
+                    follow.fail_count_unreachable_conn =
+                        follow.fail_count_unreachable_conn.saturating_add(1);
+                }
+                FailSubReason::UnreachableAstar => {
+                    follow.fail_count_unreachable_astar =
+                        follow.fail_count_unreachable_astar.saturating_add(1);
+                }
+                FailSubReason::BudgetExhausted => {
+                    follow.fail_count_budget = follow.fail_count_budget.saturating_add(1);
+                }
+                FailSubReason::NoRouteRouter => {
+                    follow.fail_count_no_route_router =
+                        follow.fail_count_no_route_router.saturating_add(1);
+                }
+                FailSubReason::NoRouteStepContinuity => {
+                    follow.fail_count_no_route_continuity =
+                        follow.fail_count_no_route_continuity.saturating_add(1);
+                }
+            }
             if follow.last_fail_goal == req.goal {
                 follow.last_fail_streak = follow.last_fail_streak.saturating_add(1);
             } else {
@@ -524,8 +545,8 @@ fn write_failure(
         Err(_) => {
             diag.missing_follow_on_event += 1;
             warn!(
-                "[path] PathFailed but no PathFollow on agent={:?} (despawned?) reason={:?}",
-                req.agent, reason
+                "[path] PathFailed but no PathFollow on agent={:?} (despawned?) sub={:?}",
+                req.agent, sub
             );
         }
     }
@@ -534,7 +555,7 @@ fn write_failure(
         agent: req.agent,
         start: req.start,
         goal: req.goal,
-        reason,
+        subreason: sub,
     });
     failed_w.send(PathFailed {
         agent: req.agent,

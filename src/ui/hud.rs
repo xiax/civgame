@@ -3,13 +3,20 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::mode::EconomicMode;
 use crate::rendering::camera::CameraViewZ;
+use crate::simulation::combat::CombatTarget;
 use crate::simulation::construction::AutonomousBuildingToggle;
-use crate::simulation::faction::{FactionRegistry, PlayerFaction};
+use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
 use crate::ui::debug_panel::DebugPanelState;
+use crate::ui::selection::SelectedEntities;
 use crate::ui::tech_panel::TechPanelOpen;
-use crate::simulation::person::Person;
+use crate::simulation::person::{AiState, Drafted, Person, PersonAI};
 use crate::simulation::schedule::SimClock;
 use crate::world::seasons::Calendar;
+
+/// Set by the Draft button (or `R` keypress); consumed by
+/// `apply_draft_toggle_system` once per frame.
+#[derive(Resource, Default)]
+pub struct DraftToggleRequest(pub bool);
 
 pub fn hud_system(
     mut contexts: EguiContexts,
@@ -18,13 +25,21 @@ pub fn hud_system(
     mut auto_build: ResMut<AutonomousBuildingToggle>,
     mut tech_panel_open: ResMut<TechPanelOpen>,
     mut debug_state: ResMut<DebugPanelState>,
+    mut draft_req: ResMut<DraftToggleRequest>,
     camera_view_z: Res<CameraViewZ>,
     calendar: Res<Calendar>,
     player_faction: Res<PlayerFaction>,
     registry: Res<FactionRegistry>,
+    selected_many: Res<SelectedEntities>,
+    drafted_q: Query<(), With<Drafted>>,
     persons: Query<(), With<Person>>,
 ) {
     let pop = persons.iter().count();
+    let any_drafted = selected_many
+        .ids
+        .iter()
+        .any(|&e| drafted_q.get(e).is_ok());
+    let has_selection = !selected_many.ids.is_empty();
 
     egui::Area::new(egui::Id::new("hud"))
         .fixed_pos([0.0, 0.0])
@@ -86,6 +101,18 @@ pub fn hud_system(
                         });
                         if ui.add(tech_btn).clicked() {
                             tech_panel_open.0 = !tech_panel_open.0;
+                        }
+
+                        ui.separator();
+                        let (draft_lbl, draft_fill) = if any_drafted {
+                            ("Undraft (R)", egui::Color32::from_rgb(200, 70, 50))
+                        } else {
+                            ("Draft (R)", egui::Color32::from_gray(60))
+                        };
+                        let draft_btn = egui::Button::new(draft_lbl).fill(draft_fill);
+                        let resp = ui.add_enabled(has_selection, draft_btn);
+                        if resp.clicked() {
+                            draft_req.0 = true;
                         }
 
                         ui.separator();
@@ -159,4 +186,71 @@ pub fn hud_system(
                     }
                 });
         });
+}
+
+/// Applies a Draft/Undraft toggle requested via the HUD button or `R` key.
+/// On undraft, also clears any pending military task so the unit goes idle
+/// instead of continuing a stale chase.
+pub fn apply_draft_toggle_system(
+    mut commands: Commands,
+    mut req: ResMut<DraftToggleRequest>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut contexts: EguiContexts,
+    selected_many: Res<SelectedEntities>,
+    player_faction: Res<PlayerFaction>,
+    drafted_q: Query<(), With<Drafted>>,
+    faction_q: Query<&FactionMember>,
+    mut ai_q: Query<&mut PersonAI>,
+    mut combat_q: Query<&mut CombatTarget>,
+) {
+    let mut requested = req.0;
+    req.0 = false;
+
+    // `R` keybind, ignored when egui has keyboard focus (typing into a panel).
+    let typing = contexts.ctx_mut().wants_keyboard_input();
+    if !typing && keys.just_pressed(KeyCode::KeyR) {
+        requested = true;
+    }
+    if !requested || selected_many.ids.is_empty() {
+        return;
+    }
+
+    let player_only: Vec<Entity> = selected_many
+        .ids
+        .iter()
+        .copied()
+        .filter(|e| {
+            faction_q
+                .get(*e)
+                .map(|m| m.faction_id == player_faction.faction_id)
+                .unwrap_or(false)
+        })
+        .collect();
+    if player_only.is_empty() {
+        return;
+    }
+    // Drafting if ANY are not yet drafted; undrafting only when all already drafted.
+    let any_undrafted = player_only.iter().any(|e| drafted_q.get(*e).is_err());
+    if any_undrafted {
+        for e in player_only {
+            commands.entity(e).insert(Drafted);
+            // Strip in-flight forage / haul plans so the agent doesn't
+            // resume them when later undrafted.
+            commands
+                .entity(e)
+                .remove::<crate::simulation::plan::ActivePlan>();
+        }
+    } else {
+        for e in player_only {
+            commands.entity(e).remove::<Drafted>();
+            if let Ok(mut ai) = ai_q.get_mut(e) {
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.state = AiState::Idle;
+                ai.target_entity = None;
+            }
+            if let Ok(mut tgt) = combat_q.get_mut(e) {
+                tgt.0 = None;
+            }
+        }
+    }
 }

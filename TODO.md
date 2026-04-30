@@ -16,6 +16,12 @@
   new technologies and materials become available
 - terraforming should use mine and fill up task
 - Click dragging to select multiple units, there should be an option to draft them (rim world style) that switches them to military mode. In military mode it's right click to move, no harvesting or gathering, and right clicking on hostile entities auto attacks them and right clicking on neutral entities opens a menu for attack or move to. and use flow fields for units to reach target
+- add parallelization
+- faction camp should have 20 tiles view range
+- rimworld-like bottom menu for mass orders for gathering wood or farming or gathering bushes or construction
+- Additional orders for mass crafting from a central control menu
+- world generation to be more expansive with larger plains, bigger valleys and mountains, larger bodies of water, etc.
+
 
 2. The "Unique Target" Problem
   The weakness of Flow Fields is when every unit wants to go to a different spot (e.g., 100k units each picking a

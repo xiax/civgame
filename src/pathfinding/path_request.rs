@@ -61,6 +61,46 @@ pub enum FailReason {
     NoRoute,
 }
 
+/// Finer-grained failure classification carried in the per-agent inspector
+/// counters and the `FailureLog`. Each variant maps to exactly one
+/// `FailReason` via `to_reason()`, but tells you which gate inside the
+/// worker actually fired.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum FailSubReason {
+    /// `ChunkConnectivity` rejected the request before A* ran.
+    UnreachableConnectivity,
+    /// A* exhausted the open set without reaching the segment target.
+    UnreachableAstar,
+    /// A* exceeded `max_budget` even after the 4× retry (Strict only).
+    BudgetExhausted,
+    /// `build_chunk_route` could not produce a waypoint, or the router
+    /// returned a self-waypoint (defensive `next == cur` check).
+    NoRouteRouter,
+    /// A*/flow-field emitted a path with a step that fails
+    /// `passable_step_3d` — caught by `first_invalid_step`.
+    NoRouteStepContinuity,
+}
+
+impl FailSubReason {
+    pub fn to_reason(self) -> FailReason {
+        match self {
+            Self::UnreachableConnectivity | Self::UnreachableAstar => FailReason::Unreachable,
+            Self::BudgetExhausted => FailReason::BudgetExhausted,
+            Self::NoRouteRouter | Self::NoRouteStepContinuity => FailReason::NoRoute,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UnreachableConnectivity => "Unreachable (connectivity)",
+            Self::UnreachableAstar => "Unreachable (A*)",
+            Self::BudgetExhausted => "BudgetExhausted",
+            Self::NoRouteRouter => "NoRoute (router)",
+            Self::NoRouteStepContinuity => "NoRoute (continuity)",
+        }
+    }
+}
+
 /// Why the worker considered a path complete.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum PathReadyKind {
@@ -127,12 +167,21 @@ pub struct PathFollow {
     /// Request id this follow was last populated by — lets late-arriving
     /// `PathReady`/`PathFailed` events ignore stale requests.
     pub request_id: u64,
-    /// Reason of the most recent failed request for this agent, if any.
+    /// Subreason of the most recent failed request for this agent, if any.
     /// Survives the `Failed → Idle` transition so the inspector can still
-    /// show what went wrong.
-    pub last_fail_reason: Option<FailReason>,
-    /// Tick at which `last_fail_reason` was recorded.
+    /// show what went wrong (with the granular variant — connectivity vs A*
+    /// for Unreachable, router vs continuity for NoRoute).
+    pub last_fail_subreason: Option<FailSubReason>,
+    /// Tick at which `last_fail_subreason` was recorded.
     pub last_fail_tick: u64,
+    /// Lifetime per-agent counters, one per `FailSubReason` variant. Never
+    /// reset on success or goal change — answer the inspector's "has this
+    /// agent ever hit X?" question across the agent's whole lifetime.
+    pub fail_count_unreachable_conn: u32,
+    pub fail_count_unreachable_astar: u32,
+    pub fail_count_budget: u32,
+    pub fail_count_no_route_router: u32,
+    pub fail_count_no_route_continuity: u32,
     /// Goal of the most recent failed request, used by `movement_system`
     /// to suppress re-enqueueing the same goal for `PATH_FAIL_COOLDOWN_TICKS`.
     pub last_fail_goal: (i32, i32, i8),
@@ -158,8 +207,13 @@ impl Default for PathFollow {
             last_replan_tick: 0,
             planning_generation: 0,
             request_id: 0,
-            last_fail_reason: None,
+            last_fail_subreason: None,
             last_fail_tick: 0,
+            fail_count_unreachable_conn: 0,
+            fail_count_unreachable_astar: 0,
+            fail_count_budget: 0,
+            fail_count_no_route_router: 0,
+            fail_count_no_route_continuity: 0,
             last_fail_goal: (i32::MIN, i32::MIN, 0),
             last_fail_streak: 0,
         }
@@ -273,7 +327,7 @@ pub struct FailureRecord {
     pub agent: Entity,
     pub start: (i32, i32, i8),
     pub goal: (i32, i32, i8),
-    pub reason: FailReason,
+    pub subreason: FailSubReason,
 }
 
 /// Maximum number of failure records retained globally.

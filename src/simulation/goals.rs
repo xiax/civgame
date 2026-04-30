@@ -2,7 +2,7 @@ use super::construction::{AutonomousBuildingToggle, Blueprint, BlueprintMap};
 use super::faction::{FactionChief, FactionMember, FactionRegistry, StorageTileMap, SOLO};
 use super::lod::LodLevel;
 use super::needs::Needs;
-use super::person::{AiState, PersonAI, PlayerOrder};
+use super::person::{AiState, Drafted, PersonAI, PlayerOrder};
 use super::schedule::{BucketSlot, SimClock};
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
@@ -152,7 +152,7 @@ pub fn goal_update_system(
             Option<&mut GoalReason>,
             Option<&FactionChief>,
         ),
-        Without<PlayerOrder>,
+        (Without<PlayerOrder>, Without<Drafted>),
     >,
 ) {
     for (

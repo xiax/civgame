@@ -6,7 +6,7 @@ use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::needs::Needs;
 use super::person::PlayerOrder;
-use super::person::{AiState, PersonAI};
+use super::person::{AiState, Drafted, PersonAI};
 use super::plan::ActivePlan;
 use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
 use crate::economy::agent::EconomicAgent;
@@ -50,6 +50,8 @@ pub enum TaskKind {
     Lead = 21,        // tribal chief stations at faction home and issues build orders
     Terraform = 22,   // level a footprint tile to a target Z (dig down or fill up by one Z step)
     HaulMaterials = 23, // carry inventory goods to a blueprint and drop them into its deposit slots
+    MilitaryMove = 24,  // drafted unit walking to a player-issued destination, idles on arrival
+    MilitaryAttack = 25, // drafted unit chasing a target entity to attack it adjacent
 }
 
 /// How many free hands the task requires the agent to have before they can begin
@@ -70,6 +72,7 @@ pub fn task_requires_free_hands(task_id: u16) -> u8 {
             || x == TaskKind::Hunter as u16
             || x == TaskKind::Raid as u16
             || x == TaskKind::Defend as u16
+            || x == TaskKind::MilitaryAttack as u16
             || x == TaskKind::TameAnimal as u16 =>
         {
             1
@@ -107,6 +110,7 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::Raid as u16
         || task_id == TaskKind::Defend as u16
         || task_id == TaskKind::Lead as u16
+        || task_id == TaskKind::MilitaryAttack as u16
 }
 
 /// Spiral search outward from `target` for the closest tile that is passable
@@ -459,7 +463,7 @@ pub fn goal_dispatch_system(
             Option<&ActivePlan>,
             Option<&HomeBed>,
         ),
-        Without<PlayerOrder>,
+        (Without<PlayerOrder>, Without<Drafted>),
     >,
 ) {
     query.par_iter_mut().for_each(

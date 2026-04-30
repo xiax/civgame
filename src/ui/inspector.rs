@@ -496,22 +496,24 @@ pub fn inspector_panel_system(
                     let cur_ty =
                         (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32;
                     if let Ok(pf) = path_params.path_follows.get(entity) {
-                        let (status_text, status_color) = match pf.status {
-                            FollowStatus::Idle => ("Idle", egui::Color32::GRAY),
-                            FollowStatus::Pending => ("Pending", egui::Color32::YELLOW),
+                        let red = egui::Color32::from_rgb(240, 100, 100);
+                        let (status_text, status_color): (String, egui::Color32) = match pf.status {
+                            FollowStatus::Idle => ("Idle".into(), egui::Color32::GRAY),
+                            FollowStatus::Pending => ("Pending".into(), egui::Color32::YELLOW),
                             FollowStatus::Following => (
-                                "Following",
+                                "Following".into(),
                                 egui::Color32::from_rgb(120, 220, 120),
                             ),
-                            FollowStatus::Failed(FailReason::Unreachable) => {
-                                ("Failed: Unreachable", egui::Color32::from_rgb(240, 100, 100))
-                            }
-                            FollowStatus::Failed(FailReason::BudgetExhausted) => (
-                                "Failed: BudgetExhausted",
-                                egui::Color32::from_rgb(240, 100, 100),
-                            ),
-                            FollowStatus::Failed(FailReason::NoRoute) => {
-                                ("Failed: NoRoute", egui::Color32::from_rgb(240, 100, 100))
+                            FollowStatus::Failed(reason) => {
+                                let label = match pf.last_fail_subreason {
+                                    Some(sub) => format!("Failed: {}", sub.label()),
+                                    None => match reason {
+                                        FailReason::Unreachable => "Failed: Unreachable".into(),
+                                        FailReason::BudgetExhausted => "Failed: BudgetExhausted".into(),
+                                        FailReason::NoRoute => "Failed: NoRoute".into(),
+                                    },
+                                };
+                                (label, red)
                             }
                         };
                         ui.label(
@@ -575,15 +577,28 @@ pub fn inspector_panel_system(
                                 .size(11.0)
                                 .color(egui::Color32::GRAY),
                         );
-                        if let Some(reason) = pf.last_fail_reason {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Last failure: {:?} @ tick {}",
-                                    reason, pf.last_fail_tick
-                                ))
-                                .color(egui::Color32::from_rgb(240, 160, 100)),
-                            );
-                        }
+                        let total_fails = pf.fail_count_unreachable_conn
+                            + pf.fail_count_unreachable_astar
+                            + pf.fail_count_budget
+                            + pf.fail_count_no_route_router
+                            + pf.fail_count_no_route_continuity;
+                        let fail_color = if total_fails > 0 {
+                            egui::Color32::from_rgb(240, 160, 100)
+                        } else {
+                            egui::Color32::GRAY
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Failures: conn {}  astar {}  budget {}  router {}  cont {}",
+                                pf.fail_count_unreachable_conn,
+                                pf.fail_count_unreachable_astar,
+                                pf.fail_count_budget,
+                                pf.fail_count_no_route_router,
+                                pf.fail_count_no_route_continuity,
+                            ))
+                            .size(11.0)
+                            .color(fail_color),
+                        );
 
                         let agent_failures: Vec<_> =
                             path_params.failure_log.for_agent(entity).take(8).collect();
@@ -597,8 +612,12 @@ pub fn inspector_panel_system(
                                 for rec in agent_failures {
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "tick {}  goal ({},{},{})  {:?}",
-                                            rec.tick, rec.goal.0, rec.goal.1, rec.goal.2, rec.reason
+                                            "tick {}  goal ({},{},{})  {}",
+                                            rec.tick,
+                                            rec.goal.0,
+                                            rec.goal.1,
+                                            rec.goal.2,
+                                            rec.subreason.label()
                                         ))
                                         .size(11.0)
                                         .color(egui::Color32::GRAY),

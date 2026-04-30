@@ -11,9 +11,17 @@ use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 pub enum HotspotKind {
     FactionCenter,
     Storage,
+    /// Player-issued military rally point — registered when the player
+    /// right-clicks a tile with drafted units selected. Same flow-field
+    /// machinery; lifecycle managed by `expire_rally_points_system`.
+    RallyPoint,
 }
 
-const ALL_KINDS: [HotspotKind; 2] = [HotspotKind::FactionCenter, HotspotKind::Storage];
+const ALL_KINDS: [HotspotKind; 3] = [
+    HotspotKind::FactionCenter,
+    HotspotKind::Storage,
+    HotspotKind::RallyPoint,
+];
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct HotspotKey {

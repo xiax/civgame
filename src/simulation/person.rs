@@ -206,6 +206,12 @@ impl PlayerOrderKind {
 #[derive(Component)]
 pub struct Person;
 
+/// Persistent player-issued military mode. While present, the agent skips
+/// autonomous goal selection (gathering, hauling, socializing, etc.) and
+/// only acts on player orders. Toggled by the HUD Draft button.
+#[derive(Component, Default)]
+pub struct Drafted;
+
 pub const INITIAL_POPULATION: u32 = 200;
 const GROUP_SIZE: u32 = 20;
 const SPAWN_RADIUS: i32 = 12;
