@@ -1413,7 +1413,7 @@ type OptionalQuery<'a> = (
 );
 
 pub fn plan_execution_system(
-    mut commands: Commands,
+    par_commands: ParallelCommands,
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
     spatial: Res<SpatialIndex>,
@@ -1441,7 +1441,8 @@ pub fn plan_execution_system(
         partner_query,
         mut drop_food_events,
     } = registries;
-    for (
+    let dropped_food: std::sync::Mutex<Vec<Entity>> = std::sync::Mutex::new(Vec::new());
+    query.par_iter_mut().for_each(|(
         (
             entity,
             mut ai,
@@ -1458,10 +1459,9 @@ pub fn plan_execution_system(
             my_sex,
         ),
         (memory_opt, mut net_opt, known_plans_opt, scoring_opt, mut active_plan_opt, rel_opt, rescue_target_opt),
-    ) in query.iter_mut()
-    {
+    )| {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
-            continue;
+            return;
         }
 
         // Only handle plan-driven goals
@@ -1477,7 +1477,7 @@ pub fn plan_execution_system(
                 | AgentGoal::Rescue
                 | AgentGoal::ReturnCamp
         ) {
-            continue;
+            return;
         }
 
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
@@ -1487,15 +1487,15 @@ pub fn plan_execution_system(
         if active_plan_opt.is_none() {
             // ── Select and start a new plan ───────────────────────────────────
             if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
-                continue;
+                return;
             }
 
             let Some(known_plans) = known_plans_opt else {
-                continue;
+                return;
             };
-            let Some(scoring) = scoring_opt else { continue };
+            let Some(scoring) = scoring_opt else { return };
             if plan_registry.0.is_empty() {
-                continue;
+                return;
             }
 
             let candidates: Vec<&PlanDef> = plan_registry
@@ -1543,7 +1543,7 @@ pub fn plan_execution_system(
                     &chunk_map,
                     &chunk_connectivity,
                 );
-                continue;
+                return;
             }
 
             let plan_def = match scoring {
@@ -1604,7 +1604,7 @@ pub fn plan_execution_system(
                 PlanScoringMethod::Random => candidates[fastrand::usize(..candidates.len())],
             };
 
-            commands.entity(entity).insert(ActivePlan {
+            let new_plan = ActivePlan {
                 plan_id: plan_def.id,
                 current_step: 0,
                 started_tick: clock.tick,
@@ -1612,8 +1612,11 @@ pub fn plan_execution_system(
                 reward_acc: 0.0,
                 reward_scale: 0.0,
                 dispatched: false,
+            };
+            par_commands.command_scope(|mut commands| {
+                commands.entity(entity).insert(new_plan);
             });
-            continue;
+            return;
         }
 
         let active_plan = active_plan_opt.as_deref_mut().unwrap();
@@ -1626,14 +1629,16 @@ pub fn plan_execution_system(
             .map(|p| p.serves_goals.contains(&goal))
             .unwrap_or(false);
         if !plan_still_valid {
-            commands.entity(entity).remove::<ActivePlan>();
+            par_commands.command_scope(|mut commands| {
+                commands.entity(entity).remove::<ActivePlan>();
+            });
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_tile = (cur_tx as i16, cur_ty as i16);
             ai.dest_tile = ai.target_tile;
             ai.target_entity = None;
             combat_target.0 = None;
-            continue;
+            return;
         }
 
         // ── Timeout check ─────────────────────────────────────────────────────
@@ -1645,25 +1650,29 @@ pub fn plan_execution_system(
             // for 5000 ticks. Drop the surplus on the ground so it isn't
             // permanently bottled in inventory and can be picked up by allies.
             if active_plan.plan_id == RETURN_SURPLUS_FOOD_PLAN_ID {
-                drop_food_events.send(DropAbandonedFoodEvent(entity));
+                dropped_food.lock().unwrap().push(entity);
             }
-            commands.entity(entity).remove::<ActivePlan>();
+            par_commands.command_scope(|mut commands| {
+                commands.entity(entity).remove::<ActivePlan>();
+            });
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_tile = (cur_tx as i16, cur_ty as i16);
             ai.dest_tile = ai.target_tile;
             ai.target_entity = None;
             combat_target.0 = None;
-            continue;
+            return;
         }
 
         // ── Fetch plan and current step ───────────────────────────────────────
         let plan_def = match plan_registry.0.iter().find(|p| p.id == active_plan.plan_id) {
             Some(p) => p,
             None => {
-                commands.entity(entity).remove::<ActivePlan>();
+                par_commands.command_scope(|mut commands| {
+                    commands.entity(entity).remove::<ActivePlan>();
+                });
                 combat_target.0 = None;
-                continue;
+                return;
             }
         };
 
@@ -1674,9 +1683,11 @@ pub fn plan_execution_system(
                 let decayed_reward = active_plan.reward_acc * (1.0 - time_penalty);
                 net.learn(decayed_reward);
             }
-            commands.entity(entity).remove::<ActivePlan>();
+            par_commands.command_scope(|mut commands| {
+                commands.entity(entity).remove::<ActivePlan>();
+            });
             combat_target.0 = None;
-            continue;
+            return;
         }
 
         // ── Step completion: advance step when agent returned Idle+UNEMPLOYED ──
@@ -1695,9 +1706,11 @@ pub fn plan_execution_system(
                     let decayed_reward = active_plan.reward_acc * (1.0 - time_penalty);
                     net.learn(decayed_reward);
                 }
-                commands.entity(entity).remove::<ActivePlan>();
+                par_commands.command_scope(|mut commands| {
+                    commands.entity(entity).remove::<ActivePlan>();
+                });
                 combat_target.0 = None;
-                continue;
+                return;
             }
             // Plan has more steps — fall through to dispatch the next one immediately.
         }
@@ -1707,23 +1720,27 @@ pub fn plan_execution_system(
         let step_def = match step_registry.0.iter().find(|s| s.id == step_id) {
             Some(s) => s,
             None => {
-                commands.entity(entity).remove::<ActivePlan>();
+                par_commands.command_scope(|mut commands| {
+                    commands.entity(entity).remove::<ActivePlan>();
+                });
                 combat_target.0 = None;
-                continue;
+                return;
             }
         };
 
         // ── Dispatch current step if not yet dispatched ───────────────────────
         if !active_plan.dispatched {
             if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
-                continue;
+                return;
             }
 
             // Check preconditions
             if !step_def.preconditions.is_satisfied(&agent, needs.hunger) {
-                commands.entity(entity).remove::<ActivePlan>();
+                par_commands.command_scope(|mut commands| {
+                    commands.entity(entity).remove::<ActivePlan>();
+                });
                 combat_target.0 = None;
-                continue;
+                return;
             }
 
             if let Some((ent, target_tx, target_ty)) = resolve_target(
@@ -1794,7 +1811,9 @@ pub fn plan_execution_system(
                     &chunk_map,
                     &chunk_connectivity,
                 );
-                commands.entity(entity).remove::<ActivePlan>();
+                par_commands.command_scope(|mut commands| {
+                    commands.entity(entity).remove::<ActivePlan>();
+                });
                 combat_target.0 = None;
             }
         } else {
@@ -1893,6 +1912,9 @@ pub fn plan_execution_system(
                 }
             }
         }
+    });
+    for entity in dropped_food.into_inner().unwrap() {
+        drop_food_events.send(DropAbandonedFoodEvent(entity));
     }
 }
 

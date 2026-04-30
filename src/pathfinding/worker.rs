@@ -11,7 +11,7 @@ use crate::pathfinding::path_request::{
     FailReason, FailSubReason, FailureLog, FailureRecord, FollowStatus, PathDebugFlags, PathFailed,
     PathFollow, PathKind, PathReady, PathReadyKind, PathRequest, PathRequestQueue,
 };
-use crate::pathfinding::pool::AStarPool;
+use crate::pathfinding::pool::{AStarPool, AStarScratch};
 use crate::pathfinding::step::passable_diagonal_step;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 
@@ -138,10 +138,41 @@ fn first_invalid_step(
     None
 }
 
+/// Per-request outcome produced by the parallel A* worker tasks. Held in
+/// a flat `Vec` between the parallel compute phase and the serial apply
+/// phase so the apply phase can borrow `Query<&mut PathFollow>`, the
+/// event writers, and the diagnostics resource without contention.
+struct ComputeOutcome {
+    req: PathRequest,
+    body: OutcomeBody,
+    astar_calls: u32,
+    astar_iters: u32,
+    astar_iters_max_single: u32,
+}
+
+enum OutcomeBody {
+    Success {
+        chunk_route: Vec<ChunkCoord>,
+        segment_path: Vec<(i16, i16, i8)>,
+        ready_kind: PathReadyKind,
+        flow_field_hit: bool,
+    },
+    Failure {
+        sub: FailSubReason,
+        segment_target: (i32, i32, i8),
+        connectivity_reject: bool,
+        hotspot_fastpath_miss: bool,
+    },
+}
+
 /// Drains up to `PATH_BUDGET_PER_TICK` requests from the queue and writes
 /// `PathFollow` for the requesting agents. Runs in `PreUpdate` — that way
 /// any system that consumes `PathFollow` later in the same tick (movement
 /// after step (f)) sees the freshly-computed result.
+///
+/// A* searches run in parallel on the Bevy compute task pool. Component
+/// writes, event emission, and diagnostic counters are folded back in
+/// serially on the main schedule thread once the parallel scope returns.
 pub fn drain_path_requests_system(
     mut queue: ResMut<PathRequestQueue>,
     chunk_map: Res<ChunkMap>,
@@ -167,94 +198,132 @@ pub fn drain_path_requests_system(
     let conn_generation = conn.generation;
     let now_tick = tick.elapsed().as_millis() as u64;
 
-    let mut processed: usize = 0;
-    while processed < PATH_BUDGET_PER_TICK {
+    // Drain a batch from the queue.
+    let mut requests: Vec<PathRequest> = Vec::with_capacity(PATH_BUDGET_PER_TICK);
+    while requests.len() < PATH_BUDGET_PER_TICK {
         let Some(req) = queue.pop() else { break };
-        processed += 1;
+        requests.push(req);
+    }
 
-        process_request(
-            &req,
+    if requests.is_empty() {
+        diag.queue_len = queue.len() as u32;
+        return;
+    }
+
+    // Allocate one scratch per task so the parallel A* runs are
+    // contention-free. The pool keeps capacity across ticks.
+    pool.ensure(requests.len());
+    let scratches = pool.slice_mut(requests.len());
+
+    let chunk_map_ref: &ChunkMap = &chunk_map;
+    let graph_ref: &ChunkGraph = &graph;
+    let router_ref: &ChunkRouter = &router;
+    let conn_ref: &ChunkConnectivity = &conn;
+    let hotspots_ref: &HotspotFlowFields = &hotspots;
+    let flags_ref: &PathDebugFlags = &flags;
+
+    let outcomes: Vec<ComputeOutcome> = bevy::tasks::ComputeTaskPool::get().scope(|s| {
+        for (req, scratch) in requests.iter().zip(scratches.iter_mut()) {
+            let req_clone = req.clone();
+            s.spawn(async move {
+                compute_outcome(
+                    req_clone,
+                    chunk_map_ref,
+                    graph_ref,
+                    router_ref,
+                    conn_ref,
+                    hotspots_ref,
+                    flags_ref,
+                    scratch,
+                )
+            });
+        }
+    });
+
+    let dispatched = outcomes.len() as u32;
+    for outcome in outcomes {
+        apply_outcome(
+            outcome,
             &chunk_map,
-            &graph,
-            &router,
-            &conn,
-            &hotspots,
-            &flags,
-            conn_generation,
             now_tick,
-            &mut pool,
-            &mut diag,
-            &mut failure_log,
+            conn_generation,
             &mut follows,
             &mut ready_w,
             &mut failed_w,
+            &mut diag,
+            &mut failure_log,
         );
     }
 
-    diag.paths_dispatched_per_tick = processed as u32;
+    diag.paths_dispatched_per_tick = dispatched;
     diag.queue_len = queue.len() as u32;
     diag.worker_us_per_tick = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_request(
-    req: &PathRequest,
+fn compute_outcome(
+    req: PathRequest,
     chunk_map: &ChunkMap,
     graph: &ChunkGraph,
     router: &ChunkRouter,
     conn: &ChunkConnectivity,
     hotspots: &HotspotFlowFields,
     flags: &PathDebugFlags,
-    conn_generation: u32,
-    now_tick: u64,
-    pool: &mut AStarPool,
-    diag: &mut PathfindingDiagnostics,
-    failure_log: &mut FailureLog,
-    follows: &mut Query<&mut PathFollow>,
-    ready_w: &mut EventWriter<PathReady>,
-    failed_w: &mut EventWriter<PathFailed>,
-) {
+    scratch: &mut AStarScratch,
+) -> ComputeOutcome {
     let start_chunk = chunk_of(req.start);
     let goal_chunk = chunk_of(req.goal);
 
     if !conn.is_reachable((start_chunk, req.start.2), (goal_chunk, req.goal.2)) {
-        diag.connectivity_rejections_per_tick += 1;
-        diag.path_failed_unreachable += 1;
-        diag.path_failed_unreachable_connectivity += 1;
         if flags.verbose_logs {
             info!(
                 "[path] connectivity reject agent={:?} start={:?} goal={:?}",
                 req.agent, req.start, req.goal
             );
         }
-        write_failure(req, FailSubReason::UnreachableConnectivity, now_tick, follows, failed_w, failure_log, diag);
-        return;
+        let goal = req.goal;
+        return ComputeOutcome {
+            body: OutcomeBody::Failure {
+                sub: FailSubReason::UnreachableConnectivity,
+                segment_target: goal,
+                connectivity_reject: true,
+                hotspot_fastpath_miss: false,
+            },
+            req,
+            astar_calls: 0,
+            astar_iters: 0,
+            astar_iters_max_single: 0,
+        };
     }
 
     let chunk_route = match build_chunk_route(graph, router, start_chunk, goal_chunk, req.start.2) {
         Ok(r) => r,
         Err(_reason) => {
-            // build_chunk_route only ever returns NoRoute today, so the
-            // sub-classification is always NoRouteRouter regardless of which
-            // arm produced it.
-            diag.path_failed_no_route += 1;
             if flags.verbose_logs {
                 info!(
                     "[path] chunk-route fail agent={:?} start_chunk={:?} goal_chunk={:?}",
                     req.agent, start_chunk, goal_chunk
                 );
             }
-            write_failure(req, FailSubReason::NoRouteRouter, now_tick, follows, failed_w, failure_log, diag);
-            return;
+            let goal = req.goal;
+            return ComputeOutcome {
+                body: OutcomeBody::Failure {
+                    sub: FailSubReason::NoRouteRouter,
+                    segment_target: goal,
+                    connectivity_reject: false,
+                    hotspot_fastpath_miss: false,
+                },
+                req,
+                astar_calls: 0,
+                astar_iters: 0,
+                astar_iters_max_single: 0,
+            };
         }
     };
 
-    // Fast path: if the goal is in the start chunk and is a registered
-    // hotspot whose flow field reached the agent's cell at the agent's
-    // current Z, walk the precomputed field instead of running A*. The
-    // per-cell Z check accepts paths that climb/descend a ramp inside the
-    // chunk — the field's `goal_z` no longer needs to match `start.z`.
-    // Falls through on miss / Z mismatch / unreachable cell.
+    // Fast path: hotspot flow-field walk if the goal is in the start
+    // chunk and the agent's cell reached the goal at the agent's Z.
+    let mut hotspot_miss = false;
     if chunk_route.len() == 1 {
         let goal_tile = (req.goal.0 as i16, req.goal.1 as i16, req.goal.2);
         if let Some(field) = hotspots.lookup_field(goal_tile) {
@@ -265,8 +334,6 @@ fn process_request(
             if field.cell_z[cell_idx] == req.start.2 {
                 if let Some(path) = walk_to_goal(field, (lx, ly)) {
                     if let Some(bad) = first_invalid_step(chunk_map, req.start, &path) {
-                        diag.path_failed_step_continuity += 1;
-                        diag.path_failed_no_route += 1;
                         if flags.verbose_logs {
                             let prev = if bad == 0 {
                                 req.start
@@ -280,24 +347,34 @@ fn process_request(
                                 req.agent, prev, cur
                             );
                         }
-                        write_failure(req, FailSubReason::NoRouteStepContinuity, now_tick, follows, failed_w, failure_log, diag);
-                        return;
+                        let goal = req.goal;
+                        return ComputeOutcome {
+                            body: OutcomeBody::Failure {
+                                sub: FailSubReason::NoRouteStepContinuity,
+                                segment_target: goal,
+                                connectivity_reject: false,
+                                hotspot_fastpath_miss: false,
+                            },
+                            req,
+                            astar_calls: 0,
+                            astar_iters: 0,
+                            astar_iters_max_single: 0,
+                        };
                     }
-                    diag.flow_field_hits_per_tick += 1;
-                    diag.flow_field_hits_total += 1;
-                    write_success(
+                    return ComputeOutcome {
+                        body: OutcomeBody::Success {
+                            chunk_route,
+                            segment_path: path,
+                            ready_kind: PathReadyKind::Strict,
+                            flow_field_hit: true,
+                        },
                         req,
-                        chunk_route,
-                        path,
-                        PathReadyKind::Strict,
-                        conn_generation,
-                        follows,
-                        ready_w,
-                        diag,
-                    );
-                    return;
+                        astar_calls: 0,
+                        astar_iters: 0,
+                        astar_iters_max_single: 0,
+                    };
                 } else {
-                    diag.hotspot_fastpath_misses += 1;
+                    hotspot_miss = true;
                     if flags.verbose_logs {
                         info!(
                             "[path] hotspot fastpath miss agent={:?} goal={:?} local=({},{})",
@@ -309,10 +386,12 @@ fn process_request(
         }
     }
 
-    let segment_target = first_segment_target(graph, router, &chunk_route, req);
+    let segment_target = first_segment_target(graph, router, &chunk_route, &req);
+    let mut astar_calls: u32 = 0;
+    let mut astar_iters_total: u32 = 0;
+    let mut astar_iters_max: u32 = 0;
 
-    let scratch = pool.scratch(1);
-    diag.astar_calls_per_tick += 1;
+    astar_calls += 1;
     let (mut result, mut iters) = find_path_in(
         scratch,
         chunk_map,
@@ -320,14 +399,13 @@ fn process_request(
         segment_target,
         req.max_budget as usize,
     );
-    diag.astar_iters_last_tick = diag.astar_iters_last_tick.saturating_add(iters);
-    if iters > diag.astar_iters_max_single {
-        diag.astar_iters_max_single = iters;
+    astar_iters_total = astar_iters_total.saturating_add(iters);
+    if iters > astar_iters_max {
+        astar_iters_max = iters;
     }
 
     if matches!(result, AStarResult::BudgetExhausted { .. }) {
-        let scratch = pool.scratch(1);
-        diag.astar_calls_per_tick += 1;
+        astar_calls += 1;
         let retry = find_path_in(
             scratch,
             chunk_map,
@@ -337,9 +415,9 @@ fn process_request(
         );
         result = retry.0;
         iters = retry.1;
-        diag.astar_iters_last_tick = diag.astar_iters_last_tick.saturating_add(iters);
-        if iters > diag.astar_iters_max_single {
-            diag.astar_iters_max_single = iters;
+        astar_iters_total = astar_iters_total.saturating_add(iters);
+        if iters > astar_iters_max {
+            astar_iters_max = iters;
         }
     }
 
@@ -353,39 +431,54 @@ fn process_request(
         }
         AStarResult::BudgetExhausted { best_so_far } => {
             if matches!(req.kind, PathKind::Strict) {
-                diag.path_failed_budget += 1;
                 if flags.verbose_logs {
                     info!(
                         "[path] A* budget exhausted (strict) agent={:?} start={:?} target={:?}",
                         req.agent, req.start, segment_target
                     );
                 }
-                write_failure(req, FailSubReason::BudgetExhausted, now_tick, follows, failed_w, failure_log, diag);
-                return;
+                return ComputeOutcome {
+                    body: OutcomeBody::Failure {
+                        sub: FailSubReason::BudgetExhausted,
+                        segment_target,
+                        connectivity_reject: false,
+                        hotspot_fastpath_miss: hotspot_miss,
+                    },
+                    req,
+                    astar_calls,
+                    astar_iters: astar_iters_total,
+                    astar_iters_max_single: astar_iters_max,
+                };
             }
-            // BestEffort: walk one tile toward `best_so_far`. We don't have
-            // the full reverse-walk here (scratch is private to the call)
-            // so the partial is just the single tile — caller re-requests
-            // on arrival, exactly per the failure-recovery spec.
-            (vec![(best_so_far.0 as i16, best_so_far.1 as i16, best_so_far.2)], PathReadyKind::BestEffort)
+            // BestEffort: walk one tile toward best_so_far.
+            (
+                vec![(best_so_far.0 as i16, best_so_far.1 as i16, best_so_far.2)],
+                PathReadyKind::BestEffort,
+            )
         }
         AStarResult::Unreachable => {
-            diag.path_failed_unreachable += 1;
-            diag.path_failed_unreachable_astar += 1;
             if flags.verbose_logs {
                 info!(
                     "[path] A* unreachable agent={:?} start={:?} target={:?}",
                     req.agent, req.start, segment_target
                 );
             }
-            write_failure(req, FailSubReason::UnreachableAstar, now_tick, follows, failed_w, failure_log, diag);
-            return;
+            return ComputeOutcome {
+                body: OutcomeBody::Failure {
+                    sub: FailSubReason::UnreachableAstar,
+                    segment_target,
+                    connectivity_reject: false,
+                    hotspot_fastpath_miss: hotspot_miss,
+                },
+                req,
+                astar_calls,
+                astar_iters: astar_iters_total,
+                astar_iters_max_single: astar_iters_max,
+            };
         }
     };
 
     if let Some(bad) = first_invalid_step(chunk_map, req.start, &segment_path) {
-        diag.path_failed_step_continuity += 1;
-        diag.path_failed_no_route += 1;
         if flags.verbose_logs {
             let prev = if bad == 0 {
                 req.start
@@ -399,20 +492,120 @@ fn process_request(
                 req.agent, prev, cur
             );
         }
-        write_failure(req, FailSubReason::NoRouteStepContinuity, now_tick, follows, failed_w, failure_log, diag);
-        return;
+        return ComputeOutcome {
+            body: OutcomeBody::Failure {
+                sub: FailSubReason::NoRouteStepContinuity,
+                segment_target,
+                connectivity_reject: false,
+                hotspot_fastpath_miss: hotspot_miss,
+            },
+            req,
+            astar_calls,
+            astar_iters: astar_iters_total,
+            astar_iters_max_single: astar_iters_max,
+        };
     }
 
-    write_success(
+    ComputeOutcome {
+        body: OutcomeBody::Success {
+            chunk_route,
+            segment_path,
+            ready_kind,
+            flow_field_hit: false,
+        },
         req,
-        chunk_route,
-        segment_path,
-        ready_kind,
-        conn_generation,
-        follows,
-        ready_w,
-        diag,
-    );
+        astar_calls,
+        astar_iters: astar_iters_total,
+        astar_iters_max_single: astar_iters_max,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_outcome(
+    outcome: ComputeOutcome,
+    chunk_map: &ChunkMap,
+    now_tick: u64,
+    conn_generation: u32,
+    follows: &mut Query<&mut PathFollow>,
+    ready_w: &mut EventWriter<PathReady>,
+    failed_w: &mut EventWriter<PathFailed>,
+    diag: &mut PathfindingDiagnostics,
+    failure_log: &mut FailureLog,
+) {
+    diag.astar_calls_per_tick = diag.astar_calls_per_tick.saturating_add(outcome.astar_calls);
+    diag.astar_iters_last_tick = diag.astar_iters_last_tick.saturating_add(outcome.astar_iters);
+    if outcome.astar_iters_max_single > diag.astar_iters_max_single {
+        diag.astar_iters_max_single = outcome.astar_iters_max_single;
+    }
+
+    let req = outcome.req;
+    match outcome.body {
+        OutcomeBody::Success {
+            chunk_route,
+            segment_path,
+            ready_kind,
+            flow_field_hit,
+        } => {
+            if flow_field_hit {
+                diag.flow_field_hits_per_tick += 1;
+                diag.flow_field_hits_total += 1;
+            }
+            write_success(
+                &req,
+                chunk_route,
+                segment_path,
+                ready_kind,
+                conn_generation,
+                follows,
+                ready_w,
+                diag,
+            );
+        }
+        OutcomeBody::Failure {
+            sub,
+            segment_target,
+            connectivity_reject,
+            hotspot_fastpath_miss,
+        } => {
+            if connectivity_reject {
+                diag.connectivity_rejections_per_tick += 1;
+            }
+            if hotspot_fastpath_miss {
+                diag.hotspot_fastpath_misses += 1;
+            }
+            match sub {
+                FailSubReason::UnreachableConnectivity => {
+                    diag.path_failed_unreachable += 1;
+                    diag.path_failed_unreachable_connectivity += 1;
+                }
+                FailSubReason::UnreachableAstar => {
+                    diag.path_failed_unreachable += 1;
+                    diag.path_failed_unreachable_astar += 1;
+                }
+                FailSubReason::BudgetExhausted => {
+                    diag.path_failed_budget += 1;
+                }
+                FailSubReason::NoRouteRouter => {
+                    diag.path_failed_no_route += 1;
+                }
+                FailSubReason::NoRouteStepContinuity => {
+                    diag.path_failed_step_continuity += 1;
+                    diag.path_failed_no_route += 1;
+                }
+            }
+            write_failure(
+                &req,
+                sub,
+                segment_target,
+                now_tick,
+                chunk_map,
+                follows,
+                failed_w,
+                failure_log,
+                diag,
+            );
+        }
+    }
 }
 
 fn build_chunk_route(
@@ -496,7 +689,9 @@ fn first_segment_target(
 fn write_failure(
     req: &PathRequest,
     sub: FailSubReason,
+    segment_target: (i32, i32, i8),
     now_tick: u64,
+    chunk_map: &ChunkMap,
     follows: &mut Query<&mut PathFollow>,
     failed_w: &mut EventWriter<PathFailed>,
     failure_log: &mut FailureLog,
@@ -522,6 +717,8 @@ fn write_failure(
                 FailSubReason::UnreachableAstar => {
                     follow.fail_count_unreachable_astar =
                         follow.fail_count_unreachable_astar.saturating_add(1);
+                    follow.last_astar_dump =
+                        Some(build_astar_diagnostic(chunk_map, req.start, segment_target, req.goal));
                 }
                 FailSubReason::BudgetExhausted => {
                     follow.fail_count_budget = follow.fail_count_budget.saturating_add(1);
@@ -590,6 +787,10 @@ fn write_success(
             follow.planning_generation = conn_generation;
             follow.request_id = req.id;
             follow.last_fail_streak = 0;
+            // Intentionally do NOT clear `last_astar_dump`: a successful
+            // path between failures would wipe the dump before the user
+            // can read it. The dump is overwritten on the next
+            // UnreachableAstar or manually via "Force replan".
         }
         Err(_) => {
             diag.missing_follow_on_event += 1;
@@ -608,6 +809,104 @@ fn write_success(
         request_id: req.id,
         kind: ready_kind,
     });
+}
+
+/// Build a compact terrain dump for an A* `Unreachable` failure. Lists
+/// `surface_z` and step3d/diagonal results for each of the 8 neighbors of
+/// `start`, plus per-tile passability of the segment target. Surfaces in
+/// the inspector so the user can paste it back without re-running with
+/// debug logs enabled.
+fn build_astar_diagnostic(
+    chunk_map: &ChunkMap,
+    start: (i32, i32, i8),
+    segment_target: (i32, i32, i8),
+    goal: (i32, i32, i8),
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(900);
+    let (sx, sy, sz) = start;
+    let (tx, ty, tz) = segment_target;
+    let start3 = (sx, sy, sz as i32);
+    let _ = writeln!(out, "A* Unreachable");
+    let _ = writeln!(
+        out,
+        "start ({},{},{})  segtgt ({},{},{})  goal ({},{},{})",
+        sx, sy, sz, tx, ty, tz, goal.0, goal.1, goal.2
+    );
+    let _ = writeln!(
+        out,
+        "start surface_z={}  passable_at({})={}",
+        chunk_map.surface_z_at(sx, sy),
+        sz,
+        bchar(chunk_map.passable_at(sx, sy, sz as i32)),
+    );
+    let _ = writeln!(
+        out,
+        "segtgt surface_z={}  passable_at({})={}  nearest_standable_z={}",
+        chunk_map.surface_z_at(tx, ty),
+        tz,
+        bchar(chunk_map.passable_at(tx, ty, tz as i32)),
+        chunk_map.nearest_standable_z(tx, ty, tz as i32),
+    );
+    let _ = writeln!(out, "neighbors of start (dx,dy):");
+    let dirs: [((i32, i32), &str); 8] = [
+        ((-1, 1), "NW"),
+        ((0, 1), "N "),
+        ((1, 1), "NE"),
+        ((-1, 0), "W "),
+        ((1, 0), "E "),
+        ((-1, -1), "SW"),
+        ((0, -1), "S "),
+        ((1, -1), "SE"),
+    ];
+    for ((dx, dy), label) in dirs {
+        let nx = sx + dx;
+        let ny = sy + dy;
+        let nsurf = chunk_map.surface_z_at(nx, ny);
+        let tile_kind = chunk_map.tile_at(nx, ny, sz as i32).kind;
+        let head_kind = chunk_map.tile_at(nx, ny, sz as i32 + 1).kind;
+        let p_at = chunk_map.passable_at(nx, ny, sz as i32);
+        let s_dn = chunk_map.passable_step_3d(start3, (nx, ny, sz as i32 - 1));
+        let s_eq = chunk_map.passable_step_3d(start3, (nx, ny, sz as i32));
+        let s_up = chunk_map.passable_step_3d(start3, (nx, ny, sz as i32 + 1));
+        let is_diag = dx != 0 && dy != 0;
+        let diag_str = if is_diag {
+            let ok = passable_diagonal_step(chunk_map, start3, (nx, ny, sz as i32));
+            format!("  diag={}", bchar(ok))
+        } else {
+            String::new()
+        };
+        let goal_marker = if (nx, ny) == (tx, ty) { "  ← SEGTGT" } else { "" };
+        let _ = writeln!(
+            out,
+            "  {} ({},{}) sz={:>3} kind={:?}/{:?} p@{}={} step3d@{}={} @{}={} @{}={}{}{}",
+            label,
+            nx,
+            ny,
+            nsurf,
+            tile_kind,
+            head_kind,
+            sz,
+            bchar(p_at),
+            sz as i32 - 1,
+            bchar(s_dn),
+            sz,
+            bchar(s_eq),
+            sz as i32 + 1,
+            bchar(s_up),
+            diag_str,
+            goal_marker,
+        );
+    }
+    out
+}
+
+fn bchar(b: bool) -> char {
+    if b {
+        'T'
+    } else {
+        'F'
+    }
 }
 
 #[cfg(test)]

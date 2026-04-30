@@ -98,9 +98,14 @@ pub fn inspector_panel_system(
 
     egui::Window::new("Inspector")
         .default_pos([10.0, 10.0])
-        .default_width(240.0)
+        .default_width(560.0)
+        .default_height(720.0)
+        .min_width(400.0)
+        .resizable(true)
         .show(contexts.ctx_mut(), |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::CollapsingHeader::new(egui::RichText::new("Identity").strong())
+                .default_open(true)
+                .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!("Mood: {} ({})", mood.label(), mood.0));
                     ui.separator();
@@ -176,8 +181,10 @@ pub fn inspector_panel_system(
                             .size(11.0),
                     );
                 }
-
-                ui.separator();
+                });
+                egui::CollapsingHeader::new(egui::RichText::new("Health").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
                 if let Some(h) = health {
                     ui.horizontal(|ui| {
                         ui.label(format!("{:8}", "Health"));
@@ -231,8 +238,10 @@ pub fn inspector_panel_system(
                     });
                 }
 
-                ui.separator();
-                ui.label("Needs:");
+                });
+                egui::CollapsingHeader::new(egui::RichText::new("Needs").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
                 needs_bar(ui, "Hunger", needs.hunger);
                 needs_bar(ui, "Sleep", needs.sleep);
                 needs_bar(ui, "Shelter", needs.shelter);
@@ -240,14 +249,19 @@ pub fn inspector_panel_system(
                 needs_bar(ui, "Social", needs.social);
                 needs_bar(ui, "Repro", needs.reproduction);
 
-                ui.separator();
-                ui.label("Skills:");
+                });
+                egui::CollapsingHeader::new(egui::RichText::new("Skills").strong())
+                    .default_open(false)
+                    .show(ui, |ui| {
                 for i in 0..SKILL_COUNT {
                     let kind = unsafe { std::mem::transmute::<u8, SkillKind>(i as u8) };
                     ui.label(format!("  {}: {}", kind.name(), skills.0[i]));
                 }
 
-                ui.separator();
+                });
+                egui::CollapsingHeader::new(egui::RichText::new("Currency & Inventory").strong())
+                    .default_open(false)
+                    .show(ui, |ui| {
                 ui.label(format!("Currency: {:.1}", agent.currency));
 
                 let cur_g = agent.current_weight_g();
@@ -342,7 +356,10 @@ pub fn inspector_panel_system(
                     }
                 }
 
-                ui.separator();
+                });
+                egui::CollapsingHeader::new(egui::RichText::new("Task & State").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
 
                 let task_name = match ai.task_id {
                     j if j == TaskKind::Idle as u16 => "Idle",
@@ -437,7 +454,10 @@ pub fn inspector_panel_system(
                     }
                 }
 
-                ui.separator();
+                });
+                egui::CollapsingHeader::new(egui::RichText::new("Active Plan").strong())
+                    .default_open(false)
+                    .show(ui, |ui| {
                 let active_pair = active_plan.and_then(|ap| {
                     plan_registry
                         .0
@@ -478,7 +498,7 @@ pub fn inspector_panel_system(
                     }
                 }
 
-                ui.separator();
+                });
                 egui::CollapsingHeader::new(
                     egui::RichText::new("Pathing")
                         .strong()
@@ -488,7 +508,7 @@ pub fn inspector_panel_system(
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("path")
-                        .max_height(180.0)
+                        .max_height(ui.available_height().max(180.0))
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                     let cur_tx =
@@ -599,6 +619,26 @@ pub fn inspector_panel_system(
                             .size(11.0)
                             .color(fail_color),
                         );
+
+                        if let Some(dump) = pf.last_astar_dump.as_deref() {
+                            egui::CollapsingHeader::new("Last A* Unreachable dump")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::both()
+                                        .max_height(440.0)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(dump)
+                                                        .monospace()
+                                                        .size(12.0),
+                                                )
+                                                .wrap_mode(egui::TextWrapMode::Extend),
+                                            );
+                                        });
+                                });
+                        }
 
                         let agent_failures: Vec<_> =
                             path_params.failure_log.for_agent(entity).take(8).collect();
@@ -800,7 +840,6 @@ pub fn inspector_panel_system(
                             });
                     });
                 }
-            });
         });
 }
 

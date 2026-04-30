@@ -53,3 +53,15 @@
  separately if it becomes the dominant symptom after the Z fix.
  - Idle wander timer (movement.rs:327-420) doesn't promote back to Seeking.
  Pre-existing; out of scope.
+
+Status: Following
+Goal: (16792, 8331, -9)
+At:   (16791, 8330)
+Chunk route: 0/1
+Segment: 0/1
+stuck_ticks: 9  •  last_replan: 0
+request_id: 38222  •  planning_gen: 4  •  pending: false
+Recent tiles: (16791,8330,-9)
+Failures: conn 28  astar 48  budget 0  router 2  cont 14
+tick 2942540  goal (16791,8331,-9)  Unreachable (A*)
+tick 2941493  goal (16790,8331,-9)  Unreachable (A*)

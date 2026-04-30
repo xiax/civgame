@@ -190,6 +190,10 @@ pub struct PathFollow {
     /// `cooldown_for_streak` so persistent failures back off exponentially
     /// rather than re-issuing every 3 s forever.
     pub last_fail_streak: u8,
+    /// Multi-line ASCII dump of terrain around start/goal at the moment of
+    /// the most recent `UnreachableAstar` failure. Populated by `worker.rs`
+    /// and rendered by the inspector. Cleared on successful path build.
+    pub last_astar_dump: Option<String>,
 }
 
 impl Default for PathFollow {
@@ -216,6 +220,7 @@ impl Default for PathFollow {
             fail_count_no_route_continuity: 0,
             last_fail_goal: (i32::MIN, i32::MIN, 0),
             last_fail_streak: 0,
+            last_astar_dump: None,
         }
     }
 }

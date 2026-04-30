@@ -45,4 +45,27 @@ impl AStarPool {
         s.reset();
         s
     }
+
+    /// Grow the pool until at least `n` scratches are available. Used by
+    /// the parallel pathfinding worker before splitting the pool into
+    /// per-task scratch slots.
+    pub fn ensure(&mut self, n: usize) {
+        while self.scratches.len() < n {
+            self.scratches.push(AStarScratch::default());
+        }
+        if n > self.high_water {
+            self.high_water = n;
+        }
+    }
+
+    /// Borrow the first `n` scratches as a mutable slice for parallel use.
+    /// Each scratch is reset before return so callers can hand each one
+    /// directly to a spawned A* task. Caller must invoke `ensure(n)` first.
+    pub fn slice_mut(&mut self, n: usize) -> &mut [AStarScratch] {
+        let slice = &mut self.scratches[..n];
+        for s in slice.iter_mut() {
+            s.reset();
+        }
+        slice
+    }
 }
