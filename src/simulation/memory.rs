@@ -165,7 +165,7 @@ impl AgentMemory {
         best_res
     }
 
-    pub fn best_entity_for_dist_weighted_filtered<F: Fn(Entity) -> bool>(
+    pub fn best_entity_for_dist_weighted_filtered<F: Fn(Entity, (i16, i16)) -> bool>(
         &self,
         kind: MemoryKind,
         from_pos: (i32, i32),
@@ -177,7 +177,7 @@ impl AgentMemory {
             if let Some(e) = slot {
                 if e.kind == kind {
                     if let Some(ent) = e.entity {
-                        if !accept(ent) {
+                        if !accept(ent, e.tile) {
                             continue;
                         }
                         let dx = (e.tile.0 as i32 - from_pos.0).abs();

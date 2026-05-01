@@ -4,10 +4,11 @@ use bevy::prelude::*;
 
 use crate::economy::goods::Good;
 use crate::simulation::construction::{Blueprint, BlueprintMap};
-use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
+use crate::simulation::faction::{FactionData, FactionMember, FactionRegistry, SOLO};
 use crate::simulation::goals::{AgentGoal, Personality};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{PersonAI, Profession};
+use crate::simulation::projects::{compute_priority, ProjectPhase, Projects, PRIORITY_PLAYER};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::technology::CROP_CULTIVATION;
@@ -43,6 +44,22 @@ impl JobKind {
             JobKind::Craft => AgentGoal::Craft,
             JobKind::Build => AgentGoal::Build,
         }
+    }
+}
+
+/// Capability gate: does this faction meet the prerequisites to perform `kind`
+/// at all? Independent of "is there work to do right now" — that remains a
+/// per-posting check (e.g. grain low, seeds available, workbench in range).
+///
+/// Single source of truth consulted by both the chief's job-posting code
+/// (`faction_chief_post_system`) and the workforce-budget softmax
+/// (`compute_workforce_budget`), so the two cannot drift apart.
+pub fn faction_can_perform(faction: &FactionData, kind: JobKind) -> bool {
+    match kind {
+        JobKind::Gather => true,
+        JobKind::Farm => faction.techs.has(CROP_CULTIVATION),
+        JobKind::Build => true,
+        JobKind::Craft => true,
     }
 }
 
@@ -268,10 +285,10 @@ impl Plugin for JobsPlugin {
 /// How often the chief reconciles the job board, in fixed-update ticks.
 const CHIEF_POSTING_INTERVAL: u64 = 60;
 
-/// Default priority for chief-posted jobs. Player postings use a higher value
-/// so worker scoring favors them.
-const CHIEF_PRIORITY: u8 = 100;
-pub const PLAYER_PRIORITY: u8 = 200;
+/// Player postings use a high static priority so manual overrides win against
+/// chief-posted jobs. Chief priority is no longer constant — see
+/// `compute_priority` in `crate::simulation::projects`.
+pub const PLAYER_PRIORITY: u8 = PRIORITY_PLAYER;
 
 /// Gather posting threshold: post when `food_total / member_count` falls
 /// below this value (in `Good::nutrition` units, which are per-stack).
@@ -302,6 +319,7 @@ pub fn chief_job_posting_system(
     bp_map: Res<BlueprintMap>,
     bp_query: Query<&Blueprint>,
     workbench_map: Res<crate::simulation::construction::WorkbenchMap>,
+    projects: Res<Projects>,
     mut board: ResMut<JobBoard>,
 ) {
     if clock.tick % CHIEF_POSTING_INTERVAL != 0 {
@@ -335,6 +353,8 @@ pub fn chief_job_posting_system(
             .unwrap_or_default();
 
         // 1. Drop stale unclaimed Chief postings whose target no longer needs work.
+        //    Build postings whose project is not in the Build phase are also
+        //    dropped here — the chief re-posts them once materials are in.
         {
             let postings = board.faction_postings_mut(faction_id);
             postings.retain(|p| {
@@ -345,7 +365,15 @@ pub fn chief_job_posting_system(
                     return true;
                 }
                 match p.progress {
-                    JobProgress::Building { blueprint } => bp_query.get(blueprint).is_ok(),
+                    JobProgress::Building { blueprint } => {
+                        if bp_query.get(blueprint).is_err() {
+                            return false;
+                        }
+                        match projects.for_blueprint(blueprint) {
+                            Some(project) => project.phase == ProjectPhase::Build,
+                            None => false,
+                        }
+                    }
                     JobProgress::Calories { .. }
                     | JobProgress::Material { .. }
                     | JobProgress::Planting { .. }
@@ -354,13 +382,30 @@ pub fn chief_job_posting_system(
             });
         }
 
-        // 2. Build postings — one per uncovered blueprint.
+        // 1b. Refresh priorities on all chief-source postings still alive so
+        //     they track changing faction state without us having to drop and
+        //     re-post.
+        for p in board.faction_postings_mut(faction_id).iter_mut() {
+            if matches!(p.source, JobSource::Chief) {
+                p.priority = compute_priority(faction, faction_id, p.kind, &p.progress, &projects);
+            }
+        }
+
+        // 2. Build postings — only for blueprints whose project has advanced
+        //    to Build phase (deposits filled). Suppressed during GatherMaterials.
         let needed_builds: Vec<Entity> = {
             let postings = board.faction_postings_mut(faction_id);
             live_bps
                 .iter()
                 .copied()
                 .filter(|bp_entity| {
+                    let in_build_phase = matches!(
+                        projects.for_blueprint(*bp_entity).map(|p| p.phase),
+                        Some(ProjectPhase::Build)
+                    );
+                    if !in_build_phase {
+                        return false;
+                    }
                     !postings.iter().any(|p| matches!(
                         p.progress,
                         JobProgress::Building { blueprint } if blueprint == *bp_entity
@@ -370,15 +415,17 @@ pub fn chief_job_posting_system(
         };
         for bp_entity in needed_builds {
             let id = board.alloc_id();
+            let progress = JobProgress::Building {
+                blueprint: bp_entity,
+            };
+            let priority = compute_priority(faction, faction_id, JobKind::Build, &progress, &projects);
             board.faction_postings_mut(faction_id).push(JobPosting {
                 id,
                 faction_id,
                 kind: JobKind::Build,
-                progress: JobProgress::Building {
-                    blueprint: bp_entity,
-                },
+                progress,
                 claimants: Vec::new(),
-                priority: CHIEF_PRIORITY,
+                priority,
                 source: JobSource::Chief,
                 posted_tick,
                 expiry_tick: None,
@@ -403,16 +450,19 @@ pub fn chief_job_posting_system(
                         deficit_units * Good::Fruit.nutrition() as u32;
                     let target = calories.clamp(GATHER_TARGET_MIN, GATHER_TARGET_CAP);
                     let id = board.alloc_id();
+                    let progress = JobProgress::Calories {
+                        deposited: 0,
+                        target,
+                    };
+                    let priority =
+                        compute_priority(faction, faction_id, JobKind::Gather, &progress, &projects);
                     board.faction_postings_mut(faction_id).push(JobPosting {
                         id,
                         faction_id,
                         kind: JobKind::Gather,
-                        progress: JobProgress::Calories {
-                            deposited: 0,
-                            target,
-                        },
+                        progress,
                         claimants: Vec::new(),
-                        priority: CHIEF_PRIORITY,
+                        priority,
                         source: JobSource::Chief,
                         posted_tick,
                         expiry_tick: None,
@@ -459,17 +509,20 @@ pub fn chief_job_posting_system(
                 }
                 let target = deficit.clamp(MATERIAL_GATHER_MIN, MATERIAL_GATHER_CAP);
                 let id = board.alloc_id();
+                let progress = JobProgress::Material {
+                    good,
+                    delivered: 0,
+                    target,
+                };
+                let priority =
+                    compute_priority(faction, faction_id, JobKind::Gather, &progress, &projects);
                 board.faction_postings_mut(faction_id).push(JobPosting {
                     id,
                     faction_id,
                     kind: JobKind::Gather,
-                    progress: JobProgress::Material {
-                        good,
-                        delivered: 0,
-                        target,
-                    },
+                    progress,
                     claimants: Vec::new(),
-                    priority: CHIEF_PRIORITY,
+                    priority,
                     source: JobSource::Chief,
                     posted_tick,
                     expiry_tick: None,
@@ -477,8 +530,8 @@ pub fn chief_job_posting_system(
             }
         }
 
-        // 4. Farm posting — gated on Agriculture (CROP_CULTIVATION).
-        if faction.techs.has(CROP_CULTIVATION) && faction.member_count > 0 {
+        // 4. Farm posting — capability gated (Agriculture / CROP_CULTIVATION).
+        if faction_can_perform(faction, JobKind::Farm) && faction.member_count > 0 {
             let already_farm = board
                 .faction_postings(faction_id)
                 .iter()
@@ -498,17 +551,20 @@ pub fn chief_job_posting_system(
                     ),
                 };
                 let id = board.alloc_id();
+                let progress = JobProgress::Planting {
+                    planted: 0,
+                    target: FARM_TILES_PER_POST.min(seed),
+                    area,
+                };
+                let priority =
+                    compute_priority(faction, faction_id, JobKind::Farm, &progress, &projects);
                 board.faction_postings_mut(faction_id).push(JobPosting {
                     id,
                     faction_id,
                     kind: JobKind::Farm,
-                    progress: JobProgress::Planting {
-                        planted: 0,
-                        target: FARM_TILES_PER_POST.min(seed),
-                        area,
-                    },
+                    progress,
                     claimants: Vec::new(),
-                    priority: CHIEF_PRIORITY,
+                    priority,
                     source: JobSource::Chief,
                     posted_tick,
                     expiry_tick: None,
@@ -540,18 +596,21 @@ pub fn chief_job_posting_system(
                 if let Some(bench_entity) = bench {
                     let target = (demand - supply).min(5);
                     let id = board.alloc_id();
+                    let progress = JobProgress::Crafting {
+                        crafted: 0,
+                        target,
+                        recipe: 0,
+                        bench: Some(bench_entity),
+                    };
+                    let priority =
+                        compute_priority(faction, faction_id, JobKind::Craft, &progress, &projects);
                     board.faction_postings_mut(faction_id).push(JobPosting {
                         id,
                         faction_id,
                         kind: JobKind::Craft,
-                        progress: JobProgress::Crafting {
-                            crafted: 0,
-                            target,
-                            recipe: 0,
-                            bench: Some(bench_entity),
-                        },
+                        progress,
                         claimants: Vec::new(),
-                        priority: CHIEF_PRIORITY,
+                        priority,
                         source: JobSource::Chief,
                         posted_tick,
                         expiry_tick: None,
@@ -648,7 +707,7 @@ pub fn job_claim_system(
         let Some(faction) = registry.factions.get(&faction_id) else {
             continue;
         };
-        let cap = (faction.member_count / 2).max(1);
+        let budget = faction.workforce_budget;
         let profession = profession_opt.copied().unwrap_or(Profession::None);
         let worker_tile = (
             (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i16,
@@ -659,7 +718,10 @@ pub fn job_claim_system(
         let mut best: Option<(usize, f32)> = None;
         let postings = board.faction_postings(faction_id);
         for (idx, p) in postings.iter().enumerate() {
-            // Cap: skip kinds already at 50%.
+            // Cap: per-kind allocation is the workforce budget share applied
+            // to current member count, floored at 1 so even small factions
+            // can keep one worker on each role.
+            let cap = ((budget.share(p.kind) * faction.member_count as f32).round() as u32).max(1);
             let count = claim_counts
                 .get(&(faction_id, p.kind))
                 .copied()

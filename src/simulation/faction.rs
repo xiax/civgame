@@ -337,6 +337,15 @@ pub struct FactionData {
     /// Tile of the structure currently being torn down for upgrade-replacement.
     /// `Some` while a deconstruct→rebuild cycle is in flight (one per faction).
     pub active_upgrade: Option<(i16, i16)>,
+    /// Per-tick allocation across job kinds (gather/farm/build/craft/free).
+    /// Recomputed every chief tick from the same pressure model that drives
+    /// `compute_priority`. Consumed by `job_claim_system` as the per-kind cap
+    /// instead of the old flat 50%-of-population rule.
+    pub workforce_budget: crate::simulation::projects::WorkforceBudget,
+    /// EMA per Good of how long material gather has been stagnating for this
+    /// faction. Stage 3 reads this in `generate_candidates` to avoid picking
+    /// blueprints that need a chronically-deficient input. Range 0..=255.
+    pub material_deficit_ema: ahash::AHashMap<crate::economy::goods::Good, u8>,
 }
 
 #[derive(Resource, Default)]
@@ -382,6 +391,8 @@ impl FactionRegistry {
                 culture,
                 lineage,
                 active_upgrade: None,
+                workforce_budget: crate::simulation::projects::WorkforceBudget::default(),
+                material_deficit_ema: ahash::AHashMap::default(),
             },
         );
         id

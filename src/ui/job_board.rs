@@ -1,10 +1,13 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::simulation::faction::PlayerFaction;
+use crate::simulation::faction::{FactionRegistry, PlayerFaction};
 use crate::simulation::jobs::{
     JobBoard, JobBoardCommand, JobKind, JobPosting, JobProgress, JobSource, TileAabb,
     PLAYER_PRIORITY,
+};
+use crate::simulation::projects::{
+    ProjectCancelReason, ProjectEventKind, ProjectPhase, Projects,
 };
 use crate::simulation::schedule::SimClock;
 
@@ -34,6 +37,8 @@ pub fn job_board_panel_system(
     board: Res<JobBoard>,
     clock: Res<SimClock>,
     player_faction: Res<PlayerFaction>,
+    registry: Res<FactionRegistry>,
+    projects: Res<Projects>,
     mut commands: EventWriter<JobBoardCommand>,
 ) {
     let ctx = contexts.ctx_mut();
@@ -43,6 +48,81 @@ pub fn job_board_panel_system(
         .default_pos(egui::pos2(20.0, 360.0))
         .default_width(280.0)
         .show(ctx, |ui| {
+            // Workforce budget bars + actual claim counts.
+            if let Some(faction) = registry.factions.get(&player_faction.faction_id) {
+                let budget = faction.workforce_budget;
+                let postings = board.faction_postings(player_faction.faction_id);
+                let mut claims = [0u32; 4];
+                for p in postings {
+                    let i = match p.kind {
+                        JobKind::Gather => 0,
+                        JobKind::Farm => 1,
+                        JobKind::Build => 2,
+                        JobKind::Craft => 3,
+                    };
+                    claims[i] += p.claimants.len() as u32;
+                }
+                let pop = faction.member_count.max(1) as f32;
+                ui.collapsing("Workforce Budget", |ui| {
+                    let row = |ui: &mut egui::Ui, label: &str, share: f32, claimed: u32| {
+                        let cap = (share * pop).round().max(1.0) as u32;
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{:<7}", label));
+                            ui.add(egui::ProgressBar::new(share).desired_width(120.0));
+                            ui.label(format!("{}/{}", claimed, cap));
+                        });
+                    };
+                    row(ui, "Gather", budget.gather, claims[0]);
+                    row(ui, "Farm",   budget.farm,   claims[1]);
+                    row(ui, "Build",  budget.build,  claims[2]);
+                    row(ui, "Craft",  budget.craft,  claims[3]);
+                    ui.horizontal(|ui| {
+                        ui.label("Free");
+                        ui.add(egui::ProgressBar::new(budget.free).desired_width(120.0));
+                    });
+                });
+
+                // Active projects summary.
+                let project_list: Vec<&crate::simulation::projects::Project> = projects
+                    .faction_projects(player_faction.faction_id)
+                    .collect();
+                if !project_list.is_empty() {
+                    ui.collapsing(format!("Projects ({})", project_list.len()), |ui| {
+                        for project in project_list {
+                            let phase = match project.phase {
+                                ProjectPhase::GatherMaterials => "Gather",
+                                ProjectPhase::Build => "Build",
+                            };
+                            ui.label(format!("#{:?} — {}", project.blueprint, phase));
+                        }
+                    });
+                }
+                // Recent project lifecycle events (cancellations, downgrades).
+                let recent_events: Vec<_> = projects
+                    .recent_events
+                    .iter()
+                    .rev()
+                    .filter(|e| e.faction_id == player_faction.faction_id)
+                    .take(8)
+                    .collect();
+                if !recent_events.is_empty() {
+                    ui.collapsing("Recent project events", |ui| {
+                        for event in recent_events {
+                            let label = match &event.kind {
+                                ProjectEventKind::Cancelled { reason } => match reason {
+                                    ProjectCancelReason::StalledGather { good } => format!(
+                                        "t{} cancelled — stalled gathering {:?}",
+                                        event.tick, good
+                                    ),
+                                },
+                            };
+                            ui.label(label);
+                        }
+                    });
+                }
+                ui.separator();
+            }
+
             // Post Job form.
             ui.collapsing("Post Job", |ui| {
                 egui::ComboBox::from_label("Kind")

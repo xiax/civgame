@@ -23,6 +23,7 @@ pub mod person;
 pub mod plan;
 pub mod plants;
 pub mod production;
+pub mod projects;
 pub mod raid;
 pub mod reproduction;
 pub mod schedule;
@@ -56,6 +57,7 @@ impl Plugin for SimulationPlugin {
         plan::register_builtin_plans(&mut plan_registry);
 
         app.add_plugins(jobs::JobsPlugin)
+            .add_plugins(projects::ProjectsPlugin)
             .add_event::<combat::CombatEvent>()
             .add_event::<combat::DistressCallEvent>()
             .add_event::<combat::HandDropEvent>()
@@ -281,9 +283,17 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
+                    projects::project_lifecycle_system
+                        .after(faction::compute_faction_storage_system)
+                        .after(construction::chief_directive_system),
+                    projects::workforce_budget_system
+                        .after(projects::project_lifecycle_system),
+                    projects::project_stagnation_system
+                        .after(projects::project_lifecycle_system),
                     jobs::chief_job_posting_system
                         .after(faction::compute_faction_storage_system)
-                        .after(faction::chief_selection_system),
+                        .after(faction::chief_selection_system)
+                        .after(projects::project_lifecycle_system),
                     crafting::faction_craft_order_system
                         .after(jobs::chief_job_posting_system),
                     jobs::job_build_completion_system

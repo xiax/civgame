@@ -1479,6 +1479,37 @@ enum BuildIntent {
     PalisadeSegment(WallMaterial, i32 /*buffer*/),
 }
 
+impl BuildIntent {
+    /// The primary input goods this intent will require, summed across every
+    /// blueprint it would spawn. Used by the deficit-EMA feedback loop in
+    /// `generate_candidates` so candidates that need a chronically-scarce
+    /// good get down-scored.
+    fn required_goods(self) -> ahash::AHashMap<crate::economy::goods::Good, u32> {
+        let mut totals: ahash::AHashMap<_, u32> = ahash::AHashMap::new();
+        let mut add = |kind: BuildSiteKind, multiplier: u32| {
+            for &(good, qty) in recipe_for(kind).inputs {
+                *totals.entry(good).or_insert(0) += qty as u32 * multiplier;
+            }
+        };
+        match self {
+            BuildIntent::Single(kind) => add(kind, 1),
+            BuildIntent::Hut(mat) => {
+                // 4 wall tiles + 1 door + 1 bed.
+                add(BuildSiteKind::Wall(mat), 4);
+                add(BuildSiteKind::Door, 1);
+                add(BuildSiteKind::Bed, 1);
+            }
+            BuildIntent::Longhouse(mat) => {
+                add(BuildSiteKind::Wall(mat), 8);
+                add(BuildSiteKind::Door, 1);
+                add(BuildSiteKind::Bed, 2);
+            }
+            BuildIntent::PalisadeSegment(mat, _) => add(BuildSiteKind::Wall(mat), 1),
+        }
+        totals
+    }
+}
+
 /// Maintains the faction build queue every 60 ticks. One project at a time per
 /// faction. The selector scores candidates from several pressure sources
 /// (residential demand, defense weakness, hunger, crafting, civic priorities)
@@ -1537,7 +1568,27 @@ pub fn chief_directive_system(
         }
 
         let plan = plans.0.get(&faction_id);
-        let candidates = generate_candidates(faction_id, faction, plan, &chunk_map, &maps, &bp_map);
+        let mut candidates = generate_candidates(faction_id, faction, plan, &chunk_map, &maps, &bp_map);
+        // Stage 3 feedback: penalize candidates whose required inputs include
+        // a chronically-deficient good (per `material_deficit_ema`). Skips the
+        // upgrade-rebuild path which short-circuits with score 5000 from
+        // `generate_candidates`.
+        for candidate in candidates.iter_mut() {
+            let required = candidate.intent.required_goods();
+            let mut penalty = 0.0f32;
+            for (good, qty) in required {
+                if qty == 0 {
+                    continue;
+                }
+                let ema = faction.material_deficit_ema.get(&good).copied().unwrap_or(0);
+                if ema >= crate::simulation::projects::DEFICIT_EMA_RARE_THRESHOLD {
+                    penalty += 600.0;
+                } else if ema >= 80 {
+                    penalty += 200.0;
+                }
+            }
+            candidate.score -= penalty;
+        }
         let Some(best) = candidates.into_iter().max_by(|a, b| {
             a.score
                 .partial_cmp(&b.score)

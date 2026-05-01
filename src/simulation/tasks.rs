@@ -339,13 +339,16 @@ pub fn find_nearest_plant(
 }
 
 // Bug 2 fix: filter by `good` so agents don't target the wrong item type.
+//
+// Faction storage tiles are unconditionally excluded: this helper exists to
+// find wild ground items, and plans that want stored food / goods use the
+// dedicated `StepTarget::NearestFactionStorage*` variants instead.
 pub fn find_nearest_edible(
     spatial: &SpatialIndex,
     from: (i32, i32),
     radius: i32,
     item_query: &Query<&GroundItem>,
     storage_tile_map: &StorageTileMap,
-    is_gathering: bool,
 ) -> Option<(Entity, i16, i16)> {
     let mut best: Option<(Entity, i16, i16)> = None;
     let mut best_dist = i32::MAX;
@@ -354,8 +357,7 @@ pub fn find_nearest_edible(
             let tx = from.0 + dx;
             let ty = from.1 + dy;
 
-            // Prevent gathering agents from scavaging faction storage tiles
-            if is_gathering && storage_tile_map.tiles.contains_key(&(tx as i16, ty as i16)) {
+            if storage_tile_map.tiles.contains_key(&(tx as i16, ty as i16)) {
                 continue;
             }
 
@@ -375,6 +377,8 @@ pub fn find_nearest_edible(
     best
 }
 
+// See `find_nearest_edible` — faction storage tiles are unconditionally
+// excluded; storage-aware searches use `StepTarget::NearestFactionStorage*`.
 pub fn find_nearest_item(
     spatial: &SpatialIndex,
     from: (i32, i32),
@@ -382,7 +386,6 @@ pub fn find_nearest_item(
     good: Good,
     item_query: &Query<&GroundItem>,
     storage_tile_map: &StorageTileMap,
-    is_gathering: bool,
 ) -> Option<(Entity, i16, i16)> {
     let mut best: Option<(Entity, i16, i16)> = None;
     let mut best_dist = i32::MAX;
@@ -391,8 +394,7 @@ pub fn find_nearest_item(
             let tx = from.0 + dx;
             let ty = from.1 + dy;
 
-            // Prevent gathering agents from scavaging faction storage tiles
-            if is_gathering && storage_tile_map.tiles.contains_key(&(tx as i16, ty as i16)) {
+            if storage_tile_map.tiles.contains_key(&(tx as i16, ty as i16)) {
                 continue;
             }
 

@@ -170,13 +170,30 @@ pub fn hud_system(
                     if fid != 0 {
                         if let Some(data) = registry.factions.get(&fid) {
                             ui.horizontal(|ui| {
+                                let mut storage_text = format!(
+                                    "Your Faction #{fid}:  food: {:.1}  |  members: {}",
+                                    data.storage.food_total(),
+                                    data.member_count
+                                );
+
+                                // Append other non-empty goods
+                                let mut other_entries: Vec<_> = data
+                                    .storage
+                                    .totals
+                                    .iter()
+                                    .filter(|(_, &qty)| qty > 0)
+                                    .collect();
+                                
+                                if !other_entries.is_empty() {
+                                    other_entries.sort_by(|a, b| a.0.name().cmp(b.0.name()));
+                                    for (good, qty) in other_entries {
+                                        storage_text.push_str(&format!("  |  {}: {}", good.name(), qty));
+                                    }
+                                }
+
                                 ui.label(
-                                    egui::RichText::new(format!(
-                                        "Your Faction #{fid}:  food: {:.1}  |  members: {}",
-                                        data.storage.food_total(),
-                                        data.member_count
-                                    ))
-                                    .color(egui::Color32::from_rgb(140, 215, 255)),
+                                    egui::RichText::new(storage_text)
+                                        .color(egui::Color32::from_rgb(140, 215, 255)),
                                 );
                             });
                         }

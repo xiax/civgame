@@ -3,7 +3,6 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
 use crate::pathfinding::path_request::{
     FailReason, FailureLog, FollowStatus, PathFollow, PathRequestQueue,
 };
@@ -43,6 +42,7 @@ pub struct PathInspectorParams<'w, 's> {
 pub struct JobInspectorParams<'w, 's> {
     pub claim_query: Query<'w, 's, &'static crate::simulation::jobs::JobClaim>,
     pub commands: EventWriter<'w, crate::simulation::jobs::JobBoardCommand>,
+    pub board: Res<'w, crate::simulation::jobs::JobBoard>,
 }
 
 pub fn inspector_panel_system(
@@ -160,6 +160,31 @@ pub fn inspector_panel_system(
                                     );
                                 }
                             });
+                            // Extra job details: source, progress, fail count
+                            if let Some(postings) = job_params.board.postings.get(&claim.faction_id) {
+                                if let Some(post) = postings.iter().find(|p| p.id == claim.job_id) {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("Source: {:?}", post.source))
+                                            .on_hover_text("Reason/Source of this job posting");
+                                        ui.separator();
+                                        ui.label(format!(
+                                            "Progress: {:.0}%",
+                                            post.progress.fraction() * 100.0
+                                        ));
+                                        if claim.fail_count > 0 {
+                                            ui.separator();
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "Struggles: {}/3",
+                                                    claim.fail_count
+                                                ))
+                                                .color(egui::Color32::from_rgb(255, 100, 100)),
+                                            )
+                                            .on_hover_text("Number of times worker got stuck or timed out");
+                                        }
+                                    });
+                                }
+                            }
                         }
 
                         if member.faction_id == SOLO {
@@ -219,34 +244,6 @@ pub fn inspector_panel_system(
                             );
                         }
                     });
-                if member.faction_id != SOLO {
-                    if let Some(faction) = registry.factions.get(&member.faction_id) {
-                        egui::CollapsingHeader::new(
-                            egui::RichText::new("Faction Storage").strong(),
-                        )
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            let mut entries: Vec<(&Good, &u32)> = faction
-                                .storage
-                                .totals
-                                .iter()
-                                .filter(|(_, &q)| q > 0)
-                                .collect();
-                            if entries.is_empty() {
-                                ui.label(
-                                    egui::RichText::new("(empty)")
-                                        .italics()
-                                        .color(egui::Color32::GRAY),
-                                );
-                            } else {
-                                entries.sort_by(|a, b| a.0.name().cmp(b.0.name()));
-                                for (good, qty) in entries {
-                                    ui.label(format!("  {}: {}", good.name(), qty));
-                                }
-                            }
-                        });
-                    }
-                }
                 egui::CollapsingHeader::new(egui::RichText::new("Health").strong())
                     .default_open(true)
                     .show(ui, |ui| {

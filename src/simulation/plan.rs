@@ -1618,7 +1618,6 @@ fn resolve_target(
     chunk_connectivity: &ChunkConnectivity,
     faction_id: u32,
     agent_entity: Entity,
-    goal: &AgentGoal,
     memory: Option<&AgentMemory>,
     item_query: &Query<&GroundItem>,
     prey_query: &Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
@@ -1634,11 +1633,6 @@ fn resolve_target(
     carrier: &Carrier,
 ) -> Option<(Option<Entity>, i16, i16)> {
     const VIEW_RADIUS: i32 = 15;
-
-    let is_gathering = matches!(
-        goal,
-        AgentGoal::GatherFood | AgentGoal::GatherWood | AgentGoal::GatherStone
-    );
 
     match &step.target {
         StepTarget::HuntPrey => {
@@ -1796,7 +1790,6 @@ fn resolve_target(
                 *good,
                 item_query,
                 storage_tile_map,
-                is_gathering,
             ) {
                 let to_z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
                 if super::line_of_sight::has_los(
@@ -1809,7 +1802,9 @@ fn resolve_target(
                     return Some((Some(entity), tx, ty));
                 }
             }
-            // 2. Check memory
+            // 2. Check memory — exclude faction storage tiles to mirror the
+            //    vision-path filter; otherwise hungry/gathering agents would
+            //    walk to food remembered on a stockpile.
             if let Some(mem) = memory {
                 let mkind = match good {
                     Good::Wood => MemoryKind::Wood,
@@ -1823,7 +1818,11 @@ fn resolve_target(
                         }
                     }
                 };
-                if let Some((entity, tx, ty)) = mem.best_entity_for_dist_weighted(mkind, pos) {
+                if let Some((entity, tx, ty)) =
+                    mem.best_entity_for_dist_weighted_filtered(mkind, pos, |_, tile| {
+                        !storage_tile_map.tiles.contains_key(&tile)
+                    })
+                {
                     target_item.0 = Some(entity);
                     return Some((Some(entity), tx, ty));
                 }
@@ -1838,7 +1837,6 @@ fn resolve_target(
                 VIEW_RADIUS,
                 item_query,
                 storage_tile_map,
-                is_gathering,
             ) {
                 let to_z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
                 if super::line_of_sight::has_los(
@@ -1851,15 +1849,18 @@ fn resolve_target(
                     return Some((Some(entity), tx, ty));
                 }
             }
-            // 2. Check memory — only accept GroundItem entities; mature plants
-            //    (berry bushes, grain) are also recorded under MemoryKind::Food
-            //    but are harvested via ForageFood (TaskKind::Gather), not Scavenge.
+            // 2. Check memory — only accept GroundItem entities (mature plants
+            //    are harvested via ForageFood, not Scavenge), and skip food
+            //    sitting on faction storage tiles.
             if let Some(mem) = memory {
-                if let Some((entity, tx, ty)) =
-                    mem.best_entity_for_dist_weighted_filtered(MemoryKind::Food, pos, |e| {
+                if let Some((entity, tx, ty)) = mem.best_entity_for_dist_weighted_filtered(
+                    MemoryKind::Food,
+                    pos,
+                    |e, tile| {
                         item_query.get(e).is_ok()
-                    })
-                {
+                            && !storage_tile_map.tiles.contains_key(&tile)
+                    },
+                ) {
                     target_item.0 = Some(entity);
                     return Some((Some(entity), tx, ty));
                 }
@@ -2786,7 +2787,6 @@ pub fn plan_execution_system(
                     &chunk_connectivity,
                     member.faction_id,
                     entity,
-                    goal,
                     memory_opt,
                     &item_check,
                     &prey_query,
