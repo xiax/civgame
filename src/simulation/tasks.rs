@@ -56,6 +56,8 @@ pub enum TaskKind {
     WithdrawGood = 28, // pull one of a specific good (encoded in craft_recipe_id) from a faction storage tile; sentinel 255 = any entertainment-value good
     PlayPlant = 29,   // recreational planting: consumes a Seed from inventory, spawns a Grain plant, awards Farming XP + activity, bursts willpower
     PlayThrow = 30,   // recreational rock-throwing: consumes a Stone from inventory, awards Combat XP + activity, bursts willpower
+    HaulToCraftOrder = 31, // carry inventory goods to a faction CraftOrder anchor and drop them into deposit slots
+    WorkOnCraftOrder = 32, // adjacent to a satisfied CraftOrder anchor; advances work_progress until the recipe completes
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -92,6 +94,8 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::WithdrawGood as u16 => "Withdrawing",
         x if x == TaskKind::PlayPlant as u16 => "Play-Planting",
         x if x == TaskKind::PlayThrow as u16 => "Play-Throwing",
+        x if x == TaskKind::HaulToCraftOrder as u16 => "Hauling to Craft Order",
+        x if x == TaskKind::WorkOnCraftOrder as u16 => "Working on Craft Order",
         _ => "Unemployed",
     }
 }
@@ -103,7 +107,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
 /// `goal_dispatch_system`).
 pub fn task_requires_free_hands(task_id: u16) -> u8 {
     match task_id {
-        x if x == TaskKind::Craft as u16 => 2,
+        x if x == TaskKind::Craft as u16 || x == TaskKind::WorkOnCraftOrder as u16 => 2,
         x if x == TaskKind::Construct as u16
             || x == TaskKind::ConstructBed as u16
             || x == TaskKind::Dig as u16
@@ -155,6 +159,8 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::Play as u16
         || task_id == TaskKind::WithdrawGood as u16
         || task_id == TaskKind::PlayPlant as u16
+        || task_id == TaskKind::HaulToCraftOrder as u16
+        || task_id == TaskKind::WorkOnCraftOrder as u16
 }
 
 /// Tasks that count as productive labor — these drain willpower over time
@@ -176,6 +182,8 @@ pub fn task_is_labor(task_id: u16) -> bool {
         || task_id == TaskKind::TameAnimal as u16
         || task_id == TaskKind::WithdrawFood as u16
         || task_id == TaskKind::WithdrawMaterial as u16
+        || task_id == TaskKind::HaulToCraftOrder as u16
+        || task_id == TaskKind::WorkOnCraftOrder as u16
 }
 
 /// Spiral search outward from `target` for the closest tile that is passable

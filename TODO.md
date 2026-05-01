@@ -57,3 +57,22 @@ X- add parallelization
 
 
 
+ForageFood: 1.15= base 1.40 (+1.40 weights, +0.00 bias) -0.25 dist
+
+FarmFood: 1.21= base 1.26 (+1.26 weights, +0.00 bias) +0.2 persist -0.25 dist
+
+GatherWood: Rejected (Wrong Goal)
+GatherStone: Rejected (Wrong Goal)
+PlantAndFarm: Rejected (Not Learned)
+HuntFood: Rejected (Preconditions Unmet)
+ScavengeFood: 0.45= base 0.70 (+0.70 weights, +0.00 bias) -0.25 dist
+
+BuildBlueprint: Rejected (Wrong Goal)
+BuildBed: Rejected (Wrong Goal)
+WithdrawAndEat: 1.50= base 2.00 (+2.00 weights, +0.00 bias) -0.5 no target
+ReturnSurplusFood: Rejected (Wrong Goal)
+EatFromInventory: 1.50= base 2.00 (+2.00 weights, +0.00 bias) -0.5 no target
+
+PlaySocial: Rejected (Wrong Goal)
+PlaySolo: Rejected (Wrong Goal)
+Explore: -0.50= base 0.00 (+0.00 weights, +0.00 bias) -0.5 no target

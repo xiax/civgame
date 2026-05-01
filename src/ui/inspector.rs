@@ -3,6 +3,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::agent::EconomicAgent;
+use crate::economy::goods::Good;
 use crate::pathfinding::path_request::{
     FailReason, FailureLog, FollowStatus, PathFollow, PathRequestQueue,
 };
@@ -14,8 +15,8 @@ use crate::simulation::mood::Mood;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, PersonAI, PlayerOrder, Profession};
 use crate::simulation::plan::{
-    build_state_vec, score_weighted, ActivePlan, KnownPlans, PlanHistory, PlanRegistry,
-    StepRegistry,
+    build_state_vec, score_weighted, ActivePlan, KnownPlans, PlanHistory, PlanOutcome,
+    PlanRegistry, StepRegistry,
 };
 use crate::simulation::plants::{Plant, PlantMap};
 use crate::simulation::reproduction::{
@@ -218,6 +219,34 @@ pub fn inspector_panel_system(
                             );
                         }
                     });
+                if member.faction_id != SOLO {
+                    if let Some(faction) = registry.factions.get(&member.faction_id) {
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new("Faction Storage").strong(),
+                        )
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let mut entries: Vec<(&Good, &u32)> = faction
+                                .storage
+                                .totals
+                                .iter()
+                                .filter(|(_, &q)| q > 0)
+                                .collect();
+                            if entries.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("(empty)")
+                                        .italics()
+                                        .color(egui::Color32::GRAY),
+                                );
+                            } else {
+                                entries.sort_by(|a, b| a.0.name().cmp(b.0.name()));
+                                for (good, qty) in entries {
+                                    ui.label(format!("  {}: {}", good.name(), qty));
+                                }
+                            }
+                        });
+                    }
+                }
                 egui::CollapsingHeader::new(egui::RichText::new("Health").strong())
                     .default_open(true)
                     .show(ui, |ui| {
@@ -520,6 +549,60 @@ pub fn inspector_panel_system(
                                 );
                                 ui.label(
                                     egui::RichText::new("  Reward: —")
+                                        .italics()
+                                        .color(egui::Color32::GRAY),
+                                );
+                            }
+                        }
+
+                        if let Some(history) = plan_history {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("Recent Outcomes (oldest → newest):").strong(),
+                            );
+                            // Walk the ring oldest-to-newest starting at `head`.
+                            let len = history.entries.len();
+                            let mut any = false;
+                            for i in 0..len {
+                                let idx = (history.head as usize + i) % len;
+                                let Some((plan_id, outcome)) = history.entries[idx] else {
+                                    continue;
+                                };
+                                any = true;
+                                let plan_name = plan_registry
+                                    .0
+                                    .iter()
+                                    .find(|p| p.id == plan_id)
+                                    .map(|p| p.name)
+                                    .unwrap_or("?");
+                                let (label, color) = match outcome {
+                                    PlanOutcome::Success => {
+                                        ("Success", egui::Color32::from_rgb(120, 220, 120))
+                                    }
+                                    PlanOutcome::FailedNoTarget => {
+                                        ("FailedNoTarget", egui::Color32::from_rgb(240, 100, 100))
+                                    }
+                                    PlanOutcome::FailedPrecondition => (
+                                        "FailedPrecondition",
+                                        egui::Color32::from_rgb(240, 100, 100),
+                                    ),
+                                    PlanOutcome::Aborted => {
+                                        ("Aborted", egui::Color32::from_rgb(220, 200, 80))
+                                    }
+                                    PlanOutcome::Interrupted => {
+                                        ("Interrupted", egui::Color32::from_rgb(220, 200, 80))
+                                    }
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!("  {}: {}", plan_name, label))
+                                        .small()
+                                        .color(color),
+                                );
+                            }
+                            if !any {
+                                ui.label(
+                                    egui::RichText::new("  (none)")
+                                        .small()
                                         .italics()
                                         .color(egui::Color32::GRAY),
                                 );

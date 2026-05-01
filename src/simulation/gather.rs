@@ -321,9 +321,9 @@ pub fn gather_system(
             }
         }
 
-        // ── Hands full → go idle so they go deposit / haul ────────────────────
+        // ── Hands at haul cap → end gather step so the plan advances to deposit ──
 
-        if carrier.free_hands() == 0 {
+        if carrier.is_at_haul_cap() {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;

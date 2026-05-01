@@ -84,6 +84,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::BarracksMap::default())
             .insert_resource(construction::MonumentMap::default())
             .insert_resource(construction::BlueprintMap::default())
+            .insert_resource(crafting::CraftOrderMap::default())
             .insert_resource(construction::RoadCarveQueue::default())
             .insert_resource(construction::RitualState::default())
             .insert_resource(terraform::TerraformMap::default())
@@ -223,7 +224,9 @@ impl Plugin for SimulationPlugin {
                     items::item_pickup_system.after(combat::death_system),
                     plants::deer_graze_system.after(movement::update_spatial_index_system),
                     production::production_system.after(movement::movement_system),
-                    crafting::craft_system.after(production::production_system),
+                    crafting::craft_order_system
+                        .after(gather::gather_system)
+                        .before(plan::plan_execution_system),
                     production::eat_task_system.after(movement::movement_system),
                     production::withdraw_food_task_system.after(movement::movement_system),
                     production::withdraw_material_task_system.after(movement::movement_system),
@@ -281,6 +284,8 @@ impl Plugin for SimulationPlugin {
                     jobs::chief_job_posting_system
                         .after(faction::compute_faction_storage_system)
                         .after(faction::chief_selection_system),
+                    crafting::faction_craft_order_system
+                        .after(jobs::chief_job_posting_system),
                     jobs::job_build_completion_system
                         .after(jobs::chief_job_posting_system),
                     jobs::job_claim_release_system

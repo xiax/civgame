@@ -75,6 +75,14 @@ impl TileAabb {
 pub enum JobProgress {
     /// Gather food: total calories deposited at faction storage.
     Calories { deposited: u32, target: u32 },
+    /// Gather a specific construction material (Wood, Stone, ...): item-count
+    /// target rather than calories. Posted when blueprints declare unmet
+    /// material slots that current storage can't satisfy.
+    Material {
+        good: Good,
+        delivered: u32,
+        target: u32,
+    },
     /// Farm: tiles successfully planted within the designated area.
     Planting {
         planted: u32,
@@ -96,6 +104,9 @@ impl JobProgress {
     pub fn is_complete(&self) -> bool {
         match self {
             JobProgress::Calories { deposited, target } => deposited >= target,
+            JobProgress::Material {
+                delivered, target, ..
+            } => delivered >= target,
             JobProgress::Planting {
                 planted, target, ..
             } => planted >= target,
@@ -116,6 +127,15 @@ impl JobProgress {
                     1.0
                 } else {
                     (*deposited as f32 / *target as f32).clamp(0.0, 1.0)
+                }
+            }
+            JobProgress::Material {
+                delivered, target, ..
+            } => {
+                if *target == 0 {
+                    1.0
+                } else {
+                    (*delivered as f32 / *target as f32).clamp(0.0, 1.0)
                 }
             }
             JobProgress::Planting {
@@ -262,6 +282,10 @@ const GATHER_TARGET_PER_HEAD: u32 = 8;
 const GATHER_TARGET_CAP: u32 = 600;
 const GATHER_TARGET_MIN: u32 = 80;
 
+/// Item-count clamps for material (Wood/Stone) Gather postings.
+const MATERIAL_GATHER_MIN: u32 = 4;
+const MATERIAL_GATHER_CAP: u32 = 32;
+
 /// Farm posting target: number of tiles to plant in one posting.
 const FARM_TILES_PER_POST: u32 = 6;
 
@@ -323,6 +347,7 @@ pub fn chief_job_posting_system(
                 match p.progress {
                     JobProgress::Building { blueprint } => bp_query.get(blueprint).is_ok(),
                     JobProgress::Calories { .. }
+                    | JobProgress::Material { .. }
                     | JobProgress::Planting { .. }
                     | JobProgress::Crafting { .. } => false,
                 }
@@ -365,7 +390,7 @@ pub fn chief_job_posting_system(
             let already_gather = board
                 .faction_postings(faction_id)
                 .iter()
-                .any(|p| matches!(p.kind, JobKind::Gather));
+                .any(|p| matches!(p.progress, JobProgress::Calories { .. }));
             if !already_gather {
                 let food_total = faction.storage.food_total() as u32;
                 let target_supply = faction.member_count * GATHER_TARGET_PER_HEAD * 8;
@@ -393,6 +418,62 @@ pub fn chief_job_posting_system(
                         expiry_tick: None,
                     });
                 }
+            }
+        }
+
+        // 3b. Material Gather postings — aggregate unmet wood/stone needs
+        // across all active blueprints, subtract current storage, post one
+        // Gather (Material) job per resource with a positive deficit.
+        if faction.member_count > 0 {
+            let (mut wood_need, mut stone_need) = (0u32, 0u32);
+            for &bp_entity in &live_bps {
+                let Ok(bp) = bp_query.get(bp_entity) else {
+                    continue;
+                };
+                for slot in &bp.deposits[..bp.deposit_count as usize] {
+                    let remaining = (slot.needed.saturating_sub(slot.deposited)) as u32;
+                    match slot.good {
+                        Good::Wood => wood_need = wood_need.saturating_add(remaining),
+                        Good::Stone => stone_need = stone_need.saturating_add(remaining),
+                        _ => {}
+                    }
+                }
+            }
+            for (good, demand) in [(Good::Wood, wood_need), (Good::Stone, stone_need)] {
+                if demand == 0 {
+                    continue;
+                }
+                let stored = faction.storage.totals.get(&good).copied().unwrap_or(0);
+                let deficit = demand.saturating_sub(stored);
+                if deficit == 0 {
+                    continue;
+                }
+                let already = board.faction_postings(faction_id).iter().any(|p| {
+                    matches!(
+                        &p.progress,
+                        JobProgress::Material { good: g, .. } if *g == good
+                    )
+                });
+                if already {
+                    continue;
+                }
+                let target = deficit.clamp(MATERIAL_GATHER_MIN, MATERIAL_GATHER_CAP);
+                let id = board.alloc_id();
+                board.faction_postings_mut(faction_id).push(JobPosting {
+                    id,
+                    faction_id,
+                    kind: JobKind::Gather,
+                    progress: JobProgress::Material {
+                        good,
+                        delivered: 0,
+                        target,
+                    },
+                    claimants: Vec::new(),
+                    priority: CHIEF_PRIORITY,
+                    source: JobSource::Chief,
+                    posted_tick,
+                    expiry_tick: None,
+                });
             }
         }
 
@@ -631,12 +712,28 @@ pub fn job_claim_system(
 fn posting_target_tile(p: &JobPosting) -> Option<(i16, i16)> {
     match p.progress {
         JobProgress::Calories { .. } => None,
+        JobProgress::Material { .. } => None,
         JobProgress::Planting { area, .. } => Some((
             (area.min.0 as i32 + area.max.0 as i32) as i16 / 2,
             (area.min.1 as i32 + area.max.1 as i32) as i16 / 2,
         )),
         JobProgress::Crafting { .. } => None,
         JobProgress::Building { .. } => None,
+    }
+}
+
+/// Map a posting to the agent goal a claimant should adopt. Looks at the
+/// progress payload for `Gather` so material-specific postings (Wood/Stone)
+/// route workers to the right gather plan; otherwise falls back to the
+/// kind-level mapping in `JobKind::to_goal`.
+pub fn posting_goal(p: &JobPosting) -> AgentGoal {
+    match (&p.kind, &p.progress) {
+        (JobKind::Gather, JobProgress::Material { good, .. }) => match good {
+            Good::Wood => AgentGoal::GatherWood,
+            Good::Stone => AgentGoal::GatherStone,
+            _ => AgentGoal::GatherFood,
+        },
+        _ => p.kind.to_goal(),
     }
 }
 
@@ -657,6 +754,8 @@ pub fn job_goal_lock_system(
         if crisis {
             commands.entity(worker).remove::<JobClaim>();
             release_claimant(&mut board, claim.job_id, worker);
+        } else if let Some(p) = board.get(claim.job_id) {
+            *goal = posting_goal(p);
         } else {
             *goal = claim.kind.to_goal();
         }
@@ -721,6 +820,30 @@ pub fn record_progress(
     kind_filter: JobKind,
     increment: u32,
 ) {
+    record_progress_filtered(
+        commands,
+        board,
+        completed_events,
+        claim,
+        kind_filter,
+        None,
+        increment,
+    );
+}
+
+/// Variant of `record_progress` that also gates on the deposited `Good`. Used
+/// by the deposit hook to credit `JobProgress::Material` postings only when
+/// the worker drops the matching resource (Wood, Stone, ...). Pass `good=None`
+/// for callers that don't care about resource matching (food calorie credits).
+pub fn record_progress_filtered(
+    commands: &mut Commands,
+    board: &mut JobBoard,
+    completed_events: &mut EventWriter<JobCompletedEvent>,
+    claim: &JobClaim,
+    kind_filter: JobKind,
+    good: Option<Good>,
+    increment: u32,
+) {
     if claim.kind != kind_filter {
         return;
     }
@@ -730,8 +853,27 @@ pub fn record_progress(
     let mut completed = false;
     match &mut posting.progress {
         JobProgress::Calories { deposited, target } => {
+            // Calorie credits only apply when caller didn't request a specific
+            // material (i.e. food deposits).
+            if good.is_some() {
+                return;
+            }
             *deposited = deposited.saturating_add(increment);
             if deposited >= target {
+                completed = true;
+            }
+        }
+        JobProgress::Material {
+            good: posting_good,
+            delivered,
+            target,
+        } => {
+            // Only credit if the caller is depositing the matching resource.
+            if good != Some(*posting_good) {
+                return;
+            }
+            *delivered = delivered.saturating_add(increment);
+            if delivered >= target {
                 completed = true;
             }
         }
@@ -871,6 +1013,10 @@ fn same_target(a: &JobProgress, b: &JobProgress) -> bool {
             ax == ay
         }
         (JobProgress::Calories { .. }, JobProgress::Calories { .. }) => true,
+        (
+            JobProgress::Material { good: gx, .. },
+            JobProgress::Material { good: gy, .. },
+        ) => gx == gy,
         _ => false,
     }
 }

@@ -1,3 +1,4 @@
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts};
@@ -9,6 +10,16 @@ use crate::simulation::combat::{Body, Health};
 use crate::simulation::construction::{
     recipe_for, AutonomousBuildingToggle, Blueprint, BlueprintMap,
 };
+use crate::simulation::crafting::{CraftOrder, CraftOrderMap, CRAFT_RECIPES};
+
+#[derive(SystemParam)]
+pub struct SitesHoverParams<'w, 's> {
+    pub bp_map: Res<'w, BlueprintMap>,
+    pub auto_build: Res<'w, AutonomousBuildingToggle>,
+    pub bp_query: Query<'w, 's, &'static Blueprint>,
+    pub co_map: Res<'w, CraftOrderMap>,
+    pub co_query: Query<'w, 's, &'static CraftOrder>,
+}
 use crate::simulation::faction::FactionMember;
 use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
@@ -47,9 +58,7 @@ pub fn hover_info_system(
     plant_query: Query<&Plant>,
     item_query: Query<&GroundItem>,
     name_query: Query<&Name>,
-    bp_map: Res<BlueprintMap>,
-    auto_build: Res<AutonomousBuildingToggle>,
-    bp_query: Query<&Blueprint>,
+    sites: SitesHoverParams,
     worker_query: Query<
         (
             &FactionMember,
@@ -151,8 +160,8 @@ pub fn hover_info_system(
             }
 
             let bp_key = (tx as i16, ty as i16);
-            if let Some(&bp_entity) = bp_map.0.get(&bp_key) {
-                if let Ok(bp) = bp_query.get(bp_entity) {
+            if let Some(&bp_entity) = sites.bp_map.0.get(&bp_key) {
+                if let Ok(bp) = sites.bp_query.get(bp_entity) {
                     ui.separator();
                     let recipe = recipe_for(bp.kind);
                     ui.label(egui::RichText::new(format!("Blueprint: {}", recipe.name)).strong());
@@ -170,7 +179,7 @@ pub fn hover_info_system(
                         "Satisfied: {}",
                         if bp.is_satisfied() { "yes" } else { "no" }
                     ));
-                    ui.label(format!("AutoBuild: {}", auto_build.0));
+                    ui.label(format!("AutoBuild: {}", sites.auto_build.0));
 
                     ui.label("Deposits:");
                     for i in 0..bp.deposit_count as usize {
@@ -278,6 +287,49 @@ pub fn hover_info_system(
                     }
                     if let Some(d) = closest_dormant {
                         ui.label(format!("Closest dormant member: {} tiles", d));
+                    }
+                }
+            }
+
+            // Craft Order at this tile (anchor / workbench).
+            let co_key = (tx as i16, ty as i16);
+            if let Some(&co_entity) = sites.co_map.0.get(&co_key) {
+                if let Ok(order) = sites.co_query.get(co_entity) {
+                    ui.separator();
+                    let recipe_name = CRAFT_RECIPES
+                        .get(order.recipe_id as usize)
+                        .map(|r| r.name)
+                        .unwrap_or("?");
+                    let work_ticks = CRAFT_RECIPES
+                        .get(order.recipe_id as usize)
+                        .map(|r| r.work_ticks)
+                        .unwrap_or(0);
+                    ui.label(
+                        egui::RichText::new(format!("Craft Order: {}", recipe_name)).strong(),
+                    );
+                    ui.label(format!("Faction: {}", order.faction_id));
+                    if let Some((wbx, wby)) = order.workbench_tile {
+                        ui.label(format!("Workbench: ({}, {})", wbx, wby));
+                    } else {
+                        ui.label("Stationless (anchored at camp)");
+                    }
+                    ui.label(format!(
+                        "Work: {} / {}",
+                        order.work_progress, work_ticks
+                    ));
+                    ui.label(format!(
+                        "Satisfied: {}",
+                        if order.is_satisfied() { "yes" } else { "no" }
+                    ));
+                    ui.label("Deposits:");
+                    for i in 0..order.deposit_count as usize {
+                        let d = order.deposits[i];
+                        let line = format!("  {:?}: {}/{}", d.good, d.deposited, d.needed);
+                        if d.deposited < d.needed {
+                            ui.label(egui::RichText::new(line).color(egui::Color32::LIGHT_RED));
+                        } else {
+                            ui.label(line);
+                        }
                     }
                 }
             }

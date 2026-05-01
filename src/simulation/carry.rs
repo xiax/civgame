@@ -15,6 +15,10 @@ use bevy::prelude::*;
 /// Per-hand load ceiling, in grams. Two hands → up to ~50 kg combined.
 pub const HUMAN_HAND_CAP_G: u32 = 25_000;
 
+/// Per-hand quantity cap. A worker fills a hand with at most this many units of one
+/// item before they need to head back and deposit. Drives the gather→deposit cycle.
+pub const HAND_QTY_CAP: u32 = 3;
+
 /// One stack held in one or both hands.
 #[derive(Clone, Copy, Debug)]
 pub struct HeldStack {
@@ -139,7 +143,7 @@ impl Carrier {
                 }
                 let cap = HUMAN_HAND_CAP_G.saturating_mul(2);
                 let by_weight = cap / unit_w;
-                let take = qty.min(by_weight);
+                let take = qty.min(by_weight).min(HAND_QTY_CAP);
                 if take == 0 {
                     return qty;
                 }
@@ -158,7 +162,7 @@ impl Carrier {
                 if by_weight == 0 {
                     return qty;
                 }
-                let take = qty.min(by_weight);
+                let take = qty.min(by_weight).min(HAND_QTY_CAP);
                 let stack = HeldStack {
                     item,
                     qty: take,
@@ -186,7 +190,8 @@ impl Carrier {
                             let used = stack.weight_g();
                             let cap_left = HUMAN_HAND_CAP_G.saturating_sub(used);
                             let by_weight = cap_left / unit_w;
-                            let take = remaining.min(by_weight);
+                            let qty_room = HAND_QTY_CAP.saturating_sub(stack.qty);
+                            let take = remaining.min(by_weight).min(qty_room);
                             if take > 0 {
                                 stack.qty = stack.qty.saturating_add(take);
                                 remaining -= take;
@@ -201,7 +206,7 @@ impl Carrier {
                 for slot in [&mut self.left, &mut self.right] {
                     if slot.is_none() {
                         let by_weight = HUMAN_HAND_CAP_G / unit_w;
-                        let take = remaining.min(by_weight);
+                        let take = remaining.min(by_weight).min(HAND_QTY_CAP);
                         if take > 0 {
                             *slot = Some(HeldStack {
                                 item,
@@ -218,6 +223,20 @@ impl Carrier {
                 remaining
             }
         }
+    }
+
+    /// True when the worker has hauled enough that they should head back to
+    /// deposit. A two-handed stack at the per-hand cap is enough on its own;
+    /// otherwise both hands must be occupied with at least one at the cap.
+    pub fn is_at_haul_cap(&self) -> bool {
+        if let Some(s) = self.left {
+            if s.two_handed {
+                return s.qty >= HAND_QTY_CAP;
+            }
+        }
+        let l_full = self.left.map_or(false, |s| s.qty >= HAND_QTY_CAP);
+        let r_full = self.right.map_or(false, |s| s.qty >= HAND_QTY_CAP);
+        self.left.is_some() && self.right.is_some() && (l_full || r_full)
     }
 
     /// Remove up to `qty` of `item` from hands. Returns how many were actually removed.
@@ -407,10 +426,20 @@ mod tests {
     fn small_items_stack_in_one_hand() {
         let mut c = Carrier::default();
         let item = Item::new_commodity(Good::Fruit);
-        let leftover = c.try_pick_up(item, 10);
+        let leftover = c.try_pick_up(item, 3);
         assert_eq!(leftover, 0);
-        assert_eq!(c.quantity_of(item), 10);
+        assert_eq!(c.quantity_of(item), 3);
         assert_eq!(c.free_hands(), 1);
+    }
+
+    #[test]
+    fn small_items_capped_at_three_per_hand() {
+        let mut c = Carrier::default();
+        let item = Item::new_commodity(Good::Fruit);
+        let leftover = c.try_pick_up(item, 10);
+        assert_eq!(leftover, 4, "qty cap fills both hands at 3 each = 6");
+        assert_eq!(c.quantity_of(item), 6);
+        assert_eq!(c.free_hands(), 0);
     }
 
     #[test]
@@ -421,6 +450,15 @@ mod tests {
         assert_eq!(leftover, 0);
         assert_eq!(c.free_hands(), 0);
         assert!(c.has_two_handed_load());
+    }
+
+    #[test]
+    fn two_handed_capped_at_three() {
+        let mut c = Carrier::default();
+        let log = Item::new_commodity(Good::Wood);
+        let leftover = c.try_pick_up(log, 4);
+        assert_eq!(leftover, 1, "two-handed stack caps at HAND_QTY_CAP");
+        assert_eq!(c.quantity_of(log), 3);
     }
 
     #[test]
@@ -437,18 +475,38 @@ mod tests {
 
     #[test]
     fn over_cap_returns_leftover() {
+        // Stone is TwoHand; qty cap (3) binds before the weight cap.
         let mut c = Carrier::default();
-        let stone = Item::new_commodity(Good::Stone); // 5 kg/unit, 2 hands → ~50 kg cap → 10 stones
+        let stone = Item::new_commodity(Good::Stone);
         let leftover = c.try_pick_up(stone, 100);
-        assert!(leftover > 0);
+        assert_eq!(leftover, 97);
+        assert_eq!(c.quantity_of(stone), 3);
         assert!(c.total_weight_g() <= HUMAN_HAND_CAP_G * 2);
+    }
+
+    #[test]
+    fn is_at_haul_cap_triggers_when_two_handed_full() {
+        let mut c = Carrier::default();
+        let log = Item::new_commodity(Good::Wood);
+        let _ = c.try_pick_up(log, 3);
+        assert!(c.is_at_haul_cap());
+    }
+
+    #[test]
+    fn is_at_haul_cap_requires_both_hands_for_one_hand_goods() {
+        let mut c = Carrier::default();
+        let coal = Item::new_commodity(Good::Coal); // OneHand
+        let _ = c.try_pick_up(coal, 3);
+        assert!(!c.is_at_haul_cap(), "one filled hand isn't enough");
+        let _ = c.try_pick_up(coal, 3);
+        assert!(c.is_at_haul_cap(), "both hands at cap → return");
     }
 
     #[test]
     fn drop_one_hand_prefers_heaviest() {
         let mut c = Carrier::default();
-        let _ = c.try_pick_up(Item::new_commodity(Good::Coal), 5); // ~10 kg per hand
-        let _ = c.try_pick_up(Item::new_commodity(Good::Skin), 5); // ~4.5 kg per hand
+        let _ = c.try_pick_up(Item::new_commodity(Good::Coal), 3); // ~10 kg per hand
+        let _ = c.try_pick_up(Item::new_commodity(Good::Skin), 3); // ~4.5 kg per hand
         let dropped = c.drop_one_hand().expect("should drop something");
         assert_eq!(dropped.item.good, Good::Coal);
     }

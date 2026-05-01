@@ -1,6 +1,8 @@
 use super::goals::Personality;
 use super::items::{spawn_or_merge_ground_item, GroundItem};
-use super::jobs::{record_progress, JobBoard, JobClaim, JobCompletedEvent, JobKind};
+use super::jobs::{
+    record_progress, record_progress_filtered, JobBoard, JobClaim, JobCompletedEvent, JobKind,
+};
 use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::needs::Needs;
@@ -597,7 +599,14 @@ pub fn drop_items_at_destination_system(
 
         // First: dump everything in hands. Hauling loads (Wood, Stone, Iron, ...) are
         // exactly what storage wants; food/tools that ended up in hands also go here.
+        let mut hand_wood: u32 = 0;
+        let mut hand_stone: u32 = 0;
         for stack in carrier.drop_all() {
+            match stack.item.good {
+                Good::Wood => hand_wood = hand_wood.saturating_add(stack.qty),
+                Good::Stone => hand_stone = hand_stone.saturating_add(stack.qty),
+                _ => {}
+            }
             spawn_or_merge_ground_item(
                 &mut commands,
                 &spatial,
@@ -607,6 +616,32 @@ pub fn drop_items_at_destination_system(
                 stack.item.good,
                 stack.qty,
             );
+        }
+        // Credit any Material Gather posting this worker holds for the
+        // dropped wood/stone.
+        if let Some(claim) = claim_opt {
+            if hand_wood > 0 {
+                record_progress_filtered(
+                    &mut commands,
+                    &mut board,
+                    &mut job_completed,
+                    claim,
+                    JobKind::Gather,
+                    Some(Good::Wood),
+                    hand_wood,
+                );
+            }
+            if hand_stone > 0 {
+                record_progress_filtered(
+                    &mut commands,
+                    &mut board,
+                    &mut job_completed,
+                    claim,
+                    JobKind::Gather,
+                    Some(Good::Stone),
+                    hand_stone,
+                );
+            }
         }
 
         let food_qty = agent.total_food();

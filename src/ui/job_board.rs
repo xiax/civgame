@@ -131,6 +131,11 @@ fn progress_label(p: &JobProgress) -> String {
         JobProgress::Calories { deposited, target } => {
             format!("Calories {}/{}", deposited, target)
         }
+        JobProgress::Material {
+            good,
+            delivered,
+            target,
+        } => format!("{:?} {}/{}", good, delivered, target),
         JobProgress::Planting {
             planted, target, ..
         } => format!("Tiles planted {}/{}", planted, target),

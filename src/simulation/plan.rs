@@ -2,6 +2,7 @@ use super::animals::{Deer, Horse, Tamed, Wolf};
 use super::carry::Carrier;
 use super::combat::{CombatTarget, Health};
 use super::construction::{Blueprint, BlueprintMap, BuildSiteKind};
+use super::crafting::{CraftOrder, CraftOrderMap};
 use super::faction::{FactionMember, FactionRegistry, StorageTileMap, SOLO};
 use super::goals::{AgentGoal, RescueTarget};
 use super::items::{GroundItem, TargetItem};
@@ -138,6 +139,17 @@ pub enum StepTarget {
     /// and no random tile is reachable, falls back to the nearest reachable
     /// higher-Z tile so a stuck-underground agent climbs out.
     ExploreTile,
+    /// Nearest active CraftOrder for this faction whose deposit slots still
+    /// need a good the agent currently carries (in hand or in inventory).
+    /// Mirrors `NearestBlueprintNeedingHeldMaterial` for the order pipeline.
+    NearestCraftOrderNeedingHeldMaterial,
+    /// Nearest active CraftOrder for this faction that has all deposits
+    /// satisfied — i.e. the work step can begin.
+    NearestSatisfiedCraftOrder,
+    /// Nearest faction storage tile that holds at least one good currently
+    /// needed by an unsatisfied CraftOrder of the same faction. Pairs with
+    /// `HaulToCraftOrder` for the storage-to-order ferry path.
+    NearestFactionStorageWithCraftOrderMaterial,
 }
 
 #[derive(Clone, Debug)]
@@ -434,13 +446,18 @@ static FOREST_TILES: &[TileKind] = &[TileKind::Forest];
 static STONE_TILES: &[TileKind] = &[TileKind::Stone];
 
 // Step 9 = Eat, Step 10 = WithdrawFood (defined in register_builtin_steps)
-static PLAN_STEPS_0: &[StepId] = &[0, 9]; // ForageFood → Eat
-static PLAN_STEPS_1: &[StepId] = &[1, 9]; // FarmFood → Eat
-static PLAN_STEPS_2: &[StepId] = &[2]; // GatherWood
-static PLAN_STEPS_3: &[StepId] = &[3]; // GatherStone
-static PLAN_STEPS_4: &[StepId] = &[4, 1, 9]; // PlantAndFarm → Eat
-static PLAN_STEPS_5: &[StepId] = &[5, 6, 9]; // HuntFood → Eat
-static PLAN_STEPS_6: &[StepId] = &[6, 9]; // ScavengeFood → Eat
+// Gather plans always end in DepositGoods. Eating is handled by separate
+// plans (EatFromInventory, WithdrawAndEat) selected when hunger is high
+// enough to satisfy step 9's precondition; chaining Eat into gather plans
+// would drop the whole plan when the worker isn't yet hungry, leaving food
+// stranded in hand and no deposit run.
+static PLAN_STEPS_0: &[StepId] = &[0, 12]; // ForageFood → DepositGoods
+static PLAN_STEPS_1: &[StepId] = &[1, 12]; // FarmFood → DepositGoods
+static PLAN_STEPS_2: &[StepId] = &[2, 12]; // GatherWood → DepositGoods
+static PLAN_STEPS_3: &[StepId] = &[3, 12]; // GatherStone → DepositGoods
+static PLAN_STEPS_4: &[StepId] = &[4, 1, 12]; // PlantAndFarm → DepositGoods
+static PLAN_STEPS_5: &[StepId] = &[5, 6, 12]; // HuntFood → CollectSkin → DepositGoods
+static PLAN_STEPS_6: &[StepId] = &[6, 12]; // ScavengeFood → DepositGoods
 static PLAN_STEPS_7: &[StepId] = &[2, 28, 25]; // GatherWood, HaulToBlueprint, BuildAnyBlueprint
 static PLAN_STEPS_29: &[StepId] = &[32, 28, 25]; // FetchMaterialFromStorage, HaulToBlueprint, BuildAnyBlueprint
 static PLAN_STEPS_9: &[StepId] = &[10, 9]; // WithdrawAndEat: WithdrawFood → Eat
@@ -482,20 +499,16 @@ static PLAY_GOALS: &[AgentGoal] = &[AgentGoal::Play];
 
 static RETURN_CAMP_GOALS: &[AgentGoal] = &[AgentGoal::ReturnCamp];
 
-// Craft plan step sequences (step IDs match register_builtin_steps above)
-// 12=DepositGoods, 13=CollectSkin
-// 14=CraftStoneTools, 15=CraftSpear, 16=CraftTorch, 17=CraftBow, 18=CraftCloth
-// 19=CraftPottery, 20=CraftShield, 21=CraftLeatherArmor, 22=CraftIronTools, 23=CraftSword
-static PLAN_STEPS_11: &[StepId] = &[2, 3, 14, 12]; // MakeStoneTools
-static PLAN_STEPS_12: &[StepId] = &[2, 3, 15, 12]; // MakeSpear
-static PLAN_STEPS_13: &[StepId] = &[2, 16, 12]; // MakeTorch
-static PLAN_STEPS_14: &[StepId] = &[2, 5, 13, 17, 12]; // MakeBow
-static PLAN_STEPS_15: &[StepId] = &[1, 1, 18, 12]; // MakeCloth
-static PLAN_STEPS_16: &[StepId] = &[3, 2, 19, 12]; // MakePottery
-static PLAN_STEPS_17: &[StepId] = &[2, 2, 20, 12]; // MakeShield
-static PLAN_STEPS_18: &[StepId] = &[5, 13, 5, 13, 21, 12]; // MakeLeatherArmor
-static PLAN_STEPS_19: &[StepId] = &[3, 3, 22, 12]; // MakeIronTools
-static PLAN_STEPS_20: &[StepId] = &[3, 2, 23, 12]; // MakeSword
+// New craft pipeline (order-driven). Each "Deliver*ToCraftOrder" plan gathers
+// one raw resource and hauls it into the order's deposit slots; "WorkOnCraft"
+// runs the actual recipe once the order is satisfied.
+//   38 = HaulToCraftOrder, 39 = WorkOnCraftOrder, 40 = FetchCraftOrderMaterialFromStorage
+static PLAN_STEPS_11: &[StepId] = &[2, 38]; // DeliverWoodToCraftOrder
+static PLAN_STEPS_12: &[StepId] = &[3, 38]; // DeliverStoneToCraftOrder
+static PLAN_STEPS_13: &[StepId] = &[5, 13, 38]; // DeliverHideToCraftOrder
+static PLAN_STEPS_14: &[StepId] = &[1, 38]; // DeliverGrainToCraftOrder
+static PLAN_STEPS_15: &[StepId] = &[40, 38]; // DeliverFromStorageToCraftOrder
+static PLAN_STEPS_16: &[StepId] = &[39, 12]; // WorkOnCraft → DepositGoods
 
 pub fn register_builtin_steps(registry: &mut StepRegistry) {
     registry.0 = vec![
@@ -641,105 +654,98 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             plant_filter: None,
             extra: 0,
         },
+        // 14-23: legacy per-recipe Craft steps. Replaced by the order-driven
+        // pipeline (steps 38-40); kept as Idle placeholders so existing
+        // step-id references in any in-flight ActivePlan don't panic on lookup.
         StepDef {
-            // 14: CraftStoneTools (recipe 0)
             id: 14,
-            task: TaskKind::Craft,
+            task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
-            preconditions: StepPreconditions::needs_good(Good::Stone, 2),
-            reward_scale: 0.8,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
             extra: 0,
         },
         StepDef {
-            // 15: CraftSpear (recipe 1)
             id: 15,
-            task: TaskKind::Craft,
+            task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
-            preconditions: StepPreconditions::needs_good(Good::Stone, 1),
-            reward_scale: 0.8,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
-            extra: 1,
+            extra: 0,
         },
         StepDef {
-            // 16: CraftTorch (recipe 2)
             id: 16,
-            task: TaskKind::Craft,
+            task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
-            preconditions: StepPreconditions::needs_good(Good::Wood, 2),
-            reward_scale: 0.5,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
-            extra: 2,
+            extra: 0,
         },
         StepDef {
-            // 17: CraftBow (recipe 3)
             id: 17,
-            task: TaskKind::Craft,
+            task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
-            preconditions: StepPreconditions::needs_good(Good::Skin, 1),
-            reward_scale: 0.9,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
-            extra: 3,
+            extra: 0,
         },
         StepDef {
-            // 18: CraftCloth (recipe 4)
             id: 18,
-            task: TaskKind::Craft,
+            task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
-            preconditions: StepPreconditions::needs_good(Good::Grain, 3),
-            reward_scale: 0.7,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
-            extra: 4,
+            extra: 0,
         },
         StepDef {
-            // 19: CraftPottery (recipe 5)
             id: 19,
-            task: TaskKind::Craft,
+            task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
-            preconditions: StepPreconditions::needs_good(Good::Stone, 2),
-            reward_scale: 0.6,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
-            extra: 5,
+            extra: 0,
         },
         StepDef {
-            // 20: CraftShield (recipe 6)
             id: 20,
-            task: TaskKind::Craft,
+            task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
-            preconditions: StepPreconditions::needs_good(Good::Wood, 3),
-            reward_scale: 0.8,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
-            extra: 6,
+            extra: 0,
         },
         StepDef {
-            // 21: CraftLeatherArmor (recipe 7)
             id: 21,
-            task: TaskKind::Craft,
+            task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
-            preconditions: StepPreconditions::needs_good(Good::Skin, 2),
-            reward_scale: 0.9,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
-            extra: 7,
+            extra: 0,
         },
         StepDef {
-            // 22: CraftIronTools (recipe 8)
             id: 22,
-            task: TaskKind::Craft,
+            task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
-            preconditions: StepPreconditions::needs_good(Good::Iron, 2),
-            reward_scale: 1.0,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
-            extra: 8,
+            extra: 0,
         },
         StepDef {
-            // 23: CraftSword (recipe 9)
             id: 23,
-            task: TaskKind::Craft,
+            task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
-            preconditions: StepPreconditions::needs_good(Good::Iron, 2),
-            reward_scale: 1.0,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
-            extra: 9,
+            extra: 0,
         },
         StepDef {
             // 24: (unused — reserved for future use)
@@ -907,6 +913,41 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             plant_filter: None,
             extra: 0,
         },
+        StepDef {
+            // 38: HaulToCraftOrder — drop currently-held materials into the
+            // nearest CraftOrder that needs them. Sibling of step 28
+            // (HaulToBlueprint) for the order pipeline.
+            id: 38,
+            task: TaskKind::HaulToCraftOrder,
+            target: StepTarget::NearestCraftOrderNeedingHeldMaterial,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.4,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 39: WorkOnCraftOrder — adjacent to a satisfied CraftOrder,
+            // advance work_progress until the recipe completes.
+            id: 39,
+            task: TaskKind::WorkOnCraftOrder,
+            target: StepTarget::NearestSatisfiedCraftOrder,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 1.0,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 40: FetchCraftOrderMaterialFromStorage — withdraw one good
+            // currently needed by an open CraftOrder from a faction storage
+            // tile, so it can be hauled to the order.
+            id: 40,
+            task: TaskKind::WithdrawMaterial,
+            target: StepTarget::NearestFactionStorageWithCraftOrderMaterial,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.3,
+            plant_filter: None,
+            extra: 0,
+        },
     ];
 }
 
@@ -1041,7 +1082,11 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             id: 9,
             name: "WithdrawAndEat",
             steps: PLAN_STEPS_9,
-            state_weights: mk_weights(&[(SI_HUNGER, 1.5), (SI_IN_FACTION, 0.5)]),
+            state_weights: mk_weights(&[
+                (SI_HUNGER, 1.5),
+                (SI_IN_FACTION, 0.5),
+                (SI_HAS_FOOD, -1.0),
+            ]),
             bias: 0.0,
             serves_goals: SURVIVE_GOALS,
             tech_gate: None,
@@ -1057,118 +1102,110 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: Some(super::technology::HORSE_TAMING),
             memory_target_kind: None,
         },
-        // ── Crafting plans ────────────────────────────────────────────────────
+        // ── Crafting plans (order-driven) ─────────────────────────────────────
+        // Each Deliver*ToCraftOrder gathers one raw resource and hauls it into
+        // an open CraftOrder's deposit slots; WorkOnCraft runs the recipe once
+        // the order is satisfied. Plans are filtered out at dispatch time when
+        // no order needs the corresponding good (resolve_target → None).
         PlanDef {
             id: 11,
-            name: "MakeStoneTools",
+            name: "DeliverWoodToCraftOrder",
             steps: PLAN_STEPS_11,
-            state_weights: mk_weights(&[(SI_SKILL_CRAFTING, 0.4), (SI_HAS_STONE, 0.3)]),
-            bias: 0.0,
+            state_weights: mk_weights(&[(SI_VIS_WOOD, 0.4), (SI_MEM_WOOD, 0.3)]),
+            bias: 0.1,
             serves_goals: CRAFT_GOALS,
-            tech_gate: Some(super::technology::FLINT_KNAPPING),
-            memory_target_kind: Some(MemoryKind::Stone),
+            tech_gate: None,
+            memory_target_kind: Some(MemoryKind::Wood),
         },
         PlanDef {
             id: 12,
-            name: "MakeSpear",
+            name: "DeliverStoneToCraftOrder",
             steps: PLAN_STEPS_12,
-            state_weights: mk_weights(&[
-                (SI_SKILL_CRAFTING, 0.4),
-                (SI_SAFETY, 0.3),
-                (SI_HAS_STONE, 0.3),
-            ]),
-            bias: 0.0,
+            state_weights: mk_weights(&[(SI_VIS_STONE, 0.4), (SI_MEM_STONE, 0.3)]),
+            bias: 0.1,
             serves_goals: CRAFT_GOALS,
-            tech_gate: Some(super::technology::HUNTING_SPEAR),
+            tech_gate: None,
             memory_target_kind: Some(MemoryKind::Stone),
         },
         PlanDef {
             id: 13,
-            name: "MakeTorch",
+            name: "DeliverHideToCraftOrder",
             steps: PLAN_STEPS_13,
-            state_weights: mk_weights(&[(SI_SKILL_CRAFTING, 0.3), (SI_HAS_WOOD, 0.2)]),
+            state_weights: mk_weights(&[(SI_SKILL_COMBAT, 0.3)]),
             bias: 0.0,
             serves_goals: CRAFT_GOALS,
-            tech_gate: Some(super::technology::FIRE_MAKING),
-            memory_target_kind: Some(MemoryKind::Wood),
+            tech_gate: None,
+            memory_target_kind: Some(MemoryKind::Prey),
         },
         PlanDef {
             id: 14,
-            name: "MakeBow",
+            name: "DeliverGrainToCraftOrder",
             steps: PLAN_STEPS_14,
-            state_weights: mk_weights(&[
-                (SI_SKILL_CRAFTING, 0.4),
-                (SI_SAFETY, 0.4),
-                (SI_HAS_WOOD, 0.3),
-            ]),
+            state_weights: mk_weights(&[(SI_SKILL_FARMING, 0.3)]),
             bias: 0.0,
             serves_goals: CRAFT_GOALS,
-            tech_gate: Some(super::technology::BOW_AND_ARROW),
-            memory_target_kind: Some(MemoryKind::Prey),
-        },
-        PlanDef {
-            id: 15,
-            name: "MakeCloth",
-            steps: PLAN_STEPS_15,
-            state_weights: mk_weights(&[(SI_SKILL_CRAFTING, 0.3)]),
-            bias: 0.0,
-            serves_goals: CRAFT_GOALS,
-            tech_gate: Some(super::technology::LOOM_WEAVING),
+            tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
         },
         PlanDef {
-            id: 16,
-            name: "MakePottery",
-            steps: PLAN_STEPS_16,
-            state_weights: mk_weights(&[(SI_SKILL_CRAFTING, 0.3), (SI_HAS_STONE, 0.2)]),
-            bias: 0.0,
+            id: 15,
+            name: "DeliverFromStorageToCraftOrder",
+            steps: PLAN_STEPS_15,
+            state_weights: mk_weights(&[(SI_IN_FACTION, 0.4)]),
+            bias: 0.2,
             serves_goals: CRAFT_GOALS,
-            tech_gate: Some(super::technology::FIRED_POTTERY),
-            memory_target_kind: Some(MemoryKind::Stone),
+            tech_gate: None,
+            memory_target_kind: None,
+        },
+        PlanDef {
+            id: 16,
+            name: "WorkOnCraft",
+            steps: PLAN_STEPS_16,
+            state_weights: mk_weights(&[(SI_SKILL_CRAFTING, 0.5)]),
+            bias: 0.3,
+            serves_goals: CRAFT_GOALS,
+            tech_gate: None,
+            memory_target_kind: None,
         },
         PlanDef {
             id: 17,
-            name: "MakeShield",
-            steps: PLAN_STEPS_17,
-            state_weights: mk_weights(&[
-                (SI_SKILL_CRAFTING, 0.5),
-                (SI_SAFETY, 0.5),
-                (SI_HAS_WOOD, 0.3),
-            ]),
-            bias: 0.0,
-            serves_goals: CRAFT_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
-            memory_target_kind: Some(MemoryKind::Wood),
+            memory_target_kind: None,
         },
         PlanDef {
             id: 18,
-            name: "MakeLeatherArmor",
-            steps: PLAN_STEPS_18,
-            state_weights: mk_weights(&[(SI_SKILL_CRAFTING, 0.5), (SI_SAFETY, 0.6)]),
-            bias: 0.0,
-            serves_goals: CRAFT_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
-            memory_target_kind: Some(MemoryKind::Prey),
+            memory_target_kind: None,
         },
         PlanDef {
             id: 19,
-            name: "MakeIronTools",
-            steps: PLAN_STEPS_19,
-            state_weights: mk_weights(&[(SI_SKILL_CRAFTING, 0.5), (SI_HAS_STONE, 0.3)]),
-            bias: 0.0,
-            serves_goals: CRAFT_GOALS,
-            tech_gate: Some(super::technology::COPPER_TOOLS),
-            memory_target_kind: Some(MemoryKind::Stone),
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
+            tech_gate: None,
+            memory_target_kind: None,
         },
         PlanDef {
             id: 20,
-            name: "MakeSword",
-            steps: PLAN_STEPS_20,
-            state_weights: mk_weights(&[(SI_SKILL_CRAFTING, 0.6), (SI_SAFETY, 0.7)]),
-            bias: 0.0,
-            serves_goals: CRAFT_GOALS,
-            tech_gate: Some(super::technology::BRONZE_WEAPONS),
-            memory_target_kind: Some(MemoryKind::Stone),
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
+            tech_gate: None,
+            memory_target_kind: None,
         },
         PlanDef {
             id: 21,
@@ -1590,6 +1627,8 @@ fn resolve_target(
     target_item: &mut TargetItem,
     bp_map: &BlueprintMap,
     bp_query: &Query<&Blueprint>,
+    co_map: &CraftOrderMap,
+    co_query: &Query<&CraftOrder>,
     rescue_target: Option<&RescueTarget>,
     agent: &EconomicAgent,
     carrier: &Carrier,
@@ -2139,6 +2178,112 @@ fn resolve_target(
             }
             best.map(|(e, tx, ty)| (Some(e), tx, ty))
         }
+        StepTarget::NearestCraftOrderNeedingHeldMaterial => {
+            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best_dist = i32::MAX;
+            for (&tile, &order_entity) in &co_map.0 {
+                let Ok(order) = co_query.get(order_entity) else {
+                    continue;
+                };
+                if order.faction_id != faction_id {
+                    continue;
+                }
+                let mut useful = false;
+                for i in 0..order.deposit_count as usize {
+                    let still = order.deposits[i]
+                        .needed
+                        .saturating_sub(order.deposits[i].deposited);
+                    let held = carrier
+                        .quantity_of_good(order.deposits[i].good)
+                        .saturating_add(agent.quantity_of(order.deposits[i].good));
+                    if still > 0 && held > 0 {
+                        useful = true;
+                        break;
+                    }
+                }
+                if !useful {
+                    continue;
+                }
+                let dist = (tile.0 as i32 - pos.0).abs() + (tile.1 as i32 - pos.1).abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some((order_entity, tile.0, tile.1));
+                }
+            }
+            best.map(|(e, tx, ty)| (Some(e), tx, ty))
+        }
+        StepTarget::NearestSatisfiedCraftOrder => {
+            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best_dist = i32::MAX;
+            for (&tile, &order_entity) in &co_map.0 {
+                let Ok(order) = co_query.get(order_entity) else {
+                    continue;
+                };
+                if order.faction_id != faction_id {
+                    continue;
+                }
+                if !order.is_satisfied() {
+                    continue;
+                }
+                // Station-bound recipes require the worker to stand adjacent
+                // to the workbench/loom, which is the anchor tile.
+                let dist = (tile.0 as i32 - pos.0).abs() + (tile.1 as i32 - pos.1).abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some((order_entity, tile.0, tile.1));
+                }
+            }
+            best.map(|(e, tx, ty)| (Some(e), tx, ty))
+        }
+        StepTarget::NearestFactionStorageWithCraftOrderMaterial => {
+            // Set of goods needed by some unsatisfied CraftOrder of this faction.
+            let mut needed: [bool; crate::economy::goods::GOOD_COUNT] =
+                [false; crate::economy::goods::GOOD_COUNT];
+            let mut any_needed = false;
+            for (_, &order_entity) in &co_map.0 {
+                let Ok(order) = co_query.get(order_entity) else {
+                    continue;
+                };
+                if order.faction_id != faction_id {
+                    continue;
+                }
+                for i in 0..order.deposit_count as usize {
+                    let still = order.deposits[i]
+                        .needed
+                        .saturating_sub(order.deposits[i].deposited);
+                    if still > 0 {
+                        needed[order.deposits[i].good as usize] = true;
+                        any_needed = true;
+                    }
+                }
+            }
+            if !any_needed {
+                return None;
+            }
+            let tiles = storage_tile_map.by_faction.get(&faction_id)?;
+            let mut best: Option<(i16, i16)> = None;
+            let mut best_dist = i32::MAX;
+            for &(tx, ty) in tiles {
+                let mut has_useful = false;
+                for &gi_entity in spatial.get(tx as i32, ty as i32) {
+                    if let Ok(gi) = item_query.get(gi_entity) {
+                        if gi.qty > 0 && needed[gi.item.good as usize] {
+                            has_useful = true;
+                            break;
+                        }
+                    }
+                }
+                if !has_useful {
+                    continue;
+                }
+                let dist = (tx as i32 - pos.0).abs() + (ty as i32 - pos.1).abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some((tx, ty));
+                }
+            }
+            best.map(|(tx, ty)| (None, tx, ty))
+        }
         StepTarget::ExploreTile => {
             let home = faction_registry
                 .home_tile(faction_id)
@@ -2195,6 +2340,14 @@ pub struct PlanRegistries<'w> {
     pub drop_food_events: EventWriter<'w, DropAbandonedFoodEvent>,
 }
 
+#[derive(SystemParam)]
+pub struct SiteRegistries<'w, 's> {
+    pub bp_map: Res<'w, BlueprintMap>,
+    pub bp_query: Query<'w, 's, &'static Blueprint>,
+    pub co_map: Res<'w, CraftOrderMap>,
+    pub co_query: Query<'w, 's, &'static CraftOrder>,
+}
+
 // ── Plan execution system ─────────────────────────────────────────────────────
 // Runs in Sequential set after production_system.
 // Handles: plan selection for idle agents, step dispatching,
@@ -2235,8 +2388,7 @@ pub fn plan_execution_system(
     plant_map: Res<PlantMap>,
     plant_query: Query<&Plant>,
     registries: PlanRegistries,
-    bp_map: Res<BlueprintMap>,
-    bp_query: Query<&Blueprint>,
+    sites: SiteRegistries,
     calendar: Res<Calendar>,
     clock: Res<SimClock>,
     item_check: Query<&GroundItem>,
@@ -2300,6 +2452,8 @@ pub fn plan_execution_system(
                     | AgentGoal::Rescue
                     | AgentGoal::ReturnCamp
                     | AgentGoal::Play
+                    | AgentGoal::Farm
+                    | AgentGoal::Craft
             ) {
                 return;
             }
@@ -2391,6 +2545,19 @@ pub fn plan_execution_system(
                                     .is_some()
                         }
                         _ => true,
+                    })
+                    // Drop plans whose dispatch just failed — otherwise the NN
+                    // re-picks the same broken plan every selection cycle and
+                    // the agent thrashes through ActivePlan inserts/removes
+                    // without ever running anything. Explore is exempted so
+                    // there's always a safety-net plan that survives the filter.
+                    .filter(|p| {
+                        if p.id == EXPLORE_PLAN_ID {
+                            return true;
+                        }
+                        plan_history_opt
+                            .as_deref()
+                            .map_or(true, |h| !h.recently_failed(p.id))
                     })
                     .collect();
 
@@ -2626,8 +2793,10 @@ pub fn plan_execution_system(
                     &wild_horse_q,
                     &mut combat_target,
                     &mut target_item,
-                    &bp_map,
-                    &bp_query,
+                    &sites.bp_map,
+                    &sites.bp_query,
+                    &sites.co_map,
+                    &sites.co_query,
                     rescue_target_opt,
                     &agent,
                     &carrier,
