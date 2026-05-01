@@ -1,6 +1,9 @@
 use super::animals::{Cat, Cow, Horse, Pig, Tamed};
 use super::faction::{FactionMember, FactionRegistry, StorageTileMap, SOLO};
 use super::items::GroundItem;
+use super::jobs::{
+    planting_area_contains, record_progress, JobBoard, JobClaim, JobCompletedEvent, JobKind,
+};
 use super::lod::LodLevel;
 use super::needs::Needs;
 use super::person::{AiState, PersonAI};
@@ -67,6 +70,8 @@ pub fn production_system(
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
     mut faction_registry: ResMut<FactionRegistry>,
+    mut board: ResMut<JobBoard>,
+    mut job_completed: EventWriter<JobCompletedEvent>,
     mut query: Query<(
         &mut PersonAI,
         &mut EconomicAgent,
@@ -75,9 +80,12 @@ pub fn production_system(
         &BucketSlot,
         &LodLevel,
         Option<&FactionMember>,
+        Option<&JobClaim>,
     )>,
 ) {
-    for (mut ai, mut agent, mut skills, mut needs, slot, lod, faction_member) in query.iter_mut() {
+    for (mut ai, mut agent, mut skills, mut needs, slot, lod, faction_member, claim_opt) in
+        query.iter_mut()
+    {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -111,6 +119,25 @@ pub fn production_system(
                     if let Some(fm) = faction_member {
                         if let Some(fd) = faction_registry.factions.get_mut(&fm.faction_id) {
                             fd.activity_log.increment(ActivityKind::Farming);
+                        }
+                    }
+                    // Credit a Farm posting if this worker holds one and the
+                    // tile falls within the posting's designated area.
+                    if let Some(claim) = claim_opt {
+                        let tile = (tx as i16, ty as i16);
+                        let in_area = board
+                            .get(claim.job_id)
+                            .map(|p| planting_area_contains(&p.progress, tile))
+                            .unwrap_or(false);
+                        if in_area {
+                            record_progress(
+                                &mut commands,
+                                &mut board,
+                                &mut job_completed,
+                                claim,
+                                JobKind::Farm,
+                                1,
+                            );
                         }
                     }
                     if is_play {

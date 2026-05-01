@@ -452,6 +452,11 @@ static TAME_HORSE_GOALS: &[AgentGoal] = &[AgentGoal::TameHorse];
 static GATHER_WOOD_GOALS: &[AgentGoal] = &[AgentGoal::GatherWood];
 static GATHER_STONE_GOALS: &[AgentGoal] = &[AgentGoal::GatherStone];
 static SURVIVE_AND_GATHER_FOOD_GOALS: &[AgentGoal] = &[AgentGoal::Survive, AgentGoal::GatherFood];
+static FARM_AND_GATHER_FOOD_GOALS: &[AgentGoal] = &[
+    AgentGoal::Survive,
+    AgentGoal::GatherFood,
+    AgentGoal::Farm,
+];
 static BUILD_GOALS: &[AgentGoal] = &[AgentGoal::Build];
 static CRAFT_GOALS: &[AgentGoal] = &[AgentGoal::Craft];
 static RESCUE_GOALS: &[AgentGoal] = &[AgentGoal::Rescue];
@@ -980,7 +985,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
                 (SI_SEASON_FOOD, 0.5),
             ]),
             bias: 0.0,
-            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
+            serves_goals: FARM_AND_GATHER_FOOD_GOALS,
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
         },

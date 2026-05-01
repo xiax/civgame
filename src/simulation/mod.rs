@@ -11,6 +11,7 @@ pub mod faction;
 pub mod gather;
 pub mod goals;
 pub mod items;
+pub mod jobs;
 pub mod line_of_sight;
 pub mod lod;
 pub mod memory;
@@ -54,7 +55,8 @@ impl Plugin for SimulationPlugin {
         plan::register_builtin_steps(&mut step_registry);
         plan::register_builtin_plans(&mut plan_registry);
 
-        app.add_event::<combat::CombatEvent>()
+        app.add_plugins(jobs::JobsPlugin)
+            .add_event::<combat::CombatEvent>()
             .add_event::<combat::DistressCallEvent>()
             .add_event::<combat::HandDropEvent>()
             .add_event::<plan::DropAbandonedFoodEvent>()
@@ -136,6 +138,9 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
+                    jobs::job_goal_lock_system.before(tasks::goal_dispatch_system),
+                    jobs::job_claim_system.before(jobs::job_goal_lock_system),
+                    jobs::job_board_command_system.before(jobs::job_claim_system),
                     tasks::goal_dispatch_system,
                     terraform::terraform_dispatch_system.after(tasks::goal_dispatch_system),
                 )
@@ -267,6 +272,19 @@ impl Plugin for SimulationPlugin {
                     world_sim::agent_exploration_system,
                     faction::chief_selection_system,
                     construction::chief_directive_system.after(faction::chief_selection_system),
+                )
+                    .in_set(SimulationSet::Economy),
+            )
+            .add_systems(
+                FixedUpdate,
+                (
+                    jobs::chief_job_posting_system
+                        .after(faction::compute_faction_storage_system)
+                        .after(faction::chief_selection_system),
+                    jobs::job_build_completion_system
+                        .after(jobs::chief_job_posting_system),
+                    jobs::job_claim_release_system
+                        .after(jobs::job_build_completion_system),
                 )
                     .in_set(SimulationSet::Economy),
             )

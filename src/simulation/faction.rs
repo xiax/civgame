@@ -1,5 +1,6 @@
 use super::goals::Personality;
 use super::items::{spawn_or_merge_ground_item, GroundItem};
+use super::jobs::{record_progress, JobBoard, JobClaim, JobCompletedEvent, JobKind};
 use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::needs::Needs;
@@ -567,17 +568,23 @@ pub fn drop_items_at_destination_system(
     mut commands: Commands,
     spatial: Res<SpatialIndex>,
     registry: Res<FactionRegistry>,
+    mut board: ResMut<JobBoard>,
+    mut job_completed: EventWriter<JobCompletedEvent>,
     mut ground_items: Query<&mut GroundItem>,
     mut query: Query<(
+        Entity,
         &mut PersonAI,
         &mut EconomicAgent,
         &mut crate::simulation::carry::Carrier,
         &FactionMember,
         &Profession,
         &LodLevel,
+        Option<&JobClaim>,
     )>,
 ) {
-    for (mut ai, mut agent, mut carrier, member, profession, lod) in query.iter_mut() {
+    for (worker, mut ai, mut agent, mut carrier, member, profession, lod, claim_opt) in
+        query.iter_mut()
+    {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -617,6 +624,9 @@ pub fn drop_items_at_destination_system(
                     break;
                 }
             }
+            // Sum calories of food deposited at faction storage so a Gather
+            // job posting (if this worker holds one) can be credited.
+            let mut deposited_calories: u32 = 0;
             for (good, qty) in drops {
                 spawn_or_merge_ground_item(
                     &mut commands,
@@ -627,8 +637,23 @@ pub fn drop_items_at_destination_system(
                     good,
                     qty,
                 );
+                deposited_calories =
+                    deposited_calories.saturating_add(qty * good.nutrition() as u32);
+            }
+            if deposited_calories > 0 {
+                if let Some(claim) = claim_opt {
+                    record_progress(
+                        &mut commands,
+                        &mut board,
+                        &mut job_completed,
+                        claim,
+                        JobKind::Gather,
+                        deposited_calories,
+                    );
+                }
             }
         }
+        let _ = worker; // silence unused if no further use
 
         // Non-farmers deposit seeds so farmers can plant them.
         let has_cultivation = registry
@@ -1002,7 +1027,9 @@ pub fn chief_selection_system(
             commands.entity(new_chief).insert(FactionChief);
             if let Some(old) = old_chief {
                 if old != new_chief {
-                    commands.entity(old).remove::<FactionChief>();
+                    if let Some(mut ec) = commands.get_entity(old) {
+                        ec.remove::<FactionChief>();
+                    }
                 }
                 // Succession drift — only counts as a transition if there was
                 // a prior chief (the founding chief sets generation 0).

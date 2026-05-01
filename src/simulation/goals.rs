@@ -92,6 +92,8 @@ pub enum AgentGoal {
     /// Drained agents seek out a play partner or an item to play with to
     /// refill willpower.
     Play = 15,
+    /// Plant or tend crops on a designated farm tile. Tech-gated by Agriculture.
+    Farm = 16,
 }
 
 impl AgentGoal {
@@ -112,6 +114,7 @@ impl AgentGoal {
             AgentGoal::Lead => "Lead",
             AgentGoal::Rescue => "Rescue",
             AgentGoal::Play => "Play",
+            AgentGoal::Farm => "Farm",
         }
     }
 }

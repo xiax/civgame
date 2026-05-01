@@ -38,6 +38,12 @@ pub struct PathInspectorParams<'w, 's> {
     pub path_follows: Query<'w, 's, &'static mut PathFollow>,
 }
 
+#[derive(SystemParam)]
+pub struct JobInspectorParams<'w, 's> {
+    pub claim_query: Query<'w, 's, &'static crate::simulation::jobs::JobClaim>,
+    pub commands: EventWriter<'w, crate::simulation::jobs::JobBoardCommand>,
+}
+
 pub fn inspector_panel_system(
     mut contexts: EguiContexts,
     selected: Res<SelectedEntity>,
@@ -51,6 +57,7 @@ pub fn inspector_panel_system(
     mut path_params: PathInspectorParams,
     plants: Query<&Plant>,
     rel_query: Query<&RelationshipMemory>,
+    mut job_params: JobInspectorParams,
     repro_query: Query<(
         Option<&Pregnancy>,
         Option<&CoSleepTracker>,
@@ -137,6 +144,22 @@ pub fn inspector_panel_system(
                                     .color(egui::Color32::from_gray(160)),
                             );
                         });
+                        if let Ok(claim) = job_params.claim_query.get(entity) {
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "Job: {} (#{})",
+                                    claim.kind.name(),
+                                    claim.job_id
+                                ));
+                                if ui.button("Release").clicked() {
+                                    job_params.commands.send(
+                                        crate::simulation::jobs::JobBoardCommand::Cancel(
+                                            claim.job_id,
+                                        ),
+                                    );
+                                }
+                            });
+                        }
 
                         if member.faction_id == SOLO {
                             ui.label("Faction: Solo");
@@ -792,9 +815,9 @@ pub fn inspector_panel_system(
                                             let penalty = (dist_agent + dist_camp) as f32 * 0.002;
                                             score -= penalty;
                                             bonus_str += &format!(" -{:.2} dist", penalty);
-                                        } else {
-                                            score -= 0.5;
-                                            bonus_str += " -0.5 no target";
+                                        } else if plan_def.memory_target_kind.is_some() {
+                                            score -= 0.1;
+                                            bonus_str += " -0.1 no target";
                                         }
 
                                         ui.horizontal(|ui| {

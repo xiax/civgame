@@ -3,6 +3,9 @@ use crate::economy::goods::Good;
 use crate::economy::item::{Item, ItemMaterial, ItemQuality};
 use crate::simulation::construction::{LoomMap, WorkbenchMap};
 use crate::simulation::faction::{FactionMember, FactionRegistry};
+use crate::simulation::jobs::{
+    record_progress, JobBoard, JobClaim, JobCompletedEvent, JobKind, JobProgress,
+};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, PersonAI};
 use crate::simulation::schedule::{BucketSlot, SimClock};
@@ -174,10 +177,13 @@ fn quality_for_skill(crafting_xp: u32) -> ItemQuality {
 }
 
 pub fn craft_system(
+    mut commands: Commands,
     clock: Res<SimClock>,
     faction_registry: Res<FactionRegistry>,
     workbench_map: Res<WorkbenchMap>,
     loom_map: Res<LoomMap>,
+    mut board: ResMut<JobBoard>,
+    mut job_completed: EventWriter<JobCompletedEvent>,
     mut query: Query<(
         &mut PersonAI,
         &mut EconomicAgent,
@@ -186,9 +192,11 @@ pub fn craft_system(
         &BucketSlot,
         &LodLevel,
         &Transform,
+        Option<&JobClaim>,
     )>,
 ) {
-    for (mut ai, mut agent, mut skills, member, slot, lod, transform) in query.iter_mut() {
+    for (mut ai, mut agent, mut skills, member, slot, lod, transform, claim_opt) in query.iter_mut()
+    {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -278,6 +286,25 @@ pub fn craft_system(
 
         // Gain XP
         skills.gain_xp(SkillKind::Crafting, recipe.crafting_xp);
+
+        // Credit a Craft posting if this worker holds one matching the recipe.
+        if let Some(claim) = claim_opt {
+            let recipe_id_u8 = recipe_id as u8;
+            let matches_recipe = board
+                .get(claim.job_id)
+                .map(|p| matches!(p.progress, JobProgress::Crafting { recipe, .. } if recipe == recipe_id_u8))
+                .unwrap_or(false);
+            if matches_recipe {
+                record_progress(
+                    &mut commands,
+                    &mut board,
+                    &mut job_completed,
+                    claim,
+                    JobKind::Craft,
+                    recipe.output_qty,
+                );
+            }
+        }
 
         ai.work_progress = 0;
         ai.state = AiState::Idle;

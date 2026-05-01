@@ -839,7 +839,8 @@ pub fn goal_dispatch_system(
                 | AgentGoal::Craft
                 | AgentGoal::Rescue
                 | AgentGoal::ReturnCamp
-                | AgentGoal::Play => {
+                | AgentGoal::Play
+                | AgentGoal::Farm => {
                     if ai.task_id == TaskKind::Explore as u16 {
                         if ai.state == AiState::Working {
                             ai.state = AiState::Idle;

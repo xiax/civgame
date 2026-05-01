@@ -6,6 +6,7 @@ pub mod economy_panel;
 pub mod hover;
 pub mod hud;
 pub mod inspector;
+pub mod job_board;
 pub mod orders;
 pub mod selection;
 pub mod tech_panel;
@@ -28,6 +29,7 @@ impl Plugin for UiPlugin {
             .insert_resource(orders::MilitaryMenuState::default())
             .insert_resource(tech_panel::TechPanelOpen::default())
             .insert_resource(debug_panel::DebugPanelState::default())
+            .insert_resource(job_board::JobBoardPanelState::default())
             .add_systems(
                 Update,
                 (
@@ -44,6 +46,7 @@ impl Plugin for UiPlugin {
                     world_map::world_map_system,
                     tech_panel::tech_panel_system,
                     debug_panel::debug_panel_system,
+                    job_board::job_board_panel_system,
                     hover::hover_info_system,
                 ),
             );
