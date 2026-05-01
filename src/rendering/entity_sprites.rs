@@ -2,7 +2,8 @@ use crate::rendering::pixel_art::{ArtMode, EntityTextures};
 use crate::rendering::sprite_library::SpriteLibrary;
 use crate::simulation::animals::{Cat, Cow, Deer, Fox, Horse, Pig, Rabbit, Wolf};
 use crate::simulation::construction::{
-    Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, Loom, Table, Wall, WallMaterial, Workbench,
+    Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, Loom, Table, Wall, WallMaterial,
+    Workbench,
 };
 use crate::simulation::faction::{
     FactionCenter, FactionMember, PlayerFaction, PlayerFactionMarker,
@@ -128,7 +129,10 @@ pub struct ClothingVisual {
 
 impl Default for ClothingVisual {
     fn default() -> Self {
-        Self { color_key: "tan", visible: false }
+        Self {
+            color_key: "tan",
+            visible: false,
+        }
     }
 }
 
@@ -167,7 +171,9 @@ pub fn spawn_bed_sprites(
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
-        commands.entity(entity).insert((BedVisual, EntityFogState::default(), FogPersistent));
+        commands
+            .entity(entity)
+            .insert((BedVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -198,7 +204,9 @@ pub fn spawn_wall_sprites(
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
-        commands.entity(entity).insert((WallVisual, EntityFogState::default(), FogPersistent));
+        commands
+            .entity(entity)
+            .insert((WallVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -223,7 +231,9 @@ pub fn spawn_campfire_sprites(
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
-        commands.entity(entity).insert((CampfireVisual, EntityFogState::default(), FogPersistent));
+        commands
+            .entity(entity)
+            .insert((CampfireVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -246,7 +256,9 @@ pub fn spawn_door_sprites(
         let mut sprite = Sprite::from_image(textures.door_ascii.clone());
         sprite.anchor = Anchor::BottomCenter;
 
-        commands.entity(entity).insert((DoorVisual, EntityFogState::default(), FogPersistent));
+        commands
+            .entity(entity)
+            .insert((DoorVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -268,7 +280,9 @@ pub fn spawn_table_sprites(
     for entity in query.iter() {
         let mut sprite = Sprite::from_image(textures.table_ascii.clone());
         sprite.anchor = Anchor::BottomCenter;
-        commands.entity(entity).insert((TableVisual, EntityFogState::default(), FogPersistent));
+        commands
+            .entity(entity)
+            .insert((TableVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -290,7 +304,9 @@ pub fn spawn_chair_sprites(
     for entity in query.iter() {
         let mut sprite = Sprite::from_image(textures.chair_ascii.clone());
         sprite.anchor = Anchor::BottomCenter;
-        commands.entity(entity).insert((ChairVisual, EntityFogState::default(), FogPersistent));
+        commands
+            .entity(entity)
+            .insert((ChairVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -312,7 +328,9 @@ pub fn spawn_workbench_sprites(
     for entity in query.iter() {
         let mut sprite = Sprite::from_image(textures.workbench_ascii.clone());
         sprite.anchor = Anchor::BottomCenter;
-        commands.entity(entity).insert((WorkbenchVisual, EntityFogState::default(), FogPersistent));
+        commands
+            .entity(entity)
+            .insert((WorkbenchVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -334,7 +352,9 @@ pub fn spawn_loom_sprites(
     for entity in query.iter() {
         let mut sprite = Sprite::from_image(textures.loom_ascii.clone());
         sprite.anchor = Anchor::BottomCenter;
-        commands.entity(entity).insert((LoomVisual, EntityFogState::default(), FogPersistent));
+        commands
+            .entity(entity)
+            .insert((LoomVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -366,7 +386,11 @@ pub fn spawn_faction_center_sprites(
             sprite.color = Color::srgb(0.55, 0.85, 1.0);
         }
 
-        commands.entity(entity).insert((FactionCenterVisual, EntityFogState::default(), FogPersistent));
+        commands.entity(entity).insert((
+            FactionCenterVisual,
+            EntityFogState::default(),
+            FogPersistent,
+        ));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -383,7 +407,10 @@ pub fn spawn_faction_center_sprites(
 pub fn spawn_wolf_sprites(
     mut commands: Commands,
     query: Query<
-        (Entity, Option<&crate::simulation::reproduction::BiologicalSex>),
+        (
+            Entity,
+            Option<&crate::simulation::reproduction::BiologicalSex>,
+        ),
         (With<Wolf>, Without<WolfVisual>),
     >,
     textures: Res<EntityTextures>,
@@ -394,7 +421,8 @@ pub fn spawn_wolf_sprites(
         let img = if *art_mode == ArtMode::Ascii {
             textures.wolf_ascii.clone()
         } else {
-            sprite_lib.get("anim_wolf_s_a")
+            sprite_lib
+                .get("anim_wolf_s_a")
                 .cloned()
                 .unwrap_or_else(|| textures.wolf_ascii.clone())
         };
@@ -432,7 +460,10 @@ pub fn spawn_wolf_sprites(
 pub fn spawn_deer_sprites(
     mut commands: Commands,
     query: Query<
-        (Entity, Option<&crate::simulation::reproduction::BiologicalSex>),
+        (
+            Entity,
+            Option<&crate::simulation::reproduction::BiologicalSex>,
+        ),
         (With<Deer>, Without<DeerVisual>),
     >,
     textures: Res<EntityTextures>,
@@ -441,7 +472,8 @@ pub fn spawn_deer_sprites(
 ) {
     for (entity, sex_opt) in query.iter() {
         let img = if *art_mode == ArtMode::Pixel {
-            sprite_lib.get("anim_deer_s_a")
+            sprite_lib
+                .get("anim_deer_s_a")
                 .cloned()
                 .unwrap_or_else(|| textures.deer_ascii.clone())
         } else {
@@ -506,7 +538,11 @@ pub fn spawn_person_sprites(
         let sex_str = if is_female { "female" } else { "male" };
 
         let mut entity_cmds = commands.entity(entity);
-        entity_cmds.insert((PersonVisual, FacingDirection::South, EntityFogState::default()));
+        entity_cmds.insert((
+            PersonVisual,
+            FacingDirection::South,
+            EntityFogState::default(),
+        ));
         if clothing_opt.is_none() {
             entity_cmds.insert(ClothingVisual::default());
         }
@@ -536,12 +572,18 @@ pub fn spawn_person_sprites(
             let hair_str = hair_opt.map(|h| h.as_str()).unwrap_or("brown");
             let cloth_str = clothing_opt.map(|c| c.color_key).unwrap_or("tan");
 
-            let body_img = sprite_lib.get(&format!("body_{sex_str}_{tone_str}_s_a"))
-                .cloned().unwrap_or_else(|| textures.person_male_ascii.clone());
-            let hair_img = sprite_lib.get(&format!("hair_{sex_str}_{hair_str}_s_a"))
-                .cloned().unwrap_or_else(|| textures.person_male_ascii.clone());
-            let cloth_img = sprite_lib.get(&format!("clothing_{sex_str}_{cloth_str}_s_a"))
-                .cloned().unwrap_or_else(|| textures.person_male_ascii.clone());
+            let body_img = sprite_lib
+                .get(&format!("body_{sex_str}_{tone_str}_s_a"))
+                .cloned()
+                .unwrap_or_else(|| textures.person_male_ascii.clone());
+            let hair_img = sprite_lib
+                .get(&format!("hair_{sex_str}_{hair_str}_s_a"))
+                .cloned()
+                .unwrap_or_else(|| textures.person_male_ascii.clone());
+            let cloth_img = sprite_lib
+                .get(&format!("clothing_{sex_str}_{cloth_str}_s_a"))
+                .cloned()
+                .unwrap_or_else(|| textures.person_male_ascii.clone());
 
             let mut body_sprite = Sprite::from_image(body_img);
             body_sprite.color = Color::WHITE;
@@ -556,7 +598,8 @@ pub fn spawn_person_sprites(
 
             commands.entity(entity).with_children(|parent| {
                 parent.spawn((
-                    VisualChild, VisualLayer::Body,
+                    VisualChild,
+                    VisualLayer::Body,
                     body_sprite,
                     Transform::from_xyz(0.0, -8.0, 0.0),
                     GlobalTransform::default(),
@@ -564,7 +607,8 @@ pub fn spawn_person_sprites(
                     InheritedVisibility::default(),
                 ));
                 parent.spawn((
-                    VisualChild, VisualLayer::Clothing,
+                    VisualChild,
+                    VisualLayer::Clothing,
                     cloth_sprite,
                     Transform::from_xyz(0.0, -8.0, 0.1),
                     GlobalTransform::default(),
@@ -572,7 +616,8 @@ pub fn spawn_person_sprites(
                     InheritedVisibility::default(),
                 ));
                 parent.spawn((
-                    VisualChild, VisualLayer::Hair,
+                    VisualChild,
+                    VisualLayer::Hair,
                     hair_sprite,
                     Transform::from_xyz(0.0, -8.0, 0.2),
                     GlobalTransform::default(),
@@ -589,7 +634,10 @@ pub fn spawn_person_sprites(
                 parent.spawn((
                     PersonNameLabel,
                     Text2d::new(label_text),
-                    TextFont { font_size: 8.0, ..default() },
+                    TextFont {
+                        font_size: 8.0,
+                        ..default()
+                    },
                     TextColor(Color::WHITE),
                     TextLayout::default(),
                     // Sprite is 16px tall, bottom at Y=-8 → top at Y=+8; +3px gap
@@ -640,7 +688,9 @@ pub fn spawn_plant_sprites(
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
-        commands.entity(entity).insert((PlantVisual, EntityFogState::default(), FogPersistent));
+        commands
+            .entity(entity)
+            .insert((PlantVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -673,16 +723,19 @@ pub fn animate_person_sprites(
     time: Res<Time>,
     art_mode: Res<ArtMode>,
     sprite_lib: Res<SpriteLibrary>,
-    mut persons: Query<(
-        &PersonAI,
-        Option<&BiologicalSex>,
-        Option<&SkinTone>,
-        Option<&HairColor>,
-        Option<&ClothingVisual>,
-        &Transform,
-        &Children,
-        &mut FacingDirection,
-    ), With<Person>>,
+    mut persons: Query<
+        (
+            &PersonAI,
+            Option<&BiologicalSex>,
+            Option<&SkinTone>,
+            Option<&HairColor>,
+            Option<&ClothingVisual>,
+            &Transform,
+            &Children,
+            &mut FacingDirection,
+        ),
+        With<Person>,
+    >,
     mut child_sprites: Query<(&mut Sprite, &VisualLayer), With<VisualChild>>,
 ) {
     if *art_mode == ArtMode::Ascii {
@@ -691,16 +744,26 @@ pub fn animate_person_sprites(
 
     let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
 
-    for (ai, sex_opt, tone_opt, hair_opt, clothing_opt, transform, children, mut facing) in persons.iter_mut() {
+    for (ai, sex_opt, tone_opt, hair_opt, clothing_opt, transform, children, mut facing) in
+        persons.iter_mut()
+    {
         let target_world = tile_to_world(ai.target_tile.0 as i32, ai.target_tile.1 as i32);
         let diff = target_world - transform.translation.truncate();
         let is_moving = diff.length() > 2.0;
 
         if is_moving {
             *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+                if diff.x > 0.0 {
+                    FacingDirection::East
+                } else {
+                    FacingDirection::West
+                }
             } else {
-                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+                if diff.y > 0.0 {
+                    FacingDirection::North
+                } else {
+                    FacingDirection::South
+                }
             };
         }
 
@@ -750,9 +813,17 @@ pub fn animate_wolves_system(
         let is_moving = diff.length() > 0.5;
         if is_moving {
             *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+                if diff.x > 0.0 {
+                    FacingDirection::East
+                } else {
+                    FacingDirection::West
+                }
             } else {
-                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+                if diff.y > 0.0 {
+                    FacingDirection::North
+                } else {
+                    FacingDirection::South
+                }
             };
         }
         last_pos.0 = pos;
@@ -788,9 +859,17 @@ pub fn animate_deer_system(
         let is_moving = diff.length() > 0.5;
         if is_moving {
             *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+                if diff.x > 0.0 {
+                    FacingDirection::East
+                } else {
+                    FacingDirection::West
+                }
             } else {
-                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+                if diff.y > 0.0 {
+                    FacingDirection::North
+                } else {
+                    FacingDirection::South
+                }
             };
         }
         last_pos.0 = pos;
@@ -812,7 +891,10 @@ pub fn animate_deer_system(
 pub fn spawn_horse_sprites(
     mut commands: Commands,
     query: Query<
-        (Entity, Option<&crate::simulation::reproduction::BiologicalSex>),
+        (
+            Entity,
+            Option<&crate::simulation::reproduction::BiologicalSex>,
+        ),
         (With<Horse>, Without<HorseVisual>),
     >,
     sprite_lib: Res<SpriteLibrary>,
@@ -877,9 +959,17 @@ pub fn animate_horses_system(
         let is_moving = diff.length() > 0.5;
         if is_moving {
             *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+                if diff.x > 0.0 {
+                    FacingDirection::East
+                } else {
+                    FacingDirection::West
+                }
             } else {
-                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+                if diff.y > 0.0 {
+                    FacingDirection::North
+                } else {
+                    FacingDirection::South
+                }
             };
         }
         last_pos.0 = pos;
@@ -902,10 +992,7 @@ pub fn animate_horses_system(
 
 pub fn spawn_cow_sprites(
     mut commands: Commands,
-    query: Query<
-        (Entity, Option<&BiologicalSex>),
-        (With<Cow>, Without<CowVisual>),
-    >,
+    query: Query<(Entity, Option<&BiologicalSex>), (With<Cow>, Without<CowVisual>)>,
     sprite_lib: Res<SpriteLibrary>,
     art_mode: Res<ArtMode>,
 ) {
@@ -967,9 +1054,17 @@ pub fn animate_cows_system(
         let is_moving = diff.length() > 0.5;
         if is_moving {
             *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+                if diff.x > 0.0 {
+                    FacingDirection::East
+                } else {
+                    FacingDirection::West
+                }
             } else {
-                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+                if diff.y > 0.0 {
+                    FacingDirection::North
+                } else {
+                    FacingDirection::South
+                }
             };
         }
         last_pos.0 = pos;
@@ -990,10 +1085,7 @@ pub fn animate_cows_system(
 
 pub fn spawn_rabbit_sprites(
     mut commands: Commands,
-    query: Query<
-        (Entity, Option<&BiologicalSex>),
-        (With<Rabbit>, Without<RabbitVisual>),
-    >,
+    query: Query<(Entity, Option<&BiologicalSex>), (With<Rabbit>, Without<RabbitVisual>)>,
     sprite_lib: Res<SpriteLibrary>,
     art_mode: Res<ArtMode>,
 ) {
@@ -1054,9 +1146,17 @@ pub fn animate_rabbits_system(
         let is_moving = diff.length() > 0.5;
         if is_moving {
             *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+                if diff.x > 0.0 {
+                    FacingDirection::East
+                } else {
+                    FacingDirection::West
+                }
             } else {
-                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+                if diff.y > 0.0 {
+                    FacingDirection::North
+                } else {
+                    FacingDirection::South
+                }
             };
         }
         last_pos.0 = pos;
@@ -1077,10 +1177,7 @@ pub fn animate_rabbits_system(
 
 pub fn spawn_pig_sprites(
     mut commands: Commands,
-    query: Query<
-        (Entity, Option<&BiologicalSex>),
-        (With<Pig>, Without<PigVisual>),
-    >,
+    query: Query<(Entity, Option<&BiologicalSex>), (With<Pig>, Without<PigVisual>)>,
     sprite_lib: Res<SpriteLibrary>,
     art_mode: Res<ArtMode>,
 ) {
@@ -1141,9 +1238,17 @@ pub fn animate_pigs_system(
         let is_moving = diff.length() > 0.5;
         if is_moving {
             *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+                if diff.x > 0.0 {
+                    FacingDirection::East
+                } else {
+                    FacingDirection::West
+                }
             } else {
-                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+                if diff.y > 0.0 {
+                    FacingDirection::North
+                } else {
+                    FacingDirection::South
+                }
             };
         }
         last_pos.0 = pos;
@@ -1164,10 +1269,7 @@ pub fn animate_pigs_system(
 
 pub fn spawn_fox_sprites(
     mut commands: Commands,
-    query: Query<
-        (Entity, Option<&BiologicalSex>),
-        (With<Fox>, Without<FoxVisual>),
-    >,
+    query: Query<(Entity, Option<&BiologicalSex>), (With<Fox>, Without<FoxVisual>)>,
     sprite_lib: Res<SpriteLibrary>,
     art_mode: Res<ArtMode>,
 ) {
@@ -1228,9 +1330,17 @@ pub fn animate_foxes_system(
         let is_moving = diff.length() > 0.5;
         if is_moving {
             *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+                if diff.x > 0.0 {
+                    FacingDirection::East
+                } else {
+                    FacingDirection::West
+                }
             } else {
-                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+                if diff.y > 0.0 {
+                    FacingDirection::North
+                } else {
+                    FacingDirection::South
+                }
             };
         }
         last_pos.0 = pos;
@@ -1251,10 +1361,7 @@ pub fn animate_foxes_system(
 
 pub fn spawn_cat_sprites(
     mut commands: Commands,
-    query: Query<
-        (Entity, Option<&BiologicalSex>),
-        (With<Cat>, Without<CatVisual>),
-    >,
+    query: Query<(Entity, Option<&BiologicalSex>), (With<Cat>, Without<CatVisual>)>,
     sprite_lib: Res<SpriteLibrary>,
     art_mode: Res<ArtMode>,
 ) {
@@ -1315,9 +1422,17 @@ pub fn animate_cats_system(
         let is_moving = diff.length() > 0.5;
         if is_moving {
             *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 { FacingDirection::East } else { FacingDirection::West }
+                if diff.x > 0.0 {
+                    FacingDirection::East
+                } else {
+                    FacingDirection::West
+                }
             } else {
-                if diff.y > 0.0 { FacingDirection::North } else { FacingDirection::South }
+                if diff.y > 0.0 {
+                    FacingDirection::North
+                } else {
+                    FacingDirection::South
+                }
             };
         }
         last_pos.0 = pos;
@@ -1450,8 +1565,7 @@ pub fn apply_entity_fog_tint_system(
                 } else {
                     1.0
                 };
-                let new_color =
-                    Color::srgba(r * fog_factor, g * fog_factor, b * fog_factor, alpha);
+                let new_color = Color::srgba(r * fog_factor, g * fog_factor, b * fog_factor, alpha);
                 if sprite.color != new_color {
                     sprite.color = new_color;
                 }
@@ -1533,11 +1647,13 @@ pub fn handle_art_mode_change(
     }
 }
 
-
 /// Updates ClothingVisual color key whenever a person's Equipment changes.
 /// The animate system picks up the new key on the next frame automatically.
 pub fn update_clothing_from_equipment(
-    mut persons: Query<(&Equipment, Option<&mut ClothingVisual>), (With<Person>, Changed<Equipment>)>,
+    mut persons: Query<
+        (&Equipment, Option<&mut ClothingVisual>),
+        (With<Person>, Changed<Equipment>),
+    >,
 ) {
     for (equip, clothing_opt) in &mut persons {
         if let Some(mut clothing) = clothing_opt {

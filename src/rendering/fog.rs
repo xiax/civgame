@@ -9,7 +9,7 @@ use crate::simulation::lod::LodLevel;
 use crate::simulation::person::PersonAI;
 use crate::world::chunk::{ChunkMap, Z_MIN};
 use crate::world::chunk_streaming::{
-    resolve_render_tile, TileMaterials, TileSpriteIndex, TileSprite, RENDERABLE_KINDS,
+    resolve_render_tile, TileMaterials, TileSprite, TileSpriteIndex, RENDERABLE_KINDS,
 };
 use crate::world::globe::Globe;
 use crate::world::terrain::{WorldGen, TILE_SIZE};

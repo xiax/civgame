@@ -92,20 +92,15 @@ impl HotspotFlowFields {
     /// - the agent is in a different chunk than the hotspot (cross-chunk
     ///   routing is the router's job, not the flow field's),
     /// - the agent's tile has no path to the goal within the chunk.
-    pub fn lookup_dir(
-        &self,
-        tile: (i16, i16, i8),
-        agent_pos: (i32, i32, i8),
-    ) -> Option<u8> {
+    pub fn lookup_dir(&self, tile: (i16, i16, i8), agent_pos: (i32, i32, i8)) -> Option<u8> {
         for k in ALL_KINDS {
             let key = HotspotKey { tile, kind: k };
-            let Some(entry) = self.entries.get(&key) else { continue };
+            let Some(entry) = self.entries.get(&key) else {
+                continue;
+            };
             let chunk = entry.field.chunk;
             let csz = CHUNK_SIZE as i32;
-            let agent_chunk = ChunkCoord(
-                agent_pos.0.div_euclid(csz),
-                agent_pos.1.div_euclid(csz),
-            );
+            let agent_chunk = ChunkCoord(agent_pos.0.div_euclid(csz), agent_pos.1.div_euclid(csz));
             if agent_chunk != chunk {
                 continue;
             }
@@ -188,8 +183,10 @@ mod tests {
         let surface_z = Box::new([[surf_z; CHUNK_SIZE]; CHUNK_SIZE]);
         let surface_kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
         let surface_fertility = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
-        map.0
-            .insert(coord, Chunk::new(surface_z, surface_kind, surface_fertility));
+        map.0.insert(
+            coord,
+            Chunk::new(surface_z, surface_kind, surface_fertility),
+        );
         map
     }
 

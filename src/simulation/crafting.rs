@@ -37,7 +37,7 @@ pub struct CraftRecipe {
 }
 
 use crate::simulation::technology::{
-    BOW_AND_ARROW, BRONZE_WEAPONS, COPPER_TOOLS, FIRE_MAKING, FIRED_POTTERY, FLINT_KNAPPING,
+    BOW_AND_ARROW, BRONZE_WEAPONS, COPPER_TOOLS, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING,
     HUNTING_SPEAR, LOOM_WEAVING,
 };
 
@@ -196,7 +196,7 @@ pub fn craft_system(
             continue;
         }
 
-        let recipe_id = ai.target_z as usize;
+        let recipe_id = ai.craft_recipe_id as usize;
         let Some(recipe) = CRAFT_RECIPES.get(recipe_id) else {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;

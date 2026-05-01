@@ -61,13 +61,7 @@ pub fn dig_system(
         // The current surface tile at surf_z becomes Air (headspace), the tile
         // at surf_z - 1 becomes Dirt (the new floor). Surface drops by one.
         let target_floor_z = surf_z - 1;
-        let blocks = carve_tile(
-            &mut chunk_map,
-            tx,
-            ty,
-            target_floor_z,
-            &mut tile_changed,
-        );
+        let blocks = carve_tile(&mut chunk_map, tx, ty, target_floor_z, &mut tile_changed);
 
         let qty = blocks * STONE_PER_BLOCK;
         if qty > 0 {
@@ -76,7 +70,10 @@ pub fn dig_system(
             if leftover > 0 {
                 let pos = tile_to_world(tx, ty);
                 commands.spawn((
-                    GroundItem { item, qty: leftover },
+                    GroundItem {
+                        item,
+                        qty: leftover,
+                    },
                     Transform::from_xyz(pos.x, pos.y, 0.3),
                     GlobalTransform::default(),
                     Visibility::Visible,

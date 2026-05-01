@@ -4,20 +4,20 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
-use crate::simulation::faction::{FactionRegistry, PlayerFaction};
-use crate::simulation::needs::Needs;
-use crate::simulation::person::Person;
-use crate::simulation::construction::RitualState;
-use crate::simulation::settlement::{SettlementPlans, ZoneOverlayToggle};
-use crate::simulation::terraform::{count_terraform_sites_for, TerraformMap, TerraformSite};
-use crate::simulation::skills::{Skills, SKILL_COUNT};
-use crate::simulation::technology::{ActivityKind, Era, ACTIVITY_COUNT, TECH_COUNT, TECH_TREE};
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::pathfinding::hotspots::HotspotFlowFields;
 use crate::pathfinding::path_request::{FailureLog, PathDebugFlags};
 use crate::pathfinding::worker::PathfindingDiagnostics;
 use crate::rendering::path_debug::PathDebugOverlay;
+use crate::simulation::construction::RitualState;
+use crate::simulation::faction::{FactionRegistry, PlayerFaction};
+use crate::simulation::needs::Needs;
+use crate::simulation::person::Person;
+use crate::simulation::settlement::{SettlementPlans, ZoneOverlayToggle};
+use crate::simulation::skills::{Skills, SKILL_COUNT};
+use crate::simulation::technology::{ActivityKind, Era, ACTIVITY_COUNT, TECH_COUNT, TECH_TREE};
+use crate::simulation::terraform::{count_terraform_sites_for, TerraformMap, TerraformSite};
 use crate::ui::selection::SelectedEntity;
 
 const SKILL_NAMES: [&str; SKILL_COUNT] = [

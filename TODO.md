@@ -15,12 +15,13 @@
   the game progresses. one that builds intelligently and can replace old buildings with new ones as     
   new technologies and materials become available
 - terraforming should use mine and fill up task
-- Click dragging to select multiple units, there should be an option to draft them (rim world style) that switches them to military mode. In military mode it's right click to move, no harvesting or gathering, and right clicking on hostile entities auto attacks them and right clicking on neutral entities opens a menu for attack or move to. and use flow fields for units to reach target
-- add parallelization
+X- Click dragging to select multiple units, there should be an option to draft them (rim world style) that switches them to military mode. In military mode it's right click to move, no harvesting or gathering, and right clicking on hostile entities auto attacks them and right clicking on neutral entities opens a menu for attack or move to. and use flow fields for units to reach target
+X- add parallelization
 - faction camp should have 20 tiles view range
 - rimworld-like bottom menu for mass orders for gathering wood or farming or gathering bushes or construction
 - Additional orders for mass crafting from a central control menu
 - world generation to be more expansive with larger plains, bigger valleys and mountains, larger bodies of water, etc.
+- implement willpower system. Work decreases willpower, fun stuff increases willpower, add play task, low willpower workers can look for entertainment items or people to play with. Any item like wood or stone can be played with, though they have low entertainment value. Add entertainment values to every item. Playing with other people should have higher value for everyone except loners. Playing with people counts as socialization as well and builds relationships
 
 
 2. The "Unique Target" Problem
@@ -54,14 +55,5 @@
  - Idle wander timer (movement.rs:327-420) doesn't promote back to Seeking.
  Pre-existing; out of scope.
 
-Status: Following
-Goal: (16792, 8331, -9)
-At:   (16791, 8330)
-Chunk route: 0/1
-Segment: 0/1
-stuck_ticks: 9  •  last_replan: 0
-request_id: 38222  •  planning_gen: 4  •  pending: false
-Recent tiles: (16791,8330,-9)
-Failures: conn 28  astar 48  budget 0  router 2  cont 14
-tick 2942540  goal (16791,8331,-9)  Unreachable (A*)
-tick 2941493  goal (16790,8331,-9)  Unreachable (A*)
+
+

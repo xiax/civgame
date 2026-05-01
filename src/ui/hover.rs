@@ -4,14 +4,20 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::agent::EconomicAgent;
 use crate::simulation::animals::{AnimalAI, Deer, Wolf};
+use crate::simulation::carry::Carrier;
 use crate::simulation::combat::{Body, Health};
+use crate::simulation::construction::{
+    recipe_for, AutonomousBuildingToggle, Blueprint, BlueprintMap,
+};
 use crate::simulation::faction::FactionMember;
 use crate::simulation::items::GroundItem;
+use crate::simulation::lod::LodLevel;
 use crate::simulation::mood::Mood;
 use crate::simulation::needs::Needs;
-use crate::simulation::person::{Person, PersonAI};
+use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::plants::Plant;
 use crate::simulation::reproduction::BiologicalSex;
+use crate::simulation::tasks::TaskKind;
 use crate::world::chunk::ChunkMap;
 use crate::world::globe::Globe;
 use crate::world::spatial::SpatialIndex;
@@ -41,6 +47,20 @@ pub fn hover_info_system(
     plant_query: Query<&Plant>,
     item_query: Query<&GroundItem>,
     name_query: Query<&Name>,
+    bp_map: Res<BlueprintMap>,
+    auto_build: Res<AutonomousBuildingToggle>,
+    bp_query: Query<&Blueprint>,
+    worker_query: Query<
+        (
+            &FactionMember,
+            &PersonAI,
+            &EconomicAgent,
+            &Carrier,
+            &LodLevel,
+            &Transform,
+        ),
+        With<Person>,
+    >,
 ) {
     let Ok(window) = windows.get_single() else {
         return;
@@ -126,6 +146,138 @@ pub fn hover_info_system(
                         ui.label(format!("Item: {:?} x{}", item.item.good, item.qty));
                     } else {
                         ui.label(format!("Entity: {:?}", entity));
+                    }
+                }
+            }
+
+            let bp_key = (tx as i16, ty as i16);
+            if let Some(&bp_entity) = bp_map.0.get(&bp_key) {
+                if let Ok(bp) = bp_query.get(bp_entity) {
+                    ui.separator();
+                    let recipe = recipe_for(bp.kind);
+                    ui.label(egui::RichText::new(format!("Blueprint: {}", recipe.name)).strong());
+                    ui.label(format!("Kind: {:?}", bp.kind));
+                    ui.label(format!("Faction: {}", bp.faction_id));
+                    if let Some(owner) = bp.personal_owner {
+                        ui.label(format!("Personal owner: {:?}", owner));
+                    }
+                    ui.label(format!("Target Z: {}", bp.target_z));
+                    ui.label(format!(
+                        "Progress: {} / {}",
+                        bp.build_progress, recipe.work_ticks
+                    ));
+                    ui.label(format!(
+                        "Satisfied: {}",
+                        if bp.is_satisfied() { "yes" } else { "no" }
+                    ));
+                    ui.label(format!("AutoBuild: {}", auto_build.0));
+
+                    ui.label("Deposits:");
+                    for i in 0..bp.deposit_count as usize {
+                        let d = bp.deposits[i];
+                        let line = format!("  {:?}: {}/{}", d.good, d.deposited, d.needed);
+                        if d.deposited < d.needed {
+                            ui.label(egui::RichText::new(line).color(egui::Color32::LIGHT_RED));
+                        } else {
+                            ui.label(line);
+                        }
+                    }
+
+                    // Worker / hauler diagnostic block.
+                    let mut on_site_workers = 0u32;
+                    let mut on_site_haulers = 0u32;
+                    let mut idle_nearby = 0u32;
+                    let mut closest_dormant: Option<i32> = None;
+                    // Per-deposit-slot carrier counts.
+                    let mut slot_carriers = [0u32; 3];
+
+                    let bp_pos = (tx, ty);
+                    for (member, ai, agent, carrier, lod, transform) in worker_query.iter() {
+                        let allowed = match bp.personal_owner {
+                            Some(_) => false, // personal blueprint — only owner counts
+                            None => member.faction_id == bp.faction_id,
+                        };
+                        // For personal blueprints we still want to show owner state;
+                        // the entity-id match is checked via spatial lookup below.
+                        if !allowed && bp.personal_owner.is_none() {
+                            continue;
+                        }
+
+                        // On-site count: target_entity points at this bp AND task matches.
+                        if ai.target_entity == Some(bp_entity) {
+                            let t = ai.task_id;
+                            if t == TaskKind::Construct as u16 || t == TaskKind::ConstructBed as u16
+                            {
+                                on_site_workers += 1;
+                            } else if t == TaskKind::HaulMaterials as u16 {
+                                on_site_haulers += 1;
+                            }
+                        }
+
+                        if !allowed {
+                            continue;
+                        }
+
+                        let agent_world = transform.translation.truncate();
+                        let (atx, aty) = world_to_tile(agent_world);
+                        let dist = (atx as i32 - bp_pos.0).abs() + (aty as i32 - bp_pos.1).abs();
+
+                        if *lod == LodLevel::Dormant {
+                            if closest_dormant.map_or(true, |d| dist < d) {
+                                closest_dormant = Some(dist);
+                            }
+                            continue;
+                        }
+
+                        if ai.state == AiState::Idle && dist <= 30 {
+                            idle_nearby += 1;
+                        }
+
+                        for i in 0..bp.deposit_count as usize {
+                            let need = bp.deposits[i];
+                            if need.deposited >= need.needed {
+                                continue;
+                            }
+                            let qty =
+                                carrier.quantity_of_good(need.good) + agent.quantity_of(need.good);
+                            if qty > 0 {
+                                slot_carriers[i] += 1;
+                            }
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("Diagnostics").strong());
+                    let on_site_line = format!(
+                        "On-site: {} worker(s), {} hauler(s)",
+                        on_site_workers, on_site_haulers
+                    );
+                    if on_site_workers + on_site_haulers == 0 {
+                        ui.label(egui::RichText::new(on_site_line).color(egui::Color32::LIGHT_RED));
+                    } else {
+                        ui.label(on_site_line);
+                    }
+                    let idle_line = format!("Eligible idle nearby (≤30): {}", idle_nearby);
+                    if idle_nearby == 0 {
+                        ui.label(egui::RichText::new(idle_line).color(egui::Color32::LIGHT_RED));
+                    } else {
+                        ui.label(idle_line);
+                    }
+                    ui.label("Carriers per unmet slot:");
+                    for i in 0..bp.deposit_count as usize {
+                        let need = bp.deposits[i];
+                        if need.deposited >= need.needed {
+                            continue;
+                        }
+                        let line = format!("  {:?} carriers: {}", need.good, slot_carriers[i]);
+                        if slot_carriers[i] == 0 {
+                            ui.label(egui::RichText::new(line).color(egui::Color32::LIGHT_RED));
+                        } else {
+                            ui.label(line);
+                        }
+                    }
+                    if let Some(d) = closest_dormant {
+                        ui.label(format!("Closest dormant member: {} tiles", d));
                     }
                 }
             }

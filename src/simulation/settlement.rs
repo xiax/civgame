@@ -180,11 +180,15 @@ pub fn paleolithic_hearth_count(members: u32) -> u32 {
 /// Compute the deterministic Paleolithic hearth positions for a faction.
 /// `faction_id` selects the primary angle so different bands face different
 /// directions; secondary/tertiary hearths fan ±90° off the primary.
-pub fn paleolithic_hearth_positions(faction_id: u32, home: (i16, i16), members: u32) -> Vec<(i32, i32)> {
+pub fn paleolithic_hearth_positions(
+    faction_id: u32,
+    home: (i16, i16),
+    members: u32,
+) -> Vec<(i32, i32)> {
     let n = paleolithic_hearth_count(members);
     let (hx, hy) = (home.0 as i32, home.1 as i32);
-    let theta0 = (faction_id.wrapping_mul(2654435761) as f32 / u32::MAX as f32)
-        * std::f32::consts::TAU;
+    let theta0 =
+        (faction_id.wrapping_mul(2654435761) as f32 / u32::MAX as f32) * std::f32::consts::TAU;
     let mut hearths = Vec::with_capacity(n as usize);
     let primary = (
         (hx as f32 + theta0.cos() * PALEO_PRIMARY_HEARTH_DIST).round() as i32,
@@ -226,7 +230,7 @@ pub fn build_settlement_plan(faction_id: u32, faction: &FactionData, tick: u64) 
 
     // Density (255) ⇒ tight zones; density (0) ⇒ loose zones.
     let gap: i32 = ((255 - faction.culture.density as i32) / 50).max(0); // 0..=5
-    // Defensive trait grows the wall ring outward.
+                                                                         // Defensive trait grows the wall ring outward.
     let def_pad: i32 = (faction.culture.defensive as i32 / 80).max(1); // 1..=3
 
     let mut zones: Vec<Zone> = Vec::new();
@@ -238,12 +242,52 @@ pub fn build_settlement_plan(faction_id: u32, faction: &FactionData, tick: u64) 
             zones.push(zone(ZoneKind::Civic, hx - 2, hy - 2, 5, 5, 110, 1));
             let r = base_r;
             let arm_w = (r as u32).max(5);
-            zones.push(zone(ZoneKind::Residential, hx - r - gap, hy - 3, arm_w, 7, 200, (members.min(20) / 4 + 2) as u8));
-            zones.push(zone(ZoneKind::Residential, hx + 3 + gap, hy - 3, arm_w, 7, 200, (members.min(20) / 4 + 2) as u8));
-            zones.push(zone(ZoneKind::Residential, hx - 3, hy - r - gap, 7, arm_w, 200, (members.min(20) / 4 + 2) as u8));
-            zones.push(zone(ZoneKind::Residential, hx - 3, hy + 3 + gap, 7, arm_w, 200, (members.min(20) / 4 + 2) as u8));
+            zones.push(zone(
+                ZoneKind::Residential,
+                hx - r - gap,
+                hy - 3,
+                arm_w,
+                7,
+                200,
+                (members.min(20) / 4 + 2) as u8,
+            ));
+            zones.push(zone(
+                ZoneKind::Residential,
+                hx + 3 + gap,
+                hy - 3,
+                arm_w,
+                7,
+                200,
+                (members.min(20) / 4 + 2) as u8,
+            ));
+            zones.push(zone(
+                ZoneKind::Residential,
+                hx - 3,
+                hy - r - gap,
+                7,
+                arm_w,
+                200,
+                (members.min(20) / 4 + 2) as u8,
+            ));
+            zones.push(zone(
+                ZoneKind::Residential,
+                hx - 3,
+                hy + 3 + gap,
+                7,
+                arm_w,
+                200,
+                (members.min(20) / 4 + 2) as u8,
+            ));
             let dr = r + def_pad + gap;
-            zones.push(zone(ZoneKind::Defense, hx - dr, hy - dr, (dr as u32 * 2) as u32, (dr as u32 * 2) as u32, 180, 12));
+            zones.push(zone(
+                ZoneKind::Defense,
+                hx - dr,
+                hy - dr,
+                (dr as u32 * 2) as u32,
+                (dr as u32 * 2) as u32,
+                180,
+                12,
+            ));
             zones.push(zone(ZoneKind::Storage, hx + 1, hy - 1, 3, 3, 150, 2));
             road_spine.push(Axis::NorthSouth);
             road_spine.push(Axis::EastWest);
@@ -252,10 +296,34 @@ pub fn build_settlement_plan(faction_id: u32, faction: &FactionData, tick: u64) 
             // Long E-W spine; residential arms east and west of home.
             zones.push(zone(ZoneKind::Civic, hx - 2, hy - 2, 5, 5, 110, 1));
             let arm = (base_r * 3 / 2) as u32;
-            zones.push(zone(ZoneKind::Residential, hx - arm as i32 - gap, hy - 2, arm, 5, 200, (members / 2 + 1).min(10) as u8));
-            zones.push(zone(ZoneKind::Residential, hx + 3 + gap, hy - 2, arm, 5, 200, (members / 2 + 1).min(10) as u8));
+            zones.push(zone(
+                ZoneKind::Residential,
+                hx - arm as i32 - gap,
+                hy - 2,
+                arm,
+                5,
+                200,
+                (members / 2 + 1).min(10) as u8,
+            ));
+            zones.push(zone(
+                ZoneKind::Residential,
+                hx + 3 + gap,
+                hy - 2,
+                arm,
+                5,
+                200,
+                (members / 2 + 1).min(10) as u8,
+            ));
             let outer = arm as i32 + def_pad;
-            zones.push(zone(ZoneKind::Defense, hx - outer, hy - 4, (outer as u32 * 2) + 5, 9, 160, 10));
+            zones.push(zone(
+                ZoneKind::Defense,
+                hx - outer,
+                hy - 4,
+                (outer as u32 * 2) + 5,
+                9,
+                160,
+                10,
+            ));
             zones.push(zone(ZoneKind::Storage, hx - 1, hy - 4, 3, 3, 150, 2));
             road_spine.push(Axis::EastWest);
         }
@@ -263,9 +331,25 @@ pub fn build_settlement_plan(faction_id: u32, faction: &FactionData, tick: u64) 
             // Tight square footprint; everything packed.
             let r = (base_r * 3 / 4).max(5);
             zones.push(zone(ZoneKind::Civic, hx - 1, hy - 1, 3, 3, 110, 1));
-            zones.push(zone(ZoneKind::Residential, hx - r, hy - r, (r as u32 * 2), (r as u32 * 2), 200, members.min(20) as u8));
+            zones.push(zone(
+                ZoneKind::Residential,
+                hx - r,
+                hy - r,
+                (r as u32 * 2),
+                (r as u32 * 2),
+                200,
+                members.min(20) as u8,
+            ));
             let dr = r + def_pad;
-            zones.push(zone(ZoneKind::Defense, hx - dr, hy - dr, (dr as u32 * 2), (dr as u32 * 2), 180, 10));
+            zones.push(zone(
+                ZoneKind::Defense,
+                hx - dr,
+                hy - dr,
+                (dr as u32 * 2),
+                (dr as u32 * 2),
+                180,
+                10,
+            ));
             zones.push(zone(ZoneKind::Storage, hx, hy, 2, 2, 150, 2));
             road_spine.push(Axis::EastWest);
         }
@@ -275,12 +359,52 @@ pub fn build_settlement_plan(faction_id: u32, faction: &FactionData, tick: u64) 
             let g = (gap.max(2)) as i32;
             zones.push(zone(ZoneKind::Civic, hx - 2, hy - 2, 5, 5, 110, 1));
             let arm = r as u32;
-            zones.push(zone(ZoneKind::Residential, hx - arm as i32 - g, hy - 3 - g, arm, 7, 200, 5));
-            zones.push(zone(ZoneKind::Residential, hx + 3 + g, hy - 3 - g, arm, 7, 200, 5));
-            zones.push(zone(ZoneKind::Residential, hx - 3 - g, hy - arm as i32 - g, 7, arm, 200, 5));
-            zones.push(zone(ZoneKind::Residential, hx - 3 - g, hy + 3 + g, 7, arm, 200, 5));
+            zones.push(zone(
+                ZoneKind::Residential,
+                hx - arm as i32 - g,
+                hy - 3 - g,
+                arm,
+                7,
+                200,
+                5,
+            ));
+            zones.push(zone(
+                ZoneKind::Residential,
+                hx + 3 + g,
+                hy - 3 - g,
+                arm,
+                7,
+                200,
+                5,
+            ));
+            zones.push(zone(
+                ZoneKind::Residential,
+                hx - 3 - g,
+                hy - arm as i32 - g,
+                7,
+                arm,
+                200,
+                5,
+            ));
+            zones.push(zone(
+                ZoneKind::Residential,
+                hx - 3 - g,
+                hy + 3 + g,
+                7,
+                arm,
+                200,
+                5,
+            ));
             let dr = r + def_pad + g;
-            zones.push(zone(ZoneKind::Defense, hx - dr, hy - dr, (dr as u32 * 2), (dr as u32 * 2), 140, 14));
+            zones.push(zone(
+                ZoneKind::Defense,
+                hx - dr,
+                hy - dr,
+                (dr as u32 * 2),
+                (dr as u32 * 2),
+                140,
+                14,
+            ));
             zones.push(zone(ZoneKind::Storage, hx - 3, hy + 3, 3, 3, 150, 2));
             road_spine.push(Axis::NorthSouth);
             road_spine.push(Axis::EastWest);
@@ -292,23 +416,61 @@ pub fn build_settlement_plan(faction_id: u32, faction: &FactionData, tick: u64) 
             let inner = (base_r * 2 / 3).max(5);
             let outer = base_r * 2;
             zones.push(zone(ZoneKind::Civic, hx - 1, hy - 1, 3, 3, 110, 1));
-            zones.push(zone(ZoneKind::Residential, hx - inner, hy - inner, (inner as u32 * 2), (inner as u32 * 2), 200, 6));
+            zones.push(zone(
+                ZoneKind::Residential,
+                hx - inner,
+                hy - inner,
+                (inner as u32 * 2),
+                (inner as u32 * 2),
+                200,
+                6,
+            ));
             let dr = inner + def_pad;
-            zones.push(zone(ZoneKind::Defense, hx - dr, hy - dr, (dr as u32 * 2), (dr as u32 * 2), 240, 16));
-            zones.push(zone(ZoneKind::Agricultural, hx - outer, hy - outer, (outer as u32 * 2), (outer as u32 * 2), 100, 16));
-            zones.push(zone(ZoneKind::Storage, hx + inner + 1, hy - 1, 3, 3, 150, 2));
+            zones.push(zone(
+                ZoneKind::Defense,
+                hx - dr,
+                hy - dr,
+                (dr as u32 * 2),
+                (dr as u32 * 2),
+                240,
+                16,
+            ));
+            zones.push(zone(
+                ZoneKind::Agricultural,
+                hx - outer,
+                hy - outer,
+                (outer as u32 * 2),
+                (outer as u32 * 2),
+                100,
+                16,
+            ));
+            zones.push(zone(
+                ZoneKind::Storage,
+                hx + inner + 1,
+                hy - 1,
+                3,
+                3,
+                150,
+                2,
+            ));
             road_spine.push(Axis::NorthSouth);
             road_spine.push(Axis::EastWest);
         }
     }
 
     // ── Tech-gated optional zones ────────────────────────────────────────────
-    if techs.has(CROP_CULTIVATION)
-        && !zones.iter().any(|z| z.kind == ZoneKind::Agricultural)
-    {
+    if techs.has(CROP_CULTIVATION) && !zones.iter().any(|z| z.kind == ZoneKind::Agricultural) {
         // Place ag zone outside defense ring on the south side.
         let r = base_r * 2 + def_pad + 2;
-        zones.push(zone(ZoneKind::Agricultural, hx - r, hy + r, (r as u32) * 2, 8, 100, 12));
+        zones.push(zone(
+            ZoneKind::Agricultural,
+            hx - r,
+            hy + r,
+            (r as u32) * 2,
+            8,
+            100,
+            12,
+        ));
     }
     if techs.has(FLINT_KNAPPING) {
         // Crafting zone — west edge of residential cluster.
@@ -318,13 +480,29 @@ pub fn build_settlement_plan(faction_id: u32, faction: &FactionData, tick: u64) 
         // Sacred zone — bias toward center for ceremonial cultures.
         let cer = faction.culture.ceremonial as i32;
         let dx = if cer > 180 { 0 } else { 4 };
-        zones.push(zone(ZoneKind::Sacred, hx - 2 - dx, hy + 1, 5, 4, 120 + (cer / 4) as u8, 1));
+        zones.push(zone(
+            ZoneKind::Sacred,
+            hx - 2 - dx,
+            hy + 1,
+            5,
+            4,
+            120 + (cer / 4) as u8,
+            1,
+        ));
     }
     if techs.has(LONG_DIST_TRADE) {
         // Market — adjacent to storage.
         let mer = faction.culture.mercantile as i32;
         let cap = if mer > 180 { 2 } else { 1 };
-        zones.push(zone(ZoneKind::Market, hx + 4, hy + 1, 5, 4, 100 + (mer / 4) as u8, cap));
+        zones.push(zone(
+            ZoneKind::Market,
+            hx + 4,
+            hy + 1,
+            5,
+            4,
+            100 + (mer / 4) as u8,
+            cap,
+        ));
     }
 
     SettlementPlan {
@@ -345,8 +523,7 @@ fn build_paleolithic_plan(faction_id: u32, faction: &FactionData, tick: u64) -> 
 
     let hearths = paleolithic_hearth_positions(faction_id, faction.home_tile, members);
     let n_hearths = hearths.len() as u32;
-    let beds_per_hearth =
-        (((members + n_hearths - 1) / n_hearths) as i32).clamp(2, 6) as u8;
+    let beds_per_hearth = (((members + n_hearths - 1) / n_hearths) as i32).clamp(2, 6) as u8;
 
     let mut zones: Vec<Zone> = Vec::with_capacity(hearths.len() * 2 + 2);
 

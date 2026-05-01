@@ -66,6 +66,20 @@ impl Good {
         }
     }
 
+    /// How fun this good is to play with as a solo distraction. Drives the
+    /// willpower refill rate when an agent runs the PlaySolo plan against an
+    /// item (held or adjacent). 0 = useless to play with; higher is better.
+    /// Social play with another agent uses a fixed value, not this.
+    pub fn entertainment_value(self) -> u8 {
+        match self {
+            Good::Luxury => 50,
+            Good::Cloth | Good::Skin => 20,
+            Good::Tools | Good::Weapon | Good::Shield | Good::Armor => 15,
+            Good::Wood | Good::Stone | Good::Coal | Good::Iron => 5,
+            Good::Fruit | Good::Meat | Good::Grain | Good::Seed => 3,
+        }
+    }
+
     /// Weight of one unit of this good in grams.
     pub fn unit_weight_g(self) -> u32 {
         match self {

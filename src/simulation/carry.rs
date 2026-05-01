@@ -368,7 +368,14 @@ pub fn enforce_hand_state_system(
 
         let (tx, ty) = world_to_tile(transform.translation.truncate());
         if drop_all {
-            drop_carrier_to_ground(&mut commands, &spatial, &mut item_query, &mut carrier, tx, ty);
+            drop_carrier_to_ground(
+                &mut commands,
+                &spatial,
+                &mut item_query,
+                &mut carrier,
+                tx,
+                ty,
+            );
         } else {
             // Drop one hand at a time until we have enough free, or hands are empty.
             while carrier.free_hands() < need_free {
@@ -422,7 +429,10 @@ mod tests {
         let _ = c.try_pick_up(Item::new_commodity(Good::Fruit), 1);
         let log = Item::new_commodity(Good::Wood);
         let leftover = c.try_pick_up(log, 1);
-        assert_eq!(leftover, 1, "two-handed pickup must fail with any hand busy");
+        assert_eq!(
+            leftover, 1,
+            "two-handed pickup must fail with any hand busy"
+        );
     }
 
     #[test]

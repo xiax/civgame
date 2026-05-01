@@ -1,6 +1,6 @@
-use bevy::prelude::*;
-use ahash::AHashMap;
 use crate::rendering::pixel_art::{ascii_to_image, WARM_PALETTE};
+use ahash::AHashMap;
+use bevy::prelude::*;
 
 // ============================================================
 // UTILITIES
@@ -13,15 +13,26 @@ fn design_to_image(pixels: &[&str]) -> Image {
 /// Substitute template-specific chars with palette chars.
 /// Characters not in `subs` pass through unchanged.
 fn apply_subs(template: &[&str], subs: &[(char, char)]) -> Vec<String> {
-    template.iter().map(|row| {
-        row.chars().map(|ch| {
-            subs.iter().find(|(f, _)| *f == ch).map(|(_, t)| *t).unwrap_or(ch)
-        }).collect()
-    }).collect()
+    template
+        .iter()
+        .map(|row| {
+            row.chars()
+                .map(|ch| {
+                    subs.iter()
+                        .find(|(f, _)| *f == ch)
+                        .map(|(_, t)| *t)
+                        .unwrap_or(ch)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn mirror_h(pixels: &[String]) -> Vec<String> {
-    pixels.iter().map(|row| row.chars().rev().collect()).collect()
+    pixels
+        .iter()
+        .map(|row| row.chars().rev().collect())
+        .collect()
 }
 
 fn template_to_image(pixels: Vec<String>) -> Image {
@@ -2469,30 +2480,30 @@ const CHAR_TMPL_E_B: &[&str] = &[
 
 // [id, skin, hair, primary, secondary, accent]
 const CHARACTER_DEFS: &[(&str, char, char, char, char, char)] = &[
-    ("hunter",     'B', 'D', 'S', 'b', 'l'),
-    ("gatherer",   'B', 'D', 'G', 't', 'r'),
-    ("tribesman",  'B', 'D', 'b', 'r', 'l'),
-    ("shaman",     'B', 'P', 'p', 'D', 'y'),
-    ("farmer",     'T', 'b', 't', 'b', 'y'),
+    ("hunter", 'B', 'D', 'S', 'b', 'l'),
+    ("gatherer", 'B', 'D', 'G', 't', 'r'),
+    ("tribesman", 'B', 'D', 'b', 'r', 'l'),
+    ("shaman", 'B', 'P', 'p', 'D', 'y'),
+    ("farmer", 'T', 'b', 't', 'b', 'y'),
     ("woodcutter", 'T', 'D', 'b', 'G', 'l'),
-    ("miner",      'T', 'D', 'k', 'D', 'P'),
-    ("fisher",     'T', 'b', 'I', 'b', 'l'),
+    ("miner", 'T', 'D', 'k', 'D', 'P'),
+    ("fisher", 'T', 'b', 'I', 'b', 'l'),
     ("blacksmith", 'B', 'D', 'k', 'r', 'l'),
-    ("baker",      'T', 't', 'W', 'r', 'o'),
-    ("merchant",   'T', 'D', 'p', 'y', 'o'),
-    ("monk",       'T', 'D', 'D', 't', 'y'),
-    ("peasant_w",  'T', 'b', 'r', 'b', 'y'),
-    ("child",      'T', 'b', 'm', 't', 'y'),
-    ("archer",     'T', 'D', 'G', 't', 'D'),
-    ("spearman",   'T', 'D', 'r', 'k', 'l'),
-    ("swordsman",  'T', 'D', 'b', 'k', 'l'),
-    ("knight",     'T', 'k', 'l', 'r', 'P'),
-    ("guard",      'T', 'D', 'k', 'r', 'l'),
-    ("king",       'T', 't', 'p', 'y', 'r'),
-    ("queen",      'T', 'y', 'r', 'p', 'y'),
-    ("priest",     'T', 't', 'W', 'y', 'r'),
-    ("scout",      'T', 'D', 'G', 'D', 'l'),
-    ("barbarian",  'B', 'r', 'D', 'b', 'l'),
+    ("baker", 'T', 't', 'W', 'r', 'o'),
+    ("merchant", 'T', 'D', 'p', 'y', 'o'),
+    ("monk", 'T', 'D', 'D', 't', 'y'),
+    ("peasant_w", 'T', 'b', 'r', 'b', 'y'),
+    ("child", 'T', 'b', 'm', 't', 'y'),
+    ("archer", 'T', 'D', 'G', 't', 'D'),
+    ("spearman", 'T', 'D', 'r', 'k', 'l'),
+    ("swordsman", 'T', 'D', 'b', 'k', 'l'),
+    ("knight", 'T', 'k', 'l', 'r', 'P'),
+    ("guard", 'T', 'D', 'k', 'r', 'l'),
+    ("king", 'T', 't', 'p', 'y', 'r'),
+    ("queen", 'T', 'y', 'r', 'p', 'y'),
+    ("priest", 'T', 't', 'W', 'y', 'r'),
+    ("scout", 'T', 'D', 'G', 'D', 'l'),
+    ("barbarian", 'B', 'r', 'D', 'b', 'l'),
 ];
 
 // ============================================================
@@ -4490,156 +4501,156 @@ const ANIMAL_DOG_N_B: &[&str] = &[
 
 // [id, archetype_key, c1, c2, c3, c4]
 const CREATURE_DEFS: &[(&str, &str, char, char, char, char)] = &[
-    ("rabbit_anim",  "quad_small",  'P', 'l', 'W', 'r'),
-    ("fox",          "quad_small",  'R', 'r', 'W', 'X'),
-    ("cat",          "quad_small",  'k', 'K', 'l', 'y'),
-    ("dog",          "animal_dog",  'b', 'B', 'T', 'X'),
-    ("squirrel",     "quad_small",  'b', 'D', 'T', 'X'),
-    ("wolf",         "animal_wolf", 'K', 'k', 'l', 'y'),
-    ("deer",         "animal_deer", 'B', 'b', 'T', 'X'),
-    ("boar_anim",    "quad_med",    'd', 'D', 'b', 'W'),
-    ("sheep_anim",   "quad_med",    'W', 'P', 'l', 'X'),
-    ("goat",         "quad_med",    'T', 't', 'D', 'X'),
-    ("pig",          "animal_pig",   'R', 'r', 'B', 'X'),
-    ("horse_anim",   "animal_horse", 'b', 'D', 'T', 'X'),
-    ("cow_anim",     "animal_cow",   'W', 'd', 'D', 'r'),
-    ("bear_anim",    "quad_large",  'b', 'B', 'D', 't'),
-    ("mammoth_anim", "quad_large",  'd', 'D', 'b', 'W'),
-    ("ox",           "quad_large",  'D', 'd', 'b', 'P'),
-    ("donkey",       "quad_large",  'K', 'l', 'k', 'D'),
-    ("chicken_anim", "bird",        'W', 'P', 'y', 'r'),
-    ("eagle",        "bird",        'D', 'd', 'T', 'y'),
-    ("owl",          "bird",        'b', 'B', 'T', 'y'),
-    ("raven",        "bird",        'k', 'K', 'X', 'p'),
-    ("duck",         "bird",        'G', 'g', 'W', 'o'),
-    ("fish_anim",    "fish",        'I', 'i', 'H', 'X'),
-    ("salmon",       "fish",        'R', 'o', 'W', 'X'),
-    ("shark",        "fish",        'k', 'K', 'W', 'X'),
-    ("snake",        "slither",     'G', 'g', 'M', 'y'),
-    ("lizard",       "slither",     'm', 'G', 'M', 'y'),
-    ("frog",         "frog",        'G', 'g', 'M', 'X'),
-    ("turtle",       "turtle",      'G', 'g', 'M', 't'),
-    ("bat",          "bat",         'k', 'K', 'r', 'X'),
+    ("rabbit_anim", "quad_small", 'P', 'l', 'W', 'r'),
+    ("fox", "quad_small", 'R', 'r', 'W', 'X'),
+    ("cat", "quad_small", 'k', 'K', 'l', 'y'),
+    ("dog", "animal_dog", 'b', 'B', 'T', 'X'),
+    ("squirrel", "quad_small", 'b', 'D', 'T', 'X'),
+    ("wolf", "animal_wolf", 'K', 'k', 'l', 'y'),
+    ("deer", "animal_deer", 'B', 'b', 'T', 'X'),
+    ("boar_anim", "quad_med", 'd', 'D', 'b', 'W'),
+    ("sheep_anim", "quad_med", 'W', 'P', 'l', 'X'),
+    ("goat", "quad_med", 'T', 't', 'D', 'X'),
+    ("pig", "animal_pig", 'R', 'r', 'B', 'X'),
+    ("horse_anim", "animal_horse", 'b', 'D', 'T', 'X'),
+    ("cow_anim", "animal_cow", 'W', 'd', 'D', 'r'),
+    ("bear_anim", "quad_large", 'b', 'B', 'D', 't'),
+    ("mammoth_anim", "quad_large", 'd', 'D', 'b', 'W'),
+    ("ox", "quad_large", 'D', 'd', 'b', 'P'),
+    ("donkey", "quad_large", 'K', 'l', 'k', 'D'),
+    ("chicken_anim", "bird", 'W', 'P', 'y', 'r'),
+    ("eagle", "bird", 'D', 'd', 'T', 'y'),
+    ("owl", "bird", 'b', 'B', 'T', 'y'),
+    ("raven", "bird", 'k', 'K', 'X', 'p'),
+    ("duck", "bird", 'G', 'g', 'W', 'o'),
+    ("fish_anim", "fish", 'I', 'i', 'H', 'X'),
+    ("salmon", "fish", 'R', 'o', 'W', 'X'),
+    ("shark", "fish", 'k', 'K', 'W', 'X'),
+    ("snake", "slither", 'G', 'g', 'M', 'y'),
+    ("lizard", "slither", 'm', 'G', 'M', 'y'),
+    ("frog", "frog", 'G', 'g', 'M', 'X'),
+    ("turtle", "turtle", 'G', 'g', 'M', 't'),
+    ("bat", "bat", 'k', 'K', 'r', 'X'),
 ];
 
 fn creature_e_a(archetype: &str) -> &'static [&'static str] {
     match archetype {
-        "quad_small"   => CRTMPL_QUAD_SMALL_E_A,
-        "quad_med"     => CRTMPL_QUAD_MED_E_A,
-        "quad_large"   => CRTMPL_QUAD_LARGE_E_A,
-        "bird"         => CRTMPL_BIRD_E_A,
-        "fish"         => CRTMPL_FISH_E_A,
-        "slither"      => CRTMPL_SLITHER_E_A,
-        "frog"         => CRTMPL_FROG_E_A,
-        "turtle"       => CRTMPL_TURTLE_E_A,
-        "bat"          => CRTMPL_BAT_E_A,
+        "quad_small" => CRTMPL_QUAD_SMALL_E_A,
+        "quad_med" => CRTMPL_QUAD_MED_E_A,
+        "quad_large" => CRTMPL_QUAD_LARGE_E_A,
+        "bird" => CRTMPL_BIRD_E_A,
+        "fish" => CRTMPL_FISH_E_A,
+        "slither" => CRTMPL_SLITHER_E_A,
+        "frog" => CRTMPL_FROG_E_A,
+        "turtle" => CRTMPL_TURTLE_E_A,
+        "bat" => CRTMPL_BAT_E_A,
         "animal_horse" => ANIMAL_HORSE_E_A,
-        "animal_cow"   => ANIMAL_COW_E_A,
-        "animal_deer"  => ANIMAL_DEER_E_A,
-        "animal_wolf"  => ANIMAL_WOLF_E_A,
-        "animal_pig"   => ANIMAL_PIG_E_A,
-        "animal_dog"   => ANIMAL_DOG_E_A,
-        _              => CRTMPL_QUAD_MED_E_A,
+        "animal_cow" => ANIMAL_COW_E_A,
+        "animal_deer" => ANIMAL_DEER_E_A,
+        "animal_wolf" => ANIMAL_WOLF_E_A,
+        "animal_pig" => ANIMAL_PIG_E_A,
+        "animal_dog" => ANIMAL_DOG_E_A,
+        _ => CRTMPL_QUAD_MED_E_A,
     }
 }
 fn creature_e_b(archetype: &str) -> &'static [&'static str] {
     match archetype {
-        "quad_small"   => CRTMPL_QUAD_SMALL_E_B,
-        "quad_med"     => CRTMPL_QUAD_MED_E_B,
-        "quad_large"   => CRTMPL_QUAD_LARGE_E_B,
-        "bird"         => CRTMPL_BIRD_E_B,
-        "fish"         => CRTMPL_FISH_E_B,
-        "slither"      => CRTMPL_SLITHER_E_B,
-        "frog"         => CRTMPL_FROG_E_B,
-        "turtle"       => CRTMPL_TURTLE_E_B,
-        "bat"          => CRTMPL_BAT_E_B,
+        "quad_small" => CRTMPL_QUAD_SMALL_E_B,
+        "quad_med" => CRTMPL_QUAD_MED_E_B,
+        "quad_large" => CRTMPL_QUAD_LARGE_E_B,
+        "bird" => CRTMPL_BIRD_E_B,
+        "fish" => CRTMPL_FISH_E_B,
+        "slither" => CRTMPL_SLITHER_E_B,
+        "frog" => CRTMPL_FROG_E_B,
+        "turtle" => CRTMPL_TURTLE_E_B,
+        "bat" => CRTMPL_BAT_E_B,
         "animal_horse" => ANIMAL_HORSE_E_B,
-        "animal_cow"   => ANIMAL_COW_E_B,
-        "animal_deer"  => ANIMAL_DEER_E_B,
-        "animal_wolf"  => ANIMAL_WOLF_E_B,
-        "animal_pig"   => ANIMAL_PIG_E_B,
-        "animal_dog"   => ANIMAL_DOG_E_B,
-        _              => CRTMPL_QUAD_MED_E_B,
+        "animal_cow" => ANIMAL_COW_E_B,
+        "animal_deer" => ANIMAL_DEER_E_B,
+        "animal_wolf" => ANIMAL_WOLF_E_B,
+        "animal_pig" => ANIMAL_PIG_E_B,
+        "animal_dog" => ANIMAL_DOG_E_B,
+        _ => CRTMPL_QUAD_MED_E_B,
     }
 }
 fn creature_s_a(archetype: &str) -> &'static [&'static str] {
     match archetype {
-        "quad_small"   => CRTMPL_QUAD_SMALL_S_A,
-        "quad_med"     => CRTMPL_QUAD_MED_S_A,
-        "quad_large"   => CRTMPL_QUAD_LARGE_S_A,
-        "bird"         => CRTMPL_BIRD_S_A,
-        "fish"         => CRTMPL_FISH_S_A,
-        "slither"      => CRTMPL_SLITHER_S_A,
-        "frog"         => CRTMPL_FROG_S_A,
-        "turtle"       => CRTMPL_TURTLE_S_A,
-        "bat"          => CRTMPL_BAT_S_A,
+        "quad_small" => CRTMPL_QUAD_SMALL_S_A,
+        "quad_med" => CRTMPL_QUAD_MED_S_A,
+        "quad_large" => CRTMPL_QUAD_LARGE_S_A,
+        "bird" => CRTMPL_BIRD_S_A,
+        "fish" => CRTMPL_FISH_S_A,
+        "slither" => CRTMPL_SLITHER_S_A,
+        "frog" => CRTMPL_FROG_S_A,
+        "turtle" => CRTMPL_TURTLE_S_A,
+        "bat" => CRTMPL_BAT_S_A,
         "animal_horse" => ANIMAL_HORSE_S_A,
-        "animal_cow"   => ANIMAL_COW_S_A,
-        "animal_deer"  => ANIMAL_DEER_S_A,
-        "animal_wolf"  => ANIMAL_WOLF_S_A,
-        "animal_pig"   => ANIMAL_PIG_S_A,
-        "animal_dog"   => ANIMAL_DOG_S_A,
-        _              => CRTMPL_QUAD_MED_S_A,
+        "animal_cow" => ANIMAL_COW_S_A,
+        "animal_deer" => ANIMAL_DEER_S_A,
+        "animal_wolf" => ANIMAL_WOLF_S_A,
+        "animal_pig" => ANIMAL_PIG_S_A,
+        "animal_dog" => ANIMAL_DOG_S_A,
+        _ => CRTMPL_QUAD_MED_S_A,
     }
 }
 fn creature_s_b(archetype: &str) -> &'static [&'static str] {
     match archetype {
-        "quad_small"   => CRTMPL_QUAD_SMALL_S_B,
-        "quad_med"     => CRTMPL_QUAD_MED_S_B,
-        "quad_large"   => CRTMPL_QUAD_LARGE_S_B,
-        "bird"         => CRTMPL_BIRD_S_B,
-        "fish"         => CRTMPL_FISH_S_B,
-        "slither"      => CRTMPL_SLITHER_S_B,
-        "frog"         => CRTMPL_FROG_S_B,
-        "turtle"       => CRTMPL_TURTLE_S_B,
-        "bat"          => CRTMPL_BAT_S_B,
+        "quad_small" => CRTMPL_QUAD_SMALL_S_B,
+        "quad_med" => CRTMPL_QUAD_MED_S_B,
+        "quad_large" => CRTMPL_QUAD_LARGE_S_B,
+        "bird" => CRTMPL_BIRD_S_B,
+        "fish" => CRTMPL_FISH_S_B,
+        "slither" => CRTMPL_SLITHER_S_B,
+        "frog" => CRTMPL_FROG_S_B,
+        "turtle" => CRTMPL_TURTLE_S_B,
+        "bat" => CRTMPL_BAT_S_B,
         "animal_horse" => ANIMAL_HORSE_S_B,
-        "animal_cow"   => ANIMAL_COW_S_B,
-        "animal_deer"  => ANIMAL_DEER_S_B,
-        "animal_wolf"  => ANIMAL_WOLF_S_B,
-        "animal_pig"   => ANIMAL_PIG_S_B,
-        "animal_dog"   => ANIMAL_DOG_S_B,
-        _              => CRTMPL_QUAD_MED_S_B,
+        "animal_cow" => ANIMAL_COW_S_B,
+        "animal_deer" => ANIMAL_DEER_S_B,
+        "animal_wolf" => ANIMAL_WOLF_S_B,
+        "animal_pig" => ANIMAL_PIG_S_B,
+        "animal_dog" => ANIMAL_DOG_S_B,
+        _ => CRTMPL_QUAD_MED_S_B,
     }
 }
 fn creature_n_a(archetype: &str) -> &'static [&'static str] {
     match archetype {
-        "quad_small"   => CRTMPL_QUAD_SMALL_N_A,
-        "quad_med"     => CRTMPL_QUAD_MED_N_A,
-        "quad_large"   => CRTMPL_QUAD_LARGE_N_A,
-        "bird"         => CRTMPL_BIRD_N_A,
-        "fish"         => CRTMPL_FISH_N_A,
-        "slither"      => CRTMPL_SLITHER_N_A,
-        "frog"         => CRTMPL_FROG_N_A,
-        "turtle"       => CRTMPL_TURTLE_N_A,
-        "bat"          => CRTMPL_BAT_N_A,
+        "quad_small" => CRTMPL_QUAD_SMALL_N_A,
+        "quad_med" => CRTMPL_QUAD_MED_N_A,
+        "quad_large" => CRTMPL_QUAD_LARGE_N_A,
+        "bird" => CRTMPL_BIRD_N_A,
+        "fish" => CRTMPL_FISH_N_A,
+        "slither" => CRTMPL_SLITHER_N_A,
+        "frog" => CRTMPL_FROG_N_A,
+        "turtle" => CRTMPL_TURTLE_N_A,
+        "bat" => CRTMPL_BAT_N_A,
         "animal_horse" => ANIMAL_HORSE_N_A,
-        "animal_cow"   => ANIMAL_COW_N_A,
-        "animal_deer"  => ANIMAL_DEER_N_A,
-        "animal_wolf"  => ANIMAL_WOLF_N_A,
-        "animal_pig"   => ANIMAL_PIG_N_A,
-        "animal_dog"   => ANIMAL_DOG_N_A,
-        _              => CRTMPL_QUAD_MED_N_A,
+        "animal_cow" => ANIMAL_COW_N_A,
+        "animal_deer" => ANIMAL_DEER_N_A,
+        "animal_wolf" => ANIMAL_WOLF_N_A,
+        "animal_pig" => ANIMAL_PIG_N_A,
+        "animal_dog" => ANIMAL_DOG_N_A,
+        _ => CRTMPL_QUAD_MED_N_A,
     }
 }
 fn creature_n_b(archetype: &str) -> &'static [&'static str] {
     match archetype {
-        "quad_small"   => CRTMPL_QUAD_SMALL_N_B,
-        "quad_med"     => CRTMPL_QUAD_MED_N_B,
-        "quad_large"   => CRTMPL_QUAD_LARGE_N_B,
-        "bird"         => CRTMPL_BIRD_N_B,
-        "fish"         => CRTMPL_FISH_N_B,
-        "slither"      => CRTMPL_SLITHER_N_B,
-        "frog"         => CRTMPL_FROG_N_B,
-        "turtle"       => CRTMPL_TURTLE_N_B,
-        "bat"          => CRTMPL_BAT_N_B,
+        "quad_small" => CRTMPL_QUAD_SMALL_N_B,
+        "quad_med" => CRTMPL_QUAD_MED_N_B,
+        "quad_large" => CRTMPL_QUAD_LARGE_N_B,
+        "bird" => CRTMPL_BIRD_N_B,
+        "fish" => CRTMPL_FISH_N_B,
+        "slither" => CRTMPL_SLITHER_N_B,
+        "frog" => CRTMPL_FROG_N_B,
+        "turtle" => CRTMPL_TURTLE_N_B,
+        "bat" => CRTMPL_BAT_N_B,
         "animal_horse" => ANIMAL_HORSE_N_B,
-        "animal_cow"   => ANIMAL_COW_N_B,
-        "animal_deer"  => ANIMAL_DEER_N_B,
-        "animal_wolf"  => ANIMAL_WOLF_N_B,
-        "animal_pig"   => ANIMAL_PIG_N_B,
-        "animal_dog"   => ANIMAL_DOG_N_B,
-        _              => CRTMPL_QUAD_MED_N_B,
+        "animal_cow" => ANIMAL_COW_N_B,
+        "animal_deer" => ANIMAL_DEER_N_B,
+        "animal_wolf" => ANIMAL_WOLF_N_B,
+        "animal_pig" => ANIMAL_PIG_N_B,
+        "animal_dog" => ANIMAL_DOG_N_B,
+        _ => CRTMPL_QUAD_MED_N_B,
     }
 }
 
@@ -5142,12 +5153,12 @@ const CLOTH_FEMALE_E_B: &[&str] = &[
 
 // (id, gender, skin_palette_char)
 const BODY_PRESETS: &[(&str, &str, char)] = &[
-    ("male_tan",     "male",   'B'),
-    ("male_pale",    "male",   'T'),
-    ("male_dark",    "male",   'b'),
-    ("female_tan",   "female", 'B'),
-    ("female_pale",  "female", 'T'),
-    ("female_dark",  "female", 'b'),
+    ("male_tan", "male", 'B'),
+    ("male_pale", "male", 'T'),
+    ("male_dark", "male", 'b'),
+    ("female_tan", "female", 'B'),
+    ("female_pale", "female", 'T'),
+    ("female_dark", "female", 'b'),
 ];
 
 // ============================================================
@@ -5159,150 +5170,157 @@ pub fn setup_sprite_library(mut commands: Commands, mut images: ResMut<Assets<Im
 
     macro_rules! add {
         ($name:expr, $pixels:expr) => {
-            lib.sprites.insert($name.to_string(), images.add(design_to_image($pixels)));
+            lib.sprites
+                .insert($name.to_string(), images.add(design_to_image($pixels)));
         };
     }
 
     // --- Terrain (17) ---
-    add!("terrain_grass",          TERRAIN_GRASS);
-    add!("terrain_grass_dark",     TERRAIN_GRASS_DARK);
-    add!("terrain_sand",           TERRAIN_SAND);
-    add!("terrain_dirt",           TERRAIN_DIRT);
-    add!("terrain_stone",          TERRAIN_STONE);
-    add!("terrain_snow",           TERRAIN_SNOW);
-    add!("terrain_water",          TERRAIN_WATER);
-    add!("terrain_water_deep",     TERRAIN_WATER_DEEP);
-    add!("terrain_water_shore_n",  TERRAIN_WATER_SHORE_N);
-    add!("terrain_forest",         TERRAIN_FOREST);
-    add!("terrain_hills",          TERRAIN_HILLS);
-    add!("terrain_mountain",       TERRAIN_MOUNTAIN);
-    add!("terrain_mountain_snow",  TERRAIN_MOUNTAIN_SNOW);
-    add!("terrain_lava",           TERRAIN_LAVA);
-    add!("terrain_swamp",          TERRAIN_SWAMP);
-    add!("terrain_road",           TERRAIN_ROAD);
-    add!("terrain_bridge",         TERRAIN_BRIDGE);
+    add!("terrain_grass", TERRAIN_GRASS);
+    add!("terrain_grass_dark", TERRAIN_GRASS_DARK);
+    add!("terrain_sand", TERRAIN_SAND);
+    add!("terrain_dirt", TERRAIN_DIRT);
+    add!("terrain_stone", TERRAIN_STONE);
+    add!("terrain_snow", TERRAIN_SNOW);
+    add!("terrain_water", TERRAIN_WATER);
+    add!("terrain_water_deep", TERRAIN_WATER_DEEP);
+    add!("terrain_water_shore_n", TERRAIN_WATER_SHORE_N);
+    add!("terrain_forest", TERRAIN_FOREST);
+    add!("terrain_hills", TERRAIN_HILLS);
+    add!("terrain_mountain", TERRAIN_MOUNTAIN);
+    add!("terrain_mountain_snow", TERRAIN_MOUNTAIN_SNOW);
+    add!("terrain_lava", TERRAIN_LAVA);
+    add!("terrain_swamp", TERRAIN_SWAMP);
+    add!("terrain_road", TERRAIN_ROAD);
+    add!("terrain_bridge", TERRAIN_BRIDGE);
 
     // --- Buildings (17) ---
-    add!("building_tent",          BUILDING_TENT);
-    add!("building_hut",           BUILDING_HUT);
-    add!("building_longhouse",     BUILDING_LONGHOUSE);
-    add!("building_farm",          BUILDING_FARM);
-    add!("building_mill",          BUILDING_MILL);
-    add!("building_blacksmith",    BUILDING_BLACKSMITH);
-    add!("building_market",        BUILDING_MARKET);
-    add!("building_well",          BUILDING_WELL);
-    add!("building_watchtower",    BUILDING_WATCHTOWER);
-    add!("building_wall_stone",    BUILDING_WALL_STONE);
-    add!("building_gate",          BUILDING_GATE);
-    add!("building_church",        BUILDING_CHURCH);
-    add!("building_castle",        BUILDING_CASTLE);
-    add!("building_tavern",        BUILDING_TAVERN);
-    add!("building_lumber_mill",   BUILDING_LUMBER_MILL);
-    add!("building_stable",        BUILDING_STABLE);
-    add!("building_barracks",      BUILDING_BARRACKS);
+    add!("building_tent", BUILDING_TENT);
+    add!("building_hut", BUILDING_HUT);
+    add!("building_longhouse", BUILDING_LONGHOUSE);
+    add!("building_farm", BUILDING_FARM);
+    add!("building_mill", BUILDING_MILL);
+    add!("building_blacksmith", BUILDING_BLACKSMITH);
+    add!("building_market", BUILDING_MARKET);
+    add!("building_well", BUILDING_WELL);
+    add!("building_watchtower", BUILDING_WATCHTOWER);
+    add!("building_wall_stone", BUILDING_WALL_STONE);
+    add!("building_gate", BUILDING_GATE);
+    add!("building_church", BUILDING_CHURCH);
+    add!("building_castle", BUILDING_CASTLE);
+    add!("building_tavern", BUILDING_TAVERN);
+    add!("building_lumber_mill", BUILDING_LUMBER_MILL);
+    add!("building_stable", BUILDING_STABLE);
+    add!("building_barracks", BUILDING_BARRACKS);
 
     // --- Static creatures (15) ---
-    add!("creature_mammoth",   CREATURE_MAMMOTH);
-    add!("creature_wolf",      CREATURE_WOLF);
-    add!("creature_bear",      CREATURE_BEAR);
-    add!("creature_deer",      CREATURE_DEER);
-    add!("creature_boar",      CREATURE_BOAR);
-    add!("creature_rabbit",    CREATURE_RABBIT);
-    add!("creature_sheep",     CREATURE_SHEEP);
-    add!("creature_cow",       CREATURE_COW);
-    add!("creature_horse",     CREATURE_HORSE);
-    add!("creature_chicken",   CREATURE_CHICKEN);
-    add!("creature_fish",      CREATURE_FISH);
-    add!("creature_dragon",    CREATURE_DRAGON);
-    add!("creature_goblin",    CREATURE_GOBLIN);
-    add!("creature_skeleton",  CREATURE_SKELETON);
-    add!("creature_bandit",    CREATURE_BANDIT);
+    add!("creature_mammoth", CREATURE_MAMMOTH);
+    add!("creature_wolf", CREATURE_WOLF);
+    add!("creature_bear", CREATURE_BEAR);
+    add!("creature_deer", CREATURE_DEER);
+    add!("creature_boar", CREATURE_BOAR);
+    add!("creature_rabbit", CREATURE_RABBIT);
+    add!("creature_sheep", CREATURE_SHEEP);
+    add!("creature_cow", CREATURE_COW);
+    add!("creature_horse", CREATURE_HORSE);
+    add!("creature_chicken", CREATURE_CHICKEN);
+    add!("creature_fish", CREATURE_FISH);
+    add!("creature_dragon", CREATURE_DRAGON);
+    add!("creature_goblin", CREATURE_GOBLIN);
+    add!("creature_skeleton", CREATURE_SKELETON);
+    add!("creature_bandit", CREATURE_BANDIT);
 
     // --- Resources (13) ---
-    add!("resource_wheat",       RESOURCE_WHEAT);
-    add!("resource_berries",     RESOURCE_BERRIES);
-    add!("resource_meat",        RESOURCE_MEAT);
-    add!("resource_fish",        RESOURCE_FISH);
-    add!("resource_wood_log",    RESOURCE_WOOD_LOG);
-    add!("resource_plank",       RESOURCE_PLANK);
-    add!("resource_stone_pile",  RESOURCE_STONE_PILE);
-    add!("resource_iron_ore",    RESOURCE_IRON_ORE);
-    add!("resource_gold_ore",    RESOURCE_GOLD_ORE);
-    add!("resource_gold_coin",   RESOURCE_GOLD_COIN);
-    add!("resource_gem",         RESOURCE_GEM);
-    add!("resource_water_jug",   RESOURCE_WATER_JUG);
-    add!("resource_apple",       RESOURCE_APPLE);
+    add!("resource_wheat", RESOURCE_WHEAT);
+    add!("resource_berries", RESOURCE_BERRIES);
+    add!("resource_meat", RESOURCE_MEAT);
+    add!("resource_fish", RESOURCE_FISH);
+    add!("resource_wood_log", RESOURCE_WOOD_LOG);
+    add!("resource_plank", RESOURCE_PLANK);
+    add!("resource_stone_pile", RESOURCE_STONE_PILE);
+    add!("resource_iron_ore", RESOURCE_IRON_ORE);
+    add!("resource_gold_ore", RESOURCE_GOLD_ORE);
+    add!("resource_gold_coin", RESOURCE_GOLD_COIN);
+    add!("resource_gem", RESOURCE_GEM);
+    add!("resource_water_jug", RESOURCE_WATER_JUG);
+    add!("resource_apple", RESOURCE_APPLE);
 
     // --- Plants (20) ---
-    add!("plant_tree_oak",       PLANT_TREE_OAK);
-    add!("plant_tree_pine",      PLANT_TREE_PINE);
-    add!("plant_tree_birch",     PLANT_TREE_BIRCH);
-    add!("plant_tree_dead",      PLANT_TREE_DEAD);
-    add!("plant_tree_apple",     PLANT_TREE_APPLE);
-    add!("plant_tree_cherry",    PLANT_TREE_CHERRY);
-    add!("plant_bush_small",     PLANT_BUSH_SMALL);
-    add!("plant_bush_berry",     PLANT_BUSH_BERRY);
-    add!("plant_bush_dead",      PLANT_BUSH_DEAD);
-    add!("plant_wheat_field",    PLANT_WHEAT_FIELD);
-    add!("plant_flowers_red",    PLANT_FLOWERS_RED);
+    add!("plant_tree_oak", PLANT_TREE_OAK);
+    add!("plant_tree_pine", PLANT_TREE_PINE);
+    add!("plant_tree_birch", PLANT_TREE_BIRCH);
+    add!("plant_tree_dead", PLANT_TREE_DEAD);
+    add!("plant_tree_apple", PLANT_TREE_APPLE);
+    add!("plant_tree_cherry", PLANT_TREE_CHERRY);
+    add!("plant_bush_small", PLANT_BUSH_SMALL);
+    add!("plant_bush_berry", PLANT_BUSH_BERRY);
+    add!("plant_bush_dead", PLANT_BUSH_DEAD);
+    add!("plant_wheat_field", PLANT_WHEAT_FIELD);
+    add!("plant_flowers_red", PLANT_FLOWERS_RED);
     add!("plant_flowers_yellow", PLANT_FLOWERS_YELLOW);
     add!("plant_flowers_purple", PLANT_FLOWERS_PURPLE);
-    add!("plant_mushroom_red",   PLANT_MUSHROOM_RED);
+    add!("plant_mushroom_red", PLANT_MUSHROOM_RED);
     add!("plant_mushroom_brown", PLANT_MUSHROOM_BROWN);
-    add!("plant_cactus",         PLANT_CACTUS);
-    add!("plant_pumpkin",        PLANT_PUMPKIN);
-    add!("plant_sapling",        PLANT_SAPLING);
-    add!("plant_lily_pad",       PLANT_LILY_PAD);
-    add!("plant_cattails",       PLANT_CATTAILS);
+    add!("plant_cactus", PLANT_CACTUS);
+    add!("plant_pumpkin", PLANT_PUMPKIN);
+    add!("plant_sapling", PLANT_SAPLING);
+    add!("plant_lily_pad", PLANT_LILY_PAD);
+    add!("plant_cattails", PLANT_CATTAILS);
 
     // --- Items (15) ---
-    add!("item_stone_axe",      ITEM_STONE_AXE);
-    add!("item_bronze_axe",     ITEM_BRONZE_AXE);
-    add!("item_iron_sword",     ITEM_IRON_SWORD);
-    add!("item_bow",            ITEM_BOW);
-    add!("item_spear",          ITEM_SPEAR);
-    add!("item_shield",         ITEM_SHIELD);
-    add!("item_hammer",         ITEM_HAMMER);
-    add!("item_pickaxe",        ITEM_PICKAXE);
-    add!("item_scythe",         ITEM_SCYTHE);
-    add!("item_torch",          ITEM_TORCH);
-    add!("item_helm",           ITEM_HELM);
-    add!("item_potion",         ITEM_POTION);
-    add!("item_cloth",          ITEM_CLOTH);
-    add!("item_pottery",        ITEM_POTTERY);
-    add!("item_leather_armor",  ITEM_LEATHER_ARMOR);
+    add!("item_stone_axe", ITEM_STONE_AXE);
+    add!("item_bronze_axe", ITEM_BRONZE_AXE);
+    add!("item_iron_sword", ITEM_IRON_SWORD);
+    add!("item_bow", ITEM_BOW);
+    add!("item_spear", ITEM_SPEAR);
+    add!("item_shield", ITEM_SHIELD);
+    add!("item_hammer", ITEM_HAMMER);
+    add!("item_pickaxe", ITEM_PICKAXE);
+    add!("item_scythe", ITEM_SCYTHE);
+    add!("item_torch", ITEM_TORCH);
+    add!("item_helm", ITEM_HELM);
+    add!("item_potion", ITEM_POTION);
+    add!("item_cloth", ITEM_CLOTH);
+    add!("item_pottery", ITEM_POTTERY);
+    add!("item_leather_armor", ITEM_LEATHER_ARMOR);
 
     // --- FX (12) ---
-    add!("fx_smoke_1",      FX_SMOKE_1);
-    add!("fx_smoke_2",      FX_SMOKE_2);
-    add!("fx_smoke_3",      FX_SMOKE_3);
-    add!("fx_sparkle_1",    FX_SPARKLE_1);
-    add!("fx_sparkle_2",    FX_SPARKLE_2);
-    add!("fx_sparkle_3",    FX_SPARKLE_3);
-    add!("fx_explosion_1",  FX_EXPLOSION_1);
-    add!("fx_explosion_2",  FX_EXPLOSION_2);
-    add!("fx_explosion_3",  FX_EXPLOSION_3);
-    add!("fx_explosion_4",  FX_EXPLOSION_4);
-    add!("fx_splash",       FX_SPLASH);
-    add!("fx_chop_hit",     FX_CHOP_HIT);
+    add!("fx_smoke_1", FX_SMOKE_1);
+    add!("fx_smoke_2", FX_SMOKE_2);
+    add!("fx_smoke_3", FX_SMOKE_3);
+    add!("fx_sparkle_1", FX_SPARKLE_1);
+    add!("fx_sparkle_2", FX_SPARKLE_2);
+    add!("fx_sparkle_3", FX_SPARKLE_3);
+    add!("fx_explosion_1", FX_EXPLOSION_1);
+    add!("fx_explosion_2", FX_EXPLOSION_2);
+    add!("fx_explosion_3", FX_EXPLOSION_3);
+    add!("fx_explosion_4", FX_EXPLOSION_4);
+    add!("fx_splash", FX_SPLASH);
+    add!("fx_chop_hit", FX_CHOP_HIT);
 
     // --- UI (12) ---
-    add!("ui_cursor",       UI_CURSOR);
-    add!("ui_reticle",      UI_RETICLE);
-    add!("ui_exclamation",  UI_EXCLAMATION);
-    add!("ui_question",     UI_QUESTION);
-    add!("ui_heart",        UI_HEART);
-    add!("ui_coin",         UI_COIN);
-    add!("ui_food",         UI_FOOD);
-    add!("ui_banner",       UI_BANNER);
-    add!("ui_arrow_up",     UI_ARROW_UP);
-    add!("ui_arrow_down",   UI_ARROW_DOWN);
-    add!("ui_arrow_left",   UI_ARROW_LEFT);
-    add!("ui_arrow_right",  UI_ARROW_RIGHT);
+    add!("ui_cursor", UI_CURSOR);
+    add!("ui_reticle", UI_RETICLE);
+    add!("ui_exclamation", UI_EXCLAMATION);
+    add!("ui_question", UI_QUESTION);
+    add!("ui_heart", UI_HEART);
+    add!("ui_coin", UI_COIN);
+    add!("ui_food", UI_FOOD);
+    add!("ui_banner", UI_BANNER);
+    add!("ui_arrow_up", UI_ARROW_UP);
+    add!("ui_arrow_down", UI_ARROW_DOWN);
+    add!("ui_arrow_left", UI_ARROW_LEFT);
+    add!("ui_arrow_right", UI_ARROW_RIGHT);
 
     // --- Character sprites: 24 classes × 8 directional frames = 192 ---
     for &(id, skin, hair, primary, secondary, accent) in CHARACTER_DEFS {
-        let subs = [('~', skin), ('^', hair), ('*', primary), ('+', secondary), ('=', accent)];
+        let subs = [
+            ('~', skin),
+            ('^', hair),
+            ('*', primary),
+            ('+', secondary),
+            ('=', accent),
+        ];
 
         let e_a = apply_subs(CHAR_TMPL_E_A, &subs);
         let e_b = apply_subs(CHAR_TMPL_E_B, &subs);
@@ -5358,11 +5376,23 @@ pub fn setup_sprite_library(mut commands: Commands, mut images: ResMut<Assets<Im
     for &(id, gender, skin) in BODY_PRESETS {
         let subs = [('~', skin)];
         let (s_a, s_b, n_a, n_b, e_a_tpl, e_b_tpl) = if gender == "male" {
-            (BODY_MALE_S_A, BODY_MALE_S_B, BODY_MALE_N_A, BODY_MALE_N_B,
-             BODY_MALE_E_A, BODY_MALE_E_B)
+            (
+                BODY_MALE_S_A,
+                BODY_MALE_S_B,
+                BODY_MALE_N_A,
+                BODY_MALE_N_B,
+                BODY_MALE_E_A,
+                BODY_MALE_E_B,
+            )
         } else {
-            (BODY_FEMALE_S_A, BODY_FEMALE_S_B, BODY_FEMALE_N_A, BODY_FEMALE_N_B,
-             BODY_FEMALE_E_A, BODY_FEMALE_E_B)
+            (
+                BODY_FEMALE_S_A,
+                BODY_FEMALE_S_B,
+                BODY_FEMALE_N_A,
+                BODY_FEMALE_N_B,
+                BODY_FEMALE_E_A,
+                BODY_FEMALE_E_B,
+            )
         };
         let e_a = apply_subs(e_a_tpl, &subs);
         let e_b = apply_subs(e_b_tpl, &subs);
@@ -5390,10 +5420,10 @@ pub fn setup_sprite_library(mut commands: Commands, mut images: ResMut<Assets<Im
     // --- Hair sprites: 2 sexes × 4 colors × 8 frames = 64 ---
     // Colors reuse existing palette: b=brown, d=black, y=blonde, P=white
     const HAIR_COLORS: &[(&str, char)] = &[
-        ("brown",  'b'),
-        ("black",  'd'),
+        ("brown", 'b'),
+        ("black", 'd'),
         ("blonde", 'y'),
-        ("white",  'P'),
+        ("white", 'P'),
     ];
     for sex in ["male", "female"] {
         let (tmpl_s, tmpl_n, tmpl_e) = if sex == "male" {
@@ -5428,16 +5458,22 @@ pub fn setup_sprite_library(mut commands: Commands, mut images: ResMut<Assets<Im
 
     // --- Clothing sprites: 2 sexes × 3 colors × 8 frames = 48 ---
     // Colors: B=tan/linen, b=leather-brown, K=iron-grey
-    const CLOTHING_COLORS: &[(&str, char)] = &[
-        ("tan",   'B'),
-        ("brown", 'b'),
-        ("grey",  'K'),
-    ];
+    const CLOTHING_COLORS: &[(&str, char)] = &[("tan", 'B'), ("brown", 'b'), ("grey", 'K')];
     for sex in ["male", "female"] {
         let (s_a_tpl, s_b_tpl, e_a_tpl, e_b_tpl) = if sex == "male" {
-            (CLOTH_MALE_S_A, CLOTH_MALE_S_B, CLOTH_MALE_E_A, CLOTH_MALE_E_B)
+            (
+                CLOTH_MALE_S_A,
+                CLOTH_MALE_S_B,
+                CLOTH_MALE_E_A,
+                CLOTH_MALE_E_B,
+            )
         } else {
-            (CLOTH_FEMALE_S_A, CLOTH_FEMALE_S_B, CLOTH_FEMALE_E_A, CLOTH_FEMALE_E_B)
+            (
+                CLOTH_FEMALE_S_A,
+                CLOTH_FEMALE_S_B,
+                CLOTH_FEMALE_E_A,
+                CLOTH_FEMALE_E_B,
+            )
         };
         for &(color_name, color_char) in CLOTHING_COLORS {
             let subs = [('@', color_char)];

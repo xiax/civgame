@@ -13,8 +13,8 @@ use crate::simulation::items::{GroundItem, TargetItem};
 use crate::simulation::plants::{GrowthStage, Plant, PlantMap};
 use crate::simulation::tasks::TaskKind;
 use crate::simulation::technology::{
-    BOW_AND_ARROW, FIRE_MAKING, FIRED_POTTERY, FLINT_KNAPPING, HORSE_TAMING, HUNTING_SPEAR,
-    LOOM_WEAVING, COPPER_TOOLS, BRONZE_WEAPONS,
+    BOW_AND_ARROW, BRONZE_WEAPONS, COPPER_TOOLS, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING,
+    HORSE_TAMING, HUNTING_SPEAR, LOOM_WEAVING,
 };
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::{Calendar, Season};
@@ -39,6 +39,10 @@ pub enum Personality {
     Socialite = 1,
     Explorer = 2,
     Nurturer = 3,
+    /// Prefers solitary play with items over playing with other agents.
+    /// Loners get a small bonus from solo play and a heavily reduced bonus
+    /// from social play.
+    Loner = 4,
 }
 
 impl Personality {
@@ -48,10 +52,16 @@ impl Personality {
             Personality::Socialite => "Socialite",
             Personality::Explorer => "Explorer",
             Personality::Nurturer => "Nurturer",
+            Personality::Loner => "Loner",
         }
     }
 
     pub fn random() -> Self {
+        // 10% Loner; rest split evenly across the original four.
+        let r = fastrand::u8(..10);
+        if r == 0 {
+            return Personality::Loner;
+        }
         match fastrand::u8(..4) {
             0 => Personality::Gatherer,
             1 => Personality::Socialite,
@@ -71,7 +81,6 @@ pub enum AgentGoal {
     Survive = 3,
     ReturnCamp = 4,
     Socialize = 5,
-    Reproduce = 6,
     Raid = 7,
     Defend = 8,
     Sleep = 9,
@@ -80,6 +89,9 @@ pub enum AgentGoal {
     Craft = 12,
     Lead = 13,
     Rescue = 14,
+    /// Drained agents seek out a play partner or an item to play with to
+    /// refill willpower.
+    Play = 15,
 }
 
 impl AgentGoal {
@@ -91,7 +103,6 @@ impl AgentGoal {
             AgentGoal::Survive => "Survive",
             AgentGoal::ReturnCamp => "ReturnCamp",
             AgentGoal::Socialize => "Socialize",
-            AgentGoal::Reproduce => "Reproduce",
             AgentGoal::Raid => "Raid",
             AgentGoal::Defend => "Defend",
             AgentGoal::Sleep => "Sleep",
@@ -100,6 +111,7 @@ impl AgentGoal {
             AgentGoal::Craft => "Craft",
             AgentGoal::Lead => "Lead",
             AgentGoal::Rescue => "Rescue",
+            AgentGoal::Play => "Play",
         }
     }
 }
@@ -135,7 +147,13 @@ pub fn goal_update_system(
     bp_query: Query<&Blueprint>,
     wild_horse_q: Query<(), (With<Horse>, Without<Tamed>)>,
     rescue_q: Query<&RescueTarget>,
-    attacker_alive_q: Query<Entity, Or<(With<crate::simulation::combat::Health>, With<crate::simulation::combat::Body>)>>,
+    attacker_alive_q: Query<
+        Entity,
+        Or<(
+            With<crate::simulation::combat::Health>,
+            With<crate::simulation::combat::Body>,
+        )>,
+    >,
     mut query: Query<
         (
             Entity,
@@ -339,10 +357,13 @@ pub fn goal_update_system(
         } else {
             160.0
         };
-        let reproduce_threshold = if *personality == Personality::Nurturer {
-            140.0
+
+        // Loners get drained slightly faster (less social refill) and trigger
+        // play earlier; everyone else waits until willpower is genuinely low.
+        let play_threshold = if *personality == Personality::Loner {
+            100.0
         } else {
-            180.0
+            80.0
         };
 
         let has_horse_taming = member.faction_id != SOLO
@@ -387,7 +408,12 @@ pub fn goal_update_system(
                     cur_chunk == storage_chunk
                         || storage
                             .chunk_router
-                            .first_waypoint(&storage.chunk_graph, cur_chunk, storage_chunk, ai.current_z)
+                            .first_waypoint(
+                                &storage.chunk_graph,
+                                cur_chunk,
+                                storage_chunk,
+                                ai.current_z,
+                            )
                             .is_some()
                 })
                 .unwrap_or(false);
@@ -473,12 +499,12 @@ pub fn goal_update_system(
             (AgentGoal::Sleep, "Tired")
         } else if prioritize_food {
             (gather_goal, gather_reason)
-        } else if needs.reproduction > reproduce_threshold {
-            (AgentGoal::Reproduce, "Reproduction Need")
         } else if has_horse_taming {
             (AgentGoal::TameHorse, "Taming Horse")
         } else if needs.social > social_threshold {
             (AgentGoal::Socialize, "Social Need")
+        } else if needs.willpower < play_threshold {
+            (AgentGoal::Play, "Low Willpower")
         } else if has_build_site {
             (AgentGoal::Build, "Building Projects")
         } else if should_craft(&registry, member.faction_id, needs) {
@@ -527,9 +553,15 @@ fn should_craft(registry: &FactionRegistry, faction_id: u32, needs: &Needs) -> b
     if !has_craft_tech {
         return false;
     }
-    let crafted_total: u32 = [Good::Tools, Good::Weapon, Good::Armor, Good::Shield, Good::Cloth]
-        .iter()
-        .map(|g| faction.storage.totals.get(g).copied().unwrap_or(0))
-        .sum();
+    let crafted_total: u32 = [
+        Good::Tools,
+        Good::Weapon,
+        Good::Armor,
+        Good::Shield,
+        Good::Cloth,
+    ]
+    .iter()
+    .map(|g| faction.storage.totals.get(g).copied().unwrap_or(0))
+    .sum();
     crafted_total < faction.member_count.saturating_div(3).max(1)
 }

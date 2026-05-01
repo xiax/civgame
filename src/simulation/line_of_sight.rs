@@ -110,8 +110,24 @@ mod tests {
         );
         // Carve a tunnel at z=-4 along y=10, x=0..10.
         for x in 0..10i32 {
-            m.set_tile(x, 10, -3, TileData { kind: TileKind::Air, ..Default::default() });
-            m.set_tile(x, 10, -4, TileData { kind: TileKind::Dirt, ..Default::default() });
+            m.set_tile(
+                x,
+                10,
+                -3,
+                TileData {
+                    kind: TileKind::Air,
+                    ..Default::default()
+                },
+            );
+            m.set_tile(
+                x,
+                10,
+                -4,
+                TileData {
+                    kind: TileKind::Dirt,
+                    ..Default::default()
+                },
+            );
         }
         // Two agents inside the tunnel can see each other.
         let d = DoorMap::default();

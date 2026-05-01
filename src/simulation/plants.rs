@@ -48,15 +48,15 @@ impl Plant {
     pub fn duration_for_stage(&self, calendar: &Calendar) -> u32 {
         match self.kind {
             PlantKind::Grain => match self.stage {
-                GrowthStage::Seed => TICKS_PER_SEASON / 6,     // 1/6 season
+                GrowthStage::Seed => TICKS_PER_SEASON / 6, // 1/6 season
                 GrowthStage::Seedling => TICKS_PER_SEASON / 2, // 1/2 season
                 GrowthStage::Harvested => 0,
-                GrowthStage::Mature => TICKS_PER_SEASON / 3,   // 1/3 season
+                GrowthStage::Mature => TICKS_PER_SEASON / 3, // 1/3 season
                 GrowthStage::Overripe => 0,
             },
             PlantKind::BerryBush => match self.stage {
-                GrowthStage::Seed => TICKS_PER_SEASON / 3,      // 1/3 season
-                GrowthStage::Seedling => TICKS_PER_SEASON,       // 1 season
+                GrowthStage::Seed => TICKS_PER_SEASON / 3, // 1/3 season
+                GrowthStage::Seedling => TICKS_PER_SEASON, // 1 season
                 GrowthStage::Harvested => {
                     if matches!(calendar.season, Season::Spring | Season::Summer) {
                         TICKS_PER_SEASON / 6 // 1/6 season recovery
@@ -68,10 +68,10 @@ impl Plant {
                 GrowthStage::Overripe => 0,
             },
             PlantKind::Tree => match self.stage {
-                GrowthStage::Seed => TICKS_PER_SEASON,       // 1 season
+                GrowthStage::Seed => TICKS_PER_SEASON,         // 1 season
                 GrowthStage::Seedling => TICKS_PER_SEASON * 3, // 3 seasons
                 GrowthStage::Harvested => 0,
-                GrowthStage::Mature => TICKS_PER_SEASON * 6,   // 6 seasons
+                GrowthStage::Mature => TICKS_PER_SEASON * 6, // 6 seasons
                 GrowthStage::Overripe => 0,
             },
         }
@@ -414,9 +414,9 @@ pub fn deer_graze_system(
                 plant.growth_ticks = 0;
             }
             if let Some(ref mut needs) = animal_needs {
-                needs.hunger =
-                    (needs.hunger - crate::simulation::animals::ANIMAL_HUNGER_RECOVER_DEER)
-                        .max(0.0);
+                needs.hunger = (needs.hunger
+                    - crate::simulation::animals::ANIMAL_HUNGER_RECOVER_DEER)
+                    .max(0.0);
             }
 
             let count = 1 + fastrand::u8(..2);

@@ -275,7 +275,9 @@ pub fn spawn_chunk_sprites(
                 if !wall_map.0.contains_key(&tile_pos) {
                     let entity = commands
                         .spawn((
-                            Wall { material: WallMaterial::Stone },
+                            Wall {
+                                material: WallMaterial::Stone,
+                            },
                             Transform::from_xyz(wx, wy, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -301,8 +303,7 @@ pub fn spawn_chunk_sprites(
                 camera_view_z,
             );
 
-            let mut initial_mat =
-                MeshMaterial2d(tile_materials.handle_for(render_kind, render_z));
+            let mut initial_mat = MeshMaterial2d(tile_materials.handle_for(render_kind, render_z));
             let visibility = apply_fog_to_material(
                 fog_map,
                 tile_pos,
@@ -655,7 +656,9 @@ pub fn refresh_changed_tiles_system(
             // Spawn a new Wall entity (entity_sprites will attach the visual child)
             let new_entity = commands
                 .spawn((
-                    Wall { material: WallMaterial::Stone },
+                    Wall {
+                        material: WallMaterial::Stone,
+                    },
                     Transform::from_xyz(wx, wy, 0.4),
                     GlobalTransform::default(),
                     Visibility::Visible,

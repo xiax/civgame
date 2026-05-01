@@ -9,15 +9,26 @@ use super::skills::{SkillKind, Skills};
 use super::tasks::TaskKind;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
-use crate::world::spatial::SpatialIndex;
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
-use crate::simulation::technology::{ActivityKind, ANIMAL_HUSBANDRY, DOG_DOMESTICATION, HORSE_TAMING};
+use crate::simulation::technology::{
+    ActivityKind, ANIMAL_HUSBANDRY, DOG_DOMESTICATION, HORSE_TAMING,
+};
+use crate::world::spatial::SpatialIndex;
 use ahash::AHashMap;
 use bevy::prelude::*;
 
 pub const TICKS_FARMER_PLANT: u8 = 40;
+
+/// Ticks the agent spends winding up a play-throw before the rock leaves their
+/// hand. Short — throwing a rock is a quick action.
+const TICKS_PLAY_THROW: u8 = 30;
+
+/// One-shot willpower bonus applied when a PlayPlant or PlayThrow task
+/// completes successfully. Picked to roughly match the per-task gain a solo
+/// PlaySolo session would deliver, so all three Play plans feel comparable.
+const WILLPOWER_PLAY_BURST: f32 = 60.0;
 
 /// `work_progress` units required before the Eat task consumes a food item.
 /// Movement's Working-state tick adds ~1 progress per active sim tick.
@@ -60,12 +71,13 @@ pub fn production_system(
         &mut PersonAI,
         &mut EconomicAgent,
         &mut Skills,
+        &mut Needs,
         &BucketSlot,
         &LodLevel,
         Option<&FactionMember>,
     )>,
 ) {
-    for (mut ai, mut agent, mut skills, slot, lod, faction_member) in query.iter_mut() {
+    for (mut ai, mut agent, mut skills, mut needs, slot, lod, faction_member) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -77,7 +89,11 @@ pub fn production_system(
         let ty = ai.dest_tile.1 as i32;
         let task = ai.task_id;
 
-        if task == TaskKind::Planter as u16 {
+        // Planter and PlayPlant share the plant-on-grass pipeline. The only
+        // difference is that PlayPlant frames the activity as recreation,
+        // adding a one-shot willpower burst on completion.
+        if task == TaskKind::Planter as u16 || task == TaskKind::PlayPlant as u16 {
+            let is_play = task == TaskKind::PlayPlant as u16;
             if ai.work_progress >= TICKS_FARMER_PLANT {
                 ai.work_progress = 0;
                 if !plant_map.0.contains_key(&(tx, ty)) && agent.quantity_of(Good::Seed) > 0 {
@@ -97,6 +113,10 @@ pub fn production_system(
                             fd.activity_log.increment(ActivityKind::Farming);
                         }
                     }
+                    if is_play {
+                        needs.willpower =
+                            (needs.willpower + WILLPOWER_PLAY_BURST).clamp(0.0, 255.0);
+                    }
                 }
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
@@ -109,11 +129,202 @@ pub fn production_system(
             }
         }
 
+        if task == TaskKind::PlayThrow as u16 {
+            if ai.work_progress >= TICKS_PLAY_THROW {
+                ai.work_progress = 0;
+                if agent.quantity_of(Good::Stone) > 0 {
+                    agent.remove_good(Good::Stone, 1);
+                    skills.gain_xp(SkillKind::Combat, 2);
+                    if let Some(fm) = faction_member {
+                        if let Some(fd) = faction_registry.factions.get_mut(&fm.faction_id) {
+                            fd.activity_log.increment(ActivityKind::Combat);
+                        }
+                    }
+                    needs.willpower = (needs.willpower + WILLPOWER_PLAY_BURST).clamp(0.0, 255.0);
+                }
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+            }
+        }
+
         if agent.is_inventory_full() {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
         }
+    }
+}
+
+/// Withdraw one of a specific good (or any entertainment-valued good if
+/// `craft_recipe_id == 255`) from a faction storage tile. Driven by
+/// `TaskKind::WithdrawGood`; mirrors `withdraw_material_task_system` but the
+/// filter comes from the dispatching step rather than blueprint demand.
+pub fn withdraw_good_task_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    spatial: Res<SpatialIndex>,
+    storage_tile_map: Res<StorageTileMap>,
+    mut ground_items: Query<&mut GroundItem>,
+    mut query: Query<(
+        &mut PersonAI,
+        &mut EconomicAgent,
+        &FactionMember,
+        &BucketSlot,
+        &LodLevel,
+    )>,
+) {
+    const ENTERTAINMENT_SENTINEL: u8 = 255;
+
+    for (mut ai, mut agent, member, slot, lod) in query.iter_mut() {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        if ai.state != AiState::Working || ai.task_id != TaskKind::WithdrawGood as u16 {
+            continue;
+        }
+
+        if member.faction_id == SOLO {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            continue;
+        }
+
+        let (tx, ty) = ai.dest_tile;
+
+        if storage_tile_map.tiles.get(&(tx, ty)) != Some(&member.faction_id) {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            continue;
+        }
+
+        let filter = ai.craft_recipe_id;
+        for &gi_entity in spatial.get(tx as i32, ty as i32) {
+            if let Ok(mut gi) = ground_items.get_mut(gi_entity) {
+                if gi.qty == 0 {
+                    continue;
+                }
+                let matches = if filter == ENTERTAINMENT_SENTINEL {
+                    gi.item.good.entertainment_value() > 0
+                } else {
+                    gi.item.good as u8 == filter
+                };
+                if !matches {
+                    continue;
+                }
+                agent.add_good(gi.item.good, 1);
+                if gi.qty == 1 {
+                    commands.entity(gi_entity).despawn();
+                } else {
+                    gi.qty -= 1;
+                }
+                break;
+            }
+        }
+
+        ai.state = AiState::Idle;
+        ai.task_id = PersonAI::UNEMPLOYED;
+        ai.work_progress = 0;
+    }
+}
+
+/// Withdraw one good currently needed by an unsatisfied blueprint from a
+/// faction storage tile. Driven by `TaskKind::WithdrawMaterial`. Mirrors
+/// `withdraw_food_task_system` but selects by "is needed by a blueprint of
+/// this faction" instead of "is edible".
+pub fn withdraw_material_task_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    spatial: Res<SpatialIndex>,
+    storage_tile_map: Res<StorageTileMap>,
+    bp_map: Res<crate::simulation::construction::BlueprintMap>,
+    bp_query: Query<&crate::simulation::construction::Blueprint>,
+    mut ground_items: Query<&mut GroundItem>,
+    mut query: Query<(
+        Entity,
+        &mut PersonAI,
+        &mut EconomicAgent,
+        &FactionMember,
+        &BucketSlot,
+        &LodLevel,
+    )>,
+) {
+    // Build the set of goods currently wanted by some unsatisfied blueprint
+    // per faction. Doing this once outside the agent loop keeps the per-agent
+    // hot path simple.
+    let mut wanted_by_faction: AHashMap<u32, [bool; crate::economy::goods::GOOD_COUNT]> =
+        AHashMap::new();
+    for (_, &bp_entity) in &bp_map.0 {
+        let Ok(bp) = bp_query.get(bp_entity) else {
+            continue;
+        };
+        let entry = wanted_by_faction
+            .entry(bp.faction_id)
+            .or_insert([false; crate::economy::goods::GOOD_COUNT]);
+        for i in 0..bp.deposit_count as usize {
+            let still = bp.deposits[i]
+                .needed
+                .saturating_sub(bp.deposits[i].deposited);
+            if still > 0 {
+                entry[bp.deposits[i].good as usize] = true;
+            }
+        }
+    }
+
+    for (entity, mut ai, mut agent, member, slot, lod) in query.iter_mut() {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        if ai.state != AiState::Working || ai.task_id != TaskKind::WithdrawMaterial as u16 {
+            continue;
+        }
+
+        let _ = entity; // Reserved for future personal-blueprint targeting.
+
+        if member.faction_id == SOLO {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            continue;
+        }
+
+        let (tx, ty) = ai.dest_tile;
+
+        if storage_tile_map.tiles.get(&(tx, ty)) != Some(&member.faction_id) {
+            // Storage tile is no longer owned by our faction — abort.
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            continue;
+        }
+
+        let wanted = wanted_by_faction.get(&member.faction_id);
+        if wanted.is_none() {
+            // No outstanding blueprint needs — task is moot.
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            continue;
+        }
+        let wanted = wanted.unwrap();
+
+        for &gi_entity in spatial.get(tx as i32, ty as i32) {
+            if let Ok(mut gi) = ground_items.get_mut(gi_entity) {
+                if gi.qty == 0 {
+                    continue;
+                }
+                if !wanted[gi.item.good as usize] {
+                    continue;
+                }
+                agent.add_good(gi.item.good, 1);
+                if gi.qty == 1 {
+                    commands.entity(gi_entity).despawn();
+                } else {
+                    gi.qty -= 1;
+                }
+                break;
+            }
+        }
+
+        ai.state = AiState::Idle;
+        ai.task_id = PersonAI::UNEMPLOYED;
+        ai.work_progress = 0;
     }
 }
 
@@ -295,12 +506,7 @@ pub fn tame_task_system(
     mut commands: Commands,
     clock: Res<SimClock>,
     faction_registry: Res<FactionRegistry>,
-    mut query: Query<(
-        &mut PersonAI,
-        &FactionMember,
-        &BucketSlot,
-        &LodLevel,
-    )>,
+    mut query: Query<(&mut PersonAI, &FactionMember, &BucketSlot, &LodLevel)>,
     untamed_horses: Query<(), (With<Horse>, Without<Tamed>)>,
     untamed_cows: Query<(), (With<Cow>, Without<Tamed>)>,
     untamed_pigs: Query<(), (With<Pig>, Without<Tamed>)>,

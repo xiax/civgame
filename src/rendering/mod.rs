@@ -24,11 +24,21 @@ impl Plugin for RenderingPlugin {
             .insert_resource(path_debug::PathDebugOverlay::default())
             .insert_resource(fog::FogMap::default())
             .insert_resource(fog::FogTileMaterials::default())
-            .add_systems(Startup, (camera::setup_camera, pixel_art::setup_pixel_art, sprite_library::setup_sprite_library))
-            .add_systems(PostStartup, (
-                chunk_streaming::setup_tile_materials,
-                fog::setup_fog_tile_materials.after(chunk_streaming::setup_tile_materials),
-            ))
+            .add_systems(
+                Startup,
+                (
+                    camera::setup_camera,
+                    pixel_art::setup_pixel_art,
+                    sprite_library::setup_sprite_library,
+                ),
+            )
+            .add_systems(
+                PostStartup,
+                (
+                    chunk_streaming::setup_tile_materials,
+                    fog::setup_fog_tile_materials.after(chunk_streaming::setup_tile_materials),
+                ),
+            )
             .add_systems(
                 Update,
                 (
@@ -117,9 +127,6 @@ impl Plugin for RenderingPlugin {
                         .after(animations::update_animations),
                 ),
             )
-            .add_systems(
-                PostUpdate,
-                fog::apply_fog_to_tiles_system,
-            );
+            .add_systems(PostUpdate, fog::apply_fog_to_tiles_system);
     }
 }

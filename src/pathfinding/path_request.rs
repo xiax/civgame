@@ -112,6 +112,11 @@ pub enum PathReadyKind {
 }
 
 /// One queued request, owned by the request queue until the worker pops it.
+///
+/// `task_id` and `plan_id` are diagnostic-only: snapshots of the requesting
+/// agent's `PersonAI.task_id` / `last_plan_id` at enqueue time. They flow into
+/// the `UnreachableAstar` dump so the user can see which task/plan asked for
+/// the failing goal even after dispatch has moved on.
 #[derive(Clone, Debug)]
 pub struct PathRequest {
     pub id: u64,
@@ -120,6 +125,8 @@ pub struct PathRequest {
     pub goal: (i32, i32, i8),
     pub kind: PathKind,
     pub max_budget: u32,
+    pub task_id: u16,
+    pub plan_id: u16,
 }
 
 /// Lifecycle of an agent's `PathFollow`.
@@ -194,6 +201,15 @@ pub struct PathFollow {
     /// the most recent `UnreachableAstar` failure. Populated by `worker.rs`
     /// and rendered by the inspector. Cleared on successful path build.
     pub last_astar_dump: Option<String>,
+    /// Tick when `plan_execution_system` last fired the `ReturnToSurface`
+    /// recovery for this agent. Stops the recovery from firing every tick
+    /// once it's already underway.
+    pub last_recovery_tick: u64,
+    /// Value of `fail_count_unreachable_conn` at the last recovery attempt.
+    /// Recovery re-fires only after at least 3 *new* connectivity failures
+    /// have accumulated since the previous attempt — single transient
+    /// connectivity misses don't yank the agent off-task.
+    pub last_recovery_conn_count: u32,
 }
 
 impl Default for PathFollow {
@@ -221,6 +237,8 @@ impl Default for PathFollow {
             last_fail_goal: (i32::MIN, i32::MIN, 0),
             last_fail_streak: 0,
             last_astar_dump: None,
+            last_recovery_tick: 0,
+            last_recovery_conn_count: 0,
         }
     }
 }
@@ -245,6 +263,8 @@ impl PathRequestQueue {
         goal: (i32, i32, i8),
         kind: PathKind,
         max_budget: u32,
+        task_id: u16,
+        plan_id: u16,
     ) -> u64 {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
@@ -255,6 +275,8 @@ impl PathRequestQueue {
             goal,
             kind,
             max_budget,
+            task_id,
+            plan_id,
         };
         if self.pending.contains(&agent) {
             for slot in self.queue.iter_mut() {
@@ -359,10 +381,7 @@ impl FailureLog {
 
     /// Iterate failures for one agent, newest first.
     pub fn for_agent(&self, agent: Entity) -> impl Iterator<Item = &FailureRecord> {
-        self.recent
-            .iter()
-            .rev()
-            .filter(move |r| r.agent == agent)
+        self.recent.iter().rev().filter(move |r| r.agent == agent)
     }
 }
 
@@ -378,7 +397,15 @@ mod tests {
     fn enqueue_then_pop_round_trip() {
         let mut q = PathRequestQueue::default();
         let a = dummy(1);
-        let id = q.enqueue(a, (0, 0, 0), (5, 5, 0), PathKind::Strict, DEFAULT_PATH_BUDGET);
+        let id = q.enqueue(
+            a,
+            (0, 0, 0),
+            (5, 5, 0),
+            PathKind::Strict,
+            DEFAULT_PATH_BUDGET,
+            0,
+            0,
+        );
         assert_eq!(q.len(), 1);
         assert!(q.is_pending(a));
         let r = q.pop().unwrap();
@@ -391,8 +418,24 @@ mod tests {
     fn dedupe_replaces_request_for_same_agent() {
         let mut q = PathRequestQueue::default();
         let a = dummy(1);
-        q.enqueue(a, (0, 0, 0), (5, 5, 0), PathKind::Strict, DEFAULT_PATH_BUDGET);
-        q.enqueue(a, (0, 0, 0), (9, 9, 0), PathKind::Strict, DEFAULT_PATH_BUDGET);
+        q.enqueue(
+            a,
+            (0, 0, 0),
+            (5, 5, 0),
+            PathKind::Strict,
+            DEFAULT_PATH_BUDGET,
+            0,
+            0,
+        );
+        q.enqueue(
+            a,
+            (0, 0, 0),
+            (9, 9, 0),
+            PathKind::Strict,
+            DEFAULT_PATH_BUDGET,
+            0,
+            0,
+        );
         assert_eq!(q.len(), 1, "dedupe should keep one entry per agent");
         let r = q.pop().unwrap();
         assert_eq!(r.goal, (9, 9, 0), "newest enqueue should win");
@@ -401,8 +444,8 @@ mod tests {
     #[test]
     fn distinct_agents_keep_distinct_requests() {
         let mut q = PathRequestQueue::default();
-        q.enqueue(dummy(1), (0, 0, 0), (1, 0, 0), PathKind::Strict, 1000);
-        q.enqueue(dummy(2), (0, 0, 0), (2, 0, 0), PathKind::Strict, 1000);
+        q.enqueue(dummy(1), (0, 0, 0), (1, 0, 0), PathKind::Strict, 1000, 0, 0);
+        q.enqueue(dummy(2), (0, 0, 0), (2, 0, 0), PathKind::Strict, 1000, 0, 0);
         assert_eq!(q.len(), 2);
     }
 

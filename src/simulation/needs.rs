@@ -1,8 +1,9 @@
 use super::construction::{enclosure_score, BedMap, CampfireMap, ChairMap, TableMap};
-use super::tasks::TaskKind;
 use super::lod::LodLevel;
 use super::person::{AiState, PersonAI};
 use super::schedule::{BucketSlot, SimClock};
+use super::stats::{self, Stats};
+use super::tasks::{task_is_labor, TaskKind};
 use crate::world::chunk::ChunkMap;
 use crate::world::terrain::TILE_SIZE;
 use bevy::prelude::*;
@@ -13,7 +14,7 @@ use bevy::prelude::*;
 /// foods at low hunger.
 pub const EAT_TRIGGER_HUNGER: u8 = 180;
 
-/// 6 u8 needs + 2 padding = 8 bytes.
+/// 7 u8 needs + 1 padding = 8 bytes.
 #[derive(Component, Clone, Copy, Default)]
 #[repr(C)]
 pub struct Needs {
@@ -23,10 +24,22 @@ pub struct Needs {
     pub safety: f32,
     pub social: f32,
     pub reproduction: f32,
+    // NOTE: inverted polarity vs the other needs. 0 = drained (needs play),
+    // 255 = full vigor. Drains while the agent works; refills via the Play task.
+    // `worst()` and `avg_distress()` add (255 - willpower) so it still counts
+    // as distress when low.
+    pub willpower: f32,
 }
 
 impl Needs {
-    pub fn new(hunger: f32, sleep: f32, shelter: f32, safety: f32, social: f32) -> Self {
+    pub fn new(
+        hunger: f32,
+        sleep: f32,
+        shelter: f32,
+        safety: f32,
+        social: f32,
+        willpower: f32,
+    ) -> Self {
         Self {
             hunger,
             sleep,
@@ -34,6 +47,7 @@ impl Needs {
             safety,
             social,
             reproduction: 0.0,
+            willpower,
         }
     }
 
@@ -43,11 +57,18 @@ impl Needs {
             .max(self.shelter)
             .max(self.safety)
             .max(self.social)
+            .max(255.0 - self.willpower)
     }
 
     pub fn avg_distress(&self) -> f32 {
-        (self.hunger + self.sleep + self.shelter + self.safety + self.social + self.reproduction)
-            / 6.0
+        (self.hunger
+            + self.sleep
+            + self.shelter
+            + self.safety
+            + self.social
+            + self.reproduction
+            + (255.0 - self.willpower))
+            / 7.0
     }
 }
 
@@ -60,6 +81,10 @@ const SHELTER_FILL_PER_SCORE: f32 = 0.15; // filled per enclosure-score point pe
 const SAFETY_RATE: f32 = 0.1;
 const SOCIAL_RATE: f32 = 0.2;
 const REPRODUCTION_RATE: f32 = 0.1;
+/// Willpower drain while in a labor task (per real second).
+const WILLPOWER_WORK_DRAIN: f32 = 0.6;
+/// Baseline willpower drift while idle / not working (per real second).
+const WILLPOWER_IDLE_DRAIN: f32 = 0.05;
 
 pub fn tick_needs_system(
     time: Res<Time>,
@@ -75,13 +100,14 @@ pub fn tick_needs_system(
         &mut PersonAI,
         &LodLevel,
         &Transform,
+        Option<&Stats>,
     )>,
 ) {
     let dt = time.delta_secs() * clock.scale_factor();
 
     query
         .par_iter_mut()
-        .for_each(|(slot, mut needs, mut ai, lod, transform)| {
+        .for_each(|(slot, mut needs, mut ai, lod, transform, stats)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -92,7 +118,13 @@ pub fn tick_needs_system(
             let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
             let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
 
-            needs.hunger = (needs.hunger + HUNGER_RATE * dt).clamp(0.0, 255.0);
+            // CON modifier slows hunger and sleep decay; floor at 0.25× so a
+            // very high CON can't make an agent immortal.
+            let con_scale = stats
+                .map(|s| (1.0 - 0.05 * stats::modifier(s.constitution) as f32).max(0.25))
+                .unwrap_or(1.0);
+
+            needs.hunger = (needs.hunger + HUNGER_RATE * dt * con_scale).clamp(0.0, 255.0);
 
             if ai.state == AiState::Sleeping {
                 // Double sleep recovery when resting on a bed.
@@ -107,7 +139,7 @@ pub fn tick_needs_system(
                     ai.state = AiState::Idle;
                 }
             } else {
-                needs.sleep = (needs.sleep + SLEEP_RATE * dt).clamp(0.0, 255.0);
+                needs.sleep = (needs.sleep + SLEEP_RATE * dt * con_scale).clamp(0.0, 255.0);
             }
 
             // Shelter fills when the agent is enclosed by walls or higher terrain.
@@ -118,9 +150,10 @@ pub fn tick_needs_system(
             // Campfire warmth: agents within 3 Manhattan tiles of a campfire
             // gain shelter and safety relief — fire keeps the cold and predators away.
             const CAMPFIRE_WARMTH: f32 = 0.25;
-            let near_fire = campfire_map.0.keys().any(|&cpos| {
-                (cpos.0 as i32 - cur_tx).abs() + (cpos.1 as i32 - cur_ty).abs() <= 3
-            });
+            let near_fire = campfire_map
+                .0
+                .keys()
+                .any(|&cpos| (cpos.0 as i32 - cur_tx).abs() + (cpos.1 as i32 - cur_ty).abs() <= 3);
             if near_fire {
                 needs.shelter = (needs.shelter - CAMPFIRE_WARMTH * dt).clamp(0.0, 255.0);
                 needs.safety = (needs.safety - CAMPFIRE_WARMTH * 0.5 * dt).clamp(0.0, 255.0);
@@ -153,6 +186,23 @@ pub fn tick_needs_system(
             }
 
             needs.reproduction = (needs.reproduction + REPRODUCTION_RATE * dt).clamp(0.0, 255.0);
+
+            // Willpower: drains while doing labor, drifts down slowly otherwise.
+            // Refill is applied separately by `play_system` so it can scale by
+            // the entertainment value of the agent's chosen target. Sleeping
+            // agents don't drain — rest is restorative.
+            if ai.state != AiState::Sleeping
+                && ai.task_id != TaskKind::Play as u16
+                && ai.task_id != TaskKind::PlayPlant as u16
+                && ai.task_id != TaskKind::PlayThrow as u16
+            {
+                let drain = if task_is_labor(ai.task_id) {
+                    WILLPOWER_WORK_DRAIN
+                } else {
+                    WILLPOWER_IDLE_DRAIN
+                };
+                needs.willpower = (needs.willpower - drain * dt).clamp(0.0, 255.0);
+            }
         });
 }
 
@@ -162,14 +212,21 @@ mod tests {
 
     #[test]
     fn needs_worst() {
-        let n = Needs::new(10.0, 200.0, 50.0, 30.0, 5.0);
+        let n = Needs::new(10.0, 200.0, 50.0, 30.0, 5.0, 200.0);
         assert_eq!(n.worst(), 200.0);
     }
 
     #[test]
     fn needs_saturate() {
-        let mut n = Needs::new(250.0, 0.0, 0.0, 0.0, 0.0);
+        let mut n = Needs::new(250.0, 0.0, 0.0, 0.0, 0.0, 200.0);
         n.hunger = (n.hunger + 100.0).clamp(0.0, 255.0);
         assert_eq!(n.hunger, 255.0);
+    }
+
+    #[test]
+    fn drained_willpower_dominates_worst() {
+        // willpower=10 → contributes 245 to worst, larger than any other field.
+        let n = Needs::new(50.0, 100.0, 30.0, 30.0, 50.0, 10.0);
+        assert_eq!(n.worst(), 245.0);
     }
 }

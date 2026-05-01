@@ -79,7 +79,9 @@ pub fn find_path_in(
                 return (AStarResult::Unreachable, expansions as u32);
             }
             return (
-                AStarResult::BudgetExhausted { best_so_far: best_node },
+                AStarResult::BudgetExhausted {
+                    best_so_far: best_node,
+                },
                 expansions as u32,
             );
         }
@@ -133,7 +135,10 @@ pub fn find_path_in(
                     let f = tentative_g.saturating_add(nh);
                     scratch.open.push(Reverse((f, next)));
                 }
-                break;
+                // No `break` — every legal dz must be pushed independently.
+                // Stopping after the first hit (e.g. dz=0) used to silently
+                // suppress descent options when a flat step was also legal,
+                // stranding agents on top of plateaus and built walls.
             }
         }
     }
@@ -141,7 +146,9 @@ pub fn find_path_in(
     let result = if best_node == start {
         AStarResult::Unreachable
     } else {
-        AStarResult::BudgetExhausted { best_so_far: best_node }
+        AStarResult::BudgetExhausted {
+            best_so_far: best_node,
+        }
     };
     (result, expansions as u32)
 }
@@ -210,7 +217,10 @@ mod tests {
                     x,
                     y,
                     z,
-                    TileData { kind: TileKind::Wall, ..Default::default() },
+                    TileData {
+                        kind: TileKind::Wall,
+                        ..Default::default()
+                    },
                 );
             }
         }
@@ -240,7 +250,10 @@ mod tests {
                 6,
                 5,
                 z,
-                TileData { kind: TileKind::Wall, ..Default::default() },
+                TileData {
+                    kind: TileKind::Wall,
+                    ..Default::default()
+                },
             );
         }
         let mut s = AStarScratch::default();
@@ -271,20 +284,29 @@ mod tests {
             6,
             6,
             1,
-            TileData { kind: TileKind::Grass, ..Default::default() },
+            TileData {
+                kind: TileKind::Grass,
+                ..Default::default()
+            },
         );
         // Make (6,5) standable only at z=-1.
         map.set_tile(
             6,
             5,
             0,
-            TileData { kind: TileKind::Air, ..Default::default() },
+            TileData {
+                kind: TileKind::Air,
+                ..Default::default()
+            },
         );
         map.set_tile(
             6,
             5,
             -1,
-            TileData { kind: TileKind::Grass, ..Default::default() },
+            TileData {
+                kind: TileKind::Grass,
+                ..Default::default()
+            },
         );
         let mut s = AStarScratch::default();
         match find_path_in(&mut s, &map, (5, 5, 0), (6, 6, 1), 500) {
@@ -301,6 +323,43 @@ mod tests {
     }
 
     #[test]
+    fn neighbor_emits_all_legal_z_candidates() {
+        // Stacked ramps at (5,5) make z = -1, 0, 1 all standable on the same
+        // tile. With the old early-break in the dz loop, A* from (4,5,0)
+        // would push only (5,5,0) (first dz that succeeds) and never expand
+        // (5,5,1) — so a goal at (5,5,1) would be reported Unreachable. The
+        // fix is to push every legal dz; this test guards against regression.
+        let mut map = ChunkMap::default();
+        map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
+        for z in -1..=2i32 {
+            map.set_tile(
+                5,
+                5,
+                z,
+                TileData {
+                    kind: TileKind::Ramp,
+                    ..Default::default()
+                },
+            );
+        }
+        let mut s = AStarScratch::default();
+        match find_path_in(&mut s, &map, (4, 5, 0), (5, 5, 1), 500) {
+            (AStarResult::Found(path), _) => {
+                assert_eq!(
+                    path.last(),
+                    Some(&(5, 5, 1)),
+                    "expected to reach (5,5,1) directly: {:?}",
+                    path
+                );
+            }
+            other => panic!(
+                "expected Found, got {:?} (early-break regression?)",
+                other.0.kind()
+            ),
+        }
+    }
+
+    #[test]
     fn diagonal_allowed_on_uneven_but_routable_terrain() {
         // Gentle ramp: target (6,6) at z=1, both corners (6,5) and (5,6)
         // remain at z=0 grass. Each corner has cz=0 satisfying both legs
@@ -312,7 +371,10 @@ mod tests {
             6,
             6,
             1,
-            TileData { kind: TileKind::Grass, ..Default::default() },
+            TileData {
+                kind: TileKind::Grass,
+                ..Default::default()
+            },
         );
         let mut s = AStarScratch::default();
         match find_path_in(&mut s, &map, (5, 5, 0), (6, 6, 1), 500) {

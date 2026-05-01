@@ -13,9 +13,9 @@ use crate::simulation::construction::{
 use crate::simulation::faction::SOLO;
 use crate::simulation::faction::{FactionMember, FactionRegistry, FactionTechs, PlayerFaction};
 use crate::simulation::items::GroundItem;
-use crate::simulation::person::{AiState, Drafted, PersonAI, Person, PlayerOrder, PlayerOrderKind};
+use crate::simulation::person::{AiState, Drafted, Person, PersonAI, PlayerOrder, PlayerOrderKind};
 use crate::simulation::plants::PlantMap;
-use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
+use crate::simulation::tasks::{assign_task_with_routing, task_interacts_from_adjacent, TaskKind};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
@@ -284,12 +284,17 @@ pub fn right_click_context_menu_system(
                         .map(|m| m.faction_id)
                         .unwrap_or(SOLO);
                     let wp = tile_to_world(target_tile.0 as i32, target_tile.1 as i32);
-                    let target_z = chunk_map
-                        .surface_z_at(target_tile.0 as i32, target_tile.1 as i32)
-                        as i8;
+                    let target_z =
+                        chunk_map.surface_z_at(target_tile.0 as i32, target_tile.1 as i32) as i8;
                     let bp_e = commands
                         .spawn((
-                            Blueprint::new(faction_id, Some(sel_entity), kind, target_tile, target_z),
+                            Blueprint::new(
+                                faction_id,
+                                Some(sel_entity),
+                                kind,
+                                target_tile,
+                                target_z,
+                            ),
                             Transform::from_xyz(wp.x, wp.y, 0.3),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -327,7 +332,14 @@ pub fn right_click_context_menu_system(
                 &chunk_map,
                 &chunk_connectivity,
             );
-            ai.target_z = target_z;
+            // For non-adjacent tasks (Move) honor the player's chosen Z layer —
+            // assign_task_with_routing snaps via nearest_standable_z to the agent's
+            // current Z, which would lose an underground click. Adjacent tasks
+            // (Mine/Gather/Build/Dig/PickUp/Deconstruct) must keep the route
+            // tile's Z that assign_task_with_routing already wrote.
+            if !task_interacts_from_adjacent(task as u16) {
+                ai.target_z = target_z;
+            }
         }
         commands.entity(sel_entity).insert(PlayerOrder {
             order: action,
@@ -384,9 +396,19 @@ fn classify_target(
         let other = member.faction_id;
         let pf = registry.factions.get(&player_faction_id);
         let of = registry.factions.get(&other);
-        let at_war = pf.and_then(|f| f.raid_target).map(|t| t == other).unwrap_or(false)
-            || of.and_then(|f| f.raid_target).map(|t| t == player_faction_id).unwrap_or(false);
-        return if at_war { Hostility::Hostile } else { Hostility::Neutral };
+        let at_war = pf
+            .and_then(|f| f.raid_target)
+            .map(|t| t == other)
+            .unwrap_or(false)
+            || of
+                .and_then(|f| f.raid_target)
+                .map(|t| t == player_faction_id)
+                .unwrap_or(false);
+        return if at_war {
+            Hostility::Hostile
+        } else {
+            Hostility::Neutral
+        };
     }
     // Predator animals are auto-hostile; everyone else (passive animals,
     // unknown entities) is treated as neutral.
@@ -429,9 +451,14 @@ fn issue_group_move(
     ai_q: &mut Query<(&mut PersonAI, &Transform, &mut CombatTarget), With<Drafted>>,
     hotspots: &mut HotspotFlowFields,
 ) {
-    hotspots.register((target_tile.0, target_tile.1, target_z), HotspotKind::RallyPoint);
+    hotspots.register(
+        (target_tile.0, target_tile.1, target_z),
+        HotspotKind::RallyPoint,
+    );
     for &e in drafted_units {
-        let Ok((mut ai, transform, mut combat)) = ai_q.get_mut(e) else { continue };
+        let Ok((mut ai, transform, mut combat)) = ai_q.get_mut(e) else {
+            continue;
+        };
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         let cur_chunk = ChunkCoord(
@@ -472,7 +499,9 @@ fn issue_group_attack(
         if e == foe {
             continue;
         }
-        let Ok((mut ai, transform, mut combat)) = ai_q.get_mut(e) else { continue };
+        let Ok((mut ai, transform, mut combat)) = ai_q.get_mut(e) else {
+            continue;
+        };
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         let cur_chunk = ChunkCoord(
@@ -491,7 +520,6 @@ fn issue_group_attack(
             &routing.chunk_map,
             &routing.chunk_connectivity,
         );
-        ai.target_z = foe_z;
         combat.0 = None; // attack-task driver sets it on adjacency
     }
 }
@@ -543,7 +571,9 @@ pub fn military_right_click_system(
         else {
             return;
         };
-        let Some(cursor_pos) = window.cursor_position() else { return };
+        let Some(cursor_pos) = window.cursor_position() else {
+            return;
+        };
         let Ok(world_pos) = camera.viewport_to_world_2d(cam_transform, cursor_pos) else {
             return;
         };
@@ -567,7 +597,9 @@ pub fn military_right_click_system(
             if !is_unit {
                 continue;
             }
-            let Ok(t) = classify.transform_q.get(e) else { continue };
+            let Ok(t) = classify.transform_q.get(e) else {
+                continue;
+            };
             let d = t.translation.truncate().distance(world_pos);
             if best.map(|(_, bd)| d < bd).unwrap_or(true) {
                 best = Some((e, d));

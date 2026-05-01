@@ -6,11 +6,11 @@ use crate::rendering::camera::CameraViewZ;
 use crate::simulation::combat::CombatTarget;
 use crate::simulation::construction::AutonomousBuildingToggle;
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
+use crate::simulation::person::{AiState, Drafted, Person, PersonAI};
+use crate::simulation::schedule::SimClock;
 use crate::ui::debug_panel::DebugPanelState;
 use crate::ui::selection::SelectedEntities;
 use crate::ui::tech_panel::TechPanelOpen;
-use crate::simulation::person::{AiState, Drafted, Person, PersonAI};
-use crate::simulation::schedule::SimClock;
 use crate::world::seasons::Calendar;
 
 /// Set by the Draft button (or `R` keypress); consumed by
@@ -35,10 +35,7 @@ pub fn hud_system(
     persons: Query<(), With<Person>>,
 ) {
     let pop = persons.iter().count();
-    let any_drafted = selected_many
-        .ids
-        .iter()
-        .any(|&e| drafted_q.get(e).is_ok());
+    let any_drafted = selected_many.ids.iter().any(|&e| drafted_q.get(e).is_ok());
     let has_selection = !selected_many.ids.is_empty();
 
     egui::Area::new(egui::Id::new("hud"))
@@ -116,12 +113,11 @@ pub fn hud_system(
                         }
 
                         ui.separator();
-                        let dbg_btn =
-                            egui::Button::new("Debug").fill(if debug_state.open {
-                                egui::Color32::from_rgb(200, 100, 60)
-                            } else {
-                                egui::Color32::from_gray(60)
-                            });
+                        let dbg_btn = egui::Button::new("Debug").fill(if debug_state.open {
+                            egui::Color32::from_rgb(200, 100, 60)
+                        } else {
+                            egui::Color32::from_gray(60)
+                        });
                         if ui.add(dbg_btn).clicked() {
                             debug_state.open = !debug_state.open;
                         }
@@ -177,7 +173,8 @@ pub fn hud_system(
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "Your Faction #{fid}:  food: {:.1}  |  members: {}",
-                                        data.storage.food_total(), data.member_count
+                                        data.storage.food_total(),
+                                        data.member_count
                                     ))
                                     .color(egui::Color32::from_rgb(140, 215, 255)),
                                 );

@@ -240,11 +240,14 @@ mod tests {
         let k = Box::new([[kind; CHUNK_SIZE]; CHUNK_SIZE]);
         let f = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
         map.0.insert(ChunkCoord(0, 0), Chunk::new(z, k, f));
-        map.0.insert(ChunkCoord(1, 0), Chunk::new(
-            Box::new([[surface_z; CHUNK_SIZE]; CHUNK_SIZE]),
-            Box::new([[kind; CHUNK_SIZE]; CHUNK_SIZE]),
-            Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]),
-        ));
+        map.0.insert(
+            ChunkCoord(1, 0),
+            Chunk::new(
+                Box::new([[surface_z; CHUNK_SIZE]; CHUNK_SIZE]),
+                Box::new([[kind; CHUNK_SIZE]; CHUNK_SIZE]),
+                Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]),
+            ),
+        );
         map
     }
 

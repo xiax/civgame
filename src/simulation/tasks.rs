@@ -34,29 +34,71 @@ pub enum TaskKind {
     Planter = 5,
     Hunter = 6,
     Scavenge = 7,
-    Construct = 8,         // build wall tile
-    ConstructBed = 9,      // spawn bed entity
-    DepositResource = 10,  // return to camp and deposit goods
+    Construct = 8,        // build wall tile
+    ConstructBed = 9,     // spawn bed entity
+    DepositResource = 10, // return to camp and deposit goods
     Socialize = 11,
-    Reproduce = 12,
     Explore = 13,
     Dig = 14, // dig down at surface or mine a wall tile
     Sleep = 15,
-    Eat = 16,          // consume one food item from inventory over several ticks
-    WithdrawFood = 17, // pull one food item from a faction storage tile into inventory
-    TameAnimal = 18,  // work adjacent to a wild horse for ~100 ticks to tame it
-    Craft = 19,       // craft an item in-place using inventory ingredients
+    Eat = 16,              // consume one food item from inventory over several ticks
+    WithdrawFood = 17,     // pull one food item from a faction storage tile into inventory
+    TameAnimal = 18,       // work adjacent to a wild horse for ~100 ticks to tame it
+    Craft = 19,            // craft an item in-place using inventory ingredients
     Deconstruct = 20, // dismantle placed furniture (e.g. bed) and carry recovered wood to storage
     Lead = 21,        // tribal chief stations at faction home and issues build orders
     Terraform = 22,   // level a footprint tile to a target Z (dig down or fill up by one Z step)
     HaulMaterials = 23, // carry inventory goods to a blueprint and drop them into its deposit slots
-    MilitaryMove = 24,  // drafted unit walking to a player-issued destination, idles on arrival
+    MilitaryMove = 24, // drafted unit walking to a player-issued destination, idles on arrival
     MilitaryAttack = 25, // drafted unit chasing a target entity to attack it adjacent
+    Play = 26,        // recreation: refills willpower, optionally builds bonds with a partner
+    WithdrawMaterial = 27, // pull one good currently needed by a faction blueprint from a storage tile
+    WithdrawGood = 28, // pull one of a specific good (encoded in craft_recipe_id) from a faction storage tile; sentinel 255 = any entertainment-value good
+    PlayPlant = 29,   // recreational planting: consumes a Seed from inventory, spawns a Grain plant, awards Farming XP + activity, bursts willpower
+    PlayThrow = 30,   // recreational rock-throwing: consumes a Stone from inventory, awards Combat XP + activity, bursts willpower
+}
+
+/// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
+/// for unknown ids (notably `PersonAI::UNEMPLOYED == u16::MAX`).
+pub fn task_kind_label(task_id: u16) -> &'static str {
+    match task_id {
+        x if x == TaskKind::Idle as u16 => "Idle",
+        x if x == TaskKind::Gather as u16 => "Gatherer",
+        x if x == TaskKind::Trader as u16 => "Trader",
+        x if x == TaskKind::Raid as u16 => "Raider",
+        x if x == TaskKind::Defend as u16 => "Defender",
+        x if x == TaskKind::Planter as u16 => "Planter",
+        x if x == TaskKind::Hunter as u16 => "Hunter",
+        x if x == TaskKind::Scavenge as u16 => "Scavenger",
+        x if x == TaskKind::Construct as u16 => "Builder",
+        x if x == TaskKind::ConstructBed as u16 => "Building Bed",
+        x if x == TaskKind::HaulMaterials as u16 => "Hauling Materials",
+        x if x == TaskKind::Deconstruct as u16 => "Deconstructing",
+        x if x == TaskKind::DepositResource as u16 => "Depositing Resources",
+        x if x == TaskKind::Socialize as u16 => "Socializing",
+        x if x == TaskKind::Explore as u16 => "Explorer",
+        x if x == TaskKind::Dig as u16 => "Digger",
+        x if x == TaskKind::Sleep as u16 => "Sleeper",
+        x if x == TaskKind::Eat as u16 => "Eating",
+        x if x == TaskKind::WithdrawFood as u16 => "Withdrawing Food",
+        x if x == TaskKind::WithdrawMaterial as u16 => "Withdrawing Material",
+        x if x == TaskKind::TameAnimal as u16 => "Taming",
+        x if x == TaskKind::Craft as u16 => "Crafter",
+        x if x == TaskKind::Lead as u16 => "Leading",
+        x if x == TaskKind::Terraform as u16 => "Levelling Ground",
+        x if x == TaskKind::MilitaryMove as u16 => "Military Move",
+        x if x == TaskKind::MilitaryAttack as u16 => "Military Attack",
+        x if x == TaskKind::Play as u16 => "Playing",
+        x if x == TaskKind::WithdrawGood as u16 => "Withdrawing",
+        x if x == TaskKind::PlayPlant as u16 => "Play-Planting",
+        x if x == TaskKind::PlayThrow as u16 => "Play-Throwing",
+        _ => "Unemployed",
+    }
 }
 
 /// How many free hands the task requires the agent to have before they can begin
 /// (or continue) work. Hauling and gathering tasks are EXEMPT — the load is the
-/// whole point. Tasks like Sleep/Socialize/Reproduce return 0 because they don't
+/// whole point. Tasks like Sleep/Socialize return 0 because they don't
 /// "use" hands, but we drop hand-held loads at task-entry separately (see
 /// `goal_dispatch_system`).
 pub fn task_requires_free_hands(task_id: u16) -> u8 {
@@ -86,7 +128,6 @@ pub fn task_requires_free_hands(task_id: u16) -> u8 {
 pub fn task_drops_hand_load(task_id: u16) -> bool {
     task_id == TaskKind::Sleep as u16
         || task_id == TaskKind::Socialize as u16
-        || task_id == TaskKind::Reproduce as u16
         || task_id == TaskKind::Eat as u16
 }
 
@@ -102,15 +143,39 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::DepositResource as u16
         || task_id == TaskKind::TameAnimal as u16
         || task_id == TaskKind::Deconstruct as u16
-        || task_id == TaskKind::Reproduce as u16
         || task_id == TaskKind::Terraform as u16
         || task_id == TaskKind::Scavenge as u16
         || task_id == TaskKind::WithdrawFood as u16
+        || task_id == TaskKind::WithdrawMaterial as u16
         || task_id == TaskKind::Socialize as u16
         || task_id == TaskKind::Raid as u16
         || task_id == TaskKind::Defend as u16
         || task_id == TaskKind::Lead as u16
         || task_id == TaskKind::MilitaryAttack as u16
+        || task_id == TaskKind::Play as u16
+        || task_id == TaskKind::WithdrawGood as u16
+        || task_id == TaskKind::PlayPlant as u16
+}
+
+/// Tasks that count as productive labor — these drain willpower over time
+/// (see `tick_needs_system`). Recreational, recovery, social, and combat
+/// tasks are excluded; they don't tire the mind in the same way.
+pub fn task_is_labor(task_id: u16) -> bool {
+    task_id == TaskKind::Gather as u16
+        || task_id == TaskKind::Dig as u16
+        || task_id == TaskKind::Construct as u16
+        || task_id == TaskKind::ConstructBed as u16
+        || task_id == TaskKind::Deconstruct as u16
+        || task_id == TaskKind::HaulMaterials as u16
+        || task_id == TaskKind::DepositResource as u16
+        || task_id == TaskKind::Planter as u16
+        || task_id == TaskKind::Hunter as u16
+        || task_id == TaskKind::Scavenge as u16
+        || task_id == TaskKind::Craft as u16
+        || task_id == TaskKind::Terraform as u16
+        || task_id == TaskKind::TameAnimal as u16
+        || task_id == TaskKind::WithdrawFood as u16
+        || task_id == TaskKind::WithdrawMaterial as u16
 }
 
 /// Spiral search outward from `target` for the closest tile that is passable
@@ -157,6 +222,48 @@ pub fn nearest_reachable_tile_near(
         }
     }
     best
+}
+
+/// Spiral outward from `origin_xy` looking for a passable tile whose surface
+/// Z is strictly higher than the agent's current Z AND is in the same
+/// connectivity component as the agent. Used by the `ReturnToSurface`
+/// recovery to give a stuck-underground agent a concrete reachable goal so
+/// they walk back up via whatever ramp/staircase actually connects their
+/// current cavern to higher ground. Returns `None` if no higher reachable
+/// tile is within `max_radius` — agent is genuinely sealed in.
+pub fn nearest_reachable_higher_tile(
+    chunk_map: &ChunkMap,
+    chunk_connectivity: &ChunkConnectivity,
+    origin_xy: (i16, i16),
+    agent_origin: (ChunkCoord, i8),
+    max_radius: i32,
+) -> Option<(i16, i16)> {
+    let csz = CHUNK_SIZE as i32;
+    let agent_z = agent_origin.1;
+    for r in 1..=max_radius {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs() != r && dy.abs() != r {
+                    continue; // ring-only iteration
+                }
+                let tx = origin_xy.0 as i32 + dx;
+                let ty = origin_xy.1 as i32 + dy;
+                let surf_z = chunk_map.surface_z_at(tx, ty);
+                if surf_z as i8 <= agent_z {
+                    continue;
+                }
+                if !chunk_map.passable_at(tx, ty, surf_z) {
+                    continue;
+                }
+                let n_chunk = ChunkCoord(tx.div_euclid(csz), ty.div_euclid(csz));
+                if !chunk_connectivity.is_reachable(agent_origin, (n_chunk, surf_z as i8)) {
+                    continue;
+                }
+                return Some((tx as i16, ty as i16));
+            }
+        }
+    }
+    None
 }
 
 pub fn find_nearest_tile(
@@ -341,11 +448,8 @@ pub fn assign_task_with_routing(
     // reach the work tile. The agent's `target_z` is set below to the route
     // tile's Z (where they'll stand), not this — otherwise flow-field seeds
     // and Working-transition checks fire at the wrong Z on sloped ground.
-    let resource_z = chunk_map.nearest_standable_z(
-        target.0 as i32,
-        target.1 as i32,
-        ai.current_z as i32,
-    ) as i8;
+    let resource_z =
+        chunk_map.nearest_standable_z(target.0 as i32, target.1 as i32, ai.current_z as i32) as i8;
 
     // For tasks where the agent works from beside the target (not on it), route to
     // the nearest passable adjacent tile within ±1 Z of the resource so the agent
@@ -356,7 +460,16 @@ pub fn assign_task_with_routing(
     let route_target = if task_interacts_from_adjacent(task as u16) {
         let (tx, ty) = (target.0 as i32, target.1 as i32);
         let (ax, ay) = (cur_tile.0 as i32, cur_tile.1 as i32);
-        const ADJ: [(i32, i32); 8] = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1)];
+        const ADJ: [(i32, i32); 8] = [
+            (-1, 0),
+            (1, 0),
+            (0, -1),
+            (0, 1),
+            (-1, -1),
+            (1, -1),
+            (-1, 1),
+            (1, 1),
+        ];
         let agent_z = ai.current_z;
         let csz = CHUNK_SIZE as i32;
         let picked = ADJ
@@ -550,9 +663,8 @@ pub fn goal_dispatch_system(
                                     continue;
                                 }
                                 let dist = dx.abs() + dy.abs();
-                                let affinity = rel_opt
-                                    .map(|r| r.get_affinity(other) as i32)
-                                    .unwrap_or(0);
+                                let affinity =
+                                    rel_opt.map(|r| r.get_affinity(other) as i32).unwrap_or(0);
                                 let score = affinity * 3 - dist;
                                 if score > best_score {
                                     best_score = score;
@@ -725,9 +837,9 @@ pub fn goal_dispatch_system(
                 | AgentGoal::Build
                 | AgentGoal::TameHorse
                 | AgentGoal::Craft
-                | AgentGoal::Reproduce
                 | AgentGoal::Rescue
-                | AgentGoal::ReturnCamp => {
+                | AgentGoal::ReturnCamp
+                | AgentGoal::Play => {
                     if ai.task_id == TaskKind::Explore as u16 {
                         if ai.state == AiState::Working {
                             ai.state = AiState::Idle;
@@ -738,6 +850,177 @@ pub fn goal_dispatch_system(
             }
         },
     );
+}
+
+// ── Play task system ──────────────────────────────────────────────────────────
+// Refills willpower for agents in the Play task. Two flavors, picked by the
+// plan that dispatched the task:
+//
+// - Social play: target_entity is a Person. Both agents (initiator + partner)
+//   gain willpower from this loop iteration when their partner is adjacent and
+//   also in Play. Affinity goes both ways via a deferred RelationshipMemory pass
+//   so the partner doesn't need to be playing for the bond to form.
+//
+// - Solo play: target_entity is None or a non-Person. Willpower scales by the
+//   `entertainment_value` of the highest-rated good held in hands (or, fallback,
+//   any adjacent ground item).
+//
+// The task ends when work_progress hits PLAY_DURATION_TICKS or willpower is
+// near full. plan_execution_system observes the resulting Idle+UNEMPLOYED
+// state and advances the plan.
+
+use super::carry::Carrier;
+use super::goals::Personality;
+use super::person::Person;
+use super::schedule::SimClock;
+
+const PLAY_DURATION_TICKS: u32 = 100;
+const WILLPOWER_PLAY_GAIN_PER_ENT: f32 = 0.5;
+const SOCIAL_PLAY_PARTNER_VALUE: f32 = 30.0;
+const SOCIAL_PLAY_FILL_RATE: f32 = 0.4; // social need drop per sec for both parties
+const PLAY_FULL_WILLPOWER: f32 = 230.0;
+
+fn highest_held_entertainment(carrier: &Carrier) -> u8 {
+    let l = carrier
+        .left
+        .map(|s| s.item.good.entertainment_value())
+        .unwrap_or(0);
+    let r = carrier
+        .right
+        .map(|s| s.item.good.entertainment_value())
+        .unwrap_or(0);
+    l.max(r)
+}
+
+fn adjacent_ground_entertainment(
+    spatial: &SpatialIndex,
+    item_query: &Query<&GroundItem>,
+    cur_tx: i32,
+    cur_ty: i32,
+) -> u8 {
+    let mut best: u8 = 0;
+    for dy in -1..=1i32 {
+        for dx in -1..=1i32 {
+            for &e in spatial.get(cur_tx + dx, cur_ty + dy) {
+                if let Ok(item) = item_query.get(e) {
+                    let v = item.item.good.entertainment_value();
+                    if v > best {
+                        best = v;
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+pub fn play_system(
+    time: Res<Time>,
+    clock: Res<SimClock>,
+    spatial: Res<SpatialIndex>,
+    person_query: Query<(), With<Person>>,
+    transform_query: Query<&Transform>,
+    item_query: Query<&GroundItem>,
+    mut rel_query: Query<&mut RelationshipMemory>,
+    mut query: Query<(
+        Entity,
+        &mut PersonAI,
+        &mut Needs,
+        &Personality,
+        &Carrier,
+        &Transform,
+        &LodLevel,
+    )>,
+) {
+    let dt = time.delta_secs() * clock.scale_factor();
+
+    // Pairs of (self, partner) where social play happened this tick. Applied
+    // as a separate pass to update RelationshipMemory on both sides without
+    // borrow-checker conflicts.
+    let mut affinity_pairs: Vec<(Entity, Entity)> = Vec::new();
+
+    for (entity, mut ai, mut needs, personality, carrier, transform, lod) in query.iter_mut() {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if ai.task_id != TaskKind::Play as u16 {
+            continue;
+        }
+        if ai.state != AiState::Working {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+
+        let mut did_social = false;
+
+        if let Some(partner) = ai.target_entity {
+            if person_query.get(partner).is_ok() {
+                if let Ok(pt) = transform_query.get(partner) {
+                    let ptx = (pt.translation.x / TILE_SIZE).floor() as i32;
+                    let pty = (pt.translation.y / TILE_SIZE).floor() as i32;
+                    let dist = (ptx - cur_tx).abs() + (pty - cur_ty).abs();
+                    if dist <= 1 {
+                        let multiplier = if *personality == Personality::Loner {
+                            0.3
+                        } else {
+                            1.0
+                        };
+                        let gain = SOCIAL_PLAY_PARTNER_VALUE
+                            * WILLPOWER_PLAY_GAIN_PER_ENT
+                            * dt
+                            * multiplier;
+                        needs.willpower = (needs.willpower + gain).clamp(0.0, 255.0);
+                        needs.social =
+                            (needs.social - SOCIAL_PLAY_FILL_RATE * 100.0 * dt).clamp(0.0, 255.0);
+                        affinity_pairs.push((entity, partner));
+                        did_social = true;
+                    }
+                }
+            }
+        }
+
+        if !did_social {
+            // Solo play: held item first, then any adjacent ground item.
+            let mut ent_value = highest_held_entertainment(carrier);
+            if ent_value == 0 {
+                ent_value = adjacent_ground_entertainment(&spatial, &item_query, cur_tx, cur_ty);
+            }
+            if ent_value > 0 {
+                let multiplier = if *personality == Personality::Loner {
+                    1.5
+                } else {
+                    1.0
+                };
+                let gain = (ent_value as f32) * WILLPOWER_PLAY_GAIN_PER_ENT * dt * multiplier;
+                needs.willpower = (needs.willpower + gain).clamp(0.0, 255.0);
+            }
+            // If neither held nor adjacent items exist, the agent stands here
+            // and the task ends via the duration cap below — no infinite loop.
+        }
+
+        ai.work_progress = ai.work_progress.saturating_add(1);
+        if ai.work_progress as u32 >= PLAY_DURATION_TICKS || needs.willpower >= PLAY_FULL_WILLPOWER
+        {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
+            ai.work_progress = 0;
+        }
+    }
+
+    // Bilateral affinity gain — applies even if the partner isn't playing, so
+    // playing with someone who happens to be standing there still strengthens
+    // the bond from both directions over time.
+    for (a, b) in affinity_pairs {
+        if let Ok(mut rel) = rel_query.get_mut(a) {
+            rel.update(b, 1);
+        }
+        if let Ok(mut rel) = rel_query.get_mut(b) {
+            rel.update(a, 1);
+        }
+    }
 }
 
 #[cfg(test)]

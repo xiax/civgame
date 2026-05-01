@@ -3,26 +3,30 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::agent::EconomicAgent;
+use crate::pathfinding::path_request::{
+    FailReason, FailureLog, FollowStatus, PathFollow, PathRequestQueue,
+};
 use crate::simulation::combat::{Body, BodyPart, Health};
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction, SOLO};
 use crate::simulation::goals::{AgentGoal, GoalReason, Personality};
 use crate::simulation::memory::{AgentMemory, RelEntry, RelationshipMemory};
 use crate::simulation::mood::Mood;
 use crate::simulation::needs::Needs;
-use crate::simulation::neural::UtilityNet;
 use crate::simulation::person::{AiState, PersonAI, PlayerOrder, Profession};
 use crate::simulation::plan::{
-    build_state_vec, ActivePlan, KnownPlans, PlanRegistry, StepRegistry,
+    build_state_vec, score_weighted, ActivePlan, KnownPlans, PlanHistory, PlanRegistry,
+    StepRegistry,
 };
 use crate::simulation::plants::{Plant, PlantMap};
-use crate::simulation::reproduction::BiologicalSex;
-use crate::simulation::skills::{SkillKind, Skills, SKILL_COUNT};
-use crate::pathfinding::path_request::{
-    FailReason, FailureLog, FollowStatus, PathFollow, PathRequestQueue,
+use crate::simulation::reproduction::{
+    BiologicalSex, CoSleepTracker, MaleConceptionCooldown, Pregnancy, PREGNANCY_TICKS,
 };
-use crate::simulation::tasks::TaskKind;
+use crate::simulation::skills::{SkillKind, Skills, SKILL_COUNT};
+use crate::simulation::stats::{self, Stats};
+use crate::simulation::tasks::{task_kind_label, TaskKind};
 use crate::world::chunk::ChunkMap;
 use crate::world::seasons::Calendar;
+use crate::world::seasons::TICKS_PER_SEASON;
 use crate::world::tile::TileKind;
 
 use super::selection::SelectedEntity;
@@ -47,6 +51,11 @@ pub fn inspector_panel_system(
     mut path_params: PathInspectorParams,
     plants: Query<&Plant>,
     rel_query: Query<&RelationshipMemory>,
+    repro_query: Query<(
+        Option<&Pregnancy>,
+        Option<&CoSleepTracker>,
+        Option<&MaleConceptionCooldown>,
+    )>,
     name_query: Query<&Name>,
     query: Query<(
         (
@@ -60,6 +69,7 @@ pub fn inspector_panel_system(
             &BiologicalSex,
             &FactionMember,
             &Profession,
+            Option<&Stats>,
         ),
         (
             Option<&Health>,
@@ -68,16 +78,16 @@ pub fn inspector_panel_system(
             &Transform,
             Option<&ActivePlan>,
             Option<&KnownPlans>,
-            Option<&UtilityNet>,
             Option<&AgentMemory>,
             Option<&GoalReason>,
             Option<&crate::simulation::carry::Carrier>,
+            Option<&PlanHistory>,
         ),
     )>,
 ) {
     let Some(entity) = selected.0 else { return };
     let Ok((
-        (needs, mood, skills, ai, agent, goal, personality, sex, member, profession),
+        (needs, mood, skills, ai, agent, goal, personality, sex, member, profession, stats),
         (
             health,
             body,
@@ -85,16 +95,20 @@ pub fn inspector_panel_system(
             transform,
             active_plan,
             known_plans,
-            utility_net,
             memory,
             goal_reason,
             carrier,
+            plan_history,
         ),
     )) = query.get(entity)
     else {
         return;
     };
     let rel_mem = rel_query.get(entity).ok();
+    let (preg_opt, cosleep_opt, male_cd_opt) = repro_query
+        .get(entity)
+        .map(|(p, c, m)| (p, c, m))
+        .unwrap_or((None, None, None));
 
     egui::Window::new("Inspector")
         .default_pos([10.0, 10.0])
@@ -103,125 +117,91 @@ pub fn inspector_panel_system(
         .min_width(400.0)
         .resizable(true)
         .show(contexts.ctx_mut(), |ui| {
-            egui::CollapsingHeader::new(egui::RichText::new("Identity").strong())
-                .default_open(true)
-                .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(format!("Mood: {} ({})", mood.label(), mood.0));
-                    ui.separator();
-                    ui.label(sex.name());
-                });
-                ui.label(format!("Personality: {}", personality.name()));
-                ui.label(format!("Profession: {:?}", profession));
-                ui.horizontal(|ui| {
-                    ui.label(format!("Goal: {}", goal.name()));
-                    let reason_text = goal_reason.map(|r| r.0).unwrap_or("—");
-                    ui.label(
-                        egui::RichText::new(format!(" ({})", reason_text))
-                            .small()
-                            .color(egui::Color32::from_gray(160)),
-                    );
-                });
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::CollapsingHeader::new(egui::RichText::new("Identity").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Mood: {} ({})", mood.label(), mood.0));
+                            ui.separator();
+                            ui.label(sex.name());
+                        });
+                        ui.label(format!("Personality: {}", personality.name()));
+                        ui.label(format!("Profession: {:?}", profession));
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Goal: {}", goal.name()));
+                            let reason_text = goal_reason.map(|r| r.0).unwrap_or("—");
+                            ui.label(
+                                egui::RichText::new(format!(" ({})", reason_text))
+                                    .small()
+                                    .color(egui::Color32::from_gray(160)),
+                            );
+                        });
 
-                if member.faction_id == SOLO {
-                    ui.label("Faction: Solo");
-                    if member.bond_timer > 0 {
-                        ui.label(format!("Bonding: {}/180", member.bond_timer));
-                    } else {
-                        ui.label(
-                            egui::RichText::new("Bonding: —")
-                                .color(egui::Color32::from_gray(140)),
-                        );
-                    }
-                } else {
-                    let food_stock = registry
-                        .factions
-                        .get(&member.faction_id)
-                        .map_or(0.0, |f| f.storage.food_total());
-                    let mut raid_info = if registry.is_under_raid(member.faction_id) {
-                        " [UNDER RAID]".to_string()
-                    } else if let Some(target) = registry.raid_target(member.faction_id) {
-                        format!(" [RAIDING #{}]", target)
-                    } else {
-                        String::new()
-                    };
-                    if member.faction_id == player_faction.faction_id {
-                        raid_info += " [YOU]";
-                    }
-                    ui.label(format!(
-                        "Faction: #{} (food: {:.1}){}",
-                        member.faction_id, food_stock, raid_info
-                    ));
-                    // Lineage + culture style summary
-                    let (lineage_text, founder_text) = match registry
-                        .factions
-                        .get(&member.faction_id)
-                    {
-                        Some(f) => (
-                            format!(
-                                "Lineage: {} (gen {})",
-                                f.lineage.root, f.lineage.generation
-                            ),
-                            format!(
-                                "Founder: {} • Style: {}",
-                                f.lineage.founder,
-                                f.culture.style.label()
-                            ),
-                        ),
-                        None => ("Lineage: —".to_string(), "Founder: —".to_string()),
-                    };
-                    ui.label(
-                        egui::RichText::new(lineage_text)
-                            .color(egui::Color32::from_gray(180))
-                            .size(11.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(founder_text)
-                            .color(egui::Color32::from_gray(180))
-                            .size(11.0),
-                    );
-                }
-                });
+                        if member.faction_id == SOLO {
+                            ui.label("Faction: Solo");
+                            if member.bond_timer > 0 {
+                                ui.label(format!("Bonding: {}/180", member.bond_timer));
+                            } else {
+                                ui.label(
+                                    egui::RichText::new("Bonding: —")
+                                        .color(egui::Color32::from_gray(140)),
+                                );
+                            }
+                        } else {
+                            let food_stock = registry
+                                .factions
+                                .get(&member.faction_id)
+                                .map_or(0.0, |f| f.storage.food_total());
+                            let mut raid_info = if registry.is_under_raid(member.faction_id) {
+                                " [UNDER RAID]".to_string()
+                            } else if let Some(target) = registry.raid_target(member.faction_id) {
+                                format!(" [RAIDING #{}]", target)
+                            } else {
+                                String::new()
+                            };
+                            if member.faction_id == player_faction.faction_id {
+                                raid_info += " [YOU]";
+                            }
+                            ui.label(format!(
+                                "Faction: #{} (food: {:.1}){}",
+                                member.faction_id, food_stock, raid_info
+                            ));
+                            // Lineage + culture style summary
+                            let (lineage_text, founder_text) =
+                                match registry.factions.get(&member.faction_id) {
+                                    Some(f) => (
+                                        format!(
+                                            "Lineage: {} (gen {})",
+                                            f.lineage.root, f.lineage.generation
+                                        ),
+                                        format!(
+                                            "Founder: {} • Style: {}",
+                                            f.lineage.founder,
+                                            f.culture.style.label()
+                                        ),
+                                    ),
+                                    None => ("Lineage: —".to_string(), "Founder: —".to_string()),
+                                };
+                            ui.label(
+                                egui::RichText::new(lineage_text)
+                                    .color(egui::Color32::from_gray(180))
+                                    .size(11.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(founder_text)
+                                    .color(egui::Color32::from_gray(180))
+                                    .size(11.0),
+                            );
+                        }
+                    });
                 egui::CollapsingHeader::new(egui::RichText::new("Health").strong())
                     .default_open(true)
                     .show(ui, |ui| {
-                if let Some(h) = health {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{:8}", "Health"));
-                        let frac = h.fraction();
-                        let color = egui::Color32::from_rgb(
-                            (255.0 * (1.0 - frac)) as u8,
-                            (255.0 * frac) as u8,
-                            30,
-                        );
-                        ui.add(
-                            egui::ProgressBar::new(frac)
-                                .desired_width(140.0)
-                                .fill(color),
-                        );
-                        ui.label(format!("{}/{}", h.current, h.max));
-                    });
-                } else if let Some(b) = body {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{:8}", "Body Health"));
-                        let frac = b.fraction();
-                        let color = egui::Color32::from_rgb(
-                            (255.0 * (1.0 - frac)) as u8,
-                            (255.0 * frac) as u8,
-                            30,
-                        );
-                        ui.add(
-                            egui::ProgressBar::new(frac)
-                                .desired_width(140.0)
-                                .fill(color),
-                        );
-                    });
-                    egui::CollapsingHeader::new("Limbs").show(ui, |ui| {
-                        for part in BodyPart::ALL {
-                            let limb = b.parts[part as usize];
+                        if let Some(h) = health {
                             ui.horizontal(|ui| {
-                                ui.label(format!("{:10}", format!("{:?}", part)));
-                                let frac = limb.current as f32 / limb.max as f32;
+                                ui.label(format!("{:8}", "Health"));
+                                let frac = h.fraction();
                                 let color = egui::Color32::from_rgb(
                                     (255.0 * (1.0 - frac)) as u8,
                                     (255.0 * frac) as u8,
@@ -229,276 +209,300 @@ pub fn inspector_panel_system(
                                 );
                                 ui.add(
                                     egui::ProgressBar::new(frac)
-                                        .desired_width(100.0)
+                                        .desired_width(140.0)
                                         .fill(color),
                                 );
-                                ui.label(format!("{}/{}", limb.current, limb.max));
+                                ui.label(format!("{}/{}", h.current, h.max));
+                            });
+                        } else if let Some(b) = body {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{:8}", "Body Health"));
+                                let frac = b.fraction();
+                                let color = egui::Color32::from_rgb(
+                                    (255.0 * (1.0 - frac)) as u8,
+                                    (255.0 * frac) as u8,
+                                    30,
+                                );
+                                ui.add(
+                                    egui::ProgressBar::new(frac)
+                                        .desired_width(140.0)
+                                        .fill(color),
+                                );
+                            });
+                            egui::CollapsingHeader::new("Limbs").show(ui, |ui| {
+                                for part in BodyPart::ALL {
+                                    let limb = b.parts[part as usize];
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{:10}", format!("{:?}", part)));
+                                        let frac = limb.current as f32 / limb.max as f32;
+                                        let color = egui::Color32::from_rgb(
+                                            (255.0 * (1.0 - frac)) as u8,
+                                            (255.0 * frac) as u8,
+                                            30,
+                                        );
+                                        ui.add(
+                                            egui::ProgressBar::new(frac)
+                                                .desired_width(100.0)
+                                                .fill(color),
+                                        );
+                                        ui.label(format!("{}/{}", limb.current, limb.max));
+                                    });
+                                }
                             });
                         }
                     });
-                }
-
-                });
                 egui::CollapsingHeader::new(egui::RichText::new("Needs").strong())
                     .default_open(true)
                     .show(ui, |ui| {
-                needs_bar(ui, "Hunger", needs.hunger);
-                needs_bar(ui, "Sleep", needs.sleep);
-                needs_bar(ui, "Shelter", needs.shelter);
-                needs_bar(ui, "Safety", needs.safety);
-                needs_bar(ui, "Social", needs.social);
-                needs_bar(ui, "Repro", needs.reproduction);
-
-                });
+                        needs_bar(ui, "Hunger", needs.hunger);
+                        needs_bar(ui, "Sleep", needs.sleep);
+                        needs_bar(ui, "Shelter", needs.shelter);
+                        needs_bar(ui, "Safety", needs.safety);
+                        needs_bar(ui, "Social", needs.social);
+                        needs_bar(ui, "Repro", needs.reproduction);
+                        willpower_bar(ui, needs.willpower);
+                    });
                 egui::CollapsingHeader::new(egui::RichText::new("Skills").strong())
                     .default_open(false)
                     .show(ui, |ui| {
-                for i in 0..SKILL_COUNT {
-                    let kind = unsafe { std::mem::transmute::<u8, SkillKind>(i as u8) };
-                    ui.label(format!("  {}: {}", kind.name(), skills.0[i]));
-                }
-
-                });
+                        for i in 0..SKILL_COUNT {
+                            let kind = unsafe { std::mem::transmute::<u8, SkillKind>(i as u8) };
+                            ui.label(format!("  {}: {}", kind.name(), skills.0[i]));
+                        }
+                    });
+                egui::CollapsingHeader::new(egui::RichText::new("Stats").strong())
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if let Some(s) = stats {
+                            let row = |ui: &mut egui::Ui, label: &str, score: u8| {
+                                let m = stats::modifier(score);
+                                let sign = if m >= 0 { "+" } else { "" };
+                                ui.label(format!("  {}: {} ({}{})", label, score, sign, m));
+                            };
+                            row(ui, "STR", s.strength);
+                            row(ui, "DEX", s.dexterity);
+                            row(ui, "CON", s.constitution);
+                            row(ui, "INT", s.intelligence);
+                            row(ui, "WIS", s.wisdom);
+                            row(ui, "CHA", s.charisma);
+                        } else {
+                            ui.label("  (no stats)");
+                        }
+                    });
                 egui::CollapsingHeader::new(egui::RichText::new("Currency & Inventory").strong())
                     .default_open(false)
                     .show(ui, |ui| {
-                ui.label(format!("Currency: {:.1}", agent.currency));
+                        ui.label(format!("Currency: {:.1}", agent.currency));
 
-                let cur_g = agent.current_weight_g();
-                let cap_g = agent.capacity_g();
-                ui.label(format!(
-                    "Inventory ({:.1} / {:.1} kg):",
-                    cur_g as f32 / 1000.0,
-                    cap_g as f32 / 1000.0,
-                ));
-                let frac = if cap_g > 0 {
-                    (cur_g as f32 / cap_g as f32).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                ui.add(
-                    egui::ProgressBar::new(frac).desired_width(180.0).text(format!(
-                        "{:.1} kg",
-                        cur_g as f32 / 1000.0
-                    )),
-                );
-                egui::ScrollArea::vertical()
-                    .id_salt("inv")
-                    .max_height(100.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for (item, qty) in &agent.inventory {
-                            if *qty > 0 {
-                                let mut name = item.good.name().to_string();
-                                if let Some(mat) = item.material {
-                                    name = format!("{:?} {}", mat, name);
+                        let cur_g = agent.current_weight_g();
+                        let cap_g = agent.capacity_g();
+                        ui.label(format!(
+                            "Inventory ({:.1} / {:.1} kg):",
+                            cur_g as f32 / 1000.0,
+                            cap_g as f32 / 1000.0,
+                        ));
+                        let frac = if cap_g > 0 {
+                            (cur_g as f32 / cap_g as f32).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_width(180.0)
+                                .text(format!("{:.1} kg", cur_g as f32 / 1000.0)),
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("inv")
+                            .max_height(100.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for (item, qty) in &agent.inventory {
+                                    if *qty > 0 {
+                                        let mut name = item.good.name().to_string();
+                                        if let Some(mat) = item.material {
+                                            name = format!("{:?} {}", mat, name);
+                                        }
+                                        if let Some(qual) = item.quality {
+                                            name = format!("{} ({:?})", name, qual);
+                                        }
+                                        ui.label(format!(
+                                            "  {}: {} ({:.2} kg)",
+                                            name,
+                                            qty,
+                                            item.stack_weight_g(*qty) as f32 / 1000.0
+                                        ));
+                                    }
                                 }
-                                if let Some(qual) = item.quality {
-                                    name = format!("{} ({:?})", name, qual);
-                                }
+                            });
+
+                        let (free_hands_str, left_slot, right_slot) = match carrier {
+                            Some(c) => (format!("{} free", c.free_hands()), c.left, c.right),
+                            None => ("—".to_string(), None, None),
+                        };
+                        ui.label(format!("In hands: {}", free_hands_str));
+                        let two_handed = left_slot.map_or(false, |s| s.two_handed);
+                        match left_slot {
+                            Some(stack) => {
+                                let tag = if stack.two_handed { " [2H]" } else { "" };
                                 ui.label(format!(
-                                    "  {}: {} ({:.2} kg)",
-                                    name,
-                                    qty,
-                                    item.stack_weight_g(*qty) as f32 / 1000.0
+                                    "  L: {} ×{}{} ({:.2} kg)",
+                                    stack.item.good.name(),
+                                    stack.qty,
+                                    tag,
+                                    stack.weight_g() as f32 / 1000.0,
                                 ));
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new("  L: —")
+                                        .color(egui::Color32::from_gray(140)),
+                                );
+                            }
+                        }
+                        if two_handed {
+                            ui.label(
+                                egui::RichText::new("  R: (held with two hands)")
+                                    .color(egui::Color32::from_gray(140)),
+                            );
+                        } else {
+                            match right_slot {
+                                Some(stack) => {
+                                    let tag = if stack.two_handed { " [2H]" } else { "" };
+                                    ui.label(format!(
+                                        "  R: {} ×{}{} ({:.2} kg)",
+                                        stack.item.good.name(),
+                                        stack.qty,
+                                        tag,
+                                        stack.weight_g() as f32 / 1000.0,
+                                    ));
+                                }
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new("  R: —")
+                                            .color(egui::Color32::from_gray(140)),
+                                    );
+                                }
                             }
                         }
                     });
-
-                let (free_hands_str, left_slot, right_slot) = match carrier {
-                    Some(c) => (format!("{} free", c.free_hands()), c.left, c.right),
-                    None => ("—".to_string(), None, None),
-                };
-                ui.label(format!("In hands: {}", free_hands_str));
-                let two_handed = left_slot.map_or(false, |s| s.two_handed);
-                match left_slot {
-                    Some(stack) => {
-                        let tag = if stack.two_handed { " [2H]" } else { "" };
-                        ui.label(format!(
-                            "  L: {} ×{}{} ({:.2} kg)",
-                            stack.item.good.name(),
-                            stack.qty,
-                            tag,
-                            stack.weight_g() as f32 / 1000.0,
-                        ));
-                    }
-                    None => {
-                        ui.label(
-                            egui::RichText::new("  L: —")
-                                .color(egui::Color32::from_gray(140)),
-                        );
-                    }
-                }
-                if two_handed {
-                    ui.label(
-                        egui::RichText::new("  R: (held with two hands)")
-                            .color(egui::Color32::from_gray(140)),
-                    );
-                } else {
-                    match right_slot {
-                        Some(stack) => {
-                            let tag = if stack.two_handed { " [2H]" } else { "" };
-                            ui.label(format!(
-                                "  R: {} ×{}{} ({:.2} kg)",
-                                stack.item.good.name(),
-                                stack.qty,
-                                tag,
-                                stack.weight_g() as f32 / 1000.0,
-                            ));
-                        }
-                        None => {
-                            ui.label(
-                                egui::RichText::new("  R: —")
-                                    .color(egui::Color32::from_gray(140)),
-                            );
-                        }
-                    }
-                }
-
-                });
                 egui::CollapsingHeader::new(egui::RichText::new("Task & State").strong())
                     .default_open(true)
                     .show(ui, |ui| {
+                        let task_name = task_kind_label(ai.task_id);
+                        ui.label(format!("Task: {}", task_name));
 
-                let task_name = match ai.task_id {
-                    j if j == TaskKind::Idle as u16 => "Idle",
-                    j if j == TaskKind::Gather as u16 => "Gatherer",
-                    j if j == TaskKind::Trader as u16 => "Trader",
-                    j if j == TaskKind::Raid as u16 => "Raider",
-                    j if j == TaskKind::Defend as u16 => "Defender",
-                    j if j == TaskKind::Planter as u16 => "Planter",
-                    j if j == TaskKind::Hunter as u16 => "Hunter",
-                    j if j == TaskKind::Scavenge as u16 => "Scavenger",
-                    j if j == TaskKind::Construct as u16 => "Builder",
-                    j if j == TaskKind::ConstructBed as u16 => "Building Bed",
-                    j if j == TaskKind::HaulMaterials as u16 => "Hauling Materials",
-                    j if j == TaskKind::Deconstruct as u16 => "Deconstructing",
-                    j if j == TaskKind::DepositResource as u16 => "Depositing Resources",
-                    j if j == TaskKind::Socialize as u16 => "Socializing",
-                    j if j == TaskKind::Reproduce as u16 => "Reproducing",
-                    j if j == TaskKind::Explore as u16 => "Explorer",
-                    j if j == TaskKind::Dig as u16 => "Digger",
-                    j if j == TaskKind::Sleep as u16 => "Sleeper",
-                    j if j == TaskKind::Eat as u16 => "Eating",
-                    j if j == TaskKind::WithdrawFood as u16 => "Withdrawing Food",
-                    j if j == TaskKind::TameAnimal as u16 => "Taming",
-                    j if j == TaskKind::Craft as u16 => "Crafter",
-                    j if j == TaskKind::Lead as u16 => "Leading",
-                    j if j == TaskKind::Terraform as u16 => "Levelling Ground",
-                    _ => "Unemployed",
-                };
-                ui.label(format!("Task: {}", task_name));
+                        let state_desc = match ai.state {
+                            AiState::Idle => "Idling".to_string(),
+                            AiState::Routing => "Traveling (Long Range)".to_string(),
+                            AiState::Seeking => "Walking to Target".to_string(),
+                            AiState::Sleeping => "Sleeping".to_string(),
+                            AiState::Attacking => "In Combat".to_string(),
+                            AiState::Working => {
+                                let tx = ai.target_tile.0 as i32;
+                                let ty = ai.target_tile.1 as i32;
+                                let mut work_str = "Working".to_string();
 
-                let state_desc = match ai.state {
-                    AiState::Idle => "Idling".to_string(),
-                    AiState::Routing => "Traveling (Long Range)".to_string(),
-                    AiState::Seeking => "Walking to Target".to_string(),
-                    AiState::Sleeping => "Sleeping".to_string(),
-                    AiState::Attacking => "In Combat".to_string(),
-                    AiState::Working => {
-                        let tx = ai.target_tile.0 as i32;
-                        let ty = ai.target_tile.1 as i32;
-                        let mut work_str = "Working".to_string();
-
-                        if ai.task_id == TaskKind::Gather as u16 {
-                            if let Some(&p_entity) = plant_map.0.get(&(tx, ty)) {
-                                if let Ok(plant) = plants.get(p_entity) {
-                                    work_str = format!("Harvesting {:?}", plant.kind);
+                                if ai.task_id == TaskKind::Gather as u16 {
+                                    if let Some(&p_entity) = plant_map.0.get(&(tx, ty)) {
+                                        if let Ok(plant) = plants.get(p_entity) {
+                                            work_str = format!("Harvesting {:?}", plant.kind);
+                                        }
+                                    } else if let Some(tile_kind) = chunk_map.tile_kind_at(tx, ty) {
+                                        if tile_kind == TileKind::Stone {
+                                            work_str = "Mining Stone".to_string();
+                                        }
+                                    }
+                                    // Use u32 to avoid u8 overflow during multiplication
+                                    work_str = format!(
+                                        "{} ({}%)",
+                                        work_str,
+                                        (ai.work_progress as u32 * 100) / 30
+                                    );
+                                // 30 is base stone work_ticks
+                                } else if ai.task_id == TaskKind::Planter as u16 {
+                                    work_str = format!(
+                                        "Planting Seeds ({}%)",
+                                        (ai.work_progress as u32 * 100) / 40
+                                    );
+                                // 40 is TICKS_FARMER_PLANT
+                                } else if ai.task_id == TaskKind::Raid as u16 {
+                                    work_str = "Stealing Goods".to_string();
+                                } else if ai.task_id == TaskKind::Scavenge as u16 {
+                                    work_str = "Picking up item".to_string();
                                 }
-                            } else if let Some(tile_kind) = chunk_map.tile_kind_at(tx, ty) {
-                                if tile_kind == TileKind::Stone {
-                                    work_str = "Mining Stone".to_string();
-                                }
+
+                                work_str
                             }
-                            // Use u32 to avoid u8 overflow during multiplication
-                            work_str =
-                                format!("{} ({}%)", work_str, (ai.work_progress as u32 * 100) / 30);
-                        // 30 is base stone work_ticks
-                        } else if ai.task_id == TaskKind::Planter as u16 {
-                            work_str =
-                                format!("Planting Seeds ({}%)", (ai.work_progress as u32 * 100) / 40);
-                        // 40 is TICKS_FARMER_PLANT
-                        } else if ai.task_id == TaskKind::Raid as u16 {
-                            work_str = "Stealing Goods".to_string();
-                        } else if ai.task_id == TaskKind::Scavenge as u16 {
-                            work_str = "Picking up item".to_string();
+                        };
+                        ui.label(format!("State: {}", state_desc));
+                        ui.label(format!(
+                            "Target: {}, {}",
+                            ai.target_tile.0, ai.target_tile.1
+                        ));
+
+                        match order {
+                            Some(o) => {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Order: {} \u{2192} ({}, {})",
+                                        o.order.label(),
+                                        o.target_tile.0,
+                                        o.target_tile.1
+                                    ))
+                                    .color(egui::Color32::from_rgb(255, 220, 100)),
+                                );
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new("Order: —")
+                                        .color(egui::Color32::from_gray(120)),
+                                );
+                            }
                         }
-
-                        work_str
-                    }
-                };
-                ui.label(format!("State: {}", state_desc));
-                ui.label(format!(
-                    "Target: {}, {}",
-                    ai.target_tile.0, ai.target_tile.1
-                ));
-
-                match order {
-                    Some(o) => {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Order: {} \u{2192} ({}, {})",
-                                o.order.label(),
-                                o.target_tile.0,
-                                o.target_tile.1
-                            ))
-                            .color(egui::Color32::from_rgb(255, 220, 100)),
-                        );
-                    }
-                    None => {
-                        ui.label(
-                            egui::RichText::new("Order: —")
-                                .color(egui::Color32::from_gray(120)),
-                        );
-                    }
-                }
-
-                });
+                    });
                 egui::CollapsingHeader::new(egui::RichText::new("Active Plan").strong())
                     .default_open(false)
                     .show(ui, |ui| {
-                let active_pair = active_plan.and_then(|ap| {
-                    plan_registry
-                        .0
-                        .iter()
-                        .find(|p| p.id == ap.plan_id)
-                        .map(|pd| (ap, pd))
-                });
-                match active_pair {
-                    Some((ap, plan_def)) => {
-                        ui.label(
-                            egui::RichText::new(format!("Active Plan: {}", plan_def.name))
-                                .strong()
-                                .color(egui::Color32::LIGHT_BLUE),
-                        );
-                        ui.label(format!(
-                            "  Step: {}/{}",
-                            ap.current_step + 1,
-                            plan_def.steps.len()
-                        ));
-                        ui.label(format!("  Reward: {:.2}", ap.reward_acc));
-                    }
-                    None => {
-                        ui.label(
-                            egui::RichText::new("Active Plan: None")
-                                .italics()
-                                .color(egui::Color32::GRAY),
-                        );
-                        ui.label(
-                            egui::RichText::new("  Step: —")
-                                .italics()
-                                .color(egui::Color32::GRAY),
-                        );
-                        ui.label(
-                            egui::RichText::new("  Reward: —")
-                                .italics()
-                                .color(egui::Color32::GRAY),
-                        );
-                    }
-                }
-
-                });
+                        let active_pair = active_plan.and_then(|ap| {
+                            plan_registry
+                                .0
+                                .iter()
+                                .find(|p| p.id == ap.plan_id)
+                                .map(|pd| (ap, pd))
+                        });
+                        match active_pair {
+                            Some((ap, plan_def)) => {
+                                ui.label(
+                                    egui::RichText::new(format!("Active Plan: {}", plan_def.name))
+                                        .strong()
+                                        .color(egui::Color32::LIGHT_BLUE),
+                                );
+                                ui.label(format!(
+                                    "  Step: {}/{}",
+                                    ap.current_step + 1,
+                                    plan_def.steps.len()
+                                ));
+                                ui.label(format!("  Reward: {:.2}", ap.reward_acc));
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new("Active Plan: None")
+                                        .italics()
+                                        .color(egui::Color32::GRAY),
+                                );
+                                ui.label(
+                                    egui::RichText::new("  Step: —")
+                                        .italics()
+                                        .color(egui::Color32::GRAY),
+                                );
+                                ui.label(
+                                    egui::RichText::new("  Reward: —")
+                                        .italics()
+                                        .color(egui::Color32::GRAY),
+                                );
+                            }
+                        }
+                    });
                 egui::CollapsingHeader::new(
                     egui::RichText::new("Pathing")
                         .strong()
@@ -506,11 +510,6 @@ pub fn inspector_panel_system(
                 )
                 .default_open(true)
                 .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("path")
-                        .max_height(ui.available_height().max(180.0))
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
                     let cur_tx =
                         (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;
                     let cur_ty =
@@ -520,16 +519,17 @@ pub fn inspector_panel_system(
                         let (status_text, status_color): (String, egui::Color32) = match pf.status {
                             FollowStatus::Idle => ("Idle".into(), egui::Color32::GRAY),
                             FollowStatus::Pending => ("Pending".into(), egui::Color32::YELLOW),
-                            FollowStatus::Following => (
-                                "Following".into(),
-                                egui::Color32::from_rgb(120, 220, 120),
-                            ),
+                            FollowStatus::Following => {
+                                ("Following".into(), egui::Color32::from_rgb(120, 220, 120))
+                            }
                             FollowStatus::Failed(reason) => {
                                 let label = match pf.last_fail_subreason {
                                     Some(sub) => format!("Failed: {}", sub.label()),
                                     None => match reason {
                                         FailReason::Unreachable => "Failed: Unreachable".into(),
-                                        FailReason::BudgetExhausted => "Failed: BudgetExhausted".into(),
+                                        FailReason::BudgetExhausted => {
+                                            "Failed: BudgetExhausted".into()
+                                        }
                                         FailReason::NoRoute => "Failed: NoRoute".into(),
                                     },
                                 };
@@ -537,13 +537,14 @@ pub fn inspector_panel_system(
                             }
                         };
                         ui.label(
-                            egui::RichText::new(format!("Status: {}", status_text)).color(status_color),
+                            egui::RichText::new(format!("Status: {}", status_text))
+                                .color(status_color),
                         );
                         ui.label(format!(
                             "Goal: ({}, {}, {})",
                             pf.goal.0, pf.goal.1, pf.goal.2
                         ));
-                        ui.label(format!("At:   ({}, {})", cur_tx, cur_ty));
+                        ui.label(format!("At:   ({}, {}, {})", cur_tx, cur_ty, ai.current_z));
                         ui.label(format!(
                             "Chunk route: {}/{}",
                             pf.route_cursor.min(pf.chunk_route.len() as u8),
@@ -558,13 +559,9 @@ pub fn inspector_panel_system(
                                 .collect();
                             let suffix = if pf.chunk_route.len() > 6 { " …" } else { "" };
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "  {}{}",
-                                    preview.join(" → "),
-                                    suffix
-                                ))
-                                .size(11.0)
-                                .color(egui::Color32::GRAY),
+                                egui::RichText::new(format!("  {}{}", preview.join(" → "), suffix))
+                                    .size(11.0)
+                                    .color(egui::Color32::GRAY),
                             );
                         }
                         ui.label(format!(
@@ -691,104 +688,189 @@ pub fn inspector_panel_system(
                                 .color(egui::Color32::GRAY),
                         );
                     }
-                        });
                 });
 
-                if let (Some(kp), Some(net)) = (known_plans, utility_net) {
+                if let Some(kp) = known_plans {
                     egui::CollapsingHeader::new("Available Plans").show(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .id_salt("plans")
                             .max_height(160.0)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                        let state = build_state_vec(needs, agent, skills, member, memory, &calendar);
-                        let cur_tx =
-                            (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;
-                        let cur_ty =
-                            (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32;
-                        let camp_pos = registry.home_tile(member.faction_id);
-
-                        for plan_def in &plan_registry.0 {
-                            // Viability checks
-                            let serving_goal = plan_def.serves_goals.contains(goal);
-                            let known = kp.knows(plan_def.id);
-                            let tech_unlocked = plan_def.tech_gate.map_or(true, |tid| {
-                                registry
-                                    .factions
-                                    .get(&member.faction_id)
-                                    .map(|f| f.techs.has(tid))
-                                    .unwrap_or(false)
-                            });
-                            let first_step_ready = plan_def
-                                .steps
-                                .first()
-                                .and_then(|&sid| step_registry.0.iter().find(|s| s.id == sid))
-                                .map_or(true, |s| s.preconditions.is_satisfied(agent, needs.hunger));
-
-                            let mut rejection = None;
-                            if !serving_goal {
-                                rejection = Some("Wrong Goal");
-                            } else if !known {
-                                rejection = Some("Not Learned");
-                            } else if !tech_unlocked {
-                                rejection = Some("Tech Locked");
-                            } else if !first_step_ready {
-                                rejection = Some("Preconditions Unmet");
-                            }
-
-                            if let Some(reason) = rejection {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{}: Rejected ({})",
-                                        plan_def.name, reason
-                                    ))
-                                    .small()
-                                    .color(egui::Color32::from_gray(120)),
+                                // Inspector preview doesn't have the spatial queries to
+                                // compute visibility; pass zeros. Live agent scoring
+                                // still uses real visibility in plan_execution_system.
+                                let state = build_state_vec(
+                                    needs,
+                                    agent,
+                                    skills,
+                                    member,
+                                    memory,
+                                    &calendar,
+                                    plan_history,
+                                    0,
+                                    0,
+                                    0,
                                 );
-                            } else {
-                                let mut score = net.evaluate_plan(state, plan_def.feature_vec);
-                                let mut bonus_str = String::new();
-                                if plan_def.id == ai.last_plan_id {
-                                    score += 0.2;
-                                    bonus_str += " (+0.2 persist)";
-                                }
+                                let cur_tx = (transform.translation.x
+                                    / crate::world::terrain::TILE_SIZE)
+                                    .floor() as i32;
+                                let cur_ty = (transform.translation.y
+                                    / crate::world::terrain::TILE_SIZE)
+                                    .floor() as i32;
+                                let camp_pos = registry.home_tile(member.faction_id);
 
-                                let target_tile = plan_def.memory_target_kind.and_then(|k| {
-                                    memory.and_then(|m| m.best_for_dist_weighted(k, (cur_tx, cur_ty)))
-                                });
-
-                                if let Some(target) = target_tile {
-                                    let dist_agent = (target.0 as i32 - cur_tx).abs()
-                                        + (target.1 as i32 - cur_ty).abs();
-                                    let dist_camp = camp_pos.map_or(0, |c| {
-                                        (target.0 as i32 - c.0 as i32).abs()
-                                            + (target.1 as i32 - c.1 as i32).abs()
+                                for plan_def in &plan_registry.0 {
+                                    // Viability checks
+                                    let serving_goal = plan_def.serves_goals.contains(goal);
+                                    let known = kp.knows(plan_def.id);
+                                    let tech_unlocked = plan_def.tech_gate.map_or(true, |tid| {
+                                        registry
+                                            .factions
+                                            .get(&member.faction_id)
+                                            .map(|f| f.techs.has(tid))
+                                            .unwrap_or(false)
                                     });
-                                    let penalty = (dist_agent + dist_camp) as f32 * 0.002;
-                                    score -= penalty;
-                                    bonus_str += &format!(" (-{:.2} dist)", penalty);
-                                } else {
-                                    score -= 0.5;
-                                    bonus_str += " (-0.5 no target)";
-                                }
+                                    let first_step_ready = plan_def
+                                        .steps
+                                        .first()
+                                        .and_then(|&sid| {
+                                            step_registry.0.iter().find(|s| s.id == sid)
+                                        })
+                                        .map_or(true, |s| {
+                                            s.preconditions.is_satisfied(agent, needs.hunger)
+                                        });
 
-                                ui.horizontal(|ui| {
-                                    ui.label(format!("{}: ", plan_def.name));
-                                    ui.label(
-                                        egui::RichText::new(format!("{:.2}", score))
-                                            .color(egui::Color32::YELLOW),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(bonus_str)
+                                    let mut rejection = None;
+                                    if !serving_goal {
+                                        rejection = Some("Wrong Goal");
+                                    } else if !known {
+                                        rejection = Some("Not Learned");
+                                    } else if !tech_unlocked {
+                                        rejection = Some("Tech Locked");
+                                    } else if !first_step_ready {
+                                        rejection = Some("Preconditions Unmet");
+                                    }
+
+                                    if let Some(reason) = rejection {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{}: Rejected ({})",
+                                                plan_def.name, reason
+                                            ))
                                             .small()
-                                            .color(egui::Color32::from_gray(160)),
-                                    );
-                                });
-                            }
-                        }
+                                            .color(egui::Color32::from_gray(120)),
+                                        );
+                                    } else {
+                                        let base = score_weighted(&state, plan_def);
+                                        let mut score = base;
+                                        let mut bonus_str = format!(
+                                            "= base {:.2} ({:+.2} weights, {:+.2} bias)",
+                                            base,
+                                            base - plan_def.bias,
+                                            plan_def.bias,
+                                        );
+                                        if plan_def.id == ai.last_plan_id {
+                                            score += 0.2;
+                                            bonus_str += " +0.2 persist";
+                                        }
+
+                                        let target_tile =
+                                            plan_def.memory_target_kind.and_then(|k| {
+                                                memory.and_then(|m| {
+                                                    m.best_for_dist_weighted(k, (cur_tx, cur_ty))
+                                                })
+                                            });
+
+                                        if let Some(target) = target_tile {
+                                            let dist_agent = (target.0 as i32 - cur_tx).abs()
+                                                + (target.1 as i32 - cur_ty).abs();
+                                            let dist_camp = camp_pos.map_or(0, |c| {
+                                                (target.0 as i32 - c.0 as i32).abs()
+                                                    + (target.1 as i32 - c.1 as i32).abs()
+                                            });
+                                            let penalty = (dist_agent + dist_camp) as f32 * 0.002;
+                                            score -= penalty;
+                                            bonus_str += &format!(" -{:.2} dist", penalty);
+                                        } else {
+                                            score -= 0.5;
+                                            bonus_str += " -0.5 no target";
+                                        }
+
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("{}: ", plan_def.name));
+                                            ui.label(
+                                                egui::RichText::new(format!("{:.2}", score))
+                                                    .color(egui::Color32::YELLOW),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(bonus_str)
+                                                    .small()
+                                                    .color(egui::Color32::from_gray(160)),
+                                            );
+                                        });
+                                    }
+                                }
                             });
                     });
                 }
+
+                egui::CollapsingHeader::new(egui::RichText::new("Reproduction").strong())
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if let Some(p) = preg_opt {
+                            let elapsed = PREGNANCY_TICKS.saturating_sub(p.ticks_remaining);
+                            let seasons_remaining =
+                                p.ticks_remaining as f32 / TICKS_PER_SEASON as f32;
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Pregnant: {}/{} ticks ({:.2} seasons remaining)",
+                                    elapsed, PREGNANCY_TICKS, seasons_remaining
+                                ))
+                                .color(egui::Color32::from_rgb(220, 130, 200)),
+                            );
+                            let father_name = p
+                                .father
+                                .and_then(|f| name_query.get(f).ok())
+                                .map(|n| n.as_str().to_string())
+                                .unwrap_or_else(|| "—".to_string());
+                            ui.label(format!("Father: {}", father_name));
+                        } else if *sex == BiologicalSex::Female {
+                            ui.label(
+                                egui::RichText::new("Not pregnant")
+                                    .color(egui::Color32::from_gray(140)),
+                            );
+                        }
+                        if let Some(cs) = cosleep_opt {
+                            let partner_name = cs
+                                .partner
+                                .and_then(|e| name_query.get(e).ok())
+                                .map(|n| n.as_str().to_string())
+                                .unwrap_or_else(|| "—".to_string());
+                            ui.label(format!(
+                                "Co-sleep partner: {} (ticks: {})",
+                                partner_name, cs.ticks_co_slept
+                            ));
+                        }
+                        if *sex == BiologicalSex::Male {
+                            if let Some(cd) = male_cd_opt {
+                                if cd.0 > 0 {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Refractory: {} ticks remaining",
+                                            cd.0
+                                        ))
+                                        .color(egui::Color32::from_rgb(180, 140, 120)),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new("Refractory: ready")
+                                            .color(egui::Color32::from_gray(140)),
+                                    );
+                                }
+                            }
+                        }
+                    });
 
                 if let Some(rel) = rel_mem {
                     egui::CollapsingHeader::new("Relationships").show(ui, |ui| {
@@ -797,49 +879,50 @@ pub fn inspector_panel_system(
                             .max_height(140.0)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                        let mut entries: Vec<&RelEntry> =
-                            rel.entries.iter().filter_map(|s| s.as_ref()).collect();
-                        entries.sort_unstable_by(|a, b| b.affinity.cmp(&a.affinity));
+                                let mut entries: Vec<&RelEntry> =
+                                    rel.entries.iter().filter_map(|s| s.as_ref()).collect();
+                                entries.sort_unstable_by(|a, b| b.affinity.cmp(&a.affinity));
 
-                        if entries.is_empty() {
-                            ui.label(
-                                egui::RichText::new("No relationships yet")
-                                    .italics()
-                                    .color(egui::Color32::GRAY),
-                            );
-                        }
-                        for entry in entries {
-                            let name = name_query
-                                .get(entry.entity)
-                                .map(|n| n.as_str())
-                                .unwrap_or("Unknown");
-                            let normalized = (entry.affinity as f32 + 128.0) / 255.0;
-                            let color = if entry.affinity >= 0 {
-                                egui::Color32::from_rgb(
-                                    30,
-                                    (normalized * 510.0).min(255.0) as u8,
-                                    30,
-                                )
-                            } else {
-                                egui::Color32::from_rgb(
-                                    ((1.0 - normalized) * 510.0).min(255.0) as u8,
-                                    30,
-                                    30,
-                                )
-                            };
-                            ui.horizontal(|ui| {
-                                ui.label(format!("{:12}", name));
-                                ui.add(
-                                    egui::ProgressBar::new(normalized)
-                                        .desired_width(100.0)
-                                        .fill(color),
-                                );
-                                ui.label(format!("{:+}", entry.affinity));
-                            });
-                        }
+                                if entries.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("No relationships yet")
+                                            .italics()
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                }
+                                for entry in entries {
+                                    let name = name_query
+                                        .get(entry.entity)
+                                        .map(|n| n.as_str())
+                                        .unwrap_or("Unknown");
+                                    let normalized = (entry.affinity as f32 + 128.0) / 255.0;
+                                    let color = if entry.affinity >= 0 {
+                                        egui::Color32::from_rgb(
+                                            30,
+                                            (normalized * 510.0).min(255.0) as u8,
+                                            30,
+                                        )
+                                    } else {
+                                        egui::Color32::from_rgb(
+                                            ((1.0 - normalized) * 510.0).min(255.0) as u8,
+                                            30,
+                                            30,
+                                        )
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{:12}", name));
+                                        ui.add(
+                                            egui::ProgressBar::new(normalized)
+                                                .desired_width(100.0)
+                                                .fill(color),
+                                        );
+                                        ui.label(format!("{:+}", entry.affinity));
+                                    });
+                                }
                             });
                     });
                 }
+            });
         });
 }
 
@@ -850,6 +933,26 @@ fn needs_bar(ui: &mut egui::Ui, label: &str, value: f32) {
         let color = egui::Color32::from_rgb(
             (255.0 * progress) as u8,
             (255.0 * (1.0 - progress)) as u8,
+            30,
+        );
+        let bar = egui::ProgressBar::new(progress)
+            .desired_width(140.0)
+            .fill(color);
+        ui.add(bar);
+        ui.label(format!("{value}"));
+    });
+}
+
+/// Like `needs_bar` but inverted: full bar = green = good (high willpower);
+/// empty bar = red = drained. Bar fills proportionally to the actual value
+/// rather than to the distress component.
+fn willpower_bar(ui: &mut egui::Ui, value: f32) {
+    ui.horizontal(|ui| {
+        ui.label(format!("{:8}", "Willpower"));
+        let progress = (value / 255.0).clamp(0.0, 1.0);
+        let color = egui::Color32::from_rgb(
+            (255.0 * (1.0 - progress)) as u8,
+            (255.0 * progress) as u8,
             30,
         );
         let bar = egui::ProgressBar::new(progress)

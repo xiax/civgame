@@ -87,10 +87,7 @@ pub fn spawn_or_merge_ground_item(
 /// the only contributing slot is TorsoArmor (e.g. cloth or armor) which grants a
 /// modest pack/pocket bonus. Runs on `Changed<Equipment>`.
 pub fn recompute_inventory_capacity_system(
-    mut q: Query<
-        (&Equipment, &mut EconomicAgent),
-        Changed<Equipment>,
-    >,
+    mut q: Query<(&Equipment, &mut EconomicAgent), Changed<Equipment>>,
     item_lookup: Query<&GroundItem>,
 ) {
     for (equipment, mut agent) in q.iter_mut() {

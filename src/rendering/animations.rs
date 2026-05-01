@@ -59,10 +59,7 @@ pub fn handle_combat_events(
 pub fn update_animations(
     time: Res<Time>,
     mut anim_query: Query<&mut CombatAnimations>,
-    mut visual_query: Query<
-        (&Parent, &mut Transform),
-        With<super::entity_sprites::VisualChild>,
-    >,
+    mut visual_query: Query<(&Parent, &mut Transform), With<super::entity_sprites::VisualChild>>,
 ) {
     let dt = time.delta_secs();
     const BASE_Y: f32 = -8.0;

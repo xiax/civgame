@@ -256,8 +256,24 @@ mod tests {
         let coord = ChunkCoord(0, 0);
         let mut map = flat_map_with_chunk(coord, 5);
         for x in 0..10i32 {
-            map.set_tile(x, 5, 1, TileData { kind: TileKind::Air, ..Default::default() });
-            map.set_tile(x, 5, 0, TileData { kind: TileKind::Dirt, ..Default::default() });
+            map.set_tile(
+                x,
+                5,
+                1,
+                TileData {
+                    kind: TileKind::Air,
+                    ..Default::default()
+                },
+            );
+            map.set_tile(
+                x,
+                5,
+                0,
+                TileData {
+                    kind: TileKind::Dirt,
+                    ..Default::default()
+                },
+            );
         }
         let field = build(&map, coord, (0, 5), 0);
         let idx = 5 * CHUNK_SIZE + 5;
@@ -350,7 +366,10 @@ mod tests {
         for &(x, y, _) in &path {
             let dx = (x as i32 - prev.0 as i32).abs();
             let dy = (y as i32 - prev.1 as i32).abs();
-            assert!(dx <= 1 && dy <= 1, "non-unit step from {prev:?} to ({x},{y})");
+            assert!(
+                dx <= 1 && dy <= 1,
+                "non-unit step from {prev:?} to ({x},{y})"
+            );
             prev = (x, y);
         }
     }
@@ -439,15 +458,14 @@ mod tests {
                 6,
                 5,
                 z,
-                TileData { kind: TileKind::Wall, ..Default::default() },
+                TileData {
+                    kind: TileKind::Wall,
+                    ..Default::default()
+                },
             );
         }
         let field = build(&map, coord, (5, 5), 0);
         let path = walk_to_goal(&field, (6, 6)).expect("(6,6) must reach the goal");
-        assert!(
-            path.len() >= 2,
-            "flow field cut the corner: {:?}",
-            path
-        );
+        assert!(path.len() >= 2, "flow field cut the corner: {:?}", path);
     }
 }

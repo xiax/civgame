@@ -1,22 +1,24 @@
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
-use crate::simulation::faction::{FactionChief, FactionData, FactionMember, FactionRegistry, FactionTechs, StorageTileMap, SOLO};
+use crate::pathfinding::chunk_graph::ChunkGraph;
+use crate::pathfinding::chunk_router::ChunkRouter;
+use crate::pathfinding::connectivity::ChunkConnectivity;
+use crate::simulation::faction::{
+    FactionChief, FactionData, FactionMember, FactionRegistry, FactionTechs, StorageTileMap, SOLO,
+};
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
+use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::{
-    BRONZE_CASTING, BRONZE_TOOLS, CITY_STATE_ORG, COPPER_TOOLS, COPPER_WORKING, FIRE_MAKING,
-    FIRED_POTTERY, FLINT_KNAPPING, GRANARY, LOOM_WEAVING, LONG_DIST_TRADE, MONUMENTAL_BUILDING,
-    PERM_SETTLEMENT, PROFESSIONAL_ARMY, SACRED_RITUAL, TechId,
+    TechId, BRONZE_CASTING, BRONZE_TOOLS, CITY_STATE_ORG, COPPER_TOOLS, COPPER_WORKING,
+    FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING, GRANARY, LONG_DIST_TRADE, LOOM_WEAVING,
+    MONUMENTAL_BUILDING, PERM_SETTLEMENT, PROFESSIONAL_ARMY, SACRED_RITUAL,
 };
-use crate::pathfinding::chunk_graph::ChunkGraph;
-use crate::pathfinding::chunk_router::ChunkRouter;
-use crate::pathfinding::connectivity::ChunkConnectivity;
-use crate::simulation::needs::Needs;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::{Calendar, Season};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
@@ -427,7 +429,11 @@ impl Blueprint {
         let mut deposits = [GoodNeed::default(); MAX_BUILD_INPUTS];
         let count = recipe.inputs.len().min(MAX_BUILD_INPUTS);
         for (i, &(good, qty)) in recipe.inputs.iter().take(count).enumerate() {
-            deposits[i] = GoodNeed { good, needed: qty, deposited: 0 };
+            deposits[i] = GoodNeed {
+                good,
+                needed: qty,
+                deposited: 0,
+            };
         }
         Self {
             faction_id,
@@ -824,7 +830,15 @@ fn find_footprint_in_zone(
     }
 
     // Fallback: organic radial search.
-    find_building_origin(chunk_map, bed_map, bp_map, home, half_w, half_h, fallback_radius)
+    find_building_origin(
+        chunk_map,
+        bed_map,
+        bp_map,
+        home,
+        half_w,
+        half_h,
+        fallback_radius,
+    )
 }
 
 /// Pick a clear single-tile site inside the first zone of the given kind in
@@ -853,7 +867,9 @@ fn find_clear_tile_in_zone(
                     if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
                         continue;
                     }
-                    let Some(k) = chunk_map.tile_kind_at(tx, ty) else { continue; };
+                    let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
+                        continue;
+                    };
                     if !k.is_passable() || k == TileKind::Wall {
                         continue;
                     }
@@ -909,10 +925,7 @@ fn find_unfilled_civic_zone_tile(
     if let Some(plan) = plan {
         for zone in plan.zones.iter().filter(|z| z.kind == ZoneKind::Civic) {
             let rect = zone.rect;
-            let occupied = campfire_map
-                .0
-                .keys()
-                .any(|&(x, y)| rect.contains(x, y));
+            let occupied = campfire_map.0.keys().any(|&(x, y)| rect.contains(x, y));
             if occupied {
                 continue;
             }
@@ -927,7 +940,9 @@ fn find_unfilled_civic_zone_tile(
                     if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
                         continue;
                     }
-                    let Some(k) = chunk_map.tile_kind_at(tx, ty) else { continue };
+                    let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
+                        continue;
+                    };
                     if !k.is_passable() || k == TileKind::Wall {
                         continue;
                     }
@@ -958,7 +973,9 @@ fn find_unfilled_civic_zone_tile(
                 {
                     continue;
                 }
-                let Some(k) = chunk_map.tile_kind_at(hx + dx, hy + dy) else { continue };
+                let Some(k) = chunk_map.tile_kind_at(hx + dx, hy + dy) else {
+                    continue;
+                };
                 if k.is_passable() && k != TileKind::Wall {
                     return Some(pos);
                 }
@@ -1044,7 +1061,9 @@ fn find_bed_tile_around_hearth(
                 if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
                     continue;
                 }
-                let Some(k) = chunk_map.tile_kind_at(tx, ty) else { continue };
+                let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
+                    continue;
+                };
                 if !k.is_passable() || k == TileKind::Wall {
                     continue;
                 }
@@ -1077,13 +1096,7 @@ const MAX_TERRAFORM_SPREAD: u8 = 4;
 /// footprint — every wall/floor of the building will be placed at this
 /// height. spread = max - min, used by site selection to penalise hilly
 /// candidates.
-fn footprint_z_stats(
-    chunk_map: &ChunkMap,
-    cx: i32,
-    cy: i32,
-    half_w: i32,
-    half_h: i32,
-) -> (i8, u8) {
+fn footprint_z_stats(chunk_map: &ChunkMap, cx: i32, cy: i32, half_w: i32, half_h: i32) -> (i8, u8) {
     let mut sum: i32 = 0;
     let mut count: i32 = 0;
     let mut min_z = i32::MAX;
@@ -1167,13 +1180,7 @@ fn has_nearby_structure(
 /// Returns true if the footprint would straddle either cardinal corridor from the
 /// faction center — i.e. any tile in the footprint lies on `x = home.x` (N-S axis)
 /// or `y = home.y` (E-W axis). These corridors are reserved as future access roads.
-fn blocks_cardinal_corridor(
-    cx: i32,
-    cy: i32,
-    half_w: i32,
-    half_h: i32,
-    home: (i16, i16),
-) -> bool {
+fn blocks_cardinal_corridor(cx: i32, cy: i32, half_w: i32, half_h: i32, home: (i16, i16)) -> bool {
     let hx = home.0 as i32;
     let hy = home.1 as i32;
     let blocks_ns = cx - half_w <= hx && hx <= cx + half_w;
@@ -1336,7 +1343,10 @@ fn plan_building(
         let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
         let e = commands
             .spawn((
-                TerraformSite { faction_id, target_z },
+                TerraformSite {
+                    faction_id,
+                    target_z,
+                },
                 Transform::from_xyz(wp.x, wp.y, 0.3),
                 GlobalTransform::default(),
                 Visibility::Visible,
@@ -1527,12 +1537,12 @@ pub fn chief_directive_system(
         }
 
         let plan = plans.0.get(&faction_id);
-        let candidates =
-            generate_candidates(faction_id, faction, plan, &chunk_map, &maps, &bp_map);
-        let Some(best) = candidates
-            .into_iter()
-            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
-        else {
+        let candidates = generate_candidates(faction_id, faction, plan, &chunk_map, &maps, &bp_map);
+        let Some(best) = candidates.into_iter().max_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) else {
             continue;
         };
 
@@ -1579,8 +1589,7 @@ fn generate_candidates(
             // Slot is vacant. Verify the tile is passable and unreserved.
             let tx = up_tile.0 as i32;
             let ty = up_tile.1 as i32;
-            let blocked = bp_map.0.contains_key(&up_tile)
-                || maps.bed_map.0.contains_key(&up_tile);
+            let blocked = bp_map.0.contains_key(&up_tile) || maps.bed_map.0.contains_key(&up_tile);
             let passable = chunk_map
                 .tile_kind_at(tx, ty)
                 .map(|k| k.is_passable() && k != TileKind::Wall)
@@ -1619,7 +1628,12 @@ fn generate_candidates(
     };
     if techs.has(FIRE_MAKING) && existing_hearths < effective_desired {
         let mut tile_opt = find_unfilled_civic_zone_tile(
-            chunk_map, &maps.bed_map, bp_map, &maps.campfire_map, plan, home,
+            chunk_map,
+            &maps.bed_map,
+            bp_map,
+            &maps.campfire_map,
+            plan,
+            home,
         );
         // Bootstrap: a freshly-created Paleolithic faction may not have its
         // first plan yet (planner is staggered ~60 ticks). Use the
@@ -1641,7 +1655,9 @@ fn generate_candidates(
                         {
                             continue;
                         }
-                        let Some(k) = chunk_map.tile_kind_at(tx, ty) else { continue };
+                        let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
+                            continue;
+                        };
                         if k.is_passable() && k != TileKind::Wall {
                             tile_opt = Some(pos);
                             break 'outer;
@@ -1683,7 +1699,13 @@ fn generate_candidates(
                 .collect();
             if !hearths.is_empty() {
                 if let Some(tile) = find_bed_tile_around_hearth(
-                    chunk_map, &maps.bed_map, bp_map, &hearths, home, 2, 6,
+                    chunk_map,
+                    &maps.bed_map,
+                    bp_map,
+                    &hearths,
+                    home,
+                    2,
+                    6,
                 ) {
                     out.push(BuildCandidate {
                         intent: BuildIntent::Single(BuildSiteKind::Bed),
@@ -1694,7 +1716,15 @@ fn generate_candidates(
             }
         } else if techs.has(CITY_STATE_ORG) && bed_deficit >= 2.0 {
             if let Some(origin) = find_footprint_in_zone(
-                chunk_map, &maps.bed_map, bp_map, plan, ZoneKind::Residential, home, 2, 1, 20,
+                chunk_map,
+                &maps.bed_map,
+                bp_map,
+                plan,
+                ZoneKind::Residential,
+                home,
+                2,
+                1,
+                20,
             ) {
                 out.push(BuildCandidate {
                     intent: BuildIntent::Longhouse(wall_mat),
@@ -1702,7 +1732,15 @@ fn generate_candidates(
                     score: 260.0 + bed_deficit * 25.0,
                 });
             } else if let Some(origin) = find_footprint_in_zone(
-                chunk_map, &maps.bed_map, bp_map, plan, ZoneKind::Residential, home, 1, 1, 18,
+                chunk_map,
+                &maps.bed_map,
+                bp_map,
+                plan,
+                ZoneKind::Residential,
+                home,
+                1,
+                1,
+                18,
             ) {
                 out.push(BuildCandidate {
                     intent: BuildIntent::Hut(wall_mat),
@@ -1712,7 +1750,15 @@ fn generate_candidates(
             }
         } else {
             if let Some(origin) = find_footprint_in_zone(
-                chunk_map, &maps.bed_map, bp_map, plan, ZoneKind::Residential, home, 1, 1, 18,
+                chunk_map,
+                &maps.bed_map,
+                bp_map,
+                plan,
+                ZoneKind::Residential,
+                home,
+                1,
+                1,
+                18,
             ) {
                 out.push(BuildCandidate {
                     intent: BuildIntent::Hut(wall_mat),
@@ -1744,7 +1790,13 @@ fn generate_candidates(
         && bed_count >= 2
     {
         if let Some(tile) = find_clear_tile_in_zone(
-            chunk_map, &maps.bed_map, bp_map, plan, ZoneKind::Crafting, home, 10,
+            chunk_map,
+            &maps.bed_map,
+            bp_map,
+            plan,
+            ZoneKind::Crafting,
+            home,
+            10,
         ) {
             out.push(BuildCandidate {
                 intent: BuildIntent::Single(BuildSiteKind::Workbench),
@@ -1760,7 +1812,13 @@ fn generate_candidates(
         && bed_count >= 2
     {
         if let Some(tile) = find_clear_tile_in_zone(
-            chunk_map, &maps.bed_map, bp_map, plan, ZoneKind::Storage, home, 10,
+            chunk_map,
+            &maps.bed_map,
+            bp_map,
+            plan,
+            ZoneKind::Storage,
+            home,
+            10,
         ) {
             let mer_mult = 0.7 + (culture.mercantile as f32 / 255.0) * 0.8;
             out.push(BuildCandidate {
@@ -1777,7 +1835,13 @@ fn generate_candidates(
         && bed_count >= 2
     {
         if let Some(tile) = find_clear_tile_in_zone(
-            chunk_map, &maps.bed_map, bp_map, plan, ZoneKind::Sacred, home, 10,
+            chunk_map,
+            &maps.bed_map,
+            bp_map,
+            plan,
+            ZoneKind::Sacred,
+            home,
+            10,
         ) {
             let cer_mult = 0.4 + (culture.ceremonial as f32 / 255.0) * 2.0;
             out.push(BuildCandidate {
@@ -1793,7 +1857,13 @@ fn generate_candidates(
         let target_count = if culture.mercantile > 180 { 2 } else { 1 };
         if count_markets_near(&maps.market_map, home, 25) < target_count {
             if let Some(tile) = find_clear_tile_in_zone(
-                chunk_map, &maps.bed_map, bp_map, plan, ZoneKind::Market, home, 12,
+                chunk_map,
+                &maps.bed_map,
+                bp_map,
+                plan,
+                ZoneKind::Market,
+                home,
+                12,
             ) {
                 let mer_mult = 0.6 + (culture.mercantile as f32 / 255.0) * 1.6;
                 out.push(BuildCandidate {
@@ -1811,7 +1881,13 @@ fn generate_candidates(
         && bed_count >= 3
     {
         if let Some(tile) = find_clear_tile_in_zone(
-            chunk_map, &maps.bed_map, bp_map, plan, ZoneKind::Defense, home, 12,
+            chunk_map,
+            &maps.bed_map,
+            bp_map,
+            plan,
+            ZoneKind::Defense,
+            home,
+            12,
         ) {
             let mar_mult = 0.5 + (culture.martial as f32 / 255.0) * 1.8;
             out.push(BuildCandidate {
@@ -1828,7 +1904,13 @@ fn generate_candidates(
         && bed_count >= 4
     {
         if let Some(tile) = find_clear_tile_in_zone(
-            chunk_map, &maps.bed_map, bp_map, plan, ZoneKind::Sacred, home, 12,
+            chunk_map,
+            &maps.bed_map,
+            bp_map,
+            plan,
+            ZoneKind::Sacred,
+            home,
+            12,
         ) {
             let cer_mult = 0.5 + (culture.ceremonial as f32 / 255.0) * 2.2;
             out.push(BuildCandidate {
@@ -1871,16 +1953,36 @@ fn spawn_intent(
         }
         BuildIntent::Hut(wall_mat) => {
             plan_building(
-                commands, bp_map, terraform_map, pending_footprints, chunk_map,
-                tile.0 as i32, tile.1 as i32,
-                1, 1, faction_id, home, &[(0, 0)], wall_mat,
+                commands,
+                bp_map,
+                terraform_map,
+                pending_footprints,
+                chunk_map,
+                tile.0 as i32,
+                tile.1 as i32,
+                1,
+                1,
+                faction_id,
+                home,
+                &[(0, 0)],
+                wall_mat,
             );
         }
         BuildIntent::Longhouse(wall_mat) => {
             plan_building(
-                commands, bp_map, terraform_map, pending_footprints, chunk_map,
-                tile.0 as i32, tile.1 as i32,
-                2, 1, faction_id, home, &[(-1, 0), (1, 0)], wall_mat,
+                commands,
+                bp_map,
+                terraform_map,
+                pending_footprints,
+                chunk_map,
+                tile.0 as i32,
+                tile.1 as i32,
+                2,
+                1,
+                faction_id,
+                home,
+                &[(-1, 0), (1, 0)],
+                wall_mat,
             );
         }
         BuildIntent::PalisadeSegment(wall_mat, _) => {
@@ -1888,7 +1990,13 @@ fn spawn_intent(
             let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
             let e = commands
                 .spawn((
-                    Blueprint::new(faction_id, None, BuildSiteKind::Wall(wall_mat), tile, target_z),
+                    Blueprint::new(
+                        faction_id,
+                        None,
+                        BuildSiteKind::Wall(wall_mat),
+                        tile,
+                        target_z,
+                    ),
                     Transform::from_xyz(wp.x, wp.y, 0.3),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -2050,8 +2158,8 @@ pub fn road_carve_system(
 
         loop {
             // Skip the endpoint tiles (the building itself, the home tile).
-            let is_endpoint = (x0 == from.0 as i32 && y0 == from.1 as i32)
-                || (x0 == x1 && y0 == y1);
+            let is_endpoint =
+                (x0 == from.0 as i32 && y0 == from.1 as i32) || (x0 == x1 && y0 == y1);
             if !is_endpoint {
                 let tile = (x0 as i16, y0 as i16);
                 if !bp_map.0.contains_key(&tile) && !bed_map.0.contains_key(&tile) {
@@ -2059,9 +2167,7 @@ pub fn road_carve_system(
                     let cur = chunk_map.tile_kind_at(x0, y0);
                     let writable = matches!(
                         cur,
-                        Some(TileKind::Grass)
-                            | Some(TileKind::Dirt)
-                            | Some(TileKind::Farmland)
+                        Some(TileKind::Grass) | Some(TileKind::Dirt) | Some(TileKind::Farmland)
                     );
                     if writable {
                         chunk_map.set_tile(
@@ -2119,35 +2225,35 @@ pub fn building_upgrade_system(
     chunk_map: Res<ChunkMap>,
     wall_map: Res<WallMap>,
     wall_query: Query<&Wall>,
-    mut agent_query: Query<(
-        Entity,
-        &mut PersonAI,
-        &FactionMember,
-        &Transform,
-        &LodLevel,
-    )>,
+    mut agent_query: Query<(Entity, &mut PersonAI, &FactionMember, &Transform, &LodLevel)>,
 ) {
     if clock.tick % UPGRADE_INTERVAL_TICKS != 0 {
         return;
     }
 
     // Snapshot all faction state we need (we'll mutate `active_upgrade` later).
-    let faction_state: Vec<(u32, (i16, i16), FactionTechs, bool, bool, AHashMap<Good, u32>)> =
-        registry
-            .factions
-            .iter()
-            .filter(|(&id, _)| id != SOLO)
-            .map(|(&id, f)| {
-                (
-                    id,
-                    f.home_tile,
-                    f.techs.clone(),
-                    f.active_upgrade.is_some(),
-                    f.under_raid,
-                    f.storage.totals.clone(),
-                )
-            })
-            .collect();
+    let faction_state: Vec<(
+        u32,
+        (i16, i16),
+        FactionTechs,
+        bool,
+        bool,
+        AHashMap<Good, u32>,
+    )> = registry
+        .factions
+        .iter()
+        .filter(|(&id, _)| id != SOLO)
+        .map(|(&id, f)| {
+            (
+                id,
+                f.home_tile,
+                f.techs.clone(),
+                f.active_upgrade.is_some(),
+                f.under_raid,
+                f.storage.totals.clone(),
+            )
+        })
+        .collect();
 
     for (faction_id, home, techs, has_active, under_raid, storage) in faction_state {
         if has_active || under_raid {
@@ -2164,7 +2270,9 @@ pub fn building_upgrade_system(
             if (pos.0 as i32 - hx).abs() > 25 || (pos.1 as i32 - hy).abs() > 25 {
                 continue;
             }
-            let Ok(wall) = wall_query.get(wall_e) else { continue };
+            let Ok(wall) = wall_query.get(wall_e) else {
+                continue;
+            };
             // Lower-rank wall material gets upgraded.
             if (wall.material as u8) < target_rank {
                 outdated = Some(pos);
@@ -2175,9 +2283,10 @@ pub fn building_upgrade_system(
 
         // Surplus stock check: 2× the rebuild recipe inputs.
         let recipe = recipe_for(BuildSiteKind::Wall(target_mat));
-        let has_stock = recipe.inputs.iter().all(|&(good, qty)| {
-            storage.get(&good).copied().unwrap_or(0) >= (qty as u32) * 2
-        });
+        let has_stock = recipe
+            .inputs
+            .iter()
+            .all(|&(good, qty)| storage.get(&good).copied().unwrap_or(0) >= (qty as u32) * 2);
         if !has_stock {
             continue;
         }
@@ -2201,7 +2310,9 @@ pub fn building_upgrade_system(
                 nearest = Some((e, d, (tx as i16, ty as i16)));
             }
         }
-        let Some((agent_e, _, cur_tile)) = nearest else { continue };
+        let Some((agent_e, _, cur_tile)) = nearest else {
+            continue;
+        };
 
         // Assign the Deconstruct task at the wall's tile.
         if let Ok((_, mut ai, _, _, _)) = agent_query.get_mut(agent_e) {
@@ -2248,6 +2359,7 @@ pub fn construction_system(
     clock: Res<SimClock>,
     mut registry: ResMut<FactionRegistry>,
     mut road_carve_queue: ResMut<RoadCarveQueue>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
     mut bp_query: Query<&mut Blueprint>,
     mut agent_query: Query<(
@@ -2268,7 +2380,7 @@ pub fn construction_system(
     let mut bp_haulers: AHashMap<Entity, Vec<(Entity, [u32; MAX_BUILD_INPUTS])>> = AHashMap::new();
     let mut bp_workers: AHashMap<Entity, Vec<Entity>> = AHashMap::new();
 
-    for (entity, mut ai, agent, carrier, mut skills, slot, lod, _) in agent_query.iter_mut() {
+    for (entity, mut ai, agent, carrier, _skills, slot, lod, _) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -2277,8 +2389,7 @@ pub fn construction_system(
         }
         let task = ai.task_id;
         let is_hauler = task == TaskKind::HaulMaterials as u16;
-        let is_worker =
-            task == TaskKind::Construct as u16 || task == TaskKind::ConstructBed as u16;
+        let is_worker = task == TaskKind::Construct as u16 || task == TaskKind::ConstructBed as u16;
         if !is_hauler && !is_worker {
             continue;
         }
@@ -2329,11 +2440,14 @@ pub fn construction_system(
                 ai.target_entity = None;
                 continue;
             }
-            bp_haulers.entry(bp_entity).or_default().push((entity, snap));
+            bp_haulers
+                .entry(bp_entity)
+                .or_default()
+                .push((entity, snap));
         } else {
-            // Worker: every tick on-site advances work and earns Building XP,
-            // regardless of inventory state or material satisfaction.
-            skills.gain_xp(SkillKind::Building, 1);
+            // Worker: register on-site. XP and progress are awarded later,
+            // once we know the blueprint has all its materials deposited
+            // (see the is_satisfied gate in pass 2).
             bp_workers.entry(bp_entity).or_default().push(entity);
         }
     }
@@ -2345,6 +2459,9 @@ pub fn construction_system(
     let mut completed_agents: Vec<Entity> = Vec::new();
     let mut hauler_done: Vec<Entity> = Vec::new();
     let mut orphaned_agents: Vec<Entity> = Vec::new();
+    // Workers who actually advanced progress this tick (i.e. on-site at a
+    // satisfied blueprint). Building XP is granted in pass 3.
+    let mut xp_grants: Vec<Entity> = Vec::new();
     // (agent_entity, good, qty_to_remove)
     let mut good_removals: Vec<(Entity, Good, u32)> = Vec::new();
 
@@ -2379,19 +2496,28 @@ pub fn construction_system(
                     }
                     let take = still.min(snap[i]);
                     good_removals.push((agent_e, need.good, take));
-                    bp.deposits[i].deposited =
-                        bp.deposits[i].deposited.saturating_add(take as u8);
+                    bp.deposits[i].deposited = bp.deposits[i].deposited.saturating_add(take as u8);
                 }
                 hauler_done.push(agent_e);
             }
         }
 
-        // Advance work by one tick per on-site worker.
-        if let Some(workers) = bp_workers.get(&bp_entity) {
-            bp.build_progress = bp.build_progress.saturating_add(workers.len() as u8);
+        // Advance work by one tick per on-site worker — but only once all
+        // materials have been deposited. Gating on `is_satisfied()` here
+        // (a) prevents `build_progress` from saturating past `work_ticks`
+        // while haulers are still en route, and (b) keeps Building XP
+        // honest by only awarding it for real labour.
+        let recipe = recipe_for(bp.kind);
+        if bp.is_satisfied() {
+            if let Some(workers) = bp_workers.get(&bp_entity) {
+                bp.build_progress = bp
+                    .build_progress
+                    .saturating_add(workers.len() as u8)
+                    .min(recipe.work_ticks);
+                xp_grants.extend(workers.iter().copied());
+            }
         }
 
-        let recipe = recipe_for(bp.kind);
         if bp.build_progress >= recipe.work_ticks && bp.is_satisfied() {
             let tile = bp.tile;
             let (tx, ty) = (tile.0 as i32, tile.1 as i32);
@@ -2400,6 +2526,17 @@ pub fn construction_system(
             match bp.kind {
                 BuildSiteKind::Wall(material) => {
                     let surf_z = bp.target_z as i32;
+                    // Defer placement if any agent currently stands on the
+                    // target column at the soon-to-be-trapped foot z. Writing
+                    // a Wall at surf_z+1 invalidates passable_at(tx, ty,
+                    // surf_z) (no headspace), and the recovery system would
+                    // then need to teleport them. Cleaner to wait one tick
+                    // for them to vacate.
+                    if spatial.agent_occupied(tx, ty, surf_z)
+                        || spatial.agent_occupied(tx, ty, surf_z + 1)
+                    {
+                        continue;
+                    }
                     chunk_map.set_tile(
                         tx,
                         ty,
@@ -2453,19 +2590,32 @@ pub fn construction_system(
                     // open/closed state consulted by line_of_sight.
                     let door_entity = commands
                         .spawn((
-                            Door { faction_id: bp.faction_id, open: false, tier: DoorTier::default() },
+                            Door {
+                                faction_id: bp.faction_id,
+                                open: false,
+                                tier: DoorTier::default(),
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
                             InheritedVisibility::default(),
                         ))
                         .id();
-                    maps.door_map.0.insert(tile, DoorEntry { entity: door_entity, open: false });
+                    maps.door_map.0.insert(
+                        tile,
+                        DoorEntry {
+                            entity: door_entity,
+                            open: false,
+                        },
+                    );
                 }
                 BuildSiteKind::Workbench => {
                     let e = commands
                         .spawn((
-                            Workbench { faction_id: bp.faction_id, tier: WorkbenchTier::default() },
+                            Workbench {
+                                faction_id: bp.faction_id,
+                                tier: WorkbenchTier::default(),
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2477,7 +2627,9 @@ pub fn construction_system(
                 BuildSiteKind::Loom => {
                     let e = commands
                         .spawn((
-                            Loom { faction_id: bp.faction_id },
+                            Loom {
+                                faction_id: bp.faction_id,
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2513,7 +2665,9 @@ pub fn construction_system(
                 BuildSiteKind::Granary => {
                     let e = commands
                         .spawn((
-                            Granary { faction_id: bp.faction_id },
+                            Granary {
+                                faction_id: bp.faction_id,
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2525,7 +2679,9 @@ pub fn construction_system(
                 BuildSiteKind::Shrine => {
                     let e = commands
                         .spawn((
-                            Shrine { faction_id: bp.faction_id },
+                            Shrine {
+                                faction_id: bp.faction_id,
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2537,7 +2693,9 @@ pub fn construction_system(
                 BuildSiteKind::Market => {
                     let e = commands
                         .spawn((
-                            Market { faction_id: bp.faction_id },
+                            Market {
+                                faction_id: bp.faction_id,
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2549,7 +2707,9 @@ pub fn construction_system(
                 BuildSiteKind::Barracks => {
                     let e = commands
                         .spawn((
-                            Barracks { faction_id: bp.faction_id },
+                            Barracks {
+                                faction_id: bp.faction_id,
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2561,7 +2721,9 @@ pub fn construction_system(
                 BuildSiteKind::Monument => {
                     let e = commands
                         .spawn((
-                            Monument { faction_id: bp.faction_id },
+                            Monument {
+                                faction_id: bp.faction_id,
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.45),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2589,7 +2751,9 @@ pub fn construction_system(
                 }
                 // Queue a road carve from the new building back to home_tile so
                 // the settlement grows a connective road network organically.
-                road_carve_queue.0.push((bp.faction_id, tile, faction.home_tile));
+                road_carve_queue
+                    .0
+                    .push((bp.faction_id, tile, faction.home_tile));
             }
 
             if let Some(workers) = bp_workers.get(&bp_entity) {
@@ -2605,12 +2769,16 @@ pub fn construction_system(
         && completed_agents.is_empty()
         && hauler_done.is_empty()
         && orphaned_agents.is_empty()
+        && xp_grants.is_empty()
     {
         return;
     }
 
-    // Pass 3: remove deposited goods from agents and reset completed/hauler/orphaned agents.
-    for (entity, mut ai, mut agent, mut carrier, _, _, _, mut plan_opt) in agent_query.iter_mut() {
+    // Pass 3: remove deposited goods from agents, grant Building XP to workers
+    // whose labour actually advanced progress, and reset completed/hauler/orphaned agents.
+    for (entity, mut ai, mut agent, mut carrier, mut skills, _, _, mut plan_opt) in
+        agent_query.iter_mut()
+    {
         for &(ae, good, qty) in &good_removals {
             if ae == entity {
                 // Consume from hands first (where haulers typically carry the load),
@@ -2621,6 +2789,10 @@ pub fn construction_system(
                     agent.remove_good(good, still);
                 }
             }
+        }
+
+        if xp_grants.contains(&entity) {
+            skills.gain_xp(SkillKind::Building, 1);
         }
 
         let is_completed = completed_agents.contains(&entity);
@@ -2647,15 +2819,44 @@ pub fn construction_system(
     }
 }
 
+/// Affinity threshold above which a homeless woman gets a "discount" toward
+/// beds close to her partner's bed.
+const PARTNER_AFFINITY_THRESHOLD: i8 = 60;
+/// Higher bar for an *already-housed* woman to abandon her bed for one closer
+/// to her partner (hysteresis vs PARTNER_AFFINITY_THRESHOLD prevents flapping).
+const REASSIGN_AFFINITY_THRESHOLD: i8 = 80;
+/// Manhattan radius around partner's bed considered "close enough" — also the
+/// search radius for an unclaimed alternative.
+const PARTNER_PROXIMITY_RADIUS: i32 = 3;
+/// Distance "discount" applied to scoring when a candidate bed is within
+/// `PARTNER_PROXIMITY_RADIUS` of an affinity-≥`PARTNER_AFFINITY_THRESHOLD` partner's bed.
+const PARTNER_PROXIMITY_BONUS: i32 = 50;
+
 /// Assigns each agent a personal bed (`HomeBed`) so they consistently sleep in
 /// the same place. Faction members are paired with the nearest unclaimed bed
 /// inside their faction territory. Solo agents first try to claim any unclaimed
 /// bed within 30 tiles; failing that, they place a personal bed blueprint at
 /// their current position so they can build one themselves.
+///
+/// Affinity overlay: women's bed scoring is biased toward beds near their
+/// highest-affinity opposite-sex faction-mate. An already-housed woman whose
+/// affinity to a man exceeds `REASSIGN_AFFINITY_THRESHOLD` will migrate to an
+/// unclaimed bed within `PARTNER_PROXIMITY_RADIUS` of his bed (or queue a new
+/// bed blueprint adjacent to his bed if none exists).
 pub fn assign_beds_system(
     mut commands: Commands,
     mut bed_query: Query<&mut Bed>,
-    person_query: Query<(Entity, &FactionMember, &Transform, Option<&HomeBed>), With<Person>>,
+    person_query: Query<
+        (
+            Entity,
+            &FactionMember,
+            &Transform,
+            Option<&HomeBed>,
+            Option<&crate::simulation::memory::RelationshipMemory>,
+            Option<&crate::simulation::reproduction::BiologicalSex>,
+        ),
+        With<Person>,
+    >,
     bed_map: Res<BedMap>,
     mut bp_map: ResMut<BlueprintMap>,
     bp_query: Query<&Blueprint>,
@@ -2663,15 +2864,202 @@ pub fn assign_beds_system(
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
 ) {
+    use crate::simulation::reproduction::BiologicalSex;
+
     if clock.tick % 30 != 0 {
         return;
     }
 
     let mut claimed_this_pass: AHashSet<Entity> = AHashSet::new();
 
+    // Reverse lookup: bed entity → tile position. BedMap is sparse so the
+    // collect is cheap.
+    let bed_pos_by_entity: AHashMap<Entity, (i16, i16)> =
+        bed_map.0.iter().map(|(&pos, &e)| (e, pos)).collect();
+
+    // Snapshot every person's HomeBed entity, sex, and faction so Pass A can
+    // resolve partner data without re-querying.
+    struct PartnerInfo {
+        sex: Option<BiologicalSex>,
+        home_bed: Option<Entity>,
+        faction_id: u32,
+    }
+    let partner_info: AHashMap<Entity, PartnerInfo> = person_query
+        .iter()
+        .map(|(e, fm, _, hb, _, sex)| {
+            (
+                e,
+                PartnerInfo {
+                    sex: sex.copied(),
+                    home_bed: hb.and_then(|h| h.0),
+                    faction_id: fm.faction_id,
+                },
+            )
+        })
+        .collect();
+
+    // Resolves the highest-affinity opposite-sex same-faction partner that
+    // also has a HomeBed. Returns the partner's bed tile.
+    let best_partner_bed_for = |entity: Entity,
+                                rel: &crate::simulation::memory::RelationshipMemory,
+                                my_sex: BiologicalSex,
+                                my_faction: u32,
+                                min_aff: i8|
+     -> Option<(i16, i16)> {
+        let mut best: Option<((i16, i16), i8)> = None;
+        for slot in &rel.entries {
+            let Some(entry) = slot else { continue };
+            if entry.affinity < min_aff {
+                continue;
+            }
+            if entry.entity == entity {
+                continue;
+            }
+            let Some(info) = partner_info.get(&entry.entity) else {
+                continue;
+            };
+            if info.faction_id != my_faction {
+                continue;
+            }
+            let Some(p_sex) = info.sex else { continue };
+            if p_sex == my_sex {
+                continue;
+            }
+            let Some(p_bed_e) = info.home_bed else {
+                continue;
+            };
+            let Some(&p_bed_pos) = bed_pos_by_entity.get(&p_bed_e) else {
+                continue;
+            };
+            if best.map(|(_, a)| entry.affinity > a).unwrap_or(true) {
+                best = Some((p_bed_pos, entry.affinity));
+            }
+        }
+        best.map(|(pos, _)| pos)
+    };
+
+    // ── Pass A: re-evaluate already-housed women whose partner lives far away.
+    for (person, member, _transform, home_bed_opt, rel_opt, sex_opt) in &person_query {
+        if member.faction_id == SOLO {
+            continue;
+        }
+        let Some(my_bed) = home_bed_opt.and_then(|h| h.0) else {
+            continue;
+        };
+        let my_bed_owner = bed_query.get(my_bed).ok().and_then(|b| b.owner);
+        if my_bed_owner != Some(person) {
+            continue;
+        }
+        let Some(&my_bed_pos) = bed_pos_by_entity.get(&my_bed) else {
+            continue;
+        };
+        let Some(rel) = rel_opt else { continue };
+        let Some(my_sex) = sex_opt.copied() else {
+            continue;
+        };
+        if my_sex != BiologicalSex::Female {
+            continue;
+        }
+
+        let Some(partner_bed_pos) = best_partner_bed_for(
+            person,
+            rel,
+            my_sex,
+            member.faction_id,
+            REASSIGN_AFFINITY_THRESHOLD,
+        ) else {
+            continue;
+        };
+        let cur_dist = (my_bed_pos.0 as i32 - partner_bed_pos.0 as i32).abs()
+            + (my_bed_pos.1 as i32 - partner_bed_pos.1 as i32).abs();
+        if cur_dist <= PARTNER_PROXIMITY_RADIUS {
+            continue;
+        }
+
+        // Look for an unclaimed bed within the proximity radius of partner.
+        let mut candidate: Option<(Entity, (i16, i16))> = None;
+        for (&pos, &bed_e) in &bed_map.0 {
+            if bed_e == my_bed || claimed_this_pass.contains(&bed_e) {
+                continue;
+            }
+            let d = (pos.0 as i32 - partner_bed_pos.0 as i32).abs()
+                + (pos.1 as i32 - partner_bed_pos.1 as i32).abs();
+            if d > PARTNER_PROXIMITY_RADIUS {
+                continue;
+            }
+            match bed_query.get(bed_e) {
+                Ok(b) if b.owner.is_none() => {
+                    candidate = Some((bed_e, pos));
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if let Some((new_bed, _)) = candidate {
+            if let Ok(mut old) = bed_query.get_mut(my_bed) {
+                old.owner = None;
+            }
+            if let Ok(mut new) = bed_query.get_mut(new_bed) {
+                new.owner = Some(person);
+            }
+            commands.entity(person).insert(HomeBed(Some(new_bed)));
+            claimed_this_pass.insert(new_bed);
+            continue;
+        }
+
+        // Fallback: queue a blueprint adjacent to partner's bed.
+        let neighbors = [
+            (0, 1),
+            (1, 0),
+            (0, -1),
+            (-1, 0),
+            (1, 1),
+            (-1, 1),
+            (1, -1),
+            (-1, -1),
+        ];
+        for (dx, dy) in neighbors {
+            let tx_i32 = partner_bed_pos.0 as i32 + dx;
+            let ty_i32 = partner_bed_pos.1 as i32 + dy;
+            let tx = tx_i32 as i16;
+            let ty = ty_i32 as i16;
+            if bp_map.0.contains_key(&(tx, ty)) || bed_map.0.contains_key(&(tx, ty)) {
+                continue;
+            }
+            let target_z = chunk_map.surface_z_at(tx_i32, ty_i32) as i8;
+            if !chunk_map.passable_at(tx_i32, ty_i32, target_z as i32) {
+                continue;
+            }
+            let wp = tile_to_world(tx_i32, ty_i32);
+            let bp_e = commands
+                .spawn((
+                    Blueprint::new(
+                        member.faction_id,
+                        None,
+                        BuildSiteKind::Bed,
+                        (tx, ty),
+                        target_z,
+                    ),
+                    Transform::from_xyz(wp.x, wp.y, 0.3),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            bp_map.0.insert((tx, ty), bp_e);
+            break;
+        }
+    }
+
     // ── Faction pass ─────────────────────────────────────────────────────────
-    let mut homeless_by_faction: AHashMap<u32, Vec<(Entity, (i32, i32))>> = AHashMap::new();
-    for (person, member, transform, home_bed) in &person_query {
+    struct Homeless {
+        person: Entity,
+        pos: (i32, i32),
+        partner_bed: Option<(i16, i16)>,
+    }
+    let mut homeless_by_faction: AHashMap<u32, Vec<Homeless>> = AHashMap::new();
+    for (person, member, transform, home_bed, rel_opt, sex_opt) in &person_query {
         if member.faction_id == SOLO {
             continue;
         }
@@ -2684,10 +3072,24 @@ pub fn assign_beds_system(
         }
         let x = (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;
         let y = (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32;
+        let partner_bed = match (rel_opt, sex_opt.copied()) {
+            (Some(rel), Some(sex)) if sex == BiologicalSex::Female => best_partner_bed_for(
+                person,
+                rel,
+                sex,
+                member.faction_id,
+                PARTNER_AFFINITY_THRESHOLD,
+            ),
+            _ => None,
+        };
         homeless_by_faction
             .entry(member.faction_id)
             .or_default()
-            .push((person, (x, y)));
+            .push(Homeless {
+                person,
+                pos: (x, y),
+                partner_bed,
+            });
     }
 
     for (faction_id, homeless) in homeless_by_faction {
@@ -2713,31 +3115,45 @@ pub fn assign_beds_system(
             })
             .collect();
 
-        for (person, ppos) in homeless {
+        for h in homeless {
             if available.is_empty() {
                 break;
             }
             let mut best_idx = 0;
-            let mut best_dist = i32::MAX;
+            let mut best_score = i32::MAX;
             for (i, (_, bpos)) in available.iter().enumerate() {
-                let d = (bpos.0 as i32 - ppos.0).abs() + (bpos.1 as i32 - ppos.1).abs();
-                if d < best_dist {
-                    best_dist = d;
+                let manhattan_to_person =
+                    (bpos.0 as i32 - h.pos.0).abs() + (bpos.1 as i32 - h.pos.1).abs();
+                let partner_bonus = match h.partner_bed {
+                    Some(pbed) => {
+                        let d = (bpos.0 as i32 - pbed.0 as i32).abs()
+                            + (bpos.1 as i32 - pbed.1 as i32).abs();
+                        if d <= PARTNER_PROXIMITY_RADIUS {
+                            PARTNER_PROXIMITY_BONUS
+                        } else {
+                            0
+                        }
+                    }
+                    None => 0,
+                };
+                let score = manhattan_to_person - partner_bonus;
+                if score < best_score {
+                    best_score = score;
                     best_idx = i;
                 }
             }
             let (bed_e, _) = available.swap_remove(best_idx);
             claimed_this_pass.insert(bed_e);
-            commands.entity(person).insert(HomeBed(Some(bed_e)));
+            commands.entity(h.person).insert(HomeBed(Some(bed_e)));
             if let Ok(mut bed_comp) = bed_query.get_mut(bed_e) {
-                bed_comp.owner = Some(person);
+                bed_comp.owner = Some(h.person);
             }
         }
     }
 
     // ── Solo pass ─────────────────────────────────────────────────────────────
     // Solo agents claim any nearby unclaimed bed, or place a personal blueprint.
-    for (person, member, transform, home_bed) in &person_query {
+    for (person, member, transform, home_bed, _, _) in &person_query {
         if member.faction_id != SOLO {
             continue;
         }
@@ -2757,7 +3173,11 @@ pub fn assign_beds_system(
             if claimed_this_pass.contains(&bed_entity) {
                 continue;
             }
-            if bed_query.get(bed_entity).map(|b| b.owner.is_some()).unwrap_or(true) {
+            if bed_query
+                .get(bed_entity)
+                .map(|b| b.owner.is_some())
+                .unwrap_or(true)
+            {
                 continue;
             }
             let d = (bpos.0 as i32 - tx as i32).abs() + (bpos.1 as i32 - ty as i32).abs();
@@ -2785,13 +3205,7 @@ pub fn assign_beds_system(
                 let wp = tile_to_world(tx as i32, ty as i32);
                 let bp_e = commands
                     .spawn((
-                        Blueprint::new(
-                            SOLO,
-                            Some(person),
-                            BuildSiteKind::Bed,
-                            (tx, ty),
-                            target_z,
-                        ),
+                        Blueprint::new(SOLO, Some(person), BuildSiteKind::Bed, (tx, ty), target_z),
                         Transform::from_xyz(wp.x, wp.y, 0.3),
                         GlobalTransform::default(),
                         Visibility::Visible,
@@ -2880,7 +3294,10 @@ pub fn deconstruct_system(
             // Walls: revert chunk_map to Grass + emit TileChangedEvent so the
             // sprite refreshes. The recipe-determined refund is given via the
             // BuildSiteKind::Wall(material) path.
-            let mat = wall_query.get(e).map(|w| w.material).unwrap_or(WallMaterial::Palisade);
+            let mat = wall_query
+                .get(e)
+                .map(|w| w.material)
+                .unwrap_or(WallMaterial::Palisade);
             let surf_z = chunk_map.surface_z_at(tile.0 as i32, tile.1 as i32);
             chunk_map.set_tile(
                 tile.0 as i32,
@@ -2969,8 +3386,8 @@ pub fn deconstruct_system(
                 cur_y.div_euclid(CHUNK_SIZE as i32),
             );
 
-            if let Some(storage_tile) = storage_tile_map
-                .nearest_for_faction(faction_id, (tile.0 as i32, tile.1 as i32))
+            if let Some(storage_tile) =
+                storage_tile_map.nearest_for_faction(faction_id, (tile.0 as i32, tile.1 as i32))
             {
                 assign_task_with_routing(
                     &mut ai,

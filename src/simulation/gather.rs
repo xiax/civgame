@@ -147,7 +147,15 @@ pub fn gather_system(
             };
             let qty = (base_qty as f32 * yield_mul).round().max(1.0) as u32;
             let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
-            route_yield(&mut commands, &mut carrier, &mut agent, yield_good, qty, agent_tx, agent_ty);
+            route_yield(
+                &mut commands,
+                &mut carrier,
+                &mut agent,
+                yield_good,
+                qty,
+                agent_tx,
+                agent_ty,
+            );
 
             for &(good, extra_qty) in kind.harvest_extra_yields() {
                 route_yield(
@@ -204,8 +212,7 @@ pub fn gather_system(
 
                 let target_floor_z = ai.current_z as i32;
 
-                let blocks =
-                    carve_tile(&mut chunk_map, tx, ty, target_floor_z, &mut tile_changed);
+                let blocks = carve_tile(&mut chunk_map, tx, ty, target_floor_z, &mut tile_changed);
                 let stone_yield = (blocks * STONE_PER_BLOCK).max(STONE.base_yield_qty);
                 let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
                 route_yield(
@@ -248,8 +255,7 @@ pub fn gather_system(
 
                 let (_, _, stone_mul) =
                     faction_muls(&mut faction_registry, faction_id, ActivityKind::StoneMining);
-                let blocks =
-                    carve_tile(&mut chunk_map, tx, ty, target_floor_z, &mut tile_changed);
+                let blocks = carve_tile(&mut chunk_map, tx, ty, target_floor_z, &mut tile_changed);
                 let base = (blocks * STONE_PER_BLOCK).max(STONE.base_yield_qty);
                 let qty = (base as f32 * stone_mul).round().max(1.0) as u32;
                 let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
@@ -347,7 +353,10 @@ fn route_yield(
     if leftover > 0 {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
-            GroundItem { item, qty: leftover },
+            GroundItem {
+                item,
+                qty: leftover,
+            },
             Transform::from_xyz(pos.x, pos.y, 0.3),
             GlobalTransform::default(),
             Visibility::Visible,

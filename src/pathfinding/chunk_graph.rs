@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use std::time::Instant;
 
 use crate::pathfinding::tile_cost::{tile_step_cost, IMPASSABLE};
-use crate::world::chunk::{ChunkCoord, ChunkMap, Z_MIN, CHUNK_SIZE};
+use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE, Z_MIN};
 
 #[derive(Clone)]
 pub struct ChunkEdge {
@@ -44,7 +44,9 @@ pub fn build_chunk_graph_system(chunk_map: Res<ChunkMap>, mut graph: ResMut<Chun
     // Drop stale entries for chunks that have been unloaded since the last
     // rebuild. Without this, edges to unloaded neighbors would linger and
     // produce false-positive routes through chunks that no longer exist.
-    graph.edges.retain(|coord, _| chunk_map.0.contains_key(coord));
+    graph
+        .edges
+        .retain(|coord, _| chunk_map.0.contains_key(coord));
 
     let mut edge_count = 0usize;
 
@@ -126,8 +128,7 @@ pub fn build_chunk_graph_system(chunk_map: Res<ChunkMap>, mut graph: ResMut<Chun
                         if !chunk_map.passable_at(nb_tx, nb_ty, nz as i32) {
                             continue;
                         }
-                        let entry_kind =
-                            chunk_map.tile_at(nb_tx, nb_ty, nz as i32).kind;
+                        let entry_kind = chunk_map.tile_at(nb_tx, nb_ty, nz as i32).kind;
                         let base = tile_step_cost(entry_kind);
                         let traverse_cost = if base == IMPASSABLE {
                             IMPASSABLE
@@ -234,8 +235,24 @@ mod tests {
         let west_tx = (CHUNK_SIZE) as i32; // i.e. 32 = first tile of chunk (1,0)
         let ty = 10i32;
         for tx in [east_tx, west_tx] {
-            map.set_tile(tx, ty, -1, TileData { kind: TileKind::Air, ..Default::default() });
-            map.set_tile(tx, ty, -2, TileData { kind: TileKind::Dirt, ..Default::default() });
+            map.set_tile(
+                tx,
+                ty,
+                -1,
+                TileData {
+                    kind: TileKind::Air,
+                    ..Default::default()
+                },
+            );
+            map.set_tile(
+                tx,
+                ty,
+                -2,
+                TileData {
+                    kind: TileKind::Dirt,
+                    ..Default::default()
+                },
+            );
         }
 
         // Run the build directly (mirroring build_chunk_graph_system body).

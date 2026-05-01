@@ -3,21 +3,20 @@ use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
+use crate::pathfinding::path_request::PathFollow;
 use crate::simulation::animals::{AnimalAI, AnimalNeeds, AnimalReproductionCooldown, Deer, Wolf};
+use crate::simulation::carry::Carrier;
 use crate::simulation::combat::{Body, CombatCooldown, CombatTarget, Health};
 use crate::simulation::faction::FactionMember;
 use crate::simulation::goals::{AgentGoal, Personality};
-use crate::simulation::carry::Carrier;
 use crate::simulation::items::{Equipment, GroundItem};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::{AgentMemory, RelationshipMemory};
 use crate::simulation::mood::Mood;
-use crate::pathfinding::path_request::PathFollow;
 use crate::simulation::movement::MovementState;
 use crate::simulation::needs::Needs;
-use crate::simulation::neural::UtilityNet;
 use crate::simulation::person::{AiState, Person, PersonAI};
-use crate::simulation::plan::{KnownPlans, PlanScoringMethod};
+use crate::simulation::plan::{KnownPlans, PlanHistory, PlanScoringMethod};
 use crate::simulation::plants::{
     spawn_plant_at, DeerGrazer, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
@@ -62,7 +61,7 @@ fn setup_sandbox(
             GlobalTransform::default(),
             Visibility::Visible,
             InheritedVisibility::default(),
-            Needs::new(30.0, 20.0, 10.0, 5.0, 40.0),
+            Needs::new(30.0, 20.0, 10.0, 5.0, 40.0, 200.0),
             Mood::default(),
             Skills::default(),
             PersonAI {
@@ -77,6 +76,7 @@ fn setup_sandbox(
                 target_entity: None,
                 current_z: chunk_map.surface_z_at(cx, cy) as i8,
                 target_z: chunk_map.surface_z_at(cx, cy) as i8,
+                craft_recipe_id: 0,
             },
             EconomicAgent::default(),
         ),
@@ -97,10 +97,14 @@ fn setup_sandbox(
         (
             AgentMemory::default(),
             RelationshipMemory::default(),
-            UtilityNet::new_random(),
-            KnownPlans::with_innate(&[0, 1, 2, 3, 5, 22, 23, 25]),
-            PlanScoringMethod::UtilityNN,
+            KnownPlans::with_innate(&[
+    0, 1, 2, 3, 5, 23, 25, 26, 27, 28, 30, 31, 32,
+]),
+            PlanHistory::default(),
+            PlanScoringMethod::Weighted,
             Carrier::default(),
+            crate::simulation::reproduction::CoSleepTracker::default(),
+            crate::simulation::reproduction::MaleConceptionCooldown::default(),
         ),
     ));
 

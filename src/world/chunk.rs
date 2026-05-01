@@ -260,11 +260,7 @@ impl ChunkMap {
 
     /// 3D step passability for an agent moving from (sx,sy,sz) to (dx,dy,dz).
     /// 8-connected in XY, |Δz| ≤ 1. Both endpoints must be standable.
-    pub fn passable_step_3d(
-        &self,
-        from: (i32, i32, i32),
-        to: (i32, i32, i32),
-    ) -> bool {
+    pub fn passable_step_3d(&self, from: (i32, i32, i32), to: (i32, i32, i32)) -> bool {
         let (sx, sy, sz) = from;
         let (dx, dy, dz) = to;
         let ddx = dx - sx;

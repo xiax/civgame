@@ -7,25 +7,25 @@ use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::{tile_to_world, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
 use crate::world::tile::TileKind;
 
+use super::carry::Carrier;
 use super::combat::{Body, CombatCooldown, CombatTarget};
 use super::faction::{
     FactionCenter, FactionMember, FactionRegistry, FactionStorageTile, PlayerFaction,
     PlayerFactionMarker,
 };
 use super::goals::{AgentGoal, Personality};
-use super::carry::Carrier;
 use super::items::{Equipment, TargetItem};
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, RelationshipMemory};
 use super::mood::Mood;
 use super::movement::MovementState;
-use crate::pathfinding::path_request::PathFollow;
 use super::needs::Needs;
-use super::neural::UtilityNet;
-use super::plan::{KnownPlans, PlanScoringMethod};
+use super::plan::{KnownPlans, PlanHistory, PlanScoringMethod};
 use super::reproduction::BiologicalSex;
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
+use super::stats::Stats;
+use crate::pathfinding::path_request::PathFollow;
 
 /// Size of an entity on the grid. Absent = 1×1.
 #[derive(Component, Clone, Copy)]
@@ -105,14 +105,14 @@ impl HairColor {
 }
 
 const MALE_NAMES: &[&str] = &[
-    "Aldric", "Bram", "Caius", "Davan", "Eryn", "Finn", "Garic", "Holt",
-    "Idris", "Jorn", "Kael", "Lund", "Maren", "Nils", "Orin", "Pell",
-    "Rath", "Soren", "Tor", "Ulric", "Vael", "Wynn", "Xeno", "Yorn", "Zane",
+    "Aldric", "Bram", "Caius", "Davan", "Eryn", "Finn", "Garic", "Holt", "Idris", "Jorn", "Kael",
+    "Lund", "Maren", "Nils", "Orin", "Pell", "Rath", "Soren", "Tor", "Ulric", "Vael", "Wynn",
+    "Xeno", "Yorn", "Zane",
 ];
 const FEMALE_NAMES: &[&str] = &[
-    "Asha", "Brea", "Calla", "Dwyn", "Elara", "Faye", "Gara", "Hira",
-    "Inna", "Jova", "Kela", "Lyra", "Mira", "Nara", "Ora", "Pira",
-    "Rhea", "Saya", "Tara", "Una", "Vira", "Wren", "Xara", "Yara", "Zola",
+    "Asha", "Brea", "Calla", "Dwyn", "Elara", "Faye", "Gara", "Hira", "Inna", "Jova", "Kela",
+    "Lyra", "Mira", "Nara", "Ora", "Pira", "Rhea", "Saya", "Tara", "Una", "Vira", "Wren", "Xara",
+    "Yara", "Zola",
 ];
 
 pub fn generate_person_name(sex: BiologicalSex) -> &'static str {
@@ -142,6 +142,9 @@ pub struct PersonAI {
     /// Destination foot Z when routed across Z slices (e.g. from a
     /// PlayerOrder targeting underground). Equal to current_z by default.
     pub target_z: i8,
+    /// Recipe index for active Craft tasks. Written by `plan.rs` on
+    /// dispatch, read by `crafting.rs`. Unrelated to target_z.
+    pub craft_recipe_id: u8,
 }
 
 impl PersonAI {
@@ -343,9 +346,10 @@ pub fn spawn_population(
                     GlobalTransform::default(),
                     Visibility::Visible,
                     InheritedVisibility::default(),
-                    Needs::new(30.0, 20.0, 10.0, 5.0, 40.0),
+                    Needs::new(30.0, 20.0, 10.0, 5.0, 40.0, 200.0),
                     Mood::default(),
                     Skills::default(),
+                    Stats::roll_3d6(),
                     PersonAI {
                         task_id: PersonAI::UNEMPLOYED,
                         state: AiState::Idle,
@@ -358,6 +362,7 @@ pub fn spawn_population(
                         target_entity: None,
                         current_z: chunk_map.surface_z_at(tx, ty) as i8,
                         target_z: chunk_map.surface_z_at(tx, ty) as i8,
+                        craft_recipe_id: 0,
                     },
                     EconomicAgent::default(),
                 ),
@@ -387,12 +392,16 @@ pub fn spawn_population(
                 (
                     AgentMemory::default(),
                     RelationshipMemory::default(),
-                    UtilityNet::new_random(),
-                    KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 9, 10, 22, 23, 24, 25]),
-                    PlanScoringMethod::UtilityNN,
+                    KnownPlans::with_innate(&[
+    0, 1, 2, 3, 5, 6, 7, 9, 10, 23, 24, 25, 26, 27, 28, 30, 31, 32,
+]),
+                    PlanHistory::default(),
+                    PlanScoringMethod::Weighted,
                     Name::new(generate_person_name(sex)),
                     PathFollow::default(),
                     Carrier::default(),
+                    crate::simulation::reproduction::CoSleepTracker::default(),
+                    crate::simulation::reproduction::MaleConceptionCooldown::default(),
                 ),
             ));
 

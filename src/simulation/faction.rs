@@ -83,8 +83,6 @@ pub struct FactionMember {
     pub faction_id: u32,
     pub bond_target: Option<Entity>,
     pub bond_timer: u8,
-    /// Cooldown ticks after giving birth before reproduction need resets again.
-    pub birth_cooldown: u32,
 }
 
 #[derive(Component)]
@@ -118,9 +116,7 @@ impl StorageTileMap {
         self.by_faction
             .get(&faction_id)?
             .iter()
-            .min_by_key(|&&(tx, ty)| {
-                (tx as i32 - from.0).abs() + (ty as i32 - from.1).abs()
-            })
+            .min_by_key(|&&(tx, ty)| (tx as i32 - from.0).abs() + (ty as i32 - from.1).abs())
             .copied()
     }
 }
@@ -150,7 +146,6 @@ impl Default for FactionMember {
             faction_id: SOLO,
             bond_target: None,
             bond_timer: 0,
-            birth_cooldown: 0,
         }
     }
 }
@@ -271,9 +266,9 @@ pub struct FactionLineage {
 impl FactionLineage {
     pub fn from_seed(seed: u32) -> Self {
         const ROOTS: &[&str] = &[
-            "Aren", "Bryn", "Cael", "Doran", "Elin", "Faro", "Garen", "Hela",
-            "Irek", "Joran", "Kael", "Lyr", "Maren", "Nyx", "Oran", "Pyra",
-            "Quinn", "Rhea", "Sora", "Talin", "Uma", "Vale", "Wren", "Yara",
+            "Aren", "Bryn", "Cael", "Doran", "Elin", "Faro", "Garen", "Hela", "Irek", "Joran",
+            "Kael", "Lyr", "Maren", "Nyx", "Oran", "Pyra", "Quinn", "Rhea", "Sora", "Talin", "Uma",
+            "Vale", "Wren", "Yara",
         ];
         const SUFFIX: &[&str] = &["", "-tha", "-mir", "-ros", "-vyn", "-dor", "-an", "-eth"];
         let r = ROOTS[(seed as usize) % ROOTS.len()];
@@ -485,7 +480,7 @@ pub fn bonding_system(
                 nb_fm.bond_timer = 0;
                 nb_fm.bond_target = None;
                 registry.add_member(new_id); // for the neighbor
-                // Spawn a storage tile at the new faction's home position
+                                             // Spawn a storage tile at the new faction's home position
                 let world_pos = tile_to_world(home_tx as i32, home_ty as i32);
                 commands.spawn((
                     FactionStorageTile { faction_id: new_id },
@@ -718,10 +713,7 @@ pub fn update_storage_tile_map_system(
     mut map: ResMut<StorageTileMap>,
     mut hotspots: ResMut<HotspotFlowFields>,
     chunk_map: Res<ChunkMap>,
-    changed_q: Query<
-        (),
-        Or<(Added<FactionStorageTile>, Changed<Transform>)>,
-    >,
+    changed_q: Query<(), Or<(Added<FactionStorageTile>, Changed<Transform>)>>,
     removed: RemovedComponents<FactionStorageTile>,
     all_q: Query<(&FactionStorageTile, &Transform)>,
 ) {
@@ -982,7 +974,10 @@ pub fn chief_selection_system(
     let mut faction_members: AHashMap<u32, Vec<Entity>> = AHashMap::new();
     for (entity, member) in member_query.iter() {
         if member.faction_id != SOLO {
-            faction_members.entry(member.faction_id).or_default().push(entity);
+            faction_members
+                .entry(member.faction_id)
+                .or_default()
+                .push(entity);
         }
     }
 
@@ -1023,7 +1018,9 @@ pub fn chief_selection_system(
 /// without erasing the founder's identity. Layout style is left untouched —
 /// architectural identity persists across generations.
 fn drift_culture(culture: &mut FactionCulture, generation: u32) {
-    let mut s = culture.seed.wrapping_add(generation.wrapping_mul(0x9E37_79B9));
+    let mut s = culture
+        .seed
+        .wrapping_add(generation.wrapping_mul(0x9E37_79B9));
     let mut next = || {
         s ^= s >> 16;
         s = s.wrapping_mul(0x85EB_CA6B);

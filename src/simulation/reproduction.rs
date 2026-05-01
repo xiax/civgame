@@ -1,24 +1,25 @@
-use crate::world::seasons::TICKS_PER_SEASON;
-use super::combat::{Body, CombatTarget, CombatCooldown};
+use super::carry::Carrier;
+use super::combat::{Body, CombatCooldown, CombatTarget};
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::{AgentGoal, Personality};
-use super::carry::Carrier;
 use super::items::{Equipment, TargetItem};
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, RelationshipMemory};
 use super::mood::Mood;
 use super::movement::MovementState;
-use crate::pathfinding::path_request::PathFollow;
 use super::needs::Needs;
-use super::neural::UtilityNet;
-use super::person::{AiState, Person, PersonAI, Profession, SkinTone, HairColor, generate_person_name};
-use super::plan::{KnownPlans, PlanScoringMethod};
+use super::person::{
+    generate_person_name, AiState, HairColor, Person, PersonAI, Profession, SkinTone,
+};
+use super::plan::{KnownPlans, PlanHistory, PlanScoringMethod};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
+use super::stats::Stats;
 use crate::economy::agent::EconomicAgent;
+use crate::pathfinding::path_request::PathFollow;
+use crate::world::seasons::TICKS_PER_SEASON;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
-use ahash::AHashMap;
 use bevy::prelude::*;
 
 #[repr(u8)]
@@ -45,84 +46,97 @@ impl BiologicalSex {
     }
 }
 
-const REPRODUCE_FEMALE_THRESHOLD: u8 = 180;
-const REPRODUCE_MALE_THRESHOLD: u8 = 150;
-const BIRTH_CHANCE: u32 = 5; // out of 10,000 per tick
-const BIRTH_COOLDOWN_TICKS: u32 = TICKS_PER_SEASON * 3; // 3 seasons
+/// Pregnancy lasts three seasons (54,000 ticks at 20Hz / 5-day seasons).
+pub const PREGNANCY_TICKS: u32 = TICKS_PER_SEASON * 3;
+/// Tile radius (Chebyshev) within which a sleeping pair counts as co-sleeping.
+const COSLEEP_RADIUS: i32 = 3;
+/// Minimum overlapping sleep ticks before a co-sleep "counts" as a night —
+/// filters out brief wake-and-resettle moments.
+const MIN_COSLEEP_TICKS: u16 = 100;
+/// After participating in an attempt, a male is on cooldown for this many ticks.
+/// Prevents a single male from servicing every co-sleeping woman in one morning.
+const MALE_ATTEMPT_COOLDOWN_TICKS: u32 = 600;
 
-/// Eligible males this tick: entity → faction_id. Updated by collect_male_candidates.
-#[derive(Resource, Default)]
-pub struct MaleCandidates(pub AHashMap<Entity, u32>);
+/// First-class pregnancy state. Inserted on a female on a successful conception
+/// roll; removed by `pregnancy_system` when the timer reaches 0 and the child
+/// is spawned. Carries snapshots of father data so the birth survives the
+/// father's death or the mother's faction reassignment mid-pregnancy.
+#[derive(Component, Clone)]
+pub struct Pregnancy {
+    pub ticks_remaining: u32,
+    pub father: Option<Entity>,
+    pub father_stats: Option<Stats>,
+    pub faction_id: u32,
+}
 
-pub fn collect_male_candidates(
-    mut candidates: ResMut<MaleCandidates>,
-    query: Query<(Entity, &BiologicalSex, &FactionMember, &Needs)>,
-) {
-    candidates.0.clear();
-    for (entity, sex, member, needs) in &query {
-        if *sex == BiologicalSex::Male
-            && member.faction_id != SOLO
-            && needs.reproduction >= REPRODUCE_MALE_THRESHOLD as f32
-        {
-            candidates.0.insert(entity, member.faction_id);
+impl Pregnancy {
+    pub fn new(father: Entity, father_stats: Option<Stats>, faction_id: u32) -> Self {
+        Self {
+            ticks_remaining: PREGNANCY_TICKS,
+            father: Some(father),
+            father_stats,
+            faction_id,
         }
     }
 }
 
-pub fn birth_cooldown_system(
-    clock: Res<SimClock>,
-    mut query: Query<(&mut FactionMember, &BucketSlot, &LodLevel)>,
-) {
-    query.par_iter_mut().for_each(|(mut member, slot, lod)| {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
-            return;
-        }
-        if member.birth_cooldown > 0 {
-            member.birth_cooldown = member.birth_cooldown.saturating_sub(1);
-        }
-    });
+/// Per-agent tracking of who they're currently co-sleeping with. Updated by
+/// `cosleep_observation_system` while the agent is in `AiState::Sleeping`;
+/// consumed and cleared by `wake_up_conception_system` on the
+/// `Sleeping → !Sleeping` transition.
+#[derive(Component, Default, Clone, Debug)]
+pub struct CoSleepTracker {
+    pub partner: Option<Entity>,
+    pub ticks_co_slept: u16,
+    /// Last observed AI state, for transition detection in
+    /// `wake_up_conception_system`. Initialised to `Idle` so newly-spawned
+    /// agents register their first sleep cycle naturally.
+    pub prev_state: AiState,
 }
 
-pub fn reproduction_system(
-    mut commands: Commands,
+/// Refractory period for a male after participating in a conception attempt.
+/// Set to `MALE_ATTEMPT_COOLDOWN_TICKS` at attempt time, decremented each tick.
+/// Idle for non-males (the field is always present but only consumed on the
+/// male side of an attempt).
+#[derive(Component, Default, Clone, Debug)]
+pub struct MaleConceptionCooldown(pub u32);
+
+/// Per-tick observation of co-sleeping pairs. Runs in
+/// `SimulationSet::Sequential` after the spatial index is up to date. Also
+/// decrements `MaleConceptionCooldown` for active (non-Dormant) agents — folded
+/// in here to avoid an extra system pass.
+pub fn cosleep_observation_system(
     spatial: Res<SpatialIndex>,
-    candidates: Res<MaleCandidates>,
-    mut clock: ResMut<SimClock>,
-    mut registry: ResMut<FactionRegistry>,
-    chunk_map: Res<crate::world::chunk::ChunkMap>,
-    father_net_query: Query<Option<&UtilityNet>>,
-    mut query: Query<(
-        Entity,
-        &mut Needs,
-        &mut FactionMember,
-        &BiologicalSex,
-        &AgentGoal,
-        &Transform,
-        &LodLevel,
-        &BucketSlot,
-        Option<&UtilityNet>,
-    )>,
+    clock: Res<SimClock>,
+    others: Query<(&PersonAI, &BiologicalSex, &FactionMember), With<Person>>,
+    mut query: Query<
+        (
+            Entity,
+            &PersonAI,
+            &Transform,
+            &BiologicalSex,
+            &FactionMember,
+            &LodLevel,
+            &BucketSlot,
+            &mut CoSleepTracker,
+            &mut MaleConceptionCooldown,
+        ),
+        With<Person>,
+    >,
 ) {
-    let mut births: Vec<(Transform, u32, UtilityNet)> = Vec::new();
-    let _resets: Vec<Entity> = Vec::new();
+    for (entity, ai, transform, sex, member, lod, slot, mut tracker, mut male_cd) in
+        query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
 
-    // Use a temporary vector to avoid borrowing query while mutating it via get_mut
-    let mut found_pairs = Vec::new();
+        // Decrement male cooldown every active tick.
+        if *sex == BiologicalSex::Male && male_cd.0 > 0 && clock.is_active(slot.0) {
+            male_cd.0 = male_cd.0.saturating_sub(1);
+        }
 
-    for (entity, needs, member, sex, goal, transform, lod, slot, mother_net) in query.iter() {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
-            continue;
-        }
-        if *sex != BiologicalSex::Female {
-            continue;
-        }
-        if *goal != AgentGoal::Reproduce {
-            continue;
-        }
-        if needs.reproduction < REPRODUCE_FEMALE_THRESHOLD as f32 {
-            continue;
-        }
-        if member.birth_cooldown > 0 {
+        if ai.state != AiState::Sleeping {
             continue;
         }
         if member.faction_id == SOLO {
@@ -131,55 +145,266 @@ pub fn reproduction_system(
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-        let faction_id = member.faction_id;
 
-        let mut found_father: Option<Entity> = None;
-        'search: for dy in -1..=1i32 {
-            for dx in -1..=1i32 {
-                for &other in spatial.get(tx + dx, ty + dy) {
-                    if other != entity && candidates.0.get(&other).copied() == Some(faction_id) {
-                        found_father = Some(other);
-                        break 'search;
+        let mut closest: Option<(Entity, i32)> = None;
+        for dy in -COSLEEP_RADIUS..=COSLEEP_RADIUS {
+            for dx in -COSLEEP_RADIUS..=COSLEEP_RADIUS {
+                if dx * dx + dy * dy > COSLEEP_RADIUS * COSLEEP_RADIUS {
+                    continue;
+                }
+                for &candidate in spatial.get(tx + dx, ty + dy) {
+                    if candidate == entity {
+                        continue;
+                    }
+                    let Ok((other_ai, other_sex, other_fm)) = others.get(candidate) else {
+                        continue;
+                    };
+                    if other_ai.state != AiState::Sleeping
+                        || *other_sex == *sex
+                        || other_fm.faction_id != member.faction_id
+                    {
+                        continue;
+                    }
+                    let d = dx * dx + dy * dy;
+                    if closest.map(|(_, bd)| d < bd).unwrap_or(true) {
+                        closest = Some((candidate, d));
                     }
                 }
             }
         }
 
-        if let Some(father_entity) = found_father {
-            found_pairs.push((
-                entity,
-                father_entity,
-                *transform,
-                faction_id,
-                mother_net.cloned(),
-            ));
+        if let Some((partner, _)) = closest {
+            tracker.partner = Some(partner);
+            tracker.ticks_co_slept = tracker.ticks_co_slept.saturating_add(1);
         }
     }
+}
 
-    for (mother_ent, father_ent, transform, faction_id, mother_net) in found_pairs {
-        // Reset needs for both regardless of birth
-        if let Ok([mut m_needs, mut f_needs]) = query.get_many_mut([mother_ent, father_ent]) {
-            m_needs.1.reproduction = 0.0;
-            f_needs.1.reproduction = 0.0;
+/// Detects `Sleeping → !Sleeping` transitions and runs the conception attempt
+/// logic on females. Mirrors the transition reset on males so their tracker
+/// state stays clean. The female side is the canonical "attempt" site; the
+/// male's cooldown is consumed only there.
+///
+/// `ParamSet` is used so the female (mut Needs / CoSleepTracker) loop and the
+/// male-side mutations don't claim &mut Needs concurrently.
+pub fn wake_up_conception_system(
+    mut commands: Commands,
+    name_query: Query<&Name>,
+    pregnancy_query: Query<(), With<Pregnancy>>,
+    mut params: ParamSet<(
+        Query<
+            (
+                Entity,
+                &PersonAI,
+                &BiologicalSex,
+                &FactionMember,
+                &Transform,
+                &LodLevel,
+                &mut Needs,
+                &mut CoSleepTracker,
+            ),
+            With<Person>,
+        >,
+        Query<&mut Needs, With<Person>>,
+        Query<&mut MaleConceptionCooldown, With<Person>>,
+        Query<
+            (
+                Entity,
+                Option<&Stats>,
+                &MaleConceptionCooldown,
+                &BiologicalSex,
+                &FactionMember,
+            ),
+            With<Person>,
+        >,
+    )>,
+) {
+    struct Attempt {
+        mother: Entity,
+        male: Entity,
+        faction_id: u32,
+        mother_transform: Transform,
+        father_stats: Option<Stats>,
+        female_pregnant: bool,
+        success: bool,
+    }
 
-            // Set cooldown on mother
-            m_needs.2.birth_cooldown = BIRTH_COOLDOWN_TICKS;
-        }
+    // ── Pass 0: snapshot read-only male data so the ParamSet can later move
+    //            on to mutating Needs / MaleConceptionCooldown without
+    //            aliasing this read-only borrow.
+    struct MaleSnapshot {
+        father_stats: Option<Stats>,
+        cooldown: u32,
+        sex: BiologicalSex,
+        faction_id: u32,
+    }
+    let male_snapshot: ahash::AHashMap<Entity, MaleSnapshot> = {
+        let q = params.p3();
+        q.iter()
+            .map(|(e, stats, cd, sex, fm)| {
+                (
+                    e,
+                    MaleSnapshot {
+                        father_stats: stats.copied(),
+                        cooldown: cd.0,
+                        sex: *sex,
+                        faction_id: fm.faction_id,
+                    },
+                )
+            })
+            .collect()
+    };
 
-        // Roll for birth
-        if fastrand::u32(..10_000) < BIRTH_CHANCE {
-            let father_net = father_net_query.get(father_ent).ok().flatten();
-            let child_net = match (mother_net, father_net) {
-                (Some(m), Some(f)) => UtilityNet::from_parents(&m, f),
-                (Some(p), None) => UtilityNet::from_parent(&p),
-                (None, Some(p)) => UtilityNet::from_parent(p),
-                (None, None) => UtilityNet::new_random(),
+    let mut attempts: Vec<Attempt> = Vec::new();
+
+    // ── Pass 1: iterate every Person, detect transitions, mutate tracker
+    //            (and female Needs on attempts). Collect male-side work.
+    {
+        let mut q = params.p0();
+        for (entity, ai, sex, member, transform, lod, mut needs, mut tracker) in q.iter_mut() {
+            if *lod == LodLevel::Dormant {
+                tracker.prev_state = ai.state;
+                continue;
+            }
+
+            let was_sleeping = tracker.prev_state == AiState::Sleeping;
+            let now_sleeping = ai.state == AiState::Sleeping;
+            tracker.prev_state = ai.state;
+
+            if !(was_sleeping && !now_sleeping) {
+                continue;
+            }
+
+            let partner = tracker.partner.take();
+            let ticks_co_slept = tracker.ticks_co_slept;
+            tracker.ticks_co_slept = 0;
+
+            if *sex != BiologicalSex::Female {
+                continue;
+            }
+            if ticks_co_slept < MIN_COSLEEP_TICKS {
+                continue;
+            }
+            let Some(male) = partner else { continue };
+
+            // Validate male via the snapshot taken in Pass 0.
+            let Some(snap) = male_snapshot.get(&male) else {
+                continue;
             };
-            births.push((transform, faction_id, child_net));
+            if snap.sex == *sex || snap.faction_id != member.faction_id || snap.cooldown > 0 {
+                continue;
+            }
+
+            let female_pregnant = pregnancy_query.get(entity).is_ok();
+            let success = !female_pregnant && fastrand::u32(..2) == 0;
+
+            // Reset female's reproduction need on every attempt (success or fail,
+            // pregnant or not).
+            needs.reproduction = 0.0;
+
+            attempts.push(Attempt {
+                mother: entity,
+                male,
+                faction_id: member.faction_id,
+                mother_transform: *transform,
+                father_stats: snap.father_stats,
+                female_pregnant,
+                success,
+            });
         }
     }
 
-    for (parent_transform, faction_id, child_net) in births {
+    // ── Pass 2: reset the male's reproduction need.
+    {
+        let mut needs_q = params.p1();
+        for a in &attempts {
+            if let Ok(mut n) = needs_q.get_mut(a.male) {
+                n.reproduction = 0.0;
+            }
+        }
+    }
+
+    // ── Pass 3: set the male's cooldown.
+    {
+        let mut cd_q = params.p2();
+        for a in &attempts {
+            if let Ok(mut cd) = cd_q.get_mut(a.male) {
+                cd.0 = MALE_ATTEMPT_COOLDOWN_TICKS;
+            }
+        }
+    }
+
+    // ── Pass 4: insert pregnancies via Commands.
+    for a in attempts {
+        let mother_name = name_query
+            .get(a.mother)
+            .map(|n| n.as_str().to_string())
+            .unwrap_or_else(|_| format!("{:?}", a.mother));
+        let father_name = name_query
+            .get(a.male)
+            .map(|n| n.as_str().to_string())
+            .unwrap_or_else(|_| format!("{:?}", a.male));
+
+        if a.female_pregnant {
+            info!(
+                "Co-sleep attempt (already pregnant): {} + {} — needs reset only",
+                mother_name, father_name
+            );
+            continue;
+        }
+
+        info!(
+            "Conception attempt: {} + {} — success={}",
+            mother_name, father_name, a.success
+        );
+
+        if a.success {
+            let preg = Pregnancy::new(a.male, a.father_stats, a.faction_id);
+            commands.entity(a.mother).insert(preg);
+            let _ = a.mother_transform; // recorded for future use; transform read at birth
+        }
+    }
+}
+
+/// Ticks `Pregnancy` down each active frame and spawns the child when the
+/// timer reaches 0. Runs in `SimulationSet::Economy`, replacing the old
+/// `reproduction_system`.
+pub fn pregnancy_system(
+    mut commands: Commands,
+    mut clock: ResMut<SimClock>,
+    mut registry: ResMut<FactionRegistry>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    name_query: Query<&Name>,
+    mut query: Query<(
+        Entity,
+        &mut Pregnancy,
+        &Transform,
+        &BucketSlot,
+        &LodLevel,
+        Option<&Stats>,
+    )>,
+) {
+    let mut births: Vec<(Entity, Transform, u32, Stats)> = Vec::new();
+
+    for (mother, mut preg, transform, slot, lod, mother_stats) in query.iter_mut() {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        preg.ticks_remaining = preg.ticks_remaining.saturating_sub(1);
+        if preg.ticks_remaining > 0 {
+            continue;
+        }
+        let child_stats = match (mother_stats, preg.father_stats.as_ref()) {
+            (Some(m), Some(f)) => Stats::inherit(m, f),
+            (Some(p), None) | (None, Some(p)) => Stats::inherit(p, p),
+            (None, None) => Stats::roll_3d6(),
+        };
+        births.push((mother, *transform, preg.faction_id, child_stats));
+    }
+
+    for (mother, parent_transform, faction_id, child_stats) in births {
+        commands.entity(mother).remove::<Pregnancy>();
+
         let new_slot = clock.population;
         clock.population += 1;
         clock.bucket_size = clock.population.min(10_000);
@@ -190,6 +415,15 @@ pub fn reproduction_system(
 
         registry.add_member(faction_id);
         let sex = BiologicalSex::random();
+        let child_name = child_name_for(faction_id, sex, &registry);
+        let mother_name = name_query
+            .get(mother)
+            .map(|n| n.as_str().to_string())
+            .unwrap_or_else(|_| format!("{:?}", mother));
+        info!(
+            "Birth: mother={} → child={} (faction {})",
+            mother_name, child_name, faction_id
+        );
 
         commands.spawn((
             (
@@ -198,9 +432,10 @@ pub fn reproduction_system(
                 GlobalTransform::default(),
                 Visibility::Visible,
                 InheritedVisibility::default(),
-                Needs::new(0.0, 0.0, 0.0, 0.0, 0.0),
+                Needs::new(0.0, 0.0, 0.0, 0.0, 0.0, 255.0),
                 Mood::default(),
                 Skills::default(),
+                child_stats,
                 PersonAI {
                     task_id: PersonAI::UNEMPLOYED,
                     state: AiState::Idle,
@@ -213,6 +448,7 @@ pub fn reproduction_system(
                     target_entity: None,
                     current_z: chunk_map.surface_z_at(tx, ty) as i8,
                     target_z: chunk_map.surface_z_at(tx, ty) as i8,
+                    craft_recipe_id: 0,
                 },
                 EconomicAgent::default(),
             ),
@@ -232,20 +468,23 @@ pub fn reproduction_system(
                 },
                 Body::new_humanoid(),
                 Equipment::default(),
+            ),
+            (
                 TargetItem::default(),
                 CombatTarget::default(),
                 CombatCooldown::default(),
-            ),
-            (
                 AgentMemory::default(),
                 RelationshipMemory::default(),
-                child_net,
-                KnownPlans::with_innate(&[0, 1, 2, 3, 5, 6, 7, 22, 23, 25]),
-                PlanScoringMethod::UtilityNN,
-                Name::new(child_name_for(faction_id, sex, &registry)),
+                KnownPlans::with_innate(&[
+    0, 1, 2, 3, 5, 6, 7, 23, 25, 26, 27, 28, 30, 31, 32,
+]),
+                PlanHistory::default(),
+                PlanScoringMethod::Weighted,
+                Name::new(child_name),
                 PathFollow::default(),
                 Carrier::default(),
             ),
+            (CoSleepTracker::default(), MaleConceptionCooldown::default()),
         ));
     }
 }

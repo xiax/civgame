@@ -1,6 +1,7 @@
 use crate::world::chunk::CHUNK_SIZE;
 use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 use crate::world::terrain::TILE_SIZE;
+use bevy::input::gestures::PinchGesture;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::input::ButtonInput;
 use bevy::prelude::*;
@@ -8,6 +9,7 @@ use bevy_egui::EguiContexts;
 
 const PAN_SPEED: f32 = 400.0;
 const ZOOM_SPEED: f32 = 0.15;
+const PINCH_ZOOM_SPEED: f32 = 2.0;
 const MIN_SCALE: f32 = 0.25;
 const MAX_SCALE: f32 = 8.0;
 
@@ -60,6 +62,7 @@ pub fn camera_input_system(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     mut scroll_events: EventReader<MouseWheel>,
     mut motion_events: EventReader<MouseMotion>,
+    mut pinch_events: EventReader<PinchGesture>,
     mut camera_state: ResMut<CameraState>,
     mut camera_view_z: ResMut<CameraViewZ>,
     mut camera_query: Query<(&mut Transform, &mut OrthographicProjection), With<Camera>>,
@@ -105,17 +108,31 @@ pub fn camera_input_system(
         motion_events.clear();
     }
 
-    // Scroll zoom
+    // Scroll: trackpad two-finger swipe pans, mouse wheel zooms
     for ev in scroll_events.read() {
         if egui_wants_mouse {
             continue;
         }
-        let scroll = match ev.unit {
-            MouseScrollUnit::Line => ev.y,
-            MouseScrollUnit::Pixel => ev.y / 50.0,
-        };
+        match ev.unit {
+            MouseScrollUnit::Pixel => {
+                transform.translation.x -= ev.x * projection.scale;
+                transform.translation.y += ev.y * projection.scale;
+            }
+            MouseScrollUnit::Line => {
+                projection.scale =
+                    (projection.scale * (1.0 - ev.y * ZOOM_SPEED)).clamp(MIN_SCALE, MAX_SCALE);
+                camera_state.zoom = projection.scale;
+            }
+        }
+    }
+
+    // Pinch zoom (trackpad)
+    for ev in pinch_events.read() {
+        if egui_wants_mouse {
+            continue;
+        }
         projection.scale =
-            (projection.scale * (1.0 - scroll * ZOOM_SPEED)).clamp(MIN_SCALE, MAX_SCALE);
+            (projection.scale * (1.0 - ev.0 * PINCH_ZOOM_SPEED)).clamp(MIN_SCALE, MAX_SCALE);
         camera_state.zoom = projection.scale;
     }
 

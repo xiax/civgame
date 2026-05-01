@@ -87,9 +87,7 @@ pub fn selection_input_system(
         for (entity, transform, _faction) in persons.iter() {
             let pos = transform.translation.truncate();
             let dist = pos.distance(end);
-            if dist < SINGLE_CLICK_RADIUS_PX
-                && best.map(|(_, d)| dist < d).unwrap_or(true)
-            {
+            if dist < SINGLE_CLICK_RADIUS_PX && best.map(|(_, d)| dist < d).unwrap_or(true) {
                 best = Some((entity, dist));
             }
         }

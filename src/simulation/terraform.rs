@@ -4,15 +4,15 @@ use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
-use crate::simulation::carry::Carrier;
-use crate::simulation::items::GroundItem;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
+use crate::simulation::carry::Carrier;
 use crate::simulation::carve::{carve_tile, fill_tile, STONE_PER_BLOCK};
 use crate::simulation::construction::{Blueprint, BlueprintMap, BuildSiteKind};
 use crate::simulation::faction::{FactionMember, SOLO};
 use crate::simulation::goals::AgentGoal;
+use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, PersonAI, PlayerOrder};
 use crate::simulation::plan::ActivePlan;
@@ -56,10 +56,19 @@ pub struct PendingFootprints {
 }
 
 /// Faction-scoped count of in-flight TerraformSites (Debug panel).
-pub fn count_terraform_sites_for(map: &TerraformMap, sites: &Query<&TerraformSite>, faction_id: u32) -> usize {
+pub fn count_terraform_sites_for(
+    map: &TerraformMap,
+    sites: &Query<&TerraformSite>,
+    faction_id: u32,
+) -> usize {
     map.0
         .values()
-        .filter(|&&e| sites.get(e).map(|s| s.faction_id == faction_id).unwrap_or(false))
+        .filter(|&&e| {
+            sites
+                .get(e)
+                .map(|s| s.faction_id == faction_id)
+                .unwrap_or(false)
+        })
         .count()
 }
 
@@ -206,7 +215,10 @@ pub fn terraform_system(
                 if leftover > 0 {
                     let pos = tile_to_world(tx, ty);
                     commands.spawn((
-                        GroundItem { item, qty: leftover },
+                        GroundItem {
+                            item,
+                            qty: leftover,
+                        },
                         Transform::from_xyz(pos.x, pos.y, 0.3),
                         GlobalTransform::default(),
                         Visibility::Visible,

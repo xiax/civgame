@@ -13,6 +13,8 @@ use crate::pathfinding::path_request::{
 };
 use crate::pathfinding::pool::{AStarPool, AStarScratch};
 use crate::pathfinding::step::passable_diagonal_step;
+use crate::simulation::plan::PlanRegistry;
+use crate::simulation::tasks::task_kind_label;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 
 /// Maximum number of `PathRequest`s the worker drains in one tick. Sized
@@ -185,6 +187,7 @@ pub fn drain_path_requests_system(
     mut diag: ResMut<PathfindingDiagnostics>,
     mut failure_log: ResMut<FailureLog>,
     tick: Res<bevy::prelude::Time>,
+    plans: Res<PlanRegistry>,
     mut follows: Query<&mut PathFollow>,
     mut ready_w: EventWriter<PathReady>,
     mut failed_w: EventWriter<PathFailed>,
@@ -252,6 +255,7 @@ pub fn drain_path_requests_system(
             &mut failed_w,
             &mut diag,
             &mut failure_log,
+            &plans,
         );
     }
 
@@ -273,6 +277,33 @@ fn compute_outcome(
 ) -> ComputeOutcome {
     let start_chunk = chunk_of(req.start);
     let goal_chunk = chunk_of(req.goal);
+
+    // Reject goals whose Z slice isn't standable. A* would otherwise burn
+    // budget exploring from start until it gives up, then we'd retry on
+    // every cooldown elapse. The dispatch path is supposed to snap goal Z
+    // via `nearest_standable_z` but stale `target_z` can sneak through
+    // (Routing→Seeking, stranded recovery, etc.).
+    if !chunk_map.passable_at(req.goal.0, req.goal.1, req.goal.2 as i32) {
+        if flags.verbose_logs {
+            info!(
+                "[path] goal not standable agent={:?} goal={:?}",
+                req.agent, req.goal
+            );
+        }
+        let goal = req.goal;
+        return ComputeOutcome {
+            body: OutcomeBody::Failure {
+                sub: FailSubReason::UnreachableConnectivity,
+                segment_target: goal,
+                connectivity_reject: true,
+                hotspot_fastpath_miss: false,
+            },
+            req,
+            astar_calls: 0,
+            astar_iters: 0,
+            astar_iters_max_single: 0,
+        };
+    }
 
     if !conn.is_reachable((start_chunk, req.start.2), (goal_chunk, req.goal.2)) {
         if flags.verbose_logs {
@@ -531,9 +562,14 @@ fn apply_outcome(
     failed_w: &mut EventWriter<PathFailed>,
     diag: &mut PathfindingDiagnostics,
     failure_log: &mut FailureLog,
+    plans: &PlanRegistry,
 ) {
-    diag.astar_calls_per_tick = diag.astar_calls_per_tick.saturating_add(outcome.astar_calls);
-    diag.astar_iters_last_tick = diag.astar_iters_last_tick.saturating_add(outcome.astar_iters);
+    diag.astar_calls_per_tick = diag
+        .astar_calls_per_tick
+        .saturating_add(outcome.astar_calls);
+    diag.astar_iters_last_tick = diag
+        .astar_iters_last_tick
+        .saturating_add(outcome.astar_iters);
     if outcome.astar_iters_max_single > diag.astar_iters_max_single {
         diag.astar_iters_max_single = outcome.astar_iters_max_single;
     }
@@ -603,6 +639,7 @@ fn apply_outcome(
                 failed_w,
                 failure_log,
                 diag,
+                plans,
             );
         }
     }
@@ -696,6 +733,7 @@ fn write_failure(
     failed_w: &mut EventWriter<PathFailed>,
     failure_log: &mut FailureLog,
     diag: &mut PathfindingDiagnostics,
+    plans: &PlanRegistry,
 ) {
     let reason = sub.to_reason();
     match follows.get_mut(req.agent) {
@@ -717,8 +755,15 @@ fn write_failure(
                 FailSubReason::UnreachableAstar => {
                     follow.fail_count_unreachable_astar =
                         follow.fail_count_unreachable_astar.saturating_add(1);
-                    follow.last_astar_dump =
-                        Some(build_astar_diagnostic(chunk_map, req.start, segment_target, req.goal));
+                    follow.last_astar_dump = Some(build_astar_diagnostic(
+                        chunk_map,
+                        req.start,
+                        segment_target,
+                        req.goal,
+                        req.task_id,
+                        req.plan_id,
+                        plans,
+                    ));
                 }
                 FailSubReason::BudgetExhausted => {
                     follow.fail_count_budget = follow.fail_count_budget.saturating_add(1);
@@ -821,13 +866,28 @@ fn build_astar_diagnostic(
     start: (i32, i32, i8),
     segment_target: (i32, i32, i8),
     goal: (i32, i32, i8),
+    task_id: u16,
+    plan_id: u16,
+    plans: &PlanRegistry,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(900);
     let (sx, sy, sz) = start;
     let (tx, ty, tz) = segment_target;
     let start3 = (sx, sy, sz as i32);
+    let task_label = task_kind_label(task_id);
+    let plan_label = plans
+        .0
+        .iter()
+        .find(|p| p.id == plan_id)
+        .map(|p| p.name)
+        .unwrap_or("?");
     let _ = writeln!(out, "A* Unreachable");
+    let _ = writeln!(
+        out,
+        "origin task={}({}) plan={}({})",
+        task_label, task_id, plan_label, plan_id
+    );
     let _ = writeln!(
         out,
         "start ({},{},{})  segtgt ({},{},{})  goal ({},{},{})",
@@ -876,7 +936,11 @@ fn build_astar_diagnostic(
         } else {
             String::new()
         };
-        let goal_marker = if (nx, ny) == (tx, ty) { "  ← SEGTGT" } else { "" };
+        let goal_marker = if (nx, ny) == (tx, ty) {
+            "  ← SEGTGT"
+        } else {
+            ""
+        };
         let _ = writeln!(
             out,
             "  {} ({},{}) sz={:>3} kind={:?}/{:?} p@{}={} step3d@{}={} @{}={} @{}={}{}{}",
@@ -934,7 +998,10 @@ mod tests {
                 6,
                 5,
                 z,
-                TileData { kind: TileKind::Wall, ..Default::default() },
+                TileData {
+                    kind: TileKind::Wall,
+                    ..Default::default()
+                },
             );
         }
         let path = vec![(6i16, 6i16, 0i8)];

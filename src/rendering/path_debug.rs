@@ -47,7 +47,10 @@ fn tile_center(tx: i32, ty: i32) -> Vec2 {
 
 fn chunk_center(coord: ChunkCoord) -> Vec2 {
     let half = CHUNK_SIZE as i32 / 2;
-    tile_to_world(coord.0 * CHUNK_SIZE as i32 + half, coord.1 * CHUNK_SIZE as i32 + half)
+    tile_to_world(
+        coord.0 * CHUNK_SIZE as i32 + half,
+        coord.1 * CHUNK_SIZE as i32 + half,
+    )
 }
 
 pub fn selected_agent_path_gizmo_system(
@@ -62,7 +65,9 @@ pub fn selected_agent_path_gizmo_system(
         return;
     }
     let Some(entity) = selected.0 else { return };
-    let Ok((transform, pf, ai)) = agents.get(entity) else { return };
+    let Ok((transform, pf, ai)) = agents.get(entity) else {
+        return;
+    };
 
     let agent_pos = transform.translation.truncate();
 
@@ -120,8 +125,12 @@ pub fn flow_field_gizmo_system(
     if !overlay.show_flow_fields {
         return;
     }
-    let Ok((cam_transform, projection)) = camera_query.get_single() else { return };
-    let Ok(window) = windows.get_single() else { return };
+    let Ok((cam_transform, projection)) = camera_query.get_single() else {
+        return;
+    };
+    let Ok(window) = windows.get_single() else {
+        return;
+    };
 
     let half_w = window.width() * 0.5 * projection.scale;
     let half_h = window.height() * 0.5 * projection.scale;
@@ -247,8 +256,12 @@ pub fn connectivity_component_gizmo_system(
     if !overlay.show_connectivity_components {
         return;
     }
-    let Ok((cam_transform, projection)) = camera_query.get_single() else { return };
-    let Ok(window) = windows.get_single() else { return };
+    let Ok((cam_transform, projection)) = camera_query.get_single() else {
+        return;
+    };
+    let Ok(window) = windows.get_single() else {
+        return;
+    };
 
     let view_band = if view_z.0 == i32::MAX {
         0i8
@@ -283,7 +296,12 @@ pub fn connectivity_component_gizmo_system(
         let tr = c + Vec2::new(half, half);
         let bl = c + Vec2::new(-half, -half);
         let br = c + Vec2::new(half, -half);
-        let tick_color = Color::srgba(color.to_srgba().red, color.to_srgba().green, color.to_srgba().blue, 0.95);
+        let tick_color = Color::srgba(
+            color.to_srgba().red,
+            color.to_srgba().green,
+            color.to_srgba().blue,
+            0.95,
+        );
         gizmos.line_2d(tl, tl + Vec2::new(tick, 0.0), tick_color);
         gizmos.line_2d(tr, tr + Vec2::new(-tick, 0.0), tick_color);
         gizmos.line_2d(bl, bl + Vec2::new(tick, 0.0), tick_color);

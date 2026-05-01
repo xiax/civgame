@@ -10,6 +10,7 @@ use crate::simulation::memory::RelationshipMemory;
 use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
+use crate::simulation::stats::{self, Stats};
 use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::ChunkMap;
 use crate::world::spatial::SpatialIndex;
@@ -169,9 +170,10 @@ pub fn combat_system(
         Option<&mut ActivePlan>,
         Option<&FactionMember>,
         Option<&mut crate::simulation::carry::Carrier>,
+        Option<&Stats>,
     )>,
     mut health_query: Query<&mut Health>,
-    mut body_query: Query<&mut Body>,
+    mut body_query: Query<(&mut Body, Option<&Stats>)>,
     equipment_query: Query<&Equipment>,
     item_stats_query: Query<(Option<&WeaponStats>, Option<&ArmorStats>)>,
     mut ai_query: Query<&mut PersonAI>,
@@ -201,6 +203,7 @@ pub fn combat_system(
         _active_plan_opt,
         attacker_fm,
         mut attacker_carrier,
+        attacker_stats,
     ) in &mut attacker_query
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -238,7 +241,7 @@ pub fn combat_system(
 
         let target_is_dead = if let Ok(h) = health_query.get(target) {
             h.is_dead()
-        } else if let Ok(b) = body_query.get(target) {
+        } else if let Ok((b, _)) = body_query.get(target) {
             b.is_dead()
         } else {
             false
@@ -292,6 +295,18 @@ pub fn combat_system(
 
             combat_events.send(CombatEvent { attacker, target });
 
+            let atk_dex = attacker_stats
+                .map(|s| stats::modifier(s.dexterity))
+                .unwrap_or(0);
+            let tgt_dex = body_query
+                .get(target)
+                .ok()
+                .and_then(|(_, s)| s)
+                .map(|s| stats::modifier(s.dexterity))
+                .unwrap_or(0);
+            let hit_chance = (0.7 + 0.05 * (atk_dex - tgt_dex) as f32).clamp(0.2, 0.95);
+            let attack_lands = fastrand::f32() < hit_chance;
+
             let mut damage = ATTACK_DAMAGE;
             let mut attack_speed_bonus = 1.0;
 
@@ -302,6 +317,10 @@ pub fn combat_system(
                         attack_speed_bonus = w_stats.attack_speed;
                     }
                 }
+            }
+            // STR adds melee damage; negative mods don't subtract from base damage.
+            if let Some(s) = attacker_stats {
+                damage = damage.saturating_add(stats::modifier(s.strength).max(0) as u8);
             }
             // Apply faction tech combat bonus
             if let Some(fm) = attacker_fm {
@@ -316,6 +335,10 @@ pub fn combat_system(
             // Apply cooldown
             if let Some(ref mut cd) = cd {
                 cd.0 = BASE_ATTACK_COOLDOWN / attack_speed_bonus;
+            }
+
+            if !attack_lands {
+                continue;
             }
 
             let target_part = BodyPart::random();
@@ -359,7 +382,9 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
+        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _)) =
+            attacker_query.get_mut(target)
+        {
             if target_combat.0.is_none() {
                 if let Ok(mut target_ai) = ai_query.get_mut(target) {
                     target_combat.0 = Some(attacker);
@@ -378,7 +403,7 @@ pub fn combat_system(
     }
 
     for (target, attacker, part, dmg) in body_damage_events {
-        if let Ok(mut body) = body_query.get_mut(target) {
+        if let Ok((mut body, _)) = body_query.get_mut(target) {
             let limb = body.get_mut(part);
             limb.current = limb.current.saturating_sub(dmg);
         }
@@ -387,7 +412,9 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _)) = attacker_query.get_mut(target) {
+        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _)) =
+            attacker_query.get_mut(target)
+        {
             if target_combat.0.is_none() {
                 if let Ok(mut target_ai) = ai_query.get_mut(target) {
                     target_combat.0 = Some(attacker);
@@ -506,7 +533,9 @@ pub fn death_system(
         Option<&crate::simulation::carry::Carrier>,
     )>,
 ) {
-    for (entity, health, body, transform, member, person, wolf, deer, home_bed, agent, carrier) in &query {
+    for (entity, health, body, transform, member, person, wolf, deer, home_bed, agent, carrier) in
+        &query
+    {
         let is_dead = health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead());
         if !is_dead {
             continue;

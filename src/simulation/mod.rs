@@ -18,7 +18,6 @@ pub mod military;
 pub mod mood;
 pub mod movement;
 pub mod needs;
-pub mod neural;
 pub mod person;
 pub mod plan;
 pub mod plants;
@@ -29,6 +28,7 @@ pub mod schedule;
 pub mod settlement;
 pub mod skills;
 pub mod sound;
+pub mod stats;
 pub mod tasks;
 pub mod technology;
 pub mod terraform;
@@ -62,7 +62,6 @@ impl Plugin for SimulationPlugin {
             .insert_resource(faction::FactionRegistry::default())
             .insert_resource(faction::PlayerFaction::default())
             .insert_resource(faction::StorageTileMap::default())
-            .insert_resource(reproduction::MaleCandidates::default())
             .insert_resource(production::TileDepletion::default())
             .insert_resource(plants::PlantMap::default())
             .insert_resource(plants::PlantSpriteIndex::default())
@@ -165,10 +164,8 @@ impl Plugin for SimulationPlugin {
                     construction::deconstruct_system
                         .after(construction::construction_system)
                         .before(plan::plan_execution_system),
-                    construction::road_carve_system
-                        .after(construction::construction_system),
-                    construction::door_proximity_system
-                        .after(construction::construction_system),
+                    construction::road_carve_system.after(construction::construction_system),
+                    construction::door_proximity_system.after(construction::construction_system),
                     movement::movement_system,
                     movement::dismount_system.after(movement::movement_system),
                     animals::animal_movement_system,
@@ -178,8 +175,7 @@ impl Plugin for SimulationPlugin {
                     movement::mount_check_system
                         .after(movement::dismount_system)
                         .after(movement::update_spatial_index_system),
-                    movement::horse_position_sync_system
-                        .after(movement::mount_check_system),
+                    movement::horse_position_sync_system.after(movement::mount_check_system),
                     memory::vision_system.after(movement::update_spatial_index_system),
                     combat::combat_system.after(movement::update_spatial_index_system),
                     combat::distress_emit_system.after(combat::combat_system),
@@ -190,7 +186,14 @@ impl Plugin for SimulationPlugin {
             )
             .add_systems(
                 FixedUpdate,
-                (combat::hand_drop_event_handler.after(combat::combat_system),)
+                (
+                    combat::hand_drop_event_handler.after(combat::combat_system),
+                    reproduction::cosleep_observation_system
+                        .after(movement::update_spatial_index_system),
+                    tasks::play_system
+                        .after(movement::update_spatial_index_system)
+                        .before(plan::plan_execution_system),
+                )
                     .in_set(SimulationSet::Sequential),
             )
             .add_systems(
@@ -202,6 +205,15 @@ impl Plugin for SimulationPlugin {
             )
             .add_systems(
                 FixedUpdate,
+                (movement::recover_stranded_agents_system
+                    .after(movement::movement_system)
+                    .after(construction::construction_system)
+                    .after(dig::dig_system)
+                    .before(movement::update_spatial_index_system),)
+                    .in_set(SimulationSet::Sequential),
+            )
+            .add_systems(
+                FixedUpdate,
                 (
                     items::item_pickup_system.after(combat::death_system),
                     plants::deer_graze_system.after(movement::update_spatial_index_system),
@@ -209,16 +221,20 @@ impl Plugin for SimulationPlugin {
                     crafting::craft_system.after(production::production_system),
                     production::eat_task_system.after(movement::movement_system),
                     production::withdraw_food_task_system.after(movement::movement_system),
+                    production::withdraw_material_task_system.after(movement::movement_system),
+                    production::withdraw_good_task_system.after(movement::movement_system),
                     production::tame_task_system
                         .after(movement::movement_system)
                         .before(plan::plan_execution_system),
-                    plan::rel_influence_system
-                        .after(movement::update_spatial_index_system),
+                    plan::rel_influence_system.after(movement::update_spatial_index_system),
                     plan::plan_execution_system
                         .after(production::production_system)
                         .after(production::eat_task_system)
                         .after(production::withdraw_food_task_system)
+                        .after(production::withdraw_material_task_system)
+                        .after(production::withdraw_good_task_system)
                         .after(plan::rel_influence_system),
+                    reproduction::wake_up_conception_system.after(plan::plan_execution_system),
                     faction::bonding_system.after(movement::update_spatial_index_system),
                     production::tile_regen_system,
                     schedule::advance_sim_clock,
@@ -238,14 +254,11 @@ impl Plugin for SimulationPlugin {
                     faction::drop_items_at_destination_system,
                     faction::compute_faction_storage_system
                         .after(faction::drop_items_at_destination_system),
-                    reproduction::birth_cooldown_system,
-                    reproduction::collect_male_candidates,
-                    reproduction::reproduction_system.after(reproduction::collect_male_candidates),
+                    reproduction::pregnancy_system,
                     animals::animal_reproduction_cooldown_system,
                     animals::animal_reproduction_system
                         .after(animals::animal_reproduction_cooldown_system),
-                    raid::faction_decision_system
-                        .after(faction::compute_faction_storage_system),
+                    raid::faction_decision_system.after(faction::compute_faction_storage_system),
                     raid::raid_detection_system.after(raid::faction_decision_system),
                     raid::raid_execution_system
                         .after(raid::raid_detection_system)
@@ -253,8 +266,7 @@ impl Plugin for SimulationPlugin {
                     world_sim::world_sim_system,
                     world_sim::agent_exploration_system,
                     faction::chief_selection_system,
-                    construction::chief_directive_system
-                        .after(faction::chief_selection_system),
+                    construction::chief_directive_system.after(faction::chief_selection_system),
                 )
                     .in_set(SimulationSet::Economy),
             )
@@ -266,8 +278,7 @@ impl Plugin for SimulationPlugin {
                     construction::building_upgrade_system
                         .after(settlement::settlement_planner_system)
                         .before(construction::chief_directive_system),
-                    construction::ritual_system
-                        .after(construction::chief_directive_system),
+                    construction::ritual_system.after(construction::chief_directive_system),
                     construction::assign_beds_system,
                     faction::resource_demand_system
                         .after(construction::chief_directive_system)

@@ -8,14 +8,14 @@ use super::memory::RelationshipMemory;
 use super::person::{AiState, Person, PersonAI};
 use super::plants::Plant;
 use super::schedule::{BucketSlot, SimClock};
-use super::tasks::task_interacts_from_adjacent;
+use super::tasks::{task_interacts_from_adjacent, TaskKind};
 use super::technology::HORSEBACK_RIDING;
 use crate::pathfinding::path_request::{
     cooldown_for_streak, FollowStatus, PathDebugFlags, PathFollow, PathKind, PathRequestQueue,
     DEFAULT_PATH_BUDGET,
 };
-use crate::pathfinding::worker::PathfindingDiagnostics;
 use crate::pathfinding::tile_cost::{furniture_speed_factor, tile_speed_multiplier};
+use crate::pathfinding::worker::PathfindingDiagnostics;
 use crate::world::chunk::ChunkMap;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
@@ -106,7 +106,9 @@ pub fn movement_system(
 
     // Movement can't be fully parallel because it writes Transform (position sync)
     // and can read ChunkMap for passability. Run sequentially.
-    for (entity, mut transform, mut ai, lod, mut mv, mut pf, slot, rel_opt, mounted_opt) in query.iter_mut() {
+    for (entity, mut transform, mut ai, lod, mut mv, mut pf, slot, rel_opt, mounted_opt) in
+        query.iter_mut()
+    {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -178,7 +180,30 @@ pub fn movement_system(
             // agent stays put rather than twitching toward the goal.
             let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
             let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
-            let goal3 = (ai.target_tile.0 as i32, ai.target_tile.1 as i32, ai.target_z);
+            // Re-snap target_z if the goal Z drifted off a standable slice.
+            // target_tile can be updated mid-flight (Routing→Seeking, stranded
+            // recovery, dispatch fall-throughs) without target_z being kept in
+            // sync, leaving goal3 pointing into mid-air. A* would burn budget
+            // failing every retry until cooldown. Idempotent when valid; skip
+            // for Craft, which overloads target_z as a recipe id.
+            if ai.task_id != TaskKind::Craft as u16
+                && !chunk_map.passable_at(
+                    ai.target_tile.0 as i32,
+                    ai.target_tile.1 as i32,
+                    ai.target_z as i32,
+                )
+            {
+                ai.target_z = chunk_map.nearest_standable_z(
+                    ai.target_tile.0 as i32,
+                    ai.target_tile.1 as i32,
+                    ai.current_z as i32,
+                ) as i8;
+            }
+            let goal3 = (
+                ai.target_tile.0 as i32,
+                ai.target_tile.1 as i32,
+                ai.target_z,
+            );
             let cur3 = (cur_tx, cur_ty, ai.current_z);
 
             // The match returns both the world-space step target and the
@@ -219,6 +244,8 @@ pub fn movement_system(
                         goal3,
                         PathKind::BestEffort,
                         DEFAULT_PATH_BUDGET,
+                        ai.task_id,
+                        ai.last_plan_id,
                     );
                     pf.status = FollowStatus::Pending;
                     pf.goal = goal3;
@@ -231,13 +258,21 @@ pub fn movement_system(
                     // re-enqueues a fresh request next tick. Catches cases the
                     // hard-wall guard below misses (another agent camping the
                     // next tile, sub-tile oscillation, stale segment_path).
+                    //
+                    // Skip the heartbeat entirely when the game is paused
+                    // (`speed == 0.0`): paused agents can't move, so otherwise
+                    // every paused tick would count as "stuck" and trip the
+                    // limit ~1.5 s after the user clicks ⏸ — destroying the
+                    // diagnostic state they paused to inspect.
                     const STUCK_LIMIT: u8 = 30;
                     let here = (cur_tx as i16, cur_ty as i16, ai.current_z);
-                    if pf.recent_tiles[0] == here {
-                        pf.stuck_ticks = pf.stuck_ticks.saturating_add(1);
-                    } else {
-                        pf.recent_tiles[0] = here;
-                        pf.stuck_ticks = 0;
+                    if speed > 0.0 {
+                        if pf.recent_tiles[0] == here {
+                            pf.stuck_ticks = pf.stuck_ticks.saturating_add(1);
+                        } else {
+                            pf.recent_tiles[0] = here;
+                            pf.stuck_ticks = 0;
+                        }
                     }
                     if pf.stuck_ticks >= STUCK_LIMIT {
                         if path_flags.verbose_logs {
@@ -272,6 +307,8 @@ pub fn movement_system(
                             goal3,
                             PathKind::BestEffort,
                             DEFAULT_PATH_BUDGET,
+                            ai.task_id,
+                            ai.last_plan_id,
                         );
                         pf.status = FollowStatus::Pending;
                         pf.goal = goal3;
@@ -306,6 +343,8 @@ pub fn movement_system(
                             goal3,
                             PathKind::BestEffort,
                             DEFAULT_PATH_BUDGET,
+                            ai.task_id,
+                            ai.last_plan_id,
                         );
                         pf.status = FollowStatus::Pending;
                         continue;
@@ -324,9 +363,7 @@ pub fn movement_system(
                     // (xy, current_z).
                     let cur3i = (cur_tx, cur_ty, ai.current_z as i32);
                     let next3i = (sx as i32, sy as i32, sz as i32);
-                    if next3i != cur3i
-                        && !chunk_map.passable_step_3d(cur3i, next3i)
-                    {
+                    if next3i != cur3i && !chunk_map.passable_step_3d(cur3i, next3i) {
                         path_diag.path_drift_rejections_total += 1;
                         let center = tile_to_world(cur_tx, cur_ty);
                         transform.translation.x = center.x;
@@ -351,7 +388,11 @@ pub fn movement_system(
                 continue;
             }
             let dir = to_step / step_len;
-            let mut effective_speed = if mounted_opt.is_some() { MOUNTED_SPEED } else { MOVE_SPEED };
+            let mut effective_speed = if mounted_opt.is_some() {
+                MOUNTED_SPEED
+            } else {
+                MOVE_SPEED
+            };
             // Per-tile terrain multiplier (Road 1.4×, Forest 0.7×, etc.).
             if let Some(kind) = chunk_map.tile_kind_at(cur_tx, cur_ty) {
                 let m = tile_speed_multiplier(kind);
@@ -369,7 +410,20 @@ pub fn movement_system(
                 &loom_map,
             );
             let step = dir * effective_speed * dt * speed;
-            let new_pos = pos + step;
+            // Overshoot arrival: when the smooth step would reach or pass the
+            // final target tile this tick, clamp to target_world and fall
+            // through to the arrival branch. Without this, agents within
+            // ~2 px of target snap the last pixels in one frame (visible pop).
+            // Restricted to the final segment via step_world == target_world
+            // so intermediate path tiles never trigger arrival.
+            let step_len = step.length();
+            let is_final_segment = step_world == target_world;
+            let arrived_this_step = is_final_segment && step_len >= dist;
+            let new_pos = if arrived_this_step {
+                target_world
+            } else {
+                pos + step
+            };
 
             // Validate boundary crossings with the same Z tolerance A* used
             // when expanding neighbours (astar.rs:90 — dz ∈ {0, +1, −1}).
@@ -397,10 +451,7 @@ pub fn movement_system(
                 };
                 let mut chosen: Option<i32> = None;
                 for tz in candidates {
-                    if chunk_map.passable_step_3d(
-                        (cur_tx, cur_ty, cz),
-                        (new_tx, new_ty, tz),
-                    ) {
+                    if chunk_map.passable_step_3d((cur_tx, cur_ty, cz), (new_tx, new_ty, tz)) {
                         chosen = Some(tz);
                         break;
                     }
@@ -427,47 +478,158 @@ pub fn movement_system(
 
             transform.translation.x = new_pos.x;
             transform.translation.y = new_pos.y;
-        } else {
-            // Arrived at target
-            transform.translation.x = target_world.x;
-            transform.translation.y = target_world.y;
-
-            // Update foot Z: prefer staying at current_z; otherwise step ±1
-            // (e.g. crossing a ramp). If no neighbouring Z is standable,
-            // keep current_z and drop to Idle — snapping to surface_z
-            // would warp an underground agent up out of their tunnel.
-            let arrived_tx = (target_world.x / TILE_SIZE).floor() as i32;
-            let arrived_ty = (target_world.y / TILE_SIZE).floor() as i32;
-            let cz = ai.current_z as i32;
-            if chunk_map.passable_at(arrived_tx, arrived_ty, cz) {
-                ai.current_z = cz as i8;
-            } else if chunk_map.passable_at(arrived_tx, arrived_ty, cz + 1) {
-                ai.current_z = (cz + 1) as i8;
-            } else if chunk_map.passable_at(arrived_tx, arrived_ty, cz - 1) {
-                ai.current_z = (cz - 1) as i8;
-            } else {
-                let prev_tx = (pos.x / TILE_SIZE).floor() as i32;
-                let prev_ty = (pos.y / TILE_SIZE).floor() as i32;
-                release_to_idle(&mut ai, &mut pf, &mut transform, (prev_tx, prev_ty));
+            if !arrived_this_step {
                 continue;
             }
+        }
+        // Arrived at target — clamp transform exactly to target_world.
+        // No-op when a smooth step already landed here; required when
+        // dist <= 2.0 falls through without taking a step (e.g. agent
+        // teleported or already at goal at frame start).
+        transform.translation.x = target_world.x;
+        transform.translation.y = target_world.y;
 
-            match ai.state {
-                AiState::Seeking => {
-                    // Arrived at task target — start working, unless another agent is here.
-                    let tx = (target_world.x / TILE_SIZE).floor() as i32;
-                    let ty = (target_world.y / TILE_SIZE).floor() as i32;
-                    let cz = ai.current_z as i32;
+        // Update foot Z: prefer staying at current_z; otherwise step ±1
+        // (e.g. crossing a ramp). If no neighbouring Z is standable,
+        // keep current_z and drop to Idle — snapping to surface_z
+        // would warp an underground agent up out of their tunnel.
+        let arrived_tx = (target_world.x / TILE_SIZE).floor() as i32;
+        let arrived_ty = (target_world.y / TILE_SIZE).floor() as i32;
+        let cz = ai.current_z as i32;
+        if chunk_map.passable_at(arrived_tx, arrived_ty, cz) {
+            ai.current_z = cz as i8;
+        } else if chunk_map.passable_at(arrived_tx, arrived_ty, cz + 1) {
+            ai.current_z = (cz + 1) as i8;
+        } else if chunk_map.passable_at(arrived_tx, arrived_ty, cz - 1) {
+            ai.current_z = (cz - 1) as i8;
+        } else {
+            let prev_tx = (pos.x / TILE_SIZE).floor() as i32;
+            let prev_ty = (pos.y / TILE_SIZE).floor() as i32;
+            release_to_idle(&mut ai, &mut pf, &mut transform, (prev_tx, prev_ty));
+            continue;
+        }
 
-                    // Was this agent already here at the start of the frame?
-                    // (prevents self-nudging from the static spatial index)
-                    let was_here = (pos.x / TILE_SIZE).floor() as i32 == tx
-                        && (pos.y / TILE_SIZE).floor() as i32 == ty;
-                    let already_taken = claimed_this_tick.contains(&(tx, ty, cz));
-                    let count_limit = if was_here { 1 } else { 0 };
+        match ai.state {
+            AiState::Seeking => {
+                // Arrived at task target — start working, unless another agent is here.
+                let tx = (target_world.x / TILE_SIZE).floor() as i32;
+                let ty = (target_world.y / TILE_SIZE).floor() as i32;
+                let cz = ai.current_z as i32;
 
-                    if already_taken || spatial_index.agent_count(tx, ty, cz) > count_limit {
-                        // Nudge to an adjacent free tile and stay Seeking.
+                // Was this agent already here at the start of the frame?
+                // (prevents self-nudging from the static spatial index)
+                let was_here = (pos.x / TILE_SIZE).floor() as i32 == tx
+                    && (pos.y / TILE_SIZE).floor() as i32 == ty;
+                let already_taken = claimed_this_tick.contains(&(tx, ty, cz));
+                let count_limit = if was_here { 1 } else { 0 };
+
+                if already_taken || spatial_index.agent_count(tx, ty, cz) > count_limit {
+                    // Nudge to an adjacent free tile and stay Seeking.
+                    let dirs: [(i32, i32); 8] = [
+                        (-1, 0),
+                        (1, 0),
+                        (0, -1),
+                        (0, 1),
+                        (-1, -1),
+                        (1, -1),
+                        (-1, 1),
+                        (1, 1),
+                    ];
+                    let mut rng = rand::thread_rng();
+                    let start = rng.gen_range(0..8);
+                    let mut bumped = false;
+                    for i in 0..8usize {
+                        let (dx, dy) = dirs[(start + i) % 8];
+                        let (ntx, nty) = (tx + dx, ty + dy);
+                        // Try same-Z, then Z+1 (ramp up), then Z-1 (ramp down).
+                        for &dz in &[0, 1, -1] {
+                            let ntz = cz + dz;
+                            if chunk_map.passable_step_3d((tx, ty, cz), (ntx, nty, ntz))
+                                && !spatial_index.agent_occupied(ntx, nty, ntz)
+                                && !claimed_this_tick.contains(&(ntx, nty, ntz))
+                            {
+                                ai.target_tile = (ntx as i16, nty as i16);
+                                bumped = true;
+                                break;
+                            }
+                        }
+                        if bumped {
+                            break;
+                        }
+                    }
+                    if !bumped {
+                        ai.state = AiState::Working;
+                    }
+                    // else: stays Seeking toward the adjacent tile
+                } else {
+                    claimed_this_tick.insert((tx, ty, cz));
+                    ai.state = AiState::Working;
+                }
+            }
+            AiState::Working => {
+                // Production system handles output; only accumulate progress when bucket is active.
+                if clock.is_active(slot.0) {
+                    let progress = (sim_dt * 20.0).max(0.0) as u8;
+                    ai.work_progress = ai.work_progress.saturating_add(progress);
+                }
+            }
+            AiState::Idle => {
+                // Random wander, with 35% chance to drift toward the most-liked nearby friend.
+                mv.wander_timer -= dt * speed;
+                if mv.wander_timer <= 0.0 {
+                    mv.wander_timer = IDLE_WANDER_INTERVAL;
+
+                    let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
+                    let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
+                    let cur_z = ai.current_z as i32;
+
+                    // Try to step toward a liked friend (35% chance per wander tick).
+                    let mut drifted = false;
+                    if let Some(rel) = rel_opt {
+                        if fastrand::f32() < 0.35 {
+                            let mut best_aff: i8 = 0;
+                            let mut best_dir: Option<(i32, i32)> = None;
+                            for slot in &rel.entries {
+                                if let Some(entry) = slot {
+                                    if entry.affinity <= 0 {
+                                        continue;
+                                    }
+                                    'scan: for dy in -10i32..=10 {
+                                        for dx in -10i32..=10 {
+                                            for &cand in spatial_index.get(cur_tx + dx, cur_ty + dy)
+                                            {
+                                                if cand == entry.entity && entry.affinity > best_aff
+                                                {
+                                                    best_aff = entry.affinity;
+                                                    best_dir = Some((dx.signum(), dy.signum()));
+                                                    break 'scan;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some((dx, dy)) = best_dir {
+                                let ntx = cur_tx + dx;
+                                let nty = cur_ty + dy;
+                                for &dz in &[0, 1, -1] {
+                                    let ntz = cur_z + dz;
+                                    if chunk_map
+                                        .passable_step_3d((cur_tx, cur_ty, cur_z), (ntx, nty, ntz))
+                                        && !spatial_index.agent_occupied(ntx, nty, ntz)
+                                    {
+                                        ai.target_tile = (ntx as i16, nty as i16);
+                                        ai.dest_tile = ai.target_tile;
+                                        drifted = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !drifted {
+                        let mut rng = rand::thread_rng();
                         let dirs: [(i32, i32); 8] = [
                             (-1, 0),
                             (1, 0),
@@ -478,147 +640,43 @@ pub fn movement_system(
                             (-1, 1),
                             (1, 1),
                         ];
-                        let mut rng = rand::thread_rng();
+                        let candidates: Vec<_> = dirs.iter().collect();
                         let start = rng.gen_range(0..8);
-                        let mut bumped = false;
-                        for i in 0..8usize {
-                            let (dx, dy) = dirs[(start + i) % 8];
-                            let (ntx, nty) = (tx + dx, ty + dy);
-                            // Try same-Z, then Z+1 (ramp up), then Z-1 (ramp down).
+                        let (left, right) = candidates.split_at(start);
+                        let shuffled: Vec<_> = right.iter().chain(left.iter()).collect();
+
+                        'outer: for &&(dx, dy) in &shuffled {
+                            let ntx = cur_tx + dx;
+                            let nty = cur_ty + dy;
                             for &dz in &[0, 1, -1] {
-                                let ntz = cz + dz;
-                                if chunk_map.passable_step_3d((tx, ty, cz), (ntx, nty, ntz))
+                                let ntz = cur_z + dz;
+                                if chunk_map
+                                    .passable_step_3d((cur_tx, cur_ty, cur_z), (ntx, nty, ntz))
                                     && !spatial_index.agent_occupied(ntx, nty, ntz)
-                                    && !claimed_this_tick.contains(&(ntx, nty, ntz))
                                 {
                                     ai.target_tile = (ntx as i16, nty as i16);
-                                    bumped = true;
-                                    break;
-                                }
-                            }
-                            if bumped {
-                                break;
-                            }
-                        }
-                        if !bumped {
-                            ai.state = AiState::Working;
-                        }
-                        // else: stays Seeking toward the adjacent tile
-                    } else {
-                        claimed_this_tick.insert((tx, ty, cz));
-                        ai.state = AiState::Working;
-                    }
-                }
-                AiState::Working => {
-                    // Production system handles output; only accumulate progress when bucket is active.
-                    if clock.is_active(slot.0) {
-                        let progress = (sim_dt * 20.0).max(0.0) as u8;
-                        ai.work_progress = ai.work_progress.saturating_add(progress);
-                    }
-                }
-                AiState::Idle => {
-                    // Random wander, with 35% chance to drift toward the most-liked nearby friend.
-                    mv.wander_timer -= dt * speed;
-                    if mv.wander_timer <= 0.0 {
-                        mv.wander_timer = IDLE_WANDER_INTERVAL;
-
-                        let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
-                        let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
-                        let cur_z = ai.current_z as i32;
-
-                        // Try to step toward a liked friend (35% chance per wander tick).
-                        let mut drifted = false;
-                        if let Some(rel) = rel_opt {
-                            if fastrand::f32() < 0.35 {
-                                let mut best_aff: i8 = 0;
-                                let mut best_dir: Option<(i32, i32)> = None;
-                                for slot in &rel.entries {
-                                    if let Some(entry) = slot {
-                                        if entry.affinity <= 0 {
-                                            continue;
-                                        }
-                                        'scan: for dy in -10i32..=10 {
-                                            for dx in -10i32..=10 {
-                                                for &cand in
-                                                    spatial_index.get(cur_tx + dx, cur_ty + dy)
-                                                {
-                                                    if cand == entry.entity
-                                                        && entry.affinity > best_aff
-                                                    {
-                                                        best_aff = entry.affinity;
-                                                        best_dir =
-                                                            Some((dx.signum(), dy.signum()));
-                                                        break 'scan;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Some((dx, dy)) = best_dir {
-                                    let ntx = cur_tx + dx;
-                                    let nty = cur_ty + dy;
-                                    for &dz in &[0, 1, -1] {
-                                        let ntz = cur_z + dz;
-                                        if chunk_map.passable_step_3d(
-                                            (cur_tx, cur_ty, cur_z),
-                                            (ntx, nty, ntz),
-                                        ) && !spatial_index.agent_occupied(ntx, nty, ntz)
-                                        {
-                                            ai.target_tile = (ntx as i16, nty as i16);
-                                            ai.dest_tile = ai.target_tile;
-                                            drifted = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if !drifted {
-                            let mut rng = rand::thread_rng();
-                            let dirs: [(i32, i32); 8] = [
-                                (-1, 0),
-                                (1, 0),
-                                (0, -1),
-                                (0, 1),
-                                (-1, -1),
-                                (1, -1),
-                                (-1, 1),
-                                (1, 1),
-                            ];
-                            let candidates: Vec<_> = dirs.iter().collect();
-                            let start = rng.gen_range(0..8);
-                            let (left, right) = candidates.split_at(start);
-                            let shuffled: Vec<_> = right.iter().chain(left.iter()).collect();
-
-                            'outer: for &&(dx, dy) in &shuffled {
-                                let ntx = cur_tx + dx;
-                                let nty = cur_ty + dy;
-                                for &dz in &[0, 1, -1] {
-                                    let ntz = cur_z + dz;
-                                    if chunk_map.passable_step_3d(
-                                        (cur_tx, cur_ty, cur_z),
-                                        (ntx, nty, ntz),
-                                    ) && !spatial_index.agent_occupied(ntx, nty, ntz)
-                                    {
-                                        ai.target_tile = (ntx as i16, nty as i16);
-                                        ai.dest_tile = ai.target_tile;
-                                        break 'outer;
-                                    }
+                                    ai.dest_tile = ai.target_tile;
+                                    break 'outer;
                                 }
                             }
                         }
                     }
                 }
-                AiState::Sleeping | AiState::Attacking => {}
-                AiState::Routing => {
-                    // PathFollow handles cross-chunk routing transparently;
-                    // arriving at target_tile (= dest_tile) means we are at
-                    // the final destination. Promote to Seeking so the
-                    // adjacent-tile claim logic runs next tick.
-                    ai.state = AiState::Seeking;
-                    ai.target_tile = ai.dest_tile;
+            }
+            AiState::Sleeping | AiState::Attacking => {}
+            AiState::Routing => {
+                // PathFollow handles cross-chunk routing transparently;
+                // arriving at target_tile (= dest_tile) means we are at
+                // the final destination. Promote to Seeking so the
+                // adjacent-tile claim logic runs next tick.
+                ai.state = AiState::Seeking;
+                ai.target_tile = ai.dest_tile;
+                if ai.task_id != TaskKind::Craft as u16 {
+                    ai.target_z = chunk_map.nearest_standable_z(
+                        ai.target_tile.0 as i32,
+                        ai.target_tile.1 as i32,
+                        ai.current_z as i32,
+                    ) as i8;
                 }
             }
         }
@@ -653,7 +711,9 @@ pub fn update_spatial_index_system(
 ) {
     index.map.clear();
     index.agent_counts.clear();
-    for (entity, transform, health, body, person_ai, is_person, is_wolf, is_deer, is_horse) in &query {
+    for (entity, transform, health, body, person_ai, is_person, is_wolf, is_deer, is_horse) in
+        &query
+    {
         let is_dead = health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead());
         if is_dead {
             continue;
@@ -682,9 +742,10 @@ pub fn dismount_system(
     horse_exists: Query<(), With<Horse>>,
 ) {
     for (person_entity, ai, mounted_on) in query.iter() {
-        let should_dismount =
-            matches!(ai.state, AiState::Working | AiState::Sleeping | AiState::Idle)
-                || horse_exists.get(mounted_on.0).is_err();
+        let should_dismount = matches!(
+            ai.state,
+            AiState::Working | AiState::Sleeping | AiState::Idle
+        ) || horse_exists.get(mounted_on.0).is_err();
 
         if should_dismount {
             commands.entity(person_entity).remove::<MountedOn>();
@@ -729,8 +790,8 @@ pub fn mount_check_system(
 
         let person_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let person_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-        let dest_dist = (ai.dest_tile.0 as i32 - person_tx).abs()
-            + (ai.dest_tile.1 as i32 - person_ty).abs();
+        let dest_dist =
+            (ai.dest_tile.0 as i32 - person_tx).abs() + (ai.dest_tile.1 as i32 - person_ty).abs();
         if dest_dist < MOUNT_MIN_DIST {
             continue;
         }
@@ -750,9 +811,62 @@ pub fn mount_check_system(
         }
 
         if let Some(horse_entity) = found_horse {
-            commands.entity(person_entity).insert(MountedOn(horse_entity));
-            commands.entity(horse_entity).insert(CarriedBy(person_entity));
+            commands
+                .entity(person_entity)
+                .insert(MountedOn(horse_entity));
+            commands
+                .entity(horse_entity)
+                .insert(CarriedBy(person_entity));
         }
+    }
+}
+
+/// Detect agents whose `current_z` is no longer standable (e.g. a wall was
+/// built under them, or a tile was carved out from under their feet) and
+/// snap them to `nearest_standable_z`. Without this, an agent stranded
+/// more than ±1 z from any standable tile cannot recover via A* (every
+/// step requires `|Δz| ≤ 1` and a standable foot tile), goes Idle, then
+/// re-requests the same impossible path forever.
+///
+/// Runs after `movement_system` and before `update_spatial_index_system`
+/// so the index sees the corrected coordinates this tick.
+pub fn recover_stranded_agents_system(
+    chunk_map: Res<ChunkMap>,
+    mut query: Query<
+        (
+            Entity,
+            &mut Transform,
+            &mut PersonAI,
+            &LodLevel,
+            &mut PathFollow,
+        ),
+        (With<Person>, Without<MountedOn>),
+    >,
+) {
+    for (entity, mut transform, mut ai, lod, mut pf) in query.iter_mut() {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cz = ai.current_z as i32;
+        if chunk_map.passable_at(tx, ty, cz) {
+            continue;
+        }
+        let new_z = chunk_map.nearest_standable_z(tx, ty, cz);
+        if new_z == cz || !chunk_map.passable_at(tx, ty, new_z) {
+            // Either nothing better was found or the surface_z fallback is
+            // also non-standable (column entirely solid). Leave the agent
+            // for the next tick — terrain may still be settling.
+            continue;
+        }
+        debug!(
+            "[recovery] {:?} at ({},{}) z={} not standable; snapping to z={}",
+            entity, tx, ty, cz, new_z
+        );
+        ai.current_z = new_z as i8;
+        ai.target_z = new_z as i8;
+        release_to_idle(&mut ai, &mut pf, &mut transform, (tx, ty));
     }
 }
 

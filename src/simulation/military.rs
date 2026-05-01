@@ -41,7 +41,13 @@ pub fn military_task_system(
     health_q: Query<&Health>,
     transform_q: Query<&Transform>,
     mut q: Query<
-        (Entity, &mut PersonAI, &Transform, &mut CombatTarget, &LodLevel),
+        (
+            Entity,
+            &mut PersonAI,
+            &Transform,
+            &mut CombatTarget,
+            &LodLevel,
+        ),
         With<Drafted>,
     >,
     mut rally: ResMut<ActiveRallyPoints>,
@@ -60,15 +66,16 @@ pub fn military_task_system(
         if ai.task_id == move_id {
             // Refresh rally-point timestamp so the expire system keeps the
             // flow field around while units are still en route.
-            rally.last_seen.insert(
-                (ai.dest_tile.0, ai.dest_tile.1, ai.target_z),
-                clock.tick,
-            );
+            rally
+                .last_seen
+                .insert((ai.dest_tile.0, ai.dest_tile.1, ai.target_z), clock.tick);
 
             // Arrival: movement_system flips state to Working when the agent
             // steps onto the dest tile. For a Move order there is no work to
             // do, so we go straight back to Idle.
-            if ai.state == AiState::Working && (cur_tx, cur_ty) == (ai.dest_tile.0 as i32, ai.dest_tile.1 as i32) {
+            if ai.state == AiState::Working
+                && (cur_tx, cur_ty) == (ai.dest_tile.0 as i32, ai.dest_tile.1 as i32)
+            {
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
@@ -101,15 +108,13 @@ pub fn military_task_system(
             let foe_ty = (foe_t.translation.y / TILE_SIZE).floor() as i32;
             let foe_z = chunk_map.surface_z_at(foe_tx, foe_ty) as i8;
 
-            rally.last_seen.insert(
-                (foe_tx as i16, foe_ty as i16, foe_z),
-                clock.tick,
-            );
+            rally
+                .last_seen
+                .insert((foe_tx as i16, foe_ty as i16, foe_z), clock.tick);
 
             let dx = (foe_tx - cur_tx).abs();
             let dy = (foe_ty - cur_ty).abs();
-            let adjacent = dx.max(dy) <= 1
-                && (ai.current_z as i32 - foe_z as i32).abs() <= 1;
+            let adjacent = dx.max(dy) <= 1 && (ai.current_z as i32 - foe_z as i32).abs() <= 1;
 
             if adjacent {
                 // Within strike range — let combat_system handle the swing.
@@ -133,7 +138,6 @@ pub fn military_task_system(
                         &chunk_map,
                         &chunk_connectivity,
                     );
-                    ai.target_z = foe_z;
                 }
                 combat.0 = None;
             }

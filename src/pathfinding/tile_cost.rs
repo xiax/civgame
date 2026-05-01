@@ -1,6 +1,4 @@
-use crate::simulation::construction::{
-    BedMap, ChairMap, LoomMap, TableMap, WorkbenchMap,
-};
+use crate::simulation::construction::{BedMap, ChairMap, LoomMap, TableMap, WorkbenchMap};
 use crate::world::tile::TileKind;
 
 pub const FURNITURE_SPEED_FACTOR: f32 = 0.5;

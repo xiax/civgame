@@ -67,8 +67,7 @@ pub fn tech_panel_system(
                     .show(ui, |ui| {
                         for tech in TECH_TREE.iter().filter(|t| t.era == era) {
                             let unlocked = techs.has(tech.id);
-                            let prereqs_met =
-                                tech.prerequisites.iter().all(|&p| techs.has(p));
+                            let prereqs_met = tech.prerequisites.iter().all(|&p| techs.has(p));
 
                             let (icon, name_color) = if unlocked {
                                 ("✓", egui::Color32::from_rgb(80, 210, 100))
@@ -79,13 +78,9 @@ pub fn tech_panel_system(
                             };
 
                             let row = ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(icon).color(name_color).size(13.0));
                                 ui.label(
-                                    egui::RichText::new(icon).color(name_color).size(13.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(tech.name)
-                                        .color(name_color)
-                                        .size(13.0),
+                                    egui::RichText::new(tech.name).color(name_color).size(13.0),
                                 );
                             });
 
@@ -112,9 +107,7 @@ pub fn tech_panel_system(
                                             .color(egui::Color32::WHITE),
                                     );
                                     ui.label(
-                                        egui::RichText::new(status.0)
-                                            .size(12.0)
-                                            .color(status.1),
+                                        egui::RichText::new(status.0).size(12.0).color(status.1),
                                     );
                                 });
 
@@ -186,10 +179,8 @@ pub fn tech_panel_system(
                                     ));
                                 }
                                 if b.food_storage_bonus != 0.0 {
-                                    bonus_parts.push(format!(
-                                        "+{:.0} food storage",
-                                        b.food_storage_bonus
-                                    ));
+                                    bonus_parts
+                                        .push(format!("+{:.0} food storage", b.food_storage_bonus));
                                 }
                                 if b.combat_damage_bonus != 0 {
                                     bonus_parts.push(format!("+{} dmg", b.combat_damage_bonus));
