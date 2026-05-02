@@ -90,6 +90,7 @@ pub fn inspector_panel_system(
             Option<&GoalReason>,
             Option<&crate::simulation::carry::Carrier>,
             Option<&PlanHistory>,
+            Option<&crate::simulation::items::Equipment>,
         ),
     )>,
 ) {
@@ -107,6 +108,7 @@ pub fn inspector_panel_system(
             goal_reason,
             carrier,
             plan_history,
+            equipment,
         ),
     )) = query.get(entity)
     else {
@@ -832,6 +834,7 @@ pub fn inspector_panel_system(
                                     0,
                                     0,
                                     0,
+                                    false,
                                 );
                                 let cur_tx = (transform.translation.x
                                     / crate::world::terrain::TILE_SIZE)
@@ -862,7 +865,12 @@ pub fn inspector_panel_system(
                                             let carrier_default =
                                                 crate::simulation::carry::Carrier::default();
                                             let c = carrier.unwrap_or(&carrier_default);
-                                            s.preconditions.is_satisfied(agent, c, needs.hunger)
+                                            s.preconditions.is_satisfied(
+                                                agent,
+                                                c,
+                                                equipment,
+                                                needs.hunger,
+                                            )
                                         });
 
                                     let mut rejection = None;

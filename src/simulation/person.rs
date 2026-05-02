@@ -51,6 +51,15 @@ pub enum Profession {
     #[default]
     None,
     Farmer,
+    Hunter,
+}
+
+/// Player-controlled target Hunter headcount. `assign_hunters_system`
+/// promotes the highest-Combat-skill agents up to this count and demotes
+/// excess Hunters when the player lowers it.
+#[derive(Resource, Default, Clone, Copy)]
+pub struct HunterTargetCount {
+    pub count: u32,
 }
 
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
@@ -124,7 +133,7 @@ pub fn generate_person_name(sex: BiologicalSex) -> &'static str {
 }
 
 /// Core person AI component.
-#[derive(Component, Clone, Copy, Default)]
+#[derive(Component, Clone, Copy)]
 pub struct PersonAI {
     pub task_id: u16,
     pub state: AiState,
@@ -165,10 +174,47 @@ pub struct PersonAI {
     /// units when the task ends (success, abort, or plan teardown), so the
     /// fields must be kept in sync with the actual `StorageReservations` map.
     pub reserved_qty: u8,
+    /// Corpse the agent is currently dragging. Treated as occupying both
+    /// hands by `Carrier::pickup_capacity`. Set by `pickup_corpse_task_system`,
+    /// cleared by Butcher / drop-on-rescue / corpse-despawn paths. Drives
+    /// `corpse_follow_system` which snaps the corpse `Transform` to the agent.
+    pub carried_corpse: Option<Entity>,
+    /// Equipment slot for an active `TaskKind::Equip` step, encoded as
+    /// `EquipmentSlot as u8`. `EQUIP_SLOT_NONE` (0xFF) means no equip is
+    /// pending. Set by `plan_execution_system` on dispatch and consumed by
+    /// `equip_task_system`. The good to equip is carried in
+    /// `craft_recipe_id` (same channel WithdrawGood already uses).
+    pub equip_slot: u8,
 }
 
 impl PersonAI {
     pub const UNEMPLOYED: u16 = u16::MAX;
+}
+
+impl Default for PersonAI {
+    fn default() -> Self {
+        Self {
+            task_id: 0,
+            state: AiState::default(),
+            work_progress: 0,
+            target_tile: (0, 0),
+            dest_tile: (0, 0),
+            ticks_idle: 0,
+            last_plan_id: 0,
+            last_goal_eval_tick: 0,
+            target_entity: None,
+            current_z: 0,
+            target_z: 0,
+            craft_recipe_id: 0,
+            withdraw_good: None,
+            withdraw_qty: 0,
+            reserved_tile: (0, 0),
+            reserved_good: None,
+            reserved_qty: 0,
+            carried_corpse: None,
+            equip_slot: crate::simulation::items::EQUIP_SLOT_NONE,
+        }
+    }
 }
 
 /// Player-issued order that overrides autonomous AI for this entity.
@@ -410,7 +456,7 @@ pub fn spawn_population(
                     RelationshipMemory::default(),
                     KnownPlans::with_innate(&[
     0, 1, 2, 3, 5, 6, 7, 9, 10, 13, 14, 15, 16, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35,
-    36, 37, 38, 39, 60, 61, 62, 63,
+    36, 37, 38, 39, 60, 61, 62, 63, 64,
 ]),
                     PlanHistory::default(),
                     PlanScoringMethod::Weighted,

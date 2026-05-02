@@ -4,11 +4,12 @@ use std::collections::VecDeque;
 
 use crate::simulation::combat::{Body, CombatTarget, DistressCallEvent, Health};
 use crate::simulation::construction::DoorMap;
+use crate::simulation::faction::FactionMember;
 use crate::simulation::goals::{AgentGoal, GoalReason, RescueTarget};
 use crate::simulation::line_of_sight::has_los;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::RelationshipMemory;
-use crate::simulation::person::{AiState, Person, PersonAI};
+use crate::simulation::person::{AiState, Person, PersonAI, Profession};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::SimClock;
 use crate::world::chunk::ChunkMap;
@@ -82,6 +83,7 @@ pub fn respond_to_distress_system(
     spatial: Res<SpatialIndex>,
     clock: Res<SimClock>,
     transform_q: Query<&Transform>,
+    victim_q: Query<&FactionMember>,
     mut responders: Query<
         (
             Entity,
@@ -95,10 +97,17 @@ pub fn respond_to_distress_system(
             Option<&Health>,
             Option<&mut GoalReason>,
             Option<&ActivePlan>,
+            Option<&Profession>,
+            Option<&FactionMember>,
         ),
         With<Person>,
     >,
 ) {
+    /// Hunters respond to allied distress calls from anywhere within this
+    /// many tiles of the incident — generous compared to PROXIMITY/SIGHT
+    /// ranges because hunters are the faction's standing combat force and
+    /// shouldn't be limited to line-of-sight.
+    const HUNTER_RESPOND_RANGE: i32 = 50;
     for ev in events.read() {
         let audible = audible_tiles(&chunk_map, ev.tile, ev.z, AUDIBLE_RANGE);
         let bound = SIGHT_RANGE; // outermost branch radius
@@ -112,6 +121,8 @@ pub fn respond_to_distress_system(
             )
         });
 
+        let victim_faction = victim_q.get(ev.victim).map(|m| m.faction_id).ok();
+
         // Gather candidate entities once via the spatial index, then look them up
         // in the responders query.
         let mut candidates: Vec<Entity> = Vec::new();
@@ -123,6 +134,29 @@ pub fn respond_to_distress_system(
                     if e == ev.victim || e == ev.attacker {
                         continue;
                     }
+                    candidates.push(e);
+                }
+            }
+        }
+
+        // Augment with hunters in the victim's faction within HUNTER_RESPOND_RANGE.
+        // Hunters always rally to allied distress regardless of LOS / audibility —
+        // they're the faction's combat-trained standing force.
+        if let Some(victim_faction_id) = victim_faction {
+            for (e, _, _, _, t, _, _, _, _, _, _, prof_opt, member_opt) in responders.iter() {
+                if e == ev.victim || e == ev.attacker {
+                    continue;
+                }
+                let is_hunter = matches!(prof_opt, Some(Profession::Hunter));
+                let same_faction = member_opt
+                    .map(|m| m.faction_id == victim_faction_id)
+                    .unwrap_or(false);
+                if !(is_hunter && same_faction) {
+                    continue;
+                }
+                let etx = (t.translation.x / TILE_SIZE).floor() as i32;
+                let ety = (t.translation.y / TILE_SIZE).floor() as i32;
+                if chebyshev((etx, ety), ev.tile) <= HUNTER_RESPOND_RANGE {
                     candidates.push(e);
                 }
             }
@@ -141,6 +175,8 @@ pub fn respond_to_distress_system(
                 health_opt,
                 reason_opt,
                 active_plan_opt,
+                prof_opt,
+                member_opt,
             )) = responders.get_mut(cand)
             else {
                 continue;
@@ -189,16 +225,31 @@ pub fn respond_to_distress_system(
                     (entity_tile.0, entity_tile.1, ai.current_z),
                 );
 
-            let eligible = in_proximity || in_sight || (in_audible_flood && positive_affinity);
+            // Hunters in the victim's faction always respond (within
+            // HUNTER_RESPOND_RANGE — already filtered in the candidate
+            // augmentation above, so any matching candidate is eligible).
+            let hunter_response = matches!(prof_opt, Some(Profession::Hunter))
+                && victim_faction
+                    .zip(member_opt.map(|m| m.faction_id))
+                    .map(|(vf, mf)| vf == mf)
+                    .unwrap_or(false);
+
+            let eligible = hunter_response
+                || in_proximity
+                || in_sight
+                || (in_audible_flood && positive_affinity);
             if !eligible {
                 continue;
             }
 
             // Recruit. Wake sleepers — Bed.owner stays set so the agent can
             // return after the fight. Drop any active task / plan and pivot.
+            // Drop a carried corpse if any — combat takes priority over the
+            // hunt; the corpse stays on the ground for later retrieval.
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
+            ai.carried_corpse = None;
 
             combat_target.0 = Some(ev.attacker);
 

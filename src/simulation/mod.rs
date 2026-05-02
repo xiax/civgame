@@ -5,6 +5,7 @@ pub mod carry;
 pub mod carve;
 pub mod combat;
 pub mod construction;
+pub mod corpse;
 pub mod crafting;
 pub mod dig;
 pub mod faction;
@@ -96,6 +97,9 @@ impl Plugin for SimulationPlugin {
             .insert_resource(settlement::ZoneOverlayToggle::default())
             .insert_resource(plan::RelInfluence::default())
             .insert_resource(military::ActiveRallyPoints::default())
+            .insert_resource(corpse::CorpseMap::default())
+            .insert_resource(person::HunterTargetCount::default())
+            .insert_resource(military::MusterHuntersRequest::default())
             .configure_sets(
                 FixedUpdate,
                 (
@@ -214,6 +218,11 @@ impl Plugin for SimulationPlugin {
             )
             .add_systems(
                 FixedUpdate,
+                (corpse::corpse_follow_system.after(movement::movement_system),)
+                    .in_set(SimulationSet::Sequential),
+            )
+            .add_systems(
+                FixedUpdate,
                 (plan::explore_satisfaction_system
                     .after(memory::vision_system)
                     .before(plan::plan_execution_system),)
@@ -232,6 +241,9 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 (
                     items::item_pickup_system.after(combat::death_system),
+                    items::equip_task_system
+                        .after(items::item_pickup_system)
+                        .before(plan::plan_execution_system),
                     plants::deer_graze_system.after(movement::update_spatial_index_system),
                     production::production_system.after(movement::movement_system),
                     crafting::craft_order_system
@@ -242,6 +254,15 @@ impl Plugin for SimulationPlugin {
                     production::withdraw_material_task_system.after(movement::movement_system),
                     production::withdraw_good_task_system.after(movement::movement_system),
                     production::tame_task_system
+                        .after(movement::movement_system)
+                        .before(plan::plan_execution_system),
+                    corpse::pickup_corpse_task_system
+                        .after(movement::movement_system)
+                        .before(plan::plan_execution_system),
+                    corpse::haul_corpse_task_system
+                        .after(movement::movement_system)
+                        .before(plan::plan_execution_system),
+                    corpse::butcher_task_system
                         .after(movement::movement_system)
                         .before(plan::plan_execution_system),
                     plan::rel_influence_system.after(movement::update_spatial_index_system),
@@ -332,6 +353,10 @@ impl Plugin for SimulationPlugin {
                     plan::drop_abandoned_food_system
                         .after(faction::drop_items_at_destination_system),
                     military::expire_rally_points_system,
+                    military::apply_muster_hunters_system,
+                    faction::assign_hunters_system
+                        .after(faction::compute_faction_storage_system),
+                    corpse::corpse_decay_system,
                 )
                     .in_set(SimulationSet::Economy),
             );

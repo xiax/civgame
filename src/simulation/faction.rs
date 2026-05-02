@@ -6,14 +6,17 @@ use super::jobs::{
 use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::needs::Needs;
-use super::person::{AiState, PersonAI, Profession};
+use super::person::{AiState, HunterTargetCount, PersonAI, Profession};
+use super::plan::{ActivePlan, PlanHistory, PlanOutcome};
 use super::schedule::{BucketSlot, SimClock};
+use super::skills::{SkillKind, Skills};
 use super::tasks::TaskKind;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::pathfinding::hotspots::{HotspotFlowFields, HotspotKind};
 use crate::simulation::technology::{
-    tech_def, ActivityKind, Era, TechId, ACTIVITY_COUNT, CROP_CULTIVATION, TECH_COUNT, TECH_TREE,
+    tech_def, ActivityKind, Era, TechId, ACTIVITY_COUNT, CROP_CULTIVATION, HUNTING_SPEAR,
+    TECH_COUNT, TECH_TREE,
 };
 use crate::world::chunk::ChunkMap;
 use crate::world::spatial::SpatialIndex;
@@ -25,6 +28,109 @@ pub const SOLO: u32 = 0;
 pub const BOND_THRESHOLD: u8 = 180;
 const CAMP_KEEP: u32 = 0;
 const SOCIAL_RADIUS: i32 = 3;
+
+/// Player-driven Hunter promotion/demotion. Runs in Economy after
+/// `compute_faction_storage_system`. Reads `HunterTargetCount.count` (set by
+/// the HUD widget) and reconciles the player faction's hunter roster:
+///
+/// - Under target → promote the highest-Combat-skill `Profession::None`
+///   adult to `Hunter`. Skips Farmers (don't poach an established role).
+/// - Over target → demote the lowest-Combat-skill `Hunter` to `None`,
+///   abort their `ActivePlan`, release any storage reservation, drop a
+///   carried corpse if any. The agent picks a new plan next tick.
+///
+/// NPC factions don't auto-recruit hunters yet — combat balance for raid AI
+/// would shift, and we don't have a player-facing knob to expose. Easy
+/// future extension: per-faction target counts driven by `member_count`.
+pub fn assign_hunters_system(
+    target: Res<HunterTargetCount>,
+    player_faction: Res<crate::simulation::faction::PlayerFaction>,
+    registry: Res<FactionRegistry>,
+    reservations: Res<StorageReservations>,
+    mut commands: Commands,
+    mut query: Query<(
+        Entity,
+        &mut Profession,
+        &FactionMember,
+        &Skills,
+        Option<&mut PersonAI>,
+        Option<&mut PlanHistory>,
+    )>,
+    clock: Res<SimClock>,
+) {
+    let faction_id = player_faction.faction_id;
+    if faction_id == SOLO {
+        return;
+    }
+    // Tech gate: HUNTING_SPEAR must be unlocked. Without it, demote any
+    // existing hunters back to None — keeps state consistent if tech is
+    // ever rolled back (currently impossible, but cheap to defend).
+    let has_tech = registry
+        .factions
+        .get(&faction_id)
+        .map(|f| f.techs.has(HUNTING_SPEAR))
+        .unwrap_or(false);
+
+    let want = if has_tech { target.count as usize } else { 0 };
+
+    // Snapshot eligibility lists (entity, combat_skill).
+    let mut hunters: Vec<(Entity, u32)> = Vec::new();
+    let mut none_candidates: Vec<(Entity, u32)> = Vec::new();
+    for (entity, prof, member, skills, _, _) in query.iter() {
+        if member.faction_id != faction_id {
+            continue;
+        }
+        let combat = skills.0[SkillKind::Combat as usize];
+        match *prof {
+            Profession::Hunter => hunters.push((entity, combat)),
+            Profession::None => none_candidates.push((entity, combat)),
+            _ => {}
+        }
+    }
+
+    if hunters.len() < want {
+        // Promote highest-combat None members.
+        none_candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        let need = want - hunters.len();
+        let promote: Vec<Entity> = none_candidates
+            .into_iter()
+            .take(need)
+            .map(|(e, _)| e)
+            .collect();
+        for (entity, mut prof, _, _, _, _) in query.iter_mut() {
+            if promote.contains(&entity) {
+                *prof = Profession::Hunter;
+            }
+        }
+    } else if hunters.len() > want {
+        // Demote lowest-combat hunters.
+        hunters.sort_by(|a, b| a.1.cmp(&b.1));
+        let extra = hunters.len() - want;
+        let demote: Vec<Entity> = hunters.iter().take(extra).map(|(e, _)| *e).collect();
+        for (entity, mut prof, _, _, ai_opt, history_opt) in query.iter_mut() {
+            if !demote.contains(&entity) {
+                continue;
+            }
+            *prof = Profession::None;
+            // Tear down any in-flight hunting plan so storage reservations
+            // and dragged corpses don't outlive the role.
+            if let Some(mut ai) = ai_opt {
+                if ai.reserved_good.is_some() {
+                    release_reservation(&reservations, &mut ai);
+                }
+                ai.carried_corpse = None;
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
+                ai.work_progress = 0;
+            }
+            if let Some(mut h) = history_opt {
+                h.push(0, PlanOutcome::Aborted, clock.tick);
+            }
+            commands.entity(entity).remove::<ActivePlan>();
+        }
+    }
+}
 
 pub fn faction_profession_system(
     mut registry: ResMut<FactionRegistry>,
@@ -803,7 +909,9 @@ pub fn drop_items_at_destination_system(
         }
 
         // Deposit all crafted goods (Tools, Weapon, Armor, Shield, Cloth, Luxury).
-        let mut crafted_drops: Vec<(Good, u32)> = Vec::new();
+        // Preserve the full `Item` (material + quality + stats) through storage
+        // so an equipped Iron Spear keeps its damage_bonus after a withdraw.
+        let mut crafted_drops: Vec<(crate::economy::item::Item, u32)> = Vec::new();
         for (it, q) in agent.inventory.iter_mut() {
             if *q > 0
                 && matches!(
@@ -816,18 +924,18 @@ pub fn drop_items_at_destination_system(
                         | Good::Luxury
                 )
             {
-                crafted_drops.push((it.good, *q));
+                crafted_drops.push((*it, *q));
                 *q = 0;
             }
         }
-        for (good, qty) in crafted_drops {
-            spawn_or_merge_ground_item(
+        for (item, qty) in crafted_drops {
+            crate::simulation::items::spawn_or_merge_ground_item_full(
                 &mut commands,
                 &spatial,
                 &mut ground_items,
                 deposit_tx,
                 deposit_ty,
-                good,
+                item,
                 qty,
             );
         }

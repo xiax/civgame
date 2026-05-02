@@ -10,13 +10,16 @@ use super::{
     StepId, StepPreconditions, StepRegistry, StepTarget, TaskKind, TileKind,
     PF_DROP_FOOD_ON_TIMEOUT, PF_EXPLORE, PF_NONE, PF_SCAVENGE, PF_TARGETS_FOOD, PF_TARGETS_STONE,
     PF_TARGETS_WOOD, PF_UNINTERRUPTIBLE, SI_HAS_FOOD, SI_HAS_SEED, SI_HAS_STONE, SI_HAS_WOOD,
-    SI_IN_FACTION, SI_MEM_FOOD, SI_MEM_STONE, SI_MEM_WOOD, SI_SEASON_FOOD, SI_SKILL_BUILDING,
-    SI_SKILL_COMBAT, SI_SKILL_CRAFTING, SI_SKILL_FARMING, SI_SOCIAL, SI_STORAGE_FOOD,
-    SI_STORAGE_STONE, SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD, SI_VIS_GROUND_STONE,
+    SI_CRAFT_ORDER_NEEDS_MATERIAL, SI_IN_FACTION, SI_MEM_FOOD, SI_MEM_STONE, SI_MEM_WOOD,
+    SI_SEASON_FOOD, SI_SKILL_BUILDING, SI_SKILL_COMBAT, SI_SKILL_CRAFTING, SI_SKILL_FARMING,
+    SI_SOCIAL, SI_STORAGE_FOOD, SI_STORAGE_STONE, SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD,
+    SI_VIS_GROUND_STONE,
     SI_VIS_GROUND_WOOD, SI_VIS_PLANT_FOOD, SI_VIS_STONE_TILE, SI_VIS_TREE, SI_WILLPOWER_DISTRESS,
 };
 use crate::economy::goods::Good;
+use crate::simulation::items::EquipmentSlot;
 use crate::simulation::needs::EAT_TRIGGER_HUNGER;
+use crate::simulation::person::Profession;
 use crate::simulation::plants::PlantKind;
 use crate::simulation::technology;
 
@@ -37,7 +40,8 @@ static PLAN_STEPS_1: &[StepId] = &[1, 12]; // FarmFood → DepositGoods
 static PLAN_STEPS_2: &[StepId] = &[2, 12]; // GatherWood → DepositGoods
 static PLAN_STEPS_3: &[StepId] = &[3, 12]; // GatherStone → DepositGoods
 static PLAN_STEPS_4: &[StepId] = &[4, 1, 12]; // PlantAndFarm → DepositGoods
-static PLAN_STEPS_5: &[StepId] = &[5, 6, 12]; // HuntFood → CollectSkin → DepositGoods
+static PLAN_STEPS_5: &[StepId] = &[5, 53, 54, 55]; // HuntFood: Hunt → PickUpCorpse → HaulCorpse → Butcher
+static PLAN_STEPS_HUNTER_ARM: &[StepId] = &[52, 56]; // AcquireHuntingSpear: WithdrawSpear → EquipMainHand
 static PLAN_STEPS_6: &[StepId] = &[6, 12]; // ScavengeFood → DepositGoods
 static PLAN_STEPS_7: &[StepId] = &[2, 28, 25]; // GatherWood, HaulToBlueprint, BuildAnyBlueprint
 static PLAN_STEPS_29: &[StepId] = &[32, 28, 25]; // FetchMaterialFromStorage, HaulToBlueprint, BuildAnyBlueprint
@@ -698,6 +702,71 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             plant_filter: None,
             extra: 0,
         },
+        StepDef {
+            // 52: Hunter pulls a Spear (Good::Weapon) from faction storage.
+            // Used by `AcquireHuntingSpear` plan; the plan-level `forbids_good`
+            // precondition ensures armed hunters skip this entirely.
+            id: 52,
+            task: TaskKind::WithdrawGood,
+            target: StepTarget::NearestFactionStorageWithGood(Good::Weapon),
+            preconditions: StepPreconditions::forbids(Good::Weapon),
+            reward_scale: 0.4,
+            plant_filter: None,
+            extra: Good::Weapon as u8,
+        },
+        StepDef {
+            // 53: Walk adjacent to a fresh Corpse and attach it to the
+            // hunter via `PersonAI.carried_corpse`. No-op for non-hunters.
+            id: 53,
+            task: TaskKind::PickUpCorpse,
+            target: StepTarget::NearestFreshCorpse,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.4,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 54: Drag the carried corpse to the nearest hearth or faction
+            // home tile. `corpse_follow_system` keeps the corpse Transform
+            // glued to the hunter while they walk.
+            id: 54,
+            task: TaskKind::HaulCorpse,
+            target: StepTarget::NearestButcherSite,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.4,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 55: Butcher the carried corpse in place — work_ticks then yield
+            // Meat+Skin per `species_yield()` and despawn the corpse.
+            id: 55,
+            task: TaskKind::Butcher,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 1.0,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 56: Equip a Weapon (Spear) into the MainHand slot. Instant
+            // in-place transfer from inventory or hands → Equipment.MainHand.
+            // Used as the second step of `AcquireHuntingSpear` (plan 64) so a
+            // hunter who fetched the spear actually wields it for combat
+            // damage. The plan-level `forbids_good(Weapon)` check now also
+            // counts the equipped slot, so the plan self-deselects after this
+            // step completes.
+            id: 56,
+            task: TaskKind::Equip,
+            target: StepTarget::EquipItem {
+                slot: EquipmentSlot::MainHand,
+                good: Good::Weapon,
+            },
+            preconditions: StepPreconditions::needs_good(Good::Weapon, 1),
+            reward_scale: 0.5,
+            plant_filter: None,
+            extra: 0,
+        },
     ];
 }
 
@@ -730,6 +799,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             // Farming is a deferred-payoff plan; weight it on skill + season,
@@ -749,6 +819,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: Some(technology::CROP_CULTIVATION),
             memory_target_kind: Some(MemoryKind::Food),
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 2,
@@ -765,6 +836,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Wood),
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 3,
@@ -781,6 +853,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Stone),
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 4,
@@ -796,6 +869,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: Some(technology::CROP_CULTIVATION),
             memory_target_kind: Some(MemoryKind::Food),
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 5,
@@ -806,11 +880,15 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
                 (SI_HAS_FOOD, -0.2),
                 (SI_STORAGE_FOOD, -0.3),
             ]),
-            bias: 0.0,
+            bias: 0.5,
             serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
-            tech_gate: None,
+            tech_gate: Some(technology::HUNTING_SPEAR),
             memory_target_kind: Some(MemoryKind::Prey),
-            flags: PF_NONE,
+            // Multi-step faction commitment — survival need spikes shouldn't
+            // peel a hunter off a corpse mid-haul. The plan still ends via
+            // completion / timeout / target invalidation / rescue preempt.
+            flags: PF_UNINTERRUPTIBLE,
+            requires_profession: Some(Profession::Hunter),
         },
         PlanDef {
             id: 6,
@@ -826,6 +904,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
             flags: PF_SCAVENGE | PF_TARGETS_FOOD,
+            requires_profession: None,
         },
         PlanDef {
             // Gather-then-build sibling: only worth picking when storage is
@@ -845,6 +924,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_UNINTERRUPTIBLE,
+            requires_profession: None,
         },
         PlanDef {
             id: 8,
@@ -856,6 +936,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             // Plan 9 used to weight SI_HUNGER=1.5 — circular under Survive,
@@ -875,6 +956,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 10,
@@ -886,6 +968,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: Some(technology::HORSE_TAMING),
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         // ── Crafting plans (order-driven) ─────────────────────────────────────
         // Each Deliver*ToCraftOrder gathers one raw resource and hauls it into
@@ -906,6 +989,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             // 12: (unused — was DeliverStoneToCraftOrder; collapsed into plan 15.)
@@ -918,6 +1002,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 13,
@@ -929,6 +1014,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Prey),
             flags: PF_UNINTERRUPTIBLE,
+            requires_profession: None,
         },
         PlanDef {
             id: 14,
@@ -940,25 +1026,29 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
             flags: PF_UNINTERRUPTIBLE,
+            requires_profession: None,
         },
         PlanDef {
-            // Was a constant 0.6 (IN_FACTION 0.4 + bias 0.2) that auto-won the
-            // Craft goal regardless of whether storage held the needed material.
-            // Now scores on actual stockpile presence so the resolver's
-            // MostDeficient selector has something to draw from.
+            // Scores on SI_CRAFT_ORDER_NEEDS_MATERIAL (1.0 when any faction
+            // CraftOrder has unmet deposits) so the plan only wins when hauling
+            // work actually exists. The negative bias means that without an open
+            // order the plan scores ≈ -0.6, which loses to WorkOnCraft (≈ 0.55)
+            // and breaks the FailedNoTarget loop seen when no CraftOrders spawn.
             id: 15,
             name: "DeliverFromStorageToCraftOrder",
             steps: PLAN_STEPS_15,
             state_weights: mk_weights(&[
-                (SI_STORAGE_WOOD, 0.4),
-                (SI_STORAGE_STONE, 0.4),
+                (SI_CRAFT_ORDER_NEEDS_MATERIAL, 2.0),
+                (SI_STORAGE_WOOD, 0.3),
+                (SI_STORAGE_STONE, 0.3),
                 (SI_IN_FACTION, 0.3),
             ]),
-            bias: 0.1,
+            bias: -1.5,
             serves_goals: CRAFT_GOALS,
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_UNINTERRUPTIBLE,
+            requires_profession: None,
         },
         PlanDef {
             id: 16,
@@ -970,6 +1060,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_UNINTERRUPTIBLE,
+            requires_profession: None,
         },
         PlanDef {
             id: 17,
@@ -981,6 +1072,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 18,
@@ -992,6 +1084,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 19,
@@ -1003,6 +1096,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 20,
@@ -1014,6 +1108,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 21,
@@ -1025,6 +1120,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 22,
@@ -1036,6 +1132,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             // Sole candidate under Rescue goal; weights only need to keep
@@ -1051,6 +1148,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 24,
@@ -1062,6 +1160,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_DROP_FOOD_ON_TIMEOUT,
+            requires_profession: None,
         },
         PlanDef {
             // Cheapest survive plan: if food is in hand, just eat. Bias 0.5
@@ -1076,6 +1175,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 26,
@@ -1087,6 +1187,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 27,
@@ -1098,6 +1199,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         // Explore is split per resource kind so that `explore_satisfaction_system`
         // can abort the wander the moment the agent records a sighting of the
@@ -1114,6 +1216,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
             flags: PF_EXPLORE | PF_TARGETS_FOOD,
+            requires_profession: None,
         },
         PlanDef {
             id: 36,
@@ -1125,6 +1228,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Wood),
             flags: PF_EXPLORE | PF_TARGETS_WOOD,
+            requires_profession: None,
         },
         PlanDef {
             id: 37,
@@ -1136,6 +1240,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Stone),
             flags: PF_EXPLORE | PF_TARGETS_STONE,
+            requires_profession: None,
         },
         PlanDef {
             // Sibling of BuildBlueprint that pulls materials out of communal
@@ -1158,6 +1263,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_UNINTERRUPTIBLE,
+            requires_profession: None,
         },
         PlanDef {
             // Take a Seed from faction storage and plant it as recreation.
@@ -1176,6 +1282,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             // Take a Stone from faction storage and throw it as recreation.
@@ -1193,6 +1300,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             // Pull an entertainment-valued good (luxury, cloth, tools, …) from
@@ -1211,6 +1319,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             // Claim-driven Haul plan. Fires only when the agent holds a
@@ -1226,6 +1335,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_UNINTERRUPTIBLE,
+            requires_profession: None,
         },
         PlanDef {
             // Claim-driven Build plan. Fires only when the agent holds a
@@ -1242,6 +1352,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_UNINTERRUPTIBLE,
+            requires_profession: None,
         },
         // ── Scavenge plans for loose wood/stone ───────────────────────────────
         // Sibling of ScavengeFood (plan 6). Workers pick up loose Wood/Stone
@@ -1267,6 +1378,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_SCAVENGE | PF_TARGETS_WOOD,
+            requires_profession: None,
         },
         PlanDef {
             id: 39,
@@ -1282,6 +1394,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_SCAVENGE | PF_TARGETS_STONE,
+            requires_profession: None,
         },
         // ── Social-goal plans (60-63) ───────────────────────────────────
         // Migrated out of `tasks::goal_dispatch_system` so every goal
@@ -1302,6 +1415,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 61,
@@ -1313,6 +1427,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 62,
@@ -1324,6 +1439,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             id: 63,
@@ -1335,6 +1451,23 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
+            requires_profession: None,
+        },
+        PlanDef {
+            // Hunter-only fetch plan: pull a Spear (Good::Weapon) from
+            // faction storage when unarmed. The step's `forbids_good`
+            // precondition means the plan auto-deselects the moment the
+            // hunter is armed, so HuntFood (id 5) takes over from there.
+            id: 64,
+            name: "AcquireHuntingSpear",
+            steps: PLAN_STEPS_HUNTER_ARM,
+            state_weights: mk_weights(&[]),
+            bias: 5.0,
+            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
+            tech_gate: Some(technology::HUNTING_SPEAR),
+            memory_target_kind: None,
+            flags: PF_UNINTERRUPTIBLE,
+            requires_profession: Some(Profession::Hunter),
         },
     ];
 }

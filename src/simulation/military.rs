@@ -6,12 +6,22 @@ use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::pathfinding::hotspots::{HotspotFlowFields, HotspotKind};
 use crate::simulation::combat::{CombatTarget, Health};
+use crate::simulation::faction::{release_reservation, FactionMember, PlayerFaction, StorageReservations};
 use crate::simulation::lod::LodLevel;
-use crate::simulation::person::{AiState, Drafted, PersonAI};
+use crate::simulation::person::{AiState, Drafted, PersonAI, Profession};
+use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::TILE_SIZE;
+
+/// Pulse resource set by the HUD Muster button. `apply_muster_hunters_system`
+/// consumes it the same tick. The `pending` flag stays high until the
+/// system handles it and resets to false, so the UI can fire-and-forget.
+#[derive(Resource, Default)]
+pub struct MusterHuntersRequest {
+    pub pending: bool,
+}
 
 /// Tracks `HotspotKind::RallyPoint` registrations so they can be unregistered
 /// when no drafted unit is still routing to them. Without this they'd
@@ -142,6 +152,53 @@ pub fn military_task_system(
                 combat.0 = None;
             }
         }
+    }
+}
+
+/// Consumes a `MusterHuntersRequest` pulse from the HUD. For every
+/// `Profession::Hunter` in the player faction:
+///   - inserts `Drafted` (idempotent — Bevy replaces the component)
+///   - tears down any in-flight plan + reservations + carried corpse
+///   - resets PersonAI to Idle / UNEMPLOYED so `military_right_click_system`
+///     can route them to the player's chosen rally point next click.
+///
+/// The player issues the rally point separately via right-click on a tile —
+/// that path already registers `HotspotKind::RallyPoint` and assigns
+/// `MilitaryMove` tasks. Muster is the "go to military mode" half;
+/// right-click is the "here's where to go" half.
+pub fn apply_muster_hunters_system(
+    mut commands: Commands,
+    mut request: ResMut<MusterHuntersRequest>,
+    player_faction: Res<PlayerFaction>,
+    reservations: Res<StorageReservations>,
+    mut hunters: Query<(
+        Entity,
+        &Profession,
+        &FactionMember,
+        &mut PersonAI,
+        Option<&ActivePlan>,
+    )>,
+) {
+    if !request.pending {
+        return;
+    }
+    request.pending = false;
+    for (entity, prof, member, mut ai, plan_opt) in hunters.iter_mut() {
+        if *prof != Profession::Hunter || member.faction_id != player_faction.faction_id {
+            continue;
+        }
+        if ai.reserved_good.is_some() {
+            release_reservation(&reservations, &mut ai);
+        }
+        ai.carried_corpse = None;
+        ai.state = AiState::Idle;
+        ai.task_id = PersonAI::UNEMPLOYED;
+        ai.target_entity = None;
+        ai.work_progress = 0;
+        if plan_opt.is_some() {
+            commands.entity(entity).remove::<ActivePlan>();
+        }
+        commands.entity(entity).insert(Drafted);
     }
 }
 

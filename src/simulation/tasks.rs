@@ -58,6 +58,10 @@ pub enum TaskKind {
     PlayThrow = 30,   // recreational rock-throwing: consumes a Stone from inventory, awards Combat XP + activity, bursts willpower
     HaulToCraftOrder = 31, // carry inventory goods to a faction CraftOrder anchor and drop them into deposit slots
     WorkOnCraftOrder = 32, // adjacent to a satisfied CraftOrder anchor; advances work_progress until the recipe completes
+    PickUpCorpse = 33, // walk to a fresh `Corpse` entity and attach it via PersonAI.carried_corpse
+    HaulCorpse = 34,  // walk a carried corpse to a butcher site (hearth / faction camp) and stand there
+    Butcher = 35,     // adjacent to own carried corpse; work_ticks then yield Meat+Skin and despawn
+    Equip = 36,       // instant: move a matching Item from inventory/Carrier into Equipment[slot]
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -96,6 +100,10 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::PlayThrow as u16 => "Play-Throwing",
         x if x == TaskKind::HaulToCraftOrder as u16 => "Hauling to Craft Order",
         x if x == TaskKind::WorkOnCraftOrder as u16 => "Working on Craft Order",
+        x if x == TaskKind::PickUpCorpse as u16 => "Picking Up Corpse",
+        x if x == TaskKind::HaulCorpse as u16 => "Hauling Corpse",
+        x if x == TaskKind::Butcher as u16 => "Butchering",
+        x if x == TaskKind::Equip as u16 => "Equipping",
         _ => "Unemployed",
     }
 }
@@ -161,6 +169,8 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::PlayPlant as u16
         || task_id == TaskKind::HaulToCraftOrder as u16
         || task_id == TaskKind::WorkOnCraftOrder as u16
+        || task_id == TaskKind::PickUpCorpse as u16
+        || task_id == TaskKind::Butcher as u16
 }
 
 /// Tasks that count as productive labor — these drain willpower over time
@@ -184,6 +194,8 @@ pub fn task_is_labor(task_id: u16) -> bool {
         || task_id == TaskKind::WithdrawMaterial as u16
         || task_id == TaskKind::HaulToCraftOrder as u16
         || task_id == TaskKind::WorkOnCraftOrder as u16
+        || task_id == TaskKind::HaulCorpse as u16
+        || task_id == TaskKind::Butcher as u16
 }
 
 /// Spiral search outward from `target` for the closest tile that is passable

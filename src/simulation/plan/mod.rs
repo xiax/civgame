@@ -1,7 +1,8 @@
 use super::animals::{Deer, Horse, Tamed, Wolf};
 use super::carry::Carrier;
 use super::combat::{CombatTarget, Health};
-use super::construction::{Blueprint, BlueprintMap, BuildSiteKind};
+use super::construction::{Blueprint, BlueprintMap, BuildSiteKind, CampfireMap};
+use super::corpse::{Corpse, CorpseMap};
 use super::crafting::{CraftOrder, CraftOrderMap};
 use super::faction::{
     release_reservation, FactionMember, FactionRegistry, StorageReservations, StorageTileMap,
@@ -91,7 +92,9 @@ pub(super) const SI_STORAGE_FOOD: usize = 29;
 pub(super) const SI_STORAGE_WOOD: usize = 30;
 pub(super) const SI_STORAGE_STONE: usize = 31;
 pub(super) const SI_STORAGE_SEED: usize = 32;
-// 33-34 reserved.
+// 33: any open craft order for this faction has unmet material deposits.
+pub(super) const SI_CRAFT_ORDER_NEEDS_MATERIAL: usize = 33;
+// 34 reserved.
 // Source-only visibility: counts the harvestable *source* of each resource
 // within VISIBILITY_RADIUS — mature edible plants, mature trees, stone tiles.
 // Drives Forage/Gather/Deliver*ToCraftOrder plans that can only act on a
@@ -109,7 +112,7 @@ pub(super) const SI_VIS_GROUND_FOOD: usize = 40;
 
 pub(super) const VISIBILITY_RADIUS: i32 = 8;
 pub(super) const VISIBILITY_SATURATE: u8 = 4;
-use super::person::{AiState, Drafted, Person, PersonAI, PlayerOrder};
+use super::person::{AiState, Drafted, Person, PersonAI, PlayerOrder, Profession};
 use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
@@ -250,6 +253,22 @@ pub enum StepTarget {
     /// `FactionRegistry::raid_target` then `home_tile`). Used by the Raid
     /// plan; resolves to None for solo agents or when no raid is queued.
     FactionRaidTarget,
+    /// Nearest fresh `Corpse` entity within VIEW_RADIUS — used by the hunter
+    /// PickUpCorpse step. Resolves to the corpse entity + its tile so the
+    /// agent walks adjacent and the executor sets `carried_corpse`.
+    NearestFreshCorpse,
+    /// Nearest butcher site for this agent's faction. Tries `CampfireMap`
+    /// (any tier — open/ringed/lined hearth) first; falls back to the
+    /// faction's home tile. Resolves to the tile only — no entity target.
+    NearestButcherSite,
+    /// In-place equip: agent transfers one unit of `good` from inventory or
+    /// hands into `Equipment.items[slot]`. Resolves to `SelfPosition`; the
+    /// dispatcher writes `slot` and `good` to PersonAI fields so
+    /// `equip_task_system` knows what to wield.
+    EquipItem {
+        slot: crate::simulation::items::EquipmentSlot,
+        good: Good,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -258,6 +277,11 @@ pub struct StepPreconditions {
     pub requires_any_edible: bool,
     pub min_hunger: Option<u8>,
     pub requires_carry_anything: bool,
+    /// When set, this precondition is *unsatisfied* if the agent already has
+    /// any quantity of the named good (in inventory or hands). Used by
+    /// `AcquireHuntingSpear` so the plan is filtered out the moment the
+    /// hunter is already armed — no need to fetch another spear.
+    pub forbids_good: Option<Good>,
 }
 
 impl StepPreconditions {
@@ -267,6 +291,7 @@ impl StepPreconditions {
             requires_any_edible: false,
             min_hunger: None,
             requires_carry_anything: false,
+            forbids_good: None,
         }
     }
     pub fn needs_good(good: Good, qty: u32) -> Self {
@@ -275,6 +300,7 @@ impl StepPreconditions {
             requires_any_edible: false,
             min_hunger: None,
             requires_carry_anything: false,
+            forbids_good: None,
         }
     }
     /// Eat-style preconditions: agent must hold at least one edible and be at
@@ -285,6 +311,7 @@ impl StepPreconditions {
             requires_any_edible: true,
             min_hunger: Some(min_hunger),
             requires_carry_anything: false,
+            forbids_good: None,
         }
     }
     /// Deposit-style preconditions: agent must be carrying *something* across
@@ -297,11 +324,32 @@ impl StepPreconditions {
             requires_any_edible: false,
             min_hunger: None,
             requires_carry_anything: true,
+            forbids_good: None,
+        }
+    }
+    /// Plan-gate variant: precondition fails if the agent already has any
+    /// quantity of `good` across inventory + hands. Used to make
+    /// `AcquireHuntingSpear` self-deselect once a hunter is armed.
+    pub fn forbids(good: Good) -> Self {
+        Self {
+            requires_good: None,
+            requires_any_edible: false,
+            min_hunger: None,
+            requires_carry_anything: false,
+            forbids_good: Some(good),
         }
     }
 
     /// Returns true if the agent currently satisfies these preconditions.
-    pub fn is_satisfied(&self, agent: &EconomicAgent, carrier: &Carrier, hunger: f32) -> bool {
+    /// `equipment` is optional because non-Person agents (animals, solo
+    /// non-Persons) don't carry the component; treat None as "nothing equipped."
+    pub fn is_satisfied(
+        &self,
+        agent: &EconomicAgent,
+        carrier: &Carrier,
+        equipment: Option<&crate::simulation::items::Equipment>,
+        hunger: f32,
+    ) -> bool {
         if let Some((good, qty)) = self.requires_good {
             if agent.quantity_of(good) < qty {
                 return false;
@@ -320,6 +368,19 @@ impl StepPreconditions {
             && carrier.is_empty()
         {
             return false;
+        }
+        if let Some(good) = self.forbids_good {
+            if agent.quantity_of(good) > 0 || carrier.quantity_of_good(good) > 0 {
+                return false;
+            }
+            // A wielded weapon/armor counts as "already armed" so the
+            // AcquireHuntingSpear plan self-deselects after the equip step
+            // moves the spear out of inventory and into the MainHand slot.
+            if let Some(eq) = equipment {
+                if eq.has_good(good) {
+                    return false;
+                }
+            }
         }
         true
     }
@@ -358,6 +419,10 @@ pub struct PlanDef {
     /// `PF_*` flags describing how the candidate filter / timeout handling
     /// should treat this plan. Default is `PF_NONE`.
     pub flags: PlanFlags,
+    /// When set, candidate filter requires the agent to have this profession.
+    /// Used to gate the hunter-only HuntFood and AcquireHuntingSpear plans
+    /// without spreading profession checks through the scorer.
+    pub requires_profession: Option<Profession>,
 }
 
 /// Build a `state_weights` array from a sparse list of (index, weight) pairs.
@@ -842,6 +907,9 @@ fn resolve_target(
     bp_query: &Query<&Blueprint>,
     co_map: &CraftOrderMap,
     co_query: &Query<&CraftOrder>,
+    corpse_map: &CorpseMap,
+    corpse_query: &Query<&Corpse>,
+    campfire_map: &CampfireMap,
     rescue_target: Option<&RescueTarget>,
     agent: &EconomicAgent,
     carrier: &Carrier,
@@ -1472,6 +1540,61 @@ fn resolve_target(
             }
             None
         }
+        StepTarget::NearestFreshCorpse => {
+            // Nearest Corpse entity within VIEW_RADIUS, biased to closer tiles.
+            // We rely on `corpse_map` for an O(tiles_in_radius) lookup rather
+            // than scanning the spatial index.
+            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best_dist = i32::MAX;
+            for dy in -VIEW_RADIUS..=VIEW_RADIUS {
+                for dx in -VIEW_RADIUS..=VIEW_RADIUS {
+                    if dx * dx + dy * dy > VIEW_RADIUS * VIEW_RADIUS {
+                        continue;
+                    }
+                    let tx = pos.0 + dx;
+                    let ty = pos.1 + dy;
+                    if let Some(entities) = corpse_map.0.get(&(tx as i16, ty as i16)) {
+                        for &e in entities {
+                            if corpse_query.get(e).is_err() {
+                                continue;
+                            }
+                            let dist = dx.abs() + dy.abs();
+                            if dist < best_dist {
+                                best_dist = dist;
+                                best = Some((e, tx as i16, ty as i16));
+                            }
+                        }
+                    }
+                }
+            }
+            best.map(|(e, tx, ty)| (Some(e), tx, ty))
+        }
+        StepTarget::NearestButcherSite => {
+            // Nearest hearth tile owned by the agent's faction, falling back
+            // to the faction home tile. We don't enforce a faction filter on
+            // CampfireMap entries since hearths are placed by faction
+            // blueprint logic and can't appear unowned in practice.
+            let mut best: Option<(i16, i16)> = None;
+            let mut best_dist = i32::MAX;
+            for (&tile, _e) in campfire_map.0.iter() {
+                let dist = (tile.0 as i32 - pos.0).abs() + (tile.1 as i32 - pos.1).abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some(tile);
+                }
+            }
+            if let Some((tx, ty)) = best {
+                return Some((None, tx, ty));
+            }
+            faction_registry
+                .home_tile(faction_id)
+                .map(|(tx, ty)| (None, tx, ty))
+        }
+        StepTarget::EquipItem { .. } => {
+            // Equip is in-place — the executor reads slot/good off PersonAI
+            // (set during dispatch in `plan_execution_system`).
+            Some((None, pos.0 as i16, pos.1 as i16))
+        }
     }
 }
 
@@ -1503,6 +1626,9 @@ pub struct SiteRegistries<'w, 's> {
     pub bp_query: Query<'w, 's, &'static Blueprint>,
     pub co_map: Res<'w, CraftOrderMap>,
     pub co_query: Query<'w, 's, &'static CraftOrder>,
+    pub corpse_map: Res<'w, CorpseMap>,
+    pub corpse_query: Query<'w, 's, &'static Corpse>,
+    pub campfire_map: Res<'w, CampfireMap>,
 }
 
 // ── Plan execution system ─────────────────────────────────────────────────────
@@ -1525,6 +1651,7 @@ type AgentQuery<'a> = (
     &'a mut TargetItem,
     &'a Carrier,
     &'a mut crate::pathfinding::path_request::PathFollow,
+    &'a Profession,
 );
 
 type OptionalQuery<'a> = (
@@ -1536,6 +1663,7 @@ type OptionalQuery<'a> = (
     Option<&'a RescueTarget>,
     Option<&'a mut PlanHistory>,
     Option<&'a crate::simulation::jobs::ClaimTarget>,
+    Option<&'a crate::simulation::items::Equipment>,
 );
 
 /// Aborts an `ExploreFor*` plan as soon as the agent has memory of the
@@ -1636,6 +1764,7 @@ pub fn plan_execution_system(
                 mut target_item,
                 carrier,
                 _path_follow,
+                profession,
             ),
             (
                 memory_opt,
@@ -1646,6 +1775,7 @@ pub fn plan_execution_system(
                 rescue_target_opt,
                 mut plan_history_opt,
                 claim_target_opt,
+                equipment_opt,
             ),
         )| {
             if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -1736,6 +1866,15 @@ pub fn plan_execution_system(
                                 .unwrap_or(false)
                         })
                     })
+                    .filter(|p| {
+                        // Profession gate: hunter-only / farmer-only plans are
+                        // self-deselecting for everyone else. Plans without a
+                        // requires_profession are open to all professions.
+                        match p.requires_profession {
+                            None => true,
+                            Some(required) => *profession == required,
+                        }
+                    })
                     // Bug 3 fix: skip plans whose first step has unmet preconditions so we
                     // don't enter a tight pick-then-immediately-abandon loop.
                     .filter(|p| {
@@ -1743,7 +1882,12 @@ pub fn plan_execution_system(
                             .first()
                             .and_then(|&sid| step_registry.0.iter().find(|s| s.id == sid))
                             .map_or(true, |s| {
-                                s.preconditions.is_satisfied(&agent, &carrier, needs.hunger)
+                                s.preconditions.is_satisfied(
+                                    &agent,
+                                    &carrier,
+                                    equipment_opt,
+                                    needs.hunger,
+                                )
                             })
                     })
                     // Drop gather plans that have no idea where to go: no memory of
@@ -1854,6 +1998,15 @@ pub fn plan_execution_system(
                             .factions
                             .get(&member.faction_id)
                             .map(|f| &f.storage);
+                        let craft_order_needs_material =
+                            sites.co_map.0.values().any(|&oe| {
+                                sites.co_query.get(oe).ok().map_or(false, |o| {
+                                    o.faction_id == member.faction_id
+                                        && (0..o.deposit_count as usize).any(|i| {
+                                            o.deposits[i].deposited < o.deposits[i].needed
+                                        })
+                                })
+                            });
                         let state = build_state_vec(
                             needs,
                             agent,
@@ -1869,6 +2022,7 @@ pub fn plan_execution_system(
                             vis_ground_wood,
                             vis_ground_stone,
                             vis_ground_food,
+                            craft_order_needs_material,
                         );
                         let mut scores: Vec<(u16, f32)> = candidates
                             .iter()
@@ -2079,7 +2233,12 @@ pub fn plan_execution_system(
                 }
 
                 // Check preconditions
-                if !step_def.preconditions.is_satisfied(&agent, &carrier, needs.hunger) {
+                if !step_def.preconditions.is_satisfied(
+                    &agent,
+                    &carrier,
+                    equipment_opt,
+                    needs.hunger,
+                ) {
                     if let Some(history) = plan_history_opt.as_deref_mut() {
                         history.push(
                             active_plan.plan_id,
@@ -2119,6 +2278,9 @@ pub fn plan_execution_system(
                     &sites.bp_query,
                     &sites.co_map,
                     &sites.co_query,
+                    &sites.corpse_map,
+                    &sites.corpse_query,
+                    &sites.campfire_map,
                     rescue_target_opt,
                     &agent,
                     &carrier,
@@ -2159,6 +2321,13 @@ pub fn plan_execution_system(
                         || step_def.task == TaskKind::WithdrawGood
                     {
                         ai.craft_recipe_id = step_def.extra as u8;
+                    }
+                    // Equip dispatch: stash slot + good on PersonAI so the
+                    // executor knows what to wield. Both are read out by
+                    // `equip_task_system`, which clears them on completion.
+                    if let StepTarget::EquipItem { slot, good } = step_def.target {
+                        ai.equip_slot = slot as u8;
+                        ai.craft_recipe_id = good as u8;
                     }
                     // Commit the resolver-chosen withdraw intent (or clear any
                     // stale intent from a prior dispatch). `withdraw_material_task_system`

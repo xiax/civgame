@@ -7,9 +7,10 @@
 //! visible to a `pub use` parent.
 
 use super::{
-    PlanHistory, PLAN_HISTORY_LEN, STATE_DIM, SI_STORAGE_FOOD, SI_STORAGE_SEED, SI_STORAGE_STONE,
-    SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD, SI_VIS_GROUND_STONE, SI_VIS_GROUND_WOOD,
-    SI_VIS_PLANT_FOOD, SI_VIS_STONE_TILE, SI_VIS_TREE, VISIBILITY_RADIUS, VISIBILITY_SATURATE,
+    PlanHistory, PLAN_HISTORY_LEN, STATE_DIM, SI_CRAFT_ORDER_NEEDS_MATERIAL, SI_STORAGE_FOOD,
+    SI_STORAGE_SEED, SI_STORAGE_STONE, SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD, SI_VIS_GROUND_STONE,
+    SI_VIS_GROUND_WOOD, SI_VIS_PLANT_FOOD, SI_VIS_STONE_TILE, SI_VIS_TREE, VISIBILITY_RADIUS,
+    VISIBILITY_SATURATE,
 };
 use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
@@ -47,6 +48,7 @@ pub fn build_state_vec(
     vis_ground_wood: u8,
     vis_ground_stone: u8,
     vis_ground_food: u8,
+    craft_order_needs_material: bool,
 ) -> [f32; STATE_DIM] {
     let mut s = [0.0f32; STATE_DIM];
 
@@ -150,6 +152,10 @@ pub fn build_state_vec(
             .clamp(0.0, 1.0);
         s[SI_STORAGE_SEED] = (st.seed_total() as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
     }
+
+    // 33: any open craft order for this faction has unmet material deposits.
+    // 1.0 = hauling work exists; 0.0 = nothing to haul (no orders or all fully loaded).
+    s[SI_CRAFT_ORDER_NEEDS_MATERIAL] = if craft_order_needs_material { 1.0 } else { 0.0 };
 
     // 35-37: source-only visibility — mature edible plants, mature trees, stone
     // tiles within VISIBILITY_RADIUS, normalised to [0, 1] at VISIBILITY_SATURATE.

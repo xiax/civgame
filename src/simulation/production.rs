@@ -242,7 +242,13 @@ pub fn withdraw_good_task_system(
                 if !matches {
                     continue;
                 }
-                agent.add_good(gi.item.good, 1);
+                // Preserve the manufactured stats (material + quality +
+                // weapon/armor stats) by transferring the actual `Item`,
+                // not a freshly-constructed commodity. Without this, an
+                // Iron Spear withdrawn from storage would arrive in
+                // inventory as a stat-less commodity and the equip step
+                // would wield it for zero damage_bonus.
+                agent.add_item(gi.item, 1);
                 if gi.qty == 1 {
                     commands.entity(gi_entity).despawn();
                 } else {

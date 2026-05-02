@@ -1,9 +1,10 @@
 use crate::economy::goods::Good;
-use crate::economy::item::Item;
-use crate::simulation::animals::{AnimalAI, AnimalState, Deer, Wolf};
+use crate::economy::item::{armor_coverage, Item};
+use crate::simulation::animals::{AnimalAI, AnimalNeeds, AnimalState, Deer, Wolf};
+use crate::simulation::corpse::{Corpse, CorpseMap, CorpseSpecies, CORPSE_FRESHNESS_TICKS};
 use crate::simulation::construction::{Bed, HomeBed};
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
-use crate::simulation::items::{ArmorStats, Equipment, EquipmentSlot, GroundItem, WeaponStats};
+use crate::simulation::items::{Equipment, EquipmentSlot, GroundItem};
 use crate::simulation::line_of_sight::has_los;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::RelationshipMemory;
@@ -68,6 +69,18 @@ impl BodyPart {
             BodyPart::LeftLeg
         } else {
             BodyPart::RightLeg
+        }
+    }
+
+    /// Maps a body part to the matching `armor_coverage` flag used by
+    /// `ArmorStats::covered_parts`. Left/right limbs share a flag because the
+    /// coverage bitset only distinguishes head/torso/arms/legs.
+    pub fn coverage_bit(self) -> u8 {
+        match self {
+            BodyPart::Head => armor_coverage::HEAD,
+            BodyPart::Torso => armor_coverage::TORSO,
+            BodyPart::LeftArm | BodyPart::RightArm => armor_coverage::ARMS,
+            BodyPart::LeftLeg | BodyPart::RightLeg => armor_coverage::LEGS,
         }
     }
 }
@@ -175,7 +188,6 @@ pub fn combat_system(
     mut health_query: Query<&mut Health>,
     mut body_query: Query<(&mut Body, Option<&Stats>)>,
     equipment_query: Query<&Equipment>,
-    item_stats_query: Query<(Option<&WeaponStats>, Option<&ArmorStats>)>,
     mut ai_query: Query<&mut PersonAI>,
     mut animal_ai_query: Query<(&mut AnimalAI, Option<&Deer>)>,
     mut rel_query: Query<Option<&mut RelationshipMemory>>,
@@ -311,10 +323,10 @@ pub fn combat_system(
             let mut attack_speed_bonus = 1.0;
 
             if let Some(eq) = attacker_eq {
-                if let Some(&weapon_ent) = eq.items.get(&EquipmentSlot::MainHand) {
-                    if let Ok((Some(w_stats), _)) = item_stats_query.get(weapon_ent) {
-                        damage += w_stats.damage_bonus;
-                        attack_speed_bonus = w_stats.attack_speed;
+                if let Some(weapon) = eq.items.get(&EquipmentSlot::MainHand) {
+                    if let Some(w_stats) = weapon.weapon_stats {
+                        damage = damage.saturating_add(w_stats.damage_bonus);
+                        attack_speed_bonus = w_stats.attack_speed();
                     }
                 }
             }
@@ -346,15 +358,18 @@ pub fn combat_system(
             if body_query.contains(target) {
                 let mut mitigated_damage = damage;
                 if let Ok(target_eq) = equipment_query.get(target) {
-                    for (_slot, &armor_ent) in target_eq.items.iter() {
-                        if let Ok((_, Some(a_stats))) = item_stats_query.get(armor_ent) {
-                            if a_stats.covered_parts.contains(&target_part) {
-                                let roll = fastrand::u8(0..100);
-                                if roll < a_stats.coverage {
-                                    mitigated_damage =
-                                        mitigated_damage.saturating_sub(a_stats.damage_reduction);
-                                }
-                            }
+                    let part_bit = target_part.coverage_bit();
+                    for armor in target_eq.items.values() {
+                        let Some(a_stats) = armor.armor_stats else {
+                            continue;
+                        };
+                        if !a_stats.covers(part_bit) {
+                            continue;
+                        }
+                        let roll = fastrand::u8(0..100);
+                        if roll < a_stats.coverage_pct {
+                            mitigated_damage =
+                                mitigated_damage.saturating_sub(a_stats.damage_reduction);
                         }
                     }
                 }
@@ -518,6 +533,7 @@ pub fn death_system(
     mut commands: Commands,
     mut registry: ResMut<FactionRegistry>,
     mut clock: ResMut<SimClock>,
+    mut corpse_map: ResMut<CorpseMap>,
     mut bed_query: Query<&mut Bed>,
     query: Query<(
         Entity,
@@ -531,10 +547,23 @@ pub fn death_system(
         Option<&HomeBed>,
         Option<&crate::economy::agent::EconomicAgent>,
         Option<&crate::simulation::carry::Carrier>,
+        Option<&Equipment>,
     )>,
 ) {
-    for (entity, health, body, transform, member, person, wolf, deer, home_bed, agent, carrier) in
-        &query
+    for (
+        entity,
+        health,
+        body,
+        transform,
+        member,
+        person,
+        wolf,
+        deer,
+        home_bed,
+        agent,
+        carrier,
+        equipment,
+    ) in &query
     {
         let is_dead = health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead());
         if !is_dead {
@@ -555,37 +584,69 @@ pub fn death_system(
             clock.population = clock.population.saturating_sub(1);
         }
 
-        let mut drops: Vec<(Good, u32)> = if wolf.is_some() {
-            vec![(Good::Meat, 3), (Good::Skin, 1)]
+        // Huntable animal: convert to a `Corpse` entity in place. No Meat/Skin
+        // drops here — those come from butchering. Strip the AI/needs/species
+        // markers so the corpse stops being processed by animal systems and
+        // doesn't show up in prey scans.
+        let huntable_species = if wolf.is_some() {
+            Some(CorpseSpecies::Wolf)
         } else if deer.is_some() {
-            vec![(Good::Meat, 5), (Good::Skin, 2)]
+            Some(CorpseSpecies::Deer)
         } else {
-            vec![]
+            None
         };
 
-        // Personal inventory spills on death.
+        if let Some(species) = huntable_species {
+            let tile = (
+                (transform.translation.x / TILE_SIZE).floor() as i16,
+                (transform.translation.y / TILE_SIZE).floor() as i16,
+            );
+            corpse_map.insert(tile, entity);
+            let mut e = commands.entity(entity);
+            e.remove::<Health>();
+            e.remove::<Body>();
+            e.remove::<AnimalAI>();
+            e.remove::<AnimalNeeds>();
+            e.remove::<Wolf>();
+            e.remove::<Deer>();
+            e.remove::<CombatTarget>();
+            e.remove::<CombatCooldown>();
+            e.insert(Corpse {
+                species,
+                fresh_until_tick: clock.tick + CORPSE_FRESHNESS_TICKS,
+            });
+            // Animals carry no inventory/equipment, so nothing to spill.
+            continue;
+        }
+
+        // Person death — spill inventory, hand-held loads, AND equipped items
+        // as `GroundItem`s. Equipped items keep their material/quality (and
+        // therefore their combat stats) so a looter can pick them back up and
+        // re-equip them.
+        let mut drops: Vec<(Item, u32)> = Vec::new();
         if let Some(a) = agent {
             for (item, qty) in &a.inventory {
                 if *qty > 0 {
-                    drops.push((item.good, *qty));
+                    drops.push((*item, *qty));
                 }
             }
         }
-        // Hand-held loads spill on death.
         if let Some(c) = carrier {
             for stack in [c.left, c.right].iter().flatten() {
-                drops.push((stack.item.good, stack.qty));
+                drops.push((stack.item, stack.qty));
+            }
+        }
+        if let Some(eq) = equipment {
+            for item in eq.items.values() {
+                drops.push((*item, 1));
             }
         }
 
-        for (good, qty) in drops {
+        for (item, qty) in drops {
             let mut loot_transform = *transform;
             loot_transform.translation.z = 0.3;
             commands.spawn((
-                GroundItem {
-                    item: Item::new_commodity(good),
-                    qty,
-                },
+                GroundItem { item, qty },
                 loot_transform,
                 GlobalTransform::default(),
                 Visibility::Visible,

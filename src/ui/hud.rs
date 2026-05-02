@@ -1,3 +1,4 @@
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
@@ -6,8 +7,10 @@ use crate::rendering::camera::CameraViewZ;
 use crate::simulation::combat::CombatTarget;
 use crate::simulation::construction::AutonomousBuildingToggle;
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
-use crate::simulation::person::{AiState, Drafted, Person, PersonAI};
+use crate::simulation::military::MusterHuntersRequest;
+use crate::simulation::person::{AiState, Drafted, HunterTargetCount, Person, PersonAI, Profession};
 use crate::simulation::schedule::SimClock;
+use crate::simulation::technology::HUNTING_SPEAR;
 use crate::ui::debug_panel::DebugPanelState;
 use crate::ui::selection::SelectedEntities;
 use crate::ui::tech_panel::TechPanelOpen;
@@ -18,25 +21,58 @@ use crate::world::seasons::Calendar;
 #[derive(Resource, Default)]
 pub struct DraftToggleRequest(pub bool);
 
+/// Bundle the HUD's resource handles. Bevy caps a system at 16 top-level
+/// params, and the HUD now has more toggles + queries than that, so the
+/// resources fold into one SystemParam.
+#[derive(SystemParam)]
+pub struct HudResources<'w> {
+    pub clock: ResMut<'w, SimClock>,
+    pub mode: ResMut<'w, EconomicMode>,
+    pub auto_build: ResMut<'w, AutonomousBuildingToggle>,
+    pub tech_panel_open: ResMut<'w, TechPanelOpen>,
+    pub debug_state: ResMut<'w, DebugPanelState>,
+    pub draft_req: ResMut<'w, DraftToggleRequest>,
+    pub hunter_target: ResMut<'w, HunterTargetCount>,
+    pub muster_req: ResMut<'w, MusterHuntersRequest>,
+    pub camera_view_z: Res<'w, CameraViewZ>,
+    pub calendar: Res<'w, Calendar>,
+    pub player_faction: Res<'w, PlayerFaction>,
+    pub registry: Res<'w, FactionRegistry>,
+    pub selected_many: Res<'w, SelectedEntities>,
+}
+
 pub fn hud_system(
     mut contexts: EguiContexts,
-    mut clock: ResMut<SimClock>,
-    mut mode: ResMut<EconomicMode>,
-    mut auto_build: ResMut<AutonomousBuildingToggle>,
-    mut tech_panel_open: ResMut<TechPanelOpen>,
-    mut debug_state: ResMut<DebugPanelState>,
-    mut draft_req: ResMut<DraftToggleRequest>,
-    camera_view_z: Res<CameraViewZ>,
-    calendar: Res<Calendar>,
-    player_faction: Res<PlayerFaction>,
-    registry: Res<FactionRegistry>,
-    selected_many: Res<SelectedEntities>,
+    mut res: HudResources,
     drafted_q: Query<(), With<Drafted>>,
     persons: Query<(), With<Person>>,
+    professions: Query<(&Profession, &FactionMember), With<Person>>,
 ) {
+    let clock = &mut *res.clock;
+    let mode = &mut *res.mode;
+    let auto_build = &mut *res.auto_build;
+    let tech_panel_open = &mut *res.tech_panel_open;
+    let debug_state = &mut *res.debug_state;
+    let draft_req = &mut *res.draft_req;
+    let hunter_target = &mut *res.hunter_target;
+    let muster_req = &mut *res.muster_req;
+    let camera_view_z = &*res.camera_view_z;
+    let calendar = &*res.calendar;
+    let player_faction = &*res.player_faction;
+    let registry = &*res.registry;
+    let selected_many = &*res.selected_many;
     let pop = persons.iter().count();
     let any_drafted = selected_many.ids.iter().any(|&e| drafted_q.get(e).is_ok());
     let has_selection = !selected_many.ids.is_empty();
+    let current_hunters = professions
+        .iter()
+        .filter(|(p, m)| **p == Profession::Hunter && m.faction_id == player_faction.faction_id)
+        .count();
+    let hunting_unlocked = registry
+        .factions
+        .get(&player_faction.faction_id)
+        .map(|f| f.techs.has(HUNTING_SPEAR))
+        .unwrap_or(false);
 
     egui::Area::new(egui::Id::new("hud"))
         .fixed_pos([0.0, 0.0])
@@ -110,6 +146,40 @@ pub fn hud_system(
                         let resp = ui.add_enabled(has_selection, draft_btn);
                         if resp.clicked() {
                             draft_req.0 = true;
+                        }
+
+                        ui.separator();
+                        ui.label(egui::RichText::new("Hunters:").color(egui::Color32::WHITE));
+                        let count_label = format!(
+                            "{}/{}",
+                            current_hunters,
+                            hunter_target.count
+                        );
+                        ui.label(
+                            egui::RichText::new(count_label)
+                                .color(if hunting_unlocked {
+                                    egui::Color32::WHITE
+                                } else {
+                                    egui::Color32::GRAY
+                                }),
+                        );
+                        let minus = ui.add_enabled(
+                            hunting_unlocked && hunter_target.count > 0,
+                            egui::Button::new("−"),
+                        );
+                        if minus.clicked() {
+                            hunter_target.count = hunter_target.count.saturating_sub(1);
+                        }
+                        let plus = ui.add_enabled(hunting_unlocked, egui::Button::new("+"));
+                        if plus.clicked() {
+                            hunter_target.count = hunter_target.count.saturating_add(1);
+                        }
+                        let muster_btn = egui::Button::new("Muster")
+                            .fill(egui::Color32::from_rgb(180, 100, 60));
+                        let muster_resp =
+                            ui.add_enabled(hunting_unlocked && current_hunters > 0, muster_btn);
+                        if muster_resp.clicked() {
+                            muster_req.pending = true;
                         }
 
                         ui.separator();

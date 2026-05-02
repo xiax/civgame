@@ -37,6 +37,34 @@ pub enum Good {
 }
 
 impl Good {
+    /// Inverse of `good as u8`. Returns `None` for values outside the
+    /// 0..GOOD_COUNT range. Used by executors that decode goods packed into
+    /// `PersonAI::craft_recipe_id`.
+    pub fn try_from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Good::Fruit),
+            1 => Some(Good::Meat),
+            2 => Some(Good::Grain),
+            3 => Some(Good::Wood),
+            4 => Some(Good::Stone),
+            5 => Some(Good::Tools),
+            6 => Some(Good::Cloth),
+            7 => Some(Good::Coal),
+            8 => Some(Good::Iron),
+            9 => Some(Good::Luxury),
+            10 => Some(Good::Seed),
+            11 => Some(Good::Weapon),
+            12 => Some(Good::Armor),
+            13 => Some(Good::Shield),
+            14 => Some(Good::Skin),
+            15 => Some(Good::Copper),
+            16 => Some(Good::Tin),
+            17 => Some(Good::Gold),
+            18 => Some(Good::Silver),
+            _ => None,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Good::Fruit => "Fruit",
