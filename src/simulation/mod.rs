@@ -66,6 +66,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(faction::FactionRegistry::default())
             .insert_resource(faction::PlayerFaction::default())
             .insert_resource(faction::StorageTileMap::default())
+            .insert_resource(faction::StorageReservations::default())
             .insert_resource(production::TileDepletion::default())
             .insert_resource(plants::PlantMap::default())
             .insert_resource(plants::PlantSpriteIndex::default())

@@ -1,6 +1,9 @@
 use super::animals::{Cat, Cow, Horse, Pig, Tamed};
-use super::faction::{FactionMember, FactionRegistry, StorageTileMap, SOLO};
-use super::items::GroundItem;
+use super::carry::Carrier;
+use super::faction::{
+    release_reservation, FactionMember, FactionRegistry, StorageReservations, StorageTileMap, SOLO,
+};
+use super::items::{spawn_or_merge_ground_item, GroundItem};
 use super::jobs::{
     planting_area_contains, record_progress, JobBoard, JobClaim, JobCompletedEvent, JobKind,
 };
@@ -257,26 +260,55 @@ pub fn withdraw_good_task_system(
 /// Withdraw the specific good and quantity committed by the dispatching step
 /// resolver from a faction storage tile. Driven by `TaskKind::WithdrawMaterial`.
 /// The intent (`PersonAI.withdraw_good` / `withdraw_qty`) is set in
-/// `plan_execution_system` when a `StepTarget::NearestFactionStorage*`
+/// `plan_execution_system` when a `StepTarget::WithdrawForFactionNeed`
 /// resolves; this system consumes it. Without an intent, the task aborts —
-/// every withdraw step now commits a target up front, so an empty intent
-/// means the dispatch path skipped (e.g. plan was preempted) and the safe
-/// thing to do is bail.
+/// every withdraw step commits a target up front, so an empty intent means
+/// the dispatch path skipped (e.g. plan was preempted) and the safe thing to
+/// do is bail.
+///
+/// On entry the executor first drops any hand stack whose good doesn't match
+/// `withdraw_good` so the agent's hands are free for the deposit step that
+/// usually follows. If the spatial scan finds zero of the target good (race
+/// — another agent already drained the stack), the active plan is marked
+/// failed via `PlanHistory` so the agent doesn't immediately walk back to
+/// the same dry tile next tick. Every exit path releases the storage
+/// reservation tracked on `PersonAI`.
 pub fn withdraw_material_task_system(
     mut commands: Commands,
     clock: Res<SimClock>,
     spatial: Res<SpatialIndex>,
     storage_tile_map: Res<StorageTileMap>,
+    storage_reservations: Res<StorageReservations>,
     mut ground_items: Query<&mut GroundItem>,
     mut query: Query<(
+        Entity,
         &mut PersonAI,
         &mut EconomicAgent,
+        &mut Carrier,
+        &Transform,
         &FactionMember,
         &BucketSlot,
         &LodLevel,
+        Option<&mut crate::simulation::plan::PlanHistory>,
+        Option<&crate::simulation::plan::ActivePlan>,
     )>,
 ) {
-    for (mut ai, mut agent, member, slot, lod) in query.iter_mut() {
+    use crate::simulation::plan::PlanOutcome;
+    use crate::world::terrain::world_to_tile;
+
+    for (
+        entity,
+        mut ai,
+        mut agent,
+        mut carrier,
+        transform,
+        member,
+        slot,
+        lod,
+        mut plan_history_opt,
+        active_plan_opt,
+    ) in query.iter_mut()
+    {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -289,6 +321,7 @@ pub fn withdraw_material_task_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.withdraw_good = None;
             ai.withdraw_qty = 0;
+            release_reservation(&storage_reservations, &mut ai);
             continue;
         }
 
@@ -300,6 +333,7 @@ pub fn withdraw_material_task_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.withdraw_good = None;
             ai.withdraw_qty = 0;
+            release_reservation(&storage_reservations, &mut ai);
             continue;
         }
 
@@ -309,9 +343,46 @@ pub fn withdraw_material_task_system(
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.withdraw_qty = 0;
+            release_reservation(&storage_reservations, &mut ai);
             continue;
         };
+
+        // Drop any held stacks whose good doesn't match the target so the
+        // agent's hands are free for the next haul step. Stacks of the same
+        // good are kept (they'll be top-ups on the deposit). Drops to
+        // ground at the agent's current world tile, not the storage tile,
+        // so the spill doesn't pollute the stockpile.
+        if !carrier.is_empty() {
+            let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
+            // Check left / right; collect mismatched stacks first to avoid
+            // borrowing issues across the spawn call.
+            let mut to_drop: Vec<(Good, u32)> = Vec::new();
+            if let Some(s) = carrier.left {
+                if s.item.good != target_good {
+                    to_drop.push((s.item.good, s.qty));
+                }
+            }
+            if let Some(s) = carrier.right {
+                if s.item.good != target_good {
+                    to_drop.push((s.item.good, s.qty));
+                }
+            }
+            for (good, qty) in to_drop {
+                carrier.remove_good(good, qty);
+                spawn_or_merge_ground_item(
+                    &mut commands,
+                    &spatial,
+                    &mut ground_items,
+                    agent_tx,
+                    agent_ty,
+                    good,
+                    qty,
+                );
+            }
+        }
+
         let mut remaining = ai.withdraw_qty as u32;
+        let promised = ai.withdraw_qty as u32;
 
         for &gi_entity in spatial.get(tx as i32, ty as i32) {
             if remaining == 0 {
@@ -332,11 +403,27 @@ pub fn withdraw_material_task_system(
             }
         }
 
+        let taken = promised.saturating_sub(remaining);
+        if taken == 0 {
+            // Race: the stack we reserved was emptied between dispatch and
+            // arrival. Mark the active plan failed so PlanHistory penalizes
+            // it briefly — without this the next step (HaulTo*) silently
+            // no-ops with empty hands and the agent walks back to the same
+            // dry tile on the next dispatch cycle.
+            if let Some(plan) = active_plan_opt {
+                if let Some(history) = plan_history_opt.as_deref_mut() {
+                    history.push(plan.plan_id, PlanOutcome::FailedNoTarget, clock.tick);
+                }
+                commands.entity(entity).remove::<crate::simulation::plan::ActivePlan>();
+            }
+        }
+
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
         ai.withdraw_good = None;
         ai.withdraw_qty = 0;
+        release_reservation(&storage_reservations, &mut ai);
     }
 }
 

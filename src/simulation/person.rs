@@ -154,6 +154,17 @@ pub struct PersonAI {
     /// by carrier capacity at execution time, so a value larger than the hands
     /// can hold is harmless.
     pub withdraw_qty: u8,
+    /// Tile against which the current `StorageReservations` entry is held.
+    /// Tracked separately from `dest_tile` so we can release the reservation
+    /// even after the agent has been retargeted.
+    pub reserved_tile: (i16, i16),
+    /// Good promised to the storage tile via `StorageReservations`. `None`
+    /// means no reservation is currently active.
+    pub reserved_good: Option<crate::economy::goods::Good>,
+    /// Reserved quantity. The reservation is decremented by exactly this many
+    /// units when the task ends (success, abort, or plan teardown), so the
+    /// fields must be kept in sync with the actual `StorageReservations` map.
+    pub reserved_qty: u8,
 }
 
 impl PersonAI {
@@ -364,16 +375,10 @@ pub fn spawn_population(
                         state: AiState::Idle,
                         target_tile: (tx as i16, ty as i16),
                         dest_tile: (tx as i16, ty as i16),
-                        ticks_idle: 0,
-                        work_progress: 0,
                         last_plan_id: PersonAI::UNEMPLOYED,
-                        last_goal_eval_tick: 0,
-                        target_entity: None,
                         current_z: chunk_map.surface_z_at(tx, ty) as i8,
                         target_z: chunk_map.surface_z_at(tx, ty) as i8,
-                        craft_recipe_id: 0,
-                        withdraw_good: None,
-                        withdraw_qty: 0,
+                        ..PersonAI::default()
                     },
                     EconomicAgent::default(),
                 ),

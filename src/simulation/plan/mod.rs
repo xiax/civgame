@@ -3,7 +3,9 @@ use super::carry::Carrier;
 use super::combat::{CombatTarget, Health};
 use super::construction::{Blueprint, BlueprintMap, BuildSiteKind};
 use super::crafting::{CraftOrder, CraftOrderMap};
-use super::faction::{FactionMember, FactionRegistry, StorageTileMap};
+use super::faction::{
+    release_reservation, FactionMember, FactionRegistry, StorageReservations, StorageTileMap,
+};
 use super::goals::{AgentGoal, RescueTarget};
 use super::items::{GroundItem, TargetItem};
 use super::tasks::{
@@ -120,6 +122,31 @@ pub const PF_TARGETS_STONE: PlanFlags = 1 << 4;
 /// silently abandoning the plan. Used by the `ReturnSurplusFood` plan.
 pub const PF_DROP_FOOD_ON_TIMEOUT: PlanFlags = 1 << 5;
 
+/// Where the demand for a `WithdrawForFactionNeed` step comes from. The
+/// resolver builds a `[u32; GOOD_COUNT]` "still-needed" vector from this
+/// source, then looks for storage tiles that hold any of those goods.
+#[derive(Copy, Clone, Debug)]
+pub enum MaterialNeed {
+    /// Faction-shared blueprints plus blueprints owned by this agent.
+    Blueprint,
+    /// Open faction `CraftOrder`s.
+    CraftOrder,
+    /// The good named in the agent's active `JobClaim::Haul`.
+    HaulClaim,
+}
+
+/// How the resolver picks which good to commit to once it has chosen a tile.
+#[derive(Copy, Clone, Debug)]
+pub enum GoodSelector {
+    /// Pick the good with the largest still-needed quantity that the chosen
+    /// tile actually holds. Stable tiebreak by `Good as u8`. Lets the faction
+    /// drive selection (most-deficient material wins) without per-good plans.
+    MostDeficient,
+    /// Resolver must commit to exactly this good — used internally for
+    /// `MaterialNeed::HaulClaim` after the claim's good is read.
+    Specific(Good),
+}
+
 #[derive(Clone, Debug)]
 pub enum StepTarget {
     NearestTile(&'static [TileKind]),
@@ -141,11 +168,18 @@ pub enum StepTarget {
     SelfPosition,
     /// Nearest faction storage tile (for withdrawing food from communal stock).
     NearestFactionStorage,
-    /// Nearest faction storage tile that contains at least one good currently
-    /// needed by an unsatisfied blueprint of the same faction. Used by the
-    /// FetchMaterialFromStorage step so haulers can refill their hands from
-    /// communal stockpiles instead of relying on a fresh gather wave.
-    NearestFactionStorageWithBlueprintMaterial,
+    /// Unified withdraw target. Replaces the per-need / per-good variants
+    /// (`*WithBlueprintMaterial`, `*WithCraftOrderMaterial`,
+    /// `*ContainingForCraftOrder`, `StorageWithHaulClaimGood`). The resolver
+    /// reads `MaterialNeed` to build a per-good demand vector, picks the
+    /// nearest tile that holds something useful (after subtracting
+    /// `StorageReservations`), uses `GoodSelector` to choose which good, and
+    /// commits a `(good, qty)` intent on the agent so
+    /// `withdraw_material_task_system` knows what to take.
+    WithdrawForFactionNeed {
+        need: MaterialNeed,
+        selector: GoodSelector,
+    },
     /// Nearest faction storage tile holding ≥1 of the given Good. Used by play
     /// plans that fetch a specific good (Seed, Stone) before recreating.
     NearestFactionStorageWithGood(Good),
@@ -178,23 +212,6 @@ pub enum StepTarget {
     /// Nearest active CraftOrder for this faction that has all deposits
     /// satisfied — i.e. the work step can begin.
     NearestSatisfiedCraftOrder,
-    /// Nearest faction storage tile that holds at least one good currently
-    /// needed by an unsatisfied CraftOrder of the same faction. Pairs with
-    /// `HaulToCraftOrder` for the storage-to-order ferry path.
-    NearestFactionStorageWithCraftOrderMaterial,
-    /// Nearest faction storage tile holding ≥1 of the given Good *and* that
-    /// good is currently needed by some unsatisfied CraftOrder of the same
-    /// faction. Used by the material-specific Deliver*ToCraftOrder plans
-    /// (e.g. wood, stone) so workers draw from communal stockpiles instead of
-    /// chopping a fresh tree. The resolver also commits a `(good, qty)`
-    /// intent on the agent's `PersonAI` so `WithdrawMaterial` knows what to
-    /// pull.
-    NearestFactionStorageContainingForCraftOrder(Good),
-    /// Nearest faction storage tile holding the good named in the agent's
-    /// active `JobClaim::Haul`. Used by the Haul plan's withdrawal step.
-    /// Resolves to None if the agent has no Haul claim or the storage is
-    /// empty of that good.
-    StorageWithHaulClaimGood,
     /// The specific blueprint named in the agent's active `JobClaim::Haul`
     /// (the destination for hauled materials). Resolves to None if the agent
     /// has no Haul claim or the blueprint despawned.
@@ -555,6 +572,215 @@ pub use state::{
 
 // ── Target resolution ─────────────────────────────────────────────────────────
 
+/// Unified resolver for `StepTarget::WithdrawForFactionNeed`. Builds a
+/// per-good demand vector from `need`, picks the nearest faction storage tile
+/// holding a useful good (after subtracting in-flight reservations), then
+/// commits a `(good, qty)` withdrawal intent. Replaces four hand-rolled
+/// per-target arms (blueprint / craft-order / per-good / haul-claim).
+fn resolve_withdraw_for_faction_need(
+    need: MaterialNeed,
+    selector: GoodSelector,
+    pos: (i32, i32),
+    spatial: &SpatialIndex,
+    storage_tile_map: &StorageTileMap,
+    reservations: &StorageReservations,
+    faction_id: u32,
+    agent_entity: Entity,
+    item_query: &Query<&GroundItem>,
+    bp_map: &BlueprintMap,
+    bp_query: &Query<&Blueprint>,
+    co_map: &CraftOrderMap,
+    co_query: &Query<&CraftOrder>,
+    claim_target: Option<&crate::simulation::jobs::ClaimTarget>,
+    agent: &EconomicAgent,
+    withdraw_intent_out: &mut Option<(Good, u8)>,
+) -> Option<(Option<Entity>, i16, i16)> {
+    // 1. Build per-good still-needed demand from `need`. The HaulClaim path
+    //    bypasses the demand vector since the claim already names the good.
+    let mut still_need_by_good = [0u32; crate::economy::goods::GOOD_COUNT];
+    let mut any_needed = false;
+    let mut effective_selector = selector;
+    match need {
+        MaterialNeed::Blueprint => {
+            for (_, &bp_entity) in &bp_map.0 {
+                let Ok(bp) = bp_query.get(bp_entity) else {
+                    continue;
+                };
+                let allowed = match bp.personal_owner {
+                    Some(owner) => owner == agent_entity,
+                    None => bp.faction_id == faction_id,
+                };
+                if !allowed {
+                    continue;
+                }
+                for i in 0..bp.deposit_count as usize {
+                    let still = bp.deposits[i]
+                        .needed
+                        .saturating_sub(bp.deposits[i].deposited);
+                    if still > 0 {
+                        let g = bp.deposits[i].good as usize;
+                        still_need_by_good[g] = still_need_by_good[g].saturating_add(still as u32);
+                        any_needed = true;
+                    }
+                }
+            }
+        }
+        MaterialNeed::CraftOrder => {
+            for (_, &order_entity) in &co_map.0 {
+                let Ok(order) = co_query.get(order_entity) else {
+                    continue;
+                };
+                if order.faction_id != faction_id {
+                    continue;
+                }
+                for i in 0..order.deposit_count as usize {
+                    let still = order.deposits[i]
+                        .needed
+                        .saturating_sub(order.deposits[i].deposited);
+                    if still > 0 {
+                        let g = order.deposits[i].good as usize;
+                        still_need_by_good[g] = still_need_by_good[g].saturating_add(still as u32);
+                        any_needed = true;
+                    }
+                }
+            }
+        }
+        MaterialNeed::HaulClaim => {
+            // Claim names the exact good and (implicitly) the qty we want;
+            // no aggregation required. Override the selector so downstream
+            // logic treats this as a Specific lookup.
+            let claim = claim_target.and_then(|c| c.good)?;
+            still_need_by_good[claim as usize] = u32::MAX / 2;
+            effective_selector = GoodSelector::Specific(claim);
+            any_needed = true;
+        }
+    }
+    if !any_needed {
+        return None;
+    }
+
+    // For Specific selectors, ignore demand on other goods entirely so we
+    // never accidentally pick a tile because some unrelated good is needed.
+    if let GoodSelector::Specific(g) = effective_selector {
+        let saved = still_need_by_good[g as usize];
+        still_need_by_good = [0u32; crate::economy::goods::GOOD_COUNT];
+        still_need_by_good[g as usize] = saved;
+        if saved == 0 {
+            return None;
+        }
+    }
+
+    // 2. Helper: per-good effective stock on a tile (ground qty minus
+    //    reservations). The reservation map tracks promises that haven't
+    //    been collected yet, so two agents never commit to the same unit.
+    let effective_stock = |tx: i16, ty: i16, good: Good| -> u32 {
+        let mut stock = 0u32;
+        for &gi_entity in spatial.get(tx as i32, ty as i32) {
+            if let Ok(gi) = item_query.get(gi_entity) {
+                if gi.item.good == good {
+                    stock = stock.saturating_add(gi.qty);
+                }
+            }
+        }
+        stock.saturating_sub(reservations.get((tx, ty), good))
+    };
+
+    // 3. Find the nearest faction storage tile that holds at least one
+    //    useful good (intersection of demand & effective stock).
+    let tiles = storage_tile_map.by_faction.get(&faction_id)?;
+    let mut best: Option<(i16, i16)> = None;
+    let mut best_dist = i32::MAX;
+    for &(tx, ty) in tiles {
+        let mut has_useful = false;
+        for &gi_entity in spatial.get(tx as i32, ty as i32) {
+            if let Ok(gi) = item_query.get(gi_entity) {
+                if gi.qty == 0 {
+                    continue;
+                }
+                if still_need_by_good[gi.item.good as usize] == 0 {
+                    continue;
+                }
+                if effective_stock(tx, ty, gi.item.good) > 0 {
+                    has_useful = true;
+                    break;
+                }
+            }
+        }
+        if !has_useful {
+            continue;
+        }
+        let dist = (tx as i32 - pos.0).abs() + (ty as i32 - pos.1).abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best = Some((tx, ty));
+        }
+    }
+    let (tx, ty) = best?;
+
+    // 4. Pick the good to commit to.
+    let chosen: Option<(Good, u32)> = match effective_selector {
+        GoodSelector::Specific(g) => {
+            let stock = effective_stock(tx, ty, g);
+            if stock > 0 && still_need_by_good[g as usize] > 0 {
+                Some((g, stock.min(still_need_by_good[g as usize])))
+            } else {
+                None
+            }
+        }
+        GoodSelector::MostDeficient => {
+            // Walk goods present on the tile and keep the one with the
+            // largest still-needed value. Stable tiebreak by Good as u8.
+            let mut best_pick: Option<(Good, u32, u32)> = None; // (good, deficit, take_qty)
+            for &gi_entity in spatial.get(tx as i32, ty as i32) {
+                if let Ok(gi) = item_query.get(gi_entity) {
+                    if gi.qty == 0 {
+                        continue;
+                    }
+                    let deficit = still_need_by_good[gi.item.good as usize];
+                    if deficit == 0 {
+                        continue;
+                    }
+                    let stock = effective_stock(tx, ty, gi.item.good);
+                    if stock == 0 {
+                        continue;
+                    }
+                    let take = stock.min(deficit);
+                    let candidate = (gi.item.good, deficit, take);
+                    best_pick = Some(match best_pick {
+                        None => candidate,
+                        Some(prev) => {
+                            if deficit > prev.1
+                                || (deficit == prev.1
+                                    && (gi.item.good as u8) < (prev.0 as u8))
+                            {
+                                candidate
+                            } else {
+                                prev
+                            }
+                        }
+                    });
+                }
+            }
+            best_pick.map(|(g, _, q)| (g, q))
+        }
+    };
+
+    // 5. Cap the commit by inventory free space so we don't promise more
+    //    than the agent could actually carry home. The withdraw executor
+    //    deposits into `EconomicAgent.inventory`, which is weight-capped.
+    let (good, mut qty) = chosen?;
+    let unit_w = crate::economy::item::Item::new_commodity(good).unit_weight_g().max(1);
+    let inv_room = agent.capacity_g().saturating_sub(agent.current_weight_g());
+    let inv_cap = (inv_room / unit_w).max(1); // always allow at least one unit
+    qty = qty.min(inv_cap);
+    let qty_u8 = qty.min(u8::MAX as u32) as u8;
+    if qty_u8 == 0 {
+        return None;
+    }
+    *withdraw_intent_out = Some((good, qty_u8));
+    Some((None, tx, ty))
+}
+
 fn resolve_target(
     step: &StepDef,
     pos: (i32, i32),
@@ -583,6 +809,7 @@ fn resolve_target(
     agent: &EconomicAgent,
     carrier: &Carrier,
     claim_target: Option<&crate::simulation::jobs::ClaimTarget>,
+    reservations: &StorageReservations,
     withdraw_intent_out: &mut Option<(Good, u8)>,
 ) -> Option<(Option<Entity>, i16, i16)> {
     const VIEW_RADIUS: i32 = 15;
@@ -831,81 +1058,24 @@ fn resolve_target(
         StepTarget::NearestFactionStorage => storage_tile_map
             .nearest_for_faction(faction_id, pos)
             .map(|(tx, ty)| (None, tx, ty)),
-        StepTarget::NearestFactionStorageWithBlueprintMaterial => {
-            // Per-good remaining need across all unsatisfied blueprints this
-            // agent is allowed to deliver to (faction-shared + personal). We
-            // need the qty so the resolver can commit a withdraw intent.
-            let mut still_need_by_good: [u32; crate::economy::goods::GOOD_COUNT] =
-                [0; crate::economy::goods::GOOD_COUNT];
-            let mut any_needed = false;
-            for (_, &bp_entity) in &bp_map.0 {
-                let Ok(bp) = bp_query.get(bp_entity) else {
-                    continue;
-                };
-                let allowed = match bp.personal_owner {
-                    Some(owner) => owner == agent_entity,
-                    None => bp.faction_id == faction_id,
-                };
-                if !allowed {
-                    continue;
-                }
-                for i in 0..bp.deposit_count as usize {
-                    let still = bp.deposits[i]
-                        .needed
-                        .saturating_sub(bp.deposits[i].deposited);
-                    if still > 0 {
-                        still_need_by_good[bp.deposits[i].good as usize] =
-                            still_need_by_good[bp.deposits[i].good as usize]
-                                .saturating_add(still as u32);
-                        any_needed = true;
-                    }
-                }
-            }
-            if !any_needed {
-                return None;
-            }
-
-            // Find the nearest faction storage tile that holds at least one
-            // unit of any needed good.
-            let tiles = storage_tile_map.by_faction.get(&faction_id)?;
-            let mut best: Option<(i16, i16)> = None;
-            let mut best_dist = i32::MAX;
-            for &(tx, ty) in tiles {
-                let mut has_useful = false;
-                for &gi_entity in spatial.get(tx as i32, ty as i32) {
-                    if let Ok(gi) = item_query.get(gi_entity) {
-                        if gi.qty > 0 && still_need_by_good[gi.item.good as usize] > 0 {
-                            has_useful = true;
-                            break;
-                        }
-                    }
-                }
-                if !has_useful {
-                    continue;
-                }
-                let dist = (tx as i32 - pos.0).abs() + (ty as i32 - pos.1).abs();
-                if dist < best_dist {
-                    best_dist = dist;
-                    best = Some((tx, ty));
-                }
-            }
-            let (tx, ty) = best?;
-            // Pick the first matching good on the tile; commit qty = min(stock, blueprint need).
-            let mut chosen: Option<(Good, u32)> = None;
-            for &gi_entity in spatial.get(tx as i32, ty as i32) {
-                if let Ok(gi) = item_query.get(gi_entity) {
-                    let need = still_need_by_good[gi.item.good as usize];
-                    if gi.qty > 0 && need > 0 {
-                        chosen = Some((gi.item.good, gi.qty.min(need)));
-                        break;
-                    }
-                }
-            }
-            if let Some((good, qty)) = chosen {
-                *withdraw_intent_out = Some((good, qty.min(u8::MAX as u32) as u8));
-            }
-            Some((None, tx, ty))
-        }
+        StepTarget::WithdrawForFactionNeed { need, selector } => resolve_withdraw_for_faction_need(
+            *need,
+            *selector,
+            pos,
+            spatial,
+            storage_tile_map,
+            reservations,
+            faction_id,
+            agent_entity,
+            item_query,
+            bp_map,
+            bp_query,
+            co_map,
+            co_query,
+            claim_target,
+            agent,
+            withdraw_intent_out,
+        ),
         StepTarget::NearestFactionStorageWithGood(target_good) => {
             let tiles = storage_tile_map.by_faction.get(&faction_id)?;
             let mut best: Option<(i16, i16)> = None;
@@ -973,38 +1143,6 @@ fn resolve_target(
                 }
             }
             best.map(|(e, tx, ty)| (Some(e), tx, ty))
-        }
-        StepTarget::StorageWithHaulClaimGood => {
-            // Active Haul claim names a specific good. Find the nearest faction
-            // storage tile that holds at least one unit of that good.
-            let target_good = claim_target.and_then(|c| c.good)?;
-            let tiles = storage_tile_map.by_faction.get(&faction_id)?;
-            let mut best: Option<(i16, i16, u32)> = None;
-            let mut best_dist = i32::MAX;
-            for &(tx, ty) in tiles {
-                let mut stock: u32 = 0;
-                for &gi_entity in spatial.get(tx as i32, ty as i32) {
-                    if let Ok(gi) = item_query.get(gi_entity) {
-                        if gi.item.good == target_good {
-                            stock = stock.saturating_add(gi.qty);
-                        }
-                    }
-                }
-                if stock == 0 {
-                    continue;
-                }
-                let dist = (tx as i32 - pos.0).abs() + (ty as i32 - pos.1).abs();
-                if dist < best_dist {
-                    best_dist = dist;
-                    best = Some((tx, ty, stock));
-                }
-            }
-            let (tx, ty, stock) = best?;
-            // Haul claim has no per-trip cap of its own; let the carrier cap
-            // at execution time. u8::MAX is a safe upper bound for the intent.
-            let qty = stock.min(u8::MAX as u32) as u8;
-            *withdraw_intent_out = Some((target_good, qty.max(1)));
-            Some((None, tx, ty))
         }
         StepTarget::HaulClaimBlueprint => {
             // Route directly to the blueprint named in the agent's Haul claim.
@@ -1264,130 +1402,6 @@ fn resolve_target(
             }
             best.map(|(e, tx, ty)| (Some(e), tx, ty))
         }
-        StepTarget::NearestFactionStorageWithCraftOrderMaterial => {
-            // Aggregate per-good remaining need across all unsatisfied
-            // CraftOrders of this faction. We track the per-good total so we
-            // can both prune (no need → skip tile) and pick a deterministic
-            // good to commit to once a tile is chosen.
-            let mut still_need_by_good: [u32; crate::economy::goods::GOOD_COUNT] =
-                [0; crate::economy::goods::GOOD_COUNT];
-            let mut any_needed = false;
-            for (_, &order_entity) in &co_map.0 {
-                let Ok(order) = co_query.get(order_entity) else {
-                    continue;
-                };
-                if order.faction_id != faction_id {
-                    continue;
-                }
-                for i in 0..order.deposit_count as usize {
-                    let still = order.deposits[i]
-                        .needed
-                        .saturating_sub(order.deposits[i].deposited);
-                    if still > 0 {
-                        still_need_by_good[order.deposits[i].good as usize] =
-                            still_need_by_good[order.deposits[i].good as usize]
-                                .saturating_add(still as u32);
-                        any_needed = true;
-                    }
-                }
-            }
-            if !any_needed {
-                return None;
-            }
-            let tiles = storage_tile_map.by_faction.get(&faction_id)?;
-            let mut best: Option<(i16, i16)> = None;
-            let mut best_dist = i32::MAX;
-            for &(tx, ty) in tiles {
-                let mut has_useful = false;
-                for &gi_entity in spatial.get(tx as i32, ty as i32) {
-                    if let Ok(gi) = item_query.get(gi_entity) {
-                        if gi.qty > 0 && still_need_by_good[gi.item.good as usize] > 0 {
-                            has_useful = true;
-                            break;
-                        }
-                    }
-                }
-                if !has_useful {
-                    continue;
-                }
-                let dist = (tx as i32 - pos.0).abs() + (ty as i32 - pos.1).abs();
-                if dist < best_dist {
-                    best_dist = dist;
-                    best = Some((tx, ty));
-                }
-            }
-            let (tx, ty) = best?;
-            // Pick a specific good on the chosen tile to commit to. Iterate
-            // ground items on the tile and choose the first whose good is
-            // still needed by an order; deterministic ordering comes from
-            // the spatial index (insertion order).
-            let mut chosen: Option<(Good, u32)> = None;
-            for &gi_entity in spatial.get(tx as i32, ty as i32) {
-                if let Ok(gi) = item_query.get(gi_entity) {
-                    let need = still_need_by_good[gi.item.good as usize];
-                    if gi.qty > 0 && need > 0 {
-                        let qty = gi.qty.min(need);
-                        chosen = Some((gi.item.good, qty));
-                        break;
-                    }
-                }
-            }
-            if let Some((good, qty)) = chosen {
-                *withdraw_intent_out = Some((good, qty.min(u8::MAX as u32) as u8));
-            }
-            Some((None, tx, ty))
-        }
-        StepTarget::NearestFactionStorageContainingForCraftOrder(target_good) => {
-            // Material-specific sibling of NearestFactionStorageWithCraftOrderMaterial.
-            // Drops out unless an open CraftOrder of this faction still needs
-            // `target_good` and at least one storage tile holds some.
-            let mut still_need: u32 = 0;
-            for (_, &order_entity) in &co_map.0 {
-                let Ok(order) = co_query.get(order_entity) else {
-                    continue;
-                };
-                if order.faction_id != faction_id {
-                    continue;
-                }
-                for i in 0..order.deposit_count as usize {
-                    if order.deposits[i].good != *target_good {
-                        continue;
-                    }
-                    let still = order.deposits[i]
-                        .needed
-                        .saturating_sub(order.deposits[i].deposited);
-                    still_need = still_need.saturating_add(still as u32);
-                }
-            }
-            if still_need == 0 {
-                return None;
-            }
-            let tiles = storage_tile_map.by_faction.get(&faction_id)?;
-            let mut best: Option<(i16, i16, u32)> = None;
-            let mut best_dist = i32::MAX;
-            for &(tx, ty) in tiles {
-                let mut stock: u32 = 0;
-                for &gi_entity in spatial.get(tx as i32, ty as i32) {
-                    if let Ok(gi) = item_query.get(gi_entity) {
-                        if gi.item.good == *target_good {
-                            stock = stock.saturating_add(gi.qty);
-                        }
-                    }
-                }
-                if stock == 0 {
-                    continue;
-                }
-                let dist = (tx as i32 - pos.0).abs() + (ty as i32 - pos.1).abs();
-                if dist < best_dist {
-                    best_dist = dist;
-                    best = Some((tx, ty, stock));
-                }
-            }
-            let (tx, ty, stock) = best?;
-            let qty = stock.min(still_need).min(u8::MAX as u32) as u8;
-            *withdraw_intent_out = Some((*target_good, qty.max(1)));
-            Some((None, tx, ty))
-        }
         StepTarget::ExploreTile => {
             let home = faction_registry
                 .home_tile(faction_id)
@@ -1438,6 +1452,7 @@ pub struct PlanRegistries<'w> {
     pub step_registry: Res<'w, StepRegistry>,
     pub faction_registry: Res<'w, FactionRegistry>,
     pub storage_tile_map: Res<'w, StorageTileMap>,
+    pub storage_reservations: Res<'w, StorageReservations>,
     pub door_map: Res<'w, crate::simulation::construction::DoorMap>,
     pub chunk_router: Res<'w, ChunkRouter>,
     pub chunk_connectivity: Res<'w, ChunkConnectivity>,
@@ -1559,6 +1574,7 @@ pub fn plan_execution_system(
         step_registry,
         faction_registry,
         storage_tile_map,
+        storage_reservations,
         door_map,
         chunk_router,
         chunk_connectivity,
@@ -1627,6 +1643,16 @@ pub fn plan_execution_system(
             let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
             let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
             let cur_chunk = chunk_coord(cur_tx, cur_ty);
+
+            // Defensive: if a stale storage reservation lingers because the
+            // withdraw task didn't run its normal exit (plan preempted
+            // mid-walk, drafted, etc.), release it now. The withdraw
+            // executor handles the common path; this catches preemption.
+            if ai.reserved_good.is_some()
+                && ai.task_id != TaskKind::WithdrawMaterial as u16
+            {
+                release_reservation(&storage_reservations, &mut ai);
+            }
 
             if active_plan_opt.is_none() {
                 // ── Select and start a new plan ───────────────────────────────────
@@ -2046,6 +2072,7 @@ pub fn plan_execution_system(
                     &agent,
                     &carrier,
                     claim_target_opt,
+                    &storage_reservations,
                     &mut withdraw_intent,
                 );
 
@@ -2087,6 +2114,24 @@ pub fn plan_execution_system(
                     // reads this to know which good and how many to take.
                     ai.withdraw_good = withdraw_intent.map(|(g, _)| g);
                     ai.withdraw_qty = withdraw_intent.map(|(_, q)| q).unwrap_or(0);
+                    // Reserve that qty against the chosen storage tile so a
+                    // second agent in the same tick sees a smaller effective
+                    // stock and either picks another tile/good or aborts.
+                    if let Some((good, qty)) = withdraw_intent {
+                        if step_def.task == TaskKind::WithdrawMaterial && qty > 0 {
+                            // Withdraw is "interacts from adjacent" — the
+                            // chosen storage tile is `target_tile`, not
+                            // `dest_tile`. assign_task_with_routing has
+                            // already populated `target_tile` for the
+                            // resolved tile, so use it as the reservation
+                            // key.
+                            let reserved_tile = (target_tx, target_ty);
+                            storage_reservations.add(reserved_tile, good, qty as u32);
+                            ai.reserved_tile = reserved_tile;
+                            ai.reserved_good = Some(good);
+                            ai.reserved_qty = qty;
+                        }
+                    }
                     active_plan.dispatched = true;
                     active_plan.reward_scale = step_def.reward_scale;
                 } else {

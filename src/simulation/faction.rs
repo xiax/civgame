@@ -124,6 +124,72 @@ impl StorageTileMap {
     }
 }
 
+/// Tile-scoped reservations on storage stocks. Two agents committing to the
+/// same one-unit stack used to be possible because the resolver only saw raw
+/// `GroundItem.qty`; now the resolver subtracts entries here from the
+/// effective stock. Each `WithdrawMaterial` dispatch increments the entry,
+/// and every task-teardown path (success, race-loss, plan abort) decrements
+/// it via `release_reservation` so the map stays consistent under churn.
+///
+/// Wrapped in a `Mutex` because `plan_execution_system` runs over agents in
+/// parallel via `par_iter_mut`. Both reads (resolver) and writes (dispatch +
+/// release) take the lock; critical sections are a single hashmap op each.
+#[derive(Resource, Default)]
+pub struct StorageReservations {
+    inner: std::sync::Mutex<AHashMap<((i16, i16), Good), u32>>,
+}
+
+impl StorageReservations {
+    pub fn add(&self, tile: (i16, i16), good: Good, qty: u32) {
+        if qty == 0 {
+            return;
+        }
+        let mut m = self.inner.lock().unwrap();
+        *m.entry((tile, good)).or_insert(0) += qty;
+    }
+
+    pub fn sub(&self, tile: (i16, i16), good: Good, qty: u32) {
+        if qty == 0 {
+            return;
+        }
+        let mut m = self.inner.lock().unwrap();
+        if let Some(slot) = m.get_mut(&(tile, good)) {
+            *slot = slot.saturating_sub(qty);
+            if *slot == 0 {
+                m.remove(&(tile, good));
+            }
+        }
+    }
+
+    pub fn get(&self, tile: (i16, i16), good: Good) -> u32 {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&(tile, good))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Snapshot total reserved qty across all (tile, good) pairs. Used by
+    /// the inspector for debugging.
+    pub fn total(&self) -> u32 {
+        self.inner.lock().unwrap().values().sum()
+    }
+}
+
+/// Decrement and clear the reservation tracked on a `PersonAI`. Safe to call
+/// from any teardown path; no-ops when the agent has no live reservation.
+pub fn release_reservation(
+    reservations: &StorageReservations,
+    ai: &mut crate::simulation::person::PersonAI,
+) {
+    if let Some(good) = ai.reserved_good {
+        reservations.sub(ai.reserved_tile, good, ai.reserved_qty as u32);
+    }
+    ai.reserved_good = None;
+    ai.reserved_qty = 0;
+}
+
 /// Computed cache of goods stored on all storage tiles for a faction.
 /// Updated each Economy tick by `compute_faction_storage_system`.
 #[derive(Default, Clone)]

@@ -271,7 +271,7 @@ pub fn compute_priority(
     base.saturating_add(pressure)
 }
 
-/// 0..=120: how badly does the faction need food right now? Scales with the
+/// 0..=100: how badly does the faction need food right now? Scales with the
 /// per-head food deficit; saturates as stocks approach empty.
 pub fn food_pressure(faction: &FactionData) -> u8 {
     if faction.member_count == 0 {
@@ -282,7 +282,7 @@ pub fn food_pressure(faction: &FactionData) -> u8 {
         return 0;
     }
     let deficit_ratio = ((FOOD_PER_HEAD_TARGET - per_head) / FOOD_PER_HEAD_TARGET).clamp(0.0, 1.0);
-    (deficit_ratio * 120.0) as u8
+    (deficit_ratio * 100.0) as u8
 }
 
 /// 0..=80: build projects waiting on this material add pressure. Empty
@@ -315,6 +315,9 @@ pub fn haul_pressure() -> u8 {
     50
 }
 
+/// 0..=100: how badly does the faction need farmed grain. Scaled to the
+/// same urgency range as the other pressure helpers so the workforce
+/// budget can compare slots directly.
 pub fn farm_pressure(faction: &FactionData) -> u8 {
     if !faction_can_perform(faction, JobKind::Farm) {
         return 0;
@@ -324,9 +327,13 @@ pub fn farm_pressure(faction: &FactionData) -> u8 {
     if grain >= target || target == 0 {
         return 0;
     }
-    (target - grain).min(60) as u8
+    let deficit = (target - grain) as f32;
+    let target_f = target as f32;
+    ((deficit / target_f).clamp(0.0, 1.0) * 100.0) as u8
 }
 
+/// 0..=100: tool-supply gap pressure on the same urgency scale as the
+/// other helpers.
 pub fn craft_pressure(faction: &FactionData) -> u8 {
     let supply = faction
         .resource_supply
@@ -339,7 +346,7 @@ pub fn craft_pressure(faction: &FactionData) -> u8 {
         .copied()
         .unwrap_or(0);
     let gap = demand.saturating_sub(supply);
-    (gap.saturating_mul(2)).min(60) as u8
+    (gap.saturating_mul(4)).min(100) as u8
 }
 
 // ── Workforce budget (Stage 2) ───────────────────────────────────────────────
@@ -410,12 +417,30 @@ impl WorkforceBudget {
 }
 
 const FREE_FLOOR: f32 = 0.10;
-const BUDGET_EMA_ALPHA: f32 = 0.25;
-const BUDGET_TEMPERATURE: f32 = 1.0;
-const ROLE_FLOOR: f32 = 5.0;
+const BUDGET_EMA_ALPHA: f32 = 0.15;
+/// Per-eligible-slot floor: each role keeps a baseline share so a single
+/// urgent need can't strand the others. 7 slots × 0.03 = 0.21 reserved as
+/// floor; with `FREE_FLOOR` (0.10) that leaves 0.69 to distribute by
+/// pressure.
+const SHARE_FLOOR: f32 = 0.03;
+/// Cap on culture-modulated raw pressure. Inputs land in 0..100 before
+/// modulation; the 0.5×–1.5× multipliers can stack, so clamp at 150 to
+/// keep slots in the same order of magnitude without flattening cultural
+/// distinction.
+const CULTURE_RAW_CAP: f32 = 150.0;
+/// Trigger threshold for the critical-food override. Per-head food below
+/// 20% of target makes `food_pressure` ≥ 80, at which point we force
+/// `stockpile_food` to at least `CRITICAL_FOOD_FLOOR`.
+const CRITICAL_FOOD_TRIGGER: f32 = 80.0;
+const CRITICAL_FOOD_FLOOR: f32 = 0.45;
 
 /// Compute the next workforce budget from current pressures, blend with the
 /// previous tick's via EMA so the budget doesn't whipsaw on noisy state.
+///
+/// All seven raw pressures are normalized to the same 0..100 urgency scale,
+/// then allocated linearly with a per-slot floor — pressure 80 vs 40 yields
+/// a 2:1 split, not a winner-take-all softmax flip. EMA absorbs single-tick
+/// step changes from discrete project add/complete events.
 pub fn compute_workforce_budget(
     faction: &FactionData,
     projects: &Projects,
@@ -432,10 +457,10 @@ pub fn compute_workforce_budget(
         }
     }
 
-    // Per-good Stockpile pressure. Each good gets its own softmax slot so the
-    // food posting can't crowd out wood/stone caps. Anticipatory deficit feeds
-    // the per-good signal directly; project-waiting bumps every good so an
-    // active build project lifts material gathering across the board.
+    // Per-good Stockpile urgency on a 0..100 scale. Combines the deficit
+    // ratio (how far below target storage sits) with a saturating
+    // project-count term so adding one waiting project no longer dwarfs
+    // the deficit signal.
     let stored_of = |good: Good| {
         faction
             .storage
@@ -451,27 +476,34 @@ pub fn compute_workforce_budget(
             .copied()
             .unwrap_or(0) as f32
     };
-    let project_bump = waiting_gather as f32 * 20.0;
+    let material_urgency = |good: Good| -> f32 {
+        let target = target_of(good);
+        let stored = stored_of(good);
+        let deficit_ratio = if target > 0.0 {
+            ((target - stored) / target).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let project_term = (waiting_gather as f32 / 3.0).clamp(0.0, 1.0);
+        deficit_ratio * 70.0 + project_term * 30.0
+    };
     let stockpile_food_pressure = food;
-    let stockpile_wood_pressure =
-        (target_of(Good::Wood) - stored_of(Good::Wood)).max(0.0) * 1.5 + project_bump;
-    let stockpile_stone_pressure =
-        (target_of(Good::Stone) - stored_of(Good::Stone)).max(0.0) * 1.5 + project_bump;
+    let stockpile_wood_pressure = material_urgency(Good::Wood);
+    let stockpile_stone_pressure = material_urgency(Good::Stone);
 
-    // Haul pressure: count Haul postings on the board for this faction (those
-    // are the ones with deliverable storage). Each haulable item adds weight.
-    // Materially: aggregated as project-count * 20 — a softer signal than
-    // Stockpile so haulers don't crowd out gatherers when storage is empty.
-    let haul_pressure = waiting_build as f32 * 10.0 + waiting_gather as f32 * 20.0;
+    // Haul + Build urgency on the same 0..100 scale, saturating at modest
+    // queue depths since beyond that the bottleneck is throughput not
+    // allocation share.
+    let haul = ((waiting_build + waiting_gather) as f32 / 4.0).clamp(0.0, 1.0) * 100.0;
+    let build = (waiting_build as f32 / 2.0).clamp(0.0, 1.0) * 100.0;
 
     let farm = farm_pressure(faction) as f32;
     let craft = craft_pressure(faction) as f32;
-    let build = waiting_build as f32 * 30.0;
 
     let mut raw_food = stockpile_food_pressure;
     let mut raw_wood = stockpile_wood_pressure;
     let mut raw_stone = stockpile_stone_pressure;
-    let mut raw_haul = haul_pressure;
+    let mut raw_haul = haul;
     let mut raw_farm = farm;
     let mut raw_build = build;
     let mut raw_craft = craft;
@@ -491,10 +523,9 @@ pub fn compute_workforce_budget(
     raw_haul *= scale(c.mercantile, 0.2);
     raw_build *= scale(c.martial, 0.2);
 
-    // Capability gate — kinds the faction can't yet perform are excluded from
-    // the softmax entirely (NEG_INFINITY → exp() = 0). The three Stockpile
-    // sub-slots all gate on JobKind::Stockpile (always true today, but kept
-    // consistent with the helper).
+    // Capability gate + culture clamp. Inputs are 0..100; culture stacking
+    // can lift them past that, so cap at CULTURE_RAW_CAP to keep slots
+    // comparable.
     let stockpile_eligible = faction_can_perform(faction, JobKind::Stockpile);
     let kinds = [
         None, // food
@@ -505,39 +536,85 @@ pub fn compute_workforce_budget(
         Some(JobKind::Build),
         Some(JobKind::Craft),
     ];
-    let mut raw = [
+    let raws = [
         raw_food, raw_wood, raw_stone, raw_haul, raw_farm, raw_build, raw_craft,
     ];
-    for (i, slot) in kinds.iter().enumerate() {
-        let eligible = match slot {
+    let mut raw = [0.0f32; 7];
+    let mut eligible = [false; 7];
+    for i in 0..7 {
+        let ok = match kinds[i] {
             None => stockpile_eligible,
-            Some(kind) => faction_can_perform(faction, *kind),
+            Some(kind) => faction_can_perform(faction, kind),
         };
-        if eligible {
-            raw[i] = raw[i].max(ROLE_FLOOR);
-        } else {
-            raw[i] = f32::NEG_INFINITY;
+        eligible[i] = ok;
+        if ok {
+            raw[i] = raws[i].max(0.0).min(CULTURE_RAW_CAP);
         }
     }
 
-    // Softmax over modulated weights (numerically stable).
-    let t = BUDGET_TEMPERATURE.max(0.01);
-    let max_w = raw.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = raw.iter().map(|w| ((*w - max_w) / t).exp()).collect();
-    let sum: f32 = exps.iter().sum::<f32>().max(1e-6);
+    // Linear proportional allocation with per-slot floor. Every eligible
+    // slot gets `SHARE_FLOOR` baseline; the remaining `weight_budget` is
+    // split proportionally to raw pressure. If all pressures are ~0,
+    // distribute the weight budget equally so the faction doesn't sit on
+    // floors alone.
+    let n_eligible = eligible.iter().filter(|&&e| e).count() as f32;
     let usable = 1.0 - FREE_FLOOR;
+    let mut shares = [0.0f32; 7];
+    if n_eligible > 0.0 {
+        let floor_total = (SHARE_FLOOR * n_eligible).min(usable);
+        let weight_budget = (usable - floor_total).max(0.0);
+        let sum_raw: f32 = raw.iter().sum();
+        if sum_raw < 1e-3 {
+            let each_extra = weight_budget / n_eligible;
+            for i in 0..7 {
+                if eligible[i] {
+                    shares[i] = SHARE_FLOOR + each_extra;
+                }
+            }
+        } else {
+            for i in 0..7 {
+                if eligible[i] {
+                    shares[i] = SHARE_FLOOR + (raw[i] / sum_raw) * weight_budget;
+                }
+            }
+        }
+    }
+
+    // Critical-food override: if per-head food is dire, guarantee
+    // `stockpile_food` ≥ `CRITICAL_FOOD_FLOOR` by lifting it from the
+    // other eligible slots (excluding `free`) proportionally to their
+    // current shares.
+    if eligible[0] && food >= CRITICAL_FOOD_TRIGGER && shares[0] < CRITICAL_FOOD_FLOOR {
+        let lift = CRITICAL_FOOD_FLOOR - shares[0];
+        let donor_total: f32 = (1..7)
+            .filter(|&i| eligible[i])
+            .map(|i| shares[i])
+            .sum();
+        if donor_total > 1e-6 {
+            let take_ratio = (lift / donor_total).min(1.0);
+            for i in 1..7 {
+                if eligible[i] {
+                    shares[i] -= shares[i] * take_ratio;
+                }
+            }
+            shares[0] = CRITICAL_FOOD_FLOOR;
+        }
+    }
+
     let target = WorkforceBudget {
-        stockpile_food: (exps[0] / sum) * usable,
-        stockpile_wood: (exps[1] / sum) * usable,
-        stockpile_stone: (exps[2] / sum) * usable,
-        haul: (exps[3] / sum) * usable,
-        farm: (exps[4] / sum) * usable,
-        build: (exps[5] / sum) * usable,
-        craft: (exps[6] / sum) * usable,
+        stockpile_food: shares[0],
+        stockpile_wood: shares[1],
+        stockpile_stone: shares[2],
+        haul: shares[3],
+        farm: shares[4],
+        build: shares[5],
+        craft: shares[6],
         free: FREE_FLOOR,
     };
 
-    // EMA hysteresis with the previous budget.
+    // EMA hysteresis: smooths step changes from discrete project events.
+    // Allocation is naturally smooth across continuous pressure changes
+    // now, so α is lower than the old softmax-era setting.
     let blend = |old: f32, new: f32| old + (new - old) * BUDGET_EMA_ALPHA;
     WorkforceBudget {
         stockpile_food: blend(previous.stockpile_food, target.stockpile_food),

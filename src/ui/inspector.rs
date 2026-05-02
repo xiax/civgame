@@ -478,6 +478,15 @@ pub fn inspector_panel_system(
                                     work_str = "Stealing Goods".to_string();
                                 } else if ai.task_id == TaskKind::Scavenge as u16 {
                                     work_str = "Picking up item".to_string();
+                                } else if ai.task_id == TaskKind::WithdrawMaterial as u16 {
+                                    if let Some(good) = ai.withdraw_good {
+                                        work_str = format!(
+                                            "Withdrawing {:?} \u{00d7} {}",
+                                            good, ai.withdraw_qty
+                                        );
+                                    } else {
+                                        work_str = "Withdrawing".to_string();
+                                    }
                                 }
 
                                 work_str
@@ -488,6 +497,12 @@ pub fn inspector_panel_system(
                             "Target: {}, {}",
                             ai.target_tile.0, ai.target_tile.1
                         ));
+                        if let Some(good) = ai.withdraw_good {
+                            ui.label(format!(
+                                "Withdraw intent: {:?} \u{00d7} {} from ({}, {})",
+                                good, ai.withdraw_qty, ai.dest_tile.0, ai.dest_tile.1
+                            ));
+                        }
 
                         match order {
                             Some(o) => {

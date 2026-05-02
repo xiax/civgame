@@ -6,13 +6,14 @@
 //! is private static data shared between them.
 
 use super::{
-    mk_weights, AgentGoal, MemoryKind, PlanDef, PlanRegistry, StepDef, StepId, StepPreconditions,
-    StepRegistry, StepTarget, TaskKind, TileKind, PF_DROP_FOOD_ON_TIMEOUT, PF_EXPLORE, PF_NONE,
-    PF_SCAVENGE, PF_TARGETS_FOOD, PF_TARGETS_STONE, PF_TARGETS_WOOD, SI_HAS_FOOD, SI_HAS_SEED,
-    SI_HAS_STONE, SI_HAS_WOOD, SI_HUNGER, SI_IN_FACTION, SI_MEM_FOOD, SI_MEM_STONE, SI_MEM_WOOD,
-    SI_SAFETY, SI_SEASON_FOOD, SI_SHELTER, SI_SKILL_BUILDING, SI_SKILL_COMBAT, SI_SKILL_CRAFTING,
-    SI_SKILL_FARMING, SI_SKILL_MINING, SI_SOCIAL, SI_VIS_GROUND_FOOD, SI_VIS_GROUND_STONE,
-    SI_VIS_GROUND_WOOD, SI_VIS_PLANT_FOOD, SI_VIS_STONE_TILE, SI_VIS_TREE, SI_WILLPOWER_DISTRESS,
+    mk_weights, AgentGoal, GoodSelector, MaterialNeed, MemoryKind, PlanDef, PlanRegistry, StepDef,
+    StepId, StepPreconditions, StepRegistry, StepTarget, TaskKind, TileKind,
+    PF_DROP_FOOD_ON_TIMEOUT, PF_EXPLORE, PF_NONE, PF_SCAVENGE, PF_TARGETS_FOOD, PF_TARGETS_STONE,
+    PF_TARGETS_WOOD, SI_HAS_FOOD, SI_HAS_SEED, SI_HAS_STONE, SI_HAS_WOOD, SI_HUNGER, SI_IN_FACTION,
+    SI_MEM_FOOD, SI_MEM_STONE, SI_MEM_WOOD, SI_SAFETY, SI_SEASON_FOOD, SI_SHELTER, SI_SKILL_BUILDING,
+    SI_SKILL_COMBAT, SI_SKILL_CRAFTING, SI_SKILL_FARMING, SI_SKILL_MINING, SI_SOCIAL,
+    SI_VIS_GROUND_FOOD, SI_VIS_GROUND_STONE, SI_VIS_GROUND_WOOD, SI_VIS_PLANT_FOOD,
+    SI_VIS_STONE_TILE, SI_VIS_TREE, SI_WILLPOWER_DISTRESS,
 };
 use crate::economy::goods::Good;
 use crate::simulation::needs::EAT_TRIGGER_HUNGER;
@@ -76,14 +77,11 @@ static RETURN_CAMP_GOALS: &[AgentGoal] = &[AgentGoal::ReturnCamp];
 // New craft pipeline (order-driven). The Deliver*ToCraftOrder plans haul a
 // specific good into an open CraftOrder's deposit slots; "WorkOnCraft" runs
 // the recipe once the order is satisfied. Wood/stone draw from the faction
-// stockpile (steps 46/47); hide and grain still come from a fresh
-// hunt/harvest because there is no equivalent storage-fetch path for those
-// goods today.
+// stockpile through plan 15, which uses step 40's MostDeficient selector to
+// pick whichever good open orders need most. Hide and grain still come from
+// a fresh hunt/harvest because no storage-fetch path exists for those.
 //   38 = HaulToCraftOrder, 39 = WorkOnCraftOrder,
-//   40 = FetchCraftOrderMaterialFromStorage (any-good fallback),
-//   46 = FetchWoodFromStorage, 47 = FetchStoneFromStorage.
-static PLAN_STEPS_11: &[StepId] = &[46, 38]; // DeliverWoodToCraftOrder
-static PLAN_STEPS_12: &[StepId] = &[47, 38]; // DeliverStoneToCraftOrder
+//   40 = FetchCraftOrderMaterialFromStorage (most-deficient good).
 static PLAN_STEPS_13: &[StepId] = &[5, 13, 38]; // DeliverHideToCraftOrder
 static PLAN_STEPS_14: &[StepId] = &[1, 38]; // DeliverGrainToCraftOrder
 static PLAN_STEPS_15: &[StepId] = &[40, 38]; // DeliverFromStorageToCraftOrder
@@ -447,13 +445,16 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         StepDef {
             // 32: FetchMaterialFromStorage — route to the nearest faction
             // storage tile that holds a good currently needed by an unsatisfied
-            // blueprint, and pull one unit into the agent's inventory. Pairs
-            // with step 28 (HaulToBlueprint) so wood/stone already deposited
-            // in granaries can be ferried to in-progress build sites without
-            // requiring a fresh gather wave.
+            // blueprint and pull the most-deficient material into the agent's
+            // inventory. Pairs with step 28 (HaulToBlueprint) so stockpiled
+            // wood/stone can ferry into in-progress build sites without a
+            // fresh gather wave.
             id: 32,
             task: TaskKind::WithdrawMaterial,
-            target: StepTarget::NearestFactionStorageWithBlueprintMaterial,
+            target: StepTarget::WithdrawForFactionNeed {
+                need: MaterialNeed::Blueprint,
+                selector: GoodSelector::MostDeficient,
+            },
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
@@ -542,12 +543,17 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            // 40: FetchCraftOrderMaterialFromStorage — withdraw one good
-            // currently needed by an open CraftOrder from a faction storage
-            // tile, so it can be hauled to the order.
+            // 40: FetchCraftOrderMaterialFromStorage — withdraw the most-
+            // deficient good across open CraftOrders from a faction storage
+            // tile so it can be hauled to the order. The faction's open
+            // orders drive the choice; the agent doesn't need a per-good
+            // plan variant.
             id: 40,
             task: TaskKind::WithdrawMaterial,
-            target: StepTarget::NearestFactionStorageWithCraftOrderMaterial,
+            target: StepTarget::WithdrawForFactionNeed {
+                need: MaterialNeed::CraftOrder,
+                selector: GoodSelector::MostDeficient,
+            },
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
@@ -556,11 +562,17 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         StepDef {
             // 41: WithdrawClaimedHaulMaterial — withdraw the good named in the
             // agent's active JobClaim::Haul from the nearest faction storage
-            // tile holding that good. Pairs with step 42 (HaulToClaimedBlueprint)
-            // to deliver storage stock into a specific blueprint.
+            // tile holding that good. Pairs with step 42
+            // (HaulToClaimedBlueprint) to deliver storage stock into a
+            // specific blueprint.
             id: 41,
             task: TaskKind::WithdrawMaterial,
-            target: StepTarget::StorageWithHaulClaimGood,
+            target: StepTarget::WithdrawForFactionNeed {
+                need: MaterialNeed::HaulClaim,
+                // Selector is overridden by the resolver after reading the
+                // claim's good; placeholder kept for the type.
+                selector: GoodSelector::MostDeficient,
+            },
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
@@ -613,25 +625,26 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            // 46: FetchWoodFromStorage — withdraw wood from a faction storage
-            // tile so it can be hauled into a CraftOrder's deposit slot.
-            // Pairs with step 38 (HaulToCraftOrder). The resolver gates on
-            // both "tile has wood" and "an open order needs wood".
+            // 46: (unused — was per-good FetchWoodFromStorage; superseded by
+            // step 40's MostDeficient selector). Kept as Idle so any in-flight
+            // ActivePlan referencing this id falls through to the lookup
+            // failure path rather than panicking.
             id: 46,
-            task: TaskKind::WithdrawMaterial,
-            target: StepTarget::NearestFactionStorageContainingForCraftOrder(Good::Wood),
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
-            reward_scale: 0.3,
+            reward_scale: 0.0,
             plant_filter: None,
             extra: 0,
         },
         StepDef {
-            // 47: FetchStoneFromStorage — sibling of step 46 for stone.
+            // 47: (unused — was per-good FetchStoneFromStorage; superseded by
+            // step 40's MostDeficient selector).
             id: 47,
-            task: TaskKind::WithdrawMaterial,
-            target: StepTarget::NearestFactionStorageContainingForCraftOrder(Good::Stone),
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
-            reward_scale: 0.3,
+            reward_scale: 0.0,
             plant_filter: None,
             extra: 0,
         },
@@ -863,23 +876,28 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         // the order is satisfied. Plans are filtered out at dispatch time when
         // no order needs the corresponding good (resolve_target → None).
         PlanDef {
+            // 11: (unused — was DeliverWoodToCraftOrder; collapsed into plan
+            // 15 whose step 40 now picks the most-deficient material across
+            // all open orders. ID kept for PlanHistory ring-buffer stability;
+            // bias is wired so the candidate filter never selects it.)
             id: 11,
-            name: "DeliverWoodToCraftOrder",
-            steps: PLAN_STEPS_11,
-            state_weights: mk_weights(&[(SI_IN_FACTION, 0.4)]),
-            bias: 0.1,
-            serves_goals: CRAFT_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
         },
         PlanDef {
+            // 12: (unused — was DeliverStoneToCraftOrder; collapsed into plan 15.)
             id: 12,
-            name: "DeliverStoneToCraftOrder",
-            steps: PLAN_STEPS_12,
-            state_weights: mk_weights(&[(SI_IN_FACTION, 0.4)]),
-            bias: 0.1,
-            serves_goals: CRAFT_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
