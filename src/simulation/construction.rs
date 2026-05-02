@@ -2522,6 +2522,7 @@ pub fn construction_system(
     mut job_completed: EventWriter<JobCompletedEvent>,
     mut activity_log: EventWriter<crate::ui::activity_log::ActivityLogEvent>,
     mut bp_query: Query<&mut Blueprint>,
+    member_query: Query<&FactionMember>,
     mut agent_query: Query<(
         Entity,
         &mut PersonAI,
@@ -2959,9 +2960,11 @@ pub fn construction_system(
                         .and_then(|v| v.first().map(|(e, _, _)| *e))
                 });
             if let Some(actor) = lead_actor {
+                let faction_id = member_query.get(actor).map(|m| m.faction_id).unwrap_or(0);
                 activity_log.send(crate::ui::activity_log::ActivityLogEvent {
                     tick: clock.tick,
                     actor,
+                    faction_id,
                     kind: crate::ui::activity_log::ActivityEntryKind::Constructed {
                         site: bp.kind,
                         tile,

@@ -31,13 +31,7 @@ pub fn economy_panel_system(
                         ui.label("Item Listings:");
                         for (item, stock) in &market.listings {
                             if *stock > 0 {
-                                let mut name = item.good.name().to_string();
-                                if let Some(mat) = item.material {
-                                    name = format!("{:?} {}", mat, name);
-                                }
-                                if let Some(qual) = item.quality {
-                                    name = format!("{} ({:?})", name, qual);
-                                }
+                                let name = item.label();
                                 ui.label(format!(
                                     "  {} x{}: ${:.1}",
                                     name,

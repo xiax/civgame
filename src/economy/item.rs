@@ -56,6 +56,7 @@ pub struct Item {
     pub good: Good,
     pub material: Option<ItemMaterial>,
     pub quality: Option<ItemQuality>,
+    pub display_name: Option<&'static str>,
 }
 
 impl Item {
@@ -64,6 +65,7 @@ impl Item {
             good,
             material: None,
             quality: None,
+            display_name: None,
         }
     }
 
@@ -72,6 +74,28 @@ impl Item {
             good,
             material: Some(material),
             quality: Some(quality),
+            display_name: None,
+        }
+    }
+
+    /// Human-readable label for UI display. Uses `display_name` when set
+    /// (crafted items carry the recipe name), otherwise falls back to
+    /// "Material Good" from `material` + `good.name()`. Quality is appended
+    /// in parentheses when present.
+    pub fn label(&self) -> String {
+        let base = if let Some(dn) = self.display_name {
+            dn.to_string()
+        } else {
+            let mut s = self.good.name().to_string();
+            if let Some(mat) = self.material {
+                s = format!("{:?} {}", mat, s);
+            }
+            s
+        };
+        if let Some(qual) = self.quality {
+            format!("{} ({:?})", base, qual)
+        } else {
+            base
         }
     }
 

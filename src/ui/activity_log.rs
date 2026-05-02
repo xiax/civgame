@@ -2,21 +2,19 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 use std::collections::VecDeque;
 
-use crate::economy::goods::Good;
 use crate::simulation::construction::BuildSiteKind;
-use crate::simulation::faction::{FactionMember, PlayerFaction};
-use crate::simulation::schedule::SimClock;
-use crate::ui::selection::SelectedEntity;
-use crate::world::terrain::tile_to_world;
+use crate::simulation::faction::PlayerFaction;
 
 const MAX_ENTRIES: usize = 16;
-const TICKS_PER_SEC: f64 = 20.0;
+const TICKS_PER_DAY: u64 = 3600;
+const DAYS_PER_SEASON: u64 = 5;
 
 
 #[derive(Event, Clone)]
 pub struct ActivityLogEvent {
     pub tick: u64,
     pub actor: Entity,
+    pub faction_id: u32,
     pub kind: ActivityEntryKind,
 }
 
@@ -28,7 +26,11 @@ pub enum ActivityEntryKind {
         result_entity: Entity,
     },
     Crafted {
-        good: Good,
+        name: &'static str,
+    },
+    TechDiscovered {
+        tech_name: &'static str,
+        era_name: &'static str,
     },
 }
 
@@ -39,6 +41,7 @@ pub enum ResultLink {
         snapshot: Vec2,
     },
     HeldByActor,
+    NoTarget,
 }
 
 #[derive(Clone)]
@@ -63,17 +66,10 @@ pub fn activity_log_ingest_system(
     mut events: EventReader<ActivityLogEvent>,
     mut log: ResMut<ActivityLog>,
     transforms: Query<&Transform>,
-    members: Query<&FactionMember>,
     player_faction: Res<PlayerFaction>,
 ) {
     for ev in events.read() {
-        // Only surface activity from the player's faction. Other factions are
-        // working in the background and would just be noise.
-        let in_player_faction = members
-            .get(ev.actor)
-            .map(|m| m.faction_id == player_faction.faction_id)
-            .unwrap_or(false);
-        if !in_player_faction {
+        if ev.faction_id != player_faction.faction_id {
             continue;
         }
 
@@ -91,7 +87,9 @@ pub fn activity_log_ingest_system(
                 let world = transforms
                     .get(result_entity)
                     .map(|t| t.translation.truncate())
-                    .unwrap_or_else(|_| tile_to_world(tile.0 as i32, tile.1 as i32));
+                    .unwrap_or_else(|_| {
+                        crate::world::terrain::tile_to_world(tile.0 as i32, tile.1 as i32)
+                    });
                 (
                     "built",
                     site.label().to_string(),
@@ -101,10 +99,15 @@ pub fn activity_log_ingest_system(
                     },
                 )
             }
-            ActivityEntryKind::Crafted { good } => (
+            ActivityEntryKind::Crafted { name } => (
                 "crafted",
-                good.name().to_string(),
+                name.to_string(),
                 ResultLink::HeldByActor,
+            ),
+            ActivityEntryKind::TechDiscovered { tech_name, era_name } => (
+                "discovered",
+                format!("{} ({})", tech_name, era_name),
+                ResultLink::NoTarget,
             ),
         };
 
@@ -125,9 +128,8 @@ pub fn activity_log_ingest_system(
 pub fn activity_log_panel_system(
     mut contexts: EguiContexts,
     mut log: ResMut<ActivityLog>,
-    mut selected: ResMut<SelectedEntity>,
+    mut selected: ResMut<crate::ui::selection::SelectedEntity>,
     mut focus: ResMut<CameraFocusRequest>,
-    clock: Res<SimClock>,
     name_query: Query<&Name>,
     transforms: Query<&Transform>,
 ) {
@@ -135,7 +137,6 @@ pub fn activity_log_panel_system(
         return;
     }
 
-    let now_tick = clock.tick;
     let ctx = contexts.ctx_mut();
 
     egui::Area::new(egui::Id::new("activity_log"))
@@ -173,30 +174,32 @@ pub fn activity_log_panel_system(
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             for entry in log.entries.iter() {
-                                let actor_alive = name_query.get(entry.actor).is_ok();
-                                let actor_name = name_query
-                                    .get(entry.actor)
-                                    .map(|n| n.as_str().to_string())
-                                    .unwrap_or_else(|_| "(gone)".to_string());
-
-                                let result_alive = match entry.result {
-                                    ResultLink::Built { entity, .. } => {
-                                        transforms.get(entity).is_ok()
-                                    }
-                                    ResultLink::HeldByActor => actor_alive,
-                                };
+                                let is_tech = entry.actor == Entity::PLACEHOLDER;
 
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 4.0;
 
-                                    let actor_btn = link_button(ui, &actor_name, actor_alive);
-                                    if actor_btn.clicked() && actor_alive {
-                                        click_actor = Some(entry.actor);
-                                        click_focus = transforms
+                                    if is_tech {
+                                        ui.label(
+                                            egui::RichText::new("★")
+                                                .color(egui::Color32::from_rgb(255, 210, 80)),
+                                        );
+                                    } else {
+                                        let actor_alive = name_query.get(entry.actor).is_ok();
+                                        let actor_name = name_query
                                             .get(entry.actor)
-                                            .ok()
-                                            .map(|t| t.translation.truncate())
-                                            .or(entry.actor_snapshot);
+                                            .map(|n| n.as_str().to_string())
+                                            .unwrap_or_else(|_| "(gone)".to_string());
+
+                                        let actor_btn = link_button(ui, &actor_name, actor_alive);
+                                        if actor_btn.clicked() && actor_alive {
+                                            click_actor = Some(entry.actor);
+                                            click_focus = transforms
+                                                .get(entry.actor)
+                                                .ok()
+                                                .map(|t| t.translation.truncate())
+                                                .or(entry.actor_snapshot);
+                                        }
                                     }
 
                                     ui.label(
@@ -204,19 +207,32 @@ pub fn activity_log_panel_system(
                                             .color(egui::Color32::from_rgb(180, 180, 180)),
                                     );
 
-                                    let thing_btn =
-                                        link_button(ui, &entry.thing_label, result_alive);
-                                    if thing_btn.clicked() && result_alive {
-                                        match entry.result {
-                                            ResultLink::Built { entity, snapshot } => {
-                                                click_result_entity = Some(entity);
+                                    match &entry.result {
+                                        ResultLink::Built { entity, snapshot } => {
+                                            let result_alive = transforms.get(*entity).is_ok();
+                                            let thing_btn = link_button(
+                                                ui,
+                                                &entry.thing_label,
+                                                result_alive,
+                                            );
+                                            if thing_btn.clicked() && result_alive {
+                                                click_result_entity = Some(*entity);
                                                 click_focus = transforms
-                                                    .get(entity)
+                                                    .get(*entity)
                                                     .ok()
                                                     .map(|t| t.translation.truncate())
-                                                    .or(Some(snapshot));
+                                                    .or(Some(*snapshot));
                                             }
-                                            ResultLink::HeldByActor => {
+                                        }
+                                        ResultLink::HeldByActor => {
+                                            let actor_alive =
+                                                name_query.get(entry.actor).is_ok();
+                                            let thing_btn = link_button(
+                                                ui,
+                                                &entry.thing_label,
+                                                actor_alive,
+                                            );
+                                            if thing_btn.clicked() && actor_alive {
                                                 click_actor = Some(entry.actor);
                                                 click_focus = transforms
                                                     .get(entry.actor)
@@ -225,15 +241,21 @@ pub fn activity_log_panel_system(
                                                     .or(entry.actor_snapshot);
                                             }
                                         }
+                                        ResultLink::NoTarget => {
+                                            ui.label(
+                                                egui::RichText::new(&entry.thing_label)
+                                                    .color(egui::Color32::from_rgb(
+                                                        200, 230, 200,
+                                                    )),
+                                            );
+                                        }
                                     }
 
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            let dt_secs = now_tick.saturating_sub(entry.tick) as f64
-                                                / TICKS_PER_SEC;
                                             ui.label(
-                                                egui::RichText::new(format_age(dt_secs))
+                                                egui::RichText::new(tick_to_game_date(entry.tick))
                                                     .small()
                                                     .color(egui::Color32::from_rgb(140, 140, 140)),
                                             );
@@ -283,15 +305,9 @@ fn link_button(ui: &mut egui::Ui, text: &str, alive: bool) -> egui::Response {
     ui.add(egui::Button::new(rich).frame(false))
 }
 
-fn format_age(secs: f64) -> String {
-    let s = secs.max(0.0);
-    if s < 5.0 {
-        "just now".to_string()
-    } else if s < 60.0 {
-        format!("{}s ago", s as u32)
-    } else if s < 3600.0 {
-        format!("{}m ago", (s / 60.0) as u32)
-    } else {
-        format!("{}h ago", (s / 3600.0) as u32)
-    }
+fn tick_to_game_date(tick: u64) -> String {
+    let total_days = tick / TICKS_PER_DAY;
+    let day = total_days % DAYS_PER_SEASON + 1;
+    let season_abbr = ["Spr", "Sum", "Aut", "Win"][(total_days / DAYS_PER_SEASON % 4) as usize];
+    format!("{} D{}", season_abbr, day)
 }

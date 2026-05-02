@@ -367,16 +367,9 @@ pub fn inspector_panel_system(
                             .show(ui, |ui| {
                                 for (item, qty) in &agent.inventory {
                                     if *qty > 0 {
-                                        let mut name = item.good.name().to_string();
-                                        if let Some(mat) = item.material {
-                                            name = format!("{:?} {}", mat, name);
-                                        }
-                                        if let Some(qual) = item.quality {
-                                            name = format!("{} ({:?})", name, qual);
-                                        }
                                         ui.label(format!(
                                             "  {}: {} ({:.2} kg)",
-                                            name,
+                                            item.label(),
                                             qty,
                                             item.stack_weight_g(*qty) as f32 / 1000.0
                                         ));
@@ -395,7 +388,7 @@ pub fn inspector_panel_system(
                                 let tag = if stack.two_handed { " [2H]" } else { "" };
                                 ui.label(format!(
                                     "  L: {} ×{}{} ({:.2} kg)",
-                                    stack.item.good.name(),
+                                    stack.item.label(),
                                     stack.qty,
                                     tag,
                                     stack.weight_g() as f32 / 1000.0,
@@ -419,7 +412,7 @@ pub fn inspector_panel_system(
                                     let tag = if stack.two_handed { " [2H]" } else { "" };
                                     ui.label(format!(
                                         "  R: {} ×{}{} ({:.2} kg)",
-                                        stack.item.good.name(),
+                                        stack.item.label(),
                                         stack.qty,
                                         tag,
                                         stack.weight_g() as f32 / 1000.0,

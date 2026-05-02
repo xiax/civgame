@@ -1,4 +1,6 @@
-use super::faction::FactionRegistry;
+use super::faction::{FactionRegistry, PlayerFaction};
+use super::schedule::SimClock;
+use crate::ui::activity_log::{ActivityEntryKind, ActivityLogEvent};
 use crate::world::seasons::{Calendar, Season};
 use bevy::prelude::*;
 
@@ -1104,8 +1106,11 @@ pub static TECH_TREE: [TechDef; TECH_COUNT] = [
 /// based on its accumulated activity log, then resets the log.
 pub fn tech_discovery_system(
     calendar: Res<Calendar>,
+    clock: Res<SimClock>,
     mut registry: ResMut<FactionRegistry>,
     mut last_season: Local<Season>,
+    player_faction: Res<PlayerFaction>,
+    mut log_events: EventWriter<ActivityLogEvent>,
 ) {
     if calendar.season == *last_season {
         return;
@@ -1143,6 +1148,17 @@ pub fn tech_discovery_system(
                 tech_def(id).era.name()
             );
             faction.techs.unlock(id);
+            if *faction_id as u32 == player_faction.faction_id {
+                log_events.send(ActivityLogEvent {
+                    tick: clock.tick,
+                    actor: Entity::PLACEHOLDER,
+                    faction_id: *faction_id as u32,
+                    kind: ActivityEntryKind::TechDiscovered {
+                        tech_name: tech_def(id).name,
+                        era_name: tech_def(id).era.name(),
+                    },
+                });
+            }
         }
 
         faction.activity_log.reset();

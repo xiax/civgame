@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
+use crate::simulation::crafting::CRAFT_RECIPES;
 use crate::simulation::faction::{FactionRegistry, PlayerFaction};
 use crate::economy::goods::Good;
 use crate::simulation::jobs::{
@@ -11,6 +12,8 @@ use crate::simulation::projects::{
     ProjectCancelReason, ProjectEventKind, ProjectPhase, Projects,
 };
 use crate::simulation::schedule::SimClock;
+use crate::ui::activity_log::CameraFocusRequest;
+use crate::ui::selection::SelectedEntity;
 
 /// State persisted between frames for the player-side Post Job form.
 #[derive(Resource)]
@@ -19,6 +22,7 @@ pub struct JobBoardPanelState {
     pub draft_kind: JobKind,
     pub draft_target: u32,
     pub draft_radius: i16,
+    pub draft_recipe: u8,
 }
 
 impl Default for JobBoardPanelState {
@@ -28,6 +32,7 @@ impl Default for JobBoardPanelState {
             draft_kind: JobKind::Stockpile,
             draft_target: 200,
             draft_radius: 5,
+            draft_recipe: 0,
         }
     }
 }
@@ -41,9 +46,18 @@ pub fn job_board_panel_system(
     registry: Res<FactionRegistry>,
     projects: Res<Projects>,
     mut commands: EventWriter<JobBoardCommand>,
+    name_query: Query<&Name>,
+    transforms: Query<&Transform>,
+    mut selected: ResMut<SelectedEntity>,
+    mut focus: ResMut<CameraFocusRequest>,
 ) {
     let ctx = contexts.ctx_mut();
     let mut open = state.open;
+
+    // Collect click intents outside the egui closure so we can apply them after.
+    let mut click_entity: Option<Entity> = None;
+    let mut click_pos: Option<Vec2> = None;
+
     egui::Window::new("Faction Jobs")
         .open(&mut open)
         .default_pos(egui::pos2(20.0, 360.0))
@@ -53,9 +67,12 @@ pub fn job_board_panel_system(
             if let Some(faction) = registry.factions.get(&player_faction.faction_id) {
                 let budget = faction.workforce_budget;
                 let postings = board.faction_postings(player_faction.faction_id);
-                // Indices: 0=stockpile_food, 1=stockpile_wood, 2=stockpile_stone,
+
+                // Pre-collect claimed counts and worker entity lists per bucket.
+                // Bucket indices: 0=stockpile_food, 1=stockpile_wood, 2=stockpile_stone,
                 // 3=haul, 4=farm, 5=build, 6=craft
                 let mut claims = [0u32; 7];
+                let mut workers_by_bucket: [Vec<Entity>; 7] = Default::default();
                 for p in postings {
                     let i = match (&p.kind, &p.progress) {
                         (JobKind::Stockpile, JobProgress::Stockpile { good, .. }) => match good {
@@ -70,27 +87,65 @@ pub fn job_board_panel_system(
                         (JobKind::Craft, _) => 6,
                     };
                     claims[i] += p.claimants.len() as u32;
+                    for &e in &p.claimants {
+                        workers_by_bucket[i].push(e);
+                    }
                 }
+
                 let pop = faction.member_count.max(1) as f32;
+
                 ui.collapsing("Workforce Budget", |ui| {
-                    let row = |ui: &mut egui::Ui, label: &str, share: f32, claimed: u32| {
+                    let rows: [(&str, f32, usize); 7] = [
+                        ("Stockpile Food",  budget.stockpile_food,  0),
+                        ("Stockpile Wood",  budget.stockpile_wood,  1),
+                        ("Stockpile Stone", budget.stockpile_stone, 2),
+                        ("Haul",            budget.haul,            3),
+                        ("Farm",            budget.farm,            4),
+                        ("Build",           budget.build,           5),
+                        ("Craft",           budget.craft,           6),
+                    ];
+
+                    for (label, share, bucket_idx) in rows {
                         let cap = (share * pop).round().max(1.0) as u32;
-                        ui.horizontal(|ui| {
-                            ui.label(format!("{:<14}", label));
-                            ui.add(egui::ProgressBar::new(share).desired_width(120.0));
-                            ui.label(format!("{}/{}", claimed, cap));
-                        });
-                    };
-                    row(ui, "Stockpile Food",  budget.stockpile_food,  claims[0]);
-                    row(ui, "Stockpile Wood",  budget.stockpile_wood,  claims[1]);
-                    row(ui, "Stockpile Stone", budget.stockpile_stone, claims[2]);
-                    row(ui, "Haul",            budget.haul,            claims[3]);
-                    row(ui, "Farm",            budget.farm,            claims[4]);
-                    row(ui, "Build",           budget.build,           claims[5]);
-                    row(ui, "Craft",           budget.craft,           claims[6]);
+                        let claimed = claims[bucket_idx];
+                        let worker_entities = &workers_by_bucket[bucket_idx];
+
+                        if worker_entities.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{:<14}", label));
+                                ui.add(egui::ProgressBar::new(share).desired_width(100.0));
+                                ui.label(format!("{}/{}", claimed, cap));
+                            });
+                        } else {
+                            let header = format!("{:<14}  {}/{}", label, claimed, cap);
+                            egui::CollapsingHeader::new(header)
+                                .id_salt(format!("wfb_{}", bucket_idx))
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::ProgressBar::new(share).desired_width(160.0),
+                                    );
+                                    for &entity in worker_entities {
+                                        let name = name_query
+                                            .get(entity)
+                                            .map(|n| n.as_str().to_string())
+                                            .unwrap_or_else(|_| "(unknown)".to_string());
+                                        let alive = transforms.get(entity).is_ok();
+                                        if link_button(ui, &name, alive).clicked() && alive {
+                                            click_entity = Some(entity);
+                                            click_pos = transforms
+                                                .get(entity)
+                                                .ok()
+                                                .map(|t| t.translation.truncate());
+                                        }
+                                    }
+                                });
+                        }
+                    }
+
+                    // Free has no worker bucket — always flat.
                     ui.horizontal(|ui| {
                         ui.label(format!("{:<14}", "Free"));
-                        ui.add(egui::ProgressBar::new(budget.free).desired_width(120.0));
+                        ui.add(egui::ProgressBar::new(budget.free).desired_width(100.0));
                     });
                 });
 
@@ -140,8 +195,7 @@ pub fn job_board_panel_system(
                 egui::ComboBox::from_label("Kind")
                     .selected_text(state.draft_kind.name())
                     .show_ui(ui, |ui| {
-                        for kind in [JobKind::Stockpile, JobKind::Farm, JobKind::Craft]
-                        {
+                        for kind in [JobKind::Stockpile, JobKind::Farm, JobKind::Craft] {
                             ui.selectable_value(&mut state.draft_kind, kind, kind.name());
                         }
                     });
@@ -163,13 +217,37 @@ pub fn job_board_panel_system(
                         );
                     });
                 }
+                if matches!(state.draft_kind, JobKind::Craft) {
+                    let selected_name = CRAFT_RECIPES
+                        .get(state.draft_recipe as usize)
+                        .map(|r| r.name)
+                        .unwrap_or("(none)");
+                    egui::ComboBox::from_label("Recipe")
+                        .selected_text(selected_name)
+                        .show_ui(ui, |ui| {
+                            for (i, recipe) in CRAFT_RECIPES.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut state.draft_recipe,
+                                    i as u8,
+                                    recipe.name,
+                                );
+                            }
+                        });
+                }
                 if ui.button("Post").clicked() {
+                    let home_tile = registry
+                        .factions
+                        .get(&player_faction.faction_id)
+                        .map(|f| f.home_tile)
+                        .unwrap_or((0, 0));
                     if let Some(posting) = build_player_posting(
                         state.draft_kind,
                         state.draft_target,
                         state.draft_radius,
                         player_faction.faction_id,
                         clock.tick as u32,
+                        home_tile,
+                        state.draft_recipe,
                     ) {
                         commands.send(JobBoardCommand::Post(posting));
                     }
@@ -194,12 +272,65 @@ pub fn job_board_panel_system(
                             ui.label(progress_label(&p.progress));
                             let frac = p.progress.fraction();
                             ui.add(egui::ProgressBar::new(frac).desired_width(220.0));
+
                             ui.horizontal(|ui| {
-                                ui.label(format!("Workers: {}", p.claimants.len()));
                                 if ui.button("Cancel").clicked() {
                                     to_cancel = Some(p.id);
                                 }
                             });
+
+                            // Worker links.
+                            match p.claimants.len() {
+                                0 => {
+                                    ui.label("No workers.");
+                                }
+                                1 => {
+                                    let entity = p.claimants[0];
+                                    let name = name_query
+                                        .get(entity)
+                                        .map(|n| n.as_str().to_string())
+                                        .unwrap_or_else(|_| "(unknown)".to_string());
+                                    let alive = transforms.get(entity).is_ok();
+                                    let rich = egui::RichText::new(format!("Worker: {}", name))
+                                        .color(if alive {
+                                            egui::Color32::from_rgb(120, 200, 255)
+                                        } else {
+                                            egui::Color32::from_rgb(120, 120, 120)
+                                        })
+                                        .underline();
+                                    if ui.add(egui::Button::new(rich).frame(false)).clicked()
+                                        && alive
+                                    {
+                                        click_entity = Some(entity);
+                                        click_pos = transforms
+                                            .get(entity)
+                                            .ok()
+                                            .map(|t| t.translation.truncate());
+                                    }
+                                }
+                                n => {
+                                    egui::CollapsingHeader::new(format!("Workers ({})", n))
+                                        .id_salt(format!("posting_workers_{}", p.id))
+                                        .show(ui, |ui| {
+                                            for &entity in &p.claimants {
+                                                let name = name_query
+                                                    .get(entity)
+                                                    .map(|n| n.as_str().to_string())
+                                                    .unwrap_or_else(|_| "(unknown)".to_string());
+                                                let alive = transforms.get(entity).is_ok();
+                                                if link_button(ui, &name, alive).clicked()
+                                                    && alive
+                                                {
+                                                    click_entity = Some(entity);
+                                                    click_pos = transforms
+                                                        .get(entity)
+                                                        .ok()
+                                                        .map(|t| t.translation.truncate());
+                                                }
+                                            }
+                                        });
+                                }
+                            }
                         });
                     }
                 });
@@ -208,7 +339,15 @@ pub fn job_board_panel_system(
                 }
             }
         });
+
     state.open = open;
+
+    if let Some(e) = click_entity {
+        selected.0 = Some(e);
+    }
+    if let Some(p) = click_pos {
+        focus.0 = Some(p);
+    }
 }
 
 fn source_label(s: JobSource) -> &'static str {
@@ -242,7 +381,13 @@ fn progress_label(p: &JobProgress) -> String {
             target,
             recipe,
             ..
-        } => format!("Recipe #{} {}/{}", recipe, crafted, target),
+        } => {
+            let name = CRAFT_RECIPES
+                .get(*recipe as usize)
+                .map(|r| r.name)
+                .unwrap_or("?");
+            format!("{} {}/{}", name, crafted, target)
+        }
         JobProgress::Building { .. } => "Build in progress".to_string(),
     }
 }
@@ -253,6 +398,8 @@ fn build_player_posting(
     radius: i16,
     faction_id: u32,
     posted_tick: u32,
+    home_tile: (i16, i16),
+    recipe: u8,
 ) -> Option<JobPosting> {
     let progress = match kind {
         JobKind::Stockpile => JobProgress::Calories {
@@ -262,17 +409,15 @@ fn build_player_posting(
         JobKind::Farm => JobProgress::Planting {
             planted: 0,
             target,
-            // Without a tile picker, fall back to a placeholder area centered
-            // at origin; a future pass will hook this to the right-click menu.
             area: TileAabb {
-                min: (-radius, -radius),
-                max: (radius, radius),
+                min: (home_tile.0 - radius, home_tile.1 - radius),
+                max: (home_tile.0 + radius, home_tile.1 + radius),
             },
         },
         JobKind::Craft => JobProgress::Crafting {
             crafted: 0,
             target,
-            recipe: 0,
+            recipe,
             bench: None,
         },
         // Build and Haul postings need a concrete blueprint; the Post Job form
@@ -290,4 +435,14 @@ fn build_player_posting(
         posted_tick,
         expiry_tick: Some(posted_tick + 600),
     })
+}
+
+fn link_button(ui: &mut egui::Ui, text: &str, alive: bool) -> egui::Response {
+    let color = if alive {
+        egui::Color32::from_rgb(120, 200, 255)
+    } else {
+        egui::Color32::from_rgb(120, 120, 120)
+    };
+    let rich = egui::RichText::new(text).color(color).underline();
+    ui.add(egui::Button::new(rich).frame(false))
 }
