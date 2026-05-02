@@ -386,6 +386,26 @@ pub enum BuildSiteKind {
     Monument,
 }
 
+impl BuildSiteKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            BuildSiteKind::Wall(mat) => mat.label(),
+            BuildSiteKind::Door => "Door",
+            BuildSiteKind::Bed => "Bed",
+            BuildSiteKind::Campfire => "Campfire",
+            BuildSiteKind::Workbench => "Workbench",
+            BuildSiteKind::Loom => "Loom",
+            BuildSiteKind::Table => "Table",
+            BuildSiteKind::Chair => "Chair",
+            BuildSiteKind::Granary => "Granary",
+            BuildSiteKind::Shrine => "Shrine",
+            BuildSiteKind::Market => "Market",
+            BuildSiteKind::Barracks => "Barracks",
+            BuildSiteKind::Monument => "Monument",
+        }
+    }
+}
+
 /// A single ingredient slot inside a `Blueprint`. `needed` is fixed at spawn
 /// from the recipe; `deposited` advances as workers contribute the matching good.
 #[derive(Clone, Copy, Debug, Default)]
@@ -2500,6 +2520,7 @@ pub fn construction_system(
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
     mut job_board: ResMut<JobBoard>,
     mut job_completed: EventWriter<JobCompletedEvent>,
+    mut activity_log: EventWriter<crate::ui::activity_log::ActivityLogEvent>,
     mut bp_query: Query<&mut Blueprint>,
     mut agent_query: Query<(
         Entity,
@@ -2682,7 +2703,7 @@ pub fn construction_system(
             let (tx, ty) = (tile.0 as i32, tile.1 as i32);
 
             let world_pos = tile_to_world(tx, ty);
-            match bp.kind {
+            let result_entity: Entity = match bp.kind {
                 BuildSiteKind::Wall(material) => {
                     let surf_z = bp.target_z as i32;
                     // Defer placement if any agent currently stands on the
@@ -2719,6 +2740,7 @@ pub fn construction_system(
                         ))
                         .id();
                     maps.wall_map.0.insert(tile, wall_entity);
+                    wall_entity
                 }
                 BuildSiteKind::Bed => {
                     let bed_entity = commands
@@ -2731,6 +2753,7 @@ pub fn construction_system(
                         ))
                         .id();
                     maps.bed_map.0.insert(tile, bed_entity);
+                    bed_entity
                 }
                 BuildSiteKind::Campfire => {
                     let campfire_entity = commands
@@ -2743,6 +2766,7 @@ pub fn construction_system(
                         ))
                         .id();
                     maps.campfire_map.0.insert(tile, campfire_entity);
+                    campfire_entity
                 }
                 BuildSiteKind::Door => {
                     // A door does NOT write a Wall tile — the underlying
@@ -2768,6 +2792,7 @@ pub fn construction_system(
                             open: false,
                         },
                     );
+                    door_entity
                 }
                 BuildSiteKind::Workbench => {
                     let e = commands
@@ -2783,6 +2808,7 @@ pub fn construction_system(
                         ))
                         .id();
                     maps.workbench_map.0.insert(tile, e);
+                    e
                 }
                 BuildSiteKind::Loom => {
                     let e = commands
@@ -2797,6 +2823,7 @@ pub fn construction_system(
                         ))
                         .id();
                     maps.loom_map.0.insert(tile, e);
+                    e
                 }
                 BuildSiteKind::Table => {
                     let e = commands
@@ -2809,6 +2836,7 @@ pub fn construction_system(
                         ))
                         .id();
                     maps.table_map.0.insert(tile, e);
+                    e
                 }
                 BuildSiteKind::Chair => {
                     let e = commands
@@ -2821,6 +2849,7 @@ pub fn construction_system(
                         ))
                         .id();
                     maps.chair_map.0.insert(tile, e);
+                    e
                 }
                 BuildSiteKind::Granary => {
                     let e = commands
@@ -2835,6 +2864,7 @@ pub fn construction_system(
                         ))
                         .id();
                     maps.granary_map.0.insert(tile, e);
+                    e
                 }
                 BuildSiteKind::Shrine => {
                     let e = commands
@@ -2849,6 +2879,7 @@ pub fn construction_system(
                         ))
                         .id();
                     maps.shrine_map.0.insert(tile, e);
+                    e
                 }
                 BuildSiteKind::Market => {
                     let e = commands
@@ -2863,6 +2894,7 @@ pub fn construction_system(
                         ))
                         .id();
                     maps.market_map.0.insert(tile, e);
+                    e
                 }
                 BuildSiteKind::Barracks => {
                     let e = commands
@@ -2877,6 +2909,7 @@ pub fn construction_system(
                         ))
                         .id();
                     maps.barracks_map.0.insert(tile, e);
+                    e
                 }
                 BuildSiteKind::Monument => {
                     let e = commands
@@ -2891,8 +2924,9 @@ pub fn construction_system(
                         ))
                         .id();
                     maps.monument_map.0.insert(tile, e);
+                    e
                 }
-            }
+            };
 
             // Emit a TileChangedEvent so pathfinding caches (flow fields,
             // chunk graph) see the new wall/furniture and re-route.
@@ -2914,6 +2948,26 @@ pub fn construction_system(
                 road_carve_queue
                     .0
                     .push((bp.faction_id, tile, faction.home_tile));
+            }
+
+            let lead_actor = bp_workers
+                .get(&bp_entity)
+                .and_then(|v| v.first().copied())
+                .or_else(|| {
+                    bp_haulers
+                        .get(&bp_entity)
+                        .and_then(|v| v.first().map(|(e, _, _)| *e))
+                });
+            if let Some(actor) = lead_actor {
+                activity_log.send(crate::ui::activity_log::ActivityLogEvent {
+                    tick: clock.tick,
+                    actor,
+                    kind: crate::ui::activity_log::ActivityEntryKind::Constructed {
+                        site: bp.kind,
+                        tile,
+                        result_entity,
+                    },
+                });
             }
 
             if let Some(workers) = bp_workers.get(&bp_entity) {

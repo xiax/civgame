@@ -15,6 +15,7 @@ use super::skills::{SkillKind, Skills};
 use super::tasks::TaskKind;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
+use crate::economy::item::Item;
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
@@ -383,6 +384,7 @@ pub fn withdraw_material_task_system(
 
         let mut remaining = ai.withdraw_qty as u32;
         let promised = ai.withdraw_qty as u32;
+        let pickup_item = Item::new_commodity(target_good);
 
         for &gi_entity in spatial.get(tx as i32, ty as i32) {
             if remaining == 0 {
@@ -392,14 +394,31 @@ pub fn withdraw_material_task_system(
                 if gi.qty == 0 || gi.item.good != target_good {
                     continue;
                 }
-                let take = remaining.min(gi.qty);
-                agent.add_good(gi.item.good, take);
-                if gi.qty == take {
+                let want = remaining.min(gi.qty);
+
+                // Hands first (bulk-aware, large weight cap), then fall back to
+                // weight-capped personal inventory for any residual. Stone (and
+                // other TwoHand goods) weigh as much as the entire inventory cap,
+                // so without the hand path even a single seed in inventory would
+                // cause the executor to silently destroy units that don't fit.
+                let after_hands = carrier.try_pick_up(pickup_item, want);
+                let in_hands = want - after_hands;
+                let after_inv = if after_hands > 0 {
+                    agent.add_good(target_good, after_hands)
+                } else {
+                    0
+                };
+                let in_inv = after_hands - after_inv;
+                let taken = in_hands + in_inv;
+                if taken == 0 {
+                    continue;
+                }
+                if gi.qty == taken {
                     commands.entity(gi_entity).despawn();
                 } else {
-                    gi.qty -= take;
+                    gi.qty -= taken;
                 }
-                remaining -= take;
+                remaining -= taken;
             }
         }
 

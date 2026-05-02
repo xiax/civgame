@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy_egui::EguiPlugin;
 
+pub mod activity_log;
 pub mod debug_panel;
 pub mod economy_panel;
 pub mod hover;
@@ -30,6 +31,9 @@ impl Plugin for UiPlugin {
             .insert_resource(tech_panel::TechPanelOpen::default())
             .insert_resource(debug_panel::DebugPanelState::default())
             .insert_resource(job_board::JobBoardPanelState::default())
+            .insert_resource(activity_log::ActivityLog::default())
+            .insert_resource(activity_log::CameraFocusRequest::default())
+            .add_event::<activity_log::ActivityLogEvent>()
             .add_systems(
                 Update,
                 (
@@ -48,6 +52,9 @@ impl Plugin for UiPlugin {
                     debug_panel::debug_panel_system,
                     job_board::job_board_panel_system,
                     hover::hover_info_system,
+                    activity_log::activity_log_ingest_system,
+                    activity_log::activity_log_panel_system,
+                    activity_log::camera_focus_system,
                 ),
             );
     }

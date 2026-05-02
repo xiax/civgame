@@ -1097,6 +1097,16 @@ pub fn resource_demand_system(
         faction.resource_demand.insert(Good::Fruit, food_demand);
         faction.resource_demand.insert(Good::Meat, food_demand);
         faction.resource_demand.insert(Good::Grain, food_demand);
+
+        // Crafted-good demand: scales with member count. Drives
+        // `chief_job_posting_system`'s recipe selection (highest output-good
+        // deficit wins).
+        faction.resource_demand.insert(Good::Tools, faction.member_count.div_ceil(2));
+        faction.resource_demand.insert(Good::Weapon, faction.member_count.div_ceil(2));
+        faction.resource_demand.insert(Good::Cloth, faction.member_count.div_ceil(2));
+        faction.resource_demand.insert(Good::Luxury, faction.member_count.div_ceil(3));
+        faction.resource_demand.insert(Good::Shield, faction.member_count.div_ceil(4));
+        faction.resource_demand.insert(Good::Armor, faction.member_count.div_ceil(4));
     }
 }
 

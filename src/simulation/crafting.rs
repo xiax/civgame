@@ -190,6 +190,10 @@ pub struct CraftOrder {
     pub deposits: [GoodNeed; MAX_CRAFT_INPUTS],
     pub deposit_count: u8,
     pub work_progress: u8,
+    /// `SimClock::tick` at spawn. `faction_craft_order_system` despawns orders
+    /// older than `CRAFT_ORDER_TIMEOUT_TICKS` so a stuck order can't waste the
+    /// per-faction `CRAFT_ORDERS_PER_FACTION_*` cap forever.
+    pub spawn_tick: u64,
 }
 
 impl CraftOrder {
@@ -198,6 +202,7 @@ impl CraftOrder {
         recipe_id: u8,
         workbench_tile: Option<(i16, i16)>,
         anchor_tile: (i16, i16),
+        spawn_tick: u64,
     ) -> Option<Self> {
         let recipe = CRAFT_RECIPES.get(recipe_id as usize)?;
         let mut deposits = [GoodNeed::default(); MAX_CRAFT_INPUTS];
@@ -217,6 +222,7 @@ impl CraftOrder {
             deposits,
             deposit_count: count as u8,
             work_progress: 0,
+            spawn_tick,
         })
     }
 
@@ -239,6 +245,13 @@ pub struct CraftOrderMap(pub AHashMap<(i16, i16), Entity>);
 const CRAFT_ORDERS_PER_FACTION_BASE: u32 = 1;
 const CRAFT_ORDERS_PER_FACTION_MAX: u32 = 3;
 
+/// A `CraftOrder` older than this without completing is considered stuck
+/// (materials never arrived, station inaccessible, no idle worker, etc.) and
+/// gets despawned so the per-faction cap doesn't permanently fill with stale
+/// orders. ~30 s at 20 Hz; recipes finish within ≤80 work ticks once
+/// satisfied, so this leaves ample slack.
+const CRAFT_ORDER_TIMEOUT_TICKS: u64 = 600;
+
 /// Faction craft-order planner. For each faction with an open `Craft` job
 /// posting, spawns a `CraftOrder` if all ingredients are union-available and
 /// no order for that recipe is already in flight. Mirrors
@@ -256,6 +269,33 @@ pub fn faction_craft_order_system(
 ) {
     if clock.tick % 60 != 0 {
         return;
+    }
+
+    // Timeout sweep: despawn orders older than `CRAFT_ORDER_TIMEOUT_TICKS`
+    // (stuck on materials / station / no worker) and prune map entries whose
+    // entity has already gone away. Workers attached to a despawned order will
+    // self-clear next tick — `craft_order_system` resets `ai.task_id` when
+    // `order_query.get()` fails, and `plan_execution_system`'s safety net at
+    // the top releases any lingering storage reservation.
+    {
+        let now = clock.tick;
+        let mut to_drop: Vec<((i16, i16), Entity)> = Vec::new();
+        for (&anchor, &order_entity) in order_map.0.iter() {
+            match order_query.get(order_entity) {
+                Ok(order) => {
+                    if now.saturating_sub(order.spawn_tick) > CRAFT_ORDER_TIMEOUT_TICKS {
+                        to_drop.push((anchor, order_entity));
+                    }
+                }
+                Err(_) => to_drop.push((anchor, order_entity)),
+            }
+        }
+        for (anchor, entity) in to_drop {
+            order_map.0.remove(&anchor);
+            if let Some(ec) = commands.get_entity(entity) {
+                ec.despawn_recursive();
+            }
+        }
     }
 
     for (&faction_id, faction) in registry.factions.iter() {
@@ -373,7 +413,9 @@ pub fn faction_craft_order_system(
                 continue;
             }
 
-            let Some(order) = CraftOrder::new(faction_id, recipe, workbench, anchor) else {
+            let Some(order) =
+                CraftOrder::new(faction_id, recipe, workbench, anchor, clock.tick)
+            else {
                 continue;
             };
             let wp = tile_to_world(anchor.0 as i32, anchor.1 as i32);
@@ -409,6 +451,7 @@ pub fn craft_order_system(
     mut order_map: ResMut<CraftOrderMap>,
     mut board: ResMut<JobBoard>,
     mut job_completed: EventWriter<JobCompletedEvent>,
+    mut activity_log: EventWriter<crate::ui::activity_log::ActivityLogEvent>,
     mut order_query: Query<&mut CraftOrder>,
     mut agent_query: Query<(
         Entity,
@@ -575,6 +618,13 @@ pub fn craft_order_system(
             if let Some(lead_e) = lead {
                 output_grants.push((lead_e, order.recipe_id));
                 order_completion_credits.push((lead_e, order.recipe_id, recipe.output_qty));
+                activity_log.send(crate::ui::activity_log::ActivityLogEvent {
+                    tick: clock.tick,
+                    actor: lead_e,
+                    kind: crate::ui::activity_log::ActivityEntryKind::Crafted {
+                        good: recipe.output_good,
+                    },
+                });
             }
 
             order_map.0.remove(&order.anchor_tile);

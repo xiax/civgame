@@ -619,6 +619,7 @@ fn resolve_withdraw_for_faction_need(
     co_query: &Query<&CraftOrder>,
     claim_target: Option<&crate::simulation::jobs::ClaimTarget>,
     agent: &EconomicAgent,
+    carrier: &crate::simulation::carry::Carrier,
     withdraw_intent_out: &mut Option<(Good, u8)>,
 ) -> Option<(Option<Entity>, i16, i16)> {
     // 1. Build per-good still-needed demand from `need`. The HaulClaim path
@@ -791,14 +792,24 @@ fn resolve_withdraw_for_faction_need(
         }
     };
 
-    // 5. Cap the commit by inventory free space so we don't promise more
-    //    than the agent could actually carry home. The withdraw executor
-    //    deposits into `EconomicAgent.inventory`, which is weight-capped.
+    // 5. Cap the commit by what the agent can actually carry home. The
+    //    executor routes pickups into `Carrier` first (hands have a large
+    //    weight cap, especially for TwoHand bulk) and falls back to
+    //    `EconomicAgent.inventory` for residual. Sum the two — and don't
+    //    floor to 1 — so we never promise a unit that has no destination.
+    //    Stone weighs exactly the inventory cap, so an inventory-only floor
+    //    would commit units that vanish on pickup.
     let (good, mut qty) = chosen?;
-    let unit_w = crate::economy::item::Item::new_commodity(good).unit_weight_g().max(1);
+    let item = crate::economy::item::Item::new_commodity(good);
+    let unit_w = item.unit_weight_g().max(1);
+    let hand_cap = carrier.pickup_capacity(item);
     let inv_room = agent.capacity_g().saturating_sub(agent.current_weight_g());
-    let inv_cap = (inv_room / unit_w).max(1); // always allow at least one unit
-    qty = qty.min(inv_cap);
+    let inv_cap = inv_room / unit_w;
+    let total_cap = hand_cap.saturating_add(inv_cap);
+    if total_cap == 0 {
+        return None;
+    }
+    qty = qty.min(total_cap);
     let qty_u8 = qty.min(u8::MAX as u32) as u8;
     if qty_u8 == 0 {
         return None;
@@ -1100,6 +1111,7 @@ fn resolve_target(
             co_query,
             claim_target,
             agent,
+            carrier,
             withdraw_intent_out,
         ),
         StepTarget::NearestFactionStorageWithGood(target_good) => {

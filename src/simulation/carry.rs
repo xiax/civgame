@@ -225,6 +225,64 @@ impl Carrier {
         }
     }
 
+    /// Read-only mirror of `try_pick_up`: how many units of `item` would be
+    /// accepted into hands right now (without mutating). Used by withdraw /
+    /// haul resolvers to size a commit before they dispatch.
+    pub fn pickup_capacity(&self, item: Item) -> u32 {
+        let unit_w = item.unit_weight_g().max(1);
+        match item.good.bulk() {
+            Bulk::TwoHand => {
+                if self.left.is_some() || self.right.is_some() {
+                    return 0;
+                }
+                let cap = HUMAN_HAND_CAP_G.saturating_mul(2);
+                let by_weight = cap / unit_w;
+                by_weight.min(HAND_QTY_CAP)
+            }
+            Bulk::OneHand => {
+                // Mirrors try_pick_up: a single OneHand call fills at most one
+                // empty hand (left preferred), regardless of how many are free.
+                if self.has_two_handed_load() {
+                    return 0;
+                }
+                if self.left.is_some() && self.right.is_some() {
+                    return 0;
+                }
+                let by_weight = HUMAN_HAND_CAP_G / unit_w;
+                if by_weight == 0 {
+                    return 0;
+                }
+                by_weight.min(HAND_QTY_CAP)
+            }
+            Bulk::Small => {
+                if self.has_two_handed_load() {
+                    return 0;
+                }
+                let mut total = 0u32;
+                // Top-ups on existing matching stacks.
+                for slot in [self.left, self.right].iter().flatten() {
+                    if slot.item == item && !slot.two_handed {
+                        let used = slot.weight_g();
+                        let cap_left = HUMAN_HAND_CAP_G.saturating_sub(used);
+                        let by_weight = cap_left / unit_w;
+                        let qty_room = HAND_QTY_CAP.saturating_sub(slot.qty);
+                        total = total.saturating_add(by_weight.min(qty_room));
+                    }
+                }
+                // Empty hands available for a fresh stack.
+                let by_weight = HUMAN_HAND_CAP_G / unit_w;
+                let per_hand = by_weight.min(HAND_QTY_CAP);
+                if self.left.is_none() {
+                    total = total.saturating_add(per_hand);
+                }
+                if self.right.is_none() {
+                    total = total.saturating_add(per_hand);
+                }
+                total
+            }
+        }
+    }
+
     /// True when the worker has hauled enough that they should head back to
     /// deposit. Any two-handed stack triggers it (the slot occupies both hands,
     /// no more can be picked up regardless of qty); otherwise both hands must
@@ -565,6 +623,62 @@ mod tests {
         assert!(!c.is_at_haul_cap(), "one filled hand isn't enough");
         let _ = c.try_pick_up(coal, 3);
         assert!(c.is_at_haul_cap(), "both hands at cap → return");
+    }
+
+    #[test]
+    fn pickup_capacity_matches_try_pick_up() {
+        // Read-only capacity must agree with what try_pick_up actually accepts,
+        // across bulk classes and partial-hand states. This guards the resolver
+        // from committing units the executor would refuse.
+        let cases = [
+            Good::Stone,  // TwoHand, 5000g (binds qty cap before weight)
+            Good::Wood,   // TwoHand, 3000g
+            Good::Coal,   // OneHand, 2000g
+            Good::Fruit,  // Small, 250g
+            Good::Seed,   // Small, 20g
+        ];
+        for good in cases {
+            let item = Item::new_commodity(good);
+
+            // Empty carrier.
+            let mut probe = Carrier::default();
+            let cap = probe.pickup_capacity(item);
+            let leftover = probe.try_pick_up(item, cap.saturating_add(5));
+            assert_eq!(
+                cap.saturating_add(5).saturating_sub(leftover),
+                cap,
+                "empty carrier accepted != reported capacity for {:?}",
+                good
+            );
+
+            // Half-full carrier (one Fruit pre-loaded). Skip when good IS Fruit
+            // since the test would just be a top-up of the same stack, which
+            // is fine but redundant with the small-stack case below.
+            if good != Good::Fruit {
+                let mut c = Carrier::default();
+                let _ = c.try_pick_up(Item::new_commodity(Good::Fruit), 1);
+                let cap = c.pickup_capacity(item);
+                let leftover = c.try_pick_up(item, cap.saturating_add(5));
+                assert_eq!(
+                    cap.saturating_add(5).saturating_sub(leftover),
+                    cap,
+                    "half-full carrier accepted != reported capacity for {:?}",
+                    good
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pickup_capacity_zero_when_twohand_blocked() {
+        let mut c = Carrier::default();
+        let _ = c.try_pick_up(Item::new_commodity(Good::Fruit), 1);
+        let stone = Item::new_commodity(Good::Stone);
+        assert_eq!(
+            c.pickup_capacity(stone),
+            0,
+            "any held stack blocks a TwoHand pickup"
+        );
     }
 
     #[test]

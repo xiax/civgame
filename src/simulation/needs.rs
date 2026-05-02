@@ -25,9 +25,10 @@ pub struct Needs {
     pub social: f32,
     pub reproduction: f32,
     // NOTE: inverted polarity vs the other needs. 0 = drained (needs play),
-    // 255 = full vigor. Drains while the agent works; refills via the Play task.
-    // `worst()` and `avg_distress()` add (255 - willpower) so it still counts
-    // as distress when low.
+    // 255 = full vigor. Drains while the agent works; refills via the Play
+    // task and while sleeping (bed doubles the rate). `worst()` and
+    // `avg_distress()` add (255 - willpower) so it still counts as distress
+    // when low.
     pub willpower: f32,
 }
 
@@ -85,6 +86,9 @@ const REPRODUCTION_RATE: f32 = 0.1;
 const WILLPOWER_WORK_DRAIN: f32 = 0.6;
 /// Baseline willpower drift while idle / not working (per real second).
 const WILLPOWER_IDLE_DRAIN: f32 = 0.05;
+/// Willpower regen while AiState::Sleeping (per real second). Doubled when
+/// the sleeper is on a bed, mirroring the bed bonus on SLEEP_RECOVER_RATE.
+const WILLPOWER_SLEEP_RECOVER: f32 = 1.0;
 
 pub fn tick_needs_system(
     time: Res<Time>,
@@ -135,6 +139,13 @@ pub fn tick_needs_system(
                     SLEEP_RECOVER_RATE
                 };
                 needs.sleep = (needs.sleep - recovery * dt).clamp(0.0, 255.0);
+                let willpower_gain = if on_bed {
+                    WILLPOWER_SLEEP_RECOVER * 2.0
+                } else {
+                    WILLPOWER_SLEEP_RECOVER
+                };
+                needs.willpower =
+                    (needs.willpower + willpower_gain * dt).clamp(0.0, 255.0);
                 if needs.sleep < 10.0 {
                     ai.state = AiState::Idle;
                 }

@@ -366,6 +366,7 @@ pub fn chief_job_posting_system(
     bp_map: Res<BlueprintMap>,
     bp_query: Query<&Blueprint>,
     workbench_map: Res<crate::simulation::construction::WorkbenchMap>,
+    loom_map: Res<crate::simulation::construction::LoomMap>,
     projects: Res<Projects>,
     mut board: ResMut<JobBoard>,
 ) {
@@ -701,35 +702,83 @@ pub fn chief_job_posting_system(
             }
         }
 
-        // 5. Craft posting — Stone Tools (recipe 0) when Tools supply<demand
-        // and a workbench is available.
+        // 5. Craft posting — pick the available recipe with the largest
+        // unmet demand on its output good. One Craft posting per faction at a
+        // time; subsequent cycles rotate through recipes as deficits shift.
         if faction.member_count > 0 {
             let already_craft = board
                 .faction_postings(faction_id)
                 .iter()
                 .any(|p| matches!(p.kind, JobKind::Craft));
-            let supply = faction.resource_supply.get(&Good::Tools).copied().unwrap_or(0);
-            let demand = faction.resource_demand.get(&Good::Tools).copied().unwrap_or(0);
-            if !already_craft && demand > supply {
-                // Pick any workbench in the faction's home zone (proximity test).
+            if !already_craft {
+                let in_home_zone = |tile: &(i16, i16)| {
+                    let dx = (tile.0 as i32 - faction.home_tile.0 as i32).abs();
+                    let dy = (tile.1 as i32 - faction.home_tile.1 as i32).abs();
+                    dx <= 12 && dy <= 12
+                };
                 let bench: Option<Entity> = workbench_map
                     .0
                     .iter()
-                    .filter(|((tx, ty), _)| {
-                        let dx = (*tx as i32 - faction.home_tile.0 as i32).abs();
-                        let dy = (*ty as i32 - faction.home_tile.1 as i32).abs();
-                        dx <= 12 && dy <= 12
-                    })
-                    .map(|(_, e)| *e)
-                    .next();
-                if let Some(bench_entity) = bench {
-                    let target = (demand - supply).min(5);
+                    .find(|(t, _)| in_home_zone(t))
+                    .map(|(_, e)| *e);
+                let loom: Option<Entity> = loom_map
+                    .0
+                    .iter()
+                    .find(|(t, _)| in_home_zone(t))
+                    .map(|(_, e)| *e);
+
+                let mut best: Option<(u8, u32, Option<Entity>)> = None;
+                for (idx, recipe) in crate::simulation::crafting::CRAFT_RECIPES.iter().enumerate() {
+                    if let Some(tech) = recipe.tech_gate {
+                        if !faction.techs.has(tech) {
+                            continue;
+                        }
+                    }
+                    let bench_ref = match recipe.requires_station {
+                        Some(crate::simulation::crafting::StationKind::Workbench) => {
+                            match bench {
+                                Some(e) => Some(e),
+                                None => continue,
+                            }
+                        }
+                        Some(crate::simulation::crafting::StationKind::Loom) => {
+                            if loom.is_none() {
+                                continue;
+                            }
+                            // `job_claim_release_system` only validates Workbench
+                            // entities; pass None for looms so the release sweep
+                            // doesn't drop the posting.
+                            None
+                        }
+                        None => None,
+                    };
+                    let supply = faction
+                        .resource_supply
+                        .get(&recipe.output_good)
+                        .copied()
+                        .unwrap_or(0);
+                    let demand = faction
+                        .resource_demand
+                        .get(&recipe.output_good)
+                        .copied()
+                        .unwrap_or(0);
+                    if demand <= supply {
+                        continue;
+                    }
+                    let deficit = demand - supply;
+                    if best.map_or(true, |(_, d, _)| deficit > d) {
+                        best = Some((idx as u8, deficit, bench_ref));
+                    }
+                }
+
+                if let Some((recipe_id, deficit, bench_ref)) = best {
+                    let target = deficit.min(5);
                     let id = board.alloc_id();
                     let progress = JobProgress::Crafting {
                         crafted: 0,
                         target,
-                        recipe: 0,
-                        bench: Some(bench_entity),
+                        recipe: recipe_id,
+                        bench: bench_ref,
                     };
                     let priority =
                         compute_priority(faction, faction_id, JobKind::Craft, &progress, &projects);
