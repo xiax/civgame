@@ -7,8 +7,9 @@ use crate::rendering::camera::CameraViewZ;
 use crate::simulation::combat::CombatTarget;
 use crate::simulation::construction::AutonomousBuildingToggle;
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
+use crate::simulation::faction::HuntOrder;
 use crate::simulation::military::MusterHuntersRequest;
-use crate::simulation::person::{AiState, Drafted, HunterTargetCount, Person, PersonAI, Profession};
+use crate::simulation::person::{AiState, Drafted, Person, PersonAI, Profession};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::technology::HUNTING_SPEAR;
 use crate::ui::debug_panel::DebugPanelState;
@@ -32,7 +33,6 @@ pub struct HudResources<'w> {
     pub tech_panel_open: ResMut<'w, TechPanelOpen>,
     pub debug_state: ResMut<'w, DebugPanelState>,
     pub draft_req: ResMut<'w, DraftToggleRequest>,
-    pub hunter_target: ResMut<'w, HunterTargetCount>,
     pub muster_req: ResMut<'w, MusterHuntersRequest>,
     pub camera_view_z: Res<'w, CameraViewZ>,
     pub calendar: Res<'w, Calendar>,
@@ -54,7 +54,6 @@ pub fn hud_system(
     let tech_panel_open = &mut *res.tech_panel_open;
     let debug_state = &mut *res.debug_state;
     let draft_req = &mut *res.draft_req;
-    let hunter_target = &mut *res.hunter_target;
     let muster_req = &mut *res.muster_req;
     let camera_view_z = &*res.camera_view_z;
     let calendar = &*res.calendar;
@@ -150,30 +149,47 @@ pub fn hud_system(
 
                         ui.separator();
                         ui.label(egui::RichText::new("Hunters:").color(egui::Color32::WHITE));
-                        let count_label = format!(
-                            "{}/{}",
-                            current_hunters,
-                            hunter_target.count
-                        );
+                        // Read-only display of the chief-set hunting status.
+                        // Player no longer adjusts the count directly; the chief
+                        // (faction_hunter_assignment_system) decides headcount,
+                        // and chief_hunt_order_system posts the active directive.
+                        let order_label = registry
+                            .factions
+                            .get(&player_faction.faction_id)
+                            .and_then(|f| f.hunt_order.as_ref())
+                            .map(|o| match o {
+                                HuntOrder::Hunt {
+                                    species,
+                                    target_party_size,
+                                    mustered,
+                                    deployed_tick,
+                                    ..
+                                } => {
+                                    let prefix = if deployed_tick.is_some() {
+                                        "Deployed"
+                                    } else {
+                                        "Hunting"
+                                    };
+                                    format!(
+                                        "{} {} {}/{}",
+                                        prefix,
+                                        species.label(),
+                                        mustered.len().min(*target_party_size as usize),
+                                        target_party_size
+                                    )
+                                }
+                                HuntOrder::Scout { .. } => "Scouting".to_string(),
+                            })
+                            .unwrap_or_else(|| "Idle".to_string());
+                        let display = format!("{} · {}", current_hunters, order_label);
                         ui.label(
-                            egui::RichText::new(count_label)
+                            egui::RichText::new(display)
                                 .color(if hunting_unlocked {
                                     egui::Color32::WHITE
                                 } else {
                                     egui::Color32::GRAY
                                 }),
                         );
-                        let minus = ui.add_enabled(
-                            hunting_unlocked && hunter_target.count > 0,
-                            egui::Button::new("−"),
-                        );
-                        if minus.clicked() {
-                            hunter_target.count = hunter_target.count.saturating_sub(1);
-                        }
-                        let plus = ui.add_enabled(hunting_unlocked, egui::Button::new("+"));
-                        if plus.clicked() {
-                            hunter_target.count = hunter_target.count.saturating_add(1);
-                        }
                         let muster_btn = egui::Button::new("Muster")
                             .fill(egui::Color32::from_rgb(180, 100, 60));
                         let muster_resp =

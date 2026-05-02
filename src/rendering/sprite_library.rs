@@ -1080,6 +1080,24 @@ const RESOURCE_STONE_PILE: &[&str] = &[
     "XdSSSSSSSSSSSSdX",
     "................",
 ];
+const ITEM_LOOSE_ROCK: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "....XXXXX.......",
+    "...XKKkKkX......",
+    "...XlKkKkX......",
+    "...XKkKKkX......",
+    "....XdkXX.......",
+    ".........XXX....",
+    "........XKkKX...",
+    "........XlkKX...",
+    ".........XkXX...",
+    "................",
+    "................",
+    "................",
+];
 const RESOURCE_IRON_ORE: &[&str] = &[
     "................",
     "................",
@@ -5238,6 +5256,7 @@ pub fn setup_sprite_library(mut commands: Commands, mut images: ResMut<Assets<Im
     add!("resource_wood_log", RESOURCE_WOOD_LOG);
     add!("resource_plank", RESOURCE_PLANK);
     add!("resource_stone_pile", RESOURCE_STONE_PILE);
+    add!("resource_loose_rock", ITEM_LOOSE_ROCK);
     add!("resource_iron_ore", RESOURCE_IRON_ORE);
     add!("resource_gold_ore", RESOURCE_GOLD_ORE);
     add!("resource_gold_coin", RESOURCE_GOLD_COIN);

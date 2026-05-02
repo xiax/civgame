@@ -6,7 +6,7 @@ use super::jobs::{
 use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::needs::Needs;
-use super::person::{AiState, HunterTargetCount, PersonAI, Profession};
+use super::person::{AiState, PersonAI, Profession};
 use super::plan::{ActivePlan, PlanHistory, PlanOutcome};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::{SkillKind, Skills};
@@ -19,6 +19,7 @@ use crate::simulation::technology::{
     TECH_COUNT, TECH_TREE,
 };
 use crate::world::chunk::ChunkMap;
+use crate::world::seasons::TICKS_PER_DAY;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use ahash::AHashMap;
@@ -29,22 +30,82 @@ pub const BOND_THRESHOLD: u8 = 180;
 const CAMP_KEEP: u32 = 0;
 const SOCIAL_RADIUS: i32 = 3;
 
-/// Player-driven Hunter promotion/demotion. Runs in Economy after
-/// `compute_faction_storage_system`. Reads `HunterTargetCount.count` (set by
-/// the HUD widget) and reconciles the player faction's hunter roster:
+// ── Chief-assigned hunting ───────────────────────────────────────────────────
+
+/// Floor proportion of adults assigned as `Profession::Hunter` whenever the
+/// faction has unlocked `HUNTING_SPEAR`. Scaled up by martial culture and
+/// local prey density (see `faction_hunter_assignment_system`).
+pub const HUNTER_MIN_RATIO: f32 = 0.20;
+
+/// Tiles around `home_tile` the chief considers when picking a target species.
+pub const HUNT_SCAN_RADIUS: i32 = 40;
+
+/// Maximum age of a `HuntOrder` in ticks before the chief abandons a stalled
+/// muster and waiters fall through. `TICKS_PER_DAY / 4` ≈ 15 game-hours / 45 s
+/// real-time at 20 Hz — enough for stragglers without holding through the next
+/// chief decision cycle.
+pub const HUNT_PARTY_TIMEOUT: u64 = (TICKS_PER_DAY / 4) as u64;
+
+/// Cadence at which `chief_hunt_order_system` re-decides each faction's
+/// hunting target. Anchored at one game-day per faction so hunting reads as a
+/// daily expedition, not a per-second reflex. Factions stagger across the day
+/// via `tick % TICKS_PER_DAY == faction_id_offset`.
+pub const HUNT_DECISION_CADENCE: u64 = TICKS_PER_DAY as u64;
+
+/// Cadence for the cheap mid-day invalidation sweep. Cleared orders re-decide
+/// at the next `HUNT_DECISION_CADENCE` boundary; this only catches the case
+/// where a party finished or the prey emptied between full decision cycles.
+pub const HUNT_INVALIDATE_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
+
+/// Cadence at which `faction_hunter_assignment_system` reconciles profession
+/// counts. ~Once per quarter game-day; re-rolling every tick churns plans.
+pub const HUNTER_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
+
+/// A chief-issued hunting directive. Lives on `FactionData::hunt_order` and is
+/// either a concrete `Hunt` (with mustering bookkeeping) or a fallback
+/// `Scout` order to find new game.
+#[derive(Clone, Debug)]
+pub enum HuntOrder {
+    Hunt {
+        species: super::corpse::CorpseSpecies,
+        area_tile: (i16, i16),
+        target_party_size: u8,
+        mustered: Vec<Entity>,
+        deployed_tick: Option<u64>,
+        posted_tick: u64,
+    },
+    Scout {
+        posted_tick: u64,
+    },
+}
+
+impl HuntOrder {
+    pub fn posted_tick(&self) -> u64 {
+        match self {
+            HuntOrder::Hunt { posted_tick, .. } => *posted_tick,
+            HuntOrder::Scout { posted_tick } => *posted_tick,
+        }
+    }
+}
+
+/// Chief-driven hunter assignment. Runs in Economy after
+/// `compute_faction_storage_system` once per `HUNTER_ASSIGNMENT_CADENCE`. For
+/// every faction:
 ///
-/// - Under target → promote the highest-Combat-skill `Profession::None`
-///   adult to `Hunter`. Skips Farmers (don't poach an established role).
-/// - Over target → demote the lowest-Combat-skill `Hunter` to `None`,
-///   abort their `ActivePlan`, release any storage reservation, drop a
-///   carried corpse if any. The agent picks a new plan next tick.
+/// - Compute a target headcount from `HUNTER_MIN_RATIO * adults`, scaled up
+///   by `culture.martial` and local prey density. `HUNTING_SPEAR` is a hard
+///   tech gate; without it, target = 0.
+/// - Under target → promote the highest-Combat-skill `Profession::None` adult.
+///   Skips Farmers (don't poach an established role).
+/// - Over target → demote the lowest-Combat-skill `Hunter`, tear down their
+///   `ActivePlan`, release any storage reservation, drop any carried corpse.
 ///
-/// NPC factions don't auto-recruit hunters yet — combat balance for raid AI
-/// would shift, and we don't have a player-facing knob to expose. Easy
-/// future extension: per-faction target counts driven by `member_count`.
-pub fn assign_hunters_system(
-    target: Res<HunterTargetCount>,
-    player_faction: Res<crate::simulation::faction::PlayerFaction>,
+/// Density is read off `FactionData::nearby_prey_count`, which `chief_hunt_order_system`
+/// refreshes alongside its decision cycle. We don't re-scan the spatial index
+/// here — assignment runs more often than the chief and the density signal
+/// only needs to be roughly current.
+pub fn faction_hunter_assignment_system(
+    clock: Res<SimClock>,
     registry: Res<FactionRegistry>,
     reservations: Res<StorageReservations>,
     mut commands: Commands,
@@ -56,64 +117,101 @@ pub fn assign_hunters_system(
         Option<&mut PersonAI>,
         Option<&mut PlanHistory>,
     )>,
-    clock: Res<SimClock>,
 ) {
-    let faction_id = player_faction.faction_id;
-    if faction_id == SOLO {
+    if clock.tick % HUNTER_ASSIGNMENT_CADENCE != 0 {
         return;
     }
-    // Tech gate: HUNTING_SPEAR must be unlocked. Without it, demote any
-    // existing hunters back to None — keeps state consistent if tech is
-    // ever rolled back (currently impossible, but cheap to defend).
-    let has_tech = registry
-        .factions
-        .get(&faction_id)
-        .map(|f| f.techs.has(HUNTING_SPEAR))
-        .unwrap_or(false);
 
-    let want = if has_tech { target.count as usize } else { 0 };
+    // Snapshot per-faction target headcounts so we don't borrow registry
+    // across the mutable query iteration.
+    struct FactionTarget {
+        adult_count: u32,
+        hunter_target: usize,
+    }
+    let mut targets: AHashMap<u32, FactionTarget> = AHashMap::default();
+    for (&fid, faction) in registry.factions.iter() {
+        if fid == SOLO {
+            continue;
+        }
+        let has_tech = faction.techs.has(HUNTING_SPEAR);
+        let adults = faction.member_count;
+        let nearby = faction.nearby_prey_count as f32;
+        let martial_scale = 0.5 + (faction.culture.martial as f32 / 255.0);
+        let density_scale = if adults > 0 {
+            (nearby / adults as f32).clamp(1.0, 2.0)
+        } else {
+            1.0
+        };
+        let mut target = if has_tech && adults > 0 {
+            let floor = (adults as f32 * HUNTER_MIN_RATIO).round().max(1.0);
+            (floor * martial_scale * density_scale).round() as usize
+        } else {
+            0
+        };
+        // Don't let hunters consume more than half the workforce.
+        target = target.min((adults as usize) / 2);
+        targets.insert(
+            fid,
+            FactionTarget {
+                adult_count: adults,
+                hunter_target: target,
+            },
+        );
+    }
 
-    // Snapshot eligibility lists (entity, combat_skill).
-    let mut hunters: Vec<(Entity, u32)> = Vec::new();
-    let mut none_candidates: Vec<(Entity, u32)> = Vec::new();
+    // Per-faction snapshot of (entity, combat_skill) for current hunters and
+    // None candidates.
+    let mut by_faction_hunters: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
+    let mut by_faction_none: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
     for (entity, prof, member, skills, _, _) in query.iter() {
-        if member.faction_id != faction_id {
+        if member.faction_id == SOLO {
             continue;
         }
         let combat = skills.0[SkillKind::Combat as usize];
         match *prof {
-            Profession::Hunter => hunters.push((entity, combat)),
-            Profession::None => none_candidates.push((entity, combat)),
+            Profession::Hunter => by_faction_hunters
+                .entry(member.faction_id)
+                .or_default()
+                .push((entity, combat)),
+            Profession::None => by_faction_none
+                .entry(member.faction_id)
+                .or_default()
+                .push((entity, combat)),
             _ => {}
         }
     }
 
-    if hunters.len() < want {
-        // Promote highest-combat None members.
-        none_candidates.sort_by(|a, b| b.1.cmp(&a.1));
-        let need = want - hunters.len();
-        let promote: Vec<Entity> = none_candidates
-            .into_iter()
-            .take(need)
-            .map(|(e, _)| e)
-            .collect();
-        for (entity, mut prof, _, _, _, _) in query.iter_mut() {
-            if promote.contains(&entity) {
-                *prof = Profession::Hunter;
+    let mut promote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut demote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    for (&fid, target) in &targets {
+        let mut hunters = by_faction_hunters.remove(&fid).unwrap_or_default();
+        let mut none = by_faction_none.remove(&fid).unwrap_or_default();
+        let want = target.hunter_target;
+        let _ = target.adult_count; // populated for inspector/logging
+        if hunters.len() < want {
+            none.sort_by(|a, b| b.1.cmp(&a.1));
+            let need = want - hunters.len();
+            for (e, _) in none.into_iter().take(need) {
+                promote.insert(e);
+            }
+        } else if hunters.len() > want {
+            hunters.sort_by(|a, b| a.1.cmp(&b.1));
+            let extra = hunters.len() - want;
+            for (e, _) in hunters.into_iter().take(extra) {
+                demote.insert(e);
             }
         }
-    } else if hunters.len() > want {
-        // Demote lowest-combat hunters.
-        hunters.sort_by(|a, b| a.1.cmp(&b.1));
-        let extra = hunters.len() - want;
-        let demote: Vec<Entity> = hunters.iter().take(extra).map(|(e, _)| *e).collect();
-        for (entity, mut prof, _, _, ai_opt, history_opt) in query.iter_mut() {
-            if !demote.contains(&entity) {
-                continue;
-            }
+    }
+
+    if promote.is_empty() && demote.is_empty() {
+        return;
+    }
+
+    for (entity, mut prof, _member, _skills, ai_opt, history_opt) in query.iter_mut() {
+        if promote.contains(&entity) {
+            *prof = Profession::Hunter;
+        } else if demote.contains(&entity) {
             *prof = Profession::None;
-            // Tear down any in-flight hunting plan so storage reservations
-            // and dragged corpses don't outlive the role.
             if let Some(mut ai) = ai_opt {
                 if ai.reserved_good.is_some() {
                     release_reservation(&reservations, &mut ai);
@@ -130,6 +228,192 @@ pub fn assign_hunters_system(
             commands.entity(entity).remove::<ActivePlan>();
         }
     }
+}
+
+/// Per-faction chief decision: scan a `HUNT_SCAN_RADIUS` window around
+/// `home_tile` for living Wolves/Deer, pick the species with highest count,
+/// and post a `HuntOrder::Hunt` (or `HuntOrder::Scout` if nothing's nearby).
+/// Runs once per `HUNT_DECISION_CADENCE` per faction; factions stagger
+/// across the cadence by `faction_id` so the workload spreads. Also writes
+/// `nearby_prey_count` to drive `faction_hunter_assignment_system`.
+pub fn chief_hunt_order_system(
+    clock: Res<SimClock>,
+    spatial: Res<SpatialIndex>,
+    mut registry: ResMut<FactionRegistry>,
+    prey_query: Query<
+        (&Transform, &super::combat::Health),
+        Or<(With<super::animals::Wolf>, With<super::animals::Deer>)>,
+    >,
+    wolf_q: Query<(), With<super::animals::Wolf>>,
+    deer_q: Query<(), With<super::animals::Deer>>,
+) {
+    // Each faction's decision phase is `fid % HUNT_DECISION_CADENCE`, so
+    // factions fire on different ticks throughout the day. Same for the
+    // mid-day invalidation sweep, offset by half a cadence so it doesn't
+    // collide with the decision tick. Modulo + branch is cheap; real work
+    // only happens once per faction per cadence.
+    let factions: Vec<u32> = registry.factions.keys().copied().collect();
+    for fid in factions {
+        if fid == SOLO {
+            continue;
+        }
+        let phase_decide = (fid as u64) % HUNT_DECISION_CADENCE;
+        let phase_invalidate =
+            ((fid as u64).wrapping_add(HUNT_INVALIDATE_CADENCE / 2)) % HUNT_INVALIDATE_CADENCE;
+        let do_decide = clock.tick % HUNT_DECISION_CADENCE == phase_decide;
+        let do_invalidate = !do_decide
+            && clock.tick % HUNT_INVALIDATE_CADENCE == phase_invalidate;
+        if do_decide {
+            decide_for_faction(
+                fid,
+                &mut registry,
+                &spatial,
+                &prey_query,
+                &wolf_q,
+                &deer_q,
+                clock.tick,
+            );
+        } else if do_invalidate {
+            invalidate_for_faction(fid, &mut registry, &spatial, &prey_query, &wolf_q, &deer_q, clock.tick);
+        }
+    }
+}
+
+fn invalidate_for_faction(
+    fid: u32,
+    registry: &mut FactionRegistry,
+    spatial: &SpatialIndex,
+    prey_query: &Query<
+        (&Transform, &super::combat::Health),
+        Or<(With<super::animals::Wolf>, With<super::animals::Deer>)>,
+    >,
+    wolf_q: &Query<(), With<super::animals::Wolf>>,
+    deer_q: &Query<(), With<super::animals::Deer>>,
+    tick: u64,
+) {
+    let Some(faction) = registry.factions.get_mut(&fid) else {
+        return;
+    };
+    let Some(order) = faction.hunt_order.as_ref() else {
+        return;
+    };
+    // Stale-muster timeout: the order has been live longer than agents
+    // should patiently wait for stragglers, and the party never deployed.
+    if let HuntOrder::Hunt { deployed_tick, .. } = order {
+        if deployed_tick.is_none()
+            && tick.saturating_sub(order.posted_tick()) > HUNT_PARTY_TIMEOUT
+        {
+            faction.hunt_order = None;
+            return;
+        }
+    }
+    // Target-area-empty: prey has moved on or been butchered.
+    if let HuntOrder::Hunt { area_tile, species, .. } = order {
+        let mut count = 0u32;
+        let cx = area_tile.0 as i32;
+        let cy = area_tile.1 as i32;
+        for dy in -8..=8 {
+            for dx in -8..=8 {
+                let tx = cx + dx;
+                let ty = cy + dy;
+                for &e in spatial.get(tx, ty) {
+                    let matches_species = match species {
+                        super::corpse::CorpseSpecies::Wolf => wolf_q.get(e).is_ok(),
+                        super::corpse::CorpseSpecies::Deer => deer_q.get(e).is_ok(),
+                    };
+                    if matches_species {
+                        if let Ok((_, h)) = prey_query.get(e) {
+                            if !h.is_dead() {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if count == 0 {
+            faction.hunt_order = None;
+        }
+    }
+}
+
+fn decide_for_faction(
+    fid: u32,
+    registry: &mut FactionRegistry,
+    spatial: &SpatialIndex,
+    prey_query: &Query<
+        (&Transform, &super::combat::Health),
+        Or<(With<super::animals::Wolf>, With<super::animals::Deer>)>,
+    >,
+    wolf_q: &Query<(), With<super::animals::Wolf>>,
+    deer_q: &Query<(), With<super::animals::Deer>>,
+    tick: u64,
+) {
+    let Some(faction) = registry.factions.get_mut(&fid) else {
+        return;
+    };
+    if !faction.techs.has(HUNTING_SPEAR) {
+        faction.hunt_order = None;
+        faction.nearby_prey_count = 0;
+        return;
+    }
+    let (htx, hty) = faction.home_tile;
+    let mut wolf_count = 0u32;
+    let mut deer_count = 0u32;
+    let mut wolf_centroid = (0i64, 0i64);
+    let mut deer_centroid = (0i64, 0i64);
+    for dy in -HUNT_SCAN_RADIUS..=HUNT_SCAN_RADIUS {
+        for dx in -HUNT_SCAN_RADIUS..=HUNT_SCAN_RADIUS {
+            if dx * dx + dy * dy > HUNT_SCAN_RADIUS * HUNT_SCAN_RADIUS {
+                continue;
+            }
+            let tx = htx as i32 + dx;
+            let ty = hty as i32 + dy;
+            for &e in spatial.get(tx, ty) {
+                let Ok((_, health)) = prey_query.get(e) else {
+                    continue;
+                };
+                if health.is_dead() {
+                    continue;
+                }
+                if wolf_q.get(e).is_ok() {
+                    wolf_count += 1;
+                    wolf_centroid.0 += tx as i64;
+                    wolf_centroid.1 += ty as i64;
+                } else if deer_q.get(e).is_ok() {
+                    deer_count += 1;
+                    deer_centroid.0 += tx as i64;
+                    deer_centroid.1 += ty as i64;
+                }
+            }
+        }
+    }
+    faction.nearby_prey_count = wolf_count + deer_count;
+    if wolf_count == 0 && deer_count == 0 {
+        faction.hunt_order = Some(HuntOrder::Scout { posted_tick: tick });
+        return;
+    }
+    let (species, count, centroid) = if wolf_count >= deer_count {
+        (super::corpse::CorpseSpecies::Wolf, wolf_count, wolf_centroid)
+    } else {
+        (super::corpse::CorpseSpecies::Deer, deer_count, deer_centroid)
+    };
+    let area_tile = (
+        (centroid.0 / count as i64) as i16,
+        (centroid.1 / count as i64) as i16,
+    );
+    let target_party_size = match species {
+        super::corpse::CorpseSpecies::Wolf => 4,
+        super::corpse::CorpseSpecies::Deer => 2,
+    };
+    faction.hunt_order = Some(HuntOrder::Hunt {
+        species,
+        area_tile,
+        target_party_size,
+        mustered: Vec::new(),
+        deployed_tick: None,
+        posted_tick: tick,
+    });
 }
 
 pub fn faction_profession_system(
@@ -525,6 +809,15 @@ pub struct FactionData {
     /// Stockpile postings, and by `goal_update_system` to pick a fallback
     /// gather goal for unclaimed workers. Range 0..=u32::MAX.
     pub material_targets: ahash::AHashMap<crate::economy::goods::Good, u32>,
+    /// Active hunting directive (`Hunt` or `Scout`) issued by the chief.
+    /// Refreshed by `chief_hunt_order_system` once per game-day, with a
+    /// mid-day invalidation sweep that clears spent / empty targets.
+    pub hunt_order: Option<HuntOrder>,
+    /// Count of living Wolf+Deer entities scanned within `HUNT_SCAN_RADIUS`
+    /// of `home_tile` on the most recent chief decision. Drives
+    /// `faction_hunter_assignment_system`'s density scaling so factions in
+    /// game-rich areas grow more hunters above the 20% floor.
+    pub nearby_prey_count: u32,
 }
 
 #[derive(Resource, Default)]
@@ -573,6 +866,8 @@ impl FactionRegistry {
                 workforce_budget: crate::simulation::projects::WorkforceBudget::default(),
                 material_deficit_ema: ahash::AHashMap::default(),
                 material_targets: ahash::AHashMap::default(),
+                hunt_order: None,
+                nearby_prey_count: 0,
             },
         );
         id

@@ -12,9 +12,12 @@ use crate::simulation::faction::{FactionCenter, StorageTileMap};
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
+use crate::economy::goods::Good;
+use crate::economy::item::Item;
+use crate::simulation::items::GroundItem;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE, Z_MIN};
 use crate::world::globe::{Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
-use crate::world::terrain::{generate_chunk_from_globe, tile_at_3d, WorldGen, TILE_SIZE};
+use crate::world::terrain::{generate_chunk_from_globe, tile_at_3d, tile_to_world, WorldGen, TILE_SIZE};
 use crate::world::tile::{OreKind, TileKind};
 
 pub const LOAD_RADIUS: i32 = 12;
@@ -493,6 +496,46 @@ fn initial_stage(h: u32) -> GrowthStage {
     }
 }
 
+const ROCK_HASH_SEED: u32 = 0xDEAD_C0DE;
+
+/// Deterministically scatter loose stone items across Stone surface tiles in a chunk.
+pub fn spawn_chunk_loose_rocks(commands: &mut Commands, chunk_map: &ChunkMap, coord: ChunkCoord) {
+    let Some(chunk) = chunk_map.0.get(&coord) else {
+        return;
+    };
+
+    for ty in 0..CHUNK_SIZE {
+        for tx in 0..CHUNK_SIZE {
+            if chunk.surface_tile_kind(tx, ty) != TileKind::Stone {
+                continue;
+            }
+            let global_tx = coord.0 * CHUNK_SIZE as i32 + tx as i32;
+            let global_ty = coord.1 * CHUNK_SIZE as i32 + ty as i32;
+
+            let h = (global_tx.wrapping_mul(2_654_435_761_u32 as i32)
+                ^ global_ty.wrapping_mul(2_246_822_519_u32 as i32)
+                ^ ROCK_HASH_SEED as i32) as u32;
+
+            if h % 100 >= 35 {
+                continue;
+            }
+
+            let qty = (h % 3 + 1) as u32;
+            let world_pos = tile_to_world(global_tx, global_ty);
+            commands.spawn((
+                GroundItem {
+                    item: Item::new_commodity(Good::Stone),
+                    qty,
+                },
+                Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ));
+        }
+    }
+}
+
 /// Update: stream chunks in/out as the camera moves.
 pub fn chunk_streaming_system(
     mut has_run: Local<bool>,
@@ -574,6 +617,8 @@ pub fn chunk_streaming_system(
                     &globe,
                     coord,
                 );
+
+                spawn_chunk_loose_rocks(&mut commands, &chunk_map, coord);
             }
         }
     }

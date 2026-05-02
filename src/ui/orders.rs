@@ -1,19 +1,23 @@
 use super::selection::{SelectedEntities, SelectedEntity};
+use crate::economy::item::Item;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::pathfinding::hotspots::{HotspotFlowFields, HotspotKind};
 use crate::rendering::camera::CameraViewZ;
-use crate::simulation::animals::{Fox, Wolf};
+use crate::simulation::animals::{Deer, Fox, Wolf};
 use crate::simulation::combat::{CombatTarget, Health};
 use crate::simulation::construction::{
     faction_can_build, recipe_for, BedMap, Blueprint, BlueprintMap, BuildSiteKind, CampfireMap,
     ChairMap, DoorMap, LoomMap, TableMap, WallMaterial, WorkbenchMap,
 };
+use crate::simulation::corpse::Corpse;
 use crate::simulation::faction::SOLO;
 use crate::simulation::faction::{FactionMember, FactionRegistry, FactionTechs, PlayerFaction};
-use crate::simulation::items::GroundItem;
-use crate::simulation::person::{AiState, Drafted, Person, PersonAI, PlayerOrder, PlayerOrderKind};
+use crate::simulation::items::{GroundItem, TargetItem};
+use crate::simulation::person::{
+    AiState, Drafted, Person, PersonAI, PlayerOrder, PlayerOrderKind, Profession,
+};
 use crate::simulation::plants::PlantMap;
 use crate::simulation::tasks::{assign_task_with_routing, task_interacts_from_adjacent, TaskKind};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
@@ -25,6 +29,22 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts};
 
+/// An entity found on the right-clicked tile that is displayed in Section 2.
+struct TileEntityInfo {
+    entity: Entity,
+    display_name: String,
+    hostility: Hostility,
+    health: Option<(u8, u8)>,
+    is_corpse: bool,
+}
+
+/// A ground-item stack found on the right-clicked tile, displayed in Section 3.
+struct TileItemInfo {
+    entity: Entity,
+    item: Item,
+    qty: u32,
+}
+
 #[derive(Resource, Default)]
 pub struct ContextMenuState {
     pub open: bool,
@@ -32,11 +52,22 @@ pub struct ContextMenuState {
     pub target_tile: (i16, i16),
     /// Foot Z of the targeted tile at the moment of right-click.
     pub target_z: i8,
-    /// Top-level actions shown directly (Move, Mine, Gather, …).
+    /// Top-level tile actions shown directly (Move, Mine, Gather, …).
     pub actions: Vec<PlayerOrderKind>,
     /// Build options nested under the "Build ▸" submenu. `bool` is whether the
     /// player faction has the required tech — locked options render greyed-out.
     pub build_options: Vec<(PlayerOrderKind, bool)>,
+    /// Non-item entities on the target tile (Section 2).
+    pub tile_entities: Vec<TileEntityInfo>,
+    /// Ground-item stacks on the target tile (Section 3).
+    pub tile_items: Vec<TileItemInfo>,
+}
+
+impl ContextMenuState {
+    fn clear_tile_data(&mut self) {
+        self.tile_entities.clear();
+        self.tile_items.clear();
+    }
 }
 
 /// All build options the player could potentially place on an open tile.
@@ -65,6 +96,39 @@ pub struct OrderMemberQueries<'w, 's> {
     pub faction_q: Query<'w, 's, &'static FactionMember>,
 }
 
+/// Read-only queries for classifying and displaying entities at the target tile.
+#[derive(SystemParam)]
+pub struct TileDisplayQueries<'w, 's> {
+    pub ground_items_q: Query<'w, 's, (Entity, &'static GroundItem)>,
+    pub health_q: Query<'w, 's, &'static Health>,
+    pub name_q: Query<'w, 's, &'static Name>,
+    pub person_q: Query<'w, 's, (), With<Person>>,
+    pub wolf_q: Query<'w, 's, (), With<Wolf>>,
+    pub deer_q: Query<'w, 's, (), With<Deer>>,
+    pub fox_q: Query<'w, 's, (), With<Fox>>,
+    pub corpse_q: Query<'w, 's, &'static Corpse>,
+    pub profession_q: Query<'w, 's, &'static Profession>,
+}
+
+/// All routing resources bundled to stay under the 16-param system limit.
+#[derive(SystemParam)]
+pub struct RoutingResources<'w, 's> {
+    pub chunk_graph: Res<'w, ChunkGraph>,
+    pub chunk_router: Res<'w, ChunkRouter>,
+    pub chunk_connectivity: Res<'w, ChunkConnectivity>,
+    pub camera_view_z: Res<'w, CameraViewZ>,
+    pub bed_map: Res<'w, BedMap>,
+    pub campfire_map: Res<'w, CampfireMap>,
+    pub door_map: Res<'w, DoorMap>,
+    pub table_map: Res<'w, TableMap>,
+    pub chair_map: Res<'w, ChairMap>,
+    pub workbench_map: Res<'w, WorkbenchMap>,
+    pub loom_map: Res<'w, LoomMap>,
+    pub bp_map: ResMut<'w, BlueprintMap>,
+    #[system_param(ignore)]
+    pub _marker: std::marker::PhantomData<&'s ()>,
+}
+
 pub fn right_click_context_menu_system(
     mut contexts: EguiContexts,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
@@ -74,43 +138,15 @@ pub fn right_click_context_menu_system(
     member_q: OrderMemberQueries,
     player_faction: Res<PlayerFaction>,
     faction_registry: Res<FactionRegistry>,
-    mut ai_q: Query<(&mut PersonAI, &Transform)>,
+    mut ai_q: Query<(&mut PersonAI, &Transform, &mut CombatTarget, &mut TargetItem)>,
     chunk_map: Res<ChunkMap>,
     plant_map: Res<PlantMap>,
     spatial: Res<SpatialIndex>,
-    ground_item_check: Query<(), With<GroundItem>>,
-    routing: (
-        Res<ChunkGraph>,
-        Res<ChunkRouter>,
-        Res<ChunkConnectivity>,
-        Res<CameraViewZ>,
-        Res<BedMap>,
-        Res<CampfireMap>,
-        Res<DoorMap>,
-        Res<TableMap>,
-        Res<ChairMap>,
-        Res<WorkbenchMap>,
-        Res<LoomMap>,
-        ResMut<BlueprintMap>,
-    ),
+    tile_display: TileDisplayQueries,
+    mut routing: RoutingResources,
     mut menu_state: ResMut<ContextMenuState>,
     mut commands: Commands,
 ) {
-    let (
-        chunk_graph,
-        chunk_router,
-        chunk_connectivity,
-        camera_view_z,
-        bed_map,
-        campfire_map,
-        door_map,
-        table_map,
-        chair_map,
-        workbench_map,
-        loom_map,
-        mut bp_order_map,
-    ) = routing;
-
     // Require a selected player-faction member.
     let Some(sel_entity) = selected.0 else {
         menu_state.open = false;
@@ -125,8 +161,7 @@ pub fn right_click_context_menu_system(
         menu_state.open = false;
         return;
     }
-    // Drafted units are commanded by `military_right_click_system` instead;
-    // suppress the work-order menu so right-click is unambiguously military.
+    // Drafted units are commanded by `military_right_click_system` instead.
     if member_q.drafted_q.get(sel_entity).is_ok() {
         menu_state.open = false;
         return;
@@ -144,9 +179,9 @@ pub fn right_click_context_menu_system(
                     let tx = (world_pos.x / TILE_SIZE).floor() as i32;
                     let ty = (world_pos.y / TILE_SIZE).floor() as i32;
 
-                    let underground = camera_view_z.0 != i32::MAX;
+                    let underground = routing.camera_view_z.0 != i32::MAX;
                     let target_z_i32 = if underground {
-                        camera_view_z.0
+                        routing.camera_view_z.0
                     } else {
                         chunk_map.surface_z_at(tx, ty)
                     };
@@ -168,13 +203,13 @@ pub fn right_click_context_menu_system(
                         .unwrap_or_default();
 
                     let pos_tile = (tx as i16, ty as i16);
-                    let already_built = bed_map.0.contains_key(&pos_tile)
-                        || campfire_map.0.contains_key(&pos_tile)
-                        || door_map.0.contains_key(&pos_tile)
-                        || table_map.0.contains_key(&pos_tile)
-                        || chair_map.0.contains_key(&pos_tile)
-                        || workbench_map.0.contains_key(&pos_tile)
-                        || loom_map.0.contains_key(&pos_tile);
+                    let already_built = routing.bed_map.0.contains_key(&pos_tile)
+                        || routing.campfire_map.0.contains_key(&pos_tile)
+                        || routing.door_map.0.contains_key(&pos_tile)
+                        || routing.table_map.0.contains_key(&pos_tile)
+                        || routing.chair_map.0.contains_key(&pos_tile)
+                        || routing.workbench_map.0.contains_key(&pos_tile)
+                        || routing.loom_map.0.contains_key(&pos_tile);
 
                     if let Some(kind) = target_kind {
                         if matches!(kind, TileKind::Wall | TileKind::Stone) {
@@ -182,9 +217,6 @@ pub fn right_click_context_menu_system(
                         }
                         if kind.is_passable() && !underground {
                             actions.push(PlayerOrderKind::DigDown);
-                            // Build menu: list every option, gating advanced
-                            // ones by tech. Skip if a structure is already on
-                            // this tile.
                             if !already_built {
                                 for bk in all_build_options() {
                                     let unlocked = faction_can_build(bk, &player_techs);
@@ -199,12 +231,51 @@ pub fn right_click_context_menu_system(
                     if !underground && plant_map.0.contains_key(&(tx, ty)) {
                         actions.push(PlayerOrderKind::Gather);
                     }
-                    if !underground {
-                        for &e in spatial.get(tx, ty) {
-                            if ground_item_check.get(e).is_ok() {
-                                actions.push(PlayerOrderKind::PickUp);
-                                break;
-                            }
+
+                    // Populate tile entities and items (Sections 2 & 3).
+                    menu_state.clear_tile_data();
+                    for &e in spatial.get(tx, ty) {
+                        if e == sel_entity {
+                            continue;
+                        }
+                        if let Ok((item_entity, gi)) = tile_display.ground_items_q.get(e) {
+                            menu_state.tile_items.push(TileItemInfo {
+                                entity: item_entity,
+                                item: gi.item,
+                                qty: gi.qty,
+                            });
+                        } else {
+                            let hostility = classify_target(
+                                e,
+                                player_faction.faction_id,
+                                &faction_registry,
+                                &member_q.faction_q,
+                                &tile_display.wolf_q,
+                                &tile_display.fox_q,
+                            );
+                            let health = tile_display
+                                .health_q
+                                .get(e)
+                                .ok()
+                                .map(|h| (h.current, h.max));
+                            let is_corpse = tile_display.corpse_q.get(e).is_ok();
+                            let display_name = entity_display_name(
+                                e,
+                                &tile_display.name_q,
+                                &tile_display.person_q,
+                                &tile_display.profession_q,
+                                &tile_display.wolf_q,
+                                &tile_display.deer_q,
+                                &tile_display.fox_q,
+                                &tile_display.corpse_q,
+                            );
+                            menu_state.tile_entities.push(TileEntityInfo {
+                                entity: e,
+                                display_name,
+                                hostility,
+                                health,
+                                is_corpse,
+                            });
                         }
                     }
 
@@ -235,12 +306,32 @@ pub fn right_click_context_menu_system(
     let build_options = menu_state.build_options.clone();
     let target_tile = menu_state.target_tile;
     let target_z = menu_state.target_z;
+    // Clone enough display data to use in the closure without borrow issues.
+    let tile_entities: Vec<(Entity, String, Hostility, Option<(u8, u8)>, bool)> = menu_state
+        .tile_entities
+        .iter()
+        .map(|e| {
+            (
+                e.entity,
+                e.display_name.clone(),
+                e.hostility,
+                e.health,
+                e.is_corpse,
+            )
+        })
+        .collect();
+    let tile_items: Vec<(Entity, Item, u32)> = menu_state
+        .tile_items
+        .iter()
+        .map(|i| (i.entity, i.item, i.qty))
+        .collect();
     let mut chosen: Option<PlayerOrderKind> = None;
 
     egui::Area::new("context_menu".into())
         .fixed_pos(menu_state.screen_pos)
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
+                // Section 1 — Tile actions (Move, Mine, Gather, Dig, Deconstruct)
                 for action in &actions {
                     if ui.button(action.label()).clicked() {
                         chosen = Some(*action);
@@ -262,11 +353,59 @@ pub fn right_click_context_menu_system(
                         }
                     });
                 }
+
+                // Section 2 — Entities on tile
+                if !tile_entities.is_empty() {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("── Entities ──")
+                            .small()
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                    for (entity, name, hostility, health, is_corpse) in &tile_entities {
+                        let info_label = if let Some((cur, max)) = health {
+                            format!("{name}  \u{2665}{cur}/{max}")
+                        } else {
+                            name.clone()
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(&info_label);
+                            if *hostility != Hostility::Friendly && health.is_some() {
+                                if ui.small_button("Attack").clicked() {
+                                    chosen = Some(PlayerOrderKind::AttackEntity(*entity));
+                                }
+                            }
+                            if *is_corpse {
+                                if ui.small_button("Pick up corpse").clicked() {
+                                    chosen = Some(PlayerOrderKind::PickUpCorpse(*entity));
+                                }
+                            }
+                        });
+                    }
+                }
+
+                // Section 3 — Items on tile
+                if !tile_items.is_empty() {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("── Items ──")
+                            .small()
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                    for (entity, item, qty) in &tile_items {
+                        let label = format!("Pick up: {qty}\u{00d7} {}", item.label());
+                        if ui.button(&label).clicked() {
+                            chosen = Some(PlayerOrderKind::PickUpItem(*entity));
+                        }
+                    }
+                }
             });
         });
 
     if let Some(action) = chosen {
-        if let Ok((mut ai, transform)) = ai_q.get_mut(sel_entity) {
+        if let Ok((mut ai, transform, mut combat_target, mut target_item)) =
+            ai_q.get_mut(sel_entity)
+        {
             let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
             let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
             let cur_chunk = ChunkCoord(
@@ -274,17 +413,16 @@ pub fn right_click_context_menu_system(
                 cur_ty.div_euclid(CHUNK_SIZE as i32),
             );
 
-            // For Build orders: spawn a personal Blueprint at the target tile
-            // so the agent has a concrete entity to work toward.
+            // For Build orders: spawn a personal Blueprint at the target tile.
             let build_bp: Option<Entity> = if let PlayerOrderKind::Build(kind) = action {
-                if !bp_order_map.0.contains_key(&target_tile) {
+                if !routing.bp_map.0.contains_key(&target_tile) {
                     let faction_id = member_q
                         .faction_q
                         .get(sel_entity)
                         .map(|m| m.faction_id)
                         .unwrap_or(SOLO);
                     let wp = tile_to_world(target_tile.0 as i32, target_tile.1 as i32);
-                    let target_z =
+                    let bz =
                         chunk_map.surface_z_at(target_tile.0 as i32, target_tile.1 as i32) as i8;
                     let bp_e = commands
                         .spawn((
@@ -293,7 +431,7 @@ pub fn right_click_context_menu_system(
                                 Some(sel_entity),
                                 kind,
                                 target_tile,
-                                target_z,
+                                bz,
                             ),
                             Transform::from_xyz(wp.x, wp.y, 0.3),
                             GlobalTransform::default(),
@@ -301,43 +439,164 @@ pub fn right_click_context_menu_system(
                             InheritedVisibility::default(),
                         ))
                         .id();
-                    bp_order_map.0.insert(target_tile, bp_e);
+                    routing.bp_map.0.insert(target_tile, bp_e);
                     Some(bp_e)
                 } else {
-                    bp_order_map.0.get(&target_tile).copied()
+                    routing.bp_map.0.get(&target_tile).copied()
                 }
             } else {
                 None
             };
 
-            let task = match action {
-                PlayerOrderKind::Move => TaskKind::Idle,
-                PlayerOrderKind::Mine => TaskKind::Gather,
-                PlayerOrderKind::Gather => TaskKind::Gather,
-                PlayerOrderKind::PickUp => TaskKind::Scavenge,
-                PlayerOrderKind::Build(BuildSiteKind::Bed) => TaskKind::ConstructBed,
-                PlayerOrderKind::Build(_) => TaskKind::Construct,
-                PlayerOrderKind::DigDown => TaskKind::Dig,
-                PlayerOrderKind::Deconstruct => TaskKind::Deconstruct,
-            };
-            assign_task_with_routing(
-                &mut ai,
-                (cur_tx as i16, cur_ty as i16),
-                cur_chunk,
-                target_tile,
-                task,
-                build_bp,
-                &chunk_graph,
-                &chunk_router,
-                &chunk_map,
-                &chunk_connectivity,
-            );
-            // For non-adjacent tasks (Move) honor the player's chosen Z layer —
-            // assign_task_with_routing snaps via nearest_standable_z to the agent's
-            // current Z, which would lose an underground click. Adjacent tasks
-            // (Mine/Gather/Build/Dig/PickUp/Deconstruct) must keep the route
-            // tile's Z that assign_task_with_routing already wrote.
-            if !task_interacts_from_adjacent(task as u16) {
+            match action {
+                PlayerOrderKind::Move => {
+                    assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx as i16, cur_ty as i16),
+                        cur_chunk,
+                        target_tile,
+                        TaskKind::Idle,
+                        None,
+                        &routing.chunk_graph,
+                        &routing.chunk_router,
+                        &chunk_map,
+                        &routing.chunk_connectivity,
+                    );
+                    ai.target_z = target_z;
+                }
+                PlayerOrderKind::Mine | PlayerOrderKind::Gather => {
+                    assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx as i16, cur_ty as i16),
+                        cur_chunk,
+                        target_tile,
+                        TaskKind::Gather,
+                        None,
+                        &routing.chunk_graph,
+                        &routing.chunk_router,
+                        &chunk_map,
+                        &routing.chunk_connectivity,
+                    );
+                }
+                PlayerOrderKind::PickUp => {
+                    assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx as i16, cur_ty as i16),
+                        cur_chunk,
+                        target_tile,
+                        TaskKind::Scavenge,
+                        None,
+                        &routing.chunk_graph,
+                        &routing.chunk_router,
+                        &chunk_map,
+                        &routing.chunk_connectivity,
+                    );
+                }
+                PlayerOrderKind::PickUpItem(item_entity) => {
+                    assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx as i16, cur_ty as i16),
+                        cur_chunk,
+                        target_tile,
+                        TaskKind::Scavenge,
+                        Some(item_entity),
+                        &routing.chunk_graph,
+                        &routing.chunk_router,
+                        &chunk_map,
+                        &routing.chunk_connectivity,
+                    );
+                    target_item.0 = Some(item_entity);
+                }
+                PlayerOrderKind::AttackEntity(foe) => {
+                    assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx as i16, cur_ty as i16),
+                        cur_chunk,
+                        target_tile,
+                        TaskKind::MilitaryAttack,
+                        Some(foe),
+                        &routing.chunk_graph,
+                        &routing.chunk_router,
+                        &chunk_map,
+                        &routing.chunk_connectivity,
+                    );
+                    combat_target.0 = None;
+                }
+                PlayerOrderKind::PickUpCorpse(corpse_entity) => {
+                    assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx as i16, cur_ty as i16),
+                        cur_chunk,
+                        target_tile,
+                        TaskKind::PickUpCorpse,
+                        Some(corpse_entity),
+                        &routing.chunk_graph,
+                        &routing.chunk_router,
+                        &chunk_map,
+                        &routing.chunk_connectivity,
+                    );
+                }
+                PlayerOrderKind::Build(BuildSiteKind::Bed) => {
+                    assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx as i16, cur_ty as i16),
+                        cur_chunk,
+                        target_tile,
+                        TaskKind::ConstructBed,
+                        build_bp,
+                        &routing.chunk_graph,
+                        &routing.chunk_router,
+                        &chunk_map,
+                        &routing.chunk_connectivity,
+                    );
+                }
+                PlayerOrderKind::Build(_) => {
+                    assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx as i16, cur_ty as i16),
+                        cur_chunk,
+                        target_tile,
+                        TaskKind::Construct,
+                        build_bp,
+                        &routing.chunk_graph,
+                        &routing.chunk_router,
+                        &chunk_map,
+                        &routing.chunk_connectivity,
+                    );
+                }
+                PlayerOrderKind::DigDown => {
+                    assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx as i16, cur_ty as i16),
+                        cur_chunk,
+                        target_tile,
+                        TaskKind::Dig,
+                        None,
+                        &routing.chunk_graph,
+                        &routing.chunk_router,
+                        &chunk_map,
+                        &routing.chunk_connectivity,
+                    );
+                }
+                PlayerOrderKind::Deconstruct => {
+                    assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx as i16, cur_ty as i16),
+                        cur_chunk,
+                        target_tile,
+                        TaskKind::Deconstruct,
+                        None,
+                        &routing.chunk_graph,
+                        &routing.chunk_router,
+                        &chunk_map,
+                        &routing.chunk_connectivity,
+                    );
+                }
+            }
+
+            // For non-adjacent tasks (Move) honor the player's chosen Z layer.
+            let task = ai.task_id;
+            if !task_interacts_from_adjacent(task) {
                 ai.target_z = target_z;
             }
         }
@@ -348,6 +607,47 @@ pub fn right_click_context_menu_system(
         });
         menu_state.open = false;
     }
+}
+
+/// Build a human-readable display name for an entity on the right-clicked tile.
+fn entity_display_name(
+    entity: Entity,
+    name_q: &Query<&Name>,
+    person_q: &Query<(), With<Person>>,
+    profession_q: &Query<&Profession>,
+    wolf_q: &Query<(), With<Wolf>>,
+    deer_q: &Query<(), With<Deer>>,
+    fox_q: &Query<(), With<Fox>>,
+    corpse_q: &Query<&Corpse>,
+) -> String {
+    if let Ok(corpse) = corpse_q.get(entity) {
+        return format!("{:?} Corpse", corpse.species);
+    }
+    if person_q.get(entity).is_ok() {
+        let name = name_q
+            .get(entity)
+            .map(|n| n.as_str())
+            .unwrap_or("Person");
+        let profession = profession_q.get(entity).ok();
+        return match profession {
+            Some(Profession::Farmer) => format!("{name} (Farmer)"),
+            Some(Profession::Hunter) => format!("{name} (Hunter)"),
+            _ => name.to_owned(),
+        };
+    }
+    if wolf_q.get(entity).is_ok() {
+        return "Wolf".to_owned();
+    }
+    if deer_q.get(entity).is_ok() {
+        return "Deer".to_owned();
+    }
+    if fox_q.get(entity).is_ok() {
+        return "Fox".to_owned();
+    }
+    name_q
+        .get(entity)
+        .map(|n| n.as_str().to_owned())
+        .unwrap_or_else(|_| "Unknown".to_owned())
 }
 
 pub fn player_order_completion_system(

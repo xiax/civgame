@@ -8,7 +8,8 @@ use crate::simulation::construction::{
 use crate::simulation::faction::{
     FactionCenter, FactionMember, PlayerFaction, PlayerFactionMarker,
 };
-use crate::simulation::items::{Equipment, EquipmentSlot};
+use crate::economy::goods::Good;
+use crate::simulation::items::{Equipment, EquipmentSlot, GroundItem};
 use crate::simulation::person::{HairColor, Person, PersonAI, SkinTone};
 use crate::simulation::plants::{GrowthStage, Plant, PlantKind};
 use crate::simulation::reproduction::BiologicalSex;
@@ -103,6 +104,9 @@ pub struct WorkbenchVisual;
 
 #[derive(Component)]
 pub struct LoomVisual;
+
+#[derive(Component)]
+pub struct GroundItemVisual;
 
 /// Base tint color on a VisualChild entity — used by the fog system to preserve
 /// sex-based coloring while still applying fog darkening.
@@ -360,6 +364,38 @@ pub fn spawn_loom_sprites(
                 VisualChild,
                 sprite,
                 Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn spawn_ground_item_sprites(
+    mut commands: Commands,
+    query: Query<(Entity, &GroundItem), Without<GroundItemVisual>>,
+    sprite_lib: Res<SpriteLibrary>,
+) {
+    for (entity, gi) in query.iter() {
+        let key = match gi.item.good {
+            Good::Stone => "resource_loose_rock",
+            _ => continue,
+        };
+        let Some(img) = sprite_lib.get(key).cloned() else {
+            continue;
+        };
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
+
+        commands
+            .entity(entity)
+            .insert((GroundItemVisual, EntityFogState::default(), FogPersistent));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.5),
                 GlobalTransform::default(),
                 Visibility::Inherited,
                 InheritedVisibility::default(),

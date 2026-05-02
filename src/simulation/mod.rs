@@ -98,7 +98,6 @@ impl Plugin for SimulationPlugin {
             .insert_resource(plan::RelInfluence::default())
             .insert_resource(military::ActiveRallyPoints::default())
             .insert_resource(corpse::CorpseMap::default())
-            .insert_resource(person::HunterTargetCount::default())
             .insert_resource(military::MusterHuntersRequest::default())
             .configure_sets(
                 FixedUpdate,
@@ -256,13 +255,12 @@ impl Plugin for SimulationPlugin {
                     production::tame_task_system
                         .after(movement::movement_system)
                         .before(plan::plan_execution_system),
-                    corpse::pickup_corpse_task_system
-                        .after(movement::movement_system)
-                        .before(plan::plan_execution_system),
-                    corpse::haul_corpse_task_system
-                        .after(movement::movement_system)
-                        .before(plan::plan_execution_system),
-                    corpse::butcher_task_system
+                    (
+                        corpse::pickup_corpse_task_system,
+                        corpse::haul_corpse_task_system,
+                        corpse::butcher_task_system,
+                        corpse::wait_for_party_task_system,
+                    )
                         .after(movement::movement_system)
                         .before(plan::plan_execution_system),
                     plan::rel_influence_system.after(movement::update_spatial_index_system),
@@ -354,8 +352,10 @@ impl Plugin for SimulationPlugin {
                         .after(faction::drop_items_at_destination_system),
                     military::expire_rally_points_system,
                     military::apply_muster_hunters_system,
-                    faction::assign_hunters_system
+                    faction::chief_hunt_order_system
                         .after(faction::compute_faction_storage_system),
+                    faction::faction_hunter_assignment_system
+                        .after(faction::chief_hunt_order_system),
                     corpse::corpse_decay_system,
                 )
                     .in_set(SimulationSet::Economy),

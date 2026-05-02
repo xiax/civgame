@@ -5,7 +5,7 @@ use crate::economy::goods::Good;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
 
-use super::faction::FactionMember;
+use super::faction::{FactionMember, FactionRegistry, HuntOrder, HUNT_PARTY_TIMEOUT};
 use super::items::{spawn_or_merge_ground_item, GroundItem};
 use super::lod::LodLevel;
 use super::person::{AiState, PersonAI};
@@ -237,6 +237,79 @@ pub fn butcher_task_system(
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
+    }
+}
+
+/// Sequential.
+///
+/// `HuntPartyMuster`: hunter has walked to the chief's chosen muster tile
+/// (`StepTarget::HearthForHunt`). On arrival (`Working`), the agent registers
+/// itself in the faction's `HuntOrder::Hunt::mustered` list and stays put
+/// until the party fills (`mustered.len() >= target_party_size`) or the
+/// chief flips `deployed_tick` (the first agent to cross the threshold writes
+/// it, gating dispatch for everyone). On stale orders (timeout reached without
+/// deployment, or order cleared by the chief invalidation sweep), the executor
+/// exits as a soft failure so the plan ends and the next selection cycle
+/// re-considers the hunter.
+pub fn wait_for_party_task_system(
+    clock: Res<SimClock>,
+    mut registry: ResMut<FactionRegistry>,
+    mut agents: Query<(
+        Entity,
+        &mut PersonAI,
+        &FactionMember,
+        &BucketSlot,
+        &LodLevel,
+    )>,
+) {
+    for (entity, mut ai, member, slot, lod) in agents.iter_mut() {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        if ai.task_id != TaskKind::HuntPartyMuster as u16 || ai.state != AiState::Working {
+            continue;
+        }
+        let Some(faction) = registry.factions.get_mut(&member.faction_id) else {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            continue;
+        };
+        let Some(order) = faction.hunt_order.as_mut() else {
+            // Chief cleared the order — abort the wait.
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            continue;
+        };
+        match order {
+            HuntOrder::Hunt {
+                mustered,
+                target_party_size,
+                deployed_tick,
+                posted_tick,
+                ..
+            } => {
+                if !mustered.contains(&entity) {
+                    mustered.push(entity);
+                }
+                let mustered_len = mustered.len() as u8;
+                if deployed_tick.is_none() && mustered_len >= *target_party_size {
+                    *deployed_tick = Some(clock.tick);
+                }
+                let ready = deployed_tick.is_some();
+                let stale = clock.tick.saturating_sub(*posted_tick) > HUNT_PARTY_TIMEOUT;
+                if ready || stale {
+                    ai.state = AiState::Idle;
+                    ai.task_id = PersonAI::UNEMPLOYED;
+                }
+                // else: keep waiting (state stays Working).
+            }
+            HuntOrder::Scout { .. } => {
+                // Order flipped from Hunt to Scout while we were mustering.
+                // Bail so the plan ends and the next pick can be ScoutForPrey.
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+            }
+        }
     }
 }
 

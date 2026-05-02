@@ -125,6 +125,17 @@ pub fn spawn_or_merge_ground_item_full(
     ));
 }
 
+/// Returns the equipment slots that a given good can be placed into.
+pub fn valid_equip_slots(good: Good) -> &'static [EquipmentSlot] {
+    match good {
+        Good::Weapon => &[EquipmentSlot::MainHand, EquipmentSlot::OffHand],
+        Good::Shield => &[EquipmentSlot::OffHand],
+        Good::Armor => &[EquipmentSlot::TorsoArmor],
+        Good::Cloth => &[EquipmentSlot::TorsoArmor],
+        _ => &[],
+    }
+}
+
 /// Recompute `EconomicAgent.bonus_cap_g` from currently-equipped items. Currently
 /// the only contributing slot is TorsoArmor (e.g. cloth or armor) which grants a
 /// modest pack/pocket bonus. Runs on `Changed<Equipment>`.

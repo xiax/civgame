@@ -62,6 +62,7 @@ pub enum TaskKind {
     HaulCorpse = 34,  // walk a carried corpse to a butcher site (hearth / faction camp) and stand there
     Butcher = 35,     // adjacent to own carried corpse; work_ticks then yield Meat+Skin and despawn
     Equip = 36,       // instant: move a matching Item from inventory/Carrier into Equipment[slot]
+    HuntPartyMuster = 37, // hunter waiting at hearth for the chief's hunting party to fill
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -104,6 +105,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::HaulCorpse as u16 => "Hauling Corpse",
         x if x == TaskKind::Butcher as u16 => "Butchering",
         x if x == TaskKind::Equip as u16 => "Equipping",
+        x if x == TaskKind::HuntPartyMuster as u16 => "Mustering for Hunt",
         _ => "Unemployed",
     }
 }

@@ -81,6 +81,7 @@ impl Plugin for RenderingPlugin {
                 Update,
                 (
                     entity_sprites::spawn_plant_sprites,
+                    entity_sprites::spawn_ground_item_sprites,
                     entity_sprites::update_plant_sprites,
                     entity_sprites::spawn_wolf_sprites,
                     entity_sprites::spawn_deer_sprites,

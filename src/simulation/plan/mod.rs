@@ -269,6 +269,20 @@ pub enum StepTarget {
         slot: crate::simulation::items::EquipmentSlot,
         good: Good,
     },
+    /// Hearth tile to muster at for a chief's `HuntOrder::Hunt`. Falls back
+    /// to faction `home_tile`. Resolves to None when no hunt order is active.
+    /// The wait-for-party state itself lives in
+    /// `wait_for_party_task_system` once the agent arrives — the target only
+    /// has to route them to the muster tile.
+    HearthForHunt,
+    /// The chief's chosen hunting-area tile (centroid of detected prey).
+    /// Resolves to None when no `Hunt` order is active.
+    HuntArea,
+    /// Random reachable tile near `home_tile` used by the `ScoutForPrey`
+    /// plan. Mirrors `ExploreTile` resolver but selects only when no `Scout`
+    /// order is active. We reuse ExploreTile's resolver via this variant so
+    /// scout movement matches explore movement.
+    ScoutForPrey,
 }
 
 #[derive(Clone, Debug)]
@@ -1595,6 +1609,82 @@ fn resolve_target(
             // (set during dispatch in `plan_execution_system`).
             Some((None, pos.0 as i16, pos.1 as i16))
         }
+        StepTarget::HearthForHunt => {
+            // Only meaningful when the faction has an active Hunt order.
+            // Pick the campfire tile closest to the chief's chosen
+            // hunt area (so the muster point is on the side of camp the
+            // party will depart from); fall back to home_tile.
+            let order = faction_registry
+                .factions
+                .get(&faction_id)
+                .and_then(|f| f.hunt_order.as_ref())?;
+            let area_tile = match order {
+                crate::simulation::faction::HuntOrder::Hunt { area_tile, .. } => *area_tile,
+                _ => return None,
+            };
+            let ax = area_tile.0 as i32;
+            let ay = area_tile.1 as i32;
+            let mut best: Option<(i16, i16)> = None;
+            let mut best_dist = i32::MAX;
+            for (&tile, _e) in campfire_map.0.iter() {
+                let dist = (tile.0 as i32 - ax).abs() + (tile.1 as i32 - ay).abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some(tile);
+                }
+            }
+            if let Some((tx, ty)) = best {
+                return Some((None, tx, ty));
+            }
+            faction_registry
+                .home_tile(faction_id)
+                .map(|(tx, ty)| (None, tx, ty))
+        }
+        StepTarget::HuntArea => {
+            let order = faction_registry
+                .factions
+                .get(&faction_id)
+                .and_then(|f| f.hunt_order.as_ref())?;
+            match order {
+                crate::simulation::faction::HuntOrder::Hunt { area_tile, .. } => {
+                    Some((None, area_tile.0, area_tile.1))
+                }
+                _ => None,
+            }
+        }
+        StepTarget::ScoutForPrey => {
+            // Reuse the ExploreTile random-reachable-tile logic so scouts
+            // wander outward and dump memory along the way; `vision_system`
+            // writes `MemoryKind::Prey` whenever a hunter sees Wolf/Deer,
+            // and the candidate filter removes ScoutForPrey from contention
+            // the moment that memory is populated.
+            let has_scout = matches!(
+                faction_registry
+                    .factions
+                    .get(&faction_id)
+                    .and_then(|f| f.hunt_order.as_ref()),
+                Some(crate::simulation::faction::HuntOrder::Scout { .. })
+            );
+            if !has_scout {
+                return None;
+            }
+            let home = faction_registry
+                .home_tile(faction_id)
+                .unwrap_or((pos.0 as i16, pos.1 as i16));
+            let cur_chunk = chunk_coord(pos.0, pos.1);
+            for _ in 0..8 {
+                let dx = fastrand::i32(-96..=96);
+                let dy = fastrand::i32(-96..=96);
+                let tx = (home.0 as i32 + dx).max(0) as i16;
+                let ty = (home.1 as i32 + dy).max(0) as i16;
+                let to_chunk = chunk_coord(tx as i32, ty as i32);
+                let to_z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
+                if chunk_connectivity.is_reachable((cur_chunk, pos_z), (to_chunk, to_z)) {
+                    return Some((None, tx, ty));
+                }
+            }
+            None
+        }
     }
 }
 
@@ -1873,6 +1963,32 @@ pub fn plan_execution_system(
                         match p.requires_profession {
                             None => true,
                             Some(required) => *profession == required,
+                        }
+                    })
+                    .filter(|p| {
+                        // Hunt-order gate: HuntFood (5) requires a Hunt order;
+                        // ScoutForPrey (65) requires a Scout order. The chief
+                        // sets the order; without it, hunters fall through to
+                        // their normal plan competition (gather, haul, etc.)
+                        // and stay flexible labour. AcquireHuntingSpear (64)
+                        // is uncoupled from the order so a hunter who picks
+                        // up the role mid-day can arm before the next muster.
+                        match p.id {
+                            5 => matches!(
+                                faction_registry
+                                    .factions
+                                    .get(&member.faction_id)
+                                    .and_then(|f| f.hunt_order.as_ref()),
+                                Some(crate::simulation::faction::HuntOrder::Hunt { .. })
+                            ),
+                            65 => matches!(
+                                faction_registry
+                                    .factions
+                                    .get(&member.faction_id)
+                                    .and_then(|f| f.hunt_order.as_ref()),
+                                Some(crate::simulation::faction::HuntOrder::Scout { .. })
+                            ),
+                            _ => true,
                         }
                     })
                     // Bug 3 fix: skip plans whose first step has unmet preconditions so we

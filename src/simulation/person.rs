@@ -54,14 +54,6 @@ pub enum Profession {
     Hunter,
 }
 
-/// Player-controlled target Hunter headcount. `assign_hunters_system`
-/// promotes the highest-Combat-skill agents up to this count and demotes
-/// excess Hunters when the player lowers it.
-#[derive(Resource, Default, Clone, Copy)]
-pub struct HunterTargetCount {
-    pub count: u32,
-}
-
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SkinTone {
     Tan,
@@ -236,6 +228,12 @@ pub enum PlayerOrderKind {
     Build(crate::simulation::construction::BuildSiteKind),
     DigDown,
     Deconstruct,
+    /// Pick up a specific `GroundItem` entity.
+    PickUpItem(Entity),
+    /// Attack a specific entity (usable by non-drafted workers).
+    AttackEntity(Entity),
+    /// Pick up a specific fresh `Corpse` entity.
+    PickUpCorpse(Entity),
 }
 
 impl PlayerOrderKind {
@@ -267,6 +265,9 @@ impl PlayerOrderKind {
             },
             PlayerOrderKind::DigDown => "Dig Down",
             PlayerOrderKind::Deconstruct => "Deconstruct",
+            PlayerOrderKind::PickUpItem(_) => "Pick up item",
+            PlayerOrderKind::AttackEntity(_) => "Attack",
+            PlayerOrderKind::PickUpCorpse(_) => "Pick up corpse",
         }
     }
 }
@@ -456,7 +457,7 @@ pub fn spawn_population(
                     RelationshipMemory::default(),
                     KnownPlans::with_innate(&[
     0, 1, 2, 3, 5, 6, 7, 9, 10, 13, 14, 15, 16, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35,
-    36, 37, 38, 39, 60, 61, 62, 63, 64,
+    36, 37, 38, 39, 60, 61, 62, 63, 64, 65,
 ]),
                     PlanHistory::default(),
                     PlanScoringMethod::Weighted,

@@ -619,5 +619,20 @@ fn should_craft(registry: &FactionRegistry, faction_id: u32, needs: &Needs) -> b
     .iter()
     .map(|g| faction.storage.totals.get(g).copied().unwrap_or(0))
     .sum();
-    crafted_total < faction.member_count.saturating_div(3).max(1)
+    if crafted_total >= faction.member_count.saturating_div(3).max(1) {
+        return false;
+    }
+    // Don't flood workers into Craft goal when no recipe's inputs are covered.
+    // `resource_supply` includes agent inventories + faction storage totals,
+    // refreshed each Economy tick — cheapest faction-wide material proxy.
+    crate::simulation::crafting::CRAFT_RECIPES.iter().any(|recipe| {
+        if let Some(tech) = recipe.tech_gate {
+            if !faction.techs.has(tech) {
+                return false;
+            }
+        }
+        recipe.inputs.iter().all(|&(good, qty)| {
+            faction.resource_supply.get(&good).copied().unwrap_or(0) >= qty
+        })
+    })
 }

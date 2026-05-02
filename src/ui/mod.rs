@@ -33,6 +33,7 @@ impl Plugin for UiPlugin {
             .insert_resource(job_board::JobBoardPanelState::default())
             .insert_resource(activity_log::ActivityLog::default())
             .insert_resource(activity_log::CameraFocusRequest::default())
+            .insert_resource(inspector::PendingInspectorAction::default())
             .add_event::<activity_log::ActivityLogEvent>()
             .add_systems(
                 Update,
@@ -44,6 +45,7 @@ impl Plugin for UiPlugin {
                     orders::right_click_context_menu_system,
                     orders::player_order_completion_system,
                     inspector::inspector_panel_system,
+                    inspector::inspector_action_system,
                     economy_panel::economy_panel_system,
                     hud::hud_system,
                     hud::apply_draft_toggle_system,

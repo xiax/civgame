@@ -3,12 +3,17 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::agent::EconomicAgent;
+use crate::economy::item::Item;
 use crate::pathfinding::path_request::{
     FailReason, FailureLog, FollowStatus, PathFollow, PathRequestQueue,
 };
+use crate::simulation::carry::Carrier;
 use crate::simulation::combat::{Body, BodyPart, Health};
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction, SOLO};
 use crate::simulation::goals::{AgentGoal, GoalReason, Personality};
+use crate::simulation::items::{
+    spawn_or_merge_ground_item_full, valid_equip_slots, Equipment, EquipmentSlot, GroundItem,
+};
 use crate::simulation::memory::{AgentMemory, RelEntry, RelationshipMemory};
 use crate::simulation::mood::Mood;
 use crate::simulation::needs::Needs;
@@ -27,15 +32,32 @@ use crate::simulation::tasks::{task_kind_label, TaskKind};
 use crate::world::chunk::ChunkMap;
 use crate::world::seasons::Calendar;
 use crate::world::seasons::TICKS_PER_SEASON;
+use crate::world::spatial::SpatialIndex;
+use crate::world::terrain::TILE_SIZE;
 use crate::world::tile::TileKind;
 
 use super::selection::SelectedEntity;
+
+/// Pending inventory/equipment action queued by the inspector UI, executed by
+/// `inspector_action_system` on the next frame.
+#[derive(Resource, Default)]
+pub struct PendingInspectorAction(pub Option<InspectorActionKind>);
+
+pub enum InspectorActionKind {
+    DropInventoryItem { target: Entity, item: Item, qty: u32 },
+    DropInvItemOne { target: Entity, item: Item },
+    DropLeftHand { target: Entity },
+    DropRightHand { target: Entity },
+    EquipItem { target: Entity, item: Item, from_hands: bool, slot: EquipmentSlot },
+    UnequipSlot { target: Entity, slot: EquipmentSlot },
+}
 
 #[derive(SystemParam)]
 pub struct PathInspectorParams<'w, 's> {
     pub failure_log: Res<'w, FailureLog>,
     pub path_queue: ResMut<'w, PathRequestQueue>,
     pub path_follows: Query<'w, 's, &'static mut PathFollow>,
+    pub pending_action: ResMut<'w, PendingInspectorAction>,
 }
 
 #[derive(SystemParam)]
@@ -364,17 +386,34 @@ pub fn inspector_panel_system(
                         );
                         egui::ScrollArea::vertical()
                             .id_salt("inv")
-                            .max_height(100.0)
+                            .max_height(120.0)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 for (item, qty) in &agent.inventory {
                                     if *qty > 0 {
-                                        ui.label(format!(
-                                            "  {}: {} ({:.2} kg)",
-                                            item.label(),
-                                            qty,
-                                            item.stack_weight_g(*qty) as f32 / 1000.0
-                                        ));
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!(
+                                                "{}: {} ({:.2} kg)",
+                                                item.label(),
+                                                qty,
+                                                item.stack_weight_g(*qty) as f32 / 1000.0
+                                            ));
+                                            if ui.small_button("Drop 1").clicked() {
+                                                path_params.pending_action.0 =
+                                                    Some(InspectorActionKind::DropInvItemOne {
+                                                        target: entity,
+                                                        item: *item,
+                                                    });
+                                            }
+                                            if *qty > 1 && ui.small_button("Drop All").clicked() {
+                                                path_params.pending_action.0 =
+                                                    Some(InspectorActionKind::DropInventoryItem {
+                                                        target: entity,
+                                                        item: *item,
+                                                        qty: *qty,
+                                                    });
+                                            }
+                                        });
                                     }
                                 }
                             });
@@ -388,13 +427,21 @@ pub fn inspector_panel_system(
                         match left_slot {
                             Some(stack) => {
                                 let tag = if stack.two_handed { " [2H]" } else { "" };
-                                ui.label(format!(
-                                    "  L: {} ×{}{} ({:.2} kg)",
-                                    stack.item.label(),
-                                    stack.qty,
-                                    tag,
-                                    stack.weight_g() as f32 / 1000.0,
-                                ));
+                                ui.horizontal(|ui| {
+                                    ui.label(format!(
+                                        "  L: {} ×{}{} ({:.2} kg)",
+                                        stack.item.label(),
+                                        stack.qty,
+                                        tag,
+                                        stack.weight_g() as f32 / 1000.0,
+                                    ));
+                                    if ui.small_button("Drop").clicked() {
+                                        path_params.pending_action.0 =
+                                            Some(InspectorActionKind::DropLeftHand {
+                                                target: entity,
+                                            });
+                                    }
+                                });
                             }
                             None => {
                                 ui.label(
@@ -412,13 +459,21 @@ pub fn inspector_panel_system(
                             match right_slot {
                                 Some(stack) => {
                                     let tag = if stack.two_handed { " [2H]" } else { "" };
-                                    ui.label(format!(
-                                        "  R: {} ×{}{} ({:.2} kg)",
-                                        stack.item.label(),
-                                        stack.qty,
-                                        tag,
-                                        stack.weight_g() as f32 / 1000.0,
-                                    ));
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!(
+                                            "  R: {} ×{}{} ({:.2} kg)",
+                                            stack.item.label(),
+                                            stack.qty,
+                                            tag,
+                                            stack.weight_g() as f32 / 1000.0,
+                                        ));
+                                        if ui.small_button("Drop").clicked() {
+                                            path_params.pending_action.0 =
+                                                Some(InspectorActionKind::DropRightHand {
+                                                    target: entity,
+                                                });
+                                        }
+                                    });
                                 }
                                 None => {
                                     ui.label(
@@ -429,6 +484,128 @@ pub fn inspector_panel_system(
                             }
                         }
                     });
+
+                egui::CollapsingHeader::new(egui::RichText::new("Equipment").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        if let Some(equip) = equipment {
+                            const SLOTS: &[(EquipmentSlot, &str)] = &[
+                                (EquipmentSlot::MainHand, "Main Hand"),
+                                (EquipmentSlot::OffHand, "Off Hand"),
+                                (EquipmentSlot::TorsoArmor, "Torso"),
+                                (EquipmentSlot::HeadArmor, "Head"),
+                                (EquipmentSlot::ArmArmor, "Arms"),
+                                (EquipmentSlot::LegArmor, "Legs"),
+                            ];
+                            for &(slot, slot_name) in SLOTS {
+                                if let Some(item) = equip.items.get(&slot) {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{slot_name}: {}", item.label()));
+                                        if ui.small_button("Unequip").clicked() {
+                                            path_params.pending_action.0 =
+                                                Some(InspectorActionKind::UnequipSlot {
+                                                    target: entity,
+                                                    slot,
+                                                });
+                                        }
+                                    });
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(format!("{slot_name}: —"))
+                                            .color(egui::Color32::from_gray(140)),
+                                    );
+                                }
+                            }
+
+                            // Equip buttons for equippable items in inventory or hands
+                            let mut has_equippable = false;
+                            for (item, qty) in &agent.inventory {
+                                if *qty > 0 && !valid_equip_slots(item.good).is_empty() {
+                                    has_equippable = true;
+                                    break;
+                                }
+                            }
+                            if !has_equippable {
+                                if let Some(c) = carrier {
+                                    for stack in [c.left, c.right].into_iter().flatten() {
+                                        if !valid_equip_slots(stack.item.good).is_empty() {
+                                            has_equippable = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if has_equippable {
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new("Equip from inventory/hands:")
+                                        .color(egui::Color32::from_gray(180))
+                                        .small(),
+                                );
+                                for (item, qty) in &agent.inventory {
+                                    if *qty == 0 {
+                                        continue;
+                                    }
+                                    for &slot in valid_equip_slots(item.good) {
+                                        let slot_name = slot_display_name(slot);
+                                        if ui
+                                            .small_button(format!(
+                                                "{} → {slot_name}",
+                                                item.label()
+                                            ))
+                                            .clicked()
+                                        {
+                                            path_params.pending_action.0 =
+                                                Some(InspectorActionKind::EquipItem {
+                                                    target: entity,
+                                                    item: *item,
+                                                    from_hands: false,
+                                                    slot,
+                                                });
+                                        }
+                                    }
+                                }
+                                if let Some(c) = carrier {
+                                    for (stack, from_left) in [
+                                        (c.left, true),
+                                        (c.right, false),
+                                    ] {
+                                        let Some(stack) = stack else { continue };
+                                        for &slot in valid_equip_slots(stack.item.good) {
+                                            let slot_name = slot_display_name(slot);
+                                            let hand_tag =
+                                                if stack.two_handed { "hands" } else if from_left { "L" } else { "R" };
+                                            if ui
+                                                .small_button(format!(
+                                                    "{} ({hand_tag}) → {slot_name}",
+                                                    stack.item.label()
+                                                ))
+                                                .clicked()
+                                            {
+                                                path_params.pending_action.0 =
+                                                    Some(InspectorActionKind::EquipItem {
+                                                        target: entity,
+                                                        item: stack.item,
+                                                        from_hands: true,
+                                                        slot,
+                                                    });
+                                            }
+                                            if stack.two_handed {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new("(no equipment component)")
+                                    .color(egui::Color32::from_gray(140)),
+                            );
+                        }
+                    });
+
                 egui::CollapsingHeader::new(egui::RichText::new("Task & State").strong())
                     .default_open(true)
                     .show(ui, |ui| {
@@ -1056,6 +1233,180 @@ pub fn inspector_panel_system(
                 }
             });
         });
+}
+
+fn slot_display_name(slot: EquipmentSlot) -> &'static str {
+    match slot {
+        EquipmentSlot::MainHand => "Main Hand",
+        EquipmentSlot::OffHand => "Off Hand",
+        EquipmentSlot::TorsoArmor => "Torso",
+        EquipmentSlot::HeadArmor => "Head",
+        EquipmentSlot::ArmArmor => "Arms",
+        EquipmentSlot::LegArmor => "Legs",
+    }
+}
+
+/// Executes pending inspector inventory/equipment actions queued by
+/// `inspector_panel_system`. Runs in Update, after `inspector_panel_system`.
+pub fn inspector_action_system(
+    mut commands: Commands,
+    spatial: Res<SpatialIndex>,
+    mut pending: ResMut<PendingInspectorAction>,
+    mut worker_q: Query<(&Transform, &mut EconomicAgent, &mut Carrier, &mut Equipment)>,
+    mut ground_items: Query<&mut GroundItem>,
+) {
+    let Some(action) = pending.0.take() else {
+        return;
+    };
+
+    match action {
+        InspectorActionKind::DropInventoryItem { target, item, qty } => {
+            let Ok((transform, mut agent, _, _)) = worker_q.get_mut(target) else {
+                return;
+            };
+            let removed = agent.remove_item(item, qty);
+            if removed > 0 {
+                let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+                let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+                spawn_or_merge_ground_item_full(
+                    &mut commands,
+                    &spatial,
+                    &mut ground_items,
+                    tx,
+                    ty,
+                    item,
+                    removed,
+                );
+            }
+        }
+        InspectorActionKind::DropInvItemOne { target, item } => {
+            let Ok((transform, mut agent, _, _)) = worker_q.get_mut(target) else {
+                return;
+            };
+            let removed = agent.remove_item(item, 1);
+            if removed > 0 {
+                let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+                let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+                spawn_or_merge_ground_item_full(
+                    &mut commands,
+                    &spatial,
+                    &mut ground_items,
+                    tx,
+                    ty,
+                    item,
+                    1,
+                );
+            }
+        }
+        InspectorActionKind::DropLeftHand { target } => {
+            let Ok((transform, mut agent, mut carrier, _)) = worker_q.get_mut(target) else {
+                return;
+            };
+            let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+            let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+            if let Some(stack) = carrier.left.take() {
+                if stack.two_handed {
+                    carrier.right = None;
+                }
+                spawn_or_merge_ground_item_full(
+                    &mut commands,
+                    &spatial,
+                    &mut ground_items,
+                    tx,
+                    ty,
+                    stack.item,
+                    stack.qty,
+                );
+                // Drop-hand may free capacity for bonuses — recompute via agent
+                let _ = agent.bonus_cap_g; // touch to avoid unused warning
+            }
+        }
+        InspectorActionKind::DropRightHand { target } => {
+            let Ok((transform, mut agent, mut carrier, _)) = worker_q.get_mut(target) else {
+                return;
+            };
+            let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+            let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+            // Only drop right if not already cleared by a two-handed left drop.
+            if let Some(stack) = carrier.right.take() {
+                spawn_or_merge_ground_item_full(
+                    &mut commands,
+                    &spatial,
+                    &mut ground_items,
+                    tx,
+                    ty,
+                    stack.item,
+                    stack.qty,
+                );
+                let _ = agent.bonus_cap_g;
+            }
+        }
+        InspectorActionKind::EquipItem { target, item, from_hands, slot } => {
+            let Ok((transform, mut agent, mut carrier, mut equipment)) = worker_q.get_mut(target)
+            else {
+                return;
+            };
+            let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+            let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+
+            // Remove from source
+            let found = if from_hands {
+                carrier.remove_item(item, 1) > 0
+            } else {
+                agent.remove_item(item, 1) > 0
+            };
+            if !found {
+                return;
+            }
+
+            // Insert into slot, handle displaced item
+            let displaced = equipment.items.insert(slot, item);
+            if let Some(prev) = displaced {
+                let leftover = agent.add_item(prev, 1);
+                if leftover > 0 {
+                    let leftover2 = carrier.try_pick_up(prev, leftover);
+                    if leftover2 > 0 {
+                        spawn_or_merge_ground_item_full(
+                            &mut commands,
+                            &spatial,
+                            &mut ground_items,
+                            tx,
+                            ty,
+                            prev,
+                            leftover2,
+                        );
+                    }
+                }
+            }
+        }
+        InspectorActionKind::UnequipSlot { target, slot } => {
+            let Ok((transform, mut agent, mut carrier, mut equipment)) = worker_q.get_mut(target)
+            else {
+                return;
+            };
+            let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+            let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+
+            let Some(item) = equipment.items.remove(&slot) else {
+                return;
+            };
+            let leftover = agent.add_item(item, 1);
+            if leftover > 0 {
+                let leftover2 = carrier.try_pick_up(item, leftover);
+                if leftover2 > 0 {
+                    spawn_or_merge_ground_item_full(
+                        &mut commands,
+                        &spatial,
+                        &mut ground_items,
+                        tx,
+                        ty,
+                        item,
+                        leftover2,
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn needs_bar(ui: &mut egui::Ui, label: &str, value: f32) {

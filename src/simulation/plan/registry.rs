@@ -9,10 +9,10 @@ use super::{
     mk_weights, AgentGoal, GoodSelector, MaterialNeed, MemoryKind, PlanDef, PlanRegistry, StepDef,
     StepId, StepPreconditions, StepRegistry, StepTarget, TaskKind, TileKind,
     PF_DROP_FOOD_ON_TIMEOUT, PF_EXPLORE, PF_NONE, PF_SCAVENGE, PF_TARGETS_FOOD, PF_TARGETS_STONE,
-    PF_TARGETS_WOOD, PF_UNINTERRUPTIBLE, SI_HAS_FOOD, SI_HAS_SEED, SI_HAS_STONE, SI_HAS_WOOD,
+    PF_TARGETS_WOOD, PF_UNINTERRUPTIBLE, SI_HAS_FOOD, SI_HAS_STONE, SI_HAS_WOOD,
     SI_CRAFT_ORDER_NEEDS_MATERIAL, SI_IN_FACTION, SI_MEM_FOOD, SI_MEM_STONE, SI_MEM_WOOD,
     SI_SEASON_FOOD, SI_SKILL_BUILDING, SI_SKILL_COMBAT, SI_SKILL_CRAFTING, SI_SKILL_FARMING,
-    SI_SOCIAL, SI_STORAGE_FOOD, SI_STORAGE_STONE, SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD,
+    SI_SOCIAL, SI_STORAGE_FOOD, SI_STORAGE_SEED, SI_STORAGE_STONE, SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD,
     SI_VIS_GROUND_STONE,
     SI_VIS_GROUND_WOOD, SI_VIS_PLANT_FOOD, SI_VIS_STONE_TILE, SI_VIS_TREE, SI_WILLPOWER_DISTRESS,
 };
@@ -39,9 +39,15 @@ static PLAN_STEPS_0: &[StepId] = &[0, 12]; // ForageFood → DepositGoods
 static PLAN_STEPS_1: &[StepId] = &[1, 12]; // FarmFood → DepositGoods
 static PLAN_STEPS_2: &[StepId] = &[2, 12]; // GatherWood → DepositGoods
 static PLAN_STEPS_3: &[StepId] = &[3, 12]; // GatherStone → DepositGoods
-static PLAN_STEPS_4: &[StepId] = &[4, 1, 12]; // PlantAndFarm → DepositGoods
-static PLAN_STEPS_5: &[StepId] = &[5, 53, 54, 55]; // HuntFood: Hunt → PickUpCorpse → HaulCorpse → Butcher
+static PLAN_STEPS_4: &[StepId] = &[33, 4]; // PlantFromStorage: WithdrawSeed (from storage) → PlantSeed
+// HuntFood: muster at hearth → wait for party → travel to chief's area →
+// engage prey → corpse pickup/haul/butcher. The first three steps fold the
+// chief's hunting-party formation into the existing hunter pipeline so all
+// hunters depart together rather than each agent independently sniping prey.
+static PLAN_STEPS_5: &[StepId] =
+    &[57, 58, 5, 53, 54, 55]; // MusterAtHearth → TravelToHuntArea → Hunt → PickUpCorpse → HaulCorpse → Butcher
 static PLAN_STEPS_HUNTER_ARM: &[StepId] = &[52, 56]; // AcquireHuntingSpear: WithdrawSpear → EquipMainHand
+static PLAN_STEPS_SCOUT: &[StepId] = &[59]; // ScoutForPrey: WanderForPrey (single step, ends on prey memory)
 static PLAN_STEPS_6: &[StepId] = &[6, 12]; // ScavengeFood → DepositGoods
 static PLAN_STEPS_7: &[StepId] = &[2, 28, 25]; // GatherWood, HaulToBlueprint, BuildAnyBlueprint
 static PLAN_STEPS_29: &[StepId] = &[32, 28, 25]; // FetchMaterialFromStorage, HaulToBlueprint, BuildAnyBlueprint
@@ -54,11 +60,7 @@ static TAME_HORSE_GOALS: &[AgentGoal] = &[AgentGoal::TameHorse];
 static GATHER_WOOD_GOALS: &[AgentGoal] = &[AgentGoal::GatherWood];
 static GATHER_STONE_GOALS: &[AgentGoal] = &[AgentGoal::GatherStone];
 static SURVIVE_AND_GATHER_FOOD_GOALS: &[AgentGoal] = &[AgentGoal::Survive, AgentGoal::GatherFood];
-static FARM_AND_GATHER_FOOD_GOALS: &[AgentGoal] = &[
-    AgentGoal::Survive,
-    AgentGoal::GatherFood,
-    AgentGoal::Farm,
-];
+static FARM_GOALS: &[AgentGoal] = &[AgentGoal::Farm];
 static BUILD_GOALS: &[AgentGoal] = &[AgentGoal::Build];
 static HAUL_GOALS: &[AgentGoal] = &[AgentGoal::Haul];
 static CRAFT_GOALS: &[AgentGoal] = &[AgentGoal::Craft];
@@ -767,6 +769,50 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             plant_filter: None,
             extra: 0,
         },
+        StepDef {
+            // 57: Muster for hunt. Walk to the hearth tile selected by the
+            // chief's HuntOrder (closest campfire to the hunt area, or
+            // home_tile fallback). On arrival the executor
+            // `wait_for_party_task_system` registers the hunter into
+            // `hunt_order.mustered` and blocks until the party has filled
+            // (`mustered.len() >= target_party_size`) or `deployed_tick` is
+            // already set. Resolves to None when no Hunt order is active,
+            // making the candidate filter naturally drop the plan when the
+            // chief stops asking.
+            id: 57,
+            task: TaskKind::HuntPartyMuster,
+            target: StepTarget::HearthForHunt,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.2,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 58: Travel to the chief's chosen hunt area. Reuses the Explore
+            // task's "walk to tile, idle on arrival" semantics — once the
+            // hunter is on the area_tile, step 5's HuntPrey scan finds prey
+            // within VIEW_RADIUS naturally.
+            id: 58,
+            task: TaskKind::Explore,
+            target: StepTarget::HuntArea,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.2,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 59: Wander for prey. Used by the ScoutForPrey plan when the
+            // chief has no prey near the home tile; the agent ranges out to
+            // unmapped tiles and `vision_system` writes prey memory along
+            // the way, which the chief's next decision cycle picks up.
+            id: 59,
+            task: TaskKind::Explore,
+            target: StepTarget::ScoutForPrey,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.1,
+            plant_filter: None,
+            extra: 0,
+        },
     ];
 }
 
@@ -815,7 +861,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
                 (SI_STORAGE_FOOD, -0.2),
             ]),
             bias: 0.0,
-            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
+            serves_goals: FARM_GOALS,
             tech_gate: Some(technology::CROP_CULTIVATION),
             memory_target_kind: Some(MemoryKind::Food),
             flags: PF_NONE,
@@ -856,18 +902,21 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
+            // Withdraw a Seed from faction storage, then plant it on the nearest
+            // Grass tile. No food memory needed — targets storage then terrain.
+            // Scores high when seeds are stockpiled and food supply is low.
             id: 4,
-            name: "PlantAndFarm",
+            name: "PlantFromStorage",
             steps: PLAN_STEPS_4,
             state_weights: mk_weights(&[
-                (SI_HAS_SEED, 0.4),
+                (SI_STORAGE_SEED, 1.0),
                 (SI_SKILL_FARMING, 0.2),
-                (SI_SEASON_FOOD, 0.5),
+                (SI_STORAGE_FOOD, -0.3),
             ]),
             bias: 0.0,
-            serves_goals: FARM_AND_GATHER_FOOD_GOALS,
+            serves_goals: FARM_GOALS,
             tech_gate: Some(technology::CROP_CULTIVATION),
-            memory_target_kind: Some(MemoryKind::Food),
+            memory_target_kind: None,
             flags: PF_NONE,
             requires_profession: None,
         },
@@ -1467,6 +1516,24 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: Some(technology::HUNTING_SPEAR),
             memory_target_kind: None,
             flags: PF_UNINTERRUPTIBLE,
+            requires_profession: Some(Profession::Hunter),
+        },
+        PlanDef {
+            // Hunter-only scout plan: chief posts `HuntOrder::Scout` when no
+            // prey is visible from camp; hunters wander outward writing prey
+            // memory. The candidate filter gates this plan on the faction
+            // holding a Scout order (HuntFood gates on Hunt), so a single
+            // chief flip swaps the active plan. NOT uninterruptible — a
+            // scouting hunter can still be peeled off by survival pressures.
+            id: 65,
+            name: "ScoutForPrey",
+            steps: PLAN_STEPS_SCOUT,
+            state_weights: mk_weights(&[]),
+            bias: 1.0,
+            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
+            tech_gate: Some(technology::HUNTING_SPEAR),
+            memory_target_kind: None,
+            flags: PF_NONE,
             requires_profession: Some(Profession::Hunter),
         },
     ];
