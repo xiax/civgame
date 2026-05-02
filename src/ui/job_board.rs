@@ -2,6 +2,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::simulation::faction::{FactionRegistry, PlayerFaction};
+use crate::economy::goods::Good;
 use crate::simulation::jobs::{
     JobBoard, JobBoardCommand, JobKind, JobPosting, JobProgress, JobSource, TileAabb,
     PLAYER_PRIORITY,
@@ -24,7 +25,7 @@ impl Default for JobBoardPanelState {
     fn default() -> Self {
         Self {
             open: true,
-            draft_kind: JobKind::Gather,
+            draft_kind: JobKind::Stockpile,
             draft_target: 200,
             draft_radius: 5,
         }
@@ -52,13 +53,21 @@ pub fn job_board_panel_system(
             if let Some(faction) = registry.factions.get(&player_faction.faction_id) {
                 let budget = faction.workforce_budget;
                 let postings = board.faction_postings(player_faction.faction_id);
-                let mut claims = [0u32; 4];
+                // Indices: 0=stockpile_food, 1=stockpile_wood, 2=stockpile_stone,
+                // 3=haul, 4=farm, 5=build, 6=craft
+                let mut claims = [0u32; 7];
                 for p in postings {
-                    let i = match p.kind {
-                        JobKind::Gather => 0,
-                        JobKind::Farm => 1,
-                        JobKind::Build => 2,
-                        JobKind::Craft => 3,
+                    let i = match (&p.kind, &p.progress) {
+                        (JobKind::Stockpile, JobProgress::Stockpile { good, .. }) => match good {
+                            Good::Wood => 1,
+                            Good::Stone => 2,
+                            _ => 0,
+                        },
+                        (JobKind::Stockpile, _) => 0,
+                        (JobKind::Haul, _) => 3,
+                        (JobKind::Farm, _) => 4,
+                        (JobKind::Build, _) => 5,
+                        (JobKind::Craft, _) => 6,
                     };
                     claims[i] += p.claimants.len() as u32;
                 }
@@ -67,17 +76,20 @@ pub fn job_board_panel_system(
                     let row = |ui: &mut egui::Ui, label: &str, share: f32, claimed: u32| {
                         let cap = (share * pop).round().max(1.0) as u32;
                         ui.horizontal(|ui| {
-                            ui.label(format!("{:<7}", label));
+                            ui.label(format!("{:<14}", label));
                             ui.add(egui::ProgressBar::new(share).desired_width(120.0));
                             ui.label(format!("{}/{}", claimed, cap));
                         });
                     };
-                    row(ui, "Gather", budget.gather, claims[0]);
-                    row(ui, "Farm",   budget.farm,   claims[1]);
-                    row(ui, "Build",  budget.build,  claims[2]);
-                    row(ui, "Craft",  budget.craft,  claims[3]);
+                    row(ui, "Stockpile Food",  budget.stockpile_food,  claims[0]);
+                    row(ui, "Stockpile Wood",  budget.stockpile_wood,  claims[1]);
+                    row(ui, "Stockpile Stone", budget.stockpile_stone, claims[2]);
+                    row(ui, "Haul",            budget.haul,            claims[3]);
+                    row(ui, "Farm",            budget.farm,            claims[4]);
+                    row(ui, "Build",           budget.build,           claims[5]);
+                    row(ui, "Craft",           budget.craft,           claims[6]);
                     ui.horizontal(|ui| {
-                        ui.label("Free");
+                        ui.label(format!("{:<14}", "Free"));
                         ui.add(egui::ProgressBar::new(budget.free).desired_width(120.0));
                     });
                 });
@@ -128,7 +140,7 @@ pub fn job_board_panel_system(
                 egui::ComboBox::from_label("Kind")
                     .selected_text(state.draft_kind.name())
                     .show_ui(ui, |ui| {
-                        for kind in [JobKind::Gather, JobKind::Farm, JobKind::Craft, JobKind::Build]
+                        for kind in [JobKind::Stockpile, JobKind::Farm, JobKind::Craft]
                         {
                             ui.selectable_value(&mut state.draft_kind, kind, kind.name());
                         }
@@ -211,11 +223,17 @@ fn progress_label(p: &JobProgress) -> String {
         JobProgress::Calories { deposited, target } => {
             format!("Calories {}/{}", deposited, target)
         }
-        JobProgress::Material {
+        JobProgress::Stockpile {
+            good,
+            deposited,
+            target,
+        } => format!("Stockpile {:?} {}/{}", good, deposited, target),
+        JobProgress::Haul {
             good,
             delivered,
             target,
-        } => format!("{:?} {}/{}", good, delivered, target),
+            ..
+        } => format!("Haul {:?} {}/{}", good, delivered, target),
         JobProgress::Planting {
             planted, target, ..
         } => format!("Tiles planted {}/{}", planted, target),
@@ -237,7 +255,7 @@ fn build_player_posting(
     posted_tick: u32,
 ) -> Option<JobPosting> {
     let progress = match kind {
-        JobKind::Gather => JobProgress::Calories {
+        JobKind::Stockpile => JobProgress::Calories {
             deposited: 0,
             target,
         },
@@ -257,9 +275,9 @@ fn build_player_posting(
             recipe: 0,
             bench: None,
         },
-        // Build postings need a concrete blueprint; the Post Job form doesn't
-        // pick one yet — disabled at this layer.
-        JobKind::Build => return None,
+        // Build and Haul postings need a concrete blueprint; the Post Job form
+        // doesn't pick one yet — disabled at this layer.
+        JobKind::Build | JobKind::Haul => return None,
     };
     Some(JobPosting {
         id: 0, // overwritten by job_board_command_system

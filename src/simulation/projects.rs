@@ -25,7 +25,7 @@ use bevy::prelude::*;
 use crate::economy::goods::Good;
 use crate::simulation::construction::{Blueprint, BlueprintMap};
 use crate::simulation::faction::FactionData;
-use crate::simulation::jobs::{faction_can_perform, JobKind, JobProgress};
+use crate::simulation::jobs::{faction_can_perform, JobBoard, JobKind, JobProgress};
 use crate::simulation::schedule::SimClock;
 
 pub type ProjectId = u32;
@@ -226,6 +226,7 @@ pub const PRIORITY_PLAYER: u8 = 220;
 
 const BASE_GATHER_FOOD: u8 = 80;
 const BASE_GATHER_MATERIAL: u8 = 60;
+const BASE_HAUL: u8 = 90;
 const BASE_BUILD: u8 = 40;
 const BASE_FARM: u8 = 60;
 const BASE_CRAFT: u8 = 50;
@@ -245,20 +246,22 @@ pub fn compute_priority(
     projects: &Projects,
 ) -> u8 {
     let base = match posting_kind {
-        JobKind::Gather => match progress {
-            JobProgress::Material { .. } => BASE_GATHER_MATERIAL,
+        JobKind::Stockpile => match progress {
+            JobProgress::Stockpile { .. } => BASE_GATHER_MATERIAL,
             _ => BASE_GATHER_FOOD,
         },
+        JobKind::Haul => BASE_HAUL,
         JobKind::Build => BASE_BUILD,
         JobKind::Farm => BASE_FARM,
         JobKind::Craft => BASE_CRAFT,
     };
 
     let pressure: u8 = match (posting_kind, progress) {
-        (JobKind::Gather, JobProgress::Calories { .. }) => food_pressure(faction),
-        (JobKind::Gather, JobProgress::Material { good, .. }) => {
+        (JobKind::Stockpile, JobProgress::Calories { .. }) => food_pressure(faction),
+        (JobKind::Stockpile, JobProgress::Stockpile { good, .. }) => {
             material_pressure(faction, faction_id, projects, *good)
         }
+        (JobKind::Haul, JobProgress::Haul { .. }) => haul_pressure(),
         (JobKind::Build, JobProgress::Building { .. }) => build_pressure(),
         (JobKind::Farm, _) => farm_pressure(faction),
         (JobKind::Craft, _) => craft_pressure(faction),
@@ -305,6 +308,13 @@ pub fn build_pressure() -> u8 {
     40
 }
 
+/// Haul postings cover the bottleneck step: storage is stocked, blueprint
+/// is waiting. A flat high bump prioritises haulers over fresh stockpilers
+/// so existing stock gets used before new gathering starts.
+pub fn haul_pressure() -> u8 {
+    50
+}
+
 pub fn farm_pressure(faction: &FactionData) -> u8 {
     if !faction_can_perform(faction, JobKind::Farm) {
         return 0;
@@ -336,9 +346,16 @@ pub fn craft_pressure(faction: &FactionData) -> u8 {
 
 /// Per-faction allocation across job kinds. Sums to 1.0. Computed from the
 /// same pressures that drive priority, modulated by `FactionCulture`.
+///
+/// Stockpile is split into three sub-slices (food / wood / stone) so that a
+/// food posting can't crowd out wood/stone Stockpile postings under one shared
+/// cap. `WorkforceBudget::stockpile()` returns the combined share for UI/tests.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkforceBudget {
-    pub gather: f32,
+    pub stockpile_food: f32,
+    pub stockpile_wood: f32,
+    pub stockpile_stone: f32,
+    pub haul: f32,
     pub farm: f32,
     pub build: f32,
     pub craft: f32,
@@ -348,19 +365,43 @@ pub struct WorkforceBudget {
 impl Default for WorkforceBudget {
     fn default() -> Self {
         Self {
-            gather: 0.30,
-            farm: 0.15,
+            stockpile_food: 0.18,
+            stockpile_wood: 0.06,
+            stockpile_stone: 0.06,
+            haul: 0.20,
+            farm: 0.10,
             build: 0.15,
-            craft: 0.15,
-            free: 0.25,
+            craft: 0.10,
+            free: 0.15,
         }
     }
 }
 
 impl WorkforceBudget {
+    /// Combined Stockpile slice across all goods. Useful for the legacy UI
+    /// summary; per-good caps come from `stockpile_share`.
+    pub fn stockpile(&self) -> f32 {
+        self.stockpile_food + self.stockpile_wood + self.stockpile_stone
+    }
+
+    /// Share of the workforce allocated to a Stockpile posting for `good`.
+    /// Goods other than Food/Wood/Stone fall back to the food share since they
+    /// share the calorie pipeline.
+    pub fn stockpile_share(&self, good: Good) -> f32 {
+        match good {
+            Good::Wood => self.stockpile_wood,
+            Good::Stone => self.stockpile_stone,
+            _ => self.stockpile_food,
+        }
+    }
+
+    /// Top-level share for a `JobKind`. For Stockpile this returns the
+    /// combined slice — call `stockpile_share(good)` when you need the
+    /// per-good cap.
     pub fn share(&self, kind: JobKind) -> f32 {
         match kind {
-            JobKind::Gather => self.gather,
+            JobKind::Stockpile => self.stockpile(),
+            JobKind::Haul => self.haul,
             JobKind::Farm => self.farm,
             JobKind::Build => self.build,
             JobKind::Craft => self.craft,
@@ -382,20 +423,55 @@ pub fn compute_workforce_budget(
     previous: WorkforceBudget,
 ) -> WorkforceBudget {
     let food = food_pressure(faction) as f32;
-    let mut material = 0.0f32;
     let mut waiting_build = 0u32;
+    let mut waiting_gather = 0u32;
     for project in projects.faction_projects(faction_id) {
         match project.phase {
-            ProjectPhase::GatherMaterials => material += 20.0,
+            ProjectPhase::GatherMaterials => waiting_gather += 1,
             ProjectPhase::Build => waiting_build += 1,
         }
     }
+
+    // Per-good Stockpile pressure. Each good gets its own softmax slot so the
+    // food posting can't crowd out wood/stone caps. Anticipatory deficit feeds
+    // the per-good signal directly; project-waiting bumps every good so an
+    // active build project lifts material gathering across the board.
+    let stored_of = |good: Good| {
+        faction
+            .storage
+            .totals
+            .get(&good)
+            .copied()
+            .unwrap_or(0) as f32
+    };
+    let target_of = |good: Good| {
+        faction
+            .material_targets
+            .get(&good)
+            .copied()
+            .unwrap_or(0) as f32
+    };
+    let project_bump = waiting_gather as f32 * 20.0;
+    let stockpile_food_pressure = food;
+    let stockpile_wood_pressure =
+        (target_of(Good::Wood) - stored_of(Good::Wood)).max(0.0) * 1.5 + project_bump;
+    let stockpile_stone_pressure =
+        (target_of(Good::Stone) - stored_of(Good::Stone)).max(0.0) * 1.5 + project_bump;
+
+    // Haul pressure: count Haul postings on the board for this faction (those
+    // are the ones with deliverable storage). Each haulable item adds weight.
+    // Materially: aggregated as project-count * 20 — a softer signal than
+    // Stockpile so haulers don't crowd out gatherers when storage is empty.
+    let haul_pressure = waiting_build as f32 * 10.0 + waiting_gather as f32 * 20.0;
+
     let farm = farm_pressure(faction) as f32;
     let craft = craft_pressure(faction) as f32;
     let build = waiting_build as f32 * 30.0;
 
-    // Raw weights — gather absorbs both food and material pressure.
-    let mut raw_gather = food + material;
+    let mut raw_food = stockpile_food_pressure;
+    let mut raw_wood = stockpile_wood_pressure;
+    let mut raw_stone = stockpile_stone_pressure;
+    let mut raw_haul = haul_pressure;
     let mut raw_farm = farm;
     let mut raw_build = build;
     let mut raw_craft = craft;
@@ -406,17 +482,38 @@ pub fn compute_workforce_budget(
     raw_build *= scale(c.defensive, 0.4);
     raw_craft *= scale(c.ceremonial, 0.3);
     raw_craft *= scale(c.mercantile, 0.3);
-    raw_gather *= scale(c.mercantile, 0.2);
+    raw_food *= scale(c.mercantile, 0.2);
+    raw_wood *= scale(c.mercantile, 0.2);
+    raw_stone *= scale(c.mercantile, 0.2);
+    // Defensive cultures want stone for walls; martial want wood for hafts.
+    raw_stone *= scale(c.defensive, 0.2);
+    raw_wood *= scale(c.martial, 0.15);
+    raw_haul *= scale(c.mercantile, 0.2);
     raw_build *= scale(c.martial, 0.2);
 
     // Capability gate — kinds the faction can't yet perform are excluded from
-    // the softmax entirely (NEG_INFINITY → exp() = 0). Skip the role floor for
-    // those, otherwise it would resurrect them. Same predicate used by the
-    // chief's posting code, so budget and postings can't drift.
-    let kinds = [JobKind::Gather, JobKind::Farm, JobKind::Build, JobKind::Craft];
-    let mut raw = [raw_gather, raw_farm, raw_build, raw_craft];
-    for (i, kind) in kinds.iter().enumerate() {
-        if faction_can_perform(faction, *kind) {
+    // the softmax entirely (NEG_INFINITY → exp() = 0). The three Stockpile
+    // sub-slots all gate on JobKind::Stockpile (always true today, but kept
+    // consistent with the helper).
+    let stockpile_eligible = faction_can_perform(faction, JobKind::Stockpile);
+    let kinds = [
+        None, // food
+        None, // wood
+        None, // stone
+        Some(JobKind::Haul),
+        Some(JobKind::Farm),
+        Some(JobKind::Build),
+        Some(JobKind::Craft),
+    ];
+    let mut raw = [
+        raw_food, raw_wood, raw_stone, raw_haul, raw_farm, raw_build, raw_craft,
+    ];
+    for (i, slot) in kinds.iter().enumerate() {
+        let eligible = match slot {
+            None => stockpile_eligible,
+            Some(kind) => faction_can_perform(faction, *kind),
+        };
+        if eligible {
             raw[i] = raw[i].max(ROLE_FLOOR);
         } else {
             raw[i] = f32::NEG_INFINITY;
@@ -426,26 +523,27 @@ pub fn compute_workforce_budget(
     // Softmax over modulated weights (numerically stable).
     let t = BUDGET_TEMPERATURE.max(0.01);
     let max_w = raw.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exps = [
-        ((raw[0] - max_w) / t).exp(),
-        ((raw[1] - max_w) / t).exp(),
-        ((raw[2] - max_w) / t).exp(),
-        ((raw[3] - max_w) / t).exp(),
-    ];
+    let exps: Vec<f32> = raw.iter().map(|w| ((*w - max_w) / t).exp()).collect();
     let sum: f32 = exps.iter().sum::<f32>().max(1e-6);
     let usable = 1.0 - FREE_FLOOR;
     let target = WorkforceBudget {
-        gather: (exps[0] / sum) * usable,
-        farm: (exps[1] / sum) * usable,
-        build: (exps[2] / sum) * usable,
-        craft: (exps[3] / sum) * usable,
+        stockpile_food: (exps[0] / sum) * usable,
+        stockpile_wood: (exps[1] / sum) * usable,
+        stockpile_stone: (exps[2] / sum) * usable,
+        haul: (exps[3] / sum) * usable,
+        farm: (exps[4] / sum) * usable,
+        build: (exps[5] / sum) * usable,
+        craft: (exps[6] / sum) * usable,
         free: FREE_FLOOR,
     };
 
     // EMA hysteresis with the previous budget.
     let blend = |old: f32, new: f32| old + (new - old) * BUDGET_EMA_ALPHA;
     WorkforceBudget {
-        gather: blend(previous.gather, target.gather),
+        stockpile_food: blend(previous.stockpile_food, target.stockpile_food),
+        stockpile_wood: blend(previous.stockpile_wood, target.stockpile_wood),
+        stockpile_stone: blend(previous.stockpile_stone, target.stockpile_stone),
+        haul: blend(previous.haul, target.haul),
         farm: blend(previous.farm, target.farm),
         build: blend(previous.build, target.build),
         craft: blend(previous.craft, target.craft),
@@ -457,7 +555,7 @@ pub fn compute_workforce_budget(
 
 /// Ticks of zero deposit progress in `GatherMaterials` after which we declare
 /// the project stalled and cancel it. 600 ticks ≈ 30s at 20 Hz fixed update.
-const STAGNATION_TICKS: u32 = 600;
+const STAGNATION_TICKS: u32 = 2400;
 
 /// EMA blend factor for the per-good material-deficit signal. Each chief
 /// tick that ends with a stagnated material project bumps this toward 255;
@@ -480,6 +578,7 @@ pub fn project_stagnation_system(
     mut bp_map: ResMut<BlueprintMap>,
     mut projects: ResMut<Projects>,
     mut registry: ResMut<crate::simulation::faction::FactionRegistry>,
+    board: Res<JobBoard>,
 ) {
     let now = clock.tick as u32;
 
@@ -491,6 +590,25 @@ pub fn project_stagnation_system(
             continue;
         }
         if now.saturating_sub(project.last_progress_tick) < STAGNATION_TICKS {
+            continue;
+        }
+        // Don't cancel if a worker is already mid-haul or mid-build for this
+        // blueprint — progress is in flight even though no deposit has landed yet.
+        let bp_entity = project.blueprint;
+        let faction_id = project.faction_id;
+        let has_active_workers = board
+            .faction_postings(faction_id)
+            .iter()
+            .any(|p| match &p.progress {
+                JobProgress::Haul { blueprint, .. } => {
+                    *blueprint == bp_entity && !p.claimants.is_empty()
+                }
+                JobProgress::Building { blueprint } => {
+                    *blueprint == bp_entity && !p.claimants.is_empty()
+                }
+                _ => false,
+            });
+        if has_active_workers {
             continue;
         }
         let Ok(bp) = bp_query.get(project.blueprint) else {

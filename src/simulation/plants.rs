@@ -1,7 +1,7 @@
 use ahash::AHashMap;
 use bevy::prelude::*;
 
-use crate::economy::goods::Good;
+use crate::economy::goods::{Bulk, Good};
 use crate::economy::item::Item;
 use crate::simulation::animals::Deer;
 use crate::simulation::items::GroundItem;
@@ -87,6 +87,13 @@ impl PlantKind {
 
     /// Primary good produced and its base quantity.
     /// `has_tool` only matters for trees (felling vs branch-gathering).
+    /// Bulk class of the primary harvest yield. Used by `enforce_hand_state_system`
+    /// to require both hands free before chopping a tree (Wood is TwoHand) while
+    /// leaving Berry/Grain pickups (Small) at the lighter 1-free-hand requirement.
+    pub fn harvest_yield_bulk(self, has_tool: bool) -> Bulk {
+        self.harvest_yield(has_tool).0.bulk()
+    }
+
     pub fn harvest_yield(self, has_tool: bool) -> (Good, u32) {
         match self {
             PlantKind::Grain => (Good::Grain, 5),

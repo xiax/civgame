@@ -7,6 +7,9 @@ use crate::simulation::faction::{
     FactionChief, FactionData, FactionMember, FactionRegistry, FactionTechs, StorageTileMap, SOLO,
 };
 use crate::simulation::goals::AgentGoal;
+use crate::simulation::jobs::{
+    record_progress_filtered, JobBoard, JobClaim, JobCompletedEvent, JobKind,
+};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, Person, PersonAI};
@@ -2412,6 +2415,8 @@ pub fn construction_system(
     mut road_carve_queue: ResMut<RoadCarveQueue>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    mut job_board: ResMut<JobBoard>,
+    mut job_completed: EventWriter<JobCompletedEvent>,
     mut bp_query: Query<&mut Blueprint>,
     mut agent_query: Query<(
         Entity,
@@ -2422,16 +2427,22 @@ pub fn construction_system(
         &BucketSlot,
         &LodLevel,
         Option<&mut ActivePlan>,
+        Option<&JobClaim>,
     )>,
 ) {
     // Pass 1: collect pending contributions from Working agents, classified by
     // role.
-    //   bp_haulers: bp_entity → Vec<(agent, inventory snapshot per deposit slot)>
+    //   bp_haulers: bp_entity → Vec<(agent, inventory snapshot per deposit slot, claim)>
     //   bp_workers: bp_entity → Vec<agent>
-    let mut bp_haulers: AHashMap<Entity, Vec<(Entity, [u32; MAX_BUILD_INPUTS])>> = AHashMap::new();
+    let mut bp_haulers: AHashMap<
+        Entity,
+        Vec<(Entity, [u32; MAX_BUILD_INPUTS], Option<JobClaim>)>,
+    > = AHashMap::new();
     let mut bp_workers: AHashMap<Entity, Vec<Entity>> = AHashMap::new();
 
-    for (entity, mut ai, agent, carrier, _skills, slot, lod, _) in agent_query.iter_mut() {
+    for (entity, mut ai, agent, carrier, _skills, slot, lod, _, claim_opt) in
+        agent_query.iter_mut()
+    {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -2494,7 +2505,7 @@ pub fn construction_system(
             bp_haulers
                 .entry(bp_entity)
                 .or_default()
-                .push((entity, snap));
+                .push((entity, snap, claim_opt.copied()));
         } else {
             // Worker: register on-site. XP and progress are awarded later,
             // once we know the blueprint has all its materials deposited
@@ -2528,7 +2539,7 @@ pub fn construction_system(
     for bp_entity in bp_entities {
         let Ok(mut bp) = bp_query.get_mut(bp_entity) else {
             if let Some(haulers) = bp_haulers.get(&bp_entity) {
-                orphaned_agents.extend(haulers.iter().map(|(e, _)| *e));
+                orphaned_agents.extend(haulers.iter().map(|(e, _, _)| *e));
             }
             if let Some(workers) = bp_workers.get(&bp_entity) {
                 orphaned_agents.extend(workers.iter().copied());
@@ -2536,9 +2547,10 @@ pub fn construction_system(
             continue;
         };
 
-        // Deposit hauler goods first.
+        // Deposit hauler goods first. Credit any held Haul JobClaim with the
+        // delivered quantity so the posting tracks completion.
         if let Some(haulers) = bp_haulers.get(&bp_entity) {
-            for &(agent_e, snap) in haulers {
+            for (agent_e, snap, claim_opt) in haulers {
                 for i in 0..bp.deposit_count as usize {
                     let need = bp.deposits[i];
                     let still = need.needed.saturating_sub(need.deposited) as u32;
@@ -2546,10 +2558,23 @@ pub fn construction_system(
                         continue;
                     }
                     let take = still.min(snap[i]);
-                    good_removals.push((agent_e, need.good, take));
+                    good_removals.push((*agent_e, need.good, take));
                     bp.deposits[i].deposited = bp.deposits[i].deposited.saturating_add(take as u8);
+                    if let Some(claim) = claim_opt {
+                        if claim.kind == JobKind::Haul {
+                            record_progress_filtered(
+                                &mut commands,
+                                &mut job_board,
+                                &mut job_completed,
+                                claim,
+                                JobKind::Haul,
+                                Some(need.good),
+                                take,
+                            );
+                        }
+                    }
                 }
-                hauler_done.push(agent_e);
+                hauler_done.push(*agent_e);
             }
         }
 
@@ -2811,7 +2836,7 @@ pub fn construction_system(
                 completed_agents.extend(workers.iter().copied());
             }
             if let Some(haulers) = bp_haulers.get(&bp_entity) {
-                completed_agents.extend(haulers.iter().map(|(e, _)| *e));
+                completed_agents.extend(haulers.iter().map(|(e, _, _)| *e));
             }
         }
     }
@@ -2827,7 +2852,7 @@ pub fn construction_system(
 
     // Pass 3: remove deposited goods from agents, grant Building XP to workers
     // whose labour actually advanced progress, and reset completed/hauler/orphaned agents.
-    for (entity, mut ai, mut agent, mut carrier, mut skills, _, _, mut plan_opt) in
+    for (entity, mut ai, mut agent, mut carrier, mut skills, _, _, mut plan_opt, _) in
         agent_query.iter_mut()
     {
         for &(ae, good, qty) in &good_removals {

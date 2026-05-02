@@ -16,12 +16,23 @@ use crate::simulation::technology::CROP_CULTIVATION;
 pub type JobId = u32;
 pub type RecipeId = u8;
 
-/// Faction-directed job categories. The 50%-of-population cap is enforced per
-/// kind: at most `member_count / 2` workers may simultaneously hold a
-/// `JobClaim` of any single kind for a given faction.
+/// Faction-directed job categories. The workforce budget enforces per-kind caps
+/// so the chief can balance how many workers each role consumes.
+///
+/// The construction pipeline splits into three independent stages:
+/// - `Stockpile` — bring a Good into faction storage (anticipatory + reactive).
+/// - `Haul` — withdraw a specific Good from storage and deliver it into a
+///   specific blueprint's deposit slot.
+/// - `Build` — perform labor ticks at a blueprint whose deposits are filled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum JobKind {
-    Gather,
+    /// Gather a Good in the world and deposit it to faction storage. Covers
+    /// food (`JobProgress::Calories`) and construction materials
+    /// (`JobProgress::Stockpile`).
+    Stockpile,
+    /// Withdraw a Good from faction storage and deliver it into a specific
+    /// blueprint's deposit slot. Pure transport — does not gather.
+    Haul,
     Farm,
     Craft,
     Build,
@@ -30,7 +41,8 @@ pub enum JobKind {
 impl JobKind {
     pub fn name(self) -> &'static str {
         match self {
-            JobKind::Gather => "Gather",
+            JobKind::Stockpile => "Stockpile",
+            JobKind::Haul => "Haul",
             JobKind::Farm => "Farm",
             JobKind::Craft => "Craft",
             JobKind::Build => "Build",
@@ -39,7 +51,8 @@ impl JobKind {
 
     pub fn to_goal(self) -> AgentGoal {
         match self {
-            JobKind::Gather => AgentGoal::GatherFood,
+            JobKind::Stockpile => AgentGoal::GatherFood,
+            JobKind::Haul => AgentGoal::Haul,
             JobKind::Farm => AgentGoal::Farm,
             JobKind::Craft => AgentGoal::Craft,
             JobKind::Build => AgentGoal::Build,
@@ -56,7 +69,8 @@ impl JobKind {
 /// (`compute_workforce_budget`), so the two cannot drift apart.
 pub fn faction_can_perform(faction: &FactionData, kind: JobKind) -> bool {
     match kind {
-        JobKind::Gather => true,
+        JobKind::Stockpile => true,
+        JobKind::Haul => true,
         JobKind::Farm => faction.techs.has(CROP_CULTIVATION),
         JobKind::Build => true,
         JobKind::Craft => true,
@@ -90,12 +104,22 @@ impl TileAabb {
 /// `is_complete()` returns true.
 #[derive(Clone, Debug)]
 pub enum JobProgress {
-    /// Gather food: total calories deposited at faction storage.
+    /// Stockpile food: total calories deposited at faction storage. Posted
+    /// against `JobKind::Stockpile`.
     Calories { deposited: u32, target: u32 },
-    /// Gather a specific construction material (Wood, Stone, ...): item-count
-    /// target rather than calories. Posted when blueprints declare unmet
-    /// material slots that current storage can't satisfy.
-    Material {
+    /// Stockpile a specific construction material (Wood, Stone, ...) into
+    /// faction storage: item-count target. Posted against `JobKind::Stockpile`.
+    /// Targets blend anticipatory reserves with active blueprint demand.
+    Stockpile {
+        good: Good,
+        deposited: u32,
+        target: u32,
+    },
+    /// Haul a Good from faction storage into a specific blueprint's deposit
+    /// slot. Posted against `JobKind::Haul` once storage covers (some of) the
+    /// blueprint's demand. `delivered`/`target` are item counts.
+    Haul {
+        blueprint: Entity,
         good: Good,
         delivered: u32,
         target: u32,
@@ -121,7 +145,10 @@ impl JobProgress {
     pub fn is_complete(&self) -> bool {
         match self {
             JobProgress::Calories { deposited, target } => deposited >= target,
-            JobProgress::Material {
+            JobProgress::Stockpile {
+                deposited, target, ..
+            } => deposited >= target,
+            JobProgress::Haul {
                 delivered, target, ..
             } => delivered >= target,
             JobProgress::Planting {
@@ -146,7 +173,16 @@ impl JobProgress {
                     (*deposited as f32 / *target as f32).clamp(0.0, 1.0)
                 }
             }
-            JobProgress::Material {
+            JobProgress::Stockpile {
+                deposited, target, ..
+            } => {
+                if *target == 0 {
+                    1.0
+                } else {
+                    (*deposited as f32 / *target as f32).clamp(0.0, 1.0)
+                }
+            }
+            JobProgress::Haul {
                 delivered, target, ..
             } => {
                 if *target == 0 {
@@ -205,6 +241,17 @@ pub struct JobClaim {
     pub kind: JobKind,
     pub posted_tick: u32,
     pub fail_count: u8,
+}
+
+/// Companion component to `JobClaim` carrying the concrete target of the
+/// currently held posting. Populated/refreshed by `job_goal_lock_system` so
+/// plan resolvers can route to the claimed blueprint or good without
+/// re-querying the `JobBoard`. `None` fields mean the claim's posting kind
+/// doesn't carry that target (e.g. food Stockpile claims have no blueprint).
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct ClaimTarget {
+    pub blueprint: Option<Entity>,
+    pub good: Option<Good>,
 }
 
 /// Global resource holding all postings, sharded internally by faction.
@@ -355,6 +402,7 @@ pub fn chief_job_posting_system(
         // 1. Drop stale unclaimed Chief postings whose target no longer needs work.
         //    Build postings whose project is not in the Build phase are also
         //    dropped here — the chief re-posts them once materials are in.
+        //    Haul postings whose target blueprint despawned are dropped.
         {
             let postings = board.faction_postings_mut(faction_id);
             postings.retain(|p| {
@@ -374,8 +422,11 @@ pub fn chief_job_posting_system(
                             None => false,
                         }
                     }
+                    JobProgress::Haul { blueprint, .. } => {
+                        bp_query.get(blueprint).is_ok()
+                    }
                     JobProgress::Calories { .. }
-                    | JobProgress::Material { .. }
+                    | JobProgress::Stockpile { .. }
                     | JobProgress::Planting { .. }
                     | JobProgress::Crafting { .. } => false,
                 }
@@ -432,13 +483,13 @@ pub fn chief_job_posting_system(
             });
         }
 
-        // 3. Gather posting — one if storage food per-head is below threshold.
+        // 3. Stockpile (food) posting — one if storage food per-head is below threshold.
         if faction.member_count > 0 {
-            let already_gather = board
+            let already_food = board
                 .faction_postings(faction_id)
                 .iter()
                 .any(|p| matches!(p.progress, JobProgress::Calories { .. }));
-            if !already_gather {
+            if !already_food {
                 let food_total = faction.storage.food_total() as u32;
                 let target_supply = faction.member_count * GATHER_TARGET_PER_HEAD * 8;
                 if food_total < target_supply {
@@ -455,11 +506,11 @@ pub fn chief_job_posting_system(
                         target,
                     };
                     let priority =
-                        compute_priority(faction, faction_id, JobKind::Gather, &progress, &projects);
+                        compute_priority(faction, faction_id, JobKind::Stockpile, &progress, &projects);
                     board.faction_postings_mut(faction_id).push(JobPosting {
                         id,
                         faction_id,
-                        kind: JobKind::Gather,
+                        kind: JobKind::Stockpile,
                         progress,
                         claimants: Vec::new(),
                         priority,
@@ -471,37 +522,39 @@ pub fn chief_job_posting_system(
             }
         }
 
-        // 3b. Material Gather postings — aggregate unmet wood/stone needs
-        // across all active blueprints, subtract current storage, post one
-        // Gather (Material) job per resource with a positive deficit.
+        // 3b. Stockpile (material) postings — anticipatory + reactive. Target
+        //     for each tracked Good is `max(faction.material_targets, Σ unmet
+        //     across active blueprints)`. Posted whenever current storage is
+        //     below target. One posting per (faction, good).
         if faction.member_count > 0 {
-            let (mut wood_need, mut stone_need) = (0u32, 0u32);
-            for &bp_entity in &live_bps {
-                let Ok(bp) = bp_query.get(bp_entity) else {
-                    continue;
-                };
-                for slot in &bp.deposits[..bp.deposit_count as usize] {
-                    let remaining = (slot.needed.saturating_sub(slot.deposited)) as u32;
-                    match slot.good {
-                        Good::Wood => wood_need = wood_need.saturating_add(remaining),
-                        Good::Stone => stone_need = stone_need.saturating_add(remaining),
-                        _ => {}
+            for &good in &[Good::Wood, Good::Stone] {
+                // Sum unmet blueprint demand for this good (reactive component).
+                let mut bp_demand: u32 = 0;
+                for &bp_entity in &live_bps {
+                    let Ok(bp) = bp_query.get(bp_entity) else {
+                        continue;
+                    };
+                    for slot in &bp.deposits[..bp.deposit_count as usize] {
+                        if slot.good == good {
+                            bp_demand = bp_demand
+                                .saturating_add((slot.needed.saturating_sub(slot.deposited)) as u32);
+                        }
                     }
                 }
-            }
-            for (good, demand) in [(Good::Wood, wood_need), (Good::Stone, stone_need)] {
-                if demand == 0 {
+                let anticipatory = faction.material_targets.get(&good).copied().unwrap_or(0);
+                let target_total = anticipatory.max(bp_demand);
+                if target_total == 0 {
                     continue;
                 }
                 let stored = faction.storage.totals.get(&good).copied().unwrap_or(0);
-                let deficit = demand.saturating_sub(stored);
-                if deficit == 0 {
+                if stored >= target_total {
                     continue;
                 }
+                let deficit = target_total.saturating_sub(stored);
                 let already = board.faction_postings(faction_id).iter().any(|p| {
                     matches!(
                         &p.progress,
-                        JobProgress::Material { good: g, .. } if *g == good
+                        JobProgress::Stockpile { good: g, .. } if *g == good
                     )
                 });
                 if already {
@@ -509,17 +562,17 @@ pub fn chief_job_posting_system(
                 }
                 let target = deficit.clamp(MATERIAL_GATHER_MIN, MATERIAL_GATHER_CAP);
                 let id = board.alloc_id();
-                let progress = JobProgress::Material {
+                let progress = JobProgress::Stockpile {
                     good,
-                    delivered: 0,
+                    deposited: 0,
                     target,
                 };
                 let priority =
-                    compute_priority(faction, faction_id, JobKind::Gather, &progress, &projects);
+                    compute_priority(faction, faction_id, JobKind::Stockpile, &progress, &projects);
                 board.faction_postings_mut(faction_id).push(JobPosting {
                     id,
                     faction_id,
-                    kind: JobKind::Gather,
+                    kind: JobKind::Stockpile,
                     progress,
                     claimants: Vec::new(),
                     priority,
@@ -527,6 +580,82 @@ pub fn chief_job_posting_system(
                     posted_tick,
                     expiry_tick: None,
                 });
+            }
+        }
+
+        // 3c. Haul postings — per-blueprint, per-good. Posted only when
+        //     faction storage covers (some of) the blueprint's demand. The
+        //     hauler withdraws from storage and deposits into the blueprint.
+        //     Storage availability is shared across blueprints: the chief
+        //     allocates greedily by blueprint iteration order.
+        if faction.member_count > 0 {
+            let mut storage_remaining: AHashMap<Good, u32> = faction.storage.totals.clone();
+            // Subtract qty already committed to existing alive Haul postings
+            // (not yet delivered) so we don't double-allocate the same stock.
+            for p in board.faction_postings(faction_id).iter() {
+                if let JobProgress::Haul {
+                    good,
+                    delivered,
+                    target,
+                    ..
+                } = &p.progress
+                {
+                    let outstanding = target.saturating_sub(*delivered);
+                    let entry = storage_remaining.entry(*good).or_insert(0);
+                    *entry = entry.saturating_sub(outstanding);
+                }
+            }
+            for &bp_entity in &live_bps {
+                let Ok(bp) = bp_query.get(bp_entity) else {
+                    continue;
+                };
+                for slot in &bp.deposits[..bp.deposit_count as usize] {
+                    let remaining = slot.needed.saturating_sub(slot.deposited) as u32;
+                    if remaining == 0 {
+                        continue;
+                    }
+                    // Already a live Haul posting for (this BP, this good)?
+                    let already = board.faction_postings(faction_id).iter().any(|p| {
+                        matches!(
+                            &p.progress,
+                            JobProgress::Haul { blueprint: b, good: g, .. }
+                                if *b == bp_entity && *g == slot.good
+                        )
+                    });
+                    if already {
+                        continue;
+                    }
+                    let avail = storage_remaining.get(&slot.good).copied().unwrap_or(0);
+                    if avail == 0 {
+                        continue;
+                    }
+                    let target = remaining.min(avail);
+                    if target == 0 {
+                        continue;
+                    }
+                    let entry = storage_remaining.entry(slot.good).or_insert(0);
+                    *entry = entry.saturating_sub(target);
+                    let id = board.alloc_id();
+                    let progress = JobProgress::Haul {
+                        blueprint: bp_entity,
+                        good: slot.good,
+                        delivered: 0,
+                        target,
+                    };
+                    let priority =
+                        compute_priority(faction, faction_id, JobKind::Haul, &progress, &projects);
+                    board.faction_postings_mut(faction_id).push(JobPosting {
+                        id,
+                        faction_id,
+                        kind: JobKind::Haul,
+                        progress,
+                        claimants: Vec::new(),
+                        priority,
+                        source: JobSource::Chief,
+                        posted_tick,
+                        expiry_tick: None,
+                    });
+                }
             }
         }
 
@@ -624,7 +753,8 @@ pub fn chief_job_posting_system(
 /// Skill axis used when scoring a candidate job for a worker.
 fn skill_for(kind: JobKind) -> SkillKind {
     match kind {
-        JobKind::Gather => SkillKind::Farming,
+        JobKind::Stockpile => SkillKind::Farming,
+        JobKind::Haul => SkillKind::Farming,
         JobKind::Farm => SkillKind::Farming,
         JobKind::Build => SkillKind::Building,
         JobKind::Craft => SkillKind::Crafting,
@@ -634,14 +764,15 @@ fn skill_for(kind: JobKind) -> SkillKind {
 /// Personality additive bias for job kinds. Range -0.2 .. +0.4.
 fn personality_bias(p: Personality, kind: JobKind) -> f32 {
     match (p, kind) {
-        (Personality::Gatherer, JobKind::Gather) => 0.4,
+        (Personality::Gatherer, JobKind::Stockpile) => 0.4,
         (Personality::Gatherer, JobKind::Farm) => 0.2,
         (Personality::Nurturer, JobKind::Farm) => 0.3,
-        (Personality::Nurturer, JobKind::Gather) => 0.2,
+        (Personality::Nurturer, JobKind::Stockpile) => 0.2,
         (Personality::Nurturer, JobKind::Craft) => 0.1,
-        (Personality::Explorer, JobKind::Gather) => 0.2,
+        (Personality::Explorer, JobKind::Stockpile) => 0.2,
         (Personality::Explorer, JobKind::Farm) => -0.1,
         (Personality::Socialite, JobKind::Build) => 0.1,
+        (Personality::Socialite, JobKind::Haul) => 0.15,
         (Personality::Socialite, JobKind::Craft) => 0.1,
         (Personality::Loner, _) => -0.2,
         _ => 0.0,
@@ -654,13 +785,41 @@ fn personality_bias(p: Personality, kind: JobKind) -> f32 {
 fn profession_bias(p: Profession, kind: JobKind) -> f32 {
     match (p, kind) {
         (Profession::Farmer, JobKind::Farm) => 0.5,
-        (Profession::Farmer, JobKind::Gather) => 0.1,
+        (Profession::Farmer, JobKind::Stockpile) => 0.1,
         _ => 0.0,
     }
 }
 
-/// Claim available jobs for idle workers, with full scoring and the 50%
-/// per-category cap.
+/// Distinguishing key for claim-cap accounting. Stockpile postings split by
+/// the targeted Good so wood/stone caps are independent of food's. All other
+/// kinds (Haul, Build, Farm, Craft) cap as a single bucket per JobKind.
+fn cap_bucket(p: &JobPosting) -> (JobKind, Option<Good>) {
+    match (&p.kind, &p.progress) {
+        (JobKind::Stockpile, JobProgress::Stockpile { good, .. }) => {
+            (JobKind::Stockpile, Some(*good))
+        }
+        (JobKind::Stockpile, JobProgress::Calories { .. }) => (JobKind::Stockpile, None),
+        _ => (p.kind, None),
+    }
+}
+
+/// Per-bucket workforce share. For Stockpile, dispatches to the per-good slice;
+/// otherwise the kind-level share.
+fn bucket_share(
+    budget: &crate::simulation::projects::WorkforceBudget,
+    kind: JobKind,
+    good: Option<Good>,
+) -> f32 {
+    match (kind, good) {
+        (JobKind::Stockpile, Some(g)) => budget.stockpile_share(g),
+        (JobKind::Stockpile, None) => budget.stockpile_food,
+        _ => budget.share(kind),
+    }
+}
+
+/// Claim available jobs for idle workers, with full scoring and per-bucket
+/// caps. Stockpile postings are capped per-Good so a food posting can't
+/// monopolise the wood/stone allotment.
 pub fn job_claim_system(
     mut commands: Commands,
     clock: Res<SimClock>,
@@ -682,12 +841,14 @@ pub fn job_claim_system(
 ) {
     let posted_tick = clock.tick as u32;
 
-    // Pre-pass: count active claims per (faction_id, kind) by scanning the
-    // board's claimant lists. This is the cap-enforcement input.
-    let mut claim_counts: AHashMap<(u32, JobKind), u32> = AHashMap::new();
+    // Pre-pass: count active claims per (faction_id, kind, Option<Good>) by
+    // scanning the board's claimant lists. Stockpile postings split by Good so
+    // food/wood/stone get independent caps.
+    let mut claim_counts: AHashMap<(u32, JobKind, Option<Good>), u32> = AHashMap::new();
     for (faction_id, postings) in board.postings.iter() {
         for p in postings.iter() {
-            *claim_counts.entry((*faction_id, p.kind)).or_insert(0) +=
+            let (kind, good) = cap_bucket(p);
+            *claim_counts.entry((*faction_id, kind, good)).or_insert(0) +=
                 p.claimants.len() as u32;
         }
     }
@@ -718,12 +879,15 @@ pub fn job_claim_system(
         let mut best: Option<(usize, f32)> = None;
         let postings = board.faction_postings(faction_id);
         for (idx, p) in postings.iter().enumerate() {
-            // Cap: per-kind allocation is the workforce budget share applied
+            // Cap: per-bucket allocation is the workforce budget share applied
             // to current member count, floored at 1 so even small factions
-            // can keep one worker on each role.
-            let cap = ((budget.share(p.kind) * faction.member_count as f32).round() as u32).max(1);
+            // can keep one worker on each role. Stockpile postings cap by
+            // Good so food can't crowd out wood/stone slots.
+            let (kind, good) = cap_bucket(p);
+            let share = bucket_share(&budget, kind, good);
+            let cap = ((share * faction.member_count as f32).round() as u32).max(1);
             let count = claim_counts
-                .get(&(faction_id, p.kind))
+                .get(&(faction_id, kind, good))
                 .copied()
                 .unwrap_or(0);
             if count >= cap {
@@ -758,8 +922,9 @@ pub fn job_claim_system(
         // Apply the claim: insert component, push claimant, bump cap counter.
         let postings = board.faction_postings_mut(faction_id);
         let posting = &mut postings[idx];
+        let (kind, good) = cap_bucket(posting);
         posting.claimants.push(worker);
-        *claim_counts.entry((faction_id, posting.kind)).or_insert(0) += 1;
+        *claim_counts.entry((faction_id, kind, good)).or_insert(0) += 1;
         commands.entity(worker).insert(JobClaim {
             job_id: posting.id,
             faction_id,
@@ -774,7 +939,8 @@ pub fn job_claim_system(
 fn posting_target_tile(p: &JobPosting) -> Option<(i16, i16)> {
     match p.progress {
         JobProgress::Calories { .. } => None,
-        JobProgress::Material { .. } => None,
+        JobProgress::Stockpile { .. } => None,
+        JobProgress::Haul { .. } => None,
         JobProgress::Planting { area, .. } => Some((
             (area.min.0 as i32 + area.max.0 as i32) as i16 / 2,
             (area.min.1 as i32 + area.max.1 as i32) as i16 / 2,
@@ -784,17 +950,18 @@ fn posting_target_tile(p: &JobPosting) -> Option<(i16, i16)> {
     }
 }
 
-/// Map a posting to the agent goal a claimant should adopt. Looks at the
-/// progress payload for `Gather` so material-specific postings (Wood/Stone)
-/// route workers to the right gather plan; otherwise falls back to the
-/// kind-level mapping in `JobKind::to_goal`.
+/// Map a posting to the agent goal a claimant should adopt. Stockpile postings
+/// dispatch by the specific Good so wood/stone gathering uses the right plan;
+/// Haul and Build postings route through their kind-level mapping.
 pub fn posting_goal(p: &JobPosting) -> AgentGoal {
     match (&p.kind, &p.progress) {
-        (JobKind::Gather, JobProgress::Material { good, .. }) => match good {
+        (JobKind::Stockpile, JobProgress::Stockpile { good, .. }) => match good {
             Good::Wood => AgentGoal::GatherWood,
             Good::Stone => AgentGoal::GatherStone,
             _ => AgentGoal::GatherFood,
         },
+        (JobKind::Stockpile, JobProgress::Calories { .. }) => AgentGoal::GatherFood,
+        (JobKind::Haul, _) => AgentGoal::Haul,
         _ => p.kind.to_goal(),
     }
 }
@@ -803,24 +970,63 @@ pub fn posting_goal(p: &JobPosting) -> AgentGoal {
 /// goals to the job kind. If a crisis-class goal won (Survive/Defend/Raid/
 /// Rescue), drop the claim instead — the crisis takes precedence and the
 /// worker is freed from the job board.
+///
+/// Also refreshes the `ClaimTarget` companion component so plan resolvers
+/// can route to the specific blueprint/good named in the claimed posting.
 pub fn job_goal_lock_system(
     mut commands: Commands,
     mut board: ResMut<JobBoard>,
-    mut workers: Query<(Entity, &mut AgentGoal, &JobClaim)>,
+    mut workers: Query<(Entity, &mut AgentGoal, &JobClaim, Option<&mut ClaimTarget>)>,
 ) {
-    for (worker, mut goal, claim) in workers.iter_mut() {
+    for (worker, mut goal, claim, mut target_opt) in workers.iter_mut() {
         let crisis = matches!(
             *goal,
             AgentGoal::Survive | AgentGoal::Defend | AgentGoal::Raid | AgentGoal::Rescue
         );
         if crisis {
             commands.entity(worker).remove::<JobClaim>();
+            commands.entity(worker).remove::<ClaimTarget>();
             release_claimant(&mut board, claim.job_id, worker);
-        } else if let Some(p) = board.get(claim.job_id) {
+            continue;
+        }
+        let target = if let Some(p) = board.get(claim.job_id) {
             *goal = posting_goal(p);
+            posting_claim_target(p)
         } else {
             *goal = claim.kind.to_goal();
+            ClaimTarget::default()
+        };
+        match target_opt.as_mut() {
+            Some(existing) => {
+                **existing = target;
+            }
+            None => {
+                commands.entity(worker).insert(target);
+            }
         }
+    }
+}
+
+/// Snapshot a posting's concrete target into a `ClaimTarget`. Returns the
+/// blueprint and good a hauler/builder should route to; non-targeted postings
+/// (food stockpile, planting) yield `ClaimTarget::default()`.
+pub fn posting_claim_target(p: &JobPosting) -> ClaimTarget {
+    match &p.progress {
+        JobProgress::Stockpile { good, .. } => ClaimTarget {
+            blueprint: None,
+            good: Some(*good),
+        },
+        JobProgress::Haul {
+            blueprint, good, ..
+        } => ClaimTarget {
+            blueprint: Some(*blueprint),
+            good: Some(*good),
+        },
+        JobProgress::Building { blueprint } => ClaimTarget {
+            blueprint: Some(*blueprint),
+            good: None,
+        },
+        _ => ClaimTarget::default(),
     }
 }
 
@@ -851,6 +1057,7 @@ pub fn job_build_completion_system(
     for (job_id, faction_id, kind, claimants) in to_release {
         for c in claimants {
             commands.entity(c).remove::<JobClaim>();
+            commands.entity(c).remove::<ClaimTarget>();
         }
         completed_events.send(JobCompletedEvent {
             job_id,
@@ -925,10 +1132,25 @@ pub fn record_progress_filtered(
                 completed = true;
             }
         }
-        JobProgress::Material {
+        JobProgress::Stockpile {
+            good: posting_good,
+            deposited,
+            target,
+        } => {
+            // Only credit if the caller is depositing the matching resource.
+            if good != Some(*posting_good) {
+                return;
+            }
+            *deposited = deposited.saturating_add(increment);
+            if deposited >= target {
+                completed = true;
+            }
+        }
+        JobProgress::Haul {
             good: posting_good,
             delivered,
             target,
+            ..
         } => {
             // Only credit if the caller is depositing the matching resource.
             if good != Some(*posting_good) {
@@ -970,6 +1192,7 @@ pub fn record_progress_filtered(
         }
         for c in claimants {
             commands.entity(c).remove::<JobClaim>();
+            commands.entity(c).remove::<ClaimTarget>();
         }
         completed_events.send(JobCompletedEvent {
             job_id,
@@ -1042,6 +1265,7 @@ pub fn job_board_command_system(
                     let posting = board.postings.get_mut(&fid).unwrap().swap_remove(idx);
                     for c in posting.claimants {
                         commands.entity(c).remove::<JobClaim>();
+                        commands.entity(c).remove::<ClaimTarget>();
                     }
                     completed_events.send(JobCompletedEvent {
                         job_id,
@@ -1060,7 +1284,7 @@ pub fn job_board_command_system(
 }
 
 /// Two `JobProgress` values are considered to share a target if they refer to
-/// the same blueprint, recipe, or farm area. Calorie-target Gather postings
+/// the same blueprint, recipe, farm area, or stockpiled good. Calorie postings
 /// are matched by kind alone.
 fn same_target(a: &JobProgress, b: &JobProgress) -> bool {
     match (a, b) {
@@ -1076,9 +1300,21 @@ fn same_target(a: &JobProgress, b: &JobProgress) -> bool {
         }
         (JobProgress::Calories { .. }, JobProgress::Calories { .. }) => true,
         (
-            JobProgress::Material { good: gx, .. },
-            JobProgress::Material { good: gy, .. },
+            JobProgress::Stockpile { good: gx, .. },
+            JobProgress::Stockpile { good: gy, .. },
         ) => gx == gy,
+        (
+            JobProgress::Haul {
+                blueprint: bx,
+                good: gx,
+                ..
+            },
+            JobProgress::Haul {
+                blueprint: by,
+                good: gy,
+                ..
+            },
+        ) => bx == by && gx == gy,
         _ => false,
     }
 }
@@ -1130,6 +1366,7 @@ pub fn job_claim_release_system(
             let posting = board.postings.get_mut(&fid).unwrap().swap_remove(idx);
             for c in posting.claimants {
                 commands.entity(c).remove::<JobClaim>();
+                commands.entity(c).remove::<ClaimTarget>();
             }
             completed_events.send(JobCompletedEvent {
                 job_id,
@@ -1156,6 +1393,7 @@ pub fn job_claim_release_system(
         if claim.fail_count >= MAX_FAIL_COUNT {
             let job_id = claim.job_id;
             commands.entity(worker).remove::<JobClaim>();
+            commands.entity(worker).remove::<ClaimTarget>();
             release_claimant(&mut board, job_id, worker);
         }
     }

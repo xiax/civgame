@@ -226,12 +226,13 @@ impl Carrier {
     }
 
     /// True when the worker has hauled enough that they should head back to
-    /// deposit. A two-handed stack at the per-hand cap is enough on its own;
-    /// otherwise both hands must be occupied with at least one at the cap.
+    /// deposit. Any two-handed stack triggers it (the slot occupies both hands,
+    /// no more can be picked up regardless of qty); otherwise both hands must
+    /// be occupied with at least one at the cap.
     pub fn is_at_haul_cap(&self) -> bool {
         if let Some(s) = self.left {
             if s.two_handed {
-                return s.qty >= HAND_QTY_CAP;
+                return s.qty > 0;
             }
         }
         let l_full = self.left.map_or(false, |s| s.qty >= HAND_QTY_CAP);
@@ -340,6 +341,43 @@ pub fn drop_carrier_to_ground(
     }
 }
 
+/// Bulk class of the primary yield the agent's current Gather/Dig target will
+/// produce. Returns `None` when the task isn't a harvesting task or the target
+/// can't be resolved (plant despawned, tile out of view). Used by
+/// `enforce_hand_state_system` to require both hands free when the yield is
+/// `Bulk::TwoHand` (Wood, Stone) so `try_pick_up` doesn't spill to ground.
+fn gather_target_yield_bulk(
+    ai: &crate::simulation::person::PersonAI,
+    agent: &crate::economy::agent::EconomicAgent,
+    plant_map: &crate::simulation::plants::PlantMap,
+    plant_query: &Query<&crate::simulation::plants::Plant>,
+    chunk_map: &crate::world::chunk::ChunkMap,
+) -> Option<crate::economy::goods::Bulk> {
+    use crate::economy::goods::Bulk;
+    use crate::simulation::tasks::TaskKind;
+    use crate::world::tile::TileKind;
+
+    let tx = ai.dest_tile.0 as i32;
+    let ty = ai.dest_tile.1 as i32;
+
+    if ai.task_id == TaskKind::Gather as u16 {
+        if let Some(entity) = plant_map.0.get(&(tx, ty)).copied() {
+            if let Ok(plant) = plant_query.get(entity) {
+                return Some(plant.kind.harvest_yield_bulk(agent.has_tool()));
+            }
+        }
+        match chunk_map.tile_kind_at(tx, ty) {
+            Some(TileKind::Stone) | Some(TileKind::Wall) => Some(Bulk::TwoHand),
+            _ => None,
+        }
+    } else if ai.task_id == TaskKind::Dig as u16 {
+        // Dig always yields Stone.
+        Some(Bulk::TwoHand)
+    } else {
+        None
+    }
+}
+
 /// Enforce hand-occupancy requirements for the agent's current task. Drops hand
 /// stacks to ground at the agent's tile when the task needs more free hands than
 /// available, or when the task is incompatible with carrying anything (Sleep,
@@ -347,9 +385,16 @@ pub fn drop_carrier_to_ground(
 ///
 /// Runs once per Sequential tick before the work systems, so an agent who arrives
 /// at a worksite with their hands full sets down their load and can begin work.
+///
+/// Gather/Dig requirements are upgraded to "both hands free" when the target's
+/// yield is TwoHand (Wood, Stone). `task_requires_free_hands` returns 1 as a
+/// conservative default; `gather_target_yield_bulk` resolves the actual bulk.
 pub fn enforce_hand_state_system(
     mut commands: Commands,
     spatial: Res<crate::world::spatial::SpatialIndex>,
+    plant_map: Res<crate::simulation::plants::PlantMap>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    plant_query: Query<&crate::simulation::plants::Plant>,
     mut item_query: Query<&mut crate::simulation::items::GroundItem>,
     mut agents: Query<
         (
@@ -357,16 +402,18 @@ pub fn enforce_hand_state_system(
             &mut Carrier,
             &Transform,
             &crate::simulation::lod::LodLevel,
+            &crate::economy::agent::EconomicAgent,
         ),
         With<crate::simulation::person::Person>,
     >,
 ) {
+    use crate::economy::goods::Bulk;
     use crate::simulation::lod::LodLevel;
     use crate::simulation::person::AiState;
     use crate::simulation::tasks::{task_drops_hand_load, task_requires_free_hands};
     use crate::world::terrain::world_to_tile;
 
-    for (ai, mut carrier, transform, lod) in agents.iter_mut() {
+    for (ai, mut carrier, transform, lod, agent) in agents.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -378,7 +425,16 @@ pub fn enforce_hand_state_system(
         }
 
         let drop_all = task_drops_hand_load(ai.task_id);
-        let need_free = task_requires_free_hands(ai.task_id);
+        // Default per-task requirement, upgraded for Gather/Dig whose yield is
+        // TwoHand (Wood, Stone) — the worker needs *both* hands free or
+        // `try_pick_up` will spill the yield to ground.
+        let mut need_free = task_requires_free_hands(ai.task_id);
+        if matches!(
+            gather_target_yield_bulk(ai, agent, &plant_map, &plant_query, &chunk_map),
+            Some(Bulk::TwoHand)
+        ) {
+            need_free = 2;
+        }
         let have_free = carrier.free_hands();
 
         if !drop_all && need_free <= have_free {
@@ -489,6 +545,15 @@ mod tests {
         let mut c = Carrier::default();
         let log = Item::new_commodity(Good::Wood);
         let _ = c.try_pick_up(log, 3);
+        assert!(c.is_at_haul_cap());
+    }
+
+    #[test]
+    fn is_at_haul_cap_triggers_for_partial_two_handed() {
+        // A single log already pins both hands — can't pick up more, so deposit.
+        let mut c = Carrier::default();
+        let log = Item::new_commodity(Good::Wood);
+        let _ = c.try_pick_up(log, 1);
         assert!(c.is_at_haul_cap());
     }
 

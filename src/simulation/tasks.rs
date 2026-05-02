@@ -845,6 +845,7 @@ pub fn goal_dispatch_system(
                 | AgentGoal::GatherWood
                 | AgentGoal::GatherStone
                 | AgentGoal::Build
+                | AgentGoal::Haul
                 | AgentGoal::TameHorse
                 | AgentGoal::Craft
                 | AgentGoal::Rescue

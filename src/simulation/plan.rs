@@ -30,7 +30,7 @@ use super::needs::{Needs, EAT_TRIGGER_HUNGER};
 /// Dimensionality of the agent state vector built by `build_state_vec`.
 /// See that function for the layout — each `PlanDef::state_weights` is indexed
 /// the same way.
-pub const STATE_DIM: usize = 38;
+pub const STATE_DIM: usize = 41;
 
 /// ε-greedy exploration rate applied during plan selection: with this
 /// probability the agent picks a random candidate instead of the highest
@@ -70,12 +70,20 @@ const SI_MEM_WOOD: usize = 22;
 const SI_MEM_STONE: usize = 23;
 const SI_WILLPOWER_DISTRESS: usize = 24;
 // 25-34: plan history (2 floats per slot × PLAN_HISTORY_LEN). See build_state_vec.
-// Visibility: harvestable resources within VISIBILITY_RADIUS of the agent's
-// current tile, normalised by VISIBILITY_SATURATE. Lets gather plans beat
-// Explore when food/wood/stone is physically nearby but not yet remembered.
-const SI_VIS_FOOD: usize = 35;
-const SI_VIS_WOOD: usize = 36;
-const SI_VIS_STONE: usize = 37;
+// Source-only visibility: counts the harvestable *source* of each resource
+// within VISIBILITY_RADIUS — mature edible plants, mature trees, stone tiles.
+// Drives Forage/Gather/Deliver*ToCraftOrder plans that can only act on a
+// source. Loose `GroundItem`s of the same good live on the ground-only slots
+// below, so source and good never share a signal.
+const SI_VIS_PLANT_FOOD: usize = 35;
+const SI_VIS_TREE: usize = 36;
+const SI_VIS_STONE_TILE: usize = 37;
+// Ground-item-only visibility: counts loose `GroundItem`s (food/wood/stone
+// left by `harvest_ground_drops`, prior spills, combat). Drives the
+// `Scavenge*` plans, which can only pick up ground items.
+const SI_VIS_GROUND_WOOD: usize = 38;
+const SI_VIS_GROUND_STONE: usize = 39;
+const SI_VIS_GROUND_FOOD: usize = 40;
 
 const VISIBILITY_RADIUS: i32 = 8;
 const VISIBILITY_SATURATE: u8 = 4;
@@ -150,6 +158,27 @@ pub enum StepTarget {
     /// needed by an unsatisfied CraftOrder of the same faction. Pairs with
     /// `HaulToCraftOrder` for the storage-to-order ferry path.
     NearestFactionStorageWithCraftOrderMaterial,
+    /// Nearest faction storage tile holding ≥1 of the given Good *and* that
+    /// good is currently needed by some unsatisfied CraftOrder of the same
+    /// faction. Used by the material-specific Deliver*ToCraftOrder plans
+    /// (e.g. wood, stone) so workers draw from communal stockpiles instead of
+    /// chopping a fresh tree. The resolver also commits a `(good, qty)`
+    /// intent on the agent's `PersonAI` so `WithdrawMaterial` knows what to
+    /// pull.
+    NearestFactionStorageContainingForCraftOrder(Good),
+    /// Nearest faction storage tile holding the good named in the agent's
+    /// active `JobClaim::Haul`. Used by the Haul plan's withdrawal step.
+    /// Resolves to None if the agent has no Haul claim or the storage is
+    /// empty of that good.
+    StorageWithHaulClaimGood,
+    /// The specific blueprint named in the agent's active `JobClaim::Haul`
+    /// (the destination for hauled materials). Resolves to None if the agent
+    /// has no Haul claim or the blueprint despawned.
+    HaulClaimBlueprint,
+    /// The specific blueprint named in the agent's active `JobClaim::Build`.
+    /// Resolves to None if the agent has no Build claim or the blueprint
+    /// despawned.
+    BuildClaimBlueprint,
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +186,7 @@ pub struct StepPreconditions {
     pub requires_good: Option<(Good, u32)>,
     pub requires_any_edible: bool,
     pub min_hunger: Option<u8>,
+    pub requires_carry_anything: bool,
 }
 
 impl StepPreconditions {
@@ -165,6 +195,7 @@ impl StepPreconditions {
             requires_good: None,
             requires_any_edible: false,
             min_hunger: None,
+            requires_carry_anything: false,
         }
     }
     pub fn needs_good(good: Good, qty: u32) -> Self {
@@ -172,6 +203,7 @@ impl StepPreconditions {
             requires_good: Some((good, qty)),
             requires_any_edible: false,
             min_hunger: None,
+            requires_carry_anything: false,
         }
     }
     /// Eat-style preconditions: agent must hold at least one edible and be at
@@ -181,11 +213,24 @@ impl StepPreconditions {
             requires_good: None,
             requires_any_edible: true,
             min_hunger: Some(min_hunger),
+            requires_carry_anything: false,
+        }
+    }
+    /// Deposit-style preconditions: agent must be carrying *something* across
+    /// inventory or hands. Prevents empty-handed walks to faction storage when
+    /// a prior gather step yielded nothing (target despawned, capacity full at
+    /// pickup, etc.).
+    pub fn carry_anything() -> Self {
+        Self {
+            requires_good: None,
+            requires_any_edible: false,
+            min_hunger: None,
+            requires_carry_anything: true,
         }
     }
 
     /// Returns true if the agent currently satisfies these preconditions.
-    pub fn is_satisfied(&self, agent: &EconomicAgent, hunger: f32) -> bool {
+    pub fn is_satisfied(&self, agent: &EconomicAgent, carrier: &Carrier, hunger: f32) -> bool {
         if let Some((good, qty)) = self.requires_good {
             if agent.quantity_of(good) < qty {
                 return false;
@@ -198,6 +243,12 @@ impl StepPreconditions {
             if hunger < min as f32 {
                 return false;
             }
+        }
+        if self.requires_carry_anything
+            && agent.current_weight_g() == 0
+            && carrier.is_empty()
+        {
+            return false;
         }
         true
     }
@@ -293,7 +344,19 @@ pub struct RelInfluence(pub AHashMap<Entity, u16>);
 pub struct DropAbandonedFoodEvent(pub Entity);
 
 pub const RETURN_SURPLUS_FOOD_PLAN_ID: PlanId = 24;
-pub const EXPLORE_PLAN_ID: PlanId = 28;
+pub const EXPLORE_FOOD_PLAN_ID: PlanId = 35;
+pub const EXPLORE_WOOD_PLAN_ID: PlanId = 36;
+pub const EXPLORE_STONE_PLAN_ID: PlanId = 37;
+pub const SCAVENGE_FOOD_PLAN_ID: PlanId = 6;
+pub const SCAVENGE_WOOD_PLAN_ID: PlanId = 38;
+pub const SCAVENGE_STONE_PLAN_ID: PlanId = 39;
+
+pub const fn is_explore_plan(id: PlanId) -> bool {
+    matches!(
+        id,
+        EXPLORE_FOOD_PLAN_ID | EXPLORE_WOOD_PLAN_ID | EXPLORE_STONE_PLAN_ID
+    )
+}
 
 #[derive(Component)]
 pub struct ActivePlan {
@@ -324,30 +387,48 @@ impl PlanOutcome {
     }
 }
 
-pub const PLAN_HISTORY_LEN: usize = 5;
+pub const PLAN_HISTORY_LEN: usize = 2;
+
+/// How long a `PlanHistory` entry remains relevant for the recent-failure
+/// score penalty. Past this age the entry still occupies its ring slot but
+/// is treated as absent by `recently_failed_count` (which gates the scorer
+/// nudge in `plan_execution_system`). 100 ticks ≈ 5 seconds at 20 Hz.
+pub const PLAN_HISTORY_TTL_TICKS: u64 = 100;
 
 /// Per-agent ring buffer of the last few plan outcomes. Written at every
 /// teardown site (success, precondition fail, resolve fail, goal change,
-/// interruption). Read by `build_state_vec` so the NN gets feedback on
-/// recent plan failures.
+/// interruption). Each entry is timestamped with the SimClock tick so a
+/// stale failure does not penalise a plan forever; `recently_failed_count`
+/// returns only entries within `PLAN_HISTORY_TTL_TICKS` of the query tick.
 #[derive(Component, Default)]
 pub struct PlanHistory {
-    pub entries: [Option<(PlanId, PlanOutcome)>; PLAN_HISTORY_LEN],
+    pub entries: [Option<(PlanId, PlanOutcome, u64)>; PLAN_HISTORY_LEN],
     pub head: u8,
 }
 
 impl PlanHistory {
-    pub fn push(&mut self, plan_id: PlanId, outcome: PlanOutcome) {
+    pub fn push(&mut self, plan_id: PlanId, outcome: PlanOutcome, tick: u64) {
         let i = (self.head as usize) % PLAN_HISTORY_LEN;
-        self.entries[i] = Some((plan_id, outcome));
+        self.entries[i] = Some((plan_id, outcome, tick));
         self.head = ((self.head as usize + 1) % PLAN_HISTORY_LEN) as u8;
     }
 
-    /// True if `plan_id` appears anywhere in the buffer with a failure outcome.
-    pub fn recently_failed(&self, plan_id: PlanId) -> bool {
-        self.entries.iter().any(
-            |slot| matches!(slot, Some((id, outcome)) if *id == plan_id && outcome.is_failure()),
-        )
+    /// Number of non-expired failure entries for `plan_id`. Used as a soft
+    /// score penalty in plan selection — recent failures bias against
+    /// re-picking a plan, but never eliminate it from contention.
+    pub fn recently_failed_count(&self, plan_id: PlanId, now: u64) -> u32 {
+        self.entries
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    slot,
+                    Some((id, outcome, tick))
+                        if *id == plan_id
+                            && outcome.is_failure()
+                            && now.saturating_sub(*tick) <= PLAN_HISTORY_TTL_TICKS
+                )
+            })
+            .count() as u32
     }
 }
 
@@ -475,6 +556,7 @@ static FARM_AND_GATHER_FOOD_GOALS: &[AgentGoal] = &[
     AgentGoal::Farm,
 ];
 static BUILD_GOALS: &[AgentGoal] = &[AgentGoal::Build];
+static HAUL_GOALS: &[AgentGoal] = &[AgentGoal::Haul];
 static CRAFT_GOALS: &[AgentGoal] = &[AgentGoal::Craft];
 static RESCUE_GOALS: &[AgentGoal] = &[AgentGoal::Rescue];
 
@@ -488,27 +570,38 @@ static PLAN_STEPS_30: &[StepId] = &[33, 36]; // PlayByPlanting: WithdrawSeed →
 static PLAN_STEPS_31: &[StepId] = &[34, 37]; // PlayByThrowingRocks: WithdrawStone → ThrowRocksAsPlay
 static PLAN_STEPS_32: &[StepId] = &[35, 30]; // PlayWithStoredToy: WithdrawPlayItem → PlayWithItem (step 30, plays in place when held)
 
-static EXPLORE_GOALS: &[AgentGoal] = &[
-    AgentGoal::Survive,
-    AgentGoal::GatherFood,
-    AgentGoal::GatherWood,
-    AgentGoal::GatherStone,
-];
-
 static PLAY_GOALS: &[AgentGoal] = &[AgentGoal::Play];
 
 static RETURN_CAMP_GOALS: &[AgentGoal] = &[AgentGoal::ReturnCamp];
 
-// New craft pipeline (order-driven). Each "Deliver*ToCraftOrder" plan gathers
-// one raw resource and hauls it into the order's deposit slots; "WorkOnCraft"
-// runs the actual recipe once the order is satisfied.
-//   38 = HaulToCraftOrder, 39 = WorkOnCraftOrder, 40 = FetchCraftOrderMaterialFromStorage
-static PLAN_STEPS_11: &[StepId] = &[2, 38]; // DeliverWoodToCraftOrder
-static PLAN_STEPS_12: &[StepId] = &[3, 38]; // DeliverStoneToCraftOrder
+// New craft pipeline (order-driven). The Deliver*ToCraftOrder plans haul a
+// specific good into an open CraftOrder's deposit slots; "WorkOnCraft" runs
+// the recipe once the order is satisfied. Wood/stone draw from the faction
+// stockpile (steps 46/47); hide and grain still come from a fresh
+// hunt/harvest because there is no equivalent storage-fetch path for those
+// goods today.
+//   38 = HaulToCraftOrder, 39 = WorkOnCraftOrder,
+//   40 = FetchCraftOrderMaterialFromStorage (any-good fallback),
+//   46 = FetchWoodFromStorage, 47 = FetchStoneFromStorage.
+static PLAN_STEPS_11: &[StepId] = &[46, 38]; // DeliverWoodToCraftOrder
+static PLAN_STEPS_12: &[StepId] = &[47, 38]; // DeliverStoneToCraftOrder
 static PLAN_STEPS_13: &[StepId] = &[5, 13, 38]; // DeliverHideToCraftOrder
 static PLAN_STEPS_14: &[StepId] = &[1, 38]; // DeliverGrainToCraftOrder
 static PLAN_STEPS_15: &[StepId] = &[40, 38]; // DeliverFromStorageToCraftOrder
 static PLAN_STEPS_16: &[StepId] = &[39, 12]; // WorkOnCraft → DepositGoods
+
+// Faction-directed Haul/Build pipeline. These plans are claim-driven: they
+// only fire when the agent already holds a JobClaim of the matching kind.
+//   41 = WithdrawClaimedHaulMaterial, 42 = HaulToClaimedBlueprint,
+//   43 = BuildClaimedBlueprint.
+static PLAN_STEPS_H: &[StepId] = &[41, 42]; // ClaimedHaulPlan
+static PLAN_STEPS_BB: &[StepId] = &[43]; // ClaimedBuildPlan
+
+// Scavenge plans for loose Wood/Stone GroundItems (siblings of ScavengeFood).
+// Pick up world-litter from chop yields and prior spills, then deposit to
+// faction storage.
+static PLAN_STEPS_SW: &[StepId] = &[44, 12]; // ScavengeWood: CollectWood → DepositGoods
+static PLAN_STEPS_SS: &[StepId] = &[45, 12]; // ScavengeStone: CollectStone → DepositGoods
 
 pub fn register_builtin_steps(registry: &mut StepRegistry) {
     registry.0 = vec![
@@ -639,7 +732,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: 12,
             task: TaskKind::DepositResource,
             target: StepTarget::NearestFactionStorage,
-            preconditions: StepPreconditions::none(),
+            preconditions: StepPreconditions::carry_anything(),
             reward_scale: 0.1,
             plant_filter: None,
             extra: 0,
@@ -948,6 +1041,88 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             plant_filter: None,
             extra: 0,
         },
+        StepDef {
+            // 41: WithdrawClaimedHaulMaterial — withdraw the good named in the
+            // agent's active JobClaim::Haul from the nearest faction storage
+            // tile holding that good. Pairs with step 42 (HaulToClaimedBlueprint)
+            // to deliver storage stock into a specific blueprint.
+            id: 41,
+            task: TaskKind::WithdrawMaterial,
+            target: StepTarget::StorageWithHaulClaimGood,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.4,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 42: HaulToClaimedBlueprint — carry the agent's hand contents to
+            // the specific blueprint named in the active JobClaim::Haul and
+            // deposit. Credits the Haul posting via record_progress on success.
+            id: 42,
+            task: TaskKind::HaulMaterials,
+            target: StepTarget::HaulClaimBlueprint,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.5,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 43: BuildClaimedBlueprint — perform labor at the specific
+            // blueprint named in the agent's JobClaim::Build. The resolver
+            // gates on the blueprint being satisfied, so this never starts
+            // before all materials are in.
+            id: 43,
+            task: TaskKind::Construct,
+            target: StepTarget::BuildClaimBlueprint,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 1.5,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 44: CollectWood — pick up loose Wood GroundItems left behind by
+            // tree harvesting (`harvest_ground_drops`) or earlier spills.
+            id: 44,
+            task: TaskKind::Scavenge,
+            target: StepTarget::NearestItem(Good::Wood),
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.4,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 45: CollectStone — pick up loose Stone GroundItems on the world.
+            id: 45,
+            task: TaskKind::Scavenge,
+            target: StepTarget::NearestItem(Good::Stone),
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.4,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 46: FetchWoodFromStorage — withdraw wood from a faction storage
+            // tile so it can be hauled into a CraftOrder's deposit slot.
+            // Pairs with step 38 (HaulToCraftOrder). The resolver gates on
+            // both "tile has wood" and "an open order needs wood".
+            id: 46,
+            task: TaskKind::WithdrawMaterial,
+            target: StepTarget::NearestFactionStorageContainingForCraftOrder(Good::Wood),
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.3,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 47: FetchStoneFromStorage — sibling of step 46 for stone.
+            id: 47,
+            task: TaskKind::WithdrawMaterial,
+            target: StepTarget::NearestFactionStorageContainingForCraftOrder(Good::Stone),
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.3,
+            plant_filter: None,
+            extra: 0,
+        },
     ];
 }
 
@@ -964,7 +1139,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
                 (SI_HUNGER, 1.5),
                 (SI_HAS_FOOD, -0.3),
                 (SI_MEM_FOOD, 0.2),
-                (SI_VIS_FOOD, 0.8),
+                (SI_VIS_PLANT_FOOD, 0.8),
             ]),
             bias: 0.0,
             serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
@@ -976,14 +1151,14 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             name: "FarmFood",
             steps: PLAN_STEPS_1,
             state_weights: mk_weights(&[
-                (SI_HUNGER, 1.2),
-                (SI_HAS_FOOD, -0.3),
+                (SI_HUNGER, -0.3),
+                (SI_HAS_FOOD, 0.0),
                 (SI_SKILL_FARMING, 0.3),
                 (SI_SEASON_FOOD, 0.5),
             ]),
             bias: 0.0,
             serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
-            tech_gate: None,
+            tech_gate: Some(super::technology::CROP_CULTIVATION),
             memory_target_kind: Some(MemoryKind::Food),
         },
         PlanDef {
@@ -991,11 +1166,14 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             name: "GatherWood",
             steps: PLAN_STEPS_2,
             state_weights: mk_weights(&[
-                (SI_MEM_WOOD, 0.2),
-                (SI_HAS_WOOD, -0.1),
-                (SI_VIS_WOOD, 0.6),
+                (SI_MEM_WOOD, 0.1),
+                (SI_HAS_WOOD, -0.2),
+                (SI_VIS_TREE, 0.5),
             ]),
-            bias: 0.1,
+            // Goals are claim-locked once the chief's Stockpile{Wood} posting is
+            // claimed; once the agent has any wood vis/mem the matching gather
+            // plan should win decisively over Explore-class fallbacks.
+            bias: 0.0,
             serves_goals: GATHER_WOOD_GOALS,
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Wood),
@@ -1005,12 +1183,12 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             name: "GatherStone",
             steps: PLAN_STEPS_3,
             state_weights: mk_weights(&[
-                (SI_MEM_STONE, 0.2),
-                (SI_HAS_STONE, -0.1),
-                (SI_SKILL_MINING, 0.2),
-                (SI_VIS_STONE, 0.6),
+                (SI_MEM_STONE, 0.1),
+                (SI_HAS_STONE, -0.2),
+                (SI_SKILL_MINING, 0.0),
+                (SI_VIS_STONE_TILE, 0.4),
             ]),
-            bias: 0.1,
+            bias: 0.0,
             serves_goals: GATHER_STONE_GOALS,
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Stone),
@@ -1020,14 +1198,14 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             name: "PlantAndFarm",
             steps: PLAN_STEPS_4,
             state_weights: mk_weights(&[
-                (SI_HUNGER, 0.8),
+                (SI_HUNGER, 0.0),
                 (SI_HAS_SEED, 0.4),
-                (SI_SKILL_FARMING, 0.4),
+                (SI_SKILL_FARMING, 0.2),
                 (SI_SEASON_FOOD, 0.5),
             ]),
             bias: 0.0,
             serves_goals: FARM_AND_GATHER_FOOD_GOALS,
-            tech_gate: None,
+            tech_gate: Some(super::technology::CROP_CULTIVATION),
             memory_target_kind: Some(MemoryKind::Food),
         },
         PlanDef {
@@ -1048,7 +1226,11 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             id: 6,
             name: "ScavengeFood",
             steps: PLAN_STEPS_6,
-            state_weights: mk_weights(&[(SI_HUNGER, 1.0), (SI_HAS_FOOD, -0.3), (SI_VIS_FOOD, 0.4)]),
+            state_weights: mk_weights(&[
+                (SI_HUNGER, 1.0),
+                (SI_HAS_FOOD, -0.3),
+                (SI_VIS_GROUND_FOOD, 0.4),
+            ]),
             bias: 0.0,
             serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
             tech_gate: None,
@@ -1111,21 +1293,21 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             id: 11,
             name: "DeliverWoodToCraftOrder",
             steps: PLAN_STEPS_11,
-            state_weights: mk_weights(&[(SI_VIS_WOOD, 0.4), (SI_MEM_WOOD, 0.3)]),
+            state_weights: mk_weights(&[(SI_IN_FACTION, 0.4)]),
             bias: 0.1,
             serves_goals: CRAFT_GOALS,
             tech_gate: None,
-            memory_target_kind: Some(MemoryKind::Wood),
+            memory_target_kind: None,
         },
         PlanDef {
             id: 12,
             name: "DeliverStoneToCraftOrder",
             steps: PLAN_STEPS_12,
-            state_weights: mk_weights(&[(SI_VIS_STONE, 0.4), (SI_MEM_STONE, 0.3)]),
+            state_weights: mk_weights(&[(SI_IN_FACTION, 0.4)]),
             bias: 0.1,
             serves_goals: CRAFT_GOALS,
             tech_gate: None,
-            memory_target_kind: Some(MemoryKind::Stone),
+            memory_target_kind: None,
         },
         PlanDef {
             id: 13,
@@ -1277,19 +1459,40 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
         },
+        // Explore is split per resource kind so that `explore_satisfaction_system`
+        // can abort the wander the moment the agent records a sighting of the
+        // target kind in memory. The candidate filter inverts the Food/Wood/Stone
+        // gates for these IDs: each ExploreFor* plan is only available when the
+        // agent has neither memory nor visibility of its target.
         PlanDef {
-            // Explore is the fallback for gathering goals. It carries no
-            // need-driven weight; the candidate filter drops Food/Wood/Stone
-            // gather plans when the agent has neither memory nor visibility of
-            // the resource, so Explore wins by default in that case.
-            id: 28,
-            name: "Explore",
+            id: EXPLORE_FOOD_PLAN_ID,
+            name: "ExploreForFood",
             steps: PLAN_STEPS_28,
             state_weights: mk_weights(&[]),
             bias: 0.0,
-            serves_goals: EXPLORE_GOALS,
+            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
             tech_gate: None,
-            memory_target_kind: None,
+            memory_target_kind: Some(MemoryKind::Food),
+        },
+        PlanDef {
+            id: EXPLORE_WOOD_PLAN_ID,
+            name: "ExploreForWood",
+            steps: PLAN_STEPS_28,
+            state_weights: mk_weights(&[]),
+            bias: 0.0,
+            serves_goals: GATHER_WOOD_GOALS,
+            tech_gate: None,
+            memory_target_kind: Some(MemoryKind::Wood),
+        },
+        PlanDef {
+            id: EXPLORE_STONE_PLAN_ID,
+            name: "ExploreForStone",
+            steps: PLAN_STEPS_28,
+            state_weights: mk_weights(&[]),
+            bias: 0.0,
+            serves_goals: GATHER_STONE_GOALS,
+            tech_gate: None,
+            memory_target_kind: Some(MemoryKind::Stone),
         },
         PlanDef {
             // Sibling of BuildBlueprint that pulls materials out of communal
@@ -1361,6 +1564,65 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             tech_gate: None,
             memory_target_kind: None,
         },
+        PlanDef {
+            // Claim-driven Haul plan. Fires only when the agent holds a
+            // JobClaim::Haul (which gates the goal to AgentGoal::Haul). Step 41
+            // withdraws the named good from the nearest storage tile; step 42
+            // delivers it to the specific blueprint named in the claim.
+            id: 33,
+            name: "ClaimedHaul",
+            steps: PLAN_STEPS_H,
+            state_weights: mk_weights(&[]),
+            bias: 1.0,
+            serves_goals: HAUL_GOALS,
+            tech_gate: None,
+            memory_target_kind: None,
+        },
+        PlanDef {
+            // Claim-driven Build plan. Fires only when the agent holds a
+            // JobClaim::Build (gating goal to AgentGoal::Build via job lock).
+            // Step 43 routes to the claimed blueprint and labors there.
+            id: 34,
+            name: "ClaimedBuild",
+            steps: PLAN_STEPS_BB,
+            state_weights: mk_weights(&[
+                (SI_SKILL_BUILDING, 0.4),
+            ]),
+            bias: 1.0,
+            serves_goals: BUILD_GOALS,
+            tech_gate: None,
+            memory_target_kind: None,
+        },
+        // ── Scavenge plans for loose wood/stone ───────────────────────────────
+        // Sibling of ScavengeFood (plan 6). Workers pick up loose Wood/Stone
+        // GroundItems left behind by tree/stone harvesting or prior spills,
+        // then haul them to faction storage. Targets resolve via
+        // `StepTarget::NearestItem`, so the plan only wins when an actual
+        // GroundItem of the matching good is reachable.
+        PlanDef {
+            // Score is dominated by SI_VIS_GROUND_WOOD so the plan wins over
+            // GatherWood (≈1.1 score) only when there's loose wood lying nearby
+            // (≥1 hit → 0.375·1.5 ≈ 0.56; ≥4 hits → saturated at 1.5). With no
+            // loose wood the score is 0 and GatherWood takes the goal.
+            id: 38,
+            name: "ScavengeWood",
+            steps: PLAN_STEPS_SW,
+            state_weights: mk_weights(&[(SI_VIS_GROUND_WOOD, 1.5)]),
+            bias: 0.0,
+            serves_goals: GATHER_WOOD_GOALS,
+            tech_gate: None,
+            memory_target_kind: None,
+        },
+        PlanDef {
+            id: 39,
+            name: "ScavengeStone",
+            steps: PLAN_STEPS_SS,
+            state_weights: mk_weights(&[(SI_VIS_GROUND_STONE, 1.5)]),
+            bias: 0.0,
+            serves_goals: GATHER_STONE_GOALS,
+            tech_gate: None,
+            memory_target_kind: None,
+        },
     ];
 }
 
@@ -1374,9 +1636,12 @@ pub fn build_state_vec(
     memory: Option<&AgentMemory>,
     calendar: &Calendar,
     plan_history: Option<&PlanHistory>,
-    vis_food: u8,
-    vis_wood: u8,
-    vis_stone: u8,
+    vis_plant_food: u8,
+    vis_trees: u8,
+    vis_stone_tiles: u8,
+    vis_ground_wood: u8,
+    vis_ground_stone: u8,
+    vis_ground_food: u8,
 ) -> [f32; STATE_DIM] {
     let mut s = [0.0f32; STATE_DIM];
 
@@ -1445,15 +1710,16 @@ pub fn build_state_vec(
     // match the convention used by the other six need slots.
     s[24] = ((255.0 - needs.willpower) / 255.0).clamp(0.0, 1.0);
 
-    // 25-34: last PLAN_HISTORY_LEN plan outcomes (2 floats per slot).
-    // For each slot: (plan_id_norm, failure_flag). Lets the NN learn to
-    // deprioritize plans that just failed and reach for Explore when
-    // recent attempts have all flunked.
+    // 25-28: last PLAN_HISTORY_LEN plan outcomes (2 floats per slot).
+    // For each slot: (plan_id_norm, failure_flag). Lets the scorer factor
+    // recent failures into plan selection. Tick timestamps in the history
+    // entries are not surfaced here — the soft penalty in
+    // `plan_execution_system` consumes them via `recently_failed_count`.
     if let Some(history) = plan_history {
         for i in 0..PLAN_HISTORY_LEN {
             let base = 25 + i * 2;
             match history.entries[i] {
-                Some((plan_id, outcome)) => {
+                Some((plan_id, outcome, _tick)) => {
                     s[base] = (plan_id as f32 + 1.0) / 32.0;
                     s[base + 1] = if outcome.is_failure() { 1.0 } else { 0.0 };
                 }
@@ -1465,27 +1731,36 @@ pub fn build_state_vec(
         }
     }
 
-    // 35-37: visible harvestable resources within VISIBILITY_RADIUS, normalised
-    // to [0, 1] at VISIBILITY_SATURATE matches.
+    // 35-37: source-only visibility — mature edible plants, mature trees, stone
+    // tiles within VISIBILITY_RADIUS, normalised to [0, 1] at VISIBILITY_SATURATE.
+    // Feeds Forage/Gather/Deliver*ToCraftOrder plans, which can only act on
+    // sources. Loose ground items live on slots 38-40 so source and good never
+    // share a signal.
     let sat = VISIBILITY_SATURATE as f32;
-    s[SI_VIS_FOOD] = (vis_food as f32 / sat).clamp(0.0, 1.0);
-    s[SI_VIS_WOOD] = (vis_wood as f32 / sat).clamp(0.0, 1.0);
-    s[SI_VIS_STONE] = (vis_stone as f32 / sat).clamp(0.0, 1.0);
+    s[SI_VIS_PLANT_FOOD] = (vis_plant_food as f32 / sat).clamp(0.0, 1.0);
+    s[SI_VIS_TREE] = (vis_trees as f32 / sat).clamp(0.0, 1.0);
+    s[SI_VIS_STONE_TILE] = (vis_stone_tiles as f32 / sat).clamp(0.0, 1.0);
+
+    // 38-40: ground-only visibility for loose food/wood/stone GroundItems.
+    // Feeds the Scavenge* plans, which can only pick up loose items.
+    s[SI_VIS_GROUND_WOOD] = (vis_ground_wood as f32 / sat).clamp(0.0, 1.0);
+    s[SI_VIS_GROUND_STONE] = (vis_ground_stone as f32 / sat).clamp(0.0, 1.0);
+    s[SI_VIS_GROUND_FOOD] = (vis_ground_food as f32 / sat).clamp(0.0, 1.0);
 
     s
 }
 
-/// Counts mature edible plants and edible ground items within
-/// `VISIBILITY_RADIUS` of the agent's tile, saturating at
-/// `VISIBILITY_SATURATE`. Cheap because plan selection is bucketed (~1 Hz per
-/// agent) and scanning early-exits once saturated.
-pub(crate) fn count_visible_food(
+/// Counts mature edible *plants* (sources) within `VISIBILITY_RADIUS` of the
+/// agent's tile, saturating at `VISIBILITY_SATURATE`. Drives `SI_VIS_PLANT_FOOD`,
+/// which feeds plans that harvest plants (`ForageFood`). Loose food on the
+/// ground is counted separately by `count_visible_ground_food` so source and
+/// good never share a signal. Cheap because plan selection is bucketed
+/// (~1 Hz per agent) and scanning early-exits once saturated.
+pub(crate) fn count_visible_plant_food(
     tx: i32,
     ty: i32,
     plant_map: &PlantMap,
     plants: &Query<&Plant>,
-    spatial: &SpatialIndex,
-    items: &Query<&GroundItem>,
 ) -> u8 {
     let r = VISIBILITY_RADIUS;
     let r2 = r * r;
@@ -1508,28 +1783,20 @@ pub(crate) fn count_visible_food(
                     }
                 }
             }
-            for &e in spatial.get(pt.0, pt.1) {
-                if let Ok(item) = items.get(e) {
-                    if item.item.good.is_edible() {
-                        n = n.saturating_add(1);
-                        if n >= VISIBILITY_SATURATE {
-                            return n;
-                        }
-                    }
-                }
-            }
         }
     }
     n
 }
 
-pub(crate) fn count_visible_wood(
+/// Counts mature *trees* (sources) within `VISIBILITY_RADIUS`. Drives
+/// `SI_VIS_TREE`, which feeds plans that chop trees (`GatherWood`,
+/// `DeliverWoodToCraftOrder`). Loose wood on the ground is counted by
+/// `count_visible_ground_wood`.
+pub(crate) fn count_visible_trees(
     tx: i32,
     ty: i32,
     plant_map: &PlantMap,
     plants: &Query<&Plant>,
-    spatial: &SpatialIndex,
-    items: &Query<&GroundItem>,
 ) -> u8 {
     let r = VISIBILITY_RADIUS;
     let r2 = r * r;
@@ -1550,27 +1817,19 @@ pub(crate) fn count_visible_wood(
                     }
                 }
             }
-            for &e in spatial.get(pt.0, pt.1) {
-                if let Ok(item) = items.get(e) {
-                    if item.item.good == Good::Wood {
-                        n = n.saturating_add(1);
-                        if n >= VISIBILITY_SATURATE {
-                            return n;
-                        }
-                    }
-                }
-            }
         }
     }
     n
 }
 
-pub(crate) fn count_visible_stone(
+/// Counts visible *Stone tiles* (sources) within `VISIBILITY_RADIUS`. Drives
+/// `SI_VIS_STONE_TILE`, which feeds plans that mine stone (`GatherStone`,
+/// `DeliverStoneToCraftOrder`). Loose stone on the ground is counted by
+/// `count_visible_ground_stone`.
+pub(crate) fn count_visible_stone_tiles(
     tx: i32,
     ty: i32,
     chunk_map: &ChunkMap,
-    spatial: &SpatialIndex,
-    items: &Query<&GroundItem>,
 ) -> u8 {
     let r = VISIBILITY_RADIUS;
     let r2 = r * r;
@@ -1587,7 +1846,94 @@ pub(crate) fn count_visible_stone(
                     return n;
                 }
             }
-            for &e in spatial.get(sx, sy) {
+        }
+    }
+    n
+}
+
+/// Counts visible loose edible `GroundItem`s within `VISIBILITY_RADIUS`. Drives
+/// `SI_VIS_GROUND_FOOD`, which feeds `ScavengeFood`. Mature edible plants are
+/// counted by `count_visible_plant_food` so the two plans never share a signal.
+pub(crate) fn count_visible_ground_food(
+    tx: i32,
+    ty: i32,
+    spatial: &SpatialIndex,
+    items: &Query<&GroundItem>,
+) -> u8 {
+    let r = VISIBILITY_RADIUS;
+    let r2 = r * r;
+    let mut n: u8 = 0;
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if dx * dx + dy * dy > r2 {
+                continue;
+            }
+            for &e in spatial.get(tx + dx, ty + dy) {
+                if let Ok(item) = items.get(e) {
+                    if item.item.good.is_edible() {
+                        n = n.saturating_add(1);
+                        if n >= VISIBILITY_SATURATE {
+                            return n;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Count visible loose Wood `GroundItem`s only (excludes standing trees).
+/// Drives `SI_VIS_GROUND_WOOD` so `ScavengeWood` scores above `GatherWood` only
+/// when there's actual ground litter — without this split the two plans share
+/// the same visibility signal and `ScavengeWood` would fire spuriously next to
+/// untouched forest.
+pub(crate) fn count_visible_ground_wood(
+    tx: i32,
+    ty: i32,
+    spatial: &SpatialIndex,
+    items: &Query<&GroundItem>,
+) -> u8 {
+    let r = VISIBILITY_RADIUS;
+    let r2 = r * r;
+    let mut n: u8 = 0;
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if dx * dx + dy * dy > r2 {
+                continue;
+            }
+            for &e in spatial.get(tx + dx, ty + dy) {
+                if let Ok(item) = items.get(e) {
+                    if item.item.good == Good::Wood {
+                        n = n.saturating_add(1);
+                        if n >= VISIBILITY_SATURATE {
+                            return n;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Count visible loose Stone `GroundItem`s only (excludes Stone tiles). See
+/// `count_visible_ground_wood`.
+pub(crate) fn count_visible_ground_stone(
+    tx: i32,
+    ty: i32,
+    spatial: &SpatialIndex,
+    items: &Query<&GroundItem>,
+) -> u8 {
+    let r = VISIBILITY_RADIUS;
+    let r2 = r * r;
+    let mut n: u8 = 0;
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if dx * dx + dy * dy > r2 {
+                continue;
+            }
+            for &e in spatial.get(tx + dx, ty + dy) {
                 if let Ok(item) = items.get(e) {
                     if item.item.good == Good::Stone {
                         n = n.saturating_add(1);
@@ -1631,6 +1977,8 @@ fn resolve_target(
     rescue_target: Option<&RescueTarget>,
     agent: &EconomicAgent,
     carrier: &Carrier,
+    claim_target: Option<&crate::simulation::jobs::ClaimTarget>,
+    withdraw_intent_out: &mut Option<(Good, u8)>,
 ) -> Option<(Option<Entity>, i16, i16)> {
     const VIEW_RADIUS: i32 = 15;
 
@@ -1875,11 +2223,11 @@ fn resolve_target(
             .nearest_for_faction(faction_id, pos)
             .map(|(tx, ty)| (None, tx, ty)),
         StepTarget::NearestFactionStorageWithBlueprintMaterial => {
-            // Build the set of goods currently needed by some unsatisfied
-            // blueprint of this faction (including any blueprint personally
-            // owned by this agent). If nothing is wanted, no target.
-            let mut needed: [bool; crate::economy::goods::GOOD_COUNT] =
-                [false; crate::economy::goods::GOOD_COUNT];
+            // Per-good remaining need across all unsatisfied blueprints this
+            // agent is allowed to deliver to (faction-shared + personal). We
+            // need the qty so the resolver can commit a withdraw intent.
+            let mut still_need_by_good: [u32; crate::economy::goods::GOOD_COUNT] =
+                [0; crate::economy::goods::GOOD_COUNT];
             let mut any_needed = false;
             for (_, &bp_entity) in &bp_map.0 {
                 let Ok(bp) = bp_query.get(bp_entity) else {
@@ -1897,7 +2245,9 @@ fn resolve_target(
                         .needed
                         .saturating_sub(bp.deposits[i].deposited);
                     if still > 0 {
-                        needed[bp.deposits[i].good as usize] = true;
+                        still_need_by_good[bp.deposits[i].good as usize] =
+                            still_need_by_good[bp.deposits[i].good as usize]
+                                .saturating_add(still as u32);
                         any_needed = true;
                     }
                 }
@@ -1915,7 +2265,7 @@ fn resolve_target(
                 let mut has_useful = false;
                 for &gi_entity in spatial.get(tx as i32, ty as i32) {
                     if let Ok(gi) = item_query.get(gi_entity) {
-                        if gi.qty > 0 && needed[gi.item.good as usize] {
+                        if gi.qty > 0 && still_need_by_good[gi.item.good as usize] > 0 {
                             has_useful = true;
                             break;
                         }
@@ -1930,7 +2280,22 @@ fn resolve_target(
                     best = Some((tx, ty));
                 }
             }
-            best.map(|(tx, ty)| (None, tx, ty))
+            let (tx, ty) = best?;
+            // Pick the first matching good on the tile; commit qty = min(stock, blueprint need).
+            let mut chosen: Option<(Good, u32)> = None;
+            for &gi_entity in spatial.get(tx as i32, ty as i32) {
+                if let Ok(gi) = item_query.get(gi_entity) {
+                    let need = still_need_by_good[gi.item.good as usize];
+                    if gi.qty > 0 && need > 0 {
+                        chosen = Some((gi.item.good, gi.qty.min(need)));
+                        break;
+                    }
+                }
+            }
+            if let Some((good, qty)) = chosen {
+                *withdraw_intent_out = Some((good, qty.min(u8::MAX as u32) as u8));
+            }
+            Some((None, tx, ty))
         }
         StepTarget::NearestFactionStorageWithGood(target_good) => {
             let tiles = storage_tile_map.by_faction.get(&faction_id)?;
@@ -1999,6 +2364,60 @@ fn resolve_target(
                 }
             }
             best.map(|(e, tx, ty)| (Some(e), tx, ty))
+        }
+        StepTarget::StorageWithHaulClaimGood => {
+            // Active Haul claim names a specific good. Find the nearest faction
+            // storage tile that holds at least one unit of that good.
+            let target_good = claim_target.and_then(|c| c.good)?;
+            let tiles = storage_tile_map.by_faction.get(&faction_id)?;
+            let mut best: Option<(i16, i16, u32)> = None;
+            let mut best_dist = i32::MAX;
+            for &(tx, ty) in tiles {
+                let mut stock: u32 = 0;
+                for &gi_entity in spatial.get(tx as i32, ty as i32) {
+                    if let Ok(gi) = item_query.get(gi_entity) {
+                        if gi.item.good == target_good {
+                            stock = stock.saturating_add(gi.qty);
+                        }
+                    }
+                }
+                if stock == 0 {
+                    continue;
+                }
+                let dist = (tx as i32 - pos.0).abs() + (ty as i32 - pos.1).abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some((tx, ty, stock));
+                }
+            }
+            let (tx, ty, stock) = best?;
+            // Haul claim has no per-trip cap of its own; let the carrier cap
+            // at execution time. u8::MAX is a safe upper bound for the intent.
+            let qty = stock.min(u8::MAX as u32) as u8;
+            *withdraw_intent_out = Some((target_good, qty.max(1)));
+            Some((None, tx, ty))
+        }
+        StepTarget::HaulClaimBlueprint => {
+            // Route directly to the blueprint named in the agent's Haul claim.
+            let bp_entity = claim_target.and_then(|c| c.blueprint)?;
+            let bp = bp_query.get(bp_entity).ok()?;
+            // Skip if the blueprint is already satisfied (no more deposits
+            // needed) — the haul is moot, let the plan abandon and re-pick.
+            if bp.is_satisfied() {
+                return None;
+            }
+            Some((Some(bp_entity), bp.tile.0, bp.tile.1))
+        }
+        StepTarget::BuildClaimBlueprint => {
+            // Route directly to the blueprint named in the agent's Build claim,
+            // but only when its deposits are all in (so the build_progress
+            // counter actually advances when the agent works).
+            let bp_entity = claim_target.and_then(|c| c.blueprint)?;
+            let bp = bp_query.get(bp_entity).ok()?;
+            if !bp.is_satisfied() {
+                return None;
+            }
+            Some((Some(bp_entity), bp.tile.0, bp.tile.1))
         }
         StepTarget::NearestBuildSite(_) => None, // Legacy; construction is handled via faction_blueprint_system
         StepTarget::NearestBlueprint(kind) => {
@@ -2237,9 +2656,12 @@ fn resolve_target(
             best.map(|(e, tx, ty)| (Some(e), tx, ty))
         }
         StepTarget::NearestFactionStorageWithCraftOrderMaterial => {
-            // Set of goods needed by some unsatisfied CraftOrder of this faction.
-            let mut needed: [bool; crate::economy::goods::GOOD_COUNT] =
-                [false; crate::economy::goods::GOOD_COUNT];
+            // Aggregate per-good remaining need across all unsatisfied
+            // CraftOrders of this faction. We track the per-good total so we
+            // can both prune (no need → skip tile) and pick a deterministic
+            // good to commit to once a tile is chosen.
+            let mut still_need_by_good: [u32; crate::economy::goods::GOOD_COUNT] =
+                [0; crate::economy::goods::GOOD_COUNT];
             let mut any_needed = false;
             for (_, &order_entity) in &co_map.0 {
                 let Ok(order) = co_query.get(order_entity) else {
@@ -2253,7 +2675,9 @@ fn resolve_target(
                         .needed
                         .saturating_sub(order.deposits[i].deposited);
                     if still > 0 {
-                        needed[order.deposits[i].good as usize] = true;
+                        still_need_by_good[order.deposits[i].good as usize] =
+                            still_need_by_good[order.deposits[i].good as usize]
+                                .saturating_add(still as u32);
                         any_needed = true;
                     }
                 }
@@ -2268,7 +2692,7 @@ fn resolve_target(
                 let mut has_useful = false;
                 for &gi_entity in spatial.get(tx as i32, ty as i32) {
                     if let Ok(gi) = item_query.get(gi_entity) {
-                        if gi.qty > 0 && needed[gi.item.good as usize] {
+                        if gi.qty > 0 && still_need_by_good[gi.item.good as usize] > 0 {
                             has_useful = true;
                             break;
                         }
@@ -2283,7 +2707,77 @@ fn resolve_target(
                     best = Some((tx, ty));
                 }
             }
-            best.map(|(tx, ty)| (None, tx, ty))
+            let (tx, ty) = best?;
+            // Pick a specific good on the chosen tile to commit to. Iterate
+            // ground items on the tile and choose the first whose good is
+            // still needed by an order; deterministic ordering comes from
+            // the spatial index (insertion order).
+            let mut chosen: Option<(Good, u32)> = None;
+            for &gi_entity in spatial.get(tx as i32, ty as i32) {
+                if let Ok(gi) = item_query.get(gi_entity) {
+                    let need = still_need_by_good[gi.item.good as usize];
+                    if gi.qty > 0 && need > 0 {
+                        let qty = gi.qty.min(need);
+                        chosen = Some((gi.item.good, qty));
+                        break;
+                    }
+                }
+            }
+            if let Some((good, qty)) = chosen {
+                *withdraw_intent_out = Some((good, qty.min(u8::MAX as u32) as u8));
+            }
+            Some((None, tx, ty))
+        }
+        StepTarget::NearestFactionStorageContainingForCraftOrder(target_good) => {
+            // Material-specific sibling of NearestFactionStorageWithCraftOrderMaterial.
+            // Drops out unless an open CraftOrder of this faction still needs
+            // `target_good` and at least one storage tile holds some.
+            let mut still_need: u32 = 0;
+            for (_, &order_entity) in &co_map.0 {
+                let Ok(order) = co_query.get(order_entity) else {
+                    continue;
+                };
+                if order.faction_id != faction_id {
+                    continue;
+                }
+                for i in 0..order.deposit_count as usize {
+                    if order.deposits[i].good != *target_good {
+                        continue;
+                    }
+                    let still = order.deposits[i]
+                        .needed
+                        .saturating_sub(order.deposits[i].deposited);
+                    still_need = still_need.saturating_add(still as u32);
+                }
+            }
+            if still_need == 0 {
+                return None;
+            }
+            let tiles = storage_tile_map.by_faction.get(&faction_id)?;
+            let mut best: Option<(i16, i16, u32)> = None;
+            let mut best_dist = i32::MAX;
+            for &(tx, ty) in tiles {
+                let mut stock: u32 = 0;
+                for &gi_entity in spatial.get(tx as i32, ty as i32) {
+                    if let Ok(gi) = item_query.get(gi_entity) {
+                        if gi.item.good == *target_good {
+                            stock = stock.saturating_add(gi.qty);
+                        }
+                    }
+                }
+                if stock == 0 {
+                    continue;
+                }
+                let dist = (tx as i32 - pos.0).abs() + (ty as i32 - pos.1).abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some((tx, ty, stock));
+                }
+            }
+            let (tx, ty, stock) = best?;
+            let qty = stock.min(still_need).min(u8::MAX as u32) as u8;
+            *withdraw_intent_out = Some((*target_good, qty.max(1)));
+            Some((None, tx, ty))
         }
         StepTarget::ExploreTile => {
             let home = faction_registry
@@ -2379,7 +2873,56 @@ type OptionalQuery<'a> = (
     Option<&'a RelationshipMemory>,
     Option<&'a RescueTarget>,
     Option<&'a mut PlanHistory>,
+    Option<&'a crate::simulation::jobs::ClaimTarget>,
 );
+
+/// Aborts an `ExploreFor*` plan as soon as the agent has memory of the
+/// resource kind it was searching for. Runs after `vision_system` so that
+/// any sighting recorded this tick is visible here. Removing `ActivePlan`
+/// lets the next selection cycle pick the matching gather plan now that
+/// memory is populated. Logs `PlanOutcome::Success` — the explore objective
+/// was "find one," and we just did.
+pub fn explore_satisfaction_system(
+    mut commands: Commands,
+    plan_registry: Res<PlanRegistry>,
+    clock: Res<SimClock>,
+    mut query: Query<(
+        Entity,
+        &ActivePlan,
+        &AgentMemory,
+        &BucketSlot,
+        &LodLevel,
+        Option<&mut PlanHistory>,
+    )>,
+) {
+    for (entity, active_plan, memory, slot, lod, mut history) in query.iter_mut() {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        let target = match active_plan.plan_id {
+            EXPLORE_FOOD_PLAN_ID => MemoryKind::Food,
+            EXPLORE_WOOD_PLAN_ID => MemoryKind::Wood,
+            EXPLORE_STONE_PLAN_ID => MemoryKind::Stone,
+            _ => continue,
+        };
+        if memory.best_for(target).is_none() {
+            continue;
+        }
+        // Sanity: the registry should always carry the plan but tolerate a
+        // missing entry rather than panic if the registry diverges.
+        if !plan_registry
+            .0
+            .iter()
+            .any(|p| p.id == active_plan.plan_id)
+        {
+            continue;
+        }
+        if let Some(history) = history.as_deref_mut() {
+            history.push(active_plan.plan_id, PlanOutcome::Success, clock.tick);
+        }
+        commands.entity(entity).remove::<ActivePlan>();
+    }
+}
 
 pub fn plan_execution_system(
     par_commands: ParallelCommands,
@@ -2435,6 +2978,7 @@ pub fn plan_execution_system(
                 _rel_opt,
                 rescue_target_opt,
                 mut plan_history_opt,
+                claim_target_opt,
             ),
         )| {
             if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -2449,6 +2993,7 @@ pub fn plan_execution_system(
                     | AgentGoal::GatherWood
                     | AgentGoal::GatherStone
                     | AgentGoal::Build
+                    | AgentGoal::Haul
                     | AgentGoal::TameHorse
                     | AgentGoal::Rescue
                     | AgentGoal::ReturnCamp
@@ -2478,26 +3023,21 @@ pub fn plan_execution_system(
                 }
 
                 // Compute visibility once up front so the candidate filter and
-                // scoring share the same numbers. Cheap (bucketed plan-selection,
-                // saturating early-exit at 4 hits per kind).
-                let vis_food = count_visible_food(
-                    cur_tx,
-                    cur_ty,
-                    &plant_map,
-                    &plant_query,
-                    &spatial,
-                    &item_check,
-                );
-                let vis_wood = count_visible_wood(
-                    cur_tx,
-                    cur_ty,
-                    &plant_map,
-                    &plant_query,
-                    &spatial,
-                    &item_check,
-                );
-                let vis_stone =
-                    count_visible_stone(cur_tx, cur_ty, &chunk_map, &spatial, &item_check);
+                // scoring share the same numbers. Each slot answers one yes/no
+                // question (a tree is not a piece of wood; a stone tile is not a
+                // ground stone; an edible plant is not a ground corpse) so plans
+                // only score on signals they can actually act on. Cheap because
+                // plan selection is bucketed and counters early-exit at 4 hits.
+                let vis_plant_food =
+                    count_visible_plant_food(cur_tx, cur_ty, &plant_map, &plant_query);
+                let vis_trees = count_visible_trees(cur_tx, cur_ty, &plant_map, &plant_query);
+                let vis_stone_tiles = count_visible_stone_tiles(cur_tx, cur_ty, &chunk_map);
+                let vis_ground_wood =
+                    count_visible_ground_wood(cur_tx, cur_ty, &spatial, &item_check);
+                let vis_ground_stone =
+                    count_visible_ground_stone(cur_tx, cur_ty, &spatial, &item_check);
+                let vis_ground_food =
+                    count_visible_ground_food(cur_tx, cur_ty, &spatial, &item_check);
 
                 let candidates: Vec<&PlanDef> = plan_registry
                     .0
@@ -2518,47 +3058,83 @@ pub fn plan_execution_system(
                         p.steps
                             .first()
                             .and_then(|&sid| step_registry.0.iter().find(|s| s.id == sid))
-                            .map_or(true, |s| s.preconditions.is_satisfied(&agent, needs.hunger))
+                            .map_or(true, |s| {
+                                s.preconditions.is_satisfied(&agent, &carrier, needs.hunger)
+                            })
                     })
                     // Drop gather plans that have no idea where to go: no memory of
                     // the resource and nothing visible nearby. Otherwise the agent
                     // picks a blind ForageFood/GatherWood/GatherStone, fails to
                     // resolve step 0, and thrashes back through plan selection.
-                    // Explore (memory_target_kind: None) is unaffected and wins by
-                    // default in this case.
-                    .filter(|p| match p.memory_target_kind {
-                        Some(MemoryKind::Food) => {
-                            vis_food > 0
-                                || memory_opt
-                                    .and_then(|m| m.best_for(MemoryKind::Food))
-                                    .is_some()
-                        }
-                        Some(MemoryKind::Wood) => {
-                            vis_wood > 0
-                                || memory_opt
-                                    .and_then(|m| m.best_for(MemoryKind::Wood))
-                                    .is_some()
-                        }
-                        Some(MemoryKind::Stone) => {
-                            vis_stone > 0
-                                || memory_opt
-                                    .and_then(|m| m.best_for(MemoryKind::Stone))
-                                    .is_some()
-                        }
-                        _ => true,
-                    })
-                    // Drop plans whose dispatch just failed — otherwise the NN
-                    // re-picks the same broken plan every selection cycle and
-                    // the agent thrashes through ActivePlan inserts/removes
-                    // without ever running anything. Explore is exempted so
-                    // there's always a safety-net plan that survives the filter.
+                    // The ExploreFor* plans invert this gate: they're available
+                    // only when memory and visibility are both empty for their
+                    // target kind, so they cover the "no idea where to go" case.
                     .filter(|p| {
-                        if p.id == EXPLORE_PLAN_ID {
-                            return true;
+                        // Scavenge plans only act on loose ground items, so gate
+                        // them on the matching ground-vis slot. Without this they
+                        // fall through to the `_ => true` arm and get scored on
+                        // the (now-zeroed) ground signal, which is fine, but
+                        // dropping them here keeps the candidate set small and
+                        // mirrors the gather-plan gates below.
+                        if p.id == SCAVENGE_FOOD_PLAN_ID {
+                            return vis_ground_food > 0;
                         }
-                        plan_history_opt
-                            .as_deref()
-                            .map_or(true, |h| !h.recently_failed(p.id))
+                        if p.id == SCAVENGE_WOOD_PLAN_ID {
+                            return vis_ground_wood > 0;
+                        }
+                        if p.id == SCAVENGE_STONE_PLAN_ID {
+                            return vis_ground_stone > 0;
+                        }
+                        // Inverted gate for ExploreFor* — available only when we
+                        // have no visibility of the source, no visibility of
+                        // loose goods, and no memory. If a worker can see a pile
+                        // of wood there's nothing left to explore for.
+                        if p.id == EXPLORE_FOOD_PLAN_ID {
+                            return vis_plant_food == 0
+                                && vis_ground_food == 0
+                                && memory_opt
+                                    .and_then(|m| m.best_for(MemoryKind::Food))
+                                    .is_none();
+                        }
+                        if p.id == EXPLORE_WOOD_PLAN_ID {
+                            return vis_trees == 0
+                                && vis_ground_wood == 0
+                                && memory_opt
+                                    .and_then(|m| m.best_for(MemoryKind::Wood))
+                                    .is_none();
+                        }
+                        if p.id == EXPLORE_STONE_PLAN_ID {
+                            return vis_stone_tiles == 0
+                                && vis_ground_stone == 0
+                                && memory_opt
+                                    .and_then(|m| m.best_for(MemoryKind::Stone))
+                                    .is_none();
+                        }
+                        // Source-only gate for gather/farm/deliver plans: each
+                        // can only resolve a target through `FromMemory` (filtered
+                        // to the matching source) or by walking to a visible
+                        // source. Loose ground items don't help these plans.
+                        match p.memory_target_kind {
+                            Some(MemoryKind::Food) => {
+                                vis_plant_food > 0
+                                    || memory_opt
+                                        .and_then(|m| m.best_for(MemoryKind::Food))
+                                        .is_some()
+                            }
+                            Some(MemoryKind::Wood) => {
+                                vis_trees > 0
+                                    || memory_opt
+                                        .and_then(|m| m.best_for(MemoryKind::Wood))
+                                        .is_some()
+                            }
+                            Some(MemoryKind::Stone) => {
+                                vis_stone_tiles > 0
+                                    || memory_opt
+                                        .and_then(|m| m.best_for(MemoryKind::Stone))
+                                        .is_some()
+                            }
+                            _ => true,
+                        }
                     })
                     .collect();
 
@@ -2581,9 +3157,12 @@ pub fn plan_execution_system(
                             memory_opt,
                             &calendar,
                             plan_history_opt.as_deref(),
-                            vis_food,
-                            vis_wood,
-                            vis_stone,
+                            vis_plant_food,
+                            vis_trees,
+                            vis_stone_tiles,
+                            vis_ground_wood,
+                            vis_ground_stone,
+                            vis_ground_food,
                         );
                         let mut scores: Vec<(u16, f32)> = candidates
                             .iter()
@@ -2602,6 +3181,20 @@ pub fn plan_execution_system(
                                 *score += 0.15;
                             }
 
+                            // Soft penalty for plans that recently failed. Kept small
+                            // enough that a strongly-motivated plan (high bias +
+                            // visible target) still wins over the per-resource
+                            // Explore fallback. Entries expire after
+                            // `PLAN_HISTORY_TTL_TICKS`, so a stale failure does not
+                            // suppress a plan forever.
+                            if let Some(history) = plan_history_opt.as_deref() {
+                                let n =
+                                    history.recently_failed_count(plan_def.id, clock.tick);
+                                if n > 0 {
+                                    *score -= 0.3 * n as f32;
+                                }
+                            }
+
                             let target_tile = plan_def.memory_target_kind.and_then(|k| {
                                 memory_opt
                                     .and_then(|m| m.best_for_dist_weighted(k, (cur_tx, cur_ty)))
@@ -2615,16 +3208,20 @@ pub fn plan_execution_system(
                                         + (target.1 as i32 - c.1 as i32).abs()
                                 });
                                 *score -= (dist_agent + dist_camp) as f32 * 0.002;
-                            } else if plan_def.memory_target_kind.is_some() {
+                            } else if plan_def.memory_target_kind.is_some()
+                                && !is_explore_plan(plan_def.id)
+                            {
                                 // Plan has a target kind but no memory hit. The
                                 // candidate filter only lets Food/Wood/Stone gather
                                 // plans through here when a visible resource exists,
                                 // so this is the visible-but-unmemorised case (or a
                                 // Prey/Seed plan running blind). Gentle penalty.
+                                // ExploreFor* plans intentionally have no memory
+                                // hit (that's why they were picked) — exempting
+                                // them keeps the penalty meaningful for blind
+                                // gather plans only.
                                 *score -= 0.1;
                             }
-                            // Plans without a memory_target_kind (Explore, etc.)
-                            // get no penalty — they're targetless by design.
                         }
 
                         let idx = select_plan_idx(&scores);
@@ -2661,7 +3258,7 @@ pub fn plan_execution_system(
                 .unwrap_or(false);
             if !plan_still_valid {
                 if let Some(history) = plan_history_opt.as_deref_mut() {
-                    history.push(active_plan.plan_id, PlanOutcome::Aborted);
+                    history.push(active_plan.plan_id, PlanOutcome::Aborted, clock.tick);
                 }
                 par_commands.command_scope(|mut commands| {
                     commands.entity(entity).remove::<ActivePlan>();
@@ -2678,7 +3275,7 @@ pub fn plan_execution_system(
             // ── Timeout check ─────────────────────────────────────────────────────
             if clock.tick.saturating_sub(active_plan.started_tick) > active_plan.max_ticks {
                 if let Some(history) = plan_history_opt.as_deref_mut() {
-                    history.push(active_plan.plan_id, PlanOutcome::Interrupted);
+                    history.push(active_plan.plan_id, PlanOutcome::Interrupted, clock.tick);
                 }
                 // ReturnSurplusFood timeout means the agent couldn't reach storage
                 // for 5000 ticks. Drop the surplus on the ground so it isn't
@@ -2712,7 +3309,7 @@ pub fn plan_execution_system(
 
             if active_plan.current_step as usize >= plan_def.steps.len() {
                 if let Some(history) = plan_history_opt.as_deref_mut() {
-                    history.push(active_plan.plan_id, PlanOutcome::Success);
+                    history.push(active_plan.plan_id, PlanOutcome::Success, clock.tick);
                 }
                 par_commands.command_scope(|mut commands| {
                     commands.entity(entity).remove::<ActivePlan>();
@@ -2762,9 +3359,13 @@ pub fn plan_execution_system(
                 }
 
                 // Check preconditions
-                if !step_def.preconditions.is_satisfied(&agent, needs.hunger) {
+                if !step_def.preconditions.is_satisfied(&agent, &carrier, needs.hunger) {
                     if let Some(history) = plan_history_opt.as_deref_mut() {
-                        history.push(active_plan.plan_id, PlanOutcome::FailedPrecondition);
+                        history.push(
+                            active_plan.plan_id,
+                            PlanOutcome::FailedPrecondition,
+                            clock.tick,
+                        );
                     }
                     par_commands.command_scope(|mut commands| {
                         commands.entity(entity).remove::<ActivePlan>();
@@ -2773,6 +3374,7 @@ pub fn plan_execution_system(
                     return;
                 }
 
+                let mut withdraw_intent: Option<(Good, u8)> = None;
                 let resolved = resolve_target(
                     step_def,
                     (cur_tx, cur_ty),
@@ -2800,6 +3402,8 @@ pub fn plan_execution_system(
                     rescue_target_opt,
                     &agent,
                     &carrier,
+                    claim_target_opt,
+                    &mut withdraw_intent,
                 );
 
                 // Discard targets that aren't in the agent's connectivity component.
@@ -2835,6 +3439,11 @@ pub fn plan_execution_system(
                     {
                         ai.craft_recipe_id = step_def.extra as u8;
                     }
+                    // Commit the resolver-chosen withdraw intent (or clear any
+                    // stale intent from a prior dispatch). `withdraw_material_task_system`
+                    // reads this to know which good and how many to take.
+                    ai.withdraw_good = withdraw_intent.map(|(g, _)| g);
+                    ai.withdraw_qty = withdraw_intent.map(|(_, q)| q).unwrap_or(0);
                     active_plan.dispatched = true;
                     active_plan.reward_scale = step_def.reward_scale;
                 } else {
@@ -2844,7 +3453,11 @@ pub fn plan_execution_system(
                     // Underground recovery is handled inside the Explore plan's
                     // step resolver, which the NN can pick like any other plan.
                     if let Some(history) = plan_history_opt.as_deref_mut() {
-                        history.push(active_plan.plan_id, PlanOutcome::FailedNoTarget);
+                        history.push(
+                            active_plan.plan_id,
+                            PlanOutcome::FailedNoTarget,
+                            clock.tick,
+                        );
                     }
                     par_commands.command_scope(|mut commands| {
                         commands.entity(entity).remove::<ActivePlan>();

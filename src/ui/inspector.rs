@@ -562,7 +562,7 @@ pub fn inspector_panel_system(
                             let mut any = false;
                             for i in 0..len {
                                 let idx = (history.head as usize + i) % len;
-                                let Some((plan_id, outcome)) = history.entries[idx] else {
+                                let Some((plan_id, outcome, _tick)) = history.entries[idx] else {
                                     continue;
                                 };
                                 any = true;
@@ -814,6 +814,9 @@ pub fn inspector_panel_system(
                                     0,
                                     0,
                                     0,
+                                    0,
+                                    0,
+                                    0,
                                 );
                                 let cur_tx = (transform.translation.x
                                     / crate::world::terrain::TILE_SIZE)
@@ -841,7 +844,10 @@ pub fn inspector_panel_system(
                                             step_registry.0.iter().find(|s| s.id == sid)
                                         })
                                         .map_or(true, |s| {
-                                            s.preconditions.is_satisfied(agent, needs.hunger)
+                                            let carrier_default =
+                                                crate::simulation::carry::Carrier::default();
+                                            let c = carrier.unwrap_or(&carrier_default);
+                                            s.preconditions.is_satisfied(agent, c, needs.hunger)
                                         });
 
                                     let mut rejection = None;

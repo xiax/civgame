@@ -1,5 +1,6 @@
 use super::construction::{AutonomousBuildingToggle, Blueprint, BlueprintMap};
 use super::faction::{FactionChief, FactionMember, FactionRegistry, StorageTileMap, SOLO};
+use super::jobs::JobClaim;
 use super::lod::LodLevel;
 use super::needs::Needs;
 use super::person::{AiState, Drafted, PersonAI, PlayerOrder};
@@ -94,6 +95,9 @@ pub enum AgentGoal {
     Play = 15,
     /// Plant or tend crops on a designated farm tile. Tech-gated by Agriculture.
     Farm = 16,
+    /// Withdraw materials from faction storage and carry them to a specific
+    /// blueprint. Set exclusively by `JobClaim` of `JobKind::Haul`.
+    Haul = 17,
 }
 
 impl AgentGoal {
@@ -115,6 +119,7 @@ impl AgentGoal {
             AgentGoal::Rescue => "Rescue",
             AgentGoal::Play => "Play",
             AgentGoal::Farm => "Farm",
+            AgentGoal::Haul => "Haul",
         }
     }
 }
@@ -172,6 +177,7 @@ pub fn goal_update_system(
             &mut TargetItem,
             Option<&mut GoalReason>,
             Option<&FactionChief>,
+            Option<&JobClaim>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -190,9 +196,16 @@ pub fn goal_update_system(
         mut target_item,
         reason_opt,
         chief_opt,
+        claim_opt,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
+            continue;
+        }
+        // Workers with an active job claim are owned by job_goal_lock_system (Economy).
+        // Do not override their goal here or the ClaimedHaul/ClaimedBuild plans
+        // will never be reached by plan_execution_system (Sequential).
+        if claim_opt.is_some() {
             continue;
         }
         // Unemployed agents need immediate goal re-evaluation (e.g. just finished a deposit).
@@ -429,16 +442,15 @@ pub fn goal_update_system(
             member.faction_id != SOLO && registry.food_stock(member.faction_id) >= 1.0;
         let is_starving = needs.hunger > 120.0 && agent.total_food() == 0;
 
-        let has_build_site = auto_build.0
+        // Personal blueprints (player-commissioned, owned by this specific
+        // agent) bypass the faction job board and drive AgentGoal::Build
+        // directly. Faction-owned blueprints are routed exclusively through
+        // the Stockpile/Haul/Build job pipeline (see jobs.rs).
+        let has_personal_build_site = auto_build.0
             && bp_map.0.values().any(|&bp_e| {
                 bp_query
                     .get(bp_e)
-                    .map(|bp| {
-                        bp.personal_owner == Some(entity)
-                            || (member.faction_id != SOLO
-                                && bp.faction_id == member.faction_id
-                                && bp.personal_owner.is_none())
-                    })
+                    .map(|bp| bp.personal_owner == Some(entity))
                     .unwrap_or(false)
             });
 
@@ -446,6 +458,10 @@ pub fn goal_update_system(
         let agent_hash_val = ((entity.index() as u64 * 2654435761) % 100) as f32 / 100.0;
         let prioritize_food = faction_food_ratio < 1.0 && agent_hash_val > faction_food_ratio;
 
+        // Default fallback goal for unclaimed workers: gather whatever the
+        // faction is short of vs. its anticipatory targets. This loses to
+        // JobClaim-driven goals when the worker holds a claim (see
+        // job_goal_lock_system) — those override `*goal` later in the tick.
         let mut gather_goal = AgentGoal::GatherFood;
         let mut gather_reason = "General Gathering (Food)";
 
@@ -454,36 +470,42 @@ pub fn goal_update_system(
             gather_reason = "Prioritized Gathering (Food Low)";
         } else if member.faction_id != SOLO {
             if let Some(faction) = registry.factions.get(&member.faction_id) {
-                let wood_demand = faction
-                    .resource_demand
+                // Use anticipatory material_targets (and current blueprint
+                // demand baked in via resource_demand) to pick the highest
+                // deficit material.
+                let wood_target = faction
+                    .material_targets
+                    .get(&Good::Wood)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(faction.resource_demand.get(&Good::Wood).copied().unwrap_or(0));
+                let stone_target = faction
+                    .material_targets
+                    .get(&Good::Stone)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(faction.resource_demand.get(&Good::Stone).copied().unwrap_or(0));
+                let wood_stored = faction
+                    .storage
+                    .totals
                     .get(&Good::Wood)
                     .copied()
                     .unwrap_or(0);
-                let wood_supply = faction
-                    .resource_supply
-                    .get(&Good::Wood)
-                    .copied()
-                    .unwrap_or(0);
-                let stone_demand = faction
-                    .resource_demand
+                let stone_stored = faction
+                    .storage
+                    .totals
                     .get(&Good::Stone)
                     .copied()
                     .unwrap_or(0);
-                let stone_supply = faction
-                    .resource_supply
-                    .get(&Good::Stone)
-                    .copied()
-                    .unwrap_or(0);
-
-                let wood_deficit = wood_demand.saturating_sub(wood_supply);
-                let stone_deficit = stone_demand.saturating_sub(stone_supply);
+                let wood_deficit = wood_target.saturating_sub(wood_stored);
+                let stone_deficit = stone_target.saturating_sub(stone_stored);
 
                 if wood_deficit > 0 && wood_deficit >= stone_deficit {
                     gather_goal = AgentGoal::GatherWood;
-                    gather_reason = "Gathering Wood for Blueprints";
+                    gather_reason = "Gathering Wood (Faction Stockpile)";
                 } else if stone_deficit > 0 {
                     gather_goal = AgentGoal::GatherStone;
-                    gather_reason = "Gathering Stone for Blueprints";
+                    gather_reason = "Gathering Stone (Faction Stockpile)";
                 }
             }
         }
@@ -508,8 +530,8 @@ pub fn goal_update_system(
             (AgentGoal::Socialize, "Social Need")
         } else if needs.willpower < play_threshold {
             (AgentGoal::Play, "Low Willpower")
-        } else if has_build_site {
-            (AgentGoal::Build, "Building Projects")
+        } else if has_personal_build_site {
+            (AgentGoal::Build, "Building Personal Project")
         } else if should_craft(&registry, member.faction_id, needs) {
             (AgentGoal::Craft, "Crafting for Faction")
         } else {

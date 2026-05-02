@@ -254,20 +254,21 @@ pub fn withdraw_good_task_system(
     }
 }
 
-/// Withdraw one good currently needed by an unsatisfied blueprint from a
-/// faction storage tile. Driven by `TaskKind::WithdrawMaterial`. Mirrors
-/// `withdraw_food_task_system` but selects by "is needed by a blueprint of
-/// this faction" instead of "is edible".
+/// Withdraw the specific good and quantity committed by the dispatching step
+/// resolver from a faction storage tile. Driven by `TaskKind::WithdrawMaterial`.
+/// The intent (`PersonAI.withdraw_good` / `withdraw_qty`) is set in
+/// `plan_execution_system` when a `StepTarget::NearestFactionStorage*`
+/// resolves; this system consumes it. Without an intent, the task aborts —
+/// every withdraw step now commits a target up front, so an empty intent
+/// means the dispatch path skipped (e.g. plan was preempted) and the safe
+/// thing to do is bail.
 pub fn withdraw_material_task_system(
     mut commands: Commands,
     clock: Res<SimClock>,
     spatial: Res<SpatialIndex>,
     storage_tile_map: Res<StorageTileMap>,
-    bp_map: Res<crate::simulation::construction::BlueprintMap>,
-    bp_query: Query<&crate::simulation::construction::Blueprint>,
     mut ground_items: Query<&mut GroundItem>,
     mut query: Query<(
-        Entity,
         &mut PersonAI,
         &mut EconomicAgent,
         &FactionMember,
@@ -275,29 +276,7 @@ pub fn withdraw_material_task_system(
         &LodLevel,
     )>,
 ) {
-    // Build the set of goods currently wanted by some unsatisfied blueprint
-    // per faction. Doing this once outside the agent loop keeps the per-agent
-    // hot path simple.
-    let mut wanted_by_faction: AHashMap<u32, [bool; crate::economy::goods::GOOD_COUNT]> =
-        AHashMap::new();
-    for (_, &bp_entity) in &bp_map.0 {
-        let Ok(bp) = bp_query.get(bp_entity) else {
-            continue;
-        };
-        let entry = wanted_by_faction
-            .entry(bp.faction_id)
-            .or_insert([false; crate::economy::goods::GOOD_COUNT]);
-        for i in 0..bp.deposit_count as usize {
-            let still = bp.deposits[i]
-                .needed
-                .saturating_sub(bp.deposits[i].deposited);
-            if still > 0 {
-                entry[bp.deposits[i].good as usize] = true;
-            }
-        }
-    }
-
-    for (entity, mut ai, mut agent, member, slot, lod) in query.iter_mut() {
+    for (mut ai, mut agent, member, slot, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -305,11 +284,11 @@ pub fn withdraw_material_task_system(
             continue;
         }
 
-        let _ = entity; // Reserved for future personal-blueprint targeting.
-
         if member.faction_id == SOLO {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
+            ai.withdraw_good = None;
+            ai.withdraw_qty = 0;
             continue;
         }
 
@@ -319,39 +298,45 @@ pub fn withdraw_material_task_system(
             // Storage tile is no longer owned by our faction — abort.
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
+            ai.withdraw_good = None;
+            ai.withdraw_qty = 0;
             continue;
         }
 
-        let wanted = wanted_by_faction.get(&member.faction_id);
-        if wanted.is_none() {
-            // No outstanding blueprint needs — task is moot.
+        let Some(target_good) = ai.withdraw_good else {
+            // No targeted intent — nothing to withdraw. Older opportunistic
+            // behavior is intentionally gone: the resolver must commit a good.
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
+            ai.withdraw_qty = 0;
             continue;
-        }
-        let wanted = wanted.unwrap();
+        };
+        let mut remaining = ai.withdraw_qty as u32;
 
         for &gi_entity in spatial.get(tx as i32, ty as i32) {
+            if remaining == 0 {
+                break;
+            }
             if let Ok(mut gi) = ground_items.get_mut(gi_entity) {
-                if gi.qty == 0 {
+                if gi.qty == 0 || gi.item.good != target_good {
                     continue;
                 }
-                if !wanted[gi.item.good as usize] {
-                    continue;
-                }
-                agent.add_good(gi.item.good, 1);
-                if gi.qty == 1 {
+                let take = remaining.min(gi.qty);
+                agent.add_good(gi.item.good, take);
+                if gi.qty == take {
                     commands.entity(gi_entity).despawn();
                 } else {
-                    gi.qty -= 1;
+                    gi.qty -= take;
                 }
-                break;
+                remaining -= take;
             }
         }
 
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
+        ai.withdraw_good = None;
+        ai.withdraw_qty = 0;
     }
 }
 

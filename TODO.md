@@ -20,8 +20,10 @@ X- add parallelization
 - faction camp should have 20 tiles view range
 - rimworld-like bottom menu for mass orders for gathering wood or farming or gathering bushes or construction
 - Additional orders for mass crafting from a central control menu
-- world generation to be more expansive with larger plains, bigger valleys and mountains, larger bodies of water, etc.
-- implement willpower system. Work decreases willpower, fun stuff increases willpower, add play task, low willpower workers can look for entertainment items or people to play with. Any item like wood or stone can be played with, though they have low entertainment value. Add entertainment values to every item. Playing with other people should have higher value for everyone except loners. Playing with people counts as socialization as well and builds relationships
+- world generation to be more expansive with wider plains, bigger valleys and mountains, larger bodies of water, etc.
+X implement willpower system. Work decreases willpower, fun stuff increases willpower, add play task, low willpower workers can look for entertainment items or people to play with. Any item like wood or stone can be played with, though they have low entertainment value. Add entertainment values to every item. Playing with other people should have higher value for everyone except loners. Playing with people counts as socialization as well and builds relationships
+- allow workers to get more than one thing if their hands aren't full
+-  I want to refactor the resouce collection system. Rather than      
 
 
 2. The "Unique Target" Problem

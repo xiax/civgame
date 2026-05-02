@@ -449,6 +449,8 @@ pub fn pregnancy_system(
                     current_z: chunk_map.surface_z_at(tx, ty) as i8,
                     target_z: chunk_map.surface_z_at(tx, ty) as i8,
                     craft_recipe_id: 0,
+                    withdraw_good: None,
+                    withdraw_qty: 0,
                 },
                 EconomicAgent::default(),
             ),
@@ -476,7 +478,7 @@ pub fn pregnancy_system(
                 AgentMemory::default(),
                 RelationshipMemory::default(),
                 KnownPlans::with_innate(&[
-    0, 1, 2, 3, 5, 6, 7, 23, 25, 26, 27, 28, 30, 31, 32,
+    0, 1, 2, 3, 5, 6, 7, 23, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
 ]),
                 PlanHistory::default(),
                 PlanScoringMethod::Weighted,

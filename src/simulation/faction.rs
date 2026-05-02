@@ -346,6 +346,13 @@ pub struct FactionData {
     /// faction. Stage 3 reads this in `generate_candidates` to avoid picking
     /// blueprints that need a chronically-deficient input. Range 0..=255.
     pub material_deficit_ema: ahash::AHashMap<crate::economy::goods::Good, u8>,
+    /// Anticipatory stockpile reserves: target storage levels per Good that
+    /// the chief asks workers to maintain even before any blueprint demands
+    /// them. Computed each chief tick from member count, culture traits,
+    /// and tech foresight. Consumed by `chief_job_posting_system` to size
+    /// Stockpile postings, and by `goal_update_system` to pick a fallback
+    /// gather goal for unclaimed workers. Range 0..=u32::MAX.
+    pub material_targets: ahash::AHashMap<crate::economy::goods::Good, u32>,
 }
 
 #[derive(Resource, Default)]
@@ -393,6 +400,7 @@ impl FactionRegistry {
                 active_upgrade: None,
                 workforce_budget: crate::simulation::projects::WorkforceBudget::default(),
                 material_deficit_ema: ahash::AHashMap::default(),
+                material_targets: ahash::AHashMap::default(),
             },
         );
         id
@@ -637,7 +645,7 @@ pub fn drop_items_at_destination_system(
                     &mut board,
                     &mut job_completed,
                     claim,
-                    JobKind::Gather,
+                    JobKind::Stockpile,
                     Some(Good::Wood),
                     hand_wood,
                 );
@@ -648,7 +656,7 @@ pub fn drop_items_at_destination_system(
                     &mut board,
                     &mut job_completed,
                     claim,
-                    JobKind::Gather,
+                    JobKind::Stockpile,
                     Some(Good::Stone),
                     hand_stone,
                 );
@@ -693,7 +701,7 @@ pub fn drop_items_at_destination_system(
                         &mut board,
                         &mut job_completed,
                         claim,
-                        JobKind::Gather,
+                        JobKind::Stockpile,
                         deposited_calories,
                     );
                 }
@@ -1023,6 +1031,60 @@ pub fn resource_demand_system(
         faction.resource_demand.insert(Good::Fruit, food_demand);
         faction.resource_demand.insert(Good::Meat, food_demand);
         faction.resource_demand.insert(Good::Grain, food_demand);
+    }
+}
+
+// ── Material stockpile target system ──────────────────────────────────────────
+
+/// Refresh `FactionData::material_targets` for every faction. Targets are
+/// anticipatory reserves the chief asks workers to keep in storage even when
+/// no blueprint currently demands them. Driven by member count, culture
+/// traits, and tech foresight; runs every 60 ticks in Economy.
+pub fn update_material_targets_system(
+    clock: Res<SimClock>,
+    mut registry: ResMut<FactionRegistry>,
+) {
+    if clock.tick % 60 != 0 {
+        return;
+    }
+    for faction in registry.factions.values_mut() {
+        if faction.member_count == 0 {
+            faction.material_targets.clear();
+            continue;
+        }
+        // Baseline: scale with member count so larger tribes hold more
+        // headroom for spontaneous upgrades.
+        let members = faction.member_count;
+        let mut wood_target = (members * 2).max(8);
+        let mut stone_target = members.max(4);
+
+        // Culture modulation. Trait values are 0..=255; clamp the multiplier
+        // to a sane range so high-defense factions stockpile ~50% more stone.
+        let scale_u32 = |base: u32, trait_value: u8, max_bonus: f32| -> u32 {
+            let t = trait_value as f32 / 255.0;
+            let mult = 1.0 + t * max_bonus;
+            (base as f32 * mult).round() as u32
+        };
+        // Defensive cultures want more stone (walls); martial want both.
+        stone_target = scale_u32(stone_target, faction.culture.defensive, 0.5);
+        stone_target = scale_u32(stone_target, faction.culture.martial, 0.25);
+        wood_target = scale_u32(wood_target, faction.culture.martial, 0.25);
+        // Ceremonial bumps stone (shrines/monuments).
+        stone_target = scale_u32(stone_target, faction.culture.ceremonial, 0.3);
+        // Mercantile bumps wood (markets, granaries).
+        wood_target = scale_u32(wood_target, faction.culture.mercantile, 0.25);
+
+        // Tech foresight: once flint knapping or settlement is unlocked,
+        // construction tier-ups will start consuming stone in volume.
+        if faction.techs.has(crate::simulation::technology::FLINT_KNAPPING) {
+            stone_target = stone_target.saturating_add(4);
+        }
+        if faction.techs.has(crate::simulation::technology::PERM_SETTLEMENT) {
+            wood_target = wood_target.saturating_add(4);
+        }
+
+        faction.material_targets.insert(Good::Wood, wood_target);
+        faction.material_targets.insert(Good::Stone, stone_target);
     }
 }
 

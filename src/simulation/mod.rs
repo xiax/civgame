@@ -213,6 +213,13 @@ impl Plugin for SimulationPlugin {
             )
             .add_systems(
                 FixedUpdate,
+                (plan::explore_satisfaction_system
+                    .after(memory::vision_system)
+                    .before(plan::plan_execution_system),)
+                    .in_set(SimulationSet::Sequential),
+            )
+            .add_systems(
+                FixedUpdate,
                 (movement::recover_stranded_agents_system
                     .after(movement::movement_system)
                     .after(construction::construction_system)
@@ -315,6 +322,8 @@ impl Plugin for SimulationPlugin {
                     construction::assign_beds_system,
                     faction::resource_demand_system
                         .after(construction::chief_directive_system)
+                        .after(faction::compute_faction_storage_system),
+                    faction::update_material_targets_system
                         .after(faction::compute_faction_storage_system),
                     technology::tech_discovery_system
                         .after(faction::compute_faction_storage_system)
