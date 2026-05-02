@@ -1659,23 +1659,49 @@ fn generate_candidates(
         }
     }
 
-    // 1. Hearths — band camps (pre-PERM_SETTLEMENT) target one fire per
-    //    ~6 members, capped at 3, so a growing band naturally splits into
-    //    multiple hearth-clusters rather than piling everyone around a
-    //    single fire. Sedentary cultures keep the single civic-zone hearth.
+    // 1. Hearths — band camps (pre-PERM_SETTLEMENT) grow one fire per ~6
+    //    members, but actual queue cadence is driven by *bed-crescent
+    //    saturation*: a new hearth only opens when the existing crescents
+    //    can't fit another bed AND members still lack one. Settled cultures
+    //    keep the single civic-zone hearth (hearth-per-house is future work
+    //    that requires a Household redesign).
     let desired_hearths: u32 = if !techs.has(PERM_SETTLEMENT) {
         crate::simulation::settlement::paleolithic_hearth_count(members)
     } else {
         1
     };
     let existing_hearths = count_campfires_near(&maps.campfire_map, home, 30) as u32;
-    // Pacing: don't pre-emptively start a second hearth while the first is
-    // still acquiring its bed crescents. Require ~4 beds per existing hearth
-    // before opening a new one. Only applies once at least one fire is up.
-    let total_beds_so_far = count_beds_near(&maps.bed_map, home, 30) as u32;
-    let bed_pacing_ok =
-        existing_hearths == 0 || total_beds_so_far >= existing_hearths.saturating_mul(4);
-    let effective_desired = if bed_pacing_ok {
+    let bed_count = count_beds_near(&maps.bed_map, home, 30) as i32;
+    let bed_deficit_pre = (members as i32 - bed_count).max(0);
+    let gate_ok = if existing_hearths == 0 {
+        true
+    } else if !techs.has(PERM_SETTLEMENT) {
+        let hearths: Vec<(i16, i16)> = maps
+            .campfire_map
+            .0
+            .keys()
+            .copied()
+            .filter(|&(cx, cy)| {
+                (cx as i32 - home.0 as i32).abs() <= 25
+                    && (cy as i32 - home.1 as i32).abs() <= 25
+            })
+            .collect();
+        let crescents_saturated = !hearths.is_empty()
+            && find_bed_tile_around_hearth(
+                chunk_map,
+                &maps.bed_map,
+                bp_map,
+                &hearths,
+                home,
+                2,
+                6,
+            )
+            .is_none();
+        crescents_saturated && bed_deficit_pre > 0
+    } else {
+        false
+    };
+    let effective_desired = if gate_ok {
         desired_hearths
     } else {
         existing_hearths
@@ -1729,8 +1755,7 @@ fn generate_candidates(
         }
     }
 
-    let bed_count = count_beds_near(&maps.bed_map, home, 30) as i32;
-    let bed_deficit = (members as i32 - bed_count).max(0) as f32;
+    let bed_deficit = bed_deficit_pre as f32;
 
     // 2. Residential — the principal growth axis. Pre-settlement: simple beds.
     //    Post-settlement: walled huts; with CITY_STATE_ORG, longhouses preferred.

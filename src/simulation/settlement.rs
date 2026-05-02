@@ -172,14 +172,18 @@ pub const PALEO_PRIMARY_HEARTH_DIST: f32 = 5.0;
 pub const PALEO_SECONDARY_HEARTH_DIST: f32 = 12.0;
 
 /// Number of hearths a Paleolithic band camp targets given a member count.
-/// One hearth per ~6 members, capped at 3 (mirrors band-society scale).
+/// One hearth per ~6 members. The actual hearth-queue cadence is gated by
+/// crescent saturation + bed deficit in `generate_candidates`, so this is an
+/// upper bound, not a hard cap.
 pub fn paleolithic_hearth_count(members: u32) -> u32 {
-    ((members + 5) / 6).max(1).min(3)
+    ((members + 5) / 6).max(1)
 }
 
 /// Compute the deterministic Paleolithic hearth positions for a faction.
 /// `faction_id` selects the primary angle so different bands face different
-/// directions; secondary/tertiary hearths fan ±90° off the primary.
+/// directions; subsequent hearths fan around the home at secondary distance,
+/// pushing outward each lap so unbounded member counts still yield distinct
+/// positions.
 pub fn paleolithic_hearth_positions(
     faction_id: u32,
     home: (i16, i16),
@@ -190,23 +194,29 @@ pub fn paleolithic_hearth_positions(
     let theta0 =
         (faction_id.wrapping_mul(2654435761) as f32 / u32::MAX as f32) * std::f32::consts::TAU;
     let mut hearths = Vec::with_capacity(n as usize);
-    let primary = (
+    hearths.push((
         (hx as f32 + theta0.cos() * PALEO_PRIMARY_HEARTH_DIST).round() as i32,
         (hy as f32 + theta0.sin() * PALEO_PRIMARY_HEARTH_DIST).round() as i32,
-    );
-    hearths.push(primary);
-    if n >= 2 {
-        let theta1 = theta0 + std::f32::consts::FRAC_PI_2 + 0.3;
+    ));
+    // Preserved n=2,3 angles (±π/2±0.3) lead, then fill the remaining ring.
+    let offsets: [f32; 8] = [
+        std::f32::consts::FRAC_PI_2 + 0.3,
+        -std::f32::consts::FRAC_PI_2 - 0.3,
+        std::f32::consts::PI,
+        2.0 * std::f32::consts::PI / 3.0,
+        -2.0 * std::f32::consts::PI / 3.0,
+        std::f32::consts::FRAC_PI_4,
+        -std::f32::consts::FRAC_PI_4,
+        std::f32::consts::PI - std::f32::consts::FRAC_PI_4,
+    ];
+    for k in 1..n as usize {
+        let off = offsets[(k - 1) % offsets.len()];
+        let lap = ((k - 1) / offsets.len()) as f32;
+        let scale = 1.0 + 0.18 * lap;
+        let theta = theta0 + off;
         hearths.push((
-            (hx as f32 + theta1.cos() * PALEO_SECONDARY_HEARTH_DIST).round() as i32,
-            (hy as f32 + theta1.sin() * PALEO_SECONDARY_HEARTH_DIST).round() as i32,
-        ));
-    }
-    if n >= 3 {
-        let theta2 = theta0 - std::f32::consts::FRAC_PI_2 - 0.3;
-        hearths.push((
-            (hx as f32 + theta2.cos() * PALEO_SECONDARY_HEARTH_DIST).round() as i32,
-            (hy as f32 + theta2.sin() * PALEO_SECONDARY_HEARTH_DIST).round() as i32,
+            (hx as f32 + theta.cos() * PALEO_SECONDARY_HEARTH_DIST * scale).round() as i32,
+            (hy as f32 + theta.sin() * PALEO_SECONDARY_HEARTH_DIST * scale).round() as i32,
         ));
     }
     hearths
