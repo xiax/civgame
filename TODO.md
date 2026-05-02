@@ -24,7 +24,7 @@ X- add parallelization
 X implement willpower system. Work decreases willpower, fun stuff increases willpower, add play task, low willpower workers can look for entertainment items or people to play with. Any item like wood or stone can be played with, though they have low entertainment value. Add entertainment values to every item. Playing with other people should have higher value for everyone except loners. Playing with people counts as socialization as well and builds relationships
 - allow workers to get more than one thing if their hands aren't full
 -  I want to refactor the resouce collection system. Rather than      
-- I want to add a military system to the game. There should be a military button that opens a military menu where players can define their military, add people to the military, either individually or just increase the number cap and
+- I want to add a military system to the game. There should be a military button that opens a military menu where players can define their military, add people to the military, either individually recruiting from a list of all workers or just increase the number cap and the game will automatically pick the most suitable, making sure not to leave crucial industries like food production without workers.
 
 2. The "Unique Target" Problem
   The weakness of Flow Fields is when every unit wants to go to a different spot (e.g., 100k units each picking a
