@@ -154,13 +154,17 @@ pub fn generate_globe(seed: u64) -> Globe {
 
     for gy in 0..GLOBE_HEIGHT {
         for gx in 0..GLOBE_WIDTH {
-            let nx = gx as f64 * 0.06;
-            let ny = gy as f64 * 0.06;
+            let nx = gx as f64 * 0.03;
+            let ny = gy as f64 * 0.03;
 
-            // Elevation: layered noise
-            let ev = elev_noise.get([nx, ny]) * 0.60
-                + elev_noise.get([nx * 2.0, ny * 2.0]) * 0.30
-                + elev_noise.get([nx * 4.0, ny * 4.0]) * 0.10;
+            // Elevation: 4-octave FBM with a continental macro layer at 0.012
+            // for large oceans/landmasses; halved base frequency vs the
+            // original (0.03 was 0.06) makes biome patches span more cells.
+            let macro_e = elev_noise.get([gx as f64 * 0.012, gy as f64 * 0.012]);
+            let ev = macro_e * 0.30
+                + elev_noise.get([nx, ny]) * 0.42
+                + elev_noise.get([nx * 2.0, ny * 2.0]) * 0.20
+                + elev_noise.get([nx * 4.0, ny * 4.0]) * 0.08;
             let elev_f = ((ev + 1.0) * 0.5) as f32;
 
             // Temperature: warm equator, cold poles, cool mountains
@@ -168,7 +172,8 @@ pub fn generate_globe(seed: u64) -> Globe {
             let temp_f = (1.0 - lat_f * 0.55 - elev_f * 0.45).clamp(0.0, 1.0);
             let temp_c = (temp_f * 80.0 - 30.0) as i8; // -30 to +50°C
 
-            // Rainfall
+            // Rainfall (frequency halved with elevation so wet/dry bands match
+            // the larger biome patches)
             let rv = rain_noise.get([nx + 5.0, ny + 5.0]) * 0.70
                 + rain_noise.get([nx * 3.0, ny * 3.0]) * 0.30;
             let rain_f = ((rv + 1.0) * 0.5) as f32;

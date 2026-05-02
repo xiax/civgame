@@ -61,6 +61,9 @@ ParallelA → ParallelB → Sequential → Economy
 
 ### World and rendering
 
+- **Terrain noise (`terrain.rs::surface_v`):** 4-octave FBM — continental macro layer at freq 0.005 (weight 0.35), base octave at 0.02 (0.40), then 2× and 4× harmonics (0.18, 0.07). The result is reshaped via a signed power curve `sign(c) * |c|^0.65` (centered around 0.5) so peaks/basins push toward Z extremes instead of clustering at mid-elevation. Lowering the base frequency or the power exponent makes features bigger / more dramatic respectively.
+- **Globe noise (`globe.rs::generate_globe`):** Elevation uses 4 octaves: continental at 0.012 (weight 0.30), then 0.03/0.06/0.12 (0.42, 0.20, 0.08). Rainfall uses 2 octaves at 0.03 / 0.09 (0.70 / 0.30). Halved frequencies (vs the older 0.06 base) give continent-scale biome patches across the 64×32 globe grid.
+- **Cached globe (`world.bin`):** `globe.rs::load_or_generate` deserializes this file if present and skips regeneration. Delete `world.bin` after changing globe-level noise to see the effect; tile-level (`terrain.rs`) changes are always live.
 - **`TileChangedEvent` pipeline:** Mutations to `ChunkMap` emit `TileChangedEvent`; `refresh_changed_tiles_system` (PostUpdate) rebuilds the affected tile sprites. Use this whenever code edits a tile in place.
 - **`CameraViewZ`:** Player-controlled view Z-level — defaults to `i32::MAX` (surface). Lower it to peer underground; `update_tile_z_view_system` re-skins all tile sprites accordingly.
 - **`sprite_library.rs`:** Procedural pixel-art sprites built from a 32-color warm earth-tone palette via `ascii_to_image` + char-substitution templates. Loaded at `Startup` by `setup_sprite_library`. New sprites should reuse the palette and substitution helpers rather than introducing new color systems.

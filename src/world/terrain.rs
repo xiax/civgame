@@ -38,24 +38,34 @@ impl Default for WorldGen {
 pub fn biome_thresholds(biome: Biome) -> (f32, f32, f32, f32) {
     match biome {
         Biome::Ocean => (0.90, 0.95, 0.97, 0.99),
-        Biome::Tundra => (0.15, 0.80, 0.85, 0.95),
+        Biome::Tundra => (0.18, 0.80, 0.85, 0.95),
         Biome::Taiga => (0.18, 0.35, 0.40, 0.85),
-        Biome::Temperate => (0.22, 0.45, 0.60, 0.85),
+        Biome::Temperate => (0.26, 0.45, 0.60, 0.85),
         Biome::Grassland => (0.18, 0.60, 0.75, 0.88),
-        Biome::Tropical => (0.20, 0.30, 0.35, 0.88),
+        Biome::Tropical => (0.25, 0.30, 0.35, 0.88),
         Biome::Desert => (0.10, 0.65, 0.68, 0.75),
         Biome::Mountain => (0.12, 0.25, 0.28, 0.50),
     }
 }
 
 /// Fractional surface noise value at (tx, ty). Range [0, 1].
+///
+/// 4-octave FBM with a continental macro layer; the result is reshaped via a
+/// signed power curve so peaks and basins push toward the Z extremes instead
+/// of clustering near 0.5. Lower base frequency than the original (0.02 vs
+/// 0.04) doubles feature wavelength.
 fn surface_v(tx: i32, ty: i32, surface: &Perlin) -> f32 {
-    let nx = tx as f64 * 0.04;
-    let ny = ty as f64 * 0.04;
-    let v = surface.get([nx, ny]) * 0.6
-        + surface.get([nx * 2.0, ny * 2.0]) * 0.3
-        + surface.get([nx * 4.0, ny * 4.0]) * 0.1;
-    ((v + 1.0) * 0.5) as f32
+    let nx = tx as f64 * 0.02;
+    let ny = ty as f64 * 0.02;
+    let macro_v = surface.get([tx as f64 * 0.005, ty as f64 * 0.005]);
+    let v = macro_v * 0.35
+        + surface.get([nx, ny]) * 0.40
+        + surface.get([nx * 2.0, ny * 2.0]) * 0.18
+        + surface.get([nx * 4.0, ny * 4.0]) * 0.07;
+    let n = (((v + 1.0) * 0.5) as f32).clamp(0.0, 1.0);
+    let centered = (n - 0.5) * 2.0;
+    let shaped = centered.signum() * centered.abs().powf(0.65);
+    (shaped * 0.5 + 0.5).clamp(0.0, 1.0)
 }
 
 /// Compute discrete surface Z level at world tile (tx, ty). O(1).
