@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use super::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_HEIGHT, CHUNK_SIZE, Z_MAX, Z_MIN};
 use super::globe::{Biome, Globe, WorldCell, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
-use super::tile::{TileData, TileKind};
+use super::tile::{OreKind, TileData, TileKind};
 
 pub const WORLD_CHUNKS_X: i32 = 32;
 pub const WORLD_CHUNKS_Y: i32 = 32;
@@ -12,11 +12,19 @@ pub const TILE_SIZE: f32 = 16.0;
 
 const WORLD_SEED: u32 = 42;
 
-/// Both Perlin instances used for world generation, stored as a Bevy resource.
+/// Perlin instances used for world generation, stored as a Bevy resource.
+/// One noise field per ore lets veins of different ores overlap and span
+/// independent depth bands (see `ORE_BANDS`).
 #[derive(Resource)]
 pub struct WorldGen {
     pub surface: Perlin, // 2D surface height + tile kind (seed WORLD_SEED)
     pub cave: Perlin,    // 3D cave cavities (seed WORLD_SEED + 1)
+    pub coal: Perlin,    // 3D coal vein noise (WORLD_SEED + 2)
+    pub copper: Perlin,  // 3D copper vein noise (WORLD_SEED + 3)
+    pub iron: Perlin,    // 3D iron vein noise (WORLD_SEED + 4)
+    pub tin: Perlin,     // 3D tin vein noise (WORLD_SEED + 5)
+    pub silver: Perlin,  // 3D silver vein noise (WORLD_SEED + 6)
+    pub gold: Perlin,    // 3D gold vein noise (WORLD_SEED + 7)
 }
 
 impl WorldGen {
@@ -24,9 +32,60 @@ impl WorldGen {
         Self {
             surface: Perlin::default().set_seed(WORLD_SEED),
             cave: Perlin::default().set_seed(WORLD_SEED + 1),
+            coal: Perlin::default().set_seed(WORLD_SEED + 2),
+            copper: Perlin::default().set_seed(WORLD_SEED + 3),
+            iron: Perlin::default().set_seed(WORLD_SEED + 4),
+            tin: Perlin::default().set_seed(WORLD_SEED + 5),
+            silver: Perlin::default().set_seed(WORLD_SEED + 6),
+            gold: Perlin::default().set_seed(WORLD_SEED + 7),
+        }
+    }
+
+    fn perlin_for_ore(&self, ore: OreKind) -> Option<&Perlin> {
+        match ore {
+            OreKind::Coal => Some(&self.coal),
+            OreKind::Copper => Some(&self.copper),
+            OreKind::Iron => Some(&self.iron),
+            OreKind::Tin => Some(&self.tin),
+            OreKind::Silver => Some(&self.silver),
+            OreKind::Gold => Some(&self.gold),
+            OreKind::None => None,
         }
     }
 }
+
+/// Topsoil layer depth (number of `Dirt` tiles below the surface) by biome.
+/// Mountains have thin soil; taiga/tropical/temperate have deep soil.
+pub fn topsoil_depth(biome: Biome) -> i32 {
+    match biome {
+        Biome::Mountain => 1,
+        Biome::Desert | Biome::Tundra => 2,
+        Biome::Grassland => 3,
+        Biome::Taiga | Biome::Tropical | Biome::Temperate => 4,
+        Biome::Ocean => 0,
+    }
+}
+
+/// Ore vein parameters. `top_offset..=bot_offset` is the depth band (in tiles
+/// below the surface) where this ore can spawn; outside the band the noise is
+/// not even sampled. Higher `threshold` = rarer (Perlin output ≈ [-1, 1]).
+struct OreBand {
+    kind: OreKind,
+    top_offset: i32,
+    bot_offset: i32,
+    threshold: f64,
+    freq_xy: f64,
+    freq_z: f64,
+}
+
+const ORE_BANDS: &[OreBand] = &[
+    OreBand { kind: OreKind::Coal,   top_offset: 1,  bot_offset: 6,  threshold: 0.45, freq_xy: 0.10, freq_z: 0.18 },
+    OreBand { kind: OreKind::Copper, top_offset: 2,  bot_offset: 8,  threshold: 0.50, freq_xy: 0.10, freq_z: 0.18 },
+    OreBand { kind: OreKind::Tin,    top_offset: 5,  bot_offset: 12, threshold: 0.55, freq_xy: 0.10, freq_z: 0.18 },
+    OreBand { kind: OreKind::Iron,   top_offset: 6,  bot_offset: 14, threshold: 0.52, freq_xy: 0.10, freq_z: 0.18 },
+    OreBand { kind: OreKind::Silver, top_offset: 10, bot_offset: 18, threshold: 0.60, freq_xy: 0.12, freq_z: 0.20 },
+    OreBand { kind: OreKind::Gold,   top_offset: 14, bot_offset: 32, threshold: 0.65, freq_xy: 0.12, freq_z: 0.20 },
+];
 
 impl Default for WorldGen {
     fn default() -> Self {
@@ -91,11 +150,14 @@ fn surface_kind_fn(v: f32, water_t: f32, grass_t: f32, farm_t: f32, forest_t: f3
 
 /// Deterministically compute the tile at world tile coords (tx, ty, tz).
 /// Pure — no side effects, no allocations. Safe to call from any thread.
+///
+/// `biome` controls topsoil depth (Dirt layer thickness) for subsurface tiles.
 pub fn proc_tile(
     tx: i32,
     ty: i32,
     tz: i32,
     gen: &WorldGen,
+    biome: Biome,
     water_t: f32,
     grass_t: f32,
     farm_t: f32,
@@ -124,10 +186,12 @@ pub fn proc_tile(
             elevation: (v * 255.0) as u8,
             fertility,
             flags: 0,
+            ore: 0,
         };
     }
 
-    // Below surface — check for cave cavities.
+    // Below surface — cave cavities take precedence over geology so that any
+    // ore intersected by a cave is "lost" (becomes Air or a Dirt cave floor).
     let nx = tx as f64 * 0.08;
     let ny = ty as f64 * 0.08;
     let nz = tz as f64 * 0.12;
@@ -145,6 +209,39 @@ pub fn proc_tile(
             kind,
             ..Default::default()
         };
+    }
+
+    // Topsoil layer: a few Dirt tiles directly below the surface, biome-thick.
+    let depth = surf_z - tz; // > 0 below surface
+    if depth <= topsoil_depth(biome) {
+        return TileData {
+            kind: TileKind::Dirt,
+            ..Default::default()
+        };
+    }
+
+    // Bedrock band: try ore veins in declared order. Skip the noise sample
+    // entirely when the depth is outside an ore's band — keeps deep tiles fast.
+    for band in ORE_BANDS {
+        if depth < band.top_offset || depth > band.bot_offset {
+            continue;
+        }
+        let perlin = match gen.perlin_for_ore(band.kind) {
+            Some(p) => p,
+            None => continue,
+        };
+        let v = perlin.get([
+            tx as f64 * band.freq_xy,
+            ty as f64 * band.freq_xy,
+            tz as f64 * band.freq_z,
+        ]);
+        if v > band.threshold {
+            return TileData {
+                kind: TileKind::Ore,
+                ore: band.kind.as_u8(),
+                ..Default::default()
+            };
+        }
     }
 
     TileData {
@@ -186,7 +283,7 @@ pub fn tile_at_3d(
     );
     let biome = globe.cell(gx, gy).map(|c| c.biome).unwrap_or_default();
     let (water_t, grass_t, farm_t, forest_t) = biome_thresholds(biome);
-    proc_tile(tx, ty, tz, gen, water_t, grass_t, farm_t, forest_t)
+    proc_tile(tx, ty, tz, gen, biome, water_t, grass_t, farm_t, forest_t)
 }
 
 /// Build a new Chunk: empty delta map + surface_z and surface_kind caches pre-filled.
@@ -292,7 +389,7 @@ mod tests {
     fn proc_tile_above_surface_is_air() {
         let gen = WorldGen::new();
         let surf = surface_height(5, 5, &gen);
-        let t = proc_tile(5, 5, surf + 1, &gen, 0.22, 0.45, 0.60, 0.75);
+        let t = proc_tile(5, 5, surf + 1, &gen, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
         assert_eq!(t.kind, TileKind::Air);
     }
 
@@ -300,27 +397,38 @@ mod tests {
     fn proc_tile_surface_not_wall_or_air() {
         let gen = WorldGen::new();
         let surf = surface_height(5, 5, &gen);
-        let t = proc_tile(5, 5, surf, &gen, 0.22, 0.45, 0.60, 0.75);
+        let t = proc_tile(5, 5, surf, &gen, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
         assert!(!matches!(t.kind, TileKind::Air | TileKind::Wall));
     }
 
     #[test]
-    fn proc_tile_deep_is_wall_or_cave() {
+    fn proc_tile_deep_is_wall_or_cave_or_ore() {
         let gen = WorldGen::new();
         let surf = surface_height(5, 5, &gen);
-        let t = proc_tile(5, 5, surf - 5, &gen, 0.22, 0.45, 0.60, 0.75);
+        let t = proc_tile(5, 5, surf - 10, &gen, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
         assert!(matches!(
             t.kind,
-            TileKind::Wall | TileKind::Air | TileKind::Dirt
+            TileKind::Wall | TileKind::Air | TileKind::Dirt | TileKind::Ore
         ));
+    }
+
+    #[test]
+    fn proc_tile_topsoil_is_dirt() {
+        let gen = WorldGen::new();
+        let surf = surface_height(5, 5, &gen);
+        // One tile below the surface should be Dirt (topsoil) for any non-Mountain biome,
+        // unless cave noise carves through. Check Temperate which has 4 Dirt tiles.
+        let t = proc_tile(5, 5, surf - 1, &gen, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
+        assert!(matches!(t.kind, TileKind::Dirt | TileKind::Air));
     }
 
     #[test]
     fn proc_tile_deterministic() {
         let gen = WorldGen::new();
-        let a = proc_tile(10, 20, 0, &gen, 0.22, 0.45, 0.60, 0.75);
-        let b = proc_tile(10, 20, 0, &gen, 0.22, 0.45, 0.60, 0.75);
+        let a = proc_tile(10, 20, 0, &gen, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
+        let b = proc_tile(10, 20, 0, &gen, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
         assert_eq!(a.kind, b.kind);
+        assert_eq!(a.ore, b.ore);
     }
 
     #[test]

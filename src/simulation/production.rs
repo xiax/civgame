@@ -490,21 +490,45 @@ pub fn withdraw_food_task_system(
     }
 }
 
-/// Multi-tick eating: consumes one edible from inventory after `TICKS_EAT` ticks
-/// in the Working state, then reduces hunger and (for Fruit) yields a Seed.
-/// Driven by `TaskKind::Eat`. The Eat task is dispatched in-place by the goal
-/// dispatcher or as the final step of food-gathering plans.
+/// Identifies which physical store an edible candidate lives in.
+/// Inventory stacks are indexed; hand slots are singletons.
+#[derive(Clone, Copy)]
+enum EdibleSlot {
+    Inventory(usize),
+    HandLeft,
+    HandRight,
+}
+
+/// Total edible quantity available to an agent across both their personal
+/// inventory and their hands. Foraged food (Bulk::Small) often lives in hands
+/// because `gather::route_yield` routes through `Carrier::try_pick_up` first.
+pub fn total_edible(agent: &EconomicAgent, carrier: &Carrier) -> u32 {
+    let mut from_hands = 0u32;
+    for slot in [carrier.left, carrier.right].into_iter().flatten() {
+        if slot.item.good.is_edible() {
+            from_hands = from_hands.saturating_add(slot.qty);
+        }
+    }
+    agent.total_food().saturating_add(from_hands)
+}
+
+/// Multi-tick eating: consumes one edible from inventory or hands after
+/// `TICKS_EAT` ticks in the Working state, then reduces hunger and (for Fruit)
+/// yields a Seed. Driven by `TaskKind::Eat`. The Eat task is dispatched
+/// in-place by the goal dispatcher or as the final step of food-gathering
+/// plans.
 pub fn eat_task_system(
     clock: Res<SimClock>,
     mut query: Query<(
         &mut PersonAI,
         &mut EconomicAgent,
+        &mut Carrier,
         &mut Needs,
         &BucketSlot,
         &LodLevel,
     )>,
 ) {
-    for (mut ai, mut agent, mut needs, slot, lod) in query.iter_mut() {
+    for (mut ai, mut agent, mut carrier, mut needs, slot, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -512,8 +536,8 @@ pub fn eat_task_system(
             continue;
         }
 
-        // No food on hand — nothing to eat. Abort cleanly.
-        if agent.total_food() == 0 {
+        // No food on hand or in inventory — nothing to eat. Abort cleanly.
+        if total_edible(&agent, &carrier) == 0 {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
@@ -540,29 +564,75 @@ pub fn eat_task_system(
                 break;
             }
 
-            // Snapshot edible slots in this iteration.
+            // Snapshot edible slots across inventory + hands. Bounded by
+            // INVENTORY_SLOTS (6) + 2 hands; allocation is per eating-tick on
+            // an active eater, which is rare.
             let mut min_nut: u32 = u32::MAX;
             let mut max_nut: u32 = 0;
-            let mut best_cover: Option<(usize, u32)> = None; // (slot_idx, nutrition)
-            let mut best_largest: Option<(usize, u32)> = None;
-            for (idx, (it, q)) in agent.inventory.iter().enumerate() {
-                if !it.good.is_edible() || *q == 0 {
-                    continue;
+            let mut best_cover: Option<(EdibleSlot, u32, Good)> = None;
+            let mut best_largest: Option<(EdibleSlot, u32, Good)> = None;
+            let mut consider = |src: EdibleSlot,
+                                good: Good,
+                                qty: u32,
+                                hunger: f32,
+                                min_nut: &mut u32,
+                                max_nut: &mut u32,
+                                best_cover: &mut Option<(EdibleSlot, u32, Good)>,
+                                best_largest: &mut Option<(EdibleSlot, u32, Good)>| {
+                if qty == 0 || !good.is_edible() {
+                    return;
                 }
-                let nut = it.good.nutrition() as u32;
-                if nut < min_nut {
-                    min_nut = nut;
+                let nut = good.nutrition() as u32;
+                if nut < *min_nut {
+                    *min_nut = nut;
                 }
-                if nut >= max_nut {
-                    max_nut = nut;
-                    best_largest = Some((idx, nut));
+                if nut >= *max_nut {
+                    *max_nut = nut;
+                    *best_largest = Some((src, nut, good));
                 }
-                if (nut as f32) >= needs.hunger {
-                    match best_cover {
-                        Some((_, prev)) if nut >= prev => {}
-                        _ => best_cover = Some((idx, nut)),
+                if (nut as f32) >= hunger {
+                    match *best_cover {
+                        Some((_, prev, _)) if nut >= prev => {}
+                        _ => *best_cover = Some((src, nut, good)),
                     }
                 }
+            };
+
+            for (idx, (it, q)) in agent.inventory.iter().enumerate() {
+                consider(
+                    EdibleSlot::Inventory(idx),
+                    it.good,
+                    *q,
+                    needs.hunger,
+                    &mut min_nut,
+                    &mut max_nut,
+                    &mut best_cover,
+                    &mut best_largest,
+                );
+            }
+            if let Some(s) = carrier.left {
+                consider(
+                    EdibleSlot::HandLeft,
+                    s.item.good,
+                    s.qty,
+                    needs.hunger,
+                    &mut min_nut,
+                    &mut max_nut,
+                    &mut best_cover,
+                    &mut best_largest,
+                );
+            }
+            if let Some(s) = carrier.right {
+                consider(
+                    EdibleSlot::HandRight,
+                    s.item.good,
+                    s.qty,
+                    needs.hunger,
+                    &mut min_nut,
+                    &mut max_nut,
+                    &mut best_cover,
+                    &mut best_largest,
+                );
             }
 
             if min_nut == u32::MAX {
@@ -574,15 +644,22 @@ pub fn eat_task_system(
                 break;
             }
 
-            let pick_idx = match best_cover.or(best_largest) {
-                Some((i, _)) => i,
+            let (src, _nut, good) = match best_cover.or(best_largest) {
+                Some(x) => x,
                 None => break,
             };
 
-            let (it, q) = &mut agent.inventory[pick_idx];
-            *q -= 1;
-            needs.hunger = (needs.hunger - it.good.nutrition() as f32).max(0.0);
-            if it.good == Good::Fruit {
+            match src {
+                EdibleSlot::Inventory(idx) => {
+                    agent.inventory[idx].1 -= 1;
+                }
+                EdibleSlot::HandLeft | EdibleSlot::HandRight => {
+                    // remove_good walks both hand slots; one unit always lands.
+                    carrier.remove_good(good, 1);
+                }
+            }
+            needs.hunger = (needs.hunger - good.nutrition() as f32).max(0.0);
+            if good == Good::Fruit {
                 fruits_consumed += 1;
             }
         }

@@ -1,7 +1,6 @@
-use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::simulation::carry::Carrier;
-use crate::simulation::carve::{carve_tile, STONE_PER_BLOCK};
+use crate::simulation::carve::carve_tile;
 use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, PersonAI};
@@ -10,7 +9,8 @@ use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::TaskKind;
 use crate::world::chunk::{ChunkMap, Z_MIN};
 use crate::world::chunk_streaming::TileChangedEvent;
-use crate::world::terrain::tile_to_world;
+use crate::world::globe::Globe;
+use crate::world::terrain::{tile_to_world, WorldGen};
 use crate::world::tile::TileKind;
 use bevy::prelude::*;
 
@@ -22,6 +22,8 @@ pub fn dig_system(
     mut chunk_map: ResMut<ChunkMap>,
     mut tile_changed: EventWriter<TileChangedEvent>,
     clock: Res<SimClock>,
+    gen: Res<WorldGen>,
+    globe: Res<Globe>,
     mut agent_query: Query<(
         &mut PersonAI,
         &mut Carrier,
@@ -61,11 +63,21 @@ pub fn dig_system(
         // The current surface tile at surf_z becomes Air (headspace), the tile
         // at surf_z - 1 becomes Dirt (the new floor). Surface drops by one.
         let target_floor_z = surf_z - 1;
-        let blocks = carve_tile(&mut chunk_map, tx, ty, target_floor_z, &mut tile_changed);
+        let drops = carve_tile(
+            &mut chunk_map,
+            &gen,
+            &globe,
+            tx,
+            ty,
+            target_floor_z,
+            &mut tile_changed,
+        );
 
-        let qty = blocks * STONE_PER_BLOCK;
-        if qty > 0 {
-            let item = Item::new_commodity(Good::Stone);
+        for (good, qty) in drops {
+            if qty == 0 {
+                continue;
+            }
+            let item = Item::new_commodity(good);
             let leftover = carrier.try_pick_up(item, qty);
             if leftover > 0 {
                 let pos = tile_to_world(tx, ty);

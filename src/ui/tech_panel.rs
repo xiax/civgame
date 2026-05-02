@@ -18,6 +18,10 @@ fn activity_name(kind: ActivityKind) -> &'static str {
         ActivityKind::Combat => "Combat",
         ActivityKind::Socializing => "Socializing",
         ActivityKind::Trading => "Trading",
+        ActivityKind::CopperMining => "Copper Mining",
+        ActivityKind::TinMining => "Tin Mining",
+        ActivityKind::GoldMining => "Gold Mining",
+        ActivityKind::SilverMining => "Silver Mining",
     }
 }
 

@@ -10,7 +10,7 @@ pub fn tile_speed_multiplier(kind: TileKind) -> f32 {
         TileKind::Forest => 0.7,
         TileKind::Farmland => 0.85,
         TileKind::Dirt => 0.9,
-        TileKind::Water | TileKind::Air | TileKind::Wall => 0.0,
+        TileKind::Water | TileKind::Air | TileKind::Wall | TileKind::Ore => 0.0,
     }
 }
 

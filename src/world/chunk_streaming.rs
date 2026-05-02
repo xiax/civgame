@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use crate::pathfinding::path_request::PathFollow;
 use crate::rendering::camera::CameraViewZ;
-use crate::rendering::color_map::{shaded_tile_color, z_bucket};
+use crate::rendering::color_map::{shaded_ore_tile_color, shaded_tile_color, z_bucket};
 use crate::rendering::fog::{apply_fog_to_material, FogMap, FogTileMaterials};
 use crate::simulation::construction::{Wall, WallMap, WallMaterial};
 use crate::simulation::faction::{FactionCenter, StorageTileMap};
@@ -15,7 +15,7 @@ use crate::simulation::plants::{
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE, Z_MIN};
 use crate::world::globe::{Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 use crate::world::terrain::{generate_chunk_from_globe, tile_at_3d, WorldGen, TILE_SIZE};
-use crate::world::tile::TileKind;
+use crate::world::tile::{OreKind, TileKind};
 
 pub const LOAD_RADIUS: i32 = 12;
 pub const UNLOAD_RADIUS: i32 = 16;
@@ -101,18 +101,19 @@ fn chunk_coord_from_world(x: f32, y: f32) -> ChunkCoord {
 
 const PLANT_HASH_SEED: u32 = 42;
 
-/// One ColorMaterial per (TileKind as u8, z_bucket) pair.
-/// z_bucket = z.div_euclid(4), range −4..=3 → 8 buckets × 10 kinds = 80 materials.
+/// One ColorMaterial per (TileKind, OreKind, z_bucket) tuple.
+/// `OreKind` is `None` (0) for non-ore tiles. `TileKind::Ore` fans out into one
+/// material per non-None OreKind so per-ore colors render distinctly.
 #[derive(Resource, Default)]
 pub struct TileMaterials {
-    pub materials: AHashMap<(u8, i32), Handle<ColorMaterial>>,
+    pub materials: AHashMap<(u8, u8, i32), Handle<ColorMaterial>>,
     pub tile_mesh: Handle<Mesh>,
 }
 
 impl TileMaterials {
-    pub fn handle_for(&self, kind: TileKind, z: i32) -> Handle<ColorMaterial> {
+    pub fn handle_for(&self, kind: TileKind, ore: OreKind, z: i32) -> Handle<ColorMaterial> {
         self.materials
-            .get(&(kind as u8, z_bucket(z)))
+            .get(&(kind as u8, ore as u8, z_bucket(z)))
             .cloned()
             .unwrap_or_default()
     }
@@ -208,6 +209,18 @@ pub const RENDERABLE_KINDS: &[TileKind] = &[
     TileKind::Wall,
     TileKind::Ramp,
     TileKind::Dirt,
+    TileKind::Ore,
+];
+
+/// Ore variants rendered as `TileKind::Ore` tiles. Excludes `OreKind::None`,
+/// which never reaches the renderer.
+pub const RENDERABLE_ORES: &[OreKind] = &[
+    OreKind::Copper,
+    OreKind::Tin,
+    OreKind::Iron,
+    OreKind::Coal,
+    OreKind::Gold,
+    OreKind::Silver,
 ];
 
 /// PostStartup: create one shaded ColorMaterial per (TileKind, z_bucket) pair.
@@ -222,13 +235,26 @@ pub fn setup_tile_materials(
     let bucket_max = 15_i32.div_euclid(4);
 
     for &kind in RENDERABLE_KINDS {
+        if kind == TileKind::Ore {
+            for &ore in RENDERABLE_ORES {
+                for bucket in bucket_min..=bucket_max {
+                    let z = bucket * 4 + 2;
+                    let color = shaded_ore_tile_color(ore, z);
+                    let handle = materials.add(ColorMaterial::from_color(color));
+                    tile_materials
+                        .materials
+                        .insert((kind as u8, ore as u8, bucket), handle);
+                }
+            }
+            continue;
+        }
         for bucket in bucket_min..=bucket_max {
             let z = bucket * 4 + 2;
             let color = shaded_tile_color(kind, z);
             let handle = materials.add(ColorMaterial::from_color(color));
             tile_materials
                 .materials
-                .insert((kind as u8, bucket), handle);
+                .insert((kind as u8, OreKind::None as u8, bucket), handle);
         }
     }
 }
@@ -293,7 +319,7 @@ pub fn spawn_chunk_sprites(
             }
 
             // Compute the effective render Z and tile for this position
-            let (render_kind, render_z, base_vis) = resolve_render_tile(
+            let (render_kind, render_ore, render_z, base_vis) = resolve_render_tile(
                 chunk_map,
                 gen,
                 globe,
@@ -303,12 +329,14 @@ pub fn spawn_chunk_sprites(
                 camera_view_z,
             );
 
-            let mut initial_mat = MeshMaterial2d(tile_materials.handle_for(render_kind, render_z));
+            let mut initial_mat =
+                MeshMaterial2d(tile_materials.handle_for(render_kind, render_ore, render_z));
             let visibility = apply_fog_to_material(
                 fog_map,
                 tile_pos,
                 base_vis,
                 render_kind,
+                render_ore,
                 render_z,
                 tile_materials,
                 fog_tile_materials,
@@ -335,7 +363,8 @@ pub fn spawn_chunk_sprites(
 }
 
 /// Determine what to render at a tile given the camera view Z.
-/// Returns (kind, z_for_shading, visibility).
+/// Returns (kind, ore, z_for_shading, visibility). `ore` is `OreKind::None`
+/// for non-ore tiles.
 pub fn resolve_render_tile(
     chunk_map: &ChunkMap,
     gen: &WorldGen,
@@ -344,21 +373,28 @@ pub fn resolve_render_tile(
     ty: i32,
     surf_z: i32,
     camera_view_z: i32,
-) -> (TileKind, i32, Visibility) {
+) -> (TileKind, OreKind, i32, Visibility) {
     if camera_view_z == i32::MAX || surf_z <= camera_view_z {
-        // Surface tile is at or below the view level — render normally
+        // Surface tile is at or below the view level — render normally.
+        // Surface tiles never carry ore (ore only exists subsurface), so
+        // OreKind::None is correct here.
         let kind = chunk_map.tile_kind_at(tx, ty).unwrap_or(TileKind::Air);
         if kind == TileKind::Air {
-            return (TileKind::Grass, surf_z, Visibility::Hidden);
+            return (TileKind::Grass, OreKind::None, surf_z, Visibility::Hidden);
         }
-        return (kind, surf_z, Visibility::Visible);
+        return (kind, OreKind::None, surf_z, Visibility::Visible);
     }
     // Surface tile is above the view level — show what's at camera_view_z instead
     let underground_tile = tile_at_3d(chunk_map, gen, globe, tx, ty, camera_view_z);
     if underground_tile.kind == TileKind::Air {
-        (TileKind::Grass, camera_view_z, Visibility::Hidden)
+        (TileKind::Grass, OreKind::None, camera_view_z, Visibility::Hidden)
     } else {
-        (underground_tile.kind, camera_view_z, Visibility::Visible)
+        (
+            underground_tile.kind,
+            underground_tile.ore_kind(),
+            camera_view_z,
+            Visibility::Visible,
+        )
     }
 }
 
@@ -670,7 +706,7 @@ pub fn refresh_changed_tiles_system(
                 chunk_entities.push(new_entity);
             }
         } else {
-            let (render_kind, render_z, base_vis) = resolve_render_tile(
+            let (render_kind, render_ore, render_z, base_vis) = resolve_render_tile(
                 &chunk_map,
                 &gen,
                 &globe,
@@ -681,12 +717,14 @@ pub fn refresh_changed_tiles_system(
             );
 
             let tile_pos = (tx, ty);
-            let mut mat = MeshMaterial2d(tile_materials.handle_for(render_kind, render_z));
+            let mut mat =
+                MeshMaterial2d(tile_materials.handle_for(render_kind, render_ore, render_z));
             let visibility = apply_fog_to_material(
                 &fog_map,
                 tile_pos,
                 base_vis,
                 render_kind,
+                render_ore,
                 render_z,
                 &tile_materials,
                 &fog_tile_materials,
@@ -739,7 +777,7 @@ pub fn update_tile_z_view_system(
         };
 
         let surf_z = chunk_map.surface_z_at(tx as i32, ty as i32);
-        let (render_kind, render_z, base_vis) = resolve_render_tile(
+        let (render_kind, render_ore, render_z, base_vis) = resolve_render_tile(
             &chunk_map, &gen, &globe, tx as i32, ty as i32, surf_z, view_z,
         );
 
@@ -748,6 +786,7 @@ pub fn update_tile_z_view_system(
             (tx, ty),
             base_vis,
             render_kind,
+            render_ore,
             render_z,
             &tile_materials,
             &fog_tile_materials,

@@ -2,7 +2,7 @@ use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::simulation::carry::Carrier;
-use crate::simulation::carve::{carve_tile, STONE_PER_BLOCK};
+use crate::simulation::carve::carve_tile;
 use crate::simulation::construction::WallMap;
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::goals::AgentGoal;
@@ -18,27 +18,41 @@ use crate::simulation::tasks::TaskKind;
 use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::chunk_streaming::TileChangedEvent;
-use crate::world::terrain::{tile_to_world, world_to_tile};
+use crate::world::globe::Globe;
+use crate::world::terrain::{tile_to_world, world_to_tile, WorldGen};
 use crate::world::tile::TileKind;
 use bevy::prelude::*;
 
-// ── Stone tile harvest profile ────────────────────────────────────────────────
-// Plants carry their own harvest data via PlantKind methods; stone uses this
-// small inline struct until TileKind gets the same treatment.
+// ── Stone / ore tile harvest profile ──────────────────────────────────────────
+// Coal/Iron and the new ores (Copper/Tin/Gold/Silver) are no longer random
+// rolls on Stone tiles — they're real Ore tiles produced by `proc_tile`'s
+// stratification model. `carve_tile` returns the per-block (Good, qty) drop.
 
 struct StoneProfile {
     work_ticks: u8,
     base_yield_qty: u32,
-    bonus_yields: &'static [(Good, u32, u8)], // (good, qty, percent_chance)
     xp: u32,
 }
 
 const STONE: StoneProfile = StoneProfile {
     work_ticks: 30,
     base_yield_qty: 2,
-    bonus_yields: &[(Good::Coal, 1, 5), (Good::Iron, 1, 2)],
     xp: 2,
 };
+
+/// Activity bucket to credit when a particular `Good` was just mined.
+fn mining_activity(good: Good) -> Option<ActivityKind> {
+    match good {
+        Good::Stone => Some(ActivityKind::StoneMining),
+        Good::Coal => Some(ActivityKind::CoalMining),
+        Good::Iron => Some(ActivityKind::IronMining),
+        Good::Copper => Some(ActivityKind::CopperMining),
+        Good::Tin => Some(ActivityKind::TinMining),
+        Good::Gold => Some(ActivityKind::GoldMining),
+        Good::Silver => Some(ActivityKind::SilverMining),
+        _ => None,
+    }
+}
 
 // ── gather_system ─────────────────────────────────────────────────────────────
 
@@ -48,6 +62,8 @@ pub fn gather_system(
     mut wall_map: ResMut<WallMap>,
     mut tile_changed: EventWriter<TileChangedEvent>,
     clock: Res<SimClock>,
+    gen: Res<WorldGen>,
+    globe: Res<Globe>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
     mut faction_registry: ResMut<FactionRegistry>,
@@ -200,108 +216,79 @@ pub fn gather_system(
 
             let tile_kind = chunk_map.tile_kind_at(tx, ty);
 
-            if tile_kind == Some(TileKind::Wall) {
-                // ── Wall mining: open the target column at the agent's foot Z.
-                // For a tunnel into a hillside, this carves the headspace tile
-                // and reveals the floor below. For a flat Wall on flat ground,
-                // it just converts Wall → Dirt with no headspace change.
+            if matches!(
+                tile_kind,
+                Some(TileKind::Wall) | Some(TileKind::Stone) | Some(TileKind::Ore)
+            ) {
+                // ── Mineable rock: Wall, Stone, or Ore.
+                // Same carve operation; per-block (Good, qty) drops come from
+                // `carve_tile` which reads the actual material via tile_at_3d.
                 if ai.work_progress < STONE.work_ticks {
                     continue;
                 }
                 ai.work_progress = 0;
 
                 let target_floor_z = ai.current_z as i32;
+                let was_wall = tile_kind == Some(TileKind::Wall);
 
-                let blocks = carve_tile(&mut chunk_map, tx, ty, target_floor_z, &mut tile_changed);
-                let stone_yield = (blocks * STONE_PER_BLOCK).max(STONE.base_yield_qty);
-                let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
-                route_yield(
-                    &mut commands,
-                    &mut carrier,
-                    &mut agent,
-                    Good::Stone,
-                    stone_yield,
-                    agent_tx,
-                    agent_ty,
+                let drops = carve_tile(
+                    &mut chunk_map,
+                    &gen,
+                    &globe,
+                    tx,
+                    ty,
+                    target_floor_z,
+                    &mut tile_changed,
                 );
+
+                let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
+                let mut total_qty: u32 = 0;
+                for (good, qty) in drops {
+                    if qty == 0 {
+                        continue;
+                    }
+                    let activity = mining_activity(good).unwrap_or(ActivityKind::StoneMining);
+                    let (_, _, mul) = faction_muls(&mut faction_registry, faction_id, activity);
+                    let scaled = (qty as f32 * mul).round().max(1.0) as u32;
+                    total_qty = total_qty.saturating_add(scaled);
+                    route_yield(
+                        &mut commands,
+                        &mut carrier,
+                        &mut agent,
+                        good,
+                        scaled,
+                        agent_tx,
+                        agent_ty,
+                    );
+                    if let Some(id) = faction_id {
+                        if let Some(fd) = faction_registry.factions.get_mut(&id) {
+                            fd.activity_log.increment(activity);
+                        }
+                    }
+                }
+
+                if total_qty == 0 {
+                    // Carved a non-yielding tile (e.g. Dirt headspace); credit the
+                    // baseline so XP/effort isn't entirely wasted.
+                    total_qty = STONE.base_yield_qty;
+                }
+
                 skills.gain_xp(SkillKind::Mining, STONE.xp);
 
                 // Despawn the Wall entity only if the column no longer has
-                // any solid tile at or above the carved Z (i.e. the visible
-                // wall is fully gone). For now: if surface_z dropped below
-                // the carved head, the wall column is open; otherwise rock
-                // remains above as ceiling and we keep the Wall entity in
-                // its place visually until rendering rework in Phase 6.
-                if chunk_map.surface_z_at(tx, ty) < target_floor_z + 1 {
+                // any solid tile at or above the carved Z (the visible wall
+                // is fully gone).
+                if was_wall && chunk_map.surface_z_at(tx, ty) < target_floor_z + 1 {
                     if let Some(wall_entity) = wall_map.0.remove(&ai.dest_tile) {
                         commands.entity(wall_entity).despawn_recursive();
                     }
                 }
 
-                if let Some(ref mut plan) = plan_opt {
-                    plan.reward_acc += stone_yield as f32 * 0.3;
-                }
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
-                ai.target_entity = None;
-                ai.work_progress = 0;
-            } else if tile_kind == Some(TileKind::Stone) {
-                if ai.work_progress < STONE.work_ticks {
-                    continue;
-                }
-                ai.work_progress = 0;
-
-                let target_floor_z = ai.current_z as i32;
-
-                let (_, _, stone_mul) =
-                    faction_muls(&mut faction_registry, faction_id, ActivityKind::StoneMining);
-                let blocks = carve_tile(&mut chunk_map, tx, ty, target_floor_z, &mut tile_changed);
-                let base = (blocks * STONE_PER_BLOCK).max(STONE.base_yield_qty);
-                let qty = (base as f32 * stone_mul).round().max(1.0) as u32;
-                let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
-                route_yield(
-                    &mut commands,
-                    &mut carrier,
-                    &mut agent,
-                    Good::Stone,
-                    qty,
-                    agent_tx,
-                    agent_ty,
-                );
-
-                for &(good, bonus_qty, chance) in STONE.bonus_yields {
-                    if fastrand::u8(..100) < chance {
-                        route_yield(
-                            &mut commands,
-                            &mut carrier,
-                            &mut agent,
-                            good,
-                            bonus_qty,
-                            agent_tx,
-                            agent_ty,
-                        );
-                        if let Some(id) = faction_id {
-                            if let Some(fd) = faction_registry.factions.get_mut(&id) {
-                                let act = match good {
-                                    Good::Coal => Some(ActivityKind::CoalMining),
-                                    Good::Iron => Some(ActivityKind::IronMining),
-                                    _ => None,
-                                };
-                                if let Some(a) = act {
-                                    fd.activity_log.increment(a);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                skills.gain_xp(SkillKind::Mining, STONE.xp);
-
                 if let Some(ref mut mem) = memory_opt {
                     mem.record((tx as i16, ty as i16), MemoryKind::Stone);
                 }
                 if let Some(ref mut plan) = plan_opt {
-                    plan.reward_acc += qty as f32 * 0.3;
+                    plan.reward_acc += total_qty as f32 * 0.3;
                 }
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;

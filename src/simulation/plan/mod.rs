@@ -281,7 +281,7 @@ impl StepPreconditions {
                 return false;
             }
         }
-        if self.requires_any_edible && agent.total_food() == 0 {
+        if self.requires_any_edible && super::production::total_edible(agent, carrier) == 0 {
             return false;
         }
         if let Some(min) = self.min_hunger {

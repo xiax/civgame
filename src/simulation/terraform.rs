@@ -8,7 +8,7 @@ use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::carry::Carrier;
-use crate::simulation::carve::{carve_tile, fill_tile, STONE_PER_BLOCK};
+use crate::simulation::carve::{carve_tile, fill_tile};
 use crate::simulation::construction::{Blueprint, BlueprintMap, BuildSiteKind};
 use crate::simulation::faction::{FactionMember, SOLO};
 use crate::simulation::goals::AgentGoal;
@@ -21,7 +21,8 @@ use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::chunk_streaming::TileChangedEvent;
-use crate::world::terrain::{tile_to_world, TILE_SIZE};
+use crate::world::globe::Globe;
+use crate::world::terrain::{tile_to_world, WorldGen, TILE_SIZE};
 
 pub const TERRAFORM_WORK_TICKS: u8 = 30;
 const TERRAFORM_FILL_GOOD: Good = Good::Stone;
@@ -163,6 +164,8 @@ pub fn terraform_system(
     mut terraform_map: ResMut<TerraformMap>,
     site_query: Query<&TerraformSite>,
     clock: Res<SimClock>,
+    gen: Res<WorldGen>,
+    globe: Res<Globe>,
     mut agent_query: Query<(
         &mut PersonAI,
         &mut EconomicAgent,
@@ -207,10 +210,20 @@ pub fn terraform_system(
 
         if surf > target {
             let target_floor = surf - 1;
-            let blocks = carve_tile(&mut chunk_map, tx, ty, target_floor, &mut tile_changed);
-            let qty = blocks * STONE_PER_BLOCK;
-            if qty > 0 {
-                let item = Item::new_commodity(Good::Stone);
+            let drops = carve_tile(
+                &mut chunk_map,
+                &gen,
+                &globe,
+                tx,
+                ty,
+                target_floor,
+                &mut tile_changed,
+            );
+            for (good, qty) in drops {
+                if qty == 0 {
+                    continue;
+                }
+                let item = Item::new_commodity(good);
                 let leftover = carrier.try_pick_up(item, qty);
                 if leftover > 0 {
                     let pos = tile_to_world(tx, ty);

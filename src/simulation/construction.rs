@@ -18,9 +18,9 @@ use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::{
-    TechId, BRONZE_CASTING, BRONZE_TOOLS, CITY_STATE_ORG, COPPER_TOOLS, COPPER_WORKING,
-    FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING, GRANARY, LONG_DIST_TRADE, LOOM_WEAVING,
-    MONUMENTAL_BUILDING, PERM_SETTLEMENT, PROFESSIONAL_ARMY, SACRED_RITUAL,
+    current_era, Era, TechId, BRONZE_CASTING, BRONZE_TOOLS, CITY_STATE_ORG, COPPER_TOOLS,
+    COPPER_WORKING, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING, GRANARY, LONG_DIST_TRADE,
+    LOOM_WEAVING, MONUMENTAL_BUILDING, PERM_SETTLEMENT, PROFESSIONAL_ARMY, SACRED_RITUAL,
 };
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::{Calendar, Season};
@@ -596,12 +596,16 @@ const RECIPE_MONUMENT: BuildRecipe = BuildRecipe {
 /// chief to upgrade defensive walls automatically; the player may still pick
 /// any unlocked material via the right-click menu.
 pub fn best_wall_material(techs: &FactionTechs) -> WallMaterial {
+    // Stone walls require at least Chalcolithic copper-working (a proxy for the
+    // labor and tool sophistication needed for dressed masonry). Pre-Chalcolithic
+    // hut walls fall back to Mudbrick / Wattle & Daub / Palisade — historically
+    // appropriate for Neolithic and earlier.
     if techs.has(MONUMENTAL_BUILDING) {
         WallMaterial::CutStone
+    } else if techs.has(COPPER_WORKING) {
+        WallMaterial::Stone
     } else if techs.has(FIRED_POTTERY) {
         WallMaterial::Mudbrick
-    } else if techs.has(FLINT_KNAPPING) {
-        WallMaterial::Stone
     } else if techs.has(PERM_SETTLEMENT) {
         WallMaterial::WattleDaub
     } else {
@@ -993,6 +997,29 @@ fn find_unfilled_civic_zone_tile(
 /// flank the approach path on either side, leaving the home-facing and
 /// far-facing corridors clear. Diagonal corners (≥45° off-axis) are
 /// excluded; the chosen tile balances bed counts across the two crescents.
+/// Count beds (placed, not blueprinted) sitting inside the annulus
+/// `inner_r..=outer_r` around `hearth`. Used by the Neolithic hearth gate to
+/// decide when a household cluster is "full" and a new hearth should open.
+fn count_beds_in_crescent(
+    bed_map: &BedMap,
+    hearth: (i16, i16),
+    inner_r: i32,
+    outer_r: i32,
+) -> u32 {
+    let inner_sq = inner_r * inner_r;
+    let outer_sq = outer_r * outer_r;
+    let mut n = 0u32;
+    for &(bx, by) in bed_map.0.keys() {
+        let dx = bx as i32 - hearth.0 as i32;
+        let dy = by as i32 - hearth.1 as i32;
+        let d2 = dx * dx + dy * dy;
+        if d2 >= inner_sq && d2 <= outer_sq {
+            n += 1;
+        }
+    }
+    n
+}
+
 fn find_bed_tile_around_hearth(
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
@@ -1659,23 +1686,32 @@ fn generate_candidates(
         }
     }
 
-    // 1. Hearths — band camps (pre-PERM_SETTLEMENT) grow one fire per ~6
-    //    members, but actual queue cadence is driven by *bed-crescent
-    //    saturation*: a new hearth only opens when the existing crescents
-    //    can't fit another bed AND members still lack one. Settled cultures
-    //    keep the single civic-zone hearth (hearth-per-house is future work
-    //    that requires a Household redesign).
-    let desired_hearths: u32 = if !techs.has(PERM_SETTLEMENT) {
-        crate::simulation::settlement::paleolithic_hearth_count(members)
-    } else {
-        1
+    // 1. Hearths — pacing depends on era:
+    //    - Paleolithic/Mesolithic: band camps grow one fire per ~6 members,
+    //      gated on *crescent saturation* across all hearths plus a remaining
+    //      bed deficit. Bands fill out hearth #1's crescent before #2 opens.
+    //    - Neolithic: each hearth represents an extended-family household
+    //      cluster (~8 people). A new hearth opens once *every* existing
+    //      hearth has ≥ 8 beds inside its 2..6 crescent ring.
+    //    - Chalcolithic+: settled cultures keep a single civic-zone hearth
+    //      (hearth-per-house remains future work — needs Household component).
+    let era = current_era(techs);
+    const NEOLITHIC_BEDS_PER_HEARTH: u32 = 8;
+    let desired_hearths: u32 = match era {
+        Era::Paleolithic | Era::Mesolithic => {
+            crate::simulation::settlement::paleolithic_hearth_count(members)
+        }
+        Era::Neolithic => ((members + NEOLITHIC_BEDS_PER_HEARTH - 1)
+            / NEOLITHIC_BEDS_PER_HEARTH)
+            .max(1),
+        _ => 1,
     };
     let existing_hearths = count_campfires_near(&maps.campfire_map, home, 30) as u32;
     let bed_count = count_beds_near(&maps.bed_map, home, 30) as i32;
     let bed_deficit_pre = (members as i32 - bed_count).max(0);
     let gate_ok = if existing_hearths == 0 {
         true
-    } else if !techs.has(PERM_SETTLEMENT) {
+    } else if matches!(era, Era::Paleolithic | Era::Mesolithic) {
         let hearths: Vec<(i16, i16)> = maps
             .campfire_map
             .0
@@ -1698,8 +1734,25 @@ fn generate_candidates(
             )
             .is_none();
         crescents_saturated && bed_deficit_pre > 0
+    } else if matches!(era, Era::Neolithic) {
+        // Open a new hearth only when every existing hearth has filled its
+        // crescent ring with at least NEOLITHIC_BEDS_PER_HEARTH beds.
+        existing_hearths < desired_hearths
+            && maps
+                .campfire_map
+                .0
+                .keys()
+                .copied()
+                .filter(|&(cx, cy)| {
+                    (cx as i32 - home.0 as i32).abs() <= 25
+                        && (cy as i32 - home.1 as i32).abs() <= 25
+                })
+                .all(|h| {
+                    count_beds_in_crescent(&maps.bed_map, h, 2, 6)
+                        >= NEOLITHIC_BEDS_PER_HEARTH
+                })
     } else {
-        false
+        false // Chalcolithic+: single civic hearth
     };
     let effective_desired = if gate_ok {
         desired_hearths
@@ -1849,17 +1902,22 @@ fn generate_candidates(
     }
 
     // 3. Defense — palisade reinforcement. Driven by culture.defensive.
-    let walls_count = count_walls_near(&maps.wall_map, home, 25) as i32;
-    let target_walls = (members as i32 * 2 + 8).min(48);
-    let defense_deficit = (target_walls - walls_count).max(0) as f32;
-    if defense_deficit > 0.0 && bed_count > 0 {
-        if let Some(tile) = find_palisade_site(chunk_map, &maps.bed_map, bp_map, home, 2) {
-            let def_mult = 0.4 + (culture.defensive as f32 / 255.0) * 1.6;
-            out.push(BuildCandidate {
-                intent: BuildIntent::PalisadeSegment(wall_mat, 2),
-                tile,
-                score: 70.0 * def_mult + defense_deficit * 1.5,
-            });
+    //    Pre-Chalcolithic societies don't fortify: Paleolithic bands and
+    //    Neolithic farming villages were typically unwalled. Defensive
+    //    perimeters become standard with Chalcolithic/Bronze Age city-states.
+    if matches!(era, Era::Chalcolithic | Era::BronzeAge) {
+        let walls_count = count_walls_near(&maps.wall_map, home, 25) as i32;
+        let target_walls = (members as i32 * 2 + 8).min(48);
+        let defense_deficit = (target_walls - walls_count).max(0) as f32;
+        if defense_deficit > 0.0 && bed_count > 0 {
+            if let Some(tile) = find_palisade_site(chunk_map, &maps.bed_map, bp_map, home, 2) {
+                let def_mult = 0.4 + (culture.defensive as f32 / 255.0) * 1.6;
+                out.push(BuildCandidate {
+                    intent: BuildIntent::PalisadeSegment(wall_mat, 2),
+                    tile,
+                    score: 70.0 * def_mult + defense_deficit * 1.5,
+                });
+            }
         }
     }
 
@@ -2647,6 +2705,7 @@ pub fn construction_system(
                             elevation: 0,
                             fertility: 0,
                             flags: 0b0001,
+                            ore: 0,
                         },
                     );
 

@@ -13,21 +13,22 @@ pub enum TileKind {
     Wall = 7, // solid rock/earth — blocks movement and LOS
     Ramp = 8, // slope — passable, allows ±1 Z movement
     Dirt = 9, // underground floor (carved cave ceiling/floor)
+    Ore = 10, // ore-bearing rock; specific ore is in TileData.ore (OreKind)
 }
 
 impl TileKind {
     pub fn is_passable(self) -> bool {
-        !matches!(self, TileKind::Water | TileKind::Wall | TileKind::Air)
+        !matches!(self, TileKind::Water | TileKind::Wall | TileKind::Air | TileKind::Ore)
     }
 
     /// Solid tiles cannot be entered from any direction.
     pub fn is_solid(self) -> bool {
-        matches!(self, TileKind::Wall)
+        matches!(self, TileKind::Wall | TileKind::Ore)
     }
 
     /// Opaque tiles block line of sight.
     pub fn is_opaque(self) -> bool {
-        matches!(self, TileKind::Wall)
+        matches!(self, TileKind::Wall | TileKind::Ore)
     }
 
     /// Whether this tile can support an agent standing on top of it.
@@ -38,7 +39,53 @@ impl TileKind {
     }
 }
 
-/// 4 bytes per tile — cache-friendly.
+/// Specific ore embedded in a `TileKind::Ore` tile. Stored as a `u8` in
+/// `TileData.ore` to keep `TileData` POD-friendly.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum OreKind {
+    #[default]
+    None = 0,
+    Copper = 1,
+    Tin = 2,
+    Iron = 3,
+    Coal = 4,
+    Gold = 5,
+    Silver = 6,
+}
+
+impl OreKind {
+    pub fn from_u8(v: u8) -> OreKind {
+        match v {
+            1 => OreKind::Copper,
+            2 => OreKind::Tin,
+            3 => OreKind::Iron,
+            4 => OreKind::Coal,
+            5 => OreKind::Gold,
+            6 => OreKind::Silver,
+            _ => OreKind::None,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            OreKind::None => "None",
+            OreKind::Copper => "Copper",
+            OreKind::Tin => "Tin",
+            OreKind::Iron => "Iron",
+            OreKind::Coal => "Coal",
+            OreKind::Gold => "Gold",
+            OreKind::Silver => "Silver",
+        }
+    }
+}
+
+/// 5 bytes per tile — cache-friendly. `ore` is meaningful only when
+/// `kind == TileKind::Ore`; otherwise it's `OreKind::None` (0).
 #[derive(Clone, Copy, Default)]
 pub struct TileData {
     pub kind: TileKind,
@@ -46,6 +93,7 @@ pub struct TileData {
     pub fertility: u8,
     /// bit 0: has_building, bit 1: has_road, bit 2: explored, bit 3: currently_visible
     pub flags: u8,
+    pub ore: u8,
 }
 
 impl TileData {
@@ -63,6 +111,10 @@ impl TileData {
 
     pub fn is_visible(self) -> bool {
         self.flags & 0b1000 != 0
+    }
+
+    pub fn ore_kind(self) -> OreKind {
+        OreKind::from_u8(self.ore)
     }
 }
 

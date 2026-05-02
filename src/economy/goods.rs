@@ -1,4 +1,4 @@
-pub const GOOD_COUNT: usize = 15;
+pub const GOOD_COUNT: usize = 19;
 
 /// Encumbrance class for carrying a good in hands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +30,10 @@ pub enum Good {
     Armor = 12,
     Shield = 13,
     Skin = 14,
+    Copper = 15,
+    Tin = 16,
+    Gold = 17,
+    Silver = 18,
 }
 
 impl Good {
@@ -50,6 +54,10 @@ impl Good {
             Good::Armor => "Armor",
             Good::Shield => "Shield",
             Good::Skin => "Skin",
+            Good::Copper => "Copper",
+            Good::Tin => "Tin",
+            Good::Gold => "Gold",
+            Good::Silver => "Silver",
         }
     }
 
@@ -72,10 +80,11 @@ impl Good {
     /// Social play with another agent uses a fixed value, not this.
     pub fn entertainment_value(self) -> u8 {
         match self {
+            Good::Gold | Good::Silver => 30,
             Good::Luxury => 50,
             Good::Cloth | Good::Skin => 20,
             Good::Tools | Good::Weapon | Good::Shield | Good::Armor => 15,
-            Good::Wood | Good::Stone | Good::Coal | Good::Iron => 5,
+            Good::Wood | Good::Stone | Good::Coal | Good::Iron | Good::Copper | Good::Tin => 5,
             Good::Fruit | Good::Meat | Good::Grain | Good::Seed => 3,
         }
     }
@@ -96,6 +105,10 @@ impl Good {
             Good::Wood => 3000,
             Good::Shield => 4000,
             Good::Iron => 4500,
+            Good::Copper => 4500,
+            Good::Tin => 4500,
+            Good::Silver => 5500,
+            Good::Gold => 6000,
             Good::Stone => 5000,
             Good::Armor => 8000,
         }
@@ -111,8 +124,14 @@ impl Good {
             | Good::Cloth
             | Good::Tools
             | Good::Meat => Bulk::Small,
-            Good::Coal | Good::Skin | Good::Weapon | Good::Shield | Good::Armor => Bulk::OneHand,
-            Good::Wood | Good::Stone | Good::Iron => Bulk::TwoHand,
+            Good::Coal
+            | Good::Skin
+            | Good::Weapon
+            | Good::Shield
+            | Good::Armor
+            | Good::Gold
+            | Good::Silver => Bulk::OneHand,
+            Good::Wood | Good::Stone | Good::Iron | Good::Copper | Good::Tin => Bulk::TwoHand,
         }
     }
 
@@ -133,6 +152,10 @@ impl Good {
             Good::Armor,
             Good::Shield,
             Good::Skin,
+            Good::Copper,
+            Good::Tin,
+            Good::Gold,
+            Good::Silver,
         ]
     }
 }

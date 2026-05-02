@@ -4,7 +4,7 @@ use bevy::prelude::*;
 
 pub type TechId = u16;
 pub const TECH_COUNT: usize = 43;
-pub const ACTIVITY_COUNT: usize = 9;
+pub const ACTIVITY_COUNT: usize = 13;
 
 // ── Tech ID constants ─────────────────────────────────────────────────────────
 
@@ -94,6 +94,10 @@ pub enum ActivityKind {
     Combat = 6,
     Socializing = 7,
     Trading = 8,
+    CopperMining = 9,
+    TinMining = 10,
+    GoldMining = 11,
+    SilverMining = 12,
 }
 
 /// A single activity/probability pair that drives tech discovery.
@@ -146,6 +150,21 @@ pub struct TechDef {
 #[inline]
 pub fn tech_def(id: TechId) -> &'static TechDef {
     &TECH_TREE[id as usize]
+}
+
+/// Highest era for which the faction has unlocked at least one tech.
+/// Defaults to Paleolithic when nothing has been discovered yet.
+pub fn current_era(techs: &crate::simulation::faction::FactionTechs) -> Era {
+    let mut highest = Era::Paleolithic;
+    for id in 0..TECH_COUNT as TechId {
+        if techs.has(id) {
+            let era = TECH_TREE[id as usize].era;
+            if era as u8 > highest as u8 {
+                highest = era;
+            }
+        }
+    }
+    highest
 }
 
 // ── Static tech tree ──────────────────────────────────────────────────────────
@@ -640,8 +659,8 @@ pub static TECH_TREE: [TechDef; TECH_COUNT] = [
                 per_unit_chance: 0.004,
             },
             TechTrigger {
-                activity: ActivityKind::IronMining,
-                per_unit_chance: 0.003,
+                activity: ActivityKind::CopperMining,
+                per_unit_chance: 0.008,
             },
         ],
         bonus: TechBonus {
@@ -812,8 +831,8 @@ pub static TECH_TREE: [TechDef; TECH_COUNT] = [
                 per_unit_chance: 0.004,
             },
             TechTrigger {
-                activity: ActivityKind::CoalMining,
-                per_unit_chance: 0.004,
+                activity: ActivityKind::TinMining,
+                per_unit_chance: 0.008,
             },
         ],
         bonus: TechBonus {

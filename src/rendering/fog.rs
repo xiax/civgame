@@ -2,7 +2,7 @@ use ahash::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 use crate::rendering::camera::CameraViewZ;
-use crate::rendering::color_map::{shaded_tile_color, z_bucket};
+use crate::rendering::color_map::{shaded_ore_tile_color, shaded_tile_color, z_bucket};
 use crate::simulation::faction::{FactionMember, PlayerFaction, PlayerFactionMarker};
 use crate::simulation::line_of_sight::has_los;
 use crate::simulation::lod::LodLevel;
@@ -10,10 +10,11 @@ use crate::simulation::person::PersonAI;
 use crate::world::chunk::{ChunkMap, Z_MIN};
 use crate::world::chunk_streaming::{
     resolve_render_tile, TileMaterials, TileSprite, TileSpriteIndex, RENDERABLE_KINDS,
+    RENDERABLE_ORES,
 };
 use crate::world::globe::Globe;
 use crate::world::terrain::{WorldGen, TILE_SIZE};
-use crate::world::tile::TileKind;
+use crate::world::tile::{OreKind, TileKind};
 
 /// Fog of war state: which tiles the player faction can currently see / has ever seen.
 #[derive(Resource, Default)]
@@ -38,14 +39,14 @@ impl FogMap {
 /// explored-but-not-currently-visible fog state.
 #[derive(Resource, Default)]
 pub struct FogTileMaterials {
-    pub materials: AHashMap<(u8, i32), Handle<ColorMaterial>>,
+    pub materials: AHashMap<(u8, u8, i32), Handle<ColorMaterial>>,
     pub tile_mesh: Handle<Mesh>,
 }
 
 impl FogTileMaterials {
-    pub fn handle_for(&self, kind: TileKind, z: i32) -> Handle<ColorMaterial> {
+    pub fn handle_for(&self, kind: TileKind, ore: OreKind, z: i32) -> Handle<ColorMaterial> {
         self.materials
-            .get(&(kind as u8, z_bucket(z)))
+            .get(&(kind as u8, ore as u8, z_bucket(z)))
             .cloned()
             .unwrap_or_default()
     }
@@ -63,12 +64,29 @@ pub fn setup_fog_tile_materials(
     fog_materials.tile_mesh = tile_materials.tile_mesh.clone();
 
     for &kind in RENDERABLE_KINDS {
+        if kind == TileKind::Ore {
+            for &ore in RENDERABLE_ORES {
+                for bucket in bucket_min..=bucket_max {
+                    let z = bucket * 4 + 2;
+                    let base = shaded_ore_tile_color(ore, z).to_srgba();
+                    let fog_color =
+                        Color::srgb(base.red * 0.35, base.green * 0.35, base.blue * 0.35);
+                    let handle = materials.add(ColorMaterial::from_color(fog_color));
+                    fog_materials
+                        .materials
+                        .insert((kind as u8, ore as u8, bucket), handle);
+                }
+            }
+            continue;
+        }
         for bucket in bucket_min..=bucket_max {
             let z = bucket * 4 + 2;
             let base = shaded_tile_color(kind, z).to_srgba();
             let fog_color = Color::srgb(base.red * 0.35, base.green * 0.35, base.blue * 0.35);
             let handle = materials.add(ColorMaterial::from_color(fog_color));
-            fog_materials.materials.insert((kind as u8, bucket), handle);
+            fog_materials
+                .materials
+                .insert((kind as u8, OreKind::None as u8, bucket), handle);
         }
     }
 }
@@ -170,7 +188,7 @@ pub fn apply_fog_to_tiles_system(
         };
 
         let surf_z = chunk_map.surface_z_at(tx as i32, ty as i32);
-        let (render_kind, render_z, base_vis) = resolve_render_tile(
+        let (render_kind, render_ore, render_z, base_vis) = resolve_render_tile(
             &chunk_map,
             &gen,
             &globe,
@@ -185,6 +203,7 @@ pub fn apply_fog_to_tiles_system(
             (tx, ty),
             base_vis,
             render_kind,
+            render_ore,
             render_z,
             &tile_materials,
             &fog_tile_materials,
@@ -203,6 +222,7 @@ pub fn apply_fog_to_material(
     tile_pos: (i16, i16),
     base_vis: Visibility,
     render_kind: TileKind,
+    render_ore: OreKind,
     render_z: i32,
     tile_materials: &TileMaterials,
     fog_tile_materials: &FogTileMaterials,
@@ -212,10 +232,10 @@ pub fn apply_fog_to_material(
         return Visibility::Hidden;
     }
     if fog_map.is_visible(tile_pos) {
-        mat.0 = tile_materials.handle_for(render_kind, render_z);
+        mat.0 = tile_materials.handle_for(render_kind, render_ore, render_z);
         Visibility::Visible
     } else if fog_map.is_explored(tile_pos) {
-        mat.0 = fog_tile_materials.handle_for(render_kind, render_z);
+        mat.0 = fog_tile_materials.handle_for(render_kind, render_ore, render_z);
         Visibility::Visible
     } else {
         Visibility::Hidden

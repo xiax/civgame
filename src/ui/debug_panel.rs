@@ -34,6 +34,10 @@ const ACTIVITY_KINDS: [ActivityKind; ACTIVITY_COUNT] = [
     ActivityKind::Combat,
     ActivityKind::Socializing,
     ActivityKind::Trading,
+    ActivityKind::CopperMining,
+    ActivityKind::TinMining,
+    ActivityKind::GoldMining,
+    ActivityKind::SilverMining,
 ];
 
 const ACTIVITY_NAMES: [&str; ACTIVITY_COUNT] = [
@@ -46,6 +50,10 @@ const ACTIVITY_NAMES: [&str; ACTIVITY_COUNT] = [
     "Combat",
     "Socializing",
     "Trading",
+    "Copper Mining",
+    "Tin Mining",
+    "Gold Mining",
+    "Silver Mining",
 ];
 
 #[derive(Resource)]
