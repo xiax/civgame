@@ -306,7 +306,7 @@ pub fn memory_decay_system(
     clock: Res<SimClock>,
     mut query: Query<(&mut AgentMemory, &mut RelationshipMemory)>,
 ) {
-    if clock.tick % 60 != 0 {
+    if clock.tick % 3600 != 0 {
         return;
     }
     for (mut memory, mut rel) in query.iter_mut() {

@@ -23,6 +23,35 @@ use crate::world::terrain::TILE_SIZE;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
+// ── Need thresholds used by goal_update_system ────────────────────────────────
+//
+// All need values run 0-255 (see `needs.rs`). These constants name the
+// breakpoints so the goal logic reads as decisions rather than magic
+// arithmetic. Tune them here in one place; `goal_update_system` references
+// them by name.
+
+/// Below this hunger an agent is willing to leave camp for a raid.
+const HUNGER_RAID_CEILING: f32 = 120.0;
+/// Below this hunger an agent will start a Build/Lead task; above it the
+/// agent prioritises Survive.
+const HUNGER_WORK_CEILING: f32 = 150.0;
+/// Above this hunger an agent enters Survive even if they have food on hand.
+const HUNGER_SURVIVE_DESPERATE: f32 = 200.0;
+/// Above this hunger an agent enters Survive when they hold food (eating it
+/// is faster than going hungry).
+const HUNGER_EAT_HELD: f32 = 180.0;
+/// Above this hunger an agent enters Survive when they have NO food (must go
+/// hunt/forage immediately).
+const HUNGER_FORAGE_REQUIRED: f32 = 150.0;
+/// Above this hunger the starvation flag fires (used for emergency reactions).
+const HUNGER_STARVING: f32 = 120.0;
+/// Above this sleep need an agent enters Sleep.
+const SLEEP_TIRED: f32 = 180.0;
+/// Above this sleep need an agent prefers not to start a long task.
+const SLEEP_WORK_CEILING: f32 = 170.0;
+/// Either-or threshold for "this agent is too needy to socialise/play."
+const NEED_BUSY: f32 = 100.0;
+
 /// Bundles the storage-reachability lookup resources so `goal_update_system`
 /// stays under Bevy's 16-param limit.
 #[derive(SystemParam)]
@@ -330,7 +359,9 @@ pub fn goal_update_system(
                 }
                 continue;
             }
-            if registry.raid_target(member.faction_id).is_some() && needs.hunger < 120.0 {
+            if registry.raid_target(member.faction_id).is_some()
+                && needs.hunger < HUNGER_RAID_CEILING
+            {
                 if *goal != AgentGoal::Raid {
                     *goal = AgentGoal::Raid;
                     ai.state = AiState::Idle;
@@ -352,8 +383,8 @@ pub fn goal_update_system(
             && member.faction_id != SOLO
             && !registry.is_under_raid(member.faction_id)
             && registry.raid_target(member.faction_id).is_none()
-            && needs.hunger < 150.0
-            && needs.sleep < 170.0
+            && needs.hunger < HUNGER_WORK_CEILING
+            && needs.sleep < SLEEP_WORK_CEILING
         {
             if *goal != AgentGoal::Lead {
                 *goal = AgentGoal::Lead;
@@ -440,7 +471,7 @@ pub fn goal_update_system(
 
         let faction_has_food =
             member.faction_id != SOLO && registry.food_stock(member.faction_id) >= 1.0;
-        let is_starving = needs.hunger > 120.0 && agent.total_food() == 0;
+        let is_starving = needs.hunger > HUNGER_STARVING && agent.total_food() == 0;
 
         // Personal blueprints (player-commissioned, owned by this specific
         // agent) bypass the faction job board and drive AgentGoal::Build
@@ -512,15 +543,15 @@ pub fn goal_update_system(
 
         let (new_goal, reason) = if is_starving && faction_has_food {
             (AgentGoal::Survive, "Starving (Faction has food)")
-        } else if needs.hunger > 200.0 && agent.total_food() == 0 {
+        } else if needs.hunger > HUNGER_SURVIVE_DESPERATE && agent.total_food() == 0 {
             (AgentGoal::Survive, "Very Hungry")
-        } else if needs.hunger > 180.0 && agent.total_food() > 0 {
+        } else if needs.hunger > HUNGER_EAT_HELD && agent.total_food() > 0 {
             (AgentGoal::Survive, "Hungry (Eating)")
         } else if agent.total_food() >= 3 && can_return_camp {
             (AgentGoal::ReturnCamp, "Returning Surplus Food")
-        } else if needs.hunger > 150.0 && agent.total_food() == 0 {
+        } else if needs.hunger > HUNGER_FORAGE_REQUIRED && agent.total_food() == 0 {
             (AgentGoal::Survive, "Hungry")
-        } else if needs.sleep > 180.0 {
+        } else if needs.sleep > SLEEP_TIRED {
             (AgentGoal::Sleep, "Tired")
         } else if prioritize_food {
             (gather_goal, gather_reason)
@@ -561,7 +592,7 @@ fn should_craft(registry: &FactionRegistry, faction_id: u32, needs: &Needs) -> b
         return false;
     }
     // Only craft when not hungry or tired
-    if needs.hunger > 100.0 || needs.sleep > 100.0 {
+    if needs.hunger > NEED_BUSY || needs.sleep > NEED_BUSY {
         return false;
     }
     let Some(faction) = registry.factions.get(&faction_id) else {

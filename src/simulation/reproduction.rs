@@ -479,6 +479,7 @@ pub fn pregnancy_system(
                 RelationshipMemory::default(),
                 KnownPlans::with_innate(&[
     0, 1, 2, 3, 5, 6, 7, 23, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+    60, 61, 62, 63,
 ]),
                 PlanHistory::default(),
                 PlanScoringMethod::Weighted,

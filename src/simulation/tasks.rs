@@ -569,7 +569,7 @@ pub fn goal_dispatch_system(
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
     chunk_connectivity: Res<ChunkConnectivity>,
-    spatial: Res<SpatialIndex>,
+    _spatial: Res<SpatialIndex>,
     faction_registry: Res<FactionRegistry>,
     bed_query: Query<&Transform, With<Bed>>,
     mut query: Query<
@@ -591,15 +591,15 @@ pub fn goal_dispatch_system(
 ) {
     query.par_iter_mut().for_each(
         |(
-            entity,
+            _entity,
             mut ai,
-            agent,
-            needs,
+            _agent,
+            _needs,
             mut goal,
             member,
             transform,
             lod,
-            rel_opt,
+            _rel_opt,
             plan_opt,
             home_bed_opt,
         )| {
@@ -608,31 +608,16 @@ pub fn goal_dispatch_system(
             }
 
             if plan_opt.is_none() && ai.task_id != PersonAI::UNEMPLOYED {
+                // Sleep still dispatches inline below, so its task is
+                // expected to outlive the plan reset. Everything else is
+                // plan-driven — when an agent has no `ActivePlan`, any
+                // lingering task is stale and gets cleared.
                 let expected_task = match *goal {
-                    AgentGoal::Socialize => Some(TaskKind::Socialize as u16),
-                    AgentGoal::Raid => Some(TaskKind::Raid as u16),
-                    AgentGoal::Defend => Some(TaskKind::Defend as u16),
                     AgentGoal::Sleep => Some(TaskKind::Sleep as u16),
-                    AgentGoal::Lead => Some(TaskKind::Lead as u16),
                     AgentGoal::Survive if ai.task_id == TaskKind::Eat as u16 => {
                         Some(TaskKind::Eat as u16)
                     }
-                    _ => {
-                        if ai.task_id == TaskKind::Explore as u16
-                            && matches!(
-                                *goal,
-                                AgentGoal::GatherFood
-                                    | AgentGoal::GatherWood
-                                    | AgentGoal::GatherStone
-                                    | AgentGoal::Survive
-                                    | AgentGoal::Build
-                            )
-                        {
-                            Some(TaskKind::Explore as u16)
-                        } else {
-                            None
-                        }
-                    }
+                    _ => None,
                 };
 
                 if Some(ai.task_id) != expected_task {
@@ -654,119 +639,11 @@ pub fn goal_dispatch_system(
                 cur_ty.div_euclid(CHUNK_SIZE as i32),
             );
 
+            // Socialize / Raid / Defend / Lead were migrated to plans 60-63 in
+            // `plan/registry.rs`; they now flow through `plan_execution_system`.
+            // Sleep is the lone holdout — its bed/camp fallback chain is
+            // tricky enough to leave here for now.
             match *goal {
-                AgentGoal::Socialize => {
-                    if is_active && ai.task_id == TaskKind::Socialize as u16 {
-                        return;
-                    }
-                    // Prefer liked agents over merely nearest: score = affinity*3 - dist.
-                    // Degrades to pure distance when affinity is zero for all candidates.
-                    let radius = 15i32;
-                    let mut best_target: Option<(i16, i16, Entity)> = None;
-                    let mut best_score = i32::MIN;
-                    for dy in -radius..=radius {
-                        for dx in -radius..=radius {
-                            let tx = cur_tx + dx;
-                            let ty = cur_ty + dy;
-                            for &other in spatial.get(tx, ty) {
-                                if other == entity {
-                                    continue;
-                                }
-                                let dist = dx.abs() + dy.abs();
-                                let affinity =
-                                    rel_opt.map(|r| r.get_affinity(other) as i32).unwrap_or(0);
-                                let score = affinity * 3 - dist;
-                                if score > best_score {
-                                    best_score = score;
-                                    best_target = Some((tx as i16, ty as i16, other));
-                                }
-                            }
-                        }
-                    }
-                    if let Some((tx, ty, other)) = best_target {
-                        assign_task_with_routing(
-                            &mut ai,
-                            (cur_tx as i16, cur_ty as i16),
-                            cur_chunk,
-                            (tx, ty),
-                            TaskKind::Socialize,
-                            Some(other),
-                            &chunk_graph,
-                            &chunk_router,
-                            &chunk_map,
-                            &chunk_connectivity,
-                        );
-                    }
-                }
-
-                AgentGoal::Raid => {
-                    if is_active && ai.task_id == TaskKind::Raid as u16 {
-                        return;
-                    }
-                    if member.faction_id != SOLO {
-                        if let Some(target_id) = faction_registry.raid_target(member.faction_id) {
-                            if let Some(enemy_home) = faction_registry.home_tile(target_id) {
-                                assign_task_with_routing(
-                                    &mut ai,
-                                    (cur_tx as i16, cur_ty as i16),
-                                    cur_chunk,
-                                    enemy_home,
-                                    TaskKind::Raid,
-                                    None,
-                                    &chunk_graph,
-                                    &chunk_router,
-                                    &chunk_map,
-                                    &chunk_connectivity,
-                                );
-                            }
-                        }
-                    }
-                }
-
-                AgentGoal::Defend => {
-                    if is_active && ai.task_id == TaskKind::Defend as u16 {
-                        return;
-                    }
-                    if member.faction_id != SOLO {
-                        if let Some(home) = faction_registry.home_tile(member.faction_id) {
-                            assign_task_with_routing(
-                                &mut ai,
-                                (cur_tx as i16, cur_ty as i16),
-                                cur_chunk,
-                                home,
-                                TaskKind::Defend,
-                                None,
-                                &chunk_graph,
-                                &chunk_router,
-                                &chunk_map,
-                                &chunk_connectivity,
-                            );
-                        }
-                    }
-                }
-
-                AgentGoal::Lead => {
-                    if is_active && ai.task_id == TaskKind::Lead as u16 {
-                        return;
-                    }
-                    if member.faction_id != SOLO {
-                        if let Some(home) = faction_registry.home_tile(member.faction_id) {
-                            assign_task_with_routing(
-                                &mut ai,
-                                (cur_tx as i16, cur_ty as i16),
-                                cur_chunk,
-                                home,
-                                TaskKind::Lead,
-                                None,
-                                &chunk_graph,
-                                &chunk_router,
-                                &chunk_map,
-                                &chunk_connectivity,
-                            );
-                        }
-                    }
-                }
-
                 AgentGoal::Sleep => {
                     if ai.state == AiState::Sleeping {
                         return;
@@ -837,26 +714,15 @@ pub fn goal_dispatch_system(
                     ai.task_id = TaskKind::Sleep as u16;
                 }
 
-                // Survive, Gather, Build, TameHorse, Craft, Reproduce, Rescue, ReturnCamp are
-                // handled by plan_execution_system. Eating runs through the EatFromInventory /
-                // ForageFood / WithdrawAndEat plans whose Eat step is gated on hunger.
-                AgentGoal::Survive
-                | AgentGoal::GatherFood
-                | AgentGoal::GatherWood
-                | AgentGoal::GatherStone
-                | AgentGoal::Build
-                | AgentGoal::Haul
-                | AgentGoal::TameHorse
-                | AgentGoal::Craft
-                | AgentGoal::Rescue
-                | AgentGoal::ReturnCamp
-                | AgentGoal::Play
-                | AgentGoal::Farm => {
-                    if ai.task_id == TaskKind::Explore as u16 {
-                        if ai.state == AiState::Working {
-                            ai.state = AiState::Idle;
-                            ai.task_id = PersonAI::UNEMPLOYED;
-                        }
+                // Everything except Sleep is plan-driven. The catch-all only
+                // exists to clear a stale Explore task when the goal has
+                // moved on (gather/survive/build all share the Explore plan).
+                _ => {
+                    if ai.task_id == TaskKind::Explore as u16
+                        && ai.state == AiState::Working
+                    {
+                        ai.state = AiState::Idle;
+                        ai.task_id = PersonAI::UNEMPLOYED;
                     }
                 }
             }
