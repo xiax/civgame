@@ -9,11 +9,11 @@ use super::{
     mk_weights, AgentGoal, GoodSelector, MaterialNeed, MemoryKind, PlanDef, PlanRegistry, StepDef,
     StepId, StepPreconditions, StepRegistry, StepTarget, TaskKind, TileKind,
     PF_DROP_FOOD_ON_TIMEOUT, PF_EXPLORE, PF_NONE, PF_SCAVENGE, PF_TARGETS_FOOD, PF_TARGETS_STONE,
-    PF_TARGETS_WOOD, SI_HAS_FOOD, SI_HAS_SEED, SI_HAS_STONE, SI_HAS_WOOD, SI_HUNGER, SI_IN_FACTION,
-    SI_MEM_FOOD, SI_MEM_STONE, SI_MEM_WOOD, SI_SAFETY, SI_SEASON_FOOD, SI_SHELTER, SI_SKILL_BUILDING,
-    SI_SKILL_COMBAT, SI_SKILL_CRAFTING, SI_SKILL_FARMING, SI_SKILL_MINING, SI_SOCIAL,
-    SI_VIS_GROUND_FOOD, SI_VIS_GROUND_STONE, SI_VIS_GROUND_WOOD, SI_VIS_PLANT_FOOD,
-    SI_VIS_STONE_TILE, SI_VIS_TREE, SI_WILLPOWER_DISTRESS,
+    PF_TARGETS_WOOD, PF_UNINTERRUPTIBLE, SI_HAS_FOOD, SI_HAS_SEED, SI_HAS_STONE, SI_HAS_WOOD,
+    SI_IN_FACTION, SI_MEM_FOOD, SI_MEM_STONE, SI_MEM_WOOD, SI_SEASON_FOOD, SI_SKILL_BUILDING,
+    SI_SKILL_COMBAT, SI_SKILL_CRAFTING, SI_SKILL_FARMING, SI_SOCIAL, SI_STORAGE_FOOD,
+    SI_STORAGE_STONE, SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD, SI_VIS_GROUND_STONE,
+    SI_VIS_GROUND_WOOD, SI_VIS_PLANT_FOOD, SI_VIS_STONE_TILE, SI_VIS_TREE, SI_WILLPOWER_DISTRESS,
 };
 use crate::economy::goods::Good;
 use crate::simulation::needs::EAT_TRIGGER_HUNGER;
@@ -705,16 +705,25 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
     // Hand-tuned linear weights on `build_state_vec` features (see `STATE_DIM`
     // and `SI_*` constants). Score = dot(state, state_weights) + bias + manual
     // bonuses (persistence, ally, distance) applied at selection time.
+    //
+    // Design rule: weights score *plan-specific viability*, not the need that
+    // selected the goal. Inside a need-driven goal (Survive, Build, Socialize)
+    // the triggering need is constant across all candidate plans, so weighting
+    // it again is circular noise. Plans discriminate via inventory presence,
+    // visibility, memory, skills, and faction-storage stocks (slots 29-32).
     registry.0 = vec![
         PlanDef {
+            // Visibility/memory drive the score; STORAGE_FOOD is a soft brake
+            // so foragers stop wandering out when the granary is already full
+            // and let WithdrawAndEat handle hungry siblings instead.
             id: 0,
             name: "ForageFood",
             steps: PLAN_STEPS_0,
             state_weights: mk_weights(&[
-                (SI_HUNGER, 1.5),
+                (SI_VIS_PLANT_FOOD, 1.0),
+                (SI_MEM_FOOD, 0.4),
                 (SI_HAS_FOOD, -0.3),
-                (SI_MEM_FOOD, 0.2),
-                (SI_VIS_PLANT_FOOD, 0.8),
+                (SI_STORAGE_FOOD, -0.4),
             ]),
             bias: 0.0,
             serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
@@ -723,14 +732,17 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_NONE,
         },
         PlanDef {
+            // Farming is a deferred-payoff plan; weight it on skill + season,
+            // and let it fade as storage fills. Hunger weight removed — under
+            // Survive the eating plans now dominate via bias, and under
+            // GatherFood hunger is moderate anyway.
             id: 1,
             name: "FarmFood",
             steps: PLAN_STEPS_1,
             state_weights: mk_weights(&[
-                (SI_HUNGER, -0.3),
-                (SI_HAS_FOOD, 0.0),
-                (SI_SKILL_FARMING, 0.3),
-                (SI_SEASON_FOOD, 0.5),
+                (SI_SKILL_FARMING, 0.4),
+                (SI_SEASON_FOOD, 0.6),
+                (SI_STORAGE_FOOD, -0.2),
             ]),
             bias: 0.0,
             serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
@@ -743,13 +755,11 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             name: "GatherWood",
             steps: PLAN_STEPS_2,
             state_weights: mk_weights(&[
-                (SI_MEM_WOOD, 0.1),
-                (SI_HAS_WOOD, -0.2),
-                (SI_VIS_TREE, 0.5),
+                (SI_VIS_TREE, 1.0),
+                (SI_MEM_WOOD, 0.4),
+                (SI_HAS_WOOD, -0.3),
+                (SI_STORAGE_WOOD, -0.5),
             ]),
-            // Goals are claim-locked once the chief's Stockpile{Wood} posting is
-            // claimed; once the agent has any wood vis/mem the matching gather
-            // plan should win decisively over Explore-class fallbacks.
             bias: 0.0,
             serves_goals: GATHER_WOOD_GOALS,
             tech_gate: None,
@@ -761,10 +771,10 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             name: "GatherStone",
             steps: PLAN_STEPS_3,
             state_weights: mk_weights(&[
-                (SI_MEM_STONE, 0.1),
-                (SI_HAS_STONE, -0.2),
-                (SI_SKILL_MINING, 0.0),
-                (SI_VIS_STONE_TILE, 0.4),
+                (SI_VIS_STONE_TILE, 1.0),
+                (SI_MEM_STONE, 0.4),
+                (SI_HAS_STONE, -0.3),
+                (SI_STORAGE_STONE, -0.5),
             ]),
             bias: 0.0,
             serves_goals: GATHER_STONE_GOALS,
@@ -777,7 +787,6 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             name: "PlantAndFarm",
             steps: PLAN_STEPS_4,
             state_weights: mk_weights(&[
-                (SI_HUNGER, 0.0),
                 (SI_HAS_SEED, 0.4),
                 (SI_SKILL_FARMING, 0.2),
                 (SI_SEASON_FOOD, 0.5),
@@ -793,9 +802,9 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             name: "HuntFood",
             steps: PLAN_STEPS_5,
             state_weights: mk_weights(&[
-                (SI_HUNGER, 1.0),
+                (SI_SKILL_COMBAT, 0.6),
                 (SI_HAS_FOOD, -0.2),
-                (SI_SKILL_COMBAT, 0.5),
+                (SI_STORAGE_FOOD, -0.3),
             ]),
             bias: 0.0,
             serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
@@ -808,30 +817,34 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             name: "ScavengeFood",
             steps: PLAN_STEPS_6,
             state_weights: mk_weights(&[
-                (SI_HUNGER, 1.0),
+                (SI_VIS_GROUND_FOOD, 1.5),
                 (SI_HAS_FOOD, -0.3),
-                (SI_VIS_GROUND_FOOD, 0.4),
+                (SI_STORAGE_FOOD, -0.3),
             ]),
-            bias: 0.0,
+            bias: 0.1,
             serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
             flags: PF_SCAVENGE | PF_TARGETS_FOOD,
         },
         PlanDef {
+            // Gather-then-build sibling: only worth picking when storage is
+            // dry and the agent can actually see/remember wood. Otherwise
+            // HaulFromStorageAndBuild (29) is the cheaper path.
             id: 7,
             name: "BuildBlueprint",
             steps: PLAN_STEPS_7,
             state_weights: mk_weights(&[
-                (SI_SHELTER, 0.8),
-                (SI_SAFETY, 0.3),
-                (SI_SKILL_BUILDING, 0.4),
+                (SI_SKILL_BUILDING, 0.5),
+                (SI_VIS_TREE, 0.4),
+                (SI_MEM_WOOD, 0.3),
+                (SI_STORAGE_WOOD, -0.5),
             ]),
             bias: 0.2,
             serves_goals: BUILD_GOALS,
             tech_gate: None,
             memory_target_kind: None,
-            flags: PF_NONE,
+            flags: PF_UNINTERRUPTIBLE,
         },
         PlanDef {
             id: 8,
@@ -845,15 +858,19 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_NONE,
         },
         PlanDef {
+            // Plan 9 used to weight SI_HUNGER=1.5 — circular under Survive,
+            // since hunger is what selected the goal. Now scores on whether
+            // storage actually has food (the only viability question that
+            // distinguishes this from EatFromInventory and ExploreForFood).
             id: 9,
             name: "WithdrawAndEat",
             steps: PLAN_STEPS_9,
             state_weights: mk_weights(&[
-                (SI_HUNGER, 1.5),
-                (SI_IN_FACTION, 0.5),
-                (SI_HAS_FOOD, -1.0),
+                (SI_STORAGE_FOOD, 1.5),
+                (SI_IN_FACTION, 0.4),
+                (SI_HAS_FOOD, -0.5),
             ]),
-            bias: 0.0,
+            bias: 0.3,
             serves_goals: SURVIVE_GOALS,
             tech_gate: None,
             memory_target_kind: None,
@@ -906,34 +923,42 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             id: 13,
             name: "DeliverHideToCraftOrder",
             steps: PLAN_STEPS_13,
-            state_weights: mk_weights(&[(SI_SKILL_COMBAT, 0.3)]),
+            state_weights: mk_weights(&[(SI_SKILL_COMBAT, 0.5), (SI_HAS_FOOD, -0.1)]),
             bias: 0.0,
             serves_goals: CRAFT_GOALS,
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Prey),
-            flags: PF_NONE,
+            flags: PF_UNINTERRUPTIBLE,
         },
         PlanDef {
             id: 14,
             name: "DeliverGrainToCraftOrder",
             steps: PLAN_STEPS_14,
-            state_weights: mk_weights(&[(SI_SKILL_FARMING, 0.3)]),
+            state_weights: mk_weights(&[(SI_SKILL_FARMING, 0.5), (SI_SEASON_FOOD, 0.4)]),
             bias: 0.0,
             serves_goals: CRAFT_GOALS,
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
-            flags: PF_NONE,
+            flags: PF_UNINTERRUPTIBLE,
         },
         PlanDef {
+            // Was a constant 0.6 (IN_FACTION 0.4 + bias 0.2) that auto-won the
+            // Craft goal regardless of whether storage held the needed material.
+            // Now scores on actual stockpile presence so the resolver's
+            // MostDeficient selector has something to draw from.
             id: 15,
             name: "DeliverFromStorageToCraftOrder",
             steps: PLAN_STEPS_15,
-            state_weights: mk_weights(&[(SI_IN_FACTION, 0.4)]),
-            bias: 0.2,
+            state_weights: mk_weights(&[
+                (SI_STORAGE_WOOD, 0.4),
+                (SI_STORAGE_STONE, 0.4),
+                (SI_IN_FACTION, 0.3),
+            ]),
+            bias: 0.1,
             serves_goals: CRAFT_GOALS,
             tech_gate: None,
             memory_target_kind: None,
-            flags: PF_NONE,
+            flags: PF_UNINTERRUPTIBLE,
         },
         PlanDef {
             id: 16,
@@ -944,7 +969,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             serves_goals: CRAFT_GOALS,
             tech_gate: None,
             memory_target_kind: None,
-            flags: PF_NONE,
+            flags: PF_UNINTERRUPTIBLE,
         },
         PlanDef {
             id: 17,
@@ -1013,11 +1038,15 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_NONE,
         },
         PlanDef {
+            // Sole candidate under Rescue goal; weights only need to keep
+            // combat-skilled responders preferred. Old `SI_SAFETY=0.5` was
+            // perversely scoring the *agent's own* safety need, biasing AWAY
+            // from rescue under threat — dropped.
             id: 23,
             name: "RescueAlly",
             steps: PLAN_STEPS_23,
-            state_weights: mk_weights(&[(SI_SAFETY, 0.5), (SI_SOCIAL, 0.3)]),
-            bias: 0.5, // bias up so allies tend to respond when this goal fires
+            state_weights: mk_weights(&[(SI_SKILL_COMBAT, 0.3)]),
+            bias: 0.5,
             serves_goals: RESCUE_GOALS,
             tech_gate: None,
             memory_target_kind: None,
@@ -1035,11 +1064,14 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_DROP_FOOD_ON_TIMEOUT,
         },
         PlanDef {
+            // Cheapest survive plan: if food is in hand, just eat. Bias 0.5
+            // plus HAS_FOOD 2.0 wins decisively over WithdrawAndEat (~2.2)
+            // and any food-gathering candidate when food is held.
             id: 25,
             name: "EatFromInventory",
             steps: PLAN_STEPS_25,
-            state_weights: mk_weights(&[(SI_HUNGER, 1.5), (SI_HAS_FOOD, 0.5)]),
-            bias: 0.0,
+            state_weights: mk_weights(&[(SI_HAS_FOOD, 2.0)]),
+            bias: 0.5,
             serves_goals: SURVIVE_GOALS,
             tech_gate: None,
             memory_target_kind: None,
@@ -1077,7 +1109,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             name: "ExploreForFood",
             steps: PLAN_STEPS_28,
             state_weights: mk_weights(&[]),
-            bias: 0.15,
+            bias: 0.3,
             serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
@@ -1088,7 +1120,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             name: "ExploreForWood",
             steps: PLAN_STEPS_28,
             state_weights: mk_weights(&[]),
-            bias: 0.15,
+            bias: 0.3,
             serves_goals: GATHER_WOOD_GOALS,
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Wood),
@@ -1099,7 +1131,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             name: "ExploreForStone",
             steps: PLAN_STEPS_28,
             state_weights: mk_weights(&[]),
-            bias: 0.15,
+            bias: 0.3,
             serves_goals: GATHER_STONE_GOALS,
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Stone),
@@ -1116,15 +1148,16 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             name: "HaulFromStorageAndBuild",
             steps: PLAN_STEPS_29,
             state_weights: mk_weights(&[
-                (SI_SHELTER, 0.8),
-                (SI_SAFETY, 0.3),
-                (SI_SKILL_BUILDING, 0.4),
+                (SI_SKILL_BUILDING, 0.5),
+                (SI_STORAGE_WOOD, 0.6),
+                (SI_STORAGE_STONE, 0.4),
+                (SI_IN_FACTION, 0.3),
             ]),
             bias: 0.2,
             serves_goals: BUILD_GOALS,
             tech_gate: None,
             memory_target_kind: None,
-            flags: PF_NONE,
+            flags: PF_UNINTERRUPTIBLE,
         },
         PlanDef {
             // Take a Seed from faction storage and plant it as recreation.
@@ -1192,7 +1225,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             serves_goals: HAUL_GOALS,
             tech_gate: None,
             memory_target_kind: None,
-            flags: PF_NONE,
+            flags: PF_UNINTERRUPTIBLE,
         },
         PlanDef {
             // Claim-driven Build plan. Fires only when the agent holds a
@@ -1208,7 +1241,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             serves_goals: BUILD_GOALS,
             tech_gate: None,
             memory_target_kind: None,
-            flags: PF_NONE,
+            flags: PF_UNINTERRUPTIBLE,
         },
         // ── Scavenge plans for loose wood/stone ───────────────────────────────
         // Sibling of ScavengeFood (plan 6). Workers pick up loose Wood/Stone
@@ -1224,8 +1257,12 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             id: 38,
             name: "ScavengeWood",
             steps: PLAN_STEPS_SW,
-            state_weights: mk_weights(&[(SI_VIS_GROUND_WOOD, 1.5)]),
-            bias: 0.0,
+            state_weights: mk_weights(&[
+                (SI_VIS_GROUND_WOOD, 1.5),
+                (SI_HAS_WOOD, -0.3),
+                (SI_STORAGE_WOOD, -0.3),
+            ]),
+            bias: 0.1,
             serves_goals: GATHER_WOOD_GOALS,
             tech_gate: None,
             memory_target_kind: None,
@@ -1235,8 +1272,12 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             id: 39,
             name: "ScavengeStone",
             steps: PLAN_STEPS_SS,
-            state_weights: mk_weights(&[(SI_VIS_GROUND_STONE, 1.5)]),
-            bias: 0.0,
+            state_weights: mk_weights(&[
+                (SI_VIS_GROUND_STONE, 1.5),
+                (SI_HAS_STONE, -0.3),
+                (SI_STORAGE_STONE, -0.3),
+            ]),
+            bias: 0.1,
             serves_goals: GATHER_STONE_GOALS,
             tech_gate: None,
             memory_target_kind: None,
@@ -1250,10 +1291,12 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         // sole plan serving that goal. A high `bias` keeps them dominant
         // against any future siblings.
         PlanDef {
+            // Sole candidate under Socialize goal — bias alone wins.
+            // Old SI_SOCIAL=1.5 was the goal-trigger need re-amplified.
             id: 60,
             name: "Socialize",
             steps: PLAN_STEPS_SOCIALIZE,
-            state_weights: mk_weights(&[(SI_SOCIAL, 1.5)]),
+            state_weights: mk_weights(&[]),
             bias: 1.0,
             serves_goals: SOCIALIZE_GOALS,
             tech_gate: None,

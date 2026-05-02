@@ -40,11 +40,22 @@ pub const STATE_DIM: usize = 41;
 pub(super) const PLAN_EPSILON: f32 = 0.10;
 
 // ── State-vector indices (mirror `build_state_vec`) ───────────────────────────
+// The need slots (0-5) are populated by `build_state_vec` so the state vector
+// itself is complete, but no plan currently weights them: under a need-driven
+// goal the triggering need is constant across all candidate plans, so weighting
+// it again would just re-amplify the goal trigger. Kept addressable for future
+// plans that might legitimately discriminate on a need that is *not* the goal
+// trigger (e.g. SI_SLEEP on a Survive food plan).
+#[allow(dead_code)]
 pub(super) const SI_HUNGER: usize = 0;
+#[allow(dead_code)]
 pub(super) const SI_SLEEP: usize = 1;
+#[allow(dead_code)]
 pub(super) const SI_SHELTER: usize = 2;
+#[allow(dead_code)]
 pub(super) const SI_SAFETY: usize = 3;
 pub(super) const SI_SOCIAL: usize = 4;
+#[allow(dead_code)]
 pub(super) const SI_REPRO: usize = 5;
 pub(super) const SI_HAS_FOOD: usize = 6;
 pub(super) const SI_HAS_WOOD: usize = 7;
@@ -71,7 +82,16 @@ pub(super) const SI_MEM_FOOD: usize = 21;
 pub(super) const SI_MEM_WOOD: usize = 22;
 pub(super) const SI_MEM_STONE: usize = 23;
 pub(super) const SI_WILLPOWER_DISTRESS: usize = 24;
-// 25-34: plan history (2 floats per slot × PLAN_HISTORY_LEN). See build_state_vec.
+// 25-28: plan history (2 floats per slot × PLAN_HISTORY_LEN). See build_state_vec.
+// 29-32: faction storage stocks (per-good total in the agent's faction storage,
+// saturated at STORAGE_SATURATE units). Lets withdraw/haul plans score on
+// whether storage actually has the goods this plan wants to use, and lets
+// producer plans (gather/forage/farm) self-throttle when storage is full.
+pub(super) const SI_STORAGE_FOOD: usize = 29;
+pub(super) const SI_STORAGE_WOOD: usize = 30;
+pub(super) const SI_STORAGE_STONE: usize = 31;
+pub(super) const SI_STORAGE_SEED: usize = 32;
+// 33-34 reserved.
 // Source-only visibility: counts the harvestable *source* of each resource
 // within VISIBILITY_RADIUS — mature edible plants, mature trees, stone tiles.
 // Drives Forage/Gather/Deliver*ToCraftOrder plans that can only act on a
@@ -121,6 +141,12 @@ pub const PF_TARGETS_STONE: PlanFlags = 1 << 4;
 /// On timeout, drop the agent's surplus food at their feet rather than
 /// silently abandoning the plan. Used by the `ReturnSurplusFood` plan.
 pub const PF_DROP_FOOD_ON_TIMEOUT: PlanFlags = 1 << 5;
+/// Skip the "goal changed" preemption check for this plan. The plan can still
+/// be dropped by timeout, target invalidation, precondition failure, or normal
+/// completion — but a transient survival-need spike won't peel a worker off a
+/// committed faction task. Used by claimed-job, blueprint-haul, and
+/// craft-order plans.
+pub const PF_UNINTERRUPTIBLE: PlanFlags = 1 << 6;
 
 /// Where the demand for a `WithdrawForFactionNeed` step comes from. The
 /// resolver builds a `[u32; GOOD_COUNT]` "still-needed" vector from this
@@ -1812,6 +1838,10 @@ pub fn plan_execution_system(
 
                 let plan_def = match scoring {
                     PlanScoringMethod::Weighted => {
+                        let storage_opt = faction_registry
+                            .factions
+                            .get(&member.faction_id)
+                            .map(|f| &f.storage);
                         let state = build_state_vec(
                             needs,
                             agent,
@@ -1820,6 +1850,7 @@ pub fn plan_execution_system(
                             memory_opt,
                             &calendar,
                             plan_history_opt.as_deref(),
+                            storage_opt,
                             vis_plant_food,
                             vis_trees,
                             vis_stone_tiles,
@@ -1913,13 +1944,21 @@ pub fn plan_execution_system(
             let active_plan = active_plan_opt.as_deref_mut().unwrap();
 
             // ── Abandon if goal changed (no longer served by this plan) ──────────
-            let plan_still_valid = plan_registry
+            // Plans flagged with `PF_UNINTERRUPTIBLE` (claimed jobs, blueprint
+            // hauls, craft-order pipeline) ignore goal changes — survival
+            // goals wait until the task succeeds, fails, or times out.
+            let (plan_still_valid, uninterruptible) = plan_registry
                 .0
                 .iter()
                 .find(|p| p.id == active_plan.plan_id)
-                .map(|p| p.serves_goals.contains(&goal))
-                .unwrap_or(false);
-            if !plan_still_valid {
+                .map(|p| {
+                    (
+                        p.serves_goals.contains(&goal),
+                        p.flags & PF_UNINTERRUPTIBLE != 0,
+                    )
+                })
+                .unwrap_or((false, false));
+            if !plan_still_valid && !uninterruptible {
                 if let Some(history) = plan_history_opt.as_deref_mut() {
                     history.push(active_plan.plan_id, PlanOutcome::Aborted, clock.tick);
                 }

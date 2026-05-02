@@ -7,14 +7,14 @@
 //! visible to a `pub use` parent.
 
 use super::{
-    PlanHistory, PLAN_HISTORY_LEN, STATE_DIM, SI_VIS_GROUND_FOOD, SI_VIS_GROUND_STONE,
-    SI_VIS_GROUND_WOOD, SI_VIS_PLANT_FOOD, SI_VIS_STONE_TILE, SI_VIS_TREE, VISIBILITY_RADIUS,
-    VISIBILITY_SATURATE,
+    PlanHistory, PLAN_HISTORY_LEN, STATE_DIM, SI_STORAGE_FOOD, SI_STORAGE_SEED, SI_STORAGE_STONE,
+    SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD, SI_VIS_GROUND_STONE, SI_VIS_GROUND_WOOD,
+    SI_VIS_PLANT_FOOD, SI_VIS_STONE_TILE, SI_VIS_TREE, VISIBILITY_RADIUS, VISIBILITY_SATURATE,
 };
 use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
-use crate::simulation::faction::{FactionMember, SOLO};
+use crate::simulation::faction::{FactionMember, FactionStorage, SOLO};
 use crate::simulation::items::GroundItem;
 use crate::simulation::memory::{AgentMemory, MemoryKind};
 use crate::simulation::needs::Needs;
@@ -27,6 +27,11 @@ use crate::world::tile::TileKind;
 
 // ── State vector ──────────────────────────────────────────────────────────────
 
+/// Saturation cap for faction-storage state slots (`SI_STORAGE_*`). Storage
+/// totals divided by this and clamped to [0,1] — same shape as visibility
+/// saturation so the slots compose cleanly with the rest of the state vector.
+pub const STORAGE_SATURATE: f32 = 20.0;
+
 pub fn build_state_vec(
     needs: &Needs,
     agent: &EconomicAgent,
@@ -35,6 +40,7 @@ pub fn build_state_vec(
     memory: Option<&AgentMemory>,
     calendar: &Calendar,
     plan_history: Option<&PlanHistory>,
+    storage: Option<&FactionStorage>,
     vis_plant_food: u8,
     vis_trees: u8,
     vis_stone_tiles: u8,
@@ -128,6 +134,21 @@ pub fn build_state_vec(
                 }
             }
         }
+    }
+
+    // 29-32: faction storage stocks. SOLO members and unfounded factions pass
+    // None → all storage slots stay 0, which is the correct signal for plans
+    // that read storage availability (WithdrawAndEat, HaulFromStorageAndBuild,
+    // DeliverFromStorageToCraftOrder).
+    if let Some(st) = storage {
+        s[SI_STORAGE_FOOD] = (st.food_total() / STORAGE_SATURATE).clamp(0.0, 1.0);
+        s[SI_STORAGE_WOOD] = (st.totals.get(&Good::Wood).copied().unwrap_or(0) as f32
+            / STORAGE_SATURATE)
+            .clamp(0.0, 1.0);
+        s[SI_STORAGE_STONE] = (st.totals.get(&Good::Stone).copied().unwrap_or(0) as f32
+            / STORAGE_SATURATE)
+            .clamp(0.0, 1.0);
+        s[SI_STORAGE_SEED] = (st.seed_total() as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
     }
 
     // 35-37: source-only visibility — mature edible plants, mature trees, stone

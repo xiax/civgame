@@ -816,8 +816,14 @@ pub fn inspector_panel_system(
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 // Inspector preview doesn't have the spatial queries to
-                                // compute visibility; pass zeros. Live agent scoring
-                                // still uses real visibility in plan_execution_system.
+                                // compute visibility; pass zeros. Storage stocks come
+                                // from FactionRegistry directly so the SI_STORAGE_* slots
+                                // reflect reality. Live agent scoring still uses real
+                                // visibility in plan_execution_system.
+                                let storage_opt = registry
+                                    .factions
+                                    .get(&member.faction_id)
+                                    .map(|f| &f.storage);
                                 let state = build_state_vec(
                                     needs,
                                     agent,
@@ -826,6 +832,7 @@ pub fn inspector_panel_system(
                                     memory,
                                     &calendar,
                                     plan_history,
+                                    storage_opt,
                                     0,
                                     0,
                                     0,
@@ -895,8 +902,8 @@ pub fn inspector_panel_system(
                                             plan_def.bias,
                                         );
                                         if plan_def.id == ai.last_plan_id {
-                                            score += 0.2;
-                                            bonus_str += " +0.2 persist";
+                                            score += 0.0;
+                                            bonus_str += " +0.0 persist";
                                         }
 
                                         let target_tile =
