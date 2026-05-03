@@ -12,8 +12,8 @@ use super::{
     PF_TARGETS_WOOD, PF_UNINTERRUPTIBLE, SI_HAS_FOOD, SI_HAS_STONE, SI_HAS_WOOD,
     SI_CRAFT_ORDER_NEEDS_MATERIAL, SI_IN_FACTION, SI_MEM_FOOD, SI_MEM_STONE, SI_MEM_WOOD,
     SI_SEASON_FOOD, SI_SKILL_BUILDING, SI_SKILL_COMBAT, SI_SKILL_CRAFTING, SI_SKILL_FARMING,
-    SI_SOCIAL, SI_STORAGE_FOOD, SI_STORAGE_SEED, SI_STORAGE_STONE, SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD,
-    SI_VIS_GROUND_STONE,
+    SI_SOCIAL, SI_STORAGE_BERRY_SEED, SI_STORAGE_FOOD, SI_STORAGE_GRAIN_SEED, SI_STORAGE_STONE,
+    SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD, SI_VIS_GROUND_STONE,
     SI_VIS_GROUND_WOOD, SI_VIS_PLANT_FOOD, SI_VIS_STONE_TILE, SI_VIS_TREE, SI_WILLPOWER_DISTRESS,
 };
 use crate::economy::goods::Good;
@@ -39,7 +39,9 @@ static PLAN_STEPS_0: &[StepId] = &[0, 12]; // ForageFood → DepositGoods
 static PLAN_STEPS_1: &[StepId] = &[1, 12]; // FarmFood → DepositGoods
 static PLAN_STEPS_2: &[StepId] = &[2, 12]; // GatherWood → DepositGoods
 static PLAN_STEPS_3: &[StepId] = &[3, 12]; // GatherStone → DepositGoods
-static PLAN_STEPS_4: &[StepId] = &[33, 4]; // PlantFromStorage: WithdrawSeed (from storage) → PlantSeed
+static PLAN_STEPS_4: &[StepId] = &[33, 4]; // PlantGrainFromStorage: WithdrawGrainSeed → PlantGrainSeed
+static PLAN_STEPS_66: &[StepId] = &[60, 61]; // PlantBerryFromStorage: WithdrawBerrySeed → PlantBerrySeed
+static PLAN_STEPS_67: &[StepId] = &[60, 62]; // PlayByPlantingBerry: WithdrawBerrySeed → PlantBerrySeedAsPlay
 // HuntFood: muster at hearth → wait for party → travel to chief's area →
 // engage prey → corpse pickup/haul/butcher. The first three steps fold the
 // chief's hunting-party formation into the existing hunter pipeline so all
@@ -162,11 +164,11 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            // 4: PlantSeed (requires Seed in inventory)
+            // 4: PlantGrainSeed (requires GrainSeed in inventory)
             id: 4,
             task: TaskKind::Planter,
             target: StepTarget::NearestTile(GRASS_TILES),
-            preconditions: StepPreconditions::needs_good(Good::Seed, 1),
+            preconditions: StepPreconditions::needs_good(Good::GrainSeed, 1),
             reward_scale: 0.2,
             plant_filter: None,
             extra: 0,
@@ -467,15 +469,14 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            // 33: WithdrawSeed — pull one Seed from a faction storage tile so
-            // the agent can plant it as recreation in step 36.
+            // 33: WithdrawGrainSeed — pull one GrainSeed from faction storage.
             id: 33,
             task: TaskKind::WithdrawGood,
-            target: StepTarget::NearestFactionStorageWithGood(Good::Seed),
+            target: StepTarget::NearestFactionStorageWithGood(Good::GrainSeed),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.2,
             plant_filter: None,
-            extra: Good::Seed as u8,
+            extra: Good::GrainSeed as u8,
         },
         StepDef {
             // 34: WithdrawStone — pull one Stone from a faction storage tile so
@@ -501,13 +502,13 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 255,
         },
         StepDef {
-            // 36: PlantSeedAsPlay — plant a held Seed on a grass tile as
-            // recreation. Same effect as Planter (spawns Grain, Farming XP +
-            // activity), plus a one-shot willpower burst on completion.
+            // 36: PlantGrainSeedAsPlay — plant a held GrainSeed on a grass tile
+            // as recreation. Spawns Grain, awards Farming XP + activity, plus a
+            // one-shot willpower burst on completion.
             id: 36,
             task: TaskKind::PlayPlant,
             target: StepTarget::NearestTile(GRASS_TILES),
-            preconditions: StepPreconditions::needs_good(Good::Seed, 1),
+            preconditions: StepPreconditions::needs_good(Good::GrainSeed, 1),
             reward_scale: 0.6,
             plant_filter: None,
             extra: 0,
@@ -813,6 +814,38 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             plant_filter: None,
             extra: 0,
         },
+        StepDef {
+            // 60: WithdrawBerrySeed — pull one BerrySeed from faction storage.
+            id: 60,
+            task: TaskKind::WithdrawGood,
+            target: StepTarget::NearestFactionStorageWithGood(Good::BerrySeed),
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.2,
+            plant_filter: None,
+            extra: Good::BerrySeed as u8,
+        },
+        StepDef {
+            // 61: PlantBerrySeed (requires BerrySeed in inventory)
+            id: 61,
+            task: TaskKind::Planter,
+            target: StepTarget::NearestTile(GRASS_TILES),
+            preconditions: StepPreconditions::needs_good(Good::BerrySeed, 1),
+            reward_scale: 0.2,
+            plant_filter: None,
+            extra: 0,
+        },
+        StepDef {
+            // 62: PlantBerrySeedAsPlay — plant a held BerrySeed on a grass tile
+            // as recreation. Spawns BerryBush, awards Farming XP + activity,
+            // plus a one-shot willpower burst on completion.
+            id: 62,
+            task: TaskKind::PlayPlant,
+            target: StepTarget::NearestTile(GRASS_TILES),
+            preconditions: StepPreconditions::needs_good(Good::BerrySeed, 1),
+            reward_scale: 0.6,
+            plant_filter: None,
+            extra: 0,
+        },
     ];
 }
 
@@ -902,14 +935,14 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            // Withdraw a Seed from faction storage, then plant it on the nearest
-            // Grass tile. No food memory needed — targets storage then terrain.
-            // Scores high when seeds are stockpiled and food supply is low.
+            // Withdraw a GrainSeed from faction storage, then plant it on the
+            // nearest Grass tile. Scores high when grain seeds are stockpiled
+            // and food supply is low.
             id: 4,
             name: "PlantFromStorage",
             steps: PLAN_STEPS_4,
             state_weights: mk_weights(&[
-                (SI_STORAGE_SEED, 1.0),
+                (SI_STORAGE_GRAIN_SEED, 1.0),
                 (SI_SKILL_FARMING, 0.2),
                 (SI_STORAGE_FOOD, -0.3),
             ]),
@@ -1535,6 +1568,43 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             memory_target_kind: None,
             flags: PF_NONE,
             requires_profession: Some(Profession::Hunter),
+        },
+        PlanDef {
+            // Withdraw a BerrySeed from faction storage and plant it on the
+            // nearest Grass tile, spawning a BerryBush. Scores high when berry
+            // seeds are stockpiled and food supply is low.
+            id: 66,
+            name: "PlantBerryFromStorage",
+            steps: PLAN_STEPS_66,
+            state_weights: mk_weights(&[
+                (SI_STORAGE_BERRY_SEED, 1.0),
+                (SI_SKILL_FARMING, 0.2),
+                (SI_STORAGE_FOOD, -0.3),
+            ]),
+            bias: 0.0,
+            serves_goals: FARM_GOALS,
+            tech_gate: Some(technology::CROP_CULTIVATION),
+            memory_target_kind: None,
+            flags: PF_NONE,
+            requires_profession: None,
+        },
+        PlanDef {
+            // Take a BerrySeed from faction storage and plant it as recreation,
+            // spawning a BerryBush. Awards Farming XP + willpower burst.
+            id: 67,
+            name: "PlayByPlantingBerry",
+            steps: PLAN_STEPS_67,
+            state_weights: mk_weights(&[
+                (SI_WILLPOWER_DISTRESS, 0.6),
+                (SI_SKILL_FARMING, 0.4),
+                (SI_SEASON_FOOD, 0.3),
+            ]),
+            bias: 0.0,
+            serves_goals: PLAY_GOALS,
+            tech_gate: None,
+            memory_target_kind: None,
+            flags: PF_NONE,
+            requires_profession: None,
         },
     ];
 }

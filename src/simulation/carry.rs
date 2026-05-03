@@ -635,7 +635,8 @@ mod tests {
             Good::Wood,   // TwoHand, 3000g
             Good::Coal,   // OneHand, 2000g
             Good::Fruit,  // Small, 250g
-            Good::Seed,   // Small, 20g
+            Good::GrainSeed,   // Small, 20g
+            Good::BerrySeed,   // Small, 20g
         ];
         for good in cases {
             let item = Item::new_commodity(good);

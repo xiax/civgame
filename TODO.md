@@ -26,6 +26,8 @@ X implement willpower system. Work decreases willpower, fun stuff increases will
 -  I want to refactor the resouce collection system. Rather than      
 - I want to add a military system to the game. There should be a military button that opens a military menu where players can define their military, add people to the military, either individually recruiting from a list of all workers or just increase the number cap and the game will automatically pick the most suitable, making sure not to leave crucial industries like food production without workers.
 
+- I want to overhaul the world generation system. I want to first generate a realistic earth-like planet with various biomes and geographical features, mountains, rivers, valleys, plains, lakes, and oceans. The globe is divided into grids, like mega-chunks that make up the world. Then the player should be allowed to choose where they want to settle, and then the game generates the game map from that location's information using a deterministic seed that stays the same for that game, and when the player explores past their mega-chunk, we generate the map for that mega-chunk and allow the player to switch between the two using the world map. Make sure the geographical features between adjacent mega-chunks connect properly and that the biomes transition from on to the next in a way that makes realistic sense.
+
 2. The "Unique Target" Problem
   The weakness of Flow Fields is when every unit wants to go to a different spot (e.g., 100k units each picking a
   specific individual enemy to fight).

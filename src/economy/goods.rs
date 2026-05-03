@@ -1,4 +1,4 @@
-pub const GOOD_COUNT: usize = 19;
+pub const GOOD_COUNT: usize = 20;
 
 /// Encumbrance class for carrying a good in hands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,7 +25,7 @@ pub enum Good {
     Coal = 7,
     Iron = 8,
     Luxury = 9,
-    Seed = 10,
+    GrainSeed = 10,
     Weapon = 11,
     Armor = 12,
     Shield = 13,
@@ -34,6 +34,7 @@ pub enum Good {
     Tin = 16,
     Gold = 17,
     Silver = 18,
+    BerrySeed = 19,
 }
 
 impl Good {
@@ -52,7 +53,8 @@ impl Good {
             7 => Some(Good::Coal),
             8 => Some(Good::Iron),
             9 => Some(Good::Luxury),
-            10 => Some(Good::Seed),
+            10 => Some(Good::GrainSeed),
+            19 => Some(Good::BerrySeed),
             11 => Some(Good::Weapon),
             12 => Some(Good::Armor),
             13 => Some(Good::Shield),
@@ -77,7 +79,8 @@ impl Good {
             Good::Coal => "Coal",
             Good::Iron => "Iron",
             Good::Luxury => "Luxury",
-            Good::Seed => "Seed",
+            Good::GrainSeed => "Grain Seed",
+            Good::BerrySeed => "Berry Seed",
             Good::Weapon => "Weapon",
             Good::Armor => "Armor",
             Good::Shield => "Shield",
@@ -113,14 +116,14 @@ impl Good {
             Good::Cloth | Good::Skin => 20,
             Good::Tools | Good::Weapon | Good::Shield | Good::Armor => 15,
             Good::Wood | Good::Stone | Good::Coal | Good::Iron | Good::Copper | Good::Tin => 5,
-            Good::Fruit | Good::Meat | Good::Grain | Good::Seed => 3,
+            Good::Fruit | Good::Meat | Good::Grain | Good::GrainSeed | Good::BerrySeed => 3,
         }
     }
 
     /// Weight of one unit of this good in grams.
     pub fn unit_weight_g(self) -> u32 {
         match self {
-            Good::Seed => 20,
+            Good::GrainSeed | Good::BerrySeed => 20,
             Good::Luxury => 100,
             Good::Grain => 200,
             Good::Fruit => 250,
@@ -145,7 +148,8 @@ impl Good {
     /// How this good must be held in hands when carried.
     pub fn bulk(self) -> Bulk {
         match self {
-            Good::Seed
+            Good::GrainSeed
+            | Good::BerrySeed
             | Good::Luxury
             | Good::Grain
             | Good::Fruit
@@ -175,7 +179,7 @@ impl Good {
             Good::Coal,
             Good::Iron,
             Good::Luxury,
-            Good::Seed,
+            Good::GrainSeed,
             Good::Weapon,
             Good::Armor,
             Good::Shield,
@@ -184,6 +188,7 @@ impl Good {
             Good::Tin,
             Good::Gold,
             Good::Silver,
+            Good::BerrySeed,
         ]
     }
 }

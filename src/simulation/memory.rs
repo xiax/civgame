@@ -14,8 +14,9 @@ pub enum MemoryKind {
     Food = 0,
     Wood = 1,
     Stone = 2,
-    Seed = 3,
+    GrainSeed = 3,
     Prey = 4,
+    BerrySeed = 5,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -401,7 +402,8 @@ pub fn vision_system(
                             match item.item.good {
                                 crate::economy::goods::Good::Wood => Some(MemoryKind::Wood),
                                 crate::economy::goods::Good::Stone => Some(MemoryKind::Stone),
-                                crate::economy::goods::Good::Seed => Some(MemoryKind::Seed),
+                                crate::economy::goods::Good::GrainSeed => Some(MemoryKind::GrainSeed),
+                                crate::economy::goods::Good::BerrySeed => Some(MemoryKind::BerrySeed),
                                 _ => None,
                             }
                         };

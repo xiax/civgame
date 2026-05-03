@@ -105,7 +105,8 @@ impl PlantKind {
     /// Fixed co-yields always added alongside the primary yield (no faction multiplier).
     pub fn harvest_extra_yields(self) -> &'static [(Good, u32)] {
         match self {
-            PlantKind::BerryBush => &[(Good::Seed, 1)],
+            PlantKind::Grain => &[(Good::GrainSeed, 1)],
+            PlantKind::BerryBush => &[(Good::BerrySeed, 1)],
             _ => &[],
         }
     }
@@ -113,8 +114,8 @@ impl PlantKind {
     /// Items spawned as loose ground entities adjacent to the harvest tile.
     pub fn harvest_ground_drops(self, has_tool: bool) -> &'static [(Good, u32)] {
         match self {
-            PlantKind::Grain => &[(Good::Seed, 1)],
-            PlantKind::BerryBush => &[(Good::Seed, 1)],
+            PlantKind::Grain => &[],
+            PlantKind::BerryBush => &[(Good::BerrySeed, 1)],
             PlantKind::Tree => {
                 if has_tool {
                     &[(Good::Wood, 2)]
@@ -434,7 +435,7 @@ pub fn deer_graze_system(
                 let pos = tile_to_world(sx, sy);
                 commands.spawn((
                     GroundItem {
-                        item: Item::new_commodity(Good::Seed),
+                        item: Item::new_commodity(Good::BerrySeed),
                         qty: 1,
                     },
                     Transform::from_xyz(pos.x, pos.y, 0.3),

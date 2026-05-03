@@ -108,45 +108,54 @@ pub fn production_system(
             let is_play = task == TaskKind::PlayPlant as u16;
             if ai.work_progress >= TICKS_FARMER_PLANT {
                 ai.work_progress = 0;
-                if !plant_map.0.contains_key(&(tx, ty)) && agent.quantity_of(Good::Seed) > 0 {
-                    agent.remove_good(Good::Seed, 1);
-                    spawn_plant_at(
-                        &mut commands,
-                        &mut plant_map,
-                        &mut plant_sprite_index,
-                        tx,
-                        ty,
-                        PlantKind::Grain,
-                        GrowthStage::Seed,
-                    );
-                    skills.gain_xp(SkillKind::Farming, 3);
-                    if let Some(fm) = faction_member {
-                        if let Some(fd) = faction_registry.factions.get_mut(&fm.faction_id) {
-                            fd.activity_log.increment(ActivityKind::Farming);
+                let seed_and_plant = if agent.quantity_of(Good::GrainSeed) > 0 {
+                    Some((Good::GrainSeed, PlantKind::Grain))
+                } else if agent.quantity_of(Good::BerrySeed) > 0 {
+                    Some((Good::BerrySeed, PlantKind::BerryBush))
+                } else {
+                    None
+                };
+                if !plant_map.0.contains_key(&(tx, ty)) {
+                    if let Some((seed_good, plant_kind)) = seed_and_plant {
+                        agent.remove_good(seed_good, 1);
+                        spawn_plant_at(
+                            &mut commands,
+                            &mut plant_map,
+                            &mut plant_sprite_index,
+                            tx,
+                            ty,
+                            plant_kind,
+                            GrowthStage::Seed,
+                        );
+                        skills.gain_xp(SkillKind::Farming, 3);
+                        if let Some(fm) = faction_member {
+                            if let Some(fd) = faction_registry.factions.get_mut(&fm.faction_id) {
+                                fd.activity_log.increment(ActivityKind::Farming);
+                            }
                         }
-                    }
-                    // Credit a Farm posting if this worker holds one and the
-                    // tile falls within the posting's designated area.
-                    if let Some(claim) = claim_opt {
-                        let tile = (tx as i16, ty as i16);
-                        let in_area = board
-                            .get(claim.job_id)
-                            .map(|p| planting_area_contains(&p.progress, tile))
-                            .unwrap_or(false);
-                        if in_area {
-                            record_progress(
-                                &mut commands,
-                                &mut board,
-                                &mut job_completed,
-                                claim,
-                                JobKind::Farm,
-                                1,
-                            );
+                        // Credit a Farm posting if this worker holds one and the
+                        // tile falls within the posting's designated area.
+                        if let Some(claim) = claim_opt {
+                            let tile = (tx as i16, ty as i16);
+                            let in_area = board
+                                .get(claim.job_id)
+                                .map(|p| planting_area_contains(&p.progress, tile))
+                                .unwrap_or(false);
+                            if in_area {
+                                record_progress(
+                                    &mut commands,
+                                    &mut board,
+                                    &mut job_completed,
+                                    claim,
+                                    JobKind::Farm,
+                                    1,
+                                );
+                            }
                         }
-                    }
-                    if is_play {
-                        needs.willpower =
-                            (needs.willpower + WILLPOWER_PLAY_BURST).clamp(0.0, 255.0);
+                        if is_play {
+                            needs.willpower =
+                                (needs.willpower + WILLPOWER_PLAY_BURST).clamp(0.0, 255.0);
+                        }
                     }
                 }
                 ai.state = AiState::Idle;
@@ -732,7 +741,7 @@ pub fn eat_task_system(
             }
         }
         for _ in 0..fruits_consumed {
-            agent.add_good(Good::Seed, 1);
+            agent.add_good(Good::BerrySeed, 1);
         }
 
         ai.state = AiState::Idle;

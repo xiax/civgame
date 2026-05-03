@@ -594,8 +594,14 @@ impl FactionStorage {
             .map(|g| self.totals.get(g).copied().unwrap_or(0) as f32)
             .sum()
     }
+    pub fn grain_seed_total(&self) -> u32 {
+        self.totals.get(&Good::GrainSeed).copied().unwrap_or(0)
+    }
+    pub fn berry_seed_total(&self) -> u32 {
+        self.totals.get(&Good::BerrySeed).copied().unwrap_or(0)
+    }
     pub fn seed_total(&self) -> u32 {
-        self.totals.get(&Good::Seed).copied().unwrap_or(0)
+        self.grain_seed_total() + self.berry_seed_total()
     }
 }
 
@@ -1183,23 +1189,25 @@ pub fn drop_items_at_destination_system(
             .map(|f| f.techs.has(CROP_CULTIVATION))
             .unwrap_or(false);
         if *profession != Profession::Farmer && has_cultivation {
-            let mut seeds: u32 = 0;
-            for (it, q) in agent.inventory.iter_mut() {
-                if it.good == Good::Seed && *q > 0 {
-                    seeds += *q;
-                    *q = 0;
+            for seed_good in [Good::GrainSeed, Good::BerrySeed] {
+                let mut qty: u32 = 0;
+                for (it, q) in agent.inventory.iter_mut() {
+                    if it.good == seed_good && *q > 0 {
+                        qty += *q;
+                        *q = 0;
+                    }
                 }
-            }
-            if seeds > 0 {
-                spawn_or_merge_ground_item(
-                    &mut commands,
-                    &spatial,
-                    &mut ground_items,
-                    deposit_tx,
-                    deposit_ty,
-                    Good::Seed,
-                    seeds,
-                );
+                if qty > 0 {
+                    spawn_or_merge_ground_item(
+                        &mut commands,
+                        &spatial,
+                        &mut ground_items,
+                        deposit_tx,
+                        deposit_ty,
+                        seed_good,
+                        qty,
+                    );
+                }
             }
         }
 

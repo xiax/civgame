@@ -33,7 +33,7 @@ use super::needs::Needs;
 /// Dimensionality of the agent state vector built by `build_state_vec`.
 /// See that function for the layout — each `PlanDef::state_weights` is indexed
 /// the same way.
-pub const STATE_DIM: usize = 41;
+pub const STATE_DIM: usize = 42;
 
 /// ε-greedy exploration rate applied during plan selection: with this
 /// probability the agent picks a random candidate instead of the highest
@@ -61,7 +61,8 @@ pub(super) const SI_REPRO: usize = 5;
 pub(super) const SI_HAS_FOOD: usize = 6;
 pub(super) const SI_HAS_WOOD: usize = 7;
 pub(super) const SI_HAS_STONE: usize = 8;
-pub(super) const SI_HAS_SEED: usize = 9;
+pub(super) const SI_HAS_GRAIN_SEED: usize = 9;
+pub(super) const SI_HAS_BERRY_SEED: usize = 34;
 #[allow(dead_code)]
 pub(super) const SI_HAS_COAL: usize = 10;
 #[allow(dead_code)]
@@ -91,10 +92,11 @@ pub(super) const SI_WILLPOWER_DISTRESS: usize = 24;
 pub(super) const SI_STORAGE_FOOD: usize = 29;
 pub(super) const SI_STORAGE_WOOD: usize = 30;
 pub(super) const SI_STORAGE_STONE: usize = 31;
-pub(super) const SI_STORAGE_SEED: usize = 32;
+pub(super) const SI_STORAGE_GRAIN_SEED: usize = 32;
 // 33: any open craft order for this faction has unmet material deposits.
 pub(super) const SI_CRAFT_ORDER_NEEDS_MATERIAL: usize = 33;
-// 34 reserved.
+// 34: has berry seed in inventory.
+pub(super) const SI_STORAGE_BERRY_SEED: usize = 41;
 // Source-only visibility: counts the harvestable *source* of each resource
 // within VISIBILITY_RADIUS — mature edible plants, mature trees, stone tiles.
 // Drives Forage/Gather/Deliver*ToCraftOrder plans that can only act on a
@@ -1108,7 +1110,8 @@ fn resolve_target(
                 let mkind = match good {
                     Good::Wood => MemoryKind::Wood,
                     Good::Stone => MemoryKind::Stone,
-                    Good::Seed => MemoryKind::Seed,
+                    Good::GrainSeed => MemoryKind::GrainSeed,
+                    Good::BerrySeed => MemoryKind::BerrySeed,
                     _ => {
                         if good.is_edible() {
                             MemoryKind::Food

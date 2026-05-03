@@ -7,10 +7,11 @@
 //! visible to a `pub use` parent.
 
 use super::{
-    PlanHistory, PLAN_HISTORY_LEN, STATE_DIM, SI_CRAFT_ORDER_NEEDS_MATERIAL, SI_STORAGE_FOOD,
-    SI_STORAGE_SEED, SI_STORAGE_STONE, SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD, SI_VIS_GROUND_STONE,
-    SI_VIS_GROUND_WOOD, SI_VIS_PLANT_FOOD, SI_VIS_STONE_TILE, SI_VIS_TREE, VISIBILITY_RADIUS,
-    VISIBILITY_SATURATE,
+    PlanHistory, PLAN_HISTORY_LEN, STATE_DIM, SI_CRAFT_ORDER_NEEDS_MATERIAL,
+    SI_HAS_BERRY_SEED, SI_HAS_GRAIN_SEED, SI_STORAGE_BERRY_SEED, SI_STORAGE_FOOD,
+    SI_STORAGE_GRAIN_SEED, SI_STORAGE_STONE, SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD,
+    SI_VIS_GROUND_STONE, SI_VIS_GROUND_WOOD, SI_VIS_PLANT_FOOD, SI_VIS_STONE_TILE, SI_VIS_TREE,
+    VISIBILITY_RADIUS, VISIBILITY_SATURATE,
 };
 use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
@@ -60,7 +61,7 @@ pub fn build_state_vec(
     s[4] = needs.social as f32 / 255.0;
     s[5] = needs.reproduction as f32 / 255.0;
 
-    // 6-10: inventory has (Food, Wood, Stone, Seed, Coal)
+    // 6-10: inventory has (Food, Wood, Stone, GrainSeed, Coal)
     s[6] = if agent.total_food() > 0 { 1.0 } else { 0.0 };
     s[7] = if agent.quantity_of(Good::Wood) > 0 {
         1.0
@@ -72,11 +73,8 @@ pub fn build_state_vec(
     } else {
         0.0
     };
-    s[9] = if agent.quantity_of(Good::Seed) > 0 {
-        1.0
-    } else {
-        0.0
-    };
+    s[SI_HAS_GRAIN_SEED] = if agent.quantity_of(Good::GrainSeed) > 0 { 1.0 } else { 0.0 };
+    s[SI_HAS_BERRY_SEED] = if agent.quantity_of(Good::BerrySeed) > 0 { 1.0 } else { 0.0 };
     s[10] = if agent.quantity_of(Good::Coal) > 0 {
         1.0
     } else {
@@ -127,7 +125,7 @@ pub fn build_state_vec(
             let base = 25 + i * 2;
             match history.entries[i] {
                 Some((plan_id, outcome, _tick)) => {
-                    s[base] = (plan_id as f32 + 1.0) / 32.0;
+                    s[base] = (plan_id as f32 + 1.0) / 128.0;
                     s[base + 1] = if outcome.is_failure() { 1.0 } else { 0.0 };
                 }
                 None => {
@@ -150,7 +148,8 @@ pub fn build_state_vec(
         s[SI_STORAGE_STONE] = (st.totals.get(&Good::Stone).copied().unwrap_or(0) as f32
             / STORAGE_SATURATE)
             .clamp(0.0, 1.0);
-        s[SI_STORAGE_SEED] = (st.seed_total() as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
+        s[SI_STORAGE_GRAIN_SEED] = (st.grain_seed_total() as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
+        s[SI_STORAGE_BERRY_SEED] = (st.berry_seed_total() as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
     }
 
     // 33: any open craft order for this faction has unmet material deposits.
