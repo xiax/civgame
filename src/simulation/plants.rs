@@ -79,6 +79,23 @@ impl Plant {
 }
 
 impl PlantKind {
+    /// Single source of truth for "every plant kind that exists." Iterating this
+    /// constant powers the seed↔plant mapping, faction storage walks, and the
+    /// Planter executor — adding a new plant kind here plus an arm in
+    /// `seed_good()` is the entire extension surface for new seeds.
+    pub const ALL: &'static [PlantKind] =
+        &[PlantKind::Grain, PlantKind::BerryBush, PlantKind::Tree];
+
+    /// The seed Good that grows into this plant, if any. Tree saplings aren't
+    /// modelled as seeds yet, so trees return None.
+    pub fn seed_good(self) -> Option<Good> {
+        match self {
+            PlantKind::Grain => Some(Good::GrainSeed),
+            PlantKind::BerryBush => Some(Good::BerrySeed),
+            PlantKind::Tree => None,
+        }
+    }
+
     /// Ticks the agent must spend Working before a harvest triggers.
     /// Plants are harvested instantly (0); this mirrors how tile-based gathering uses work_ticks.
     pub fn harvest_work_ticks(self) -> u8 {

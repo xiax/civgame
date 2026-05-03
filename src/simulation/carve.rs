@@ -106,7 +106,15 @@ pub fn carve_tile(
             );
             changed = true;
         }
-        _ => {} // already a passable floor or open space — leave it
+        _ => {
+            // Floor is already passable (procedural Dirt from topsoil, etc.) —
+            // no yield, but write a delta so the chunk's surface_kind cache
+            // reflects the real kind instead of the Air placeholder left by
+            // the head carve. Without this, surface_tile_kind returns Air
+            // and the right-click menu hides Dig Down on subsequent clicks.
+            chunk_map.set_tile(tx, ty, target_floor_z, floor);
+            changed = true;
+        }
     }
 
     if changed {

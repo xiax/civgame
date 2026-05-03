@@ -5,11 +5,12 @@ use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::pathfinding::hotspots::{HotspotFlowFields, HotspotKind};
 use crate::rendering::camera::CameraViewZ;
-use crate::simulation::animals::{Deer, Fox, Wolf};
+use crate::simulation::animals::{Cat, Cow, Deer, Fox, Horse, Pig, Tamed, Wolf};
 use crate::simulation::combat::{CombatTarget, Health};
 use crate::simulation::construction::{
-    faction_can_build, recipe_for, BedMap, Blueprint, BlueprintMap, BuildSiteKind, CampfireMap,
-    ChairMap, DoorMap, LoomMap, TableMap, WallMaterial, WorkbenchMap,
+    faction_can_build, recipe_for, BarracksMap, BedMap, Blueprint, BlueprintMap, BuildSiteKind,
+    CampfireMap, ChairMap, DoorMap, GranaryMap, LoomMap, MarketMap, MonumentMap, ShrineMap,
+    TableMap, WallMaterial, WorkbenchMap,
 };
 use crate::simulation::corpse::Corpse;
 use crate::simulation::faction::SOLO;
@@ -71,7 +72,7 @@ impl ContextMenuState {
 }
 
 /// All build options the player could potentially place on an open tile.
-fn all_build_options() -> [BuildSiteKind; 12] {
+fn all_build_options() -> [BuildSiteKind; 17] {
     [
         BuildSiteKind::Wall(WallMaterial::Palisade),
         BuildSiteKind::Wall(WallMaterial::WattleDaub),
@@ -85,6 +86,11 @@ fn all_build_options() -> [BuildSiteKind; 12] {
         BuildSiteKind::Loom,
         BuildSiteKind::Table,
         BuildSiteKind::Chair,
+        BuildSiteKind::Granary,
+        BuildSiteKind::Shrine,
+        BuildSiteKind::Market,
+        BuildSiteKind::Barracks,
+        BuildSiteKind::Monument,
     ]
 }
 
@@ -106,6 +112,11 @@ pub struct TileDisplayQueries<'w, 's> {
     pub wolf_q: Query<'w, 's, (), With<Wolf>>,
     pub deer_q: Query<'w, 's, (), With<Deer>>,
     pub fox_q: Query<'w, 's, (), With<Fox>>,
+    pub horse_q: Query<'w, 's, (), With<Horse>>,
+    pub cow_q: Query<'w, 's, (), With<Cow>>,
+    pub pig_q: Query<'w, 's, (), With<Pig>>,
+    pub cat_q: Query<'w, 's, (), With<Cat>>,
+    pub tamed_q: Query<'w, 's, (), With<Tamed>>,
     pub corpse_q: Query<'w, 's, &'static Corpse>,
     pub profession_q: Query<'w, 's, &'static Profession>,
 }
@@ -124,6 +135,11 @@ pub struct RoutingResources<'w, 's> {
     pub chair_map: Res<'w, ChairMap>,
     pub workbench_map: Res<'w, WorkbenchMap>,
     pub loom_map: Res<'w, LoomMap>,
+    pub granary_map: Res<'w, GranaryMap>,
+    pub shrine_map: Res<'w, ShrineMap>,
+    pub market_map: Res<'w, MarketMap>,
+    pub barracks_map: Res<'w, BarracksMap>,
+    pub monument_map: Res<'w, MonumentMap>,
     pub bp_map: ResMut<'w, BlueprintMap>,
     #[system_param(ignore)]
     pub _marker: std::marker::PhantomData<&'s ()>,
@@ -209,7 +225,12 @@ pub fn right_click_context_menu_system(
                         || routing.table_map.0.contains_key(&pos_tile)
                         || routing.chair_map.0.contains_key(&pos_tile)
                         || routing.workbench_map.0.contains_key(&pos_tile)
-                        || routing.loom_map.0.contains_key(&pos_tile);
+                        || routing.loom_map.0.contains_key(&pos_tile)
+                        || routing.granary_map.0.contains_key(&pos_tile)
+                        || routing.shrine_map.0.contains_key(&pos_tile)
+                        || routing.market_map.0.contains_key(&pos_tile)
+                        || routing.barracks_map.0.contains_key(&pos_tile)
+                        || routing.monument_map.0.contains_key(&pos_tile);
 
                     if let Some(kind) = target_kind {
                         if matches!(kind, TileKind::Wall | TileKind::Stone) {
@@ -267,6 +288,11 @@ pub fn right_click_context_menu_system(
                                 &tile_display.wolf_q,
                                 &tile_display.deer_q,
                                 &tile_display.fox_q,
+                                &tile_display.horse_q,
+                                &tile_display.cow_q,
+                                &tile_display.pig_q,
+                                &tile_display.cat_q,
+                                &tile_display.tamed_q,
                                 &tile_display.corpse_q,
                             );
                             menu_state.tile_entities.push(TileEntityInfo {
@@ -618,6 +644,11 @@ fn entity_display_name(
     wolf_q: &Query<(), With<Wolf>>,
     deer_q: &Query<(), With<Deer>>,
     fox_q: &Query<(), With<Fox>>,
+    horse_q: &Query<(), With<Horse>>,
+    cow_q: &Query<(), With<Cow>>,
+    pig_q: &Query<(), With<Pig>>,
+    cat_q: &Query<(), With<Cat>>,
+    tamed_q: &Query<(), With<Tamed>>,
     corpse_q: &Query<&Corpse>,
 ) -> String {
     if let Ok(corpse) = corpse_q.get(entity) {
@@ -643,6 +674,22 @@ fn entity_display_name(
     }
     if fox_q.get(entity).is_ok() {
         return "Fox".to_owned();
+    }
+    if horse_q.get(entity).is_ok() {
+        return if tamed_q.get(entity).is_ok() {
+            "Horse (tamed)".to_owned()
+        } else {
+            "Horse".to_owned()
+        };
+    }
+    if cow_q.get(entity).is_ok() {
+        return "Cow".to_owned();
+    }
+    if pig_q.get(entity).is_ok() {
+        return "Pig".to_owned();
+    }
+    if cat_q.get(entity).is_ok() {
+        return "Cat".to_owned();
     }
     name_q
         .get(entity)

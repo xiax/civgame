@@ -367,7 +367,7 @@ impl StepPreconditions {
         hunger: f32,
     ) -> bool {
         if let Some((good, qty)) = self.requires_good {
-            if agent.quantity_of(good) < qty {
+            if agent.quantity_of(good) + carrier.quantity_of_good(good) < qty {
                 return false;
             }
         }

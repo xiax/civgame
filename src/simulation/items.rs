@@ -159,8 +159,11 @@ pub fn recompute_inventory_capacity_system(
 /// keeps it in their personal inventory rather than carrying it in their hands.
 /// Hungry agents personalize edibles too (so they can eat them later).
 fn personal_pickup(good: Good, needs: &Needs) -> bool {
+    if good.is_seed() {
+        return true;
+    }
     match good {
-        Good::Tools | Good::GrainSeed | Good::BerrySeed => true,
+        Good::Tools => true,
         Good::Fruit | Good::Meat | Good::Grain => needs.hunger > 80.0,
         _ => false,
     }

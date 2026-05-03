@@ -766,6 +766,18 @@ pub fn chief_job_posting_system(
                         continue;
                     }
                     let deficit = demand - supply;
+                    // Only post when ingredients are actually available;
+                    // otherwise workers adopt Craft goal with no CraftOrder.
+                    let mut has_ingredients = true;
+                    for &(good, qty) in recipe.inputs {
+                        if faction.resource_supply.get(&good).copied().unwrap_or(0) < qty {
+                            has_ingredients = false;
+                            break;
+                        }
+                    }
+                    if !has_ingredients {
+                        continue;
+                    }
                     if best.map_or(true, |(_, d, _)| deficit > d) {
                         best = Some((idx as u8, deficit, bench_ref));
                     }

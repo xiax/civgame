@@ -332,21 +332,26 @@ pub fn farm_pressure(faction: &FactionData) -> u8 {
     ((deficit / target_f).clamp(0.0, 1.0) * 100.0) as u8
 }
 
-/// 0..=100: tool-supply gap pressure on the same urgency scale as the
-/// other helpers.
+/// 0..=100: craft-supply gap pressure across all craftable goods.
 pub fn craft_pressure(faction: &FactionData) -> u8 {
-    let supply = faction
-        .resource_supply
-        .get(&Good::Tools)
-        .copied()
+    const CRAFTABLE: &[Good] = &[
+        Good::Tools,
+        Good::Weapon,
+        Good::Cloth,
+        Good::Luxury,
+        Good::Shield,
+        Good::Armor,
+    ];
+    let max_gap = CRAFTABLE
+        .iter()
+        .map(|g| {
+            let s = faction.resource_supply.get(g).copied().unwrap_or(0);
+            let d = faction.resource_demand.get(g).copied().unwrap_or(0);
+            d.saturating_sub(s)
+        })
+        .max()
         .unwrap_or(0);
-    let demand = faction
-        .resource_demand
-        .get(&Good::Tools)
-        .copied()
-        .unwrap_or(0);
-    let gap = demand.saturating_sub(supply);
-    (gap.saturating_mul(4)).min(100) as u8
+    (max_gap.saturating_mul(4)).min(100) as u8
 }
 
 // ── Workforce budget (Stage 2) ───────────────────────────────────────────────
@@ -428,6 +433,12 @@ const SHARE_FLOOR: f32 = 0.03;
 /// keep slots in the same order of magnitude without flattening cultural
 /// distinction.
 const CULTURE_RAW_CAP: f32 = 150.0;
+/// Posting window size; must match `deficit.min(N)` in `chief_job_posting_system`.
+const CRAFT_MAX_BATCH: u32 = 5;
+/// Workers allocated per item in the current craft posting batch. Caps the
+/// craft budget share so proportional allocation can't send the entire
+/// workforce to a small posting when other pressures are quiet.
+const CRAFT_WORKERS_PER_ITEM: f32 = 1.0;
 /// Trigger threshold for the critical-food override. Per-head food below
 /// 20% of target makes `food_pressure` ≥ 80, at which point we force
 /// `stockpile_food` to at least `CRITICAL_FOOD_FLOOR`.
@@ -599,6 +610,35 @@ pub fn compute_workforce_budget(
             }
             shares[0] = CRITICAL_FOOD_FLOOR;
         }
+    }
+
+    // Clamp craft share to the dispatch window. The posting system caps each
+    // craft job at min(deficit, CRAFT_MAX_BATCH) units; proportional
+    // allocation can otherwise send the full workforce to crafting when it is
+    // the only active pressure and other jobs are quiet.
+    if eligible[6] && faction.member_count > 0 {
+        const CRAFTABLE: &[Good] = &[
+            Good::Tools,
+            Good::Weapon,
+            Good::Cloth,
+            Good::Luxury,
+            Good::Shield,
+            Good::Armor,
+        ];
+        let max_gap = CRAFTABLE
+            .iter()
+            .map(|g| {
+                let s = faction.resource_supply.get(g).copied().unwrap_or(0);
+                let d = faction.resource_demand.get(g).copied().unwrap_or(0);
+                d.saturating_sub(s)
+            })
+            .max()
+            .unwrap_or(0);
+        let effective_batch = max_gap.min(CRAFT_MAX_BATCH) as f32;
+        let max_craft_share = (effective_batch * CRAFT_WORKERS_PER_ITEM
+            / faction.member_count as f32)
+            .max(SHARE_FLOOR);
+        shares[6] = shares[6].min(max_craft_share);
     }
 
     let target = WorkforceBudget {

@@ -96,6 +96,15 @@ impl Good {
         matches!(self, Good::Fruit | Good::Meat | Good::Grain)
     }
 
+    /// True if this good is a planting seed. Kept in sync with
+    /// `PlantKind::seed_good()` — the simulation-side table is the source of
+    /// truth for what plant grows from each seed; this match arm is the
+    /// inverse used by routing logic that doesn't want to pull `PlantKind`
+    /// into the economy module.
+    pub fn is_seed(self) -> bool {
+        matches!(self, Good::GrainSeed | Good::BerrySeed)
+    }
+
     pub fn nutrition(self) -> u8 {
         match self {
             Good::Fruit => 85,

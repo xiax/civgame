@@ -28,6 +28,18 @@ use bevy::prelude::*;
 
 pub const TICKS_FARMER_PLANT: u8 = 40;
 
+/// Remove one unit of `good` from wherever the agent holds it, preferring
+/// hands. Used by executors that don't care which store the consumable came
+/// from (e.g. planting a seed that may have just been harvested into hands or
+/// withdrawn into inventory).
+pub fn consume_one_good(agent: &mut EconomicAgent, carrier: &mut Carrier, good: Good) {
+    if carrier.quantity_of_good(good) > 0 {
+        carrier.remove_good(good, 1);
+    } else {
+        agent.remove_good(good, 1);
+    }
+}
+
 /// Ticks the agent spends winding up a play-throw before the rock leaves their
 /// hand. Short — throwing a rock is a quick action.
 const TICKS_PLAY_THROW: u8 = 30;
@@ -79,6 +91,7 @@ pub fn production_system(
     mut query: Query<(
         &mut PersonAI,
         &mut EconomicAgent,
+        &mut Carrier,
         &mut Skills,
         &mut Needs,
         &BucketSlot,
@@ -87,8 +100,17 @@ pub fn production_system(
         Option<&JobClaim>,
     )>,
 ) {
-    for (mut ai, mut agent, mut skills, mut needs, slot, lod, faction_member, claim_opt) in
-        query.iter_mut()
+    for (
+        mut ai,
+        mut agent,
+        mut carrier,
+        mut skills,
+        mut needs,
+        slot,
+        lod,
+        faction_member,
+        claim_opt,
+    ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
@@ -108,16 +130,18 @@ pub fn production_system(
             let is_play = task == TaskKind::PlayPlant as u16;
             if ai.work_progress >= TICKS_FARMER_PLANT {
                 ai.work_progress = 0;
-                let seed_and_plant = if agent.quantity_of(Good::GrainSeed) > 0 {
-                    Some((Good::GrainSeed, PlantKind::Grain))
-                } else if agent.quantity_of(Good::BerrySeed) > 0 {
-                    Some((Good::BerrySeed, PlantKind::BerryBush))
-                } else {
-                    None
-                };
+                // Walk PlantKind::ALL so adding a new seed/plant pair only
+                // requires editing PlantKind::seed_good(). Seeds may live in
+                // hands (harvest co-yields route through Carrier) OR
+                // inventory (withdrawn from storage), so check both stores.
+                let seed_and_plant = PlantKind::ALL.iter().copied().find_map(|kind| {
+                    let seed = kind.seed_good()?;
+                    let held = agent.quantity_of(seed) + carrier.quantity_of_good(seed);
+                    (held > 0).then_some((seed, kind))
+                });
                 if !plant_map.0.contains_key(&(tx, ty)) {
                     if let Some((seed_good, plant_kind)) = seed_and_plant {
-                        agent.remove_good(seed_good, 1);
+                        consume_one_good(&mut agent, &mut carrier, seed_good);
                         spawn_plant_at(
                             &mut commands,
                             &mut plant_map,

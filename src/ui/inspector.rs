@@ -3,6 +3,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::agent::EconomicAgent;
+use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::pathfinding::path_request::{
     FailReason, FailureLog, FollowStatus, PathFollow, PathRequestQueue,
@@ -22,6 +23,7 @@ use crate::simulation::plan::{
     build_state_vec, score_weighted, ActivePlan, KnownPlans, PlanHistory, PlanOutcome,
     PlanRegistry, StepRegistry,
 };
+use crate::simulation::corpse::Corpse;
 use crate::simulation::plants::{Plant, PlantMap};
 use crate::simulation::reproduction::{
     BiologicalSex, CoSleepTracker, MaleConceptionCooldown, Pregnancy, PREGNANCY_TICKS,
@@ -67,6 +69,12 @@ pub struct JobInspectorParams<'w, 's> {
     pub board: Res<'w, crate::simulation::jobs::JobBoard>,
 }
 
+#[derive(SystemParam)]
+pub struct TaskDisplayParams<'w, 's> {
+    pub plants: Query<'w, 's, &'static Plant>,
+    pub corpse_q: Query<'w, 's, &'static Corpse>,
+}
+
 pub fn inspector_panel_system(
     mut contexts: EguiContexts,
     selected: Res<SelectedEntity>,
@@ -78,7 +86,7 @@ pub fn inspector_panel_system(
     step_registry: Res<StepRegistry>,
     calendar: Res<Calendar>,
     mut path_params: PathInspectorParams,
-    plants: Query<&Plant>,
+    task_display: TaskDisplayParams,
     rel_query: Query<&RelationshipMemory>,
     mut job_params: JobInspectorParams,
     repro_query: Query<(
@@ -625,7 +633,7 @@ pub fn inspector_panel_system(
 
                                 if ai.task_id == TaskKind::Gather as u16 {
                                     if let Some(&p_entity) = plant_map.0.get(&(tx, ty)) {
-                                        if let Ok(plant) = plants.get(p_entity) {
+                                        if let Ok(plant) = task_display.plants.get(p_entity) {
                                             work_str = format!("Harvesting {:?}", plant.kind);
                                         }
                                     } else if let Some(tile_kind) = chunk_map.tile_kind_at(tx, ty) {
@@ -659,6 +667,35 @@ pub fn inspector_panel_system(
                                     } else {
                                         work_str = "Withdrawing".to_string();
                                     }
+                                } else if ai.task_id == TaskKind::Butcher as u16 {
+                                    work_str = format!(
+                                        "Butchering ({}%)",
+                                        (ai.work_progress as u32 * 100) / 60
+                                    );
+                                } else if ai.task_id == TaskKind::WorkOnCraftOrder as u16 {
+                                    work_str =
+                                        format!("Crafting (step: {})", ai.work_progress);
+                                } else if ai.task_id == TaskKind::WithdrawGood as u16 {
+                                    let good_label = if ai.craft_recipe_id == 255 {
+                                        "entertainment good".to_owned()
+                                    } else {
+                                        Good::try_from_u8(ai.craft_recipe_id)
+                                            .map(|g| g.name().to_owned())
+                                            .unwrap_or_else(|| {
+                                                format!("good#{}", ai.craft_recipe_id)
+                                            })
+                                    };
+                                    work_str = format!("Withdrawing {}", good_label);
+                                } else if ai.task_id == TaskKind::PlayPlant as u16 {
+                                    work_str = format!(
+                                        "Play-Planting ({}%)",
+                                        (ai.work_progress as u32 * 100) / 40
+                                    );
+                                } else if ai.task_id == TaskKind::PlayThrow as u16 {
+                                    work_str = format!(
+                                        "Play-Throwing ({}%)",
+                                        (ai.work_progress as u32 * 100) / 30
+                                    );
                                 }
 
                                 work_str
@@ -674,6 +711,17 @@ pub fn inspector_panel_system(
                                 "Withdraw intent: {:?} \u{00d7} {} from ({}, {})",
                                 good, ai.withdraw_qty, ai.dest_tile.0, ai.dest_tile.1
                             ));
+                        }
+                        if let Some(corpse_e) = ai.carried_corpse {
+                            if let Ok(corpse) = task_display.corpse_q.get(corpse_e) {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Carrying: {:?} Corpse",
+                                        corpse.species
+                                    ))
+                                    .color(egui::Color32::from_rgb(180, 120, 80)),
+                                );
+                            }
                         }
 
                         match order {

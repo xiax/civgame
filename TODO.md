@@ -28,6 +28,10 @@ X implement willpower system. Work decreases willpower, fun stuff increases will
 
 - I want to overhaul the world generation system. I want to first generate a realistic earth-like planet with various biomes and geographical features, mountains, rivers, valleys, plains, lakes, and oceans. The globe is divided into grids, like mega-chunks that make up the world. Then the player should be allowed to choose where they want to settle, and then the game generates the game map from that location's information using a deterministic seed that stays the same for that game, and when the player explores past their mega-chunk, we generate the map for that mega-chunk and allow the player to switch between the two using the world map. Make sure the geographical features between adjacent mega-chunks connect properly and that the biomes transition from on to the next in a way that makes realistic sense.
 
+-I want to overhaul the resource gathering system. Picking stuff off the ground should be prioritized over      
+  doing actual gathering work like cutting down trees or mining stone if the worker can see the resource just     
+  lying on the groun  
+
 2. The "Unique Target" Problem
   The weakness of Flow Fields is when every unit wants to go to a different spot (e.g., 100k units each picking a
   specific individual enemy to fight).

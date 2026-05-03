@@ -142,7 +142,6 @@ pub fn task_requires_free_hands(task_id: u16) -> u8 {
 pub fn task_drops_hand_load(task_id: u16) -> bool {
     task_id == TaskKind::Sleep as u16
         || task_id == TaskKind::Socialize as u16
-        || task_id == TaskKind::Eat as u16
 }
 
 /// Returns true for tasks where the agent works from an adjacent tile rather than

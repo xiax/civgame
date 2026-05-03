@@ -8,6 +8,7 @@ use super::memory::RelationshipMemory;
 use super::needs::Needs;
 use super::person::{AiState, PersonAI, Profession};
 use super::plan::{ActivePlan, PlanHistory, PlanOutcome};
+use super::plants::PlantKind;
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::{SkillKind, Skills};
 use super::tasks::TaskKind;
@@ -1182,14 +1183,19 @@ pub fn drop_items_at_destination_system(
         }
         let _ = worker; // silence unused if no further use
 
-        // Non-farmers deposit seeds so farmers can plant them.
+        // Deposit any seeds the agent is carrying in inventory. Hand seeds
+        // were already dumped via `carrier.drop_all()` above. Iterating
+        // `PlantKind::ALL` keeps this loop in sync with the seed↔plant table
+        // — adding a new seed only needs an arm in `PlantKind::seed_good()`.
+        // Farmers deposit too: PlantFromStorage withdraws seeds back as
+        // needed, which keeps the `SI_STORAGE_*_SEED` state slots meaningful.
         let has_cultivation = registry
             .factions
             .get(&member.faction_id)
             .map(|f| f.techs.has(CROP_CULTIVATION))
             .unwrap_or(false);
-        if *profession != Profession::Farmer && has_cultivation {
-            for seed_good in [Good::GrainSeed, Good::BerrySeed] {
+        if has_cultivation {
+            for seed_good in PlantKind::ALL.iter().filter_map(|k| k.seed_good()) {
                 let mut qty: u32 = 0;
                 for (it, q) in agent.inventory.iter_mut() {
                     if it.good == seed_good && *q > 0 {
