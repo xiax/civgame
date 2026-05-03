@@ -107,6 +107,7 @@ fn setup_sandbox(
             Carrier::default(),
             crate::simulation::reproduction::CoSleepTracker::default(),
             crate::simulation::reproduction::MaleConceptionCooldown::default(),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Person),
         ),
     ));
 
@@ -131,30 +132,34 @@ fn setup_sandbox(
         AnimalNeeds::default(),
         AnimalReproductionCooldown(0),
         BiologicalSex::random(),
+        crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Wolf),
     ));
 
     // Deer (4 tiles left, 3 tiles up from person)
     let deer_pos = tile_to_world(cx - 4, cy + 3);
     commands.spawn((
-        Deer,
-        Transform::from_xyz(deer_pos.x, deer_pos.y, 1.0),
-        GlobalTransform::default(),
-        Visibility::Visible,
-        InheritedVisibility::default(),
-        AnimalAI {
-            target_tile: ((cx - 4) as i32, (cy + 3) as i32),
-            wander_timer: 0.5,
-            ..Default::default()
-        },
-        Health::new(20),
-        CombatTarget::default(),
-        CombatCooldown::default(),
-        LodLevel::Full,
-        BucketSlot(2),
-        DeerGrazer { graze_timer: 0 },
-        AnimalNeeds::default(),
-        AnimalReproductionCooldown(0),
-        BiologicalSex::random(),
+        (
+            Deer,
+            Transform::from_xyz(deer_pos.x, deer_pos.y, 1.0),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
+            AnimalAI {
+                target_tile: ((cx - 4) as i32, (cy + 3) as i32),
+                wander_timer: 0.5,
+                ..Default::default()
+            },
+            Health::new(20),
+            CombatTarget::default(),
+            CombatCooldown::default(),
+            LodLevel::Full,
+            BucketSlot(2),
+            DeerGrazer { graze_timer: 0 },
+            AnimalNeeds::default(),
+            AnimalReproductionCooldown(0),
+            BiologicalSex::random(),
+        ),
+        crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Deer),
     ));
 
     clock.population = 3;
@@ -201,6 +206,7 @@ fn setup_sandbox(
         GlobalTransform::default(),
         Visibility::Visible,
         InheritedVisibility::default(),
+        crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::GroundItem),
     ));
     let wood_pos = tile_to_world(cx - 1, cy + 1);
     commands.spawn((
@@ -212,6 +218,7 @@ fn setup_sandbox(
         GlobalTransform::default(),
         Visibility::Visible,
         InheritedVisibility::default(),
+        crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::GroundItem),
     ));
 
     info!("Sandbox: 1 person, 1 wolf, 1 deer, 3 plants, 2 ground items at tile ({cx}, {cy})");

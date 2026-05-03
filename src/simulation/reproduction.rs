@@ -481,7 +481,11 @@ pub fn pregnancy_system(
                 PathFollow::default(),
                 Carrier::default(),
             ),
-            (CoSleepTracker::default(), MaleConceptionCooldown::default()),
+            (
+                CoSleepTracker::default(),
+                MaleConceptionCooldown::default(),
+                crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Person),
+            ),
         ));
     }
 }

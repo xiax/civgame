@@ -122,6 +122,7 @@ pub fn spawn_or_merge_ground_item_full(
         GlobalTransform::default(),
         Visibility::Visible,
         InheritedVisibility::default(),
+        crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::GroundItem),
     ));
 }
 

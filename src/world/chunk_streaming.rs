@@ -570,6 +570,7 @@ pub fn spawn_chunk_loose_rocks(commands: &mut Commands, chunk_map: &ChunkMap, co
                 GlobalTransform::default(),
                 Visibility::Visible,
                 InheritedVisibility::default(),
+                crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::GroundItem),
             ));
         }
     }

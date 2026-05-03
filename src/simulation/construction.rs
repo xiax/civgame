@@ -2751,6 +2751,9 @@ pub fn construction_system(
                             GlobalTransform::default(),
                             Visibility::Visible,
                             InheritedVisibility::default(),
+                            crate::world::spatial::Indexed::new(
+                                crate::world::spatial::IndexedKind::Bed,
+                            ),
                         ))
                         .id();
                     maps.bed_map.0.insert(tile, bed_entity);
@@ -3593,6 +3596,9 @@ pub fn deconstruct_system(
                         GlobalTransform::default(),
                         Visibility::Visible,
                         InheritedVisibility::default(),
+                        crate::world::spatial::Indexed::new(
+                            crate::world::spatial::IndexedKind::GroundItem,
+                        ),
                     ));
                 }
             }

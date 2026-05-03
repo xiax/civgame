@@ -611,6 +611,7 @@ pub fn death_system(
             e.remove::<Deer>();
             e.remove::<CombatTarget>();
             e.remove::<CombatCooldown>();
+            e.remove::<crate::world::spatial::Indexed>();
             e.insert(Corpse {
                 species,
                 fresh_until_tick: clock.tick + CORPSE_FRESHNESS_TICKS,
@@ -651,6 +652,9 @@ pub fn death_system(
                 GlobalTransform::default(),
                 Visibility::Visible,
                 InheritedVisibility::default(),
+                crate::world::spatial::Indexed::new(
+                    crate::world::spatial::IndexedKind::GroundItem,
+                ),
             ));
         }
 

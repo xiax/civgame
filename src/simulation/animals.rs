@@ -7,10 +7,9 @@ use crate::simulation::line_of_sight::has_los;
 use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::TICKS_PER_SEASON;
 use crate::world::spatial::SpatialIndex;
-use crate::world::terrain::{tile_to_world, TILE_SIZE, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
+use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use crate::world::tile::TileKind;
 use bevy::prelude::*;
-use rand::Rng;
 use std::time::Instant;
 
 const WOLF_COUNT: u32 = 150;
@@ -150,45 +149,36 @@ pub fn spawn_animals(
     mut clock: ResMut<SimClock>,
 ) {
     let now = Instant::now();
-    use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
-
-    let start_cx = ((GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS) - (WORLD_CHUNKS_X / 2);
-    let start_cy = ((GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS) - (WORLD_CHUNKS_Y / 2);
-
-    let start_tx = start_cx * CHUNK_SIZE as i32;
-    let start_ty = start_cy * CHUNK_SIZE as i32;
-
-    let total_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
-    let total_y = WORLD_CHUNKS_Y * CHUNK_SIZE as i32;
 
     let mut forest_tiles: Vec<(i32, i32)> = Vec::new();
     let mut grass_tiles: Vec<(i32, i32)> = Vec::new();
-    let mut rng = rand::thread_rng();
 
     let forest_target = (WOLF_COUNT + PIG_COUNT + FOX_COUNT + CAT_COUNT) as usize * 2;
     let grass_target = (DEER_COUNT + HORSE_COUNT + COW_COUNT + RABBIT_COUNT) as usize * 2;
 
-    for _ in 0..40000 {
-        let tx = start_tx + rng.gen_range(0..total_x);
-        let ty = start_ty + rng.gen_range(0..total_y);
-        if !chunk_map.is_passable(tx, ty) {
-            continue;
-        }
-        match chunk_map.tile_kind_at(tx, ty) {
-            Some(TileKind::Forest) => {
-                if forest_tiles.len() < forest_target {
-                    forest_tiles.push((tx, ty));
+    'tile_search: for (coord, chunk) in chunk_map.0.iter() {
+        let base_tx = coord.0 * CHUNK_SIZE as i32;
+        let base_ty = coord.1 * CHUNK_SIZE as i32;
+        for ly in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                if !chunk.is_locally_passable(lx, ly) {
+                    continue;
+                }
+                let tx = base_tx + lx as i32;
+                let ty = base_ty + ly as i32;
+                match chunk.surface_tile_kind(lx, ly) {
+                    TileKind::Forest if forest_tiles.len() < forest_target => {
+                        forest_tiles.push((tx, ty));
+                    }
+                    TileKind::Grass if grass_tiles.len() < grass_target => {
+                        grass_tiles.push((tx, ty));
+                    }
+                    _ => {}
+                }
+                if forest_tiles.len() >= forest_target && grass_tiles.len() >= grass_target {
+                    break 'tile_search;
                 }
             }
-            Some(TileKind::Grass) => {
-                if grass_tiles.len() < grass_target {
-                    grass_tiles.push((tx, ty));
-                }
-            }
-            _ => {}
-        }
-        if forest_tiles.len() >= forest_target && grass_tiles.len() >= grass_target {
-            break;
         }
     }
 
@@ -200,7 +190,7 @@ pub fn spawn_animals(
     );
 
     if forest_tiles.is_empty() || grass_tiles.is_empty() {
-        warn!("spawn_animals: could not find enough forest or grass tiles via random sampling!");
+        warn!("spawn_animals: no forest or grass tiles found in loaded chunks — animals may not spawn!");
     }
 
     let mut slot = clock.population;
@@ -236,6 +226,7 @@ pub fn spawn_animals(
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Wolf),
         ));
         slot += 1;
     }
@@ -249,31 +240,34 @@ pub fn spawn_animals(
         let (tx, ty) = grass_tiles[idx];
         let pos = tile_to_world(tx, ty);
         commands.spawn((
-            Deer,
-            Transform::from_xyz(pos.x, pos.y, 1.0),
-            GlobalTransform::default(),
-            Visibility::Visible,
-            InheritedVisibility::default(),
-            AnimalAI {
-                target_tile: (tx as i32, ty as i32),
-                wander_timer: i as f32 * 0.02,
-                ..Default::default()
-            },
-            Health::new(20),
-            CombatTarget::default(),
-            CombatCooldown::default(),
-            LodLevel::Full,
-            BucketSlot(slot),
-            crate::simulation::plants::DeerGrazer {
-                graze_timer: fastrand::u16(0..120),
-            },
-            AnimalNeeds {
-                hunger: fastrand::f32() * 60.0,
-                sleep: fastrand::f32() * 40.0,
-                reproduction: fastrand::f32() * 80.0,
-            },
-            AnimalReproductionCooldown(0),
-            BiologicalSex::random(),
+            (
+                Deer,
+                Transform::from_xyz(pos.x, pos.y, 1.0),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+                AnimalAI {
+                    target_tile: (tx as i32, ty as i32),
+                    wander_timer: i as f32 * 0.02,
+                    ..Default::default()
+                },
+                Health::new(20),
+                CombatTarget::default(),
+                CombatCooldown::default(),
+                LodLevel::Full,
+                BucketSlot(slot),
+                crate::simulation::plants::DeerGrazer {
+                    graze_timer: fastrand::u16(0..120),
+                },
+                AnimalNeeds {
+                    hunger: fastrand::f32() * 60.0,
+                    sleep: fastrand::f32() * 40.0,
+                    reproduction: fastrand::f32() * 80.0,
+                },
+                AnimalReproductionCooldown(0),
+                BiologicalSex::random(),
+            ),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Deer),
         ));
         slot += 1;
     }
@@ -311,6 +305,7 @@ pub fn spawn_animals(
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Horse),
         ));
         slot += 1;
     }
@@ -1628,27 +1623,33 @@ pub fn animal_reproduction_system(
                     AnimalNeeds::default(),
                     AnimalReproductionCooldown(0),
                     sex,
+                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Wolf),
                 ));
             }
             1 => {
                 commands.spawn((
-                    Deer,
-                    transform,
-                    GlobalTransform::default(),
-                    Visibility::Visible,
-                    InheritedVisibility::default(),
-                    ai,
-                    Health::new(20),
-                    CombatTarget::default(),
-                    CombatCooldown::default(),
-                    LodLevel::Full,
-                    BucketSlot(slot),
-                    crate::simulation::plants::DeerGrazer {
-                        graze_timer: fastrand::u16(0..120),
-                    },
-                    AnimalNeeds::default(),
-                    AnimalReproductionCooldown(0),
-                    sex,
+                    (
+                        Deer,
+                        transform,
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                        ai,
+                        Health::new(20),
+                        CombatTarget::default(),
+                        CombatCooldown::default(),
+                        LodLevel::Full,
+                        BucketSlot(slot),
+                        crate::simulation::plants::DeerGrazer {
+                            graze_timer: fastrand::u16(0..120),
+                        },
+                        AnimalNeeds::default(),
+                        AnimalReproductionCooldown(0),
+                        sex,
+                    ),
+                    crate::world::spatial::Indexed::new(
+                        crate::world::spatial::IndexedKind::Deer,
+                    ),
                 ));
             }
             2 => {
@@ -1667,6 +1668,7 @@ pub fn animal_reproduction_system(
                     AnimalNeeds::default(),
                     AnimalReproductionCooldown(0),
                     sex,
+                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Horse),
                 ));
             }
             3 => {

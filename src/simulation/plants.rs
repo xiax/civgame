@@ -229,6 +229,7 @@ pub fn spawn_plant_at(
             GlobalTransform::default(),
             Visibility::Visible,
             InheritedVisibility::default(),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Plant),
         ))
         .id();
 
@@ -325,6 +326,9 @@ pub fn seed_scatter_system(
                         GlobalTransform::default(),
                         Visibility::Visible,
                         InheritedVisibility::default(),
+                        crate::world::spatial::Indexed::new(
+                            crate::world::spatial::IndexedKind::GroundItem,
+                        ),
                     ));
 
                     plant.stage = GrowthStage::Mature;
@@ -459,6 +463,9 @@ pub fn deer_graze_system(
                     GlobalTransform::default(),
                     Visibility::Visible,
                     InheritedVisibility::default(),
+                    crate::world::spatial::Indexed::new(
+                        crate::world::spatial::IndexedKind::GroundItem,
+                    ),
                 ));
             }
         }

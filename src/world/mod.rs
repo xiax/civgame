@@ -24,6 +24,9 @@ pub struct WorldPlugin;
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
         insert_globe(app);
+        app.world_mut()
+            .register_component_hooks::<spatial::Indexed>()
+            .on_remove(spatial::on_indexed_remove);
         app.insert_resource(ChunkMap::default())
             .insert_resource(spatial::SpatialIndex::default())
             .insert_resource(seasons::Calendar::default())

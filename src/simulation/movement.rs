@@ -17,7 +17,7 @@ use crate::pathfinding::path_request::{
 use crate::pathfinding::tile_cost::{furniture_speed_factor, tile_speed_multiplier};
 use crate::pathfinding::worker::PathfindingDiagnostics;
 use crate::world::chunk::ChunkMap;
-use crate::world::spatial::SpatialIndex;
+use crate::world::spatial::{Indexed, SpatialIndex};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use ahash::AHashSet;
 use bevy::prelude::*;
@@ -683,55 +683,86 @@ pub fn movement_system(
     }
 }
 
-pub fn update_spatial_index_system(
-    mut index: ResMut<SpatialIndex>,
+/// Incrementally update `SpatialIndex` for entities that moved or were just spawned.
+///
+/// Replaces the old O(all) full-rebuild path. Despawn removal is handled by the
+/// `on_remove` hook on `Indexed` (see `world::spatial::on_indexed_remove`), so this
+/// system only needs to handle Add/Move via `Or<(Changed<Transform>, Added<Indexed>)>`.
+///
+/// Z-tracking: `PersonAI.current_z` may change without `Transform` mutating
+/// (e.g. dig down). Sites that mutate `current_z` must call `transform.set_changed()`
+/// so we observe the z change here.
+pub fn sync_indexed_after_move_system(
+    mut spatial: ResMut<SpatialIndex>,
     chunk_map: Res<ChunkMap>,
-    query: Query<
+    mut query: Query<
         (
             Entity,
             &Transform,
+            &mut Indexed,
+            Option<&PersonAI>,
             Option<&Health>,
             Option<&Body>,
-            Option<&PersonAI>,
-            Has<Person>,
-            Has<Wolf>,
-            Has<Deer>,
-            Has<Horse>,
         ),
-        Or<(
-            With<Person>,
-            With<Wolf>,
-            With<Deer>,
-            With<Horse>,
-            With<Plant>,
-            With<GroundItem>,
-            With<Bed>,
-        )>,
+        Or<(Changed<Transform>, Added<Indexed>)>,
     >,
 ) {
-    index.map.clear();
-    index.agent_counts.clear();
-    for (entity, transform, health, body, person_ai, is_person, is_wolf, is_deer, is_horse) in
-        &query
-    {
+    for (entity, transform, mut idx, person_ai, health, body) in &mut query {
         let is_dead = health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead());
         if is_dead {
+            // Pull dead entities out of the index immediately; on_remove cleans up
+            // the rest when death_system finally despawns them.
+            if idx.tile.0 != i32::MIN {
+                spatial.remove(idx.tile.0, idx.tile.1, entity);
+                if idx.kind.is_mobile_agent() {
+                    let key = (idx.tile.0, idx.tile.1, idx.z);
+                    if let Some(c) = spatial.agent_counts.get_mut(&key) {
+                        *c = c.saturating_sub(1);
+                        if *c == 0 {
+                            spatial.agent_counts.remove(&key);
+                        }
+                    }
+                }
+                idx.tile = (i32::MIN, 0);
+            }
             continue;
         }
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-        index.insert(tx, ty, entity);
-
-        if is_person || is_wolf || is_deer || is_horse {
-            // Persons track their own Z (may be in a tunnel below surface);
-            // animals always live at surface_z.
-            let tz = match person_ai {
-                Some(ai) if is_person => ai.current_z as i32,
+        let tz = if idx.kind.is_mobile_agent() {
+            match (idx.kind, person_ai) {
+                (crate::world::spatial::IndexedKind::Person, Some(ai)) => ai.current_z as i32,
                 _ => chunk_map.surface_z_at(tx, ty),
-            };
-            *index.agent_counts.entry((tx, ty, tz)).or_insert(0) += 1;
+            }
+        } else {
+            0
+        };
+
+        if idx.tile == (tx, ty) && idx.z == tz {
+            continue;
         }
+
+        if idx.tile.0 != i32::MIN {
+            spatial.remove(idx.tile.0, idx.tile.1, entity);
+            if idx.kind.is_mobile_agent() {
+                let key = (idx.tile.0, idx.tile.1, idx.z);
+                if let Some(c) = spatial.agent_counts.get_mut(&key) {
+                    *c = c.saturating_sub(1);
+                    if *c == 0 {
+                        spatial.agent_counts.remove(&key);
+                    }
+                }
+            }
+        }
+
+        spatial.insert(tx, ty, entity);
+        if idx.kind.is_mobile_agent() {
+            *spatial.agent_counts.entry((tx, ty, tz)).or_insert(0) += 1;
+        }
+
+        idx.tile = (tx, ty);
+        idx.z = tz;
     }
 }
 
@@ -757,7 +788,7 @@ pub fn dismount_system(
 }
 
 /// Automatically mount a nearby tamed faction horse when traveling a long distance.
-/// Requires HORSEBACK_RIDING tech. Runs after dismount_system and update_spatial_index_system.
+/// Requires HORSEBACK_RIDING tech. Runs after dismount_system and sync_indexed_after_move_system.
 pub fn mount_check_system(
     mut commands: Commands,
     faction_registry: Res<FactionRegistry>,
@@ -828,7 +859,7 @@ pub fn mount_check_system(
 /// step requires `|Δz| ≤ 1` and a standable foot tile), goes Idle, then
 /// re-requests the same impossible path forever.
 ///
-/// Runs after `movement_system` and before `update_spatial_index_system`
+/// Runs after `movement_system` and before `sync_indexed_after_move_system`
 /// so the index sees the corrected coordinates this tick.
 pub fn recover_stranded_agents_system(
     chunk_map: Res<ChunkMap>,

@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use crate::economy::agent::EconomicAgent;
 use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
+use crate::world::spatial::{Indexed, IndexedKind};
 use crate::world::terrain::{tile_to_world, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
 use crate::world::tile::TileKind;
 
@@ -491,6 +492,7 @@ pub fn spawn_population(
                     Carrier::default(),
                     crate::simulation::reproduction::CoSleepTracker::default(),
                     crate::simulation::reproduction::MaleConceptionCooldown::default(),
+                    Indexed::new(IndexedKind::Person),
                 ),
             ));
 

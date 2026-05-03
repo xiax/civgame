@@ -348,6 +348,7 @@ fn route_yield(
             GlobalTransform::default(),
             Visibility::Visible,
             InheritedVisibility::default(),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::GroundItem),
         ));
     }
 }
@@ -384,6 +385,7 @@ fn spawn_ground_drop(commands: &mut Commands, tx: i32, ty: i32, good: Good, qty:
         GlobalTransform::default(),
         Visibility::Visible,
         InheritedVisibility::default(),
+        crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::GroundItem),
     ));
 }
 

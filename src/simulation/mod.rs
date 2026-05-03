@@ -183,15 +183,15 @@ impl Plugin for SimulationPlugin {
                     movement::movement_system,
                     movement::dismount_system.after(movement::movement_system),
                     animals::animal_movement_system,
-                    movement::update_spatial_index_system
+                    movement::sync_indexed_after_move_system
                         .after(movement::movement_system)
                         .after(animals::animal_movement_system),
                     movement::mount_check_system
                         .after(movement::dismount_system)
-                        .after(movement::update_spatial_index_system),
+                        .after(movement::sync_indexed_after_move_system),
                     movement::horse_position_sync_system.after(movement::mount_check_system),
-                    memory::vision_system.after(movement::update_spatial_index_system),
-                    combat::combat_system.after(movement::update_spatial_index_system),
+                    memory::vision_system.after(movement::sync_indexed_after_move_system),
+                    combat::combat_system.after(movement::sync_indexed_after_move_system),
                     combat::distress_emit_system.after(combat::combat_system),
                     combat::death_system.after(combat::distress_emit_system),
                     sound::respond_to_distress_system.after(combat::distress_emit_system),
@@ -203,9 +203,9 @@ impl Plugin for SimulationPlugin {
                 (
                     combat::hand_drop_event_handler.after(combat::combat_system),
                     reproduction::cosleep_observation_system
-                        .after(movement::update_spatial_index_system),
+                        .after(movement::sync_indexed_after_move_system),
                     tasks::play_system
-                        .after(movement::update_spatial_index_system)
+                        .after(movement::sync_indexed_after_move_system)
                         .before(plan::plan_execution_system),
                 )
                     .in_set(SimulationSet::Sequential),
@@ -235,7 +235,7 @@ impl Plugin for SimulationPlugin {
                     .after(movement::movement_system)
                     .after(construction::construction_system)
                     .after(dig::dig_system)
-                    .before(movement::update_spatial_index_system),)
+                    .before(movement::sync_indexed_after_move_system),)
                     .in_set(SimulationSet::Sequential),
             )
             .add_systems(
@@ -245,7 +245,7 @@ impl Plugin for SimulationPlugin {
                     items::equip_task_system
                         .after(items::item_pickup_system)
                         .before(plan::plan_execution_system),
-                    plants::deer_graze_system.after(movement::update_spatial_index_system),
+                    plants::deer_graze_system.after(movement::sync_indexed_after_move_system),
                     production::production_system.after(movement::movement_system),
                     crafting::craft_order_system
                         .after(gather::gather_system)
@@ -265,7 +265,7 @@ impl Plugin for SimulationPlugin {
                     )
                         .after(movement::movement_system)
                         .before(plan::plan_execution_system),
-                    plan::rel_influence_system.after(movement::update_spatial_index_system),
+                    plan::rel_influence_system.after(movement::sync_indexed_after_move_system),
                     plan::plan_execution_system
                         .after(production::production_system)
                         .after(production::eat_task_system)
@@ -274,7 +274,7 @@ impl Plugin for SimulationPlugin {
                         .after(production::withdraw_good_task_system)
                         .after(plan::rel_influence_system),
                     reproduction::wake_up_conception_system.after(plan::plan_execution_system),
-                    faction::bonding_system.after(movement::update_spatial_index_system),
+                    faction::bonding_system.after(movement::sync_indexed_after_move_system),
                     production::tile_regen_system,
                     schedule::advance_sim_clock,
                     crate::world::seasons::advance_calendar_system,
