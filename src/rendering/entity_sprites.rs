@@ -379,8 +379,25 @@ pub fn spawn_ground_item_sprites(
 ) {
     for (entity, gi) in query.iter() {
         let key = match gi.item.good {
-            Good::Stone => "resource_loose_rock",
-            _ => continue,
+            Good::Stone   => "resource_loose_rock",
+            Good::Wood    => "resource_wood_log",
+            Good::Fruit   => "resource_berries",
+            Good::Meat    => "resource_meat",
+            Good::Grain   => "resource_wheat",
+            Good::Seed    => "resource_wheat",
+            Good::Coal    => "resource_iron_ore",
+            Good::Iron    => "resource_iron_ore",
+            Good::Copper  => "resource_iron_ore",
+            Good::Tin     => "resource_iron_ore",
+            Good::Gold    => "resource_gold_ore",
+            Good::Silver  => "resource_gold_ore",
+            Good::Weapon  => "item_spear",
+            Good::Tools   => "item_hammer",
+            Good::Shield  => "item_shield",
+            Good::Armor   => "item_leather_armor",
+            Good::Cloth   => "item_cloth",
+            Good::Skin    => "item_leather_armor",
+            Good::Luxury  => "resource_gem",
         };
         let Some(img) = sprite_lib.get(key).cloned() else {
             continue;

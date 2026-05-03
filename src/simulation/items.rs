@@ -251,7 +251,7 @@ pub fn item_pickup_system(
             }
 
             if actually_taken >= item.qty {
-                commands.entity(target_ent).despawn();
+                commands.entity(target_ent).despawn_recursive();
             } else {
                 item.qty -= actually_taken;
             }

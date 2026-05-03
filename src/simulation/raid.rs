@@ -221,7 +221,7 @@ pub fn raid_execution_system(
                 if let Ok(mut gi) = ground_items.get_mut(gi_entity) {
                     if gi.item.good.is_edible() && gi.qty > 0 {
                         if gi.qty == 1 {
-                            commands.entity(gi_entity).despawn();
+                            commands.entity(gi_entity).despawn_recursive();
                         } else {
                             gi.qty -= 1;
                         }

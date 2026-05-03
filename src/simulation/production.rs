@@ -14,7 +14,7 @@ use super::schedule::{BucketSlot, SimClock};
 use super::skills::{SkillKind, Skills};
 use super::tasks::TaskKind;
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
+use crate::economy::goods::{Bulk, Good};
 use crate::economy::item::Item;
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
@@ -250,7 +250,7 @@ pub fn withdraw_good_task_system(
                 // would wield it for zero damage_bonus.
                 agent.add_item(gi.item, 1);
                 if gi.qty == 1 {
-                    commands.entity(gi_entity).despawn();
+                    commands.entity(gi_entity).despawn_recursive();
                 } else {
                     gi.qty -= 1;
                 }
@@ -420,7 +420,7 @@ pub fn withdraw_material_task_system(
                     continue;
                 }
                 if gi.qty == taken {
-                    commands.entity(gi_entity).despawn();
+                    commands.entity(gi_entity).despawn_recursive();
                 } else {
                     gi.qty -= taken;
                 }
@@ -452,9 +452,17 @@ pub fn withdraw_material_task_system(
     }
 }
 
-/// Withdraw one edible good from a faction storage tile into the agent's inventory.
+/// Withdraw one edible good from a faction storage tile into the agent's hands or inventory.
 /// Driven by `TaskKind::WithdrawFood`. Agent works from a tile adjacent to the
 /// storage tile (`ai.dest_tile`) and reaches over to pull one item off the stack.
+///
+/// Before picking up food, any `Bulk::TwoHand` building materials (Stone, Wood, Iron)
+/// sitting in the agent's personal inventory are returned to the faction storage tile.
+/// These goods fill the entire 5 kg inventory cap and prevent food from being stored,
+/// so clearing them first ensures the agent can always accept the food.
+///
+/// Food is then placed hands-first (matching how `withdraw_material_task_system` works)
+/// so an agent whose inventory is still tight can still receive food in hand.
 pub fn withdraw_food_task_system(
     mut commands: Commands,
     clock: Res<SimClock>,
@@ -464,12 +472,13 @@ pub fn withdraw_food_task_system(
     mut query: Query<(
         &mut PersonAI,
         &mut EconomicAgent,
+        &mut Carrier,
         &FactionMember,
         &BucketSlot,
         &LodLevel,
     )>,
 ) {
-    for (mut ai, mut agent, member, slot, lod) in query.iter_mut() {
+    for (mut ai, mut agent, mut carrier, member, slot, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -491,17 +500,51 @@ pub fn withdraw_food_task_system(
             continue;
         }
 
+        // Return TwoHand building materials from personal inventory to the faction
+        // storage tile. Stone/Wood/Iron each weigh 5 kg (the full inventory cap), so
+        // keeping them in a hungry worker's pocket blocks all food intake.
+        let mut deposit_buf = [(Good::Stone, 0u32); 8];
+        let mut deposit_len = 0usize;
+        for &(item, qty) in agent.inventory.iter() {
+            if qty > 0 && item.good.bulk() == Bulk::TwoHand {
+                deposit_buf[deposit_len] = (item.good, qty);
+                deposit_len += 1;
+            }
+        }
+        for &(good, qty) in &deposit_buf[..deposit_len] {
+            agent.remove_good(good, qty);
+            spawn_or_merge_ground_item(
+                &mut commands,
+                &spatial,
+                &mut ground_items,
+                tx as i32,
+                ty as i32,
+                good,
+                qty,
+            );
+        }
+
         let mut withdrew = false;
         for &gi_entity in spatial.get(tx as i32, ty as i32) {
             if let Ok(mut gi) = ground_items.get_mut(gi_entity) {
                 if gi.item.good.is_edible() && gi.qty > 0 {
-                    agent.add_good(gi.item.good, 1);
-                    if gi.qty == 1 {
-                        commands.entity(gi_entity).despawn();
+                    // Try hands first; fall back to inventory for any leftover.
+                    let food_item = Item::new_commodity(gi.item.good);
+                    let after_hands = carrier.try_pick_up(food_item, 1);
+                    let leftover = if after_hands > 0 {
+                        agent.add_good(gi.item.good, after_hands)
                     } else {
-                        gi.qty -= 1;
+                        0
+                    };
+                    let taken = 1u32.saturating_sub(leftover);
+                    if taken > 0 {
+                        if gi.qty == 1 {
+                            commands.entity(gi_entity).despawn_recursive();
+                        } else {
+                            gi.qty -= 1;
+                        }
+                        withdrew = true;
                     }
-                    withdrew = true;
                     break;
                 }
             }
