@@ -68,7 +68,7 @@ pub const HUNTER_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
 pub enum HuntOrder {
     Hunt {
         species: super::corpse::CorpseSpecies,
-        area_tile: (i16, i16),
+        area_tile: (i32, i32),
         target_party_size: u8,
         mustered: Vec<Entity>,
         deployed_tick: Option<u64>,
@@ -399,8 +399,8 @@ fn decide_for_faction(
         (super::corpse::CorpseSpecies::Deer, deer_count, deer_centroid)
     };
     let area_tile = (
-        (centroid.0 / count as i64) as i16,
-        (centroid.1 / count as i64) as i16,
+        (centroid.0 / count as i64) as i32,
+        (centroid.1 / count as i64) as i32,
     );
     let target_party_size = match species {
         super::corpse::CorpseSpecies::Wolf => 4,
@@ -500,12 +500,12 @@ pub struct FactionStorageTile {
 /// Fast lookup from tile coords to faction_id for all storage tiles.
 #[derive(Resource, Default)]
 pub struct StorageTileMap {
-    pub tiles: AHashMap<(i16, i16), u32>,
-    pub by_faction: AHashMap<u32, Vec<(i16, i16)>>,
+    pub tiles: AHashMap<(i32, i32), u32>,
+    pub by_faction: AHashMap<u32, Vec<(i32, i32)>>,
 }
 
 impl StorageTileMap {
-    pub fn nearest_for_faction(&self, faction_id: u32, from: (i32, i32)) -> Option<(i16, i16)> {
+    pub fn nearest_for_faction(&self, faction_id: u32, from: (i32, i32)) -> Option<(i32, i32)> {
         self.by_faction
             .get(&faction_id)?
             .iter()
@@ -526,11 +526,11 @@ impl StorageTileMap {
 /// release) take the lock; critical sections are a single hashmap op each.
 #[derive(Resource, Default)]
 pub struct StorageReservations {
-    inner: std::sync::Mutex<AHashMap<((i16, i16), Good), u32>>,
+    inner: std::sync::Mutex<AHashMap<((i32, i32), Good), u32>>,
 }
 
 impl StorageReservations {
-    pub fn add(&self, tile: (i16, i16), good: Good, qty: u32) {
+    pub fn add(&self, tile: (i32, i32), good: Good, qty: u32) {
         if qty == 0 {
             return;
         }
@@ -538,7 +538,7 @@ impl StorageReservations {
         *m.entry((tile, good)).or_insert(0) += qty;
     }
 
-    pub fn sub(&self, tile: (i16, i16), good: Good, qty: u32) {
+    pub fn sub(&self, tile: (i32, i32), good: Good, qty: u32) {
         if qty == 0 {
             return;
         }
@@ -551,7 +551,7 @@ impl StorageReservations {
         }
     }
 
-    pub fn get(&self, tile: (i16, i16), good: Good) -> u32 {
+    pub fn get(&self, tile: (i32, i32), good: Good) -> u32 {
         self.inner
             .lock()
             .unwrap()
@@ -781,7 +781,7 @@ impl ActivityLog {
 
 pub struct FactionData {
     pub storage: FactionStorage,
-    pub home_tile: (i16, i16),
+    pub home_tile: (i32, i32),
     pub member_count: u32,
     pub raid_target: Option<u32>,
     pub under_raid: bool,
@@ -798,7 +798,7 @@ pub struct FactionData {
     pub lineage: FactionLineage,
     /// Tile of the structure currently being torn down for upgrade-replacement.
     /// `Some` while a deconstruct→rebuild cycle is in flight (one per faction).
-    pub active_upgrade: Option<(i16, i16)>,
+    pub active_upgrade: Option<(i32, i32)>,
     /// Per-tick allocation across job kinds (gather/farm/build/craft/free).
     /// Recomputed every chief tick from the same pressure model that drives
     /// `compute_priority`. Consumed by `job_claim_system` as the per-kind cap
@@ -838,7 +838,7 @@ pub struct PlayerFaction {
 }
 
 impl FactionRegistry {
-    pub fn create_faction(&mut self, home_tile: (i16, i16)) -> u32 {
+    pub fn create_faction(&mut self, home_tile: (i32, i32)) -> u32 {
         self.next_id += 1;
         let id = self.next_id;
         let mut techs = FactionTechs::default();
@@ -966,8 +966,8 @@ pub fn bonding_system(
             fm.bond_target = None;
 
             let pos = transform.translation.truncate();
-            let home_tx = (pos.x / TILE_SIZE).floor() as i16;
-            let home_ty = (pos.y / TILE_SIZE).floor() as i16;
+            let home_tx = (pos.x / TILE_SIZE).floor() as i32;
+            let home_ty = (pos.y / TILE_SIZE).floor() as i32;
 
             let faction_id = if nb_faction == SOLO {
                 let new_id = registry.create_faction((home_tx, home_ty));
@@ -1277,13 +1277,13 @@ pub fn update_storage_tile_map_system(
         return;
     }
     // Snapshot the previous tile set so we can diff hotspot registrations.
-    let prev: ahash::AHashSet<(i16, i16)> = map.tiles.keys().copied().collect();
+    let prev: ahash::AHashSet<(i32, i32)> = map.tiles.keys().copied().collect();
 
     map.tiles.clear();
     map.by_faction.clear();
     for (tile, transform) in all_q.iter() {
-        let tx = (transform.translation.x / TILE_SIZE).floor() as i16;
-        let ty = (transform.translation.y / TILE_SIZE).floor() as i16;
+        let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         map.tiles.insert((tx, ty), tile.faction_id);
         map.by_faction
             .entry(tile.faction_id)
@@ -1317,14 +1317,14 @@ pub fn update_storage_tile_map_system(
 pub fn sync_faction_center_hotspots_system(
     mut hotspots: ResMut<HotspotFlowFields>,
     chunk_map: Res<ChunkMap>,
-    mut last_seen: Local<ahash::AHashMap<Entity, (i16, i16, i8)>>,
+    mut last_seen: Local<ahash::AHashMap<Entity, (i32, i32, i8)>>,
     mut removed: RemovedComponents<FactionCenter>,
     centers: Query<(Entity, &Transform), With<FactionCenter>>,
 ) {
-    let mut current: ahash::AHashMap<Entity, (i16, i16, i8)> = ahash::AHashMap::new();
+    let mut current: ahash::AHashMap<Entity, (i32, i32, i8)> = ahash::AHashMap::new();
     for (entity, transform) in centers.iter() {
-        let tx = (transform.translation.x / TILE_SIZE).floor() as i16;
-        let ty = (transform.translation.y / TILE_SIZE).floor() as i16;
+        let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         let z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
         current.insert(entity, (tx, ty, z));
     }
@@ -1365,8 +1365,8 @@ pub fn compute_faction_storage_system(
     }
 
     for (gi, transform) in ground_items.iter() {
-        let tx = (transform.translation.x / TILE_SIZE).floor() as i16;
-        let ty = (transform.translation.y / TILE_SIZE).floor() as i16;
+        let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         let Some(&faction_id) = storage_tile_map.tiles.get(&(tx, ty)) else {
             continue;
         };
@@ -1380,7 +1380,7 @@ pub fn compute_faction_storage_system(
 // ── Helpers for task dispatch ──────────────────────────────────────────────────
 
 impl FactionRegistry {
-    pub fn home_tile(&self, faction_id: u32) -> Option<(i16, i16)> {
+    pub fn home_tile(&self, faction_id: u32) -> Option<(i32, i32)> {
         self.factions.get(&faction_id).map(|f| f.home_tile)
     }
 

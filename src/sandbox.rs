@@ -35,8 +35,13 @@ pub struct SandboxPlugin;
 impl Plugin for SandboxPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(SandboxMode)
-            .add_systems(PostStartup, setup_sandbox);
+            .add_systems(Startup, sandbox_auto_skip_spawn_select)
+            .add_systems(OnEnter(crate::GameState::Playing), setup_sandbox);
     }
+}
+
+fn sandbox_auto_skip_spawn_select(mut next_state: ResMut<NextState<crate::GameState>>) {
+    next_state.set(crate::GameState::Playing);
 }
 
 fn setup_sandbox(
@@ -67,8 +72,8 @@ fn setup_sandbox(
             PersonAI {
                 task_id: PersonAI::UNEMPLOYED,
                 state: AiState::Idle,
-                target_tile: (cx as i16, cy as i16),
-                dest_tile: (cx as i16, cy as i16),
+                target_tile: (cx as i32, cy as i32),
+                dest_tile: (cx as i32, cy as i32),
                 last_plan_id: PersonAI::UNEMPLOYED,
                 current_z: chunk_map.surface_z_at(cx, cy) as i8,
                 target_z: chunk_map.surface_z_at(cx, cy) as i8,
@@ -114,7 +119,7 @@ fn setup_sandbox(
         Visibility::Visible,
         InheritedVisibility::default(),
         AnimalAI {
-            target_tile: ((cx + 5) as i16, cy as i16),
+            target_tile: ((cx + 5) as i32, cy as i32),
             wander_timer: 0.0,
             ..Default::default()
         },
@@ -137,7 +142,7 @@ fn setup_sandbox(
         Visibility::Visible,
         InheritedVisibility::default(),
         AnimalAI {
-            target_tile: ((cx - 4) as i16, (cy + 3) as i16),
+            target_tile: ((cx - 4) as i32, (cy + 3) as i32),
             wander_timer: 0.5,
             ..Default::default()
         },

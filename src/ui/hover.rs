@@ -159,7 +159,7 @@ pub fn hover_info_system(
                 }
             }
 
-            let bp_key = (tx as i16, ty as i16);
+            let bp_key = (tx as i32, ty as i32);
             if let Some(&bp_entity) = sites.bp_map.0.get(&bp_key) {
                 if let Ok(bp) = sites.bp_query.get(bp_entity) {
                     ui.separator();
@@ -292,7 +292,7 @@ pub fn hover_info_system(
             }
 
             // Craft Order at this tile (anchor / workbench).
-            let co_key = (tx as i16, ty as i16);
+            let co_key = (tx as i32, ty as i32);
             if let Some(&co_entity) = sites.co_map.0.get(&co_key) {
                 if let Ok(order) = sites.co_query.get(co_entity) {
                     ui.separator();

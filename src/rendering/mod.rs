@@ -33,6 +33,10 @@ impl Plugin for RenderingPlugin {
                 ),
             )
             .add_systems(
+                OnEnter(crate::GameState::Playing),
+                camera::position_camera_for_spawn,
+            )
+            .add_systems(
                 PostStartup,
                 (
                     chunk_streaming::setup_tile_materials,
@@ -47,6 +51,8 @@ impl Plugin for RenderingPlugin {
                     entity_sprites::handle_art_mode_change,
                     chunk_streaming::update_chunk_retention_system
                         .before(chunk_streaming::chunk_streaming_system),
+                    chunk_streaming::update_simulation_focus_system
+                        .before(chunk_streaming::chunk_streaming_system),
                     chunk_streaming::chunk_streaming_system.after(camera::camera_input_system),
                     chunk_streaming::update_tile_z_view_system.after(camera::camera_input_system),
                     fog::fog_update_system.after(chunk_streaming::chunk_streaming_system),
@@ -58,7 +64,8 @@ impl Plugin for RenderingPlugin {
                     path_debug::connectivity_component_gizmo_system,
                     path_debug::recent_failures_gizmo_system,
                     path_debug::selected_agent_failures_gizmo_system,
-                ),
+                )
+                    .run_if(in_state(crate::GameState::Playing)),
             )
             .add_systems(
                 Update,

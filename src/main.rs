@@ -1,12 +1,15 @@
 use bevy::prelude::*;
 
 mod economy;
+mod game_state;
 mod pathfinding;
 mod rendering;
 mod sandbox;
 mod simulation;
 mod ui;
 mod world;
+
+pub use game_state::{GameState, PendingSpawn};
 
 fn main() {
     let is_sandbox = std::env::args().any(|a| a == "--sandbox");
@@ -26,6 +29,10 @@ fn main() {
         }),
         ..default()
     }))
+    .init_state::<GameState>()
+    .insert_resource(PendingSpawn::default())
+    .insert_resource(simulation::region::SettledRegions::default())
+    .insert_resource(simulation::region::SimulationFocus::default())
     .add_plugins(world::WorldPlugin)
     .add_plugins(simulation::SimulationPlugin)
     .add_plugins(economy::EconomyPlugin)

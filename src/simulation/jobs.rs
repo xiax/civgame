@@ -87,12 +87,12 @@ pub enum JobSource {
 /// jobs to a designated zone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TileAabb {
-    pub min: (i16, i16),
-    pub max: (i16, i16),
+    pub min: (i32, i32),
+    pub max: (i32, i32),
 }
 
 impl TileAabb {
-    pub fn contains(&self, tile: (i16, i16)) -> bool {
+    pub fn contains(&self, tile: (i32, i32)) -> bool {
         tile.0 >= self.min.0
             && tile.0 <= self.max.0
             && tile.1 >= self.min.1
@@ -711,7 +711,7 @@ pub fn chief_job_posting_system(
                 .iter()
                 .any(|p| matches!(p.kind, JobKind::Craft));
             if !already_craft {
-                let in_home_zone = |tile: &(i16, i16)| {
+                let in_home_zone = |tile: &(i32, i32)| {
                     let dx = (tile.0 as i32 - faction.home_tile.0 as i32).abs();
                     let dy = (tile.1 as i32 - faction.home_tile.1 as i32).abs();
                     dx <= 12 && dy <= 12
@@ -920,8 +920,8 @@ pub fn job_claim_system(
         let budget = faction.workforce_budget;
         let profession = profession_opt.copied().unwrap_or(Profession::None);
         let worker_tile = (
-            (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i16,
-            (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i16,
+            (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32,
+            (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32,
         );
 
         // Score every eligible posting and pick the best.
@@ -985,14 +985,14 @@ pub fn job_claim_system(
 }
 
 /// Best-effort representative tile for a posting (used in distance scoring).
-fn posting_target_tile(p: &JobPosting) -> Option<(i16, i16)> {
+fn posting_target_tile(p: &JobPosting) -> Option<(i32, i32)> {
     match p.progress {
         JobProgress::Calories { .. } => None,
         JobProgress::Stockpile { .. } => None,
         JobProgress::Haul { .. } => None,
         JobProgress::Planting { area, .. } => Some((
-            (area.min.0 as i32 + area.max.0 as i32) as i16 / 2,
-            (area.min.1 as i32 + area.max.1 as i32) as i16 / 2,
+            (area.min.0 as i32 + area.max.0 as i32) as i32 / 2,
+            (area.min.1 as i32 + area.max.1 as i32) as i32 / 2,
         )),
         JobProgress::Crafting { .. } => None,
         JobProgress::Building { .. } => None,
@@ -1253,7 +1253,7 @@ pub fn record_progress_filtered(
 
 /// Public helper for callers that have a tile and want to know whether it
 /// falls within a posting's farm area (used by the planter completion hook).
-pub fn planting_area_contains(progress: &JobProgress, tile: (i16, i16)) -> bool {
+pub fn planting_area_contains(progress: &JobProgress, tile: (i32, i32)) -> bool {
     match progress {
         JobProgress::Planting { area, .. } => area.contains(tile),
         _ => false,

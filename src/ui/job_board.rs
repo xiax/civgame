@@ -21,7 +21,7 @@ pub struct JobBoardPanelState {
     pub open: bool,
     pub draft_kind: JobKind,
     pub draft_target: u32,
-    pub draft_radius: i16,
+    pub draft_radius: i32,
     pub draft_recipe: u8,
 }
 
@@ -395,10 +395,10 @@ fn progress_label(p: &JobProgress) -> String {
 fn build_player_posting(
     kind: JobKind,
     target: u32,
-    radius: i16,
+    radius: i32,
     faction_id: u32,
     posted_tick: u32,
-    home_tile: (i16, i16),
+    home_tile: (i32, i32),
     recipe: u8,
 ) -> Option<JobPosting> {
     let progress = match kind {

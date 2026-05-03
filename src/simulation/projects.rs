@@ -661,7 +661,7 @@ pub fn project_stagnation_system(
 
     // Cull projects that have stalled for too long. We collect cancellations
     // first to avoid mutating `projects` while iterating it.
-    let mut to_cancel: Vec<(ProjectId, Entity, u32, Good, (i16, i16))> = Vec::new();
+    let mut to_cancel: Vec<(ProjectId, Entity, u32, Good, (i32, i32))> = Vec::new();
     for project in projects.projects.values() {
         if project.phase != ProjectPhase::GatherMaterials {
             continue;

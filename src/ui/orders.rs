@@ -49,7 +49,7 @@ struct TileItemInfo {
 pub struct ContextMenuState {
     pub open: bool,
     pub screen_pos: egui::Pos2,
-    pub target_tile: (i16, i16),
+    pub target_tile: (i32, i32),
     /// Foot Z of the targeted tile at the moment of right-click.
     pub target_z: i8,
     /// Top-level tile actions shown directly (Move, Mine, Gather, …).
@@ -202,7 +202,7 @@ pub fn right_click_context_menu_system(
                         .map(|f| f.techs.clone())
                         .unwrap_or_default();
 
-                    let pos_tile = (tx as i16, ty as i16);
+                    let pos_tile = (tx as i32, ty as i32);
                     let already_built = routing.bed_map.0.contains_key(&pos_tile)
                         || routing.campfire_map.0.contains_key(&pos_tile)
                         || routing.door_map.0.contains_key(&pos_tile)
@@ -452,7 +452,7 @@ pub fn right_click_context_menu_system(
                 PlayerOrderKind::Move => {
                     assign_task_with_routing(
                         &mut ai,
-                        (cur_tx as i16, cur_ty as i16),
+                        (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
                         target_tile,
                         TaskKind::Idle,
@@ -467,7 +467,7 @@ pub fn right_click_context_menu_system(
                 PlayerOrderKind::Mine | PlayerOrderKind::Gather => {
                     assign_task_with_routing(
                         &mut ai,
-                        (cur_tx as i16, cur_ty as i16),
+                        (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
                         target_tile,
                         TaskKind::Gather,
@@ -481,7 +481,7 @@ pub fn right_click_context_menu_system(
                 PlayerOrderKind::PickUp => {
                     assign_task_with_routing(
                         &mut ai,
-                        (cur_tx as i16, cur_ty as i16),
+                        (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
                         target_tile,
                         TaskKind::Scavenge,
@@ -495,7 +495,7 @@ pub fn right_click_context_menu_system(
                 PlayerOrderKind::PickUpItem(item_entity) => {
                     assign_task_with_routing(
                         &mut ai,
-                        (cur_tx as i16, cur_ty as i16),
+                        (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
                         target_tile,
                         TaskKind::Scavenge,
@@ -510,7 +510,7 @@ pub fn right_click_context_menu_system(
                 PlayerOrderKind::AttackEntity(foe) => {
                     assign_task_with_routing(
                         &mut ai,
-                        (cur_tx as i16, cur_ty as i16),
+                        (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
                         target_tile,
                         TaskKind::MilitaryAttack,
@@ -525,7 +525,7 @@ pub fn right_click_context_menu_system(
                 PlayerOrderKind::PickUpCorpse(corpse_entity) => {
                     assign_task_with_routing(
                         &mut ai,
-                        (cur_tx as i16, cur_ty as i16),
+                        (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
                         target_tile,
                         TaskKind::PickUpCorpse,
@@ -539,7 +539,7 @@ pub fn right_click_context_menu_system(
                 PlayerOrderKind::Build(BuildSiteKind::Bed) => {
                     assign_task_with_routing(
                         &mut ai,
-                        (cur_tx as i16, cur_ty as i16),
+                        (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
                         target_tile,
                         TaskKind::ConstructBed,
@@ -553,7 +553,7 @@ pub fn right_click_context_menu_system(
                 PlayerOrderKind::Build(_) => {
                     assign_task_with_routing(
                         &mut ai,
-                        (cur_tx as i16, cur_ty as i16),
+                        (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
                         target_tile,
                         TaskKind::Construct,
@@ -567,7 +567,7 @@ pub fn right_click_context_menu_system(
                 PlayerOrderKind::DigDown => {
                     assign_task_with_routing(
                         &mut ai,
-                        (cur_tx as i16, cur_ty as i16),
+                        (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
                         target_tile,
                         TaskKind::Dig,
@@ -581,7 +581,7 @@ pub fn right_click_context_menu_system(
                 PlayerOrderKind::Deconstruct => {
                     assign_task_with_routing(
                         &mut ai,
-                        (cur_tx as i16, cur_ty as i16),
+                        (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
                         target_tile,
                         TaskKind::Deconstruct,
@@ -670,7 +670,7 @@ pub struct MilitaryMenuState {
     pub open: bool,
     pub screen_pos: egui::Pos2,
     pub target_entity: Option<Entity>,
-    pub target_tile: (i16, i16),
+    pub target_tile: (i32, i32),
     pub target_z: i8,
 }
 
@@ -745,7 +745,7 @@ pub struct ClassifyQueries<'w, 's> {
 /// hotspot so units in the goal chunk skip per-agent A*.
 fn issue_group_move(
     drafted_units: &[Entity],
-    target_tile: (i16, i16),
+    target_tile: (i32, i32),
     target_z: i8,
     routing: &MilitaryRouting,
     ai_q: &mut Query<(&mut PersonAI, &Transform, &mut CombatTarget), With<Drafted>>,
@@ -767,7 +767,7 @@ fn issue_group_move(
         );
         assign_task_with_routing(
             &mut ai,
-            (cur_tx as i16, cur_ty as i16),
+            (cur_tx as i32, cur_ty as i32),
             cur_chunk,
             target_tile,
             TaskKind::MilitaryMove,
@@ -788,7 +788,7 @@ fn issue_group_move(
 fn issue_group_attack(
     drafted_units: &[Entity],
     foe: Entity,
-    foe_tile: (i16, i16),
+    foe_tile: (i32, i32),
     foe_z: i8,
     routing: &MilitaryRouting,
     ai_q: &mut Query<(&mut PersonAI, &Transform, &mut CombatTarget), With<Drafted>>,
@@ -810,7 +810,7 @@ fn issue_group_attack(
         );
         assign_task_with_routing(
             &mut ai,
-            (cur_tx as i16, cur_ty as i16),
+            (cur_tx as i32, cur_ty as i32),
             cur_chunk,
             foe_tile,
             TaskKind::MilitaryAttack,
@@ -907,14 +907,14 @@ pub fn military_right_click_system(
         }
 
         let target = best.map(|(e, _)| e);
-        let target_tile_i16 = (tx as i16, ty as i16);
+        let target_tile_i32 = (tx as i32, ty as i32);
 
         match target {
             None => {
                 // Empty tile → group move.
                 issue_group_move(
                     &drafted_units,
-                    target_tile_i16,
+                    target_tile_i32,
                     target_z,
                     &routing,
                     &mut ai_q,
@@ -936,11 +936,11 @@ pub fn military_right_click_system(
                     .get(foe)
                     .map(|t| {
                         (
-                            (t.translation.x / TILE_SIZE).floor() as i16,
-                            (t.translation.y / TILE_SIZE).floor() as i16,
+                            (t.translation.x / TILE_SIZE).floor() as i32,
+                            (t.translation.y / TILE_SIZE).floor() as i32,
                         )
                     })
-                    .unwrap_or(target_tile_i16);
+                    .unwrap_or(target_tile_i32);
                 match class {
                     Hostility::Friendly => {
                         // Right-clicking your own unit is a no-op.

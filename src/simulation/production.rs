@@ -136,7 +136,7 @@ pub fn production_system(
                         // Credit a Farm posting if this worker holds one and the
                         // tile falls within the posting's designated area.
                         if let Some(claim) = claim_opt {
-                            let tile = (tx as i16, ty as i16);
+                            let tile = (tx as i32, ty as i32);
                             let in_area = board
                                 .get(claim.job_id)
                                 .map(|p| planting_area_contains(&p.progress, tile))

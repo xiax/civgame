@@ -1,8 +1,13 @@
 use bevy::prelude::*;
 
+pub mod biome;
 pub mod chunk;
 pub mod chunk_streaming;
+pub mod climate;
+pub mod erosion;
 pub mod globe;
+pub mod hydrology;
+pub mod plates;
 pub mod seasons;
 pub mod spatial;
 pub mod terrain;
@@ -27,7 +32,7 @@ impl Plugin for WorldPlugin {
             .add_event::<chunk_streaming::TileChangedEvent>()
             .add_event::<chunk_streaming::ChunkLoadedEvent>()
             .add_event::<chunk_streaming::ChunkUnloadedEvent>()
-            .add_systems(Startup, terrain::spawn_world_system)
+            .add_systems(OnEnter(crate::GameState::Playing), terrain::spawn_world_system)
             .add_systems(PostUpdate, chunk_streaming::refresh_changed_tiles_system);
     }
 }

@@ -182,10 +182,10 @@ pub struct CraftOrder {
     pub faction_id: u32,
     /// `Some` for station-bound recipes; `None` for stationless recipes
     /// (Bow, Pottery, Spear, Torch, Shield, Leather Armor).
-    pub workbench_tile: Option<(i16, i16)>,
+    pub workbench_tile: Option<(i32, i32)>,
     /// Tile the agent must work adjacent to. Workbench tile when present,
     /// faction camp tile otherwise.
-    pub anchor_tile: (i16, i16),
+    pub anchor_tile: (i32, i32),
     pub recipe_id: u8,
     pub deposits: [GoodNeed; MAX_CRAFT_INPUTS],
     pub deposit_count: u8,
@@ -200,8 +200,8 @@ impl CraftOrder {
     pub fn new(
         faction_id: u32,
         recipe_id: u8,
-        workbench_tile: Option<(i16, i16)>,
-        anchor_tile: (i16, i16),
+        workbench_tile: Option<(i32, i32)>,
+        anchor_tile: (i32, i32),
         spawn_tick: u64,
     ) -> Option<Self> {
         let recipe = CRAFT_RECIPES.get(recipe_id as usize)?;
@@ -239,7 +239,7 @@ impl CraftOrder {
 /// Maps anchor tile → CraftOrder entity. Mirrors `BlueprintMap` so resolvers
 /// can find the order from a worker's tile cheaply.
 #[derive(Resource, Default)]
-pub struct CraftOrderMap(pub AHashMap<(i16, i16), Entity>);
+pub struct CraftOrderMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Per-faction cap on simultaneous orders. Keeps the work board focused.
 const CRAFT_ORDERS_PER_FACTION_BASE: u32 = 1;
@@ -279,7 +279,7 @@ pub fn faction_craft_order_system(
     // the top releases any lingering storage reservation.
     {
         let now = clock.tick;
-        let mut to_drop: Vec<((i16, i16), Entity)> = Vec::new();
+        let mut to_drop: Vec<((i32, i32), Entity)> = Vec::new();
         for (&anchor, &order_entity) in order_map.0.iter() {
             match order_query.get(order_entity) {
                 Ok(order) => {
@@ -380,7 +380,7 @@ pub fn faction_craft_order_system(
 
             // Pick anchor tile: workbench/loom for station-bound recipes;
             // faction home for stationless ones.
-            let anchor_opt: Option<((i16, i16), Option<(i16, i16)>)> =
+            let anchor_opt: Option<((i32, i32), Option<(i32, i32)>)> =
                 match recipe_def.requires_station {
                     Some(crate::simulation::crafting::StationKind::Workbench) => workbench_map
                         .0

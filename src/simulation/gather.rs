@@ -119,8 +119,8 @@ pub fn gather_system(
             let Ok(mut plant) = plant_query.get_mut(entity) else {
                 plant_map.0.remove(&(tx, ty));
                 if let Some(ref mut mem) = memory_opt {
-                    mem.forget((tx as i16, ty as i16), MemoryKind::Food);
-                    mem.forget((tx as i16, ty as i16), MemoryKind::Wood);
+                    mem.forget((tx as i32, ty as i32), MemoryKind::Food);
+                    mem.forget((tx as i32, ty as i32), MemoryKind::Wood);
                 }
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
@@ -133,7 +133,7 @@ pub fn gather_system(
                         PlantKind::BerryBush | PlantKind::Grain => MemoryKind::Food,
                         PlantKind::Tree => MemoryKind::Wood,
                     };
-                    mem.forget((tx as i16, ty as i16), kind);
+                    mem.forget((tx as i32, ty as i32), kind);
                 }
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
@@ -189,7 +189,7 @@ pub fn gather_system(
             skills.gain_xp(skill, xp);
 
             if let Some(ref mut mem) = memory_opt {
-                mem.record((tx as i16, ty as i16), kind.harvest_memory_kind());
+                mem.record((tx as i32, ty as i32), kind.harvest_memory_kind());
             }
             if let Some(ref mut plan) = plan_opt {
                 plan.reward_acc += qty as f32 * kind.harvest_reward_per_unit();
@@ -285,7 +285,7 @@ pub fn gather_system(
                 }
 
                 if let Some(ref mut mem) = memory_opt {
-                    mem.record((tx as i16, ty as i16), MemoryKind::Stone);
+                    mem.record((tx as i32, ty as i32), MemoryKind::Stone);
                 }
                 if let Some(ref mut plan) = plan_opt {
                     plan.reward_acc += total_qty as f32 * 0.3;
@@ -297,9 +297,9 @@ pub fn gather_system(
             } else {
                 // Not a stone/wall tile and not a plant -> target is invalid or already harvested
                 if let Some(ref mut mem) = memory_opt {
-                    mem.forget((tx as i16, ty as i16), MemoryKind::Stone);
-                    mem.forget((tx as i16, ty as i16), MemoryKind::Food);
-                    mem.forget((tx as i16, ty as i16), MemoryKind::Wood);
+                    mem.forget((tx as i32, ty as i32), MemoryKind::Stone);
+                    mem.forget((tx as i32, ty as i32), MemoryKind::Food);
+                    mem.forget((tx as i32, ty as i32), MemoryKind::Wood);
                 }
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;

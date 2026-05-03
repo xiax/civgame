@@ -10,6 +10,7 @@ pub mod inspector;
 pub mod job_board;
 pub mod orders;
 pub mod selection;
+pub mod spawn_select;
 pub mod tech_panel;
 pub mod world_map;
 
@@ -34,7 +35,13 @@ impl Plugin for UiPlugin {
             .insert_resource(activity_log::ActivityLog::default())
             .insert_resource(activity_log::CameraFocusRequest::default())
             .insert_resource(inspector::PendingInspectorAction::default())
+            .insert_resource(spawn_select::SpawnSelectTexture::default())
             .add_event::<activity_log::ActivityLogEvent>()
+            .add_systems(
+                Update,
+                spawn_select::spawn_select_system
+                    .run_if(in_state(crate::GameState::SpawnSelect)),
+            )
             .add_systems(
                 Update,
                 (
@@ -57,7 +64,8 @@ impl Plugin for UiPlugin {
                     activity_log::activity_log_ingest_system,
                     activity_log::activity_log_panel_system,
                     activity_log::camera_focus_system,
-                ),
+                )
+                    .run_if(in_state(crate::GameState::Playing)),
             );
     }
 }

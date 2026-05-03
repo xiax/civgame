@@ -876,7 +876,7 @@ pub fn inspector_panel_system(
                         let recent: Vec<String> = pf
                             .recent_tiles
                             .iter()
-                            .filter(|(x, y, _)| !(*x == i16::MIN && *y == i16::MIN))
+                            .filter(|(x, y, _)| !(*x == i32::MIN && *y == i32::MIN))
                             .map(|(x, y, z)| format!("({},{},{})", x, y, z))
                             .collect();
                         ui.label(
@@ -967,7 +967,7 @@ pub fn inspector_panel_system(
                                 pf.segment_path.clear();
                                 pf.segment_cursor = 0;
                                 pf.stuck_ticks = 0;
-                                pf.recent_tiles = [(i16::MIN, i16::MIN, 0); 4];
+                                pf.recent_tiles = [(i32::MIN, i32::MIN, 0); 4];
                             }
                             path_params.path_queue.cancel_for_agent(entity);
                         }

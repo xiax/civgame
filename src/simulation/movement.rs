@@ -55,7 +55,7 @@ fn release_to_idle(
 ) {
     ai.state = AiState::Idle;
     ai.task_id = PersonAI::UNEMPLOYED;
-    ai.target_tile = (here.0 as i16, here.1 as i16);
+    ai.target_tile = (here.0 as i32, here.1 as i32);
     ai.dest_tile = ai.target_tile;
     ai.target_entity = None;
 
@@ -265,7 +265,7 @@ pub fn movement_system(
                     // limit ~1.5 s after the user clicks ⏸ — destroying the
                     // diagnostic state they paused to inspect.
                     const STUCK_LIMIT: u8 = 30;
-                    let here = (cur_tx as i16, cur_ty as i16, ai.current_z);
+                    let here = (cur_tx as i32, cur_ty as i32, ai.current_z);
                     if speed > 0.0 {
                         if pf.recent_tiles[0] == here {
                             pf.stuck_ticks = pf.stuck_ticks.saturating_add(1);
@@ -287,7 +287,7 @@ pub fn movement_system(
                         pf.route_cursor = 0;
                         pf.status = FollowStatus::Idle;
                         pf.stuck_ticks = 0;
-                        pf.recent_tiles[0] = (i16::MIN, i16::MIN, 0);
+                        pf.recent_tiles[0] = (i32::MIN, i32::MIN, 0);
                         continue;
                     }
 
@@ -402,7 +402,7 @@ pub fn movement_system(
             }
             // Furniture slowdown (Bed/Chair/Table/Workbench/Loom).
             effective_speed *= furniture_speed_factor(
-                (cur_tx as i16, cur_ty as i16),
+                (cur_tx as i32, cur_ty as i32),
                 &bed_map,
                 &chair_map,
                 &table_map,
@@ -548,7 +548,7 @@ pub fn movement_system(
                                 && !spatial_index.agent_occupied(ntx, nty, ntz)
                                 && !claimed_this_tick.contains(&(ntx, nty, ntz))
                             {
-                                ai.target_tile = (ntx as i16, nty as i16);
+                                ai.target_tile = (ntx as i32, nty as i32);
                                 bumped = true;
                                 break;
                             }
@@ -618,7 +618,7 @@ pub fn movement_system(
                                         .passable_step_3d((cur_tx, cur_ty, cur_z), (ntx, nty, ntz))
                                         && !spatial_index.agent_occupied(ntx, nty, ntz)
                                     {
-                                        ai.target_tile = (ntx as i16, nty as i16);
+                                        ai.target_tile = (ntx as i32, nty as i32);
                                         ai.dest_tile = ai.target_tile;
                                         drifted = true;
                                         break;
@@ -654,7 +654,7 @@ pub fn movement_system(
                                     .passable_step_3d((cur_tx, cur_ty, cur_z), (ntx, nty, ntz))
                                     && !spatial_index.agent_occupied(ntx, nty, ntz)
                                 {
-                                    ai.target_tile = (ntx as i16, nty as i16);
+                                    ai.target_tile = (ntx as i32, nty as i32);
                                     ai.dest_tile = ai.target_tile;
                                     break 'outer;
                                 }

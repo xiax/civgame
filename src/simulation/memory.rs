@@ -21,7 +21,7 @@ pub enum MemoryKind {
 
 #[derive(Clone, Copy, Debug)]
 pub struct MemoryEntry {
-    pub tile: (i16, i16),
+    pub tile: (i32, i32),
     pub kind: MemoryKind,
     pub entity: Option<Entity>,
     pub freshness: u8,
@@ -35,7 +35,7 @@ pub struct AgentMemory {
 impl AgentMemory {
     fn insert_with_freshness(
         &mut self,
-        tile: (i16, i16),
+        tile: (i32, i32),
         kind: MemoryKind,
         entity: Option<Entity>,
         freshness: u8,
@@ -84,16 +84,16 @@ impl AgentMemory {
         }
     }
 
-    pub fn record(&mut self, tile: (i16, i16), kind: MemoryKind) {
+    pub fn record(&mut self, tile: (i32, i32), kind: MemoryKind) {
         self.insert_with_freshness(tile, kind, None, 255);
     }
 
-    pub fn record_entity(&mut self, tile: (i16, i16), kind: MemoryKind, entity: Entity) {
+    pub fn record_entity(&mut self, tile: (i32, i32), kind: MemoryKind, entity: Entity) {
         self.insert_with_freshness(tile, kind, Some(entity), 255);
     }
 
     // Bug 4 fix: remove ALL matching entries, not just the first one.
-    pub fn forget(&mut self, tile: (i16, i16), kind: MemoryKind) {
+    pub fn forget(&mut self, tile: (i32, i32), kind: MemoryKind) {
         for slot in &mut self.entries {
             if let Some(e) = slot {
                 if e.tile == tile && e.kind == kind {
@@ -103,7 +103,7 @@ impl AgentMemory {
         }
     }
 
-    pub fn best_for(&self, kind: MemoryKind) -> Option<(i16, i16)> {
+    pub fn best_for(&self, kind: MemoryKind) -> Option<(i32, i32)> {
         let mut best_fresh = 0u8;
         let mut best_tile = None;
         for slot in &self.entries {
@@ -121,7 +121,7 @@ impl AgentMemory {
         &self,
         kind: MemoryKind,
         from_pos: (i32, i32),
-    ) -> Option<(i16, i16)> {
+    ) -> Option<(i32, i32)> {
         let mut best_score = -1.0f32;
         let mut best_tile = None;
         for slot in &self.entries {
@@ -146,7 +146,7 @@ impl AgentMemory {
         &self,
         kind: MemoryKind,
         from_pos: (i32, i32),
-    ) -> Option<(Entity, i16, i16)> {
+    ) -> Option<(Entity, i32, i32)> {
         let mut best_score = -1.0f32;
         let mut best_res = None;
         for slot in &self.entries {
@@ -166,12 +166,12 @@ impl AgentMemory {
         best_res
     }
 
-    pub fn best_entity_for_dist_weighted_filtered<F: Fn(Entity, (i16, i16)) -> bool>(
+    pub fn best_entity_for_dist_weighted_filtered<F: Fn(Entity, (i32, i32)) -> bool>(
         &self,
         kind: MemoryKind,
         from_pos: (i32, i32),
         accept: F,
-    ) -> Option<(Entity, i16, i16)> {
+    ) -> Option<(Entity, i32, i32)> {
         let mut best_score = -1.0f32;
         let mut best_res = None;
         for slot in &self.entries {
@@ -383,14 +383,14 @@ pub fn vision_system(
                             crate::simulation::plants::PlantKind::Tree => MemoryKind::Wood,
                         };
                         if plant.stage == crate::simulation::plants::GrowthStage::Mature {
-                            memory.record_entity((ntx as i16, nty as i16), kind, entity);
+                            memory.record_entity((ntx as i32, nty as i32), kind, entity);
                         } else {
-                            memory.forget((ntx as i16, nty as i16), kind);
+                            memory.forget((ntx as i32, nty as i32), kind);
                         }
                     }
                 } else {
-                    memory.forget((ntx as i16, nty as i16), MemoryKind::Food);
-                    memory.forget((ntx as i16, nty as i16), MemoryKind::Wood);
+                    memory.forget((ntx as i32, nty as i32), MemoryKind::Food);
+                    memory.forget((ntx as i32, nty as i32), MemoryKind::Wood);
                 }
 
                 // Check spatial for entities (items, prey)
@@ -408,11 +408,11 @@ pub fn vision_system(
                             }
                         };
                         if let Some(k) = kind {
-                            memory.record_entity((ntx as i16, nty as i16), k, entity);
+                            memory.record_entity((ntx as i32, nty as i32), k, entity);
                         }
                     } else if let Ok((e, health)) = prey_query.get(entity) {
                         if !health.is_dead() {
-                            memory.record_entity((ntx as i16, nty as i16), MemoryKind::Prey, e);
+                            memory.record_entity((ntx as i32, nty as i32), MemoryKind::Prey, e);
                         }
                     }
                 }
@@ -420,9 +420,9 @@ pub fn vision_system(
                 // Check tile kinds (stone fallback)
                 if let Some(tile_kind) = chunk_map.tile_kind_at(ntx, nty) {
                     if tile_kind == crate::world::tile::TileKind::Stone {
-                        memory.record((ntx as i16, nty as i16), MemoryKind::Stone);
+                        memory.record((ntx as i32, nty as i32), MemoryKind::Stone);
                     } else {
-                        memory.forget((ntx as i16, nty as i16), MemoryKind::Stone);
+                        memory.forget((ntx as i32, nty as i32), MemoryKind::Stone);
                     }
                 }
             }

@@ -29,7 +29,7 @@ pub struct MusterHuntersRequest {
 #[derive(Resource, Default)]
 pub struct ActiveRallyPoints {
     /// tile -> last sim tick a drafted unit was still routing to it.
-    pub last_seen: AHashMap<(i16, i16, i8), u64>,
+    pub last_seen: AHashMap<(i32, i32, i8), u64>,
 }
 
 const RALLY_EXPIRE_TICKS: u64 = 60;
@@ -120,7 +120,7 @@ pub fn military_task_system(
 
             rally
                 .last_seen
-                .insert((foe_tx as i16, foe_ty as i16, foe_z), clock.tick);
+                .insert((foe_tx as i32, foe_ty as i32, foe_z), clock.tick);
 
             let dx = (foe_tx - cur_tx).abs();
             let dy = (foe_ty - cur_ty).abs();
@@ -131,16 +131,16 @@ pub fn military_task_system(
                 combat.0 = Some(foe);
             } else {
                 // Re-route if the foe has moved off our last destination.
-                if ai.dest_tile != (foe_tx as i16, foe_ty as i16) {
+                if ai.dest_tile != (foe_tx as i32, foe_ty as i32) {
                     let cur_chunk = ChunkCoord(
                         cur_tx.div_euclid(CHUNK_SIZE as i32),
                         cur_ty.div_euclid(CHUNK_SIZE as i32),
                     );
                     assign_task_with_routing(
                         &mut ai,
-                        (cur_tx as i16, cur_ty as i16),
+                        (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
-                        (foe_tx as i16, foe_ty as i16),
+                        (foe_tx as i32, foe_ty as i32),
                         TaskKind::MilitaryAttack,
                         Some(foe),
                         &chunk_graph,
@@ -210,7 +210,7 @@ pub fn expire_rally_points_system(
     mut hotspots: ResMut<HotspotFlowFields>,
 ) {
     let now = clock.tick;
-    let stale: Vec<(i16, i16, i8)> = rally
+    let stale: Vec<(i32, i32, i8)> = rally
         .last_seen
         .iter()
         .filter(|(_, &t)| now.saturating_sub(t) > RALLY_EXPIRE_TICKS)

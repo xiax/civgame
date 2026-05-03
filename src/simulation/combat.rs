@@ -598,8 +598,8 @@ pub fn death_system(
 
         if let Some(species) = huntable_species {
             let tile = (
-                (transform.translation.x / TILE_SIZE).floor() as i16,
-                (transform.translation.y / TILE_SIZE).floor() as i16,
+                (transform.translation.x / TILE_SIZE).floor() as i32,
+                (transform.translation.y / TILE_SIZE).floor() as i32,
             );
             corpse_map.insert(tile, entity);
             let mut e = commands.entity(entity);

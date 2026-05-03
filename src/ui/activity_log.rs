@@ -22,7 +22,7 @@ pub struct ActivityLogEvent {
 pub enum ActivityEntryKind {
     Constructed {
         site: BuildSiteKind,
-        tile: (i16, i16),
+        tile: (i32, i32),
         result_entity: Entity,
     },
     Crafted {
@@ -31,6 +31,10 @@ pub enum ActivityEntryKind {
     TechDiscovered {
         tech_name: &'static str,
         era_name: &'static str,
+    },
+    RegionSettled {
+        megachunk: (i32, i32),
+        region_name: String,
     },
 }
 
@@ -78,8 +82,15 @@ pub fn activity_log_ingest_system(
             .ok()
             .map(|t| t.translation.truncate());
 
-        let (verb, thing_label, result) = match ev.kind {
-            ActivityEntryKind::Constructed {
+        let (verb, thing_label, result) = match &ev.kind {
+            ActivityEntryKind::RegionSettled { megachunk, region_name } => {
+                (
+                    "settled",
+                    format!("{} (mega-chunk {:?})", region_name, megachunk),
+                    ResultLink::NoTarget,
+                )
+            }
+            &ActivityEntryKind::Constructed {
                 site,
                 tile,
                 result_entity,
@@ -99,12 +110,12 @@ pub fn activity_log_ingest_system(
                     },
                 )
             }
-            ActivityEntryKind::Crafted { name } => (
+            &ActivityEntryKind::Crafted { name } => (
                 "crafted",
                 name.to_string(),
                 ResultLink::HeldByActor,
             ),
-            ActivityEntryKind::TechDiscovered { tech_name, era_name } => (
+            &ActivityEntryKind::TechDiscovered { tech_name, era_name } => (
                 "discovered",
                 format!("{} ({})", tech_name, era_name),
                 ResultLink::NoTarget,

@@ -212,9 +212,9 @@ pub fn nearest_reachable_tile_near(
     target: (i32, i32),
     agent_origin: (ChunkCoord, i8),
     radius: i32,
-) -> Option<(i16, i16)> {
+) -> Option<(i32, i32)> {
     let csz = CHUNK_SIZE as i32;
-    let mut best: Option<(i16, i16)> = None;
+    let mut best: Option<(i32, i32)> = None;
     let mut best_dist = i32::MAX;
     for r in 1..=radius {
         for dy in -r..=r {
@@ -235,7 +235,7 @@ pub fn nearest_reachable_tile_near(
                 let dist = dx.abs() + dy.abs();
                 if dist < best_dist {
                     best_dist = dist;
-                    best = Some((tx as i16, ty as i16));
+                    best = Some((tx as i32, ty as i32));
                 }
             }
         }
@@ -256,10 +256,10 @@ pub fn nearest_reachable_tile_near(
 pub fn nearest_reachable_higher_tile(
     chunk_map: &ChunkMap,
     chunk_connectivity: &ChunkConnectivity,
-    origin_xy: (i16, i16),
+    origin_xy: (i32, i32),
     agent_origin: (ChunkCoord, i8),
     max_radius: i32,
-) -> Option<(i16, i16)> {
+) -> Option<(i32, i32)> {
     let csz = CHUNK_SIZE as i32;
     let agent_z = agent_origin.1;
     for r in 1..=max_radius {
@@ -281,7 +281,7 @@ pub fn nearest_reachable_higher_tile(
                 if !chunk_connectivity.is_reachable(agent_origin, (n_chunk, surf_z as i8)) {
                     continue;
                 }
-                return Some((tx as i16, ty as i16));
+                return Some((tx as i32, ty as i32));
             }
         }
     }
@@ -293,8 +293,8 @@ pub fn find_nearest_tile(
     from: (i32, i32),
     radius: i32,
     kinds: &[TileKind],
-) -> Option<(i16, i16)> {
-    let mut best: Option<(i16, i16)> = None;
+) -> Option<(i32, i32)> {
+    let mut best: Option<(i32, i32)> = None;
     let mut best_dist = i32::MAX;
 
     for dy in -radius..=radius {
@@ -306,7 +306,7 @@ pub fn find_nearest_tile(
                     let dist = dx.abs() + dy.abs();
                     if dist < best_dist {
                         best_dist = dist;
-                        best = Some((tx as i16, ty as i16));
+                        best = Some((tx as i32, ty as i32));
                     }
                 }
             }
@@ -322,8 +322,8 @@ pub fn find_nearest_plant(
     plant_query: &Query<&Plant>,
     mature_only: bool,
     kind_filter: Option<PlantKind>,
-) -> Option<(Entity, i16, i16)> {
-    let mut best: Option<(Entity, i16, i16)> = None;
+) -> Option<(Entity, i32, i32)> {
+    let mut best: Option<(Entity, i32, i32)> = None;
     let mut best_dist = i32::MAX;
 
     for dy in -radius..=radius {
@@ -343,7 +343,7 @@ pub fn find_nearest_plant(
                     let dist = dx.abs() + dy.abs();
                     if dist < best_dist {
                         best_dist = dist;
-                        best = Some((entity, tx as i16, ty as i16));
+                        best = Some((entity, tx as i32, ty as i32));
                     }
                 }
             }
@@ -363,15 +363,15 @@ pub fn find_nearest_edible(
     radius: i32,
     item_query: &Query<&GroundItem>,
     storage_tile_map: &StorageTileMap,
-) -> Option<(Entity, i16, i16)> {
-    let mut best: Option<(Entity, i16, i16)> = None;
+) -> Option<(Entity, i32, i32)> {
+    let mut best: Option<(Entity, i32, i32)> = None;
     let mut best_dist = i32::MAX;
     for dy in -radius..=radius {
         for dx in -radius..=radius {
             let tx = from.0 + dx;
             let ty = from.1 + dy;
 
-            if storage_tile_map.tiles.contains_key(&(tx as i16, ty as i16)) {
+            if storage_tile_map.tiles.contains_key(&(tx as i32, ty as i32)) {
                 continue;
             }
 
@@ -381,7 +381,7 @@ pub fn find_nearest_edible(
                         let dist = dx.abs() + dy.abs();
                         if dist < best_dist {
                             best_dist = dist;
-                            best = Some((e, tx as i16, ty as i16));
+                            best = Some((e, tx as i32, ty as i32));
                         }
                     }
                 }
@@ -400,15 +400,15 @@ pub fn find_nearest_item(
     good: Good,
     item_query: &Query<&GroundItem>,
     storage_tile_map: &StorageTileMap,
-) -> Option<(Entity, i16, i16)> {
-    let mut best: Option<(Entity, i16, i16)> = None;
+) -> Option<(Entity, i32, i32)> {
+    let mut best: Option<(Entity, i32, i32)> = None;
     let mut best_dist = i32::MAX;
     for dy in -radius..=radius {
         for dx in -radius..=radius {
             let tx = from.0 + dx;
             let ty = from.1 + dy;
 
-            if storage_tile_map.tiles.contains_key(&(tx as i16, ty as i16)) {
+            if storage_tile_map.tiles.contains_key(&(tx as i32, ty as i32)) {
                 continue;
             }
 
@@ -418,7 +418,7 @@ pub fn find_nearest_item(
                         let dist = dx.abs() + dy.abs();
                         if dist < best_dist {
                             best_dist = dist;
-                            best = Some((e, tx as i16, ty as i16));
+                            best = Some((e, tx as i32, ty as i32));
                         }
                     }
                 }
@@ -433,8 +433,8 @@ pub fn find_nearest_unplanted_farmland(
     plant_map: &PlantMap,
     from: (i32, i32),
     radius: i32,
-) -> Option<(i16, i16)> {
-    let mut best: Option<(i16, i16)> = None;
+) -> Option<(i32, i32)> {
+    let mut best: Option<(i32, i32)> = None;
     let mut best_dist = i32::MAX;
 
     for dy in -radius..=radius {
@@ -448,7 +448,7 @@ pub fn find_nearest_unplanted_farmland(
                 let dist = dx.abs() + dy.abs();
                 if dist < best_dist {
                     best_dist = dist;
-                    best = Some((tx as i16, ty as i16));
+                    best = Some((tx as i32, ty as i32));
                 }
             }
         }
@@ -458,9 +458,9 @@ pub fn find_nearest_unplanted_farmland(
 
 pub fn assign_task_with_routing(
     ai: &mut PersonAI,
-    cur_tile: (i16, i16),
+    cur_tile: (i32, i32),
     cur_chunk: ChunkCoord,
-    target: (i16, i16),
+    target: (i32, i32),
     task: TaskKind,
     target_entity: Option<Entity>,
     chunk_graph: &ChunkGraph,
@@ -512,7 +512,7 @@ pub fn assign_task_with_routing(
                 chunk_connectivity.is_reachable((cur_chunk, agent_z), (n_chunk, nz as i8))
             })
             .min_by_key(|&(ntx, nty)| (ntx - ax).abs() + (nty - ay).abs())
-            .map(|(ntx, nty)| (ntx as i16, nty as i16));
+            .map(|(ntx, nty)| (ntx as i32, nty as i32));
         match picked {
             Some(t) => t,
             None => {
@@ -676,11 +676,11 @@ pub fn goal_dispatch_system(
                     // 1) Persistent claim: route to my own bed if it still exists.
                     if let Some(bed_entity) = home_bed_opt.and_then(|h| h.0) {
                         if let Ok(bed_transform) = bed_query.get(bed_entity) {
-                            let btx = (bed_transform.translation.x / TILE_SIZE).floor() as i16;
-                            let bty = (bed_transform.translation.y / TILE_SIZE).floor() as i16;
+                            let btx = (bed_transform.translation.x / TILE_SIZE).floor() as i32;
+                            let bty = (bed_transform.translation.y / TILE_SIZE).floor() as i32;
                             assign_task_with_routing(
                                 &mut ai,
-                                (cur_tx as i16, cur_ty as i16),
+                                (cur_tx as i32, cur_ty as i32),
                                 cur_chunk,
                                 (btx, bty),
                                 TaskKind::Sleep,
@@ -709,7 +709,7 @@ pub fn goal_dispatch_system(
                         if dx * dx + dy * dy > 5 * 5 {
                             assign_task_with_routing(
                                 &mut ai,
-                                (cur_tx as i16, cur_ty as i16),
+                                (cur_tx as i32, cur_ty as i32),
                                 cur_chunk,
                                 home,
                                 TaskKind::Sleep,

@@ -39,7 +39,7 @@ pub struct TerraformSite {
 
 /// Tile → TerraformSite entity. Used by plan dispatch to find work.
 #[derive(Resource, Default)]
-pub struct TerraformMap(pub AHashMap<(i16, i16), Entity>);
+pub struct TerraformMap(pub AHashMap<(i32, i32), Entity>);
 
 /// A footprint that's mid-terraform. Once every tile in `terraform_tiles`
 /// drains from `TerraformMap`, `footprint_completion_system` spawns the
@@ -47,8 +47,8 @@ pub struct TerraformMap(pub AHashMap<(i16, i16), Entity>);
 pub struct PendingFootprint {
     pub faction_id: u32,
     pub target_z: i8,
-    pub terraform_tiles: Vec<(i16, i16)>,
-    pub wall_plan: Vec<(BuildSiteKind, (i16, i16))>,
+    pub terraform_tiles: Vec<(i32, i32)>,
+    pub wall_plan: Vec<(BuildSiteKind, (i32, i32))>,
 }
 
 #[derive(Resource, Default)]
@@ -124,7 +124,7 @@ pub fn terraform_dispatch_system(
             cur_ty.div_euclid(CHUNK_SIZE as i32),
         );
 
-        let mut best: Option<((i16, i16), i32)> = None;
+        let mut best: Option<((i32, i32), i32)> = None;
         for (&tile, &e) in &terraform_map.0 {
             let Ok(site) = site_query.get(e) else {
                 continue;
@@ -140,7 +140,7 @@ pub fn terraform_dispatch_system(
         if let Some((tile, _)) = best {
             assign_task_with_routing(
                 &mut ai,
-                (cur_tx as i16, cur_ty as i16),
+                (cur_tx as i32, cur_ty as i32),
                 cur_chunk,
                 tile,
                 TaskKind::Terraform,

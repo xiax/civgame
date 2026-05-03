@@ -2,8 +2,9 @@ use bevy::prelude::*;
 use noise::{NoiseFn, Perlin, Seedable};
 use std::time::Instant;
 
+use super::biome as biome_mod;
 use super::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_HEIGHT, CHUNK_SIZE, Z_MAX, Z_MIN};
-use super::globe::{Biome, Globe, WorldCell, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
+use super::globe::{Biome, Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 use super::tile::{OreKind, TileData, TileKind};
 
 pub const WORLD_CHUNKS_X: i32 = 32;
@@ -277,31 +278,29 @@ pub fn tile_at_3d(
     if let Some(d) = chunk_map.tile_delta_at(tx, ty, tz) {
         return d;
     }
-    let (gx, gy) = Globe::cell_for_chunk(
-        tx.div_euclid(CHUNK_SIZE as i32),
-        ty.div_euclid(CHUNK_SIZE as i32),
-    );
-    let biome = globe.cell(gx, gy).map(|c| c.biome).unwrap_or_default();
+    let biome = biome_mod::classify_at_tile(globe, tx, ty);
     let (water_t, grass_t, farm_t, forest_t) = biome_thresholds(biome);
     proc_tile(tx, ty, tz, gen, biome, water_t, grass_t, farm_t, forest_t)
 }
 
-/// Build a new Chunk: empty delta map + surface_z and surface_kind caches pre-filled.
-pub fn generate_chunk_from_globe(
-    coord: ChunkCoord,
-    globe_cell: &WorldCell,
-    gen: &WorldGen,
-) -> Chunk {
-    let (water_t, grass_t, farm_t, forest_t) = biome_thresholds(globe_cell.biome);
-
+/// Build a new Chunk: empty delta map + surface_z and surface_kind caches
+/// pre-filled. Per-tile biome via `biome::classify_at_tile` (continuous
+/// across mega-chunk seams). Rivers and lakes from the globe-level network
+/// are stamped over the noise-derived surface.
+pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGen) -> Chunk {
     let mut surface_z = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
     let mut surface_kind = Box::new([[TileKind::default(); CHUNK_SIZE]; CHUNK_SIZE]);
     let mut surface_fertility = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
 
+    let chunk_tx0 = coord.0 * CHUNK_SIZE as i32;
+    let chunk_ty0 = coord.1 * CHUNK_SIZE as i32;
+
     for ly in 0..CHUNK_SIZE {
         for lx in 0..CHUNK_SIZE {
-            let global_tx = coord.0 * CHUNK_SIZE as i32 + lx as i32;
-            let global_ty = coord.1 * CHUNK_SIZE as i32 + ly as i32;
+            let global_tx = chunk_tx0 + lx as i32;
+            let global_ty = chunk_ty0 + ly as i32;
+            let biome = biome_mod::classify_at_tile(globe, global_tx, global_ty);
+            let (water_t, grass_t, farm_t, forest_t) = biome_thresholds(biome);
             let v = surface_v(global_tx, global_ty, &gen.surface);
             let z = (Z_MIN as f32 + v * CHUNK_HEIGHT as f32).round() as i32;
             let z = z.clamp(Z_MIN, Z_MAX);
@@ -316,7 +315,119 @@ pub fn generate_chunk_from_globe(
             surface_fertility[ly][lx] = fertility;
         }
     }
+
+    // Stamp rivers (Bresenham along each edge that touches this chunk).
+    let chunk_tx1 = chunk_tx0 + CHUNK_SIZE as i32;
+    let chunk_ty1 = chunk_ty0 + CHUNK_SIZE as i32;
+    let tiles_per_climate_cell = (GLOBE_CELL_CHUNKS * CHUNK_SIZE as i32) as f32;
+    let cell_to_tile = |gx: u32, gy: u32| {
+        let tx = (gx as f32 + 0.5) * tiles_per_climate_cell;
+        let ty = (gy as f32 + 0.5) * tiles_per_climate_cell;
+        (tx as i32, ty as i32)
+    };
+    for edge in &globe.rivers.edges {
+        let (ax, ay) = cell_to_tile(edge.from.0, edge.from.1);
+        let (bx, by) = cell_to_tile(edge.to.0, edge.to.1);
+        // Quick AABB reject — the edge's bbox vs this chunk's bbox.
+        let lo_x = ax.min(bx);
+        let hi_x = ax.max(bx);
+        let lo_y = ay.min(by);
+        let hi_y = ay.max(by);
+        let half_w = edge.width as i32;
+        if hi_x + half_w < chunk_tx0
+            || lo_x - half_w >= chunk_tx1
+            || hi_y + half_w < chunk_ty0
+            || lo_y - half_w >= chunk_ty1
+        {
+            continue;
+        }
+        bresenham_stamp(
+            ax,
+            ay,
+            bx,
+            by,
+            edge.width as i32,
+            chunk_tx0,
+            chunk_ty0,
+            &mut surface_kind,
+            &mut surface_z,
+        );
+    }
+
+    // Stamp lakes (disc fill).
+    for lake in &globe.lakes.lakes {
+        let (cx, cy) = lake.center_tile;
+        let r = lake.radius_tiles as i32;
+        if cx + r < chunk_tx0 || cx - r >= chunk_tx1 || cy + r < chunk_ty0 || cy - r >= chunk_ty1 {
+            continue;
+        }
+        let r2 = r * r;
+        for ly in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let tx = chunk_tx0 + lx as i32;
+                let ty = chunk_ty0 + ly as i32;
+                let dx = tx - cx;
+                let dy = ty - cy;
+                if dx * dx + dy * dy <= r2 {
+                    surface_kind[ly][lx] = TileKind::Water;
+                    surface_z[ly][lx] = lake.level_z;
+                    surface_fertility[ly][lx] = 0;
+                }
+            }
+        }
+    }
+
     Chunk::new(surface_z, surface_kind, surface_fertility)
+}
+
+/// Bresenham line from (ax,ay) to (bx,by), widened by `half_w` tiles each
+/// side, stamping `Water` into the chunk-local arrays for any covered tile
+/// inside [chunk_tx0, chunk_tx0+CHUNK_SIZE) × [chunk_ty0, chunk_ty0+CHUNK_SIZE).
+fn bresenham_stamp(
+    ax: i32,
+    ay: i32,
+    bx: i32,
+    by: i32,
+    half_w: i32,
+    chunk_tx0: i32,
+    chunk_ty0: i32,
+    surface_kind: &mut [[TileKind; CHUNK_SIZE]; CHUNK_SIZE],
+    surface_z: &mut [[i8; CHUNK_SIZE]; CHUNK_SIZE],
+) {
+    let dx = (bx - ax).abs();
+    let sx = if ax < bx { 1 } else { -1 };
+    let dy = -(by - ay).abs();
+    let sy = if ay < by { 1 } else { -1 };
+    let mut err = dx + dy;
+    let mut x = ax;
+    let mut y = ay;
+    loop {
+        // Stamp a half_w×half_w square centered on (x, y).
+        for oy in -half_w..=half_w {
+            for ox in -half_w..=half_w {
+                let lx = x + ox - chunk_tx0;
+                let ly = y + oy - chunk_ty0;
+                if lx >= 0 && lx < CHUNK_SIZE as i32 && ly >= 0 && ly < CHUNK_SIZE as i32 {
+                    surface_kind[ly as usize][lx as usize] = TileKind::Water;
+                    // Lower river by 1 below current surface for a gentle channel.
+                    let cur = surface_z[ly as usize][lx as usize];
+                    surface_z[ly as usize][lx as usize] = (cur as i32 - 1).max(Z_MIN) as i8;
+                }
+            }
+        }
+        if x == bx && y == by {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
 }
 
 pub fn spawn_world_system(
@@ -324,10 +435,10 @@ pub fn spawn_world_system(
     mut chunk_map: ResMut<ChunkMap>,
     globe: Res<Globe>,
     sandbox: Option<Res<crate::sandbox::SandboxMode>>,
+    pending: Res<crate::PendingSpawn>,
 ) {
     let now = Instant::now();
-    let globe_center_x = (GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS;
-    let globe_center_y = (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS;
+    use crate::world::globe::MEGACHUNK_SIZE_CHUNKS;
 
     let (chunks_x, chunks_y) = if sandbox.is_some() {
         (5, 5)
@@ -335,25 +446,37 @@ pub fn spawn_world_system(
         (WORLD_CHUNKS_X, WORLD_CHUNKS_Y)
     };
 
-    let start_cx = globe_center_x - (chunks_x / 2);
-    let start_cy = globe_center_y - (chunks_y / 2);
+    // Centre the initial chunk pre-gen on the player-picked mega-chunk
+    // (PendingSpawn) — fall back to globe centre when nothing was picked
+    // (sandbox / no-spawn-select path).
+    let (center_cx, center_cy) = match pending.0 {
+        Some((mx, my)) => (
+            mx * MEGACHUNK_SIZE_CHUNKS + MEGACHUNK_SIZE_CHUNKS / 2,
+            my * MEGACHUNK_SIZE_CHUNKS + MEGACHUNK_SIZE_CHUNKS / 2,
+        ),
+        None => (
+            (GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS,
+            (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS,
+        ),
+    };
+
+    let start_cx = center_cx - (chunks_x / 2);
+    let start_cy = center_cy - (chunks_y / 2);
 
     for dy in 0..chunks_y {
         for dx in 0..chunks_x {
             let coord = ChunkCoord(start_cx + dx, start_cy + dy);
-            let (gx, gy) = Globe::cell_for_chunk(coord.0, coord.1);
-            let cell = globe.cell(gx, gy).copied().unwrap_or_default();
-            let chunk = generate_chunk_from_globe(coord, &cell, &gen);
+            let chunk = generate_chunk_from_globe(coord, &globe, &gen);
             chunk_map.0.insert(coord, chunk);
         }
     }
 
     info!(
-        "Initial area generated: {}x{} chunks centered at globe ({},{}) in {:?}",
+        "Initial area generated: {}x{} chunks centered at chunk ({},{}) in {:?}",
         chunks_x,
         chunks_y,
-        globe_center_x,
-        globe_center_y,
+        center_cx,
+        center_cy,
         now.elapsed()
     );
 }

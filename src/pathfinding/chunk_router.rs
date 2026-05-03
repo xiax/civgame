@@ -47,7 +47,7 @@ impl ChunkRouter {
         cur: ChunkCoord,
         dest: ChunkCoord,
         current_z: i8,
-    ) -> Option<(i16, i16)> {
+    ) -> Option<(i32, i32)> {
         if cur == dest {
             return None;
         }
@@ -109,7 +109,7 @@ impl ChunkRouter {
         let chosen = best?;
         let gx = chosen.neighbor.0 * CHUNK_SIZE as i32 + chosen.entry_local.0 as i32;
         let gy = chosen.neighbor.1 * CHUNK_SIZE as i32 + chosen.entry_local.1 as i32;
-        Some((gx as i16, gy as i16))
+        Some((gx as i32, gy as i32))
     }
 
     pub fn cached_destination_count(&self) -> usize {
@@ -261,6 +261,6 @@ mod tests {
         let wp = router
             .first_waypoint(&graph, ChunkCoord(0, 0), ChunkCoord(2, 0), 0)
             .unwrap();
-        assert_eq!(wp.0, CHUNK_SIZE as i16);
+        assert_eq!(wp.0, CHUNK_SIZE as i32);
     }
 }

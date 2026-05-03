@@ -111,8 +111,8 @@ pub fn carve_tile(
 
     if changed {
         events.send(TileChangedEvent {
-            tx: tx as i16,
-            ty: ty as i16,
+            tx: tx as i32,
+            ty: ty as i32,
         });
     }
 
@@ -168,8 +168,8 @@ pub fn fill_tile(
 
     if changed {
         events.send(TileChangedEvent {
-            tx: tx as i16,
-            ty: ty as i16,
+            tx: tx as i32,
+            ty: ty as i32,
         });
     }
 

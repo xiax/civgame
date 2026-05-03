@@ -126,7 +126,7 @@ pub enum AnimalState {
 #[derive(Component, Clone, Copy, Default)]
 pub struct AnimalAI {
     pub state: AnimalState,
-    pub target_tile: (i16, i16),
+    pub target_tile: (i32, i32),
     pub target_entity: Option<Entity>,
     pub wander_timer: f32,
 }
@@ -220,7 +220,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i16, ty as i16),
+                target_tile: (tx as i32, ty as i32),
                 wander_timer: i as f32 * 0.05,
                 ..Default::default()
             },
@@ -255,7 +255,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i16, ty as i16),
+                target_tile: (tx as i32, ty as i32),
                 wander_timer: i as f32 * 0.02,
                 ..Default::default()
             },
@@ -295,7 +295,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i16, ty as i16),
+                target_tile: (tx as i32, ty as i32),
                 wander_timer: i as f32 * 0.03,
                 ..Default::default()
             },
@@ -332,7 +332,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i16, ty as i16),
+                target_tile: (tx as i32, ty as i32),
                 wander_timer: i as f32 * 0.04,
                 ..Default::default()
             },
@@ -368,7 +368,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i16, ty as i16),
+                target_tile: (tx as i32, ty as i32),
                 wander_timer: i as f32 * 0.01,
                 ..Default::default()
             },
@@ -405,7 +405,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i16, ty as i16),
+                target_tile: (tx as i32, ty as i32),
                 wander_timer: i as f32 * 0.04,
                 ..Default::default()
             },
@@ -442,7 +442,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i16, ty as i16),
+                target_tile: (tx as i32, ty as i32),
                 wander_timer: i as f32 * 0.03,
                 ..Default::default()
             },
@@ -479,7 +479,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i16, ty as i16),
+                target_tile: (tx as i32, ty as i32),
                 wander_timer: i as f32 * 0.03,
                 ..Default::default()
             },
@@ -579,7 +579,7 @@ pub fn animal_movement_system(
                             if chunk_map.is_passable(ntx, nty)
                                 && !spatial.agent_occupied(ntx, nty, ntz)
                             {
-                                ai.target_tile = (ntx as i16, nty as i16);
+                                ai.target_tile = (ntx as i32, nty as i32);
                                 break;
                             }
                         }
@@ -711,8 +711,8 @@ pub fn animal_sense_system(
                             needs.hunger = (needs.hunger - ANIMAL_HUNGER_RECOVER_WOLF).max(0.0);
                         }
                     } else {
-                        let ptx = (prey_transform.translation.x / TILE_SIZE).floor() as i16;
-                        let pty = (prey_transform.translation.y / TILE_SIZE).floor() as i16;
+                        let ptx = (prey_transform.translation.x / TILE_SIZE).floor() as i32;
+                        let pty = (prey_transform.translation.y / TILE_SIZE).floor() as i32;
                         ai.target_tile = (ptx, pty);
 
                         let target_tile = ai.target_tile;
@@ -739,7 +739,7 @@ pub fn animal_sense_system(
         }
 
         // Scan for prey
-        let mut found: Option<(Entity, i16, i16)> = None;
+        let mut found: Option<(Entity, i32, i32)> = None;
 
         'scan: for dy in -WOLF_HUNT_RADIUS..=WOLF_HUNT_RADIUS {
             for dx in -WOLF_HUNT_RADIUS..=WOLF_HUNT_RADIUS {
@@ -773,7 +773,7 @@ pub fn animal_sense_system(
 
                     // Prefer deer (best meal, ends scan)
                     if deer_query.contains(candidate) {
-                        found = Some((candidate, (tx + dx) as i16, (ty + dy) as i16));
+                        found = Some((candidate, (tx + dx) as i32, (ty + dy) as i32));
                         break 'scan;
                     }
 
@@ -782,7 +782,7 @@ pub fn animal_sense_system(
                     if found.is_none()
                         && (rabbit_query.contains(candidate) || pig_query.contains(candidate))
                     {
-                        found = Some((candidate, (tx + dx) as i16, (ty + dy) as i16));
+                        found = Some((candidate, (tx + dx) as i32, (ty + dy) as i32));
                         continue;
                     }
 
@@ -806,7 +806,7 @@ pub fn animal_sense_system(
                             }
                         }
                         if nearby_persons == 0 {
-                            found = Some((candidate, (tx + dx) as i16, (ty + dy) as i16));
+                            found = Some((candidate, (tx + dx) as i32, (ty + dy) as i32));
                         }
                     }
                 }
@@ -877,7 +877,7 @@ pub fn animal_sense_system(
             let flee_tx = (tx - threat_dx / threat_count).clamp(0, total_tiles_x - 1);
             let flee_ty = (ty - threat_dy / threat_count).clamp(0, total_tiles_y - 1);
             ai.state = AnimalState::Flee;
-            ai.target_tile = (flee_tx as i16, flee_ty as i16);
+            ai.target_tile = (flee_tx as i32, flee_ty as i32);
             ai.wander_timer = 1.5;
         } else if ai.state == AnimalState::Flee {
             ai.state = AnimalState::Wander;
@@ -937,7 +937,7 @@ pub fn animal_sense_system(
             let flee_tx = (tx - threat_dx / threat_count).clamp(0, total_tiles_x - 1);
             let flee_ty = (ty - threat_dy / threat_count).clamp(0, total_tiles_y - 1);
             ai.state = AnimalState::Flee;
-            ai.target_tile = (flee_tx as i16, flee_ty as i16);
+            ai.target_tile = (flee_tx as i32, flee_ty as i32);
             ai.wander_timer = 1.5;
         } else if ai.state == AnimalState::Flee {
             ai.state = AnimalState::Wander;
@@ -991,7 +991,7 @@ pub fn animal_sense_system(
             let flee_tx = (tx - threat_dx / threat_count).clamp(0, total_tiles_x - 1);
             let flee_ty = (ty - threat_dy / threat_count).clamp(0, total_tiles_y - 1);
             ai.state = AnimalState::Flee;
-            ai.target_tile = (flee_tx as i16, flee_ty as i16);
+            ai.target_tile = (flee_tx as i32, flee_ty as i32);
             ai.wander_timer = 1.5;
         } else if ai.state == AnimalState::Flee {
             ai.state = AnimalState::Wander;
@@ -1042,7 +1042,7 @@ pub fn animal_sense_system(
             let flee_tx = (tx - threat_dx / threat_count).clamp(0, total_tiles_x - 1);
             let flee_ty = (ty - threat_dy / threat_count).clamp(0, total_tiles_y - 1);
             ai.state = AnimalState::Flee;
-            ai.target_tile = (flee_tx as i16, flee_ty as i16);
+            ai.target_tile = (flee_tx as i32, flee_ty as i32);
             ai.wander_timer = 1.5;
         } else if ai.state == AnimalState::Flee {
             ai.state = AnimalState::Wander;
@@ -1097,7 +1097,7 @@ pub fn animal_sense_system(
             let flee_tx = (tx - threat_dx / threat_count).clamp(0, total_tiles_x - 1);
             let flee_ty = (ty - threat_dy / threat_count).clamp(0, total_tiles_y - 1);
             ai.state = AnimalState::Flee;
-            ai.target_tile = (flee_tx as i16, flee_ty as i16);
+            ai.target_tile = (flee_tx as i32, flee_ty as i32);
             ai.wander_timer = 1.0;
         } else if ai.state == AnimalState::Flee {
             ai.state = AnimalState::Wander;
@@ -1150,7 +1150,7 @@ pub fn animal_sense_system(
             let flee_tx = (tx - threat_dx / threat_count).clamp(0, total_tiles_x - 1);
             let flee_ty = (ty - threat_dy / threat_count).clamp(0, total_tiles_y - 1);
             ai.state = AnimalState::Flee;
-            ai.target_tile = (flee_tx as i16, flee_ty as i16);
+            ai.target_tile = (flee_tx as i32, flee_ty as i32);
             ai.target_entity = None;
             combat_target.0 = None;
             ai.wander_timer = 1.5;
@@ -1174,8 +1174,8 @@ pub fn animal_sense_system(
                             needs.hunger = (needs.hunger - ANIMAL_HUNGER_RECOVER_FOX).max(0.0);
                         }
                     } else {
-                        let ptx = (prey_transform.translation.x / TILE_SIZE).floor() as i16;
-                        let pty = (prey_transform.translation.y / TILE_SIZE).floor() as i16;
+                        let ptx = (prey_transform.translation.x / TILE_SIZE).floor() as i32;
+                        let pty = (prey_transform.translation.y / TILE_SIZE).floor() as i32;
                         ai.target_tile = (ptx, pty);
                         let dist = (ptx as i32 - tx).abs() + (pty as i32 - ty).abs();
                         if dist <= 1 {
@@ -1198,7 +1198,7 @@ pub fn animal_sense_system(
         }
 
         // Scan for rabbits
-        let mut found: Option<(Entity, i16, i16)> = None;
+        let mut found: Option<(Entity, i32, i32)> = None;
         'fox_scan: for dy in -FOX_HUNT_RADIUS..=FOX_HUNT_RADIUS {
             for dx in -FOX_HUNT_RADIUS..=FOX_HUNT_RADIUS {
                 for &candidate in spatial.get(tx + dx, ty + dy) {
@@ -1229,7 +1229,7 @@ pub fn animal_sense_system(
                     ) {
                         continue;
                     }
-                    found = Some((candidate, (tx + dx) as i16, (ty + dy) as i16));
+                    found = Some((candidate, (tx + dx) as i32, (ty + dy) as i32));
                     break 'fox_scan;
                 }
             }
@@ -1291,7 +1291,7 @@ pub fn animal_sense_system(
             let flee_tx = (tx - threat_dx / threat_count).clamp(0, total_tiles_x - 1);
             let flee_ty = (ty - threat_dy / threat_count).clamp(0, total_tiles_y - 1);
             ai.state = AnimalState::Flee;
-            ai.target_tile = (flee_tx as i16, flee_ty as i16);
+            ai.target_tile = (flee_tx as i32, flee_ty as i32);
             ai.target_entity = None;
             combat_target.0 = None;
             ai.wander_timer = 1.5;
@@ -1315,8 +1315,8 @@ pub fn animal_sense_system(
                             needs.hunger = (needs.hunger - ANIMAL_HUNGER_RECOVER_CAT).max(0.0);
                         }
                     } else {
-                        let ptx = (prey_transform.translation.x / TILE_SIZE).floor() as i16;
-                        let pty = (prey_transform.translation.y / TILE_SIZE).floor() as i16;
+                        let ptx = (prey_transform.translation.x / TILE_SIZE).floor() as i32;
+                        let pty = (prey_transform.translation.y / TILE_SIZE).floor() as i32;
                         ai.target_tile = (ptx, pty);
                         let dist = (ptx as i32 - tx).abs() + (pty as i32 - ty).abs();
                         if dist <= 1 {
@@ -1339,7 +1339,7 @@ pub fn animal_sense_system(
         }
 
         // Scan for rabbits
-        let mut found: Option<(Entity, i16, i16)> = None;
+        let mut found: Option<(Entity, i32, i32)> = None;
         'cat_scan: for dy in -CAT_HUNT_RADIUS..=CAT_HUNT_RADIUS {
             for dx in -CAT_HUNT_RADIUS..=CAT_HUNT_RADIUS {
                 for &candidate in spatial.get(tx + dx, ty + dy) {
@@ -1370,7 +1370,7 @@ pub fn animal_sense_system(
                     ) {
                         continue;
                     }
-                    found = Some((candidate, (tx + dx) as i16, (ty + dy) as i16));
+                    found = Some((candidate, (tx + dx) as i32, (ty + dy) as i32));
                     break 'cat_scan;
                 }
             }
@@ -1607,7 +1607,7 @@ pub fn animal_reproduction_system(
         let sex = BiologicalSex::random();
         let transform = Transform::from_xyz(world_pos.x, world_pos.y, 1.0);
         let ai = AnimalAI {
-            target_tile: (tx as i16, ty as i16),
+            target_tile: (tx as i32, ty as i32),
             ..Default::default()
         };
 

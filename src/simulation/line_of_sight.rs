@@ -39,7 +39,7 @@ pub fn has_los(
                 return false;
             }
             // Closed door blocks LOS even though the underlying tile is passable.
-            if let Some(door) = door_map.0.get(&(x0 as i16, y0 as i16)) {
+            if let Some(door) = door_map.0.get(&(x0 as i32, y0 as i32)) {
                 if !door.open {
                     return false;
                 }

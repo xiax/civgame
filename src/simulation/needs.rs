@@ -132,7 +132,7 @@ pub fn tick_needs_system(
 
             if ai.state == AiState::Sleeping {
                 // Double sleep recovery when resting on a bed.
-                let on_bed = bed_map.0.contains_key(&(cur_tx as i16, cur_ty as i16));
+                let on_bed = bed_map.0.contains_key(&(cur_tx as i32, cur_ty as i32));
                 let recovery = if on_bed {
                     SLEEP_RECOVER_RATE * 2.0
                 } else {
@@ -176,11 +176,11 @@ pub fn tick_needs_system(
             // Table+Chair social bonus: agents in the Socialize task within
             // one tile of both a Table and a Chair recover social need 2× faster.
             if ai.task_id == TaskKind::Socialize as u16 {
-                let tile = (cur_tx as i16, cur_ty as i16);
+                let tile = (cur_tx as i32, cur_ty as i32);
                 let mut near_table = false;
                 let mut near_chair = false;
-                for dy in -1..=1i16 {
-                    for dx in -1..=1i16 {
+                for dy in -1..=1i32 {
+                    for dx in -1..=1i32 {
                         let p = (tile.0 + dx, tile.1 + dy);
                         if !near_table && table_map.0.contains_key(&p) {
                             near_table = true;

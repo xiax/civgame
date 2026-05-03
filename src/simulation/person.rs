@@ -131,8 +131,8 @@ pub struct PersonAI {
     pub state: AiState,
     /// Progress ticks toward the next production event.
     pub work_progress: u8,
-    pub target_tile: (i16, i16),
-    pub dest_tile: (i16, i16),
+    pub target_tile: (i32, i32),
+    pub dest_tile: (i32, i32),
     pub ticks_idle: u8,
     pub last_plan_id: u16,
     pub last_goal_eval_tick: u64,
@@ -158,7 +158,7 @@ pub struct PersonAI {
     /// Tile against which the current `StorageReservations` entry is held.
     /// Tracked separately from `dest_tile` so we can release the reservation
     /// even after the agent has been retargeted.
-    pub reserved_tile: (i16, i16),
+    pub reserved_tile: (i32, i32),
     /// Good promised to the storage tile via `StorageReservations`. `None`
     /// means no reservation is currently active.
     pub reserved_good: Option<crate::economy::goods::Good>,
@@ -213,7 +213,7 @@ impl Default for PersonAI {
 #[derive(Component, Clone, Copy, Debug)]
 pub struct PlayerOrder {
     pub order: PlayerOrderKind,
-    pub target_tile: (i16, i16),
+    pub target_tile: (i32, i32),
     /// Foot Z of the target. For surface clicks, equal to the tile's surface_z.
     /// For underground clicks (CameraViewZ != i32::MAX), this is the camera Z.
     pub target_z: i8,
@@ -292,12 +292,27 @@ pub fn spawn_population(
     mut clock: ResMut<SimClock>,
     mut registry: ResMut<FactionRegistry>,
     mut player_faction: ResMut<PlayerFaction>,
+    mut settled: ResMut<crate::simulation::region::SettledRegions>,
+    pending: Res<crate::PendingSpawn>,
 ) {
     let now = Instant::now();
-    use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
+    use crate::simulation::region::MegaChunkCoord;
+    use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH, MEGACHUNK_SIZE_CHUNKS};
 
-    let start_cx = ((GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS) - (WORLD_CHUNKS_X / 2);
-    let start_cy = ((GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS) - (WORLD_CHUNKS_Y / 2);
+    // Centre the spawn region on the player-picked mega-chunk; fall back to
+    // globe centre if nothing was picked.
+    let (center_cx, center_cy) = match pending.0 {
+        Some((mx, my)) => (
+            mx * MEGACHUNK_SIZE_CHUNKS + MEGACHUNK_SIZE_CHUNKS / 2,
+            my * MEGACHUNK_SIZE_CHUNKS + MEGACHUNK_SIZE_CHUNKS / 2,
+        ),
+        None => (
+            (GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS,
+            (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS,
+        ),
+    };
+    let start_cx = center_cx - (WORLD_CHUNKS_X / 2);
+    let start_cy = center_cy - (WORLD_CHUNKS_Y / 2);
 
     let mut rng = rand::thread_rng();
     let total_tiles_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
@@ -371,7 +386,7 @@ pub fn spawn_population(
         };
         spawned_homes.push((home_tx, home_ty));
 
-        let faction_id = registry.create_faction((home_tx as i16, home_ty as i16));
+        let faction_id = registry.create_faction((home_tx as i32, home_ty as i32));
 
         let home_world = tile_to_world(home_tx, home_ty);
 
@@ -396,6 +411,16 @@ pub fn spawn_population(
                 Visibility::Visible,
                 InheritedVisibility::default(),
             ));
+
+            // Seed the player's first settled region.
+            let megachunk = MegaChunkCoord::from_tile(home_tx, home_ty);
+            settled.settle(
+                megachunk,
+                clock.tick,
+                "Home".to_string(),
+                home_world,
+                true,
+            );
         }
 
         for _ in 0..GROUP_SIZE {
@@ -420,8 +445,8 @@ pub fn spawn_population(
                     PersonAI {
                         task_id: PersonAI::UNEMPLOYED,
                         state: AiState::Idle,
-                        target_tile: (tx as i16, ty as i16),
-                        dest_tile: (tx as i16, ty as i16),
+                        target_tile: (tx as i32, ty as i32),
+                        dest_tile: (tx as i32, ty as i32),
                         last_plan_id: PersonAI::UNEMPLOYED,
                         current_z: chunk_map.surface_z_at(tx, ty) as i8,
                         target_z: chunk_map.surface_z_at(tx, ty) as i8,

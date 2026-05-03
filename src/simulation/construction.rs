@@ -39,19 +39,19 @@ pub struct AutonomousBuildingToggle(pub bool);
 
 /// Maps tile positions to bed entities placed there.
 #[derive(Resource, Default)]
-pub struct BedMap(pub AHashMap<(i16, i16), Entity>);
+pub struct BedMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Maps tile positions to wall entities placed there.
 #[derive(Resource, Default)]
-pub struct WallMap(pub AHashMap<(i16, i16), Entity>);
+pub struct WallMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Maps tile positions to campfire entities placed there.
 #[derive(Resource, Default)]
-pub struct CampfireMap(pub AHashMap<(i16, i16), Entity>);
+pub struct CampfireMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Maps tile positions to active Blueprint entities (faction build reservations).
 #[derive(Resource, Default)]
-pub struct BlueprintMap(pub AHashMap<(i16, i16), Entity>);
+pub struct BlueprintMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Queue of (faction_id, building_tile, home_tile) tuples populated by
 /// `construction_system` when a structure finalises and by the planner when a
@@ -59,7 +59,7 @@ pub struct BlueprintMap(pub AHashMap<(i16, i16), Entity>);
 /// runs Bresenham from the building tile back to the home tile, marking each
 /// passable, non-Wall tile as `TileKind::Road`.
 #[derive(Resource, Default)]
-pub struct RoadCarveQueue(pub Vec<(u32, (i16, i16), (i16, i16))>);
+pub struct RoadCarveQueue(pub Vec<(u32, (i32, i32), (i32, i32))>);
 
 /// Per-door tracking: stores the door entity and its current open state so
 /// `has_los` can query door state by tile without joining a Bevy query.
@@ -71,43 +71,43 @@ pub struct DoorEntry {
 
 /// Maps tile positions to door entries placed there.
 #[derive(Resource, Default)]
-pub struct DoorMap(pub AHashMap<(i16, i16), DoorEntry>);
+pub struct DoorMap(pub AHashMap<(i32, i32), DoorEntry>);
 
 /// Maps tile positions to workbench entities placed there.
 #[derive(Resource, Default)]
-pub struct WorkbenchMap(pub AHashMap<(i16, i16), Entity>);
+pub struct WorkbenchMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Maps tile positions to loom entities placed there.
 #[derive(Resource, Default)]
-pub struct LoomMap(pub AHashMap<(i16, i16), Entity>);
+pub struct LoomMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Maps tile positions to table entities placed there.
 #[derive(Resource, Default)]
-pub struct TableMap(pub AHashMap<(i16, i16), Entity>);
+pub struct TableMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Maps tile positions to chair entities placed there.
 #[derive(Resource, Default)]
-pub struct ChairMap(pub AHashMap<(i16, i16), Entity>);
+pub struct ChairMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Maps tile positions to granary entities placed there.
 #[derive(Resource, Default)]
-pub struct GranaryMap(pub AHashMap<(i16, i16), Entity>);
+pub struct GranaryMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Maps tile positions to shrine entities placed there.
 #[derive(Resource, Default)]
-pub struct ShrineMap(pub AHashMap<(i16, i16), Entity>);
+pub struct ShrineMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Maps tile positions to market entities placed there.
 #[derive(Resource, Default)]
-pub struct MarketMap(pub AHashMap<(i16, i16), Entity>);
+pub struct MarketMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Maps tile positions to barracks entities placed there.
 #[derive(Resource, Default)]
-pub struct BarracksMap(pub AHashMap<(i16, i16), Entity>);
+pub struct BarracksMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Maps tile positions to monument entities placed there.
 #[derive(Resource, Default)]
-pub struct MonumentMap(pub AHashMap<(i16, i16), Entity>);
+pub struct MonumentMap(pub AHashMap<(i32, i32), Entity>);
 
 /// Bundle of furniture/structure maps used by `construction_system`. Bevy caps
 /// systems at 16 top-level params; bundling these stays under that limit.
@@ -429,7 +429,7 @@ pub struct Blueprint {
     pub faction_id: u32,
     pub personal_owner: Option<Entity>,
     pub kind: BuildSiteKind,
-    pub tile: (i16, i16),
+    pub tile: (i32, i32),
     /// Z-level at which the placed structure should sit. All blueprints
     /// belonging to one building share this value so the walls form a
     /// coherent floor instead of scattering across per-tile surface_z.
@@ -445,7 +445,7 @@ impl Blueprint {
         faction_id: u32,
         personal_owner: Option<Entity>,
         kind: BuildSiteKind,
-        tile: (i16, i16),
+        tile: (i32, i32),
         target_z: i8,
     ) -> Self {
         let recipe = recipe_for(kind);
@@ -730,7 +730,7 @@ pub fn enclosure_score(chunk_map: &ChunkMap, tx: i32, ty: i32) -> u8 {
 
 // ── Placement helpers ─────────────────────────────────────────────────────────
 
-fn count_beds_near(bed_map: &BedMap, home: (i16, i16), radius: i32) -> usize {
+fn count_beds_near(bed_map: &BedMap, home: (i32, i32), radius: i32) -> usize {
     let (hx, hy) = (home.0 as i32, home.1 as i32);
     bed_map
         .0
@@ -739,7 +739,7 @@ fn count_beds_near(bed_map: &BedMap, home: (i16, i16), radius: i32) -> usize {
         .count()
 }
 
-fn count_campfires_near(campfire_map: &CampfireMap, home: (i16, i16), radius: i32) -> usize {
+fn count_campfires_near(campfire_map: &CampfireMap, home: (i32, i32), radius: i32) -> usize {
     let (hx, hy) = (home.0 as i32, home.1 as i32);
     campfire_map
         .0
@@ -748,7 +748,7 @@ fn count_campfires_near(campfire_map: &CampfireMap, home: (i16, i16), radius: i3
         .count()
 }
 
-fn count_walls_near(wall_map: &WallMap, home: (i16, i16), radius: i32) -> usize {
+fn count_walls_near(wall_map: &WallMap, home: (i32, i32), radius: i32) -> usize {
     let (hx, hy) = (home.0 as i32, home.1 as i32);
     wall_map
         .0
@@ -757,7 +757,7 @@ fn count_walls_near(wall_map: &WallMap, home: (i16, i16), radius: i32) -> usize 
         .count()
 }
 
-fn count_workbenches_near(map: &WorkbenchMap, home: (i16, i16), radius: i32) -> usize {
+fn count_workbenches_near(map: &WorkbenchMap, home: (i32, i32), radius: i32) -> usize {
     let (hx, hy) = (home.0 as i32, home.1 as i32);
     map.0
         .keys()
@@ -765,7 +765,7 @@ fn count_workbenches_near(map: &WorkbenchMap, home: (i16, i16), radius: i32) -> 
         .count()
 }
 
-fn count_granaries_near(map: &GranaryMap, home: (i16, i16), radius: i32) -> usize {
+fn count_granaries_near(map: &GranaryMap, home: (i32, i32), radius: i32) -> usize {
     let (hx, hy) = (home.0 as i32, home.1 as i32);
     map.0
         .keys()
@@ -773,7 +773,7 @@ fn count_granaries_near(map: &GranaryMap, home: (i16, i16), radius: i32) -> usiz
         .count()
 }
 
-fn count_shrines_near(map: &ShrineMap, home: (i16, i16), radius: i32) -> usize {
+fn count_shrines_near(map: &ShrineMap, home: (i32, i32), radius: i32) -> usize {
     let (hx, hy) = (home.0 as i32, home.1 as i32);
     map.0
         .keys()
@@ -781,7 +781,7 @@ fn count_shrines_near(map: &ShrineMap, home: (i16, i16), radius: i32) -> usize {
         .count()
 }
 
-fn count_markets_near(map: &MarketMap, home: (i16, i16), radius: i32) -> usize {
+fn count_markets_near(map: &MarketMap, home: (i32, i32), radius: i32) -> usize {
     let (hx, hy) = (home.0 as i32, home.1 as i32);
     map.0
         .keys()
@@ -789,7 +789,7 @@ fn count_markets_near(map: &MarketMap, home: (i16, i16), radius: i32) -> usize {
         .count()
 }
 
-fn count_barracks_near(map: &BarracksMap, home: (i16, i16), radius: i32) -> usize {
+fn count_barracks_near(map: &BarracksMap, home: (i32, i32), radius: i32) -> usize {
     let (hx, hy) = (home.0 as i32, home.1 as i32);
     map.0
         .keys()
@@ -797,7 +797,7 @@ fn count_barracks_near(map: &BarracksMap, home: (i16, i16), radius: i32) -> usiz
         .count()
 }
 
-fn count_monuments_near(map: &MonumentMap, home: (i16, i16), radius: i32) -> usize {
+fn count_monuments_near(map: &MonumentMap, home: (i32, i32), radius: i32) -> usize {
     let (hx, hy) = (home.0 as i32, home.1 as i32);
     map.0
         .keys()
@@ -814,11 +814,11 @@ fn find_footprint_in_zone(
     bp_map: &BlueprintMap,
     plan: Option<&crate::simulation::settlement::SettlementPlan>,
     kind: crate::simulation::settlement::ZoneKind,
-    home: (i16, i16),
+    home: (i32, i32),
     half_w: i32,
     half_h: i32,
     fallback_radius: i32,
-) -> Option<(i16, i16)> {
+) -> Option<(i32, i32)> {
     let (hx, hy) = (home.0 as i32, home.1 as i32);
 
     if let Some(plan) = plan {
@@ -826,7 +826,7 @@ fn find_footprint_in_zone(
             // Rank candidates by (spread asc, distance asc). Flat ground is
             // strongly preferred; uneven sites that exceed MAX_TERRAFORM_SPREAD
             // are rejected outright so we don't queue megaprojects.
-            let mut best: Option<(u8, i32, (i16, i16))> = None;
+            let mut best: Option<(u8, i32, (i32, i32))> = None;
             let cx_min = rect.x0 as i32 + half_w;
             let cy_min = rect.y0 as i32 + half_h;
             let cx_max = rect.x0 as i32 + rect.w as i32 - half_w - 1;
@@ -844,7 +844,7 @@ fn find_footprint_in_zone(
                         continue;
                     }
                     let d = (cx - hx).abs() + (cy - hy).abs();
-                    let cand = (spread, d, (cx as i16, cy as i16));
+                    let cand = (spread, d, (cx as i32, cy as i32));
                     if best.map(|b| (cand.0, cand.1) < (b.0, b.1)).unwrap_or(true) {
                         best = Some(cand);
                     }
@@ -878,19 +878,19 @@ fn find_clear_tile_in_zone(
     bp_map: &BlueprintMap,
     plan: Option<&crate::simulation::settlement::SettlementPlan>,
     kind: crate::simulation::settlement::ZoneKind,
-    home: (i16, i16),
+    home: (i32, i32),
     fallback_radius: i32,
-) -> Option<(i16, i16)> {
+) -> Option<(i32, i32)> {
     let (hx, hy) = (home.0 as i32, home.1 as i32);
 
     if let Some(plan) = plan {
         if let Some(rect) = plan.zones.iter().find(|z| z.kind == kind).map(|z| z.rect) {
-            let mut best: Option<(i32, (i16, i16))> = None;
+            let mut best: Option<(i32, (i32, i32))> = None;
             for dy in 0..rect.h as i32 {
                 for dx in 0..rect.w as i32 {
                     let tx = rect.x0 as i32 + dx;
                     let ty = rect.y0 as i32 + dy;
-                    let pos = (tx as i16, ty as i16);
+                    let pos = (tx as i32, ty as i32);
                     if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
                         continue;
                     }
@@ -919,7 +919,7 @@ fn find_clear_tile_in_zone(
                 if dx.abs().max(dy.abs()) != d {
                     continue;
                 }
-                let pos = ((hx + dx) as i16, (hy + dy) as i16);
+                let pos = ((hx + dx) as i32, (hy + dy) as i32);
                 if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
                     continue;
                 }
@@ -946,8 +946,8 @@ fn find_unfilled_civic_zone_tile(
     bp_map: &BlueprintMap,
     campfire_map: &CampfireMap,
     plan: Option<&crate::simulation::settlement::SettlementPlan>,
-    home: (i16, i16),
-) -> Option<(i16, i16)> {
+    home: (i32, i32),
+) -> Option<(i32, i32)> {
     use crate::simulation::settlement::ZoneKind;
     if let Some(plan) = plan {
         for zone in plan.zones.iter().filter(|z| z.kind == ZoneKind::Civic) {
@@ -956,14 +956,14 @@ fn find_unfilled_civic_zone_tile(
             if occupied {
                 continue;
             }
-            let mut best: Option<(i32, (i16, i16))> = None;
+            let mut best: Option<(i32, (i32, i32))> = None;
             let zcx = (rect.x0 as i32 + rect.w as i32 / 2);
             let zcy = (rect.y0 as i32 + rect.h as i32 / 2);
             for dy in 0..rect.h as i32 {
                 for dx in 0..rect.w as i32 {
                     let tx = rect.x0 as i32 + dx;
                     let ty = rect.y0 as i32 + dy;
-                    let pos = (tx as i16, ty as i16);
+                    let pos = (tx as i32, ty as i32);
                     if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
                         continue;
                     }
@@ -993,7 +993,7 @@ fn find_unfilled_civic_zone_tile(
                 if dx.abs().max(dy.abs()) != d {
                     continue;
                 }
-                let pos = ((hx + dx) as i16, (hy + dy) as i16);
+                let pos = ((hx + dx) as i32, (hy + dy) as i32);
                 if bp_map.0.contains_key(&pos)
                     || bed_map.0.contains_key(&pos)
                     || campfire_map.0.contains_key(&pos)
@@ -1022,7 +1022,7 @@ fn find_unfilled_civic_zone_tile(
 /// decide when a household cluster is "full" and a new hearth should open.
 fn count_beds_in_crescent(
     bed_map: &BedMap,
-    hearth: (i16, i16),
+    hearth: (i32, i32),
     inner_r: i32,
     outer_r: i32,
 ) -> u32 {
@@ -1044,11 +1044,11 @@ fn find_bed_tile_around_hearth(
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
     bp_map: &BlueprintMap,
-    hearths: &[(i16, i16)],
-    home: (i16, i16),
+    hearths: &[(i32, i32)],
+    home: (i32, i32),
     inner_r: i32,
     outer_r: i32,
-) -> Option<(i16, i16)> {
+) -> Option<(i32, i32)> {
     if hearths.is_empty() {
         return None;
     }
@@ -1094,7 +1094,7 @@ fn find_bed_tile_around_hearth(
         })
         .collect();
 
-    let mut best: Option<(i32, (i16, i16))> = None;
+    let mut best: Option<(i32, (i32, i32))> = None;
     for (hi, &(hx, hy)) in hearths.iter().enumerate() {
         let (ax, ay) = bed_axes[hi];
         let crescents = &crescents_per_hearth[hi];
@@ -1107,7 +1107,7 @@ fn find_bed_tile_around_hearth(
                 }
                 let tx = hx as i32 + dx;
                 let ty = hy as i32 + dy;
-                let pos = (tx as i16, ty as i16);
+                let pos = (tx as i32, ty as i32);
                 if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
                     continue;
                 }
@@ -1178,7 +1178,7 @@ fn is_clear_footprint(
 ) -> bool {
     for dy in -half_h..=half_h {
         for dx in -half_w..=half_w {
-            let pos = ((cx + dx) as i16, (cy + dy) as i16);
+            let pos = ((cx + dx) as i32, (cy + dy) as i32);
             if bp_map.0.contains_key(&pos) {
                 return false;
             }
@@ -1216,7 +1216,7 @@ fn has_nearby_structure(
             } // skip own footprint
             let nx = cx + dx;
             let ny = cy + dy;
-            if bed_map.0.contains_key(&(nx as i16, ny as i16)) {
+            if bed_map.0.contains_key(&(nx as i32, ny as i32)) {
                 return true;
             }
             if chunk_map.tile_kind_at(nx, ny) == Some(TileKind::Wall) {
@@ -1230,7 +1230,7 @@ fn has_nearby_structure(
 /// Returns true if the footprint would straddle either cardinal corridor from the
 /// faction center — i.e. any tile in the footprint lies on `x = home.x` (N-S axis)
 /// or `y = home.y` (E-W axis). These corridors are reserved as future access roads.
-fn blocks_cardinal_corridor(cx: i32, cy: i32, half_w: i32, half_h: i32, home: (i16, i16)) -> bool {
+fn blocks_cardinal_corridor(cx: i32, cy: i32, half_w: i32, half_h: i32, home: (i32, i32)) -> bool {
     let hx = home.0 as i32;
     let hy = home.1 as i32;
     let blocks_ns = cx - half_w <= hx && hx <= cx + half_w;
@@ -1245,11 +1245,11 @@ fn find_building_origin(
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
     bp_map: &BlueprintMap,
-    camp_home: (i16, i16),
+    camp_home: (i32, i32),
     half_w: i32,
     half_h: i32,
     max_radius: i32,
-) -> Option<(i16, i16)> {
+) -> Option<(i32, i32)> {
     let (hx, hy) = (camp_home.0 as i32, camp_home.1 as i32);
     let min_ring = half_w.max(half_h) + 1;
     let early_ring = min_ring + 3; // within this ring: always accept a clear footprint
@@ -1269,11 +1269,11 @@ fn find_building_origin(
                     continue;
                 }
                 if ring <= early_ring {
-                    return Some((cx as i16, cy as i16));
+                    return Some((cx as i32, cy as i32));
                 }
                 // Beyond the seeding zone, grow organically: require adjacency.
                 if has_nearby_structure(chunk_map, bed_map, cx, cy, half_w, half_h, 2) {
-                    return Some((cx as i16, cy as i16));
+                    return Some((cx as i32, cy as i32));
                 }
             }
         }
@@ -1295,7 +1295,7 @@ fn plan_building(
     half_w: i32,
     half_h: i32,
     faction_id: u32,
-    camp_home: (i16, i16),
+    camp_home: (i32, i32),
     interior_beds: &[(i32, i32)],
     wall_material: WallMaterial,
 ) {
@@ -1328,13 +1328,13 @@ fn plan_building(
     // Build the wall+bed plan. We always compute it first so the deferred
     // path (footprint_completion_system) can spawn the same blueprints once
     // terraform completes.
-    let mut wall_plan: Vec<(BuildSiteKind, (i16, i16))> = Vec::new();
+    let mut wall_plan: Vec<(BuildSiteKind, (i32, i32))> = Vec::new();
     for dy in -half_h..=half_h {
         for dx in -half_w..=half_w {
             if dx.abs() < half_w && dy.abs() < half_h {
                 continue;
             } // interior — beds go here
-            let tile = ((cx + dx) as i16, (cy + dy) as i16);
+            let tile = ((cx + dx) as i32, (cy + dy) as i32);
             let kind = if (dx, dy) == entrance {
                 BuildSiteKind::Door
             } else {
@@ -1344,21 +1344,21 @@ fn plan_building(
         }
     }
     for &(bdx, bdy) in interior_beds {
-        let tile = ((cx + bdx) as i16, (cy + bdy) as i16);
+        let tile = ((cx + bdx) as i32, (cy + bdy) as i32);
         wall_plan.push((BuildSiteKind::Bed, tile));
     }
 
     // Collect the tiles that need terraforming (footprint covers walls AND
     // interior — every tile under the building must sit at target_z so the
     // floor is level).
-    let mut terraform_tiles: Vec<(i16, i16)> = Vec::new();
+    let mut terraform_tiles: Vec<(i32, i32)> = Vec::new();
     for dy in -half_h..=half_h {
         for dx in -half_w..=half_w {
             let tx = cx + dx;
             let ty = cy + dy;
             let surf = chunk_map.surface_z_at(tx, ty);
             if surf as i8 != target_z {
-                terraform_tiles.push((tx as i16, ty as i16));
+                terraform_tiles.push((tx as i32, ty as i32));
             }
         }
     }
@@ -1420,9 +1420,9 @@ fn find_palisade_site(
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
     bp_map: &BlueprintMap,
-    camp_home: (i16, i16),
+    camp_home: (i32, i32),
     buffer: i32,
-) -> Option<(i16, i16)> {
+) -> Option<(i32, i32)> {
     let (hx, hy) = (camp_home.0 as i32, camp_home.1 as i32);
     let search = 25i32;
 
@@ -1455,7 +1455,7 @@ fn find_palisade_site(
             if x == hx {
                 continue; // N or S gateway: keep open for cardinal access
             }
-            let tile = (x as i16, y as i16);
+            let tile = (x as i32, y as i32);
             if bp_map.0.contains_key(&tile) {
                 continue;
             }
@@ -1474,7 +1474,7 @@ fn find_palisade_site(
             if y == hy {
                 continue; // W or E gateway: keep open for cardinal access
             }
-            let tile = (x as i16, y as i16);
+            let tile = (x as i32, y as i32);
             if bp_map.0.contains_key(&tile) {
                 continue;
             }
@@ -1513,7 +1513,7 @@ pub struct BuildingMapsRO<'w> {
 struct BuildCandidate {
     intent: BuildIntent,
     /// Centre tile for the placement (single-tile target or footprint centre).
-    tile: (i16, i16),
+    tile: (i32, i32),
     score: f32,
 }
 
@@ -1732,7 +1732,7 @@ fn generate_candidates(
     let gate_ok = if existing_hearths == 0 {
         true
     } else if matches!(era, Era::Paleolithic | Era::Mesolithic) {
-        let hearths: Vec<(i16, i16)> = maps
+        let hearths: Vec<(i32, i32)> = maps
             .campfire_map
             .0
             .keys()
@@ -1801,7 +1801,7 @@ fn generate_candidates(
                     for dx in -1i32..=1 {
                         let tx = hx + dx;
                         let ty = hy + dy;
-                        let pos = (tx as i16, ty as i16);
+                        let pos = (tx as i32, ty as i32);
                         if bp_map.0.contains_key(&pos)
                             || maps.bed_map.0.contains_key(&pos)
                             || maps.campfire_map.0.contains_key(&pos)
@@ -1838,7 +1838,7 @@ fn generate_candidates(
             // nearest hearth. Defer if no fire exists yet — the campfire
             // candidate above (score 1000) will resolve first, matching the
             // historical ordering of fire-then-shelter.
-            let hearths: Vec<(i16, i16)> = maps
+            let hearths: Vec<(i32, i32)> = maps
                 .campfire_map
                 .0
                 .keys()
@@ -2089,9 +2089,9 @@ fn spawn_intent(
     pending_footprints: &mut crate::simulation::terraform::PendingFootprints,
     chunk_map: &ChunkMap,
     faction_id: u32,
-    home: (i16, i16),
+    home: (i32, i32),
     intent: BuildIntent,
-    tile: (i16, i16),
+    tile: (i32, i32),
 ) {
     match intent {
         BuildIntent::Single(kind) => {
@@ -2173,7 +2173,7 @@ fn spawn_intent(
 pub struct RitualEvent {
     pub faction_id: u32,
     pub season: Season,
-    pub focal: (i16, i16),
+    pub focal: (i32, i32),
     pub uses_monument: bool,
     pub members_affected: u32,
     pub pulse: u8,
@@ -2300,7 +2300,7 @@ pub fn road_carve_system(
         return;
     }
     // Drain — re-allocate a fresh empty Vec to release the lock on `queue`.
-    let drained: Vec<(u32, (i16, i16), (i16, i16))> = std::mem::take(&mut queue.0);
+    let drained: Vec<(u32, (i32, i32), (i32, i32))> = std::mem::take(&mut queue.0);
 
     for (_faction_id, from, to) in drained {
         let mut x0 = from.0 as i32;
@@ -2318,7 +2318,7 @@ pub fn road_carve_system(
             let is_endpoint =
                 (x0 == from.0 as i32 && y0 == from.1 as i32) || (x0 == x1 && y0 == y1);
             if !is_endpoint {
-                let tile = (x0 as i16, y0 as i16);
+                let tile = (x0 as i32, y0 as i32);
                 if !bp_map.0.contains_key(&tile) && !bed_map.0.contains_key(&tile) {
                     let surf_z = chunk_map.surface_z_at(x0, y0);
                     let cur = chunk_map.tile_kind_at(x0, y0);
@@ -2391,7 +2391,7 @@ pub fn building_upgrade_system(
     // Snapshot all faction state we need (we'll mutate `active_upgrade` later).
     let faction_state: Vec<(
         u32,
-        (i16, i16),
+        (i32, i32),
         FactionTechs,
         bool,
         bool,
@@ -2422,7 +2422,7 @@ pub fn building_upgrade_system(
 
         // Find one outdated wall within radius 25 of home.
         let (hx, hy) = (home.0 as i32, home.1 as i32);
-        let mut outdated: Option<(i16, i16)> = None;
+        let mut outdated: Option<(i32, i32)> = None;
         for (&pos, &wall_e) in wall_map.0.iter() {
             if (pos.0 as i32 - hx).abs() > 25 || (pos.1 as i32 - hy).abs() > 25 {
                 continue;
@@ -2449,7 +2449,7 @@ pub fn building_upgrade_system(
         }
 
         // Find the closest idle, non-dormant faction member.
-        let mut nearest: Option<(Entity, i32, (i16, i16))> = None;
+        let mut nearest: Option<(Entity, i32, (i32, i32))> = None;
         for (e, ai, member, transform, lod) in agent_query.iter() {
             if member.faction_id != faction_id {
                 continue;
@@ -2464,7 +2464,7 @@ pub fn building_upgrade_system(
             let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
             let d = (tx - tile.0 as i32).abs() + (ty - tile.1 as i32).abs();
             if nearest.map(|(_, nd, _)| d < nd).unwrap_or(true) {
-                nearest = Some((e, d, (tx as i16, ty as i16)));
+                nearest = Some((e, d, (tx as i32, ty as i32)));
             }
         }
         let Some((agent_e, _, cur_tile)) = nearest else {
@@ -3091,7 +3091,7 @@ pub fn assign_beds_system(
 
     // Reverse lookup: bed entity → tile position. BedMap is sparse so the
     // collect is cheap.
-    let bed_pos_by_entity: AHashMap<Entity, (i16, i16)> =
+    let bed_pos_by_entity: AHashMap<Entity, (i32, i32)> =
         bed_map.0.iter().map(|(&pos, &e)| (e, pos)).collect();
 
     // Snapshot every person's HomeBed entity, sex, and faction so Pass A can
@@ -3122,8 +3122,8 @@ pub fn assign_beds_system(
                                 my_sex: BiologicalSex,
                                 my_faction: u32,
                                 min_aff: i8|
-     -> Option<(i16, i16)> {
-        let mut best: Option<((i16, i16), i8)> = None;
+     -> Option<(i32, i32)> {
+        let mut best: Option<((i32, i32), i8)> = None;
         for slot in &rel.entries {
             let Some(entry) = slot else { continue };
             if entry.affinity < min_aff {
@@ -3194,7 +3194,7 @@ pub fn assign_beds_system(
         }
 
         // Look for an unclaimed bed within the proximity radius of partner.
-        let mut candidate: Option<(Entity, (i16, i16))> = None;
+        let mut candidate: Option<(Entity, (i32, i32))> = None;
         for (&pos, &bed_e) in &bed_map.0 {
             if bed_e == my_bed || claimed_this_pass.contains(&bed_e) {
                 continue;
@@ -3239,8 +3239,8 @@ pub fn assign_beds_system(
         for (dx, dy) in neighbors {
             let tx_i32 = partner_bed_pos.0 as i32 + dx;
             let ty_i32 = partner_bed_pos.1 as i32 + dy;
-            let tx = tx_i32 as i16;
-            let ty = ty_i32 as i16;
+            let tx = tx_i32 as i32;
+            let ty = ty_i32 as i32;
             if bp_map.0.contains_key(&(tx, ty)) || bed_map.0.contains_key(&(tx, ty)) {
                 continue;
             }
@@ -3273,7 +3273,7 @@ pub fn assign_beds_system(
     struct Homeless {
         person: Entity,
         pos: (i32, i32),
-        partner_bed: Option<(i16, i16)>,
+        partner_bed: Option<(i32, i32)>,
     }
     let mut homeless_by_faction: AHashMap<u32, Vec<Homeless>> = AHashMap::new();
     for (person, member, transform, home_bed, rel_opt, sex_opt) in &person_query {
@@ -3314,7 +3314,7 @@ pub fn assign_beds_system(
             continue;
         };
         let home = fd.home_tile;
-        let mut available: Vec<(Entity, (i16, i16))> = bed_map
+        let mut available: Vec<(Entity, (i32, i32))> = bed_map
             .0
             .iter()
             .filter(|(pos, _)| {
@@ -3381,8 +3381,8 @@ pub fn assign_beds_system(
         if !stale {
             continue;
         }
-        let tx = (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i16;
-        let ty = (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i16;
+        let tx = (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;
+        let ty = (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32;
 
         // Try to claim the nearest unclaimed bed within 30 tiles.
         let mut best_bed: Option<(Entity, i32)> = None;
@@ -3465,7 +3465,7 @@ pub fn deconstruct_system(
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
 ) {
     // Collect agents that just finished deconstruction.
-    let mut to_complete: Vec<(Entity, (i16, i16), u32, (i32, i32))> = Vec::new();
+    let mut to_complete: Vec<(Entity, (i32, i32), u32, (i32, i32))> = Vec::new();
 
     for (entity, mut ai, _, _, member, transform) in agent_query.iter_mut() {
         if ai.state != AiState::Working || ai.task_id != TaskKind::Deconstruct as u16 {
@@ -3597,7 +3597,7 @@ pub fn deconstruct_system(
                 }
             }
 
-            let cur_tile = (cur_x as i16, cur_y as i16);
+            let cur_tile = (cur_x as i32, cur_y as i32);
             let cur_chunk = ChunkCoord(
                 cur_x.div_euclid(CHUNK_SIZE as i32),
                 cur_y.div_euclid(CHUNK_SIZE as i32),

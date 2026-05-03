@@ -19,29 +19,29 @@ use crate::world::terrain::TILE_SIZE;
 /// `x0 <= x < x0+w`, `y0 <= y < y0+h`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TileRect {
-    pub x0: i16,
-    pub y0: i16,
+    pub x0: i32,
+    pub y0: i32,
     pub w: u16,
     pub h: u16,
 }
 
 impl TileRect {
-    pub fn new(x0: i16, y0: i16, w: u16, h: u16) -> Self {
+    pub fn new(x0: i32, y0: i32, w: u16, h: u16) -> Self {
         Self { x0, y0, w, h }
     }
 
     #[inline]
-    pub fn contains(&self, x: i16, y: i16) -> bool {
+    pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.x0
             && y >= self.y0
             && (x as i32) < self.x0 as i32 + self.w as i32
             && (y as i32) < self.y0 as i32 + self.h as i32
     }
 
-    pub fn center(&self) -> (i16, i16) {
+    pub fn center(&self) -> (i32, i32) {
         (
-            (self.x0 as i32 + self.w as i32 / 2) as i16,
-            (self.y0 as i32 + self.h as i32 / 2) as i16,
+            (self.x0 as i32 + self.w as i32 / 2) as i32,
+            (self.y0 as i32 + self.h as i32 / 2) as i32,
         )
     }
 
@@ -122,7 +122,7 @@ pub struct SettlementPlan {
 }
 
 impl SettlementPlan {
-    pub fn zone_for(&self, kind: ZoneKind, x: i16, y: i16) -> Option<&Zone> {
+    pub fn zone_for(&self, kind: ZoneKind, x: i32, y: i32) -> Option<&Zone> {
         self.zones
             .iter()
             .find(|z| z.kind == kind && z.rect.contains(x, y))
@@ -154,8 +154,8 @@ fn culture_hash(faction: &FactionData) -> u64 {
 fn zone(kind: ZoneKind, x0: i32, y0: i32, w: u32, h: u32, priority: u8, capacity: u8) -> Zone {
     let w = w.max(1).min(u16::MAX as u32) as u16;
     let h = h.max(1).min(u16::MAX as u32) as u16;
-    let x0 = x0.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-    let y0 = y0.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    let x0 = x0.clamp(i32::MIN as i32, i32::MAX as i32) as i32;
+    let y0 = y0.clamp(i32::MIN as i32, i32::MAX as i32) as i32;
     Zone {
         kind,
         rect: TileRect::new(x0, y0, w, h),
@@ -186,7 +186,7 @@ pub fn paleolithic_hearth_count(members: u32) -> u32 {
 /// positions.
 pub fn paleolithic_hearth_positions(
     faction_id: u32,
-    home: (i16, i16),
+    home: (i32, i32),
     members: u32,
 ) -> Vec<(i32, i32)> {
     let n = paleolithic_hearth_count(members);

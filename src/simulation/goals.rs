@@ -162,7 +162,7 @@ impl AgentGoal {
 #[derive(Component, Clone, Copy)]
 pub struct RescueTarget {
     pub attacker: Entity,
-    pub attacker_tile: (i16, i16),
+    pub attacker_tile: (i32, i32),
     pub set_tick: u64,
 }
 

@@ -41,7 +41,7 @@ pub struct Plant {
     pub kind: PlantKind,
     pub stage: GrowthStage,
     pub growth_ticks: u32,
-    pub tile_pos: (i16, i16),
+    pub tile_pos: (i32, i32),
 }
 
 impl Plant {
@@ -206,7 +206,7 @@ pub fn spawn_plant_at(
                 kind,
                 stage,
                 growth_ticks: 0,
-                tile_pos: (tile_x as i16, tile_y as i16),
+                tile_pos: (tile_x as i32, tile_y as i32),
             },
             Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
             GlobalTransform::default(),

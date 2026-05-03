@@ -439,8 +439,8 @@ pub fn pregnancy_system(
                 PersonAI {
                     task_id: PersonAI::UNEMPLOYED,
                     state: AiState::Idle,
-                    target_tile: (tx as i16, ty as i16),
-                    dest_tile: (tx as i16, ty as i16),
+                    target_tile: (tx as i32, ty as i32),
+                    dest_tile: (tx as i32, ty as i32),
                     last_plan_id: PersonAI::UNEMPLOYED,
                     current_z: chunk_map.surface_z_at(tx, ty) as i8,
                     target_z: chunk_map.surface_z_at(tx, ty) as i8,

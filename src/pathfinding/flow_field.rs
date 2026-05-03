@@ -167,12 +167,12 @@ const DIR_OFFSET: [(i32, i32); 8] = [
 /// Each step's Z comes from `field.cell_z` — when the BFS routed via a ramp
 /// inside the chunk, the path will follow the ramp's standable Z per cell
 /// instead of pinning every step to `field.goal_z`.
-pub fn walk_to_goal(field: &FlowField, start_local: (u8, u8)) -> Option<Vec<(i16, i16, i8)>> {
+pub fn walk_to_goal(field: &FlowField, start_local: (u8, u8)) -> Option<Vec<(i32, i32, i8)>> {
     let csz = CHUNK_SIZE;
     let origin_x = field.chunk.0 * csz as i32;
     let origin_y = field.chunk.1 * csz as i32;
 
-    let mut path: Vec<(i16, i16, i8)> = Vec::new();
+    let mut path: Vec<(i32, i32, i8)> = Vec::new();
     let mut x = start_local.0 as i32;
     let mut y = start_local.1 as i32;
     let goal_x = field.goal_tile.0 as i32;
@@ -197,8 +197,8 @@ pub fn walk_to_goal(field: &FlowField, start_local: (u8, u8)) -> Option<Vec<(i16
             return None;
         }
         let next_idx = y as usize * csz + x as usize;
-        let gx = (origin_x + x) as i16;
-        let gy = (origin_y + y) as i16;
+        let gx = (origin_x + x) as i32;
+        let gy = (origin_y + y) as i32;
         path.push((gx, gy, field.cell_z[next_idx]));
         if x == goal_x && y == goal_y {
             return Some(path);
@@ -353,15 +353,15 @@ mod tests {
         assert_eq!(
             last,
             (
-                (origin_x + goal.0 as i32) as i16,
-                (origin_y + goal.1 as i32) as i16,
+                (origin_x + goal.0 as i32) as i32,
+                (origin_y + goal.1 as i32) as i32,
                 0,
             )
         );
 
         let mut prev = (
-            (origin_x + start.0 as i32) as i16,
-            (origin_y + start.1 as i32) as i16,
+            (origin_x + start.0 as i32) as i32,
+            (origin_y + start.1 as i32) as i32,
         );
         for &(x, y, _) in &path {
             let dx = (x as i32 - prev.0 as i32).abs();

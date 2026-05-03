@@ -33,7 +33,7 @@ pub fn faction_decision_system(
     }
 
     // Pass 1: collect decisions
-    let snapshot: Vec<(u32, f32, (i16, i16), f32)> = registry
+    let snapshot: Vec<(u32, f32, (i32, i32), f32)> = registry
         .factions
         .iter()
         .map(|(&id, f)| {

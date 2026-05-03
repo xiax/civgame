@@ -48,14 +48,14 @@ pub const CORPSE_FRESHNESS_TICKS: u64 = 600;
 /// and `corpse_decay_system` / Butcher executor (remove). Used by the
 /// `NearestFreshCorpse` step resolver.
 #[derive(Resource, Default)]
-pub struct CorpseMap(pub AHashMap<(i16, i16), Vec<Entity>>);
+pub struct CorpseMap(pub AHashMap<(i32, i32), Vec<Entity>>);
 
 impl CorpseMap {
-    pub fn insert(&mut self, tile: (i16, i16), e: Entity) {
+    pub fn insert(&mut self, tile: (i32, i32), e: Entity) {
         self.0.entry(tile).or_default().push(e);
     }
 
-    pub fn remove(&mut self, tile: (i16, i16), e: Entity) {
+    pub fn remove(&mut self, tile: (i32, i32), e: Entity) {
         if let Some(v) = self.0.get_mut(&tile) {
             v.retain(|x| *x != e);
             if v.is_empty() {
@@ -119,8 +119,8 @@ pub fn pickup_corpse_task_system(
 
         if let Ok((_, t)) = corpse_q.get(corpse_e) {
             let tile = (
-                (t.translation.x / TILE_SIZE).floor() as i16,
-                (t.translation.y / TILE_SIZE).floor() as i16,
+                (t.translation.x / TILE_SIZE).floor() as i32,
+                (t.translation.y / TILE_SIZE).floor() as i32,
             );
             corpse_map.remove(tile, corpse_e);
             ai.carried_corpse = Some(corpse_e);
@@ -328,8 +328,8 @@ pub fn corpse_decay_system(
             continue;
         }
         let tile = (
-            (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i16,
-            (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i16,
+            (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32,
+            (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32,
         );
         corpse_map.remove(tile, e);
         // Anyone currently dragging this corpse needs their reference cleared.

@@ -26,6 +26,7 @@ pub mod plants;
 pub mod production;
 pub mod projects;
 pub mod raid;
+pub mod region;
 pub mod reproduction;
 pub mod schedule;
 pub mod settlement;
@@ -109,9 +110,10 @@ impl Plugin for SimulationPlugin {
                 ),
             )
             .add_systems(
-                PostStartup,
+                OnEnter(crate::GameState::Playing),
                 (
                     person::spawn_population
+                        .after(crate::world::terrain::spawn_world_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     animals::spawn_animals
                         .after(person::spawn_population)
@@ -304,6 +306,7 @@ impl Plugin for SimulationPlugin {
                     world_sim::agent_exploration_system,
                     faction::chief_selection_system,
                     construction::chief_directive_system.after(faction::chief_selection_system),
+                    region::detect_edge_crossing_system,
                 )
                     .in_set(SimulationSet::Economy),
             )

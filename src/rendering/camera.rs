@@ -40,7 +40,9 @@ impl Default for CameraState {
 }
 
 pub fn setup_camera(mut commands: Commands) {
-    // Start at the center of the globe (globe cell 32,16 = chunk 512,256 = pixel 8192,4096)
+    // Initial camera at the centre of the globe — egui needs a camera early.
+    // The actual play position is set on OnEnter(GameState::Playing) by
+    // `position_camera_for_spawn`, which reads `PendingSpawn`.
     let globe_cx = (GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS;
     let globe_cy = (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS;
     let start_x = globe_cx as f32 * CHUNK_SIZE as f32 * TILE_SIZE;
@@ -53,6 +55,28 @@ pub fn setup_camera(mut commands: Commands) {
         Visibility::Visible,
         InheritedVisibility::default(),
     ));
+}
+
+/// Reposition the camera to the chosen mega-chunk's centre when entering
+/// `GameState::Playing`. Reads `PendingSpawn`; falls back to globe centre if
+/// nothing was picked (e.g. tests).
+pub fn position_camera_for_spawn(
+    pending: Res<crate::PendingSpawn>,
+    mut camera_query: Query<&mut Transform, With<Camera>>,
+) {
+    let Ok(mut transform) = camera_query.get_single_mut() else {
+        return;
+    };
+    let (mx, my) = pending.0.unwrap_or_else(|| {
+        let half_w = GLOBE_WIDTH / 2;
+        let half_h = GLOBE_HEIGHT / 2;
+        (half_w * GLOBE_CELL_CHUNKS / crate::world::globe::MEGACHUNK_SIZE_CHUNKS,
+         half_h * GLOBE_CELL_CHUNKS / crate::world::globe::MEGACHUNK_SIZE_CHUNKS)
+    });
+    let (tx, ty) = crate::simulation::region::MegaChunkCoord::center_tile(mx, my);
+    transform.translation.x = tx as f32 * TILE_SIZE + TILE_SIZE * 0.5;
+    transform.translation.y = ty as f32 * TILE_SIZE + TILE_SIZE * 0.5;
+    info!("Camera repositioned to mega-chunk ({mx},{my}) tile ({tx},{ty})");
 }
 
 pub fn camera_input_system(

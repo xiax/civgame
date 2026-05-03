@@ -25,7 +25,7 @@ const ALL_KINDS: [HotspotKind; 3] = [
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct HotspotKey {
-    pub tile: (i16, i16, i8),
+    pub tile: (i32, i32, i8),
     pub kind: HotspotKind,
 }
 
@@ -51,21 +51,21 @@ pub struct HotspotFlowFields {
 }
 
 impl HotspotFlowFields {
-    pub fn register(&mut self, tile: (i16, i16, i8), kind: HotspotKind) {
+    pub fn register(&mut self, tile: (i32, i32, i8), kind: HotspotKind) {
         let key = HotspotKey { tile, kind };
         if !self.entries.contains_key(&key) {
             self.dirty.insert(key);
         }
     }
 
-    pub fn unregister(&mut self, tile: (i16, i16, i8), kind: HotspotKind) {
+    pub fn unregister(&mut self, tile: (i32, i32, i8), kind: HotspotKind) {
         let key = HotspotKey { tile, kind };
         self.entries.remove(&key);
         self.dirty.remove(&key);
         self.field_count = self.entries.len() as u32;
     }
 
-    pub fn is_registered(&self, tile: (i16, i16, i8), kind: HotspotKind) -> bool {
+    pub fn is_registered(&self, tile: (i32, i32, i8), kind: HotspotKind) -> bool {
         let key = HotspotKey { tile, kind };
         self.entries.contains_key(&key) || self.dirty.contains(&key)
     }
@@ -92,7 +92,7 @@ impl HotspotFlowFields {
     /// - the agent is in a different chunk than the hotspot (cross-chunk
     ///   routing is the router's job, not the flow field's),
     /// - the agent's tile has no path to the goal within the chunk.
-    pub fn lookup_dir(&self, tile: (i16, i16, i8), agent_pos: (i32, i32, i8)) -> Option<u8> {
+    pub fn lookup_dir(&self, tile: (i32, i32, i8), agent_pos: (i32, i32, i8)) -> Option<u8> {
         for k in ALL_KINDS {
             let key = HotspotKey { tile, kind: k };
             let Some(entry) = self.entries.get(&key) else {
@@ -126,7 +126,7 @@ impl HotspotFlowFields {
     /// of which hotspot kind it was registered under. Used by the path
     /// worker to short-circuit single-chunk A* when the goal is a known
     /// hotspot.
-    pub fn lookup_field(&self, tile: (i16, i16, i8)) -> Option<&FlowField> {
+    pub fn lookup_field(&self, tile: (i32, i32, i8)) -> Option<&FlowField> {
         for k in ALL_KINDS {
             if let Some(entry) = self.entries.get(&HotspotKey { tile, kind: k }) {
                 return Some(&entry.field);
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn register_then_rebuild_populates_lookup_field() {
         let mut fields = HotspotFlowFields::default();
-        let goal_tile = (5i16, 6i16, 0i8);
+        let goal_tile = (5i32, 6i32, 0i8);
         fields.register(goal_tile, HotspotKind::FactionCenter);
         assert!(fields.is_registered(goal_tile, HotspotKind::FactionCenter));
         assert!(fields.lookup_field(goal_tile).is_none(), "not yet built");
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn lookup_dir_rejects_z_mismatch() {
         let mut fields = HotspotFlowFields::default();
-        let goal_tile = (5i16, 6i16, 0i8);
+        let goal_tile = (5i32, 6i32, 0i8);
         fields.register(goal_tile, HotspotKind::FactionCenter);
 
         let coord = ChunkCoord(0, 0);

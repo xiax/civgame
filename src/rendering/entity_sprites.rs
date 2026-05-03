@@ -1543,8 +1543,8 @@ pub fn update_entity_z_visibility_system(
         } else {
             entity_z == cam_z
         };
-        let fog_visible = fog_map.is_visible((tx as i16, ty as i16));
-        let fog_explored = fog_map.is_explored((tx as i16, ty as i16));
+        let fog_visible = fog_map.is_visible((tx as i32, ty as i32));
+        let fog_explored = fog_map.is_explored((tx as i32, ty as i32));
         let fog_ok = fog_visible || (fog_persistent && fog_explored);
         let new_vis = if should_show && fog_ok {
             Visibility::Visible

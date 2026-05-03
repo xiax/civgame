@@ -19,18 +19,18 @@ use crate::world::tile::{OreKind, TileKind};
 /// Fog of war state: which tiles the player faction can currently see / has ever seen.
 #[derive(Resource, Default)]
 pub struct FogMap {
-    pub visible: AHashSet<(i16, i16)>,
-    pub explored: AHashSet<(i16, i16)>,
+    pub visible: AHashSet<(i32, i32)>,
+    pub explored: AHashSet<(i32, i32)>,
     /// Tiles whose fog state changed this frame — processed by apply_fog_to_tiles_system.
-    pub dirty_tiles: Vec<(i16, i16)>,
+    pub dirty_tiles: Vec<(i32, i32)>,
 }
 
 impl FogMap {
-    pub fn is_visible(&self, pos: (i16, i16)) -> bool {
+    pub fn is_visible(&self, pos: (i32, i32)) -> bool {
         self.visible.contains(&pos)
     }
 
-    pub fn is_explored(&self, pos: (i16, i16)) -> bool {
+    pub fn is_explored(&self, pos: (i32, i32)) -> bool {
         self.explored.contains(&pos)
     }
 }
@@ -106,13 +106,13 @@ pub fn fog_update_system(
     let old_visible = std::mem::take(&mut fog_map.visible);
     fog_map.dirty_tiles.clear();
 
-    let mut new_visible: AHashSet<(i16, i16)> = AHashSet::default();
+    let mut new_visible: AHashSet<(i32, i32)> = AHashSet::default();
 
     // Player-owned landmarks (FactionCenter) are always considered visible so
     // they stay bright even when no persons are nearby.
     for transform in landmark_query.iter() {
-        let lx = (transform.translation.x / TILE_SIZE).floor() as i16;
-        let ly = (transform.translation.y / TILE_SIZE).floor() as i16;
+        let lx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let ly = (transform.translation.y / TILE_SIZE).floor() as i32;
         new_visible.insert((lx, ly));
     }
 
@@ -127,7 +127,7 @@ pub fn fog_update_system(
         if *lod == LodLevel::Dormant {
             // Dormant agents skip the expensive LOS scan but still mark their
             // own tile so a lone settler far from the camera stays bright.
-            new_visible.insert((ax as i16, ay as i16));
+            new_visible.insert((ax as i32, ay as i32));
             continue;
         }
 
@@ -147,7 +147,7 @@ pub fn fog_update_system(
                 let in_los = dx * dx + dy * dy <= 1
                     || has_los(&chunk_map, &door_map, (ax, ay, az), (ttx, tty, tz));
                 if in_los {
-                    new_visible.insert((ttx as i16, tty as i16));
+                    new_visible.insert((ttx as i32, tty as i32));
                 }
             }
         }
@@ -219,7 +219,7 @@ pub fn apply_fog_to_tiles_system(
 /// material handle and return the final Visibility value.
 pub fn apply_fog_to_material(
     fog_map: &FogMap,
-    tile_pos: (i16, i16),
+    tile_pos: (i32, i32),
     base_vis: Visibility,
     render_kind: TileKind,
     render_ore: OreKind,

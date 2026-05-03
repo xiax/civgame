@@ -23,6 +23,11 @@ use crate::world::tile::{OreKind, TileKind};
 pub const LOAD_RADIUS: i32 = 12;
 pub const UNLOAD_RADIUS: i32 = 16;
 
+/// Smaller load radius for off-camera settled regions (data + sim only,
+/// no sprites). Each region keeps a column of chunks active around its
+/// centre so its agents can sim normally without being on screen.
+pub const REGION_LOAD_RADIUS: i32 = 6;
+
 /// Chunks that must NOT be unloaded by `chunk_streaming_system` even when
 /// they're outside `UNLOAD_RADIUS` from the camera. Recomputed each tick by
 /// `update_chunk_retention_system` from three sources:
@@ -60,6 +65,40 @@ pub struct ChunkUnloadedEvent {
 pub struct ChunkStreamEvents<'w> {
     pub loaded: EventWriter<'w, ChunkLoadedEvent>,
     pub unloaded: EventWriter<'w, ChunkUnloadedEvent>,
+}
+
+/// Rebuild `SimulationFocus` from camera + every settled region's mega-chunk
+/// centre. Runs each tick before `chunk_streaming_system` so the loader sees
+/// the current focus set.
+pub fn update_simulation_focus_system(
+    mut focus: ResMut<crate::simulation::region::SimulationFocus>,
+    settled: Res<crate::simulation::region::SettledRegions>,
+    camera_q: Query<&Transform, With<Camera>>,
+) {
+    use crate::simulation::region::{FocusPoint, MegaChunkCoord};
+
+    focus.points.clear();
+
+    if let Ok(cam) = camera_q.get_single() {
+        focus.points.push(FocusPoint {
+            world_pos: cam.translation.truncate(),
+            chunk_radius: LOAD_RADIUS,
+            is_camera: true,
+        });
+    }
+
+    for region in settled.by_id.values() {
+        let (tx, ty) = MegaChunkCoord::center_tile(region.megachunk.0, region.megachunk.1);
+        let world_pos = Vec2::new(
+            tx as f32 * TILE_SIZE + TILE_SIZE * 0.5,
+            ty as f32 * TILE_SIZE + TILE_SIZE * 0.5,
+        );
+        focus.points.push(FocusPoint {
+            world_pos,
+            chunk_radius: REGION_LOAD_RADIUS,
+            is_camera: false,
+        });
+    }
 }
 
 /// Runs each tick before `chunk_streaming_system`. Rebuilds `ChunkRetention`
@@ -188,7 +227,7 @@ pub fn chunk_boundary_gizmo_system(
 pub struct TileSpriteIndex {
     pub by_chunk: AHashMap<ChunkCoord, Vec<Entity>>,
     /// Per-tile lookup for TileSprite entities (excludes Wall entities).
-    pub by_tile: AHashMap<(i16, i16), Entity>,
+    pub by_tile: AHashMap<(i32, i32), Entity>,
 }
 
 #[derive(Component)]
@@ -198,8 +237,8 @@ pub struct TileSprite;
 /// despawns the old sprite and spawns a new one matching the updated terrain.
 #[derive(Event)]
 pub struct TileChangedEvent {
-    pub tx: i16,
-    pub ty: i16,
+    pub tx: i32,
+    pub ty: i32,
 }
 
 pub const RENDERABLE_KINDS: &[TileKind] = &[
@@ -298,7 +337,7 @@ pub fn spawn_chunk_sprites(
 
             let wx = global_tx as f32 * TILE_SIZE + TILE_SIZE * 0.5;
             let wy = global_ty as f32 * TILE_SIZE + TILE_SIZE * 0.5;
-            let tile_pos = (global_tx as i16, global_ty as i16);
+            let tile_pos = (global_tx as i32, global_ty as i32);
 
             if kind == TileKind::Wall {
                 if !wall_map.0.contains_key(&tile_pos) {
@@ -553,79 +592,97 @@ pub fn chunk_streaming_system(
     camera_view_z: Res<CameraViewZ>,
     retention: Res<ChunkRetention>,
     mut stream_events: ChunkStreamEvents,
-    camera_q: Query<&Transform, With<Camera>>,
+    focus: Res<crate::simulation::region::SimulationFocus>,
 ) {
     let now = Instant::now();
-    let Ok(cam_transform) = camera_q.get_single() else {
+    if focus.points.is_empty() {
         return;
-    };
-
-    let cam_cx = (cam_transform.translation.x / (CHUNK_SIZE as f32 * TILE_SIZE)).floor() as i32;
-    let cam_cy = (cam_transform.translation.y / (CHUNK_SIZE as f32 * TILE_SIZE)).floor() as i32;
+    }
 
     let total_cx = GLOBE_WIDTH * GLOBE_CELL_CHUNKS;
     let total_cy = GLOBE_HEIGHT * GLOBE_CELL_CHUNKS;
 
-    // --- Load chunks within LOAD_RADIUS ---
-    for dy in -LOAD_RADIUS..=LOAD_RADIUS {
-        for dx in -LOAD_RADIUS..=LOAD_RADIUS {
-            let cx = cam_cx + dx;
-            let cy = cam_cy + dy;
+    // Compute each focus's chunk-coord centre once.
+    let focus_centres: Vec<(i32, i32, i32, bool)> = focus
+        .points
+        .iter()
+        .map(|p| {
+            let pcx = (p.world_pos.x / (CHUNK_SIZE as f32 * TILE_SIZE)).floor() as i32;
+            let pcy = (p.world_pos.y / (CHUNK_SIZE as f32 * TILE_SIZE)).floor() as i32;
+            (pcx, pcy, p.chunk_radius, p.is_camera)
+        })
+        .collect();
 
-            if cx < 0 || cy < 0 || cx >= total_cx || cy >= total_cy {
-                continue;
-            }
-
-            let coord = ChunkCoord(cx, cy);
-            let (gx, gy) = Globe::cell_for_chunk(cx, cy);
-
-            // 1. Ensure the chunk data exists in ChunkMap
-            if !chunk_map.0.contains_key(&coord) {
-                let cell = globe.cell(gx, gy).copied();
-                let Some(c) = cell else { continue };
-                let chunk = generate_chunk_from_globe(coord, &c, &gen);
-                chunk_map.0.insert(coord, chunk);
-                stream_events.loaded.send(ChunkLoadedEvent { coord });
-
-                if let Some(gc) = globe.cell_mut(gx, gy) {
-                    gc.explored = true;
+    // --- Load chunks within union of focus discs ---
+    // `seen` prevents duplicate work when discs overlap.
+    let mut seen: AHashSet<ChunkCoord> = AHashSet::default();
+    for &(pcx, pcy, radius, is_camera) in &focus_centres {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let cx = pcx + dx;
+                let cy = pcy + dy;
+                if cx < 0 || cy < 0 || cx >= total_cx || cy >= total_cy {
+                    continue;
                 }
-            }
+                let coord = ChunkCoord(cx, cy);
+                if !seen.insert(coord) {
+                    // Already processed by a prior focus; if either focus is
+                    // the camera we still need to spawn sprites — so re-run
+                    // sprite check below regardless.
+                }
+                let (gx, gy) = Globe::cell_for_chunk(cx, cy);
 
-            // 2. Lazy-spawn sprites if not already present
-            if !sprite_index.by_chunk.contains_key(&coord) {
-                spawn_chunk_sprites(
-                    &mut commands,
-                    &tile_materials,
-                    &fog_tile_materials,
-                    &fog_map,
-                    &mut sprite_index,
-                    &mut wall_map,
-                    &chunk_map,
-                    &gen,
-                    &globe,
-                    coord,
-                    camera_view_z.0,
-                );
+                // 1. Ensure the chunk data exists in ChunkMap.
+                if !chunk_map.0.contains_key(&coord) {
+                    if globe.cell(gx, gy).is_none() {
+                        continue;
+                    }
+                    let chunk = generate_chunk_from_globe(coord, &globe, &gen);
+                    chunk_map.0.insert(coord, chunk);
+                    stream_events.loaded.send(ChunkLoadedEvent { coord });
 
-                spawn_chunk_plants(
-                    &mut commands,
-                    &mut plant_map,
-                    &mut plant_sprite_index,
-                    &chunk_map,
-                    &gen,
-                    &globe,
-                    coord,
-                );
+                    if let Some(gc) = globe.cell_mut(gx, gy) {
+                        gc.explored = true;
+                    }
+                }
 
-                spawn_chunk_loose_rocks(&mut commands, &chunk_map, coord);
+                // 2. Sprites only spawn for the camera focus.
+                if is_camera && !sprite_index.by_chunk.contains_key(&coord) {
+                    spawn_chunk_sprites(
+                        &mut commands,
+                        &tile_materials,
+                        &fog_tile_materials,
+                        &fog_map,
+                        &mut sprite_index,
+                        &mut wall_map,
+                        &chunk_map,
+                        &gen,
+                        &globe,
+                        coord,
+                        camera_view_z.0,
+                    );
+
+                    spawn_chunk_plants(
+                        &mut commands,
+                        &mut plant_map,
+                        &mut plant_sprite_index,
+                        &chunk_map,
+                        &gen,
+                        &globe,
+                        coord,
+                    );
+
+                    spawn_chunk_loose_rocks(&mut commands, &chunk_map, coord);
+                }
             }
         }
     }
 
-    // --- Unload chunks beyond UNLOAD_RADIUS ---
-    // Pinned chunks (faction centers, storage tiles, active path routes) are
-    // exempt — see `ChunkRetention` for why.
+    // --- Unload chunks beyond UNLOAD_RADIUS of every focus ---
+    // A chunk is kept if (a) pinned by ChunkRetention or (b) within
+    // (focus.chunk_radius + unload_extra) of any focus point. unload_extra
+    // matches the original UNLOAD_RADIUS - LOAD_RADIUS = 4 chunk margin.
+    let unload_extra = UNLOAD_RADIUS - LOAD_RADIUS;
     let to_unload: Vec<ChunkCoord> = chunk_map
         .0
         .keys()
@@ -634,9 +691,14 @@ pub fn chunk_streaming_system(
             if retention.pinned.contains(&c) {
                 return false;
             }
-            let dx = (c.0 - cam_cx).abs();
-            let dy = (c.1 - cam_cy).abs();
-            dx.max(dy) > UNLOAD_RADIUS
+            for &(pcx, pcy, radius, _) in &focus_centres {
+                let dx = (c.0 - pcx).abs();
+                let dy = (c.1 - pcy).abs();
+                if dx.max(dy) <= radius + unload_extra {
+                    return false;
+                }
+            }
+            true
         })
         .collect();
 
@@ -644,12 +706,12 @@ pub fn chunk_streaming_system(
         chunk_map.0.remove(&coord);
         stream_events.unloaded.send(ChunkUnloadedEvent { coord });
 
-        let x0 = (coord.0 * CHUNK_SIZE as i32) as i16;
-        let y0 = (coord.1 * CHUNK_SIZE as i32) as i16;
+        let x0 = (coord.0 * CHUNK_SIZE as i32) as i32;
+        let y0 = (coord.1 * CHUNK_SIZE as i32) as i32;
 
         // Optimization: iterate locally over chunk tiles instead of scanning the whole map.
-        for ly in 0..CHUNK_SIZE as i16 {
-            for lx in 0..CHUNK_SIZE as i16 {
+        for ly in 0..CHUNK_SIZE as i32 {
+            for lx in 0..CHUNK_SIZE as i32 {
                 let tx = x0 + lx;
                 let ty = y0 + ly;
                 wall_map.0.remove(&(tx, ty));

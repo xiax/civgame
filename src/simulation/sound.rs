@@ -116,8 +116,8 @@ pub fn respond_to_distress_system(
         // a concrete destination for the planner.
         let attacker_tile = transform_q.get(ev.attacker).ok().map(|t| {
             (
-                (t.translation.x / TILE_SIZE).floor() as i16,
-                (t.translation.y / TILE_SIZE).floor() as i16,
+                (t.translation.x / TILE_SIZE).floor() as i32,
+                (t.translation.y / TILE_SIZE).floor() as i32,
             )
         });
 

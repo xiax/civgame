@@ -116,7 +116,7 @@ fn chunk_of(tile: (i32, i32, i8)) -> ChunkCoord {
 fn first_invalid_step(
     chunk_map: &ChunkMap,
     start: (i32, i32, i8),
-    path: &[(i16, i16, i8)],
+    path: &[(i32, i32, i8)],
 ) -> Option<usize> {
     let mut prev = start;
     for (i, &(x, y, z)) in path.iter().enumerate() {
@@ -155,7 +155,7 @@ struct ComputeOutcome {
 enum OutcomeBody {
     Success {
         chunk_route: Vec<ChunkCoord>,
-        segment_path: Vec<(i16, i16, i8)>,
+        segment_path: Vec<(i32, i32, i8)>,
         ready_kind: PathReadyKind,
         flow_field_hit: bool,
     },
@@ -356,7 +356,7 @@ fn compute_outcome(
     // chunk and the agent's cell reached the goal at the agent's Z.
     let mut hotspot_miss = false;
     if chunk_route.len() == 1 {
-        let goal_tile = (req.goal.0 as i16, req.goal.1 as i16, req.goal.2);
+        let goal_tile = (req.goal.0 as i32, req.goal.1 as i32, req.goal.2);
         if let Some(field) = hotspots.lookup_field(goal_tile) {
             let csz = CHUNK_SIZE as i32;
             let lx = (req.start.0 - field.chunk.0 * csz) as u8;
@@ -454,9 +454,9 @@ fn compute_outcome(
 
     let (segment_path, ready_kind) = match result {
         AStarResult::Found(path) => {
-            let converted: Vec<(i16, i16, i8)> = path
+            let converted: Vec<(i32, i32, i8)> = path
                 .into_iter()
-                .map(|(x, y, z)| (x as i16, y as i16, z))
+                .map(|(x, y, z)| (x as i32, y as i32, z))
                 .collect();
             (converted, PathReadyKind::Strict)
         }
@@ -483,7 +483,7 @@ fn compute_outcome(
             }
             // BestEffort: walk one tile toward best_so_far.
             (
-                vec![(best_so_far.0 as i16, best_so_far.1 as i16, best_so_far.2)],
+                vec![(best_so_far.0 as i32, best_so_far.1 as i32, best_so_far.2)],
                 PathReadyKind::BestEffort,
             )
         }
@@ -810,7 +810,7 @@ fn write_failure(
 fn write_success(
     req: &PathRequest,
     chunk_route: Vec<ChunkCoord>,
-    segment_path: Vec<(i16, i16, i8)>,
+    segment_path: Vec<(i32, i32, i8)>,
     ready_kind: PathReadyKind,
     conn_generation: u32,
     follows: &mut Query<&mut PathFollow>,
@@ -825,7 +825,7 @@ fn write_success(
             follow.route_cursor = 0;
             follow.segment_path = segment_path;
             follow.segment_cursor = 0;
-            follow.recent_tiles = [(i16::MIN, i16::MIN, 0); 4];
+            follow.recent_tiles = [(i32::MIN, i32::MIN, 0); 4];
             follow.recent_idx = 0;
             follow.stuck_ticks = 0;
             follow.last_replan_tick = 0;
@@ -1004,7 +1004,7 @@ mod tests {
                 },
             );
         }
-        let path = vec![(6i16, 6i16, 0i8)];
+        let path = vec![(6i32, 6i32, 0i8)];
         assert_eq!(first_invalid_step(&map, (5, 5, 0), &path), Some(0));
     }
 
@@ -1012,7 +1012,7 @@ mod tests {
     fn first_invalid_step_accepts_clean_diagonal() {
         let mut map = ChunkMap::default();
         map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
-        let path = vec![(6i16, 6i16, 0i8)];
+        let path = vec![(6i32, 6i32, 0i8)];
         assert_eq!(first_invalid_step(&map, (5, 5, 0), &path), None);
     }
 }

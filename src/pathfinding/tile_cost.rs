@@ -27,7 +27,7 @@ pub fn tile_step_cost(kind: TileKind) -> u16 {
 }
 
 pub fn furniture_speed_factor(
-    pos: (i16, i16),
+    pos: (i32, i32),
     bed_map: &BedMap,
     chair_map: &ChairMap,
     table_map: &TableMap,

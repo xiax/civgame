@@ -159,12 +159,12 @@ pub struct PathFollow {
     pub route_cursor: u8,
     /// A* output for the *current* chunk segment — list of tiles to step
     /// onto, target inclusive.
-    pub segment_path: Vec<(i16, i16, i8)>,
+    pub segment_path: Vec<(i32, i32, i8)>,
     pub segment_cursor: u16,
     /// `recent_tiles[0]` doubles as the "last tile observed by movement_system"
-    /// slot used by the stuck-tick heartbeat. Sentinel `(i16::MIN, i16::MIN, 0)`
+    /// slot used by the stuck-tick heartbeat. Sentinel `(i32::MIN, i32::MIN, 0)`
     /// means "no observation yet" so the first post-plan tick can't false-match.
-    pub recent_tiles: [(i16, i16, i8); 4],
+    pub recent_tiles: [(i32, i32, i8); 4],
     pub recent_idx: u8,
     pub stuck_ticks: u8,
     pub last_replan_tick: u64,
@@ -221,7 +221,7 @@ impl Default for PathFollow {
             route_cursor: 0,
             segment_path: Vec::new(),
             segment_cursor: 0,
-            recent_tiles: [(i16::MIN, i16::MIN, 0); 4],
+            recent_tiles: [(i32::MIN, i32::MIN, 0); 4],
             recent_idx: 0,
             stuck_ticks: 0,
             last_replan_tick: 0,

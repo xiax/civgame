@@ -702,7 +702,7 @@ fn resolve_withdraw_for_faction_need(
     agent: &EconomicAgent,
     carrier: &crate::simulation::carry::Carrier,
     withdraw_intent_out: &mut Option<(Good, u8)>,
-) -> Option<(Option<Entity>, i16, i16)> {
+) -> Option<(Option<Entity>, i32, i32)> {
     // 1. Build per-good still-needed demand from `need`. The HaulClaim path
     //    bypasses the demand vector since the claim already names the good.
     let mut still_need_by_good = [0u32; crate::economy::goods::GOOD_COUNT];
@@ -781,7 +781,7 @@ fn resolve_withdraw_for_faction_need(
     // 2. Helper: per-good effective stock on a tile (ground qty minus
     //    reservations). The reservation map tracks promises that haven't
     //    been collected yet, so two agents never commit to the same unit.
-    let effective_stock = |tx: i16, ty: i16, good: Good| -> u32 {
+    let effective_stock = |tx: i32, ty: i32, good: Good| -> u32 {
         let mut stock = 0u32;
         for &gi_entity in spatial.get(tx as i32, ty as i32) {
             if let Ok(gi) = item_query.get(gi_entity) {
@@ -796,7 +796,7 @@ fn resolve_withdraw_for_faction_need(
     // 3. Find the nearest faction storage tile that holds at least one
     //    useful good (intersection of demand & effective stock).
     let tiles = storage_tile_map.by_faction.get(&faction_id)?;
-    let mut best: Option<(i16, i16)> = None;
+    let mut best: Option<(i32, i32)> = None;
     let mut best_dist = i32::MAX;
     for &(tx, ty) in tiles {
         let mut has_useful = false;
@@ -932,13 +932,13 @@ fn resolve_target(
     claim_target: Option<&crate::simulation::jobs::ClaimTarget>,
     reservations: &StorageReservations,
     withdraw_intent_out: &mut Option<(Good, u8)>,
-) -> Option<(Option<Entity>, i16, i16)> {
+) -> Option<(Option<Entity>, i32, i32)> {
     const VIEW_RADIUS: i32 = 15;
 
     match &step.target {
         StepTarget::HuntPrey => {
             // 1. Check vision
-            let mut best_v: Option<(Entity, i16, i16)> = None;
+            let mut best_v: Option<(Entity, i32, i32)> = None;
             let mut best_dist_v = i32::MAX;
             for dy in -VIEW_RADIUS..=VIEW_RADIUS {
                 for dx in -VIEW_RADIUS..=VIEW_RADIUS {
@@ -962,7 +962,7 @@ fn resolve_target(
                                 let dist = dx.abs() + dy.abs();
                                 if dist < best_dist_v {
                                     best_dist_v = dist;
-                                    best_v = Some((candidate, tx as i16, ty as i16));
+                                    best_v = Some((candidate, tx as i32, ty as i32));
                                 }
                             }
                         }
@@ -987,7 +987,7 @@ fn resolve_target(
         }
         StepTarget::FromMemory(kind) => {
             // 1. Check vision
-            let vision_target: Option<(Option<Entity>, i16, i16)> = match kind {
+            let vision_target: Option<(Option<Entity>, i32, i32)> = match kind {
                 MemoryKind::Food => find_nearest_plant(
                     plant_map,
                     pos,
@@ -1035,7 +1035,7 @@ fn resolve_target(
                         matches!(plant_query.get(*ent), Ok(p) if p.stage == GrowthStage::Mature)
                     })
                     .max_by(|a, b| {
-                        let score = |e: &(Entity, (i16, i16), u8)| {
+                        let score = |e: &(Entity, (i32, i32), u8)| {
                             e.2 as f32
                                 / ((e.1.0 as i32 - pos.0).abs() + (e.1.1 as i32 - pos.1).abs())
                                     .max(1) as f32
@@ -1176,7 +1176,7 @@ fn resolve_target(
             .raid_target(faction_id)
             .and_then(|target_id| faction_registry.home_tile(target_id))
             .map(|(tx, ty)| (None, tx, ty)),
-        StepTarget::SelfPosition => Some((None, pos.0 as i16, pos.1 as i16)),
+        StepTarget::SelfPosition => Some((None, pos.0 as i32, pos.1 as i32)),
         StepTarget::NearestFactionStorage => storage_tile_map
             .nearest_for_faction(faction_id, pos)
             .map(|(tx, ty)| (None, tx, ty)),
@@ -1201,7 +1201,7 @@ fn resolve_target(
         ),
         StepTarget::NearestFactionStorageWithGood(target_good) => {
             let tiles = storage_tile_map.by_faction.get(&faction_id)?;
-            let mut best: Option<(i16, i16)> = None;
+            let mut best: Option<(i32, i32)> = None;
             let mut best_dist = i32::MAX;
             for &(tx, ty) in tiles {
                 let mut has = false;
@@ -1226,7 +1226,7 @@ fn resolve_target(
         }
         StepTarget::NearestFactionStorageWithEntertainment => {
             let tiles = storage_tile_map.by_faction.get(&faction_id)?;
-            let mut best: Option<(i16, i16)> = None;
+            let mut best: Option<(i32, i32)> = None;
             let mut best_dist = i32::MAX;
             for &(tx, ty) in tiles {
                 let mut has = false;
@@ -1250,7 +1250,7 @@ fn resolve_target(
             best.map(|(tx, ty)| (None, tx, ty))
         }
         StepTarget::NearestWildHorse => {
-            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best: Option<(Entity, i32, i32)> = None;
             let mut best_dist = i32::MAX;
             for dy in -VIEW_RADIUS..=VIEW_RADIUS {
                 for dx in -VIEW_RADIUS..=VIEW_RADIUS {
@@ -1259,7 +1259,7 @@ fn resolve_target(
                             let dist = dx.abs() + dy.abs();
                             if dist < best_dist {
                                 best_dist = dist;
-                                best = Some((candidate, (pos.0 + dx) as i16, (pos.1 + dy) as i16));
+                                best = Some((candidate, (pos.0 + dx) as i32, (pos.1 + dy) as i32));
                             }
                         }
                     }
@@ -1293,7 +1293,7 @@ fn resolve_target(
         StepTarget::NearestBlueprint(kind) => {
             // Find the nearest active Blueprint this agent is allowed to build.
             // Personal blueprints are matched by agent_entity; faction blueprints by faction_id.
-            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best: Option<(Entity, i32, i32)> = None;
             let mut best_dist = i32::MAX;
             for (&tile, &bp_entity) in &bp_map.0 {
                 let Ok(bp) = bp_query.get(bp_entity) else {
@@ -1334,7 +1334,7 @@ fn resolve_target(
             // whose materials haven't arrived. If no satisfied blueprint is
             // reachable, return None so the plan abandons and the agent
             // picks a different one (likely a haul-related plan) next round.
-            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best: Option<(Entity, i32, i32)> = None;
             let mut best_dist = i32::MAX;
             for (&tile, &bp_entity) in &bp_map.0 {
                 let Ok(bp) = bp_query.get(bp_entity) else {
@@ -1363,7 +1363,7 @@ fn resolve_target(
             // (blueprints, ground items, animals) so we don't try to play with
             // a wolf. play_system also defensively re-checks via Person query.
             const PLAY_RADIUS: i32 = 12;
-            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best: Option<(Entity, i32, i32)> = None;
             let mut best_dist = i32::MAX;
             for dy in -PLAY_RADIUS..=PLAY_RADIUS {
                 for dx in -PLAY_RADIUS..=PLAY_RADIUS {
@@ -1383,7 +1383,7 @@ fn resolve_target(
                         let dist = dx.abs() + dy.abs();
                         if dist < best_dist {
                             best_dist = dist;
-                            best = Some((other, tx as i16, ty as i16));
+                            best = Some((other, tx as i32, ty as i32));
                         }
                     }
                 }
@@ -1401,11 +1401,11 @@ fn resolve_target(
                 .map(|s| s.item.good.entertainment_value())
                 .unwrap_or(0);
             if held_l > 0 || held_r > 0 {
-                return Some((None, pos.0 as i16, pos.1 as i16));
+                return Some((None, pos.0 as i32, pos.1 as i32));
             }
             // Otherwise scan for the most-entertaining ground item nearby.
             const ITEM_RADIUS: i32 = 8;
-            let mut best: Option<(Entity, i16, i16, i32)> = None;
+            let mut best: Option<(Entity, i32, i32, i32)> = None;
             for dy in -ITEM_RADIUS..=ITEM_RADIUS {
                 for dx in -ITEM_RADIUS..=ITEM_RADIUS {
                     let tx = pos.0 + dx;
@@ -1420,7 +1420,7 @@ fn resolve_target(
                             let score = v * 4 - dist;
                             match best {
                                 Some((_, _, _, s)) if s >= score => {}
-                                _ => best = Some((e, tx as i16, ty as i16, score)),
+                                _ => best = Some((e, tx as i32, ty as i32, score)),
                             }
                         }
                     }
@@ -1431,7 +1431,7 @@ fn resolve_target(
         StepTarget::NearestBlueprintNeedingHeldMaterial => {
             // Nearest blueprint with at least one unmet deposit slot whose good
             // is currently in the agent's inventory.
-            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best: Option<(Entity, i32, i32)> = None;
             let mut best_dist = i32::MAX;
             for (&tile, &bp_entity) in &bp_map.0 {
                 let Ok(bp) = bp_query.get(bp_entity) else {
@@ -1469,7 +1469,7 @@ fn resolve_target(
             best.map(|(e, tx, ty)| (Some(e), tx, ty))
         }
         StepTarget::NearestCraftOrderNeedingHeldMaterial => {
-            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best: Option<(Entity, i32, i32)> = None;
             let mut best_dist = i32::MAX;
             for (&tile, &order_entity) in &co_map.0 {
                 let Ok(order) = co_query.get(order_entity) else {
@@ -1503,7 +1503,7 @@ fn resolve_target(
             best.map(|(e, tx, ty)| (Some(e), tx, ty))
         }
         StepTarget::NearestSatisfiedCraftOrder => {
-            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best: Option<(Entity, i32, i32)> = None;
             let mut best_dist = i32::MAX;
             for (&tile, &order_entity) in &co_map.0 {
                 let Ok(order) = co_query.get(order_entity) else {
@@ -1528,13 +1528,13 @@ fn resolve_target(
         StepTarget::ExploreTile => {
             let home = faction_registry
                 .home_tile(faction_id)
-                .unwrap_or((pos.0 as i16, pos.1 as i16));
+                .unwrap_or((pos.0 as i32, pos.1 as i32));
             let cur_chunk = chunk_coord(pos.0, pos.1);
             for _ in 0..8 {
                 let dx = fastrand::i32(-96..=96);
                 let dy = fastrand::i32(-96..=96);
-                let tx = (home.0 as i32 + dx).max(0) as i16;
-                let ty = (home.1 as i32 + dy).max(0) as i16;
+                let tx = (home.0 as i32 + dx).max(0) as i32;
+                let ty = (home.1 as i32 + dy).max(0) as i32;
                 let to_chunk = chunk_coord(tx as i32, ty as i32);
                 let to_z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
                 if chunk_connectivity.is_reachable((cur_chunk, pos_z), (to_chunk, to_z)) {
@@ -1548,7 +1548,7 @@ fn resolve_target(
                 if let Some((tx, ty)) = nearest_reachable_higher_tile(
                     chunk_map,
                     chunk_connectivity,
-                    (pos.0 as i16, pos.1 as i16),
+                    (pos.0 as i32, pos.1 as i32),
                     (cur_chunk, pos_z),
                     96,
                 ) {
@@ -1561,7 +1561,7 @@ fn resolve_target(
             // Nearest Corpse entity within VIEW_RADIUS, biased to closer tiles.
             // We rely on `corpse_map` for an O(tiles_in_radius) lookup rather
             // than scanning the spatial index.
-            let mut best: Option<(Entity, i16, i16)> = None;
+            let mut best: Option<(Entity, i32, i32)> = None;
             let mut best_dist = i32::MAX;
             for dy in -VIEW_RADIUS..=VIEW_RADIUS {
                 for dx in -VIEW_RADIUS..=VIEW_RADIUS {
@@ -1570,7 +1570,7 @@ fn resolve_target(
                     }
                     let tx = pos.0 + dx;
                     let ty = pos.1 + dy;
-                    if let Some(entities) = corpse_map.0.get(&(tx as i16, ty as i16)) {
+                    if let Some(entities) = corpse_map.0.get(&(tx as i32, ty as i32)) {
                         for &e in entities {
                             if corpse_query.get(e).is_err() {
                                 continue;
@@ -1578,7 +1578,7 @@ fn resolve_target(
                             let dist = dx.abs() + dy.abs();
                             if dist < best_dist {
                                 best_dist = dist;
-                                best = Some((e, tx as i16, ty as i16));
+                                best = Some((e, tx as i32, ty as i32));
                             }
                         }
                     }
@@ -1591,7 +1591,7 @@ fn resolve_target(
             // to the faction home tile. We don't enforce a faction filter on
             // CampfireMap entries since hearths are placed by faction
             // blueprint logic and can't appear unowned in practice.
-            let mut best: Option<(i16, i16)> = None;
+            let mut best: Option<(i32, i32)> = None;
             let mut best_dist = i32::MAX;
             for (&tile, _e) in campfire_map.0.iter() {
                 let dist = (tile.0 as i32 - pos.0).abs() + (tile.1 as i32 - pos.1).abs();
@@ -1610,7 +1610,7 @@ fn resolve_target(
         StepTarget::EquipItem { .. } => {
             // Equip is in-place — the executor reads slot/good off PersonAI
             // (set during dispatch in `plan_execution_system`).
-            Some((None, pos.0 as i16, pos.1 as i16))
+            Some((None, pos.0 as i32, pos.1 as i32))
         }
         StepTarget::HearthForHunt => {
             // Only meaningful when the faction has an active Hunt order.
@@ -1627,7 +1627,7 @@ fn resolve_target(
             };
             let ax = area_tile.0 as i32;
             let ay = area_tile.1 as i32;
-            let mut best: Option<(i16, i16)> = None;
+            let mut best: Option<(i32, i32)> = None;
             let mut best_dist = i32::MAX;
             for (&tile, _e) in campfire_map.0.iter() {
                 let dist = (tile.0 as i32 - ax).abs() + (tile.1 as i32 - ay).abs();
@@ -1673,13 +1673,13 @@ fn resolve_target(
             }
             let home = faction_registry
                 .home_tile(faction_id)
-                .unwrap_or((pos.0 as i16, pos.1 as i16));
+                .unwrap_or((pos.0 as i32, pos.1 as i32));
             let cur_chunk = chunk_coord(pos.0, pos.1);
             for _ in 0..8 {
                 let dx = fastrand::i32(-96..=96);
                 let dy = fastrand::i32(-96..=96);
-                let tx = (home.0 as i32 + dx).max(0) as i16;
-                let ty = (home.1 as i32 + dy).max(0) as i16;
+                let tx = (home.0 as i32 + dx).max(0) as i32;
+                let ty = (home.1 as i32 + dy).max(0) as i32;
                 let to_chunk = chunk_coord(tx as i32, ty as i32);
                 let to_z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
                 if chunk_connectivity.is_reachable((cur_chunk, pos_z), (to_chunk, to_z)) {
@@ -2252,7 +2252,7 @@ pub fn plan_execution_system(
                 });
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
-                ai.target_tile = (cur_tx as i16, cur_ty as i16);
+                ai.target_tile = (cur_tx as i32, cur_ty as i32);
                 ai.dest_tile = ai.target_tile;
                 ai.target_entity = None;
                 combat_target.0 = None;
@@ -2281,7 +2281,7 @@ pub fn plan_execution_system(
                 });
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
-                ai.target_tile = (cur_tx as i16, cur_ty as i16);
+                ai.target_tile = (cur_tx as i32, cur_ty as i32);
                 ai.dest_tile = ai.target_tile;
                 ai.target_entity = None;
                 combat_target.0 = None;
@@ -2426,7 +2426,7 @@ pub fn plan_execution_system(
                 if let Some((ent, target_tx, target_ty)) = resolved {
                     assign_task_with_routing(
                         &mut ai,
-                        (cur_tx as i16, cur_ty as i16),
+                        (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
                         (target_tx, target_ty),
                         step_def.task,
@@ -2500,12 +2500,12 @@ pub fn plan_execution_system(
                                 // Target is dead, step will complete via Idle+UNEMPLOYED in combat_system or similar
                             } else {
                                 // Update target tile to prey's current position if it moved
-                                let ptx = (target_t.translation.x / TILE_SIZE).floor() as i16;
-                                let pty = (target_t.translation.y / TILE_SIZE).floor() as i16;
+                                let ptx = (target_t.translation.x / TILE_SIZE).floor() as i32;
+                                let pty = (target_t.translation.y / TILE_SIZE).floor() as i32;
                                 if ai.dest_tile != (ptx, pty) {
                                     assign_task_with_routing(
                                         &mut ai,
-                                        (cur_tx as i16, cur_ty as i16),
+                                        (cur_tx as i32, cur_ty as i32),
                                         cur_chunk,
                                         (ptx, pty),
                                         step_def.task,
