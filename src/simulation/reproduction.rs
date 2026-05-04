@@ -66,15 +66,25 @@ pub struct Pregnancy {
     pub ticks_remaining: u32,
     pub father: Option<Entity>,
     pub father_stats: Option<Stats>,
+    /// Snapshot of the father's `PersonKnowledge.aware | learned` at conception,
+    /// so the child still inherits paternal awareness if the father dies or
+    /// wanders out of range before birth.
+    pub father_known: u64,
     pub faction_id: u32,
 }
 
 impl Pregnancy {
-    pub fn new(father: Entity, father_stats: Option<Stats>, faction_id: u32) -> Self {
+    pub fn new(
+        father: Entity,
+        father_stats: Option<Stats>,
+        father_known: u64,
+        faction_id: u32,
+    ) -> Self {
         Self {
             ticks_remaining: PREGNANCY_TICKS,
             father: Some(father),
             father_stats,
+            father_known,
             faction_id,
         }
     }
@@ -214,6 +224,7 @@ pub fn wake_up_conception_system(
                 &MaleConceptionCooldown,
                 &BiologicalSex,
                 &FactionMember,
+                Option<&crate::simulation::knowledge::PersonKnowledge>,
             ),
             With<Person>,
         >,
@@ -225,6 +236,7 @@ pub fn wake_up_conception_system(
         faction_id: u32,
         mother_transform: Transform,
         father_stats: Option<Stats>,
+        father_known: u64,
         female_pregnant: bool,
         success: bool,
     }
@@ -234,6 +246,7 @@ pub fn wake_up_conception_system(
     //            aliasing this read-only borrow.
     struct MaleSnapshot {
         father_stats: Option<Stats>,
+        father_known: u64,
         cooldown: u32,
         sex: BiologicalSex,
         faction_id: u32,
@@ -241,11 +254,12 @@ pub fn wake_up_conception_system(
     let male_snapshot: ahash::AHashMap<Entity, MaleSnapshot> = {
         let q = params.p3();
         q.iter()
-            .map(|(e, stats, cd, sex, fm)| {
+            .map(|(e, stats, cd, sex, fm, knowledge)| {
                 (
                     e,
                     MaleSnapshot {
                         father_stats: stats.copied(),
+                        father_known: knowledge.map_or(0u64, |k| k.aware | k.learned),
                         cooldown: cd.0,
                         sex: *sex,
                         faction_id: fm.faction_id,
@@ -308,6 +322,7 @@ pub fn wake_up_conception_system(
                 faction_id: member.faction_id,
                 mother_transform: *transform,
                 father_stats: snap.father_stats,
+                father_known: snap.father_known,
                 female_pregnant,
                 success,
             });
@@ -359,7 +374,7 @@ pub fn wake_up_conception_system(
         );
 
         if a.success {
-            let preg = Pregnancy::new(a.male, a.father_stats, a.faction_id);
+            let preg = Pregnancy::new(a.male, a.father_stats, a.father_known, a.faction_id);
             commands.entity(a.mother).insert(preg);
             let _ = a.mother_transform; // recorded for future use; transform read at birth
         }
@@ -382,11 +397,14 @@ pub fn pregnancy_system(
         &BucketSlot,
         &LodLevel,
         Option<&Stats>,
+        Option<&crate::simulation::knowledge::PersonKnowledge>,
     )>,
 ) {
-    let mut births: Vec<(Entity, Transform, u32, Stats)> = Vec::new();
+    let mut births: Vec<(Entity, Transform, u32, Stats, u64)> = Vec::new();
 
-    for (mother, mut preg, transform, slot, lod, mother_stats) in query.iter_mut() {
+    for (mother, mut preg, transform, slot, lod, mother_stats, mother_knowledge) in
+        query.iter_mut()
+    {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -399,10 +417,18 @@ pub fn pregnancy_system(
             (Some(p), None) | (None, Some(p)) => Stats::inherit(p, p),
             (None, None) => Stats::roll_3d6(),
         };
-        births.push((mother, *transform, preg.faction_id, child_stats));
+        let mother_known = mother_knowledge.map_or(0u64, |k| k.aware | k.learned);
+        let inherited_aware = mother_known | preg.father_known;
+        births.push((
+            mother,
+            *transform,
+            preg.faction_id,
+            child_stats,
+            inherited_aware,
+        ));
     }
 
-    for (mother, parent_transform, faction_id, child_stats) in births {
+    for (mother, parent_transform, faction_id, child_stats, inherited_aware) in births {
         commands.entity(mother).remove::<Pregnancy>();
 
         let new_slot = clock.population;
@@ -485,6 +511,12 @@ pub fn pregnancy_system(
                 CoSleepTracker::default(),
                 MaleConceptionCooldown::default(),
                 crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Person),
+                crate::simulation::knowledge::PersonKnowledge {
+                    aware: inherited_aware,
+                    learned: 0,
+                    learned_at: [0u32; crate::simulation::knowledge::KNOWLEDGE_SLOTS],
+                    study_progress: ahash::AHashMap::new(),
+                },
             ),
         ));
     }

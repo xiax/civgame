@@ -1,4 +1,4 @@
-pub const GOOD_COUNT: usize = 20;
+pub const GOOD_COUNT: usize = 22;
 
 /// Encumbrance class for carrying a good in hands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +35,12 @@ pub enum Good {
     Gold = 17,
     Silver = 18,
     BerrySeed = 19,
+    /// Clay tablet — encodes a single tech for reading. `tech_payload` on
+    /// `Item` carries the encoded TechId. Reusable; consumed only by decay.
+    ClayTablet = 20,
+    /// Book — durable codex form of a tablet. Same payload semantics, longer
+    /// to craft, lighter to carry.
+    Book = 21,
 }
 
 impl Good {
@@ -63,6 +69,8 @@ impl Good {
             16 => Some(Good::Tin),
             17 => Some(Good::Gold),
             18 => Some(Good::Silver),
+            20 => Some(Good::ClayTablet),
+            21 => Some(Good::Book),
             _ => None,
         }
     }
@@ -89,6 +97,8 @@ impl Good {
             Good::Tin => "Tin",
             Good::Gold => "Gold",
             Good::Silver => "Silver",
+            Good::ClayTablet => "Clay Tablet",
+            Good::Book => "Book",
         }
     }
 
@@ -126,6 +136,9 @@ impl Good {
             Good::Tools | Good::Weapon | Good::Shield | Good::Armor => 15,
             Good::Wood | Good::Stone | Good::Coal | Good::Iron | Good::Copper | Good::Tin => 5,
             Good::Fruit | Good::Meat | Good::Grain | Good::GrainSeed | Good::BerrySeed => 3,
+            // Books and tablets are studied, not played with — minimal solo
+            // entertainment, they're not toys.
+            Good::ClayTablet | Good::Book => 5,
         }
     }
 
@@ -151,6 +164,8 @@ impl Good {
             Good::Gold => 6000,
             Good::Stone => 5000,
             Good::Armor => 8000,
+            Good::ClayTablet => 1500,
+            Good::Book => 600,
         }
     }
 
@@ -164,6 +179,7 @@ impl Good {
             | Good::Fruit
             | Good::Cloth
             | Good::Tools
+            | Good::Book
             | Good::Meat => Bulk::Small,
             Good::Coal
             | Good::Skin
@@ -171,6 +187,7 @@ impl Good {
             | Good::Shield
             | Good::Armor
             | Good::Gold
+            | Good::ClayTablet
             | Good::Silver => Bulk::OneHand,
             Good::Wood | Good::Stone | Good::Iron | Good::Copper | Good::Tin => Bulk::TwoHand,
         }
@@ -198,6 +215,8 @@ impl Good {
             Good::Gold,
             Good::Silver,
             Good::BerrySeed,
+            Good::ClayTablet,
+            Good::Book,
         ]
     }
 }

@@ -41,8 +41,8 @@ pub struct CraftRecipe {
 }
 
 use crate::simulation::technology::{
-    BOW_AND_ARROW, BRONZE_WEAPONS, COPPER_TOOLS, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING,
-    HUNTING_SPEAR, LOOM_WEAVING,
+    BOW_AND_ARROW, BRONZE_WEAPONS, COPPER_TOOLS, CUNEIFORM_WRITING, FIRED_POTTERY, FIRE_MAKING,
+    FLINT_KNAPPING, HUNTING_SPEAR, LOOM_WEAVING,
 };
 
 pub static CRAFT_RECIPES: &[CraftRecipe] = &[
@@ -166,7 +166,40 @@ pub static CRAFT_RECIPES: &[CraftRecipe] = &[
         tech_gate: Some(BRONZE_WEAPONS),
         requires_station: Some(StationKind::Workbench),
     },
+    // 10
+    CraftRecipe {
+        name: "Clay Tablet",
+        inputs: &[(Good::Stone, 1), (Good::Wood, 1)],
+        output_good: Good::ClayTablet,
+        output_qty: 1,
+        output_material: None,
+        work_ticks: 90,
+        crafting_xp: 8,
+        tech_gate: Some(CUNEIFORM_WRITING),
+        requires_station: Some(StationKind::Workbench),
+    },
+    // 11
+    CraftRecipe {
+        name: "Book",
+        inputs: &[(Good::Cloth, 2), (Good::Skin, 1)],
+        output_good: Good::Book,
+        output_qty: 1,
+        output_material: None,
+        work_ticks: 180,
+        crafting_xp: 12,
+        tech_gate: Some(CUNEIFORM_WRITING),
+        requires_station: Some(StationKind::Workbench),
+    },
 ];
+
+/// Recipe ids for the two written-knowledge artefacts. Used by chief-posting
+/// and player-encode paths to know which crafts need a `tech_payload` set.
+pub const RECIPE_CLAY_TABLET: u8 = 10;
+pub const RECIPE_BOOK: u8 = 11;
+#[inline]
+pub fn recipe_encodes_knowledge(recipe_id: u8) -> bool {
+    recipe_id == RECIPE_CLAY_TABLET || recipe_id == RECIPE_BOOK
+}
 
 /// Maximum distinct ingredient types per craft recipe. Three is plenty for
 /// every recipe in `CRAFT_RECIPES`.
@@ -194,6 +227,10 @@ pub struct CraftOrder {
     /// older than `CRAFT_ORDER_TIMEOUT_TICKS` so a stuck order can't waste the
     /// per-faction `CRAFT_ORDERS_PER_FACTION_*` cap forever.
     pub spawn_tick: u64,
+    /// For Clay Tablet / Book recipes: the TechId encoded into the produced
+    /// item. Stamped onto `output_item.tech_payload` at completion. None for
+    /// every other recipe.
+    pub tech_payload: Option<TechId>,
 }
 
 impl CraftOrder {
@@ -203,6 +240,7 @@ impl CraftOrder {
         workbench_tile: Option<(i32, i32)>,
         anchor_tile: (i32, i32),
         spawn_tick: u64,
+        tech_payload: Option<TechId>,
     ) -> Option<Self> {
         let recipe = CRAFT_RECIPES.get(recipe_id as usize)?;
         let mut deposits = [GoodNeed::default(); MAX_CRAFT_INPUTS];
@@ -223,6 +261,7 @@ impl CraftOrder {
             deposit_count: count as u8,
             work_progress: 0,
             spawn_tick,
+            tech_payload,
         })
     }
 
@@ -413,8 +452,14 @@ pub fn faction_craft_order_system(
                 continue;
             }
 
+            // Pull tech_payload from the JobBoard posting (chief-posting path
+            // sets it for Clay Tablet / Book recipes; everything else is None).
+            let tech_payload = match posting.progress {
+                JobProgress::Crafting { tech_payload, .. } => tech_payload,
+                _ => None,
+            };
             let Some(order) =
-                CraftOrder::new(faction_id, recipe, workbench, anchor, clock.tick)
+                CraftOrder::new(faction_id, recipe, workbench, anchor, clock.tick, tech_payload)
             else {
                 continue;
             };
@@ -542,8 +587,8 @@ pub fn craft_order_system(
     let mut xp_grants: Vec<Entity> = Vec::new();
     // (agent_entity, good, qty_to_remove)
     let mut good_removals: Vec<(Entity, Good, u32)> = Vec::new();
-    // (agent_entity, recipe_id) — paid out as inventory at end of pass.
-    let mut output_grants: Vec<(Entity, u8)> = Vec::new();
+    // (agent_entity, recipe_id, tech_payload) — paid out as inventory at end of pass.
+    let mut output_grants: Vec<(Entity, u8, Option<TechId>)> = Vec::new();
     // Job board credits to apply (recipe, qty) per worker entity.
     let mut order_completion_credits: Vec<(Entity, u8, u32)> = Vec::new();
 
@@ -617,7 +662,7 @@ pub fn craft_order_system(
                 .get(&order_entity)
                 .and_then(|v| v.first().copied());
             if let Some(lead_e) = lead {
-                output_grants.push((lead_e, order.recipe_id));
+                output_grants.push((lead_e, order.recipe_id, order.tech_payload));
                 order_completion_credits.push((lead_e, order.recipe_id, recipe.output_qty));
                 let faction_id =
                     member_query.get(lead_e).map(|m| m.faction_id).unwrap_or(0);
@@ -673,7 +718,7 @@ pub fn craft_order_system(
         }
 
         // Output payout & job credit for the lead worker on completed orders.
-        for &(ae, recipe_id) in &output_grants {
+        for &(ae, recipe_id, tech_payload) in &output_grants {
             if ae != entity {
                 continue;
             }
@@ -687,6 +732,10 @@ pub fn craft_order_system(
                 Item::new_commodity(recipe.output_good)
             };
             output_item.display_name = Some(recipe.name);
+            // Stamp tech payload onto Clay Tablet / Book outputs. Equality
+            // partitions tablets-of-tech-A from tablets-of-tech-B in
+            // inventories and ground-item piles.
+            output_item.tech_payload = tech_payload;
             agent.add_item(output_item, recipe.output_qty);
             skills.gain_xp(SkillKind::Crafting, recipe.crafting_xp);
         }

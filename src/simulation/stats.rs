@@ -47,3 +47,10 @@ fn blend(a: u8, b: u8) -> u8 {
 pub fn modifier(score: u8) -> i8 {
     (score as i16 - 10).div_euclid(2) as i8
 }
+
+/// Total complexity points a person can hold across their Learned techs.
+/// Intelligence 10 → 20 points (≈12 simple OR ≈3 advanced techs); int 16 → 32.
+#[inline]
+pub fn knowledge_capacity(intelligence: u8) -> u16 {
+    (intelligence as u16).saturating_mul(2)
+}

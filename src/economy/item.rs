@@ -1,4 +1,5 @@
 use super::goods::Good;
+use crate::simulation::technology::TechId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ItemMaterial {
@@ -98,6 +99,10 @@ pub struct Item {
     pub display_name: Option<&'static str>,
     pub weapon_stats: Option<WeaponStats>,
     pub armor_stats: Option<ArmorStats>,
+    /// For ClayTablet/Book: encoded TechId. None for everything else.
+    /// Equality propagates so two tablets encoding different techs do not
+    /// merge in inventories or ground-item piles.
+    pub tech_payload: Option<TechId>,
 }
 
 impl Item {
@@ -109,6 +114,7 @@ impl Item {
             display_name: None,
             weapon_stats: None,
             armor_stats: None,
+            tech_payload: None,
         }
     }
 
@@ -121,6 +127,7 @@ impl Item {
             display_name: None,
             weapon_stats,
             armor_stats,
+            tech_payload: None,
         }
     }
 

@@ -63,6 +63,10 @@ pub enum TaskKind {
     Butcher = 35,     // adjacent to own carried corpse; work_ticks then yield Meat+Skin and despawn
     Equip = 36,       // instant: move a matching Item from inventory/Carrier into Equipment[slot]
     HuntPartyMuster = 37, // hunter waiting at hearth for the chief's hunting party to fill
+    Read = 38,        // study a tablet/book held in inventory; accumulates StudyProgress on its tech_payload
+    Teach = 39,       // adjacent to a target student, both stand still while teacher transfers progress
+    HoldLecture = 40, // stand at lecture anchor and broadcast progress to nearby Attending students
+    AttendLecture = 41, // student rooted near a Lecturing teacher, accumulating progress per tick
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -106,6 +110,10 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::Butcher as u16 => "Butchering",
         x if x == TaskKind::Equip as u16 => "Equipping",
         x if x == TaskKind::HuntPartyMuster as u16 => "Mustering for Hunt",
+        x if x == TaskKind::Read as u16 => "Reading",
+        x if x == TaskKind::Teach as u16 => "Teaching",
+        x if x == TaskKind::HoldLecture as u16 => "Lecturing",
+        x if x == TaskKind::AttendLecture as u16 => "Attending Lecture",
         _ => "Unemployed",
     }
 }

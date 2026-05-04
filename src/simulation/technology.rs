@@ -1,7 +1,3 @@
-use super::faction::{FactionRegistry, PlayerFaction};
-use super::schedule::SimClock;
-use crate::ui::activity_log::{ActivityEntryKind, ActivityLogEvent};
-use crate::world::seasons::{Calendar, Season};
 use bevy::prelude::*;
 
 pub type TechId = u16;
@@ -152,6 +148,25 @@ pub struct TechDef {
 #[inline]
 pub fn tech_def(id: TechId) -> &'static TechDef {
     &TECH_TREE[id as usize]
+}
+
+/// Capacity-cost of a tech in a person's Learned set. Era-based with a few
+/// high-cognition bumps. Used by `PersonKnowledge::try_learn` against the
+/// intelligence-derived `knowledge_capacity`.
+#[inline]
+pub fn complexity(id: TechId) -> u8 {
+    // Specific high-cognition bumps.
+    match id {
+        CUNEIFORM_WRITING | LUNAR_CALENDAR | CITY_STATE_ORG => return 6,
+        _ => {}
+    }
+    match TECH_TREE[id as usize].era {
+        Era::Paleolithic => 1,
+        Era::Mesolithic => 2,
+        Era::Neolithic => 3,
+        Era::Chalcolithic => 4,
+        Era::BronzeAge => 5,
+    }
 }
 
 /// Highest era for which the faction has unlocked at least one tech.
@@ -1100,67 +1115,6 @@ pub static TECH_TREE: [TechDef; TECH_COUNT] = [
     },
 ];
 
-// ── Discovery system ──────────────────────────────────────────────────────────
-
-/// Fires once per season transition; rolls discovery chances for each faction
-/// based on its accumulated activity log, then resets the log.
-pub fn tech_discovery_system(
-    calendar: Res<Calendar>,
-    clock: Res<SimClock>,
-    mut registry: ResMut<FactionRegistry>,
-    mut last_season: Local<Season>,
-    player_faction: Res<PlayerFaction>,
-    mut log_events: EventWriter<ActivityLogEvent>,
-) {
-    if calendar.season == *last_season {
-        return;
-    }
-    *last_season = calendar.season;
-
-    for (faction_id, faction) in registry.factions.iter_mut() {
-        let member_scale = (faction.member_count as f32).sqrt().max(1.0);
-        let mut to_unlock: Vec<TechId> = Vec::new();
-
-        for def in TECH_TREE.iter() {
-            if faction.techs.has(def.id) {
-                continue;
-            }
-            if def.prerequisites.iter().any(|&p| !faction.techs.has(p)) {
-                continue;
-            }
-
-            let mut chance: f32 = 0.0;
-            for t in def.triggers {
-                chance += faction.activity_log.get(t.activity) as f32 * t.per_unit_chance;
-            }
-            chance = (chance * member_scale).min(0.95);
-
-            if chance > 0.0 && fastrand::f32() < chance {
-                to_unlock.push(def.id);
-            }
-        }
-
-        for id in to_unlock {
-            info!(
-                "Faction {} discovered: {} ({})",
-                faction_id,
-                tech_def(id).name,
-                tech_def(id).era.name()
-            );
-            faction.techs.unlock(id);
-            if *faction_id as u32 == player_faction.faction_id {
-                log_events.send(ActivityLogEvent {
-                    tick: clock.tick,
-                    actor: Entity::PLACEHOLDER,
-                    faction_id: *faction_id as u32,
-                    kind: ActivityEntryKind::TechDiscovered {
-                        tech_name: tech_def(id).name,
-                        era_name: tech_def(id).era.name(),
-                    },
-                });
-            }
-        }
-
-        faction.activity_log.reset();
-    }
-}
+// Discovery is now per-person and per-action; see
+// `simulation::knowledge::discovery_system`. The old season-boundary
+// faction-level roller has been removed.

@@ -25,6 +25,7 @@ impl Default for Market {
             prices: [
                 1.0, 1.2, 0.8, 0.8, 0.5, 2.0, 1.5, 1.2, 1.8, 5.0, 0.5, 3.0, 4.0, 2.5, 0.7, 2.0,
                 2.5, 25.0, 10.0, 0.4, // BerrySeed
+                3.0, 8.0, // ClayTablet, Book
             ],
             supply: [0.0; GOOD_COUNT],
             demand: [0.0; GOOD_COUNT],
@@ -32,6 +33,7 @@ impl Default for Market {
             price_ceiling: [
                 50.0, 50.0, 50.0, 20.0, 10.0, 100.0, 50.0, 30.0, 80.0, 200.0, 5.0, 150.0, 180.0,
                 100.0, 20.0, 100.0, 120.0, 1000.0, 400.0, 5.0, // BerrySeed
+                80.0, 200.0, // ClayTablet, Book
             ],
             market_stock,
             listings: Vec::new(),

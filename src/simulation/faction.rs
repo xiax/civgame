@@ -117,6 +117,7 @@ pub fn faction_hunter_assignment_system(
         &Skills,
         Option<&mut PersonAI>,
         Option<&mut PlanHistory>,
+        Option<&crate::simulation::knowledge::PersonKnowledge>,
     )>,
 ) {
     if clock.tick % HUNTER_ASSIGNMENT_CADENCE != 0 {
@@ -161,10 +162,14 @@ pub fn faction_hunter_assignment_system(
     }
 
     // Per-faction snapshot of (entity, combat_skill) for current hunters and
-    // None candidates.
+    // None candidates. None candidates are pre-filtered to those who have
+    // personally Learned HUNTING_SPEAR — the chief can post hunter slots
+    // (faction-aware) but only members who actually know the technique are
+    // promotable. Existing hunters are left alone; demotion will catch any
+    // who lost the tech via LRU eviction.
     let mut by_faction_hunters: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
     let mut by_faction_none: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
-    for (entity, prof, member, skills, _, _) in query.iter() {
+    for (entity, prof, member, skills, _, _, knowledge_opt) in query.iter() {
         if member.faction_id == SOLO {
             continue;
         }
@@ -174,10 +179,17 @@ pub fn faction_hunter_assignment_system(
                 .entry(member.faction_id)
                 .or_default()
                 .push((entity, combat)),
-            Profession::None => by_faction_none
-                .entry(member.faction_id)
-                .or_default()
-                .push((entity, combat)),
+            Profession::None => {
+                let knows_hunting = knowledge_opt
+                    .map(|k| k.has_learned(HUNTING_SPEAR))
+                    .unwrap_or(false);
+                if knows_hunting {
+                    by_faction_none
+                        .entry(member.faction_id)
+                        .or_default()
+                        .push((entity, combat));
+                }
+            }
             _ => {}
         }
     }
@@ -208,7 +220,9 @@ pub fn faction_hunter_assignment_system(
         return;
     }
 
-    for (entity, mut prof, _member, _skills, ai_opt, history_opt) in query.iter_mut() {
+    for (entity, mut prof, _member, _skills, ai_opt, history_opt, _knowledge) in
+        query.iter_mut()
+    {
         if promote.contains(&entity) {
             *prof = Profession::Hunter;
         } else if demote.contains(&entity) {
@@ -842,12 +856,11 @@ impl FactionRegistry {
     pub fn create_faction(&mut self, home_tile: (i32, i32)) -> u32 {
         self.next_id += 1;
         let id = self.next_id;
-        let mut techs = FactionTechs::default();
-        for def in TECH_TREE.iter() {
-            if matches!(def.era, Era::Paleolithic) {
-                techs.unlock(def.id);
-            }
-        }
+        // FactionTechs starts empty; `sync_faction_techs_from_chief_system`
+        // populates it from the chief's PersonKnowledge.aware bitset every
+        // Economy tick. The founding chief already carries Paleolithic
+        // awareness from `PersonKnowledge::paleolithic_seed` at spawn.
+        let techs = FactionTechs::default();
         // Deterministic per-faction seed: home tile + faction id, packed.
         let seed = ((home_tile.0 as i32 as u32) << 16)
             ^ (home_tile.1 as i32 as u32)
@@ -1017,6 +1030,7 @@ pub fn social_fill_system(
     spatial: Res<SpatialIndex>,
     clock: Res<SimClock>,
     mut registry: ResMut<FactionRegistry>,
+    mut discovery_events: EventWriter<crate::simulation::knowledge::DiscoveryActionEvent>,
     mut query: Query<(
         Entity,
         &mut Needs,
@@ -1053,6 +1067,10 @@ pub fn social_fill_system(
             if let Some(fd) = registry.factions.get_mut(&member.faction_id) {
                 fd.activity_log.increment(ActivityKind::Socializing);
             }
+            discovery_events.send(crate::simulation::knowledge::DiscoveryActionEvent {
+                actor: entity,
+                activity: ActivityKind::Socializing,
+            });
         }
     }
 }
@@ -1638,6 +1656,32 @@ pub fn chief_selection_system(
                 drift_culture(&mut faction.culture, faction.lineage.generation);
             }
         }
+    }
+}
+
+/// Sole writer of `FactionData.techs`. Each Economy tick, project the chief's
+/// `PersonKnowledge.aware` bitset onto the faction so existing read sites
+/// (plan filters, recipe gates, building gates, era checks) reflect the
+/// leader's awareness. If the faction has no chief, leave the previous value
+/// untouched — `chief_selection_system` runs every 60 ticks and will refill it.
+pub fn sync_faction_techs_from_chief_system(
+    mut registry: ResMut<FactionRegistry>,
+    chief_q: Query<&crate::simulation::knowledge::PersonKnowledge>,
+) {
+    for (_id, faction) in registry.factions.iter_mut() {
+        let Some(chief) = faction.chief_entity else {
+            continue;
+        };
+        let Ok(knowledge) = chief_q.get(chief) else {
+            continue;
+        };
+        // Mask to valid tech bits (lower TECH_COUNT) to keep the bitset clean.
+        let mask = if TECH_COUNT >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << TECH_COUNT) - 1
+        };
+        faction.techs.0 = knowledge.aware & mask;
     }
 }
 

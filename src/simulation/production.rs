@@ -88,7 +88,9 @@ pub fn production_system(
     mut faction_registry: ResMut<FactionRegistry>,
     mut board: ResMut<JobBoard>,
     mut job_completed: EventWriter<JobCompletedEvent>,
+    mut discovery_events: EventWriter<crate::simulation::knowledge::DiscoveryActionEvent>,
     mut query: Query<(
+        Entity,
         &mut PersonAI,
         &mut EconomicAgent,
         &mut Carrier,
@@ -101,6 +103,7 @@ pub fn production_system(
     )>,
 ) {
     for (
+        actor,
         mut ai,
         mut agent,
         mut carrier,
@@ -157,6 +160,10 @@ pub fn production_system(
                                 fd.activity_log.increment(ActivityKind::Farming);
                             }
                         }
+                        discovery_events.send(crate::simulation::knowledge::DiscoveryActionEvent {
+                            actor,
+                            activity: ActivityKind::Farming,
+                        });
                         // Credit a Farm posting if this worker holds one and the
                         // tile falls within the posting's designated area.
                         if let Some(claim) = claim_opt {
@@ -204,6 +211,10 @@ pub fn production_system(
                             fd.activity_log.increment(ActivityKind::Combat);
                         }
                     }
+                    discovery_events.send(crate::simulation::knowledge::DiscoveryActionEvent {
+                        actor,
+                        activity: ActivityKind::Combat,
+                    });
                     needs.willpower = (needs.willpower + WILLPOWER_PLAY_BURST).clamp(0.0, 255.0);
                 }
                 ai.state = AiState::Idle;

@@ -1,8 +1,11 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::simulation::faction::{FactionRegistry, PlayerFaction};
-use crate::simulation::technology::{ActivityKind, Era, TECH_TREE};
+use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
+use crate::simulation::knowledge::PersonKnowledge;
+use crate::simulation::technology::{
+    complexity, ActivityKind, Era, TechId, TECH_COUNT, TECH_TREE,
+};
 
 #[derive(Resource, Default)]
 pub struct TechPanelOpen(pub bool);
@@ -30,15 +33,36 @@ pub fn tech_panel_system(
     open: Res<TechPanelOpen>,
     player_faction: Res<PlayerFaction>,
     registry: Res<FactionRegistry>,
+    member_query: Query<(&FactionMember, &PersonKnowledge)>,
 ) {
     if !open.0 {
         return;
     }
 
-    let faction_techs = registry
-        .factions
-        .get(&player_faction.faction_id)
-        .map(|d| &d.techs);
+    let faction_data = registry.factions.get(&player_faction.faction_id);
+    let chief_entity = faction_data.and_then(|f| f.chief_entity);
+    let chief_knowledge: Option<&PersonKnowledge> = chief_entity
+        .and_then(|e| member_query.get(e).ok())
+        .map(|(_, k)| k);
+
+    // Per-tech tally of how many faction members have it Learned vs Aware,
+    // for the distribution annotation in the hover tooltip.
+    let mut learned_counts = [0u32; TECH_COUNT];
+    let mut aware_counts = [0u32; TECH_COUNT];
+    let mut member_total = 0u32;
+    for (fm, k) in member_query.iter() {
+        if fm.faction_id != player_faction.faction_id {
+            continue;
+        }
+        member_total += 1;
+        for id in 0..TECH_COUNT as TechId {
+            if k.has_learned(id) {
+                learned_counts[id as usize] += 1;
+            } else if k.is_aware(id) {
+                aware_counts[id as usize] += 1;
+            }
+        }
+    }
 
     let ctx = contexts.ctx_mut();
     egui::Window::new("Technology Tree")
@@ -47,11 +71,20 @@ pub fn tech_panel_system(
         .resizable(true)
         .collapsible(false)
         .show(ctx, |ui| {
-            if faction_techs.is_none() {
+            if faction_data.is_none() {
                 ui.label(egui::RichText::new("No faction yet.").color(egui::Color32::GRAY));
                 return;
             }
-            let techs = faction_techs.unwrap();
+            ui.label(
+                egui::RichText::new("State reflects the chief's awareness.")
+                    .small()
+                    .color(egui::Color32::from_gray(160)),
+            );
+            ui.separator();
+            // Use the cached faction-tech projection of chief awareness as the
+            // primary display state. Hover dives into chief Learned vs Aware
+            // and member distribution.
+            let techs = &faction_data.unwrap().techs;
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for era in [
@@ -72,9 +105,16 @@ pub fn tech_panel_system(
                         for tech in TECH_TREE.iter().filter(|t| t.era == era) {
                             let unlocked = techs.has(tech.id);
                             let prereqs_met = tech.prerequisites.iter().all(|&p| techs.has(p));
+                            let chief_learned = chief_knowledge
+                                .map(|k| k.has_learned(tech.id))
+                                .unwrap_or(false);
 
-                            let (icon, name_color) = if unlocked {
+                            // ✓ green = chief Learned, ◉ teal = chief Aware
+                            // only, ◎ yellow = discoverable, ○ gray = locked.
+                            let (icon, name_color) = if chief_learned {
                                 ("✓", egui::Color32::from_rgb(80, 210, 100))
+                            } else if unlocked {
+                                ("◉", egui::Color32::from_rgb(120, 200, 200))
                             } else if prereqs_met {
                                 ("◎", egui::Color32::from_rgb(240, 200, 60))
                             } else {
@@ -96,8 +136,13 @@ pub fn tech_panel_system(
                             hover_response.on_hover_ui(|ui| {
                                 ui.set_max_width(280.0);
 
-                                let status = if unlocked {
-                                    ("Unlocked", egui::Color32::from_rgb(80, 210, 100))
+                                let status = if chief_learned {
+                                    ("Chief Learned", egui::Color32::from_rgb(80, 210, 100))
+                                } else if unlocked {
+                                    (
+                                        "Chief Aware",
+                                        egui::Color32::from_rgb(120, 200, 200),
+                                    )
                                 } else if prereqs_met {
                                     ("Discoverable", egui::Color32::from_rgb(240, 200, 60))
                                 } else {
@@ -120,6 +165,19 @@ pub fn tech_panel_system(
                                     egui::RichText::new(tech.description)
                                         .color(egui::Color32::from_gray(210))
                                         .size(12.0),
+                                );
+
+                                let cx = complexity(tech.id);
+                                let learned_n = learned_counts[tech.id as usize];
+                                let aware_n = aware_counts[tech.id as usize];
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Complexity: {} pt(s) · Members: {}/{} learned, {} aware",
+                                        cx, learned_n, member_total, aware_n
+                                    ))
+                                    .color(egui::Color32::from_rgb(180, 200, 220))
+                                    .size(11.0),
                                 );
 
                                 if !tech.prerequisites.is_empty() {

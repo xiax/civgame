@@ -13,6 +13,7 @@ pub mod gather;
 pub mod goals;
 pub mod items;
 pub mod jobs;
+pub mod knowledge;
 pub mod line_of_sight;
 pub mod lod;
 pub mod memory;
@@ -34,6 +35,7 @@ pub mod skills;
 pub mod sound;
 pub mod stats;
 pub mod tasks;
+pub mod teaching;
 pub mod technology;
 pub mod terraform;
 pub mod world_sim;
@@ -64,6 +66,7 @@ impl Plugin for SimulationPlugin {
             .add_event::<combat::DistressCallEvent>()
             .add_event::<combat::HandDropEvent>()
             .add_event::<plan::DropAbandonedFoodEvent>()
+            .add_event::<knowledge::DiscoveryActionEvent>()
             .insert_resource(SimClock::default())
             .insert_resource(faction::FactionRegistry::default())
             .insert_resource(faction::PlayerFaction::default())
@@ -100,6 +103,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(military::ActiveRallyPoints::default())
             .insert_resource(corpse::CorpseMap::default())
             .insert_resource(military::MusterHuntersRequest::default())
+            .insert_resource(teaching::LectureRequest::default())
+            .insert_resource(jobs::PlayerCraftRequest::default())
             .configure_sets(
                 FixedUpdate,
                 (
@@ -224,6 +229,25 @@ impl Plugin for SimulationPlugin {
             )
             .add_systems(
                 FixedUpdate,
+                (
+                    teaching::apply_player_knowledge_orders_system
+                        .after(movement::movement_system),
+                    teaching::apply_teach_order_system
+                        .after(teaching::apply_player_knowledge_orders_system),
+                    teaching::read_task_system
+                        .after(teaching::apply_player_knowledge_orders_system)
+                        .before(plan::plan_execution_system),
+                    teaching::teach_task_system
+                        .after(teaching::apply_teach_order_system)
+                        .before(plan::plan_execution_system),
+                    teaching::lecture_tick_system
+                        .after(movement::movement_system)
+                        .before(plan::plan_execution_system),
+                )
+                    .in_set(SimulationSet::Sequential),
+            )
+            .add_systems(
+                FixedUpdate,
                 (plan::explore_satisfaction_system
                     .after(memory::vision_system)
                     .before(plan::plan_execution_system),)
@@ -326,6 +350,8 @@ impl Plugin for SimulationPlugin {
                         .after(projects::project_lifecycle_system),
                     crafting::faction_craft_order_system
                         .after(jobs::chief_job_posting_system),
+                    jobs::chief_tablet_posting_system
+                        .after(jobs::chief_job_posting_system),
                     jobs::job_build_completion_system
                         .after(jobs::chief_job_posting_system),
                     jobs::job_claim_release_system
@@ -348,13 +374,20 @@ impl Plugin for SimulationPlugin {
                         .after(faction::compute_faction_storage_system),
                     faction::update_material_targets_system
                         .after(faction::compute_faction_storage_system),
-                    technology::tech_discovery_system
-                        .after(faction::compute_faction_storage_system)
-                        .after(raid::raid_execution_system),
+                    knowledge::discovery_system
+                        .after(faction::compute_faction_storage_system),
+                    knowledge::tech_teaching_system
+                        .after(plan::plan_gossip_system),
+                    faction::sync_faction_techs_from_chief_system
+                        .after(faction::chief_selection_system)
+                        .after(knowledge::discovery_system)
+                        .after(knowledge::tech_teaching_system),
                     plan::drop_abandoned_food_system
                         .after(faction::drop_items_at_destination_system),
                     military::expire_rally_points_system,
                     military::apply_muster_hunters_system,
+                    teaching::apply_lecture_request_system
+                        .after(military::apply_muster_hunters_system),
                     faction::chief_hunt_order_system
                         .after(faction::compute_faction_storage_system),
                     faction::faction_hunter_assignment_system

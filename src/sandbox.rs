@@ -108,6 +108,7 @@ fn setup_sandbox(
             crate::simulation::reproduction::CoSleepTracker::default(),
             crate::simulation::reproduction::MaleConceptionCooldown::default(),
             crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Person),
+            crate::simulation::knowledge::PersonKnowledge::paleolithic_seed(0),
         ),
     ));
 

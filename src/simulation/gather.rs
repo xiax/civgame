@@ -15,6 +15,7 @@ use crate::simulation::plants::{GrowthStage, PlantKind, PlantMap, PlantSpriteInd
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::TaskKind;
+use crate::simulation::knowledge::DiscoveryActionEvent;
 use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::chunk_streaming::TileChangedEvent;
@@ -61,6 +62,7 @@ pub fn gather_system(
     mut chunk_map: ResMut<ChunkMap>,
     mut wall_map: ResMut<WallMap>,
     mut tile_changed: EventWriter<TileChangedEvent>,
+    mut discovery_events: EventWriter<DiscoveryActionEvent>,
     clock: Res<SimClock>,
     gen: Res<WorldGen>,
     globe: Res<Globe>,
@@ -69,6 +71,7 @@ pub fn gather_system(
     mut faction_registry: ResMut<FactionRegistry>,
     mut plant_query: Query<&mut crate::simulation::plants::Plant>,
     mut agent_query: Query<(
+        Entity,
         &mut PersonAI,
         &mut EconomicAgent,
         &mut Carrier,
@@ -83,6 +86,7 @@ pub fn gather_system(
     )>,
 ) {
     for (
+        actor,
         mut ai,
         mut agent,
         mut carrier,
@@ -150,8 +154,13 @@ pub fn gather_system(
             ai.work_progress = 0;
 
             // Faction multipliers & activity log
+            let harvest_activity = kind.harvest_activity();
             let (food_mul, wood_mul, _) =
-                faction_muls(&mut faction_registry, faction_id, kind.harvest_activity());
+                faction_muls(&mut faction_registry, faction_id, harvest_activity);
+            discovery_events.send(DiscoveryActionEvent {
+                actor,
+                activity: harvest_activity,
+            });
 
             let (yield_good, base_qty) = kind.harvest_yield(has_tool);
             let yield_mul = if yield_good.is_edible() {
@@ -265,6 +274,7 @@ pub fn gather_system(
                             fd.activity_log.increment(activity);
                         }
                     }
+                    discovery_events.send(DiscoveryActionEvent { actor, activity });
                 }
 
                 if total_qty == 0 {

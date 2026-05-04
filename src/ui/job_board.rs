@@ -419,6 +419,7 @@ fn build_player_posting(
             target,
             recipe,
             bench: None,
+            tech_payload: None,
         },
         // Build and Haul postings need a concrete blueprint; the Post Job form
         // doesn't pick one yet — disabled at this layer.

@@ -36,6 +36,15 @@ pub enum ActivityEntryKind {
         megachunk: (i32, i32),
         region_name: String,
     },
+    /// One-on-one or lecture teaching produced a Learned bit on the student.
+    Taught {
+        student_name: String,
+        tech_name: &'static str,
+    },
+    /// Reading a tablet/book produced a Learned bit.
+    Read {
+        tech_name: &'static str,
+    },
 }
 
 #[derive(Clone)]
@@ -119,6 +128,19 @@ pub fn activity_log_ingest_system(
                 "discovered",
                 format!("{} ({})", tech_name, era_name),
                 ResultLink::NoTarget,
+            ),
+            ActivityEntryKind::Taught {
+                student_name,
+                tech_name,
+            } => (
+                "taught",
+                format!("{} ({})", student_name, tech_name),
+                ResultLink::NoTarget,
+            ),
+            &ActivityEntryKind::Read { tech_name } => (
+                "read of",
+                tech_name.to_string(),
+                ResultLink::HeldByActor,
             ),
         };
 

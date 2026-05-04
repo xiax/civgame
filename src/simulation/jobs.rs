@@ -130,12 +130,16 @@ pub enum JobProgress {
         target: u32,
         area: TileAabb,
     },
-    /// Craft: units of a specific recipe produced.
+    /// Craft: units of a specific recipe produced. `tech_payload` is set when
+    /// the recipe is Clay Tablet / Book — it travels through the spawned
+    /// `CraftOrder` and ends up on the produced `Item`. `None` for every
+    /// non-knowledge recipe.
     Crafting {
         crafted: u32,
         target: u32,
         recipe: RecipeId,
         bench: Option<Entity>,
+        tech_payload: Option<crate::simulation::technology::TechId>,
     },
     /// Build: completes when the named blueprint entity despawns.
     Building { blueprint: Entity },
@@ -791,6 +795,10 @@ pub fn chief_job_posting_system(
                         target,
                         recipe: recipe_id,
                         bench: bench_ref,
+                        // Demand-driven crafts (Spear, Cloth, Iron Tools, ...)
+                        // do not encode tech. The tablet/book pipeline posts
+                        // separately via `chief_tablet_posting_system`.
+                        tech_payload: None,
                     };
                     let priority =
                         compute_priority(faction, faction_id, JobKind::Craft, &progress, &projects);
@@ -808,6 +816,209 @@ pub fn chief_job_posting_system(
                 }
             }
         }
+    }
+}
+
+/// Player override for crafting a specific tablet/book on demand. Inspector
+/// "Encode Tablet" writes the recipe + tech_payload here; the apply system
+/// posts a Craft job to the player faction at the next chief-posting tick.
+#[derive(Resource, Default)]
+pub struct PlayerCraftRequest(pub Option<(u8, Option<crate::simulation::technology::TechId>)>);
+
+/// Cadence: chief reconsiders tablet posting once per game-day. See plan
+/// memory `feedback_game_time_pacing.md` — faction-level decisions anchor on
+/// game time, not 60-tick reactive cadence.
+const CHIEF_TABLET_POSTING_INTERVAL: u64 = 3600;
+
+/// Auto-post Clay Tablet craft jobs when the chief has Learned a tech the
+/// rest of the faction is largely unaware of. Runs once per game-day per
+/// faction; player override via `PlayerCraftRequest` is consumed every tick.
+pub fn chief_tablet_posting_system(
+    clock: Res<SimClock>,
+    registry: Res<FactionRegistry>,
+    workbench_map: Res<crate::simulation::construction::WorkbenchMap>,
+    mut player_request: ResMut<PlayerCraftRequest>,
+    player: Res<crate::simulation::faction::PlayerFaction>,
+    mut board: ResMut<JobBoard>,
+    knowledge_query: Query<&crate::simulation::knowledge::PersonKnowledge>,
+    members_query: Query<(
+        &FactionMember,
+        &crate::simulation::knowledge::PersonKnowledge,
+        &crate::simulation::stats::Stats,
+        &LodLevel,
+    )>,
+) {
+    use crate::simulation::crafting::{recipe_encodes_knowledge, CRAFT_RECIPES, RECIPE_CLAY_TABLET};
+    use crate::simulation::technology::{complexity, TechId, TECH_COUNT};
+
+    let posted_tick = clock.tick as u32;
+
+    // Fast path: consume player override (always, regardless of cadence).
+    if let Some((recipe_id, tech_payload)) = player_request.0.take() {
+        if recipe_encodes_knowledge(recipe_id) {
+            let faction_id = player.faction_id;
+            if let Some(faction) = registry.factions.get(&faction_id) {
+                let in_home_zone = |tile: &(i32, i32)| {
+                    let dx = (tile.0 as i32 - faction.home_tile.0 as i32).abs();
+                    let dy = (tile.1 as i32 - faction.home_tile.1 as i32).abs();
+                    dx <= 16 && dy <= 16
+                };
+                let bench_ok = workbench_map.0.iter().any(|(t, _)| in_home_zone(t));
+                let dup = board.faction_postings(faction_id).iter().any(|p| {
+                    matches!(p.progress,
+                        JobProgress::Crafting { recipe, tech_payload: tp, .. }
+                            if recipe == recipe_id && tp == tech_payload)
+                });
+                if bench_ok && !dup {
+                    let id = board.alloc_id();
+                    let progress = JobProgress::Crafting {
+                        crafted: 0,
+                        target: 1,
+                        recipe: recipe_id,
+                        bench: None,
+                        tech_payload,
+                    };
+                    let priority = 180; // High — the player asked for it.
+                    board.faction_postings_mut(faction_id).push(JobPosting {
+                        id,
+                        faction_id,
+                        kind: JobKind::Craft,
+                        progress,
+                        claimants: Vec::new(),
+                        priority,
+                        source: JobSource::Player,
+                        posted_tick,
+                        expiry_tick: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Slow path: chief autonomous tablet posting.
+    if clock.tick % CHIEF_TABLET_POSTING_INTERVAL != 0 {
+        return;
+    }
+
+    for (&faction_id, faction) in registry.factions.iter() {
+        if faction_id == SOLO {
+            continue;
+        }
+        // Workbench in zone.
+        let in_home_zone = |tile: &(i32, i32)| {
+            let dx = (tile.0 as i32 - faction.home_tile.0 as i32).abs();
+            let dy = (tile.1 as i32 - faction.home_tile.1 as i32).abs();
+            dx <= 16 && dy <= 16
+        };
+        let has_bench = workbench_map.0.iter().any(|(t, _)| in_home_zone(t));
+        if !has_bench {
+            continue;
+        }
+        // Need the chief's bitsets.
+        let Some(chief_e) = faction.chief_entity else {
+            continue;
+        };
+        let Ok(chief_knowledge) = knowledge_query.get(chief_e) else {
+            continue;
+        };
+        if chief_knowledge.learned == 0 {
+            continue;
+        }
+
+        // Tally adult awareness across faction members.
+        let mut adults = 0u32;
+        let mut aware_count = [0u32; 64];
+        for (m, k, stats, lod) in members_query.iter() {
+            if m.faction_id != faction_id || *lod == LodLevel::Dormant {
+                continue;
+            }
+            // Treat anyone with stats present as adult-eligible. (The repo's
+            // adult predicate lives elsewhere — use member count as a proxy
+            // and let the awareness threshold do the gating.)
+            let _ = stats;
+            adults += 1;
+            for id in 0..TECH_COUNT as TechId {
+                if k.is_aware(id) {
+                    aware_count[id as usize] += 1;
+                }
+            }
+        }
+        if adults < 2 {
+            continue;
+        }
+        let half = adults / 2;
+
+        // Pick the highest-complexity tech the chief Learned that is lacking
+        // awareness in the faction. Skip techs already encoded by a live
+        // tablet posting/order.
+        let live_tablet_techs: Vec<TechId> = board
+            .faction_postings(faction_id)
+            .iter()
+            .filter_map(|p| match p.progress {
+                JobProgress::Crafting {
+                    recipe,
+                    tech_payload: Some(t),
+                    ..
+                } if recipe_encodes_knowledge(recipe) => Some(t),
+                _ => None,
+            })
+            .collect();
+
+        let mut chosen: Option<(TechId, u8)> = None;
+        for id in 0..TECH_COUNT as TechId {
+            if !chief_knowledge.has_learned(id) {
+                continue;
+            }
+            if aware_count[id as usize] >= half {
+                continue;
+            }
+            if live_tablet_techs.contains(&id) {
+                continue;
+            }
+            let cx = complexity(id);
+            match chosen {
+                None => chosen = Some((id, cx)),
+                Some((_, best_cx)) if cx > best_cx => chosen = Some((id, cx)),
+                _ => {}
+            }
+        }
+
+        let Some((tech, _cx)) = chosen else {
+            continue;
+        };
+
+        // Verify recipe ingredients are available (Stone+Wood for tablet).
+        let recipe = &CRAFT_RECIPES[RECIPE_CLAY_TABLET as usize];
+        let mut ok = true;
+        for &(good, qty) in recipe.inputs {
+            if faction.resource_supply.get(&good).copied().unwrap_or(0) < qty {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+
+        let id = board.alloc_id();
+        let progress = JobProgress::Crafting {
+            crafted: 0,
+            target: 1,
+            recipe: RECIPE_CLAY_TABLET,
+            bench: None,
+            tech_payload: Some(tech),
+        };
+        board.faction_postings_mut(faction_id).push(JobPosting {
+            id,
+            faction_id,
+            kind: JobKind::Craft,
+            progress,
+            claimants: Vec::new(),
+            priority: 100,
+            source: JobSource::Chief,
+            posted_tick,
+            expiry_tick: None,
+        });
     }
 }
 
@@ -896,6 +1107,7 @@ pub fn job_claim_system(
             &Personality,
             Option<&Profession>,
             &Transform,
+            Option<&crate::simulation::knowledge::PersonKnowledge>,
         ),
         Without<JobClaim>,
     >,
@@ -914,7 +1126,8 @@ pub fn job_claim_system(
         }
     }
 
-    for (worker, member, ai, lod, skills, personality, profession_opt, transform) in workers.iter()
+    for (worker, member, ai, lod, skills, personality, profession_opt, transform, knowledge_opt) in
+        workers.iter()
     {
         if *lod == LodLevel::Dormant {
             continue;
@@ -957,6 +1170,25 @@ pub fn job_claim_system(
             // Skip postings that completed but haven't been removed yet.
             if p.progress.is_complete() {
                 continue;
+            }
+            // Per-person craft tech-gate: a worker can only claim a Craft
+            // posting whose recipe `tech_gate` they have personally Learned.
+            // Faction-level posting still uses chief awareness; this filter
+            // prevents low-knowledge workers from grabbing tablet/book jobs
+            // they can't actually execute.
+            if let JobProgress::Crafting { recipe, .. } = p.progress {
+                if let Some(rdef) =
+                    crate::simulation::crafting::CRAFT_RECIPES.get(recipe as usize)
+                {
+                    if let Some(req_tech) = rdef.tech_gate {
+                        let knows = knowledge_opt
+                            .map(|k| k.has_learned(req_tech))
+                            .unwrap_or(false);
+                        if !knows {
+                            continue;
+                        }
+                    }
+                }
             }
             let skill_norm = skills.0[skill_for(p.kind) as usize] as f32 / 255.0;
             let target_tile = posting_target_tile(p);

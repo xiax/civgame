@@ -399,6 +399,8 @@ pub fn spawn_ground_item_sprites(
             Good::Cloth   => "item_cloth",
             Good::Skin    => "item_leather_armor",
             Good::Luxury  => "resource_gem",
+            Good::ClayTablet => "resource_loose_rock",
+            Good::Book    => "item_cloth",
         };
         let Some(img) = sprite_lib.get(key).cloned() else {
             continue;

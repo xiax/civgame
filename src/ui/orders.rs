@@ -406,6 +406,18 @@ pub fn right_click_context_menu_system(
                                     chosen = Some(PlayerOrderKind::PickUpCorpse(*entity));
                                 }
                             }
+                            // Teach: friendly person target, distinct from
+                            // selected. Eligibility (teacher has any teachable
+                            // tech) is verified by `apply_teach_order_system`.
+                            if *hostility == Hostility::Friendly
+                                && !*is_corpse
+                                && *entity != sel_entity
+                                && health.is_some()
+                            {
+                                if ui.small_button("Teach").clicked() {
+                                    chosen = Some(PlayerOrderKind::Teach(*entity));
+                                }
+                            }
                         });
                     }
                 }
@@ -617,6 +629,33 @@ pub fn right_click_context_menu_system(
                         &chunk_map,
                         &routing.chunk_connectivity,
                     );
+                }
+                // Knowledge-system orders are routed by dedicated systems
+                // (`apply_teach_order_system`, `apply_lecture_request_system`,
+                // `apply_read_order_system`, `apply_player_craft_request_system`)
+                // that consume the inserted `PlayerOrder` component below.
+                PlayerOrderKind::Teach(student) => {
+                    // The right-click "Teach <name>" entry stores the
+                    // student's tile in `target_tile`; route the teacher there
+                    // and `apply_teach_order_system` (in `teaching.rs`) inserts
+                    // the TeachingPair/BeingTaught markers on adjacency.
+                    assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx as i32, cur_ty as i32),
+                        cur_chunk,
+                        target_tile,
+                        TaskKind::Teach,
+                        Some(student),
+                        &routing.chunk_graph,
+                        &routing.chunk_router,
+                        &chunk_map,
+                        &routing.chunk_connectivity,
+                    );
+                }
+                PlayerOrderKind::HoldLecture(_)
+                | PlayerOrderKind::ReadItem(_)
+                | PlayerOrderKind::EncodeTablet(_) => {
+                    // Handled by dedicated systems that read PlayerOrder.
                 }
             }
 

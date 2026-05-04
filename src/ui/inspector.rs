@@ -52,6 +52,15 @@ pub enum InspectorActionKind {
     DropRightHand { target: Entity },
     EquipItem { target: Entity, item: Item, from_hands: bool, slot: EquipmentSlot },
     UnequipSlot { target: Entity, slot: EquipmentSlot },
+    /// Selected agent broadcasts a tech to nearby same-faction adults via
+    /// `apply_lecture_request_system` (Economy).
+    HoldLecture { lecturer: Entity, tech: crate::simulation::technology::TechId },
+    /// Selected agent reads an inventory tablet/book whose `tech_payload`
+    /// matches `tech`. Routed by `apply_player_knowledge_orders_system`.
+    ReadItem { reader: Entity, tech: crate::simulation::technology::TechId },
+    /// Player asks the faction to craft a Clay Tablet encoding `tech`.
+    /// Posted by `chief_tablet_posting_system` via `PlayerCraftRequest`.
+    EncodeTablet { tech: crate::simulation::technology::TechId },
 }
 
 #[derive(SystemParam)]
@@ -121,6 +130,7 @@ pub fn inspector_panel_system(
             Option<&crate::simulation::carry::Carrier>,
             Option<&PlanHistory>,
             Option<&crate::simulation::items::Equipment>,
+            Option<&crate::simulation::knowledge::PersonKnowledge>,
         ),
     )>,
 ) {
@@ -139,6 +149,7 @@ pub fn inspector_panel_system(
             carrier,
             plan_history,
             equipment,
+            knowledge,
         ),
     )) = query.get(entity)
     else {
@@ -368,6 +379,141 @@ pub fn inspector_panel_system(
                             row(ui, "CHA", s.charisma);
                         } else {
                             ui.label("  (no stats)");
+                        }
+                    });
+                egui::CollapsingHeader::new(egui::RichText::new("Knowledge").strong())
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if let Some(k) = knowledge {
+                            let cap = stats
+                                .map(|s| stats::knowledge_capacity(s.intelligence))
+                                .unwrap_or(0);
+                            let used = k.complexity_used();
+                            ui.label(format!(
+                                "Capacity: {}/{} pts (INT × 2)",
+                                used, cap
+                            ));
+                            let mut learned: Vec<crate::simulation::technology::TechId> =
+                                Vec::new();
+                            let mut aware_only: Vec<crate::simulation::technology::TechId> =
+                                Vec::new();
+                            for id in 0..crate::simulation::technology::TECH_COUNT
+                                as crate::simulation::technology::TechId
+                            {
+                                if k.has_learned(id) {
+                                    learned.push(id);
+                                } else if k.is_aware(id) {
+                                    aware_only.push(id);
+                                }
+                            }
+                            ui.label(format!("Learned ({}):", learned.len()));
+                            egui::ScrollArea::vertical()
+                                .id_salt("knowledge_learned")
+                                .max_height(140.0)
+                                .show(ui, |ui| {
+                                    for id in &learned {
+                                        let def =
+                                            crate::simulation::technology::tech_def(*id);
+                                        let cx = crate::simulation::technology::complexity(*id);
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!(
+                                                "  \u{2713} {} ({}, {} pts)",
+                                                def.name,
+                                                def.era.name(),
+                                                cx
+                                            ));
+                                            if ui.small_button("Lecture").on_hover_text(
+                                                "Have this person hold a lecture on this tech"
+                                            ).clicked() {
+                                                path_params.pending_action.0 =
+                                                    Some(InspectorActionKind::HoldLecture {
+                                                        lecturer: entity,
+                                                        tech: *id,
+                                                    });
+                                            }
+                                            if ui.small_button("Encode").on_hover_text(
+                                                "Faction crafts a Clay Tablet encoding this tech"
+                                            ).clicked() {
+                                                path_params.pending_action.0 =
+                                                    Some(InspectorActionKind::EncodeTablet {
+                                                        tech: *id,
+                                                    });
+                                            }
+                                        });
+                                    }
+                                    if learned.is_empty() {
+                                        ui.label("  (none)");
+                                    }
+                                });
+                            // In-flight study progress (tracked per tech).
+                            if !k.study_progress.is_empty() {
+                                ui.separator();
+                                ui.label("In progress:");
+                                let mut entries: Vec<(crate::simulation::technology::TechId, u32)> =
+                                    k.study_progress.iter().map(|(t, p)| (*t, *p)).collect();
+                                entries.sort_by_key(|e| e.0);
+                                for (tech, prog) in entries {
+                                    let def =
+                                        crate::simulation::technology::tech_def(tech);
+                                    let thr =
+                                        crate::simulation::knowledge::study_threshold(tech);
+                                    ui.label(format!(
+                                        "  · {}: {}/{} ticks",
+                                        def.name, prog, thr
+                                    ));
+                                }
+                            }
+                            ui.label(format!("Aware of ({}):", aware_only.len()));
+                            egui::ScrollArea::vertical()
+                                .id_salt("knowledge_aware")
+                                .max_height(140.0)
+                                .show(ui, |ui| {
+                                    // Determine which aware-only techs the
+                                    // agent has a readable tablet/book for.
+                                    let mut readable: ahash::AHashSet<
+                                        crate::simulation::technology::TechId,
+                                    > = ahash::AHashSet::new();
+                                    for (item, qty) in agent.inventory.iter() {
+                                        if *qty == 0 {
+                                            continue;
+                                        }
+                                        if !matches!(
+                                            item.good,
+                                            crate::economy::goods::Good::ClayTablet
+                                                | crate::economy::goods::Good::Book
+                                        ) {
+                                            continue;
+                                        }
+                                        if let Some(t) = item.tech_payload {
+                                            readable.insert(t);
+                                        }
+                                    }
+                                    for id in &aware_only {
+                                        let def =
+                                            crate::simulation::technology::tech_def(*id);
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!(
+                                                "  \u{25CE} {} ({})",
+                                                def.name,
+                                                def.era.name()
+                                            ));
+                                            if readable.contains(id) {
+                                                if ui.small_button("Read").clicked() {
+                                                    path_params.pending_action.0 =
+                                                        Some(InspectorActionKind::ReadItem {
+                                                            reader: entity,
+                                                            tech: *id,
+                                                        });
+                                                }
+                                            }
+                                        });
+                                    }
+                                    if aware_only.is_empty() {
+                                        ui.label("  (none)");
+                                    }
+                                });
+                        } else {
+                            ui.label("  (no knowledge component)");
                         }
                     });
                 egui::CollapsingHeader::new(egui::RichText::new("Currency & Inventory").strong())
@@ -1300,6 +1446,8 @@ pub fn inspector_action_system(
     mut commands: Commands,
     spatial: Res<SpatialIndex>,
     mut pending: ResMut<PendingInspectorAction>,
+    mut lecture_request: ResMut<crate::simulation::teaching::LectureRequest>,
+    mut player_craft: ResMut<crate::simulation::jobs::PlayerCraftRequest>,
     mut worker_q: Query<(&Transform, &mut EconomicAgent, &mut Carrier, &mut Equipment)>,
     mut ground_items: Query<&mut GroundItem>,
 ) {
@@ -1452,6 +1600,30 @@ pub fn inspector_action_system(
                         leftover2,
                     );
                 }
+            }
+        }
+        InspectorActionKind::HoldLecture { lecturer, tech } => {
+            // Single-slot pulse — overwrites any pending request.
+            lecture_request.0 = Some((lecturer, tech));
+        }
+        InspectorActionKind::ReadItem { reader, tech } => {
+            // Route via a synthetic PlayerOrder so
+            // `apply_player_knowledge_orders_system` handles task setup.
+            let Ok((transform, _, _, _)) = worker_q.get(reader) else {
+                return;
+            };
+            let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+            let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+            commands.entity(reader).insert(crate::simulation::person::PlayerOrder {
+                order: crate::simulation::person::PlayerOrderKind::ReadItem(tech),
+                target_tile: (tx, ty),
+                target_z: 0,
+            });
+        }
+        InspectorActionKind::EncodeTablet { tech } => {
+            if player_craft.0.is_none() {
+                player_craft.0 =
+                    Some((crate::simulation::crafting::RECIPE_CLAY_TABLET, Some(tech)));
             }
         }
     }

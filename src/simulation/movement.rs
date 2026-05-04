@@ -791,10 +791,17 @@ pub fn dismount_system(
 /// Requires HORSEBACK_RIDING tech. Runs after dismount_system and sync_indexed_after_move_system.
 pub fn mount_check_system(
     mut commands: Commands,
-    faction_registry: Res<FactionRegistry>,
+    _faction_registry: Res<FactionRegistry>,
     spatial: Res<SpatialIndex>,
     person_query: Query<
-        (Entity, &Transform, &PersonAI, &FactionMember, &LodLevel),
+        (
+            Entity,
+            &Transform,
+            &PersonAI,
+            &FactionMember,
+            &LodLevel,
+            Option<&crate::simulation::knowledge::PersonKnowledge>,
+        ),
         (With<Person>, Without<MountedOn>),
     >,
     horse_query: Query<(Entity, &Tamed), (With<Horse>, Without<CarriedBy>)>,
@@ -802,7 +809,7 @@ pub fn mount_check_system(
     const MOUNT_SCAN_RADIUS: i32 = 2;
     const MOUNT_MIN_DIST: i32 = 8;
 
-    for (person_entity, transform, ai, member, lod) in person_query.iter() {
+    for (person_entity, transform, ai, member, lod, knowledge_opt) in person_query.iter() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -810,10 +817,10 @@ pub fn mount_check_system(
             continue;
         }
 
-        let has_riding = faction_registry
-            .factions
-            .get(&member.faction_id)
-            .map(|f| f.techs.has(HORSEBACK_RIDING))
+        // Personal mastery: only riders who have Learned HORSEBACK_RIDING can
+        // actually mount, even if their faction is aware of the tech.
+        let has_riding = knowledge_opt
+            .map(|k| k.has_learned(HORSEBACK_RIDING))
             .unwrap_or(false);
         if !has_riding {
             continue;

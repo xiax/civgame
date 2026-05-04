@@ -1,0 +1,155 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2709
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fnil\fcharset0 Menlo-Regular;\f1\fnil\fcharset0 Menlo-Bold;\f2\fnil\fcharset0 Menlo-Italic;
+}
+{\colortbl;\red255\green255\blue255;\red0\green0\blue0;\red184\green180\blue255;\red255\green255\blue255;
+\red227\green176\blue255;}
+{\*\expandedcolortbl;;\csgray\c0;\cssrgb\c77003\c76775\c100000;\cspthree\c100000\c100000\c100000;
+\cssrgb\c91743\c75738\c100000;}
+\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f0\fs22 \cf2 \CocoaLigature0  
+\f1\b \cf3 Capitalist/Contract Economy & Utility AI Plan
+\f0\b0 \cf2 \
+\
+  
+\f1\b \cf3 Objective
+\f0\b0 \cf2 \
+  \cf4 Transform the centralized, fraction-based workforce allocation system into a decentralized, peer-to-peer (P2P)\cf2 \
+  \cf4 capitalist economy. Agents will evaluate tasks using a strict Utility AI equation ($U = E(R) - C$), and the\cf2 \
+  \cf4 market will use historical forecasting (EWMA) to determine the true value of goods and labor. Individual agents\cf2 \
+  \cf4 will earn wages, hold personal wealth, and post contracts for others to fulfill.\cf2 \
+\
+  
+\f1\b \cf3 Background & Motivation
+\f0\b0 \cf2 \
+  \cf4 Currently, Faction Chiefs allocate labor using rigid percentages (\cf5 workforce_budget\cf4 ), and agents fulfill jobs\cf2 \
+  \cf4 communally. By moving to a P2P contract economy, we unlock emergent gameplay: wealthy agents paying for personal\cf2 \
+  \cf4 services, specialized artisans demanding high wages, and dynamic labor shifting based on actual supply and\cf2 \
+  \cf4 demand.\cf2 \
+\
+  
+\f1\b \cf3 Scope & Impact
+\f0\b0 \cf2 \
+   \cf4 * 
+\f1\b \cf5 src/economy/market.rs
+\f0\b0 \cf4 : Shift from instantaneous Walrasian pricing to an Exponentially Weighted Moving Average\cf2 \
+     \cf4 (EWMA) for price, supply, and demand.\cf2 \
+   \cf4 * 
+\f1\b \cf5 src/simulation/jobs.rs
+\f0\b0 \cf4 : \cf2 \
+       \cf4 * Add \cf5 reward\cf4  (wage) and \cf5 employer\cf4  to \cf5 JobPosting\cf4 .\cf2 \
+       \cf4 * Rewrite \cf5 job_claim_system\cf4  to use the Utility AI equation.\cf2 \
+   \cf4 * 
+\f1\b \cf5 src/economy/agent.rs
+\f0\b0 \cf4 : Enhance \cf5 EconomicAgent\cf4  to support escrow (holding funds while a contract is active) and\cf2 \
+     \cf4 direct agent-to-agent transfers.\cf2 \
+   \cf4 * 
+\f1\b \cf5 src/simulation/goals.rs\cf4  & \cf5 person.rs
+\f0\b0 \cf4 : Allow individual agents to evaluate their personal needs and post\cf2 \
+     \cf4 contracts to the \cf5 JobBoard\cf4  if they have excess wealth but lack time/skill.\cf2 \
+\
+  
+\f1\b \cf3 Proposed Solution & Implementation Steps
+\f0\b0 \cf2 \
+\
+  
+\f1\b \cf4 Phase 1: Advanced Market Tracking (The Ledger)
+\f0\b0 \cf2 \
+   \cf4 1. 
+\f1\b Market History Resource
+\f0\b0 : Create a \cf5 MarketHistory\cf4  resource that records daily production volume, consumption\cf2 \
+      \cf4 volume, and average clearing prices for all \cf5 Good\cf4  types.\cf2 \
+   \cf4 2. 
+\f1\b EWMA Forecasting
+\f0\b0 : Update the \cf5 SimulationSet::Economy\cf4  to calculate a moving average of these metrics. This\cf2 \
+      \cf4 prevents hyper-volatility (e.g., a massive price crash just because one tree was chopped) and gives agents\cf2 \
+      \cf4 reliable data to calculate expected future value.\cf2 \
+   \cf4 3. 
+\f1\b Cost of Goods Sold (COGS)
+\f0\b0 : Base item valuations on the historical cost of the raw materials plus the expected\cf2 \
+      \cf4 labor time.\cf2 \
+\
+  
+\f1\b \cf4 Phase 2: The Contract Job Board
+\f0\b0 \cf2 \
+   \cf4 1. 
+\f1\b Job Posting Overhaul
+\f0\b0 :\cf2 \
+       \cf4 * Expand \cf5 JobSource\cf4  to include \cf5 Agent(Entity)\cf4 .\cf2 \
+       \cf4 * Add a \cf5 reward: f32\cf4  field to \cf5 JobPosting\cf4 .\cf2 \
+   \cf4 2. 
+\f1\b Financial Escrow
+\f0\b0 : When a \cf5 JobBoardCommand::Post\cf4  is issued by an agent or faction, the \cf5 reward\cf4  amount is\cf2 \
+      \cf4 immediately deducted from the employer's \cf5 EconomicAgent\cf4  component and held in escrow on the \cf5 JobBoard\cf4 .\cf2 \
+   \cf4 3. 
+\f1\b Payout
+\f0\b0 : Modify \cf5 JobCompletedEvent\cf4  handling so the escrowed funds are directly transferred to the claimant(s)\cf2 \
+      \cf4 upon successful completion. If cancelled, funds return to the employer.\cf2 \
+\
+  
+\f1\b \cf4 Phase 3: Utility-Driven Workforce Allocation (Worker AI)
+\f0\b0 \cf2 \
+   \cf4 1. 
+\f1\b The Utility Equation
+\f0\b0 : Rewrite \cf5 job_claim_system\cf4 . Remove the rigid \cf5 bucket_share\cf4  limits. Workers will calculate:\cf2 \
+  \cf4     $$U_\{bid\} = E(R) - (C_\{action\} + C_\{opportunity\})$$\cf2 \
+       \cf4 * 
+\f1\b $E(R)$ (Expected Reward)
+\f0\b0 : The \cf5 reward\cf4  value of the posting, modified by the agent's personal value of money\cf2 \
+         \cf4 (a starving agent values $1 more than a rich agent).\cf2 \
+       \cf4 * 
+\f1\b $C_\{action\}$ (Action Cost)
+\f0\b0 : Time spent walking to the job + stamina/tool degradation costs.\cf2 \
+       \cf4 * 
+\f1\b $C_\{opportunity\}$ (Opportunity Cost)
+\f0\b0 : The value of the agent's 
+\f2\i best alternative
+\f0\i0 . For a master crafter, the\cf2 \
+         \cf4 opportunity cost of hauling wood is massive, so they will only accept hauling if the wage is exorbitant.\cf2 \
+   \cf4 2. 
+\f1\b Claiming
+\f0\b0 : The agent simply iterates through available jobs, scores them using the $U$ equation, and claims\cf2 \
+      \cf4 the job with the highest $U > 0$.\cf2 \
+\
+  
+\f1\b \cf4 Phase 4: Faction Treasury & Wealthy Agents (Employer AI)
+\f0\b0 \cf2 \
+   \cf4 1. 
+\f1\b Faction Behavior
+\f0\b0 : The Chief (representing the Faction Treasury) posts public works (e.g., walls, shared\cf2 \
+      \cf4 farms, emergency food stockpiles) offering wages from the Faction's tax pool.\cf2 \
+   \cf4 2. 
+\f1\b Agent Behavior
+\f0\b0 : High-wealth agents who need a house built or raw materials gathered will post jobs to the\cf2 \
+      \cf4 board, pricing the \cf5 reward\cf4  based on the current market moving average for labor.\cf2 \
+\
+  
+\f1\b \cf3 Verification & Testing
+\f0\b0 \cf2 \
+   \cf4 * 
+\f1\b Escrow Integrity
+\f0\b0 : Verify through unit tests that total currency in the system remains constant when jobs are\cf2 \
+     \cf4 posted, completed, or cancelled (no money created or destroyed).\cf2 \
+   \cf4 * 
+\f1\b Death Spiral Prevention
+\f0\b0 : Ensure the Utility equation properly handles extreme edge cases. If the town is\cf2 \
+     \cf4 starving, the subjective value of food ($E(R)$ for food gathering) must skyrocket asymptotically so agents\cf2 \
+     \cf4 abandon all other tasks to survive.\cf2 \
+   \cf4 * 
+\f1\b Performance
+\f0\b0 : Verify that calculating the Utility equation for all idle workers against all postings does not\cf2 \
+     \cf4 cause a CPU bottleneck in the 20Hz update loop.\cf2 \
+\
+  
+\f1\b \cf3 Migration & Alternatives Considered
+\f0\b0 \cf2 \
+   \cf4 * 
+\f2\i Alternative:
+\f0\i0  A true "Bidding" system (workers submit bids, employers choose the cheapest). 
+\f2\i Rejected
+\f0\i0  because\cf2 \
+     \cf4 multi-step asynchronous negotiation in an ECS game loop creates excessive state-machine complexity and\cf2 \
+     \cf4 performance overhead. The "Posted Price" (Utility AI claims) achieves the exact same macroeconomic result\cf2 \
+     \cf4 instantaneously.\
+}

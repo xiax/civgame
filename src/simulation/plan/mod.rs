@@ -1757,6 +1757,7 @@ type OptionalQuery<'a> = (
     Option<&'a mut PlanHistory>,
     Option<&'a crate::simulation::jobs::ClaimTarget>,
     Option<&'a crate::simulation::items::Equipment>,
+    Option<&'a crate::simulation::knowledge::PersonKnowledge>,
 );
 
 /// Aborts an `ExploreFor*` plan as soon as the agent has memory of the
@@ -1869,6 +1870,7 @@ pub fn plan_execution_system(
                 mut plan_history_opt,
                 claim_target_opt,
                 equipment_opt,
+                knowledge_opt,
             ),
         )| {
             if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -1951,11 +1953,14 @@ pub fn plan_execution_system(
                     .iter()
                     .filter(|p| p.serves_goals.contains(&goal) && known_plans.knows(p.id))
                     .filter(|p| {
+                        // Per-person tech gate: a worker can only execute a
+                        // plan whose tech they have personally Learned. The
+                        // chief's awareness drives faction-level direction
+                        // (recipes, postings, building choices); execution is
+                        // gated on individual mastery.
                         p.tech_gate.map_or(true, |tid| {
-                            faction_registry
-                                .factions
-                                .get(&member.faction_id)
-                                .map(|f| f.techs.has(tid))
+                            knowledge_opt
+                                .map(|k| k.has_learned(tid))
                                 .unwrap_or(false)
                         })
                     })
@@ -2539,23 +2544,45 @@ pub fn plan_execution_system(
 
 pub fn plan_gossip_system(
     spatial: Res<SpatialIndex>,
-    mut query: Query<(Entity, &AgentGoal, &Transform, &mut KnownPlans, &LodLevel)>,
+    mut query: Query<(
+        Entity,
+        &AgentGoal,
+        &Transform,
+        &mut KnownPlans,
+        &LodLevel,
+        Option<&mut crate::simulation::knowledge::PersonKnowledge>,
+    )>,
 ) {
-    // Pass 1: snapshot known plans from Socialize agents
-    let snapshots: AHashMap<Entity, Vec<(PlanId, u8)>> = query
+    // Pass 1: snapshot known plans + tech awareness from Socialize agents
+    struct GossipSnapshot {
+        plans: Vec<(PlanId, u8)>,
+        aware: u64,
+    }
+    let snapshots: AHashMap<Entity, GossipSnapshot> = query
         .iter()
-        .filter(|(_, goal, _, _, lod)| {
+        .filter(|(_, goal, _, _, lod, _)| {
             matches!(goal, AgentGoal::Socialize) && **lod != LodLevel::Dormant
         })
-        .map(|(e, _, _, plans, _)| (e, plans.top_entries(8)))
+        .map(|(e, _, _, plans, _, knowledge)| {
+            let aware = knowledge.map_or(0u64, |k| k.aware | k.learned);
+            (
+                e,
+                GossipSnapshot {
+                    plans: plans.top_entries(8),
+                    aware,
+                },
+            )
+        })
         .collect();
 
     if snapshots.is_empty() {
         return;
     }
 
-    // Pass 2: apply gossip to Socialize agents within 3 tiles
-    for (entity, goal, transform, mut known_plans, lod) in query.iter_mut() {
+    // Pass 2: apply gossip to Socialize agents within 3 tiles. Tech awareness
+    // is free (single bit) and propagates only between socializing agents —
+    // mastery (Learned) only spreads via the explicit Teach plan.
+    for (entity, goal, transform, mut known_plans, lod, mut knowledge_opt) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !matches!(goal, AgentGoal::Socialize) {
             continue;
         }
@@ -2563,18 +2590,25 @@ pub fn plan_gossip_system(
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
 
+        let mut aware_received: u64 = 0;
         for dy in -3i32..=3 {
             for dx in -3i32..=3 {
                 for &other in spatial.get(tx + dx, ty + dy) {
                     if other == entity {
                         continue;
                     }
-                    if let Some(entries) = snapshots.get(&other) {
-                        for &(plan_id, freshness) in entries {
+                    if let Some(snap) = snapshots.get(&other) {
+                        for &(plan_id, freshness) in &snap.plans {
                             known_plans.receive_gossip(plan_id, freshness / 2);
                         }
+                        aware_received |= snap.aware;
                     }
                 }
+            }
+        }
+        if aware_received != 0 {
+            if let Some(knowledge) = knowledge_opt.as_mut() {
+                knowledge.merge_awareness(aware_received);
             }
         }
     }

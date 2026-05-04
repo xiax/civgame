@@ -24,6 +24,7 @@ use super::needs::Needs;
 use super::plan::{KnownPlans, PlanHistory, PlanScoringMethod};
 use super::reproduction::BiologicalSex;
 use super::schedule::{BucketSlot, SimClock};
+use super::knowledge::PersonKnowledge;
 use super::skills::Skills;
 use super::stats::Stats;
 use crate::pathfinding::path_request::PathFollow;
@@ -178,6 +179,11 @@ pub struct PersonAI {
     /// `equip_task_system`. The good to equip is carried in
     /// `craft_recipe_id` (same channel WithdrawGood already uses).
     pub equip_slot: u8,
+    /// Tech the agent is currently studying / teaching / lecturing about.
+    /// Set when a knowledge-system task starts (Read/Teach/HoldLecture/
+    /// AttendLecture); consumed by the matching task executor in
+    /// `teaching.rs`. `None` for every non-knowledge task.
+    pub tech_focus: Option<crate::simulation::technology::TechId>,
 }
 
 impl PersonAI {
@@ -206,6 +212,7 @@ impl Default for PersonAI {
             reserved_qty: 0,
             carried_corpse: None,
             equip_slot: crate::simulation::items::EQUIP_SLOT_NONE,
+            tech_focus: None,
         }
     }
 }
@@ -235,6 +242,19 @@ pub enum PlayerOrderKind {
     AttackEntity(Entity),
     /// Pick up a specific fresh `Corpse` entity.
     PickUpCorpse(Entity),
+    /// Player-directed 1-on-1 teaching: the selected agent walks to the target
+    /// person and tutors them on the highest-complexity tech the student
+    /// doesn't know yet.
+    Teach(Entity),
+    /// Player-directed lecture: the selected agent broadcasts the chosen tech
+    /// to nearby same-faction adults for `LECTURE_DURATION` ticks.
+    HoldLecture(crate::simulation::technology::TechId),
+    /// Player-directed self-study: the selected agent reads a tablet/book in
+    /// their inventory whose `tech_payload` carries the chosen TechId.
+    ReadItem(crate::simulation::technology::TechId),
+    /// Player-directed craft of a tablet encoding a specific tech. Posted to
+    /// the player faction's nearest Workbench, bypassing the chief.
+    EncodeTablet(crate::simulation::technology::TechId),
 }
 
 impl PlayerOrderKind {
@@ -269,6 +289,10 @@ impl PlayerOrderKind {
             PlayerOrderKind::PickUpItem(_) => "Pick up item",
             PlayerOrderKind::AttackEntity(_) => "Attack",
             PlayerOrderKind::PickUpCorpse(_) => "Pick up corpse",
+            PlayerOrderKind::Teach(_) => "Teach",
+            PlayerOrderKind::HoldLecture(_) => "Hold Lecture",
+            PlayerOrderKind::ReadItem(_) => "Read",
+            PlayerOrderKind::EncodeTablet(_) => "Encode Tablet",
         }
     }
 }
@@ -493,6 +517,7 @@ pub fn spawn_population(
                     crate::simulation::reproduction::CoSleepTracker::default(),
                     crate::simulation::reproduction::MaleConceptionCooldown::default(),
                     Indexed::new(IndexedKind::Person),
+                    PersonKnowledge::paleolithic_seed(clock.tick as u32),
                 ),
             ));
 

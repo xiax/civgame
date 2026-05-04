@@ -194,6 +194,7 @@ pub fn combat_system(
     mut faction_registry: ResMut<FactionRegistry>,
     clock: Res<SimClock>,
     mut combat_events: EventWriter<CombatEvent>,
+    mut discovery_events: EventWriter<crate::simulation::knowledge::DiscoveryActionEvent>,
 ) {
     let dt = time.delta_secs();
 
@@ -203,6 +204,8 @@ pub fn combat_system(
     let mut body_damage_events: Vec<(Entity, Entity, BodyPart, u8)> = Vec::new();
     // (faction_id) — attackers whose faction logs a combat event this frame
     let mut combat_activity_factions: Vec<u32> = Vec::new();
+    // (attacker) — emitted as per-attacker DiscoveryActionEvent at end of system
+    let mut combat_activity_attackers: Vec<Entity> = Vec::new();
 
     for (
         attacker,
@@ -343,6 +346,7 @@ pub fn combat_system(
                     combat_activity_factions.push(fm.faction_id);
                 }
             }
+            combat_activity_attackers.push(attacker);
 
             // Apply cooldown
             if let Some(ref mut cd) = cd {
@@ -451,6 +455,13 @@ pub fn combat_system(
         if let Some(fd) = faction_registry.factions.get_mut(&faction_id) {
             fd.activity_log.increment(ActivityKind::Combat);
         }
+    }
+    // Per-attacker discovery rolls (knowledge-system).
+    for attacker in combat_activity_attackers {
+        discovery_events.send(crate::simulation::knowledge::DiscoveryActionEvent {
+            actor: attacker,
+            activity: ActivityKind::Combat,
+        });
     }
 }
 
