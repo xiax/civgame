@@ -12,6 +12,7 @@ use crate::simulation::person::{AiState, Drafted, PersonAI, Profession};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
+use crate::simulation::typed_task::{Task, WalkReason};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::TILE_SIZE;
 
@@ -54,6 +55,7 @@ pub fn military_task_system(
         (
             Entity,
             &mut PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
             &Transform,
             &mut CombatTarget,
             &LodLevel,
@@ -66,7 +68,7 @@ pub fn military_task_system(
     let move_id = TaskKind::MilitaryMove as u16;
     let attack_id = TaskKind::MilitaryAttack as u16;
 
-    for (_entity, mut ai, transform, mut combat, lod) in q.iter_mut() {
+    for (_entity, mut ai, mut aq, transform, mut combat, lod) in q.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -74,21 +76,38 @@ pub fn military_task_system(
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
 
         if ai.task_id == move_id {
+            // Phase 3a: dest/z come from the typed `Task::WalkTo` variant.
+            // The legacy `dest_tile`/`target_z` fields are still written by
+            // `assign_task_with_routing` because `movement_system` reads them,
+            // but the *task semantics* live on the typed task now.
+            let Some((dest, target_z, _why)) = aq
+                .current
+                .as_walk_to()
+                .filter(|(_, _, why)| *why == WalkReason::MilitaryMove)
+            else {
+                // Inconsistent state: task_id says MilitaryMove but the typed
+                // task variant disagrees. Drop back to idle so the agent
+                // doesn't loop.
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.state = AiState::Idle;
+                ai.target_entity = None;
+                continue;
+            };
+
             // Refresh rally-point timestamp so the expire system keeps the
             // flow field around while units are still en route.
             rally
                 .last_seen
-                .insert((ai.dest_tile.0, ai.dest_tile.1, ai.target_z), clock.tick);
+                .insert((dest.0, dest.1, target_z), clock.tick);
 
             // Arrival: movement_system flips state to Working when the agent
             // steps onto the dest tile. For a Move order there is no work to
             // do, so we go straight back to Idle.
-            if ai.state == AiState::Working
-                && (cur_tx, cur_ty) == (ai.dest_tile.0 as i32, ai.dest_tile.1 as i32)
-            {
+            if ai.state == AiState::Working && (cur_tx, cur_ty) == (dest.0, dest.1) {
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
+                aq.advance();
             }
             continue;
         }
@@ -176,6 +195,7 @@ pub fn apply_muster_hunters_system(
         &Profession,
         &FactionMember,
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         Option<&ActivePlan>,
     )>,
 ) {
@@ -183,22 +203,29 @@ pub fn apply_muster_hunters_system(
         return;
     }
     request.pending = false;
-    for (entity, prof, member, mut ai, plan_opt) in hunters.iter_mut() {
+    for (entity, prof, member, mut ai, mut aq, plan_opt) in hunters.iter_mut() {
         if *prof != Profession::Hunter || member.faction_id != player_faction.faction_id {
             continue;
         }
         if ai.reserved_good.is_some() {
             release_reservation(&reservations, &mut ai);
         }
-        ai.carried_corpse = None;
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
         ai.target_entity = None;
         ai.work_progress = 0;
+        // Phase 4b-ii: muster is an external preempt (player drops every
+        // in-flight hunter plan to draft them). Use `cancel()` so any
+        // prefetched tasks queued behind `current` are dropped along with the
+        // plan, not promoted into `current` next tick.
+        aq.cancel();
         if plan_opt.is_some() {
             commands.entity(entity).remove::<ActivePlan>();
         }
-        commands.entity(entity).insert(Drafted);
+        commands
+            .entity(entity)
+            .remove::<crate::simulation::corpse::Carrying>()
+            .insert(Drafted);
     }
 }
 

@@ -879,7 +879,7 @@ fn build_astar_diagnostic(
     let plan_label = plans
         .0
         .iter()
-        .find(|p| p.id == plan_id)
+        .find(|p| p.id.raw() == plan_id)
         .map(|p| p.name)
         .unwrap_or("?");
     let _ = writeln!(out, "A* Unreachable");

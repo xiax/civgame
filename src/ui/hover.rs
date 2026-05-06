@@ -10,7 +10,7 @@ use crate::simulation::combat::{Body, Health};
 use crate::simulation::construction::{
     recipe_for, AutonomousBuildingToggle, Blueprint, BlueprintMap,
 };
-use crate::simulation::crafting::{CraftOrder, CraftOrderMap, CRAFT_RECIPES};
+use crate::simulation::crafting::{craft_recipes, CraftOrder, CraftOrderMap};
 
 #[derive(SystemParam)]
 pub struct SitesHoverParams<'w, 's> {
@@ -135,7 +135,7 @@ pub fn hover_info_system(
                             ui.label("Inventory:");
                             for (item, qty) in agent.inventory {
                                 if qty > 0 {
-                                    ui.label(format!("  - {:?} x{}", item.good, qty));
+                                    ui.label(format!("  - {:?} x{}", item.good(), qty));
                                 }
                             }
                         });
@@ -152,7 +152,7 @@ pub fn hover_info_system(
                     } else if let Ok(plant) = plant_query.get(entity) {
                         ui.label(format!("Plant: {:?} ({:?})", plant.kind, plant.stage));
                     } else if let Ok(item) = item_query.get(entity) {
-                        ui.label(format!("Item: {:?} x{}", item.item.good, item.qty));
+                        ui.label(format!("Item: {:?} x{}", item.item.good(), item.qty));
                     } else {
                         ui.label(format!("Entity: {:?}", entity));
                     }
@@ -296,11 +296,11 @@ pub fn hover_info_system(
             if let Some(&co_entity) = sites.co_map.0.get(&co_key) {
                 if let Ok(order) = sites.co_query.get(co_entity) {
                     ui.separator();
-                    let recipe_name = CRAFT_RECIPES
+                    let recipe_name = craft_recipes()
                         .get(order.recipe_id as usize)
                         .map(|r| r.name)
                         .unwrap_or("?");
-                    let work_ticks = CRAFT_RECIPES
+                    let work_ticks = craft_recipes()
                         .get(order.recipe_id as usize)
                         .map(|r| r.work_ticks)
                         .unwrap_or(0);

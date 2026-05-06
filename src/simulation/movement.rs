@@ -184,15 +184,12 @@ pub fn movement_system(
             // target_tile can be updated mid-flight (Routing→Seeking, stranded
             // recovery, dispatch fall-throughs) without target_z being kept in
             // sync, leaving goal3 pointing into mid-air. A* would burn budget
-            // failing every retry until cooldown. Idempotent when valid; skip
-            // for Craft, which overloads target_z as a recipe id.
-            if ai.task_id != TaskKind::Craft as u16
-                && !chunk_map.passable_at(
-                    ai.target_tile.0 as i32,
-                    ai.target_tile.1 as i32,
-                    ai.target_z as i32,
-                )
-            {
+            // failing every retry until cooldown. Idempotent when valid.
+            if !chunk_map.passable_at(
+                ai.target_tile.0 as i32,
+                ai.target_tile.1 as i32,
+                ai.target_z as i32,
+            ) {
                 ai.target_z = chunk_map.nearest_standable_z(
                     ai.target_tile.0 as i32,
                     ai.target_tile.1 as i32,
@@ -671,13 +668,11 @@ pub fn movement_system(
                 // adjacent-tile claim logic runs next tick.
                 ai.state = AiState::Seeking;
                 ai.target_tile = ai.dest_tile;
-                if ai.task_id != TaskKind::Craft as u16 {
-                    ai.target_z = chunk_map.nearest_standable_z(
-                        ai.target_tile.0 as i32,
-                        ai.target_tile.1 as i32,
-                        ai.current_z as i32,
-                    ) as i8;
-                }
+                ai.target_z = chunk_map.nearest_standable_z(
+                    ai.target_tile.0 as i32,
+                    ai.target_tile.1 as i32,
+                    ai.current_z as i32,
+                ) as i8;
             }
         }
     }

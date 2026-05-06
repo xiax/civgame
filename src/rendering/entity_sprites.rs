@@ -8,7 +8,7 @@ use crate::simulation::construction::{
 use crate::simulation::faction::{
     FactionCenter, FactionMember, PlayerFaction, PlayerFactionMarker,
 };
-use crate::economy::goods::Good;
+use crate::economy::resource_catalog::ResourceCatalog;
 use crate::simulation::items::{Equipment, EquipmentSlot, GroundItem};
 use crate::simulation::person::{HairColor, Person, PersonAI, SkinTone};
 use crate::simulation::plants::{GrowthStage, Plant, PlantKind};
@@ -376,32 +376,12 @@ pub fn spawn_ground_item_sprites(
     mut commands: Commands,
     query: Query<(Entity, &GroundItem), Without<GroundItemVisual>>,
     sprite_lib: Res<SpriteLibrary>,
+    catalog: Res<ResourceCatalog>,
 ) {
     for (entity, gi) in query.iter() {
-        let key = match gi.item.good {
-            Good::Stone   => "resource_loose_rock",
-            Good::Wood    => "resource_wood_log",
-            Good::Fruit   => "resource_berries",
-            Good::Meat    => "resource_meat",
-            Good::Grain   => "resource_wheat",
-            Good::GrainSeed => "resource_wheat",
-            Good::BerrySeed => "resource_berries",
-            Good::Coal    => "resource_iron_ore",
-            Good::Iron    => "resource_iron_ore",
-            Good::Copper  => "resource_iron_ore",
-            Good::Tin     => "resource_iron_ore",
-            Good::Gold    => "resource_gold_ore",
-            Good::Silver  => "resource_gold_ore",
-            Good::Weapon  => "item_spear",
-            Good::Tools   => "item_hammer",
-            Good::Shield  => "item_shield",
-            Good::Armor   => "item_leather_armor",
-            Good::Cloth   => "item_cloth",
-            Good::Skin    => "item_leather_armor",
-            Good::Luxury  => "resource_gem",
-            Good::ClayTablet => "resource_loose_rock",
-            Good::Book    => "item_cloth",
-        };
+        let id = gi.item.resource_id;
+        let Some(def) = catalog.get(id) else { continue };
+        let Some(key) = def.sprite_key.as_deref() else { continue };
         let Some(img) = sprite_lib.get(key).cloned() else {
             continue;
         };

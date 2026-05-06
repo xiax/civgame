@@ -8,8 +8,10 @@
 //! wield) go to inventory. Tasks like construct/craft/dig require free hand(s); see
 //! `tasks::task_requires_free_hands`.
 
+use crate::economy::core_ids::resource_id_to_good;
 use crate::economy::goods::Bulk;
 use crate::economy::item::Item;
+use crate::economy::resource_catalog::ResourceId;
 use bevy::prelude::*;
 
 /// Per-hand load ceiling, in grams. Two hands → up to ~50 kg combined.
@@ -87,12 +89,12 @@ impl Carrier {
     pub fn quantity_of_good(&self, good: crate::economy::goods::Good) -> u32 {
         let mut q = 0u32;
         if let Some(s) = self.left {
-            if s.item.good == good {
+            if s.item.good() == good {
                 q = q.saturating_add(s.qty);
             }
         }
         if let Some(s) = self.right {
-            if s.item.good == good {
+            if s.item.good() == good {
                 q = q.saturating_add(s.qty);
             }
         }
@@ -134,7 +136,7 @@ impl Carrier {
             return 0;
         }
         let unit_w = item.unit_weight_g().max(1);
-        let bulk = item.good.bulk();
+        let bulk = item.good().bulk();
 
         match bulk {
             Bulk::TwoHand => {
@@ -225,12 +227,26 @@ impl Carrier {
         }
     }
 
+    /// Phase 2b migration accessor: pickup capacity for a commodity
+    /// `id`. Reverse-resolves to `Item::new_commodity(good)` and
+    /// delegates to `pickup_capacity`. Returns 0 for resources outside
+    /// the legacy `Good` enum (impossible until Phase 2c adds non-legacy
+    /// resources). Manufactured items must still go through
+    /// `pickup_capacity(item)` because material multipliers nudge the
+    /// per-unit weight.
+    pub fn pickup_capacity_resource(&self, id: ResourceId) -> u32 {
+        match resource_id_to_good(id) {
+            Some(good) => self.pickup_capacity(Item::new_commodity(good)),
+            None => 0,
+        }
+    }
+
     /// Read-only mirror of `try_pick_up`: how many units of `item` would be
     /// accepted into hands right now (without mutating). Used by withdraw /
     /// haul resolvers to size a commit before they dispatch.
     pub fn pickup_capacity(&self, item: Item) -> u32 {
         let unit_w = item.unit_weight_g().max(1);
-        match item.good.bulk() {
+        match item.good().bulk() {
             Bulk::TwoHand => {
                 if self.left.is_some() || self.right.is_some() {
                     return 0;
@@ -330,7 +346,7 @@ impl Carrier {
                 break;
             }
             if let Some(stack) = slot.as_mut() {
-                if stack.item.good == good {
+                if stack.item.good() == good {
                     let take = stack.qty.min(want);
                     stack.qty -= take;
                     removed += take;
@@ -393,7 +409,7 @@ pub fn drop_carrier_to_ground(
             item_query,
             tx,
             ty,
-            stack.item.good,
+            stack.item.good(),
             stack.qty,
         );
     }
@@ -519,7 +535,7 @@ pub fn enforce_hand_state_system(
                         &mut item_query,
                         tx,
                         ty,
-                        stack.item.good,
+                        stack.item.good(),
                         stack.qty,
                     );
                 } else {
@@ -688,6 +704,6 @@ mod tests {
         let _ = c.try_pick_up(Item::new_commodity(Good::Coal), 3); // ~10 kg per hand
         let _ = c.try_pick_up(Item::new_commodity(Good::Skin), 3); // ~4.5 kg per hand
         let dropped = c.drop_one_hand().expect("should drop something");
-        assert_eq!(dropped.item.good, Good::Coal);
+        assert_eq!(dropped.item.good(), Good::Coal);
     }
 }

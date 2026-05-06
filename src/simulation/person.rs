@@ -21,7 +21,7 @@ use super::memory::{AgentMemory, RelationshipMemory};
 use super::mood::Mood;
 use super::movement::MovementState;
 use super::needs::Needs;
-use super::plan::{KnownPlans, PlanHistory, PlanScoringMethod};
+use super::plan::{KnownPlans, PlanHistory, PlanId, PlanScoringMethod};
 use super::reproduction::BiologicalSex;
 use super::schedule::{BucketSlot, SimClock};
 use super::knowledge::PersonKnowledge;
@@ -145,18 +145,6 @@ pub struct PersonAI {
     /// Destination foot Z when routed across Z slices (e.g. from a
     /// PlayerOrder targeting underground). Equal to current_z by default.
     pub target_z: i8,
-    /// Recipe index for active Craft tasks. Written by `plan.rs` on
-    /// dispatch, read by `crafting.rs`. Unrelated to target_z.
-    pub craft_recipe_id: u8,
-    /// Material the agent has committed to withdraw on the next
-    /// `TaskKind::WithdrawMaterial` step. Written by the step resolver at
-    /// dispatch time, consumed (and cleared) by `withdraw_material_task_system`.
-    /// `None` means no targeted withdrawal is active.
-    pub withdraw_good: Option<crate::economy::goods::Good>,
-    /// Upper bound on units to take when fulfilling `withdraw_good`. Bounded
-    /// by carrier capacity at execution time, so a value larger than the hands
-    /// can hold is harmless.
-    pub withdraw_qty: u8,
     /// Tile against which the current `StorageReservations` entry is held.
     /// Tracked separately from `dest_tile` so we can release the reservation
     /// even after the agent has been retargeted.
@@ -168,22 +156,6 @@ pub struct PersonAI {
     /// units when the task ends (success, abort, or plan teardown), so the
     /// fields must be kept in sync with the actual `StorageReservations` map.
     pub reserved_qty: u8,
-    /// Corpse the agent is currently dragging. Treated as occupying both
-    /// hands by `Carrier::pickup_capacity`. Set by `pickup_corpse_task_system`,
-    /// cleared by Butcher / drop-on-rescue / corpse-despawn paths. Drives
-    /// `corpse_follow_system` which snaps the corpse `Transform` to the agent.
-    pub carried_corpse: Option<Entity>,
-    /// Equipment slot for an active `TaskKind::Equip` step, encoded as
-    /// `EquipmentSlot as u8`. `EQUIP_SLOT_NONE` (0xFF) means no equip is
-    /// pending. Set by `plan_execution_system` on dispatch and consumed by
-    /// `equip_task_system`. The good to equip is carried in
-    /// `craft_recipe_id` (same channel WithdrawGood already uses).
-    pub equip_slot: u8,
-    /// Tech the agent is currently studying / teaching / lecturing about.
-    /// Set when a knowledge-system task starts (Read/Teach/HoldLecture/
-    /// AttendLecture); consumed by the matching task executor in
-    /// `teaching.rs`. `None` for every non-knowledge task.
-    pub tech_focus: Option<crate::simulation::technology::TechId>,
 }
 
 impl PersonAI {
@@ -204,15 +176,9 @@ impl Default for PersonAI {
             target_entity: None,
             current_z: 0,
             target_z: 0,
-            craft_recipe_id: 0,
-            withdraw_good: None,
-            withdraw_qty: 0,
             reserved_tile: (0, 0),
             reserved_good: None,
             reserved_qty: 0,
-            carried_corpse: None,
-            equip_slot: crate::simulation::items::EQUIP_SLOT_NONE,
-            tech_focus: None,
         }
     }
 }
@@ -506,9 +472,36 @@ pub fn spawn_population(
                     AgentMemory::default(),
                     RelationshipMemory::default(),
                     KnownPlans::with_innate(&[
-    0, 1, 2, 3, 5, 6, 7, 9, 10, 13, 14, 15, 16, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35,
-    36, 37, 38, 39, 60, 61, 62, 63, 64, 65,
-]),
+                        PlanId::FORAGE_FOOD,
+                        PlanId::FARM_FOOD,
+                        // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
+                        PlanId::HUNT_FOOD,
+                        PlanId::SCAVENGE_FOOD,
+                        PlanId::BUILD_BLUEPRINT,
+                        PlanId::TAME_HORSE,
+                        PlanId::DELIVER_HIDE_TO_CRAFT_ORDER,
+                        PlanId::DELIVER_GRAIN_TO_CRAFT_ORDER,
+                        PlanId::DELIVER_FROM_STORAGE_TO_CRAFT_ORDER,
+                        PlanId::WORK_ON_CRAFT,
+                        PlanId::RESCUE_ALLY,
+                        PlanId::RETURN_SURPLUS_FOOD,
+                        PlanId::PLAY_SOCIAL,
+                        PlanId::PLAY_SOLO,
+                        PlanId::HAUL_FROM_STORAGE_AND_BUILD,
+                        PlanId::PLAY_BY_PLANTING,
+                        PlanId::PLAY_BY_THROWING_ROCKS,
+                        PlanId::PLAY_WITH_STORED_TOY,
+                        PlanId::CLAIMED_BUILD,
+                        PlanId::EXPLORE_FOR_FOOD,
+                        // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
+                        // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
+                        PlanId::SOCIALIZE,
+                        PlanId::RAID,
+                        PlanId::DEFEND,
+                        PlanId::LEAD,
+                        PlanId::ACQUIRE_HUNTING_SPEAR,
+                        PlanId::SCOUT_FOR_PREY,
+                    ]),
                     PlanHistory::default(),
                     PlanScoringMethod::Weighted,
                     Name::new(generate_person_name(sex)),
@@ -518,6 +511,7 @@ pub fn spawn_population(
                     crate::simulation::reproduction::MaleConceptionCooldown::default(),
                     Indexed::new(IndexedKind::Person),
                     PersonKnowledge::paleolithic_seed(clock.tick as u32),
+                    crate::simulation::typed_task::ActionQueue::idle(),
                 ),
             ));
 

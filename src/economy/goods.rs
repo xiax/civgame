@@ -11,6 +11,20 @@ pub enum Bulk {
     TwoHand,
 }
 
+impl Bulk {
+    /// Catalog-driven bulk lookup. Phase 2b migration accessor — Phase
+    /// 2c will replace `Good::bulk()` call sites with this. Returns
+    /// `None` only when the resource is unknown to the catalog (which
+    /// indicates a programming error: the catalog must define every
+    /// resource referenced by simulation code).
+    pub fn for_resource(
+        id: super::resource_catalog::ResourceId,
+        catalog: &super::resource_catalog::ResourceCatalog,
+    ) -> Option<Bulk> {
+        catalog.get(id).map(|d| d.bulk.as_bulk())
+    }
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Good {
@@ -102,95 +116,72 @@ impl Good {
         }
     }
 
+    /// True if this good can be eaten. Phase 2c: sources from the
+    /// catalog (`edible_calories.is_some()`) rather than a hardcoded
+    /// match. Adding a new edible resource = set `edible_calories` in
+    /// the RON file; no Rust edit required.
     pub fn is_edible(self) -> bool {
-        matches!(self, Good::Fruit | Good::Meat | Good::Grain)
+        let id = super::core_ids::good_to_resource_id(self);
+        super::core_ids::catalog()
+            .get(id)
+            .and_then(|d| d.edible_calories)
+            .is_some()
     }
 
-    /// True if this good is a planting seed. Kept in sync with
-    /// `PlantKind::seed_good()` — the simulation-side table is the source of
-    /// truth for what plant grows from each seed; this match arm is the
-    /// inverse used by routing logic that doesn't want to pull `PlantKind`
-    /// into the economy module.
+    /// True if this good is a planting seed. Phase 2c: sources from
+    /// the catalog (`class == Seed`).
     pub fn is_seed(self) -> bool {
-        matches!(self, Good::GrainSeed | Good::BerrySeed)
+        let id = super::core_ids::good_to_resource_id(self);
+        matches!(
+            super::core_ids::catalog().get(id).map(|d| d.class),
+            Some(super::resource_catalog::ResourceClass::Seed)
+        )
     }
 
+    /// Calories restored per unit when eaten. Phase 2c: sources from the
+    /// catalog (`edible_calories`); `None`/inedible → 0. Truncates from
+    /// `u16` to `u8` since the legacy contract was `u8` — values past
+    /// 255 cap rather than wrap.
     pub fn nutrition(self) -> u8 {
-        match self {
-            Good::Fruit => 85,
-            Good::Grain => 150,
-            Good::Meat => 255,
-            _ => 0,
-        }
+        let id = super::core_ids::good_to_resource_id(self);
+        super::core_ids::catalog()
+            .get(id)
+            .and_then(|d| d.edible_calories)
+            .map(|c| c.min(u8::MAX as u16) as u8)
+            .unwrap_or(0)
     }
 
-    /// How fun this good is to play with as a solo distraction. Drives the
-    /// willpower refill rate when an agent runs the PlaySolo plan against an
-    /// item (held or adjacent). 0 = useless to play with; higher is better.
-    /// Social play with another agent uses a fixed value, not this.
+    /// How fun this good is to play with as a solo distraction. Phase
+    /// 2c: sources from the catalog (`entertainment_value`). Drives the
+    /// PlaySolo plan's willpower refill rate.
     pub fn entertainment_value(self) -> u8 {
-        match self {
-            Good::Gold | Good::Silver => 30,
-            Good::Luxury => 50,
-            Good::Cloth | Good::Skin => 20,
-            Good::Tools | Good::Weapon | Good::Shield | Good::Armor => 15,
-            Good::Wood | Good::Stone | Good::Coal | Good::Iron | Good::Copper | Good::Tin => 5,
-            Good::Fruit | Good::Meat | Good::Grain | Good::GrainSeed | Good::BerrySeed => 3,
-            // Books and tablets are studied, not played with — minimal solo
-            // entertainment, they're not toys.
-            Good::ClayTablet | Good::Book => 5,
-        }
+        let id = super::core_ids::good_to_resource_id(self);
+        super::core_ids::catalog()
+            .get(id)
+            .map(|d| d.entertainment_value)
+            .unwrap_or(0)
     }
 
-    /// Weight of one unit of this good in grams.
+    /// Weight of one unit of this good in grams. Phase 2c: sources
+    /// from the catalog (`weight_g`).
     pub fn unit_weight_g(self) -> u32 {
-        match self {
-            Good::GrainSeed | Good::BerrySeed => 20,
-            Good::Luxury => 100,
-            Good::Grain => 200,
-            Good::Fruit => 250,
-            Good::Cloth => 400,
-            Good::Meat => 800,
-            Good::Skin => 900,
-            Good::Tools => 1500,
-            Good::Coal => 2000,
-            Good::Weapon => 2500,
-            Good::Wood => 3000,
-            Good::Shield => 4000,
-            Good::Iron => 4500,
-            Good::Copper => 4500,
-            Good::Tin => 4500,
-            Good::Silver => 5500,
-            Good::Gold => 6000,
-            Good::Stone => 5000,
-            Good::Armor => 8000,
-            Good::ClayTablet => 1500,
-            Good::Book => 600,
-        }
+        let id = super::core_ids::good_to_resource_id(self);
+        super::core_ids::catalog()
+            .get(id)
+            .map(|d| d.weight_g)
+            .unwrap_or(0)
     }
 
-    /// How this good must be held in hands when carried.
+    /// How this good must be held in hands when carried. Phase 2c:
+    /// sources from the catalog (`bulk`). Defaults to `Small` if the
+    /// catalog is missing the entry — should be impossible since every
+    /// `Good` is in `core.ron`.
     pub fn bulk(self) -> Bulk {
-        match self {
-            Good::GrainSeed
-            | Good::BerrySeed
-            | Good::Luxury
-            | Good::Grain
-            | Good::Fruit
-            | Good::Cloth
-            | Good::Tools
-            | Good::Book
-            | Good::Meat => Bulk::Small,
-            Good::Coal
-            | Good::Skin
-            | Good::Weapon
-            | Good::Shield
-            | Good::Armor
-            | Good::Gold
-            | Good::ClayTablet
-            | Good::Silver => Bulk::OneHand,
-            Good::Wood | Good::Stone | Good::Iron | Good::Copper | Good::Tin => Bulk::TwoHand,
-        }
+        let id = super::core_ids::good_to_resource_id(self);
+        super::core_ids::catalog()
+            .get(id)
+            .map(|d| d.bulk.as_bulk())
+            .unwrap_or(Bulk::Small)
     }
 
     pub fn all() -> [Good; GOOD_COUNT] {

@@ -1,4 +1,5 @@
 use super::goods::Good;
+use super::resource_catalog::ResourceId;
 use crate::simulation::technology::TechId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +94,7 @@ impl ArmorStats {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Item {
-    pub good: Good,
+    pub resource_id: ResourceId,
     pub material: Option<ItemMaterial>,
     pub quality: Option<ItemQuality>,
     pub display_name: Option<&'static str>,
@@ -108,7 +109,7 @@ pub struct Item {
 impl Item {
     pub fn new_commodity(good: Good) -> Self {
         Self {
-            good,
+            resource_id: super::core_ids::good_to_resource_id(good),
             material: None,
             quality: None,
             display_name: None,
@@ -121,7 +122,7 @@ impl Item {
     pub fn new_manufactured(good: Good, material: ItemMaterial, quality: ItemQuality) -> Self {
         let (weapon_stats, armor_stats) = compute_combat_stats(good, material, quality);
         Self {
-            good,
+            resource_id: super::core_ids::good_to_resource_id(good),
             material: Some(material),
             quality: Some(quality),
             display_name: None,
@@ -129,6 +130,16 @@ impl Item {
             armor_stats,
             tech_payload: None,
         }
+    }
+
+    /// Migration accessor: project the catalog id back to the legacy
+    /// `Good` enum. Once the `Good` enum is deleted (Phase 2 residual #7)
+    /// this accessor disappears and call sites compare `ResourceId`s
+    /// directly.
+    #[inline]
+    pub fn good(&self) -> Good {
+        super::core_ids::resource_id_to_good(self.resource_id)
+            .expect("Item carries a non-legacy ResourceId; legacy `Good` accessor cannot answer")
     }
 
     /// Human-readable label for UI display. Uses `display_name` when set
@@ -139,7 +150,7 @@ impl Item {
         let base = if let Some(dn) = self.display_name {
             dn.to_string()
         } else {
-            let mut s = self.good.name().to_string();
+            let mut s = self.good().name().to_string();
             if let Some(mat) = self.material {
                 s = format!("{:?} {}", mat, s);
             }
@@ -164,7 +175,7 @@ impl Item {
 
     /// Weight of one unit, in grams. Material nudges base weight (iron > wood).
     pub fn unit_weight_g(&self) -> u32 {
-        let base = self.good.unit_weight_g() as f32;
+        let base = self.good().unit_weight_g() as f32;
         let mult = self.material.map(|m| m.weight_multiplier()).unwrap_or(1.0);
         (base * mult).round() as u32
     }

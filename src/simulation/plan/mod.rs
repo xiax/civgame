@@ -120,8 +120,163 @@ use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
 use super::technology::TechId;
 
-pub type StepId = u8;
-pub type PlanId = u16;
+/// Typed identifier for a `StepDef`. Stored as a `u8` (no enum-discriminant
+/// gaps) so it stays cheap to compare and serialise. Construct via the
+/// associated `pub const`s (e.g. `StepId::FORAGE_GRASS`) — the bare
+/// `StepId(n)` constructor is public for migration / testing only.
+#[derive(Copy, Clone, Eq, Hash, PartialEq, Debug)]
+pub struct StepId(pub u8);
+
+impl StepId {
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+}
+
+#[allow(non_upper_case_globals, dead_code)]
+impl StepId {
+    pub const FORAGE_GRASS: Self = Self(0);
+    pub const FARM_FARMLAND: Self = Self(1);
+    pub const CHOP_FOREST: Self = Self(2);
+    pub const MINE_STONE: Self = Self(3);
+    pub const PLANT_GRAIN_SEED: Self = Self(4);
+    pub const HUNT: Self = Self(5);
+    pub const COLLECT_FOOD: Self = Self(6);
+    pub const RESERVED_7: Self = Self(7);
+    pub const RESERVED_8: Self = Self(8);
+    pub const EAT: Self = Self(9);
+    pub const WITHDRAW_FOOD: Self = Self(10);
+    pub const TAME_ANIMAL: Self = Self(11);
+    pub const DEPOSIT_GOODS: Self = Self(12);
+    pub const COLLECT_SKIN: Self = Self(13);
+    pub const RESERVED_14: Self = Self(14);
+    pub const RESERVED_15: Self = Self(15);
+    pub const RESERVED_16: Self = Self(16);
+    pub const RESERVED_17: Self = Self(17);
+    pub const RESERVED_18: Self = Self(18);
+    pub const RESERVED_19: Self = Self(19);
+    pub const RESERVED_20: Self = Self(20);
+    pub const RESERVED_21: Self = Self(21);
+    pub const RESERVED_22: Self = Self(22);
+    pub const RESERVED_23: Self = Self(23);
+    pub const RESERVED_24: Self = Self(24);
+    pub const BUILD_ANY_BLUEPRINT: Self = Self(25);
+    pub const RESERVED_26: Self = Self(26);
+    pub const ENGAGE_RESCUE: Self = Self(27);
+    pub const HAUL_TO_BLUEPRINT: Self = Self(28);
+    pub const PLAY_WITH_PARTNER: Self = Self(29);
+    pub const PLAY_WITH_ITEM: Self = Self(30);
+    pub const EXPLORE: Self = Self(31);
+    pub const FETCH_MATERIAL_FROM_STORAGE: Self = Self(32);
+    pub const WITHDRAW_GRAIN_SEED: Self = Self(33);
+    pub const WITHDRAW_STONE: Self = Self(34);
+    pub const WITHDRAW_PLAY_ITEM: Self = Self(35);
+    pub const PLANT_GRAIN_SEED_AS_PLAY: Self = Self(36);
+    pub const THROW_ROCKS_AS_PLAY: Self = Self(37);
+    pub const HAUL_TO_CRAFT_ORDER: Self = Self(38);
+    pub const WORK_ON_CRAFT_ORDER: Self = Self(39);
+    pub const FETCH_CRAFT_ORDER_MATERIAL_FROM_STORAGE: Self = Self(40);
+    pub const WITHDRAW_CLAIMED_HAUL_MATERIAL: Self = Self(41);
+    pub const HAUL_TO_CLAIMED_BLUEPRINT: Self = Self(42);
+    pub const BUILD_CLAIMED_BLUEPRINT: Self = Self(43);
+    pub const COLLECT_WOOD: Self = Self(44);
+    pub const COLLECT_STONE: Self = Self(45);
+    pub const RESERVED_46: Self = Self(46);
+    pub const RESERVED_47: Self = Self(47);
+    pub const SOCIALIZE: Self = Self(48);
+    pub const RAID_TRAVEL: Self = Self(49);
+    pub const DEFEND_CAMP: Self = Self(50);
+    pub const LEAD_AT_CAMP: Self = Self(51);
+    pub const WITHDRAW_HUNTING_SPEAR: Self = Self(52);
+    pub const PICK_UP_CORPSE: Self = Self(53);
+    pub const HAUL_CORPSE: Self = Self(54);
+    pub const BUTCHER: Self = Self(55);
+    pub const EQUIP_WEAPON: Self = Self(56);
+    pub const MUSTER_AT_HEARTH: Self = Self(57);
+    pub const TRAVEL_TO_HUNT_AREA: Self = Self(58);
+    pub const SCOUT_FOR_PREY: Self = Self(59);
+    pub const WITHDRAW_BERRY_SEED: Self = Self(60);
+    pub const PLANT_BERRY_SEED: Self = Self(61);
+    pub const PLANT_BERRY_SEED_AS_PLAY: Self = Self(62);
+}
+
+/// Typed identifier for a `PlanDef`. Same shape as `StepId` — stored as a
+/// `u16` so the IDs can stay sparse (gaps for retired plans), `Copy`/`Hash`
+/// for use in sets and maps, and ergonomically constructible from the
+/// associated `pub const`s. Sentinels for "no plan" stay on the call site
+/// (`PersonAI::UNEMPLOYED == u16::MAX`); a fresh `Option<PlanId>` would be
+/// nicer but is out of scope for the Phase 1 mechanical rename.
+#[derive(Copy, Clone, Eq, Hash, PartialEq, Debug)]
+pub struct PlanId(pub u16);
+
+impl PlanId {
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+}
+
+#[allow(non_upper_case_globals, dead_code)]
+impl PlanId {
+    pub const FORAGE_FOOD: Self = Self(0);
+    pub const FARM_FOOD: Self = Self(1);
+    // GATHER_WOOD (Self(2)) and GATHER_STONE (Self(3)) retired in Phase
+    // 5c-ii-c-ii — the gather → deposit chain is now produced by HTN
+    // `htn_acquire_good_dispatch_system` + `GatherFromKnownMethod`. The plan
+    // IDs themselves are not reused; future plans should pick from the
+    // unused range (>= 70).
+    pub const PLANT_FROM_STORAGE: Self = Self(4);
+    pub const HUNT_FOOD: Self = Self(5);
+    pub const SCAVENGE_FOOD: Self = Self(6);
+    pub const BUILD_BLUEPRINT: Self = Self(7);
+    pub const BUILD_BED: Self = Self(8);
+    // 9: unused — WithdrawAndEat retired in Phase 5b-iii-ii (HTN
+    // `htn_acquire_food_dispatch_system` + `WithdrawFromStorageMethod`).
+    pub const TAME_HORSE: Self = Self(10);
+    // 11, 12: unused
+    pub const DELIVER_HIDE_TO_CRAFT_ORDER: Self = Self(13);
+    pub const DELIVER_GRAIN_TO_CRAFT_ORDER: Self = Self(14);
+    pub const DELIVER_FROM_STORAGE_TO_CRAFT_ORDER: Self = Self(15);
+    pub const WORK_ON_CRAFT: Self = Self(16);
+    // 17–20: unused
+    pub const BUILD_CAMPFIRE: Self = Self(21);
+    // 22: unused
+    pub const RESCUE_ALLY: Self = Self(23);
+    pub const RETURN_SURPLUS_FOOD: Self = Self(24);
+    // Self(25) "EatFromInventory" was retired in Phase 5b-ii — the in-place
+    // eat-with-food-on-hand dispatch now flows through
+    // `htn_eat_dispatch_system` driven by `EatFromInventoryMethod`.
+    pub const PLAY_SOCIAL: Self = Self(26);
+    pub const PLAY_SOLO: Self = Self(27);
+    pub const HAUL_FROM_STORAGE_AND_BUILD: Self = Self(29);
+    pub const PLAY_BY_PLANTING: Self = Self(30);
+    pub const PLAY_BY_THROWING_ROCKS: Self = Self(31);
+    pub const PLAY_WITH_STORED_TOY: Self = Self(32);
+    // Self(33) "ClaimedHaul" was retired in Phase 5c-ii-b — the
+    // claim-driven `WithdrawMaterial → HaulToBlueprint` chain now flows
+    // through `htn_acquire_good_dispatch_system` driven by
+    // `WithdrawAndHaulToBlueprintMethod`.
+    pub const CLAIMED_BUILD: Self = Self(34);
+    pub const EXPLORE_FOR_FOOD: Self = Self(35);
+    // Self(36) "ExploreForWood" and Self(37) "ExploreForStone" were retired in
+    // Phase 5c-ii-d-iv-ii — the random-walk fallback now flows through
+    // `htn_acquire_good_dispatch_system` driven by `ExploreForMaterialMethod`.
+    // PlanId 35 survives but its `serves_goals` was retargeted from
+    // `SURVIVE_AND_GATHER_FOOD_GOALS` to `GATHER_FOOD_GOALS` only — HTN owns
+    // the Survive case via `ExploreForFoodMethod`; the GatherFood case is
+    // still plan-driven (no hunger gate in `htn_acquire_food_dispatch_system`).
+    // Self(38) "ScavengeWood" and Self(39) "ScavengeStone" were retired in
+    // Phase 5c-ii-d-ii-b — the vision-based `[Scavenge, DepositToFactionStorage]`
+    // chain now flows through `htn_acquire_good_dispatch_system` driven by
+    // `ScavengeFromGroundMethod`.
+    pub const SOCIALIZE: Self = Self(60);
+    pub const RAID: Self = Self(61);
+    pub const DEFEND: Self = Self(62);
+    pub const LEAD: Self = Self(63);
+    pub const ACQUIRE_HUNTING_SPEAR: Self = Self(64);
+    pub const SCOUT_FOR_PREY: Self = Self(65);
+    pub const PLANT_BERRY_FROM_STORAGE: Self = Self(66);
+    pub const PLAY_BY_PLANTING_BERRY: Self = Self(67);
+}
 
 /// Bitfield on `PlanDef::flags` describing how the candidate filter and
 /// post-execution hooks should treat a plan, replacing the old per-plan-id
@@ -412,7 +567,7 @@ pub struct StepDef {
     /// When falling back from memory to a plant search (Food memory kind),
     /// restricts which plant kind is targeted. None = any mature plant.
     pub plant_filter: Option<PlantKind>,
-    /// For Craft steps: the recipe ID in CRAFT_RECIPES to execute.
+    /// For Craft steps: the recipe ID in craft_recipes() to execute.
     /// Encoded into ai.target_z at dispatch time.
     pub extra: u8,
 }
@@ -462,7 +617,7 @@ pub fn score_weighted(state: &[f32; STATE_DIM], plan: &PlanDef) -> f32 {
 
 /// ε-greedy plan selection from a slice of (plan_id, score) pairs.
 /// Returns the index into the slice (not the plan_id directly).
-pub fn select_plan_idx(scores: &[(u16, f32)]) -> usize {
+pub fn select_plan_idx(scores: &[(PlanId, f32)]) -> usize {
     if scores.is_empty() {
         return 0;
     }
@@ -489,7 +644,7 @@ pub struct PlanRegistry(pub Vec<PlanDef>);
 /// Maps each agent entity to the plan_id currently running by their most-liked ally.
 /// Written each frame by `rel_influence_system`; consumed by `plan_execution_system`.
 #[derive(Resource, Default)]
-pub struct RelInfluence(pub AHashMap<Entity, u16>);
+pub struct RelInfluence(pub AHashMap<Entity, PlanId>);
 
 /// Emitted by `plan_execution_system` when an agent's `ReturnSurplusFood` plan
 /// times out (storage tile unreachable). `drop_abandoned_food_system` consumes
@@ -785,7 +940,7 @@ fn resolve_withdraw_for_faction_need(
         let mut stock = 0u32;
         for &gi_entity in spatial.get(tx as i32, ty as i32) {
             if let Ok(gi) = item_query.get(gi_entity) {
-                if gi.item.good == good {
+                if gi.item.good() == good {
                     stock = stock.saturating_add(gi.qty);
                 }
             }
@@ -805,10 +960,10 @@ fn resolve_withdraw_for_faction_need(
                 if gi.qty == 0 {
                     continue;
                 }
-                if still_need_by_good[gi.item.good as usize] == 0 {
+                if still_need_by_good[gi.item.good() as usize] == 0 {
                     continue;
                 }
-                if effective_stock(tx, ty, gi.item.good) > 0 {
+                if effective_stock(tx, ty, gi.item.good()) > 0 {
                     has_useful = true;
                     break;
                 }
@@ -844,22 +999,22 @@ fn resolve_withdraw_for_faction_need(
                     if gi.qty == 0 {
                         continue;
                     }
-                    let deficit = still_need_by_good[gi.item.good as usize];
+                    let deficit = still_need_by_good[gi.item.good() as usize];
                     if deficit == 0 {
                         continue;
                     }
-                    let stock = effective_stock(tx, ty, gi.item.good);
+                    let stock = effective_stock(tx, ty, gi.item.good());
                     if stock == 0 {
                         continue;
                     }
                     let take = stock.min(deficit);
-                    let candidate = (gi.item.good, deficit, take);
+                    let candidate = (gi.item.good(), deficit, take);
                     best_pick = Some(match best_pick {
                         None => candidate,
                         Some(prev) => {
                             if deficit > prev.1
                                 || (deficit == prev.1
-                                    && (gi.item.good as u8) < (prev.0 as u8))
+                                    && (gi.item.good() as u8) < (prev.0 as u8))
                             {
                                 candidate
                             } else {
@@ -1207,7 +1362,7 @@ fn resolve_target(
                 let mut has = false;
                 for &gi_entity in spatial.get(tx as i32, ty as i32) {
                     if let Ok(gi) = item_query.get(gi_entity) {
-                        if gi.qty > 0 && gi.item.good == *target_good {
+                        if gi.qty > 0 && gi.item.good() == *target_good {
                             has = true;
                             break;
                         }
@@ -1232,7 +1387,7 @@ fn resolve_target(
                 let mut has = false;
                 for &gi_entity in spatial.get(tx as i32, ty as i32) {
                     if let Ok(gi) = item_query.get(gi_entity) {
-                        if gi.qty > 0 && gi.item.good.entertainment_value() > 0 {
+                        if gi.qty > 0 && gi.item.good().entertainment_value() > 0 {
                             has = true;
                             break;
                         }
@@ -1394,11 +1549,11 @@ fn resolve_target(
             // Already holding something fun? Play in place.
             let held_l = carrier
                 .left
-                .map(|s| s.item.good.entertainment_value())
+                .map(|s| s.item.good().entertainment_value())
                 .unwrap_or(0);
             let held_r = carrier
                 .right
-                .map(|s| s.item.good.entertainment_value())
+                .map(|s| s.item.good().entertainment_value())
                 .unwrap_or(0);
             if held_l > 0 || held_r > 0 {
                 return Some((None, pos.0 as i32, pos.1 as i32));
@@ -1412,7 +1567,7 @@ fn resolve_target(
                     let ty = pos.1 + dy;
                     for &e in spatial.get(tx, ty) {
                         if let Ok(item) = item_query.get(e) {
-                            let v = item.item.good.entertainment_value() as i32;
+                            let v = item.item.good().entertainment_value() as i32;
                             if v == 0 {
                                 continue;
                             }
@@ -1747,6 +1902,11 @@ type AgentQuery<'a> = (
     &'a Profession,
 );
 
+// Phase 4a: `ActionQueue` is mandatory on every Person but lives here as an
+// `Option<&mut>` because `AgentQuery` is already at the 15-tuple limit. The
+// `unwrap_or` fallback never fires in steady state — every spawn site adds
+// `ActionQueue::idle()` — but defending against `None` keeps the executor
+// behaviour-stable if a future caller forgets the bundle.
 type OptionalQuery<'a> = (
     Option<&'a AgentMemory>,
     Option<&'a KnownPlans>,
@@ -1758,6 +1918,7 @@ type OptionalQuery<'a> = (
     Option<&'a crate::simulation::jobs::ClaimTarget>,
     Option<&'a crate::simulation::items::Equipment>,
     Option<&'a crate::simulation::knowledge::PersonKnowledge>,
+    Option<&'a mut crate::simulation::typed_task::ActionQueue>,
 );
 
 /// Aborts an `ExploreFor*` plan as soon as the agent has memory of the
@@ -1871,8 +2032,15 @@ pub fn plan_execution_system(
                 claim_target_opt,
                 equipment_opt,
                 knowledge_opt,
+                action_queue_opt,
             ),
         )| {
+            // Per the OptionalQuery comment, every spawn site adds
+            // `ActionQueue::idle()`. A missing component would be a Phase 4a
+            // bundle-invariant violation; surface it loudly rather than
+            // silently dispatching with stale typed-task state.
+            let mut aq = action_queue_opt
+                .expect("Person entity missing ActionQueue (Phase 4a bundle invariant)");
             if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
                 return;
             }
@@ -1982,14 +2150,14 @@ pub fn plan_execution_system(
                         // is uncoupled from the order so a hunter who picks
                         // up the role mid-day can arm before the next muster.
                         match p.id {
-                            5 => matches!(
+                            PlanId::HUNT_FOOD => matches!(
                                 faction_registry
                                     .factions
                                     .get(&member.faction_id)
                                     .and_then(|f| f.hunt_order.as_ref()),
                                 Some(crate::simulation::faction::HuntOrder::Hunt { .. })
                             ),
-                            65 => matches!(
+                            PlanId::SCOUT_FOR_PREY => matches!(
                                 faction_registry
                                     .factions
                                     .get(&member.faction_id)
@@ -2148,7 +2316,7 @@ pub fn plan_execution_system(
                             vis_ground_food,
                             craft_order_needs_material,
                         );
-                        let mut scores: Vec<(u16, f32)> = candidates
+                        let mut scores: Vec<(PlanId, f32)> = candidates
                             .iter()
                             .map(|p| (p.id, score_weighted(&state, p)))
                             .collect();
@@ -2156,7 +2324,7 @@ pub fn plan_execution_system(
                         let camp_pos = faction_registry.home_tile(member.faction_id);
                         for ((_, score), plan_def) in scores.iter_mut().zip(candidates.iter()) {
                             // Persistence bonus reduces plan-switching jitter.
-                            if plan_def.id == ai.last_plan_id {
+                            if plan_def.id.raw() == ai.last_plan_id {
                                 *score += 0.2;
                             }
 
@@ -2210,7 +2378,7 @@ pub fn plan_execution_system(
 
                         let idx = select_plan_idx(&scores);
                         let selected = candidates[idx];
-                        ai.last_plan_id = selected.id;
+                        ai.last_plan_id = selected.id.raw();
                         selected
                     }
                     PlanScoringMethod::Random => candidates[fastrand::usize(..candidates.len())],
@@ -2261,6 +2429,15 @@ pub fn plan_execution_system(
                 ai.dest_tile = ai.target_tile;
                 ai.target_entity = None;
                 combat_target.0 = None;
+                // Phase 4b-ii lifecycle: a plan abandoned due to goal flip is
+                // an external preempt — drop both the typed `current` and the
+                // prefetched queue so a future HTN dispatcher (or this
+                // system, after re-selection) doesn't see stale task state
+                // from the dropped plan. Without this, e.g. a `Task::Scavenge`
+                // dispatched by the abandoned `ScavengeFood` plan can
+                // outlive its plan and double-enqueue when the next
+                // dispatcher runs.
+                aq.cancel();
                 return;
             }
 
@@ -2290,6 +2467,9 @@ pub fn plan_execution_system(
                 ai.dest_tile = ai.target_tile;
                 ai.target_entity = None;
                 combat_target.0 = None;
+                // Phase 4b-ii lifecycle: timeout is an external invalidation
+                // — drop the typed channel alongside the legacy reset.
+                aq.cancel();
                 return;
             }
 
@@ -2441,23 +2621,120 @@ pub fn plan_execution_system(
                         &chunk_map,
                         &chunk_connectivity,
                     );
-                    if step_def.task == TaskKind::Craft
-                        || step_def.task == TaskKind::WithdrawGood
-                    {
-                        ai.craft_recipe_id = step_def.extra as u8;
+                    // Phase 4b-ii: dispatchers route through `aq.dispatch()`,
+                    // which enqueues the resolved task and immediately
+                    // promotes the head into `current` if `current` was Idle.
+                    // Producers therefore never poke `current` directly —
+                    // the queue is the sole write-path. With nothing else
+                    // pushing into the queue today this is behaviourally
+                    // identical to the old `aq.current = X` direct-write,
+                    // but the wiring is in place for chained methods to
+                    // pre-decompose multi-task plans in Phase 5.
+                    //
+                    // Phase 3c-ii: populate the typed `Task::Construct`
+                    // variant when the step is a build worker. Either
+                    // `Construct` or `ConstructBed` resolves to the same
+                    // typed shape — the `task_id` discriminant survives
+                    // for reward-scaling in `construction_system`.
+                    if matches!(
+                        step_def.task,
+                        TaskKind::Construct | TaskKind::ConstructBed
+                    ) {
+                        if let Some(bp) = ent {
+                            aq.dispatch(crate::simulation::typed_task::Task::Construct {
+                                blueprint: bp,
+                            });
+                        }
                     }
-                    // Equip dispatch: stash slot + good on PersonAI so the
-                    // executor knows what to wield. Both are read out by
-                    // `equip_task_system`, which clears them on completion.
+                    // Phase 3b-iv: populate `Task::Gather { tile }` for any
+                    // Gather step. The executor reads the tile from the typed
+                    // variant; legacy `dest_tile` is kept for routing.
+                    if step_def.task == TaskKind::Gather {
+                        aq.dispatch(crate::simulation::typed_task::Task::Gather {
+                            tile: (target_tx, target_ty),
+                        });
+                    }
+                    // Phase 3b-v: same shape for `Task::Dig`.
+                    if step_def.task == TaskKind::Dig {
+                        aq.dispatch(crate::simulation::typed_task::Task::Dig {
+                            tile: (target_tx, target_ty),
+                        });
+                    }
+                    // Phase 3b-vi: `Task::Scavenge { target }` carries the
+                    // GroundItem entity. `resolve_target` already wrote it
+                    // to `target_item.0`; we just mirror it onto the typed
+                    // task. If `ent` is None at this point (rare for
+                    // Scavenge — resolve_target typically returns Some) the
+                    // typed task stays at its previous value and the
+                    // executor's fallback to `target_item.0` covers it.
+                    if step_def.task == TaskKind::Scavenge {
+                        if let Some(target) = ent {
+                            aq.dispatch(crate::simulation::typed_task::Task::Scavenge {
+                                target,
+                            });
+                        }
+                    }
+                    // Phase 3d-iii: `Task::PickUpCorpse { corpse }` carries
+                    // the Corpse entity resolved by the step's target.
+                    if step_def.task == TaskKind::PickUpCorpse {
+                        if let Some(corpse) = ent {
+                            aq.dispatch(crate::simulation::typed_task::Task::PickUpCorpse {
+                                corpse,
+                            });
+                        }
+                    }
+                    // Phase 3b-i: populate the typed `Task::WithdrawGood`
+                    // variant from `step_def.extra`. Sentinel 255 means
+                    // "any entertainment good", anything else is a specific
+                    // `Good` discriminant. (The legacy `craft_recipe_id`
+                    // channel was retired in 3c-i — no readers remained.)
+                    if step_def.task == TaskKind::WithdrawGood {
+                        let filter = if step_def.extra == 255 {
+                            crate::simulation::typed_task::WithdrawGoodFilter::AnyEntertainment
+                        } else {
+                            match crate::economy::goods::Good::try_from_u8(step_def.extra as u8) {
+                                Some(g) => {
+                                    crate::simulation::typed_task::WithdrawGoodFilter::Specific(g)
+                                }
+                                None => crate::simulation::typed_task::WithdrawGoodFilter::AnyEntertainment,
+                            }
+                        };
+                        aq.dispatch(crate::simulation::typed_task::Task::WithdrawGood { filter });
+                    }
+                    // Equip dispatch: populate the typed `Task::Equip` variant.
+                    // Phase 3d-i retired the `equip_slot` legacy field; the
+                    // executor reads slot + good from `aq.current.as_equip()`.
                     if let StepTarget::EquipItem { slot, good } = step_def.target {
-                        ai.equip_slot = slot as u8;
-                        ai.craft_recipe_id = good as u8;
+                        aq.dispatch(crate::simulation::typed_task::Task::Equip { slot, good });
                     }
-                    // Commit the resolver-chosen withdraw intent (or clear any
-                    // stale intent from a prior dispatch). `withdraw_material_task_system`
-                    // reads this to know which good and how many to take.
-                    ai.withdraw_good = withdraw_intent.map(|(g, _)| g);
-                    ai.withdraw_qty = withdraw_intent.map(|(_, q)| q).unwrap_or(0);
+                    // Commit the resolver-chosen withdraw intent into the typed
+                    // `Task::WithdrawMaterial` variant (Phase 3b-iii: legacy
+                    // `withdraw_good`/`withdraw_qty` retired, typed task is
+                    // the sole channel). Other step kinds may also carry a
+                    // `withdraw_intent` (some claimed-haul flows pre-stage
+                    // one) but only the WithdrawMaterial executor reads it —
+                    // leaving `aq.current` at its current value for non-
+                    // WithdrawMaterial dispatch is correct.
+                    if step_def.task == TaskKind::WithdrawMaterial {
+                        match withdraw_intent {
+                            Some((good, qty)) => {
+                                aq.dispatch(
+                                    crate::simulation::typed_task::Task::WithdrawMaterial {
+                                        good,
+                                        qty,
+                                    },
+                                );
+                            }
+                            None => {
+                                // No intent resolved — the dispatch site
+                                // can't proceed. Treat the slot as a fresh
+                                // failure rather than queuing nothing: clear
+                                // `current` so the inconsistent-state guard
+                                // in `withdraw_material_task_system` fires.
+                                aq.current = crate::simulation::typed_task::Task::Idle;
+                            }
+                        }
+                    }
                     // Reserve that qty against the chosen storage tile so a
                     // second agent in the same tick sees a smaller effective
                     // stock and either picks another tile/good or aborts.
@@ -2636,14 +2913,14 @@ pub fn rel_influence_system(
     influence.0.clear();
 
     // Collect which plan each agent is running.
-    let running: AHashMap<Entity, u16> = query
+    let running: AHashMap<Entity, PlanId> = query
         .iter()
         .filter_map(|(e, _, ap)| ap.map(|p| (e, p.plan_id)))
         .collect();
 
     // For each agent, find the highest-affinity ally that has an active plan.
     for (entity, rel, _) in query.iter() {
-        let mut best_plan: Option<u16> = None;
+        let mut best_plan: Option<PlanId> = None;
         let mut best_aff: i8 = 0;
         for slot in &rel.entries {
             if let Some(entry) = slot {
@@ -2681,8 +2958,8 @@ pub fn drop_abandoned_food_system(
 
         let mut drops: Vec<(Good, u32)> = Vec::new();
         for (it, q) in agent.inventory.iter_mut() {
-            if it.good.is_edible() && *q > 0 {
-                drops.push((it.good, *q));
+            if it.good().is_edible() && *q > 0 {
+                drops.push((it.good(), *q));
                 *q = 0;
             }
         }

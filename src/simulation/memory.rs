@@ -396,10 +396,10 @@ pub fn vision_system(
                 // Check spatial for entities (items, prey)
                 for &entity in spatial.get(ntx, nty) {
                     if let Ok(item) = item_query.get(entity) {
-                        let kind = if item.item.good.is_edible() {
+                        let kind = if item.item.good().is_edible() {
                             Some(MemoryKind::Food)
                         } else {
-                            match item.item.good {
+                            match item.item.good() {
                                 crate::economy::goods::Good::Wood => Some(MemoryKind::Wood),
                                 crate::economy::goods::Good::Stone => Some(MemoryKind::Stone),
                                 crate::economy::goods::Good::GrainSeed => Some(MemoryKind::GrainSeed),

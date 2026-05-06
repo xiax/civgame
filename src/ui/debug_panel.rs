@@ -291,11 +291,16 @@ pub fn debug_panel_system(
                     ui.label(egui::RichText::new("Give Item").strong());
                     let goods = Good::all();
                     ui.horizontal(|ui| {
+                        let dn = |g: Good| {
+                            crate::economy::core_ids::display_name(
+                                crate::economy::core_ids::good_to_resource_id(g),
+                            )
+                        };
                         egui::ComboBox::from_id_salt("give_good")
-                            .selected_text(goods[give_idx].name())
+                            .selected_text(dn(goods[give_idx]))
                             .show_ui(ui, |ui| {
                                 for (i, good) in goods.iter().enumerate() {
-                                    ui.selectable_value(&mut give_idx, i, good.name());
+                                    ui.selectable_value(&mut give_idx, i, dn(*good));
                                 }
                             });
                         ui.add(egui::DragValue::new(&mut give_qty).range(1..=9999u32).prefix("×"));

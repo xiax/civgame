@@ -74,15 +74,19 @@ pub fn species_yield(species: CorpseSpecies) -> &'static [(Good, u32)] {
     }
 }
 
-/// Release a carried corpse at the agent's current tile. Called by plan
-/// teardown / rescue preemption / butcher-completion paths. Idempotent:
-/// safe to call when `carried_corpse` is already `None`.
+/// Marker component: this entity is currently dragging a `Corpse`. Inserted
+/// by `pickup_corpse_task_system` on arrival, removed by butcher completion,
+/// rescue preempt, decay system, and various teardown paths. The
+/// `corpse_follow_system` keys on this component to snap the corpse's
+/// transform to the carrier each tick.
 ///
-/// The corpse entity itself is not despawned — `corpse_follow_system` stops
-/// snapping it to the agent the next tick, so it stays on the ground.
-pub fn drop_corpse(ai: &mut PersonAI) {
-    ai.carried_corpse = None;
-}
+/// Replaces `PersonAI.carried_corpse: Option<Entity>` (Phase 3d follow-up
+/// refactor): the carrying state spans 3 tasks (PickUpCorpse → HaulCorpse →
+/// Butcher) so it lives at the component level rather than as a task-local
+/// param. Insert/Remove is the natural ECS shape; the previous Option-field
+/// required every teardown path to remember to clear it.
+#[derive(bevy::prelude::Component, Copy, Clone, Debug)]
+pub struct Carrying(pub bevy::prelude::Entity);
 
 /// Ticks of work the Butcher task takes to process a corpse. Roughly matches
 /// `TICKS_TAME` and the Workbench craft cadence — short enough that hunters
@@ -98,12 +102,19 @@ pub const BUTCHER_TICKS: u8 = 60;
 /// between dispatch and arrival (decay, rescued by another hunter), end
 /// the task — the resolver will pick a new corpse next plan iteration.
 pub fn pickup_corpse_task_system(
+    mut commands: Commands,
     clock: Res<SimClock>,
     mut corpse_map: ResMut<CorpseMap>,
     corpse_q: Query<(&Corpse, &Transform)>,
-    mut agents: Query<(&mut PersonAI, &BucketSlot, &LodLevel)>,
+    mut agents: Query<(
+        Entity,
+        &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
+        &BucketSlot,
+        &LodLevel,
+    )>,
 ) {
-    for (mut ai, slot, lod) in agents.iter_mut() {
+    for (entity, mut ai, mut aq, slot, lod) in agents.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -111,9 +122,12 @@ pub fn pickup_corpse_task_system(
             continue;
         }
 
-        let Some(corpse_e) = ai.target_entity else {
+        // Phase 3d-iii: corpse comes from typed `Task::PickUpCorpse`, falling
+        // back to `target_entity` for any unmigrated dispatch path.
+        let Some(corpse_e) = aq.current.as_pickup_corpse().or(ai.target_entity) else {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
+            aq.advance();
             continue;
         };
 
@@ -123,13 +137,14 @@ pub fn pickup_corpse_task_system(
                 (t.translation.y / TILE_SIZE).floor() as i32,
             );
             corpse_map.remove(tile, corpse_e);
-            ai.carried_corpse = Some(corpse_e);
+            commands.entity(entity).insert(Carrying(corpse_e));
         }
         // Whether or not the corpse still existed, this dispatch is done —
         // a missing corpse just means the next plan iteration retargets.
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
         ai.target_entity = None;
+        aq.advance();
     }
 }
 
@@ -180,9 +195,10 @@ pub fn butcher_task_system(
         &LodLevel,
         &mut Skills,
         Option<&FactionMember>,
+        Option<&Carrying>,
     )>,
 ) {
-    for (entity, mut ai, transform, slot, lod, mut skills, member) in agents.iter_mut() {
+    for (entity, mut ai, transform, slot, lod, mut skills, member, carrying) in agents.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -190,8 +206,8 @@ pub fn butcher_task_system(
             continue;
         }
 
-        let Some(corpse_e) = ai.carried_corpse else {
-            // Corpse was dropped (rescue preempt) — abort this dispatch.
+        let Some(Carrying(corpse_e)) = carrying.copied() else {
+            // Carrying was removed (rescue preempt) — abort this dispatch.
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
@@ -200,7 +216,7 @@ pub fn butcher_task_system(
 
         let Ok(corpse) = corpse_q.get(corpse_e) else {
             // Corpse despawned (decayed or stolen). Clear and abort.
-            ai.carried_corpse = None;
+            commands.entity(entity).remove::<Carrying>();
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
@@ -233,7 +249,7 @@ pub fn butcher_task_system(
         });
 
         commands.entity(corpse_e).despawn_recursive();
-        ai.carried_corpse = None;
+        commands.entity(entity).remove::<Carrying>();
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
@@ -319,7 +335,7 @@ pub fn corpse_decay_system(
     mut commands: Commands,
     clock: Res<SimClock>,
     mut corpse_map: ResMut<CorpseMap>,
-    mut carriers: Query<&mut PersonAI>,
+    carriers: Query<(Entity, &Carrying)>,
     q: Query<(Entity, &Corpse, &Transform)>,
 ) {
     let now = clock.tick;
@@ -332,26 +348,27 @@ pub fn corpse_decay_system(
             (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32,
         );
         corpse_map.remove(tile, e);
-        // Anyone currently dragging this corpse needs their reference cleared.
-        for mut ai in &mut carriers {
-            if ai.carried_corpse == Some(e) {
-                ai.carried_corpse = None;
+        // Anyone currently dragging this corpse needs their Carrying removed.
+        for (carrier_e, carrying) in &carriers {
+            if carrying.0 == e {
+                commands.entity(carrier_e).remove::<Carrying>();
             }
         }
         commands.entity(e).despawn_recursive();
     }
 }
 
-/// While a `PersonAI.carried_corpse` is set, snap the corpse's transform
-/// to the carrier's transform each tick so it visibly follows them.
+/// While a carrier has a `Carrying(corpse_e)` component, snap the corpse's
+/// transform to the carrier's transform each tick so it visibly follows them.
 /// Schedule after `movement_system` so the corpse lands on the carrier's
 /// new tile before any tile-based read.
 pub fn corpse_follow_system(
-    carriers: Query<(&PersonAI, &Transform), Without<Corpse>>,
+    carriers: Query<(&Carrying, &Transform), Without<Corpse>>,
     mut corpses: Query<&mut Transform, With<Corpse>>,
 ) {
-    for (ai, t) in &carriers {
-        if let Some(corpse_e) = ai.carried_corpse {
+    for (carrying, t) in &carriers {
+        let corpse_e = carrying.0;
+        {
             if let Ok(mut ct) = corpses.get_mut(corpse_e) {
                 ct.translation.x = t.translation.x;
                 ct.translation.y = t.translation.y;

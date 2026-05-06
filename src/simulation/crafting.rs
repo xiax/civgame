@@ -1,6 +1,9 @@
 use crate::economy::agent::EconomicAgent;
+use crate::economy::core_ids::{self, resource_id_to_good};
 use crate::economy::goods::Good;
 use crate::economy::item::{Item, ItemMaterial, ItemQuality};
+use crate::economy::resource_catalog::ResourceId;
+use std::sync::OnceLock;
 use crate::simulation::construction::{GoodNeed, LoomMap, WorkbenchMap, MAX_BUILD_INPUTS};
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::jobs::{
@@ -26,9 +29,12 @@ pub enum StationKind {
 
 pub struct CraftRecipe {
     pub name: &'static str,
-    /// All ingredients that must be consumed. Agent's inventory is checked for each.
-    pub inputs: &'static [(Good, u32)],
-    pub output_good: Good,
+    /// All ingredients that must be consumed. Agent's inventory is
+    /// checked for each. Phase 2d: keyed on `ResourceId` so adding a
+    /// new resource to the catalog automatically widens the recipe-input
+    /// space without changes to recipe consumers.
+    pub inputs: Vec<(ResourceId, u32)>,
+    pub output_resource: ResourceId,
     pub output_qty: u32,
     /// None means the output item has no material tag (e.g. Luxury goods).
     pub output_material: Option<ItemMaterial>,
@@ -40,157 +46,208 @@ pub struct CraftRecipe {
     pub requires_station: Option<StationKind>,
 }
 
+impl CraftRecipe {
+    /// Convenience: returns the legacy `Good` for the output. Helper
+    /// for sites that still need a `Good` (e.g. `Item::new_manufactured`
+    /// constructors). Panics if the catalog/core_ids hasn't been
+    /// initialised — by the time recipes are read, both are in place.
+    pub fn output_good_legacy(&self) -> Good {
+        resource_id_to_good(self.output_resource)
+            .expect("CraftRecipe.output_resource is not in the legacy Good enum")
+    }
+}
+
 use crate::simulation::technology::{
     BOW_AND_ARROW, BRONZE_WEAPONS, COPPER_TOOLS, CUNEIFORM_WRITING, FIRED_POTTERY, FIRE_MAKING,
     FLINT_KNAPPING, HUNTING_SPEAR, LOOM_WEAVING,
 };
 
-pub static CRAFT_RECIPES: &[CraftRecipe] = &[
-    // 0
-    CraftRecipe {
-        name: "Stone Tools",
-        inputs: &[(Good::Stone, 2), (Good::Wood, 1)],
-        output_good: Good::Tools,
-        output_qty: 1,
-        output_material: Some(ItemMaterial::Stone),
-        work_ticks: 30,
-        crafting_xp: 5,
-        tech_gate: Some(FLINT_KNAPPING),
-        requires_station: Some(StationKind::Workbench),
-    },
-    // 1
-    CraftRecipe {
-        name: "Spear",
-        inputs: &[(Good::Wood, 2), (Good::Stone, 1)],
-        output_good: Good::Weapon,
-        output_qty: 1,
-        output_material: Some(ItemMaterial::Stone),
-        work_ticks: 40,
-        crafting_xp: 5,
-        tech_gate: Some(HUNTING_SPEAR),
-        requires_station: None,
-    },
-    // 2
-    CraftRecipe {
-        name: "Torch",
-        inputs: &[(Good::Wood, 2)],
-        output_good: Good::Luxury,
-        output_qty: 2,
-        output_material: None,
-        work_ticks: 20,
-        crafting_xp: 3,
-        tech_gate: Some(FIRE_MAKING),
-        requires_station: None,
-    },
-    // 3
-    CraftRecipe {
-        name: "Bow",
-        inputs: &[(Good::Wood, 2), (Good::Skin, 1)],
-        output_good: Good::Weapon,
-        output_qty: 1,
-        output_material: Some(ItemMaterial::Wood),
-        work_ticks: 50,
-        crafting_xp: 6,
-        tech_gate: Some(BOW_AND_ARROW),
-        requires_station: None,
-    },
-    // 4
-    CraftRecipe {
-        name: "Woven Cloth",
-        inputs: &[(Good::Grain, 3)],
-        output_good: Good::Cloth,
-        output_qty: 1,
-        output_material: None,
-        work_ticks: 60,
-        crafting_xp: 6,
-        tech_gate: Some(LOOM_WEAVING),
-        requires_station: Some(StationKind::Loom),
-    },
-    // 5
-    CraftRecipe {
-        name: "Pottery",
-        inputs: &[(Good::Stone, 2), (Good::Wood, 1)],
-        output_good: Good::Luxury,
-        output_qty: 2,
-        output_material: None,
-        work_ticks: 60,
-        crafting_xp: 5,
-        tech_gate: Some(FIRED_POTTERY),
-        requires_station: None,
-    },
-    // 6
-    CraftRecipe {
-        name: "Wooden Shield",
-        inputs: &[(Good::Wood, 3)],
-        output_good: Good::Shield,
-        output_qty: 1,
-        output_material: Some(ItemMaterial::Wood),
-        work_ticks: 40,
-        crafting_xp: 4,
-        tech_gate: None,
-        requires_station: None,
-    },
-    // 7
-    CraftRecipe {
-        name: "Leather Armor",
-        inputs: &[(Good::Skin, 2)],
-        output_good: Good::Armor,
-        output_qty: 1,
-        output_material: Some(ItemMaterial::Leather),
-        work_ticks: 50,
-        crafting_xp: 6,
-        tech_gate: None,
-        requires_station: None,
-    },
-    // 8
-    CraftRecipe {
-        name: "Iron Tools",
-        inputs: &[(Good::Iron, 2), (Good::Coal, 1)],
-        output_good: Good::Tools,
-        output_qty: 1,
-        output_material: Some(ItemMaterial::Iron),
-        work_ticks: 60,
-        crafting_xp: 8,
-        tech_gate: Some(COPPER_TOOLS),
-        requires_station: Some(StationKind::Workbench),
-    },
-    // 9
-    CraftRecipe {
-        name: "Iron Sword",
-        inputs: &[(Good::Iron, 2), (Good::Wood, 1)],
-        output_good: Good::Weapon,
-        output_qty: 1,
-        output_material: Some(ItemMaterial::Iron),
-        work_ticks: 80,
-        crafting_xp: 10,
-        tech_gate: Some(BRONZE_WEAPONS),
-        requires_station: Some(StationKind::Workbench),
-    },
-    // 10
-    CraftRecipe {
-        name: "Clay Tablet",
-        inputs: &[(Good::Stone, 1), (Good::Wood, 1)],
-        output_good: Good::ClayTablet,
-        output_qty: 1,
-        output_material: None,
-        work_ticks: 90,
-        crafting_xp: 8,
-        tech_gate: Some(CUNEIFORM_WRITING),
-        requires_station: Some(StationKind::Workbench),
-    },
-    // 11
-    CraftRecipe {
-        name: "Book",
-        inputs: &[(Good::Cloth, 2), (Good::Skin, 1)],
-        output_good: Good::Book,
-        output_qty: 1,
-        output_material: None,
-        work_ticks: 180,
-        crafting_xp: 12,
-        tech_gate: Some(CUNEIFORM_WRITING),
-        requires_station: Some(StationKind::Workbench),
-    },
-];
+/// Lazily-built recipe table. Phase 2d migrated `CraftRecipe` from a
+/// `static &[...]` to a `OnceLock<Vec<...>>` so the inputs/outputs can
+/// be `ResourceId`s — those need to be resolved against the runtime
+/// catalog at first read, which a `const` array can't express.
+///
+/// Production callers reach this via [`craft_recipes`]; they never
+/// notice the lazy-init since `core_ids::catalog()` (which feeds the
+/// resolution) is also lazy. First call out of any test or system
+/// triggers both inits in the right order.
+fn build_craft_recipes() -> Vec<CraftRecipe> {
+    // Force catalog/core_ids init so the `*.get().copied().unwrap()` calls
+    // below are safe.
+    let _ = core_ids::catalog();
+
+    let stone = *core_ids::Stone.get().unwrap();
+    let wood = *core_ids::Wood.get().unwrap();
+    let iron = *core_ids::Iron.get().unwrap();
+    let coal = *core_ids::Coal.get().unwrap();
+    let grain = *core_ids::Grain.get().unwrap();
+    let skin = *core_ids::Skin.get().unwrap();
+    let cloth = *core_ids::Cloth.get().unwrap();
+    let tools = *core_ids::Tools.get().unwrap();
+    let weapon = *core_ids::Weapon.get().unwrap();
+    let shield = *core_ids::Shield.get().unwrap();
+    let armor = *core_ids::Armor.get().unwrap();
+    let luxury = *core_ids::Luxury.get().unwrap();
+    let clay_tablet = *core_ids::ClayTablet.get().unwrap();
+    let book = *core_ids::Book.get().unwrap();
+
+    vec![
+        // 0
+        CraftRecipe {
+            name: "Stone Tools",
+            inputs: vec![(stone, 2), (wood, 1)],
+            output_resource: tools,
+            output_qty: 1,
+            output_material: Some(ItemMaterial::Stone),
+            work_ticks: 30,
+            crafting_xp: 5,
+            tech_gate: Some(FLINT_KNAPPING),
+            requires_station: Some(StationKind::Workbench),
+        },
+        // 1
+        CraftRecipe {
+            name: "Spear",
+            inputs: vec![(wood, 2), (stone, 1)],
+            output_resource: weapon,
+            output_qty: 1,
+            output_material: Some(ItemMaterial::Stone),
+            work_ticks: 40,
+            crafting_xp: 5,
+            tech_gate: Some(HUNTING_SPEAR),
+            requires_station: None,
+        },
+        // 2
+        CraftRecipe {
+            name: "Torch",
+            inputs: vec![(wood, 2)],
+            output_resource: luxury,
+            output_qty: 2,
+            output_material: None,
+            work_ticks: 20,
+            crafting_xp: 3,
+            tech_gate: Some(FIRE_MAKING),
+            requires_station: None,
+        },
+        // 3
+        CraftRecipe {
+            name: "Bow",
+            inputs: vec![(wood, 2), (skin, 1)],
+            output_resource: weapon,
+            output_qty: 1,
+            output_material: Some(ItemMaterial::Wood),
+            work_ticks: 50,
+            crafting_xp: 6,
+            tech_gate: Some(BOW_AND_ARROW),
+            requires_station: None,
+        },
+        // 4
+        CraftRecipe {
+            name: "Woven Cloth",
+            inputs: vec![(grain, 3)],
+            output_resource: cloth,
+            output_qty: 1,
+            output_material: None,
+            work_ticks: 60,
+            crafting_xp: 6,
+            tech_gate: Some(LOOM_WEAVING),
+            requires_station: Some(StationKind::Loom),
+        },
+        // 5
+        CraftRecipe {
+            name: "Pottery",
+            inputs: vec![(stone, 2), (wood, 1)],
+            output_resource: luxury,
+            output_qty: 2,
+            output_material: None,
+            work_ticks: 60,
+            crafting_xp: 5,
+            tech_gate: Some(FIRED_POTTERY),
+            requires_station: None,
+        },
+        // 6
+        CraftRecipe {
+            name: "Wooden Shield",
+            inputs: vec![(wood, 3)],
+            output_resource: shield,
+            output_qty: 1,
+            output_material: Some(ItemMaterial::Wood),
+            work_ticks: 40,
+            crafting_xp: 4,
+            tech_gate: None,
+            requires_station: None,
+        },
+        // 7
+        CraftRecipe {
+            name: "Leather Armor",
+            inputs: vec![(skin, 2)],
+            output_resource: armor,
+            output_qty: 1,
+            output_material: Some(ItemMaterial::Leather),
+            work_ticks: 50,
+            crafting_xp: 6,
+            tech_gate: None,
+            requires_station: None,
+        },
+        // 8
+        CraftRecipe {
+            name: "Iron Tools",
+            inputs: vec![(iron, 2), (coal, 1)],
+            output_resource: tools,
+            output_qty: 1,
+            output_material: Some(ItemMaterial::Iron),
+            work_ticks: 60,
+            crafting_xp: 8,
+            tech_gate: Some(COPPER_TOOLS),
+            requires_station: Some(StationKind::Workbench),
+        },
+        // 9
+        CraftRecipe {
+            name: "Iron Sword",
+            inputs: vec![(iron, 2), (wood, 1)],
+            output_resource: weapon,
+            output_qty: 1,
+            output_material: Some(ItemMaterial::Iron),
+            work_ticks: 80,
+            crafting_xp: 10,
+            tech_gate: Some(BRONZE_WEAPONS),
+            requires_station: Some(StationKind::Workbench),
+        },
+        // 10
+        CraftRecipe {
+            name: "Clay Tablet",
+            inputs: vec![(stone, 1), (wood, 1)],
+            output_resource: clay_tablet,
+            output_qty: 1,
+            output_material: None,
+            work_ticks: 90,
+            crafting_xp: 8,
+            tech_gate: Some(CUNEIFORM_WRITING),
+            requires_station: Some(StationKind::Workbench),
+        },
+        // 11
+        CraftRecipe {
+            name: "Book",
+            inputs: vec![(cloth, 2), (skin, 1)],
+            output_resource: book,
+            output_qty: 1,
+            output_material: None,
+            work_ticks: 180,
+            crafting_xp: 12,
+            tech_gate: Some(CUNEIFORM_WRITING),
+            requires_station: Some(StationKind::Workbench),
+        },
+    ]
+}
+
+/// Borrow the recipe table. Lazy-initialised on first call (the
+/// `OnceLock` ensures the heavy `Vec` allocation happens once per
+/// process). Recipe ids are stable and match the indices in
+/// `build_craft_recipes` — preserving the legacy `recipe_id: u8`
+/// numbering used by `CraftOrder` and the chief job-posting system.
+pub fn craft_recipes() -> &'static [CraftRecipe] {
+    static RECIPES: OnceLock<Vec<CraftRecipe>> = OnceLock::new();
+    RECIPES.get_or_init(build_craft_recipes).as_slice()
+}
 
 /// Recipe ids for the two written-knowledge artefacts. Used by chief-posting
 /// and player-encode paths to know which crafts need a `tech_payload` set.
@@ -202,7 +259,7 @@ pub fn recipe_encodes_knowledge(recipe_id: u8) -> bool {
 }
 
 /// Maximum distinct ingredient types per craft recipe. Three is plenty for
-/// every recipe in `CRAFT_RECIPES`.
+/// every recipe in `craft_recipes()`.
 pub const MAX_CRAFT_INPUTS: usize = MAX_BUILD_INPUTS;
 
 /// Faction-shared crafting accumulator. Mirrors `Blueprint`: workers haul each
@@ -242,10 +299,16 @@ impl CraftOrder {
         spawn_tick: u64,
         tech_payload: Option<TechId>,
     ) -> Option<Self> {
-        let recipe = CRAFT_RECIPES.get(recipe_id as usize)?;
+        let recipe = craft_recipes().get(recipe_id as usize)?;
         let mut deposits = [GoodNeed::default(); MAX_CRAFT_INPUTS];
         let count = recipe.inputs.len().min(MAX_CRAFT_INPUTS);
-        for (i, &(good, qty)) in recipe.inputs.iter().take(count).enumerate() {
+        for (i, &(id, qty)) in recipe.inputs.iter().take(count).enumerate() {
+            // GoodNeed stores legacy `Good`. Resource catalog is the
+            // source of truth for the recipe; reverse-resolve to the
+            // matching legacy enum variant. Recipes only reference core
+            // resources, so the lookup never returns None.
+            let good = resource_id_to_good(id)
+                .expect("recipe input is not in the legacy Good enum");
             deposits[i] = GoodNeed {
                 good,
                 needed: qty.min(u8::MAX as u32) as u8,
@@ -359,16 +422,19 @@ pub fn faction_craft_order_system(
             continue;
         }
 
-        // Sum faction inventory across living members.
-        let mut faction_inv: AHashMap<Good, u32> = AHashMap::new();
+        // Sum faction inventory across living members. Phase 2d:
+        // ResourceId-keyed to match `storage.totals` so the union check
+        // below can drop its reverse-resolve.
+        let mut faction_inv: AHashMap<ResourceId, u32> = AHashMap::new();
         for (member, agent, lod) in agent_query.iter() {
             if *lod == LodLevel::Dormant || member.faction_id != faction_id {
                 continue;
             }
             for (item, qty) in agent.inventory.iter() {
                 if *qty > 0 {
-                    *faction_inv.entry(item.good).or_insert(0) =
-                        faction_inv.entry(item.good).or_insert(0).saturating_add(*qty);
+                    let id = item.resource_id;
+                    *faction_inv.entry(id).or_insert(0) =
+                        faction_inv.entry(id).or_insert(0).saturating_add(*qty);
                 }
             }
         }
@@ -388,7 +454,7 @@ pub fn faction_craft_order_system(
             if live_recipes.get(&recipe).copied().unwrap_or(0) >= 1 {
                 continue;
             }
-            let Some(recipe_def) = CRAFT_RECIPES.get(recipe as usize) else {
+            let Some(recipe_def) = craft_recipes().get(recipe as usize) else {
                 continue;
             };
             // Tech gate.
@@ -397,11 +463,13 @@ pub fn faction_craft_order_system(
                     continue;
                 }
             }
-            // Union-availability for every ingredient.
+            // Union-availability for every ingredient. Phase 2d: both
+            // faction_inv and storage.totals are ResourceId-keyed, so
+            // the recipe's input id indexes them directly.
             let mut ok = true;
-            for &(good, qty) in recipe_def.inputs {
-                let in_inv = faction_inv.get(&good).copied().unwrap_or(0);
-                let in_store = faction.storage.totals.get(&good).copied().unwrap_or(0);
+            for &(id, qty) in recipe_def.inputs.iter() {
+                let in_inv = faction_inv.get(&id).copied().unwrap_or(0);
+                let in_store = faction.storage.totals.get(&id).copied().unwrap_or(0);
                 if in_inv.saturating_add(in_store) >= qty {
                     continue;
                 }
@@ -630,7 +698,7 @@ pub fn craft_order_system(
         }
 
         // 2. Advance work once satisfied.
-        let Some(recipe) = CRAFT_RECIPES.get(order.recipe_id as usize) else {
+        let Some(recipe) = craft_recipes().get(order.recipe_id as usize) else {
             // Unknown recipe — clean up.
             if let Some(workers) = order_workers.get(&order_entity) {
                 orphaned_agents.extend(workers.iter().copied());
@@ -722,14 +790,15 @@ pub fn craft_order_system(
             if ae != entity {
                 continue;
             }
-            let Some(recipe) = CRAFT_RECIPES.get(recipe_id as usize) else {
+            let Some(recipe) = craft_recipes().get(recipe_id as usize) else {
                 continue;
             };
             let quality = quality_for_skill(skills.get(SkillKind::Crafting));
+            let output_good = recipe.output_good_legacy();
             let mut output_item = if let Some(mat) = recipe.output_material {
-                Item::new_manufactured(recipe.output_good, mat, quality)
+                Item::new_manufactured(output_good, mat, quality)
             } else {
-                Item::new_commodity(recipe.output_good)
+                Item::new_commodity(output_good)
             };
             output_item.display_name = Some(recipe.name);
             // Stamp tech payload onto Clay Tablet / Book outputs. Equality
@@ -803,3 +872,57 @@ fn quality_for_skill(crafting_xp: u32) -> ItemQuality {
 // `faction_craft_order_system` (planner) → `craft_order_system` (haul + work +
 // completion). `TaskKind::Craft` is retained as a deprecated enum value so old
 // references compile, but no plan dispatches it anymore.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::economy::core_ids;
+
+    /// Pin: the recipe table resolves to the expected `ResourceId`s for
+    /// every input and output. Catches drift between `core.ron` keys
+    /// and the recipe definitions in `build_craft_recipes`.
+    #[test]
+    fn craft_recipe_inputs_resolve_to_known_resources() {
+        let recipes = craft_recipes();
+        assert_eq!(
+            recipes.len(),
+            12,
+            "expected 12 recipes; counts feed CraftOrder.recipe_id wire format"
+        );
+
+        // Stone Tools (recipe 0): Stone×2 + Wood×1 → Tools×1
+        let stone_tools = &recipes[0];
+        assert_eq!(stone_tools.name, "Stone Tools");
+        assert_eq!(
+            stone_tools.inputs,
+            vec![
+                (*core_ids::Stone.get().unwrap(), 2),
+                (*core_ids::Wood.get().unwrap(), 1),
+            ]
+        );
+        assert_eq!(stone_tools.output_resource, *core_ids::Tools.get().unwrap());
+        assert_eq!(stone_tools.output_qty, 1);
+
+        // Book (recipe 11): Cloth×2 + Skin×1 → Book×1, gated on writing.
+        let book = &recipes[11];
+        assert_eq!(book.name, "Book");
+        assert_eq!(
+            book.inputs,
+            vec![
+                (*core_ids::Cloth.get().unwrap(), 2),
+                (*core_ids::Skin.get().unwrap(), 1),
+            ]
+        );
+        assert_eq!(book.output_resource, *core_ids::Book.get().unwrap());
+    }
+
+    /// Pin: `output_good_legacy()` round-trips every recipe through the
+    /// reverse table without panicking. Until Item.good is migrated to
+    /// ResourceId, this is the bridge into the legacy item constructors.
+    #[test]
+    fn every_recipe_output_maps_to_a_legacy_good() {
+        for recipe in craft_recipes() {
+            let _ = recipe.output_good_legacy();
+        }
+    }
+}

@@ -7,7 +7,7 @@ use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::needs::Needs;
 use super::person::{AiState, PersonAI, Profession};
-use super::plan::{ActivePlan, PlanHistory, PlanOutcome};
+use super::plan::{ActivePlan, PlanHistory, PlanId, PlanOutcome};
 use super::plants::PlantKind;
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::{SkillKind, Skills};
@@ -116,6 +116,7 @@ pub fn faction_hunter_assignment_system(
         &FactionMember,
         &Skills,
         Option<&mut PersonAI>,
+        Option<&mut crate::simulation::typed_task::ActionQueue>,
         Option<&mut PlanHistory>,
         Option<&crate::simulation::knowledge::PersonKnowledge>,
     )>,
@@ -169,7 +170,7 @@ pub fn faction_hunter_assignment_system(
     // who lost the tech via LRU eviction.
     let mut by_faction_hunters: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
     let mut by_faction_none: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
-    for (entity, prof, member, skills, _, _, knowledge_opt) in query.iter() {
+    for (entity, prof, member, skills, _, _, _, knowledge_opt) in query.iter() {
         if member.faction_id == SOLO {
             continue;
         }
@@ -220,7 +221,7 @@ pub fn faction_hunter_assignment_system(
         return;
     }
 
-    for (entity, mut prof, _member, _skills, ai_opt, history_opt, _knowledge) in
+    for (entity, mut prof, _member, _skills, ai_opt, aq_opt, history_opt, _knowledge) in
         query.iter_mut()
     {
         if promote.contains(&entity) {
@@ -231,16 +232,28 @@ pub fn faction_hunter_assignment_system(
                 if ai.reserved_good.is_some() {
                     release_reservation(&reservations, &mut ai);
                 }
-                ai.carried_corpse = None;
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
                 ai.work_progress = 0;
             }
-            if let Some(mut h) = history_opt {
-                h.push(0, PlanOutcome::Aborted, clock.tick);
+            if let Some(mut aq) = aq_opt {
+                // Phase 4b-ii: hunter demote tears down an in-flight hunt
+                // chain entirely. `cancel()` drops both `current` and the
+                // prefetched queue so a chained hunt method can't leak into
+                // the next plan.
+                aq.cancel();
             }
-            commands.entity(entity).remove::<ActivePlan>();
+            if let Some(mut h) = history_opt {
+                // Pre-existing: pushes PlanId(0) (FORAGE_FOOD) as a placeholder
+                // since we don't track which plan was active at demotion. The
+                // soft penalty against FORAGE_FOOD is incidental and small.
+                h.push(PlanId(0), PlanOutcome::Aborted, clock.tick);
+            }
+            commands
+                .entity(entity)
+                .remove::<ActivePlan>()
+                .remove::<crate::simulation::corpse::Carrying>();
         }
     }
 }
@@ -595,25 +608,51 @@ pub fn release_reservation(
     ai.reserved_qty = 0;
 }
 
-/// Computed cache of goods stored on all storage tiles for a faction.
-/// Updated each Economy tick by `compute_faction_storage_system`.
+/// Computed cache of resources stored on all storage tiles for a
+/// faction. Updated each Economy tick by `compute_faction_storage_system`.
+/// Phase 2d: keyed on `ResourceId` instead of `Good`.
 #[derive(Default, Clone)]
 pub struct FactionStorage {
-    pub totals: AHashMap<Good, u32>,
+    pub totals: AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
 }
 
 impl FactionStorage {
+    /// Lookup helper for the legacy `Good`-keyed callers — resolves
+    /// `good` to its catalog id and reads from `totals`. Phase 3+ HTN
+    /// code should hit `totals` directly with a `ResourceId`. Keeps
+    /// migration call sites readable while we still have `Good` floating
+    /// around at consumer surfaces.
+    pub fn stock_of(&self, good: Good) -> u32 {
+        let id = crate::economy::core_ids::good_to_resource_id(good);
+        self.totals.get(&id).copied().unwrap_or(0)
+    }
+
     pub fn food_total(&self) -> f32 {
-        [Good::Fruit, Good::Meat, Good::Grain]
-            .iter()
-            .map(|g| self.totals.get(g).copied().unwrap_or(0) as f32)
+        // Iterate by core_ids so the migration accessors keep working;
+        // a future refactor could read `catalog.with_tag("food")` to
+        // avoid the per-good list, once tag enumeration is hot enough
+        // to matter.
+        let ids = [
+            crate::economy::core_ids::Fruit.get(),
+            crate::economy::core_ids::Meat.get(),
+            crate::economy::core_ids::Grain.get(),
+        ];
+        ids.iter()
+            .filter_map(|opt| opt.copied())
+            .map(|id| self.totals.get(&id).copied().unwrap_or(0) as f32)
             .sum()
     }
     pub fn grain_seed_total(&self) -> u32 {
-        self.totals.get(&Good::GrainSeed).copied().unwrap_or(0)
+        crate::economy::core_ids::GrainSeed
+            .get()
+            .and_then(|id| self.totals.get(id).copied())
+            .unwrap_or(0)
     }
     pub fn berry_seed_total(&self) -> u32 {
-        self.totals.get(&Good::BerrySeed).copied().unwrap_or(0)
+        crate::economy::core_ids::BerrySeed
+            .get()
+            .and_then(|id| self.totals.get(id).copied())
+            .unwrap_or(0)
     }
     pub fn seed_total(&self) -> u32 {
         self.grain_seed_total() + self.berry_seed_total()
@@ -802,8 +841,11 @@ pub struct FactionData {
     pub under_raid: bool,
     pub techs: FactionTechs,
     pub activity_log: ActivityLog,
-    pub resource_supply: ahash::AHashMap<crate::economy::goods::Good, u32>,
-    pub resource_demand: ahash::AHashMap<crate::economy::goods::Good, u32>,
+    /// Phase 2d: keyed on `ResourceId` so consumers (recipe pipelines,
+    /// HTN methods) can look up by catalog id without reverse-resolving
+    /// to a legacy `Good` enum variant.
+    pub resource_supply: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
+    pub resource_demand: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
     /// The current tribal chief of this faction, if one has been designated.
     pub chief_entity: Option<Entity>,
     /// Architectural / behavioural personality. Drives planner, selector,
@@ -819,17 +861,23 @@ pub struct FactionData {
     /// `compute_priority`. Consumed by `job_claim_system` as the per-kind cap
     /// instead of the old flat 50%-of-population rule.
     pub workforce_budget: crate::simulation::projects::WorkforceBudget,
-    /// EMA per Good of how long material gather has been stagnating for this
-    /// faction. Stage 3 reads this in `generate_candidates` to avoid picking
-    /// blueprints that need a chronically-deficient input. Range 0..=255.
-    pub material_deficit_ema: ahash::AHashMap<crate::economy::goods::Good, u8>,
-    /// Anticipatory stockpile reserves: target storage levels per Good that
-    /// the chief asks workers to maintain even before any blueprint demands
-    /// them. Computed each chief tick from member count, culture traits,
-    /// and tech foresight. Consumed by `chief_job_posting_system` to size
-    /// Stockpile postings, and by `goal_update_system` to pick a fallback
-    /// gather goal for unclaimed workers. Range 0..=u32::MAX.
-    pub material_targets: ahash::AHashMap<crate::economy::goods::Good, u32>,
+    /// EMA per resource of how long material gather has been stagnating for
+    /// this faction. Stage 3 reads this in `generate_candidates` to avoid
+    /// picking blueprints that need a chronically-deficient input. Range
+    /// 0..=255. Phase 2-residual: keyed on `ResourceId`; legacy callers go
+    /// through `material_deficit_ema_of(good)`.
+    pub material_deficit_ema:
+        ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u8>,
+    /// Anticipatory stockpile reserves: target storage levels per resource
+    /// that the chief asks workers to maintain even before any blueprint
+    /// demands them. Computed each chief tick from member count, culture
+    /// traits, and tech foresight. Consumed by `chief_job_posting_system` to
+    /// size Stockpile postings, and by `goal_update_system` to pick a
+    /// fallback gather goal for unclaimed workers. Range 0..=u32::MAX.
+    /// Phase 2-residual: keyed on `ResourceId`; legacy callers go through
+    /// `material_target_of(good)`.
+    pub material_targets:
+        ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
     /// Active hunting directive (`Hunt` or `Scout`) issued by the chief.
     /// Refreshed by `chief_hunt_order_system` once per game-day, with a
     /// mid-day invalidation sweep that clears spent / empty targets.
@@ -1087,6 +1135,7 @@ pub fn drop_items_at_destination_system(
     mut query: Query<(
         Entity,
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut EconomicAgent,
         &mut crate::simulation::carry::Carrier,
         &FactionMember,
@@ -1095,7 +1144,7 @@ pub fn drop_items_at_destination_system(
         Option<&JobClaim>,
     )>,
 ) {
-    for (worker, mut ai, mut agent, mut carrier, member, profession, lod, claim_opt) in
+    for (worker, mut ai, mut aq, mut agent, mut carrier, member, profession, lod, claim_opt) in
         query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -1113,7 +1162,7 @@ pub fn drop_items_at_destination_system(
         let mut hand_wood: u32 = 0;
         let mut hand_stone: u32 = 0;
         for stack in carrier.drop_all() {
-            match stack.item.good {
+            match stack.item.good() {
                 Good::Wood => hand_wood = hand_wood.saturating_add(stack.qty),
                 Good::Stone => hand_stone = hand_stone.saturating_add(stack.qty),
                 _ => {}
@@ -1124,7 +1173,7 @@ pub fn drop_items_at_destination_system(
                 &mut ground_items,
                 deposit_tx,
                 deposit_ty,
-                stack.item.good,
+                stack.item.good(),
                 stack.qty,
             );
         }
@@ -1160,11 +1209,11 @@ pub fn drop_items_at_destination_system(
             let mut deposit = food_qty - CAMP_KEEP;
             let mut drops: Vec<(Good, u32)> = Vec::new();
             for (it, q) in agent.inventory.iter_mut() {
-                if it.good.is_edible() && *q > 0 {
+                if it.good().is_edible() && *q > 0 {
                     let to_remove = (*q).min(deposit);
                     *q -= to_remove;
                     deposit -= to_remove;
-                    drops.push((it.good, to_remove));
+                    drops.push((it.good(), to_remove));
                 }
                 if deposit == 0 {
                     break;
@@ -1216,7 +1265,7 @@ pub fn drop_items_at_destination_system(
             for seed_good in PlantKind::ALL.iter().filter_map(|k| k.seed_good()) {
                 let mut qty: u32 = 0;
                 for (it, q) in agent.inventory.iter_mut() {
-                    if it.good == seed_good && *q > 0 {
+                    if it.good() == seed_good && *q > 0 {
                         qty += *q;
                         *q = 0;
                     }
@@ -1242,7 +1291,7 @@ pub fn drop_items_at_destination_system(
         for (it, q) in agent.inventory.iter_mut() {
             if *q > 0
                 && matches!(
-                    it.good,
+                    it.good(),
                     Good::Tools
                         | Good::Weapon
                         | Good::Armor
@@ -1284,6 +1333,12 @@ pub fn drop_items_at_destination_system(
 
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
+        // Phase 5c-ii-c-ii: clear the typed `Task::DepositToFactionStorage`
+        // (or any pending DepositResource variant) so the next tick's HTN
+        // dispatcher sees a clean Idle slot. `advance()` promotes any further
+        // queued task — today the gather chain ends here so the queue is
+        // empty and `current` flips to `Task::Idle`.
+        aq.advance();
     }
 }
 
@@ -1397,7 +1452,11 @@ pub fn compute_faction_storage_system(
         let Some(faction) = registry.factions.get_mut(&faction_id) else {
             continue;
         };
-        *faction.storage.totals.entry(gi.item.good).or_insert(0) += gi.qty;
+        *faction
+            .storage
+            .totals
+            .entry(gi.item.resource_id)
+            .or_insert(0) += gi.qty;
     }
 }
 
@@ -1428,6 +1487,37 @@ impl FactionRegistry {
 }
 
 impl FactionData {
+    /// Phase 2d transitional helper: read `resource_supply` by legacy
+    /// `Good`. Resolves to `ResourceId` and looks up; returns 0 for
+    /// missing entries. New (Phase 3+) code should index `resource_supply`
+    /// by `ResourceId` directly.
+    pub fn supply_of(&self, good: Good) -> u32 {
+        let id = crate::economy::core_ids::good_to_resource_id(good);
+        self.resource_supply.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Phase 2d transitional helper: read `resource_demand` by legacy
+    /// `Good`. See `supply_of` for migration semantics.
+    pub fn demand_of(&self, good: Good) -> u32 {
+        let id = crate::economy::core_ids::good_to_resource_id(good);
+        self.resource_demand.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Phase 2-residual transitional helper: read `material_targets` by
+    /// legacy `Good`. Resolves to `ResourceId` and looks up; returns 0 for
+    /// missing entries. New code should index by `ResourceId` directly.
+    pub fn material_target_of(&self, good: Good) -> u32 {
+        let id = crate::economy::core_ids::good_to_resource_id(good);
+        self.material_targets.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Phase 2-residual transitional helper: read `material_deficit_ema` by
+    /// legacy `Good`.
+    pub fn material_deficit_ema_of(&self, good: Good) -> u8 {
+        let id = crate::economy::core_ids::good_to_resource_id(good);
+        self.material_deficit_ema.get(&id).copied().unwrap_or(0)
+    }
+
     pub fn food_yield_multiplier(&self) -> f32 {
         1.0 + (0..TECH_COUNT as u16)
             .filter(|&id| self.techs.has(id))
@@ -1498,20 +1588,24 @@ pub fn resource_demand_system(
         if let Some(faction) = registry.factions.get_mut(&member.faction_id) {
             for (item, qty) in &agent.inventory {
                 if *qty > 0 {
-                    *faction.resource_supply.entry(item.good).or_insert(0) += *qty;
+                    *faction
+                        .resource_supply
+                        .entry(item.resource_id)
+                        .or_insert(0) += *qty;
                 }
             }
         }
     }
 
     for faction in registry.factions.values_mut() {
-        for (&good, &qty) in &faction.storage.totals {
-            *faction.resource_supply.entry(good).or_insert(0) += qty;
+        for (&id, &qty) in &faction.storage.totals {
+            *faction.resource_supply.entry(id).or_insert(0) += qty;
         }
     }
 
     // 2. Tally demand
     // Materials from Blueprints — sum unmet need per ingredient across all deposit slots.
+    // Blueprints still carry `Good` (legacy `GoodNeed`); reverse-resolve to ResourceId.
     for &bp_entity in bp_map.0.values() {
         if let Ok(bp) = bp_query.get(bp_entity) {
             if let Some(faction) = registry.factions.get_mut(&bp.faction_id) {
@@ -1519,29 +1613,40 @@ pub fn resource_demand_system(
                     let need = bp.deposits[i];
                     let unmet = need.needed.saturating_sub(need.deposited) as u32;
                     if unmet > 0 {
-                        *faction.resource_demand.entry(need.good).or_insert(0) += unmet;
+                        let id = crate::economy::core_ids::good_to_resource_id(need.good);
+                        *faction.resource_demand.entry(id).or_insert(0) += unmet;
                     }
                 }
             }
         }
     }
 
-    // Food demand from population size
+    // Food demand from population size. Resolve core_ids upfront so we
+    // pay one OnceLock read per attribute, not per faction.
+    let fruit = crate::economy::core_ids::good_to_resource_id(Good::Fruit);
+    let meat = crate::economy::core_ids::good_to_resource_id(Good::Meat);
+    let grain = crate::economy::core_ids::good_to_resource_id(Good::Grain);
+    let tools = crate::economy::core_ids::good_to_resource_id(Good::Tools);
+    let weapon = crate::economy::core_ids::good_to_resource_id(Good::Weapon);
+    let cloth = crate::economy::core_ids::good_to_resource_id(Good::Cloth);
+    let luxury = crate::economy::core_ids::good_to_resource_id(Good::Luxury);
+    let shield = crate::economy::core_ids::good_to_resource_id(Good::Shield);
+    let armor = crate::economy::core_ids::good_to_resource_id(Good::Armor);
     for faction in registry.factions.values_mut() {
         let food_demand = faction.member_count * 10;
-        faction.resource_demand.insert(Good::Fruit, food_demand);
-        faction.resource_demand.insert(Good::Meat, food_demand);
-        faction.resource_demand.insert(Good::Grain, food_demand);
+        faction.resource_demand.insert(fruit, food_demand);
+        faction.resource_demand.insert(meat, food_demand);
+        faction.resource_demand.insert(grain, food_demand);
 
         // Crafted-good demand: scales with member count. Drives
-        // `chief_job_posting_system`'s recipe selection (highest output-good
+        // `chief_job_posting_system`'s recipe selection (highest output
         // deficit wins).
-        faction.resource_demand.insert(Good::Tools, faction.member_count.div_ceil(2));
-        faction.resource_demand.insert(Good::Weapon, faction.member_count.div_ceil(2));
-        faction.resource_demand.insert(Good::Cloth, faction.member_count.div_ceil(2));
-        faction.resource_demand.insert(Good::Luxury, faction.member_count.div_ceil(3));
-        faction.resource_demand.insert(Good::Shield, faction.member_count.div_ceil(4));
-        faction.resource_demand.insert(Good::Armor, faction.member_count.div_ceil(4));
+        faction.resource_demand.insert(tools, faction.member_count.div_ceil(2));
+        faction.resource_demand.insert(weapon, faction.member_count.div_ceil(2));
+        faction.resource_demand.insert(cloth, faction.member_count.div_ceil(2));
+        faction.resource_demand.insert(luxury, faction.member_count.div_ceil(3));
+        faction.resource_demand.insert(shield, faction.member_count.div_ceil(4));
+        faction.resource_demand.insert(armor, faction.member_count.div_ceil(4));
     }
 }
 
@@ -1594,8 +1699,10 @@ pub fn update_material_targets_system(
             wood_target = wood_target.saturating_add(4);
         }
 
-        faction.material_targets.insert(Good::Wood, wood_target);
-        faction.material_targets.insert(Good::Stone, stone_target);
+        let wood_id = crate::economy::core_ids::good_to_resource_id(Good::Wood);
+        let stone_id = crate::economy::core_ids::good_to_resource_id(Good::Stone);
+        faction.material_targets.insert(wood_id, wood_target);
+        faction.material_targets.insert(stone_id, stone_target);
     }
 }
 

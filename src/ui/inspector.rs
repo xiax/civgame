@@ -82,6 +82,7 @@ pub struct JobInspectorParams<'w, 's> {
 pub struct TaskDisplayParams<'w, 's> {
     pub plants: Query<'w, 's, &'static Plant>,
     pub corpse_q: Query<'w, 's, &'static Corpse>,
+    pub carrying_q: Query<'w, 's, &'static crate::simulation::corpse::Carrying>,
 }
 
 pub fn inspector_panel_system(
@@ -131,6 +132,7 @@ pub fn inspector_panel_system(
             Option<&PlanHistory>,
             Option<&crate::simulation::items::Equipment>,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
+            &crate::simulation::typed_task::ActionQueue,
         ),
     )>,
 ) {
@@ -150,6 +152,7 @@ pub fn inspector_panel_system(
             plan_history,
             equipment,
             knowledge,
+            aq,
         ),
     )) = query.get(entity)
     else {
@@ -478,7 +481,7 @@ pub fn inspector_panel_system(
                                             continue;
                                         }
                                         if !matches!(
-                                            item.good,
+                                            item.good(),
                                             crate::economy::goods::Good::ClayTablet
                                                 | crate::economy::goods::Good::Book
                                         ) {
@@ -674,7 +677,7 @@ pub fn inspector_panel_system(
                             // Equip buttons for equippable items in inventory or hands
                             let mut has_equippable = false;
                             for (item, qty) in &agent.inventory {
-                                if *qty > 0 && !valid_equip_slots(item.good).is_empty() {
+                                if *qty > 0 && !valid_equip_slots(item.good()).is_empty() {
                                     has_equippable = true;
                                     break;
                                 }
@@ -682,7 +685,7 @@ pub fn inspector_panel_system(
                             if !has_equippable {
                                 if let Some(c) = carrier {
                                     for stack in [c.left, c.right].into_iter().flatten() {
-                                        if !valid_equip_slots(stack.item.good).is_empty() {
+                                        if !valid_equip_slots(stack.item.good()).is_empty() {
                                             has_equippable = true;
                                             break;
                                         }
@@ -701,7 +704,7 @@ pub fn inspector_panel_system(
                                     if *qty == 0 {
                                         continue;
                                     }
-                                    for &slot in valid_equip_slots(item.good) {
+                                    for &slot in valid_equip_slots(item.good()) {
                                         let slot_name = slot_display_name(slot);
                                         if ui
                                             .small_button(format!(
@@ -726,7 +729,7 @@ pub fn inspector_panel_system(
                                         (c.right, false),
                                     ] {
                                         let Some(stack) = stack else { continue };
-                                        for &slot in valid_equip_slots(stack.item.good) {
+                                        for &slot in valid_equip_slots(stack.item.good()) {
                                             let slot_name = slot_display_name(slot);
                                             let hand_tag =
                                                 if stack.two_handed { "hands" } else if from_left { "L" } else { "R" };
@@ -805,10 +808,10 @@ pub fn inspector_panel_system(
                                 } else if ai.task_id == TaskKind::Scavenge as u16 {
                                     work_str = "Picking up item".to_string();
                                 } else if ai.task_id == TaskKind::WithdrawMaterial as u16 {
-                                    if let Some(good) = ai.withdraw_good {
+                                    if let Some((good, qty)) = aq.current.as_withdraw_material() {
                                         work_str = format!(
                                             "Withdrawing {:?} \u{00d7} {}",
-                                            good, ai.withdraw_qty
+                                            good, qty
                                         );
                                     } else {
                                         work_str = "Withdrawing".to_string();
@@ -822,14 +825,18 @@ pub fn inspector_panel_system(
                                     work_str =
                                         format!("Crafting (step: {})", ai.work_progress);
                                 } else if ai.task_id == TaskKind::WithdrawGood as u16 {
-                                    let good_label = if ai.craft_recipe_id == 255 {
-                                        "entertainment good".to_owned()
-                                    } else {
-                                        Good::try_from_u8(ai.craft_recipe_id)
-                                            .map(|g| g.name().to_owned())
-                                            .unwrap_or_else(|| {
-                                                format!("good#{}", ai.craft_recipe_id)
-                                            })
+                                    use crate::simulation::typed_task::WithdrawGoodFilter;
+                                    let good_label = match aq.current.as_withdraw_good() {
+                                        Some(WithdrawGoodFilter::AnyEntertainment) => {
+                                            "entertainment good".to_owned()
+                                        }
+                                        Some(WithdrawGoodFilter::Specific(g)) => {
+                                            crate::economy::core_ids::display_name(
+                                                crate::economy::core_ids::good_to_resource_id(g),
+                                            )
+                                            .to_owned()
+                                        }
+                                        None => "good".to_owned(),
                                     };
                                     work_str = format!("Withdrawing {}", good_label);
                                 } else if ai.task_id == TaskKind::PlayPlant as u16 {
@@ -852,14 +859,14 @@ pub fn inspector_panel_system(
                             "Target: {}, {}",
                             ai.target_tile.0, ai.target_tile.1
                         ));
-                        if let Some(good) = ai.withdraw_good {
+                        if let Some((good, qty)) = aq.current.as_withdraw_material() {
                             ui.label(format!(
                                 "Withdraw intent: {:?} \u{00d7} {} from ({}, {})",
-                                good, ai.withdraw_qty, ai.dest_tile.0, ai.dest_tile.1
+                                good, qty, ai.dest_tile.0, ai.dest_tile.1
                             ));
                         }
-                        if let Some(corpse_e) = ai.carried_corpse {
-                            if let Ok(corpse) = task_display.corpse_q.get(corpse_e) {
+                        if let Ok(carrying) = task_display.carrying_q.get(entity) {
+                            if let Ok(corpse) = task_display.corpse_q.get(carrying.0) {
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "Carrying: {:?} Corpse",
@@ -1273,7 +1280,7 @@ pub fn inspector_panel_system(
                                             base - plan_def.bias,
                                             plan_def.bias,
                                         );
-                                        if plan_def.id == ai.last_plan_id {
+                                        if plan_def.id.raw() == ai.last_plan_id {
                                             score += 0.0;
                                             bonus_str += " +0.0 persist";
                                         }

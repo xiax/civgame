@@ -249,7 +249,9 @@ pub fn respond_to_distress_system(
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
-            ai.carried_corpse = None;
+            commands
+                .entity(entity)
+                .remove::<crate::simulation::corpse::Carrying>();
 
             combat_target.0 = Some(ev.attacker);
 

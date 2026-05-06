@@ -6,15 +6,15 @@
 //! is private static data shared between them.
 
 use super::{
-    mk_weights, AgentGoal, GoodSelector, MaterialNeed, MemoryKind, PlanDef, PlanRegistry, StepDef,
-    StepId, StepPreconditions, StepRegistry, StepTarget, TaskKind, TileKind,
-    PF_DROP_FOOD_ON_TIMEOUT, PF_EXPLORE, PF_NONE, PF_SCAVENGE, PF_TARGETS_FOOD, PF_TARGETS_STONE,
-    PF_TARGETS_WOOD, PF_UNINTERRUPTIBLE, SI_HAS_FOOD, SI_HAS_STONE, SI_HAS_WOOD,
-    SI_CRAFT_ORDER_NEEDS_MATERIAL, SI_IN_FACTION, SI_MEM_FOOD, SI_MEM_STONE, SI_MEM_WOOD,
+    mk_weights, AgentGoal, GoodSelector, MaterialNeed, MemoryKind, PlanDef, PlanId, PlanRegistry,
+    StepDef, StepId, StepPreconditions, StepRegistry, StepTarget, TaskKind, TileKind,
+    PF_DROP_FOOD_ON_TIMEOUT, PF_EXPLORE, PF_NONE, PF_SCAVENGE, PF_TARGETS_FOOD,
+    PF_UNINTERRUPTIBLE, SI_HAS_FOOD,
+    SI_CRAFT_ORDER_NEEDS_MATERIAL, SI_IN_FACTION, SI_MEM_FOOD, SI_MEM_WOOD,
     SI_SEASON_FOOD, SI_SKILL_BUILDING, SI_SKILL_COMBAT, SI_SKILL_CRAFTING, SI_SKILL_FARMING,
     SI_SOCIAL, SI_STORAGE_BERRY_SEED, SI_STORAGE_FOOD, SI_STORAGE_GRAIN_SEED, SI_STORAGE_STONE,
-    SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD, SI_VIS_GROUND_STONE,
-    SI_VIS_GROUND_WOOD, SI_VIS_PLANT_FOOD, SI_VIS_STONE_TILE, SI_VIS_TREE, SI_WILLPOWER_DISTRESS,
+    SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD, SI_VIS_PLANT_FOOD, SI_VIS_TREE,
+    SI_WILLPOWER_DISTRESS,
 };
 use crate::economy::goods::Good;
 use crate::simulation::items::EquipmentSlot;
@@ -30,35 +30,52 @@ static FARMLAND_TILES: &[TileKind] = &[TileKind::Farmland];
 static FOREST_TILES: &[TileKind] = &[TileKind::Forest];
 
 // Step 9 = Eat, Step 10 = WithdrawFood (defined in register_builtin_steps)
-// Gather plans always end in DepositGoods. Eating is handled by separate
-// plans (EatFromInventory, WithdrawAndEat) selected when hunger is high
-// enough to satisfy step 9's precondition; chaining Eat into gather plans
-// would drop the whole plan when the worker isn't yet hungry, leaving food
-// stranded in hand and no deposit run.
-static PLAN_STEPS_0: &[StepId] = &[0, 12]; // ForageFood → DepositGoods
-static PLAN_STEPS_1: &[StepId] = &[1, 12]; // FarmFood → DepositGoods
-static PLAN_STEPS_2: &[StepId] = &[2, 12]; // GatherWood → DepositGoods
-static PLAN_STEPS_3: &[StepId] = &[3, 12]; // GatherStone → DepositGoods
-static PLAN_STEPS_4: &[StepId] = &[33, 4]; // PlantGrainFromStorage: WithdrawGrainSeed → PlantGrainSeed
-static PLAN_STEPS_66: &[StepId] = &[60, 61]; // PlantBerryFromStorage: WithdrawBerrySeed → PlantBerrySeed
-static PLAN_STEPS_67: &[StepId] = &[60, 62]; // PlayByPlantingBerry: WithdrawBerrySeed → PlantBerrySeedAsPlay
+// Gather plans always end in DepositGoods. Eating-from-hand is handled by
+// `htn_eat_dispatch_system` driven by `EatFromInventoryMethod` (Phase 5b-ii);
+// the walk-to-storage-then-eat path is owned by
+// `htn_acquire_food_dispatch_system` driven by `WithdrawFromStorageMethod`
+// (Phase 5b-iii-ii). Chaining Eat into gather plans would drop the whole
+// plan when the worker isn't yet hungry, leaving food stranded in hand and
+// no deposit run.
+static PLAN_STEPS_0: &[StepId] = &[StepId(0), StepId(12)]; // ForageFood → DepositGoods
+static PLAN_STEPS_1: &[StepId] = &[StepId(1), StepId(12)]; // FarmFood → DepositGoods
+// PLAN_STEPS_2 (GatherWood) and PLAN_STEPS_3 (GatherStone) were retired in
+// Phase 5c-ii-c-ii — the gather → deposit chain is now driven by HTN
+// `htn_acquire_good_dispatch_system` + `GatherFromKnownMethod`. Both StepId(2)
+// (ChopForest) and StepId(3) (MineStone) are still defined because BuildBlueprint
+// (PLAN_STEPS_7) embeds StepId(2) as its first step, and external dispatchers
+// can reuse `TaskKind::Gather`.
+static PLAN_STEPS_4: &[StepId] = &[StepId(33), StepId(4)]; // PlantGrainFromStorage: WithdrawGrainSeed → PlantGrainSeed
+static PLAN_STEPS_66: &[StepId] = &[StepId(60), StepId(61)]; // PlantBerryFromStorage: WithdrawBerrySeed → PlantBerrySeed
+static PLAN_STEPS_67: &[StepId] = &[StepId(60), StepId(62)]; // PlayByPlantingBerry: WithdrawBerrySeed → PlantBerrySeedAsPlay
 // HuntFood: muster at hearth → wait for party → travel to chief's area →
 // engage prey → corpse pickup/haul/butcher. The first three steps fold the
 // chief's hunting-party formation into the existing hunter pipeline so all
 // hunters depart together rather than each agent independently sniping prey.
 static PLAN_STEPS_5: &[StepId] =
-    &[57, 58, 5, 53, 54, 55]; // MusterAtHearth → TravelToHuntArea → Hunt → PickUpCorpse → HaulCorpse → Butcher
-static PLAN_STEPS_HUNTER_ARM: &[StepId] = &[52, 56]; // AcquireHuntingSpear: WithdrawSpear → EquipMainHand
-static PLAN_STEPS_SCOUT: &[StepId] = &[59]; // ScoutForPrey: WanderForPrey (single step, ends on prey memory)
-static PLAN_STEPS_6: &[StepId] = &[6, 12]; // ScavengeFood → DepositGoods
-static PLAN_STEPS_7: &[StepId] = &[2, 28, 25]; // GatherWood, HaulToBlueprint, BuildAnyBlueprint
-static PLAN_STEPS_29: &[StepId] = &[32, 28, 25]; // FetchMaterialFromStorage, HaulToBlueprint, BuildAnyBlueprint
-static PLAN_STEPS_9: &[StepId] = &[10, 9]; // WithdrawAndEat: WithdrawFood → Eat
-static PLAN_STEPS_10: &[StepId] = &[11]; // TameHorse: TameAnimal
+    &[StepId(57), StepId(58), StepId(5), StepId(53), StepId(54), StepId(55)]; // MusterAtHearth → TravelToHuntArea → Hunt → PickUpCorpse → HaulCorpse → Butcher
+static PLAN_STEPS_HUNTER_ARM: &[StepId] = &[StepId(52), StepId(56)]; // AcquireHuntingSpear: WithdrawSpear → EquipMainHand
+static PLAN_STEPS_SCOUT: &[StepId] = &[StepId(59)]; // ScoutForPrey: WanderForPrey (single step, ends on prey memory)
+static PLAN_STEPS_6: &[StepId] = &[StepId(6), StepId(12)]; // ScavengeFood → DepositGoods
+static PLAN_STEPS_7: &[StepId] = &[StepId(2), StepId(28), StepId(25)]; // GatherWood, HaulToBlueprint, BuildAnyBlueprint
+static PLAN_STEPS_29: &[StepId] = &[StepId(32), StepId(28), StepId(25)]; // FetchMaterialFromStorage, HaulToBlueprint, BuildAnyBlueprint
+// PLAN_STEPS_9 (WithdrawAndEat) was retired in Phase 5b-iii-ii — the
+// walk-to-storage-then-eat path is now driven by HTN
+// `htn_acquire_food_dispatch_system` + `WithdrawFromStorageMethod`. Both
+// StepId(10) (WithdrawFood) and StepId(9) (Eat) are still defined because
+// the legacy Forage / ScavengeFood plans embed the shared Eat step and the
+// HTN dispatcher reuses the WithdrawFood `TaskKind` executor.
+static PLAN_STEPS_10: &[StepId] = &[StepId(11)]; // TameHorse: TameAnimal
 
 static SURVIVE_GOALS: &[AgentGoal] = &[AgentGoal::Survive];
 static GATHER_FOOD_GOALS: &[AgentGoal] = &[AgentGoal::GatherFood];
 static TAME_HORSE_GOALS: &[AgentGoal] = &[AgentGoal::TameHorse];
+// PlanId 2/3 (GatherWood/GatherStone) were retired in 5c-ii-c-ii, and
+// PlanId 38/39 (ScavengeWood/ScavengeStone) were retired in 5c-ii-d-ii-b.
+// The goal arrays stay because ExploreForWood/Stone (PlanId 36/37) still
+// fire as the plan-driven fallback when memory is empty AND no ground item
+// is visible. HTN's `GatherFromKnownMethod` (memory) and
+// `ScavengeFromGroundMethod` (vision) cover the other two cases.
 static GATHER_WOOD_GOALS: &[AgentGoal] = &[AgentGoal::GatherWood];
 static GATHER_STONE_GOALS: &[AgentGoal] = &[AgentGoal::GatherStone];
 static SURVIVE_AND_GATHER_FOOD_GOALS: &[AgentGoal] = &[AgentGoal::Survive, AgentGoal::GatherFood];
@@ -68,15 +85,18 @@ static HAUL_GOALS: &[AgentGoal] = &[AgentGoal::Haul];
 static CRAFT_GOALS: &[AgentGoal] = &[AgentGoal::Craft];
 static RESCUE_GOALS: &[AgentGoal] = &[AgentGoal::Rescue];
 
-static PLAN_STEPS_23: &[StepId] = &[27]; // RescueAlly: EngageRescue
-static PLAN_STEPS_24: &[StepId] = &[12]; // ReturnSurplusFood: DepositGoods at faction storage
-static PLAN_STEPS_25: &[StepId] = &[9]; // EatFromInventory: Eat (gated by hunger + edible-on-hand)
-static PLAN_STEPS_26: &[StepId] = &[29]; // PlaySocial: PlayWithPartner (resolves partner inline)
-static PLAN_STEPS_27: &[StepId] = &[30]; // PlaySolo: PlayWithItem (resolves item inline)
-static PLAN_STEPS_28: &[StepId] = &[31]; // Explore: walk to a random reachable tile near home
-static PLAN_STEPS_30: &[StepId] = &[33, 36]; // PlayByPlanting: WithdrawSeed → PlantSeedAsPlay
-static PLAN_STEPS_31: &[StepId] = &[34, 37]; // PlayByThrowingRocks: WithdrawStone → ThrowRocksAsPlay
-static PLAN_STEPS_32: &[StepId] = &[35, 30]; // PlayWithStoredToy: WithdrawPlayItem → PlayWithItem (step 30, plays in place when held)
+static PLAN_STEPS_23: &[StepId] = &[StepId(27)]; // RescueAlly: EngageRescue
+static PLAN_STEPS_24: &[StepId] = &[StepId(12)]; // ReturnSurplusFood: DepositGoods at faction storage
+// PLAN_STEPS_25 (EatFromInventory) was retired in Phase 5b-ii — the in-place
+// eat-with-food-on-hand dispatch is now driven by `EatFromInventoryMethod`
+// (see `htn.rs`). The shared StepId(9) Eat step is still used as the final
+// step of Forage/Scavenge/WithdrawAndEat plans.
+static PLAN_STEPS_26: &[StepId] = &[StepId(29)]; // PlaySocial: PlayWithPartner (resolves partner inline)
+static PLAN_STEPS_27: &[StepId] = &[StepId(30)]; // PlaySolo: PlayWithItem (resolves item inline)
+static PLAN_STEPS_28: &[StepId] = &[StepId(31)]; // Explore: walk to a random reachable tile near home
+static PLAN_STEPS_30: &[StepId] = &[StepId(33), StepId(36)]; // PlayByPlanting: WithdrawSeed → PlantSeedAsPlay
+static PLAN_STEPS_31: &[StepId] = &[StepId(34), StepId(37)]; // PlayByThrowingRocks: WithdrawStone → ThrowRocksAsPlay
+static PLAN_STEPS_32: &[StepId] = &[StepId(35), StepId(30)]; // PlayWithStoredToy: WithdrawPlayItem → PlayWithItem (step 30, plays in place when held)
 
 static PLAY_GOALS: &[AgentGoal] = &[AgentGoal::Play];
 
@@ -90,31 +110,37 @@ static RETURN_CAMP_GOALS: &[AgentGoal] = &[AgentGoal::ReturnCamp];
 // a fresh hunt/harvest because no storage-fetch path exists for those.
 //   38 = HaulToCraftOrder, 39 = WorkOnCraftOrder,
 //   40 = FetchCraftOrderMaterialFromStorage (most-deficient good).
-static PLAN_STEPS_13: &[StepId] = &[5, 13, 38]; // DeliverHideToCraftOrder
-static PLAN_STEPS_14: &[StepId] = &[1, 38]; // DeliverGrainToCraftOrder
-static PLAN_STEPS_15: &[StepId] = &[40, 38]; // DeliverFromStorageToCraftOrder
-static PLAN_STEPS_16: &[StepId] = &[39, 12]; // WorkOnCraft → DepositGoods
+static PLAN_STEPS_13: &[StepId] = &[StepId(5), StepId(13), StepId(38)]; // DeliverHideToCraftOrder
+static PLAN_STEPS_14: &[StepId] = &[StepId(1), StepId(38)]; // DeliverGrainToCraftOrder
+static PLAN_STEPS_15: &[StepId] = &[StepId(40), StepId(38)]; // DeliverFromStorageToCraftOrder
+static PLAN_STEPS_16: &[StepId] = &[StepId(39), StepId(12)]; // WorkOnCraft → DepositGoods
 
-// Faction-directed Haul/Build pipeline. These plans are claim-driven: they
-// only fire when the agent already holds a JobClaim of the matching kind.
-//   41 = WithdrawClaimedHaulMaterial, 42 = HaulToClaimedBlueprint,
+// Faction-directed Build pipeline. The Haul half of this pipeline (PLAN_STEPS_H,
+// PlanId 33 ClaimedHaul) was retired in Phase 5c-ii-b — the claim-driven
+// `WithdrawMaterial → HaulToBlueprint` chain now flows through
+// `htn_acquire_good_dispatch_system` (`WithdrawAndHaulToBlueprintMethod`).
+// StepId 41 (WithdrawClaimedHaulMaterial) and StepId 42 (HaulToClaimedBlueprint)
+// are no longer referenced by any plan but kept in the StepRegistry for
+// in-flight ActivePlan compatibility.
 //   43 = BuildClaimedBlueprint.
-static PLAN_STEPS_H: &[StepId] = &[41, 42]; // ClaimedHaulPlan
-static PLAN_STEPS_BB: &[StepId] = &[43]; // ClaimedBuildPlan
+static PLAN_STEPS_BB: &[StepId] = &[StepId(43)]; // ClaimedBuildPlan
 
-// Scavenge plans for loose Wood/Stone GroundItems (siblings of ScavengeFood).
-// Pick up world-litter from chop yields and prior spills, then deposit to
-// faction storage.
-static PLAN_STEPS_SW: &[StepId] = &[44, 12]; // ScavengeWood: CollectWood → DepositGoods
-static PLAN_STEPS_SS: &[StepId] = &[45, 12]; // ScavengeStone: CollectStone → DepositGoods
+// PLAN_STEPS_SW / PLAN_STEPS_SS (ScavengeWood/Stone PlanId 38/39) were
+// retired in Phase 5c-ii-d-ii-b — the vision-based scavenge chain
+// `[Scavenge, DepositToFactionStorage]` now flows through
+// `htn_acquire_good_dispatch_system`'s gather branch driven by
+// `ScavengeFromGroundMethod` (utility 1.5 > GatherFromKnownMethod's 1.0).
+// StepId(44) (CollectWood) and StepId(45) (CollectStone) are no longer
+// referenced by any plan but kept in the StepRegistry for in-flight
+// ActivePlan compatibility (mirrors the StepId(41/42) ClaimedHaul pattern).
 
 // Social-goal plans (60-63). Each is a single-step plan whose target lookup
 // matches what `goal_dispatch_system` used to do inline — see the StepDef
 // notes at IDs 48-51 for resolver details.
-static PLAN_STEPS_SOCIALIZE: &[StepId] = &[48];
-static PLAN_STEPS_RAID: &[StepId] = &[49];
-static PLAN_STEPS_DEFEND: &[StepId] = &[50];
-static PLAN_STEPS_LEAD: &[StepId] = &[51];
+static PLAN_STEPS_SOCIALIZE: &[StepId] = &[StepId(48)];
+static PLAN_STEPS_RAID: &[StepId] = &[StepId(49)];
+static PLAN_STEPS_DEFEND: &[StepId] = &[StepId(50)];
+static PLAN_STEPS_LEAD: &[StepId] = &[StepId(51)];
 
 static SOCIALIZE_GOALS: &[AgentGoal] = &[AgentGoal::Socialize];
 static RAID_GOALS: &[AgentGoal] = &[AgentGoal::Raid];
@@ -125,7 +151,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
     registry.0 = vec![
         StepDef {
             // 0: ForageGrass — targets BerryBushes, falls back via memory
-            id: 0,
+            id: StepId(0),
             task: TaskKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Food),
             preconditions: StepPreconditions::none(),
@@ -135,7 +161,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 1: FarmFarmland — targets Grain, falls back via memory
-            id: 1,
+            id: StepId(1),
             task: TaskKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Food),
             preconditions: StepPreconditions::none(),
@@ -145,7 +171,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 2: ChopForest
-            id: 2,
+            id: StepId(2),
             task: TaskKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Wood),
             preconditions: StepPreconditions::none(),
@@ -155,7 +181,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 3: MineStone
-            id: 3,
+            id: StepId(3),
             task: TaskKind::Gather,
             target: StepTarget::FromMemory(MemoryKind::Stone),
             preconditions: StepPreconditions::none(),
@@ -165,7 +191,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 4: PlantGrainSeed (requires GrainSeed in inventory)
-            id: 4,
+            id: StepId(4),
             task: TaskKind::Planter,
             target: StepTarget::NearestTile(GRASS_TILES),
             preconditions: StepPreconditions::needs_good(Good::GrainSeed, 1),
@@ -175,7 +201,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 5: Hunt
-            id: 5,
+            id: StepId(5),
             task: TaskKind::Hunter,
             target: StepTarget::HuntPrey,
             preconditions: StepPreconditions::needs_good(Good::Weapon, 1),
@@ -185,7 +211,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 6: CollectFood
-            id: 6,
+            id: StepId(6),
             task: TaskKind::Scavenge,
             target: StepTarget::NearestEdible,
             preconditions: StepPreconditions::none(),
@@ -195,7 +221,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 7: (unused — reserved for future use)
-            id: 7,
+            id: StepId(7),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -205,7 +231,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 8: (unused — reserved for future use)
-            id: 8,
+            id: StepId(8),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -216,7 +242,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         StepDef {
             // 9: Eat — consume edibles from inventory in place. Gated on hunger
             // so plans don't waste food when the agent is already sated.
-            id: 9,
+            id: StepId(9),
             task: TaskKind::Eat,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::eat_when_hungry(EAT_TRIGGER_HUNGER),
@@ -226,7 +252,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 10: WithdrawFood — pull one edible from a faction storage tile
-            id: 10,
+            id: StepId(10),
             task: TaskKind::WithdrawFood,
             target: StepTarget::NearestFactionStorage,
             preconditions: StepPreconditions::none(),
@@ -236,7 +262,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 11: TameAnimal — work adjacent to a wild horse for ~100 ticks
-            id: 11,
+            id: StepId(11),
             task: TaskKind::TameAnimal,
             target: StepTarget::NearestWildHorse,
             preconditions: StepPreconditions::none(),
@@ -247,7 +273,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         // ── Crafting steps ────────────────────────────────────────────────────
         StepDef {
             // 12: DepositGoods — deposit crafted items at faction storage
-            id: 12,
+            id: StepId(12),
             task: TaskKind::DepositResource,
             target: StepTarget::NearestFactionStorage,
             preconditions: StepPreconditions::carry_anything(),
@@ -257,7 +283,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 13: CollectSkin — pick up Skin from ground (after hunting)
-            id: 13,
+            id: StepId(13),
             task: TaskKind::Scavenge,
             target: StepTarget::NearestItem(Good::Skin),
             preconditions: StepPreconditions::none(),
@@ -269,7 +295,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         // pipeline (steps 38-40); kept as Idle placeholders so existing
         // step-id references in any in-flight ActivePlan don't panic on lookup.
         StepDef {
-            id: 14,
+            id: StepId(14),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -278,7 +304,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            id: 15,
+            id: StepId(15),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -287,7 +313,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            id: 16,
+            id: StepId(16),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -296,7 +322,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            id: 17,
+            id: StepId(17),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -305,7 +331,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            id: 18,
+            id: StepId(18),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -314,7 +340,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            id: 19,
+            id: StepId(19),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -323,7 +349,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            id: 20,
+            id: StepId(20),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -332,7 +358,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            id: 21,
+            id: StepId(21),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -341,7 +367,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            id: 22,
+            id: StepId(22),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -350,7 +376,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             extra: 0,
         },
         StepDef {
-            id: 23,
+            id: StepId(23),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -360,7 +386,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 24: (unused — reserved for future use)
-            id: 24,
+            id: StepId(24),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -371,7 +397,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         StepDef {
             // 25: BuildAnyBlueprint — finds the nearest accessible blueprint of any kind
             // and contributes wood + labor. Requirements come from the blueprint itself.
-            id: 25,
+            id: StepId(25),
             task: TaskKind::Construct,
             target: StepTarget::NearestAnyBlueprint,
             preconditions: StepPreconditions::none(),
@@ -381,7 +407,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 26: (unused — formerly FindMate; reproduction is now passive via co-sleeping)
-            id: 26,
+            id: StepId(26),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -393,7 +419,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 27: EngageRescue — route to the attacker stored on RescueTarget and engage.
             // CombatTarget is already set by respond_to_distress_system; combat_system
             // takes over as soon as the responder is adjacent.
-            id: 27,
+            id: StepId(27),
             task: TaskKind::Defend,
             target: StepTarget::RescueAttacker,
             preconditions: StepPreconditions::none(),
@@ -405,7 +431,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 28: HaulToBlueprint — carry currently-held materials to the nearest
             // blueprint that still needs them and drop them in. Excess stays in
             // the hauler's inventory; the step ends as soon as the drop is applied.
-            id: 28,
+            id: StepId(28),
             task: TaskKind::HaulMaterials,
             target: StepTarget::NearestBlueprintNeedingHeldMaterial,
             preconditions: StepPreconditions::none(),
@@ -417,7 +443,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 29: PlayWithPartner — route to the nearest play partner and
             // recreate together. play_system handles tick-by-tick willpower
             // refill, social fill, and bilateral affinity.
-            id: 29,
+            id: StepId(29),
             task: TaskKind::Play,
             target: StepTarget::NearestPlayPartner,
             preconditions: StepPreconditions::none(),
@@ -429,7 +455,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 30: PlayWithItem — solo play. Resolves to the agent's tile if
             // they already hold an entertaining good, else the nearest ground
             // item with non-zero entertainment_value.
-            id: 30,
+            id: StepId(30),
             task: TaskKind::Play,
             target: StepTarget::NearestPlayItem,
             preconditions: StepPreconditions::none(),
@@ -442,7 +468,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // Used by the Explore plan as the NN's "no good options right now"
             // choice; reward_scale is intentionally low so the network reaches
             // for it only when other plans score worse.
-            id: 31,
+            id: StepId(31),
             task: TaskKind::Explore,
             target: StepTarget::ExploreTile,
             preconditions: StepPreconditions::none(),
@@ -457,7 +483,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // inventory. Pairs with step 28 (HaulToBlueprint) so stockpiled
             // wood/stone can ferry into in-progress build sites without a
             // fresh gather wave.
-            id: 32,
+            id: StepId(32),
             task: TaskKind::WithdrawMaterial,
             target: StepTarget::WithdrawForFactionNeed {
                 need: MaterialNeed::Blueprint,
@@ -470,7 +496,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 33: WithdrawGrainSeed — pull one GrainSeed from faction storage.
-            id: 33,
+            id: StepId(33),
             task: TaskKind::WithdrawGood,
             target: StepTarget::NearestFactionStorageWithGood(Good::GrainSeed),
             preconditions: StepPreconditions::none(),
@@ -481,7 +507,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         StepDef {
             // 34: WithdrawStone — pull one Stone from a faction storage tile so
             // the agent can throw it as recreation in step 37.
-            id: 34,
+            id: StepId(34),
             task: TaskKind::WithdrawGood,
             target: StepTarget::NearestFactionStorageWithGood(Good::Stone),
             preconditions: StepPreconditions::none(),
@@ -493,7 +519,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 35: WithdrawPlayItem — pull one entertainment-valued good from a
             // faction storage tile (sentinel 255 in craft_recipe_id signals
             // "first item with entertainment_value > 0").
-            id: 35,
+            id: StepId(35),
             task: TaskKind::WithdrawGood,
             target: StepTarget::NearestFactionStorageWithEntertainment,
             preconditions: StepPreconditions::none(),
@@ -505,7 +531,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 36: PlantGrainSeedAsPlay — plant a held GrainSeed on a grass tile
             // as recreation. Spawns Grain, awards Farming XP + activity, plus a
             // one-shot willpower burst on completion.
-            id: 36,
+            id: StepId(36),
             task: TaskKind::PlayPlant,
             target: StepTarget::NearestTile(GRASS_TILES),
             preconditions: StepPreconditions::needs_good(Good::GrainSeed, 1),
@@ -518,7 +544,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // one Stone, awards Combat XP + ActivityKind::Combat, bursts
             // willpower. Resolves to the agent's current tile (they throw in
             // place; the rock is consumed).
-            id: 37,
+            id: StepId(37),
             task: TaskKind::PlayThrow,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::needs_good(Good::Stone, 1),
@@ -530,7 +556,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 38: HaulToCraftOrder — drop currently-held materials into the
             // nearest CraftOrder that needs them. Sibling of step 28
             // (HaulToBlueprint) for the order pipeline.
-            id: 38,
+            id: StepId(38),
             task: TaskKind::HaulToCraftOrder,
             target: StepTarget::NearestCraftOrderNeedingHeldMaterial,
             preconditions: StepPreconditions::none(),
@@ -541,7 +567,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         StepDef {
             // 39: WorkOnCraftOrder — adjacent to a satisfied CraftOrder,
             // advance work_progress until the recipe completes.
-            id: 39,
+            id: StepId(39),
             task: TaskKind::WorkOnCraftOrder,
             target: StepTarget::NearestSatisfiedCraftOrder,
             preconditions: StepPreconditions::none(),
@@ -555,7 +581,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // tile so it can be hauled to the order. The faction's open
             // orders drive the choice; the agent doesn't need a per-good
             // plan variant.
-            id: 40,
+            id: StepId(40),
             task: TaskKind::WithdrawMaterial,
             target: StepTarget::WithdrawForFactionNeed {
                 need: MaterialNeed::CraftOrder,
@@ -572,7 +598,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // tile holding that good. Pairs with step 42
             // (HaulToClaimedBlueprint) to deliver storage stock into a
             // specific blueprint.
-            id: 41,
+            id: StepId(41),
             task: TaskKind::WithdrawMaterial,
             target: StepTarget::WithdrawForFactionNeed {
                 need: MaterialNeed::HaulClaim,
@@ -589,7 +615,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 42: HaulToClaimedBlueprint — carry the agent's hand contents to
             // the specific blueprint named in the active JobClaim::Haul and
             // deposit. Credits the Haul posting via record_progress on success.
-            id: 42,
+            id: StepId(42),
             task: TaskKind::HaulMaterials,
             target: StepTarget::HaulClaimBlueprint,
             preconditions: StepPreconditions::none(),
@@ -602,7 +628,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // blueprint named in the agent's JobClaim::Build. The resolver
             // gates on the blueprint being satisfied, so this never starts
             // before all materials are in.
-            id: 43,
+            id: StepId(43),
             task: TaskKind::Construct,
             target: StepTarget::BuildClaimBlueprint,
             preconditions: StepPreconditions::none(),
@@ -613,7 +639,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         StepDef {
             // 44: CollectWood — pick up loose Wood GroundItems left behind by
             // tree harvesting (`harvest_ground_drops`) or earlier spills.
-            id: 44,
+            id: StepId(44),
             task: TaskKind::Scavenge,
             target: StepTarget::NearestItem(Good::Wood),
             preconditions: StepPreconditions::none(),
@@ -623,7 +649,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 45: CollectStone — pick up loose Stone GroundItems on the world.
-            id: 45,
+            id: StepId(45),
             task: TaskKind::Scavenge,
             target: StepTarget::NearestItem(Good::Stone),
             preconditions: StepPreconditions::none(),
@@ -636,7 +662,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // step 40's MostDeficient selector). Kept as Idle so any in-flight
             // ActivePlan referencing this id falls through to the lookup
             // failure path rather than panicking.
-            id: 46,
+            id: StepId(46),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -647,7 +673,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         StepDef {
             // 47: (unused — was per-good FetchStoneFromStorage; superseded by
             // step 40's MostDeficient selector).
-            id: 47,
+            id: StepId(47),
             task: TaskKind::Idle,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -664,7 +690,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // animals/blueprints) — the resolver returns a partner entity
             // and tile, then `assign_task_with_routing` walks the agent
             // there with TaskKind::Socialize.
-            id: 48,
+            id: StepId(48),
             task: TaskKind::Socialize,
             target: StepTarget::NearestPlayPartner,
             preconditions: StepPreconditions::none(),
@@ -676,7 +702,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 49: Walk to the home tile of the faction we're raiding (per
             // `FactionRegistry::raid_target`). Solo agents and peacetime
             // factions resolve to None and the plan aborts harmlessly.
-            id: 49,
+            id: StepId(49),
             task: TaskKind::Raid,
             target: StepTarget::FactionRaidTarget,
             preconditions: StepPreconditions::none(),
@@ -687,7 +713,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         StepDef {
             // 50: Walk to faction camp and run TaskKind::Defend. Reuses
             // `FactionCamp` — the resolver returns home_tile.
-            id: 50,
+            id: StepId(50),
             task: TaskKind::Defend,
             target: StepTarget::FactionCamp,
             preconditions: StepPreconditions::none(),
@@ -697,7 +723,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 51: Walk to faction camp and run TaskKind::Lead.
-            id: 51,
+            id: StepId(51),
             task: TaskKind::Lead,
             target: StepTarget::FactionCamp,
             preconditions: StepPreconditions::none(),
@@ -709,7 +735,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 52: Hunter pulls a Spear (Good::Weapon) from faction storage.
             // Used by `AcquireHuntingSpear` plan; the plan-level `forbids_good`
             // precondition ensures armed hunters skip this entirely.
-            id: 52,
+            id: StepId(52),
             task: TaskKind::WithdrawGood,
             target: StepTarget::NearestFactionStorageWithGood(Good::Weapon),
             preconditions: StepPreconditions::forbids(Good::Weapon),
@@ -720,7 +746,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         StepDef {
             // 53: Walk adjacent to a fresh Corpse and attach it to the
             // hunter via `PersonAI.carried_corpse`. No-op for non-hunters.
-            id: 53,
+            id: StepId(53),
             task: TaskKind::PickUpCorpse,
             target: StepTarget::NearestFreshCorpse,
             preconditions: StepPreconditions::none(),
@@ -732,7 +758,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 54: Drag the carried corpse to the nearest hearth or faction
             // home tile. `corpse_follow_system` keeps the corpse Transform
             // glued to the hunter while they walk.
-            id: 54,
+            id: StepId(54),
             task: TaskKind::HaulCorpse,
             target: StepTarget::NearestButcherSite,
             preconditions: StepPreconditions::none(),
@@ -743,7 +769,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         StepDef {
             // 55: Butcher the carried corpse in place — work_ticks then yield
             // Meat+Skin per `species_yield()` and despawn the corpse.
-            id: 55,
+            id: StepId(55),
             task: TaskKind::Butcher,
             target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
@@ -759,7 +785,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // damage. The plan-level `forbids_good(Weapon)` check now also
             // counts the equipped slot, so the plan self-deselects after this
             // step completes.
-            id: 56,
+            id: StepId(56),
             task: TaskKind::Equip,
             target: StepTarget::EquipItem {
                 slot: EquipmentSlot::MainHand,
@@ -780,7 +806,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // already set. Resolves to None when no Hunt order is active,
             // making the candidate filter naturally drop the plan when the
             // chief stops asking.
-            id: 57,
+            id: StepId(57),
             task: TaskKind::HuntPartyMuster,
             target: StepTarget::HearthForHunt,
             preconditions: StepPreconditions::none(),
@@ -793,7 +819,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // task's "walk to tile, idle on arrival" semantics — once the
             // hunter is on the area_tile, step 5's HuntPrey scan finds prey
             // within VIEW_RADIUS naturally.
-            id: 58,
+            id: StepId(58),
             task: TaskKind::Explore,
             target: StepTarget::HuntArea,
             preconditions: StepPreconditions::none(),
@@ -806,7 +832,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // chief has no prey near the home tile; the agent ranges out to
             // unmapped tiles and `vision_system` writes prey memory along
             // the way, which the chief's next decision cycle picks up.
-            id: 59,
+            id: StepId(59),
             task: TaskKind::Explore,
             target: StepTarget::ScoutForPrey,
             preconditions: StepPreconditions::none(),
@@ -816,7 +842,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 60: WithdrawBerrySeed — pull one BerrySeed from faction storage.
-            id: 60,
+            id: StepId(60),
             task: TaskKind::WithdrawGood,
             target: StepTarget::NearestFactionStorageWithGood(Good::BerrySeed),
             preconditions: StepPreconditions::none(),
@@ -826,7 +852,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         },
         StepDef {
             // 61: PlantBerrySeed (requires BerrySeed in inventory)
-            id: 61,
+            id: StepId(61),
             task: TaskKind::Planter,
             target: StepTarget::NearestTile(GRASS_TILES),
             preconditions: StepPreconditions::needs_good(Good::BerrySeed, 1),
@@ -838,7 +864,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 62: PlantBerrySeedAsPlay — plant a held BerrySeed on a grass tile
             // as recreation. Spawns BerryBush, awards Farming XP + activity,
             // plus a one-shot willpower burst on completion.
-            id: 62,
+            id: StepId(62),
             task: TaskKind::PlayPlant,
             target: StepTarget::NearestTile(GRASS_TILES),
             preconditions: StepPreconditions::needs_good(Good::BerrySeed, 1),
@@ -863,8 +889,8 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         PlanDef {
             // Visibility/memory drive the score; STORAGE_FOOD is a soft brake
             // so foragers stop wandering out when the granary is already full
-            // and let WithdrawAndEat handle hungry siblings instead.
-            id: 0,
+            // and let HTN AcquireFood handle hungry siblings instead.
+            id: PlanId(0),
             name: "ForageFood",
             steps: PLAN_STEPS_0,
             state_weights: mk_weights(&[
@@ -885,7 +911,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             // and let it fade as storage fills. Hunger weight removed — under
             // Survive the eating plans now dominate via bias, and under
             // GatherFood hunger is moderate anyway.
-            id: 1,
+            id: PlanId(1),
             name: "FarmFood",
             steps: PLAN_STEPS_1,
             state_weights: mk_weights(&[
@@ -900,45 +926,17 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_NONE,
             requires_profession: None,
         },
-        PlanDef {
-            id: 2,
-            name: "GatherWood",
-            steps: PLAN_STEPS_2,
-            state_weights: mk_weights(&[
-                (SI_VIS_TREE, 1.0),
-                (SI_MEM_WOOD, 0.4),
-                (SI_HAS_WOOD, -0.3),
-                (SI_STORAGE_WOOD, -0.5),
-            ]),
-            bias: 0.0,
-            serves_goals: GATHER_WOOD_GOALS,
-            tech_gate: None,
-            memory_target_kind: Some(MemoryKind::Wood),
-            flags: PF_NONE,
-            requires_profession: None,
-        },
-        PlanDef {
-            id: 3,
-            name: "GatherStone",
-            steps: PLAN_STEPS_3,
-            state_weights: mk_weights(&[
-                (SI_VIS_STONE_TILE, 1.0),
-                (SI_MEM_STONE, 0.4),
-                (SI_HAS_STONE, -0.3),
-                (SI_STORAGE_STONE, -0.5),
-            ]),
-            bias: 0.0,
-            serves_goals: GATHER_STONE_GOALS,
-            tech_gate: None,
-            memory_target_kind: Some(MemoryKind::Stone),
-            flags: PF_NONE,
-            requires_profession: None,
-        },
+        // PlanId 2 (GatherWood) and PlanId 3 (GatherStone) were retired in
+        // Phase 5c-ii-c-ii. The gather → deposit chain is now produced by
+        // `htn_acquire_good_dispatch_system` + `GatherFromKnownMethod` under
+        // `AgentGoal::GatherWood` / `AgentGoal::GatherStone`. The
+        // `GATHER_WOOD_GOALS` / `GATHER_STONE_GOALS` static arrays are also
+        // retired (their only consumers were these two PlanDefs).
         PlanDef {
             // Withdraw a GrainSeed from faction storage, then plant it on the
             // nearest Grass tile. Scores high when grain seeds are stockpiled
             // and food supply is low.
-            id: 4,
+            id: PlanId(4),
             name: "PlantFromStorage",
             steps: PLAN_STEPS_4,
             state_weights: mk_weights(&[
@@ -954,7 +952,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 5,
+            id: PlanId(5),
             name: "HuntFood",
             steps: PLAN_STEPS_5,
             state_weights: mk_weights(&[
@@ -973,7 +971,20 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: Some(Profession::Hunter),
         },
         PlanDef {
-            id: 6,
+            // Phase 5c-ii-d-iii-ii: `serves_goals` retargeted from
+            // `SURVIVE_AND_GATHER_FOOD_GOALS` to `GATHER_FOOD_GOALS` — the
+            // hunger-driven Survive case is now owned by the HTN registry's
+            // `ScavengeFoodFromGroundMethod` (chain `[Scavenge, Eat]`,
+            // dispatched by `htn_acquire_food_dispatch_system`'s scavenge
+            // branch). The chief-driven GatherFood path still produces the
+            // legacy `[CollectFood, DepositGoods]` chain through this plan
+            // — chiefs want loose food in storage, not eaten on the spot,
+            // so the deposit-tail expansion is the right shape there.
+            // Migrating GatherFood to HTN needs a `ScavengeFoodForStorage`
+            // method whose expansion is `[Scavenge, DepositToFactionStorage]`
+            // and a per-good ctx field that threads the food good through;
+            // deferred until the wiring substrate stabilises.
+            id: PlanId(6),
             name: "ScavengeFood",
             steps: PLAN_STEPS_6,
             state_weights: mk_weights(&[
@@ -982,7 +993,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
                 (SI_STORAGE_FOOD, -0.3),
             ]),
             bias: 0.1,
-            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
+            serves_goals: GATHER_FOOD_GOALS,
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
             flags: PF_SCAVENGE | PF_TARGETS_FOOD,
@@ -992,7 +1003,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             // Gather-then-build sibling: only worth picking when storage is
             // dry and the agent can actually see/remember wood. Otherwise
             // HaulFromStorageAndBuild (29) is the cheaper path.
-            id: 7,
+            id: PlanId(7),
             name: "BuildBlueprint",
             steps: PLAN_STEPS_7,
             state_weights: mk_weights(&[
@@ -1009,7 +1020,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 8,
+            id: PlanId(8),
             name: "BuildBed",
             steps: &[],
             state_weights: mk_weights(&[]),
@@ -1021,27 +1032,24 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            // Plan 9 used to weight SI_HUNGER=1.5 — circular under Survive,
-            // since hunger is what selected the goal. Now scores on whether
-            // storage actually has food (the only viability question that
-            // distinguishes this from EatFromInventory and ExploreForFood).
-            id: 9,
-            name: "WithdrawAndEat",
-            steps: PLAN_STEPS_9,
-            state_weights: mk_weights(&[
-                (SI_STORAGE_FOOD, 1.5),
-                (SI_IN_FACTION, 0.4),
-                (SI_HAS_FOOD, -0.5),
-            ]),
-            bias: 0.3,
-            serves_goals: SURVIVE_GOALS,
+            // 9: (unused — was WithdrawAndEat; retired in Phase 5b-iii-ii.
+            // The walk-to-storage-then-eat path is owned by HTN
+            // `htn_acquire_food_dispatch_system` + `WithdrawFromStorageMethod`.
+            // ID kept for PlanHistory ring-buffer stability; bias is wired so
+            // the candidate filter never selects it.)
+            id: PlanId(9),
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
             requires_profession: None,
         },
         PlanDef {
-            id: 10,
+            id: PlanId(10),
             name: "TameHorse",
             steps: PLAN_STEPS_10,
             state_weights: mk_weights(&[]),
@@ -1062,7 +1070,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             // 15 whose step 40 now picks the most-deficient material across
             // all open orders. ID kept for PlanHistory ring-buffer stability;
             // bias is wired so the candidate filter never selects it.)
-            id: 11,
+            id: PlanId(11),
             name: "(unused)",
             steps: &[],
             state_weights: mk_weights(&[]),
@@ -1075,7 +1083,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         },
         PlanDef {
             // 12: (unused — was DeliverStoneToCraftOrder; collapsed into plan 15.)
-            id: 12,
+            id: PlanId(12),
             name: "(unused)",
             steps: &[],
             state_weights: mk_weights(&[]),
@@ -1087,7 +1095,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 13,
+            id: PlanId(13),
             name: "DeliverHideToCraftOrder",
             steps: PLAN_STEPS_13,
             state_weights: mk_weights(&[(SI_SKILL_COMBAT, 0.5), (SI_HAS_FOOD, -0.1)]),
@@ -1099,7 +1107,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 14,
+            id: PlanId(14),
             name: "DeliverGrainToCraftOrder",
             steps: PLAN_STEPS_14,
             state_weights: mk_weights(&[(SI_SKILL_FARMING, 0.5), (SI_SEASON_FOOD, 0.4)]),
@@ -1116,7 +1124,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             // work actually exists. The negative bias means that without an open
             // order the plan scores ≈ -0.6, which loses to WorkOnCraft (≈ 0.55)
             // and breaks the FailedNoTarget loop seen when no CraftOrders spawn.
-            id: 15,
+            id: PlanId(15),
             name: "DeliverFromStorageToCraftOrder",
             steps: PLAN_STEPS_15,
             state_weights: mk_weights(&[
@@ -1133,7 +1141,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 16,
+            id: PlanId(16),
             name: "WorkOnCraft",
             steps: PLAN_STEPS_16,
             state_weights: mk_weights(&[(SI_SKILL_CRAFTING, 0.5)]),
@@ -1145,7 +1153,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 17,
+            id: PlanId(17),
             name: "(unused)",
             steps: &[],
             state_weights: mk_weights(&[]),
@@ -1157,7 +1165,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 18,
+            id: PlanId(18),
             name: "(unused)",
             steps: &[],
             state_weights: mk_weights(&[]),
@@ -1169,7 +1177,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 19,
+            id: PlanId(19),
             name: "(unused)",
             steps: &[],
             state_weights: mk_weights(&[]),
@@ -1181,7 +1189,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 20,
+            id: PlanId(20),
             name: "(unused)",
             steps: &[],
             state_weights: mk_weights(&[]),
@@ -1193,7 +1201,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 21,
+            id: PlanId(21),
             name: "BuildCampfire",
             steps: &[],
             state_weights: mk_weights(&[]),
@@ -1205,7 +1213,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 22,
+            id: PlanId(22),
             name: "(unused)",
             steps: &[],
             state_weights: mk_weights(&[]),
@@ -1221,7 +1229,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             // combat-skilled responders preferred. Old `SI_SAFETY=0.5` was
             // perversely scoring the *agent's own* safety need, biasing AWAY
             // from rescue under threat — dropped.
-            id: 23,
+            id: PlanId(23),
             name: "RescueAlly",
             steps: PLAN_STEPS_23,
             state_weights: mk_weights(&[(SI_SKILL_COMBAT, 0.3)]),
@@ -1233,7 +1241,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 24,
+            id: PlanId(24),
             name: "ReturnSurplusFood",
             steps: PLAN_STEPS_24,
             state_weights: mk_weights(&[(SI_HAS_FOOD, 0.3), (SI_IN_FACTION, 0.3)]),
@@ -1244,23 +1252,16 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_DROP_FOOD_ON_TIMEOUT,
             requires_profession: None,
         },
+        // PlanId(25) "EatFromInventory" was retired in Phase 5b-ii. The
+        // single-step "if you have food and you're hungry, eat in place"
+        // dispatch now flows through `htn::htn_eat_dispatch_system` driven by
+        // `EatFromInventoryMethod`. PlanId(9) "WithdrawAndEat" was retired in
+        // Phase 5b-iii-ii — replaced by `htn::htn_acquire_food_dispatch_system`
+        // + `WithdrawFromStorageMethod`. Other Survive plans (Forage,
+        // ScavengeFood) still embed `StepId(9)` Eat as their final step and
+        // dispatch through `plan_execution_system`.
         PlanDef {
-            // Cheapest survive plan: if food is in hand, just eat. Bias 0.5
-            // plus HAS_FOOD 2.0 wins decisively over WithdrawAndEat (~2.2)
-            // and any food-gathering candidate when food is held.
-            id: 25,
-            name: "EatFromInventory",
-            steps: PLAN_STEPS_25,
-            state_weights: mk_weights(&[(SI_HAS_FOOD, 2.0)]),
-            bias: 0.5,
-            serves_goals: SURVIVE_GOALS,
-            tech_gate: None,
-            memory_target_kind: None,
-            flags: PF_NONE,
-            requires_profession: None,
-        },
-        PlanDef {
-            id: 26,
+            id: PlanId(26),
             name: "PlaySocial",
             steps: PLAN_STEPS_26,
             state_weights: mk_weights(&[(SI_SOCIAL, 1.5), (SI_WILLPOWER_DISTRESS, 0.5)]),
@@ -1272,7 +1273,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 27,
+            id: PlanId(27),
             name: "PlaySolo",
             steps: PLAN_STEPS_27,
             state_weights: mk_weights(&[(SI_SOCIAL, 0.6), (SI_WILLPOWER_DISTRESS, 0.7)]),
@@ -1283,45 +1284,29 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_NONE,
             requires_profession: None,
         },
-        // Explore is split per resource kind so that `explore_satisfaction_system`
-        // can abort the wander the moment the agent records a sighting of the
-        // target kind in memory. The candidate filter inverts the Food/Wood/Stone
-        // gates for these IDs: each ExploreFor* plan is only available when the
-        // agent has neither memory nor visibility of its target.
+        // Phase 5c-ii-d-iv-ii: PlanId 36/37 (`ExploreForWood`/`ExploreForStone`)
+        // deleted. The HTN `ExploreForMaterialMethod` (utility 0.3) under
+        // `AcquireGood` replaces both — `htn_acquire_good_dispatch_system`'s
+        // gather branch dispatches `Task::Explore { kind }` whenever no
+        // concrete method's precondition fires.
+        //
+        // PlanId 35 (`ExploreForFood`) retargeted from `SURVIVE_AND_GATHER_FOOD_GOALS`
+        // to `GATHER_FOOD_GOALS` only — HTN owns the Survive case via
+        // `ExploreForFoodMethod` under `AcquireFood`; the chief-driven
+        // GatherFood case still uses the legacy plan path because
+        // `htn_acquire_food_dispatch_system` only fires under Survive (no
+        // hunger gate exists for GatherFood). Mirrors the PlanId 6
+        // `ScavengeFood` retargeting in 5c-ii-d-iii-ii.
         PlanDef {
-            id: 35,
+            id: PlanId(35),
             name: "ExploreForFood",
             steps: PLAN_STEPS_28,
             state_weights: mk_weights(&[]),
             bias: 0.3,
-            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
+            serves_goals: GATHER_FOOD_GOALS,
             tech_gate: None,
             memory_target_kind: Some(MemoryKind::Food),
             flags: PF_EXPLORE | PF_TARGETS_FOOD,
-            requires_profession: None,
-        },
-        PlanDef {
-            id: 36,
-            name: "ExploreForWood",
-            steps: PLAN_STEPS_28,
-            state_weights: mk_weights(&[]),
-            bias: 0.3,
-            serves_goals: GATHER_WOOD_GOALS,
-            tech_gate: None,
-            memory_target_kind: Some(MemoryKind::Wood),
-            flags: PF_EXPLORE | PF_TARGETS_WOOD,
-            requires_profession: None,
-        },
-        PlanDef {
-            id: 37,
-            name: "ExploreForStone",
-            steps: PLAN_STEPS_28,
-            state_weights: mk_weights(&[]),
-            bias: 0.3,
-            serves_goals: GATHER_STONE_GOALS,
-            tech_gate: None,
-            memory_target_kind: Some(MemoryKind::Stone),
-            flags: PF_EXPLORE | PF_TARGETS_STONE,
             requires_profession: None,
         },
         PlanDef {
@@ -1331,7 +1316,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             // surplus into granaries — without this plan, blueprints stall at
             // the "haulers can only deliver what they happen to be carrying"
             // step (NearestBlueprintNeedingHeldMaterial).
-            id: 29,
+            id: PlanId(29),
             name: "HaulFromStorageAndBuild",
             steps: PLAN_STEPS_29,
             state_weights: mk_weights(&[
@@ -1351,7 +1336,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             // Take a Seed from faction storage and plant it as recreation.
             // Doubles as low-effort farming progress: each completion spawns a
             // Grain plant and feeds Farming activity for tech discovery.
-            id: 30,
+            id: PlanId(30),
             name: "PlayByPlanting",
             steps: PLAN_STEPS_30,
             state_weights: mk_weights(&[
@@ -1370,7 +1355,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             // Take a Stone from faction storage and throw it as recreation.
             // Each completion increments ActivityKind::Combat (driving combat
             // tech discovery) and grants a small Combat XP bump.
-            id: 31,
+            id: PlanId(31),
             name: "PlayByThrowingRocks",
             steps: PLAN_STEPS_31,
             state_weights: mk_weights(&[
@@ -1389,7 +1374,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             // faction storage and play with it in place. Chains into PlaySolo's
             // PlayWithItem step so the willpower-per-tick refill scales by the
             // toy's `entertainment_value`.
-            id: 32,
+            id: PlanId(32),
             name: "PlayWithStoredToy",
             steps: PLAN_STEPS_32,
             state_weights: mk_weights(&[
@@ -1404,26 +1389,10 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            // Claim-driven Haul plan. Fires only when the agent holds a
-            // JobClaim::Haul (which gates the goal to AgentGoal::Haul). Step 41
-            // withdraws the named good from the nearest storage tile; step 42
-            // delivers it to the specific blueprint named in the claim.
-            id: 33,
-            name: "ClaimedHaul",
-            steps: PLAN_STEPS_H,
-            state_weights: mk_weights(&[]),
-            bias: 1.0,
-            serves_goals: HAUL_GOALS,
-            tech_gate: None,
-            memory_target_kind: None,
-            flags: PF_UNINTERRUPTIBLE,
-            requires_profession: None,
-        },
-        PlanDef {
             // Claim-driven Build plan. Fires only when the agent holds a
             // JobClaim::Build (gating goal to AgentGoal::Build via job lock).
             // Step 43 routes to the claimed blueprint and labors there.
-            id: 34,
+            id: PlanId(34),
             name: "ClaimedBuild",
             steps: PLAN_STEPS_BB,
             state_weights: mk_weights(&[
@@ -1436,48 +1405,9 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_UNINTERRUPTIBLE,
             requires_profession: None,
         },
-        // ── Scavenge plans for loose wood/stone ───────────────────────────────
-        // Sibling of ScavengeFood (plan 6). Workers pick up loose Wood/Stone
-        // GroundItems left behind by tree/stone harvesting or prior spills,
-        // then haul them to faction storage. Targets resolve via
-        // `StepTarget::NearestItem`, so the plan only wins when an actual
-        // GroundItem of the matching good is reachable.
-        PlanDef {
-            // Score is dominated by SI_VIS_GROUND_WOOD so the plan wins over
-            // GatherWood (≈1.1 score) only when there's loose wood lying nearby
-            // (≥1 hit → 0.375·1.5 ≈ 0.56; ≥4 hits → saturated at 1.5). With no
-            // loose wood the score is 0 and GatherWood takes the goal.
-            id: 38,
-            name: "ScavengeWood",
-            steps: PLAN_STEPS_SW,
-            state_weights: mk_weights(&[
-                (SI_VIS_GROUND_WOOD, 1.5),
-                (SI_HAS_WOOD, -0.3),
-                (SI_STORAGE_WOOD, -0.3),
-            ]),
-            bias: 0.1,
-            serves_goals: GATHER_WOOD_GOALS,
-            tech_gate: None,
-            memory_target_kind: None,
-            flags: PF_SCAVENGE | PF_TARGETS_WOOD,
-            requires_profession: None,
-        },
-        PlanDef {
-            id: 39,
-            name: "ScavengeStone",
-            steps: PLAN_STEPS_SS,
-            state_weights: mk_weights(&[
-                (SI_VIS_GROUND_STONE, 1.5),
-                (SI_HAS_STONE, -0.3),
-                (SI_STORAGE_STONE, -0.3),
-            ]),
-            bias: 0.1,
-            serves_goals: GATHER_STONE_GOALS,
-            tech_gate: None,
-            memory_target_kind: None,
-            flags: PF_SCAVENGE | PF_TARGETS_STONE,
-            requires_profession: None,
-        },
+        // PlanId 38/39 (ScavengeWood/ScavengeStone) were retired in
+        // Phase 5c-ii-d-ii-b — see the registry preamble notes above and
+        // `ScavengeFromGroundMethod` in `htn.rs`.
         // ── Social-goal plans (60-63) ───────────────────────────────────
         // Migrated out of `tasks::goal_dispatch_system` so every goal
         // dispatches through `plan_execution_system`. Each is a single-step
@@ -1488,7 +1418,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         PlanDef {
             // Sole candidate under Socialize goal — bias alone wins.
             // Old SI_SOCIAL=1.5 was the goal-trigger need re-amplified.
-            id: 60,
+            id: PlanId(60),
             name: "Socialize",
             steps: PLAN_STEPS_SOCIALIZE,
             state_weights: mk_weights(&[]),
@@ -1500,7 +1430,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 61,
+            id: PlanId(61),
             name: "Raid",
             steps: PLAN_STEPS_RAID,
             state_weights: mk_weights(&[(SI_SKILL_COMBAT, 0.5)]),
@@ -1512,7 +1442,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 62,
+            id: PlanId(62),
             name: "Defend",
             steps: PLAN_STEPS_DEFEND,
             state_weights: mk_weights(&[(SI_SKILL_COMBAT, 0.5)]),
@@ -1524,7 +1454,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            id: 63,
+            id: PlanId(63),
             name: "Lead",
             steps: PLAN_STEPS_LEAD,
             state_weights: mk_weights(&[]),
@@ -1540,7 +1470,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             // faction storage when unarmed. The step's `forbids_good`
             // precondition means the plan auto-deselects the moment the
             // hunter is armed, so HuntFood (id 5) takes over from there.
-            id: 64,
+            id: PlanId(64),
             name: "AcquireHuntingSpear",
             steps: PLAN_STEPS_HUNTER_ARM,
             state_weights: mk_weights(&[]),
@@ -1558,7 +1488,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             // holding a Scout order (HuntFood gates on Hunt), so a single
             // chief flip swaps the active plan. NOT uninterruptible — a
             // scouting hunter can still be peeled off by survival pressures.
-            id: 65,
+            id: PlanId(65),
             name: "ScoutForPrey",
             steps: PLAN_STEPS_SCOUT,
             state_weights: mk_weights(&[]),
@@ -1573,7 +1503,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             // Withdraw a BerrySeed from faction storage and plant it on the
             // nearest Grass tile, spawning a BerryBush. Scores high when berry
             // seeds are stockpiled and food supply is low.
-            id: 66,
+            id: PlanId(66),
             name: "PlantBerryFromStorage",
             steps: PLAN_STEPS_66,
             state_weights: mk_weights(&[
@@ -1591,7 +1521,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         PlanDef {
             // Take a BerrySeed from faction storage and plant it as recreation,
             // spawning a BerryBush. Awards Farming XP + willpower burst.
-            id: 67,
+            id: PlanId(67),
             name: "PlayByPlantingBerry",
             steps: PLAN_STEPS_67,
             state_weights: mk_weights(&[

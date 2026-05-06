@@ -39,6 +39,7 @@ pub struct HudResources<'w> {
     pub player_faction: Res<'w, PlayerFaction>,
     pub registry: Res<'w, FactionRegistry>,
     pub selected_many: Res<'w, SelectedEntities>,
+    pub catalog: Res<'w, crate::economy::resource_catalog::ResourceCatalog>,
 }
 
 pub fn hud_system(
@@ -60,6 +61,7 @@ pub fn hud_system(
     let player_faction = &*res.player_faction;
     let registry = &*res.registry;
     let selected_many = &*res.selected_many;
+    let catalog = &*res.catalog;
     let pop = persons.iter().count();
     let any_drafted = selected_many.ids.iter().any(|&e| drafted_q.get(e).is_ok());
     let has_selection = !selected_many.ids.is_empty();
@@ -271,9 +273,21 @@ pub fn hud_system(
                                     .collect();
                                 
                                 if !other_entries.is_empty() {
-                                    other_entries.sort_by(|a, b| a.0.name().cmp(b.0.name()));
-                                    for (good, qty) in other_entries {
-                                        storage_text.push_str(&format!("  |  {}: {}", good.name(), qty));
+                                    // Storage is now ResourceId-keyed; pull
+                                    // display names from the catalog.
+                                    let name_of = |id: &crate::economy::resource_catalog::ResourceId| {
+                                        catalog
+                                            .get(*id)
+                                            .map(|d| d.display_name.as_str())
+                                            .unwrap_or("?")
+                                    };
+                                    other_entries.sort_by(|a, b| name_of(a.0).cmp(name_of(b.0)));
+                                    for (id, qty) in other_entries {
+                                        storage_text.push_str(&format!(
+                                            "  |  {}: {}",
+                                            name_of(id),
+                                            qty
+                                        ));
                                     }
                                 }
 

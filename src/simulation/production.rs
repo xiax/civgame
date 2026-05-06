@@ -242,15 +242,16 @@ pub fn withdraw_good_task_system(
     mut ground_items: Query<&mut GroundItem>,
     mut query: Query<(
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut EconomicAgent,
         &FactionMember,
         &BucketSlot,
         &LodLevel,
     )>,
 ) {
-    const ENTERTAINMENT_SENTINEL: u8 = 255;
+    use crate::simulation::typed_task::{Task, WithdrawGoodFilter};
 
-    for (mut ai, mut agent, member, slot, lod) in query.iter_mut() {
+    for (mut ai, mut aq, mut agent, member, slot, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -258,9 +259,20 @@ pub fn withdraw_good_task_system(
             continue;
         }
 
+        // Phase 3b-i: filter comes from the typed task variant. If the typed
+        // task disagrees with task_id, the dispatcher forgot to populate it —
+        // bail rather than read stale `craft_recipe_id`.
+        let Some(filter) = aq.current.as_withdraw_good() else {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            aq.advance();
+            continue;
+        };
+
         if member.faction_id == SOLO {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
+            aq.advance();
             continue;
         }
 
@@ -269,19 +281,20 @@ pub fn withdraw_good_task_system(
         if storage_tile_map.tiles.get(&(tx, ty)) != Some(&member.faction_id) {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
+            aq.advance();
             continue;
         }
 
-        let filter = ai.craft_recipe_id;
         for &gi_entity in spatial.get(tx as i32, ty as i32) {
             if let Ok(mut gi) = ground_items.get_mut(gi_entity) {
                 if gi.qty == 0 {
                     continue;
                 }
-                let matches = if filter == ENTERTAINMENT_SENTINEL {
-                    gi.item.good.entertainment_value() > 0
-                } else {
-                    gi.item.good as u8 == filter
+                let matches = match filter {
+                    WithdrawGoodFilter::AnyEntertainment => {
+                        gi.item.good().entertainment_value() > 0
+                    }
+                    WithdrawGoodFilter::Specific(good) => gi.item.good() == good,
                 };
                 if !matches {
                     continue;
@@ -305,20 +318,20 @@ pub fn withdraw_good_task_system(
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
+        aq.advance();
     }
 }
 
 /// Withdraw the specific good and quantity committed by the dispatching step
 /// resolver from a faction storage tile. Driven by `TaskKind::WithdrawMaterial`.
-/// The intent (`PersonAI.withdraw_good` / `withdraw_qty`) is set in
-/// `plan_execution_system` when a `StepTarget::WithdrawForFactionNeed`
-/// resolves; this system consumes it. Without an intent, the task aborts —
-/// every withdraw step commits a target up front, so an empty intent means
+/// The intent lives on the typed `Task::WithdrawMaterial { good, qty }`
+/// variant (Phase 3b-ii / 3b-iii); without it the task aborts — every withdraw
+/// step commits a target up front at dispatch, so a missing typed task means
 /// the dispatch path skipped (e.g. plan was preempted) and the safe thing to
 /// do is bail.
 ///
 /// On entry the executor first drops any hand stack whose good doesn't match
-/// `withdraw_good` so the agent's hands are free for the deposit step that
+/// the target so the agent's hands are free for the deposit step that
 /// usually follows. If the spatial scan finds zero of the target good (race
 /// — another agent already drained the stack), the active plan is marked
 /// failed via `PlanHistory` so the agent doesn't immediately walk back to
@@ -330,10 +343,16 @@ pub fn withdraw_material_task_system(
     spatial: Res<SpatialIndex>,
     storage_tile_map: Res<StorageTileMap>,
     storage_reservations: Res<StorageReservations>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    chunk_graph: Res<crate::pathfinding::chunk_graph::ChunkGraph>,
+    chunk_router: Res<crate::pathfinding::chunk_router::ChunkRouter>,
+    chunk_connectivity: Res<crate::pathfinding::connectivity::ChunkConnectivity>,
+    bp_query: Query<&crate::simulation::construction::Blueprint>,
     mut ground_items: Query<&mut GroundItem>,
     mut query: Query<(
         Entity,
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut EconomicAgent,
         &mut Carrier,
         &Transform,
@@ -345,11 +364,13 @@ pub fn withdraw_material_task_system(
     )>,
 ) {
     use crate::simulation::plan::PlanOutcome;
+    use crate::simulation::typed_task::Task;
     use crate::world::terrain::world_to_tile;
 
     for (
         entity,
         mut ai,
+        mut aq,
         mut agent,
         mut carrier,
         transform,
@@ -367,12 +388,44 @@ pub fn withdraw_material_task_system(
             continue;
         }
 
+        let cur_tile = world_to_tile(transform.translation.truncate());
+        let cur_chunk = crate::world::chunk::ChunkCoord(
+            cur_tile.0.div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+            cur_tile.1.div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+        );
+
+        // Phase 3b-ii: target good + qty come from the typed variant. If the
+        // typed task disagrees with task_id, the dispatcher forgot to populate
+        // it — bail rather than fall back to stale legacy intent.
+        let Some((target_good, target_qty)) = aq.current.as_withdraw_material() else {
+            finish_withdraw_material(
+                &mut ai,
+                &mut aq,
+                &storage_reservations,
+                &chunk_map,
+                &chunk_graph,
+                &chunk_router,
+                &chunk_connectivity,
+                &bp_query,
+                cur_tile,
+                cur_chunk,
+            );
+            continue;
+        };
+
         if member.faction_id == SOLO {
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
-            ai.withdraw_good = None;
-            ai.withdraw_qty = 0;
-            release_reservation(&storage_reservations, &mut ai);
+            finish_withdraw_material(
+                &mut ai,
+                &mut aq,
+                &storage_reservations,
+                &chunk_map,
+                &chunk_graph,
+                &chunk_router,
+                &chunk_connectivity,
+                &bp_query,
+                cur_tile,
+                cur_chunk,
+            );
             continue;
         }
 
@@ -380,23 +433,20 @@ pub fn withdraw_material_task_system(
 
         if storage_tile_map.tiles.get(&(tx, ty)) != Some(&member.faction_id) {
             // Storage tile is no longer owned by our faction — abort.
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
-            ai.withdraw_good = None;
-            ai.withdraw_qty = 0;
-            release_reservation(&storage_reservations, &mut ai);
+            finish_withdraw_material(
+                &mut ai,
+                &mut aq,
+                &storage_reservations,
+                &chunk_map,
+                &chunk_graph,
+                &chunk_router,
+                &chunk_connectivity,
+                &bp_query,
+                cur_tile,
+                cur_chunk,
+            );
             continue;
         }
-
-        let Some(target_good) = ai.withdraw_good else {
-            // No targeted intent — nothing to withdraw. Older opportunistic
-            // behavior is intentionally gone: the resolver must commit a good.
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
-            ai.withdraw_qty = 0;
-            release_reservation(&storage_reservations, &mut ai);
-            continue;
-        };
 
         // Drop any held stacks whose good doesn't match the target so the
         // agent's hands are free for the next haul step. Stacks of the same
@@ -409,13 +459,13 @@ pub fn withdraw_material_task_system(
             // borrowing issues across the spawn call.
             let mut to_drop: Vec<(Good, u32)> = Vec::new();
             if let Some(s) = carrier.left {
-                if s.item.good != target_good {
-                    to_drop.push((s.item.good, s.qty));
+                if s.item.good() != target_good {
+                    to_drop.push((s.item.good(), s.qty));
                 }
             }
             if let Some(s) = carrier.right {
-                if s.item.good != target_good {
-                    to_drop.push((s.item.good, s.qty));
+                if s.item.good() != target_good {
+                    to_drop.push((s.item.good(), s.qty));
                 }
             }
             for (good, qty) in to_drop {
@@ -432,8 +482,8 @@ pub fn withdraw_material_task_system(
             }
         }
 
-        let mut remaining = ai.withdraw_qty as u32;
-        let promised = ai.withdraw_qty as u32;
+        let mut remaining = target_qty as u32;
+        let promised = target_qty as u32;
         let pickup_item = Item::new_commodity(target_good);
 
         for &gi_entity in spatial.get(tx as i32, ty as i32) {
@@ -441,7 +491,7 @@ pub fn withdraw_material_task_system(
                 break;
             }
             if let Ok(mut gi) = ground_items.get_mut(gi_entity) {
-                if gi.qty == 0 || gi.item.good != target_good {
+                if gi.qty == 0 || gi.item.good() != target_good {
                     continue;
                 }
                 let want = remaining.min(gi.qty);
@@ -487,12 +537,98 @@ pub fn withdraw_material_task_system(
             }
         }
 
-        ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
-        ai.work_progress = 0;
-        ai.withdraw_good = None;
-        ai.withdraw_qty = 0;
-        release_reservation(&storage_reservations, &mut ai);
+        finish_withdraw_material(
+            &mut ai,
+            &mut aq,
+            &storage_reservations,
+            &chunk_map,
+            &chunk_graph,
+            &chunk_router,
+            &chunk_connectivity,
+            &bp_query,
+            cur_tile,
+            cur_chunk,
+        );
+    }
+}
+
+/// Shared exit path for `withdraw_material_task_system`. Releases the storage
+/// reservation, advances the prefetched ring, and primes the legacy channel
+/// for the next leg of the chain. When the next task is a chained
+/// `Task::HaulToBlueprint { blueprint }` (the canonical 5c-ii-b shape produced
+/// by `WithdrawAndHaulToBlueprintMethod` under the HTN AcquireGood pipeline),
+/// looks up the blueprint's tile and routes the agent there with
+/// `TaskKind::HaulMaterials`. From there `construction_system`'s hauler branch
+/// takes over.
+///
+/// Other (non-HaulToBlueprint / Idle) follow-ups fall back to a clean
+/// `(Idle, UNEMPLOYED)` slot — defensive against future methods that chain
+/// something other than HaulToBlueprint behind WithdrawMaterial. A blueprint
+/// entity that's been despawned (mid-chain race) collapses to Idle so the
+/// agent doesn't strand on a missing target.
+fn finish_withdraw_material(
+    ai: &mut PersonAI,
+    aq: &mut crate::simulation::typed_task::ActionQueue,
+    storage_reservations: &StorageReservations,
+    chunk_map: &crate::world::chunk::ChunkMap,
+    chunk_graph: &crate::pathfinding::chunk_graph::ChunkGraph,
+    chunk_router: &crate::pathfinding::chunk_router::ChunkRouter,
+    chunk_connectivity: &crate::pathfinding::connectivity::ChunkConnectivity,
+    bp_query: &Query<&crate::simulation::construction::Blueprint>,
+    cur_tile: (i32, i32),
+    cur_chunk: crate::world::chunk::ChunkCoord,
+) {
+    use crate::simulation::tasks::assign_task_with_routing;
+    use crate::simulation::typed_task::Task;
+
+    release_reservation(storage_reservations, ai);
+    ai.work_progress = 0;
+    aq.advance();
+
+    match aq.current {
+        Task::HaulToBlueprint { blueprint } => {
+            // Blueprint may have been satisfied / despawned between dispatch
+            // and arrival. Drop the chain to Idle so the goal-dispatch path
+            // can re-evaluate next tick rather than strand the agent.
+            let Ok(bp) = bp_query.get(blueprint) else {
+                aq.cancel();
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
+                return;
+            };
+            let bp_tile = (bp.tile.0, bp.tile.1);
+            let dispatched = assign_task_with_routing(
+                ai,
+                cur_tile,
+                cur_chunk,
+                bp_tile,
+                TaskKind::HaulMaterials,
+                Some(blueprint),
+                chunk_graph,
+                chunk_router,
+                chunk_map,
+                chunk_connectivity,
+            );
+            if !dispatched {
+                aq.cancel();
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
+            }
+        }
+        Task::Idle => {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+        }
+        _ => {
+            // No other task family is expected as a chained follow-up to
+            // WithdrawMaterial at 5c-ii-b. Drop the entire chain to Idle so a
+            // mis-built expansion can't strand the agent.
+            aq.cancel();
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+        }
     }
 }
 
@@ -515,6 +651,7 @@ pub fn withdraw_food_task_system(
     mut ground_items: Query<&mut GroundItem>,
     mut query: Query<(
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut EconomicAgent,
         &mut Carrier,
         &FactionMember,
@@ -522,7 +659,7 @@ pub fn withdraw_food_task_system(
         &LodLevel,
     )>,
 ) {
-    for (mut ai, mut agent, mut carrier, member, slot, lod) in query.iter_mut() {
+    for (mut ai, mut aq, mut agent, mut carrier, member, slot, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -530,8 +667,7 @@ pub fn withdraw_food_task_system(
             continue;
         }
         if member.faction_id == SOLO {
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
+            finish_withdraw_food(&mut ai, &mut aq);
             continue;
         }
 
@@ -539,8 +675,7 @@ pub fn withdraw_food_task_system(
 
         if storage_tile_map.tiles.get(&(tx, ty)) != Some(&member.faction_id) {
             // Storage tile is no longer owned by our faction (or never was) — abort.
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
+            finish_withdraw_food(&mut ai, &mut aq);
             continue;
         }
 
@@ -550,8 +685,8 @@ pub fn withdraw_food_task_system(
         let mut deposit_buf = [(Good::Stone, 0u32); 8];
         let mut deposit_len = 0usize;
         for &(item, qty) in agent.inventory.iter() {
-            if qty > 0 && item.good.bulk() == Bulk::TwoHand {
-                deposit_buf[deposit_len] = (item.good, qty);
+            if qty > 0 && item.good().bulk() == Bulk::TwoHand {
+                deposit_buf[deposit_len] = (item.good(), qty);
                 deposit_len += 1;
             }
         }
@@ -571,12 +706,12 @@ pub fn withdraw_food_task_system(
         let mut withdrew = false;
         for &gi_entity in spatial.get(tx as i32, ty as i32) {
             if let Ok(mut gi) = ground_items.get_mut(gi_entity) {
-                if gi.item.good.is_edible() && gi.qty > 0 {
+                if gi.item.good().is_edible() && gi.qty > 0 {
                     // Try hands first; fall back to inventory for any leftover.
-                    let food_item = Item::new_commodity(gi.item.good);
+                    let food_item = Item::new_commodity(gi.item.good());
                     let after_hands = carrier.try_pick_up(food_item, 1);
                     let leftover = if after_hands > 0 {
-                        agent.add_good(gi.item.good, after_hands)
+                        agent.add_good(gi.item.good(), after_hands)
                     } else {
                         0
                     };
@@ -596,9 +731,42 @@ pub fn withdraw_food_task_system(
 
         // Whether or not food was found, the task ends this tick.
         let _ = withdrew;
-        ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
-        ai.work_progress = 0;
+        finish_withdraw_food(&mut ai, &mut aq);
+    }
+}
+
+/// Shared exit path for `withdraw_food_task_system`. Pops the prefetched queue
+/// into `aq.current`; if the next task is a chained `Task::Eat` (the canonical
+/// shape produced by `WithdrawFromStorageMethod` under the HTN AcquireFood
+/// pipeline) primes the legacy channel directly so `eat_task_system` picks up
+/// without re-entering dispatch. Other (non-Eat / Idle) follow-ups fall back to
+/// a clean `(Idle, UNEMPLOYED)` slot — defensive against future methods that
+/// chain something other than Eat behind WithdrawFood.
+fn finish_withdraw_food(
+    ai: &mut PersonAI,
+    aq: &mut crate::simulation::typed_task::ActionQueue,
+) {
+    use crate::simulation::typed_task::Task;
+    aq.advance();
+    ai.work_progress = 0;
+    match aq.current {
+        Task::Eat => {
+            // Hand off straight into the Eat executor.
+            ai.state = AiState::Working;
+            ai.task_id = TaskKind::Eat as u16;
+        }
+        Task::Idle => {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+        }
+        _ => {
+            // No other task family is expected as a chained follow-up to
+            // WithdrawFood at 5b-iii-ii. Drop the entire chain to Idle so a
+            // mis-built expansion can't strand the agent.
+            aq.cancel();
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+        }
     }
 }
 
@@ -617,7 +785,7 @@ enum EdibleSlot {
 pub fn total_edible(agent: &EconomicAgent, carrier: &Carrier) -> u32 {
     let mut from_hands = 0u32;
     for slot in [carrier.left, carrier.right].into_iter().flatten() {
-        if slot.item.good.is_edible() {
+        if slot.item.good().is_edible() {
             from_hands = from_hands.saturating_add(slot.qty);
         }
     }
@@ -713,7 +881,7 @@ pub fn eat_task_system(
             for (idx, (it, q)) in agent.inventory.iter().enumerate() {
                 consider(
                     EdibleSlot::Inventory(idx),
-                    it.good,
+                    it.good(),
                     *q,
                     needs.hunger,
                     &mut min_nut,
@@ -725,7 +893,7 @@ pub fn eat_task_system(
             if let Some(s) = carrier.left {
                 consider(
                     EdibleSlot::HandLeft,
-                    s.item.good,
+                    s.item.good(),
                     s.qty,
                     needs.hunger,
                     &mut min_nut,
@@ -737,7 +905,7 @@ pub fn eat_task_system(
             if let Some(s) = carrier.right {
                 consider(
                     EdibleSlot::HandRight,
-                    s.item.good,
+                    s.item.good(),
                     s.qty,
                     needs.hunger,
                     &mut min_nut,

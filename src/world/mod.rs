@@ -23,6 +23,17 @@ pub struct WorldPlugin;
 
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
+        // Resource catalog must be inserted before any system reads
+        // resource-typed data. We install it here (alongside the globe)
+        // because WorldPlugin already loads file-system data at build.
+        // The catalog is shared two ways: a Bevy `Resource` for systems
+        // that take `Res<ResourceCatalog>`, and a process-global
+        // `OnceLock` (`core_ids::install_catalog`) for the legacy
+        // `Good::*` methods which can't take system params.
+        let catalog = crate::economy::resource_catalog::load_resource_catalog();
+        crate::economy::core_ids::install_catalog(catalog.clone());
+        app.insert_resource(catalog);
+
         insert_globe(app);
         app.world_mut()
             .register_component_hooks::<spatial::Indexed>()

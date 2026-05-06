@@ -11,6 +11,7 @@ pub mod dig;
 pub mod faction;
 pub mod gather;
 pub mod goals;
+pub mod htn;
 pub mod items;
 pub mod jobs;
 pub mod knowledge;
@@ -36,6 +37,9 @@ pub mod sound;
 pub mod stats;
 pub mod tasks;
 pub mod teaching;
+pub mod typed_task;
+#[cfg(test)]
+pub mod test_fixture;
 pub mod technology;
 pub mod terraform;
 pub mod world_sim;
@@ -60,6 +64,9 @@ impl Plugin for SimulationPlugin {
         plan::register_builtin_steps(&mut step_registry);
         plan::register_builtin_plans(&mut plan_registry);
 
+        let mut method_registry = htn::MethodRegistry::default();
+        htn::register_builtin_methods(&mut method_registry);
+
         app.add_plugins(jobs::JobsPlugin)
             .add_plugins(projects::ProjectsPlugin)
             .add_event::<combat::CombatEvent>()
@@ -77,6 +84,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(plants::PlantSpriteIndex::default())
             .insert_resource(step_registry)
             .insert_resource(plan_registry)
+            .insert_resource(method_registry)
             .insert_resource(construction::AutonomousBuildingToggle(true))
             .insert_resource(construction::BedMap::default())
             .insert_resource(construction::WallMap::default())
@@ -156,7 +164,19 @@ impl Plugin for SimulationPlugin {
                     jobs::job_claim_system.before(jobs::job_goal_lock_system),
                     jobs::job_board_command_system.before(jobs::job_claim_system),
                     tasks::goal_dispatch_system,
-                    terraform::terraform_dispatch_system.after(tasks::goal_dispatch_system),
+                    htn::htn_dispatch_system.after(tasks::goal_dispatch_system),
+                    htn::htn_eat_dispatch_system
+                        .after(htn::htn_dispatch_system),
+                    htn::htn_acquire_food_dispatch_system
+                        .after(htn::htn_eat_dispatch_system),
+                    htn::htn_acquire_good_dispatch_system
+                        .after(htn::htn_acquire_food_dispatch_system),
+                    terraform::terraform_dispatch_system
+                        .after(tasks::goal_dispatch_system)
+                        .after(htn::htn_dispatch_system)
+                        .after(htn::htn_eat_dispatch_system)
+                        .after(htn::htn_acquire_food_dispatch_system)
+                        .after(htn::htn_acquire_good_dispatch_system),
                 )
                     .in_set(SimulationSet::ParallelB),
             )

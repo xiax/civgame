@@ -117,7 +117,7 @@ fn find_readable_slot(agent: &EconomicAgent, tech: TechId) -> Option<usize> {
         if *qty == 0 {
             continue;
         }
-        if !matches!(item.good, Good::ClayTablet | Good::Book) {
+        if !matches!(item.good(), Good::ClayTablet | Good::Book) {
             continue;
         }
         if item.tech_payload == Some(tech) {
@@ -157,15 +157,20 @@ fn lecture_candidate_ok(
 pub fn apply_player_knowledge_orders_system(
     mut commands: Commands,
     mut player_craft: ResMut<crate::simulation::jobs::PlayerCraftRequest>,
-    mut q: Query<(Entity, &PlayerOrder, &mut PersonAI)>,
+    mut q: Query<(
+        Entity,
+        &PlayerOrder,
+        &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
+    )>,
 ) {
-    for (entity, order, mut ai) in q.iter_mut() {
+    for (entity, order, mut ai, mut aq) in q.iter_mut() {
         match order.order {
             PlayerOrderKind::ReadItem(tech) => {
                 ai.task_id = TaskKind::Read as u16;
                 ai.state = AiState::Working;
                 ai.work_progress = 0;
-                ai.tech_focus = Some(tech);
+                aq.dispatch(crate::simulation::typed_task::Task::Read { tech });
                 if let Some(mut ec) = commands.get_entity(entity) {
                     // Drop any in-flight plan so the read task is not
                     // immediately overwritten by `plan_execution_system`.
@@ -202,6 +207,7 @@ pub fn read_task_system(
     mut q: Query<(
         Entity,
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut PersonKnowledge,
         &Stats,
         &EconomicAgent,
@@ -210,24 +216,25 @@ pub fn read_task_system(
     )>,
 ) {
     let now = clock.tick as u32;
-    for (entity, mut ai, mut knowledge, stats, agent, fm, lod) in q.iter_mut() {
+    for (entity, mut ai, mut aq, mut knowledge, stats, agent, fm, lod) in q.iter_mut() {
         if ai.task_id != TaskKind::Read as u16 || ai.state != AiState::Working {
             continue;
         }
         if *lod == LodLevel::Dormant {
             continue;
         }
-        let Some(tech) = ai.tech_focus else {
+        let Some(tech) = aq.current.knowledge_tech() else {
             // Misconfigured task — clear it.
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.state = AiState::Idle;
+            aq.advance();
             continue;
         };
         if find_readable_slot(agent, tech).is_none() {
             // Lost the tablet (dropped, traded). End task.
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.state = AiState::Idle;
-            ai.tech_focus = None;
+            aq.advance();
             continue;
         }
 
@@ -257,7 +264,7 @@ pub fn read_task_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.state = AiState::Idle;
             ai.work_progress = 0;
-            ai.tech_focus = None;
+            aq.advance();
             // Release the player-imposed `Drafted` marker so autonomous goal
             // dispatch can pick the agent back up.
             if let Some(mut ec) = commands.get_entity(entity) {
@@ -278,7 +285,15 @@ pub fn teach_task_system(
     transforms: Query<&Transform>,
     name_query: Query<&Name>,
     members: Query<&FactionMember>,
-    mut teachers: Query<(Entity, &mut PersonAI, Option<&TeachingPair>), With<PersonAI>>,
+    mut teachers: Query<
+        (
+            Entity,
+            &mut PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
+            Option<&TeachingPair>,
+        ),
+        With<PersonAI>,
+    >,
     mut students_kn: Query<(&mut PersonKnowledge, &Stats), Without<TeachingPair>>,
 ) {
     let now = clock.tick as u32;
@@ -286,7 +301,7 @@ pub fn teach_task_system(
     // Snapshot teacher → (student, tech, ends_tick) pairs.
     let pairs: Vec<(Entity, Entity, TechId, u64)> = teachers
         .iter()
-        .filter_map(|(e, _ai, tp)| tp.map(|tp| (e, tp.student, tp.tech, tp.ends_tick)))
+        .filter_map(|(e, _ai, _aq, tp)| tp.map(|tp| (e, tp.student, tp.tech, tp.ends_tick)))
         .collect();
 
     if pairs.is_empty() {
@@ -347,10 +362,11 @@ pub fn teach_task_system(
             cleanup_teach(&mut commands, teacher_e, student_e);
         } else {
             // Pin the teacher to "Working" so movement doesn't drift them.
-            if let Ok((_, mut ai, _)) = teachers.get_mut(teacher_e) {
+            if let Ok((_, mut ai, mut aq, _)) = teachers.get_mut(teacher_e) {
                 ai.task_id = TaskKind::Teach as u16;
                 ai.state = AiState::Working;
                 ai.work_progress = ai.work_progress.saturating_add(1);
+                aq.current = crate::simulation::typed_task::Task::Teach { tech };
             }
         }
     }
@@ -467,17 +483,26 @@ pub fn lecture_tick_system(
             Entity,
             &Attending,
             &mut PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
             &mut PersonKnowledge,
             &Stats,
         ),
         Without<Lecturing>,
     >,
-    mut lecturers: Query<(Entity, &Lecturing, &mut PersonAI), Without<Attending>>,
+    mut lecturers: Query<
+        (
+            Entity,
+            &Lecturing,
+            &mut PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
+        ),
+        Without<Attending>,
+    >,
 ) {
     let now = clock.tick as u32;
 
     // Process students.
-    for (student_e, att, mut ai, mut knowledge, stats) in students.iter_mut() {
+    for (student_e, att, mut ai, mut aq, mut knowledge, stats) in students.iter_mut() {
         let lecturer_present = transforms.get(att.lecturer).is_ok();
         let in_range = match (transforms.get(student_e), transforms.get(att.lecturer)) {
             (Ok(s), Ok(l)) => {
@@ -496,14 +521,14 @@ pub fn lecture_tick_system(
             }
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.state = AiState::Idle;
-            ai.tech_focus = None;
+            aq.advance();
             continue;
         }
 
         // Pin task each tick.
         ai.task_id = TaskKind::AttendLecture as u16;
         ai.state = AiState::Working;
-        ai.tech_focus = Some(att.tech);
+        aq.current = crate::simulation::typed_task::Task::AttendLecture { tech: att.tech };
 
         let amount = study_amount(stats, 2.0);
         let capacity = capacity_for(stats);
@@ -533,12 +558,12 @@ pub fn lecture_tick_system(
             }
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.state = AiState::Idle;
-            ai.tech_focus = None;
+            aq.advance();
         }
     }
 
     // Process lecturers (timeouts).
-    for (lec_e, lec, mut ai) in lecturers.iter_mut() {
+    for (lec_e, lec, mut ai, mut aq) in lecturers.iter_mut() {
         if clock.tick >= lec.ends_tick {
             if let Some(mut ec) = commands.get_entity(lec_e) {
                 ec.remove::<Lecturing>();
@@ -546,12 +571,12 @@ pub fn lecture_tick_system(
             }
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.state = AiState::Idle;
-            ai.tech_focus = None;
+            aq.advance();
         } else {
             // Pin lecturer in HoldLecture state.
             ai.task_id = TaskKind::HoldLecture as u16;
             ai.state = AiState::Working;
-            ai.tech_focus = Some(lec.tech);
+            aq.current = crate::simulation::typed_task::Task::HoldLecture { tech: lec.tech };
         }
     }
 

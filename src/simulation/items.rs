@@ -2,13 +2,18 @@ use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::simulation::carry::Carrier;
+use crate::simulation::faction::{FactionMember, SOLO};
+use crate::simulation::gather::GatherRoutingResources;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, Person, PersonAI};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
+use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
+use crate::simulation::typed_task::{ActionQueue, Task};
+use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::spatial::SpatialIndex;
-use crate::world::terrain::{tile_to_world, TILE_SIZE};
+use crate::world::terrain::{tile_to_world, world_to_tile, TILE_SIZE};
 use bevy::prelude::*;
 
 #[derive(Component, Clone, Copy, Default, Debug)]
@@ -31,25 +36,6 @@ pub enum EquipmentSlot {
     ArmArmor = 5,
 }
 
-/// Sentinel for `PersonAI.equip_slot` meaning "no pending equip". Stored as
-/// `u8` (not `Option<EquipmentSlot>`) to keep PersonAI free of an items.rs
-/// import — items.rs already imports PersonAI, so a back-edge would cycle.
-pub const EQUIP_SLOT_NONE: u8 = 0xFF;
-
-impl EquipmentSlot {
-    pub fn from_u8(v: u8) -> Option<EquipmentSlot> {
-        match v {
-            0 => Some(EquipmentSlot::MainHand),
-            1 => Some(EquipmentSlot::OffHand),
-            2 => Some(EquipmentSlot::HeadArmor),
-            3 => Some(EquipmentSlot::TorsoArmor),
-            4 => Some(EquipmentSlot::LegArmor),
-            5 => Some(EquipmentSlot::ArmArmor),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Component, Default, Clone)]
 pub struct Equipment {
     pub items: bevy::utils::HashMap<EquipmentSlot, Item>,
@@ -60,11 +46,9 @@ impl Equipment {
     /// `forbids_good` preconditions so a wielded weapon counts the same as one
     /// in inventory or hands.
     pub fn has_good(&self, good: Good) -> bool {
-        self.items.values().any(|it| it.good == good)
+        self.items.values().any(|it| it.good() == good)
     }
 }
-
-use super::tasks::TaskKind;
 
 /// Deposits `qty` of `good` at tile `(tx, ty)` as a commodity stack.
 /// Convenience wrapper for callers that don't have a full `Item` (combat
@@ -146,7 +130,7 @@ pub fn recompute_inventory_capacity_system(
     for (equipment, mut agent) in q.iter_mut() {
         let mut bonus = 0u32;
         if let Some(item) = equipment.items.get(&EquipmentSlot::TorsoArmor) {
-            bonus = bonus.saturating_add(match item.good {
+            bonus = bonus.saturating_add(match item.good() {
                 Good::Cloth => 2_000,
                 Good::Armor => 1_000,
                 _ => 0,
@@ -170,22 +154,102 @@ fn personal_pickup(good: Good, needs: &Needs) -> bool {
     }
 }
 
+/// Phase 5c-ii-d-ii-a chain handoff: called by every `item_pickup_system`
+/// exit path instead of inlining the legacy reset block. Performs the
+/// standard Idle reset + `aq.advance()`, *and* if the prefetch ring promotes
+/// a `Task::DepositToFactionStorage { .. }` into `current`, routes the agent
+/// to the nearest faction storage tile and primes
+/// `task_id = TaskKind::DepositResource` so `drop_items_at_destination_system`
+/// picks up next tick. Mirrors `gather.rs::finish_gather`.
+///
+/// On routing failure (no faction storage, all storage unreachable, or SOLO
+/// agent — the dispatcher already gates SOLO out, so this is defensive) the
+/// chain is dropped via `aq.cancel()`. The agent stays Idle with full hands;
+/// the next dispatcher tick will either re-dispatch a fresh chain or fall
+/// through to `Explore`.
+fn finish_scavenge(
+    ai: &mut PersonAI,
+    aq: &mut ActionQueue,
+    cur_tile: (i32, i32),
+    cur_chunk: ChunkCoord,
+    faction_id: Option<u32>,
+    chunk_map: &ChunkMap,
+    routing: &GatherRoutingResources,
+) {
+    ai.state = AiState::Idle;
+    ai.task_id = PersonAI::UNEMPLOYED;
+    ai.target_entity = None;
+    aq.advance();
+
+    match aq.current {
+        Task::DepositToFactionStorage { .. } => {
+            // 5c-ii-d-ii-a: AcquireGood scavenge tail. Walk to nearest faction
+            // storage and prime DepositResource.
+            let Some(fid) = faction_id else {
+                aq.cancel();
+                return;
+            };
+            let Some(storage_tile) =
+                routing.storage_tile_map.nearest_for_faction(fid, cur_tile)
+            else {
+                aq.cancel();
+                return;
+            };
+            let dispatched = assign_task_with_routing(
+                ai,
+                cur_tile,
+                cur_chunk,
+                storage_tile,
+                TaskKind::DepositResource,
+                None,
+                &routing.chunk_graph,
+                &routing.chunk_router,
+                chunk_map,
+                &routing.chunk_connectivity,
+            );
+            if !dispatched {
+                aq.cancel();
+            }
+        }
+        Task::Eat => {
+            // 5c-ii-d-iii-ii: AcquireFood scavenge tail. The food is in the
+            // agent's hands now; eat it on the spot — no routing needed,
+            // just prime the legacy Eat channel directly. Mirrors
+            // `production::finish_withdraw_food`'s Task::Eat handoff for the
+            // [WithdrawFood, Eat] chain.
+            ai.state = AiState::Working;
+            ai.task_id = TaskKind::Eat as u16;
+            ai.work_progress = 0;
+        }
+        _ => {
+            // Idle or unrecognised follow-up: ring is empty or contains a
+            // task not expected after Scavenge. Default exit (already set
+            // above) is correct; nothing more to do.
+        }
+    }
+}
+
 /// Sequential, after death_system.
 /// Agents explicitly targeting a GroundItem pick it up once they arrive.
 pub fn item_pickup_system(
     mut commands: Commands,
     clock: Res<SimClock>,
+    chunk_map: Res<ChunkMap>,
+    routing: GatherRoutingResources,
     mut item_query: Query<&mut GroundItem>,
     mut pickers: Query<
         (
             Entity,
             &mut PersonAI,
+            &mut ActionQueue,
             &mut EconomicAgent,
             &mut Carrier,
             &Needs,
             &mut TargetItem,
             &BucketSlot,
             &LodLevel,
+            &Transform,
+            Option<&FactionMember>,
             Option<&mut ActivePlan>,
         ),
         With<Person>,
@@ -194,12 +258,15 @@ pub fn item_pickup_system(
     for (
         _entity,
         mut ai,
+        mut aq,
         mut agent,
         mut carrier,
         needs,
         mut target_item,
         slot,
         lod,
+        transform,
+        faction_member,
         mut active_plan_opt,
     ) in pickers.iter_mut()
     {
@@ -210,17 +277,37 @@ pub fn item_pickup_system(
             continue;
         }
 
-        let Some(target_ent) = target_item.0 else {
+        // Agent's current tile + chunk for `finish_scavenge`'s routing
+        // decision when the prefetch ring promotes a `DepositToFactionStorage`.
+        let cur_tile = world_to_tile(transform.translation.truncate());
+        let cur_chunk = ChunkCoord(
+            cur_tile.0.div_euclid(CHUNK_SIZE as i32),
+            cur_tile.1.div_euclid(CHUNK_SIZE as i32),
+        );
+        let faction_id = faction_member
+            .map(|fm| fm.faction_id)
+            .filter(|&id| id != SOLO);
+
+        // Phase 3b-vi: target comes from typed `Task::Scavenge`, falling back
+        // to legacy `target_item.0` for any unmigrated dispatch path.
+        let Some(target_ent) = aq.current.as_scavenge().or(target_item.0) else {
             // No target, but in scavenge state? Cleanup.
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
-            ai.target_entity = None;
+            target_item.0 = None;
+            finish_scavenge(
+                &mut ai,
+                &mut aq,
+                cur_tile,
+                cur_chunk,
+                faction_id,
+                &chunk_map,
+                &routing,
+            );
             continue;
         };
 
         if let Ok(mut item) = item_query.get_mut(target_ent) {
-            let take_qty = if item.item.good.is_edible() {
-                let nutrition = item.item.good.nutrition();
+            let take_qty = if item.item.good().is_edible() {
+                let nutrition = item.item.good().nutrition();
                 if nutrition == 0 {
                     item.qty
                 } else {
@@ -233,7 +320,7 @@ pub fn item_pickup_system(
 
             // Personal goods → inventory; hauling goods → hands. Fall back to the other
             // bucket if the primary is full (e.g. inventory cap exceeded).
-            let leftover = if personal_pickup(item.item.good, needs) {
+            let leftover = if personal_pickup(item.item.good(), needs) {
                 let inv_left = agent.add_item(item.item, take_qty);
                 if inv_left > 0 {
                     carrier.try_pick_up(item.item, inv_left)
@@ -260,16 +347,28 @@ pub fn item_pickup_system(
                 item.qty -= actually_taken;
             }
 
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
-            ai.target_entity = None;
             target_item.0 = None;
+            finish_scavenge(
+                &mut ai,
+                &mut aq,
+                cur_tile,
+                cur_chunk,
+                faction_id,
+                &chunk_map,
+                &routing,
+            );
         } else {
             // Targeted item is gone (stolen or rotted)
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
-            ai.target_entity = None;
             target_item.0 = None;
+            finish_scavenge(
+                &mut ai,
+                &mut aq,
+                cur_tile,
+                cur_chunk,
+                faction_id,
+                &chunk_map,
+                &routing,
+            );
         }
     }
 }
@@ -288,7 +387,7 @@ fn find_best_matching_item(
     let mut best: Option<(Item, EquipSource)> = None;
     let mut best_mult = f32::NEG_INFINITY;
     for (item, qty) in &agent.inventory {
-        if *qty == 0 || item.good != wanted {
+        if *qty == 0 || item.good() != wanted {
             continue;
         }
         let m = item.multiplier();
@@ -298,7 +397,7 @@ fn find_best_matching_item(
         }
     }
     for stack in [carrier.left, carrier.right].iter().flatten() {
-        if stack.item.good != wanted {
+        if stack.item.good() != wanted {
             continue;
         }
         let m = stack.item.multiplier();
@@ -318,12 +417,12 @@ enum EquipSource {
 
 /// Sequential, after `item_pickup_system`, before `combat_system`.
 /// Instant transfer of a single matching `Item` from inventory or Carrier
-/// into the target `Equipment` slot. Slot + good come from `PersonAI`
-/// (`equip_slot` + `craft_recipe_id`), set by the dispatcher when the step's
-/// `StepTarget::EquipItem` was committed. If the slot was already occupied,
-/// the previous item gets pushed back to inventory; if inventory is full it
-/// is dumped as a `GroundItem` at the agent's tile so combat stats aren't
-/// silently lost.
+/// into the target `Equipment` slot. Slot + good come from the typed
+/// `Task::Equip { slot, good }` variant (Phase 3d-i), set by the dispatcher
+/// when the step's `StepTarget::EquipItem` was committed. If the slot was
+/// already occupied, the previous item gets pushed back to inventory; if
+/// inventory is full it is dumped as a `GroundItem` at the agent's tile so
+/// combat stats aren't silently lost.
 pub fn equip_task_system(
     mut commands: Commands,
     clock: Res<SimClock>,
@@ -332,6 +431,7 @@ pub fn equip_task_system(
     mut q: Query<
         (
             &mut PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
             &mut EconomicAgent,
             &mut Carrier,
             &mut Equipment,
@@ -342,7 +442,7 @@ pub fn equip_task_system(
         With<Person>,
     >,
 ) {
-    for (mut ai, mut agent, mut carrier, mut equipment, transform, slot, lod) in q.iter_mut() {
+    for (mut ai, mut aq, mut agent, mut carrier, mut equipment, transform, slot, lod) in q.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -352,24 +452,12 @@ pub fn equip_task_system(
         // Equip is in-place — fire as soon as the dispatcher pushes the agent
         // into the task. No routing or arrival check needed (target is SelfPosition).
 
-        let target_slot = match EquipmentSlot::from_u8(ai.equip_slot) {
-            Some(s) => s,
-            None => {
-                // Bad slot id — clear the task so the plan moves on.
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
-                ai.equip_slot = EQUIP_SLOT_NONE;
-                continue;
-            }
-        };
-        let wanted = match crate::economy::goods::Good::try_from_u8(ai.craft_recipe_id) {
-            Some(g) => g,
-            None => {
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
-                ai.equip_slot = EQUIP_SLOT_NONE;
-                continue;
-            }
+        let Some((target_slot, wanted)) = aq.current.as_equip() else {
+            // Inconsistent state: task_id says Equip but typed task disagrees.
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            aq.advance();
+            continue;
         };
 
         let Some((to_equip, source)) = find_best_matching_item(&agent, &carrier, wanted) else {
@@ -377,7 +465,7 @@ pub fn equip_task_system(
             // FailedNoTarget on its next dispatch tick.
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
-            ai.equip_slot = EQUIP_SLOT_NONE;
+            aq.advance();
             continue;
         };
 
@@ -415,6 +503,6 @@ pub fn equip_task_system(
 
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
-        ai.equip_slot = EQUIP_SLOT_NONE;
+        aq.advance();
     }
 }

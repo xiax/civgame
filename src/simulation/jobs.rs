@@ -546,12 +546,12 @@ pub fn chief_job_posting_system(
                         }
                     }
                 }
-                let anticipatory = faction.material_targets.get(&good).copied().unwrap_or(0);
+                let anticipatory = faction.material_target_of(good);
                 let target_total = anticipatory.max(bp_demand);
                 if target_total == 0 {
                     continue;
                 }
-                let stored = faction.storage.totals.get(&good).copied().unwrap_or(0);
+                let stored = faction.storage.stock_of(good);
                 if stored >= target_total {
                     continue;
                 }
@@ -594,7 +594,14 @@ pub fn chief_job_posting_system(
         //     Storage availability is shared across blueprints: the chief
         //     allocates greedily by blueprint iteration order.
         if faction.member_count > 0 {
-            let mut storage_remaining: AHashMap<Good, u32> = faction.storage.totals.clone();
+            // Phase 2d: storage_remaining now mirrors `storage.totals` —
+            // also ResourceId-keyed. Haul-posting deposit slots still
+            // carry legacy `Good` (`GoodNeed.good`); we convert at the
+            // few lookup sites below.
+            let mut storage_remaining: AHashMap<
+                crate::economy::resource_catalog::ResourceId,
+                u32,
+            > = faction.storage.totals.clone();
             // Subtract qty already committed to existing alive Haul postings
             // (not yet delivered) so we don't double-allocate the same stock.
             for p in board.faction_postings(faction_id).iter() {
@@ -606,7 +613,8 @@ pub fn chief_job_posting_system(
                 } = &p.progress
                 {
                     let outstanding = target.saturating_sub(*delivered);
-                    let entry = storage_remaining.entry(*good).or_insert(0);
+                    let id = crate::economy::core_ids::good_to_resource_id(*good);
+                    let entry = storage_remaining.entry(id).or_insert(0);
                     *entry = entry.saturating_sub(outstanding);
                 }
             }
@@ -630,7 +638,9 @@ pub fn chief_job_posting_system(
                     if already {
                         continue;
                     }
-                    let avail = storage_remaining.get(&slot.good).copied().unwrap_or(0);
+                    let slot_id =
+                        crate::economy::core_ids::good_to_resource_id(slot.good);
+                    let avail = storage_remaining.get(&slot_id).copied().unwrap_or(0);
                     if avail == 0 {
                         continue;
                     }
@@ -638,7 +648,7 @@ pub fn chief_job_posting_system(
                     if target == 0 {
                         continue;
                     }
-                    let entry = storage_remaining.entry(slot.good).or_insert(0);
+                    let entry = storage_remaining.entry(slot_id).or_insert(0);
                     *entry = entry.saturating_sub(target);
                     let id = board.alloc_id();
                     let progress = JobProgress::Haul {
@@ -670,7 +680,7 @@ pub fn chief_job_posting_system(
                 .faction_postings(faction_id)
                 .iter()
                 .any(|p| matches!(p.kind, JobKind::Farm));
-            let grain = faction.storage.totals.get(&Good::Grain).copied().unwrap_or(0);
+            let grain = faction.storage.stock_of(Good::Grain);
             let seed = faction.storage.seed_total();
             // Post farm if grain is low and seeds are available.
             if !already_farm && grain < faction.member_count * 4 && seed > 0 {
@@ -732,7 +742,7 @@ pub fn chief_job_posting_system(
                     .map(|(_, e)| *e);
 
                 let mut best: Option<(u8, u32, Option<Entity>)> = None;
-                for (idx, recipe) in crate::simulation::crafting::CRAFT_RECIPES.iter().enumerate() {
+                for (idx, recipe) in crate::simulation::crafting::craft_recipes().iter().enumerate() {
                     if let Some(tech) = recipe.tech_gate {
                         if !faction.techs.has(tech) {
                             continue;
@@ -756,14 +766,16 @@ pub fn chief_job_posting_system(
                         }
                         None => None,
                     };
+                    // Phase 2d: resource_supply/demand are ResourceId-keyed,
+                    // so we use the recipe's output_resource directly.
                     let supply = faction
                         .resource_supply
-                        .get(&recipe.output_good)
+                        .get(&recipe.output_resource)
                         .copied()
                         .unwrap_or(0);
                     let demand = faction
                         .resource_demand
-                        .get(&recipe.output_good)
+                        .get(&recipe.output_resource)
                         .copied()
                         .unwrap_or(0);
                     if demand <= supply {
@@ -773,8 +785,8 @@ pub fn chief_job_posting_system(
                     // Only post when ingredients are actually available;
                     // otherwise workers adopt Craft goal with no CraftOrder.
                     let mut has_ingredients = true;
-                    for &(good, qty) in recipe.inputs {
-                        if faction.resource_supply.get(&good).copied().unwrap_or(0) < qty {
+                    for &(id, qty) in recipe.inputs.iter() {
+                        if faction.resource_supply.get(&id).copied().unwrap_or(0) < qty {
                             has_ingredients = false;
                             break;
                         }
@@ -848,7 +860,7 @@ pub fn chief_tablet_posting_system(
         &LodLevel,
     )>,
 ) {
-    use crate::simulation::crafting::{recipe_encodes_knowledge, CRAFT_RECIPES, RECIPE_CLAY_TABLET};
+    use crate::simulation::crafting::{craft_recipes, recipe_encodes_knowledge, RECIPE_CLAY_TABLET};
     use crate::simulation::technology::{complexity, TechId, TECH_COUNT};
 
     let posted_tick = clock.tick as u32;
@@ -988,10 +1000,11 @@ pub fn chief_tablet_posting_system(
         };
 
         // Verify recipe ingredients are available (Stone+Wood for tablet).
-        let recipe = &CRAFT_RECIPES[RECIPE_CLAY_TABLET as usize];
+        let recipe = &craft_recipes()[RECIPE_CLAY_TABLET as usize];
         let mut ok = true;
-        for &(good, qty) in recipe.inputs {
-            if faction.resource_supply.get(&good).copied().unwrap_or(0) < qty {
+        for &(id, qty) in recipe.inputs.iter() {
+            // Phase 2d: resource_supply is ResourceId-keyed.
+            if faction.resource_supply.get(&id).copied().unwrap_or(0) < qty {
                 ok = false;
                 break;
             }
@@ -1178,7 +1191,7 @@ pub fn job_claim_system(
             // they can't actually execute.
             if let JobProgress::Crafting { recipe, .. } = p.progress {
                 if let Some(rdef) =
-                    crate::simulation::crafting::CRAFT_RECIPES.get(recipe as usize)
+                    crate::simulation::crafting::craft_recipes().get(recipe as usize)
                 {
                     if let Some(req_tech) = rdef.tech_gate {
                         let knows = knowledge_opt

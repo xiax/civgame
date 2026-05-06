@@ -1,40 +1,81 @@
-use super::goods::{Good, GOOD_COUNT};
+use super::core_ids;
+use super::goods::Good;
 use super::item::Item;
 use super::mode::EconomicMode;
+use super::resource_catalog::ResourceId;
+use ahash::AHashMap;
 use bevy::prelude::*;
 
 /// Walrasian market — prices adjust toward supply/demand equilibrium.
+///
+/// Phase 2 residual #2: the price/supply/demand/floor/ceiling/stock arrays
+/// were `[f32; GOOD_COUNT]` indexed by `Good as usize`. They're now sparse
+/// `AHashMap<ResourceId, f32>` keyed by catalog id — same shape used by
+/// `FactionStorage.totals` (Phase 2d-ii). Lookups go through helper methods
+/// that accept legacy `Good`; new code should index by `ResourceId` directly.
 #[derive(Resource)]
 pub struct Market {
-    pub prices: [f32; GOOD_COUNT],
-    pub supply: [f32; GOOD_COUNT],
-    pub demand: [f32; GOOD_COUNT],
-    pub price_floor: [f32; GOOD_COUNT],
-    pub price_ceiling: [f32; GOOD_COUNT],
+    prices: AHashMap<ResourceId, f32>,
+    supply: AHashMap<ResourceId, f32>,
+    demand: AHashMap<ResourceId, f32>,
+    price_floor: AHashMap<ResourceId, f32>,
+    price_ceiling: AHashMap<ResourceId, f32>,
     /// Physical commodities held in the market (Food, Wood, Iron, etc.)
-    pub market_stock: [f32; GOOD_COUNT],
+    market_stock: AHashMap<ResourceId, f32>,
     /// Specific manufactured items available for purchase.
     pub listings: Vec<(Item, u32)>,
 }
 
+const DEFAULT_PRICE_FLOOR: f32 = 0.1;
+
 impl Default for Market {
     fn default() -> Self {
-        let mut market_stock = [0.0f32; GOOD_COUNT];
-        market_stock[Good::Tools as usize] = 50.0; // Startup supply of generic tools
+        // Seed legacy (Good, price, ceiling) tuples; everything else defaults
+        // to floor=0.1, ceiling=large, stock=0.
+        const SEED_PRICES: &[(Good, f32, f32)] = &[
+            (Good::Fruit, 1.0, 50.0),
+            (Good::Meat, 1.2, 50.0),
+            (Good::Grain, 0.8, 50.0),
+            (Good::Wood, 0.8, 20.0),
+            (Good::Stone, 0.5, 10.0),
+            (Good::Tools, 2.0, 100.0),
+            (Good::Cloth, 1.5, 50.0),
+            (Good::Coal, 1.2, 30.0),
+            (Good::Iron, 1.8, 80.0),
+            (Good::Luxury, 5.0, 200.0),
+            (Good::GrainSeed, 0.5, 5.0),
+            (Good::Weapon, 3.0, 150.0),
+            (Good::Armor, 4.0, 180.0),
+            (Good::Shield, 2.5, 100.0),
+            (Good::Skin, 0.7, 20.0),
+            (Good::Copper, 2.0, 100.0),
+            (Good::Tin, 2.5, 120.0),
+            (Good::Gold, 25.0, 1000.0),
+            (Good::Silver, 10.0, 400.0),
+            (Good::BerrySeed, 0.4, 5.0),
+            (Good::ClayTablet, 3.0, 80.0),
+            (Good::Book, 8.0, 200.0),
+        ];
+
+        let mut prices = AHashMap::new();
+        let mut price_floor = AHashMap::new();
+        let mut price_ceiling = AHashMap::new();
+        let mut market_stock = AHashMap::new();
+
+        for (good, base_price, ceiling) in SEED_PRICES {
+            let id = core_ids::good_to_resource_id(*good);
+            prices.insert(id, *base_price);
+            price_floor.insert(id, DEFAULT_PRICE_FLOOR);
+            price_ceiling.insert(id, *ceiling);
+        }
+        market_stock.insert(core_ids::good_to_resource_id(Good::Tools), 50.0);
+
         Self {
-            prices: [
-                1.0, 1.2, 0.8, 0.8, 0.5, 2.0, 1.5, 1.2, 1.8, 5.0, 0.5, 3.0, 4.0, 2.5, 0.7, 2.0,
-                2.5, 25.0, 10.0, 0.4, // BerrySeed
-                3.0, 8.0, // ClayTablet, Book
-            ],
-            supply: [0.0; GOOD_COUNT],
-            demand: [0.0; GOOD_COUNT],
-            price_floor: [0.1; GOOD_COUNT],
-            price_ceiling: [
-                50.0, 50.0, 50.0, 20.0, 10.0, 100.0, 50.0, 30.0, 80.0, 200.0, 5.0, 150.0, 180.0,
-                100.0, 20.0, 100.0, 120.0, 1000.0, 400.0, 5.0, // BerrySeed
-                80.0, 200.0, // ClayTablet, Book
-            ],
+            prices,
+            supply: AHashMap::new(),
+            demand: AHashMap::new(),
+            price_floor,
+            price_ceiling,
             market_stock,
             listings: Vec::new(),
         }
@@ -42,23 +83,73 @@ impl Default for Market {
 }
 
 impl Market {
+    fn price_id(&self, id: ResourceId) -> f32 {
+        self.prices.get(&id).copied().unwrap_or(1.0)
+    }
+
+    fn floor_id(&self, id: ResourceId) -> f32 {
+        self.price_floor.get(&id).copied().unwrap_or(DEFAULT_PRICE_FLOOR)
+    }
+
+    fn ceiling_id(&self, id: ResourceId) -> f32 {
+        self.price_ceiling.get(&id).copied().unwrap_or(f32::INFINITY)
+    }
+
+    /// Current price for `good`. Returns 1.0 if no entry exists yet.
+    pub fn price_of(&self, good: Good) -> f32 {
+        self.price_id(core_ids::good_to_resource_id(good))
+    }
+
+    pub fn add_supply(&mut self, good: Good, qty: f32) {
+        *self
+            .supply
+            .entry(core_ids::good_to_resource_id(good))
+            .or_insert(0.0) += qty;
+    }
+
+    pub fn add_demand(&mut self, good: Good, qty: f32) {
+        *self
+            .demand
+            .entry(core_ids::good_to_resource_id(good))
+            .or_insert(0.0) += qty;
+    }
+
+    pub fn stock_of(&self, good: Good) -> f32 {
+        self.market_stock
+            .get(&core_ids::good_to_resource_id(good))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
     pub fn update_prices(&mut self) {
-        for i in 0..GOOD_COUNT {
-            let ratio = (self.demand[i] + 1.0) / (self.supply[i] + 1.0);
-            self.prices[i] = (self.prices[i] * ratio.powf(0.05))
-                .clamp(self.price_floor[i], self.price_ceiling[i]);
+        // Sweep every resource that has any market activity (price, supply,
+        // demand, floor, ceiling, or stock entry). Sparse representation
+        // means we never touch resources that have never traded.
+        let mut active: Vec<ResourceId> = self.prices.keys().copied().collect();
+        for id in self.supply.keys().chain(self.demand.keys()) {
+            if !active.contains(id) {
+                active.push(*id);
+            }
+        }
+        for id in active {
+            let supply = self.supply.get(&id).copied().unwrap_or(0.0);
+            let demand = self.demand.get(&id).copied().unwrap_or(0.0);
+            let ratio = (demand + 1.0) / (supply + 1.0);
+            let cur = self.price_id(id);
+            let next = (cur * ratio.powf(0.05)).clamp(self.floor_id(id), self.ceiling_id(id));
+            self.prices.insert(id, next);
         }
     }
 
     pub fn calculate_price(&self, item: &Item) -> f32 {
-        let base_price = self.prices[item.good as usize];
-        base_price * item.multiplier()
+        self.price_id(item.resource_id) * item.multiplier()
     }
 
     /// Agent sells an item to the market. Returns currency earned.
     pub fn sell_item(&mut self, item: Item, qty: u32) -> f32 {
         let price = self.calculate_price(&item);
         let total_earned = price * qty as f32;
+        let id = item.resource_id;
 
         if item.is_manufactured() {
             // Add to specific listings
@@ -69,10 +160,10 @@ impl Market {
             }
         } else {
             // Add to commodity pool
-            self.market_stock[item.good as usize] += qty as f32;
+            *self.market_stock.entry(id).or_insert(0.0) += qty as f32;
         }
 
-        self.supply[item.good as usize] += qty as f32;
+        *self.supply.entry(id).or_insert(0.0) += qty as f32;
         total_earned
     }
 
@@ -85,7 +176,7 @@ impl Market {
         qty: u32,
         currency: &mut f32,
     ) -> (Option<Item>, u32) {
-        let i = good as usize;
+        let id = core_ids::good_to_resource_id(good);
 
         // 1. Check specific listings first if it's potentially manufactured
         // In this simple version, we'll try to buy the BEST quality item affordable.
@@ -93,7 +184,7 @@ impl Market {
         let mut best_mult = -1.0;
 
         for (idx, (item, stock)) in self.listings.iter().enumerate() {
-            if item.good == good && *stock > 0 {
+            if item.good() == good && *stock > 0 {
                 let price = self.calculate_price(item);
                 if price <= *currency {
                     let mult = item.multiplier();
@@ -115,13 +206,14 @@ impl Market {
                 *currency -= total_cost;
                 self.listings[idx].1 -= buy_qty;
                 let bought_item = item;
-                self.demand[i] += buy_qty as f32;
+                *self.demand.entry(id).or_insert(0.0) += buy_qty as f32;
                 return (Some(bought_item), buy_qty);
             }
         }
 
         // 2. Fallback to generic commodity stock
-        let available = self.market_stock[i].min(qty as f32);
+        let stock = self.market_stock.get(&id).copied().unwrap_or(0.0);
+        let available = stock.min(qty as f32);
         if available <= 0.0 {
             return (None, 0);
         }
@@ -136,8 +228,8 @@ impl Market {
         }
 
         *currency -= total_cost;
-        self.market_stock[i] -= buy_qty as f32;
-        self.demand[i] += buy_qty as f32;
+        self.market_stock.insert(id, stock - buy_qty as f32);
+        *self.demand.entry(id).or_insert(0.0) += buy_qty as f32;
         (Some(item), buy_qty)
     }
 
@@ -162,12 +254,12 @@ pub fn price_update_system(mut market: ResMut<Market>, mode: Res<EconomicMode>) 
         return;
     }
     // Background Food demand to prevent price collapse when all agents are fed
-    market.demand[Good::Fruit as usize] += 2.0;
-    market.demand[Good::Meat as usize] += 1.0;
-    market.demand[Good::Grain as usize] += 2.0;
+    market.add_demand(Good::Fruit, 2.0);
+    market.add_demand(Good::Meat, 1.0);
+    market.add_demand(Good::Grain, 2.0);
     market.update_prices();
-    market.supply = [0.0; GOOD_COUNT];
-    market.demand = [0.0; GOOD_COUNT];
+    market.supply.clear();
+    market.demand.clear();
 }
 
 #[cfg(test)]
@@ -177,10 +269,10 @@ mod tests {
     #[test]
     fn price_rises_when_demand_exceeds_supply() {
         let mut m = Market::default();
-        m.supply[0] = 10.0;
-        m.demand[0] = 100.0;
-        let old_price = m.prices[0];
+        m.add_supply(Good::Fruit, 10.0);
+        m.add_demand(Good::Fruit, 100.0);
+        let old_price = m.price_of(Good::Fruit);
         m.update_prices();
-        assert!(m.prices[0] > old_price);
+        assert!(m.price_of(Good::Fruit) > old_price);
     }
 }

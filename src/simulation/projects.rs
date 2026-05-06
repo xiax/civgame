@@ -293,7 +293,7 @@ pub fn material_pressure(
     projects: &Projects,
     good: Good,
 ) -> u8 {
-    let stored = faction.storage.totals.get(&good).copied().unwrap_or(0);
+    let stored = faction.storage.stock_of(good);
     let waiting = projects
         .faction_projects(faction_id)
         .filter(|p| p.phase == ProjectPhase::GatherMaterials)
@@ -322,7 +322,7 @@ pub fn farm_pressure(faction: &FactionData) -> u8 {
     if !faction_can_perform(faction, JobKind::Farm) {
         return 0;
     }
-    let grain = faction.storage.totals.get(&Good::Grain).copied().unwrap_or(0);
+    let grain = faction.storage.stock_of(Good::Grain);
     let target = faction.member_count.saturating_mul(4);
     if grain >= target || target == 0 {
         return 0;
@@ -345,8 +345,8 @@ pub fn craft_pressure(faction: &FactionData) -> u8 {
     let max_gap = CRAFTABLE
         .iter()
         .map(|g| {
-            let s = faction.resource_supply.get(g).copied().unwrap_or(0);
-            let d = faction.resource_demand.get(g).copied().unwrap_or(0);
+            let s = faction.supply_of(*g);
+            let d = faction.demand_of(*g);
             d.saturating_sub(s)
         })
         .max()
@@ -472,21 +472,8 @@ pub fn compute_workforce_budget(
     // ratio (how far below target storage sits) with a saturating
     // project-count term so adding one waiting project no longer dwarfs
     // the deficit signal.
-    let stored_of = |good: Good| {
-        faction
-            .storage
-            .totals
-            .get(&good)
-            .copied()
-            .unwrap_or(0) as f32
-    };
-    let target_of = |good: Good| {
-        faction
-            .material_targets
-            .get(&good)
-            .copied()
-            .unwrap_or(0) as f32
-    };
+    let stored_of = |good: Good| faction.storage.stock_of(good) as f32;
+    let target_of = |good: Good| faction.material_target_of(good) as f32;
     let material_urgency = |good: Good| -> f32 {
         let target = target_of(good);
         let stored = stored_of(good);
@@ -628,8 +615,8 @@ pub fn compute_workforce_budget(
         let max_gap = CRAFTABLE
             .iter()
             .map(|g| {
-                let s = faction.resource_supply.get(g).copied().unwrap_or(0);
-                let d = faction.resource_demand.get(g).copied().unwrap_or(0);
+                let s = faction.supply_of(*g);
+                let d = faction.demand_of(*g);
                 d.saturating_sub(s)
             })
             .max()
@@ -742,9 +729,10 @@ pub fn project_stagnation_system(
     for (project_id, blueprint, faction_id, good, tile) in to_cancel {
         // Bump the faction's deficit EMA for the stalled good.
         if let Some(faction) = registry.factions.get_mut(&faction_id) {
-            let prev = faction.material_deficit_ema.get(&good).copied().unwrap_or(0) as f32;
+            let id = crate::economy::core_ids::good_to_resource_id(good);
+            let prev = faction.material_deficit_ema.get(&id).copied().unwrap_or(0) as f32;
             let next = (prev + (255.0 - prev) * DEFICIT_EMA_ALPHA).round() as u8;
-            faction.material_deficit_ema.insert(good, next);
+            faction.material_deficit_ema.insert(id, next);
         }
         // Despawn the blueprint and unregister it from the BlueprintMap so
         // the chief's one-project-at-a-time gate releases.

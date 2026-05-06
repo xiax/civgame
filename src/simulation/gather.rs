@@ -14,7 +14,13 @@ use crate::simulation::plan::ActivePlan;
 use crate::simulation::plants::{GrowthStage, PlantKind, PlantMap, PlantSpriteIndex};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
-use crate::simulation::tasks::TaskKind;
+use crate::simulation::faction::StorageTileMap;
+use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
+use crate::simulation::typed_task::{ActionQueue, Task};
+use crate::pathfinding::chunk_graph::ChunkGraph;
+use crate::pathfinding::chunk_router::ChunkRouter;
+use crate::pathfinding::connectivity::ChunkConnectivity;
+use bevy::ecs::system::SystemParam;
 use crate::simulation::knowledge::DiscoveryActionEvent;
 use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
@@ -57,6 +63,89 @@ fn mining_activity(good: Good) -> Option<ActivityKind> {
 
 // ── gather_system ─────────────────────────────────────────────────────────────
 
+/// Routing resources bundled together so `gather_system` stays under Bevy's
+/// 16-tuple `IntoSystem` ceiling after the 5c-ii-c-ii additions. `gather_system`
+/// itself doesn't read these — only `finish_gather`, the chain-handoff helper.
+#[derive(SystemParam)]
+pub struct GatherRoutingResources<'w> {
+    pub storage_tile_map: Res<'w, StorageTileMap>,
+    pub chunk_graph: Res<'w, ChunkGraph>,
+    pub chunk_router: Res<'w, ChunkRouter>,
+    pub chunk_connectivity: Res<'w, ChunkConnectivity>,
+}
+
+/// Phase 5c-ii-c-ii chain handoff: called by every `gather_system` exit path
+/// (5 sites today) instead of inlining the legacy reset block. Performs the
+/// standard Idle reset + `aq.advance()`, *and* if the prefetch ring promotes
+/// a `Task::DepositToFactionStorage { .. }` into `current`, routes the agent
+/// to the nearest faction storage tile and primes
+/// `task_id = TaskKind::DepositResource` so `drop_items_at_destination_system`
+/// picks up next tick.
+///
+/// The good payload on `Task::DepositToFactionStorage` is informational: the
+/// deposit executor is parameterless (dumps everything in hand at the current
+/// `dest_tile`), so the routing is identical regardless of the good. Carrying
+/// it on the typed task lets a future inspector-side or chain-integrity check
+/// assert "this chain expected to deposit Wood — did Gather actually leave
+/// Wood in our hands?"
+///
+/// On routing failure (no faction storage, all storage unreachable, or SOLO
+/// agent — though the dispatcher already gates SOLO out) the chain is dropped
+/// via `aq.cancel()`. The agent stays Idle with full hands; the next dispatcher
+/// tick will either re-dispatch a fresh chain (if memory still has a target)
+/// or fall through to `Explore`.
+fn finish_gather(
+    ai: &mut PersonAI,
+    aq: &mut ActionQueue,
+    cur_tile: (i32, i32),
+    cur_chunk: ChunkCoord,
+    faction_id: Option<u32>,
+    chunk_map: &ChunkMap,
+    routing: &GatherRoutingResources,
+) {
+    ai.state = AiState::Idle;
+    ai.task_id = PersonAI::UNEMPLOYED;
+    ai.target_entity = None;
+    ai.work_progress = 0;
+    aq.advance();
+
+    // Chain handoff: if the next task in the prefetch ring is
+    // DepositToFactionStorage, route there and prime the legacy channel for
+    // `drop_items_at_destination_system`.
+    if matches!(aq.current, Task::DepositToFactionStorage { .. }) {
+        let Some(fid) = faction_id else {
+            // SOLO agent — no faction storage. The dispatcher already filters
+            // SOLO out, so this is defensive.
+            aq.cancel();
+            return;
+        };
+        let Some(storage_tile) = routing.storage_tile_map.nearest_for_faction(fid, cur_tile) else {
+            // No storage tiles for this faction — drop the chain, hands stay
+            // full. They'll be eligible to gather again next tick (the legacy
+            // gather plan registry never had a "where do I dump this" answer
+            // either; the agent just held the haul cap until something else
+            // happened).
+            aq.cancel();
+            return;
+        };
+        let dispatched = assign_task_with_routing(
+            ai,
+            cur_tile,
+            cur_chunk,
+            storage_tile,
+            TaskKind::DepositResource,
+            None,
+            &routing.chunk_graph,
+            &routing.chunk_router,
+            chunk_map,
+            &routing.chunk_connectivity,
+        );
+        if !dispatched {
+            aq.cancel();
+        }
+    }
+}
+
 pub fn gather_system(
     mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,
@@ -69,10 +158,12 @@ pub fn gather_system(
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
     mut faction_registry: ResMut<FactionRegistry>,
+    routing: GatherRoutingResources,
     mut plant_query: Query<&mut crate::simulation::plants::Plant>,
     mut agent_query: Query<(
         Entity,
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut EconomicAgent,
         &mut Carrier,
         &mut Skills,
@@ -88,6 +179,7 @@ pub fn gather_system(
     for (
         actor,
         mut ai,
+        mut aq,
         mut agent,
         mut carrier,
         mut skills,
@@ -110,12 +202,25 @@ pub fn gather_system(
             continue;
         }
 
-        let tx = ai.dest_tile.0 as i32;
-        let ty = ai.dest_tile.1 as i32;
+        // Phase 3b-iv: tile comes from the typed `Task::Gather` variant. Falls
+        // back to `dest_tile` for any unmigrated dispatcher; in steady state
+        // the typed task agrees with `dest_tile` (both populated together).
+        let (tx, ty) = aq
+            .current
+            .as_gather()
+            .unwrap_or((ai.dest_tile.0 as i32, ai.dest_tile.1 as i32));
 
         let faction_id = faction_member
             .map(|fm| fm.faction_id)
             .filter(|&id| id != SOLO);
+
+        // Agent's current tile + chunk for `finish_gather`'s routing decision
+        // when the prefetch ring promotes a `DepositToFactionStorage` task.
+        let cur_tile = world_to_tile(transform.translation.truncate());
+        let cur_chunk = ChunkCoord(
+            cur_tile.0.div_euclid(CHUNK_SIZE as i32),
+            cur_tile.1.div_euclid(CHUNK_SIZE as i32),
+        );
 
         if let Some(entity) = plant_map.0.get(&(tx, ty)).copied() {
             // ── Plant harvest ────────────────────────────────────────────────
@@ -126,9 +231,15 @@ pub fn gather_system(
                     mem.forget((tx as i32, ty as i32), MemoryKind::Food);
                     mem.forget((tx as i32, ty as i32), MemoryKind::Wood);
                 }
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
-                ai.target_entity = None;
+                finish_gather(
+                    &mut ai,
+                    &mut aq,
+                    cur_tile,
+                    cur_chunk,
+                    faction_id,
+                    &chunk_map,
+                    &routing,
+                );
                 continue;
             };
             if plant.stage != GrowthStage::Mature {
@@ -139,9 +250,15 @@ pub fn gather_system(
                     };
                     mem.forget((tx as i32, ty as i32), kind);
                 }
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
-                ai.target_entity = None;
+                finish_gather(
+                    &mut ai,
+                    &mut aq,
+                    cur_tile,
+                    cur_chunk,
+                    faction_id,
+                    &chunk_map,
+                    &routing,
+                );
                 continue;
             }
 
@@ -300,10 +417,15 @@ pub fn gather_system(
                 if let Some(ref mut plan) = plan_opt {
                     plan.reward_acc += total_qty as f32 * 0.3;
                 }
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
-                ai.target_entity = None;
-                ai.work_progress = 0;
+                finish_gather(
+                    &mut ai,
+                    &mut aq,
+                    cur_tile,
+                    cur_chunk,
+                    faction_id,
+                    &chunk_map,
+                    &routing,
+                );
             } else {
                 // Not a stone/wall tile and not a plant -> target is invalid or already harvested
                 if let Some(ref mut mem) = memory_opt {
@@ -311,20 +433,30 @@ pub fn gather_system(
                     mem.forget((tx as i32, ty as i32), MemoryKind::Food);
                     mem.forget((tx as i32, ty as i32), MemoryKind::Wood);
                 }
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
-                ai.target_entity = None;
-                ai.work_progress = 0;
+                finish_gather(
+                    &mut ai,
+                    &mut aq,
+                    cur_tile,
+                    cur_chunk,
+                    faction_id,
+                    &chunk_map,
+                    &routing,
+                );
             }
         }
 
         // ── Hands at haul cap → end gather step so the plan advances to deposit ──
 
         if carrier.is_at_haul_cap() {
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
-            ai.target_entity = None;
-            ai.work_progress = 0;
+            finish_gather(
+                &mut ai,
+                &mut aq,
+                cur_tile,
+                cur_chunk,
+                faction_id,
+                &chunk_map,
+                &routing,
+            );
         }
     }
 }

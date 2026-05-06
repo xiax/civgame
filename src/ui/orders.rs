@@ -154,7 +154,13 @@ pub fn right_click_context_menu_system(
     member_q: OrderMemberQueries,
     player_faction: Res<PlayerFaction>,
     faction_registry: Res<FactionRegistry>,
-    mut ai_q: Query<(&mut PersonAI, &Transform, &mut CombatTarget, &mut TargetItem)>,
+    mut ai_q: Query<(
+        &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
+        &Transform,
+        &mut CombatTarget,
+        &mut TargetItem,
+    )>,
     chunk_map: Res<ChunkMap>,
     plant_map: Res<PlantMap>,
     spatial: Res<SpatialIndex>,
@@ -441,7 +447,7 @@ pub fn right_click_context_menu_system(
         });
 
     if let Some(action) = chosen {
-        if let Ok((mut ai, transform, mut combat_target, mut target_item)) =
+        if let Ok((mut ai, mut aq, transform, mut combat_target, mut target_item)) =
             ai_q.get_mut(sel_entity)
         {
             let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
@@ -515,6 +521,9 @@ pub fn right_click_context_menu_system(
                         &chunk_map,
                         &routing.chunk_connectivity,
                     );
+                    aq.dispatch(crate::simulation::typed_task::Task::Gather {
+                        tile: target_tile,
+                    });
                 }
                 PlayerOrderKind::PickUp => {
                     assign_task_with_routing(
@@ -544,6 +553,9 @@ pub fn right_click_context_menu_system(
                         &routing.chunk_connectivity,
                     );
                     target_item.0 = Some(item_entity);
+                    aq.dispatch(crate::simulation::typed_task::Task::Scavenge {
+                        target: item_entity,
+                    });
                 }
                 PlayerOrderKind::AttackEntity(foe) => {
                     assign_task_with_routing(
@@ -573,6 +585,9 @@ pub fn right_click_context_menu_system(
                         &chunk_map,
                         &routing.chunk_connectivity,
                     );
+                    aq.dispatch(crate::simulation::typed_task::Task::PickUpCorpse {
+                        corpse: corpse_entity,
+                    });
                 }
                 PlayerOrderKind::Build(BuildSiteKind::Bed) => {
                     assign_task_with_routing(
@@ -587,6 +602,11 @@ pub fn right_click_context_menu_system(
                         &chunk_map,
                         &routing.chunk_connectivity,
                     );
+                    if let Some(bp) = build_bp {
+                        aq.dispatch(crate::simulation::typed_task::Task::Construct {
+                            blueprint: bp,
+                        });
+                    }
                 }
                 PlayerOrderKind::Build(_) => {
                     assign_task_with_routing(
@@ -601,6 +621,11 @@ pub fn right_click_context_menu_system(
                         &chunk_map,
                         &routing.chunk_connectivity,
                     );
+                    if let Some(bp) = build_bp {
+                        aq.dispatch(crate::simulation::typed_task::Task::Construct {
+                            blueprint: bp,
+                        });
+                    }
                 }
                 PlayerOrderKind::DigDown => {
                     assign_task_with_routing(
@@ -615,6 +640,9 @@ pub fn right_click_context_menu_system(
                         &chunk_map,
                         &routing.chunk_connectivity,
                     );
+                    aq.dispatch(crate::simulation::typed_task::Task::Dig {
+                        tile: target_tile,
+                    });
                 }
                 PlayerOrderKind::Deconstruct => {
                     assign_task_with_routing(
@@ -834,7 +862,15 @@ fn issue_group_move(
     target_tile: (i32, i32),
     target_z: i8,
     routing: &MilitaryRouting,
-    ai_q: &mut Query<(&mut PersonAI, &Transform, &mut CombatTarget), With<Drafted>>,
+    ai_q: &mut Query<
+        (
+            &mut PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
+            &Transform,
+            &mut CombatTarget,
+        ),
+        With<Drafted>,
+    >,
     hotspots: &mut HotspotFlowFields,
 ) {
     hotspots.register(
@@ -842,7 +878,7 @@ fn issue_group_move(
         HotspotKind::RallyPoint,
     );
     for &e in drafted_units {
-        let Ok((mut ai, transform, mut combat)) = ai_q.get_mut(e) else {
+        let Ok((mut ai, mut aq, transform, mut combat)) = ai_q.get_mut(e) else {
             continue;
         };
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
@@ -864,6 +900,11 @@ fn issue_group_move(
             &routing.chunk_connectivity,
         );
         ai.target_z = target_z;
+        aq.dispatch(crate::simulation::typed_task::Task::WalkTo {
+            tile: target_tile,
+            z: target_z,
+            why: crate::simulation::typed_task::WalkReason::MilitaryMove,
+        });
         combat.0 = None;
     }
 }
@@ -877,7 +918,15 @@ fn issue_group_attack(
     foe_tile: (i32, i32),
     foe_z: i8,
     routing: &MilitaryRouting,
-    ai_q: &mut Query<(&mut PersonAI, &Transform, &mut CombatTarget), With<Drafted>>,
+    ai_q: &mut Query<
+        (
+            &mut PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
+            &Transform,
+            &mut CombatTarget,
+        ),
+        With<Drafted>,
+    >,
     hotspots: &mut HotspotFlowFields,
 ) {
     hotspots.register((foe_tile.0, foe_tile.1, foe_z), HotspotKind::RallyPoint);
@@ -885,7 +934,7 @@ fn issue_group_attack(
         if e == foe {
             continue;
         }
-        let Ok((mut ai, transform, mut combat)) = ai_q.get_mut(e) else {
+        let Ok((mut ai, mut _aq, transform, mut combat)) = ai_q.get_mut(e) else {
             continue;
         };
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
@@ -923,7 +972,15 @@ pub fn military_right_click_system(
     camera_view_z: Res<CameraViewZ>,
     registry: Res<FactionRegistry>,
     routing: MilitaryRouting,
-    mut ai_q: Query<(&mut PersonAI, &Transform, &mut CombatTarget), With<Drafted>>,
+    mut ai_q: Query<
+        (
+            &mut PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
+            &Transform,
+            &mut CombatTarget,
+        ),
+        With<Drafted>,
+    >,
     mut hotspots: ResMut<HotspotFlowFields>,
     mut menu_state: ResMut<MilitaryMenuState>,
 ) {

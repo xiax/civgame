@@ -505,29 +505,13 @@ pub fn goal_update_system(
                 // demand baked in via resource_demand) to pick the highest
                 // deficit material.
                 let wood_target = faction
-                    .material_targets
-                    .get(&Good::Wood)
-                    .copied()
-                    .unwrap_or(0)
-                    .max(faction.resource_demand.get(&Good::Wood).copied().unwrap_or(0));
+                    .material_target_of(Good::Wood)
+                    .max(faction.demand_of(Good::Wood));
                 let stone_target = faction
-                    .material_targets
-                    .get(&Good::Stone)
-                    .copied()
-                    .unwrap_or(0)
-                    .max(faction.resource_demand.get(&Good::Stone).copied().unwrap_or(0));
-                let wood_stored = faction
-                    .storage
-                    .totals
-                    .get(&Good::Wood)
-                    .copied()
-                    .unwrap_or(0);
-                let stone_stored = faction
-                    .storage
-                    .totals
-                    .get(&Good::Stone)
-                    .copied()
-                    .unwrap_or(0);
+                    .material_target_of(Good::Stone)
+                    .max(faction.demand_of(Good::Stone));
+                let wood_stored = faction.storage.stock_of(Good::Wood);
+                let stone_stored = faction.storage.stock_of(Good::Stone);
                 let wood_deficit = wood_target.saturating_sub(wood_stored);
                 let stone_deficit = stone_target.saturating_sub(stone_stored);
 
@@ -617,7 +601,7 @@ fn should_craft(registry: &FactionRegistry, faction_id: u32, needs: &Needs) -> b
         Good::Cloth,
     ]
     .iter()
-    .map(|g| faction.storage.totals.get(g).copied().unwrap_or(0))
+    .map(|g| faction.storage.stock_of(*g))
     .sum();
     if crafted_total >= faction.member_count.saturating_div(3).max(1) {
         return false;
@@ -625,14 +609,16 @@ fn should_craft(registry: &FactionRegistry, faction_id: u32, needs: &Needs) -> b
     // Don't flood workers into Craft goal when no recipe's inputs are covered.
     // `resource_supply` includes agent inventories + faction storage totals,
     // refreshed each Economy tick — cheapest faction-wide material proxy.
-    crate::simulation::crafting::CRAFT_RECIPES.iter().any(|recipe| {
+    crate::simulation::crafting::craft_recipes().iter().any(|recipe| {
         if let Some(tech) = recipe.tech_gate {
             if !faction.techs.has(tech) {
                 return false;
             }
         }
-        recipe.inputs.iter().all(|&(good, qty)| {
-            faction.resource_supply.get(&good).copied().unwrap_or(0) >= qty
+        recipe.inputs.iter().all(|&(id, qty)| {
+            // Phase 2d: resource_supply is now ResourceId-keyed, so the
+            // recipe's id can index it directly — no reverse-resolve.
+            faction.resource_supply.get(&id).copied().unwrap_or(0) >= qty
         })
     })
 }

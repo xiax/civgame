@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::simulation::crafting::CRAFT_RECIPES;
+use crate::simulation::crafting::craft_recipes;
 use crate::simulation::faction::{FactionRegistry, PlayerFaction};
 use crate::economy::goods::Good;
 use crate::simulation::jobs::{
@@ -218,14 +218,14 @@ pub fn job_board_panel_system(
                     });
                 }
                 if matches!(state.draft_kind, JobKind::Craft) {
-                    let selected_name = CRAFT_RECIPES
+                    let selected_name = craft_recipes()
                         .get(state.draft_recipe as usize)
                         .map(|r| r.name)
                         .unwrap_or("(none)");
                     egui::ComboBox::from_label("Recipe")
                         .selected_text(selected_name)
                         .show_ui(ui, |ui| {
-                            for (i, recipe) in CRAFT_RECIPES.iter().enumerate() {
+                            for (i, recipe) in craft_recipes().iter().enumerate() {
                                 ui.selectable_value(
                                     &mut state.draft_recipe,
                                     i as u8,
@@ -382,7 +382,7 @@ fn progress_label(p: &JobProgress) -> String {
             recipe,
             ..
         } => {
-            let name = CRAFT_RECIPES
+            let name = craft_recipes()
                 .get(*recipe as usize)
                 .map(|r| r.name)
                 .unwrap_or("?");

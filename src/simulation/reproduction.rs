@@ -11,7 +11,7 @@ use super::needs::Needs;
 use super::person::{
     generate_person_name, AiState, HairColor, Person, PersonAI, Profession, SkinTone,
 };
-use super::plan::{KnownPlans, PlanHistory, PlanScoringMethod};
+use super::plan::{KnownPlans, PlanHistory, PlanId, PlanScoringMethod};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
 use super::stats::Stats;
@@ -498,9 +498,32 @@ pub fn pregnancy_system(
                 AgentMemory::default(),
                 RelationshipMemory::default(),
                 KnownPlans::with_innate(&[
-    0, 1, 2, 3, 5, 6, 7, 13, 14, 15, 16, 23, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35, 36, 37,
-    38, 39, 60, 61, 62, 63,
-]),
+                    PlanId::FORAGE_FOOD,
+                    PlanId::FARM_FOOD,
+                    // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
+                    PlanId::HUNT_FOOD,
+                    PlanId::SCAVENGE_FOOD,
+                    PlanId::BUILD_BLUEPRINT,
+                    PlanId::DELIVER_HIDE_TO_CRAFT_ORDER,
+                    PlanId::DELIVER_GRAIN_TO_CRAFT_ORDER,
+                    PlanId::DELIVER_FROM_STORAGE_TO_CRAFT_ORDER,
+                    PlanId::WORK_ON_CRAFT,
+                    PlanId::RESCUE_ALLY,
+                    PlanId::PLAY_SOCIAL,
+                    PlanId::PLAY_SOLO,
+                    PlanId::HAUL_FROM_STORAGE_AND_BUILD,
+                    PlanId::PLAY_BY_PLANTING,
+                    PlanId::PLAY_BY_THROWING_ROCKS,
+                    PlanId::PLAY_WITH_STORED_TOY,
+                    PlanId::CLAIMED_BUILD,
+                    PlanId::EXPLORE_FOR_FOOD,
+                    // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
+                    // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
+                    PlanId::SOCIALIZE,
+                    PlanId::RAID,
+                    PlanId::DEFEND,
+                    PlanId::LEAD,
+                ]),
                 PlanHistory::default(),
                 PlanScoringMethod::Weighted,
                 Name::new(child_name),
@@ -517,6 +540,7 @@ pub fn pregnancy_system(
                     learned_at: [0u32; crate::simulation::knowledge::KNOWLEDGE_SLOTS],
                     study_progress: ahash::AHashMap::new(),
                 },
+                crate::simulation::typed_task::ActionQueue::idle(),
             ),
         ));
     }

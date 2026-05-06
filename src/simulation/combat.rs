@@ -247,7 +247,7 @@ pub fn combat_system(
                     let dty = (transform.translation.y / TILE_SIZE).floor() as i32;
                     hand_drops.send(HandDropEvent {
                         tile: (dtx, dty),
-                        good: stack.item.good,
+                        good: stack.item.good(),
                         qty: stack.qty,
                     });
                 }

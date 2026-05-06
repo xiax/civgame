@@ -1630,7 +1630,7 @@ pub fn chief_directive_system(
                 if qty == 0 {
                     continue;
                 }
-                let ema = faction.material_deficit_ema.get(&good).copied().unwrap_or(0);
+                let ema = faction.material_deficit_ema_of(good);
                 if ema >= crate::simulation::projects::DEFICIT_EMA_RARE_THRESHOLD {
                     penalty += 600.0;
                 } else if ema >= 80 {
@@ -2395,7 +2395,7 @@ pub fn building_upgrade_system(
         FactionTechs,
         bool,
         bool,
-        AHashMap<Good, u32>,
+        AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
     )> = registry
         .factions
         .iter()
@@ -2443,7 +2443,10 @@ pub fn building_upgrade_system(
         let has_stock = recipe
             .inputs
             .iter()
-            .all(|&(good, qty)| storage.get(&good).copied().unwrap_or(0) >= (qty as u32) * 2);
+            .all(|&(good, qty)| {
+                let id = crate::economy::core_ids::good_to_resource_id(good);
+                storage.get(&id).copied().unwrap_or(0) >= (qty as u32) * 2
+            });
         if !has_stock {
             continue;
         }
@@ -2526,6 +2529,7 @@ pub fn construction_system(
     mut agent_query: Query<(
         Entity,
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut EconomicAgent,
         &mut crate::simulation::carry::Carrier,
         &mut Skills,
@@ -2545,7 +2549,7 @@ pub fn construction_system(
     > = AHashMap::new();
     let mut bp_workers: AHashMap<Entity, Vec<Entity>> = AHashMap::new();
 
-    for (entity, mut ai, agent, carrier, _skills, slot, lod, _, claim_opt) in
+    for (entity, mut ai, mut aq, agent, carrier, _skills, slot, lod, _, claim_opt) in
         agent_query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -2561,10 +2565,21 @@ pub fn construction_system(
             continue;
         }
 
-        let Some(bp_entity) = ai.target_entity else {
+        // Phase 3c-ii: workers read the blueprint from the typed
+        // `Task::Construct` variant; haulers still use `target_entity`
+        // (HaulMaterials hasn't migrated yet). Falls through to
+        // `target_entity` for workers when the typed task is absent so
+        // legacy dispatch paths that haven't been migrated still work.
+        let bp_entity_opt = if is_worker {
+            aq.current.as_construct().or(ai.target_entity)
+        } else {
+            ai.target_entity
+        };
+        let Some(bp_entity) = bp_entity_opt else {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
+            aq.advance();
             continue;
         };
 
@@ -2579,6 +2594,7 @@ pub fn construction_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             ai.target_entity = None;
+            aq.advance();
             continue;
         };
 
@@ -2996,7 +3012,7 @@ pub fn construction_system(
 
     // Pass 3: remove deposited goods from agents, grant Building XP to workers
     // whose labour actually advanced progress, and reset completed/hauler/orphaned agents.
-    for (entity, mut ai, mut agent, mut carrier, mut skills, _, _, mut plan_opt, _) in
+    for (entity, mut ai, mut aq, mut agent, mut carrier, mut skills, _, _, mut plan_opt, _) in
         agent_query.iter_mut()
     {
         for &(ae, good, qty) in &good_removals {
@@ -3035,6 +3051,7 @@ pub fn construction_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.work_progress = 0;
+            aq.advance();
         }
     }
 }

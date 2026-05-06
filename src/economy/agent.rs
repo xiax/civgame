@@ -1,5 +1,7 @@
+use super::core_ids::resource_id_to_good;
 use super::goods::Good;
 use super::item::Item;
+use super::resource_catalog::ResourceId;
 use bevy::prelude::*;
 
 /// Number of inventory stacks. Personal inventory is weight-capped; this is just an upper
@@ -35,14 +37,14 @@ impl EconomicAgent {
     pub fn total_food(&self) -> u32 {
         self.inventory
             .iter()
-            .filter(|(it, _)| it.good.is_edible())
+            .filter(|(it, _)| it.good().is_edible())
             .fold(0u32, |acc, (_, q)| acc.saturating_add(*q))
     }
 
     pub fn quantity_of(&self, good: Good) -> u32 {
         self.inventory
             .iter()
-            .filter(|(it, _)| it.good == good)
+            .filter(|(it, _)| it.good() == good)
             .fold(0u32, |acc, (_, q)| acc.saturating_add(*q))
     }
 
@@ -139,6 +141,56 @@ impl EconomicAgent {
 
     pub fn has_tool(&self) -> bool {
         self.quantity_of(Good::Tools) > 0
+    }
+
+    // ── Phase 2b: ResourceId-keyed mirrors of the Good-keyed methods ──
+    //
+    // These are migration accessors so HTN/planner code being authored
+    // against the catalog doesn't need to know about the `Good` enum.
+    // They delegate to the existing `Good` paths via `resource_id_to_good`,
+    // which returns `None` only for non-legacy resources (currently
+    // impossible — the catalog is exactly the 22 legacy goods until
+    // Phase 2c). Once `Item.good` becomes `ResourceId` (Phase 2c/2d),
+    // these methods become the canonical implementation and the legacy
+    // `Good`-keyed ones become thin wrappers, then disappear.
+
+    /// Sum of `qty` across every inventory stack whose underlying
+    /// resource matches `id`. Mirrors `quantity_of(Good)`.
+    pub fn quantity_of_resource(&self, id: ResourceId) -> u32 {
+        match resource_id_to_good(id) {
+            Some(good) => self.quantity_of(good),
+            None => 0,
+        }
+    }
+
+    /// Try to add `qty` of the resource identified by `id`. Returns the
+    /// amount that did not fit. Mirrors `add_good(Good, qty)`.
+    pub fn add_resource(&mut self, id: ResourceId, qty: u32) -> u32 {
+        match resource_id_to_good(id) {
+            Some(good) => self.add_good(good, qty),
+            None => qty,
+        }
+    }
+
+    /// Remove up to `qty` units of the resource identified by `id`.
+    /// Returns how many were removed. Mirrors `remove_good(Good, qty)`.
+    pub fn remove_resource(&mut self, id: ResourceId, qty: u32) -> u32 {
+        match resource_id_to_good(id) {
+            Some(good) => self.remove_good(good, qty),
+            None => 0,
+        }
+    }
+
+    /// Iterate `(ResourceId, qty)` over every non-empty stack. The
+    /// ResourceId is computed via `Item::resource_id()` so manufactured
+    /// items collapse onto their base resource — caller can re-query the
+    /// catalog for class/tag inspection without touching the legacy
+    /// `Good` enum.
+    pub fn iter_resource_stacks(&self) -> impl Iterator<Item = (ResourceId, u32)> + '_ {
+        self.inventory
+            .iter()
+            .filter(|(_, q)| *q > 0)
+            .map(|(it, q)| (it.resource_id, *q))
     }
 
     /// Inventory is full when no more weight can fit (using the smallest stocked item as a

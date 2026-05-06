@@ -1,5 +1,4 @@
-use super::construction::{Bed, HomeBed};
-use super::faction::{FactionMember, FactionRegistry, StorageTileMap, SOLO};
+use super::faction::StorageTileMap;
 use super::goals::AgentGoal;
 use super::items::GroundItem;
 use super::lod::LodLevel;
@@ -9,7 +8,6 @@ use super::person::PlayerOrder;
 use super::person::{AiState, Drafted, PersonAI};
 use super::plan::ActivePlan;
 use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
-use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
@@ -384,7 +382,7 @@ pub fn find_nearest_edible(
 
             for &e in spatial.get(tx, ty) {
                 if let Ok(item) = item_query.get(e) {
-                    if item.item.good.is_edible() {
+                    if item.item.good().is_edible() {
                         let dist = dx.abs() + dy.abs();
                         if dist < best_dist {
                             best_dist = dist;
@@ -421,7 +419,7 @@ pub fn find_nearest_item(
 
             for &e in spatial.get(tx, ty) {
                 if let Ok(item) = item_query.get(e) {
-                    if item.item.good == good {
+                    if item.item.good() == good {
                         let dist = dx.abs() + dy.abs();
                         if dist < best_dist {
                             best_dist = dist;
@@ -583,60 +581,103 @@ pub fn assign_task_with_routing(
     true
 }
 
-/// Handles goals that don't yet use the plan system:
-/// Socialize, Raid, Defend, Sleep, Lead.
+/// Stale-task reset + Explore cleanup. The Sleep arm that used to live here
+/// moved to `htn::htn_dispatch_system` in Phase 5a-ii; every other goal is
+/// plan-driven. This system now just handles the two pieces that don't
+/// belong anywhere else:
+///
+/// 1. **No-plan stale-reset.** When `ActivePlan` is gone but the agent's
+///    `task_id` is non-empty, the task is leftover from the abandoned plan.
+///    Clear it (and `aq.cancel()` the prefetched queue) unless the goal
+///    legitimately keeps the task alive (Sleep keeps `TaskKind::Sleep`,
+///    Survive keeps an in-progress `Eat`).
+/// 2. **Explore cleanup.** Gather/Survive/Build share the Explore plan, so
+///    when one of those goals flips and a stale `Explore` task is still
+///    Working, drop it back to Idle.
 pub fn goal_dispatch_system(
-    chunk_map: Res<ChunkMap>,
-    chunk_graph: Res<ChunkGraph>,
-    chunk_router: Res<ChunkRouter>,
-    chunk_connectivity: Res<ChunkConnectivity>,
-    _spatial: Res<SpatialIndex>,
-    faction_registry: Res<FactionRegistry>,
-    bed_query: Query<&Transform, With<Bed>>,
     mut query: Query<
         (
-            Entity,
             &mut PersonAI,
-            &EconomicAgent,
-            &Needs,
-            &mut AgentGoal,
-            &FactionMember,
-            &Transform,
+            &mut crate::simulation::typed_task::ActionQueue,
+            &AgentGoal,
             &LodLevel,
-            Option<&RelationshipMemory>,
             Option<&ActivePlan>,
-            Option<&HomeBed>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
 ) {
-    query.par_iter_mut().for_each(
-        |(
-            _entity,
-            mut ai,
-            _agent,
-            _needs,
-            mut goal,
-            member,
-            transform,
-            lod,
-            _rel_opt,
-            plan_opt,
-            home_bed_opt,
-        )| {
+    query
+        .par_iter_mut()
+        .for_each(|(mut ai, mut aq, goal, lod, plan_opt)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
 
             if plan_opt.is_none() && ai.task_id != PersonAI::UNEMPLOYED {
-                // Sleep still dispatches inline below, so its task is
-                // expected to outlive the plan reset. Everything else is
-                // plan-driven — when an agent has no `ActivePlan`, any
+                // Sleep dispatches via `htn_dispatch_system`, not a plan, so its
+                // task is expected to outlive the plan reset. Everything else
+                // is plan-driven — when an agent has no `ActivePlan`, any
                 // lingering task is stale and gets cleared.
                 let expected_task = match *goal {
                     AgentGoal::Sleep => Some(TaskKind::Sleep as u16),
                     AgentGoal::Survive if ai.task_id == TaskKind::Eat as u16 => {
                         Some(TaskKind::Eat as u16)
+                    }
+                    AgentGoal::Survive if ai.task_id == TaskKind::WithdrawFood as u16 => {
+                        Some(TaskKind::WithdrawFood as u16)
+                    }
+                    // Phase 5c-ii-d-iii-ii: AcquireFood scavenge chain runs
+                    // without an ActivePlan under Survive. The Scavenge head
+                    // and trailing Eat both need to survive across
+                    // goal-dispatch ticks until completion or external
+                    // preempt.
+                    AgentGoal::Survive if ai.task_id == TaskKind::Scavenge as u16 => {
+                        Some(TaskKind::Scavenge as u16)
+                    }
+                    // Phase 5c-ii-b: AcquireGood haul chain runs without an
+                    // ActivePlan. Both legs (storage withdraw + haul to
+                    // blueprint) need to survive across goal-dispatch ticks
+                    // until either completion or external preempt.
+                    AgentGoal::Haul if ai.task_id == TaskKind::WithdrawMaterial as u16 => {
+                        Some(TaskKind::WithdrawMaterial as u16)
+                    }
+                    AgentGoal::Haul if ai.task_id == TaskKind::HaulMaterials as u16 => {
+                        Some(TaskKind::HaulMaterials as u16)
+                    }
+                    // Phase 5c-ii-c-ii: AcquireGood gather chain runs without
+                    // an ActivePlan. Both legs (gather + deposit at faction
+                    // storage) need to survive across goal-dispatch ticks
+                    // until either completion or external preempt.
+                    AgentGoal::GatherWood | AgentGoal::GatherStone
+                        if ai.task_id == TaskKind::Gather as u16 =>
+                    {
+                        Some(TaskKind::Gather as u16)
+                    }
+                    AgentGoal::GatherWood | AgentGoal::GatherStone
+                        if ai.task_id == TaskKind::DepositResource as u16 =>
+                    {
+                        Some(TaskKind::DepositResource as u16)
+                    }
+                    // Phase 5c-ii-d-ii-a: AcquireGood scavenge chain runs
+                    // without an ActivePlan. Same lifecycle as the gather
+                    // chain — Scavenge head, DepositResource tail.
+                    AgentGoal::GatherWood | AgentGoal::GatherStone
+                        if ai.task_id == TaskKind::Scavenge as u16 =>
+                    {
+                        Some(TaskKind::Scavenge as u16)
+                    }
+                    // Phase 5c-ii-d-iv-ii: HTN Explore fallback (`ExploreForFoodMethod`
+                    // / `ExploreForMaterialMethod`) runs without an ActivePlan.
+                    // The walk-to-random-tile leg shouldn't be reset every
+                    // tick by the absence of a plan; the catch-all below
+                    // handles arrival-then-Idle once `state == Working`.
+                    AgentGoal::Survive if ai.task_id == TaskKind::Explore as u16 => {
+                        Some(TaskKind::Explore as u16)
+                    }
+                    AgentGoal::GatherWood | AgentGoal::GatherStone
+                        if ai.task_id == TaskKind::Explore as u16 =>
+                    {
+                        Some(TaskKind::Explore as u16)
                     }
                     _ => None,
                 };
@@ -645,110 +686,34 @@ pub fn goal_dispatch_system(
                     // Goal changed or task is done; drop the current task.
                     ai.state = AiState::Idle;
                     ai.task_id = PersonAI::UNEMPLOYED;
+                    // Phase 4b-ii: a goal flip is an external preempt — any
+                    // prefetched tasks belong to the abandoned plan. `cancel()`
+                    // drops both `current` and the queue so executors with the
+                    // inconsistent-state guard see clean state and chained
+                    // follow-ups don't outlive their plan.
+                    aq.cancel();
                 }
             }
 
-            let is_active = matches!(
-                ai.state,
-                AiState::Working | AiState::Seeking | AiState::Routing
-            );
-
-            let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
-            let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-            let cur_chunk = ChunkCoord(
-                cur_tx.div_euclid(CHUNK_SIZE as i32),
-                cur_ty.div_euclid(CHUNK_SIZE as i32),
-            );
-
-            // Socialize / Raid / Defend / Lead were migrated to plans 60-63 in
-            // `plan/registry.rs`; they now flow through `plan_execution_system`.
-            // Sleep is the lone holdout — its bed/camp fallback chain is
-            // tricky enough to leave here for now.
-            match *goal {
-                AgentGoal::Sleep => {
-                    if ai.state == AiState::Sleeping {
-                        return;
-                    }
-
-                    // If arrived at "working" tile for Sleep task, start sleeping
-                    if ai.state == AiState::Working && ai.task_id == TaskKind::Sleep as u16 {
-                        ai.state = AiState::Sleeping;
-                        return;
-                    }
-
-                    if is_active && ai.task_id == TaskKind::Sleep as u16 {
-                        return;
-                    }
-
-                    // 1) Persistent claim: route to my own bed if it still exists.
-                    if let Some(bed_entity) = home_bed_opt.and_then(|h| h.0) {
-                        if let Ok(bed_transform) = bed_query.get(bed_entity) {
-                            let btx = (bed_transform.translation.x / TILE_SIZE).floor() as i32;
-                            let bty = (bed_transform.translation.y / TILE_SIZE).floor() as i32;
-                            assign_task_with_routing(
-                                &mut ai,
-                                (cur_tx as i32, cur_ty as i32),
-                                cur_chunk,
-                                (btx, bty),
-                                TaskKind::Sleep,
-                                Some(bed_entity),
-                                &chunk_graph,
-                                &chunk_router,
-                                &chunk_map,
-                                &chunk_connectivity,
-                            );
-                            return;
-                        }
-                    }
-
-                    // 2) No claim yet (or stale): head toward faction home so the
-                    //    next assign_beds_system pass can pair us with a free bed.
-                    //    Sleep on the ground there until that happens.
-                    let home_opt = if member.faction_id != SOLO {
-                        faction_registry.home_tile(member.faction_id)
-                    } else {
-                        None
-                    };
-
-                    if let Some(home) = home_opt {
-                        let dx = cur_tx - home.0 as i32;
-                        let dy = cur_ty - home.1 as i32;
-                        if dx * dx + dy * dy > 5 * 5 {
-                            assign_task_with_routing(
-                                &mut ai,
-                                (cur_tx as i32, cur_ty as i32),
-                                cur_chunk,
-                                home,
-                                TaskKind::Sleep,
-                                None,
-                                &chunk_graph,
-                                &chunk_router,
-                                &chunk_map,
-                                &chunk_connectivity,
-                            );
-                            return;
-                        }
-                    }
-
-                    // Solo, no home, or already at home with no bed yet: sleep here.
-                    ai.state = AiState::Sleeping;
-                    ai.task_id = TaskKind::Sleep as u16;
-                }
-
-                // Everything except Sleep is plan-driven. The catch-all only
-                // exists to clear a stale Explore task when the goal has
-                // moved on (gather/survive/build all share the Explore plan).
-                _ => {
-                    if ai.task_id == TaskKind::Explore as u16
-                        && ai.state == AiState::Working
-                    {
-                        ai.state = AiState::Idle;
-                        ai.task_id = PersonAI::UNEMPLOYED;
-                    }
-                }
+            // Catch-all for stale Explore tasks. Gather/Survive/Build share
+            // the Explore plan, so when the goal flips and an Explore task is
+            // still Working, drop it back to Idle so plan_execution_system
+            // can pick a fresh plan next tick.
+            //
+            // Phase 5c-ii-d-iv-ii: HTN-dispatched Explore (`ExploreForFoodMethod`
+            // / `ExploreForMaterialMethod`) lands here too on arrival. Calling
+            // `aq.advance()` flips the typed channel to `Task::Idle` so the
+            // next HTN dispatch tick re-evaluates with a fresh ctx (memory
+            // populated en route may now reveal a concrete target).
+            if !matches!(*goal, AgentGoal::Sleep)
+                && ai.task_id == TaskKind::Explore as u16
+                && ai.state == AiState::Working
+            {
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+                aq.advance();
             }
-        },
-    );
+        });
 }
 
 // ── Play task system ──────────────────────────────────────────────────────────
@@ -782,11 +747,11 @@ const PLAY_FULL_WILLPOWER: f32 = 230.0;
 fn highest_held_entertainment(carrier: &Carrier) -> u8 {
     let l = carrier
         .left
-        .map(|s| s.item.good.entertainment_value())
+        .map(|s| s.item.good().entertainment_value())
         .unwrap_or(0);
     let r = carrier
         .right
-        .map(|s| s.item.good.entertainment_value())
+        .map(|s| s.item.good().entertainment_value())
         .unwrap_or(0);
     l.max(r)
 }
@@ -802,7 +767,7 @@ fn adjacent_ground_entertainment(
         for dx in -1..=1i32 {
             for &e in spatial.get(cur_tx + dx, cur_ty + dy) {
                 if let Ok(item) = item_query.get(e) {
-                    let v = item.item.good.entertainment_value();
+                    let v = item.item.good().entertainment_value();
                     if v > best {
                         best = v;
                     }

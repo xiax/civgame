@@ -26,13 +26,14 @@ pub fn dig_system(
     globe: Res<Globe>,
     mut agent_query: Query<(
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut Carrier,
         &mut Skills,
         &BucketSlot,
         &LodLevel,
     )>,
 ) {
-    for (mut ai, mut carrier, mut skills, slot, lod) in agent_query.iter_mut() {
+    for (mut ai, mut aq, mut carrier, mut skills, slot, lod) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -48,14 +49,19 @@ pub fn dig_system(
         }
         ai.work_progress = 0;
 
-        let tx = ai.dest_tile.0 as i32;
-        let ty = ai.dest_tile.1 as i32;
+        // Phase 3b-v: tile from typed `Task::Dig`; fall back to dest_tile
+        // when the typed task is absent (un-migrated dispatch path).
+        let (tx, ty) = aq
+            .current
+            .as_dig()
+            .unwrap_or((ai.dest_tile.0 as i32, ai.dest_tile.1 as i32));
         let surf_z = chunk_map.surface_z_at(tx, ty);
         let kind = chunk_map.tile_kind_at(tx, ty).unwrap_or(TileKind::Air);
 
         if kind == TileKind::Air || kind == TileKind::Water || surf_z <= Z_MIN {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
+            aq.advance();
             continue;
         }
 
@@ -100,5 +106,6 @@ pub fn dig_system(
 
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
+        aq.advance();
     }
 }

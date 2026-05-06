@@ -3,10 +3,12 @@ use bevy::prelude::*;
 
 pub mod agent;
 pub mod command;
+pub mod core_ids;
 pub mod goods;
 pub mod item;
 pub mod market;
 pub mod mode;
+pub mod resource_catalog;
 pub mod transactions;
 
 pub use command::CommandPools;

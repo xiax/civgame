@@ -16,7 +16,7 @@ use crate::simulation::mood::Mood;
 use crate::simulation::movement::MovementState;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, Person, PersonAI};
-use crate::simulation::plan::{KnownPlans, PlanHistory, PlanScoringMethod};
+use crate::simulation::plan::{KnownPlans, PlanHistory, PlanId, PlanScoringMethod};
 use crate::simulation::plants::{
     spawn_plant_at, DeerGrazer, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
@@ -99,9 +99,28 @@ fn setup_sandbox(
             AgentMemory::default(),
             RelationshipMemory::default(),
             KnownPlans::with_innate(&[
-    0, 1, 2, 3, 5, 6, 7, 23, 25, 26, 27, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
-    60, 61, 62, 63,
-]),
+                PlanId::FORAGE_FOOD,
+                PlanId::FARM_FOOD,
+                // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
+                PlanId::HUNT_FOOD,
+                PlanId::SCAVENGE_FOOD,
+                PlanId::BUILD_BLUEPRINT,
+                PlanId::RESCUE_ALLY,
+                PlanId::PLAY_SOCIAL,
+                PlanId::PLAY_SOLO,
+                PlanId::HAUL_FROM_STORAGE_AND_BUILD,
+                PlanId::PLAY_BY_PLANTING,
+                PlanId::PLAY_BY_THROWING_ROCKS,
+                PlanId::PLAY_WITH_STORED_TOY,
+                PlanId::CLAIMED_BUILD,
+                PlanId::EXPLORE_FOR_FOOD,
+                // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
+                // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
+                PlanId::SOCIALIZE,
+                PlanId::RAID,
+                PlanId::DEFEND,
+                PlanId::LEAD,
+            ]),
             PlanHistory::default(),
             PlanScoringMethod::Weighted,
             Carrier::default(),
@@ -109,6 +128,7 @@ fn setup_sandbox(
             crate::simulation::reproduction::MaleConceptionCooldown::default(),
             crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Person),
             crate::simulation::knowledge::PersonKnowledge::paleolithic_seed(0),
+            crate::simulation::typed_task::ActionQueue::idle(),
         ),
     ));
 

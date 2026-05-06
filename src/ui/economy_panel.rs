@@ -23,8 +23,13 @@ pub fn economy_panel_system(
                 EconomicMode::Market | EconomicMode::Mixed => {
                     ui.label("Market Prices (Commodities):");
                     for good in Good::all() {
-                        let price = market.prices[good as usize];
-                        ui.label(format!("  {:6}: ${:.2}", good.name(), price));
+                        let price = market.price_of(good);
+                        let id = crate::economy::core_ids::good_to_resource_id(good);
+                        ui.label(format!(
+                            "  {:6}: ${:.2}",
+                            crate::economy::core_ids::display_name(id),
+                            price
+                        ));
                     }
                     if !market.listings.is_empty() {
                         ui.separator();
@@ -47,9 +52,10 @@ pub fn economy_panel_system(
                     for good in Good::all() {
                         let stock = pools.stockpile[good as usize];
                         let quota = pools.quotas[good as usize];
+                        let id = crate::economy::core_ids::good_to_resource_id(good);
                         ui.label(format!(
                             "  {:6}: {:.0} units  ({} workers)",
-                            good.name(),
+                            crate::economy::core_ids::display_name(id),
                             stock,
                             quota
                         ));

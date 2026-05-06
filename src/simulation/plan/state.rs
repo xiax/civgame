@@ -125,7 +125,7 @@ pub fn build_state_vec(
             let base = 25 + i * 2;
             match history.entries[i] {
                 Some((plan_id, outcome, _tick)) => {
-                    s[base] = (plan_id as f32 + 1.0) / 128.0;
+                    s[base] = (plan_id.raw() as f32 + 1.0) / 128.0;
                     s[base + 1] = if outcome.is_failure() { 1.0 } else { 0.0 };
                 }
                 None => {
@@ -142,12 +142,10 @@ pub fn build_state_vec(
     // DeliverFromStorageToCraftOrder).
     if let Some(st) = storage {
         s[SI_STORAGE_FOOD] = (st.food_total() / STORAGE_SATURATE).clamp(0.0, 1.0);
-        s[SI_STORAGE_WOOD] = (st.totals.get(&Good::Wood).copied().unwrap_or(0) as f32
-            / STORAGE_SATURATE)
-            .clamp(0.0, 1.0);
-        s[SI_STORAGE_STONE] = (st.totals.get(&Good::Stone).copied().unwrap_or(0) as f32
-            / STORAGE_SATURATE)
-            .clamp(0.0, 1.0);
+        s[SI_STORAGE_WOOD] =
+            (st.stock_of(Good::Wood) as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
+        s[SI_STORAGE_STONE] =
+            (st.stock_of(Good::Stone) as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
         s[SI_STORAGE_GRAIN_SEED] = (st.grain_seed_total() as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
         s[SI_STORAGE_BERRY_SEED] = (st.berry_seed_total() as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
     }
@@ -295,7 +293,7 @@ pub fn count_visible_ground_food(
             }
             for &e in spatial.get(tx + dx, ty + dy) {
                 if let Ok(item) = items.get(e) {
-                    if item.item.good.is_edible() {
+                    if item.item.good().is_edible() {
                         n = n.saturating_add(1);
                         if n >= VISIBILITY_SATURATE {
                             return n;
@@ -329,7 +327,7 @@ pub fn count_visible_ground_wood(
             }
             for &e in spatial.get(tx + dx, ty + dy) {
                 if let Ok(item) = items.get(e) {
-                    if item.item.good == Good::Wood {
+                    if item.item.good() == Good::Wood {
                         n = n.saturating_add(1);
                         if n >= VISIBILITY_SATURATE {
                             return n;
@@ -360,7 +358,7 @@ pub fn count_visible_ground_stone(
             }
             for &e in spatial.get(tx + dx, ty + dy) {
                 if let Ok(item) = items.get(e) {
-                    if item.item.good == Good::Stone {
+                    if item.item.good() == Good::Stone {
                         n = n.saturating_add(1);
                         if n >= VISIBILITY_SATURATE {
                             return n;

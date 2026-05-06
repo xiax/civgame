@@ -31,7 +31,7 @@ pub fn market_sell_system(
                 continue;
             }
 
-            let sell_qty = if item.good.is_edible() {
+            let sell_qty = if item.good().is_edible() {
                 if qty > FOOD_KEEP_RESERVE {
                     qty - FOOD_KEEP_RESERVE
                 } else {
@@ -81,7 +81,7 @@ pub fn market_buy_system(
 
         // Buy Tools when affordable and not already owning one
         if !agent.has_tool() {
-            let tool_price = market.prices[Good::Tools as usize];
+            let tool_price = market.price_of(Good::Tools);
             if agent.currency >= tool_price * TOOL_BUY_CURRENCY_FACTOR {
                 let (bought_item, qty) = market.try_buy_item(Good::Tools, 1, &mut agent.currency);
                 if let Some(it) = bought_item {
