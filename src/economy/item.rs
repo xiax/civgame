@@ -107,9 +107,14 @@ pub struct Item {
 }
 
 impl Item {
-    pub fn new_commodity(good: Good) -> Self {
+    /// Sub-PR (b) of Phase 2 residual #7: takes `impl Into<ResourceId>`
+    /// so callers can pass either a catalog `ResourceId` directly or a
+    /// legacy `Good` (via `From<Good> for ResourceId` in `core_ids`).
+    /// Once `Good` is deleted the polymorphism collapses to a
+    /// `ResourceId`-only signature.
+    pub fn new_commodity(resource_id: impl Into<ResourceId>) -> Self {
         Self {
-            resource_id: super::core_ids::good_to_resource_id(good),
+            resource_id: resource_id.into(),
             material: None,
             quality: None,
             display_name: None,
@@ -119,10 +124,24 @@ impl Item {
         }
     }
 
-    pub fn new_manufactured(good: Good, material: ItemMaterial, quality: ItemQuality) -> Self {
+    /// Sub-PR (b): mirrors `new_commodity`. `compute_combat_stats` still
+    /// matches on legacy `Good::Weapon | Shield | Armor` arms, so the
+    /// body reverse-resolves the id to feed it. The roundtrip
+    /// (`Good → id` at the call site, `id → Good` here) disappears once
+    /// `compute_combat_stats` migrates to `ResourceId` matching.
+    pub fn new_manufactured(
+        resource_id: impl Into<ResourceId>,
+        material: ItemMaterial,
+        quality: ItemQuality,
+    ) -> Self {
+        let resource_id = resource_id.into();
+        let good = super::core_ids::resource_id_to_good(resource_id).expect(
+            "Item::new_manufactured: non-legacy ResourceId; \
+             compute_combat_stats still keys on legacy `Good`",
+        );
         let (weapon_stats, armor_stats) = compute_combat_stats(good, material, quality);
         Self {
-            resource_id: super::core_ids::good_to_resource_id(good),
+            resource_id,
             material: Some(material),
             quality: Some(quality),
             display_name: None,

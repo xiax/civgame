@@ -400,7 +400,7 @@ pub fn gather_system(
                         &mut commands,
                         &mut carrier,
                         &mut agent,
-                        core_ids::good_to_resource_id(good),
+                        good.into(),
                         scaled,
                         agent_tx,
                         agent_ty,
@@ -496,9 +496,7 @@ fn route_yield(
     if qty == 0 {
         return;
     }
-    let good = core_ids::resource_id_to_good(resource_id)
-        .expect("route_yield: non-legacy ResourceId; Item::new_commodity needs Good");
-    let item = Item::new_commodity(good);
+    let item = Item::new_commodity(resource_id);
     let leftover = carrier.try_pick_up(item, qty);
     if leftover > 0 {
         let pos = tile_to_world(tx, ty);
@@ -537,13 +535,11 @@ fn faction_muls(
 }
 
 fn spawn_ground_drop(commands: &mut Commands, tx: i32, ty: i32, resource_id: ResourceId, qty: u32) {
-    let good = core_ids::resource_id_to_good(resource_id)
-        .expect("spawn_ground_drop: non-legacy ResourceId; Item::new_commodity needs Good");
     let (dx, dy) = adjacent_offset();
     let pos = tile_to_world(tx + dx, ty + dy);
     commands.spawn((
         GroundItem {
-            item: Item::new_commodity(good),
+            item: Item::new_commodity(resource_id),
             qty,
         },
         Transform::from_xyz(pos.x, pos.y, 0.3),

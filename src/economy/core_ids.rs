@@ -13,6 +13,15 @@ use std::sync::OnceLock;
 use super::goods::Good;
 use super::resource_catalog::{load_resource_catalog, ResourceCatalog, ResourceId};
 
+/// Bridge `Good → ResourceId` so callers don't sprinkle
+/// `core_ids::good_to_resource_id(...)` everywhere. Disappears alongside
+/// `Good` once Phase 2 residual #7 finishes.
+impl From<Good> for ResourceId {
+    fn from(g: Good) -> Self {
+        good_to_resource_id(g)
+    }
+}
+
 /// Process-global cache of the loaded `ResourceCatalog`. Populated either
 /// by an explicit `install_catalog()` call from `WorldPlugin::build` (the
 /// production path) or lazily on first read via `catalog()` (the test
