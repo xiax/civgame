@@ -504,14 +504,16 @@ pub fn goal_update_system(
                 // Use anticipatory material_targets (and current blueprint
                 // demand baked in via resource_demand) to pick the highest
                 // deficit material.
+                let wood_id: crate::economy::resource_catalog::ResourceId = Good::Wood.into();
+                let stone_id: crate::economy::resource_catalog::ResourceId = Good::Stone.into();
                 let wood_target = faction
-                    .material_target_of(Good::Wood)
-                    .max(faction.demand_of(Good::Wood));
+                    .material_target_of(wood_id)
+                    .max(faction.demand_of(wood_id));
                 let stone_target = faction
-                    .material_target_of(Good::Stone)
-                    .max(faction.demand_of(Good::Stone));
-                let wood_stored = faction.storage.stock_of(Good::Wood);
-                let stone_stored = faction.storage.stock_of(Good::Stone);
+                    .material_target_of(stone_id)
+                    .max(faction.demand_of(stone_id));
+                let wood_stored = faction.storage.stock_of(wood_id);
+                let stone_stored = faction.storage.stock_of(stone_id);
                 let wood_deficit = wood_target.saturating_sub(wood_stored);
                 let stone_deficit = stone_target.saturating_sub(stone_stored);
 
@@ -601,7 +603,7 @@ fn should_craft(registry: &FactionRegistry, faction_id: u32, needs: &Needs) -> b
         Good::Cloth,
     ]
     .iter()
-    .map(|g| faction.storage.stock_of(*g))
+    .map(|g| faction.storage.stock_of((*g).into()))
     .sum();
     if crafted_total >= faction.member_count.saturating_div(3).max(1) {
         return false;

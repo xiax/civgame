@@ -533,30 +533,30 @@ pub fn chief_job_posting_system(
         //     below target. One posting per (faction, good).
         if faction.member_count > 0 {
             for &good in &[Good::Wood, Good::Stone] {
-                // Sum unmet blueprint demand for this good (reactive component).
+                let target_rid: crate::economy::resource_catalog::ResourceId = good.into();
+                // Sum unmet blueprint demand for this resource (reactive component).
                 let mut bp_demand: u32 = 0;
                 for &bp_entity in &live_bps {
                     let Ok(bp) = bp_query.get(bp_entity) else {
                         continue;
                     };
                     for slot in &bp.deposits[..bp.deposit_count as usize] {
-                        if slot.resource_id == good.into() {
+                        if slot.resource_id == target_rid {
                             bp_demand = bp_demand
                                 .saturating_add((slot.needed.saturating_sub(slot.deposited)) as u32);
                         }
                     }
                 }
-                let anticipatory = faction.material_target_of(good);
+                let anticipatory = faction.material_target_of(target_rid);
                 let target_total = anticipatory.max(bp_demand);
                 if target_total == 0 {
                     continue;
                 }
-                let stored = faction.storage.stock_of(good);
+                let stored = faction.storage.stock_of(target_rid);
                 if stored >= target_total {
                     continue;
                 }
                 let deficit = target_total.saturating_sub(stored);
-                let target_rid = crate::economy::core_ids::good_to_resource_id(good);
                 let already = board.faction_postings(faction_id).iter().any(|p| {
                     matches!(
                         &p.progress,
@@ -678,7 +678,7 @@ pub fn chief_job_posting_system(
                 .faction_postings(faction_id)
                 .iter()
                 .any(|p| matches!(p.kind, JobKind::Farm));
-            let grain = faction.storage.stock_of(Good::Grain);
+            let grain = faction.storage.stock_of(Good::Grain.into());
             let seed = faction.storage.seed_total();
             // Post farm if grain is low and seeds are available.
             if !already_farm && grain < faction.member_count * 4 && seed > 0 {

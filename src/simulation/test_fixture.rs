@@ -747,7 +747,7 @@ mod baseline_behaviour {
             .factions
             .get(&sim.player_faction_id)
             .expect("player faction missing");
-        let wood_total = faction.storage.stock_of(Good::Wood);
+        let wood_total = faction.storage.stock_of(Good::Wood.into());
         assert!(
             wood_total > 0,
             "expected wood at storage tile to register on faction storage; got {}",
@@ -1611,7 +1611,7 @@ mod baseline_behaviour {
             let stock = registry
                 .factions
                 .get(&sim.player_faction_id)
-                .map(|f| f.storage.stock_of(Good::Wood))
+                .map(|f| f.storage.stock_of(Good::Wood.into()))
                 .unwrap_or(0);
             assert!(
                 stock > 0,

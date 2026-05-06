@@ -143,9 +143,9 @@ pub fn build_state_vec(
     if let Some(st) = storage {
         s[SI_STORAGE_FOOD] = (st.food_total() / STORAGE_SATURATE).clamp(0.0, 1.0);
         s[SI_STORAGE_WOOD] =
-            (st.stock_of(Good::Wood) as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
+            (st.stock_of(Good::Wood.into()) as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
         s[SI_STORAGE_STONE] =
-            (st.stock_of(Good::Stone) as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
+            (st.stock_of(Good::Stone.into()) as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
         s[SI_STORAGE_GRAIN_SEED] = (st.grain_seed_total() as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
         s[SI_STORAGE_BERRY_SEED] = (st.berry_seed_total() as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
     }

@@ -618,14 +618,11 @@ pub struct FactionStorage {
 }
 
 impl FactionStorage {
-    /// Lookup helper for the legacy `Good`-keyed callers — resolves
-    /// `good` to its catalog id and reads from `totals`. Phase 3+ HTN
-    /// code should hit `totals` directly with a `ResourceId`. Keeps
-    /// migration call sites readable while we still have `Good` floating
-    /// around at consumer surfaces.
-    pub fn stock_of(&self, good: Good) -> u32 {
-        let id = crate::economy::core_ids::good_to_resource_id(good);
-        self.totals.get(&id).copied().unwrap_or(0)
+    /// Look up `totals` by `ResourceId`. Returns 0 for resources that
+    /// have never been deposited. Legacy `Good`-typed callers pass
+    /// `good.into()` at the boundary.
+    pub fn stock_of(&self, resource_id: crate::economy::resource_catalog::ResourceId) -> u32 {
+        self.totals.get(&resource_id).copied().unwrap_or(0)
     }
 
     pub fn food_total(&self) -> f32 {
@@ -1488,35 +1485,35 @@ impl FactionRegistry {
 }
 
 impl FactionData {
-    /// Phase 2d transitional helper: read `resource_supply` by legacy
-    /// `Good`. Resolves to `ResourceId` and looks up; returns 0 for
-    /// missing entries. New (Phase 3+) code should index `resource_supply`
-    /// by `ResourceId` directly.
-    pub fn supply_of(&self, good: Good) -> u32 {
-        let id = crate::economy::core_ids::good_to_resource_id(good);
-        self.resource_supply.get(&id).copied().unwrap_or(0)
+    /// Read `resource_supply` by `ResourceId`. Returns 0 for missing entries.
+    /// Legacy `Good`-typed callers pass `good.into()` at the boundary.
+    pub fn supply_of(&self, resource_id: crate::economy::resource_catalog::ResourceId) -> u32 {
+        self.resource_supply.get(&resource_id).copied().unwrap_or(0)
     }
 
-    /// Phase 2d transitional helper: read `resource_demand` by legacy
-    /// `Good`. See `supply_of` for migration semantics.
-    pub fn demand_of(&self, good: Good) -> u32 {
-        let id = crate::economy::core_ids::good_to_resource_id(good);
-        self.resource_demand.get(&id).copied().unwrap_or(0)
+    /// Read `resource_demand` by `ResourceId`. See `supply_of` for migration
+    /// semantics.
+    pub fn demand_of(&self, resource_id: crate::economy::resource_catalog::ResourceId) -> u32 {
+        self.resource_demand.get(&resource_id).copied().unwrap_or(0)
     }
 
-    /// Phase 2-residual transitional helper: read `material_targets` by
-    /// legacy `Good`. Resolves to `ResourceId` and looks up; returns 0 for
-    /// missing entries. New code should index by `ResourceId` directly.
-    pub fn material_target_of(&self, good: Good) -> u32 {
-        let id = crate::economy::core_ids::good_to_resource_id(good);
-        self.material_targets.get(&id).copied().unwrap_or(0)
+    /// Read `material_targets` by `ResourceId`. Returns 0 for missing entries.
+    pub fn material_target_of(
+        &self,
+        resource_id: crate::economy::resource_catalog::ResourceId,
+    ) -> u32 {
+        self.material_targets.get(&resource_id).copied().unwrap_or(0)
     }
 
-    /// Phase 2-residual transitional helper: read `material_deficit_ema` by
-    /// legacy `Good`.
-    pub fn material_deficit_ema_of(&self, good: Good) -> u8 {
-        let id = crate::economy::core_ids::good_to_resource_id(good);
-        self.material_deficit_ema.get(&id).copied().unwrap_or(0)
+    /// Read `material_deficit_ema` by `ResourceId`.
+    pub fn material_deficit_ema_of(
+        &self,
+        resource_id: crate::economy::resource_catalog::ResourceId,
+    ) -> u8 {
+        self.material_deficit_ema
+            .get(&resource_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn food_yield_multiplier(&self) -> f32 {

@@ -329,7 +329,7 @@ pub fn farm_pressure(faction: &FactionData) -> u8 {
     if !faction_can_perform(faction, JobKind::Farm) {
         return 0;
     }
-    let grain = faction.storage.stock_of(Good::Grain);
+    let grain = faction.storage.stock_of(Good::Grain.into());
     let target = faction.member_count.saturating_mul(4);
     if grain >= target || target == 0 {
         return 0;
@@ -352,8 +352,9 @@ pub fn craft_pressure(faction: &FactionData) -> u8 {
     let max_gap = CRAFTABLE
         .iter()
         .map(|g| {
-            let s = faction.supply_of(*g);
-            let d = faction.demand_of(*g);
+            let id: crate::economy::resource_catalog::ResourceId = (*g).into();
+            let s = faction.supply_of(id);
+            let d = faction.demand_of(id);
             d.saturating_sub(s)
         })
         .max()
@@ -482,11 +483,13 @@ pub fn compute_workforce_budget(
     // ratio (how far below target storage sits) with a saturating
     // project-count term so adding one waiting project no longer dwarfs
     // the deficit signal.
-    let stored_of = |good: Good| faction.storage.stock_of(good) as f32;
-    let target_of = |good: Good| faction.material_target_of(good) as f32;
-    let material_urgency = |good: Good| -> f32 {
-        let target = target_of(good);
-        let stored = stored_of(good);
+    let stored_of =
+        |id: crate::economy::resource_catalog::ResourceId| faction.storage.stock_of(id) as f32;
+    let target_of =
+        |id: crate::economy::resource_catalog::ResourceId| faction.material_target_of(id) as f32;
+    let material_urgency = |id: crate::economy::resource_catalog::ResourceId| -> f32 {
+        let target = target_of(id);
+        let stored = stored_of(id);
         let deficit_ratio = if target > 0.0 {
             ((target - stored) / target).clamp(0.0, 1.0)
         } else {
@@ -496,8 +499,8 @@ pub fn compute_workforce_budget(
         deficit_ratio * 70.0 + project_term * 30.0
     };
     let stockpile_food_pressure = food;
-    let stockpile_wood_pressure = material_urgency(Good::Wood);
-    let stockpile_stone_pressure = material_urgency(Good::Stone);
+    let stockpile_wood_pressure = material_urgency(Good::Wood.into());
+    let stockpile_stone_pressure = material_urgency(Good::Stone.into());
 
     // Haul + Build urgency on the same 0..100 scale, saturating at modest
     // queue depths since beyond that the bottleneck is throughput not
@@ -625,8 +628,9 @@ pub fn compute_workforce_budget(
         let max_gap = CRAFTABLE
             .iter()
             .map(|g| {
-                let s = faction.supply_of(*g);
-                let d = faction.demand_of(*g);
+                let id: crate::economy::resource_catalog::ResourceId = (*g).into();
+                let s = faction.supply_of(id);
+                let d = faction.demand_of(id);
                 d.saturating_sub(s)
             })
             .max()

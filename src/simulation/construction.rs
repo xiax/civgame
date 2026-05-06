@@ -1631,7 +1631,7 @@ pub fn chief_directive_system(
                 if qty == 0 {
                     continue;
                 }
-                let ema = faction.material_deficit_ema_of(good);
+                let ema = faction.material_deficit_ema_of(good.into());
                 if ema >= crate::simulation::projects::DEFICIT_EMA_RARE_THRESHOLD {
                     penalty += 600.0;
                 } else if ema >= 80 {
