@@ -621,7 +621,8 @@ pub fn craft_order_system(
                     .needed
                     .saturating_sub(order.deposits[i].deposited) as u32;
                 if still > 0 {
-                    let in_hand = carrier.quantity_of_good(order.deposits[i].good);
+                    let id = crate::economy::core_ids::good_to_resource_id(order.deposits[i].good);
+                    let in_hand = carrier.quantity_of_resource(id);
                     let in_inv = agent.quantity_of(order.deposits[i].good);
                     snap[i] = in_hand.saturating_add(in_inv);
                     if snap[i] > 0 {
@@ -771,10 +772,11 @@ pub fn craft_order_system(
     {
         for &(ae, good, qty) in &good_removals {
             if ae == entity {
-                let from_hand = carrier.remove_good(good, qty);
+                let id = crate::economy::core_ids::good_to_resource_id(good);
+                let from_hand = carrier.remove_resource(id, qty);
                 let still = qty - from_hand;
                 if still > 0 {
-                    agent.remove_good(good, still);
+                    agent.remove_resource(id, still);
                 }
             }
         }

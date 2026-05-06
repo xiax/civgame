@@ -527,7 +527,8 @@ impl StepPreconditions {
         hunger: f32,
     ) -> bool {
         if let Some((good, qty)) = self.requires_good {
-            if agent.quantity_of(good) + carrier.quantity_of_good(good) < qty {
+            let id = crate::economy::core_ids::good_to_resource_id(good);
+            if agent.quantity_of(good) + carrier.quantity_of_resource(id) < qty {
                 return false;
             }
         }
@@ -546,7 +547,8 @@ impl StepPreconditions {
             return false;
         }
         if let Some(good) = self.forbids_good {
-            if agent.quantity_of(good) > 0 || carrier.quantity_of_good(good) > 0 {
+            let id = crate::economy::core_ids::good_to_resource_id(good);
+            if agent.quantity_of(good) > 0 || carrier.quantity_of_resource(id) > 0 {
                 return false;
             }
             // A wielded weapon/armor counts as "already armed" so the
@@ -1615,8 +1617,9 @@ fn resolve_target(
                     let still = bp.deposits[i]
                         .needed
                         .saturating_sub(bp.deposits[i].deposited);
+                    let id = crate::economy::core_ids::good_to_resource_id(bp.deposits[i].good);
                     let held = carrier
-                        .quantity_of_good(bp.deposits[i].good)
+                        .quantity_of_resource(id)
                         .saturating_add(agent.quantity_of(bp.deposits[i].good));
                     if still > 0 && held > 0 {
                         useful = true;
@@ -1649,8 +1652,9 @@ fn resolve_target(
                     let still = order.deposits[i]
                         .needed
                         .saturating_sub(order.deposits[i].deposited);
+                    let id = crate::economy::core_ids::good_to_resource_id(order.deposits[i].good);
                     let held = carrier
-                        .quantity_of_good(order.deposits[i].good)
+                        .quantity_of_resource(id)
                         .saturating_add(agent.quantity_of(order.deposits[i].good));
                     if still > 0 && held > 0 {
                         useful = true;

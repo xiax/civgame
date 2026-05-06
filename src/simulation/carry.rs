@@ -85,48 +85,20 @@ impl Carrier {
         q
     }
 
-    /// Total quantity of `good` (any material/quality) across both hands.
-    pub fn quantity_of_good(&self, good: crate::economy::goods::Good) -> u32 {
+    /// Total quantity of `id` (any material/quality) across both hands.
+    pub fn quantity_of_resource(&self, id: ResourceId) -> u32 {
         let mut q = 0u32;
         if let Some(s) = self.left {
-            if s.item.good() == good {
+            if s.item.resource_id == id {
                 q = q.saturating_add(s.qty);
             }
         }
         if let Some(s) = self.right {
-            if s.item.good() == good {
+            if s.item.resource_id == id {
                 q = q.saturating_add(s.qty);
             }
         }
         q
-    }
-
-    /// True if at least one unit of `good` could be picked up given current hand state
-    /// (does not consider weight cap exhaustively — used as a coarse "room left" check).
-    pub fn can_accept(&self, good: crate::economy::goods::Good) -> bool {
-        match good.bulk() {
-            Bulk::TwoHand => self.left.is_none() && self.right.is_none(),
-            Bulk::OneHand => !self.has_two_handed_load() && self.free_hands() > 0,
-            Bulk::Small => {
-                if self.has_two_handed_load() {
-                    return false;
-                }
-                if self.free_hands() > 0 {
-                    return true;
-                }
-                let item = crate::economy::item::Item::new_commodity(good);
-                let unit_w = item.unit_weight_g().max(1);
-                for slot in [self.left, self.right].iter().flatten() {
-                    if !slot.two_handed && slot.item == item {
-                        let used = slot.weight_g();
-                        if HUMAN_HAND_CAP_G.saturating_sub(used) >= unit_w {
-                            return true;
-                        }
-                    }
-                }
-                false
-            }
-        }
     }
 
     /// Try to pick up `qty` of `item` into hands. Returns leftover that did not fit.
@@ -338,7 +310,9 @@ impl Carrier {
         removed
     }
 
-    pub fn remove_good(&mut self, good: crate::economy::goods::Good, qty: u32) -> u32 {
+    /// Remove up to `qty` units of resource `id` (any material/quality) from
+    /// hands. Returns how many were actually removed. Drains left first.
+    pub fn remove_resource(&mut self, id: ResourceId, qty: u32) -> u32 {
         let mut removed = 0u32;
         let mut want = qty;
         for slot in [&mut self.left, &mut self.right] {
@@ -346,7 +320,7 @@ impl Carrier {
                 break;
             }
             if let Some(stack) = slot.as_mut() {
-                if stack.item.good() == good {
+                if stack.item.resource_id == id {
                     let take = stack.qty.min(want);
                     stack.qty -= take;
                     removed += take;

@@ -79,11 +79,11 @@ pub fn dig_system(
             &mut tile_changed,
         );
 
-        for (good, qty) in drops {
+        for (resource_id, qty) in drops {
             if qty == 0 {
                 continue;
             }
-            let item = Item::new_commodity(good);
+            let item = Item::new_commodity(resource_id);
             let leftover = carrier.try_pick_up(item, qty);
             if leftover > 0 {
                 let pos = tile_to_world(tx, ty);

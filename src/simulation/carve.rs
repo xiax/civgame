@@ -1,4 +1,5 @@
-use crate::economy::goods::Good;
+use crate::economy::core_ids;
+use crate::economy::resource_catalog::ResourceId;
 use crate::world::chunk::ChunkMap;
 use crate::world::chunk_streaming::TileChangedEvent;
 use crate::world::globe::Globe;
@@ -9,26 +10,32 @@ use bevy::prelude::*;
 /// Yield per Wall/Stone block carved away. Ore tiles use the same per-block qty.
 pub const STONE_PER_BLOCK: u32 = 2;
 
-/// Map an ore kind to the Good that pops out of the rock when its tile is mined.
-pub fn ore_yield_good(ore: OreKind) -> Good {
-    match ore {
-        OreKind::Coal => Good::Coal,
-        OreKind::Iron => Good::Iron,
-        OreKind::Copper => Good::Copper,
-        OreKind::Tin => Good::Tin,
-        OreKind::Gold => Good::Gold,
-        OreKind::Silver => Good::Silver,
-        OreKind::None => Good::Stone,
-    }
+/// Map an ore kind to the resource that pops out of the rock when its tile is mined.
+pub fn ore_yield_resource_id(ore: OreKind) -> ResourceId {
+    let id = match ore {
+        OreKind::Coal => core_ids::Coal.get(),
+        OreKind::Iron => core_ids::Iron.get(),
+        OreKind::Copper => core_ids::Copper.get(),
+        OreKind::Tin => core_ids::Tin.get(),
+        OreKind::Gold => core_ids::Gold.get(),
+        OreKind::Silver => core_ids::Silver.get(),
+        OreKind::None => core_ids::Stone.get(),
+    };
+    *id.expect("core_ids: ore_yield_resource_id called before init_core_ids()")
 }
 
 /// Yields produced by a single carve call. At most two entries (head + floor).
-pub type CarveYield = Vec<(Good, u32)>;
+pub type CarveYield = Vec<(ResourceId, u32)>;
 
-fn yield_for_tile(data: TileData) -> Option<(Good, u32)> {
+fn yield_for_tile(data: TileData) -> Option<(ResourceId, u32)> {
     match data.kind {
-        TileKind::Wall | TileKind::Stone => Some((Good::Stone, STONE_PER_BLOCK)),
-        TileKind::Ore => Some((ore_yield_good(data.ore_kind()), STONE_PER_BLOCK)),
+        TileKind::Wall | TileKind::Stone => {
+            let id = *core_ids::Stone
+                .get()
+                .expect("core_ids: yield_for_tile called before init_core_ids()");
+            Some((id, STONE_PER_BLOCK))
+        }
+        TileKind::Ore => Some((ore_yield_resource_id(data.ore_kind()), STONE_PER_BLOCK)),
         _ => None,
     }
 }
@@ -38,9 +45,9 @@ fn yield_for_tile(data: TileData) -> Option<(Good, u32)> {
 /// - Headspace at (tx, ty, target_floor_z + 1): if Wall/Stone/Ore, set to Air.
 /// - Floor at (tx, ty, target_floor_z): if Wall/Stone/Ore, set to Dirt.
 ///
-/// Returns the per-block (Good, qty) drops. The actual material is read via
-/// `tile_at_3d` so that uncarved subsurface ore yields the right Good rather
-/// than the cache-only "Wall everywhere" approximation. Emits a
+/// Returns the per-block (ResourceId, qty) drops. The actual material is read
+/// via `tile_at_3d` so that uncarved subsurface ore yields the right resource
+/// rather than the cache-only "Wall everywhere" approximation. Emits a
 /// `TileChangedEvent` if anything changed.
 pub fn carve_tile(
     chunk_map: &mut ChunkMap,

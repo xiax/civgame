@@ -247,8 +247,9 @@ pub fn hover_info_system(
                             if need.deposited >= need.needed {
                                 continue;
                             }
-                            let qty =
-                                carrier.quantity_of_good(need.good) + agent.quantity_of(need.good);
+                            let qty = carrier.quantity_of_resource(
+                                crate::economy::core_ids::good_to_resource_id(need.good),
+                            ) + agent.quantity_of(need.good);
                             if qty > 0 {
                                 slot_carriers[i] += 1;
                             }

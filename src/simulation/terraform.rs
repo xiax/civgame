@@ -219,11 +219,11 @@ pub fn terraform_system(
                 target_floor,
                 &mut tile_changed,
             );
-            for (good, qty) in drops {
+            for (resource_id, qty) in drops {
                 if qty == 0 {
                     continue;
                 }
-                let item = Item::new_commodity(good);
+                let item = Item::new_commodity(resource_id);
                 let leftover = carrier.try_pick_up(item, qty);
                 if leftover > 0 {
                     let pos = tile_to_world(tx, ty);
@@ -245,7 +245,8 @@ pub fn terraform_system(
             skills.gain_xp(SkillKind::Mining, TERRAFORM_XP);
         } else if surf < target {
             // Filler can come from hands first (just-mined stone) or personal inventory.
-            let in_hand = carrier.quantity_of_good(TERRAFORM_FILL_GOOD);
+            let fill_id = crate::economy::core_ids::good_to_resource_id(TERRAFORM_FILL_GOOD);
+            let in_hand = carrier.quantity_of_resource(fill_id);
             let in_inv = agent.quantity_of(TERRAFORM_FILL_GOOD);
             if in_hand + in_inv < 1 {
                 ai.state = AiState::Idle;
@@ -256,9 +257,9 @@ pub fn terraform_system(
             let filled = fill_tile(&mut chunk_map, tx, ty, target_floor, &mut tile_changed);
             if filled > 0 {
                 if in_hand > 0 {
-                    carrier.remove_good(TERRAFORM_FILL_GOOD, 1);
+                    carrier.remove_resource(fill_id, 1);
                 } else {
-                    agent.remove_good(TERRAFORM_FILL_GOOD, 1);
+                    agent.remove_resource(fill_id, 1);
                 }
                 skills.gain_xp(SkillKind::Building, TERRAFORM_XP);
             }

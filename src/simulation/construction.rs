@@ -2607,7 +2607,8 @@ pub fn construction_system(
             for i in 0..count as usize {
                 let still = deposits[i].needed.saturating_sub(deposits[i].deposited) as u32;
                 if still > 0 {
-                    let in_hand = carrier.quantity_of_good(deposits[i].good);
+                    let id = crate::economy::core_ids::good_to_resource_id(deposits[i].good);
+                    let in_hand = carrier.quantity_of_resource(id);
                     let in_inv = agent.quantity_of(deposits[i].good);
                     snap[i] = in_hand.saturating_add(in_inv);
                     if snap[i] > 0 {
@@ -3019,10 +3020,11 @@ pub fn construction_system(
             if ae == entity {
                 // Consume from hands first (where haulers typically carry the load),
                 // fall back to personal inventory.
-                let from_hand = carrier.remove_good(good, qty);
+                let id = crate::economy::core_ids::good_to_resource_id(good);
+                let from_hand = carrier.remove_resource(id, qty);
                 let still = qty - from_hand;
                 if still > 0 {
-                    agent.remove_good(good, still);
+                    agent.remove_resource(id, still);
                 }
             }
         }

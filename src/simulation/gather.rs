@@ -1,6 +1,5 @@
 use crate::economy::agent::EconomicAgent;
 use crate::economy::core_ids;
-use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::economy::resource_catalog::ResourceId;
 use crate::simulation::carry::Carrier;
@@ -35,7 +34,7 @@ use bevy::prelude::*;
 // ── Stone / ore tile harvest profile ──────────────────────────────────────────
 // Coal/Iron and the new ores (Copper/Tin/Gold/Silver) are no longer random
 // rolls on Stone tiles — they're real Ore tiles produced by `proc_tile`'s
-// stratification model. `carve_tile` returns the per-block (Good, qty) drop.
+// stratification model. `carve_tile` returns the per-block (ResourceId, qty) drop.
 
 struct StoneProfile {
     work_ticks: u8,
@@ -49,17 +48,31 @@ const STONE: StoneProfile = StoneProfile {
     xp: 2,
 };
 
-/// Activity bucket to credit when a particular `Good` was just mined.
-fn mining_activity(good: Good) -> Option<ActivityKind> {
-    match good {
-        Good::Stone => Some(ActivityKind::StoneMining),
-        Good::Coal => Some(ActivityKind::CoalMining),
-        Good::Iron => Some(ActivityKind::IronMining),
-        Good::Copper => Some(ActivityKind::CopperMining),
-        Good::Tin => Some(ActivityKind::TinMining),
-        Good::Gold => Some(ActivityKind::GoldMining),
-        Good::Silver => Some(ActivityKind::SilverMining),
-        _ => None,
+/// Activity bucket to credit when a particular resource was just mined.
+fn mining_activity(id: ResourceId) -> Option<ActivityKind> {
+    let stone = *core_ids::Stone.get()?;
+    let coal = *core_ids::Coal.get()?;
+    let iron = *core_ids::Iron.get()?;
+    let copper = *core_ids::Copper.get()?;
+    let tin = *core_ids::Tin.get()?;
+    let gold = *core_ids::Gold.get()?;
+    let silver = *core_ids::Silver.get()?;
+    if id == stone {
+        Some(ActivityKind::StoneMining)
+    } else if id == coal {
+        Some(ActivityKind::CoalMining)
+    } else if id == iron {
+        Some(ActivityKind::IronMining)
+    } else if id == copper {
+        Some(ActivityKind::CopperMining)
+    } else if id == tin {
+        Some(ActivityKind::TinMining)
+    } else if id == gold {
+        Some(ActivityKind::GoldMining)
+    } else if id == silver {
+        Some(ActivityKind::SilverMining)
+    } else {
+        None
     }
 }
 
@@ -366,7 +379,7 @@ pub fn gather_system(
                 Some(TileKind::Wall) | Some(TileKind::Stone) | Some(TileKind::Ore)
             ) {
                 // ── Mineable rock: Wall, Stone, or Ore.
-                // Same carve operation; per-block (Good, qty) drops come from
+                // Same carve operation; per-block (ResourceId, qty) drops come from
                 // `carve_tile` which reads the actual material via tile_at_3d.
                 if ai.work_progress < STONE.work_ticks {
                     continue;
@@ -388,11 +401,12 @@ pub fn gather_system(
 
                 let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
                 let mut total_qty: u32 = 0;
-                for (good, qty) in drops {
+                for (resource_id, qty) in drops {
                     if qty == 0 {
                         continue;
                     }
-                    let activity = mining_activity(good).unwrap_or(ActivityKind::StoneMining);
+                    let activity =
+                        mining_activity(resource_id).unwrap_or(ActivityKind::StoneMining);
                     let (_, _, mul) = faction_muls(&mut faction_registry, faction_id, activity);
                     let scaled = (qty as f32 * mul).round().max(1.0) as u32;
                     total_qty = total_qty.saturating_add(scaled);
@@ -400,7 +414,7 @@ pub fn gather_system(
                         &mut commands,
                         &mut carrier,
                         &mut agent,
-                        good.into(),
+                        resource_id,
                         scaled,
                         agent_tx,
                         agent_ty,

@@ -33,10 +33,11 @@ pub const TICKS_FARMER_PLANT: u8 = 40;
 /// from (e.g. planting a seed that may have just been harvested into hands or
 /// withdrawn into inventory).
 pub fn consume_one_good(agent: &mut EconomicAgent, carrier: &mut Carrier, good: Good) {
-    if carrier.quantity_of_good(good) > 0 {
-        carrier.remove_good(good, 1);
+    let id = crate::economy::core_ids::good_to_resource_id(good);
+    if carrier.quantity_of_resource(id) > 0 {
+        carrier.remove_resource(id, 1);
     } else {
-        agent.remove_good(good, 1);
+        agent.remove_resource(id, 1);
     }
 }
 
@@ -139,7 +140,9 @@ pub fn production_system(
                 // inventory (withdrawn from storage), so check both stores.
                 let seed_and_plant = PlantKind::ALL.iter().copied().find_map(|kind| {
                     let seed = kind.seed_good()?;
-                    let held = agent.quantity_of(seed) + carrier.quantity_of_good(seed);
+                    let seed_id = crate::economy::core_ids::good_to_resource_id(seed);
+                    let held =
+                        agent.quantity_of_resource(seed_id) + carrier.quantity_of_resource(seed_id);
                     (held > 0).then_some((seed, kind))
                 });
                 if !plant_map.0.contains_key(&(tx, ty)) {
@@ -469,7 +472,7 @@ pub fn withdraw_material_task_system(
                 }
             }
             for (good, qty) in to_drop {
-                carrier.remove_good(good, qty);
+                carrier.remove_resource(crate::economy::core_ids::good_to_resource_id(good), qty);
                 spawn_or_merge_ground_item(
                     &mut commands,
                     &spatial,
@@ -940,8 +943,8 @@ pub fn eat_task_system(
                     agent.inventory[idx].1 -= 1;
                 }
                 EdibleSlot::HandLeft | EdibleSlot::HandRight => {
-                    // remove_good walks both hand slots; one unit always lands.
-                    carrier.remove_good(good, 1);
+                    // remove_resource walks both hand slots; one unit always lands.
+                    carrier.remove_resource(crate::economy::core_ids::good_to_resource_id(good), 1);
                 }
             }
             needs.hunger = (needs.hunger - good.nutrition() as f32).max(0.0);
