@@ -2252,4 +2252,67 @@ mod baseline_behaviour {
              behind the Scavenge head"
         );
     }
+
+    /// Phase 6b-ii: when an HTN-dispatched chain drains naturally to
+    /// `Task::Idle`, `htn_method_completion_system` records
+    /// `MethodOutcome::Success` against `MethodHistory` and clears
+    /// `PersonAI.active_method`. Pinned via the eat-from-inventory chain:
+    /// `htn_eat_dispatch_system` stamps `active_method = EAT_FROM_INVENTORY`,
+    /// `eat_task_system` runs to completion and `aq.advance()`s the typed
+    /// channel to Idle, and the next Economy phase records Success.
+    #[test]
+    fn htn_chain_completion_records_method_success() {
+        use crate::simulation::htn::{MethodHistory, MethodId, MethodOutcome};
+
+        let mut sim = TestSim::new(42);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
+            b.hunger(210.0).add_inventory(Good::Fruit, 10);
+        });
+
+        // Eat task takes TICKS_EAT (~60) ticks of Working state. 400 ticks
+        // is enough for at least one full Eat chain to dispatch, run, and
+        // be recorded by `htn_method_completion_system` (which runs in
+        // Economy after `drop_items_at_destination_system`).
+        sim.tick_n(400);
+
+        let ai = person_ai(&sim.app, person);
+        let history = sim
+            .app
+            .world()
+            .get::<MethodHistory>(person)
+            .expect("person should have MethodHistory");
+        let now = sim.app.world().resource::<SimClock>().tick;
+
+        // active_method clears once the chain drains and the completion
+        // system records the outcome.
+        assert!(
+            ai.active_method.is_none(),
+            "expected PersonAI.active_method to be None after chain drained, got {:?}",
+            ai.active_method
+        );
+
+        // MethodHistory contains a Success entry for EAT_FROM_INVENTORY.
+        // We don't gate on TTL — the test runs 400 ticks but each Eat chain
+        // is short, so the buffer may have rotated past the TTL window. The
+        // key fact is "Success was recorded at all," which fails today only
+        // when the dispatch + drain pipeline doesn't stamp + clear the
+        // outcome. (`recently_failed_count` only counts failures, so we
+        // walk the ring directly.)
+        let _ = now; // ticks are visible in the asserted entries below
+        let has_eat_success = history.entries.iter().any(|slot| {
+            matches!(
+                slot,
+                Some((id, outcome, _tick))
+                    if *id == MethodId::EAT_FROM_INVENTORY
+                        && *outcome == MethodOutcome::Success
+            )
+        });
+        assert!(
+            has_eat_success,
+            "expected MethodHistory to carry Success(EAT_FROM_INVENTORY); \
+             entries = {:?}",
+            history.entries
+        );
+    }
 }

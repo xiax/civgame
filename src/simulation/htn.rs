@@ -1932,8 +1932,14 @@ pub fn htn_eat_dispatch_system(
             let Some(method) = chosen else {
                 return;
             };
+            let chosen_id = method.id();
+            // Phase 6b-ii: stamp active method for chain-completion success
+            // recording. Eat is a single-task chain with no failure paths
+            // beyond the empty-expansion edge case.
+            ai.active_method = Some(chosen_id);
             let mut tasks = method.expand(abstract_task, &ctx);
             if tasks.is_empty() {
+                ai.active_method = None;
                 return;
             }
             let head = tasks.remove(0);
@@ -1953,6 +1959,7 @@ pub fn htn_eat_dispatch_system(
                     // No registered Eat method returns a non-Eat head today.
                     // Defensive: leave the agent untouched so the next tick
                     // re-runs dispatch.
+                    ai.active_method = None;
                 }
             }
 
@@ -2188,8 +2195,14 @@ pub fn htn_acquire_food_dispatch_system(
                 return;
             };
             let chosen_id = method.id();
+            // Phase 6b-ii: stamp the active method so `htn_method_completion_system`
+            // can record `MethodOutcome::Success` when the chain naturally
+            // drains to `Task::Idle`. Failure paths below clear it before
+            // pushing the explicit failure outcome.
+            ai.active_method = Some(chosen_id);
             let mut tasks = method.expand(abstract_task, &ctx);
             if tasks.is_empty() {
+                ai.active_method = None;
                 return;
             }
             let head = tasks.remove(0);
@@ -2214,6 +2227,7 @@ pub fn htn_acquire_food_dispatch_system(
                         // tick's argmax biases away from this method (Phase
                         // 6b: `score_method_with_history` reads `history` and
                         // applies `METHOD_FAILURE_PENALTY` per recent miss).
+                        ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     }
@@ -2240,6 +2254,7 @@ pub fn htn_acquire_food_dispatch_system(
                     // JobClaim::Stockpile, which `goal_update_system` skips
                     // entirely (line 237).
                     let Some(scav_tile) = scavenge_target_tile else {
+                        ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedTarget, now);
                         return;
                     };
@@ -2256,6 +2271,7 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_connectivity,
                     );
                     if !dispatched {
+                        ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     }
@@ -2283,6 +2299,7 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_map,
                         &chunk_connectivity,
                     ) else {
+                        ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     };
@@ -2299,6 +2316,7 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_connectivity,
                     );
                     if !dispatched {
+                        ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     }
@@ -2322,6 +2340,7 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_connectivity,
                     );
                     if !dispatched {
+                        ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     }
@@ -2332,6 +2351,7 @@ pub fn htn_acquire_food_dispatch_system(
                     // non-Scavenge, non-Explore, non-Gather head today.
                     // Defensive fallthrough; future Hunt methods will land
                     // as new arms here.
+                    ai.active_method = None;
                     return;
                 }
             }
@@ -2579,8 +2599,12 @@ pub fn htn_acquire_good_dispatch_system(
                     });
                 let Some(method) = chosen else { continue };
                 let chosen_id = method.id();
+                // Phase 6b-ii: stamp active method for chain-completion
+                // success recording; failure paths clear it explicitly.
+                ai.active_method = Some(chosen_id);
                 let mut tasks = method.expand(abstract_task, &ctx);
                 if tasks.is_empty() {
+                    ai.active_method = None;
                     continue;
                 }
                 let head = tasks.remove(0);
@@ -2600,6 +2624,7 @@ pub fn htn_acquire_good_dispatch_system(
                             &chunk_connectivity,
                         );
                         if !dispatched {
+                            ai.active_method = None;
                             history.push(chosen_id, MethodOutcome::FailedRouting, now);
                             continue;
                         }
@@ -2607,6 +2632,7 @@ pub fn htn_acquire_good_dispatch_system(
                     }
                     Task::Scavenge { target } => {
                         let Some(scav_tile) = scavenge_target_tile else {
+                            ai.active_method = None;
                             history.push(chosen_id, MethodOutcome::FailedTarget, now);
                             continue;
                         };
@@ -2623,6 +2649,7 @@ pub fn htn_acquire_good_dispatch_system(
                             &chunk_connectivity,
                         );
                         if !dispatched {
+                            ai.active_method = None;
                             history.push(chosen_id, MethodOutcome::FailedRouting, now);
                             continue;
                         }
@@ -2649,6 +2676,7 @@ pub fn htn_acquire_good_dispatch_system(
                             &chunk_map,
                             &chunk_connectivity,
                         ) else {
+                            ai.active_method = None;
                             history.push(chosen_id, MethodOutcome::FailedRouting, now);
                             continue;
                         };
@@ -2665,6 +2693,7 @@ pub fn htn_acquire_good_dispatch_system(
                             &chunk_connectivity,
                         );
                         if !dispatched {
+                            ai.active_method = None;
                             history.push(chosen_id, MethodOutcome::FailedRouting, now);
                             continue;
                         }
@@ -2674,6 +2703,7 @@ pub fn htn_acquire_good_dispatch_system(
                         // No registered AcquireGood method returns a
                         // non-Gather, non-Scavenge, non-Explore head under
                         // the gather branch today. Defensive fallthrough.
+                        ai.active_method = None;
                         continue;
                     }
                 }
@@ -2800,8 +2830,12 @@ pub fn htn_acquire_good_dispatch_system(
             });
         let Some(method) = chosen else { continue };
         let chosen_id = method.id();
+        // Phase 6b-ii: stamp active method for chain-completion success
+        // recording; failure paths clear it explicitly.
+        ai.active_method = Some(chosen_id);
         let mut tasks = method.expand(abstract_task, &ctx);
         if tasks.is_empty() {
+            ai.active_method = None;
             continue;
         }
         let head = tasks.remove(0);
@@ -2821,6 +2855,7 @@ pub fn htn_acquire_good_dispatch_system(
                     &chunk_connectivity,
                 );
                 if !dispatched {
+                    ai.active_method = None;
                     history.push(chosen_id, MethodOutcome::FailedRouting, now);
                     continue;
                 }
@@ -2838,6 +2873,7 @@ pub fn htn_acquire_good_dispatch_system(
             _ => {
                 // No registered AcquireGood method returns a non-WithdrawMaterial
                 // head today. Defensive fallthrough.
+                ai.active_method = None;
                 continue;
             }
         }
@@ -3076,8 +3112,12 @@ pub fn htn_stockpile_food_dispatch_system(
                 return;
             };
             let chosen_id = method.id();
+            // Phase 6b-ii: stamp active method for chain-completion success
+            // recording; failure paths clear it explicitly.
+            ai.active_method = Some(chosen_id);
             let mut tasks = method.expand(abstract_task, &ctx);
             if tasks.is_empty() {
+                ai.active_method = None;
                 return;
             }
             let head = tasks.remove(0);
@@ -3085,6 +3125,7 @@ pub fn htn_stockpile_food_dispatch_system(
             match head {
                 Task::Scavenge { target } => {
                     let Some(scav_tile) = scavenge_target_tile else {
+                        ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedTarget, now);
                         return;
                     };
@@ -3108,6 +3149,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         &chunk_connectivity,
                     );
                     if !dispatched {
+                        ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     }
@@ -3124,6 +3166,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         &chunk_map,
                         &chunk_connectivity,
                     ) else {
+                        ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     };
@@ -3140,6 +3183,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         &chunk_connectivity,
                     );
                     if !dispatched {
+                        ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     }
@@ -3164,6 +3208,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         &chunk_connectivity,
                     );
                     if !dispatched {
+                        ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     }
@@ -3172,6 +3217,7 @@ pub fn htn_stockpile_food_dispatch_system(
                 _ => {
                     // No registered StockpileFood method returns a non-Scavenge,
                     // non-Explore, non-Gather head today. Defensive fallthrough.
+                    ai.active_method = None;
                     return;
                 }
             }
@@ -3181,6 +3227,40 @@ pub fn htn_stockpile_food_dispatch_system(
             }
         },
     );
+}
+
+/// Phase 6b-ii chain-completion. When an HTN-dispatched chain drains to
+/// `Task::Idle` with an empty prefetch ring and the agent still carries an
+/// `active_method` stamp, record `MethodOutcome::Success` against that method
+/// and clear the stamp. Together with the per-dispatcher failure-recording
+/// paths (which clear `active_method` before pushing `FailedRouting` /
+/// `FailedTarget`), this completes the symmetric outcome model for
+/// `MethodHistory` — failures bias `score_method_with_history` away from
+/// repeated misses, successes leave the history slot ready for the next
+/// dispatch decision.
+///
+/// Runs in `SimulationSet::Economy` after `drop_items_at_destination_system`
+/// so it observes both Sequential-finishing chains (Eat / Withdraw / Gather /
+/// Scavenge — those executors call `aq.advance()` in Sequential) and
+/// Economy-finishing chains (DepositResource — finalised by
+/// `drop_items_at_destination_system`). External preempts via `aq.cancel()`
+/// at non-instrumented sites still produce a noisy Success entry; the plan's
+/// failure-only bias remains the load-bearing case (per
+/// `feedback_plan_history_design.md`), so the residual noise from cancel
+/// paths is acceptable until success-rate weighting actually consumes it.
+pub fn htn_method_completion_system(
+    mut q: Query<(&mut crate::simulation::person::PersonAI, &mut MethodHistory, &ActionQueue)>,
+    clock: Res<crate::simulation::schedule::SimClock>,
+) {
+    let now = clock.tick;
+    for (mut ai, mut history, aq) in q.iter_mut() {
+        if let Some(method_id) = ai.active_method {
+            if aq.current == Task::Idle && aq.queued_is_empty() {
+                history.push(method_id, MethodOutcome::Success, now);
+                ai.active_method = None;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

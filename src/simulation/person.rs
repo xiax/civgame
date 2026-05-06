@@ -21,7 +21,7 @@ use super::memory::{AgentMemory, RelationshipMemory};
 use super::mood::Mood;
 use super::movement::MovementState;
 use super::needs::Needs;
-use super::htn::MethodHistory;
+use super::htn::{MethodHistory, MethodId};
 use super::plan::{KnownPlans, PlanHistory, PlanId, PlanScoringMethod};
 use super::reproduction::BiologicalSex;
 use super::schedule::{BucketSlot, SimClock};
@@ -157,6 +157,14 @@ pub struct PersonAI {
     /// units when the task ends (success, abort, or plan teardown), so the
     /// fields must be kept in sync with the actual `StorageReservations` map.
     pub reserved_qty: u8,
+    /// The HTN `MethodId` whose expansion produced the agent's currently-running
+    /// task chain. Stamped by each `htn_*_dispatch_system` after a successful
+    /// dispatch and cleared by `htn_method_completion_system` (Sequential, after
+    /// executors) when the chain drains to `Task::Idle`. Failure dispatch paths
+    /// also clear it before pushing `MethodOutcome::FailedRouting` /
+    /// `FailedTarget` onto `MethodHistory`. `None` when no HTN-driven chain is
+    /// in flight (legacy plans, player orders, sleep states between dispatches).
+    pub active_method: Option<MethodId>,
 }
 
 impl PersonAI {
@@ -180,6 +188,7 @@ impl Default for PersonAI {
             reserved_tile: (0, 0),
             reserved_good: None,
             reserved_qty: 0,
+            active_method: None,
         }
     }
 }

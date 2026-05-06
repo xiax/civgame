@@ -338,6 +338,8 @@ impl Plugin for SimulationPlugin {
                     plan::plan_decay_system,
                     faction::faction_profession_system,
                     faction::drop_items_at_destination_system,
+                    htn::htn_method_completion_system
+                        .after(faction::drop_items_at_destination_system),
                     faction::compute_faction_storage_system
                         .after(faction::drop_items_at_destination_system),
                     reproduction::pregnancy_system,

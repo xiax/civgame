@@ -801,6 +801,7 @@ pub fn eat_task_system(
     clock: Res<SimClock>,
     mut query: Query<(
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut EconomicAgent,
         &mut Carrier,
         &mut Needs,
@@ -808,7 +809,7 @@ pub fn eat_task_system(
         &LodLevel,
     )>,
 ) {
-    for (mut ai, mut agent, mut carrier, mut needs, slot, lod) in query.iter_mut() {
+    for (mut ai, mut aq, mut agent, mut carrier, mut needs, slot, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -821,6 +822,11 @@ pub fn eat_task_system(
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
+            // Phase 6b-ii: drain the typed channel so
+            // `htn_method_completion_system` can record `MethodOutcome::Success`
+            // for the dispatching method (or `htn_eat_dispatch_system` doesn't
+            // pile duplicate Eat tasks onto the queue ring next tick).
+            aq.advance();
             continue;
         }
 
@@ -950,6 +956,11 @@ pub fn eat_task_system(
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
+        // Phase 6b-ii: drain the typed channel on natural completion so
+        // `htn_method_completion_system` (Economy, after deposit) sees
+        // `aq.current == Idle` and records the dispatching method's
+        // `MethodOutcome::Success` against `MethodHistory`.
+        aq.advance();
     }
 }
 
