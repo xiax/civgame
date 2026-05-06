@@ -12,7 +12,6 @@ use crate::simulation::faction::{FactionCenter, StorageTileMap};
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
-use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::simulation::items::GroundItem;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE, Z_MIN};
@@ -563,7 +562,9 @@ pub fn spawn_chunk_loose_rocks(commands: &mut Commands, chunk_map: &ChunkMap, co
             let world_pos = tile_to_world(global_tx, global_ty);
             commands.spawn((
                 GroundItem {
-                    item: Item::new_commodity(Good::Stone),
+                    item: Item::new_commodity(
+                        *crate::economy::core_ids::Stone.get().unwrap(),
+                    ),
                     qty,
                 },
                 Transform::from_xyz(world_pos.x, world_pos.y, 0.3),

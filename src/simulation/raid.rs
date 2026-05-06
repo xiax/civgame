@@ -7,7 +7,6 @@ use super::needs::Needs;
 use super::person::{AiState, PersonAI};
 use super::schedule::{BucketSlot, SimClock};
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
 use ahash::AHashMap;
@@ -176,7 +175,7 @@ pub fn raid_execution_system(
         // Steal food from enemy storage tiles
         if registry.food_stock(raid_target_faction) >= 1.0 {
             food_steals.push(raid_target_faction);
-            agent.add_good(Good::Fruit, 1);
+            agent.add_resource(*crate::economy::core_ids::Fruit.get().unwrap(), 1);
         }
 
         // Find a defender (enemy faction member) nearby to attack

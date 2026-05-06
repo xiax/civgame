@@ -2,7 +2,6 @@ use ahash::AHashMap;
 use bevy::prelude::*;
 
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
@@ -25,8 +24,13 @@ use crate::world::globe::Globe;
 use crate::world::terrain::{tile_to_world, WorldGen, TILE_SIZE};
 
 pub const TERRAFORM_WORK_TICKS: u8 = 30;
-const TERRAFORM_FILL_GOOD: Good = Good::Stone;
 const TERRAFORM_XP: u32 = 5;
+
+/// Resource consumed when filling a tile back up. Stone today; resolved
+/// from the catalog at first use because `ResourceId` isn't const.
+fn terraform_fill_resource() -> crate::economy::resource_catalog::ResourceId {
+    *crate::economy::core_ids::Stone.get().unwrap()
+}
 
 /// Active terraform reservation on a single tile. The agent levels this
 /// tile to `target_z` (digging down or filling up by one Z step at a time)
@@ -245,9 +249,9 @@ pub fn terraform_system(
             skills.gain_xp(SkillKind::Mining, TERRAFORM_XP);
         } else if surf < target {
             // Filler can come from hands first (just-mined stone) or personal inventory.
-            let fill_id = crate::economy::core_ids::good_to_resource_id(TERRAFORM_FILL_GOOD);
+            let fill_id = terraform_fill_resource();
             let in_hand = carrier.quantity_of_resource(fill_id);
-            let in_inv = agent.quantity_of(TERRAFORM_FILL_GOOD);
+            let in_inv = agent.quantity_of_resource(fill_id);
             if in_hand + in_inv < 1 {
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
