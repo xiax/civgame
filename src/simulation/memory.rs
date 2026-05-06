@@ -450,24 +450,36 @@ pub fn vision_system(
                     memory.forget((ntx as i32, nty as i32), MemoryKind::wood());
                 }
 
-                // Check spatial for entities (items, prey)
+                // Check spatial for entities (items, prey).
+                //
+                // Sub-PR 2: derive the memory variant from the catalog rather
+                // than switching on legacy `Good` variants. Edibles (every
+                // resource whose `class == Food`) collapse into the
+                // `AnyEdible` aggregate so AcquireFood / StockpileFood /
+                // Forage readers don't have to enumerate Fruit/Meat/Grain.
+                // Materials (Wood / Stone today, Iron / Copper / Tin / any
+                // future ore for free) and Seeds record the specific
+                // `Resource(id)` so AcquireGood-style readers ask for one
+                // concrete resource. Other classes (Tool / Weapon / Armor /
+                // Cloth / Hide / Luxury / Currency / Knowledge / Fuel) skip
+                // the write — no current gather/scavenge consumer, and
+                // recording them would churn the 32-slot memory cap. Adding
+                // a class here is the single touch-point if a future method
+                // wants those resources remembered.
+                let catalog = core_ids::catalog();
                 for &entity in spatial.get(ntx, nty) {
                     if let Ok(item) = item_query.get(entity) {
-                        let kind = if item.item.good().is_edible() {
-                            Some(MemoryKind::AnyEdible)
-                        } else {
-                            match item.item.good() {
-                                crate::economy::goods::Good::Wood => Some(MemoryKind::wood()),
-                                crate::economy::goods::Good::Stone => Some(MemoryKind::stone()),
-                                crate::economy::goods::Good::GrainSeed => {
-                                    Some(MemoryKind::grain_seed())
-                                }
-                                crate::economy::goods::Good::BerrySeed => {
-                                    Some(MemoryKind::berry_seed())
-                                }
-                                _ => None,
+                        let resource_id = item.item.resource_id;
+                        let kind = catalog.get(resource_id).and_then(|def| match def.class {
+                            crate::economy::resource_catalog::ResourceClass::Food => {
+                                Some(MemoryKind::AnyEdible)
                             }
-                        };
+                            crate::economy::resource_catalog::ResourceClass::Material
+                            | crate::economy::resource_catalog::ResourceClass::Seed => {
+                                Some(MemoryKind::Resource(resource_id))
+                            }
+                            _ => None,
+                        });
                         if let Some(k) = kind {
                             memory.record_entity((ntx as i32, nty as i32), k, entity);
                         }

@@ -180,10 +180,19 @@ impl PlantKind {
     }
 
     /// Memory category for recording this plant's location.
+    ///
+    /// Sub-PR 2: derived from the catalog class of `harvest_yield(false).0`
+    /// rather than switching on `PlantKind` directly. Adding a new plant
+    /// kind whose harvest is a non-edible material (e.g. a future Cotton
+    /// plant yielding Cloth, or a Reed plant yielding a new Material)
+    /// records under `MemoryKind::Resource(id)` automatically without
+    /// touching this method.
     pub fn harvest_memory_kind(self) -> MemoryKind {
-        match self {
-            PlantKind::Tree => MemoryKind::wood(),
-            _ => MemoryKind::AnyEdible,
+        let (good, _qty) = self.harvest_yield(false);
+        let id = crate::economy::core_ids::good_to_resource_id(good);
+        match crate::economy::core_ids::catalog().get(id).map(|d| d.class) {
+            Some(crate::economy::resource_catalog::ResourceClass::Food) => MemoryKind::AnyEdible,
+            _ => MemoryKind::Resource(id),
         }
     }
 }
