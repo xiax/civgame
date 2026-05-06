@@ -124,22 +124,16 @@ impl Item {
         }
     }
 
-    /// Sub-PR (b): mirrors `new_commodity`. `compute_combat_stats` still
-    /// matches on legacy `Good::Weapon | Shield | Armor` arms, so the
-    /// body reverse-resolves the id to feed it. The roundtrip
-    /// (`Good → id` at the call site, `id → Good` here) disappears once
-    /// `compute_combat_stats` migrates to `ResourceId` matching.
+    /// Sub-PR (b): mirrors `new_commodity`. `compute_combat_stats` is
+    /// `ResourceId`-keyed so the body passes `resource_id` straight
+    /// through with no reverse-resolve.
     pub fn new_manufactured(
         resource_id: impl Into<ResourceId>,
         material: ItemMaterial,
         quality: ItemQuality,
     ) -> Self {
         let resource_id = resource_id.into();
-        let good = super::core_ids::resource_id_to_good(resource_id).expect(
-            "Item::new_manufactured: non-legacy ResourceId; \
-             compute_combat_stats still keys on legacy `Good`",
-        );
-        let (weapon_stats, armor_stats) = compute_combat_stats(good, material, quality);
+        let (weapon_stats, armor_stats) = compute_combat_stats(resource_id, material, quality);
         Self {
             resource_id,
             material: Some(material),
@@ -205,64 +199,68 @@ impl Item {
     }
 }
 
-/// Derive combat stats from `(good, material, quality)`. Weapons get a
-/// `damage_bonus` proportional to material × quality; Shields and Armor get
-/// `ArmorStats` covering the body parts they protect. Other goods carry no
-/// combat stats (`(None, None)`).
+/// Derive combat stats from `(resource_id, material, quality)`. Weapons get
+/// a `damage_bonus` proportional to material × quality; Shields and Armor
+/// get `ArmorStats` covering the body parts they protect. Other resources
+/// carry no combat stats (`(None, None)`). Keys on `core_ids::Weapon /
+/// Shield / Armor` so `Item::new_manufactured` no longer needs to
+/// reverse-resolve to legacy `Good`.
 fn compute_combat_stats(
-    good: Good,
+    resource_id: ResourceId,
     material: ItemMaterial,
     quality: ItemQuality,
 ) -> (Option<WeaponStats>, Option<ArmorStats>) {
+    use super::core_ids;
+    let weapon_id = *core_ids::Weapon.get().expect("core_ids not init");
+    let shield_id = *core_ids::Shield.get().expect("core_ids not init");
+    let armor_id = *core_ids::Armor.get().expect("core_ids not init");
+
     let m = material.multiplier();
     let q = quality.multiplier();
-    match good {
-        Good::Weapon => {
-            let damage_bonus = (2.0 * m * q).round().clamp(1.0, 60.0) as u8;
-            // Fine/Masterwork weapons swing slightly faster.
-            let attack_speed_pct = match quality {
-                ItemQuality::Poor => 90,
-                ItemQuality::Normal => 100,
-                ItemQuality::Fine => 110,
-                ItemQuality::Masterwork => 125,
-            };
-            (
-                Some(WeaponStats {
-                    damage_bonus,
-                    attack_speed_pct,
-                }),
-                None,
-            )
-        }
-        Good::Shield => {
-            let damage_reduction = (1.0 * m * q).round().clamp(1.0, 30.0) as u8;
-            let coverage_pct = 60u8;
-            let covered_parts = armor_coverage::TORSO | armor_coverage::ARMS;
-            (
-                None,
-                Some(ArmorStats {
-                    damage_reduction,
-                    coverage_pct,
-                    covered_parts,
-                }),
-            )
-        }
-        Good::Armor => {
-            let damage_reduction = (2.0 * m * q).round().clamp(1.0, 40.0) as u8;
-            let coverage_pct = 80u8;
-            // Body armor covers torso + arms; helmets/leggings would be future
-            // recipes with their own covered_parts mask.
-            let covered_parts = armor_coverage::TORSO | armor_coverage::ARMS;
-            (
-                None,
-                Some(ArmorStats {
-                    damage_reduction,
-                    coverage_pct,
-                    covered_parts,
-                }),
-            )
-        }
-        _ => (None, None),
+    if resource_id == weapon_id {
+        let damage_bonus = (2.0 * m * q).round().clamp(1.0, 60.0) as u8;
+        // Fine/Masterwork weapons swing slightly faster.
+        let attack_speed_pct = match quality {
+            ItemQuality::Poor => 90,
+            ItemQuality::Normal => 100,
+            ItemQuality::Fine => 110,
+            ItemQuality::Masterwork => 125,
+        };
+        (
+            Some(WeaponStats {
+                damage_bonus,
+                attack_speed_pct,
+            }),
+            None,
+        )
+    } else if resource_id == shield_id {
+        let damage_reduction = (1.0 * m * q).round().clamp(1.0, 30.0) as u8;
+        let coverage_pct = 60u8;
+        let covered_parts = armor_coverage::TORSO | armor_coverage::ARMS;
+        (
+            None,
+            Some(ArmorStats {
+                damage_reduction,
+                coverage_pct,
+                covered_parts,
+            }),
+        )
+    } else if resource_id == armor_id {
+        let damage_reduction = (2.0 * m * q).round().clamp(1.0, 40.0) as u8;
+        let coverage_pct = 80u8;
+        // Body armor covers torso + arms; helmets/leggings would be future
+        // recipes with their own covered_parts mask.
+        let covered_parts = armor_coverage::TORSO | armor_coverage::ARMS;
+        (
+            None,
+            Some(ArmorStats {
+                damage_reduction,
+                coverage_pct,
+                covered_parts,
+            }),
+        )
+    } else {
+        (None, None)
     }
 }
 
