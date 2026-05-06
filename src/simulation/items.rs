@@ -306,8 +306,8 @@ pub fn item_pickup_system(
         };
 
         if let Ok(mut item) = item_query.get_mut(target_ent) {
-            let take_qty = if item.item.good().is_edible() {
-                let nutrition = item.item.good().nutrition();
+            let take_qty = if item.item.resource_id.is_edible() {
+                let nutrition = item.item.resource_id.nutrition();
                 if nutrition == 0 {
                     item.qty
                 } else {

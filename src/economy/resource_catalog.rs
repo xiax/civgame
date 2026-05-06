@@ -56,6 +56,26 @@ impl ResourceId {
             .and_then(|d| d.edible_calories)
             .is_some()
     }
+
+    /// Per-unit entertainment value (drives solo-play willpower refill).
+    /// Mirrors `Good::entertainment_value`. Returns 0 for unknown ids.
+    pub fn entertainment_value(self) -> u8 {
+        super::core_ids::catalog()
+            .get(self)
+            .map(|d| d.entertainment_value)
+            .unwrap_or(0)
+    }
+
+    /// Calories restored per unit when eaten. Mirrors `Good::nutrition`;
+    /// returns 0 for inedible / unknown resources. Truncates `u16` →
+    /// `u8` (matches the legacy contract).
+    pub fn nutrition(self) -> u8 {
+        super::core_ids::catalog()
+            .get(self)
+            .and_then(|d| d.edible_calories)
+            .map(|c| c.min(u8::MAX as u16) as u8)
+            .unwrap_or(0)
+    }
 }
 
 /// High-level functional category. Used by HTN methods to enumerate "all

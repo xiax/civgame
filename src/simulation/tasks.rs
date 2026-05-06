@@ -382,7 +382,7 @@ pub fn find_nearest_edible(
 
             for &e in spatial.get(tx, ty) {
                 if let Ok(item) = item_query.get(e) {
-                    if item.item.good().is_edible() {
+                    if item.item.resource_id.is_edible() {
                         let dist = dx.abs() + dy.abs();
                         if dist < best_dist {
                             best_dist = dist;
@@ -763,11 +763,11 @@ const PLAY_FULL_WILLPOWER: f32 = 230.0;
 fn highest_held_entertainment(carrier: &Carrier) -> u8 {
     let l = carrier
         .left
-        .map(|s| s.item.good().entertainment_value())
+        .map(|s| s.item.resource_id.entertainment_value())
         .unwrap_or(0);
     let r = carrier
         .right
-        .map(|s| s.item.good().entertainment_value())
+        .map(|s| s.item.resource_id.entertainment_value())
         .unwrap_or(0);
     l.max(r)
 }
@@ -783,7 +783,7 @@ fn adjacent_ground_entertainment(
         for dx in -1..=1i32 {
             for &e in spatial.get(cur_tx + dx, cur_ty + dy) {
                 if let Ok(item) = item_query.get(e) {
-                    let v = item.item.good().entertainment_value();
+                    let v = item.item.resource_id.entertainment_value();
                     if v > best {
                         best = v;
                     }

@@ -219,7 +219,7 @@ pub fn raid_execution_system(
         'tile: for &(stx, sty) in tiles {
             for &gi_entity in spatial.get(stx as i32, sty as i32) {
                 if let Ok(mut gi) = ground_items.get_mut(gi_entity) {
-                    if gi.item.good().is_edible() && gi.qty > 0 {
+                    if gi.item.resource_id.is_edible() && gi.qty > 0 {
                         if gi.qty == 1 {
                             commands.entity(gi_entity).despawn_recursive();
                         } else {

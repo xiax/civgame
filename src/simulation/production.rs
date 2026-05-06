@@ -296,7 +296,7 @@ pub fn withdraw_good_task_system(
                 }
                 let matches = match filter {
                     WithdrawGoodFilter::AnyEntertainment => {
-                        gi.item.good().entertainment_value() > 0
+                        gi.item.resource_id.entertainment_value() > 0
                     }
                     WithdrawGoodFilter::Specific(rid) => gi.item.resource_id == rid,
                 };
@@ -789,7 +789,7 @@ enum EdibleSlot {
 pub fn total_edible(agent: &EconomicAgent, carrier: &Carrier) -> u32 {
     let mut from_hands = 0u32;
     for slot in [carrier.left, carrier.right].into_iter().flatten() {
-        if slot.item.good().is_edible() {
+        if slot.item.resource_id.is_edible() {
             from_hands = from_hands.saturating_add(slot.qty);
         }
     }

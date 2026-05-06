@@ -301,7 +301,7 @@ pub fn count_visible_ground_food(
             }
             for &e in spatial.get(tx + dx, ty + dy) {
                 if let Ok(item) = items.get(e) {
-                    if item.item.good().is_edible() {
+                    if item.item.resource_id.is_edible() {
                         n = n.saturating_add(1);
                         if n >= VISIBILITY_SATURATE {
                             return n;
@@ -327,6 +327,7 @@ pub fn count_visible_ground_wood(
 ) -> u8 {
     let r = VISIBILITY_RADIUS;
     let r2 = r * r;
+    let wood_id: crate::economy::resource_catalog::ResourceId = Good::Wood.into();
     let mut n: u8 = 0;
     for dy in -r..=r {
         for dx in -r..=r {
@@ -335,7 +336,7 @@ pub fn count_visible_ground_wood(
             }
             for &e in spatial.get(tx + dx, ty + dy) {
                 if let Ok(item) = items.get(e) {
-                    if item.item.good() == Good::Wood {
+                    if item.item.resource_id == wood_id {
                         n = n.saturating_add(1);
                         if n >= VISIBILITY_SATURATE {
                             return n;
@@ -358,6 +359,7 @@ pub fn count_visible_ground_stone(
 ) -> u8 {
     let r = VISIBILITY_RADIUS;
     let r2 = r * r;
+    let stone_id: crate::economy::resource_catalog::ResourceId = Good::Stone.into();
     let mut n: u8 = 0;
     for dy in -r..=r {
         for dx in -r..=r {
@@ -366,7 +368,7 @@ pub fn count_visible_ground_stone(
             }
             for &e in spatial.get(tx + dx, ty + dy) {
                 if let Ok(item) = items.get(e) {
-                    if item.item.good() == Good::Stone {
+                    if item.item.resource_id == stone_id {
                         n = n.saturating_add(1);
                         if n >= VISIBILITY_SATURATE {
                             return n;

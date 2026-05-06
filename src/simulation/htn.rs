@@ -2125,7 +2125,10 @@ pub fn htn_acquire_food_dispatch_system(
                         }
                         for &gi_entity in spatial.get(tx, ty) {
                             if let Ok(gi) = item_query.get(gi_entity) {
-                                if gi.item.good().is_edible() && gi.qty > 0 && d2 < best_dist_sq {
+                                if gi.item.resource_id.is_edible()
+                                    && gi.qty > 0
+                                    && d2 < best_dist_sq
+                                {
                                     best_dist_sq = d2;
                                     scavenge_target_entity = Some(gi_entity);
                                     scavenge_target_tile = Some((tx, ty));
