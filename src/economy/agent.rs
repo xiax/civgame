@@ -25,7 +25,13 @@ impl Default for EconomicAgent {
     fn default() -> Self {
         Self {
             currency: 50.0,
-            inventory: [(Item::new_commodity(Good::Fruit), 0); INVENTORY_SLOTS],
+            // Empty placeholder slots use Fruit's id; qty=0 means the slot
+            // is unused (the underlying resource doesn't matter until a
+            // real Item is stamped in).
+            inventory: [(
+                Item::new_commodity(crate::economy::core_ids::fruit()),
+                0,
+            ); INVENTORY_SLOTS],
             base_cap_g: BASE_INVENTORY_CAP_G,
             bonus_cap_g: 0,
         }

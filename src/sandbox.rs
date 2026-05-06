@@ -1,7 +1,6 @@
 use bevy::prelude::*;
 
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::pathfinding::path_request::PathFollow;
 use crate::simulation::animals::{AnimalAI, AnimalNeeds, AnimalReproductionCooldown, Deer, Wolf};
@@ -220,7 +219,7 @@ fn setup_sandbox(
     let food_pos = tile_to_world(cx + 1, cy + 1);
     commands.spawn((
         GroundItem {
-            item: Item::new_commodity(Good::Fruit),
+            item: Item::new_commodity(crate::economy::core_ids::fruit()),
             qty: 5,
         },
         Transform::from_xyz(food_pos.x, food_pos.y, 0.5),
@@ -232,7 +231,7 @@ fn setup_sandbox(
     let wood_pos = tile_to_world(cx - 1, cy + 1);
     commands.spawn((
         GroundItem {
-            item: Item::new_commodity(Good::Wood),
+            item: Item::new_commodity(crate::economy::core_ids::wood()),
             qty: 3,
         },
         Transform::from_xyz(wood_pos.x, wood_pos.y, 0.5),

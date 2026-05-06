@@ -667,7 +667,7 @@ mod baseline_behaviour {
         let mut sim = TestSim::new(1);
         sim.flat_world(1, 0, TileKind::Grass);
         let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
-            b.hunger(210.0).add_inventory(Good::Fruit, 10);
+            b.hunger(210.0).add_inventory(crate::economy::core_ids::fruit(), 10);
         });
 
         let initial_food = person_inventory(&sim.app, person)
@@ -748,7 +748,7 @@ mod baseline_behaviour {
         sim.flat_world(1, 0, TileKind::Grass);
         let storage_tile = (4, 4);
         sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
-        sim.spawn_ground_item(storage_tile, Good::Wood, 5);
+        sim.spawn_ground_item(storage_tile, crate::economy::core_ids::wood(), 5);
 
         // Storage rollup runs in Economy each tick but spatial-index
         // sync needs a Transform-changed pass first. ~80 ticks is
@@ -810,7 +810,7 @@ mod baseline_behaviour {
         sim.flat_world(1, 0, TileKind::Grass);
         let storage_tile = (4, 4);
         sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
-        sim.spawn_ground_item(storage_tile, Good::Wood, 3);
+        sim.spawn_ground_item(storage_tile, crate::economy::core_ids::wood(), 3);
 
         let person = sim.spawn_person(sim.player_faction_id, storage_tile, |b| {
             b.hunger(0.0); // sated, no autonomous goal interference
@@ -904,7 +904,7 @@ mod baseline_behaviour {
                 .get_mut::<crate::economy::agent::EconomicAgent>(person)
                 .unwrap();
             let tablet = Item {
-                resource_id: crate::economy::core_ids::good_to_resource_id(Good::ClayTablet),
+                resource_id: crate::economy::core_ids::clay_tablet(),
                 material: None,
                 quality: None,
                 display_name: None,
@@ -983,7 +983,7 @@ mod baseline_behaviour {
         let mut sim = TestSim::new(8);
         sim.flat_world(1, 0, TileKind::Grass);
         let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
-            b.hunger(0.0).add_inventory(Good::Weapon, 1);
+            b.hunger(0.0).add_inventory(crate::economy::core_ids::weapon(), 1);
         });
 
         sim.app.world_mut().entity_mut(person).insert(Drafted);
@@ -1036,7 +1036,7 @@ mod baseline_behaviour {
         sim.flat_world(1, 0, TileKind::Grass);
         let storage_tile = (4, 4);
         sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
-        sim.spawn_ground_item(storage_tile, Good::Wood, 3);
+        sim.spawn_ground_item(storage_tile, crate::economy::core_ids::wood(), 3);
 
         let person = sim.spawn_person(sim.player_faction_id, storage_tile, |b| {
             b.hunger(0.0);
@@ -1078,8 +1078,9 @@ mod baseline_behaviour {
             .world()
             .get::<crate::simulation::carry::Carrier>(person)
             .map(|c| {
-                let l = c.left.map(|s| if s.item.good() == Good::Wood { s.qty } else { 0 }).unwrap_or(0);
-                let r = c.right.map(|s| if s.item.good() == Good::Wood { s.qty } else { 0 }).unwrap_or(0);
+                let wood = crate::economy::core_ids::wood();
+                let l = c.left.map(|s| if s.item.resource_id == wood { s.qty } else { 0 }).unwrap_or(0);
+                let r = c.right.map(|s| if s.item.resource_id == wood { s.qty } else { 0 }).unwrap_or(0);
                 l + r
             })
             .unwrap_or(0);
@@ -1328,7 +1329,7 @@ mod baseline_behaviour {
         // before we can observe the dispatch.
         let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
             b.hunger(210.0)
-                .add_inventory(Good::Fruit, 5)
+                .add_inventory(crate::economy::core_ids::fruit(), 5)
                 .goal(AgentGoal::Survive);
         });
 
@@ -1374,7 +1375,7 @@ mod baseline_behaviour {
         sim.flat_world(2, 0, TileKind::Grass);
         let storage_tile = (4, 4);
         sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
-        sim.spawn_ground_item(storage_tile, Good::Fruit, 5);
+        sim.spawn_ground_item(storage_tile, crate::economy::core_ids::fruit(), 5);
 
         // Spawn the agent sated and Idle so it does not start dispatching
         // during the warm-up. The warm-up is needed for SpatialIndex sync
@@ -1491,7 +1492,7 @@ mod baseline_behaviour {
         // argmax is unambiguous (1.5 from ScavengeFood vs 0 applicable
         // others). Ground item is within VIEW_RADIUS=15 of (0,0).
         let scavenge_tile = (5, 0);
-        let ground_item = sim.spawn_ground_item(scavenge_tile, Good::Fruit, 3);
+        let ground_item = sim.spawn_ground_item(scavenge_tile, crate::economy::core_ids::fruit(), 3);
 
         let person = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
             b.hunger(0.0);
@@ -1582,7 +1583,7 @@ mod baseline_behaviour {
         sim.flat_world(2, 0, TileKind::Grass);
         let storage_tile = (4, 4);
         sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
-        sim.spawn_ground_item(storage_tile, Good::Wood, 5);
+        sim.spawn_ground_item(storage_tile, crate::economy::core_ids::wood(), 5);
 
         // Spawn the construction target somewhere reachable but distinct
         // from the storage tile. The blueprint isn't satisfied (no deposits
@@ -1900,7 +1901,7 @@ mod baseline_behaviour {
         // storage tiles from the scavenge scan, mirroring the legacy
         // `StepTarget::NearestItem` resolver.
         let scavenge_tile = (5, 0);
-        let ground_item = sim.spawn_ground_item(scavenge_tile, Good::Wood, 3);
+        let ground_item = sim.spawn_ground_item(scavenge_tile, crate::economy::core_ids::wood(), 3);
 
         // Warm-up ticks: SpatialIndex picks up the new GroundItem (Added<Indexed>
         // hooks need at least 2-3 FixedUpdate frames to register), storage
@@ -2284,7 +2285,7 @@ mod baseline_behaviour {
         let mut sim = TestSim::new(42);
         sim.flat_world(1, 0, TileKind::Grass);
         let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
-            b.hunger(210.0).add_inventory(Good::Fruit, 10);
+            b.hunger(210.0).add_inventory(crate::economy::core_ids::fruit(), 10);
         });
 
         // Eat task takes TICKS_EAT (~60) ticks of Working state. 400 ticks

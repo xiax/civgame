@@ -762,7 +762,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             withdraw_filter: None,
         },
         StepDef {
-            // 52: Hunter pulls a Spear (Good::Weapon) from faction storage.
+            // 52: Hunter pulls a Spear (Weapon resource) from faction storage.
             // Used by `AcquireHuntingSpear` plan; the plan-level `forbids_good`
             // precondition ensures armed hunters skip this entirely.
             id: StepId(52),
@@ -1469,7 +1469,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            // Hunter-only fetch plan: pull a Spear (Good::Weapon) from
+            // Hunter-only fetch plan: pull a Spear (Weapon resource) from
             // faction storage when unarmed. The step's `forbids_good`
             // precondition means the plan auto-deselects the moment the
             // hunter is armed, so HuntFood (id 5) takes over from there.

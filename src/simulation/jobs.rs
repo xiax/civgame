@@ -341,7 +341,7 @@ const CHIEF_POSTING_INTERVAL: u64 = 60;
 pub const PLAYER_PRIORITY: u8 = PRIORITY_PLAYER;
 
 /// Gather posting threshold: post when `food_total / member_count` falls
-/// below this value (in `Good::nutrition` units, which are per-stack).
+/// below this value (in `ResourceId::nutrition` units, which are per-stack).
 const GATHER_TARGET_PER_HEAD: u32 = 8;
 
 /// Maximum target size for any single Gather posting, so progress is visible

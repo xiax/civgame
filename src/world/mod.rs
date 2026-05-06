@@ -29,7 +29,7 @@ impl Plugin for WorldPlugin {
         // The catalog is shared two ways: a Bevy `Resource` for systems
         // that take `Res<ResourceCatalog>`, and a process-global
         // `OnceLock` (`core_ids::install_catalog`) for the legacy
-        // `Good::*` methods which can't take system params.
+        // `ResourceId::*` accessors which can't take system params.
         let catalog = crate::economy::resource_catalog::load_resource_catalog();
         crate::economy::core_ids::install_catalog(catalog.clone());
         app.insert_resource(catalog);
