@@ -136,7 +136,7 @@ impl EconomicAgent {
     }
 
     pub fn has_tool(&self) -> bool {
-        self.quantity_of(Good::Tools) > 0
+        self.quantity_of_resource(*crate::economy::core_ids::Tools.get().unwrap()) > 0
     }
 
     // ── ResourceId-keyed inventory accessors ──

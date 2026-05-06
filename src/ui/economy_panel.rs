@@ -23,8 +23,8 @@ pub fn economy_panel_system(
                 EconomicMode::Market | EconomicMode::Mixed => {
                     ui.label("Market Prices (Commodities):");
                     for good in Good::all() {
-                        let price = market.price_of(good);
                         let id = crate::economy::core_ids::good_to_resource_id(good);
+                        let price = market.price_of(id);
                         ui.label(format!(
                             "  {:6}: ${:.2}",
                             crate::economy::core_ids::display_name(id),

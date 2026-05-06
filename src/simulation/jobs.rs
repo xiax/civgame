@@ -2,7 +2,6 @@ use ahash::AHashMap;
 use bevy::ecs::entity::Entities;
 use bevy::prelude::*;
 
-use crate::economy::goods::Good;
 use crate::simulation::construction::{Blueprint, BlueprintMap};
 use crate::simulation::faction::{FactionData, FactionMember, FactionRegistry, SOLO};
 use crate::simulation::goals::{AgentGoal, Personality};
@@ -502,8 +501,12 @@ pub fn chief_job_posting_system(
                     // Convert deficit units to a calorie target (use Fruit nutrition
                     // as a conservative average; deposits contribute their actual
                     // good's nutrition).
-                    let calories =
-                        deficit_units * Good::Fruit.nutrition() as u32;
+                    let calories = deficit_units
+                        * crate::economy::core_ids::Fruit
+                            .get()
+                            .copied()
+                            .unwrap()
+                            .nutrition() as u32;
                     let target = calories.clamp(GATHER_TARGET_MIN, GATHER_TARGET_CAP);
                     let id = board.alloc_id();
                     let progress = JobProgress::Calories {
@@ -532,8 +535,9 @@ pub fn chief_job_posting_system(
         //     across active blueprints)`. Posted whenever current storage is
         //     below target. One posting per (faction, good).
         if faction.member_count > 0 {
-            for &good in &[Good::Wood, Good::Stone] {
-                let target_rid: crate::economy::resource_catalog::ResourceId = good.into();
+            let wood_id = *crate::economy::core_ids::Wood.get().unwrap();
+            let stone_id = *crate::economy::core_ids::Stone.get().unwrap();
+            for &target_rid in &[wood_id, stone_id] {
                 // Sum unmet blueprint demand for this resource (reactive component).
                 let mut bp_demand: u32 = 0;
                 for &bp_entity in &live_bps {
@@ -678,7 +682,9 @@ pub fn chief_job_posting_system(
                 .faction_postings(faction_id)
                 .iter()
                 .any(|p| matches!(p.kind, JobKind::Farm));
-            let grain = faction.storage.stock_of(Good::Grain.into());
+            let grain = faction
+                .storage
+                .stock_of(*crate::economy::core_ids::Grain.get().unwrap());
             let seed = faction.storage.seed_total();
             // Post farm if grain is low and seeds are available.
             if !already_farm && grain < faction.member_count * 4 && seed > 0 {

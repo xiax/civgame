@@ -1,7 +1,7 @@
 use ahash::AHashMap;
 use bevy::prelude::*;
 
-use crate::economy::goods::{Bulk, Good};
+use crate::economy::goods::Bulk;
 use crate::economy::item::Item;
 use crate::economy::resource_catalog::ResourceId;
 use crate::simulation::animals::Deer;
@@ -87,12 +87,12 @@ impl PlantKind {
     pub const ALL: &'static [PlantKind] =
         &[PlantKind::Grain, PlantKind::BerryBush, PlantKind::Tree];
 
-    /// The seed Good that grows into this plant, if any. Tree saplings aren't
-    /// modelled as seeds yet, so trees return None.
-    pub fn seed_good(self) -> Option<Good> {
+    /// The seed `ResourceId` that grows into this plant, if any. Tree
+    /// saplings aren't modelled as seeds yet, so trees return None.
+    pub fn seed_resource(self) -> Option<crate::economy::resource_catalog::ResourceId> {
         match self {
-            PlantKind::Grain => Some(Good::GrainSeed),
-            PlantKind::BerryBush => Some(Good::BerrySeed),
+            PlantKind::Grain => crate::economy::core_ids::GrainSeed.get().copied(),
+            PlantKind::BerryBush => crate::economy::core_ids::BerrySeed.get().copied(),
             PlantKind::Tree => None,
         }
     }
@@ -343,7 +343,9 @@ pub fn seed_scatter_system(
                     let pos = tile_to_world(sx, sy);
                     commands.spawn((
                         GroundItem {
-                            item: Item::new_commodity(Good::Wood),
+                            item: Item::new_commodity(
+                                *crate::economy::core_ids::Wood.get().unwrap(),
+                            ),
                             qty: 1,
                         },
                         Transform::from_xyz(pos.x, pos.y, 0.3),
@@ -480,7 +482,9 @@ pub fn deer_graze_system(
                 let pos = tile_to_world(sx, sy);
                 commands.spawn((
                     GroundItem {
-                        item: Item::new_commodity(Good::BerrySeed),
+                        item: Item::new_commodity(
+                            *crate::economy::core_ids::BerrySeed.get().unwrap(),
+                        ),
                         qty: 1,
                     },
                     Transform::from_xyz(pos.x, pos.y, 0.3),

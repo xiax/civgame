@@ -13,7 +13,6 @@ use super::schedule::{BucketSlot, SimClock};
 use super::skills::{SkillKind, Skills};
 use super::tasks::TaskKind;
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
 use crate::economy::resource_catalog::ResourceId;
 use crate::pathfinding::hotspots::{HotspotFlowFields, HotspotKind};
 use crate::simulation::technology::{
@@ -1157,8 +1156,8 @@ pub fn drop_items_at_destination_system(
 
         // First: dump everything in hands. Hauling loads (Wood, Stone, Iron, ...) are
         // exactly what storage wants; food/tools that ended up in hands also go here.
-        let wood_id: crate::economy::resource_catalog::ResourceId = Good::Wood.into();
-        let stone_id: crate::economy::resource_catalog::ResourceId = Good::Stone.into();
+        let wood_id = *crate::economy::core_ids::Wood.get().unwrap();
+        let stone_id = *crate::economy::core_ids::Stone.get().unwrap();
         let mut hand_wood: u32 = 0;
         let mut hand_stone: u32 = 0;
         for stack in carrier.drop_all() {
@@ -1264,8 +1263,7 @@ pub fn drop_items_at_destination_system(
             .map(|f| f.techs.has(CROP_CULTIVATION))
             .unwrap_or(false);
         if has_cultivation {
-            for seed_good in PlantKind::ALL.iter().filter_map(|k| k.seed_good()) {
-                let seed_id: crate::economy::resource_catalog::ResourceId = seed_good.into();
+            for seed_id in PlantKind::ALL.iter().filter_map(|k| k.seed_resource()) {
                 let mut qty: u32 = 0;
                 for (it, q) in agent.inventory.iter_mut() {
                     if it.resource_id == seed_id && *q > 0 {
@@ -1322,7 +1320,7 @@ pub fn drop_items_at_destination_system(
         }
 
         // Deposit recovered construction materials (Wood from deconstruction).
-        let wood_id: crate::economy::resource_catalog::ResourceId = Good::Wood.into();
+        let wood_id = *crate::economy::core_ids::Wood.get().unwrap();
         let wood_qty = agent.quantity_of_resource(wood_id);
         if wood_qty > 0 {
             agent.remove_resource(wood_id, wood_qty);
@@ -1332,7 +1330,7 @@ pub fn drop_items_at_destination_system(
                 &mut ground_items,
                 deposit_tx,
                 deposit_ty,
-                Good::Wood,
+                wood_id,
                 wood_qty,
             );
         }
@@ -1611,7 +1609,6 @@ pub fn resource_demand_system(
 
     // 2. Tally demand
     // Materials from Blueprints — sum unmet need per ingredient across all deposit slots.
-    // Blueprints still carry `Good` (legacy `GoodNeed`); reverse-resolve to ResourceId.
     for &bp_entity in bp_map.0.values() {
         if let Ok(bp) = bp_query.get(bp_entity) {
             if let Some(faction) = registry.factions.get_mut(&bp.faction_id) {
@@ -1628,15 +1625,15 @@ pub fn resource_demand_system(
 
     // Food demand from population size. Resolve core_ids upfront so we
     // pay one OnceLock read per attribute, not per faction.
-    let fruit = crate::economy::core_ids::good_to_resource_id(Good::Fruit);
-    let meat = crate::economy::core_ids::good_to_resource_id(Good::Meat);
-    let grain = crate::economy::core_ids::good_to_resource_id(Good::Grain);
-    let tools = crate::economy::core_ids::good_to_resource_id(Good::Tools);
-    let weapon = crate::economy::core_ids::good_to_resource_id(Good::Weapon);
-    let cloth = crate::economy::core_ids::good_to_resource_id(Good::Cloth);
-    let luxury = crate::economy::core_ids::good_to_resource_id(Good::Luxury);
-    let shield = crate::economy::core_ids::good_to_resource_id(Good::Shield);
-    let armor = crate::economy::core_ids::good_to_resource_id(Good::Armor);
+    let fruit = *crate::economy::core_ids::Fruit.get().unwrap();
+    let meat = *crate::economy::core_ids::Meat.get().unwrap();
+    let grain = *crate::economy::core_ids::Grain.get().unwrap();
+    let tools = *crate::economy::core_ids::Tools.get().unwrap();
+    let weapon = *crate::economy::core_ids::Weapon.get().unwrap();
+    let cloth = *crate::economy::core_ids::Cloth.get().unwrap();
+    let luxury = *crate::economy::core_ids::Luxury.get().unwrap();
+    let shield = *crate::economy::core_ids::Shield.get().unwrap();
+    let armor = *crate::economy::core_ids::Armor.get().unwrap();
     for faction in registry.factions.values_mut() {
         let food_demand = faction.member_count * 10;
         faction.resource_demand.insert(fruit, food_demand);
@@ -1704,8 +1701,8 @@ pub fn update_material_targets_system(
             wood_target = wood_target.saturating_add(4);
         }
 
-        let wood_id = crate::economy::core_ids::good_to_resource_id(Good::Wood);
-        let stone_id = crate::economy::core_ids::good_to_resource_id(Good::Stone);
+        let wood_id = *crate::economy::core_ids::Wood.get().unwrap();
+        let stone_id = *crate::economy::core_ids::Stone.get().unwrap();
         faction.material_targets.insert(wood_id, wood_target);
         faction.material_targets.insert(stone_id, stone_target);
     }

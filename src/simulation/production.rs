@@ -14,7 +14,7 @@ use super::schedule::{BucketSlot, SimClock};
 use super::skills::{SkillKind, Skills};
 use super::tasks::TaskKind;
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::{Bulk, Good};
+use crate::economy::goods::Bulk;
 use crate::economy::item::Item;
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
@@ -28,12 +28,15 @@ use bevy::prelude::*;
 
 pub const TICKS_FARMER_PLANT: u8 = 40;
 
-/// Remove one unit of `good` from wherever the agent holds it, preferring
+/// Remove one unit of `id` from wherever the agent holds it, preferring
 /// hands. Used by executors that don't care which store the consumable came
 /// from (e.g. planting a seed that may have just been harvested into hands or
 /// withdrawn into inventory).
-pub fn consume_one_good(agent: &mut EconomicAgent, carrier: &mut Carrier, good: Good) {
-    let id = crate::economy::core_ids::good_to_resource_id(good);
+pub fn consume_one_resource(
+    agent: &mut EconomicAgent,
+    carrier: &mut Carrier,
+    id: crate::economy::resource_catalog::ResourceId,
+) {
     if carrier.quantity_of_resource(id) > 0 {
         carrier.remove_resource(id, 1);
     } else {
@@ -139,15 +142,14 @@ pub fn production_system(
                 // hands (harvest co-yields route through Carrier) OR
                 // inventory (withdrawn from storage), so check both stores.
                 let seed_and_plant = PlantKind::ALL.iter().copied().find_map(|kind| {
-                    let seed = kind.seed_good()?;
-                    let seed_id = crate::economy::core_ids::good_to_resource_id(seed);
+                    let seed_id = kind.seed_resource()?;
                     let held =
                         agent.quantity_of_resource(seed_id) + carrier.quantity_of_resource(seed_id);
-                    (held > 0).then_some((seed, kind))
+                    (held > 0).then_some((seed_id, kind))
                 });
                 if !plant_map.0.contains_key(&(tx, ty)) {
-                    if let Some((seed_good, plant_kind)) = seed_and_plant {
-                        consume_one_good(&mut agent, &mut carrier, seed_good);
+                    if let Some((seed_id, plant_kind)) = seed_and_plant {
+                        consume_one_resource(&mut agent, &mut carrier, seed_id);
                         spawn_plant_at(
                             &mut commands,
                             &mut plant_map,
@@ -206,7 +208,7 @@ pub fn production_system(
         if task == TaskKind::PlayThrow as u16 {
             if ai.work_progress >= TICKS_PLAY_THROW {
                 ai.work_progress = 0;
-                let stone_id: crate::economy::resource_catalog::ResourceId = Good::Stone.into();
+                let stone_id = *crate::economy::core_ids::Stone.get().unwrap();
                 if agent.quantity_of_resource(stone_id) > 0 {
                     agent.remove_resource(stone_id, 1);
                     skills.gain_xp(SkillKind::Combat, 2);
@@ -972,8 +974,7 @@ pub fn eat_task_system(
             }
         }
         if fruits_consumed > 0 {
-            let berry_seed: crate::economy::resource_catalog::ResourceId =
-                Good::BerrySeed.into();
+            let berry_seed = *crate::economy::core_ids::BerrySeed.get().unwrap();
             for _ in 0..fruits_consumed {
                 agent.add_resource(berry_seed, 1);
             }

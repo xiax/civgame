@@ -1,5 +1,4 @@
 use super::agent::EconomicAgent;
-use super::goods::Good;
 use super::market::Market;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
@@ -68,7 +67,11 @@ pub fn market_buy_system(
 
         // Buy Food when hungry and have no food
         if needs.hunger > HUNGER_BUY_THRESHOLD as f32 && agent.total_food() == 0 {
-            let (bought_item, qty) = market.try_buy_item(Good::Fruit, 1, &mut agent.currency);
+            let (bought_item, qty) = market.try_buy_item(
+                *crate::economy::core_ids::Fruit.get().unwrap(),
+                1,
+                &mut agent.currency,
+            );
             if let Some(it) = bought_item {
                 agent.add_item(it, qty);
                 // Clear Trader task now that the buy was handled
@@ -81,9 +84,10 @@ pub fn market_buy_system(
 
         // Buy Tools when affordable and not already owning one
         if !agent.has_tool() {
-            let tool_price = market.price_of(Good::Tools);
+            let tools_id = *crate::economy::core_ids::Tools.get().unwrap();
+            let tool_price = market.price_of(tools_id);
             if agent.currency >= tool_price * TOOL_BUY_CURRENCY_FACTOR {
-                let (bought_item, qty) = market.try_buy_item(Good::Tools, 1, &mut agent.currency);
+                let (bought_item, qty) = market.try_buy_item(tools_id, 1, &mut agent.currency);
                 if let Some(it) = bought_item {
                     agent.add_item(it, qty);
                 }

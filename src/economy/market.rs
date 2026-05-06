@@ -95,30 +95,22 @@ impl Market {
         self.price_ceiling.get(&id).copied().unwrap_or(f32::INFINITY)
     }
 
-    /// Current price for `good`. Returns 1.0 if no entry exists yet.
-    pub fn price_of(&self, good: Good) -> f32 {
-        self.price_id(core_ids::good_to_resource_id(good))
+    /// Current price for the resource identified by `id`. Returns 1.0 if
+    /// no entry exists yet.
+    pub fn price_of(&self, id: ResourceId) -> f32 {
+        self.price_id(id)
     }
 
-    pub fn add_supply(&mut self, good: Good, qty: f32) {
-        *self
-            .supply
-            .entry(core_ids::good_to_resource_id(good))
-            .or_insert(0.0) += qty;
+    pub fn add_supply(&mut self, id: ResourceId, qty: f32) {
+        *self.supply.entry(id).or_insert(0.0) += qty;
     }
 
-    pub fn add_demand(&mut self, good: Good, qty: f32) {
-        *self
-            .demand
-            .entry(core_ids::good_to_resource_id(good))
-            .or_insert(0.0) += qty;
+    pub fn add_demand(&mut self, id: ResourceId, qty: f32) {
+        *self.demand.entry(id).or_insert(0.0) += qty;
     }
 
-    pub fn stock_of(&self, good: Good) -> f32 {
-        self.market_stock
-            .get(&core_ids::good_to_resource_id(good))
-            .copied()
-            .unwrap_or(0.0)
+    pub fn stock_of(&self, id: ResourceId) -> f32 {
+        self.market_stock.get(&id).copied().unwrap_or(0.0)
     }
 
     pub fn update_prices(&mut self) {
@@ -172,11 +164,10 @@ impl Market {
     /// If commodity, buys from stock.
     pub fn try_buy_item(
         &mut self,
-        good: Good,
+        id: ResourceId,
         qty: u32,
         currency: &mut f32,
     ) -> (Option<Item>, u32) {
-        let id = core_ids::good_to_resource_id(good);
 
         // 1. Check specific listings first if it's potentially manufactured
         // In this simple version, we'll try to buy the BEST quality item affordable.
@@ -218,7 +209,7 @@ impl Market {
             return (None, 0);
         }
 
-        let item = Item::new_commodity(good);
+        let item = Item::new_commodity(id);
         let price = self.calculate_price(&item);
         let buy_qty = (available.floor() as u32).min(qty);
         let total_cost = price * buy_qty as f32;
@@ -233,20 +224,6 @@ impl Market {
         (Some(item), buy_qty)
     }
 
-    /// Legacy support for simple Good selling
-    pub fn sell(&mut self, good: Good, qty: f32) -> f32 {
-        self.sell_item(Item::new_commodity(good), qty as u32)
-    }
-
-    /// Legacy support for simple Good buying
-    pub fn try_buy(&mut self, good: Good, qty: f32, currency: &mut f32) -> f32 {
-        let (item, bought) = self.try_buy_item(good, qty as u32, currency);
-        if item.is_some() {
-            bought as f32
-        } else {
-            0.0
-        }
-    }
 }
 
 pub fn price_update_system(mut market: ResMut<Market>, mode: Res<EconomicMode>) {
@@ -254,9 +231,9 @@ pub fn price_update_system(mut market: ResMut<Market>, mode: Res<EconomicMode>) 
         return;
     }
     // Background Food demand to prevent price collapse when all agents are fed
-    market.add_demand(Good::Fruit, 2.0);
-    market.add_demand(Good::Meat, 1.0);
-    market.add_demand(Good::Grain, 2.0);
+    market.add_demand(*core_ids::Fruit.get().unwrap(), 2.0);
+    market.add_demand(*core_ids::Meat.get().unwrap(), 1.0);
+    market.add_demand(*core_ids::Grain.get().unwrap(), 2.0);
     market.update_prices();
     market.supply.clear();
     market.demand.clear();
@@ -269,10 +246,11 @@ mod tests {
     #[test]
     fn price_rises_when_demand_exceeds_supply() {
         let mut m = Market::default();
-        m.add_supply(Good::Fruit, 10.0);
-        m.add_demand(Good::Fruit, 100.0);
-        let old_price = m.price_of(Good::Fruit);
+        let fruit: ResourceId = Good::Fruit.into();
+        m.add_supply(fruit, 10.0);
+        m.add_demand(fruit, 100.0);
+        let old_price = m.price_of(fruit);
         m.update_prices();
-        assert!(m.price_of(Good::Fruit) > old_price);
+        assert!(m.price_of(fruit) > old_price);
     }
 }

@@ -1,7 +1,6 @@
 use ahash::AHashMap;
 use bevy::prelude::*;
 
-use crate::economy::goods::Good;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
 
@@ -67,10 +66,15 @@ impl CorpseMap {
 
 /// Yields a corpse drops when butchered. Mirrors the legacy `death_system`
 /// drops for Wolf and Deer (Wolf: 3 Meat + 1 Skin; Deer: 5 Meat + 2 Skin).
-pub fn species_yield(species: CorpseSpecies) -> &'static [(Good, u32)] {
+pub fn species_yield(
+    species: CorpseSpecies,
+) -> [(crate::economy::resource_catalog::ResourceId, u32); 2] {
+    use crate::economy::core_ids;
+    let meat = *core_ids::Meat.get().unwrap();
+    let skin = *core_ids::Skin.get().unwrap();
     match species {
-        CorpseSpecies::Wolf => &[(Good::Meat, 3), (Good::Skin, 1)],
-        CorpseSpecies::Deer => &[(Good::Meat, 5), (Good::Skin, 2)],
+        CorpseSpecies::Wolf => [(meat, 3), (skin, 1)],
+        CorpseSpecies::Deer => [(meat, 5), (skin, 2)],
     }
 }
 
@@ -232,8 +236,8 @@ pub fn butcher_task_system(
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         let species = corpse.species;
-        for &(good, qty) in species_yield(species) {
-            spawn_or_merge_ground_item(&mut commands, &spatial, &mut item_query, tx, ty, good, qty);
+        for &(rid, qty) in species_yield(species).iter() {
+            spawn_or_merge_ground_item(&mut commands, &spatial, &mut item_query, tx, ty, rid, qty);
         }
         skills.gain_xp(SkillKind::Crafting, 5);
 

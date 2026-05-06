@@ -6,7 +6,6 @@ use super::needs::Needs;
 use super::person::{AiState, Drafted, PersonAI, PlayerOrder};
 use super::schedule::{BucketSlot, SimClock};
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::simulation::animals::{Horse, Tamed};
@@ -504,8 +503,8 @@ pub fn goal_update_system(
                 // Use anticipatory material_targets (and current blueprint
                 // demand baked in via resource_demand) to pick the highest
                 // deficit material.
-                let wood_id: crate::economy::resource_catalog::ResourceId = Good::Wood.into();
-                let stone_id: crate::economy::resource_catalog::ResourceId = Good::Stone.into();
+                let wood_id = *crate::economy::core_ids::Wood.get().unwrap();
+                let stone_id = *crate::economy::core_ids::Stone.get().unwrap();
                 let wood_target = faction
                     .material_target_of(wood_id)
                     .max(faction.demand_of(wood_id));
@@ -595,15 +594,16 @@ fn should_craft(registry: &FactionRegistry, faction_id: u32, needs: &Needs) -> b
     if !has_craft_tech {
         return false;
     }
+    use crate::economy::core_ids;
     let crafted_total: u32 = [
-        Good::Tools,
-        Good::Weapon,
-        Good::Armor,
-        Good::Shield,
-        Good::Cloth,
+        *core_ids::Tools.get().unwrap(),
+        *core_ids::Weapon.get().unwrap(),
+        *core_ids::Armor.get().unwrap(),
+        *core_ids::Shield.get().unwrap(),
+        *core_ids::Cloth.get().unwrap(),
     ]
     .iter()
-    .map(|g| faction.storage.stock_of((*g).into()))
+    .map(|id| faction.storage.stock_of(*id))
     .sum();
     if crafted_total >= faction.member_count.saturating_div(3).max(1) {
         return false;
