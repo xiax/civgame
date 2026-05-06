@@ -1790,7 +1790,7 @@ mod baseline_behaviour {
         {
             let mut entity = sim.app.world_mut().entity_mut(person);
             if let Some(mut mem) = entity.get_mut::<AgentMemory>() {
-                mem.record(memory_tile, MemoryKind::Wood);
+                mem.record(memory_tile, MemoryKind::wood());
             } else {
                 panic!("Person should have AgentMemory");
             }
@@ -1823,7 +1823,7 @@ mod baseline_behaviour {
             Task::Gather { tile } => {
                 assert_eq!(
                     tile, memory_tile,
-                    "head tile should match the injected `MemoryKind::Wood` entry"
+                    "head tile should match the injected `MemoryKind::wood()` entry"
                 );
             }
             other => panic!(
@@ -1979,7 +1979,7 @@ mod baseline_behaviour {
     /// Phase 5c-ii-d-iv-ii: when a `GatherWood`-goal agent has *no* memory and
     /// *no* visible loose Wood within `VIEW_RADIUS`, `ExploreForMaterialMethod`
     /// (utility 0.3) is the only applicable method — the dispatcher wins by
-    /// fallback ranking and dispatches `Task::Explore { kind: MemoryKind::Wood }`.
+    /// fallback ranking and dispatches `Task::Explore { kind: MemoryKind::wood() }`.
     /// Mirrors the gather/scavenge dispatch tests but with neither memory nor
     /// vision populated, so only the Explore method's precondition fires.
     #[test]
@@ -2054,7 +2054,7 @@ mod baseline_behaviour {
             Task::Explore { kind } => {
                 assert_eq!(
                     kind,
-                    MemoryKind::Wood,
+                    MemoryKind::wood(),
                     "Explore kind should match GatherWood goal's MemoryKind"
                 );
             }

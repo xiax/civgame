@@ -177,7 +177,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 0: ForageGrass — targets BerryBushes, falls back via memory
             id: StepId(0),
             task: TaskKind::Gather,
-            target: StepTarget::FromMemory(MemoryKind::Food),
+            target: StepTarget::FromMemory(MemoryKind::AnyEdible),
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: Some(PlantKind::BerryBush),
@@ -187,7 +187,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 1: FarmFarmland — targets Grain, falls back via memory
             id: StepId(1),
             task: TaskKind::Gather,
-            target: StepTarget::FromMemory(MemoryKind::Food),
+            target: StepTarget::FromMemory(MemoryKind::AnyEdible),
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: Some(PlantKind::Grain),
@@ -197,7 +197,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 2: ChopForest
             id: StepId(2),
             task: TaskKind::Gather,
-            target: StepTarget::FromMemory(MemoryKind::Wood),
+            target: StepTarget::FromMemory(MemoryKind::wood()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
@@ -207,7 +207,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 3: MineStone
             id: StepId(3),
             task: TaskKind::Gather,
-            target: StepTarget::FromMemory(MemoryKind::Stone),
+            target: StepTarget::FromMemory(MemoryKind::stone()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
@@ -946,7 +946,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             bias: 0.0,
             serves_goals: FARM_GOALS,
             tech_gate: Some(technology::CROP_CULTIVATION),
-            memory_target_kind: Some(MemoryKind::Food),
+            memory_target_kind: Some(MemoryKind::AnyEdible),
             flags: PF_NONE,
             requires_profession: None,
         },
@@ -1116,7 +1116,7 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             bias: 0.0,
             serves_goals: CRAFT_GOALS,
             tech_gate: None,
-            memory_target_kind: Some(MemoryKind::Food),
+            memory_target_kind: Some(MemoryKind::AnyEdible),
             flags: PF_UNINTERRUPTIBLE,
             requires_profession: None,
         },

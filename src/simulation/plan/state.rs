@@ -94,17 +94,17 @@ pub fn build_state_vec(
 
     // 21-23: memory availability
     if let Some(mem) = memory {
-        s[21] = if mem.best_for(MemoryKind::Food).is_some() {
+        s[21] = if mem.best_for(MemoryKind::AnyEdible).is_some() {
             1.0
         } else {
             0.0
         };
-        s[22] = if mem.best_for(MemoryKind::Wood).is_some() {
+        s[22] = if mem.best_for(MemoryKind::wood()).is_some() {
             1.0
         } else {
             0.0
         };
-        s[23] = if mem.best_for(MemoryKind::Stone).is_some() {
+        s[23] = if mem.best_for(MemoryKind::stone()).is_some() {
             1.0
         } else {
             0.0

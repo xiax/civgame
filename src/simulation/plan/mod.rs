@@ -1147,8 +1147,11 @@ fn resolve_target(
         }
         StepTarget::FromMemory(kind) => {
             // 1. Check vision
-            let vision_target: Option<(Option<Entity>, i32, i32)> = match kind {
-                MemoryKind::Food => find_nearest_plant(
+            let kind = *kind;
+            let vision_target: Option<(Option<Entity>, i32, i32)> = if kind
+                == MemoryKind::AnyEdible
+            {
+                find_nearest_plant(
                     plant_map,
                     pos,
                     VIEW_RADIUS,
@@ -1156,8 +1159,9 @@ fn resolve_target(
                     true,
                     step.plant_filter,
                 )
-                .map(|(e, tx, ty)| (Some(e), tx, ty)),
-                MemoryKind::Wood => find_nearest_plant(
+                .map(|(e, tx, ty)| (Some(e), tx, ty))
+            } else if kind == MemoryKind::wood() {
+                find_nearest_plant(
                     plant_map,
                     pos,
                     VIEW_RADIUS,
@@ -1165,10 +1169,12 @@ fn resolve_target(
                     true,
                     Some(PlantKind::Tree),
                 )
-                .map(|(e, tx, ty)| (Some(e), tx, ty)),
-                MemoryKind::Stone => find_nearest_tile(chunk_map, pos, VIEW_RADIUS, STONE_TILES)
-                    .map(|(tx, ty)| (None, tx, ty)),
-                _ => None,
+                .map(|(e, tx, ty)| (Some(e), tx, ty))
+            } else if kind == MemoryKind::stone() {
+                find_nearest_tile(chunk_map, pos, VIEW_RADIUS, STONE_TILES)
+                    .map(|(tx, ty)| (None, tx, ty))
+            } else {
+                None
             };
             if let Some((ent, tx, ty)) = vision_target {
                 let to_z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
@@ -1189,7 +1195,7 @@ fn resolve_target(
                     .entries
                     .iter()
                     .filter_map(|slot| slot.as_ref())
-                    .filter(|e| e.kind == *kind)
+                    .filter(|e| e.kind == kind)
                     .filter_map(|e| e.entity.map(|ent| (ent, e.tile, e.freshness)))
                     .filter(|(ent, _, _)| {
                         matches!(plant_query.get(*ent), Ok(p) if p.stage == GrowthStage::Mature)
@@ -1210,7 +1216,7 @@ fn resolve_target(
                 }
 
                 // Tile-based fallback: for plant resources require a Mature plant at the tile.
-                if let Some((tx, ty)) = mem.best_for_dist_weighted(*kind, pos) {
+                if let Some((tx, ty)) = mem.best_for_dist_weighted(kind, pos) {
                     let mut found_ent = None;
                     let plant_ok = match plant_map.0.get(&(tx as i32, ty as i32)) {
                         Some(&tile_ent) => {
@@ -1222,8 +1228,8 @@ fn resolve_target(
                                 false
                             }
                         }
-                        // No plant at tile: valid for Stone, stale for Food/Wood.
-                        None => !matches!(kind, MemoryKind::Food | MemoryKind::Wood),
+                        // No plant at tile: valid for Stone, stale for AnyEdible/Wood.
+                        None => !(kind == MemoryKind::AnyEdible || kind.is_wood()),
                     };
                     if plant_ok {
                         return Some((found_ent, tx, ty));
@@ -1268,13 +1274,13 @@ fn resolve_target(
             //    walk to food remembered on a stockpile.
             if let Some(mem) = memory {
                 let mkind = match good {
-                    Good::Wood => MemoryKind::Wood,
-                    Good::Stone => MemoryKind::Stone,
-                    Good::GrainSeed => MemoryKind::GrainSeed,
-                    Good::BerrySeed => MemoryKind::BerrySeed,
+                    Good::Wood => MemoryKind::wood(),
+                    Good::Stone => MemoryKind::stone(),
+                    Good::GrainSeed => MemoryKind::grain_seed(),
+                    Good::BerrySeed => MemoryKind::berry_seed(),
                     _ => {
                         if good.is_edible() {
-                            MemoryKind::Food
+                            MemoryKind::AnyEdible
                         } else {
                             return None;
                         }
@@ -1316,7 +1322,7 @@ fn resolve_target(
             //    sitting on faction storage tiles.
             if let Some(mem) = memory {
                 if let Some((entity, tx, ty)) = mem.best_entity_for_dist_weighted_filtered(
-                    MemoryKind::Food,
+                    MemoryKind::AnyEdible,
                     pos,
                     |e, tile| {
                         item_query.get(e).is_ok()
@@ -1960,11 +1966,11 @@ pub fn explore_satisfaction_system(
             continue;
         }
         let target = if plan_def.flags & PF_TARGETS_FOOD != 0 {
-            MemoryKind::Food
+            MemoryKind::AnyEdible
         } else if plan_def.flags & PF_TARGETS_WOOD != 0 {
-            MemoryKind::Wood
+            MemoryKind::wood()
         } else if plan_def.flags & PF_TARGETS_STONE != 0 {
-            MemoryKind::Stone
+            MemoryKind::stone()
         } else {
             continue;
         };
@@ -2199,11 +2205,11 @@ pub fn plan_execution_system(
                         // PF_TARGETS_* flag. Returns None for plans that don't
                         // gate on a single resource (build, play, deposit, …).
                         let target_kind = if p.flags & PF_TARGETS_FOOD != 0 {
-                            Some(MemoryKind::Food)
+                            Some(MemoryKind::AnyEdible)
                         } else if p.flags & PF_TARGETS_WOOD != 0 {
-                            Some(MemoryKind::Wood)
+                            Some(MemoryKind::wood())
                         } else if p.flags & PF_TARGETS_STONE != 0 {
-                            Some(MemoryKind::Stone)
+                            Some(MemoryKind::stone())
                         } else {
                             None
                         };
@@ -2212,9 +2218,9 @@ pub fn plan_execution_system(
                         // on the matching ground-vis slot.
                         if p.flags & PF_SCAVENGE != 0 {
                             return match target_kind {
-                                Some(MemoryKind::Food) => vis_ground_food > 0,
-                                Some(MemoryKind::Wood) => vis_ground_wood > 0,
-                                Some(MemoryKind::Stone) => vis_ground_stone > 0,
+                                Some(tk) if tk == MemoryKind::AnyEdible => vis_ground_food > 0,
+                                Some(tk) if tk.is_wood() => vis_ground_wood > 0,
+                                Some(tk) if tk.is_stone() => vis_ground_stone > 0,
                                 _ => true,
                             };
                         }
@@ -2226,25 +2232,25 @@ pub fn plan_execution_system(
                         // to explore for.
                         if p.flags & PF_EXPLORE != 0 {
                             return match target_kind {
-                                Some(MemoryKind::Food) => {
+                                Some(tk) if tk == MemoryKind::AnyEdible => {
                                     vis_plant_food == 0
                                         && vis_ground_food == 0
                                         && memory_opt
-                                            .and_then(|m| m.best_for(MemoryKind::Food))
+                                            .and_then(|m| m.best_for(MemoryKind::AnyEdible))
                                             .is_none()
                                 }
-                                Some(MemoryKind::Wood) => {
+                                Some(tk) if tk.is_wood() => {
                                     vis_trees == 0
                                         && vis_ground_wood == 0
                                         && memory_opt
-                                            .and_then(|m| m.best_for(MemoryKind::Wood))
+                                            .and_then(|m| m.best_for(MemoryKind::wood()))
                                             .is_none()
                                 }
-                                Some(MemoryKind::Stone) => {
+                                Some(tk) if tk.is_stone() => {
                                     vis_stone_tiles == 0
                                         && vis_ground_stone == 0
                                         && memory_opt
-                                            .and_then(|m| m.best_for(MemoryKind::Stone))
+                                            .and_then(|m| m.best_for(MemoryKind::stone()))
                                             .is_none()
                                 }
                                 _ => true,
@@ -2257,22 +2263,22 @@ pub fn plan_execution_system(
                         // visible source. Loose ground items don't help these
                         // plans.
                         match p.memory_target_kind {
-                            Some(MemoryKind::Food) => {
+                            Some(tk) if tk == MemoryKind::AnyEdible => {
                                 vis_plant_food > 0
                                     || memory_opt
-                                        .and_then(|m| m.best_for(MemoryKind::Food))
+                                        .and_then(|m| m.best_for(MemoryKind::AnyEdible))
                                         .is_some()
                             }
-                            Some(MemoryKind::Wood) => {
+                            Some(tk) if tk.is_wood() => {
                                 vis_trees > 0
                                     || memory_opt
-                                        .and_then(|m| m.best_for(MemoryKind::Wood))
+                                        .and_then(|m| m.best_for(MemoryKind::wood()))
                                         .is_some()
                             }
-                            Some(MemoryKind::Stone) => {
+                            Some(tk) if tk.is_stone() => {
                                 vis_stone_tiles > 0
                                     || memory_opt
-                                        .and_then(|m| m.best_for(MemoryKind::Stone))
+                                        .and_then(|m| m.best_for(MemoryKind::stone()))
                                         .is_some()
                             }
                             _ => true,

@@ -1169,7 +1169,7 @@ impl Method for ScavengeFromGroundMethod {
 /// `flags: PF_EXPLORE | PF_TARGETS_FOOD`). Fires when the dispatcher's ctx
 /// shows no concrete food source — no storage stock, no visible scavenge
 /// target — but the agent is still hungry. The expansion is a single
-/// `Task::Explore { kind: MemoryKind::Food }`; the legacy `TaskKind::Explore`
+/// `Task::Explore { kind: MemoryKind::AnyEdible }`; the legacy `TaskKind::Explore`
 /// path drives random-tile selection + walk + vision pickup, and the
 /// pre-existing `explore_satisfaction_system` aborts the moment matching
 /// memory is recorded (so under HTN the next dispatch tick re-evaluates with
@@ -1224,7 +1224,7 @@ impl Method for ExploreForFoodMethod {
             return Vec::new();
         }
         vec![Task::Explore {
-            kind: MemoryKind::Food,
+            kind: MemoryKind::AnyEdible,
         }]
     }
 
@@ -1243,7 +1243,7 @@ impl Method for ExploreForFoodMethod {
 /// `flags: PF_EXPLORE | PF_TARGETS_{WOOD,STONE}`). Fires when the dispatcher's
 /// ctx shows no concrete material source — no storage stock, no visible
 /// scavenge target, no known harvest tile, no claimed blueprint. The
-/// expansion is a single `Task::Explore { kind: MemoryKind::Wood/Stone }` —
+/// expansion is a single `Task::Explore { kind: MemoryKind::Resource(WOOD/STONE) }` —
 /// the kind is derived from the abstract task's `good` payload, so one method
 /// body serves both Wood and Stone (and any future material whose
 /// `Good → MemoryKind` mapping is added).
@@ -1280,8 +1280,8 @@ impl ExploreForMaterialMethod {
     /// cleanly.
     fn memory_kind_for(good: Good) -> Option<MemoryKind> {
         match good {
-            Good::Wood => Some(MemoryKind::Wood),
-            Good::Stone => Some(MemoryKind::Stone),
+            Good::Wood => Some(MemoryKind::wood()),
+            Good::Stone => Some(MemoryKind::stone()),
             _ => None,
         }
     }
@@ -1426,7 +1426,7 @@ impl Method for ExploreForFoodForStorageMethod {
             return Vec::new();
         }
         vec![Task::Explore {
-            kind: MemoryKind::Food,
+            kind: MemoryKind::AnyEdible,
         }]
     }
 
@@ -2139,7 +2139,7 @@ pub fn htn_acquire_food_dispatch_system(
             // None — the argmax falls through to scavenge / withdraw /
             // explore.
             let forage_candidate = memory_opt
-                .and_then(|m| m.best_for(MemoryKind::Food))
+                .and_then(|m| m.best_for(MemoryKind::AnyEdible))
                 .and_then(|tile| {
                     let entity = plant_map.0.get(&tile).copied()?;
                     let plant = plant_query.get(entity).ok()?;
@@ -2398,7 +2398,7 @@ pub fn htn_acquire_food_dispatch_system(
 ///
 /// **Gather branch (5c-ii-c-ii).** For each non-Drafted, non-PlayerOrder
 /// `GatherWood`/`GatherStone`-goal agent without an `ActivePlan`, an idle
-/// task slot, and a populated `AgentMemory::best_for(MemoryKind::Wood|Stone)`:
+/// task slot, and a populated `AgentMemory::best_for(MemoryKind::Resource(WOOD|STONE))`:
 ///
 /// 1. Maps the goal to a `(Good, MemoryKind)` pair.
 /// 2. Reads `AgentMemory::best_for(memory_kind)` for the gather target tile.
@@ -2491,8 +2491,8 @@ pub fn htn_acquire_good_dispatch_system(
             AgentGoal::GatherWood | AgentGoal::GatherStone => {
                 const VIEW_RADIUS: i32 = 15;
                 let (good, memory_kind) = match *goal {
-                    AgentGoal::GatherWood => (Good::Wood, MemoryKind::Wood),
-                    AgentGoal::GatherStone => (Good::Stone, MemoryKind::Stone),
+                    AgentGoal::GatherWood => (Good::Wood, MemoryKind::wood()),
+                    AgentGoal::GatherStone => (Good::Stone, MemoryKind::stone()),
                     _ => unreachable!(),
                 };
 
@@ -3060,7 +3060,7 @@ pub fn htn_stockpile_food_dispatch_system(
             // `Task::DepositToFactionStorage` carries the right payload.
             // `ForageFromKnownForStorageMethod` (utility 1.0) consumes both.
             let forage_candidate = memory_opt
-                .and_then(|m| m.best_for(MemoryKind::Food))
+                .and_then(|m| m.best_for(MemoryKind::AnyEdible))
                 .and_then(|tile| {
                     let entity = plant_map.0.get(&tile).copied()?;
                     let plant = plant_query.get(entity).ok()?;
@@ -4261,7 +4261,7 @@ mod tests {
         assert_eq!(
             tasks,
             vec![Task::Explore {
-                kind: MemoryKind::Food
+                kind: MemoryKind::AnyEdible
             }]
         );
     }
@@ -4366,7 +4366,7 @@ mod tests {
         assert_eq!(
             tasks,
             vec![Task::Explore {
-                kind: MemoryKind::Wood
+                kind: MemoryKind::wood()
             }]
         );
     }
@@ -4384,13 +4384,13 @@ mod tests {
         assert_eq!(
             wood,
             vec![Task::Explore {
-                kind: MemoryKind::Wood
+                kind: MemoryKind::wood()
             }]
         );
         assert_eq!(
             stone,
             vec![Task::Explore {
-                kind: MemoryKind::Stone
+                kind: MemoryKind::stone()
             }]
         );
     }
@@ -4894,7 +4894,7 @@ mod tests {
         assert_eq!(
             tasks,
             vec![Task::Explore {
-                kind: MemoryKind::Food
+                kind: MemoryKind::AnyEdible
             }]
         );
     }

@@ -2,21 +2,76 @@ use super::goals::AgentGoal;
 use super::lod::LodLevel;
 use super::person::Person;
 use super::schedule::{BucketSlot, SimClock};
+use crate::economy::core_ids;
+use crate::economy::resource_catalog::ResourceId;
 use crate::world::chunk::ChunkMap;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
 use ahash::AHashMap;
 use bevy::prelude::*;
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What an `AgentMemory` entry refers to. Phase 2-residual #3 collapsed the
+/// per-good `Food` / `Wood` / `Stone` / `GrainSeed` / `BerrySeed` variants
+/// into a single `Resource(ResourceId)` so any catalog resource can be
+/// remembered without an enum change. `AnyEdible` survives as the
+/// "see any food" aggregate read by AcquireFood / StockpileFood / Forage —
+/// vision writes one `AnyEdible` entry per visible food so the dispatcher
+/// can pick the closest without iterating every edible `ResourceId`. Adding
+/// a second class-level aggregate (e.g. "any building material") would land
+/// as a new variant; today AnyEdible is the only one with a consumer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryKind {
-    Food = 0,
-    Wood = 1,
-    Stone = 2,
-    GrainSeed = 3,
-    Prey = 4,
-    BerrySeed = 5,
+    AnyEdible,
+    Resource(ResourceId),
+    Prey,
+}
+
+impl MemoryKind {
+    /// `MemoryKind::Resource(WOOD)` constructed via the global core-id cache.
+    /// Panics if `init_core_ids` hasn't run (every production / test path
+    /// installs the catalog at startup).
+    pub fn wood() -> Self {
+        Self::Resource(
+            *core_ids::Wood
+                .get()
+                .expect("MemoryKind::wood: core_ids not initialised"),
+        )
+    }
+    pub fn stone() -> Self {
+        Self::Resource(
+            *core_ids::Stone
+                .get()
+                .expect("MemoryKind::stone: core_ids not initialised"),
+        )
+    }
+    pub fn grain_seed() -> Self {
+        Self::Resource(
+            *core_ids::GrainSeed
+                .get()
+                .expect("MemoryKind::grain_seed: core_ids not initialised"),
+        )
+    }
+    pub fn berry_seed() -> Self {
+        Self::Resource(
+            *core_ids::BerrySeed
+                .get()
+                .expect("MemoryKind::berry_seed: core_ids not initialised"),
+        )
+    }
+
+    /// True for every kind whose semantic meaning is "this tile holds food."
+    /// Used by readers that filter on "is the remembered tile a food
+    /// source?" — e.g. plan/mod.rs's plant-tile fallback (Food/Wood require
+    /// a live plant; Stone tolerates the plant being missing).
+    pub fn is_any_edible(self) -> bool {
+        matches!(self, MemoryKind::AnyEdible)
+    }
+    pub fn is_wood(self) -> bool {
+        self == MemoryKind::wood()
+    }
+    pub fn is_stone(self) -> bool {
+        self == MemoryKind::stone()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -379,8 +434,10 @@ pub fn vision_system(
                     if let Ok(plant) = plant_query.get(entity) {
                         let kind = match plant.kind {
                             crate::simulation::plants::PlantKind::BerryBush
-                            | crate::simulation::plants::PlantKind::Grain => MemoryKind::Food,
-                            crate::simulation::plants::PlantKind::Tree => MemoryKind::Wood,
+                            | crate::simulation::plants::PlantKind::Grain => {
+                                MemoryKind::AnyEdible
+                            }
+                            crate::simulation::plants::PlantKind::Tree => MemoryKind::wood(),
                         };
                         if plant.stage == crate::simulation::plants::GrowthStage::Mature {
                             memory.record_entity((ntx as i32, nty as i32), kind, entity);
@@ -389,21 +446,25 @@ pub fn vision_system(
                         }
                     }
                 } else {
-                    memory.forget((ntx as i32, nty as i32), MemoryKind::Food);
-                    memory.forget((ntx as i32, nty as i32), MemoryKind::Wood);
+                    memory.forget((ntx as i32, nty as i32), MemoryKind::AnyEdible);
+                    memory.forget((ntx as i32, nty as i32), MemoryKind::wood());
                 }
 
                 // Check spatial for entities (items, prey)
                 for &entity in spatial.get(ntx, nty) {
                     if let Ok(item) = item_query.get(entity) {
                         let kind = if item.item.good().is_edible() {
-                            Some(MemoryKind::Food)
+                            Some(MemoryKind::AnyEdible)
                         } else {
                             match item.item.good() {
-                                crate::economy::goods::Good::Wood => Some(MemoryKind::Wood),
-                                crate::economy::goods::Good::Stone => Some(MemoryKind::Stone),
-                                crate::economy::goods::Good::GrainSeed => Some(MemoryKind::GrainSeed),
-                                crate::economy::goods::Good::BerrySeed => Some(MemoryKind::BerrySeed),
+                                crate::economy::goods::Good::Wood => Some(MemoryKind::wood()),
+                                crate::economy::goods::Good::Stone => Some(MemoryKind::stone()),
+                                crate::economy::goods::Good::GrainSeed => {
+                                    Some(MemoryKind::grain_seed())
+                                }
+                                crate::economy::goods::Good::BerrySeed => {
+                                    Some(MemoryKind::berry_seed())
+                                }
                                 _ => None,
                             }
                         };
@@ -420,9 +481,9 @@ pub fn vision_system(
                 // Check tile kinds (stone fallback)
                 if let Some(tile_kind) = chunk_map.tile_kind_at(ntx, nty) {
                     if tile_kind == crate::world::tile::TileKind::Stone {
-                        memory.record((ntx as i32, nty as i32), MemoryKind::Stone);
+                        memory.record((ntx as i32, nty as i32), MemoryKind::stone());
                     } else {
-                        memory.forget((ntx as i32, nty as i32), MemoryKind::Stone);
+                        memory.forget((ntx as i32, nty as i32), MemoryKind::stone());
                     }
                 }
             }

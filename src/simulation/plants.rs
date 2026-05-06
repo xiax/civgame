@@ -182,8 +182,8 @@ impl PlantKind {
     /// Memory category for recording this plant's location.
     pub fn harvest_memory_kind(self) -> MemoryKind {
         match self {
-            PlantKind::Tree => MemoryKind::Wood,
-            _ => MemoryKind::Food,
+            PlantKind::Tree => MemoryKind::wood(),
+            _ => MemoryKind::AnyEdible,
         }
     }
 }

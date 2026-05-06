@@ -240,8 +240,8 @@ pub fn gather_system(
             let Ok(mut plant) = plant_query.get_mut(entity) else {
                 plant_map.0.remove(&(tx, ty));
                 if let Some(ref mut mem) = memory_opt {
-                    mem.forget((tx as i32, ty as i32), MemoryKind::Food);
-                    mem.forget((tx as i32, ty as i32), MemoryKind::Wood);
+                    mem.forget((tx as i32, ty as i32), MemoryKind::AnyEdible);
+                    mem.forget((tx as i32, ty as i32), MemoryKind::wood());
                 }
                 finish_gather(
                     &mut ai,
@@ -257,8 +257,8 @@ pub fn gather_system(
             if plant.stage != GrowthStage::Mature {
                 if let Some(ref mut mem) = memory_opt {
                     let kind = match plant.kind {
-                        PlantKind::BerryBush | PlantKind::Grain => MemoryKind::Food,
-                        PlantKind::Tree => MemoryKind::Wood,
+                        PlantKind::BerryBush | PlantKind::Grain => MemoryKind::AnyEdible,
+                        PlantKind::Tree => MemoryKind::wood(),
                     };
                     mem.forget((tx as i32, ty as i32), kind);
                 }
@@ -424,7 +424,7 @@ pub fn gather_system(
                 }
 
                 if let Some(ref mut mem) = memory_opt {
-                    mem.record((tx as i32, ty as i32), MemoryKind::Stone);
+                    mem.record((tx as i32, ty as i32), MemoryKind::stone());
                 }
                 if let Some(ref mut plan) = plan_opt {
                     plan.reward_acc += total_qty as f32 * 0.3;
@@ -441,9 +441,9 @@ pub fn gather_system(
             } else {
                 // Not a stone/wall tile and not a plant -> target is invalid or already harvested
                 if let Some(ref mut mem) = memory_opt {
-                    mem.forget((tx as i32, ty as i32), MemoryKind::Stone);
-                    mem.forget((tx as i32, ty as i32), MemoryKind::Food);
-                    mem.forget((tx as i32, ty as i32), MemoryKind::Wood);
+                    mem.forget((tx as i32, ty as i32), MemoryKind::stone());
+                    mem.forget((tx as i32, ty as i32), MemoryKind::AnyEdible);
+                    mem.forget((tx as i32, ty as i32), MemoryKind::wood());
                 }
                 finish_gather(
                     &mut ai,
