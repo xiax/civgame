@@ -330,12 +330,13 @@ pub enum MaterialNeed {
 #[derive(Copy, Clone, Debug)]
 pub enum GoodSelector {
     /// Pick the good with the largest still-needed quantity that the chosen
-    /// tile actually holds. Stable tiebreak by `Good as u8`. Lets the faction
-    /// drive selection (most-deficient material wins) without per-good plans.
+    /// tile actually holds. Stable tiebreak by `ResourceId.0`. Lets the
+    /// faction drive selection (most-deficient material wins) without
+    /// per-good plans.
     MostDeficient,
-    /// Resolver must commit to exactly this good — used internally for
-    /// `MaterialNeed::HaulClaim` after the claim's good is read.
-    Specific(Good),
+    /// Resolver must commit to exactly this resource — used internally for
+    /// `MaterialNeed::HaulClaim` after the claim's resource is read.
+    Specific(crate::economy::resource_catalog::ResourceId),
 }
 
 #[derive(Clone, Debug)]
@@ -555,7 +556,7 @@ impl StepPreconditions {
             // AcquireHuntingSpear plan self-deselects after the equip step
             // moves the spear out of inventory and into the MainHand slot.
             if let Some(eq) = equipment {
-                if eq.has_good(good) {
+                if eq.has_resource(id) {
                     return false;
                 }
             }
@@ -863,12 +864,13 @@ fn resolve_withdraw_for_faction_need(
     claim_target: Option<&crate::simulation::jobs::ClaimTarget>,
     agent: &EconomicAgent,
     carrier: &crate::simulation::carry::Carrier,
-    withdraw_intent_out: &mut Option<(Good, u8)>,
+    withdraw_intent_out: &mut Option<(crate::economy::resource_catalog::ResourceId, u8)>,
 ) -> Option<(Option<Entity>, i32, i32)> {
-    // 1. Build per-good still-needed demand from `need`. The HaulClaim path
-    //    bypasses the demand vector since the claim already names the good.
-    let mut still_need_by_good = [0u32; crate::economy::goods::GOOD_COUNT];
-    let mut any_needed = false;
+    use crate::economy::resource_catalog::ResourceId;
+    // 1. Build per-resource still-needed demand from `need`. The HaulClaim
+    //    path bypasses the demand map since the claim already names the
+    //    resource.
+    let mut still_need: AHashMap<ResourceId, u32> = AHashMap::new();
     let mut effective_selector = selector;
     match need {
         MaterialNeed::Blueprint => {
@@ -888,13 +890,9 @@ fn resolve_withdraw_for_faction_need(
                         .needed
                         .saturating_sub(bp.deposits[i].deposited);
                     if still > 0 {
-                        if let Some(good) = crate::economy::core_ids::resource_id_to_good(
-                            bp.deposits[i].resource_id,
-                        ) {
-                            let g = good as usize;
-                            still_need_by_good[g] = still_need_by_good[g].saturating_add(still as u32);
-                            any_needed = true;
-                        }
+                        let rid = bp.deposits[i].resource_id;
+                        let slot = still_need.entry(rid).or_insert(0);
+                        *slot = slot.saturating_add(still as u32);
                     }
                 }
             }
@@ -912,61 +910,55 @@ fn resolve_withdraw_for_faction_need(
                         .needed
                         .saturating_sub(order.deposits[i].deposited);
                     if still > 0 {
-                        if let Some(good) = crate::economy::core_ids::resource_id_to_good(
-                            order.deposits[i].resource_id,
-                        ) {
-                            let g = good as usize;
-                            still_need_by_good[g] = still_need_by_good[g].saturating_add(still as u32);
-                            any_needed = true;
-                        }
+                        let rid = order.deposits[i].resource_id;
+                        let slot = still_need.entry(rid).or_insert(0);
+                        *slot = slot.saturating_add(still as u32);
                     }
                 }
             }
         }
         MaterialNeed::HaulClaim => {
-            // Claim names the exact good and (implicitly) the qty we want;
-            // no aggregation required. Override the selector so downstream
-            // logic treats this as a Specific lookup.
-            let claim = claim_target
-                .and_then(|c| c.resource_id)
-                .and_then(crate::economy::core_ids::resource_id_to_good)?;
-            still_need_by_good[claim as usize] = u32::MAX / 2;
-            effective_selector = GoodSelector::Specific(claim);
-            any_needed = true;
+            // Claim names the exact resource and (implicitly) the qty we
+            // want; no aggregation required. Override the selector so
+            // downstream logic treats this as a Specific lookup.
+            let claim_rid = claim_target.and_then(|c| c.resource_id)?;
+            still_need.insert(claim_rid, u32::MAX / 2);
+            effective_selector = GoodSelector::Specific(claim_rid);
         }
     }
-    if !any_needed {
+    if still_need.is_empty() {
         return None;
     }
 
-    // For Specific selectors, ignore demand on other goods entirely so we
-    // never accidentally pick a tile because some unrelated good is needed.
-    if let GoodSelector::Specific(g) = effective_selector {
-        let saved = still_need_by_good[g as usize];
-        still_need_by_good = [0u32; crate::economy::goods::GOOD_COUNT];
-        still_need_by_good[g as usize] = saved;
+    // For Specific selectors, ignore demand on other resources entirely so
+    // we never accidentally pick a tile because some unrelated resource is
+    // needed.
+    if let GoodSelector::Specific(rid) = effective_selector {
+        let saved = still_need.get(&rid).copied().unwrap_or(0);
+        still_need.clear();
         if saved == 0 {
             return None;
         }
+        still_need.insert(rid, saved);
     }
 
-    // 2. Helper: per-good effective stock on a tile (ground qty minus
+    // 2. Helper: per-resource effective stock on a tile (ground qty minus
     //    reservations). The reservation map tracks promises that haven't
     //    been collected yet, so two agents never commit to the same unit.
-    let effective_stock = |tx: i32, ty: i32, good: Good| -> u32 {
+    let effective_stock = |tx: i32, ty: i32, rid: ResourceId| -> u32 {
         let mut stock = 0u32;
         for &gi_entity in spatial.get(tx as i32, ty as i32) {
             if let Ok(gi) = item_query.get(gi_entity) {
-                if gi.item.good() == good {
+                if gi.item.resource_id == rid {
                     stock = stock.saturating_add(gi.qty);
                 }
             }
         }
-        stock.saturating_sub(reservations.get((tx, ty), good.into()))
+        stock.saturating_sub(reservations.get((tx, ty), rid))
     };
 
     // 3. Find the nearest faction storage tile that holds at least one
-    //    useful good (intersection of demand & effective stock).
+    //    useful resource (intersection of demand & effective stock).
     let tiles = storage_tile_map.by_faction.get(&faction_id)?;
     let mut best: Option<(i32, i32)> = None;
     let mut best_dist = i32::MAX;
@@ -977,10 +969,11 @@ fn resolve_withdraw_for_faction_need(
                 if gi.qty == 0 {
                     continue;
                 }
-                if still_need_by_good[gi.item.good() as usize] == 0 {
+                let rid = gi.item.resource_id;
+                if still_need.get(&rid).copied().unwrap_or(0) == 0 {
                     continue;
                 }
-                if effective_stock(tx, ty, gi.item.good()) > 0 {
+                if effective_stock(tx, ty, rid) > 0 {
                     has_useful = true;
                     break;
                 }
@@ -997,41 +990,42 @@ fn resolve_withdraw_for_faction_need(
     }
     let (tx, ty) = best?;
 
-    // 4. Pick the good to commit to.
-    let chosen: Option<(Good, u32)> = match effective_selector {
-        GoodSelector::Specific(g) => {
-            let stock = effective_stock(tx, ty, g);
-            if stock > 0 && still_need_by_good[g as usize] > 0 {
-                Some((g, stock.min(still_need_by_good[g as usize])))
+    // 4. Pick the resource to commit to.
+    let chosen: Option<(ResourceId, u32)> = match effective_selector {
+        GoodSelector::Specific(rid) => {
+            let stock = effective_stock(tx, ty, rid);
+            let deficit = still_need.get(&rid).copied().unwrap_or(0);
+            if stock > 0 && deficit > 0 {
+                Some((rid, stock.min(deficit)))
             } else {
                 None
             }
         }
         GoodSelector::MostDeficient => {
-            // Walk goods present on the tile and keep the one with the
-            // largest still-needed value. Stable tiebreak by Good as u8.
-            let mut best_pick: Option<(Good, u32, u32)> = None; // (good, deficit, take_qty)
+            // Walk resources present on the tile and keep the one with the
+            // largest still-needed value. Stable tiebreak by ResourceId.0.
+            let mut best_pick: Option<(ResourceId, u32, u32)> = None; // (rid, deficit, take_qty)
             for &gi_entity in spatial.get(tx as i32, ty as i32) {
                 if let Ok(gi) = item_query.get(gi_entity) {
                     if gi.qty == 0 {
                         continue;
                     }
-                    let deficit = still_need_by_good[gi.item.good() as usize];
+                    let rid = gi.item.resource_id;
+                    let deficit = still_need.get(&rid).copied().unwrap_or(0);
                     if deficit == 0 {
                         continue;
                     }
-                    let stock = effective_stock(tx, ty, gi.item.good());
+                    let stock = effective_stock(tx, ty, rid);
                     if stock == 0 {
                         continue;
                     }
                     let take = stock.min(deficit);
-                    let candidate = (gi.item.good(), deficit, take);
+                    let candidate = (rid, deficit, take);
                     best_pick = Some(match best_pick {
                         None => candidate,
                         Some(prev) => {
                             if deficit > prev.1
-                                || (deficit == prev.1
-                                    && (gi.item.good() as u8) < (prev.0 as u8))
+                                || (deficit == prev.1 && rid.0 < prev.0 .0)
                             {
                                 candidate
                             } else {
@@ -1041,7 +1035,7 @@ fn resolve_withdraw_for_faction_need(
                     });
                 }
             }
-            best_pick.map(|(g, _, q)| (g, q))
+            best_pick.map(|(rid, _, q)| (rid, q))
         }
     };
 
@@ -1052,8 +1046,8 @@ fn resolve_withdraw_for_faction_need(
     //    floor to 1 — so we never promise a unit that has no destination.
     //    Stone weighs exactly the inventory cap, so an inventory-only floor
     //    would commit units that vanish on pickup.
-    let (good, mut qty) = chosen?;
-    let item = crate::economy::item::Item::new_commodity(good);
+    let (rid, mut qty) = chosen?;
+    let item = crate::economy::item::Item::new_commodity(rid);
     let unit_w = item.unit_weight_g().max(1);
     let hand_cap = carrier.pickup_capacity(item);
     let inv_room = agent.capacity_g().saturating_sub(agent.current_weight_g());
@@ -1067,7 +1061,7 @@ fn resolve_withdraw_for_faction_need(
     if qty_u8 == 0 {
         return None;
     }
-    *withdraw_intent_out = Some((good, qty_u8));
+    *withdraw_intent_out = Some((rid, qty_u8));
     Some((None, tx, ty))
 }
 
@@ -1103,7 +1097,7 @@ fn resolve_target(
     carrier: &Carrier,
     claim_target: Option<&crate::simulation::jobs::ClaimTarget>,
     reservations: &StorageReservations,
-    withdraw_intent_out: &mut Option<(Good, u8)>,
+    withdraw_intent_out: &mut Option<(crate::economy::resource_catalog::ResourceId, u8)>,
 ) -> Option<(Option<Entity>, i32, i32)> {
     const VIEW_RADIUS: i32 = 15;
 
@@ -2584,7 +2578,10 @@ pub fn plan_execution_system(
                     return;
                 }
 
-                let mut withdraw_intent: Option<(Good, u8)> = None;
+                let mut withdraw_intent: Option<(
+                    crate::economy::resource_catalog::ResourceId,
+                    u8,
+                )> = None;
                 let resolved = resolve_target(
                     step_def,
                     (cur_tx, cur_ty),
@@ -2749,10 +2746,10 @@ pub fn plan_execution_system(
                     // WithdrawMaterial dispatch is correct.
                     if step_def.task == TaskKind::WithdrawMaterial {
                         match withdraw_intent {
-                            Some((good, qty)) => {
+                            Some((rid, qty)) => {
                                 aq.dispatch(
                                     crate::simulation::typed_task::Task::WithdrawMaterial {
-                                        resource_id: crate::economy::core_ids::good_to_resource_id(good),
+                                        resource_id: rid,
                                         qty,
                                     },
                                 );
@@ -2769,8 +2766,8 @@ pub fn plan_execution_system(
                     }
                     // Reserve that qty against the chosen storage tile so a
                     // second agent in the same tick sees a smaller effective
-                    // stock and either picks another tile/good or aborts.
-                    if let Some((good, qty)) = withdraw_intent {
+                    // stock and either picks another tile/resource or aborts.
+                    if let Some((rid, qty)) = withdraw_intent {
                         if step_def.task == TaskKind::WithdrawMaterial && qty > 0 {
                             // Withdraw is "interacts from adjacent" — the
                             // chosen storage tile is `target_tile`, not
@@ -2779,9 +2776,9 @@ pub fn plan_execution_system(
                             // resolved tile, so use it as the reservation
                             // key.
                             let reserved_tile = (target_tx, target_ty);
-                            storage_reservations.add(reserved_tile, good.into(), qty as u32);
+                            storage_reservations.add(reserved_tile, rid, qty as u32);
                             ai.reserved_tile = reserved_tile;
-                            ai.reserved_resource = Some(good.into());
+                            ai.reserved_resource = Some(rid);
                             ai.reserved_qty = qty;
                         }
                     }

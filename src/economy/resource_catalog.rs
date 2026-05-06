@@ -104,6 +104,12 @@ impl ResourceId {
             Some(ResourceClass::Seed)
         )
     }
+
+    /// Catalog `ResourceClass` of this resource. Returns `None` for the
+    /// `NONE` sentinel and any unknown id.
+    pub fn class(self) -> Option<ResourceClass> {
+        super::core_ids::catalog().get(self).map(|d| d.class)
+    }
 }
 
 /// High-level functional category. Used by HTN methods to enumerate "all

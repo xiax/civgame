@@ -42,11 +42,11 @@ pub struct Equipment {
 }
 
 impl Equipment {
-    /// True if any equipped slot holds an Item with the given `good`. Used by
-    /// `forbids_good` preconditions so a wielded weapon counts the same as one
-    /// in inventory or hands.
-    pub fn has_good(&self, good: Good) -> bool {
-        self.items.values().any(|it| it.good() == good)
+    /// True if any equipped slot holds an Item with the given resource id.
+    /// Used by `forbids_good` preconditions so a wielded weapon counts the
+    /// same as one in inventory or hands.
+    pub fn has_resource(&self, id: crate::economy::resource_catalog::ResourceId) -> bool {
+        self.items.values().any(|it| it.resource_id == id)
     }
 }
 
@@ -112,13 +112,17 @@ pub fn spawn_or_merge_ground_item_full(
     ));
 }
 
-/// Returns the equipment slots that a given good can be placed into.
-pub fn valid_equip_slots(good: Good) -> &'static [EquipmentSlot] {
-    match good {
-        Good::Weapon => &[EquipmentSlot::MainHand, EquipmentSlot::OffHand],
-        Good::Shield => &[EquipmentSlot::OffHand],
-        Good::Armor => &[EquipmentSlot::TorsoArmor],
-        Good::Cloth => &[EquipmentSlot::TorsoArmor],
+/// Returns the equipment slots that the resource identified by `id` can be
+/// placed into. Keyed off catalog `ResourceClass` so adding a new
+/// weapon/shield/armor/cloth resource needs no Rust changes.
+pub fn valid_equip_slots(
+    id: crate::economy::resource_catalog::ResourceId,
+) -> &'static [EquipmentSlot] {
+    use crate::economy::resource_catalog::ResourceClass;
+    match id.class() {
+        Some(ResourceClass::Weapon) => &[EquipmentSlot::MainHand, EquipmentSlot::OffHand],
+        Some(ResourceClass::Shield) => &[EquipmentSlot::OffHand],
+        Some(ResourceClass::Armor) | Some(ResourceClass::Cloth) => &[EquipmentSlot::TorsoArmor],
         _ => &[],
     }
 }
@@ -129,14 +133,17 @@ pub fn valid_equip_slots(good: Good) -> &'static [EquipmentSlot] {
 pub fn recompute_inventory_capacity_system(
     mut q: Query<(&Equipment, &mut EconomicAgent), Changed<Equipment>>,
 ) {
+    let cloth_id = crate::economy::core_ids::Cloth.get().copied();
+    let armor_id = crate::economy::core_ids::Armor.get().copied();
     for (equipment, mut agent) in q.iter_mut() {
         let mut bonus = 0u32;
         if let Some(item) = equipment.items.get(&EquipmentSlot::TorsoArmor) {
-            bonus = bonus.saturating_add(match item.good() {
-                Good::Cloth => 2_000,
-                Good::Armor => 1_000,
-                _ => 0,
-            });
+            let rid = item.resource_id;
+            if Some(rid) == cloth_id {
+                bonus = bonus.saturating_add(2_000);
+            } else if Some(rid) == armor_id {
+                bonus = bonus.saturating_add(1_000);
+            }
         }
         agent.bonus_cap_g = bonus;
     }

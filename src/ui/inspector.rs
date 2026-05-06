@@ -480,11 +480,13 @@ pub fn inspector_panel_system(
                                         if *qty == 0 {
                                             continue;
                                         }
-                                        if !matches!(
-                                            item.good(),
-                                            crate::economy::goods::Good::ClayTablet
-                                                | crate::economy::goods::Good::Book
-                                        ) {
+                                        let tablet_id = crate::economy::core_ids::ClayTablet
+                                            .get()
+                                            .copied();
+                                        let book_id =
+                                            crate::economy::core_ids::Book.get().copied();
+                                        let rid = item.resource_id;
+                                        if Some(rid) != tablet_id && Some(rid) != book_id {
                                             continue;
                                         }
                                         if let Some(t) = item.tech_payload {
@@ -677,7 +679,7 @@ pub fn inspector_panel_system(
                             // Equip buttons for equippable items in inventory or hands
                             let mut has_equippable = false;
                             for (item, qty) in &agent.inventory {
-                                if *qty > 0 && !valid_equip_slots(item.good()).is_empty() {
+                                if *qty > 0 && !valid_equip_slots(item.resource_id).is_empty() {
                                     has_equippable = true;
                                     break;
                                 }
@@ -685,7 +687,7 @@ pub fn inspector_panel_system(
                             if !has_equippable {
                                 if let Some(c) = carrier {
                                     for stack in [c.left, c.right].into_iter().flatten() {
-                                        if !valid_equip_slots(stack.item.good()).is_empty() {
+                                        if !valid_equip_slots(stack.item.resource_id).is_empty() {
                                             has_equippable = true;
                                             break;
                                         }
@@ -704,7 +706,7 @@ pub fn inspector_panel_system(
                                     if *qty == 0 {
                                         continue;
                                     }
-                                    for &slot in valid_equip_slots(item.good()) {
+                                    for &slot in valid_equip_slots(item.resource_id) {
                                         let slot_name = slot_display_name(slot);
                                         if ui
                                             .small_button(format!(
@@ -729,7 +731,7 @@ pub fn inspector_panel_system(
                                         (c.right, false),
                                     ] {
                                         let Some(stack) = stack else { continue };
-                                        for &slot in valid_equip_slots(stack.item.good()) {
+                                        for &slot in valid_equip_slots(stack.item.resource_id) {
                                             let slot_name = slot_display_name(slot);
                                             let hand_tag =
                                                 if stack.two_handed { "hands" } else if from_left { "L" } else { "R" };

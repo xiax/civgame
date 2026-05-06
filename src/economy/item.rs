@@ -163,7 +163,7 @@ impl Item {
         let base = if let Some(dn) = self.display_name {
             dn.to_string()
         } else {
-            let mut s = self.good().name().to_string();
+            let mut s = super::core_ids::display_name(self.resource_id).to_string();
             if let Some(mat) = self.material {
                 s = format!("{:?} {}", mat, s);
             }

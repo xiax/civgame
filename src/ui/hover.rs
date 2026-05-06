@@ -135,7 +135,11 @@ pub fn hover_info_system(
                             ui.label("Inventory:");
                             for (item, qty) in agent.inventory {
                                 if qty > 0 {
-                                    ui.label(format!("  - {:?} x{}", item.good(), qty));
+                                    ui.label(format!(
+                                        "  - {} x{}",
+                                        crate::economy::core_ids::display_name(item.resource_id),
+                                        qty
+                                    ));
                                 }
                             }
                         });
@@ -152,7 +156,11 @@ pub fn hover_info_system(
                     } else if let Ok(plant) = plant_query.get(entity) {
                         ui.label(format!("Plant: {:?} ({:?})", plant.kind, plant.stage));
                     } else if let Ok(item) = item_query.get(entity) {
-                        ui.label(format!("Item: {:?} x{}", item.item.good(), item.qty));
+                        ui.label(format!(
+                            "Item: {} x{}",
+                            crate::economy::core_ids::display_name(item.item.resource_id),
+                            item.qty
+                        ));
                     } else {
                         ui.label(format!("Entity: {:?}", entity));
                     }

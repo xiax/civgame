@@ -383,7 +383,7 @@ pub fn drop_carrier_to_ground(
             item_query,
             tx,
             ty,
-            stack.item.good(),
+            stack.item.resource_id,
             stack.qty,
         );
     }
@@ -509,7 +509,7 @@ pub fn enforce_hand_state_system(
                         &mut item_query,
                         tx,
                         ty,
-                        stack.item.good(),
+                        stack.item.resource_id,
                         stack.qty,
                     );
                 } else {

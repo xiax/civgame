@@ -1294,13 +1294,15 @@ pub fn drop_items_at_destination_system(
         for (it, q) in agent.inventory.iter_mut() {
             if *q > 0
                 && matches!(
-                    it.good(),
-                    Good::Tools
-                        | Good::Weapon
-                        | Good::Armor
-                        | Good::Shield
-                        | Good::Cloth
-                        | Good::Luxury
+                    it.resource_id.class(),
+                    Some(
+                        crate::economy::resource_catalog::ResourceClass::Tool
+                            | crate::economy::resource_catalog::ResourceClass::Weapon
+                            | crate::economy::resource_catalog::ResourceClass::Armor
+                            | crate::economy::resource_catalog::ResourceClass::Shield
+                            | crate::economy::resource_catalog::ResourceClass::Cloth
+                            | crate::economy::resource_catalog::ResourceClass::Luxury
+                    )
                 )
             {
                 crafted_drops.push((*it, *q));
