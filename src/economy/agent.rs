@@ -1,4 +1,3 @@
-use super::core_ids::resource_id_to_good;
 use super::goods::Good;
 use super::item::Item;
 use super::resource_catalog::ResourceId;
@@ -42,10 +41,7 @@ impl EconomicAgent {
     }
 
     pub fn quantity_of(&self, good: Good) -> u32 {
-        self.inventory
-            .iter()
-            .filter(|(it, _)| it.good() == good)
-            .fold(0u32, |acc, (_, q)| acc.saturating_add(*q))
+        self.quantity_of_resource(crate::economy::core_ids::good_to_resource_id(good))
     }
 
     /// Total weight capacity, in grams.
@@ -120,7 +116,7 @@ impl EconomicAgent {
     }
 
     pub fn add_good(&mut self, good: Good, qty: u32) -> u32 {
-        self.add_item(Item::new_commodity(good), qty)
+        self.add_resource(crate::economy::core_ids::good_to_resource_id(good), qty)
     }
 
     /// Remove up to `qty` units of a specific `item`. Returns how many were actually removed.
@@ -136,49 +132,39 @@ impl EconomicAgent {
     }
 
     pub fn remove_good(&mut self, good: Good, qty: u32) -> u32 {
-        self.remove_item(Item::new_commodity(good), qty)
+        self.remove_resource(crate::economy::core_ids::good_to_resource_id(good), qty)
     }
 
     pub fn has_tool(&self) -> bool {
         self.quantity_of(Good::Tools) > 0
     }
 
-    // ── Phase 2b: ResourceId-keyed mirrors of the Good-keyed methods ──
+    // ── ResourceId-keyed inventory accessors ──
     //
-    // These are migration accessors so HTN/planner code being authored
-    // against the catalog doesn't need to know about the `Good` enum.
-    // They delegate to the existing `Good` paths via `resource_id_to_good`,
-    // which returns `None` only for non-legacy resources (currently
-    // impossible — the catalog is exactly the 22 legacy goods until
-    // Phase 2c). Once `Item.good` becomes `ResourceId` (Phase 2c/2d),
-    // these methods become the canonical implementation and the legacy
-    // `Good`-keyed ones become thin wrappers, then disappear.
+    // These are the canonical implementations. The legacy `*_good` methods
+    // are thin wrappers that convert via `core_ids::good_to_resource_id`;
+    // they disappear once the `Good` enum does.
 
     /// Sum of `qty` across every inventory stack whose underlying
-    /// resource matches `id`. Mirrors `quantity_of(Good)`.
+    /// resource matches `id`. Manufactured items collapse onto their base
+    /// resource (e.g. a manufactured weapon counts as the base material).
     pub fn quantity_of_resource(&self, id: ResourceId) -> u32 {
-        match resource_id_to_good(id) {
-            Some(good) => self.quantity_of(good),
-            None => 0,
-        }
+        self.inventory
+            .iter()
+            .filter(|(it, _)| it.resource_id == id)
+            .fold(0u32, |acc, (_, q)| acc.saturating_add(*q))
     }
 
     /// Try to add `qty` of the resource identified by `id`. Returns the
-    /// amount that did not fit. Mirrors `add_good(Good, qty)`.
+    /// amount that did not fit.
     pub fn add_resource(&mut self, id: ResourceId, qty: u32) -> u32 {
-        match resource_id_to_good(id) {
-            Some(good) => self.add_good(good, qty),
-            None => qty,
-        }
+        self.add_item(Item::new_commodity(id), qty)
     }
 
     /// Remove up to `qty` units of the resource identified by `id`.
-    /// Returns how many were removed. Mirrors `remove_good(Good, qty)`.
+    /// Returns how many were removed.
     pub fn remove_resource(&mut self, id: ResourceId, qty: u32) -> u32 {
-        match resource_id_to_good(id) {
-            Some(good) => self.remove_good(good, qty),
-            None => 0,
-        }
+        self.remove_item(Item::new_commodity(id), qty)
     }
 
     /// Iterate `(ResourceId, qty)` over every non-empty stack. The

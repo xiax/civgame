@@ -1315,9 +1315,10 @@ pub fn drop_items_at_destination_system(
         }
 
         // Deposit recovered construction materials (Wood from deconstruction).
-        let wood_qty = agent.quantity_of(Good::Wood);
+        let wood_id: crate::economy::resource_catalog::ResourceId = Good::Wood.into();
+        let wood_qty = agent.quantity_of_resource(wood_id);
         if wood_qty > 0 {
-            agent.remove_good(Good::Wood, wood_qty);
+            agent.remove_resource(wood_id, wood_qty);
             spawn_or_merge_ground_item(
                 &mut commands,
                 &spatial,

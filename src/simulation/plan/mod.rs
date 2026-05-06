@@ -528,7 +528,7 @@ impl StepPreconditions {
     ) -> bool {
         if let Some((good, qty)) = self.requires_good {
             let id = crate::economy::core_ids::good_to_resource_id(good);
-            if agent.quantity_of(good) + carrier.quantity_of_resource(id) < qty {
+            if agent.quantity_of_resource(id) + carrier.quantity_of_resource(id) < qty {
                 return false;
             }
         }
@@ -548,7 +548,7 @@ impl StepPreconditions {
         }
         if let Some(good) = self.forbids_good {
             let id = crate::economy::core_ids::good_to_resource_id(good);
-            if agent.quantity_of(good) > 0 || carrier.quantity_of_resource(id) > 0 {
+            if agent.quantity_of_resource(id) > 0 || carrier.quantity_of_resource(id) > 0 {
                 return false;
             }
             // A wielded weapon/armor counts as "already armed" so the

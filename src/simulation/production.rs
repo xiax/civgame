@@ -206,8 +206,9 @@ pub fn production_system(
         if task == TaskKind::PlayThrow as u16 {
             if ai.work_progress >= TICKS_PLAY_THROW {
                 ai.work_progress = 0;
-                if agent.quantity_of(Good::Stone) > 0 {
-                    agent.remove_good(Good::Stone, 1);
+                let stone_id: crate::economy::resource_catalog::ResourceId = Good::Stone.into();
+                if agent.quantity_of_resource(stone_id) > 0 {
+                    agent.remove_resource(stone_id, 1);
                     skills.gain_xp(SkillKind::Combat, 2);
                     if let Some(fm) = faction_member {
                         if let Some(fd) = faction_registry.factions.get_mut(&fm.faction_id) {
@@ -709,12 +710,12 @@ pub fn withdraw_food_task_system(
         let mut withdrew = false;
         for &gi_entity in spatial.get(tx as i32, ty as i32) {
             if let Ok(mut gi) = ground_items.get_mut(gi_entity) {
-                if gi.item.good().is_edible() && gi.qty > 0 {
+                if gi.item.resource_id.is_edible() && gi.qty > 0 {
                     // Try hands first; fall back to inventory for any leftover.
-                    let food_item = Item::new_commodity(gi.item.good());
+                    let food_item = Item::new_commodity(gi.item.resource_id);
                     let after_hands = carrier.try_pick_up(food_item, 1);
                     let leftover = if after_hands > 0 {
-                        agent.add_good(gi.item.good(), after_hands)
+                        agent.add_resource(gi.item.resource_id, after_hands)
                     } else {
                         0
                     };
@@ -952,8 +953,12 @@ pub fn eat_task_system(
                 fruits_consumed += 1;
             }
         }
-        for _ in 0..fruits_consumed {
-            agent.add_good(Good::BerrySeed, 1);
+        if fruits_consumed > 0 {
+            let berry_seed: crate::economy::resource_catalog::ResourceId =
+                Good::BerrySeed.into();
+            for _ in 0..fruits_consumed {
+                agent.add_resource(berry_seed, 1);
+            }
         }
 
         ai.state = AiState::Idle;

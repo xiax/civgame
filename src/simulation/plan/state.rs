@@ -63,19 +63,27 @@ pub fn build_state_vec(
 
     // 6-10: inventory has (Food, Wood, Stone, GrainSeed, Coal)
     s[6] = if agent.total_food() > 0 { 1.0 } else { 0.0 };
-    s[7] = if agent.quantity_of(Good::Wood) > 0 {
+    s[7] = if agent.quantity_of_resource(Good::Wood.into()) > 0 {
         1.0
     } else {
         0.0
     };
-    s[8] = if agent.quantity_of(Good::Stone) > 0 {
+    s[8] = if agent.quantity_of_resource(Good::Stone.into()) > 0 {
         1.0
     } else {
         0.0
     };
-    s[SI_HAS_GRAIN_SEED] = if agent.quantity_of(Good::GrainSeed) > 0 { 1.0 } else { 0.0 };
-    s[SI_HAS_BERRY_SEED] = if agent.quantity_of(Good::BerrySeed) > 0 { 1.0 } else { 0.0 };
-    s[10] = if agent.quantity_of(Good::Coal) > 0 {
+    s[SI_HAS_GRAIN_SEED] = if agent.quantity_of_resource(Good::GrainSeed.into()) > 0 {
+        1.0
+    } else {
+        0.0
+    };
+    s[SI_HAS_BERRY_SEED] = if agent.quantity_of_resource(Good::BerrySeed.into()) > 0 {
+        1.0
+    } else {
+        0.0
+    };
+    s[10] = if agent.quantity_of_resource(Good::Coal.into()) > 0 {
         1.0
     } else {
         0.0
