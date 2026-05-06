@@ -1188,7 +1188,7 @@ pub fn drop_items_at_destination_system(
                     &mut job_completed,
                     claim,
                     JobKind::Stockpile,
-                    Some(Good::Wood),
+                    Some(Good::Wood.into()),
                     hand_wood,
                 );
             }
@@ -1199,7 +1199,7 @@ pub fn drop_items_at_destination_system(
                     &mut job_completed,
                     claim,
                     JobKind::Stockpile,
-                    Some(Good::Stone),
+                    Some(Good::Stone.into()),
                     hand_stone,
                 );
             }

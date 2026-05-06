@@ -2691,7 +2691,7 @@ pub fn construction_system(
                                 &mut job_completed,
                                 claim,
                                 JobKind::Haul,
-                                crate::economy::core_ids::resource_id_to_good(need.resource_id),
+                                Some(need.resource_id),
                                 take,
                             );
                         }

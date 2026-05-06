@@ -260,8 +260,8 @@ pub fn compute_priority(
 
     let pressure: u8 = match (posting_kind, progress) {
         (JobKind::Stockpile, JobProgress::Calories { .. }) => food_pressure(faction),
-        (JobKind::Stockpile, JobProgress::Stockpile { good, .. }) => {
-            material_pressure(faction, faction_id, projects, *good)
+        (JobKind::Stockpile, JobProgress::Stockpile { resource_id, .. }) => {
+            material_pressure(faction, faction_id, projects, *resource_id)
         }
         (JobKind::Haul, JobProgress::Haul { .. }) => haul_pressure(),
         (JobKind::Build, JobProgress::Building { .. }) => build_pressure(),
@@ -288,14 +288,19 @@ pub fn food_pressure(faction: &FactionData) -> u8 {
 }
 
 /// 0..=80: build projects waiting on this material add pressure. Empty
-/// storage of this good adds extra so chronic shortfalls climb fast.
+/// storage of this resource adds extra so chronic shortfalls climb fast.
 pub fn material_pressure(
     faction: &FactionData,
     faction_id: u32,
     projects: &Projects,
-    good: Good,
+    resource_id: crate::economy::resource_catalog::ResourceId,
 ) -> u8 {
-    let stored = faction.storage.stock_of(good);
+    let stored = faction
+        .storage
+        .totals
+        .get(&resource_id)
+        .copied()
+        .unwrap_or(0);
     let waiting = projects
         .faction_projects(faction_id)
         .filter(|p| p.phase == ProjectPhase::GatherMaterials)
@@ -398,14 +403,17 @@ impl WorkforceBudget {
         self.stockpile_food + self.stockpile_wood + self.stockpile_stone
     }
 
-    /// Share of the workforce allocated to a Stockpile posting for `good`.
-    /// Goods other than Food/Wood/Stone fall back to the food share since they
-    /// share the calorie pipeline.
-    pub fn stockpile_share(&self, good: Good) -> f32 {
-        match good {
-            Good::Wood => self.stockpile_wood,
-            Good::Stone => self.stockpile_stone,
-            _ => self.stockpile_food,
+    /// Share of the workforce allocated to a Stockpile posting for
+    /// `resource_id`. Resources other than Wood/Stone fall back to the food
+    /// share since they share the calorie pipeline.
+    pub fn stockpile_share(&self, resource_id: crate::economy::resource_catalog::ResourceId) -> f32 {
+        use crate::economy::core_ids;
+        if Some(resource_id) == core_ids::Wood.get().copied() {
+            self.stockpile_wood
+        } else if Some(resource_id) == core_ids::Stone.get().copied() {
+            self.stockpile_stone
+        } else {
+            self.stockpile_food
         }
     }
 

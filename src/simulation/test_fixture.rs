@@ -1635,7 +1635,7 @@ mod baseline_behaviour {
                 kind: JobKind::Haul,
                 progress: JobProgress::Haul {
                     blueprint,
-                    good: Good::Wood,
+                    resource_id: Good::Wood.into(),
                     delivered: 0,
                     target: 2,
                 },
@@ -1774,7 +1774,7 @@ mod baseline_behaviour {
                 faction_id: sim.player_faction_id,
                 kind: JobKind::Stockpile,
                 progress: JobProgress::Stockpile {
-                    good: Good::Wood,
+                    resource_id: Good::Wood.into(),
                     deposited: 0,
                     target: 8,
                 },
@@ -1902,7 +1902,7 @@ mod baseline_behaviour {
                 faction_id: sim.player_faction_id,
                 kind: JobKind::Stockpile,
                 progress: JobProgress::Stockpile {
-                    good: Good::Wood,
+                    resource_id: Good::Wood.into(),
                     deposited: 0,
                     target: 8,
                 },
@@ -2016,7 +2016,7 @@ mod baseline_behaviour {
                 faction_id: sim.player_faction_id,
                 kind: JobKind::Stockpile,
                 progress: JobProgress::Stockpile {
-                    good: Good::Wood,
+                    resource_id: Good::Wood.into(),
                     deposited: 0,
                     target: 8,
                 },
@@ -2197,7 +2197,7 @@ mod baseline_behaviour {
                 faction_id: sim.player_faction_id,
                 kind: JobKind::Stockpile,
                 progress: JobProgress::Stockpile {
-                    good: Good::Fruit,
+                    resource_id: Good::Fruit.into(),
                     deposited: 0,
                     target: 5,
                 },

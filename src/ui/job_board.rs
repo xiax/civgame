@@ -3,7 +3,6 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::simulation::crafting::craft_recipes;
 use crate::simulation::faction::{FactionRegistry, PlayerFaction};
-use crate::economy::goods::Good;
 use crate::simulation::jobs::{
     JobBoard, JobBoardCommand, JobKind, JobPosting, JobProgress, JobSource, TileAabb,
     PLAYER_PRIORITY,
@@ -75,11 +74,16 @@ pub fn job_board_panel_system(
                 let mut workers_by_bucket: [Vec<Entity>; 7] = Default::default();
                 for p in postings {
                     let i = match (&p.kind, &p.progress) {
-                        (JobKind::Stockpile, JobProgress::Stockpile { good, .. }) => match good {
-                            Good::Wood => 1,
-                            Good::Stone => 2,
-                            _ => 0,
-                        },
+                        (JobKind::Stockpile, JobProgress::Stockpile { resource_id, .. }) => {
+                            use crate::economy::core_ids;
+                            if Some(*resource_id) == core_ids::Wood.get().copied() {
+                                1
+                            } else if Some(*resource_id) == core_ids::Stone.get().copied() {
+                                2
+                            } else {
+                                0
+                            }
+                        }
                         (JobKind::Stockpile, _) => 0,
                         (JobKind::Haul, _) => 3,
                         (JobKind::Farm, _) => 4,
@@ -363,16 +367,26 @@ fn progress_label(p: &JobProgress) -> String {
             format!("Calories {}/{}", deposited, target)
         }
         JobProgress::Stockpile {
-            good,
+            resource_id,
             deposited,
             target,
-        } => format!("Stockpile {:?} {}/{}", good, deposited, target),
+        } => format!(
+            "Stockpile {} {}/{}",
+            crate::economy::core_ids::display_name(*resource_id),
+            deposited,
+            target
+        ),
         JobProgress::Haul {
-            good,
+            resource_id,
             delivered,
             target,
             ..
-        } => format!("Haul {:?} {}/{}", good, delivered, target),
+        } => format!(
+            "Haul {} {}/{}",
+            crate::economy::core_ids::display_name(*resource_id),
+            delivered,
+            target
+        ),
         JobProgress::Planting {
             planted, target, ..
         } => format!("Tiles planted {}/{}", planted, target),
