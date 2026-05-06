@@ -1,5 +1,4 @@
 use super::core_ids;
-use super::goods::Good;
 use super::item::Item;
 use super::mode::EconomicMode;
 use super::resource_catalog::ResourceId;
@@ -30,31 +29,32 @@ const DEFAULT_PRICE_FLOOR: f32 = 0.1;
 
 impl Default for Market {
     fn default() -> Self {
-        // Seed legacy (Good, price, ceiling) tuples; everything else defaults
-        // to floor=0.1, ceiling=large, stock=0.
-        const SEED_PRICES: &[(Good, f32, f32)] = &[
-            (Good::Fruit, 1.0, 50.0),
-            (Good::Meat, 1.2, 50.0),
-            (Good::Grain, 0.8, 50.0),
-            (Good::Wood, 0.8, 20.0),
-            (Good::Stone, 0.5, 10.0),
-            (Good::Tools, 2.0, 100.0),
-            (Good::Cloth, 1.5, 50.0),
-            (Good::Coal, 1.2, 30.0),
-            (Good::Iron, 1.8, 80.0),
-            (Good::Luxury, 5.0, 200.0),
-            (Good::GrainSeed, 0.5, 5.0),
-            (Good::Weapon, 3.0, 150.0),
-            (Good::Armor, 4.0, 180.0),
-            (Good::Shield, 2.5, 100.0),
-            (Good::Skin, 0.7, 20.0),
-            (Good::Copper, 2.0, 100.0),
-            (Good::Tin, 2.5, 120.0),
-            (Good::Gold, 25.0, 1000.0),
-            (Good::Silver, 10.0, 400.0),
-            (Good::BerrySeed, 0.4, 5.0),
-            (Good::ClayTablet, 3.0, 80.0),
-            (Good::Book, 8.0, 200.0),
+        // Seed (resource_id_accessor, base_price, ceiling) tuples for the
+        // 22 legacy goods; everything else defaults to floor=0.1,
+        // ceiling=large, stock=0 on first trade.
+        let seed_prices: [(fn() -> ResourceId, f32, f32); 22] = [
+            (core_ids::fruit, 1.0, 50.0),
+            (core_ids::meat, 1.2, 50.0),
+            (core_ids::grain, 0.8, 50.0),
+            (core_ids::wood, 0.8, 20.0),
+            (core_ids::stone, 0.5, 10.0),
+            (core_ids::tools, 2.0, 100.0),
+            (core_ids::cloth, 1.5, 50.0),
+            (core_ids::coal, 1.2, 30.0),
+            (core_ids::iron, 1.8, 80.0),
+            (core_ids::luxury, 5.0, 200.0),
+            (core_ids::grain_seed, 0.5, 5.0),
+            (core_ids::weapon, 3.0, 150.0),
+            (core_ids::armor, 4.0, 180.0),
+            (core_ids::shield, 2.5, 100.0),
+            (core_ids::skin, 0.7, 20.0),
+            (core_ids::copper, 2.0, 100.0),
+            (core_ids::tin, 2.5, 120.0),
+            (core_ids::gold, 25.0, 1000.0),
+            (core_ids::silver, 10.0, 400.0),
+            (core_ids::berry_seed, 0.4, 5.0),
+            (core_ids::clay_tablet, 3.0, 80.0),
+            (core_ids::book, 8.0, 200.0),
         ];
 
         let mut prices = AHashMap::new();
@@ -62,13 +62,13 @@ impl Default for Market {
         let mut price_ceiling = AHashMap::new();
         let mut market_stock = AHashMap::new();
 
-        for (good, base_price, ceiling) in SEED_PRICES {
-            let id = core_ids::good_to_resource_id(*good);
-            prices.insert(id, *base_price);
+        for &(get_id, base_price, ceiling) in &seed_prices {
+            let id = get_id();
+            prices.insert(id, base_price);
             price_floor.insert(id, DEFAULT_PRICE_FLOOR);
-            price_ceiling.insert(id, *ceiling);
+            price_ceiling.insert(id, ceiling);
         }
-        market_stock.insert(core_ids::good_to_resource_id(Good::Tools), 50.0);
+        market_stock.insert(core_ids::tools(), 50.0);
 
         Self {
             prices,
@@ -231,9 +231,9 @@ pub fn price_update_system(mut market: ResMut<Market>, mode: Res<EconomicMode>) 
         return;
     }
     // Background Food demand to prevent price collapse when all agents are fed
-    market.add_demand(*core_ids::Fruit.get().unwrap(), 2.0);
-    market.add_demand(*core_ids::Meat.get().unwrap(), 1.0);
-    market.add_demand(*core_ids::Grain.get().unwrap(), 2.0);
+    market.add_demand(core_ids::fruit(), 2.0);
+    market.add_demand(core_ids::meat(), 1.0);
+    market.add_demand(core_ids::grain(), 2.0);
     market.update_prices();
     market.supply.clear();
     market.demand.clear();
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn price_rises_when_demand_exceeds_supply() {
         let mut m = Market::default();
-        let fruit: ResourceId = Good::Fruit.into();
+        let fruit = core_ids::fruit();
         m.add_supply(fruit, 10.0);
         m.add_demand(fruit, 100.0);
         let old_price = m.price_of(fruit);

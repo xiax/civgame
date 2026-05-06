@@ -503,8 +503,8 @@ pub fn goal_update_system(
                 // Use anticipatory material_targets (and current blueprint
                 // demand baked in via resource_demand) to pick the highest
                 // deficit material.
-                let wood_id = *crate::economy::core_ids::Wood.get().unwrap();
-                let stone_id = *crate::economy::core_ids::Stone.get().unwrap();
+                let wood_id = crate::economy::core_ids::wood();
+                let stone_id = crate::economy::core_ids::stone();
                 let wood_target = faction
                     .material_target_of(wood_id)
                     .max(faction.demand_of(wood_id));
@@ -596,11 +596,11 @@ fn should_craft(registry: &FactionRegistry, faction_id: u32, needs: &Needs) -> b
     }
     use crate::economy::core_ids;
     let crafted_total: u32 = [
-        *core_ids::Tools.get().unwrap(),
-        *core_ids::Weapon.get().unwrap(),
-        *core_ids::Armor.get().unwrap(),
-        *core_ids::Shield.get().unwrap(),
-        *core_ids::Cloth.get().unwrap(),
+        core_ids::tools(),
+        core_ids::weapon(),
+        core_ids::armor(),
+        core_ids::shield(),
+        core_ids::cloth(),
     ]
     .iter()
     .map(|id| faction.storage.stock_of(*id))

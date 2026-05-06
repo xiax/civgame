@@ -63,29 +63,29 @@ pub fn build_state_vec(
     // 6-10: inventory has (Food, Wood, Stone, GrainSeed, Coal)
     use crate::economy::core_ids;
     s[6] = if agent.total_food() > 0 { 1.0 } else { 0.0 };
-    s[7] = if agent.quantity_of_resource(*core_ids::Wood.get().unwrap()) > 0 {
+    s[7] = if agent.quantity_of_resource(core_ids::wood()) > 0 {
         1.0
     } else {
         0.0
     };
-    s[8] = if agent.quantity_of_resource(*core_ids::Stone.get().unwrap()) > 0 {
+    s[8] = if agent.quantity_of_resource(core_ids::stone()) > 0 {
         1.0
     } else {
         0.0
     };
     s[SI_HAS_GRAIN_SEED] =
-        if agent.quantity_of_resource(*core_ids::GrainSeed.get().unwrap()) > 0 {
+        if agent.quantity_of_resource(core_ids::grain_seed()) > 0 {
             1.0
         } else {
             0.0
         };
     s[SI_HAS_BERRY_SEED] =
-        if agent.quantity_of_resource(*core_ids::BerrySeed.get().unwrap()) > 0 {
+        if agent.quantity_of_resource(core_ids::berry_seed()) > 0 {
             1.0
         } else {
             0.0
         };
-    s[10] = if agent.quantity_of_resource(*core_ids::Coal.get().unwrap()) > 0 {
+    s[10] = if agent.quantity_of_resource(core_ids::coal()) > 0 {
         1.0
     } else {
         0.0
@@ -152,10 +152,10 @@ pub fn build_state_vec(
     // DeliverFromStorageToCraftOrder).
     if let Some(st) = storage {
         s[SI_STORAGE_FOOD] = (st.food_total() / STORAGE_SATURATE).clamp(0.0, 1.0);
-        s[SI_STORAGE_WOOD] = (st.stock_of(*core_ids::Wood.get().unwrap()) as f32
+        s[SI_STORAGE_WOOD] = (st.stock_of(core_ids::wood()) as f32
             / STORAGE_SATURATE)
             .clamp(0.0, 1.0);
-        s[SI_STORAGE_STONE] = (st.stock_of(*core_ids::Stone.get().unwrap()) as f32
+        s[SI_STORAGE_STONE] = (st.stock_of(core_ids::stone()) as f32
             / STORAGE_SATURATE)
             .clamp(0.0, 1.0);
         s[SI_STORAGE_GRAIN_SEED] = (st.grain_seed_total() as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
@@ -331,7 +331,7 @@ pub fn count_visible_ground_wood(
 ) -> u8 {
     let r = VISIBILITY_RADIUS;
     let r2 = r * r;
-    let wood_id = *crate::economy::core_ids::Wood.get().unwrap();
+    let wood_id = crate::economy::core_ids::wood();
     let mut n: u8 = 0;
     for dy in -r..=r {
         for dx in -r..=r {
@@ -363,7 +363,7 @@ pub fn count_visible_ground_stone(
 ) -> u8 {
     let r = VISIBILITY_RADIUS;
     let r2 = r * r;
-    let stone_id = *crate::economy::core_ids::Stone.get().unwrap();
+    let stone_id = crate::economy::core_ids::stone();
     let mut n: u8 = 0;
     for dy in -r..=r {
         for dx in -r..=r {

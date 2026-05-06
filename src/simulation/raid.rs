@@ -175,7 +175,7 @@ pub fn raid_execution_system(
         // Steal food from enemy storage tiles
         if registry.food_stock(raid_target_faction) >= 1.0 {
             food_steals.push(raid_target_faction);
-            agent.add_resource(*crate::economy::core_ids::Fruit.get().unwrap(), 1);
+            agent.add_resource(crate::economy::core_ids::fruit(), 1);
         }
 
         // Find a defender (enemy faction member) nearby to attack

@@ -76,20 +76,20 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
     // below are safe.
     let _ = core_ids::catalog();
 
-    let stone = *core_ids::Stone.get().unwrap();
-    let wood = *core_ids::Wood.get().unwrap();
-    let iron = *core_ids::Iron.get().unwrap();
-    let coal = *core_ids::Coal.get().unwrap();
-    let grain = *core_ids::Grain.get().unwrap();
-    let skin = *core_ids::Skin.get().unwrap();
-    let cloth = *core_ids::Cloth.get().unwrap();
-    let tools = *core_ids::Tools.get().unwrap();
-    let weapon = *core_ids::Weapon.get().unwrap();
-    let shield = *core_ids::Shield.get().unwrap();
-    let armor = *core_ids::Armor.get().unwrap();
-    let luxury = *core_ids::Luxury.get().unwrap();
-    let clay_tablet = *core_ids::ClayTablet.get().unwrap();
-    let book = *core_ids::Book.get().unwrap();
+    let stone = core_ids::stone();
+    let wood = core_ids::wood();
+    let iron = core_ids::iron();
+    let coal = core_ids::coal();
+    let grain = core_ids::grain();
+    let skin = core_ids::skin();
+    let cloth = core_ids::cloth();
+    let tools = core_ids::tools();
+    let weapon = core_ids::weapon();
+    let shield = core_ids::shield();
+    let armor = core_ids::armor();
+    let luxury = core_ids::luxury();
+    let clay_tablet = core_ids::clay_tablet();
+    let book = core_ids::book();
 
     vec![
         // 0
@@ -890,11 +890,11 @@ mod tests {
         assert_eq!(
             stone_tools.inputs,
             vec![
-                (*core_ids::Stone.get().unwrap(), 2),
-                (*core_ids::Wood.get().unwrap(), 1),
+                (core_ids::stone(), 2),
+                (core_ids::wood(), 1),
             ]
         );
-        assert_eq!(stone_tools.output_resource, *core_ids::Tools.get().unwrap());
+        assert_eq!(stone_tools.output_resource, core_ids::tools());
         assert_eq!(stone_tools.output_qty, 1);
 
         // Book (recipe 11): Cloth×2 + Skin×1 → Book×1, gated on writing.
@@ -903,11 +903,11 @@ mod tests {
         assert_eq!(
             book.inputs,
             vec![
-                (*core_ids::Cloth.get().unwrap(), 2),
-                (*core_ids::Skin.get().unwrap(), 1),
+                (core_ids::cloth(), 2),
+                (core_ids::skin(), 1),
             ]
         );
-        assert_eq!(book.output_resource, *core_ids::Book.get().unwrap());
+        assert_eq!(book.output_resource, core_ids::book());
     }
 
     /// Pin: `output_good_legacy()` round-trips every recipe through the

@@ -563,7 +563,7 @@ pub fn spawn_chunk_loose_rocks(commands: &mut Commands, chunk_map: &ChunkMap, co
             commands.spawn((
                 GroundItem {
                     item: Item::new_commodity(
-                        *crate::economy::core_ids::Stone.get().unwrap(),
+                        crate::economy::core_ids::stone(),
                     ),
                     qty,
                 },

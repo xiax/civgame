@@ -70,8 +70,8 @@ pub fn species_yield(
     species: CorpseSpecies,
 ) -> [(crate::economy::resource_catalog::ResourceId, u32); 2] {
     use crate::economy::core_ids;
-    let meat = *core_ids::Meat.get().unwrap();
-    let skin = *core_ids::Skin.get().unwrap();
+    let meat = core_ids::meat();
+    let skin = core_ids::skin();
     match species {
         CorpseSpecies::Wolf => [(meat, 3), (skin, 1)],
         CorpseSpecies::Deer => [(meat, 5), (skin, 2)],

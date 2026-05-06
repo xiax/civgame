@@ -522,9 +522,9 @@ enum BuildRecipeIdx {
 fn build_recipes_table() -> Vec<BuildRecipe> {
     use crate::economy::core_ids;
     let _ = core_ids::catalog();
-    let wood = *core_ids::Wood.get().unwrap();
-    let stone = *core_ids::Stone.get().unwrap();
-    let grain = *core_ids::Grain.get().unwrap();
+    let wood = core_ids::wood();
+    let stone = core_ids::stone();
+    let grain = core_ids::grain();
 
     vec![
         BuildRecipe {

@@ -68,7 +68,7 @@ pub fn market_buy_system(
         // Buy Food when hungry and have no food
         if needs.hunger > HUNGER_BUY_THRESHOLD as f32 && agent.total_food() == 0 {
             let (bought_item, qty) = market.try_buy_item(
-                *crate::economy::core_ids::Fruit.get().unwrap(),
+                crate::economy::core_ids::fruit(),
                 1,
                 &mut agent.currency,
             );
@@ -84,7 +84,7 @@ pub fn market_buy_system(
 
         // Buy Tools when affordable and not already owning one
         if !agent.has_tool() {
-            let tools_id = *crate::economy::core_ids::Tools.get().unwrap();
+            let tools_id = crate::economy::core_ids::tools();
             let tool_price = market.price_of(tools_id);
             if agent.currency >= tool_price * TOOL_BUY_CURRENCY_FACTOR {
                 let (bought_item, qty) = market.try_buy_item(tools_id, 1, &mut agent.currency);

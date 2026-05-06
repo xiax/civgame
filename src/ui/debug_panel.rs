@@ -3,7 +3,6 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::pathfinding::hotspots::HotspotFlowFields;
@@ -289,23 +288,24 @@ pub fn debug_panel_system(
 
                     // Give Item
                     ui.label(egui::RichText::new("Give Item").strong());
-                    let goods = Good::all();
+                    let catalog = crate::economy::core_ids::catalog();
+                    let resources: Vec<crate::economy::resource_catalog::ResourceId> =
+                        catalog.iter().map(|(id, _)| id).collect();
+                    if give_idx >= resources.len() {
+                        give_idx = 0;
+                    }
                     ui.horizontal(|ui| {
-                        let dn = |g: Good| {
-                            crate::economy::core_ids::display_name(
-                                crate::economy::core_ids::good_to_resource_id(g),
-                            )
-                        };
+                        let dn = crate::economy::core_ids::display_name;
                         egui::ComboBox::from_id_salt("give_good")
-                            .selected_text(dn(goods[give_idx]))
+                            .selected_text(dn(resources[give_idx]))
                             .show_ui(ui, |ui| {
-                                for (i, good) in goods.iter().enumerate() {
-                                    ui.selectable_value(&mut give_idx, i, dn(*good));
+                                for (i, &id) in resources.iter().enumerate() {
+                                    ui.selectable_value(&mut give_idx, i, dn(id));
                                 }
                             });
                         ui.add(egui::DragValue::new(&mut give_qty).range(1..=9999u32).prefix("×"));
                         if ui.button("Give").clicked() {
-                            agent.add_good(goods[give_idx], give_qty);
+                            agent.add_resource(resources[give_idx], give_qty);
                         }
                     });
 

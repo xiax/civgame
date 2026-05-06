@@ -208,7 +208,7 @@ pub fn production_system(
         if task == TaskKind::PlayThrow as u16 {
             if ai.work_progress >= TICKS_PLAY_THROW {
                 ai.work_progress = 0;
-                let stone_id = *crate::economy::core_ids::Stone.get().unwrap();
+                let stone_id = crate::economy::core_ids::stone();
                 if agent.quantity_of_resource(stone_id) > 0 {
                     agent.remove_resource(stone_id, 1);
                     skills.gain_xp(SkillKind::Combat, 2);
@@ -974,7 +974,7 @@ pub fn eat_task_system(
             }
         }
         if fruits_consumed > 0 {
-            let berry_seed = *crate::economy::core_ids::BerrySeed.get().unwrap();
+            let berry_seed = crate::economy::core_ids::berry_seed();
             for _ in 0..fruits_consumed {
                 agent.add_resource(berry_seed, 1);
             }

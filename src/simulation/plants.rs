@@ -120,10 +120,10 @@ impl PlantKind {
     pub fn harvest_yield(self, has_tool: bool) -> (ResourceId, u32) {
         use crate::economy::core_ids;
         match self {
-            PlantKind::Grain => (*core_ids::Grain.get().expect("core_ids not init"), 5),
-            PlantKind::BerryBush => (*core_ids::Fruit.get().expect("core_ids not init"), 3),
+            PlantKind::Grain => (core_ids::grain(), 5),
+            PlantKind::BerryBush => (core_ids::fruit(), 3),
             PlantKind::Tree => (
-                *core_ids::Wood.get().expect("core_ids not init"),
+                core_ids::wood(),
                 if has_tool { 3 } else { 1 },
             ),
         }
@@ -136,9 +136,9 @@ impl PlantKind {
     pub fn harvest_extra_yields(self) -> Vec<(ResourceId, u32)> {
         use crate::economy::core_ids;
         match self {
-            PlantKind::Grain => vec![(*core_ids::GrainSeed.get().expect("core_ids not init"), 1)],
+            PlantKind::Grain => vec![(core_ids::grain_seed(), 1)],
             PlantKind::BerryBush => {
-                vec![(*core_ids::BerrySeed.get().expect("core_ids not init"), 1)]
+                vec![(core_ids::berry_seed(), 1)]
             }
             _ => Vec::new(),
         }
@@ -150,11 +150,11 @@ impl PlantKind {
         match self {
             PlantKind::Grain => Vec::new(),
             PlantKind::BerryBush => {
-                vec![(*core_ids::BerrySeed.get().expect("core_ids not init"), 1)]
+                vec![(core_ids::berry_seed(), 1)]
             }
             PlantKind::Tree => {
                 let qty = if has_tool { 2 } else { 1 };
-                vec![(*core_ids::Wood.get().expect("core_ids not init"), qty)]
+                vec![(core_ids::wood(), qty)]
             }
         }
     }
@@ -344,7 +344,7 @@ pub fn seed_scatter_system(
                     commands.spawn((
                         GroundItem {
                             item: Item::new_commodity(
-                                *crate::economy::core_ids::Wood.get().unwrap(),
+                                crate::economy::core_ids::wood(),
                             ),
                             qty: 1,
                         },
@@ -483,7 +483,7 @@ pub fn deer_graze_system(
                 commands.spawn((
                     GroundItem {
                         item: Item::new_commodity(
-                            *crate::economy::core_ids::BerrySeed.get().unwrap(),
+                            crate::economy::core_ids::berry_seed(),
                         ),
                         qty: 1,
                     },

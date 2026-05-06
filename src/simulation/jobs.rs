@@ -535,8 +535,8 @@ pub fn chief_job_posting_system(
         //     across active blueprints)`. Posted whenever current storage is
         //     below target. One posting per (faction, good).
         if faction.member_count > 0 {
-            let wood_id = *crate::economy::core_ids::Wood.get().unwrap();
-            let stone_id = *crate::economy::core_ids::Stone.get().unwrap();
+            let wood_id = crate::economy::core_ids::wood();
+            let stone_id = crate::economy::core_ids::stone();
             for &target_rid in &[wood_id, stone_id] {
                 // Sum unmet blueprint demand for this resource (reactive component).
                 let mut bp_demand: u32 = 0;
@@ -684,7 +684,7 @@ pub fn chief_job_posting_system(
                 .any(|p| matches!(p.kind, JobKind::Farm));
             let grain = faction
                 .storage
-                .stock_of(*crate::economy::core_ids::Grain.get().unwrap());
+                .stock_of(crate::economy::core_ids::grain());
             let seed = faction.storage.seed_total();
             // Post farm if grain is low and seeds are available.
             if !already_farm && grain < faction.member_count * 4 && seed > 0 {

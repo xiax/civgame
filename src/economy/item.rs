@@ -211,9 +211,9 @@ fn compute_combat_stats(
     quality: ItemQuality,
 ) -> (Option<WeaponStats>, Option<ArmorStats>) {
     use super::core_ids;
-    let weapon_id = *core_ids::Weapon.get().expect("core_ids not init");
-    let shield_id = *core_ids::Shield.get().expect("core_ids not init");
-    let armor_id = *core_ids::Armor.get().expect("core_ids not init");
+    let weapon_id = core_ids::weapon();
+    let shield_id = core_ids::shield();
+    let armor_id = core_ids::armor();
 
     let m = material.multiplier();
     let q = quality.multiplier();

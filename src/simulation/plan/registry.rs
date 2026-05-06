@@ -16,7 +16,6 @@ use super::{
     SI_STORAGE_WOOD, SI_VIS_GROUND_FOOD, SI_VIS_PLANT_FOOD, SI_VIS_TREE,
     SI_WILLPOWER_DISTRESS,
 };
-use crate::economy::goods::Good;
 use crate::simulation::items::EquipmentSlot;
 use crate::simulation::needs::EAT_TRIGGER_HUNGER;
 use crate::simulation::person::Profession;
@@ -218,7 +217,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: StepId(4),
             task: TaskKind::Planter,
             target: StepTarget::NearestTile(GRASS_TILES),
-            preconditions: StepPreconditions::needs_good(Good::GrainSeed, 1),
+            preconditions: StepPreconditions::needs_good(crate::economy::core_ids::grain_seed(), 1),
             reward_scale: 0.2,
             plant_filter: None,
             withdraw_filter: None,
@@ -228,7 +227,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: StepId(5),
             task: TaskKind::Hunter,
             target: StepTarget::HuntPrey,
-            preconditions: StepPreconditions::needs_good(Good::Weapon, 1),
+            preconditions: StepPreconditions::needs_good(crate::economy::core_ids::weapon(), 1),
             reward_scale: 0.4,
             plant_filter: None,
             withdraw_filter: None,
@@ -309,7 +308,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 13: CollectSkin — pick up Skin from ground (after hunting)
             id: StepId(13),
             task: TaskKind::Scavenge,
-            target: StepTarget::NearestItem(Good::Skin.into()),
+            target: StepTarget::NearestItem(crate::economy::core_ids::skin()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
@@ -522,13 +521,13 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 33: WithdrawGrainSeed — pull one GrainSeed from faction storage.
             id: StepId(33),
             task: TaskKind::WithdrawGood,
-            target: StepTarget::NearestFactionStorageWithGood(Good::GrainSeed.into()),
+            target: StepTarget::NearestFactionStorageWithGood(crate::economy::core_ids::grain_seed()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.2,
             plant_filter: None,
             withdraw_filter: Some(
                 crate::simulation::typed_task::WithdrawGoodFilter::Specific(
-                    Good::GrainSeed.into(),
+                    crate::economy::core_ids::grain_seed(),
                 ),
             ),
         },
@@ -537,12 +536,12 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // the agent can throw it as recreation in step 37.
             id: StepId(34),
             task: TaskKind::WithdrawGood,
-            target: StepTarget::NearestFactionStorageWithGood(Good::Stone.into()),
+            target: StepTarget::NearestFactionStorageWithGood(crate::economy::core_ids::stone()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.2,
             plant_filter: None,
             withdraw_filter: Some(
-                crate::simulation::typed_task::WithdrawGoodFilter::Specific(Good::Stone.into()),
+                crate::simulation::typed_task::WithdrawGoodFilter::Specific(crate::economy::core_ids::stone()),
             ),
         },
         StepDef {
@@ -565,7 +564,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: StepId(36),
             task: TaskKind::PlayPlant,
             target: StepTarget::NearestTile(GRASS_TILES),
-            preconditions: StepPreconditions::needs_good(Good::GrainSeed, 1),
+            preconditions: StepPreconditions::needs_good(crate::economy::core_ids::grain_seed(), 1),
             reward_scale: 0.6,
             plant_filter: None,
             withdraw_filter: None,
@@ -578,7 +577,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: StepId(37),
             task: TaskKind::PlayThrow,
             target: StepTarget::SelfPosition,
-            preconditions: StepPreconditions::needs_good(Good::Stone, 1),
+            preconditions: StepPreconditions::needs_good(crate::economy::core_ids::stone(), 1),
             reward_scale: 0.6,
             plant_filter: None,
             withdraw_filter: None,
@@ -672,7 +671,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // tree harvesting (`harvest_ground_drops`) or earlier spills.
             id: StepId(44),
             task: TaskKind::Scavenge,
-            target: StepTarget::NearestItem(Good::Wood.into()),
+            target: StepTarget::NearestItem(crate::economy::core_ids::wood()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
@@ -682,7 +681,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 45: CollectStone — pick up loose Stone GroundItems on the world.
             id: StepId(45),
             task: TaskKind::Scavenge,
-            target: StepTarget::NearestItem(Good::Stone.into()),
+            target: StepTarget::NearestItem(crate::economy::core_ids::stone()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
@@ -768,13 +767,13 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // precondition ensures armed hunters skip this entirely.
             id: StepId(52),
             task: TaskKind::WithdrawGood,
-            target: StepTarget::NearestFactionStorageWithGood(Good::Weapon.into()),
-            preconditions: StepPreconditions::forbids(Good::Weapon),
+            target: StepTarget::NearestFactionStorageWithGood(crate::economy::core_ids::weapon()),
+            preconditions: StepPreconditions::forbids(crate::economy::core_ids::weapon()),
             reward_scale: 0.4,
             plant_filter: None,
             withdraw_filter: Some(
                 crate::simulation::typed_task::WithdrawGoodFilter::Specific(
-                    Good::Weapon.into(),
+                    crate::economy::core_ids::weapon(),
                 ),
             ),
         },
@@ -824,9 +823,9 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             task: TaskKind::Equip,
             target: StepTarget::EquipItem {
                 slot: EquipmentSlot::MainHand,
-                resource_id: Good::Weapon.into(),
+                resource_id: crate::economy::core_ids::weapon(),
             },
-            preconditions: StepPreconditions::needs_good(Good::Weapon, 1),
+            preconditions: StepPreconditions::needs_good(crate::economy::core_ids::weapon(), 1),
             reward_scale: 0.5,
             plant_filter: None,
             withdraw_filter: None,
@@ -879,13 +878,13 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 60: WithdrawBerrySeed — pull one BerrySeed from faction storage.
             id: StepId(60),
             task: TaskKind::WithdrawGood,
-            target: StepTarget::NearestFactionStorageWithGood(Good::BerrySeed.into()),
+            target: StepTarget::NearestFactionStorageWithGood(crate::economy::core_ids::berry_seed()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.2,
             plant_filter: None,
             withdraw_filter: Some(
                 crate::simulation::typed_task::WithdrawGoodFilter::Specific(
-                    Good::BerrySeed.into(),
+                    crate::economy::core_ids::berry_seed(),
                 ),
             ),
         },
@@ -894,7 +893,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: StepId(61),
             task: TaskKind::Planter,
             target: StepTarget::NearestTile(GRASS_TILES),
-            preconditions: StepPreconditions::needs_good(Good::BerrySeed, 1),
+            preconditions: StepPreconditions::needs_good(crate::economy::core_ids::berry_seed(), 1),
             reward_scale: 0.2,
             plant_filter: None,
             withdraw_filter: None,
@@ -906,7 +905,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             id: StepId(62),
             task: TaskKind::PlayPlant,
             target: StepTarget::NearestTile(GRASS_TILES),
-            preconditions: StepPreconditions::needs_good(Good::BerrySeed, 1),
+            preconditions: StepPreconditions::needs_good(crate::economy::core_ids::berry_seed(), 1),
             reward_scale: 0.6,
             plant_filter: None,
             withdraw_filter: None,

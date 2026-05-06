@@ -29,7 +29,7 @@ const TERRAFORM_XP: u32 = 5;
 /// Resource consumed when filling a tile back up. Stone today; resolved
 /// from the catalog at first use because `ResourceId` isn't const.
 fn terraform_fill_resource() -> crate::economy::resource_catalog::ResourceId {
-    *crate::economy::core_ids::Stone.get().unwrap()
+    crate::economy::core_ids::stone()
 }
 
 /// Active terraform reservation on a single tile. The agent levels this

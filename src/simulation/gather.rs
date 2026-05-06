@@ -307,7 +307,7 @@ pub fn gather_system(
             });
 
             let (yield_id, base_qty) = kind.harvest_yield(has_tool);
-            let wood_id = *core_ids::Wood.get().expect("core_ids not init");
+            let wood_id = core_ids::wood();
             let is_edible = core_ids::catalog()
                 .get(yield_id)
                 .and_then(|d| d.edible_calories)

@@ -91,10 +91,23 @@ pub fn resource_id_to_good(id: ResourceId) -> Option<Good> {
 }
 
 macro_rules! core_ids {
-    ($( $name:ident => $key:literal ),+ $(,)?) => {
+    ($( $name:ident => $key:literal => $snake:ident ),+ $(,)?) => {
         $(
             #[allow(non_upper_case_globals)]
             pub static $name: OnceLock<ResourceId> = OnceLock::new();
+
+            /// Lazy snake-case accessor. First call lazy-loads the catalog
+            /// and primes every core_ids `OnceLock`; subsequent reads are a
+            /// single relaxed atomic load. Use this anywhere code wants
+            /// "the ResourceId for <name>" — replaces the legacy
+            /// `Good::<Name>.into()` pattern.
+            pub fn $snake() -> ResourceId {
+                let _ = catalog();
+                *$name.get().expect(concat!(
+                    "core_ids::", stringify!($snake),
+                    "() read before init_core_ids() ran"
+                ))
+            }
         )+
 
         /// Resolve every legacy `Good`'s `ResourceId` from the catalog and
@@ -137,10 +150,6 @@ macro_rules! core_ids {
         /// here) panic with "read before init_core_ids ran" when used
         /// from non-fixture tests like `simulation::carry::tests`.
         pub fn good_to_resource_id(good: Good) -> ResourceId {
-            // The side effect we want: `catalog()` lazy-init populates
-            // every per-Good `OnceLock` before we read it below. Calling
-            // `catalog()` is cheap (a relaxed atomic load) once init has
-            // run, so the production hot path pays nothing.
             let _ = catalog();
             match good {
                 $( Good::$name => *$name.get().expect(concat!(
@@ -153,26 +162,26 @@ macro_rules! core_ids {
 }
 
 core_ids! {
-    Fruit => "fruit",
-    Meat => "meat",
-    Grain => "grain",
-    Wood => "wood",
-    Stone => "stone",
-    Tools => "tools",
-    Cloth => "cloth",
-    Coal => "coal",
-    Iron => "iron",
-    Luxury => "luxury",
-    GrainSeed => "grain_seed",
-    Weapon => "weapon",
-    Armor => "armor",
-    Shield => "shield",
-    Skin => "skin",
-    Copper => "copper",
-    Tin => "tin",
-    Gold => "gold",
-    Silver => "silver",
-    BerrySeed => "berry_seed",
-    ClayTablet => "clay_tablet",
-    Book => "book",
+    Fruit => "fruit" => fruit,
+    Meat => "meat" => meat,
+    Grain => "grain" => grain,
+    Wood => "wood" => wood,
+    Stone => "stone" => stone,
+    Tools => "tools" => tools,
+    Cloth => "cloth" => cloth,
+    Coal => "coal" => coal,
+    Iron => "iron" => iron,
+    Luxury => "luxury" => luxury,
+    GrainSeed => "grain_seed" => grain_seed,
+    Weapon => "weapon" => weapon,
+    Armor => "armor" => armor,
+    Shield => "shield" => shield,
+    Skin => "skin" => skin,
+    Copper => "copper" => copper,
+    Tin => "tin" => tin,
+    Gold => "gold" => gold,
+    Silver => "silver" => silver,
+    BerrySeed => "berry_seed" => berry_seed,
+    ClayTablet => "clay_tablet" => clay_tablet,
+    Book => "book" => book,
 }

@@ -332,7 +332,7 @@ pub fn farm_pressure(faction: &FactionData) -> u8 {
     }
     let grain = faction
         .storage
-        .stock_of(*crate::economy::core_ids::Grain.get().unwrap());
+        .stock_of(crate::economy::core_ids::grain());
     let target = faction.member_count.saturating_mul(4);
     if grain >= target || target == 0 {
         return 0;
@@ -365,12 +365,12 @@ fn craftable_resources() -> &'static [crate::economy::resource_catalog::Resource
     IDS.get_or_init(|| {
         let _ = core_ids::catalog();
         [
-            *core_ids::Tools.get().unwrap(),
-            *core_ids::Weapon.get().unwrap(),
-            *core_ids::Cloth.get().unwrap(),
-            *core_ids::Luxury.get().unwrap(),
-            *core_ids::Shield.get().unwrap(),
-            *core_ids::Armor.get().unwrap(),
+            core_ids::tools(),
+            core_ids::weapon(),
+            core_ids::cloth(),
+            core_ids::luxury(),
+            core_ids::shield(),
+            core_ids::armor(),
         ]
     })
 }
@@ -513,9 +513,9 @@ pub fn compute_workforce_budget(
     };
     let stockpile_food_pressure = food;
     let stockpile_wood_pressure =
-        material_urgency(*crate::economy::core_ids::Wood.get().unwrap());
+        material_urgency(crate::economy::core_ids::wood());
     let stockpile_stone_pressure =
-        material_urgency(*crate::economy::core_ids::Stone.get().unwrap());
+        material_urgency(crate::economy::core_ids::stone());
 
     // Haul + Build urgency on the same 0..100 scale, saturating at modest
     // queue depths since beyond that the bottleneck is throughput not

@@ -1156,8 +1156,8 @@ pub fn drop_items_at_destination_system(
 
         // First: dump everything in hands. Hauling loads (Wood, Stone, Iron, ...) are
         // exactly what storage wants; food/tools that ended up in hands also go here.
-        let wood_id = *crate::economy::core_ids::Wood.get().unwrap();
-        let stone_id = *crate::economy::core_ids::Stone.get().unwrap();
+        let wood_id = crate::economy::core_ids::wood();
+        let stone_id = crate::economy::core_ids::stone();
         let mut hand_wood: u32 = 0;
         let mut hand_stone: u32 = 0;
         for stack in carrier.drop_all() {
@@ -1320,7 +1320,7 @@ pub fn drop_items_at_destination_system(
         }
 
         // Deposit recovered construction materials (Wood from deconstruction).
-        let wood_id = *crate::economy::core_ids::Wood.get().unwrap();
+        let wood_id = crate::economy::core_ids::wood();
         let wood_qty = agent.quantity_of_resource(wood_id);
         if wood_qty > 0 {
             agent.remove_resource(wood_id, wood_qty);
@@ -1625,15 +1625,15 @@ pub fn resource_demand_system(
 
     // Food demand from population size. Resolve core_ids upfront so we
     // pay one OnceLock read per attribute, not per faction.
-    let fruit = *crate::economy::core_ids::Fruit.get().unwrap();
-    let meat = *crate::economy::core_ids::Meat.get().unwrap();
-    let grain = *crate::economy::core_ids::Grain.get().unwrap();
-    let tools = *crate::economy::core_ids::Tools.get().unwrap();
-    let weapon = *crate::economy::core_ids::Weapon.get().unwrap();
-    let cloth = *crate::economy::core_ids::Cloth.get().unwrap();
-    let luxury = *crate::economy::core_ids::Luxury.get().unwrap();
-    let shield = *crate::economy::core_ids::Shield.get().unwrap();
-    let armor = *crate::economy::core_ids::Armor.get().unwrap();
+    let fruit = crate::economy::core_ids::fruit();
+    let meat = crate::economy::core_ids::meat();
+    let grain = crate::economy::core_ids::grain();
+    let tools = crate::economy::core_ids::tools();
+    let weapon = crate::economy::core_ids::weapon();
+    let cloth = crate::economy::core_ids::cloth();
+    let luxury = crate::economy::core_ids::luxury();
+    let shield = crate::economy::core_ids::shield();
+    let armor = crate::economy::core_ids::armor();
     for faction in registry.factions.values_mut() {
         let food_demand = faction.member_count * 10;
         faction.resource_demand.insert(fruit, food_demand);
@@ -1701,8 +1701,8 @@ pub fn update_material_targets_system(
             wood_target = wood_target.saturating_add(4);
         }
 
-        let wood_id = *crate::economy::core_ids::Wood.get().unwrap();
-        let stone_id = *crate::economy::core_ids::Stone.get().unwrap();
+        let wood_id = crate::economy::core_ids::wood();
+        let stone_id = crate::economy::core_ids::stone();
         faction.material_targets.insert(wood_id, wood_target);
         faction.material_targets.insert(stone_id, stone_target);
     }

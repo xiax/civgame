@@ -2,7 +2,6 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::command::CommandPools;
-use crate::economy::goods::Good;
 use crate::economy::market::Market;
 use crate::economy::mode::EconomicMode;
 
@@ -19,11 +18,11 @@ pub fn economy_panel_system(
             ui.label(format!("Mode: {}", mode.label()));
             ui.separator();
 
+            let catalog = crate::economy::core_ids::catalog();
             match *mode {
                 EconomicMode::Market | EconomicMode::Mixed => {
                     ui.label("Market Prices (Commodities):");
-                    for good in Good::all() {
-                        let id = crate::economy::core_ids::good_to_resource_id(good);
+                    for (id, _def) in catalog.iter() {
                         let price = market.price_of(id);
                         ui.label(format!(
                             "  {:6}: ${:.2}",
@@ -49,10 +48,13 @@ pub fn economy_panel_system(
                 }
                 EconomicMode::Command => {
                     ui.label("Command Stockpiles:");
-                    for good in Good::all() {
-                        let stock = pools.stockpile[good as usize];
-                        let quota = pools.quotas[good as usize];
-                        let id = crate::economy::core_ids::good_to_resource_id(good);
+                    for (id, _def) in catalog.iter() {
+                        let idx = id.0 as usize;
+                        if idx >= pools.stockpile.len() {
+                            continue;
+                        }
+                        let stock = pools.stockpile[idx];
+                        let quota = pools.quotas[idx];
                         ui.label(format!(
                             "  {:6}: {:.0} units  ({} workers)",
                             crate::economy::core_ids::display_name(id),
