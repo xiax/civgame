@@ -952,7 +952,7 @@ fn resolve_withdraw_for_faction_need(
                 }
             }
         }
-        stock.saturating_sub(reservations.get((tx, ty), good))
+        stock.saturating_sub(reservations.get((tx, ty), good.into()))
     };
 
     // 3. Find the nearest faction storage tile that holds at least one
@@ -2094,7 +2094,7 @@ pub fn plan_execution_system(
             // withdraw task didn't run its normal exit (plan preempted
             // mid-walk, drafted, etc.), release it now. The withdraw
             // executor handles the common path; this catches preemption.
-            if ai.reserved_good.is_some()
+            if ai.reserved_resource.is_some()
                 && ai.task_id != TaskKind::WithdrawMaterial as u16
             {
                 release_reservation(&storage_reservations, &mut ai);
@@ -2767,9 +2767,9 @@ pub fn plan_execution_system(
                             // resolved tile, so use it as the reservation
                             // key.
                             let reserved_tile = (target_tx, target_ty);
-                            storage_reservations.add(reserved_tile, good, qty as u32);
+                            storage_reservations.add(reserved_tile, good.into(), qty as u32);
                             ai.reserved_tile = reserved_tile;
-                            ai.reserved_good = Some(good);
+                            ai.reserved_resource = Some(good.into());
                             ai.reserved_qty = qty;
                         }
                     }

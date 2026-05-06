@@ -772,9 +772,9 @@ mod baseline_behaviour {
 
         let ai = person_ai(&sim.app, person);
         assert!(
-            ai.reserved_qty == 0 && ai.reserved_good.is_none(),
-            "idle agent leaked a storage reservation: good={:?}, qty={}",
-            ai.reserved_good,
+            ai.reserved_qty == 0 && ai.reserved_resource.is_none(),
+            "idle agent leaked a storage reservation: resource={:?}, qty={}",
+            ai.reserved_resource,
             ai.reserved_qty
         );
         assert!(

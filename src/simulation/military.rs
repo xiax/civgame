@@ -207,7 +207,7 @@ pub fn apply_muster_hunters_system(
         if *prof != Profession::Hunter || member.faction_id != player_faction.faction_id {
             continue;
         }
-        if ai.reserved_good.is_some() {
+        if ai.reserved_resource.is_some() {
             release_reservation(&reservations, &mut ai);
         }
         ai.state = AiState::Idle;

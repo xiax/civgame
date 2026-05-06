@@ -150,9 +150,9 @@ pub struct PersonAI {
     /// Tracked separately from `dest_tile` so we can release the reservation
     /// even after the agent has been retargeted.
     pub reserved_tile: (i32, i32),
-    /// Good promised to the storage tile via `StorageReservations`. `None`
-    /// means no reservation is currently active.
-    pub reserved_good: Option<crate::economy::goods::Good>,
+    /// Catalog `ResourceId` promised to the storage tile via
+    /// `StorageReservations`. `None` means no reservation is currently active.
+    pub reserved_resource: Option<crate::economy::resource_catalog::ResourceId>,
     /// Reserved quantity. The reservation is decremented by exactly this many
     /// units when the task ends (success, abort, or plan teardown), so the
     /// fields must be kept in sync with the actual `StorageReservations` map.
@@ -186,7 +186,7 @@ impl Default for PersonAI {
             current_z: 0,
             target_z: 0,
             reserved_tile: (0, 0),
-            reserved_good: None,
+            reserved_resource: None,
             reserved_qty: 0,
             active_method: None,
         }

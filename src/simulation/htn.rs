@@ -2777,7 +2777,7 @@ pub fn htn_acquire_good_dispatch_system(
                     }
                 }
             }
-            let reserved = storage_reservations.get((tx, ty), good);
+            let reserved = storage_reservations.get((tx, ty), good.into());
             let effective = tile_stock.saturating_sub(reserved);
             if effective == 0 {
                 continue;
@@ -2865,20 +2865,11 @@ pub fn htn_acquire_good_dispatch_system(
                 // Reserve the qty against the chosen tile so a parallel
                 // dispatch in the same tick sees a smaller effective stock.
                 // Mirrors `plan_execution_system`'s WithdrawMaterial dispatch
-                // site (`plan/mod.rs:2724`). `StorageReservations` and
-                // `PersonAI.reserved_good` still take legacy `Good`; reverse-
-                // resolve at the boundary until those APIs migrate.
-                let head_good = match crate::economy::core_ids::resource_id_to_good(head_resource) {
-                    Some(g) => g,
-                    None => {
-                        ai.active_method = None;
-                        continue;
-                    }
-                };
+                // site (`plan/mod.rs:2724`).
                 let reserved_tile = (storage_tile.0, storage_tile.1);
-                storage_reservations.add(reserved_tile, head_good, qty as u32);
+                storage_reservations.add(reserved_tile, head_resource, qty as u32);
                 ai.reserved_tile = reserved_tile;
-                ai.reserved_good = Some(head_good);
+                ai.reserved_resource = Some(head_resource);
                 ai.reserved_qty = qty;
                 aq.dispatch(Task::WithdrawMaterial { resource_id: head_resource, qty });
             }

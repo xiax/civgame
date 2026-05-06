@@ -14,6 +14,7 @@ use super::skills::{SkillKind, Skills};
 use super::tasks::TaskKind;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
+use crate::economy::resource_catalog::ResourceId;
 use crate::pathfinding::hotspots::{HotspotFlowFields, HotspotKind};
 use crate::simulation::technology::{
     tech_def, ActivityKind, Era, TechId, ACTIVITY_COUNT, CROP_CULTIVATION, HUNTING_SPEAR,
@@ -229,7 +230,7 @@ pub fn faction_hunter_assignment_system(
         } else if demote.contains(&entity) {
             *prof = Profession::None;
             if let Some(mut ai) = ai_opt {
-                if ai.reserved_good.is_some() {
+                if ai.reserved_resource.is_some() {
                     release_reservation(&reservations, &mut ai);
                 }
                 ai.state = AiState::Idle;
@@ -554,41 +555,41 @@ impl StorageTileMap {
 /// release) take the lock; critical sections are a single hashmap op each.
 #[derive(Resource, Default)]
 pub struct StorageReservations {
-    inner: std::sync::Mutex<AHashMap<((i32, i32), Good), u32>>,
+    inner: std::sync::Mutex<AHashMap<((i32, i32), ResourceId), u32>>,
 }
 
 impl StorageReservations {
-    pub fn add(&self, tile: (i32, i32), good: Good, qty: u32) {
+    pub fn add(&self, tile: (i32, i32), resource_id: ResourceId, qty: u32) {
         if qty == 0 {
             return;
         }
         let mut m = self.inner.lock().unwrap();
-        *m.entry((tile, good)).or_insert(0) += qty;
+        *m.entry((tile, resource_id)).or_insert(0) += qty;
     }
 
-    pub fn sub(&self, tile: (i32, i32), good: Good, qty: u32) {
+    pub fn sub(&self, tile: (i32, i32), resource_id: ResourceId, qty: u32) {
         if qty == 0 {
             return;
         }
         let mut m = self.inner.lock().unwrap();
-        if let Some(slot) = m.get_mut(&(tile, good)) {
+        if let Some(slot) = m.get_mut(&(tile, resource_id)) {
             *slot = slot.saturating_sub(qty);
             if *slot == 0 {
-                m.remove(&(tile, good));
+                m.remove(&(tile, resource_id));
             }
         }
     }
 
-    pub fn get(&self, tile: (i32, i32), good: Good) -> u32 {
+    pub fn get(&self, tile: (i32, i32), resource_id: ResourceId) -> u32 {
         self.inner
             .lock()
             .unwrap()
-            .get(&(tile, good))
+            .get(&(tile, resource_id))
             .copied()
             .unwrap_or(0)
     }
 
-    /// Snapshot total reserved qty across all (tile, good) pairs. Used by
+    /// Snapshot total reserved qty across all (tile, resource) pairs. Used by
     /// the inspector for debugging.
     pub fn total(&self) -> u32 {
         self.inner.lock().unwrap().values().sum()
@@ -601,10 +602,10 @@ pub fn release_reservation(
     reservations: &StorageReservations,
     ai: &mut crate::simulation::person::PersonAI,
 ) {
-    if let Some(good) = ai.reserved_good {
-        reservations.sub(ai.reserved_tile, good, ai.reserved_qty as u32);
+    if let Some(resource_id) = ai.reserved_resource {
+        reservations.sub(ai.reserved_tile, resource_id, ai.reserved_qty as u32);
     }
-    ai.reserved_good = None;
+    ai.reserved_resource = None;
     ai.reserved_qty = 0;
 }
 
