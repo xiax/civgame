@@ -402,7 +402,7 @@ pub fn find_nearest_item(
     spatial: &SpatialIndex,
     from: (i32, i32),
     radius: i32,
-    good: Good,
+    resource_id: crate::economy::resource_catalog::ResourceId,
     item_query: &Query<&GroundItem>,
     storage_tile_map: &StorageTileMap,
 ) -> Option<(Entity, i32, i32)> {
@@ -419,7 +419,7 @@ pub fn find_nearest_item(
 
             for &e in spatial.get(tx, ty) {
                 if let Ok(item) = item_query.get(e) {
-                    if item.item.good() == good {
+                    if item.item.resource_id == resource_id {
                         let dist = dx.abs() + dy.abs();
                         if dist < best_dist {
                             best_dist = dist;

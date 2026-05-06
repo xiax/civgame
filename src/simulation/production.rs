@@ -461,26 +461,27 @@ pub fn withdraw_material_task_system(
             let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
             // Check left / right; collect mismatched stacks first to avoid
             // borrowing issues across the spawn call.
-            let mut to_drop: Vec<(Good, u32)> = Vec::new();
+            let mut to_drop: Vec<(crate::economy::resource_catalog::ResourceId, u32)> =
+                Vec::new();
             if let Some(s) = carrier.left {
                 if s.item.resource_id != target_resource {
-                    to_drop.push((s.item.good(), s.qty));
+                    to_drop.push((s.item.resource_id, s.qty));
                 }
             }
             if let Some(s) = carrier.right {
                 if s.item.resource_id != target_resource {
-                    to_drop.push((s.item.good(), s.qty));
+                    to_drop.push((s.item.resource_id, s.qty));
                 }
             }
-            for (good, qty) in to_drop {
-                carrier.remove_resource(crate::economy::core_ids::good_to_resource_id(good), qty);
+            for (rid, qty) in to_drop {
+                carrier.remove_resource(rid, qty);
                 spawn_or_merge_ground_item(
                     &mut commands,
                     &spatial,
                     &mut ground_items,
                     agent_tx,
                     agent_ty,
-                    good,
+                    rid,
                     qty,
                 );
             }
@@ -859,39 +860,56 @@ pub fn eat_task_system(
             // an active eater, which is rare.
             let mut min_nut: u32 = u32::MAX;
             let mut max_nut: u32 = 0;
-            let mut best_cover: Option<(EdibleSlot, u32, Good)> = None;
-            let mut best_largest: Option<(EdibleSlot, u32, Good)> = None;
-            let mut consider = |src: EdibleSlot,
-                                good: Good,
-                                qty: u32,
-                                hunger: f32,
-                                min_nut: &mut u32,
-                                max_nut: &mut u32,
-                                best_cover: &mut Option<(EdibleSlot, u32, Good)>,
-                                best_largest: &mut Option<(EdibleSlot, u32, Good)>| {
-                if qty == 0 || !good.is_edible() {
-                    return;
-                }
-                let nut = good.nutrition() as u32;
-                if nut < *min_nut {
-                    *min_nut = nut;
-                }
-                if nut >= *max_nut {
-                    *max_nut = nut;
-                    *best_largest = Some((src, nut, good));
-                }
-                if (nut as f32) >= hunger {
-                    match *best_cover {
-                        Some((_, prev, _)) if nut >= prev => {}
-                        _ => *best_cover = Some((src, nut, good)),
+            let mut best_cover: Option<(
+                EdibleSlot,
+                u32,
+                crate::economy::resource_catalog::ResourceId,
+            )> = None;
+            let mut best_largest: Option<(
+                EdibleSlot,
+                u32,
+                crate::economy::resource_catalog::ResourceId,
+            )> = None;
+            let mut consider =
+                |src: EdibleSlot,
+                 rid: crate::economy::resource_catalog::ResourceId,
+                 qty: u32,
+                 hunger: f32,
+                 min_nut: &mut u32,
+                 max_nut: &mut u32,
+                 best_cover: &mut Option<(
+                    EdibleSlot,
+                    u32,
+                    crate::economy::resource_catalog::ResourceId,
+                )>,
+                 best_largest: &mut Option<(
+                    EdibleSlot,
+                    u32,
+                    crate::economy::resource_catalog::ResourceId,
+                )>| {
+                    if qty == 0 || !rid.is_edible() {
+                        return;
                     }
-                }
-            };
+                    let nut = rid.nutrition() as u32;
+                    if nut < *min_nut {
+                        *min_nut = nut;
+                    }
+                    if nut >= *max_nut {
+                        *max_nut = nut;
+                        *best_largest = Some((src, nut, rid));
+                    }
+                    if (nut as f32) >= hunger {
+                        match *best_cover {
+                            Some((_, prev, _)) if nut >= prev => {}
+                            _ => *best_cover = Some((src, nut, rid)),
+                        }
+                    }
+                };
 
             for (idx, (it, q)) in agent.inventory.iter().enumerate() {
                 consider(
                     EdibleSlot::Inventory(idx),
-                    it.good(),
+                    it.resource_id,
                     *q,
                     needs.hunger,
                     &mut min_nut,
@@ -903,7 +921,7 @@ pub fn eat_task_system(
             if let Some(s) = carrier.left {
                 consider(
                     EdibleSlot::HandLeft,
-                    s.item.good(),
+                    s.item.resource_id,
                     s.qty,
                     needs.hunger,
                     &mut min_nut,
@@ -915,7 +933,7 @@ pub fn eat_task_system(
             if let Some(s) = carrier.right {
                 consider(
                     EdibleSlot::HandRight,
-                    s.item.good(),
+                    s.item.resource_id,
                     s.qty,
                     needs.hunger,
                     &mut min_nut,
@@ -934,7 +952,7 @@ pub fn eat_task_system(
                 break;
             }
 
-            let (src, _nut, good) = match best_cover.or(best_largest) {
+            let (src, _nut, rid) = match best_cover.or(best_largest) {
                 Some(x) => x,
                 None => break,
             };
@@ -945,11 +963,11 @@ pub fn eat_task_system(
                 }
                 EdibleSlot::HandLeft | EdibleSlot::HandRight => {
                     // remove_resource walks both hand slots; one unit always lands.
-                    carrier.remove_resource(crate::economy::core_ids::good_to_resource_id(good), 1);
+                    carrier.remove_resource(rid, 1);
                 }
             }
-            needs.hunger = (needs.hunger - good.nutrition() as f32).max(0.0);
-            if good == Good::Fruit {
+            needs.hunger = (needs.hunger - rid.nutrition() as f32).max(0.0);
+            if Some(rid) == crate::economy::core_ids::Fruit.get().copied() {
                 fruits_consumed += 1;
             }
         }

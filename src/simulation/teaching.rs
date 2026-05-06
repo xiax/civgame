@@ -113,11 +113,14 @@ fn study_amount(stats: &Stats, base: f32) -> u32 {
 /// Find the inventory slot index of a tablet/book whose `tech_payload` matches
 /// `tech`. Returns the first match.
 fn find_readable_slot(agent: &EconomicAgent, tech: TechId) -> Option<usize> {
+    let tablet = crate::economy::core_ids::ClayTablet.get().copied();
+    let book = crate::economy::core_ids::Book.get().copied();
     for (i, (item, qty)) in agent.inventory.iter().enumerate() {
         if *qty == 0 {
             continue;
         }
-        if !matches!(item.good(), Good::ClayTablet | Good::Book) {
+        let rid = Some(item.resource_id);
+        if rid != tablet && rid != book {
             continue;
         }
         if item.tech_payload == Some(tech) {

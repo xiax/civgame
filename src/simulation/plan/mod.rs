@@ -341,7 +341,7 @@ pub enum GoodSelector {
 #[derive(Clone, Debug)]
 pub enum StepTarget {
     NearestTile(&'static [TileKind]),
-    NearestItem(Good),
+    NearestItem(crate::economy::resource_catalog::ResourceId),
     NearestEdible,
     FactionCamp,
     FromMemory(MemoryKind),
@@ -1260,13 +1260,13 @@ fn resolve_target(
                     .map(|(tx, ty)| (None, tx, ty))
             }
         }
-        StepTarget::NearestItem(good) => {
-            // 1. Check vision — Bug 2 fix: pass good so only matching items are targeted.
+        StepTarget::NearestItem(resource_id) => {
+            // 1. Check vision — Bug 2 fix: pass resource_id so only matching items are targeted.
             if let Some((entity, tx, ty)) = find_nearest_item(
                 spatial,
                 pos,
                 VIEW_RADIUS,
-                *good,
+                *resource_id,
                 item_query,
                 storage_tile_map,
             ) {
@@ -1285,18 +1285,20 @@ fn resolve_target(
             //    vision-path filter; otherwise hungry/gathering agents would
             //    walk to food remembered on a stockpile.
             if let Some(mem) = memory {
-                let mkind = match good {
-                    Good::Wood => MemoryKind::wood(),
-                    Good::Stone => MemoryKind::stone(),
-                    Good::GrainSeed => MemoryKind::grain_seed(),
-                    Good::BerrySeed => MemoryKind::berry_seed(),
-                    _ => {
-                        if good.is_edible() {
-                            MemoryKind::AnyEdible
-                        } else {
-                            return None;
-                        }
-                    }
+                use crate::economy::core_ids;
+                let rid = *resource_id;
+                let mkind = if Some(rid) == core_ids::Wood.get().copied() {
+                    MemoryKind::wood()
+                } else if Some(rid) == core_ids::Stone.get().copied() {
+                    MemoryKind::stone()
+                } else if Some(rid) == core_ids::GrainSeed.get().copied() {
+                    MemoryKind::grain_seed()
+                } else if Some(rid) == core_ids::BerrySeed.get().copied() {
+                    MemoryKind::berry_seed()
+                } else if rid.is_edible() {
+                    MemoryKind::AnyEdible
+                } else {
+                    return None;
                 };
                 if let Some((entity, tx, ty)) =
                     mem.best_entity_for_dist_weighted_filtered(mkind, pos, |_, tile| {

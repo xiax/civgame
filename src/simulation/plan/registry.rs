@@ -309,7 +309,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 13: CollectSkin — pick up Skin from ground (after hunting)
             id: StepId(13),
             task: TaskKind::Scavenge,
-            target: StepTarget::NearestItem(Good::Skin),
+            target: StepTarget::NearestItem(Good::Skin.into()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
@@ -665,7 +665,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // tree harvesting (`harvest_ground_drops`) or earlier spills.
             id: StepId(44),
             task: TaskKind::Scavenge,
-            target: StepTarget::NearestItem(Good::Wood),
+            target: StepTarget::NearestItem(Good::Wood.into()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
@@ -675,7 +675,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 45: CollectStone — pick up loose Stone GroundItems on the world.
             id: StepId(45),
             task: TaskKind::Scavenge,
-            target: StepTarget::NearestItem(Good::Stone),
+            target: StepTarget::NearestItem(Good::Stone.into()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,

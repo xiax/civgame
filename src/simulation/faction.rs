@@ -1157,13 +1157,16 @@ pub fn drop_items_at_destination_system(
 
         // First: dump everything in hands. Hauling loads (Wood, Stone, Iron, ...) are
         // exactly what storage wants; food/tools that ended up in hands also go here.
+        let wood_id: crate::economy::resource_catalog::ResourceId = Good::Wood.into();
+        let stone_id: crate::economy::resource_catalog::ResourceId = Good::Stone.into();
         let mut hand_wood: u32 = 0;
         let mut hand_stone: u32 = 0;
         for stack in carrier.drop_all() {
-            match stack.item.good() {
-                Good::Wood => hand_wood = hand_wood.saturating_add(stack.qty),
-                Good::Stone => hand_stone = hand_stone.saturating_add(stack.qty),
-                _ => {}
+            let rid = stack.item.resource_id;
+            if rid == wood_id {
+                hand_wood = hand_wood.saturating_add(stack.qty);
+            } else if rid == stone_id {
+                hand_stone = hand_stone.saturating_add(stack.qty);
             }
             spawn_or_merge_ground_item(
                 &mut commands,
@@ -1171,7 +1174,7 @@ pub fn drop_items_at_destination_system(
                 &mut ground_items,
                 deposit_tx,
                 deposit_ty,
-                stack.item.good(),
+                rid,
                 stack.qty,
             );
         }
@@ -1185,7 +1188,7 @@ pub fn drop_items_at_destination_system(
                     &mut job_completed,
                     claim,
                     JobKind::Stockpile,
-                    Some(Good::Wood.into()),
+                    Some(wood_id),
                     hand_wood,
                 );
             }
@@ -1196,7 +1199,7 @@ pub fn drop_items_at_destination_system(
                     &mut job_completed,
                     claim,
                     JobKind::Stockpile,
-                    Some(Good::Stone.into()),
+                    Some(stone_id),
                     hand_stone,
                 );
             }
