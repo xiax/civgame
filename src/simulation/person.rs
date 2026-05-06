@@ -501,7 +501,7 @@ pub fn spawn_population(
                         PlanId::PLAY_BY_PLANTING,
                         PlanId::PLAY_BY_THROWING_ROCKS,
                         PlanId::PLAY_WITH_STORED_TOY,
-                        PlanId::CLAIMED_BUILD,
+                        // CLAIMED_BUILD retired in Phase 5e-vi (HTN method).
                         // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
                         // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
                         // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.

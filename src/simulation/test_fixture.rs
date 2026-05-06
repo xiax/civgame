@@ -316,7 +316,7 @@ impl PersonBuilder {
                 PlanId::PLAY_BY_PLANTING,
                 PlanId::PLAY_BY_THROWING_ROCKS,
                 PlanId::PLAY_WITH_STORED_TOY,
-                PlanId::CLAIMED_BUILD,
+                // CLAIMED_BUILD retired in Phase 5e-vi (HTN method).
                 // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
                 // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
                 // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
@@ -2195,6 +2195,129 @@ mod baseline_behaviour {
             "expected MethodHistory to carry Success(EAT_FROM_INVENTORY); \
              entries = {:?}",
             history.entries
+        );
+    }
+
+    /// Phase 5e-vi: an agent under `AgentGoal::Build` holding a
+    /// `JobClaim::Build` with a `ClaimTarget.blueprint` pointing at a satisfied
+    /// blueprint dispatches `Task::Construct { blueprint }` via
+    /// `htn_build_claimed_blueprint_dispatch_system` +
+    /// `BuildClaimedBlueprintMethod`. Replaces the legacy `ClaimedBuild` plan
+    /// (PlanId 34, `[BuildClaimedBlueprint]`).
+    #[test]
+    fn build_claimed_blueprint_goal_dispatches_construct_task() {
+        use crate::simulation::construction::{Blueprint, BuildSiteKind, WallMaterial};
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::jobs::{
+            ClaimTarget, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+        };
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(13);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Spawn a Palisade blueprint and pre-fill all deposit slots so
+        // `bp.is_satisfied()` returns true (the dispatcher's gate).
+        let blueprint_tile = (10, 10);
+        let blueprint_world = tile_to_world(blueprint_tile.0, blueprint_tile.1);
+        let blueprint = sim
+            .app
+            .world_mut()
+            .spawn((
+                Blueprint::new(
+                    sim.player_faction_id,
+                    None,
+                    BuildSiteKind::Wall(WallMaterial::Palisade),
+                    blueprint_tile,
+                    0,
+                ),
+                Transform::from_xyz(blueprint_world.x, blueprint_world.y, 0.5),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        {
+            let mut bp = sim.app.world_mut().get_mut::<Blueprint>(blueprint).unwrap();
+            for i in 0..bp.deposit_count as usize {
+                bp.deposits[i].deposited = bp.deposits[i].needed;
+            }
+            assert!(bp.is_satisfied(), "test setup: bp must read as satisfied");
+        }
+
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Brief warm-up so SpatialIndex / `Added<Indexed>` settle for the
+        // blueprint entity. `htn_build_claimed_blueprint_dispatch_system`
+        // doesn't read the spatial index for the bp lookup (uses bp_query +
+        // ClaimTarget directly), so this is just for routing readiness.
+        sim.tick_n(5);
+
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            let posting = JobPosting {
+                id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Build,
+                progress: JobProgress::Building { blueprint },
+                claimants: vec![person],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+            };
+            board
+                .postings
+                .entry(sim.player_faction_id)
+                .or_default()
+                .push(posting);
+            id
+        };
+        {
+            let mut entity = sim.app.world_mut().entity_mut(person);
+            entity.insert(JobClaim {
+                job_id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Build,
+                posted_tick: 0,
+                fail_count: 0,
+            });
+            entity.insert(ClaimTarget {
+                blueprint: Some(blueprint),
+                resource_id: None,
+            });
+            let mut goal = entity.get_mut::<AgentGoal>().unwrap();
+            *goal = AgentGoal::Build;
+        }
+
+        // Two ticks: ParallelB's `htn_build_claimed_blueprint_dispatch_system`
+        // argmaxes the registry, routes the agent toward the bp tile, and
+        // dispatches `Task::Construct { blueprint }`.
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+
+        match aq.current {
+            Task::Construct { blueprint: bp } => {
+                assert_eq!(
+                    bp, blueprint,
+                    "head Task::Construct should target the claimed blueprint entity"
+                );
+            }
+            other => panic!(
+                "expected Task::Construct as head of ConstructBlueprint chain, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(
+            aq.queued_len(),
+            0,
+            "ConstructBlueprint is single-leg — nothing should be queued behind Construct"
         );
     }
 }

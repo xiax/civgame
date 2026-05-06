@@ -160,8 +160,13 @@ static PLAN_STEPS_16: &[StepId] = &[StepId(39), StepId(12)]; // WorkOnCraft → 
 // StepId 41 (WithdrawClaimedHaulMaterial) and StepId 42 (HaulToClaimedBlueprint)
 // are no longer referenced by any plan but kept in the StepRegistry for
 // in-flight ActivePlan compatibility.
-//   43 = BuildClaimedBlueprint.
-static PLAN_STEPS_BB: &[StepId] = &[StepId(43)]; // ClaimedBuildPlan
+// PLAN_STEPS_BB (ClaimedBuild) was retired in Phase 5e-vi — the
+// `[Construct { blueprint }]` expansion is now driven by HTN
+// `htn_build_claimed_blueprint_dispatch_system` + `BuildClaimedBlueprintMethod`.
+// StepId(43) (BuildClaimedBlueprint) is kept as an `(unused)` placeholder for
+// in-flight ActivePlan compatibility (mirrors the StepId(41/42) ClaimedHaul
+// pattern); the const `StepId::BUILD_CLAIMED_BLUEPRINT = StepId(43)` survives
+// only as a stable sentinel for `PlanHistory` ring-buffer entries.
 
 // PLAN_STEPS_SW / PLAN_STEPS_SS (ScavengeWood/Stone PlanId 38/39) were
 // retired in Phase 5c-ii-d-ii-b — the vision-based scavenge chain
@@ -666,15 +671,18 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             withdraw_filter: None,
         },
         StepDef {
-            // 43: BuildClaimedBlueprint — perform labor at the specific
-            // blueprint named in the agent's JobClaim::Build. The resolver
-            // gates on the blueprint being satisfied, so this never starts
-            // before all materials are in.
+            // 43: (unused — was BuildClaimedBlueprint; retired in Phase 5e-vi.
+            // The walk-to-claimed-bp + on-site labor path is now driven by HTN
+            // `htn_build_claimed_blueprint_dispatch_system` +
+            // `BuildClaimedBlueprintMethod`, which dispatches the existing
+            // `Task::Construct { blueprint }` typed variant. ID kept for
+            // in-flight ActivePlan compatibility and PlanHistory sentinel
+            // stability via `StepId::BUILD_CLAIMED_BLUEPRINT`.)
             id: StepId(43),
-            task: TaskKind::Construct,
-            target: StepTarget::BuildClaimBlueprint,
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
-            reward_scale: 1.5,
+            reward_scale: 0.0,
             plant_filter: None,
             withdraw_filter: None,
         },
@@ -1379,21 +1387,23 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_NONE,
             requires_profession: None,
         },
+        // Phase 5e-vi: PlanId 34 (`ClaimedBuild`) retired. The HTN
+        // `BuildClaimedBlueprintMethod` under
+        // `AbstractTaskKind::ConstructBlueprint`
+        // (`htn_build_claimed_blueprint_dispatch_system`) owns the
+        // walk-to-claimed-bp-and-labor path end-to-end. The const
+        // `PlanId::CLAIMED_BUILD = PlanId(34)` survives only as a stable
+        // sentinel for `PlanHistory` ring-buffer entries.
         PlanDef {
-            // Claim-driven Build plan. Fires only when the agent holds a
-            // JobClaim::Build (gating goal to AgentGoal::Build via job lock).
-            // Step 43 routes to the claimed blueprint and labors there.
             id: PlanId(34),
-            name: "ClaimedBuild",
-            steps: PLAN_STEPS_BB,
-            state_weights: mk_weights(&[
-                (SI_SKILL_BUILDING, 0.4),
-            ]),
-            bias: 1.0,
-            serves_goals: BUILD_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
-            flags: PF_UNINTERRUPTIBLE,
+            flags: PF_NONE,
             requires_profession: None,
         },
         // PlanId 38/39 (ScavengeWood/ScavengeStone) were retired in

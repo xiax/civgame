@@ -186,6 +186,8 @@ impl Plugin for SimulationPlugin {
                         .after(htn::htn_return_surplus_dispatch_system),
                     htn::htn_plant_from_storage_dispatch_system
                         .after(htn::htn_tame_horse_dispatch_system),
+                    htn::htn_build_claimed_blueprint_dispatch_system
+                        .after(htn::htn_plant_from_storage_dispatch_system),
                     terraform::terraform_dispatch_system
                         .after(tasks::goal_dispatch_system)
                         .after(htn::htn_dispatch_system)
@@ -197,7 +199,8 @@ impl Plugin for SimulationPlugin {
                         .after(htn::htn_scout_dispatch_system)
                         .after(htn::htn_return_surplus_dispatch_system)
                         .after(htn::htn_tame_horse_dispatch_system)
-                        .after(htn::htn_plant_from_storage_dispatch_system),
+                        .after(htn::htn_plant_from_storage_dispatch_system)
+                        .after(htn::htn_build_claimed_blueprint_dispatch_system),
                 )
                     .in_set(SimulationSet::ParallelB),
             )

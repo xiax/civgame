@@ -134,6 +134,14 @@ pub enum AbstractTask {
     /// `PlantFromStorage` (PlanId 4) and `PlantBerryFromStorage` (PlanId 66)
     /// plans, restoring chief-driven planting under the Farm goal.
     PlantFromStorage { resource_id: ResourceId },
+    /// Agent holding a `JobClaim::Build` walks to the claimed blueprint and
+    /// labors at it. Single expansion `[Task::Construct { blueprint }]`.
+    /// `MF_UNINTERRUPTIBLE` so a goal flip mid-walk doesn't drop the claim.
+    /// Dispatcher gates on `bp.is_satisfied()` so the agent only commits when
+    /// every deposit slot is full — until then the legacy build plans
+    /// (`BuildBlueprint`, `HaulFromStorageAndBuild`) own the gather/haul work.
+    /// Replaces the legacy `ClaimedBuild` plan (PlanId 34).
+    ConstructBlueprint,
 }
 
 /// Discriminant-only key for `MethodRegistry` lookups. `AbstractTask` itself
@@ -152,6 +160,7 @@ pub enum AbstractTaskKind {
     ReturnSurplus,
     TameWildHorse,
     PlantFromStorage,
+    ConstructBlueprint,
 }
 
 impl AbstractTask {
@@ -167,6 +176,7 @@ impl AbstractTask {
             AbstractTask::ReturnSurplus => AbstractTaskKind::ReturnSurplus,
             AbstractTask::TameWildHorse => AbstractTaskKind::TameWildHorse,
             AbstractTask::PlantFromStorage { .. } => AbstractTaskKind::PlantFromStorage,
+            AbstractTask::ConstructBlueprint => AbstractTaskKind::ConstructBlueprint,
         }
     }
 }
@@ -204,6 +214,7 @@ impl MethodId {
     pub const DEPOSIT_SURPLUS_AT_STORAGE: MethodId = MethodId(16);
     pub const TAME_WILD_HORSE: MethodId = MethodId(17);
     pub const WITHDRAW_AND_PLANT_SEED: MethodId = MethodId(18);
+    pub const BUILD_CLAIMED_BLUEPRINT: MethodId = MethodId(19);
 
     pub fn raw(self) -> u16 {
         self.0
@@ -652,6 +663,10 @@ pub fn register_builtin_methods(reg: &mut MethodRegistry) {
     reg.register(
         AbstractTaskKind::PlantFromStorage,
         Box::new(WithdrawAndPlantSeedMethod),
+    );
+    reg.register(
+        AbstractTaskKind::ConstructBlueprint,
+        Box::new(BuildClaimedBlueprintMethod),
     );
 }
 
@@ -1886,6 +1901,52 @@ impl Method for WithdrawAndPlantSeedMethod {
 
     fn id(&self) -> MethodId {
         MethodId::WITHDRAW_AND_PLANT_SEED
+    }
+}
+
+/// Sole method for `AbstractTask::ConstructBlueprint`. The dispatcher gates on
+/// `JobClaim::Build` + `ClaimTarget.blueprint = Some(_)` + `bp.is_satisfied()`,
+/// snapshots the blueprint entity into `ctx.claimed_blueprint` (re-using the
+/// existing slot from the haul branch — semantically "the blueprint this agent
+/// is committed to"), and the method emits the single-task expansion
+/// `[Task::Construct { blueprint }]`. `MF_UNINTERRUPTIBLE` mirrors the legacy
+/// `PF_UNINTERRUPTIBLE` on PlanId 34 so a transient goal flip mid-walk doesn't
+/// drop the claim. Replaces the legacy `ClaimedBuild` plan (PlanId 34) and its
+/// `BuildClaimedBlueprint` step (StepId 43).
+pub struct BuildClaimedBlueprintMethod;
+
+impl Method for BuildClaimedBlueprintMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::ConstructBlueprint) {
+            return false;
+        }
+        ctx.claimed_blueprint.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.claimed_blueprint_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::ConstructBlueprint) {
+            return Vec::new();
+        }
+        let Some(blueprint) = ctx.claimed_blueprint else {
+            return Vec::new();
+        };
+        vec![Task::Construct { blueprint }]
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn name(&self) -> &'static str {
+        "BuildClaimedBlueprint"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::BUILD_CLAIMED_BLUEPRINT
     }
 }
 
@@ -4677,6 +4738,186 @@ pub fn htn_plant_from_storage_dispatch_system(
                     resource_id: head_resource,
                     qty,
                 });
+            }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
+}
+
+/// Build-goal dispatcher. Replaces the legacy `ClaimedBuild` plan (PlanId 34) +
+/// its `BuildClaimedBlueprint` step (StepId 43). Single-method registry —
+/// `BuildClaimedBlueprintMethod` always wins.
+///
+/// Gates on `AgentGoal::Build` + held `JobClaim::Build` + companion
+/// `ClaimTarget.blueprint = Some(_)` + `bp.is_satisfied()` (every deposit slot
+/// full). Until the blueprint is satisfied the legacy build plans
+/// (`BuildBlueprint`, `HaulFromStorageAndBuild`) keep doing the gather/haul
+/// work; this dispatcher takes over for the final labor leg only. Snapshots
+/// `(blueprint, blueprint.tile)` into the existing `claimed_blueprint` /
+/// `claimed_blueprint_tile` ctx slots (semantically "the blueprint this agent
+/// is committed to" — same usage as the haul branch in
+/// `htn_acquire_good_dispatch_system`), routes via
+/// `assign_task_with_routing(... TaskKind::Construct, Some(bp_entity) ...)`, and
+/// dispatches `Task::Construct { blueprint }` (the existing typed variant —
+/// `construction_system` reads `aq.current.as_construct().or(target_entity)`).
+/// `aq.advance()` on completion lives in `construction_system`'s pass-3 cleanup,
+/// so the chain naturally drains and `htn_method_completion_system` records
+/// Success.
+pub fn htn_build_claimed_blueprint_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    clock: Res<SimClock>,
+    bp_query: Query<&crate::simulation::construction::Blueprint>,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+            Option<&ActivePlan>,
+            Option<&crate::simulation::jobs::JobClaim>,
+            Option<&crate::simulation::jobs::ClaimTarget>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    use crate::simulation::jobs::JobKind;
+    let now = clock.tick;
+    for (
+        mut ai,
+        mut aq,
+        mut history,
+        goal,
+        transform,
+        member,
+        lod,
+        active_plan_opt,
+        job_claim_opt,
+        claim_target_opt,
+    ) in query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::Build) {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+        // Need both a Build claim and the ClaimTarget pointing at a concrete
+        // blueprint. Mirrors the legacy `StepTarget::BuildClaimBlueprint`
+        // resolver's claim_target.blueprint lookup.
+        let Some(claim) = job_claim_opt else {
+            continue;
+        };
+        if claim.kind != JobKind::Build {
+            continue;
+        }
+        let Some(target) = claim_target_opt else {
+            continue;
+        };
+        let Some(bp_entity) = target.blueprint else {
+            continue;
+        };
+        let Ok(bp) = bp_query.get(bp_entity) else {
+            continue;
+        };
+        // Gate on materials-in. Until the bp is satisfied the legacy build
+        // plans (BuildBlueprint, HaulFromStorageAndBuild) own the gather/haul
+        // work — mirrors the legacy resolver's `if !bp.is_satisfied() { return None; }`.
+        if !bp.is_satisfied() {
+            continue;
+        }
+        let bp_tile = bp.tile;
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home: faction_registry.home_tile(member.faction_id),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: Some(bp_entity),
+            claimed_blueprint_tile: Some((bp_tile.0, bp_tile.1)),
+            gather_target_tile: None,
+            scavenge_target_entity: None,
+            scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+        };
+
+        let abstract_task = AbstractTask::ConstructBlueprint;
+        let methods = method_registry.methods_for(AbstractTaskKind::ConstructBlueprint);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        match head {
+            Task::Construct { blueprint } => {
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    (bp_tile.0, bp_tile.1),
+                    TaskKind::Construct,
+                    Some(blueprint),
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                aq.dispatch(Task::Construct { blueprint });
             }
             _ => {
                 ai.active_method = None;

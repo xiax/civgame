@@ -688,6 +688,17 @@ pub fn goal_dispatch_system(
                     AgentGoal::Farm if ai.task_id == TaskKind::Planter as u16 => {
                         Some(TaskKind::Planter as u16)
                     }
+                    // Phase 5e-vi: HTN-driven ConstructBlueprint chain runs without
+                    // an ActivePlan under Build. The Construct walk + on-site
+                    // labor must survive across goal-dispatch ticks until
+                    // `construction_system`'s pass-3 cleanup fires `aq.advance()`
+                    // — mirrors the legacy `ClaimedBuild` plan's `PF_UNINTERRUPTIBLE`.
+                    AgentGoal::Build if ai.task_id == TaskKind::Construct as u16 => {
+                        Some(TaskKind::Construct as u16)
+                    }
+                    AgentGoal::Build if ai.task_id == TaskKind::ConstructBed as u16 => {
+                        Some(TaskKind::ConstructBed as u16)
+                    }
                     // Phase 5c-ii-c-ii: AcquireGood gather chain runs without
                     // an ActivePlan. Both legs (gather + deposit at faction
                     // storage) need to survive across goal-dispatch ticks
