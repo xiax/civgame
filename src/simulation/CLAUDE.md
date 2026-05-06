@@ -70,11 +70,11 @@ Current variants:
 
 ## HTN domain (`htn.rs`)
 
-Five abstract tasks are dispatcher-live: `Sleep`, `Eat`, `AcquireFood` (Survive case), `AcquireGood { good }` (Haul + GatherWood/Stone), `StockpileFood` (chief-driven GatherFood).
+Five abstract tasks are dispatcher-live: `Sleep`, `Eat`, `AcquireFood` (Survive case), `AcquireGood { resource_id }` (Haul + GatherWood/Stone), `StockpileFood` (chief-driven GatherFood).
 
 ### Core types
 
-- **`AbstractTask` / `AbstractTaskKind`** — the high-level goal a method decomposes. `Sleep`, `Eat`, `AcquireFood`, and `StockpileFood` are parameterless; `AcquireGood { good }` carries the target good so one method body serves every material. AcquireFood ends in `Eat` (cover personal hunger); StockpileFood ends in `DepositToFactionStorage` (chief-driven storage-fill). AcquireFood gates on a hunger condition; StockpileFood gates on a `JobClaim::Stockpile{food}` posting.
+- **`AbstractTask` / `AbstractTaskKind`** — the high-level goal a method decomposes. `Sleep`, `Eat`, `AcquireFood`, and `StockpileFood` are parameterless; `AcquireGood { resource_id }` carries the target catalog `ResourceId` so one method body serves every material. AcquireFood ends in `Eat` (cover personal hunger); StockpileFood ends in `DepositToFactionStorage` (chief-driven storage-fill). AcquireFood gates on a hunger condition; StockpileFood gates on a `JobClaim::Stockpile{food}` posting.
 - **`Method` trait** — `precondition` / `utility` / `expand(ctx) -> Vec<Task>` / `flags` / `tech_gate` / `profession_gate` / `name`. Methods read only the `PlannerCtx` fields they care about; the ctx is a borrowed snapshot built per-decision, not a long-lived component. New ctx fields land on demand; Sleep-only sites leave them at zero / `None`.
 - **`MethodRegistry`** — `Resource`, `AHashMap<AbstractTaskKind, Vec<Box<dyn Method>>>`. Built once in `SimulationPlugin::build` via `register_builtin_methods`. Read-only after init so dispatch systems can borrow immutably in parallel.
 - **`MethodFlags`** is a plain `u8` bitmask (no `bitflags` dep). `MF_UNINTERRUPTIBLE` mirrors `PF_UNINTERRUPTIBLE`.

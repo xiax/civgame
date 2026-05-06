@@ -38,6 +38,7 @@ use bevy::prelude::*;
 
 use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Good;
+use crate::economy::resource_catalog::ResourceId;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
@@ -89,7 +90,7 @@ pub enum AbstractTask {
     /// Scaffolding only at 5c-i: `WithdrawMaterialFromStorageMethod` is
     /// registered, but no dispatcher consumes `AbstractTaskKind::AcquireGood`
     /// yet. 5c-ii adds the dispatcher and starts deleting per-good plans.
-    AcquireGood { good: Good },
+    AcquireGood { resource_id: ResourceId },
     /// Fill faction food storage. The chief-driven counterpart to
     /// `AcquireFood`: instead of "agent is hungry, get food into mouth," this
     /// expresses "faction wants more food in storage, regardless of who is
@@ -886,7 +887,7 @@ impl Method for WithdrawMaterialFromStorageMethod {
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
-        let AbstractTask::AcquireGood { good } = abstract_task else {
+        let AbstractTask::AcquireGood { resource_id } = abstract_task else {
             return Vec::new();
         };
         // Defensive: precondition guarantees Some(_), but a method body
@@ -894,7 +895,7 @@ impl Method for WithdrawMaterialFromStorageMethod {
         if ctx.material_storage_tile.is_none() {
             return Vec::new();
         }
-        vec![Task::WithdrawMaterial { resource_id: good.into(), qty: 1 }]
+        vec![Task::WithdrawMaterial { resource_id, qty: 1 }]
     }
 
     fn name(&self) -> &'static str {
@@ -961,7 +962,7 @@ impl Method for WithdrawAndHaulToBlueprintMethod {
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
-        let AbstractTask::AcquireGood { good } = abstract_task else {
+        let AbstractTask::AcquireGood { resource_id } = abstract_task else {
             return Vec::new();
         };
         let Some(blueprint) = ctx.claimed_blueprint else {
@@ -971,7 +972,7 @@ impl Method for WithdrawAndHaulToBlueprintMethod {
             return Vec::new();
         }
         vec![
-            Task::WithdrawMaterial { resource_id: good.into(), qty: 1 },
+            Task::WithdrawMaterial { resource_id, qty: 1 },
             Task::HaulToBlueprint { blueprint },
         ]
     }
@@ -1044,7 +1045,7 @@ impl Method for GatherFromKnownMethod {
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
-        let AbstractTask::AcquireGood { good } = abstract_task else {
+        let AbstractTask::AcquireGood { resource_id } = abstract_task else {
             return Vec::new();
         };
         let Some(tile) = ctx.gather_target_tile else {
@@ -1052,7 +1053,7 @@ impl Method for GatherFromKnownMethod {
         };
         vec![
             Task::Gather { tile },
-            Task::DepositToFactionStorage { resource_id: good.into() },
+            Task::DepositToFactionStorage { resource_id },
         ]
     }
 
@@ -1137,7 +1138,7 @@ impl Method for ScavengeFromGroundMethod {
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
-        let AbstractTask::AcquireGood { good } = abstract_task else {
+        let AbstractTask::AcquireGood { resource_id } = abstract_task else {
             return Vec::new();
         };
         let Some(target) = ctx.scavenge_target_entity else {
@@ -1150,7 +1151,7 @@ impl Method for ScavengeFromGroundMethod {
         }
         vec![
             Task::Scavenge { target },
-            Task::DepositToFactionStorage { resource_id: good.into() },
+            Task::DepositToFactionStorage { resource_id },
         ]
     }
 
@@ -1255,8 +1256,8 @@ impl Method for ExploreForFoodMethod {
 /// populated, which is the behaviour the legacy candidate-filter inversion
 /// (`PF_EXPLORE` only available with no memory + no vis) enforced.
 ///
-/// Precondition gates on the `good` payload mapping cleanly to a `MemoryKind`
-/// — only `Good::Wood` and `Good::Stone` are gather goals today. Other goods
+/// Precondition gates on the `resource_id` payload mapping cleanly to a
+/// `MemoryKind` — only Wood and Stone are gather goals today. Other resources
 /// (Iron, Fruit, etc.) fail the precondition and the dispatcher falls back to
 /// whatever other methods are applicable. The legacy plan registry handled
 /// this implicitly: only `ExploreForWood` (gated on `GATHER_WOOD_GOALS`) and
@@ -1273,26 +1274,28 @@ impl Method for ExploreForFoodMethod {
 pub struct ExploreForMaterialMethod;
 
 impl ExploreForMaterialMethod {
-    /// Map a target good to the `MemoryKind` the agent records when they
-    /// spot a source of that good. Only Wood / Stone today — other goods
-    /// have no corresponding `MemoryKind` because no gather-goal targets
-    /// them. Returns `None` for unsupported goods so the method can opt out
+    /// Map a target resource to the `MemoryKind` the agent records when they
+    /// spot a source of it. Only Wood / Stone today — other resources have
+    /// no corresponding `MemoryKind` because no gather-goal targets them.
+    /// Returns `None` for unsupported resources so the method can opt out
     /// cleanly.
-    fn memory_kind_for(good: Good) -> Option<MemoryKind> {
-        match good {
-            Good::Wood => Some(MemoryKind::wood()),
-            Good::Stone => Some(MemoryKind::stone()),
-            _ => None,
+    fn memory_kind_for(resource_id: ResourceId) -> Option<MemoryKind> {
+        if Some(resource_id) == crate::economy::core_ids::Wood.get().copied() {
+            Some(MemoryKind::wood())
+        } else if Some(resource_id) == crate::economy::core_ids::Stone.get().copied() {
+            Some(MemoryKind::stone())
+        } else {
+            None
         }
     }
 }
 
 impl Method for ExploreForMaterialMethod {
     fn precondition(&self, abstract_task: AbstractTask, _ctx: &PlannerCtx) -> bool {
-        let AbstractTask::AcquireGood { good } = abstract_task else {
+        let AbstractTask::AcquireGood { resource_id } = abstract_task else {
             return false;
         };
-        Self::memory_kind_for(good).is_some()
+        Self::memory_kind_for(resource_id).is_some()
     }
 
     fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
@@ -1300,10 +1303,10 @@ impl Method for ExploreForMaterialMethod {
     }
 
     fn expand(&self, abstract_task: AbstractTask, _ctx: &PlannerCtx) -> Vec<Task> {
-        let AbstractTask::AcquireGood { good } = abstract_task else {
+        let AbstractTask::AcquireGood { resource_id } = abstract_task else {
             return Vec::new();
         };
-        let Some(kind) = Self::memory_kind_for(good) else {
+        let Some(kind) = Self::memory_kind_for(resource_id) else {
             return Vec::new();
         };
         vec![Task::Explore { kind }]
@@ -2575,7 +2578,7 @@ pub fn htn_acquire_good_dispatch_system(
                     forage_food_good: None,
                 };
 
-                let abstract_task = AbstractTask::AcquireGood { good };
+                let abstract_task = AbstractTask::AcquireGood { resource_id: good.into() };
                 let methods = method_registry.methods_for(AbstractTaskKind::AcquireGood);
                 let chosen = methods
                     .iter()
@@ -2818,7 +2821,7 @@ pub fn htn_acquire_good_dispatch_system(
             forage_food_good: None,
         };
 
-        let abstract_task = AbstractTask::AcquireGood { good };
+        let abstract_task = AbstractTask::AcquireGood { resource_id: good.into() };
         let methods = method_registry.methods_for(AbstractTaskKind::AcquireGood);
         let chosen = methods
             .iter()
@@ -3736,7 +3739,7 @@ mod tests {
             AbstractTaskKind::AcquireFood
         );
         assert_eq!(
-            AbstractTask::AcquireGood { good: Good::Wood }.kind(),
+            AbstractTask::AcquireGood { resource_id: Good::Wood.into() }.kind(),
             AbstractTaskKind::AcquireGood
         );
     }
@@ -3759,7 +3762,7 @@ mod tests {
     fn withdraw_material_precondition_true_when_stock_and_storage() {
         let m = WithdrawMaterialFromStorageMethod;
         let ctx = ctx_with_material_storage(Some((2, 3)), 4);
-        assert!(m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
     }
 
     #[test]
@@ -3767,14 +3770,14 @@ mod tests {
         let m = WithdrawMaterialFromStorageMethod;
         // Stock recorded but no reachable tile.
         let ctx = ctx_with_material_storage(None, 5);
-        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
     }
 
     #[test]
     fn withdraw_material_precondition_false_without_stock() {
         let m = WithdrawMaterialFromStorageMethod;
         let ctx = ctx_with_material_storage(Some((1, 1)), 0);
-        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Stone }, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Stone.into() }, &ctx));
     }
 
     #[test]
@@ -3791,7 +3794,7 @@ mod tests {
     fn withdraw_material_expands_to_single_withdraw_task_carrying_good() {
         let m = WithdrawMaterialFromStorageMethod;
         let ctx = ctx_with_material_storage(Some((6, 9)), 3);
-        let tasks = m.expand(AbstractTask::AcquireGood { good: Good::Stone }, &ctx);
+        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: Good::Stone.into() }, &ctx);
         // qty: 1 — the single-unit acquisition contract; larger needs come
         // from chained calls or a future `FulfillClaim` abstract task.
         assert_eq!(
@@ -3810,8 +3813,8 @@ mod tests {
         // parameterised method is the whole point of 5c.
         let m = WithdrawMaterialFromStorageMethod;
         let ctx = ctx_with_material_storage(Some((0, 0)), 1);
-        let wood = m.expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
-        let iron = m.expand(AbstractTask::AcquireGood { good: Good::Iron }, &ctx);
+        let wood = m.expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
+        let iron = m.expand(AbstractTask::AcquireGood { resource_id: Good::Iron.into() }, &ctx);
         assert_eq!(
             wood,
             vec![Task::WithdrawMaterial {
@@ -3834,7 +3837,7 @@ mod tests {
         // empty-vec answer rather than a panic.
         let m = WithdrawMaterialFromStorageMethod;
         let ctx = ctx_with_material_storage(None, 5);
-        let tasks = m.expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
         assert!(tasks.is_empty());
     }
 
@@ -3875,7 +3878,7 @@ mod tests {
     fn gather_from_known_precondition_true_when_target_tile_known() {
         let m = GatherFromKnownMethod;
         let ctx = ctx_with_gather_target(Some((4, 7)));
-        assert!(m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
     }
 
     #[test]
@@ -3884,7 +3887,7 @@ mod tests {
         // No memory of trees / stone tiles for this agent — falls back to
         // the bare-withdraw method or `ExploreFor*`.
         let ctx = ctx_with_gather_target(None);
-        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
     }
 
     #[test]
@@ -3902,7 +3905,7 @@ mod tests {
     fn gather_from_known_expands_to_gather_then_deposit_chain() {
         let m = GatherFromKnownMethod;
         let ctx = ctx_with_gather_target(Some((6, 9)));
-        let tasks = m.expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
         // Two-task chain: gather at the known tile, then deposit at faction
         // storage. The deposit's `good` mirrors the abstract-task payload so
         // chain integrity can be inspected at runtime.
@@ -3924,8 +3927,8 @@ mod tests {
         // multi-task chain rather than the single-task expansion.
         let m = GatherFromKnownMethod;
         let ctx = ctx_with_gather_target(Some((0, 0)));
-        let wood = m.expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
-        let stone = m.expand(AbstractTask::AcquireGood { good: Good::Stone }, &ctx);
+        let wood = m.expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
+        let stone = m.expand(AbstractTask::AcquireGood { resource_id: Good::Stone.into() }, &ctx);
         assert_eq!(
             wood,
             vec![
@@ -3948,7 +3951,7 @@ mod tests {
         // empty-vec answer rather than a panic.
         let m = GatherFromKnownMethod;
         let ctx = ctx_with_gather_target(None);
-        let tasks = m.expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
         assert!(tasks.is_empty());
     }
 
@@ -3992,7 +3995,7 @@ mod tests {
     fn scavenge_from_ground_precondition_true_when_target_known() {
         let m = ScavengeFromGroundMethod;
         let ctx = ctx_with_scavenge_target(Some(Entity::from_raw(11)), Some((4, 7)));
-        assert!(m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
     }
 
     #[test]
@@ -4001,7 +4004,7 @@ mod tests {
         // Tile populated but no live ground-item entity — falls back to the
         // gather / bare-withdraw / explore methods.
         let ctx = ctx_with_scavenge_target(None, Some((4, 7)));
-        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
     }
 
     #[test]
@@ -4010,7 +4013,7 @@ mod tests {
         // Entity recorded but no tile — the dispatcher couldn't route the
         // agent there, so the method must opt out cleanly.
         let ctx = ctx_with_scavenge_target(Some(Entity::from_raw(11)), None);
-        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
     }
 
     #[test]
@@ -4029,7 +4032,7 @@ mod tests {
         let m = ScavengeFromGroundMethod;
         let target = Entity::from_raw(13);
         let ctx = ctx_with_scavenge_target(Some(target), Some((6, 9)));
-        let tasks = m.expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
         // Two-task chain: pick up the loose item, then deposit at faction
         // storage. The deposit's `good` mirrors the abstract-task payload so
         // chain integrity can be inspected at runtime.
@@ -4051,8 +4054,8 @@ mod tests {
         let m = ScavengeFromGroundMethod;
         let target = Entity::from_raw(21);
         let ctx = ctx_with_scavenge_target(Some(target), Some((0, 0)));
-        let wood = m.expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
-        let stone = m.expand(AbstractTask::AcquireGood { good: Good::Stone }, &ctx);
+        let wood = m.expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
+        let stone = m.expand(AbstractTask::AcquireGood { resource_id: Good::Stone.into() }, &ctx);
         assert_eq!(
             wood,
             vec![
@@ -4075,12 +4078,12 @@ mod tests {
         // empty-vec answer rather than a panic.
         let m = ScavengeFromGroundMethod;
         let ctx = ctx_with_scavenge_target(None, Some((1, 1)));
-        let tasks = m.expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
         assert!(tasks.is_empty());
 
         // Also defensive: target entity present but tile missing.
         let ctx = ctx_with_scavenge_target(Some(Entity::from_raw(7)), None);
-        let tasks = m.expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
         assert!(tasks.is_empty());
     }
 
@@ -4175,7 +4178,7 @@ mod tests {
         let m = ScavengeFoodFromGroundMethod;
         let ctx =
             ctx_with_food_scavenge_target(Some(Entity::from_raw(11)), Some((1, 1)), 220.0);
-        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
         assert!(!m.precondition(AbstractTask::Sleep, &ctx));
         assert!(!m.precondition(AbstractTask::Eat, &ctx));
     }
@@ -4212,7 +4215,7 @@ mod tests {
             ctx_with_food_scavenge_target(Some(Entity::from_raw(7)), Some((1, 1)), 220.0);
         let tasks = m.expand(AbstractTask::Eat, &ctx);
         assert!(tasks.is_empty());
-        let tasks = m.expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
         assert!(tasks.is_empty());
     }
 
@@ -4247,7 +4250,7 @@ mod tests {
         // hunger is high.
         let m = ExploreForFoodMethod;
         let ctx = ctx_with_storage(None, 0, 220.0);
-        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
         assert!(!m.precondition(AbstractTask::Sleep, &ctx));
         assert!(!m.precondition(AbstractTask::Eat, &ctx));
     }
@@ -4285,7 +4288,7 @@ mod tests {
         let m = ExploreForFoodMethod;
         let ctx = ctx_with_storage(None, 0, 220.0);
         assert!(m
-            .expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx)
+            .expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx)
             .is_empty());
         assert!(m.expand(AbstractTask::Sleep, &ctx).is_empty());
         assert!(m.expand(AbstractTask::Eat, &ctx).is_empty());
@@ -4328,14 +4331,14 @@ mod tests {
     fn explore_for_material_precondition_true_for_wood() {
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
-        assert!(m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
     }
 
     #[test]
     fn explore_for_material_precondition_true_for_stone() {
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
-        assert!(m.precondition(AbstractTask::AcquireGood { good: Good::Stone }, &ctx));
+        assert!(m.precondition(AbstractTask::AcquireGood { resource_id: Good::Stone.into() }, &ctx));
     }
 
     #[test]
@@ -4346,8 +4349,8 @@ mod tests {
         // with a default kind.
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
-        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Iron }, &ctx));
-        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Fruit }, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Iron.into() }, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Fruit.into() }, &ctx));
     }
 
     #[test]
@@ -4367,7 +4370,7 @@ mod tests {
         // (scavenge), and 2.0 (haul) — Explore must lose to all four.
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
-        let u = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        let u = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
         assert!(u < 1.0, "ExploreForMaterial utility {} should be below 1.0", u);
         assert!(u > 0.0, "ExploreForMaterial utility {} should be positive", u);
     }
@@ -4376,7 +4379,7 @@ mod tests {
     fn explore_for_material_expands_to_single_explore_task_for_wood() {
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
-        let tasks = m.expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
         assert_eq!(
             tasks,
             vec![Task::Explore {
@@ -4393,8 +4396,8 @@ mod tests {
         // hardcoded MemoryKind.
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
-        let wood = m.expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
-        let stone = m.expand(AbstractTask::AcquireGood { good: Good::Stone }, &ctx);
+        let wood = m.expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
+        let stone = m.expand(AbstractTask::AcquireGood { resource_id: Good::Stone.into() }, &ctx);
         assert_eq!(
             wood,
             vec![Task::Explore {
@@ -4417,7 +4420,7 @@ mod tests {
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
         assert!(m
-            .expand(AbstractTask::AcquireGood { good: Good::Iron }, &ctx)
+            .expand(AbstractTask::AcquireGood { resource_id: Good::Iron.into() }, &ctx)
             .is_empty());
     }
 
@@ -4502,8 +4505,8 @@ mod tests {
         let m = WithdrawMaterialFromStorageMethod;
         let near = ctx_with_material_storage(Some((1, 1)), 5);
         let far = ctx_with_material_storage(Some((12, 12)), 5);
-        let u_near = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &near);
-        let u_far = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &far);
+        let u_near = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &near);
+        let u_far = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &far);
         assert!(u_near > u_far);
     }
 
@@ -4519,8 +4522,8 @@ mod tests {
         let bare = WithdrawMaterialFromStorageMethod;
         // Bare-withdraw on a degenerate ctx with storage at zero distance:
         let bare_ctx = ctx_with_material_storage(Some((0, 0)), 5);
-        let u_haul = haul.utility(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
-        let u_bare = bare.utility(AbstractTask::AcquireGood { good: Good::Wood }, &bare_ctx);
+        let u_haul = haul.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
+        let u_bare = bare.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &bare_ctx);
         assert!(u_haul > u_bare, "haul {} should beat bare-withdraw {}", u_haul, u_bare);
     }
 
@@ -4543,8 +4546,8 @@ mod tests {
         let bp = Entity::from_raw(99);
         let near = ctx_with_haul_claim_at(Some((5, 0)), 5, Some(bp), Some((10, 0)));
         let far = ctx_with_haul_claim_at(Some((5, 0)), 5, Some(bp), Some((20, 0)));
-        let u_near = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &near);
-        let u_far = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &far);
+        let u_near = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &near);
+        let u_far = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &far);
         assert!(
             u_near > u_far,
             "near-bp {} should outscore far-bp {} when storage is identical",
@@ -4563,7 +4566,7 @@ mod tests {
         let bp = Entity::from_raw(7);
         // storage at chebyshev=10 from agent. Storage-only path: 2.0 - 0.20.
         let ctx = ctx_with_haul_claim(Some((10, 0)), 5, Some(bp));
-        let u = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        let u = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
         assert!((u - (2.0 - 0.20)).abs() < 1e-6, "expected 1.80, got {}", u);
     }
 
@@ -4575,7 +4578,7 @@ mod tests {
         let m = WithdrawAndHaulToBlueprintMethod;
         let bp = Entity::from_raw(7);
         let ctx = ctx_with_haul_claim_at(Some((20, 0)), 5, Some(bp), Some((40, 0)));
-        let u = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        let u = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
         assert!(
             (u - (2.0 - MAX_DIST_PENALTY)).abs() < 1e-6,
             "expected {}, got {}",
@@ -4594,8 +4597,8 @@ mod tests {
         let ctx = ctx_with_haul_claim_at(Some((20, 0)), 5, Some(bp), Some((40, 0)));
         let bare = WithdrawMaterialFromStorageMethod;
         let bare_ctx = ctx_with_material_storage(Some((0, 0)), 5);
-        let u_haul = haul.utility(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
-        let u_bare = bare.utility(AbstractTask::AcquireGood { good: Good::Wood }, &bare_ctx);
+        let u_haul = haul.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
+        let u_bare = bare.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &bare_ctx);
         assert!(
             u_haul > u_bare,
             "full-trip haul {} should still beat bare-withdraw {}",
@@ -4609,8 +4612,8 @@ mod tests {
         let m = GatherFromKnownMethod;
         let near = ctx_with_gather_target(Some((2, 0)));
         let far = ctx_with_gather_target(Some((12, 0)));
-        let u_near = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &near);
-        let u_far = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &far);
+        let u_near = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &near);
+        let u_far = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &far);
         assert!(u_near > u_far);
     }
 
@@ -4625,8 +4628,8 @@ mod tests {
         let mut ctx = ctx_with_gather_target(Some((0, 0)));
         ctx.scavenge_target_entity = Some(Entity::from_raw(5));
         ctx.scavenge_target_tile = Some((30, 0));
-        let u_scav = scav.utility(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
-        let u_gath = gath.utility(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        let u_scav = scav.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
+        let u_gath = gath.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx);
         assert!(u_scav > u_gath);
     }
 
@@ -4635,8 +4638,8 @@ mod tests {
         let m = ScavengeFromGroundMethod;
         let near = ctx_with_scavenge_target(Some(Entity::from_raw(1)), Some((2, 0)));
         let far = ctx_with_scavenge_target(Some(Entity::from_raw(2)), Some((12, 0)));
-        let u_near = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &near);
-        let u_far = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &far);
+        let u_near = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &near);
+        let u_far = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &far);
         assert!(u_near > u_far);
     }
 
@@ -4756,7 +4759,7 @@ mod tests {
             Some(Good::Fruit),
         );
         assert!(!m.precondition(AbstractTask::AcquireFood, &ctx));
-        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
         assert!(!m.precondition(AbstractTask::Sleep, &ctx));
         assert!(!m.precondition(AbstractTask::Eat, &ctx));
     }
@@ -4848,7 +4851,7 @@ mod tests {
         );
         assert!(m.expand(AbstractTask::AcquireFood, &ctx).is_empty());
         assert!(m
-            .expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx)
+            .expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx)
             .is_empty());
     }
 
@@ -4869,7 +4872,7 @@ mod tests {
         let m = ExploreForFoodForStorageMethod;
         let ctx = ctx_empty();
         assert!(!m.precondition(AbstractTask::AcquireFood, &ctx));
-        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
         assert!(!m.precondition(AbstractTask::Sleep, &ctx));
         assert!(!m.precondition(AbstractTask::Eat, &ctx));
     }
@@ -4919,7 +4922,7 @@ mod tests {
         let ctx = ctx_empty();
         assert!(m.expand(AbstractTask::AcquireFood, &ctx).is_empty());
         assert!(m
-            .expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx)
+            .expand(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx)
             .is_empty());
         assert!(m.expand(AbstractTask::Sleep, &ctx).is_empty());
         assert!(m.expand(AbstractTask::Eat, &ctx).is_empty());
@@ -4955,7 +4958,7 @@ mod tests {
         let ctx = ctx_with_gather_target(Some((1, 1)));
         // Defensive: only AcquireFood drives this method. AcquireGood would
         // double-fire alongside `GatherFromKnownMethod` if this gate slipped.
-        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
         assert!(!m.precondition(AbstractTask::Sleep, &ctx));
         assert!(!m.precondition(AbstractTask::Eat, &ctx));
         assert!(!m.precondition(AbstractTask::StockpileFood, &ctx));
@@ -5025,7 +5028,7 @@ mod tests {
         let m = ForageFromKnownForStorageMethod;
         let ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(Good::Grain));
         assert!(!m.precondition(AbstractTask::AcquireFood, &ctx));
-        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
         assert!(!m.precondition(AbstractTask::Sleep, &ctx));
         assert!(!m.precondition(AbstractTask::Eat, &ctx));
     }
@@ -5105,8 +5108,8 @@ mod tests {
         let m = GatherFromKnownMethod;
         let near = ctx_with_gather_full_trip(Some((5, 0)), Some((6, 0)));
         let far = ctx_with_gather_full_trip(Some((5, 0)), Some((20, 0)));
-        let u_near = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &near);
-        let u_far = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &far);
+        let u_near = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &near);
+        let u_far = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &far);
         assert!(u_near > u_far, "near {} should beat far {}", u_near, u_far);
     }
 
@@ -5115,8 +5118,8 @@ mod tests {
         let m = GatherFromKnownMethod;
         let with_dep = ctx_with_gather_full_trip(Some((5, 0)), Some((5, 0))); // 0-cost second leg
         let no_dep = ctx_with_gather_full_trip(Some((5, 0)), None);
-        let u_a = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &with_dep);
-        let u_b = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &no_dep);
+        let u_a = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &with_dep);
+        let u_b = m.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &no_dep);
         assert!((u_a - u_b).abs() < 1e-6, "{} vs {}", u_a, u_b);
     }
 
@@ -5129,9 +5132,9 @@ mod tests {
         let target = Entity::from_raw(1);
         let scav_ctx = ctx_with_scavenge_full_trip(Some(target), Some((20, 0)), Some((40, 0)));
         let gather_ctx = ctx_with_gather_target(Some((0, 0)));
-        let u_scav = scav.utility(AbstractTask::AcquireGood { good: Good::Wood }, &scav_ctx);
+        let u_scav = scav.utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &scav_ctx);
         let u_gat = GatherFromKnownMethod
-            .utility(AbstractTask::AcquireGood { good: Good::Wood }, &gather_ctx);
+            .utility(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &gather_ctx);
         assert!(u_scav > u_gat, "scav {} should beat gather {}", u_scav, u_gat);
     }
 
