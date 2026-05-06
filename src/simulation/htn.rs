@@ -445,7 +445,7 @@ pub struct PlannerCtx {
     /// the typed task makes the good explicit for chain-integrity inspection.
     /// `None` for non-food scavenge dispatches and dispatcher ctx-build sites
     /// that don't populate it.
-    pub scavenge_food_good: Option<Good>,
+    pub scavenge_food_good: Option<crate::economy::resource_catalog::ResourceId>,
     /// Nearest faction storage tile from `gather_target_tile`. Used by
     /// `GatherFromKnownMethod` to discount on the full gather→deposit trip
     /// (matches the haul method's full-trip discount from 5c-ii-d-vii).
@@ -466,7 +466,7 @@ pub struct PlannerCtx {
     /// typed task makes the good explicit for chain-integrity inspection.
     /// `None` for non-forage dispatches and AcquireFood (whose chain ends in
     /// `Eat`, not `DepositToFactionStorage`).
-    pub forage_food_good: Option<Good>,
+    pub forage_food_good: Option<crate::economy::resource_catalog::ResourceId>,
 }
 
 /// A single decomposition rule for an `AbstractTask`. Scoring (`utility`) and
@@ -1382,12 +1382,12 @@ impl Method for ScavengeFoodForStorageMethod {
         if ctx.scavenge_target_tile.is_none() {
             return Vec::new();
         }
-        let Some(good) = ctx.scavenge_food_good else {
+        let Some(resource_id) = ctx.scavenge_food_good else {
             return Vec::new();
         };
         vec![
             Task::Scavenge { target },
-            Task::DepositToFactionStorage { resource_id: good.into() },
+            Task::DepositToFactionStorage { resource_id },
         ]
     }
 
@@ -1531,12 +1531,12 @@ impl Method for ForageFromKnownForStorageMethod {
         let Some(tile) = ctx.gather_target_tile else {
             return Vec::new();
         };
-        let Some(good) = ctx.forage_food_good else {
+        let Some(resource_id) = ctx.forage_food_good else {
             return Vec::new();
         };
         vec![
             Task::Gather { tile },
-            Task::DepositToFactionStorage { resource_id: good.into() },
+            Task::DepositToFactionStorage { resource_id },
         ]
     }
 
@@ -2493,9 +2493,12 @@ pub fn htn_acquire_good_dispatch_system(
             }
             AgentGoal::GatherWood | AgentGoal::GatherStone => {
                 const VIEW_RADIUS: i32 = 15;
-                let (good, memory_kind) = match *goal {
-                    AgentGoal::GatherWood => (Good::Wood, MemoryKind::wood()),
-                    AgentGoal::GatherStone => (Good::Stone, MemoryKind::stone()),
+                let (target_rid, memory_kind): (
+                    crate::economy::resource_catalog::ResourceId,
+                    MemoryKind,
+                ) = match *goal {
+                    AgentGoal::GatherWood => (Good::Wood.into(), MemoryKind::wood()),
+                    AgentGoal::GatherStone => (Good::Stone.into(), MemoryKind::stone()),
                     _ => unreachable!(),
                 };
 
@@ -2534,7 +2537,10 @@ pub fn htn_acquire_good_dispatch_system(
                         }
                         for &gi_entity in spatial.get(tx, ty) {
                             if let Ok(gi) = item_query.get(gi_entity) {
-                                if gi.item.good() == good && gi.qty > 0 && d2 < best_dist_sq {
+                                if gi.item.resource_id == target_rid
+                                    && gi.qty > 0
+                                    && d2 < best_dist_sq
+                                {
                                     best_dist_sq = d2;
                                     scavenge_target_entity = Some(gi_entity);
                                     scavenge_target_tile = Some((tx, ty));
@@ -2578,7 +2584,9 @@ pub fn htn_acquire_good_dispatch_system(
                     forage_food_good: None,
                 };
 
-                let abstract_task = AbstractTask::AcquireGood { resource_id: good.into() };
+                let abstract_task = AbstractTask::AcquireGood {
+                    resource_id: target_rid,
+                };
                 let methods = method_registry.methods_for(AbstractTaskKind::AcquireGood);
                 let chosen = methods
                     .iter()
@@ -3028,7 +3036,8 @@ pub fn htn_stockpile_food_dispatch_system(
             // the scan records (entity, tile, good) per decision.
             let mut scavenge_target_entity: Option<Entity> = None;
             let mut scavenge_target_tile: Option<(i32, i32)> = None;
-            let mut scavenge_food_good: Option<Good> = None;
+            let mut scavenge_food_good: Option<crate::economy::resource_catalog::ResourceId> =
+                None;
             {
                 let mut best_dist_sq = i32::MAX;
                 for dx in -VIEW_RADIUS..=VIEW_RADIUS {
@@ -3044,11 +3053,14 @@ pub fn htn_stockpile_food_dispatch_system(
                         }
                         for &gi_entity in spatial.get(tx, ty) {
                             if let Ok(gi) = item_query.get(gi_entity) {
-                                if gi.item.good().is_edible() && gi.qty > 0 && d2 < best_dist_sq {
+                                if gi.item.resource_id.is_edible()
+                                    && gi.qty > 0
+                                    && d2 < best_dist_sq
+                                {
                                     best_dist_sq = d2;
                                     scavenge_target_entity = Some(gi_entity);
                                     scavenge_target_tile = Some((tx, ty));
-                                    scavenge_food_good = Some(gi.item.good());
+                                    scavenge_food_good = Some(gi.item.resource_id);
                                 }
                             }
                         }
@@ -3061,12 +3073,9 @@ pub fn htn_stockpile_food_dispatch_system(
 
             // Forage candidate: nearest remembered food-bearing plant whose
             // entity is still live and mature. Threads the plant's harvest
-            // good through `forage_food_good` so the trailing
+            // resource through `forage_food_good` so the trailing
             // `Task::DepositToFactionStorage` carries the right payload.
             // `ForageFromKnownForStorageMethod` (utility 1.0) consumes both.
-            // `harvest_yield` now returns `ResourceId`; reverse-resolve to
-            // `Good` at the boundary while `forage_food_good` (and the
-            // downstream `Task::DepositToFactionStorage`) still take `Good`.
             let forage_candidate = memory_opt
                 .and_then(|m| m.best_for(MemoryKind::AnyEdible))
                 .and_then(|tile| {
@@ -3076,11 +3085,10 @@ pub fn htn_stockpile_food_dispatch_system(
                         return None;
                     }
                     let (id, _) = plant.kind.harvest_yield(false);
-                    let good = crate::economy::core_ids::resource_id_to_good(id)?;
-                    Some((tile, good))
+                    Some((tile, id))
                 });
             let gather_target_tile = forage_candidate.map(|(tile, _)| tile);
-            let forage_food_good = forage_candidate.map(|(_, good)| good);
+            let forage_food_good = forage_candidate.map(|(_, id)| id);
             let gather_deposit_tile = gather_target_tile
                 .and_then(|t| storage_tile_map.nearest_for_faction(member.faction_id, t));
 
@@ -4664,7 +4672,7 @@ mod tests {
     fn ctx_with_food_scavenge_for_storage(
         target: Option<Entity>,
         tile: Option<(i32, i32)>,
-        good: Option<Good>,
+        good: Option<crate::economy::resource_catalog::ResourceId>,
     ) -> PlannerCtx {
         PlannerCtx {
             tile: (0, 0),
@@ -4706,7 +4714,7 @@ mod tests {
         let ctx = ctx_with_food_scavenge_for_storage(
             Some(Entity::from_raw(11)),
             Some((4, 7)),
-            Some(Good::Fruit),
+            Some(Good::Fruit.into()),
         );
         assert!(m.precondition(AbstractTask::StockpileFood, &ctx));
     }
@@ -4715,7 +4723,7 @@ mod tests {
     fn scavenge_food_for_storage_precondition_false_without_entity() {
         let m = ScavengeFoodForStorageMethod;
         let ctx =
-            ctx_with_food_scavenge_for_storage(None, Some((4, 7)), Some(Good::Fruit));
+            ctx_with_food_scavenge_for_storage(None, Some((4, 7)), Some(Good::Fruit.into()));
         assert!(!m.precondition(AbstractTask::StockpileFood, &ctx));
     }
 
@@ -4725,7 +4733,7 @@ mod tests {
         let ctx = ctx_with_food_scavenge_for_storage(
             Some(Entity::from_raw(11)),
             None,
-            Some(Good::Fruit),
+            Some(Good::Fruit.into()),
         );
         assert!(!m.precondition(AbstractTask::StockpileFood, &ctx));
     }
@@ -4749,7 +4757,7 @@ mod tests {
         let ctx = ctx_with_food_scavenge_for_storage(
             Some(Entity::from_raw(11)),
             Some((1, 1)),
-            Some(Good::Fruit),
+            Some(Good::Fruit.into()),
         );
         assert!(!m.precondition(AbstractTask::AcquireFood, &ctx));
         assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
@@ -4766,7 +4774,7 @@ mod tests {
         let mut ctx = ctx_with_food_scavenge_for_storage(
             Some(Entity::from_raw(11)),
             Some((4, 7)),
-            Some(Good::Fruit),
+            Some(Good::Fruit.into()),
         );
         ctx.hunger = 0.0;
         assert!(m.precondition(AbstractTask::StockpileFood, &ctx));
@@ -4779,7 +4787,7 @@ mod tests {
         let ctx = ctx_with_food_scavenge_for_storage(
             Some(target),
             Some((6, 9)),
-            Some(Good::Fruit),
+            Some(Good::Fruit.into()),
         );
         let tasks = m.expand(AbstractTask::StockpileFood, &ctx);
         assert_eq!(
@@ -4800,9 +4808,9 @@ mod tests {
         let m = ScavengeFoodForStorageMethod;
         let target = Entity::from_raw(21);
         let fruit_ctx =
-            ctx_with_food_scavenge_for_storage(Some(target), Some((0, 0)), Some(Good::Fruit));
+            ctx_with_food_scavenge_for_storage(Some(target), Some((0, 0)), Some(Good::Fruit.into()));
         let meat_ctx =
-            ctx_with_food_scavenge_for_storage(Some(target), Some((0, 0)), Some(Good::Meat));
+            ctx_with_food_scavenge_for_storage(Some(target), Some((0, 0)), Some(Good::Meat.into()));
         let fruit = m.expand(AbstractTask::StockpileFood, &fruit_ctx);
         let meat = m.expand(AbstractTask::StockpileFood, &meat_ctx);
         assert_eq!(
@@ -4824,10 +4832,10 @@ mod tests {
     #[test]
     fn scavenge_food_for_storage_expand_returns_empty_without_target_or_good() {
         let m = ScavengeFoodForStorageMethod;
-        let ctx = ctx_with_food_scavenge_for_storage(None, Some((1, 1)), Some(Good::Fruit));
+        let ctx = ctx_with_food_scavenge_for_storage(None, Some((1, 1)), Some(Good::Fruit.into()));
         assert!(m.expand(AbstractTask::StockpileFood, &ctx).is_empty());
         let ctx =
-            ctx_with_food_scavenge_for_storage(Some(Entity::from_raw(7)), None, Some(Good::Fruit));
+            ctx_with_food_scavenge_for_storage(Some(Entity::from_raw(7)), None, Some(Good::Fruit.into()));
         assert!(m.expand(AbstractTask::StockpileFood, &ctx).is_empty());
         let ctx =
             ctx_with_food_scavenge_for_storage(Some(Entity::from_raw(7)), Some((1, 1)), None);
@@ -4840,7 +4848,7 @@ mod tests {
         let ctx = ctx_with_food_scavenge_for_storage(
             Some(Entity::from_raw(7)),
             Some((1, 1)),
-            Some(Good::Fruit),
+            Some(Good::Fruit.into()),
         );
         assert!(m.expand(AbstractTask::AcquireFood, &ctx).is_empty());
         assert!(m
@@ -4889,7 +4897,7 @@ mod tests {
         let ctx = ctx_with_food_scavenge_for_storage(
             Some(Entity::from_raw(1)),
             Some((30, 30)), // max-penalty distance
-            Some(Good::Fruit),
+            Some(Good::Fruit.into()),
         );
         let u_exp = exp.utility(AbstractTask::StockpileFood, &ctx);
         let u_scav = scav.utility(AbstractTask::StockpileFood, &ctx);
@@ -4991,7 +4999,7 @@ mod tests {
     fn ctx_with_forage_for_storage(
         gather: Option<(i32, i32)>,
         deposit: Option<(i32, i32)>,
-        good: Option<Good>,
+        good: Option<crate::economy::resource_catalog::ResourceId>,
     ) -> PlannerCtx {
         let mut ctx = ctx_with_gather_target(gather);
         ctx.gather_deposit_tile = deposit;
@@ -5002,7 +5010,7 @@ mod tests {
     #[test]
     fn forage_from_known_for_storage_precondition_true_with_target_and_good() {
         let m = ForageFromKnownForStorageMethod;
-        let ctx = ctx_with_forage_for_storage(Some((4, 7)), None, Some(Good::Fruit));
+        let ctx = ctx_with_forage_for_storage(Some((4, 7)), None, Some(Good::Fruit.into()));
         assert!(m.precondition(AbstractTask::StockpileFood, &ctx));
     }
 
@@ -5019,7 +5027,7 @@ mod tests {
     #[test]
     fn forage_from_known_for_storage_precondition_false_for_wrong_abstract_task() {
         let m = ForageFromKnownForStorageMethod;
-        let ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(Good::Grain));
+        let ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(Good::Grain.into()));
         assert!(!m.precondition(AbstractTask::AcquireFood, &ctx));
         assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: Good::Wood.into() }, &ctx));
         assert!(!m.precondition(AbstractTask::Sleep, &ctx));
@@ -5029,7 +5037,7 @@ mod tests {
     #[test]
     fn forage_from_known_for_storage_expands_to_gather_then_deposit_chain() {
         let m = ForageFromKnownForStorageMethod;
-        let ctx = ctx_with_forage_for_storage(Some((6, 9)), Some((0, 0)), Some(Good::Fruit));
+        let ctx = ctx_with_forage_for_storage(Some((6, 9)), Some((0, 0)), Some(Good::Fruit.into()));
         let tasks = m.expand(AbstractTask::StockpileFood, &ctx);
         assert_eq!(
             tasks,
@@ -5047,8 +5055,8 @@ mod tests {
         // except the good comes from `ctx.forage_food_good` (resolved at
         // dispatch from the plant kind) instead of the abstract task.
         let m = ForageFromKnownForStorageMethod;
-        let grain_ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(Good::Grain));
-        let fruit_ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(Good::Fruit));
+        let grain_ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(Good::Grain.into()));
+        let fruit_ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(Good::Fruit.into()));
         assert_eq!(
             m.expand(AbstractTask::StockpileFood, &grain_ctx).last(),
             Some(&Task::DepositToFactionStorage { resource_id: Good::Grain.into() })
@@ -5065,7 +5073,7 @@ mod tests {
         // outranks `ExploreForFoodForStorageMethod` (0.3 flat) so the
         // tier-preserving invariant holds for forage→deposit chains too.
         let m = ForageFromKnownForStorageMethod;
-        let ctx = ctx_with_forage_for_storage(Some((20, 0)), Some((40, 0)), Some(Good::Fruit));
+        let ctx = ctx_with_forage_for_storage(Some((20, 0)), Some((40, 0)), Some(Good::Fruit.into()));
         let u = m.utility(AbstractTask::StockpileFood, &ctx);
         assert!(
             u >= UTIL_EXPLORE_FALLBACK,

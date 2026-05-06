@@ -47,6 +47,15 @@ impl ResourceId {
     pub const fn raw(self) -> u16 {
         self.0
     }
+
+    /// True if this resource has `edible_calories` set in the catalog.
+    /// Mirrors `Good::is_edible`; lazy-loads the catalog on first call.
+    pub fn is_edible(self) -> bool {
+        super::core_ids::catalog()
+            .get(self)
+            .and_then(|d| d.edible_calories)
+            .is_some()
+    }
 }
 
 /// High-level functional category. Used by HTN methods to enumerate "all
