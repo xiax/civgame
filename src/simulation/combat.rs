@@ -247,7 +247,7 @@ pub fn combat_system(
                     let dty = (transform.translation.y / TILE_SIZE).floor() as i32;
                     hand_drops.send(HandDropEvent {
                         tile: (dtx, dty),
-                        good: stack.item.good(),
+                        resource_id: stack.item.resource_id,
                         qty: stack.qty,
                     });
                 }
@@ -470,7 +470,7 @@ pub fn combat_system(
 #[derive(Event, Clone, Copy, Debug)]
 pub struct HandDropEvent {
     pub tile: (i32, i32),
-    pub good: Good,
+    pub resource_id: crate::economy::resource_catalog::ResourceId,
     pub qty: u32,
 }
 
@@ -487,7 +487,7 @@ pub fn hand_drop_event_handler(
             &mut ground_items,
             ev.tile.0,
             ev.tile.1,
-            ev.good,
+            ev.resource_id,
             ev.qty,
         );
     }

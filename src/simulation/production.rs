@@ -686,23 +686,23 @@ pub fn withdraw_food_task_system(
         // Return TwoHand building materials from personal inventory to the faction
         // storage tile. Stone/Wood/Iron each weigh 5 kg (the full inventory cap), so
         // keeping them in a hungry worker's pocket blocks all food intake.
-        let mut deposit_buf = [(Good::Stone, 0u32); 8];
+        let mut deposit_buf = [(crate::economy::resource_catalog::ResourceId::NONE, 0u32); 8];
         let mut deposit_len = 0usize;
         for &(item, qty) in agent.inventory.iter() {
-            if qty > 0 && item.good().bulk() == Bulk::TwoHand {
-                deposit_buf[deposit_len] = (item.good(), qty);
+            if qty > 0 && item.resource_id.bulk() == Bulk::TwoHand {
+                deposit_buf[deposit_len] = (item.resource_id, qty);
                 deposit_len += 1;
             }
         }
-        for &(good, qty) in &deposit_buf[..deposit_len] {
-            agent.remove_good(good, qty);
+        for &(rid, qty) in &deposit_buf[..deposit_len] {
+            agent.remove_resource(rid, qty);
             spawn_or_merge_ground_item(
                 &mut commands,
                 &spatial,
                 &mut ground_items,
                 tx as i32,
                 ty as i32,
-                good,
+                rid,
                 qty,
             );
         }

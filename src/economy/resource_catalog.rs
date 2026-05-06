@@ -76,6 +76,16 @@ impl ResourceId {
             .map(|c| c.min(u8::MAX as u16) as u8)
             .unwrap_or(0)
     }
+
+    /// How this resource must be held in hands when carried. Mirrors
+    /// `Good::bulk`; defaults to `Small` for unknown ids (matches the
+    /// legacy fallback).
+    pub fn bulk(self) -> super::goods::Bulk {
+        super::core_ids::catalog()
+            .get(self)
+            .map(|d| d.bulk.as_bulk())
+            .unwrap_or(super::goods::Bulk::Small)
+    }
 }
 
 /// High-level functional category. Used by HTN methods to enumerate "all

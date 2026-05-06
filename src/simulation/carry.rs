@@ -108,7 +108,7 @@ impl Carrier {
             return 0;
         }
         let unit_w = item.unit_weight_g().max(1);
-        let bulk = item.good().bulk();
+        let bulk = item.resource_id.bulk();
 
         match bulk {
             Bulk::TwoHand => {
@@ -218,7 +218,7 @@ impl Carrier {
     /// haul resolvers to size a commit before they dispatch.
     pub fn pickup_capacity(&self, item: Item) -> u32 {
         let unit_w = item.unit_weight_g().max(1);
-        match item.good().bulk() {
+        match item.resource_id.bulk() {
             Bulk::TwoHand => {
                 if self.left.is_some() || self.right.is_some() {
                     return 0;

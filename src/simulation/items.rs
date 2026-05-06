@@ -50,17 +50,19 @@ impl Equipment {
     }
 }
 
-/// Deposits `qty` of `good` at tile `(tx, ty)` as a commodity stack.
-/// Convenience wrapper for callers that don't have a full `Item` (combat
-/// drops, scavenge spills, etc.) — equivalent to passing
-/// `Item::new_commodity(good)` to `spawn_or_merge_ground_item_full`.
+/// Deposits `qty` units of the resource identified by `id` at tile
+/// `(tx, ty)` as a commodity stack. Convenience wrapper for callers that
+/// don't have a full `Item` (combat drops, scavenge spills, etc.) —
+/// equivalent to passing `Item::new_commodity(id)` to
+/// `spawn_or_merge_ground_item_full`. Accepts `impl Into<ResourceId>` so
+/// legacy `Good`-typed callers compile unchanged via `From<Good>`.
 pub fn spawn_or_merge_ground_item(
     commands: &mut Commands,
     spatial: &SpatialIndex,
     item_query: &mut Query<&mut GroundItem>,
     tx: i32,
     ty: i32,
-    good: Good,
+    resource_id: impl Into<crate::economy::resource_catalog::ResourceId>,
     qty: u32,
 ) {
     spawn_or_merge_ground_item_full(
@@ -69,7 +71,7 @@ pub fn spawn_or_merge_ground_item(
         item_query,
         tx,
         ty,
-        Item::new_commodity(good),
+        Item::new_commodity(resource_id),
         qty,
     );
 }
