@@ -2137,8 +2137,9 @@ pub fn htn_acquire_food_dispatch_system(
             // entity is still live and mature. `ForageFromKnownMethod`
             // (utility 1.0) picks this up. Empty memory leaves the field
             // None — the argmax falls through to scavenge / withdraw /
-            // explore.
-            let forage_candidate = memory_opt
+            // explore. AcquireFood ends in `Eat` (no deposit), so only
+            // the tile is consumed downstream.
+            let gather_target_tile = memory_opt
                 .and_then(|m| m.best_for(MemoryKind::AnyEdible))
                 .and_then(|tile| {
                     let entity = plant_map.0.get(&tile).copied()?;
@@ -2146,9 +2147,8 @@ pub fn htn_acquire_food_dispatch_system(
                     if plant.stage != GrowthStage::Mature {
                         return None;
                     }
-                    Some((tile, plant.kind.harvest_yield(false).0))
+                    Some(tile)
                 });
-            let gather_target_tile = forage_candidate.map(|(tile, _)| tile);
 
             let ctx = PlannerCtx {
                 tile: (cur_tx, cur_ty),
@@ -3059,6 +3059,9 @@ pub fn htn_stockpile_food_dispatch_system(
             // good through `forage_food_good` so the trailing
             // `Task::DepositToFactionStorage` carries the right payload.
             // `ForageFromKnownForStorageMethod` (utility 1.0) consumes both.
+            // `harvest_yield` now returns `ResourceId`; reverse-resolve to
+            // `Good` at the boundary while `forage_food_good` (and the
+            // downstream `Task::DepositToFactionStorage`) still take `Good`.
             let forage_candidate = memory_opt
                 .and_then(|m| m.best_for(MemoryKind::AnyEdible))
                 .and_then(|tile| {
@@ -3067,7 +3070,9 @@ pub fn htn_stockpile_food_dispatch_system(
                     if plant.stage != GrowthStage::Mature {
                         return None;
                     }
-                    Some((tile, plant.kind.harvest_yield(false).0))
+                    let (id, _) = plant.kind.harvest_yield(false);
+                    let good = crate::economy::core_ids::resource_id_to_good(id)?;
+                    Some((tile, good))
                 });
             let gather_target_tile = forage_candidate.map(|(tile, _)| tile);
             let forage_food_good = forage_candidate.map(|(_, good)| good);

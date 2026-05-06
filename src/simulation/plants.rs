@@ -3,6 +3,7 @@ use bevy::prelude::*;
 
 use crate::economy::goods::{Bulk, Good};
 use crate::economy::item::Item;
+use crate::economy::resource_catalog::ResourceId;
 use crate::simulation::animals::Deer;
 use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
@@ -108,37 +109,52 @@ impl PlantKind {
     /// to require both hands free before chopping a tree (Wood is TwoHand) while
     /// leaving Berry/Grain pickups (Small) at the lighter 1-free-hand requirement.
     pub fn harvest_yield_bulk(self, has_tool: bool) -> Bulk {
-        self.harvest_yield(has_tool).0.bulk()
+        let (id, _qty) = self.harvest_yield(has_tool);
+        Bulk::for_resource(id, crate::economy::core_ids::catalog()).unwrap_or(Bulk::Small)
     }
 
-    pub fn harvest_yield(self, has_tool: bool) -> (Good, u32) {
+    /// Primary harvest yield as a catalog `ResourceId`. Sub-PR (a) of the
+    /// `Good`-retirement migration: previously returned `(Good, u32)`. Callers
+    /// that still need the legacy `Good` go via
+    /// `core_ids::resource_id_to_good`.
+    pub fn harvest_yield(self, has_tool: bool) -> (ResourceId, u32) {
+        use crate::economy::core_ids;
         match self {
-            PlantKind::Grain => (Good::Grain, 5),
-            PlantKind::BerryBush => (Good::Fruit, 3),
-            PlantKind::Tree => (Good::Wood, if has_tool { 3 } else { 1 }),
+            PlantKind::Grain => (*core_ids::Grain.get().expect("core_ids not init"), 5),
+            PlantKind::BerryBush => (*core_ids::Fruit.get().expect("core_ids not init"), 3),
+            PlantKind::Tree => (
+                *core_ids::Wood.get().expect("core_ids not init"),
+                if has_tool { 3 } else { 1 },
+            ),
         }
     }
 
-    /// Fixed co-yields always added alongside the primary yield (no faction multiplier).
-    pub fn harvest_extra_yields(self) -> &'static [(Good, u32)] {
+    /// Fixed co-yields always added alongside the primary yield (no faction
+    /// multiplier). `ResourceId`-typed; callers route through
+    /// `core_ids::resource_id_to_good` while `Item::new_commodity` still
+    /// takes `Good`.
+    pub fn harvest_extra_yields(self) -> Vec<(ResourceId, u32)> {
+        use crate::economy::core_ids;
         match self {
-            PlantKind::Grain => &[(Good::GrainSeed, 1)],
-            PlantKind::BerryBush => &[(Good::BerrySeed, 1)],
-            _ => &[],
+            PlantKind::Grain => vec![(*core_ids::GrainSeed.get().expect("core_ids not init"), 1)],
+            PlantKind::BerryBush => {
+                vec![(*core_ids::BerrySeed.get().expect("core_ids not init"), 1)]
+            }
+            _ => Vec::new(),
         }
     }
 
     /// Items spawned as loose ground entities adjacent to the harvest tile.
-    pub fn harvest_ground_drops(self, has_tool: bool) -> &'static [(Good, u32)] {
+    pub fn harvest_ground_drops(self, has_tool: bool) -> Vec<(ResourceId, u32)> {
+        use crate::economy::core_ids;
         match self {
-            PlantKind::Grain => &[],
-            PlantKind::BerryBush => &[(Good::BerrySeed, 1)],
+            PlantKind::Grain => Vec::new(),
+            PlantKind::BerryBush => {
+                vec![(*core_ids::BerrySeed.get().expect("core_ids not init"), 1)]
+            }
             PlantKind::Tree => {
-                if has_tool {
-                    &[(Good::Wood, 2)]
-                } else {
-                    &[(Good::Wood, 1)]
-                }
+                let qty = if has_tool { 2 } else { 1 };
+                vec![(*core_ids::Wood.get().expect("core_ids not init"), qty)]
             }
         }
     }
@@ -188,8 +204,7 @@ impl PlantKind {
     /// records under `MemoryKind::Resource(id)` automatically without
     /// touching this method.
     pub fn harvest_memory_kind(self) -> MemoryKind {
-        let (good, _qty) = self.harvest_yield(false);
-        let id = crate::economy::core_ids::good_to_resource_id(good);
+        let (id, _qty) = self.harvest_yield(false);
         match crate::economy::core_ids::catalog().get(id).map(|d| d.class) {
             Some(crate::economy::resource_catalog::ResourceClass::Food) => MemoryKind::AnyEdible,
             _ => MemoryKind::Resource(id),

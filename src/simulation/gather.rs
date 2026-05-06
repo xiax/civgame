@@ -1,6 +1,8 @@
 use crate::economy::agent::EconomicAgent;
+use crate::economy::core_ids;
 use crate::economy::goods::Good;
 use crate::economy::item::Item;
+use crate::economy::resource_catalog::ResourceId;
 use crate::simulation::carry::Carrier;
 use crate::simulation::carve::carve_tile;
 use crate::simulation::construction::WallMap;
@@ -291,10 +293,15 @@ pub fn gather_system(
                 activity: harvest_activity,
             });
 
-            let (yield_good, base_qty) = kind.harvest_yield(has_tool);
-            let yield_mul = if yield_good.is_edible() {
+            let (yield_id, base_qty) = kind.harvest_yield(has_tool);
+            let wood_id = *core_ids::Wood.get().expect("core_ids not init");
+            let is_edible = core_ids::catalog()
+                .get(yield_id)
+                .and_then(|d| d.edible_calories)
+                .is_some();
+            let yield_mul = if is_edible {
                 food_mul
-            } else if yield_good == Good::Wood {
+            } else if yield_id == wood_id {
                 wood_mul
             } else {
                 1.0
@@ -305,18 +312,18 @@ pub fn gather_system(
                 &mut commands,
                 &mut carrier,
                 &mut agent,
-                yield_good,
+                yield_id,
                 qty,
                 agent_tx,
                 agent_ty,
             );
 
-            for &(good, extra_qty) in kind.harvest_extra_yields() {
+            for (extra_id, extra_qty) in kind.harvest_extra_yields() {
                 route_yield(
                     &mut commands,
                     &mut carrier,
                     &mut agent,
-                    good,
+                    extra_id,
                     extra_qty,
                     agent_tx,
                     agent_ty,
@@ -333,8 +340,8 @@ pub fn gather_system(
                 plan.reward_acc += qty as f32 * kind.harvest_reward_per_unit();
             }
 
-            for &(drop_good, drop_qty) in kind.harvest_ground_drops(has_tool) {
-                spawn_ground_drop(&mut commands, tx, ty, drop_good, drop_qty);
+            for (drop_id, drop_qty) in kind.harvest_ground_drops(has_tool) {
+                spawn_ground_drop(&mut commands, tx, ty, drop_id, drop_qty);
             }
 
             if kind.harvest_despawns(has_tool) {
@@ -393,7 +400,7 @@ pub fn gather_system(
                         &mut commands,
                         &mut carrier,
                         &mut agent,
-                        good,
+                        core_ids::good_to_resource_id(good),
                         scaled,
                         agent_tx,
                         agent_ty,
@@ -481,7 +488,7 @@ fn route_yield(
     commands: &mut Commands,
     carrier: &mut Carrier,
     _agent: &mut EconomicAgent,
-    good: Good,
+    resource_id: ResourceId,
     qty: u32,
     tx: i32,
     ty: i32,
@@ -489,6 +496,8 @@ fn route_yield(
     if qty == 0 {
         return;
     }
+    let good = core_ids::resource_id_to_good(resource_id)
+        .expect("route_yield: non-legacy ResourceId; Item::new_commodity needs Good");
     let item = Item::new_commodity(good);
     let leftover = carrier.try_pick_up(item, qty);
     if leftover > 0 {
@@ -527,7 +536,9 @@ fn faction_muls(
     (1.0, 1.0, 1.0)
 }
 
-fn spawn_ground_drop(commands: &mut Commands, tx: i32, ty: i32, good: Good, qty: u32) {
+fn spawn_ground_drop(commands: &mut Commands, tx: i32, ty: i32, resource_id: ResourceId, qty: u32) {
+    let good = core_ids::resource_id_to_good(resource_id)
+        .expect("spawn_ground_drop: non-legacy ResourceId; Item::new_commodity needs Good");
     let (dx, dy) = adjacent_offset();
     let pos = tile_to_world(tx + dx, ty + dy);
     commands.spawn((
