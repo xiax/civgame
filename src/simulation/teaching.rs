@@ -24,7 +24,7 @@
 use bevy::prelude::*;
 
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
+
 use crate::simulation::faction::{FactionMember, PlayerFaction};
 use crate::simulation::knowledge::{
     capacity_for, study_threshold, PersonKnowledge, StudyOutcome,

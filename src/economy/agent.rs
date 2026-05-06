@@ -1,4 +1,3 @@
-use super::goods::Good;
 use super::item::Item;
 use super::resource_catalog::ResourceId;
 use bevy::prelude::*;
@@ -44,10 +43,6 @@ impl EconomicAgent {
             .iter()
             .filter(|(it, _)| it.resource_id.is_edible())
             .fold(0u32, |acc, (_, q)| acc.saturating_add(*q))
-    }
-
-    pub fn quantity_of(&self, good: Good) -> u32 {
-        self.quantity_of_resource(crate::economy::core_ids::good_to_resource_id(good))
     }
 
     /// Total weight capacity, in grams.
@@ -121,10 +116,6 @@ impl EconomicAgent {
         remaining
     }
 
-    pub fn add_good(&mut self, good: Good, qty: u32) -> u32 {
-        self.add_resource(crate::economy::core_ids::good_to_resource_id(good), qty)
-    }
-
     /// Remove up to `qty` units of a specific `item`. Returns how many were actually removed.
     pub fn remove_item(&mut self, item: Item, qty: u32) -> u32 {
         for (it, q) in self.inventory.iter_mut() {
@@ -135,10 +126,6 @@ impl EconomicAgent {
             }
         }
         0
-    }
-
-    pub fn remove_good(&mut self, good: Good, qty: u32) -> u32 {
-        self.remove_resource(crate::economy::core_ids::good_to_resource_id(good), qty)
     }
 
     pub fn has_tool(&self) -> bool {

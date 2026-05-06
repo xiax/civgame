@@ -3,7 +3,6 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::pathfinding::path_request::{
     FailReason, FailureLog, FollowStatus, PathFollow, PathRequestQueue,

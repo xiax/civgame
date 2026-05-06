@@ -8,7 +8,7 @@ use super::person::PlayerOrder;
 use super::person::{AiState, Drafted, PersonAI};
 use super::plan::ActivePlan;
 use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
-use crate::economy::goods::Good;
+
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;

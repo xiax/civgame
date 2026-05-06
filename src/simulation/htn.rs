@@ -37,7 +37,7 @@ use ahash::AHashMap;
 use bevy::prelude::*;
 
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
+
 use crate::economy::resource_catalog::ResourceId;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
@@ -3015,14 +3015,14 @@ pub fn htn_stockpile_food_dispatch_system(
             if claim.kind != JobKind::Stockpile {
                 return;
             }
-            // Confirm the claim targets a food good — `Stockpile{Wood}` would
+            // Confirm the claim targets an edible — `Stockpile{Wood}` would
             // route through the AcquireGood gather branch, not here.
-            let claim_good = claim_target_opt
+            let claim_is_food = claim_target_opt
                 .and_then(|t| t.resource_id)
-                .and_then(crate::economy::core_ids::resource_id_to_good);
-            match claim_good {
-                Some(g) if g.is_edible() => {}
-                _ => return,
+                .map(|rid| rid.is_edible())
+                .unwrap_or(false);
+            if !claim_is_food {
+                return;
             }
 
             let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;

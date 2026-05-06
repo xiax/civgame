@@ -1,6 +1,6 @@
 use crate::economy::agent::EconomicAgent;
-use crate::economy::core_ids::{self, resource_id_to_good};
-use crate::economy::goods::Good;
+use crate::economy::core_ids;
+
 use crate::economy::item::{Item, ItemMaterial, ItemQuality};
 use crate::economy::resource_catalog::ResourceId;
 use std::sync::OnceLock;
@@ -44,17 +44,6 @@ pub struct CraftRecipe {
     pub tech_gate: Option<TechId>,
     /// If Some, the agent must be within 1 tile of an entity of this kind to craft.
     pub requires_station: Option<StationKind>,
-}
-
-impl CraftRecipe {
-    /// Convenience: returns the legacy `Good` for the output. Helper
-    /// for sites that still need a `Good` (e.g. `Item::new_manufactured`
-    /// constructors). Panics if the catalog/core_ids hasn't been
-    /// initialised — by the time recipes are read, both are in place.
-    pub fn output_good_legacy(&self) -> Good {
-        resource_id_to_good(self.output_resource)
-            .expect("CraftRecipe.output_resource is not in the legacy Good enum")
-    }
 }
 
 use crate::simulation::technology::{
@@ -910,13 +899,4 @@ mod tests {
         assert_eq!(book.output_resource, core_ids::book());
     }
 
-    /// Pin: `output_good_legacy()` round-trips every recipe through the
-    /// reverse table without panicking. Until Item.good is migrated to
-    /// ResourceId, this is the bridge into the legacy item constructors.
-    #[test]
-    fn every_recipe_output_maps_to_a_legacy_good() {
-        for recipe in craft_recipes() {
-            let _ = recipe.output_good_legacy();
-        }
-    }
 }

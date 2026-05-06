@@ -19,7 +19,6 @@ use bevy::state::app::StatesPlugin;
 use bevy::time::{TimePlugin, TimeUpdateStrategy};
 
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
 use crate::economy::item::Item;
 use crate::pathfinding::path_request::PathFollow;
 use crate::simulation::carry::Carrier;
@@ -512,141 +511,6 @@ mod smoke {
         let _person = sim.spawn_person(sim.player_faction_id, (4, 4), |_| {});
         sim.tick_n(5);
         assert!(sim.tick_count() > 0);
-    }
-}
-
-/// Phase 2b parity tests. Confirms that the new `ResourceId`-keyed APIs
-/// on `EconomicAgent`, `Carrier`, and `Bulk` give the same answers as
-/// the legacy `Good`-keyed methods for every legacy resource. Locks the
-/// migration: Phase 2c can't quietly diverge consumer behaviour.
-#[cfg(test)]
-mod resource_id_parity {
-    use super::*;
-    use crate::economy::core_ids::good_to_resource_id;
-    use crate::economy::core_ids::resource_id_to_good;
-    use crate::economy::goods::{Bulk, Good};
-    use crate::economy::resource_catalog::ResourceCatalog;
-    use crate::simulation::carry::Carrier;
-
-    /// Constructing a fixture initialises `core_ids` and the catalog as
-    /// a side effect. Helper extracts the catalog so the test bodies can
-    /// stay short.
-    fn catalog_from_fixture() -> (TestSim, &'static ResourceCatalog) {
-        let sim = TestSim::new(0xC4742106);
-        // Borrow the catalog with a static lifetime via the world's
-        // resource pointer — only safe because the catalog is read-only
-        // after init and the App outlives the test body.
-        let catalog: *const ResourceCatalog = sim.app.world().resource::<ResourceCatalog>();
-        // SAFETY: `sim` is held for the full test body via the returned
-        // tuple. Catalog lives inside `sim.app`'s world; the static cast
-        // is purely to satisfy the borrow checker for the test's
-        // ergonomics.
-        let catalog: &'static ResourceCatalog = unsafe { &*catalog };
-        (sim, catalog)
-    }
-
-    /// `core_ids::good_to_resource_id` and `resource_id_to_good` form
-    /// inverse mappings on the 22 legacy goods.
-    #[test]
-    fn good_resource_id_is_invertible() {
-        let _sim = TestSim::new(0xA001);
-        for good in Good::all() {
-            let id = good_to_resource_id(good);
-            assert_eq!(
-                resource_id_to_good(id),
-                Some(good),
-                "round-trip Good::{:?} → ResourceId({}) → Good failed",
-                good,
-                id.raw()
-            );
-        }
-    }
-
-    /// `Bulk::for_resource(id, &catalog)` returns the same `Bulk` as the
-    /// legacy `Good::bulk()` for every legacy good.
-    #[test]
-    fn bulk_lookup_matches_legacy_for_every_good() {
-        let (_sim, catalog) = catalog_from_fixture();
-        for good in Good::all() {
-            let id = good_to_resource_id(good);
-            let from_catalog = Bulk::for_resource(id, catalog).expect("catalog has bulk");
-            assert_eq!(
-                from_catalog,
-                good.bulk(),
-                "Bulk mismatch for {:?}: catalog={:?}, legacy={:?}",
-                good,
-                from_catalog,
-                good.bulk()
-            );
-        }
-    }
-
-    /// Adding via `EconomicAgent::add_resource` and reading via
-    /// `quantity_of_resource` round-trips identically to the
-    /// `add_good`/`quantity_of` pair for every legacy resource.
-    #[test]
-    fn economic_agent_resource_apis_match_good_apis() {
-        let _sim = TestSim::new(0xA002);
-        for good in Good::all() {
-            let id = good_to_resource_id(good);
-
-            let mut via_good = crate::economy::agent::EconomicAgent::default();
-            let leftover_good = via_good.add_good(good, 3);
-
-            let mut via_resource = crate::economy::agent::EconomicAgent::default();
-            let leftover_resource = via_resource.add_resource(id, 3);
-
-            assert_eq!(
-                leftover_good, leftover_resource,
-                "{:?}: add_good leftover={}, add_resource leftover={}",
-                good, leftover_good, leftover_resource
-            );
-            assert_eq!(
-                via_good.quantity_of(good),
-                via_resource.quantity_of_resource(id),
-                "{:?}: quantity_of vs quantity_of_resource diverge",
-                good
-            );
-
-            // iter_resource_stacks reports the resource — but only when
-            // at least one unit actually fit. Heavy goods (Armor at 8kg
-            // vs the 5kg base cap) leave the inventory empty.
-            let stacks: Vec<_> = via_resource.iter_resource_stacks().collect();
-            let added = via_resource.quantity_of_resource(id);
-            if added > 0 {
-                assert!(
-                    stacks.iter().any(|(rid, q)| *rid == id && *q == added),
-                    "{:?} not visible in iter_resource_stacks: {:?}",
-                    good,
-                    stacks
-                );
-            } else {
-                assert!(
-                    stacks.is_empty(),
-                    "{:?} reported empty quantity but iter_resource_stacks shows {:?}",
-                    good,
-                    stacks
-                );
-            }
-        }
-    }
-
-    /// `Carrier::pickup_capacity_resource` matches `pickup_capacity` for
-    /// commodity items derived from the same good.
-    #[test]
-    fn carrier_pickup_capacity_resource_matches_legacy() {
-        let _sim = TestSim::new(0xA003);
-        let carrier = Carrier::default();
-        for good in Good::all() {
-            let id = good_to_resource_id(good);
-            let item = crate::economy::item::Item::new_commodity(good);
-            assert_eq!(
-                carrier.pickup_capacity(item),
-                carrier.pickup_capacity_resource(id),
-                "pickup capacity diverges for {:?}",
-                good,
-            );
-        }
     }
 }
 
@@ -2189,7 +2053,7 @@ mod baseline_behaviour {
 
         // Spawn a Fruit GroundItem at (5, 0) — within VIEW_RADIUS=15 of the
         // worker at (0, 0) and outside the storage tile filter.
-        let fruit_entity = sim.spawn_ground_item((5, 0), Good::Fruit, 3);
+        let fruit_entity = sim.spawn_ground_item((5, 0), crate::economy::core_ids::fruit(), 3);
 
         let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
             b.hunger(0.0);

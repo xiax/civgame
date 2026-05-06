@@ -1,4 +1,3 @@
-use super::goods::Good;
 use super::resource_catalog::ResourceId;
 use crate::simulation::technology::TechId;
 
@@ -143,16 +142,6 @@ impl Item {
             armor_stats,
             tech_payload: None,
         }
-    }
-
-    /// Migration accessor: project the catalog id back to the legacy
-    /// `Good` enum. Once the `Good` enum is deleted (Phase 2 residual #7)
-    /// this accessor disappears and call sites compare `ResourceId`s
-    /// directly.
-    #[inline]
-    pub fn good(&self) -> Good {
-        super::core_ids::resource_id_to_good(self.resource_id)
-            .expect("Item carries a non-legacy ResourceId; legacy `Good` accessor cannot answer")
     }
 
     /// Human-readable label for UI display. Uses `display_name` when set

@@ -1,18 +1,12 @@
-//! Data-driven resource catalog (Phase 2a infrastructure).
+//! Data-driven resource catalog.
 //!
 //! Resources are loaded from `assets/data/resources/*.ron` at startup into a
 //! `ResourceCatalog` resource, indexed by both stable string keys and
 //! deterministic `ResourceId(u16)` integer ids. Per-resource attributes
 //! (bulk, weight, nutrition, tags…) live in the catalog, not in scattered
-//! `match good { ... }` blocks.
-//!
-//! This module is **scaffolding only** — Phase 2a inserts the catalog so
-//! tests and tools can read it, but no production system has been migrated
-//! off of `Good`-based switches yet. The migration to `ResourceId` happens
-//! in Phases 2b–2d. During the transition, both representations coexist;
-//! `core_ids::*` pre-resolves the `ResourceId` for every legacy `Good`
-//! variant at startup so hot paths can compare against an integer rather
-//! than re-querying the catalog.
+//! `match good { ... }` blocks. `core_ids::*` pre-resolves the `ResourceId`
+//! for every founding resource at startup so hot paths can compare against
+//! an integer rather than re-querying the catalog.
 
 use ahash::AHashMap;
 use bevy::prelude::*;
@@ -30,7 +24,7 @@ use super::goods::Bulk;
 pub struct ResourceId(pub u16);
 
 /// Default resolves to the `NONE` sentinel so newtype consumers using
-/// `Default::default()` (e.g. `[GoodNeed::default(); N]` array seeds) get
+/// `Default::default()` (e.g. fixed-size deposit-slot array seeds) get
 /// an unambiguous "no resource" marker that callers must overwrite.
 impl Default for ResourceId {
     fn default() -> Self {
@@ -49,7 +43,7 @@ impl ResourceId {
     }
 
     /// True if this resource has `edible_calories` set in the catalog.
-    /// Mirrors `Good::is_edible`; lazy-loads the catalog on first call.
+    /// Mirrors catalog `edible_calories`; lazy-loads the catalog on first call.
     pub fn is_edible(self) -> bool {
         super::core_ids::catalog()
             .get(self)
@@ -58,7 +52,7 @@ impl ResourceId {
     }
 
     /// Per-unit entertainment value (drives solo-play willpower refill).
-    /// Mirrors `Good::entertainment_value`. Returns 0 for unknown ids.
+    /// Mirrors the catalog `entertainment_value`. Returns 0 for unknown ids.
     pub fn entertainment_value(self) -> u8 {
         super::core_ids::catalog()
             .get(self)
@@ -66,7 +60,7 @@ impl ResourceId {
             .unwrap_or(0)
     }
 
-    /// Calories restored per unit when eaten. Mirrors `Good::nutrition`;
+    /// Calories restored per unit when eaten. Mirrors catalog `edible_calories`;
     /// returns 0 for inedible / unknown resources. Truncates `u16` →
     /// `u8` (matches the legacy contract).
     pub fn nutrition(self) -> u8 {
@@ -78,7 +72,7 @@ impl ResourceId {
     }
 
     /// How this resource must be held in hands when carried. Mirrors
-    /// `Good::bulk`; defaults to `Small` for unknown ids (matches the
+    /// catalog `bulk`; defaults to `Small` for unknown ids (matches the
     /// legacy fallback).
     pub fn bulk(self) -> super::goods::Bulk {
         super::core_ids::catalog()
@@ -87,7 +81,7 @@ impl ResourceId {
             .unwrap_or(super::goods::Bulk::Small)
     }
 
-    /// Per-unit weight in grams. Mirrors `Good::unit_weight_g`; returns
+    /// Per-unit weight in grams. Mirrors catalog `weight_g`; returns
     /// 0 for unknown ids.
     pub fn unit_weight_g(self) -> u32 {
         super::core_ids::catalog()
@@ -97,7 +91,7 @@ impl ResourceId {
     }
 
     /// True if this resource is a planting seed (catalog `class == Seed`).
-    /// Mirrors `Good::is_seed`.
+    /// Mirrors catalog `class == Seed`.
     pub fn is_seed(self) -> bool {
         matches!(
             super::core_ids::catalog().get(self).map(|d| d.class),
@@ -153,10 +147,10 @@ pub enum StorageClass {
 /// switch to a small interned-symbol table if tag traffic becomes hot.
 pub type ResourceTag = String;
 
-/// Single resource entry. Mirrors the per-`Good` data currently scattered
-/// across `goods.rs::Good::*` methods. Phase 2a populates it from RON;
-/// Phase 2b/2c moves the consuming code (`Item`, executors, plans) onto
-/// these attributes and deletes the methods on `Good`.
+/// Single resource entry. Carries every per-resource attribute consumed
+/// by simulation code — bulk/weight for carrying, edibility/nutrition for
+/// hunger, entertainment for play, sprite for rendering, etc. Adding a
+/// new resource is one RON entry plus an optional sprite.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ResourceDef {
     /// Stable, lowercase, snake_case identifier. Sorts alphabetically to
@@ -221,7 +215,7 @@ impl BulkDef {
 /// so hot paths skip locking and can take immutable refs freely. `Clone`
 /// is implemented (cheap — `Vec<ResourceDef>` plus two `AHashMap`s) so the
 /// same catalog can live both as a Bevy resource and as a process-global
-/// `OnceLock` for the legacy `Good` methods that can't take system params.
+/// `OnceLock` for the `ResourceId::*` accessors that can't take system params.
 #[derive(Resource, Default, Clone)]
 pub struct ResourceCatalog {
     /// Indexed by `ResourceId.0`. Always sorted by `key` so two loads of
@@ -350,7 +344,34 @@ pub fn load_resource_catalog() -> ResourceCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::economy::goods::Good;
+
+    /// Stable keys for the 22 founding resources. Pins the catalog
+    /// contract: every key listed here must resolve and carry the
+    /// expected attributes, otherwise the migration broke.
+    const LEGACY_KEYS: &[&str] = &[
+        "fruit",
+        "meat",
+        "grain",
+        "wood",
+        "stone",
+        "tools",
+        "cloth",
+        "coal",
+        "iron",
+        "luxury",
+        "grain_seed",
+        "weapon",
+        "armor",
+        "shield",
+        "skin",
+        "copper",
+        "tin",
+        "gold",
+        "silver",
+        "berry_seed",
+        "clay_tablet",
+        "book",
+    ];
 
     /// Loading the catalog twice yields identical `ResourceId` assignments
     /// for every key. This is the contract that lets save games store
@@ -371,158 +392,35 @@ mod tests {
         }
     }
 
-    /// Every legacy `Good` variant must have a matching catalog entry, or
-    /// the migration breaks. Pinning this catches accidental drift between
-    /// the Rust enum and the RON file.
+    /// Every legacy resource must have a matching catalog entry, or
+    /// the migration broke. Pinning this catches accidental drift between
+    /// the founding key list and the RON file.
     #[test]
-    fn every_legacy_good_resolves_to_a_catalog_entry() {
+    fn every_legacy_key_resolves_to_a_catalog_entry() {
         let catalog = load_resource_catalog();
-        for good in Good::all() {
-            // We can't use core_ids in this test because OnceLock state is
-            // shared across the test binary — id_of() on the freshly-loaded
-            // catalog avoids any global-state ordering issues.
-            let key = match good {
-                Good::Fruit => "fruit",
-                Good::Meat => "meat",
-                Good::Grain => "grain",
-                Good::Wood => "wood",
-                Good::Stone => "stone",
-                Good::Tools => "tools",
-                Good::Cloth => "cloth",
-                Good::Coal => "coal",
-                Good::Iron => "iron",
-                Good::Luxury => "luxury",
-                Good::GrainSeed => "grain_seed",
-                Good::Weapon => "weapon",
-                Good::Armor => "armor",
-                Good::Shield => "shield",
-                Good::Skin => "skin",
-                Good::Copper => "copper",
-                Good::Tin => "tin",
-                Good::Gold => "gold",
-                Good::Silver => "silver",
-                Good::BerrySeed => "berry_seed",
-                Good::ClayTablet => "clay_tablet",
-                Good::Book => "book",
-            };
+        for &key in LEGACY_KEYS {
             assert!(
                 catalog.id_of(key).is_some(),
-                "Good::{:?} has no catalog entry under key {:?}",
-                good,
+                "no catalog entry under key {:?}",
                 key
             );
         }
     }
 
-    /// Catalog attributes must match what the legacy `Good::*` methods
-    /// return. Phase 2b/2c will delete the methods and read from the
-    /// catalog instead — this test fails loudly if the attributes drift
-    /// during the migration.
-    #[test]
-    fn catalog_attributes_match_legacy_good_methods() {
-        let catalog = load_resource_catalog();
-        for good in Good::all() {
-            let key = match good {
-                Good::Fruit => "fruit",
-                Good::Meat => "meat",
-                Good::Grain => "grain",
-                Good::Wood => "wood",
-                Good::Stone => "stone",
-                Good::Tools => "tools",
-                Good::Cloth => "cloth",
-                Good::Coal => "coal",
-                Good::Iron => "iron",
-                Good::Luxury => "luxury",
-                Good::GrainSeed => "grain_seed",
-                Good::Weapon => "weapon",
-                Good::Armor => "armor",
-                Good::Shield => "shield",
-                Good::Skin => "skin",
-                Good::Copper => "copper",
-                Good::Tin => "tin",
-                Good::Gold => "gold",
-                Good::Silver => "silver",
-                Good::BerrySeed => "berry_seed",
-                Good::ClayTablet => "clay_tablet",
-                Good::Book => "book",
-            };
-            let id = catalog.id_of(key).unwrap();
-            let def = catalog.get(id).unwrap();
-
-            assert_eq!(
-                def.bulk.as_bulk(),
-                good.bulk(),
-                "{:?} bulk mismatch",
-                good
-            );
-            assert_eq!(
-                def.weight_g,
-                good.unit_weight_g(),
-                "{:?} weight mismatch",
-                good
-            );
-            assert_eq!(
-                def.entertainment_value,
-                good.entertainment_value(),
-                "{:?} entertainment mismatch",
-                good
-            );
-            if good.is_edible() {
-                assert_eq!(
-                    def.edible_calories,
-                    Some(good.nutrition() as u16),
-                    "{:?} nutrition mismatch",
-                    good
-                );
-            } else {
-                assert_eq!(
-                    def.edible_calories, None,
-                    "{:?} should be inedible in catalog",
-                    good
-                );
-            }
-        }
-    }
-
-    /// Every legacy `Good` has a `sprite_key` populated so the
+    /// Every legacy resource has a `sprite_key` populated so the
     /// catalog-driven `spawn_ground_item_sprites` doesn't silently regress
     /// to invisible piles when a new resource is authored. Pinning this
     /// makes the contract explicit: adding a resource without a sprite
     /// is allowed, but removing one from an existing entry will fail.
     #[test]
-    fn every_legacy_good_has_a_sprite_key() {
+    fn every_legacy_key_has_a_sprite_key() {
         let catalog = load_resource_catalog();
-        for good in Good::all() {
-            let key = match good {
-                Good::Fruit => "fruit",
-                Good::Meat => "meat",
-                Good::Grain => "grain",
-                Good::Wood => "wood",
-                Good::Stone => "stone",
-                Good::Tools => "tools",
-                Good::Cloth => "cloth",
-                Good::Coal => "coal",
-                Good::Iron => "iron",
-                Good::Luxury => "luxury",
-                Good::GrainSeed => "grain_seed",
-                Good::Weapon => "weapon",
-                Good::Armor => "armor",
-                Good::Shield => "shield",
-                Good::Skin => "skin",
-                Good::Copper => "copper",
-                Good::Tin => "tin",
-                Good::Gold => "gold",
-                Good::Silver => "silver",
-                Good::BerrySeed => "berry_seed",
-                Good::ClayTablet => "clay_tablet",
-                Good::Book => "book",
-            };
+        for &key in LEGACY_KEYS {
             let id = catalog.id_of(key).unwrap();
             let def = catalog.get(id).unwrap();
             assert!(
                 def.sprite_key.is_some(),
-                "Good::{:?} (key {:?}) is missing sprite_key in catalog",
-                good,
+                "key {:?} is missing sprite_key in catalog",
                 key
             );
         }

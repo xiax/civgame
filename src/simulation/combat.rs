@@ -1,4 +1,4 @@
-use crate::economy::goods::Good;
+
 use crate::economy::item::{armor_coverage, Item};
 use crate::simulation::animals::{AnimalAI, AnimalNeeds, AnimalState, Deer, Wolf};
 use crate::simulation::corpse::{Corpse, CorpseMap, CorpseSpecies, CORPSE_FRESHNESS_TICKS};

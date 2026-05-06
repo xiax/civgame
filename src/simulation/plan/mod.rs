@@ -14,7 +14,7 @@ use super::tasks::{
     find_nearest_tile, find_nearest_unplanted_farmland, nearest_reachable_higher_tile, TaskKind,
 };
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
+
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;

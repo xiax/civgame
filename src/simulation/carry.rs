@@ -8,7 +8,6 @@
 //! wield) go to inventory. Tasks like construct/craft/dig require free hand(s); see
 //! `tasks::task_requires_free_hands`.
 
-use crate::economy::core_ids::resource_id_to_good;
 use crate::economy::goods::Bulk;
 use crate::economy::item::Item;
 use crate::economy::resource_catalog::ResourceId;
@@ -199,18 +198,12 @@ impl Carrier {
         }
     }
 
-    /// Phase 2b migration accessor: pickup capacity for a commodity
-    /// `id`. Reverse-resolves to `Item::new_commodity(good)` and
-    /// delegates to `pickup_capacity`. Returns 0 for resources outside
-    /// the legacy `Good` enum (impossible until Phase 2c adds non-legacy
-    /// resources). Manufactured items must still go through
-    /// `pickup_capacity(item)` because material multipliers nudge the
-    /// per-unit weight.
+    /// Pickup capacity for a commodity `id`. Builds a placeholder
+    /// commodity `Item` and delegates to `pickup_capacity`. Manufactured
+    /// items must still go through `pickup_capacity(item)` because
+    /// material multipliers nudge the per-unit weight.
     pub fn pickup_capacity_resource(&self, id: ResourceId) -> u32 {
-        match resource_id_to_good(id) {
-            Some(good) => self.pickup_capacity(Item::new_commodity(good)),
-            None => 0,
-        }
+        self.pickup_capacity(Item::new_commodity(id))
     }
 
     /// Read-only mirror of `try_pick_up`: how many units of `item` would be
