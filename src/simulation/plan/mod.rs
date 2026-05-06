@@ -919,7 +919,9 @@ fn resolve_withdraw_for_faction_need(
             // Claim names the exact good and (implicitly) the qty we want;
             // no aggregation required. Override the selector so downstream
             // logic treats this as a Specific lookup.
-            let claim = claim_target.and_then(|c| c.good)?;
+            let claim = claim_target
+                .and_then(|c| c.resource_id)
+                .and_then(crate::economy::core_ids::resource_id_to_good)?;
             still_need_by_good[claim as usize] = u32::MAX / 2;
             effective_selector = GoodSelector::Specific(claim);
             any_needed = true;

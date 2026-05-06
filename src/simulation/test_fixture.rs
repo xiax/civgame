@@ -1666,7 +1666,7 @@ mod baseline_behaviour {
             });
             entity.insert(ClaimTarget {
                 blueprint: Some(blueprint),
-                good: Some(Good::Wood),
+                resource_id: Some(Good::Wood.into()),
             });
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::Haul;
@@ -2224,7 +2224,7 @@ mod baseline_behaviour {
                 fail_count: 0,
             },
             ClaimTarget {
-                good: Some(Good::Fruit),
+                resource_id: Some(Good::Fruit.into()),
                 blueprint: None,
             },
             AgentGoal::GatherFood,

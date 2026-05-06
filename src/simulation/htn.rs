@@ -2735,7 +2735,7 @@ pub fn htn_acquire_good_dispatch_system(
         let Some(target) = claim_target_opt else {
             continue;
         };
-        let (Some(good), Some(blueprint)) = (target.good, target.blueprint) else {
+        let (Some(resource_id), Some(blueprint)) = (target.resource_id, target.blueprint) else {
             continue;
         };
 
@@ -2745,7 +2745,7 @@ pub fn htn_acquire_good_dispatch_system(
         let stock = faction_registry
             .factions
             .get(&member.faction_id)
-            .map(|f| f.storage.stock_of(good))
+            .and_then(|f| f.storage.totals.get(&resource_id).copied())
             .unwrap_or(0);
         if stock == 0 {
             continue;
@@ -2772,12 +2772,12 @@ pub fn htn_acquire_good_dispatch_system(
             let mut tile_stock: u32 = 0;
             for &gi_entity in spatial.get(tx as i32, ty as i32) {
                 if let Ok(gi) = item_query.get(gi_entity) {
-                    if gi.item.good() == good && gi.qty > 0 {
+                    if gi.item.resource_id == resource_id && gi.qty > 0 {
                         tile_stock = tile_stock.saturating_add(gi.qty);
                     }
                 }
             }
-            let reserved = storage_reservations.get((tx, ty), good.into());
+            let reserved = storage_reservations.get((tx, ty), resource_id);
             let effective = tile_stock.saturating_sub(reserved);
             if effective == 0 {
                 continue;
@@ -2821,7 +2821,7 @@ pub fn htn_acquire_good_dispatch_system(
             forage_food_good: None,
         };
 
-        let abstract_task = AbstractTask::AcquireGood { resource_id: good.into() };
+        let abstract_task = AbstractTask::AcquireGood { resource_id };
         let methods = method_registry.methods_for(AbstractTaskKind::AcquireGood);
         let chosen = methods
             .iter()
@@ -3006,7 +3006,9 @@ pub fn htn_stockpile_food_dispatch_system(
             }
             // Confirm the claim targets a food good — `Stockpile{Wood}` would
             // route through the AcquireGood gather branch, not here.
-            let claim_good = claim_target_opt.and_then(|t| t.good);
+            let claim_good = claim_target_opt
+                .and_then(|t| t.resource_id)
+                .and_then(crate::economy::core_ids::resource_id_to_good);
             match claim_good {
                 Some(g) if g.is_edible() => {}
                 _ => return,

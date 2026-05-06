@@ -249,13 +249,13 @@ pub struct JobClaim {
 
 /// Companion component to `JobClaim` carrying the concrete target of the
 /// currently held posting. Populated/refreshed by `job_goal_lock_system` so
-/// plan resolvers can route to the claimed blueprint or good without
+/// plan resolvers can route to the claimed blueprint or resource without
 /// re-querying the `JobBoard`. `None` fields mean the claim's posting kind
 /// doesn't carry that target (e.g. food Stockpile claims have no blueprint).
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct ClaimTarget {
     pub blueprint: Option<Entity>,
-    pub good: Option<Good>,
+    pub resource_id: Option<crate::economy::resource_catalog::ResourceId>,
 }
 
 /// Global resource holding all postings, sharded internally by faction.
@@ -1320,17 +1320,17 @@ pub fn posting_claim_target(p: &JobPosting) -> ClaimTarget {
     match &p.progress {
         JobProgress::Stockpile { good, .. } => ClaimTarget {
             blueprint: None,
-            good: Some(*good),
+            resource_id: Some((*good).into()),
         },
         JobProgress::Haul {
             blueprint, good, ..
         } => ClaimTarget {
             blueprint: Some(*blueprint),
-            good: Some(*good),
+            resource_id: Some((*good).into()),
         },
         JobProgress::Building { blueprint } => ClaimTarget {
             blueprint: Some(*blueprint),
-            good: None,
+            resource_id: None,
         },
         _ => ClaimTarget::default(),
     }
