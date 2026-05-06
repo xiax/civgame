@@ -181,7 +181,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: Some(PlantKind::BerryBush),
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 1: FarmFarmland — targets Grain, falls back via memory
@@ -191,7 +191,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: Some(PlantKind::Grain),
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 2: ChopForest
@@ -201,7 +201,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 3: MineStone
@@ -211,7 +211,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 4: PlantGrainSeed (requires GrainSeed in inventory)
@@ -221,7 +221,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::needs_good(Good::GrainSeed, 1),
             reward_scale: 0.2,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 5: Hunt
@@ -231,7 +231,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::needs_good(Good::Weapon, 1),
             reward_scale: 0.4,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 6: CollectFood
@@ -241,7 +241,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 7: (unused — reserved for future use)
@@ -251,7 +251,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 8: (unused — reserved for future use)
@@ -261,7 +261,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 9: Eat — consume edibles from inventory in place. Gated on hunger
@@ -272,7 +272,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::eat_when_hungry(EAT_TRIGGER_HUNGER),
             reward_scale: 1.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 10: WithdrawFood — pull one edible from a faction storage tile
@@ -282,7 +282,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 11: TameAnimal — work adjacent to a wild horse for ~100 ticks
@@ -292,7 +292,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 1.5,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         // ── Crafting steps ────────────────────────────────────────────────────
         StepDef {
@@ -303,7 +303,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::carry_anything(),
             reward_scale: 0.1,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 13: CollectSkin — pick up Skin from ground (after hunting)
@@ -313,7 +313,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         // 14-23: legacy per-recipe Craft steps. Replaced by the order-driven
         // pipeline (steps 38-40); kept as Idle placeholders so existing
@@ -325,7 +325,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             id: StepId(15),
@@ -334,7 +334,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             id: StepId(16),
@@ -343,7 +343,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             id: StepId(17),
@@ -352,7 +352,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             id: StepId(18),
@@ -361,7 +361,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             id: StepId(19),
@@ -370,7 +370,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             id: StepId(20),
@@ -379,7 +379,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             id: StepId(21),
@@ -388,7 +388,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             id: StepId(22),
@@ -397,7 +397,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             id: StepId(23),
@@ -406,7 +406,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 24: (unused — reserved for future use)
@@ -416,7 +416,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 25: BuildAnyBlueprint — finds the nearest accessible blueprint of any kind
@@ -427,7 +427,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 1.2,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 26: (unused — formerly FindMate; reproduction is now passive via co-sleeping)
@@ -437,7 +437,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 27: EngageRescue — route to the attacker stored on RescueTarget and engage.
@@ -449,7 +449,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 1.5,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 28: HaulToBlueprint — carry currently-held materials to the nearest
@@ -461,7 +461,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 29: PlayWithPartner — route to the nearest play partner and
@@ -473,7 +473,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 30: PlayWithItem — solo play. Resolves to the agent's tile if
@@ -485,7 +485,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 31: Explore — walk to a random reachable tile near home.
@@ -498,7 +498,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.05,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 32: FetchMaterialFromStorage — route to the nearest faction
@@ -516,7 +516,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 33: WithdrawGrainSeed — pull one GrainSeed from faction storage.
@@ -526,7 +526,11 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.2,
             plant_filter: None,
-            extra: Good::GrainSeed as u8,
+            withdraw_filter: Some(
+                crate::simulation::typed_task::WithdrawGoodFilter::Specific(
+                    Good::GrainSeed.into(),
+                ),
+            ),
         },
         StepDef {
             // 34: WithdrawStone — pull one Stone from a faction storage tile so
@@ -537,19 +541,22 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.2,
             plant_filter: None,
-            extra: Good::Stone as u8,
+            withdraw_filter: Some(
+                crate::simulation::typed_task::WithdrawGoodFilter::Specific(Good::Stone.into()),
+            ),
         },
         StepDef {
             // 35: WithdrawPlayItem — pull one entertainment-valued good from a
-            // faction storage tile (sentinel 255 in craft_recipe_id signals
-            // "first item with entertainment_value > 0").
+            // faction storage tile.
             id: StepId(35),
             task: TaskKind::WithdrawGood,
             target: StepTarget::NearestFactionStorageWithEntertainment,
             preconditions: StepPreconditions::none(),
             reward_scale: 0.2,
             plant_filter: None,
-            extra: 255,
+            withdraw_filter: Some(
+                crate::simulation::typed_task::WithdrawGoodFilter::AnyEntertainment,
+            ),
         },
         StepDef {
             // 36: PlantGrainSeedAsPlay — plant a held GrainSeed on a grass tile
@@ -561,7 +568,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::needs_good(Good::GrainSeed, 1),
             reward_scale: 0.6,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 37: ThrowRocksAsPlay — throw a held Stone as recreation. Consumes
@@ -574,7 +581,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::needs_good(Good::Stone, 1),
             reward_scale: 0.6,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 38: HaulToCraftOrder — drop currently-held materials into the
@@ -586,7 +593,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 39: WorkOnCraftOrder — adjacent to a satisfied CraftOrder,
@@ -597,7 +604,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 40: FetchCraftOrderMaterialFromStorage — withdraw the most-
@@ -614,7 +621,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.3,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 41: WithdrawClaimedHaulMaterial — withdraw the good named in the
@@ -633,7 +640,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 42: HaulToClaimedBlueprint — carry the agent's hand contents to
@@ -645,7 +652,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.5,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 43: BuildClaimedBlueprint — perform labor at the specific
@@ -658,7 +665,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 1.5,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 44: CollectWood — pick up loose Wood GroundItems left behind by
@@ -669,7 +676,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 45: CollectStone — pick up loose Stone GroundItems on the world.
@@ -679,7 +686,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 46: (unused — was per-good FetchWoodFromStorage; superseded by
@@ -692,7 +699,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 47: (unused — was per-good FetchStoneFromStorage; superseded by
@@ -703,7 +710,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         // 48-51: social/military steps that previously lived as hard-coded
         // goal arms in `tasks::goal_dispatch_system`. Now plan-driven so
@@ -720,7 +727,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.5,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 49: Walk to the home tile of the faction we're raiding (per
@@ -732,7 +739,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.5,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 50: Walk to faction camp and run TaskKind::Defend. Reuses
@@ -743,7 +750,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.5,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 51: Walk to faction camp and run TaskKind::Lead.
@@ -753,7 +760,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.5,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 52: Hunter pulls a Spear (Good::Weapon) from faction storage.
@@ -765,7 +772,11 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::forbids(Good::Weapon),
             reward_scale: 0.4,
             plant_filter: None,
-            extra: Good::Weapon as u8,
+            withdraw_filter: Some(
+                crate::simulation::typed_task::WithdrawGoodFilter::Specific(
+                    Good::Weapon.into(),
+                ),
+            ),
         },
         StepDef {
             // 53: Walk adjacent to a fresh Corpse and attach it to the
@@ -776,7 +787,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 54: Drag the carried corpse to the nearest hearth or faction
@@ -788,7 +799,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.4,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 55: Butcher the carried corpse in place — work_ticks then yield
@@ -799,7 +810,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 1.0,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 56: Equip a Weapon (Spear) into the MainHand slot. Instant
@@ -813,12 +824,12 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             task: TaskKind::Equip,
             target: StepTarget::EquipItem {
                 slot: EquipmentSlot::MainHand,
-                good: Good::Weapon,
+                resource_id: Good::Weapon.into(),
             },
             preconditions: StepPreconditions::needs_good(Good::Weapon, 1),
             reward_scale: 0.5,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 57: Muster for hunt. Walk to the hearth tile selected by the
@@ -836,7 +847,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.2,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 58: Travel to the chief's chosen hunt area. Reuses the Explore
@@ -849,7 +860,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.2,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 59: Wander for prey. Used by the ScoutForPrey plan when the
@@ -862,7 +873,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.1,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 60: WithdrawBerrySeed — pull one BerrySeed from faction storage.
@@ -872,7 +883,11 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::none(),
             reward_scale: 0.2,
             plant_filter: None,
-            extra: Good::BerrySeed as u8,
+            withdraw_filter: Some(
+                crate::simulation::typed_task::WithdrawGoodFilter::Specific(
+                    Good::BerrySeed.into(),
+                ),
+            ),
         },
         StepDef {
             // 61: PlantBerrySeed (requires BerrySeed in inventory)
@@ -882,7 +897,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::needs_good(Good::BerrySeed, 1),
             reward_scale: 0.2,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
         StepDef {
             // 62: PlantBerrySeedAsPlay — plant a held BerrySeed on a grass tile
@@ -894,7 +909,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             preconditions: StepPreconditions::needs_good(Good::BerrySeed, 1),
             reward_scale: 0.6,
             plant_filter: None,
-            extra: 0,
+            withdraw_filter: None,
         },
     ];
 }

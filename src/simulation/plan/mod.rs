@@ -424,13 +424,14 @@ pub enum StepTarget {
     /// (any tier — open/ringed/lined hearth) first; falls back to the
     /// faction's home tile. Resolves to the tile only — no entity target.
     NearestButcherSite,
-    /// In-place equip: agent transfers one unit of `good` from inventory or
-    /// hands into `Equipment.items[slot]`. Resolves to `SelfPosition`; the
-    /// dispatcher writes `slot` and `good` to PersonAI fields so
-    /// `equip_task_system` knows what to wield.
+    /// In-place equip: agent transfers one unit of the resource at
+    /// `resource_id` from inventory or hands into `Equipment.items[slot]`.
+    /// Resolves to `SelfPosition`; the dispatcher routes `slot` +
+    /// `resource_id` into the typed `Task::Equip` so `equip_task_system`
+    /// knows what to wield.
     EquipItem {
         slot: crate::simulation::items::EquipmentSlot,
-        good: Good,
+        resource_id: crate::economy::resource_catalog::ResourceId,
     },
     /// Hearth tile to muster at for a chief's `HuntOrder::Hunt`. Falls back
     /// to faction `home_tile`. Resolves to None when no hunt order is active.
@@ -450,45 +451,49 @@ pub enum StepTarget {
 
 #[derive(Clone, Debug)]
 pub struct StepPreconditions {
-    pub requires_good: Option<(Good, u32)>,
+    pub requires_resource:
+        Option<(crate::economy::resource_catalog::ResourceId, u32)>,
     pub requires_any_edible: bool,
     pub min_hunger: Option<u8>,
     pub requires_carry_anything: bool,
     /// When set, this precondition is *unsatisfied* if the agent already has
-    /// any quantity of the named good (in inventory or hands). Used by
+    /// any quantity of the named resource (in inventory or hands). Used by
     /// `AcquireHuntingSpear` so the plan is filtered out the moment the
     /// hunter is already armed — no need to fetch another spear.
-    pub forbids_good: Option<Good>,
+    pub forbids_resource: Option<crate::economy::resource_catalog::ResourceId>,
 }
 
 impl StepPreconditions {
     pub fn none() -> Self {
         Self {
-            requires_good: None,
+            requires_resource: None,
             requires_any_edible: false,
             min_hunger: None,
             requires_carry_anything: false,
-            forbids_good: None,
+            forbids_resource: None,
         }
     }
-    pub fn needs_good(good: Good, qty: u32) -> Self {
+    pub fn needs_good(
+        good: impl Into<crate::economy::resource_catalog::ResourceId>,
+        qty: u32,
+    ) -> Self {
         Self {
-            requires_good: Some((good, qty)),
+            requires_resource: Some((good.into(), qty)),
             requires_any_edible: false,
             min_hunger: None,
             requires_carry_anything: false,
-            forbids_good: None,
+            forbids_resource: None,
         }
     }
     /// Eat-style preconditions: agent must hold at least one edible and be at
     /// or above the given hunger threshold.
     pub fn eat_when_hungry(min_hunger: u8) -> Self {
         Self {
-            requires_good: None,
+            requires_resource: None,
             requires_any_edible: true,
             min_hunger: Some(min_hunger),
             requires_carry_anything: false,
-            forbids_good: None,
+            forbids_resource: None,
         }
     }
     /// Deposit-style preconditions: agent must be carrying *something* across
@@ -497,23 +502,23 @@ impl StepPreconditions {
     /// pickup, etc.).
     pub fn carry_anything() -> Self {
         Self {
-            requires_good: None,
+            requires_resource: None,
             requires_any_edible: false,
             min_hunger: None,
             requires_carry_anything: true,
-            forbids_good: None,
+            forbids_resource: None,
         }
     }
     /// Plan-gate variant: precondition fails if the agent already has any
     /// quantity of `good` across inventory + hands. Used to make
     /// `AcquireHuntingSpear` self-deselect once a hunter is armed.
-    pub fn forbids(good: Good) -> Self {
+    pub fn forbids(good: impl Into<crate::economy::resource_catalog::ResourceId>) -> Self {
         Self {
-            requires_good: None,
+            requires_resource: None,
             requires_any_edible: false,
             min_hunger: None,
             requires_carry_anything: false,
-            forbids_good: Some(good),
+            forbids_resource: Some(good.into()),
         }
     }
 
@@ -527,8 +532,7 @@ impl StepPreconditions {
         equipment: Option<&crate::simulation::items::Equipment>,
         hunger: f32,
     ) -> bool {
-        if let Some((good, qty)) = self.requires_good {
-            let id = crate::economy::core_ids::good_to_resource_id(good);
+        if let Some((id, qty)) = self.requires_resource {
             if agent.quantity_of_resource(id) + carrier.quantity_of_resource(id) < qty {
                 return false;
             }
@@ -547,8 +551,7 @@ impl StepPreconditions {
         {
             return false;
         }
-        if let Some(good) = self.forbids_good {
-            let id = crate::economy::core_ids::good_to_resource_id(good);
+        if let Some(id) = self.forbids_resource {
             if agent.quantity_of_resource(id) > 0 || carrier.quantity_of_resource(id) > 0 {
                 return false;
             }
@@ -575,9 +578,10 @@ pub struct StepDef {
     /// When falling back from memory to a plant search (Food memory kind),
     /// restricts which plant kind is targeted. None = any mature plant.
     pub plant_filter: Option<PlantKind>,
-    /// For Craft steps: the recipe ID in craft_recipes() to execute.
-    /// Encoded into ai.target_z at dispatch time.
-    pub extra: u8,
+    /// For `TaskKind::WithdrawGood` steps only: the filter dispatched into
+    /// the typed `Task::WithdrawGood` (`Specific(rid)` or
+    /// `AnyEntertainment`). `None` for every non-WithdrawGood step.
+    pub withdraw_filter: Option<crate::simulation::typed_task::WithdrawGoodFilter>,
 }
 
 #[derive(Clone)]
@@ -2708,32 +2712,24 @@ pub fn plan_execution_system(
                         }
                     }
                     // Phase 3b-i: populate the typed `Task::WithdrawGood`
-                    // variant from `step_def.extra`. Sentinel 255 means
-                    // "any entertainment good", anything else is a specific
-                    // `Good` discriminant. (The legacy `craft_recipe_id`
-                    // channel was retired in 3c-i — no readers remained.)
+                    // variant from the StepDef's typed `withdraw_filter`
+                    // field. Defaults to `AnyEntertainment` for steps that
+                    // are accidentally tagged WithdrawGood without a
+                    // filter (defensive — every WithdrawGood StepDef sets
+                    // one).
                     if step_def.task == TaskKind::WithdrawGood {
-                        let filter = if step_def.extra == 255 {
-                            crate::simulation::typed_task::WithdrawGoodFilter::AnyEntertainment
-                        } else {
-                            match crate::economy::goods::Good::try_from_u8(step_def.extra as u8) {
-                                Some(g) => {
-                                    crate::simulation::typed_task::WithdrawGoodFilter::Specific(
-                                        crate::economy::core_ids::good_to_resource_id(g),
-                                    )
-                                }
-                                None => crate::simulation::typed_task::WithdrawGoodFilter::AnyEntertainment,
-                            }
-                        };
+                        let filter = step_def.withdraw_filter.unwrap_or(
+                            crate::simulation::typed_task::WithdrawGoodFilter::AnyEntertainment,
+                        );
                         aq.dispatch(crate::simulation::typed_task::Task::WithdrawGood { filter });
                     }
                     // Equip dispatch: populate the typed `Task::Equip` variant.
                     // Phase 3d-i retired the `equip_slot` legacy field; the
                     // executor reads slot + good from `aq.current.as_equip()`.
-                    if let StepTarget::EquipItem { slot, good } = step_def.target {
+                    if let StepTarget::EquipItem { slot, resource_id } = step_def.target {
                         aq.dispatch(crate::simulation::typed_task::Task::Equip {
                             slot,
-                            resource_id: crate::economy::core_ids::good_to_resource_id(good),
+                            resource_id,
                         });
                     }
                     // Commit the resolver-chosen withdraw intent into the typed
