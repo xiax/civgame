@@ -84,6 +84,7 @@ pub fn resource_id_to_good(id: ResourceId) -> Option<Good> {
 macro_rules! core_ids {
     ($( $name:ident => $key:literal ),+ $(,)?) => {
         $(
+            #[allow(non_upper_case_globals)]
             pub static $name: OnceLock<ResourceId> = OnceLock::new();
         )+
 

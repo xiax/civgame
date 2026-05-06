@@ -46,11 +46,13 @@ use crate::simulation::construction::{Bed, HomeBed};
 use crate::simulation::faction::{FactionMember, FactionRegistry, StorageTileMap, SOLO};
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
-use crate::simulation::memory::MemoryKind;
+use crate::simulation::memory::{AgentMemory, MemoryKind};
+use crate::simulation::plants::{GrowthStage, Plant, PlantMap};
 use crate::simulation::needs::{Needs, EAT_TRIGGER_HUNGER};
 use crate::simulation::person::{AiState, Drafted, PersonAI, PlayerOrder, Profession};
 use crate::simulation::plan::ActivePlan;
 use crate::simulation::production::total_edible;
+use crate::simulation::schedule::SimClock;
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::TechId;
 use crate::simulation::typed_task::{ActionQueue, Task};
@@ -88,6 +90,16 @@ pub enum AbstractTask {
     /// registered, but no dispatcher consumes `AbstractTaskKind::AcquireGood`
     /// yet. 5c-ii adds the dispatcher and starts deleting per-good plans.
     AcquireGood { good: Good },
+    /// Fill faction food storage. The chief-driven counterpart to
+    /// `AcquireFood`: instead of "agent is hungry, get food into mouth," this
+    /// expresses "faction wants more food in storage, regardless of who is
+    /// hungry." Methods under this kind chain pick-up tasks with a trailing
+    /// `DepositToFactionStorage` (parallel to `AcquireFood`'s trailing `Eat`).
+    /// Phase 5c-ii-d-vi adds two methods: `ScavengeFoodForStorageMethod` and
+    /// `ExploreForFoodForStorageMethod` — the GatherFood-goal replacements
+    /// for the legacy `ScavengeFood` (PlanId 6) and `ExploreForFood`
+    /// (PlanId 35) plans, both now retired.
+    StockpileFood,
 }
 
 /// Discriminant-only key for `MethodRegistry` lookups. `AbstractTask` itself
@@ -100,6 +112,7 @@ pub enum AbstractTaskKind {
     Eat,
     AcquireFood,
     AcquireGood,
+    StockpileFood,
 }
 
 impl AbstractTask {
@@ -109,6 +122,7 @@ impl AbstractTask {
             AbstractTask::Eat => AbstractTaskKind::Eat,
             AbstractTask::AcquireFood => AbstractTaskKind::AcquireFood,
             AbstractTask::AcquireGood { .. } => AbstractTaskKind::AcquireGood,
+            AbstractTask::StockpileFood => AbstractTaskKind::StockpileFood,
         }
     }
 }
@@ -117,6 +131,161 @@ impl AbstractTask {
 /// 5a-i's lone Sleep method.
 pub type MethodFlags = u8;
 pub const MF_UNINTERRUPTIBLE: MethodFlags = 1 << 0;
+
+/// Stable per-method identity. Mirrors `PlanId` in `plan/mod.rs` — newtype
+/// over `u16` with one `pub const` per registered method. Method dispatchers
+/// will use this to key per-agent recency-failure history (`MethodHistory`,
+/// Phase 6a) so a method that just routing-failed scores lower next tick
+/// than one that hasn't been tried.
+#[derive(Copy, Clone, Eq, Hash, PartialEq, Debug)]
+pub struct MethodId(pub u16);
+
+impl MethodId {
+    pub const SLEEP: MethodId = MethodId(0);
+    pub const EAT_FROM_INVENTORY: MethodId = MethodId(1);
+    pub const WITHDRAW_FROM_STORAGE: MethodId = MethodId(2);
+    pub const SCAVENGE_FOOD_FROM_GROUND: MethodId = MethodId(3);
+    pub const EXPLORE_FOR_FOOD: MethodId = MethodId(4);
+    pub const WITHDRAW_MATERIAL_FROM_STORAGE: MethodId = MethodId(5);
+    pub const WITHDRAW_AND_HAUL_TO_BLUEPRINT: MethodId = MethodId(6);
+    pub const GATHER_FROM_KNOWN: MethodId = MethodId(7);
+    pub const SCAVENGE_FROM_GROUND: MethodId = MethodId(8);
+    pub const EXPLORE_FOR_MATERIAL: MethodId = MethodId(9);
+    pub const SCAVENGE_FOOD_FOR_STORAGE: MethodId = MethodId(10);
+    pub const EXPLORE_FOR_FOOD_FOR_STORAGE: MethodId = MethodId(11);
+    pub const FORAGE_FROM_KNOWN: MethodId = MethodId(12);
+    pub const FORAGE_FROM_KNOWN_FOR_STORAGE: MethodId = MethodId(13);
+
+    pub fn raw(self) -> u16 {
+        self.0
+    }
+}
+
+/// Outcome of a method expansion once it stops running. Pushed onto
+/// `MethodHistory` so `utility()` can apply a soft recency penalty to a
+/// method that just failed. Mirrors `PlanOutcome` in `plan/mod.rs`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MethodOutcome {
+    Success,
+    /// The dispatcher could not route the head task (no path / unreachable
+    /// target / SOLO with no storage).
+    FailedRouting,
+    /// The executor ran but its target became invalid (despawned plant,
+    /// reservation lost, etc.).
+    FailedTarget,
+    /// External preempt: chain dropped via `aq.cancel()` from a goal flip,
+    /// muster, or distress response.
+    Interrupted,
+}
+
+impl MethodOutcome {
+    pub const fn is_failure(self) -> bool {
+        !matches!(self, MethodOutcome::Success)
+    }
+}
+
+/// Soft utility penalty applied per recent failure in `MethodHistory` when
+/// the dispatcher scores a method. `0.5` keeps a once-failed method
+/// candidate (1.5 base scavenge → 1.0 effective) but pushes a twice-failed
+/// method below most siblings (1.5 → 0.5). Lower than `MAX_DIST_PENALTY`
+/// (0.30) so distance still discriminates between two siblings on the same
+/// failure count.
+pub const METHOD_FAILURE_PENALTY: f32 = 0.5;
+
+// ── Method utility tiers (Phase 6c) ────────────────────────────────────
+//
+// Centralised so every `Method::utility()` body pulls its base from one
+// place; tuning the inter-tier ranking touches one block instead of a
+// dozen scattered literals.
+//
+// Tier semantics:
+//
+// - `UTIL_CLAIMED_HAUL` (2.0): the agent holds an active `JobClaim`
+//   naming a specific blueprint+material. Outranks every opportunistic
+//   alternative; survives goal flips via `MF_UNINTERRUPTIBLE`.
+// - `UTIL_VISIBLE_GROUND` (1.5): a concrete loose `GroundItem` is
+//   visible right now (or freshly remembered). Bias-on-visibility —
+//   outranks the storage / known-gather baseline so a seen pile is
+//   preferred over walking to a known tree or a known stockpile.
+// - `UTIL_BASELINE` (1.0): the ordinary "do the obvious thing" tier
+//   for sleep, eat, withdraw-from-storage, and gather-from-known.
+// - `UTIL_EXPLORE_FALLBACK` (0.3): no concrete option fires; walk
+//   somewhere new in the hope of recording a memory. Loses to any
+//   concrete method whose precondition holds.
+//
+// Cap-preserving invariant (with `MAX_DIST_PENALTY = 0.30`):
+//
+//   CLAIMED_HAUL      − 0.30 = 1.70   (max-distance haul)
+//   VISIBLE_GROUND    − 0.30 = 1.20   (max-distance scavenge)
+//   BASELINE          − 0.00 = 1.00   (zero-distance baseline)
+//   BASELINE          − 0.30 = 0.70   (max-distance baseline)
+//   EXPLORE_FALLBACK         = 0.30
+//
+// Distance discounts can move a method *within* its tier but never
+// across tiers — pinned by tests like
+// `haul_full_trip_cap_preserves_ranking_over_bare_withdraw`.
+pub const UTIL_BASELINE: f32 = 1.0;
+pub const UTIL_VISIBLE_GROUND: f32 = 1.5;
+pub const UTIL_CLAIMED_HAUL: f32 = 2.0;
+pub const UTIL_EXPLORE_FALLBACK: f32 = 0.3;
+
+/// Apply the recency-failure penalty to a method's raw utility. Centralised
+/// so every dispatcher applies the same bias schedule and unit tests can
+/// pin the contract. `now` is the current `SimClock.tick`.
+pub fn score_method_with_history(
+    method: &dyn Method,
+    abstract_task: AbstractTask,
+    ctx: &PlannerCtx,
+    history: &MethodHistory,
+    now: u64,
+) -> f32 {
+    let raw = method.utility(abstract_task, ctx);
+    let failures = history.recently_failed_count(method.id(), now) as f32;
+    raw - failures * METHOD_FAILURE_PENALTY
+}
+
+/// Mirrors `PLAN_HISTORY_LEN` / `PLAN_HISTORY_TTL_TICKS` from `plan/mod.rs`
+/// (per `feedback_plan_history_design.md`: ring length stays short; failures
+/// expire by tick age, not buffer eviction).
+pub const METHOD_HISTORY_LEN: usize = 2;
+pub const METHOD_HISTORY_TTL_TICKS: u64 = 100;
+
+/// Per-agent ring buffer of the last few method outcomes. Phase 6a writes the
+/// component on every Person spawn site and exposes `recently_failed_count`;
+/// Phase 6b instruments the chain-teardown sites that push outcomes here, and
+/// extends `PlannerCtx` so method `utility()` bodies can read the count and
+/// apply a soft penalty.
+#[derive(Component, Default)]
+pub struct MethodHistory {
+    pub entries: [Option<(MethodId, MethodOutcome, u64)>; METHOD_HISTORY_LEN],
+    pub head: u8,
+}
+
+impl MethodHistory {
+    pub fn push(&mut self, method_id: MethodId, outcome: MethodOutcome, tick: u64) {
+        let i = (self.head as usize) % METHOD_HISTORY_LEN;
+        self.entries[i] = Some((method_id, outcome, tick));
+        self.head = ((self.head as usize + 1) % METHOD_HISTORY_LEN) as u8;
+    }
+
+    /// Number of non-expired failure entries for `method_id`. Soft penalty
+    /// only — the dispatcher still considers the method, just at lower
+    /// utility.
+    pub fn recently_failed_count(&self, method_id: MethodId, now: u64) -> u32 {
+        self.entries
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    slot,
+                    Some((id, outcome, tick))
+                        if *id == method_id
+                            && outcome.is_failure()
+                            && now.saturating_sub(*tick) <= METHOD_HISTORY_TTL_TICKS
+                )
+            })
+            .count() as u32
+    }
+}
 
 /// Tile-level chebyshev (king's-move) distance, the same metric `SpatialIndex`
 /// scans use. Used by method `utility()` bodies to bias toward closer targets.
@@ -147,6 +316,26 @@ fn dist_penalty(agent: (i32, i32), target: Option<(i32, i32)>) -> f32 {
             (d * DIST_DISCOUNT_PER_TILE).min(MAX_DIST_PENALTY)
         }
         None => 0.0,
+    }
+}
+
+/// Two-leg distance discount for chains shaped agent → target → deposit
+/// (gather/scavenge methods whose expansion ends in `DepositToFactionStorage`,
+/// or the haul method's storage→blueprint pair). Total penalty caps at
+/// `MAX_DIST_PENALTY` so the cap-preserves-ranking invariant survives — a
+/// far full-trip never undercuts a method that outranked it on base utility.
+/// Falls back to the agent→target single-leg signal when `deposit` is `None`.
+fn full_trip_penalty(
+    agent: (i32, i32),
+    target: Option<(i32, i32)>,
+    deposit: Option<(i32, i32)>,
+) -> f32 {
+    match (target, deposit) {
+        (Some(t), Some(d)) => {
+            let total = (chebyshev_dist(agent, t) + chebyshev_dist(t, d)) as f32;
+            (total * DIST_DISCOUNT_PER_TILE).min(MAX_DIST_PENALTY)
+        }
+        _ => dist_penalty(agent, target),
     }
 }
 
@@ -213,6 +402,12 @@ pub struct PlannerCtx {
     /// Sleep / Eat / AcquireFood / single-task AcquireGood dispatchers leave
     /// it at `None`.
     pub claimed_blueprint: Option<Entity>,
+    /// World tile of `claimed_blueprint`, snapshot at decision time. Read by
+    /// `WithdrawAndHaulToBlueprintMethod`'s `utility()` to discount on the
+    /// *full* storage→blueprint trip rather than just the storage hop. The
+    /// haul dispatcher populates this from `Blueprint.tile` whenever
+    /// `claimed_blueprint` is set; siblings leave both at `None`.
+    pub claimed_blueprint_tile: Option<(i32, i32)>,
     /// A known harvest tile for the `AcquireGood` target material — a tree
     /// for Wood, a stone tile for Stone, a berry bush for Fruit, etc. Read
     /// by `GatherFromKnownMethod` (Phase 5c-ii-c) to seed the head of a
@@ -241,6 +436,36 @@ pub struct PlannerCtx {
     /// `assign_task_with_routing`. Same `None` semantics as
     /// `scavenge_target_entity`.
     pub scavenge_target_tile: Option<(i32, i32)>,
+    /// Specific food good the picked-up `scavenge_target_entity` will yield
+    /// (Fruit / Meat / Grain / etc.). Read by `ScavengeFoodForStorageMethod`
+    /// (Phase 5c-ii-d-vi) so the trailing `Task::DepositToFactionStorage` can
+    /// carry the right `good` payload. The legacy `ScavengeFood` plan (PlanId
+    /// 6) didn't need this field because the deposit step was parameterless;
+    /// the typed task makes the good explicit for chain-integrity inspection.
+    /// `None` for non-food scavenge dispatches and dispatcher ctx-build sites
+    /// that don't populate it.
+    pub scavenge_food_good: Option<Good>,
+    /// Nearest faction storage tile from `gather_target_tile`. Used by
+    /// `GatherFromKnownMethod` to discount on the full gather→deposit trip
+    /// (matches the haul method's full-trip discount from 5c-ii-d-vii).
+    /// `None` when no gather target is set or the faction has no storage.
+    pub gather_deposit_tile: Option<(i32, i32)>,
+    /// Nearest faction storage tile from `scavenge_target_tile`. Used by the
+    /// AcquireGood/StockpileFood scavenge methods (whose chains end in
+    /// `DepositToFactionStorage`) for full-trip discount. `None` when no
+    /// scavenge target is set, the faction has no storage, or the chain ends
+    /// in `Eat` (AcquireFood case — no second hop to discount).
+    pub scavenge_deposit_tile: Option<(i32, i32)>,
+    /// Specific food good the picked-up plant at `gather_target_tile` will
+    /// yield (Fruit / Grain / etc.). Read by `ForageFromKnownForStorageMethod`
+    /// so the trailing `Task::DepositToFactionStorage` carries the right
+    /// `good` payload. Mirrors `scavenge_food_good`'s role for the scavenge
+    /// chain. The `Task::DepositToFactionStorage` payload is informational
+    /// (the deposit executor dumps everything in hand regardless), but the
+    /// typed task makes the good explicit for chain-integrity inspection.
+    /// `None` for non-forage dispatches and AcquireFood (whose chain ends in
+    /// `Eat`, not `DepositToFactionStorage`).
+    pub forage_food_good: Option<Good>,
 }
 
 /// A single decomposition rule for an `AbstractTask`. Scoring (`utility`) and
@@ -277,6 +502,12 @@ pub trait Method: Send + Sync + 'static {
     /// Static name for debug / inspector display. Keep these short and
     /// human-recognisable.
     fn name(&self) -> &'static str;
+
+    /// Stable identity for `MethodHistory` keying. Phase 6a: every method
+    /// returns a hardcoded `MethodId::*` const; the registry doesn't yet
+    /// consume the value, but the trait surface lets 6b's outcome-recording
+    /// sites stamp the right id without re-deriving it from `name()`.
+    fn id(&self) -> MethodId;
 }
 
 /// Registry of methods keyed by abstract-task kind. Populated once at startup
@@ -317,6 +548,10 @@ pub fn register_builtin_methods(reg: &mut MethodRegistry) {
         Box::new(ScavengeFoodFromGroundMethod),
     );
     reg.register(
+        AbstractTaskKind::AcquireFood,
+        Box::new(ForageFromKnownMethod),
+    );
+    reg.register(
         AbstractTaskKind::AcquireGood,
         Box::new(WithdrawMaterialFromStorageMethod),
     );
@@ -339,6 +574,18 @@ pub fn register_builtin_methods(reg: &mut MethodRegistry) {
     reg.register(
         AbstractTaskKind::AcquireGood,
         Box::new(ExploreForMaterialMethod),
+    );
+    reg.register(
+        AbstractTaskKind::StockpileFood,
+        Box::new(ScavengeFoodForStorageMethod),
+    );
+    reg.register(
+        AbstractTaskKind::StockpileFood,
+        Box::new(ForageFromKnownForStorageMethod),
+    );
+    reg.register(
+        AbstractTaskKind::StockpileFood,
+        Box::new(ExploreForFoodForStorageMethod),
     );
 }
 
@@ -365,7 +612,7 @@ impl Method for SleepMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
-        1.0
+        UTIL_BASELINE
     }
 
     fn expand(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -375,6 +622,10 @@ impl Method for SleepMethod {
 
     fn name(&self) -> &'static str {
         "Sleep"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::SLEEP
     }
 }
 
@@ -400,10 +651,11 @@ impl Method for EatFromInventoryMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
-        // Single-method registry today, so any positive value wins. 1.0
-        // matches `SleepMethod`; future Eat methods (e.g. EatFromCarriedFood
-        // with a freshness preference) will discriminate here.
-        1.0
+        // Single-method registry today, so any positive value wins.
+        // `UTIL_BASELINE` matches `SleepMethod`; future Eat methods (e.g.
+        // EatFromCarriedFood with a freshness preference) will
+        // discriminate here.
+        UTIL_BASELINE
     }
 
     fn expand(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> Vec<Task> {
@@ -412,6 +664,10 @@ impl Method for EatFromInventoryMethod {
 
     fn name(&self) -> &'static str {
         "EatFromInventory"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::EAT_FROM_INVENTORY
     }
 }
 
@@ -450,12 +706,12 @@ impl Method for WithdrawFromStorageMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        // Phase 5c-ii-d-v: base 1.0 minus chebyshev distance to the storage
-        // tile (capped at MAX_DIST_PENALTY). When two methods both apply, the
-        // closer target wins. Sibling `ScavengeFoodFromGroundMethod` (base
-        // 1.5) keeps a >=0.20 margin even at the worst-case dist-spread
-        // because both methods clamp at the same MAX_DIST_PENALTY.
-        1.0 - dist_penalty(ctx.tile, ctx.nearest_storage_tile)
+        // Baseline tier minus chebyshev distance to the storage tile
+        // (capped at `MAX_DIST_PENALTY`). Sibling
+        // `ScavengeFoodFromGroundMethod` (`UTIL_VISIBLE_GROUND`) keeps a
+        // ≥0.20 margin even at the worst-case dist-spread because both
+        // methods clamp at the same cap.
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.nearest_storage_tile)
     }
 
     fn expand(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -471,6 +727,10 @@ impl Method for WithdrawFromStorageMethod {
 
     fn name(&self) -> &'static str {
         "WithdrawFromStorage"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::WITHDRAW_FROM_STORAGE
     }
 }
 
@@ -546,13 +806,11 @@ impl Method for ScavengeFoodFromGroundMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        // Bias-on-visibility (base 1.5): outranks `WithdrawFromStorageMethod`
-        // (base 1.0). Phase 5c-ii-d-v adds a distance discount on top so the
-        // closer of two visible loose-food piles wins. Capped at
-        // `MAX_DIST_PENALTY` so a far visible item never falls below
-        // `WithdrawFromStorageMethod` at zero distance (1.5 - 0.30 = 1.20 >
-        // 1.0).
-        1.5 - dist_penalty(ctx.tile, ctx.scavenge_target_tile)
+        // Visible-ground tier: outranks `WithdrawFromStorageMethod`
+        // (`UTIL_BASELINE`). Distance discount picks the closer of two
+        // visible piles; cap (`MAX_DIST_PENALTY`) preserves the
+        // inter-tier ranking against the baseline-tier sibling.
+        UTIL_VISIBLE_GROUND - dist_penalty(ctx.tile, ctx.scavenge_target_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -572,6 +830,10 @@ impl Method for ScavengeFoodFromGroundMethod {
 
     fn name(&self) -> &'static str {
         "ScavengeFoodFromGround"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::SCAVENGE_FOOD_FROM_GROUND
     }
 }
 
@@ -616,11 +878,11 @@ impl Method for WithdrawMaterialFromStorageMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        // Phase 5c-ii-d-v: base 1.0 minus chebyshev distance to the material
-        // storage tile (capped at MAX_DIST_PENALTY). Mirrors
-        // `WithdrawFromStorageMethod`'s shape — same base, same penalty
+        // Baseline tier minus chebyshev distance to the material storage
+        // tile (capped at `MAX_DIST_PENALTY`). Mirrors
+        // `WithdrawFromStorageMethod`'s shape — same tier, same penalty
         // schedule, different ctx field.
-        1.0 - dist_penalty(ctx.tile, ctx.material_storage_tile)
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.material_storage_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -637,6 +899,10 @@ impl Method for WithdrawMaterialFromStorageMethod {
 
     fn name(&self) -> &'static str {
         "WithdrawMaterialFromStorage"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::WITHDRAW_MATERIAL_FROM_STORAGE
     }
 }
 
@@ -676,14 +942,14 @@ impl Method for WithdrawAndHaulToBlueprintMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        // Phase 5c-ii-d-v: base 2.0 minus chebyshev distance to the
-        // *storage* tile (the haul method's own first hop — the blueprint
-        // tile isn't in ctx today, so the storage hop is the only routable
-        // distance signal). Stays strictly above
-        // `WithdrawMaterialFromStorageMethod`'s base 1.0 even at max
-        // penalty (2.0 - 0.30 = 1.70 > 1.0), so a hauler with both methods
-        // applicable always picks the chain that actually delivers.
-        2.0 - dist_penalty(ctx.tile, ctx.material_storage_tile)
+        // Claimed-haul tier minus the full agent→storage→blueprint trip,
+        // capped at `MAX_DIST_PENALTY`. Stays strictly above
+        // `WithdrawMaterialFromStorageMethod` (`UTIL_BASELINE`) even at
+        // max penalty (`UTIL_CLAIMED_HAUL - MAX_DIST_PENALTY = 1.70 >
+        // UTIL_BASELINE`). Falls back to the storage-only signal when the
+        // blueprint tile is missing.
+        UTIL_CLAIMED_HAUL
+            - full_trip_penalty(ctx.tile, ctx.material_storage_tile, ctx.claimed_blueprint_tile)
     }
 
     fn flags(&self) -> MethodFlags {
@@ -712,6 +978,10 @@ impl Method for WithdrawAndHaulToBlueprintMethod {
 
     fn name(&self) -> &'static str {
         "WithdrawAndHaulToBlueprint"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::WITHDRAW_AND_HAUL_TO_BLUEPRINT
     }
 }
 
@@ -766,11 +1036,11 @@ impl Method for GatherFromKnownMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        // Phase 5c-ii-d-v: base 1.0 minus chebyshev distance to the gather
-        // target tile (capped at MAX_DIST_PENALTY). Parity with the other
-        // base-1.0 AcquireGood methods (`WithdrawMaterialFromStorageMethod`),
-        // discriminated by target distance when both apply.
-        1.0 - dist_penalty(ctx.tile, ctx.gather_target_tile)
+        // Baseline tier minus the full agent→gather→deposit trip when
+        // both legs are populated, capped at `MAX_DIST_PENALTY`. Falls
+        // back to the gather-only signal when no deposit anchor is set
+        // (SOLO / no storage / faction without storage tiles).
+        UTIL_BASELINE - full_trip_penalty(ctx.tile, ctx.gather_target_tile, ctx.gather_deposit_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -788,6 +1058,10 @@ impl Method for GatherFromKnownMethod {
 
     fn name(&self) -> &'static str {
         "GatherFromKnown"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::GATHER_FROM_KNOWN
     }
 }
 
@@ -854,16 +1128,12 @@ impl Method for ScavengeFromGroundMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        // Bias-on-visibility (base 1.5): outranks `GatherFromKnownMethod`
-        // (base 1.0) so a worker who can see a loose log scavenges it
-        // instead of walking past to chop a fresh tree. Phase 5c-ii-d-v adds
-        // a distance discount on top so the closer of two visible loose
-        // piles wins. Capped at `MAX_DIST_PENALTY` so a far visible item
-        // never falls below `GatherFromKnownMethod` at zero distance
-        // (1.5 - 0.30 = 1.20 > 1.0). Stays below
-        // `WithdrawAndHaulToBlueprintMethod` (base 2.0) on hauler context
-        // by the same margin.
-        1.5 - dist_penalty(ctx.tile, ctx.scavenge_target_tile)
+        // Visible-ground tier minus the full agent→scavenge→deposit trip
+        // when both legs are populated, capped at `MAX_DIST_PENALTY`.
+        // Falls back to the scavenge-only signal when no deposit anchor
+        // is set.
+        UTIL_VISIBLE_GROUND
+            - full_trip_penalty(ctx.tile, ctx.scavenge_target_tile, ctx.scavenge_deposit_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -886,6 +1156,10 @@ impl Method for ScavengeFromGroundMethod {
 
     fn name(&self) -> &'static str {
         "ScavengeFromGround"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::SCAVENGE_FROM_GROUND
     }
 }
 
@@ -942,7 +1216,7 @@ impl Method for ExploreForFoodMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
-        0.3
+        UTIL_EXPLORE_FALLBACK
     }
 
     fn expand(&self, abstract_task: AbstractTask, _ctx: &PlannerCtx) -> Vec<Task> {
@@ -956,6 +1230,10 @@ impl Method for ExploreForFoodMethod {
 
     fn name(&self) -> &'static str {
         "ExploreForFood"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::EXPLORE_FOR_FOOD
     }
 }
 
@@ -1018,7 +1296,7 @@ impl Method for ExploreForMaterialMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
-        0.3
+        UTIL_EXPLORE_FALLBACK
     }
 
     fn expand(&self, abstract_task: AbstractTask, _ctx: &PlannerCtx) -> Vec<Task> {
@@ -1033,6 +1311,238 @@ impl Method for ExploreForMaterialMethod {
 
     fn name(&self) -> &'static str {
         "ExploreForMaterial"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::EXPLORE_FOR_MATERIAL
+    }
+}
+
+/// Phase 5c-ii-d-vi method for `AbstractTask::StockpileFood` — the
+/// chief-driven counterpart to `ScavengeFoodFromGroundMethod`. Replaces the
+/// `AgentGoal::GatherFood` half of the legacy `ScavengeFood` plan (PlanId 6,
+/// which served `SURVIVE_AND_GATHER_FOOD_GOALS` until 5c-ii-d-iii-ii
+/// retargeted it to `GATHER_FOOD_GOALS` only). The legacy plan's two-step
+/// `[CollectFood, DepositGoods]` chain becomes the typed-task chain
+/// `[Scavenge, DepositToFactionStorage { good }]`.
+///
+/// Where this differs from `ScavengeFoodFromGroundMethod`:
+/// - **No hunger gate.** Chief-driven storage-fill fires regardless of the
+///   agent's hunger; an agent with full hands of fruit is exactly who the
+///   chief wants walking to storage.
+/// - **Trailing task is Deposit, not Eat.** GatherFood's intent is "fill
+///   storage," so the chain ends in `DepositToFactionStorage { good }`. The
+///   `good` payload threads through from `ctx.scavenge_food_good`, which the
+///   dispatcher populates by inspecting the picked GroundItem.
+/// - **Different abstract task kind.** `AcquireFood` and `StockpileFood` are
+///   sibling abstract tasks, mirroring the AcquireFood/AcquireGood split.
+///   Methods can't share a `precondition`/`expand` body across both intents
+///   because the chain shape diverges fundamentally — Eat-in-place vs walk-
+///   to-storage-and-deposit.
+///
+/// Utility `1.5` matches `ScavengeFoodFromGroundMethod` and
+/// `ScavengeFromGroundMethod` (bias-on-visibility — outranks the explore
+/// fallback's `0.3`). Distance-weighted via `dist_penalty` so two visible
+/// piles tie-break on closer-target.
+pub struct ScavengeFoodForStorageMethod;
+
+impl Method for ScavengeFoodForStorageMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::StockpileFood) {
+            return false;
+        }
+        // Both fields must be populated — the entity is the executor's input
+        // (`Task::Scavenge { target }`); the tile is the dispatcher's input
+        // (`assign_task_with_routing` needs somewhere to route to). The good
+        // is the deposit's payload — without it the chain can't know what to
+        // record on the deposit, so opt out cleanly.
+        ctx.scavenge_target_entity.is_some()
+            && ctx.scavenge_target_tile.is_some()
+            && ctx.scavenge_food_good.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        // Visible-ground tier — same shape as `ScavengeFromGroundMethod`
+        // (the AcquireGood sibling); chief-driven storage-fill rather
+        // than personal-hunger drive.
+        UTIL_VISIBLE_GROUND
+            - full_trip_penalty(ctx.tile, ctx.scavenge_target_tile, ctx.scavenge_deposit_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::StockpileFood) {
+            return Vec::new();
+        }
+        let Some(target) = ctx.scavenge_target_entity else {
+            return Vec::new();
+        };
+        if ctx.scavenge_target_tile.is_none() {
+            return Vec::new();
+        }
+        let Some(good) = ctx.scavenge_food_good else {
+            return Vec::new();
+        };
+        vec![
+            Task::Scavenge { target },
+            Task::DepositToFactionStorage { good },
+        ]
+    }
+
+    fn name(&self) -> &'static str {
+        "ScavengeFoodForStorage"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::SCAVENGE_FOOD_FOR_STORAGE
+    }
+}
+
+/// Phase 5c-ii-d-vi fallback method for `AbstractTask::StockpileFood`.
+/// Replaces the `AgentGoal::GatherFood` half of the legacy `ExploreForFood`
+/// plan (PlanId 35, retired by this PR). Mirrors `ExploreForFoodMethod` but
+/// without the hunger gate — chief-driven storage-fill explores even when no
+/// agent is hungry, because the goal is sustaining stockpile depth rather
+/// than satisfying an immediate need.
+///
+/// Utility `0.3` matches the legacy plan's `bias` and `ExploreForFoodMethod`.
+/// Loses to `ScavengeFoodForStorageMethod` (1.5) when a visible target is
+/// available. The legacy plan's candidate-filter inversion ("only fires with
+/// no source vis AND no good vis AND no memory") collapses into the
+/// utility-ranking model: at 0.3, this method only wins when no concrete
+/// method's precondition fires.
+pub struct ExploreForFoodForStorageMethod;
+
+impl Method for ExploreForFoodForStorageMethod {
+    fn precondition(&self, abstract_task: AbstractTask, _ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::StockpileFood)
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        UTIL_EXPLORE_FALLBACK
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, _ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::StockpileFood) {
+            return Vec::new();
+        }
+        vec![Task::Explore {
+            kind: MemoryKind::Food,
+        }]
+    }
+
+    fn name(&self) -> &'static str {
+        "ExploreForFoodForStorage"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::EXPLORE_FOR_FOOD_FOR_STORAGE
+    }
+}
+
+/// Method for `AbstractTask::AcquireFood`: harvest a known mature
+/// food-bearing plant (berry bush, grain) and eat in place. Mirrors
+/// `GatherFromKnownMethod`'s shape under AcquireGood (Wood/Stone) but the
+/// trailing leg is `Eat` instead of `DepositToFactionStorage` — the agent's
+/// own hunger drove the dispatch, so the harvest goes straight to mouth.
+///
+/// Replaces the AcquireFood half of the legacy `ForageFood` plan (PlanId 0,
+/// `[ForageGrass, DepositGoods]`). The legacy plan always deposited at
+/// faction storage; the HTN split intentionally skips storage when the agent
+/// is hungry — `htn_eat_dispatch_system` would just walk the food back out
+/// next tick.
+///
+/// Utility `UTIL_BASELINE` (1.0) — same tier as `WithdrawFromStorageMethod`
+/// and `GatherFromKnownMethod`. Single-leg distance discount on the
+/// agent→plant hop (no second hop to discount, since Eat is in-place).
+pub struct ForageFromKnownMethod;
+
+impl Method for ForageFromKnownMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::AcquireFood) {
+            return false;
+        }
+        ctx.gather_target_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.gather_target_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::AcquireFood) {
+            return Vec::new();
+        }
+        let Some(tile) = ctx.gather_target_tile else {
+            return Vec::new();
+        };
+        vec![Task::Gather { tile }, Task::Eat]
+    }
+
+    fn name(&self) -> &'static str {
+        "ForageFromKnown"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::FORAGE_FROM_KNOWN
+    }
+}
+
+/// Method for `AbstractTask::StockpileFood`: harvest a known mature
+/// food-bearing plant and deposit at faction storage. Chief-driven
+/// counterpart to `ForageFromKnownMethod` — fires regardless of the agent's
+/// personal hunger, because the goal is sustaining the storage stockpile.
+///
+/// Replaces the GatherFood half of the legacy `ForageFood` plan (PlanId 0).
+/// The trailing `DepositToFactionStorage { good }` carries the food good the
+/// plant at `gather_target_tile` will yield (`forage_food_good` ctx field),
+/// for chain-integrity inspection — the deposit executor itself is
+/// parameterless and dumps everything in hand.
+///
+/// Utility `UTIL_BASELINE` (1.0) — same tier as `ForageFromKnownMethod`.
+/// Full-trip distance discount on agent→plant→storage when both
+/// `gather_deposit_tile` and `gather_target_tile` are populated; falls back
+/// to single-leg when the faction has no storage.
+pub struct ForageFromKnownForStorageMethod;
+
+impl Method for ForageFromKnownForStorageMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::StockpileFood) {
+            return false;
+        }
+        // Need both the harvest tile (head Task::Gather { tile }) and the
+        // good (trailing Task::DepositToFactionStorage { good }). Without
+        // the good the chain can't be expressed in typed form, even though
+        // the deposit executor itself is parameterless.
+        ctx.gather_target_tile.is_some() && ctx.forage_food_good.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE
+            - full_trip_penalty(ctx.tile, ctx.gather_target_tile, ctx.gather_deposit_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::StockpileFood) {
+            return Vec::new();
+        }
+        let Some(tile) = ctx.gather_target_tile else {
+            return Vec::new();
+        };
+        let Some(good) = ctx.forage_food_good else {
+            return Vec::new();
+        };
+        vec![
+            Task::Gather { tile },
+            Task::DepositToFactionStorage { good },
+        ]
+    }
+
+    fn name(&self) -> &'static str {
+        "ForageFromKnownForStorage"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::FORAGE_FROM_KNOWN_FOR_STORAGE
     }
 }
 
@@ -1189,9 +1699,14 @@ pub fn htn_dispatch_system(
                 material_storage_tile: None,
                 material_stock_for_target: 0,
                 claimed_blueprint: None,
+                claimed_blueprint_tile: None,
                 gather_target_tile: None,
                 scavenge_target_entity: None,
                 scavenge_target_tile: None,
+                scavenge_food_good: None,
+                gather_deposit_tile: None,
+                scavenge_deposit_tile: None,
+                forage_food_good: None,
             };
 
             // Argmax over applicable methods. f32 has no total order; ties
@@ -1393,9 +1908,14 @@ pub fn htn_eat_dispatch_system(
                 material_storage_tile: None,
                 material_stock_for_target: 0,
                 claimed_blueprint: None,
+                claimed_blueprint_tile: None,
                 gather_target_tile: None,
                 scavenge_target_entity: None,
                 scavenge_target_tile: None,
+                scavenge_food_good: None,
+                gather_deposit_tile: None,
+                scavenge_deposit_tile: None,
+                forage_food_good: None,
             };
 
             let abstract_task = AbstractTask::Eat;
@@ -1492,11 +2012,15 @@ pub fn htn_acquire_food_dispatch_system(
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
+    clock: Res<SimClock>,
+    plant_map: Res<PlantMap>,
     item_query: Query<&crate::simulation::items::GroundItem>,
+    plant_query: Query<&Plant>,
     mut query: Query<
         (
             &mut PersonAI,
             &mut ActionQueue,
+            &mut MethodHistory,
             &AgentGoal,
             &Needs,
             &EconomicAgent,
@@ -1505,6 +2029,7 @@ pub fn htn_acquire_food_dispatch_system(
             &FactionMember,
             &LodLevel,
             Option<&ActivePlan>,
+            Option<&AgentMemory>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -1512,8 +2037,9 @@ pub fn htn_acquire_food_dispatch_system(
     // The food-scavenge scan reuses the AcquireGood scavenge branch's radius
     // so the two HTN scavenge paths search out to the same vis range.
     const VIEW_RADIUS: i32 = 15;
+    let now = clock.tick;
     query.par_iter_mut().for_each(
-        |(mut ai, mut aq, goal, needs, agent, carrier, transform, member, lod, active_plan_opt)| {
+        |(mut ai, mut aq, mut history, goal, needs, agent, carrier, transform, member, lod, active_plan_opt, memory_opt)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -1600,6 +2126,23 @@ pub fn htn_acquire_food_dispatch_system(
                 }
             }
 
+            // Forage candidate: nearest remembered food-bearing plant whose
+            // entity is still live and mature. `ForageFromKnownMethod`
+            // (utility 1.0) picks this up. Empty memory leaves the field
+            // None — the argmax falls through to scavenge / withdraw /
+            // explore.
+            let forage_candidate = memory_opt
+                .and_then(|m| m.best_for(MemoryKind::Food))
+                .and_then(|tile| {
+                    let entity = plant_map.0.get(&tile).copied()?;
+                    let plant = plant_query.get(entity).ok()?;
+                    if plant.stage != GrowthStage::Mature {
+                        return None;
+                    }
+                    Some((tile, plant.kind.harvest_yield(false).0))
+                });
+            let gather_target_tile = forage_candidate.map(|(tile, _)| tile);
+
             let ctx = PlannerCtx {
                 tile: (cur_tx, cur_ty),
                 faction_id: member.faction_id,
@@ -1614,25 +2157,37 @@ pub fn htn_acquire_food_dispatch_system(
                 material_storage_tile: None,
                 material_stock_for_target: 0,
                 claimed_blueprint: None,
-                gather_target_tile: None,
+                claimed_blueprint_tile: None,
+                gather_target_tile,
                 scavenge_target_entity,
                 scavenge_target_tile,
+                scavenge_food_good: None,
+                gather_deposit_tile: None,
+                scavenge_deposit_tile: None,
+                // AcquireFood's forage chain ends in `Eat`, not
+                // `DepositToFactionStorage`, so no good payload is needed.
+                forage_food_good: None,
             };
 
             let abstract_task = AbstractTask::AcquireFood;
             let methods = method_registry.methods_for(AbstractTaskKind::AcquireFood);
+            // Phase 6b: scoring goes through `score_method_with_history` so
+            // recent routing failures bias the argmax. Sibling methods that
+            // haven't failed get a free pass; a method with two recent
+            // failures eats a `2 * METHOD_FAILURE_PENALTY` discount.
             let chosen = methods
                 .iter()
                 .filter(|m| m.precondition(abstract_task, &ctx))
                 .max_by(|a, b| {
-                    let ua = a.utility(abstract_task, &ctx);
-                    let ub = b.utility(abstract_task, &ctx);
+                    let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                    let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
                     ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
             let Some(method) = chosen else {
                 return;
             };
+            let chosen_id = method.id();
             let mut tasks = method.expand(abstract_task, &ctx);
             if tasks.is_empty() {
                 return;
@@ -1655,10 +2210,11 @@ pub fn htn_acquire_food_dispatch_system(
                     );
                     if !dispatched {
                         // Routing rejected the storage tile (no reachable
-                        // adjacent standable). Drop the chain and let the next
-                        // tick re-evaluate; method preconditions will likely
-                        // re-fire and pick a different tile if storage layout
-                        // changes.
+                        // adjacent standable). Record the failure so the next
+                        // tick's argmax biases away from this method (Phase
+                        // 6b: `score_method_with_history` reads `history` and
+                        // applies `METHOD_FAILURE_PENALTY` per recent miss).
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     }
                     aq.dispatch(Task::WithdrawFood { tile });
@@ -1684,6 +2240,7 @@ pub fn htn_acquire_food_dispatch_system(
                     // JobClaim::Stockpile, which `goal_update_system` skips
                     // entirely (line 237).
                     let Some(scav_tile) = scavenge_target_tile else {
+                        history.push(chosen_id, MethodOutcome::FailedTarget, now);
                         return;
                     };
                     let dispatched = assign_task_with_routing(
@@ -1699,6 +2256,7 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_connectivity,
                     );
                     if !dispatched {
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     }
                     aq.dispatch(Task::Scavenge { target });
@@ -1725,10 +2283,7 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_map,
                         &chunk_connectivity,
                     ) else {
-                        // No reachable random tile in 8 rolls. Drop the
-                        // chain; next tick re-rolls. Same fallback shape as
-                        // the routing-failure path above — agent stays
-                        // (Idle, UNEMPLOYED) and re-evaluates.
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     };
                     let dispatched = assign_task_with_routing(
@@ -1744,15 +2299,39 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_connectivity,
                     );
                     if !dispatched {
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     }
                     aq.dispatch(Task::Explore { kind });
                 }
+                Task::Gather { tile: gather_tile } => {
+                    // Forage dispatch under AcquireFood. The trailing leg is
+                    // `Task::Eat` (in-place); `finish_gather` primes the
+                    // legacy `task_id = Eat` channel when the prefetch ring
+                    // promotes it, mirroring `finish_withdraw_food`.
+                    let dispatched = assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx, cur_ty),
+                        cur_chunk,
+                        gather_tile,
+                        TaskKind::Gather,
+                        None,
+                        &chunk_graph,
+                        &chunk_router,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    );
+                    if !dispatched {
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                        return;
+                    }
+                    aq.dispatch(Task::Gather { tile: gather_tile });
+                }
                 _ => {
                     // No registered AcquireFood method returns a non-WithdrawFood,
-                    // non-Scavenge, non-Explore head today. Defensive
-                    // fallthrough; future Forage / Hunt methods will land as
-                    // new arms here.
+                    // non-Scavenge, non-Explore, non-Gather head today.
+                    // Defensive fallthrough; future Hunt methods will land
+                    // as new arms here.
                     return;
                 }
             }
@@ -1829,11 +2408,14 @@ pub fn htn_acquire_good_dispatch_system(
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
+    clock: Res<SimClock>,
     item_query: Query<&crate::simulation::items::GroundItem>,
+    bp_query: Query<&crate::simulation::construction::Blueprint>,
     mut query: Query<
         (
             &mut PersonAI,
             &mut ActionQueue,
+            &mut MethodHistory,
             &AgentGoal,
             &FactionMember,
             &Transform,
@@ -1848,9 +2430,11 @@ pub fn htn_acquire_good_dispatch_system(
 ) {
     use crate::simulation::jobs::JobKind;
 
+    let now = clock.tick;
     for (
         mut ai,
         mut aq,
+        mut history,
         goal,
         member,
         transform,
@@ -1944,6 +2528,10 @@ pub fn htn_acquire_good_dispatch_system(
                 // `ExploreForWood`/`ExploreForStone` plan path that this PR
                 // deletes from the registry.
 
+                let gather_deposit_tile = gather_target_tile
+                    .and_then(|t| storage_tile_map.nearest_for_faction(member.faction_id, t));
+                let scavenge_deposit_tile = scavenge_target_tile
+                    .and_then(|t| storage_tile_map.nearest_for_faction(member.faction_id, t));
                 let ctx = PlannerCtx {
                     tile: (cur_tx, cur_ty),
                     faction_id: member.faction_id,
@@ -1957,9 +2545,14 @@ pub fn htn_acquire_good_dispatch_system(
                     material_storage_tile: None,
                     material_stock_for_target: 0,
                     claimed_blueprint: None,
+                    claimed_blueprint_tile: None,
                     gather_target_tile,
                     scavenge_target_entity,
                     scavenge_target_tile,
+                    scavenge_food_good: None,
+                    gather_deposit_tile,
+                    scavenge_deposit_tile,
+                    forage_food_good: None,
                 };
 
                 let abstract_task = AbstractTask::AcquireGood { good };
@@ -1968,11 +2561,24 @@ pub fn htn_acquire_good_dispatch_system(
                     .iter()
                     .filter(|m| m.precondition(abstract_task, &ctx))
                     .max_by(|a, b| {
-                        let ua = a.utility(abstract_task, &ctx);
-                        let ub = b.utility(abstract_task, &ctx);
+                        let ua = score_method_with_history(
+                            a.as_ref(),
+                            abstract_task,
+                            &ctx,
+                            &history,
+                            now,
+                        );
+                        let ub = score_method_with_history(
+                            b.as_ref(),
+                            abstract_task,
+                            &ctx,
+                            &history,
+                            now,
+                        );
                         ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
                     });
                 let Some(method) = chosen else { continue };
+                let chosen_id = method.id();
                 let mut tasks = method.expand(abstract_task, &ctx);
                 if tasks.is_empty() {
                     continue;
@@ -1994,22 +2600,14 @@ pub fn htn_acquire_good_dispatch_system(
                             &chunk_connectivity,
                         );
                         if !dispatched {
-                            // No reachable adjacency to the gather tile — abandon
-                            // the chain. The legacy plan registry's `Explore`
-                            // plans handle the no-knowledge / unreachable case
-                            // via `goal_update_system`'s plan churn.
+                            history.push(chosen_id, MethodOutcome::FailedRouting, now);
                             continue;
                         }
                         aq.dispatch(Task::Gather { tile: gather_tile });
                     }
                     Task::Scavenge { target } => {
-                        // Phase 5c-ii-d-ii-a: scavenge dispatch. Routing is
-                        // tile-based; the entity-target lives on the typed
-                        // task and `item_pickup_system` reads it via
-                        // `aq.current.as_scavenge()`.
                         let Some(scav_tile) = scavenge_target_tile else {
-                            // Defensive: precondition required tile, but
-                            // method was selected and head is Scavenge.
+                            history.push(chosen_id, MethodOutcome::FailedTarget, now);
                             continue;
                         };
                         let dispatched = assign_task_with_routing(
@@ -2025,6 +2623,7 @@ pub fn htn_acquire_good_dispatch_system(
                             &chunk_connectivity,
                         );
                         if !dispatched {
+                            history.push(chosen_id, MethodOutcome::FailedRouting, now);
                             continue;
                         }
                         aq.dispatch(Task::Scavenge { target });
@@ -2050,6 +2649,7 @@ pub fn htn_acquire_good_dispatch_system(
                             &chunk_map,
                             &chunk_connectivity,
                         ) else {
+                            history.push(chosen_id, MethodOutcome::FailedRouting, now);
                             continue;
                         };
                         let dispatched = assign_task_with_routing(
@@ -2065,6 +2665,7 @@ pub fn htn_acquire_good_dispatch_system(
                             &chunk_connectivity,
                         );
                         if !dispatched {
+                            history.push(chosen_id, MethodOutcome::FailedRouting, now);
                             continue;
                         }
                         aq.dispatch(Task::Explore { kind });
@@ -2172,9 +2773,19 @@ pub fn htn_acquire_good_dispatch_system(
             material_storage_tile: Some(storage_tile),
             material_stock_for_target: best_tile_stock,
             claimed_blueprint: Some(blueprint),
+            // Phase 5c-ii-d-vii: feed the blueprint tile into ctx so
+            // `WithdrawAndHaulToBlueprintMethod`'s utility can discount on the
+            // *full* storage→blueprint trip rather than just the agent→storage
+            // hop. A despawned blueprint silently degrades to `None` (the
+            // method falls back to its prior storage-only signal).
+            claimed_blueprint_tile: bp_query.get(blueprint).ok().map(|bp| bp.tile),
             gather_target_tile: None,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
         };
 
         let abstract_task = AbstractTask::AcquireGood { good };
@@ -2183,11 +2794,12 @@ pub fn htn_acquire_good_dispatch_system(
             .iter()
             .filter(|m| m.precondition(abstract_task, &ctx))
             .max_by(|a, b| {
-                let ua = a.utility(abstract_task, &ctx);
-                let ub = b.utility(abstract_task, &ctx);
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
                 ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
             });
         let Some(method) = chosen else { continue };
+        let chosen_id = method.id();
         let mut tasks = method.expand(abstract_task, &ctx);
         if tasks.is_empty() {
             continue;
@@ -2209,9 +2821,7 @@ pub fn htn_acquire_good_dispatch_system(
                     &chunk_connectivity,
                 );
                 if !dispatched {
-                    // No reachable adjacency to the storage tile — abandon
-                    // the chain and let next tick re-evaluate (storage layout
-                    // may change, or another tile may become reachable).
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
                     continue;
                 }
                 // Reserve the qty against the chosen tile so a parallel
@@ -2243,9 +2853,462 @@ pub fn htn_acquire_good_dispatch_system(
     }
 }
 
+/// Phase 5c-ii-d-vi dispatcher. Owns `AgentGoal::GatherFood` end-to-end via
+/// the `StockpileFood` abstract task — the chief-driven counterpart to
+/// `htn_acquire_food_dispatch_system`'s Survive case. Replaces the
+/// `AgentGoal::GatherFood` half of the legacy `ScavengeFood` (PlanId 6) and
+/// `ExploreForFood` (PlanId 35) plans, both retired by this PR.
+///
+/// The shape mirrors `htn_acquire_food_dispatch_system` minus the hunger-gate
+/// pre-filter and the food-on-hand split: chiefs want the chain to fire
+/// regardless of the worker's personal hunger or larder. For each
+/// non-Drafted, non-PlayerOrder, non-SOLO `AgentGoal::GatherFood` agent
+/// without an `ActivePlan` and idle task slot:
+///
+/// 1. Scan `SpatialIndex` within `VIEW_RADIUS=15` for a visible loose edible
+///    `GroundItem` (excluding faction storage tiles), recording the nearest's
+///    entity, tile, and good. Same scan pattern as
+///    `htn_acquire_food_dispatch_system`'s 5c-ii-d-iii-ii branch but the
+///    picked good threads through to the trailing deposit.
+/// 2. Build a `PlannerCtx { scavenge_target_entity, scavenge_target_tile,
+///    scavenge_food_good, .. }` and argmax over `methods_for(StockpileFood)`.
+///    Today: `ScavengeFoodForStorageMethod` (1.5) wins on visibility;
+///    `ExploreForFoodForStorageMethod` (0.3) is the fallback.
+/// 3. Route the head `Task::Scavenge { target }` (or `Task::Explore { kind }`)
+///    via `assign_task_with_routing` and `aq.dispatch` it. Push the trailing
+///    `Task::DepositToFactionStorage { good }` (if any) onto the prefetch
+///    ring.
+///
+/// The chain handoff is shared with the AcquireGood scavenge branch:
+/// `item_pickup_system::finish_scavenge` already routes
+/// `Task::DepositToFactionStorage` to the nearest faction storage tile and
+/// primes `TaskKind::DepositResource`. The `drop_items_at_destination_system`
+/// executor already handles edible inventory deposit above `CAMP_KEEP`, so
+/// food landing in either hands or inventory flows correctly.
+pub fn htn_stockpile_food_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    storage_tile_map: Res<StorageTileMap>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    clock: Res<SimClock>,
+    plant_map: Res<PlantMap>,
+    item_query: Query<&crate::simulation::items::GroundItem>,
+    plant_query: Query<&Plant>,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+            Option<&ActivePlan>,
+            Option<&crate::simulation::jobs::JobClaim>,
+            Option<&crate::simulation::jobs::ClaimTarget>,
+            Option<&AgentMemory>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    use crate::simulation::jobs::JobKind;
+
+    const VIEW_RADIUS: i32 = 15;
+    let now = clock.tick;
+    query.par_iter_mut().for_each(
+        |(
+            mut ai,
+            mut aq,
+            mut history,
+            goal,
+            transform,
+            member,
+            lod,
+            active_plan_opt,
+            job_claim_opt,
+            claim_target_opt,
+            memory_opt,
+        )| {
+            if *lod == LodLevel::Dormant {
+                return;
+            }
+            if !matches!(*goal, AgentGoal::GatherFood) {
+                return;
+            }
+            if active_plan_opt.is_some() {
+                return;
+            }
+            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+                return;
+            }
+            if member.faction_id == SOLO {
+                return;
+            }
+
+            // Gate on an explicit `JobClaim::Stockpile` for a food good. The
+            // chief-driven storage-fill flow always pairs `AgentGoal::GatherFood`
+            // with a `Stockpile{food}` claim (`job_goal_lock_system` maps
+            // `Stockpile{food}` → `GatherFood` via `posting_goal`). Without
+            // the claim, an agent that happens to land on `GatherFood` during
+            // warmup or transient need-state shouldn't trigger a dispatch —
+            // the legacy plan registry's analogous gating was implicit (no
+            // posting → `chief_job_posting_system` doesn't post → plan
+            // candidate filter rejects). Same shape as the haul branch's
+            // `JobClaim::Haul` gate in `htn_acquire_good_dispatch_system`.
+            let Some(claim) = job_claim_opt else {
+                return;
+            };
+            if claim.kind != JobKind::Stockpile {
+                return;
+            }
+            // Confirm the claim targets a food good — `Stockpile{Wood}` would
+            // route through the AcquireGood gather branch, not here.
+            let claim_good = claim_target_opt.and_then(|t| t.good);
+            match claim_good {
+                Some(g) if g.is_edible() => {}
+                _ => return,
+            }
+
+            let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+            let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+            let cur_chunk = ChunkCoord(
+                cur_tx.div_euclid(CHUNK_SIZE as i32),
+                cur_ty.div_euclid(CHUNK_SIZE as i32),
+            );
+
+            // Scan SpatialIndex for the nearest visible loose edible
+            // `GroundItem` within VIEW_RADIUS, excluding faction storage tiles
+            // (mirrors `htn_acquire_food_dispatch_system`'s scavenge scan).
+            // The picked-up good threads through to the trailing deposit, so
+            // the scan records (entity, tile, good) per decision.
+            let mut scavenge_target_entity: Option<Entity> = None;
+            let mut scavenge_target_tile: Option<(i32, i32)> = None;
+            let mut scavenge_food_good: Option<Good> = None;
+            {
+                let mut best_dist_sq = i32::MAX;
+                for dx in -VIEW_RADIUS..=VIEW_RADIUS {
+                    for dy in -VIEW_RADIUS..=VIEW_RADIUS {
+                        let d2 = dx * dx + dy * dy;
+                        if d2 > VIEW_RADIUS * VIEW_RADIUS {
+                            continue;
+                        }
+                        let tx = cur_tx + dx;
+                        let ty = cur_ty + dy;
+                        if storage_tile_map.tiles.contains_key(&(tx, ty)) {
+                            continue;
+                        }
+                        for &gi_entity in spatial.get(tx, ty) {
+                            if let Ok(gi) = item_query.get(gi_entity) {
+                                if gi.item.good().is_edible() && gi.qty > 0 && d2 < best_dist_sq {
+                                    best_dist_sq = d2;
+                                    scavenge_target_entity = Some(gi_entity);
+                                    scavenge_target_tile = Some((tx, ty));
+                                    scavenge_food_good = Some(gi.item.good());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let scavenge_deposit_tile = scavenge_target_tile
+                .and_then(|t| storage_tile_map.nearest_for_faction(member.faction_id, t));
+
+            // Forage candidate: nearest remembered food-bearing plant whose
+            // entity is still live and mature. Threads the plant's harvest
+            // good through `forage_food_good` so the trailing
+            // `Task::DepositToFactionStorage` carries the right payload.
+            // `ForageFromKnownForStorageMethod` (utility 1.0) consumes both.
+            let forage_candidate = memory_opt
+                .and_then(|m| m.best_for(MemoryKind::Food))
+                .and_then(|tile| {
+                    let entity = plant_map.0.get(&tile).copied()?;
+                    let plant = plant_query.get(entity).ok()?;
+                    if plant.stage != GrowthStage::Mature {
+                        return None;
+                    }
+                    Some((tile, plant.kind.harvest_yield(false).0))
+                });
+            let gather_target_tile = forage_candidate.map(|(tile, _)| tile);
+            let forage_food_good = forage_candidate.map(|(_, good)| good);
+            let gather_deposit_tile = gather_target_tile
+                .and_then(|t| storage_tile_map.nearest_for_faction(member.faction_id, t));
+
+            let ctx = PlannerCtx {
+                tile: (cur_tx, cur_ty),
+                faction_id: member.faction_id,
+                faction_home: faction_registry.home_tile(member.faction_id),
+                home_bed: None,
+                home_bed_tile: None,
+                edible_count: 0,
+                hunger: 0.0,
+                nearest_storage_tile: None,
+                faction_food_stock: 0,
+                material_storage_tile: None,
+                material_stock_for_target: 0,
+                claimed_blueprint: None,
+                claimed_blueprint_tile: None,
+                gather_target_tile,
+                scavenge_target_entity,
+                scavenge_target_tile,
+                scavenge_food_good,
+                gather_deposit_tile,
+                scavenge_deposit_tile,
+                forage_food_good,
+            };
+
+            let abstract_task = AbstractTask::StockpileFood;
+            let methods = method_registry.methods_for(AbstractTaskKind::StockpileFood);
+            let chosen = methods
+                .iter()
+                .filter(|m| m.precondition(abstract_task, &ctx))
+                .max_by(|a, b| {
+                    let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                    let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                    ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+            let Some(method) = chosen else {
+                return;
+            };
+            let chosen_id = method.id();
+            let mut tasks = method.expand(abstract_task, &ctx);
+            if tasks.is_empty() {
+                return;
+            }
+            let head = tasks.remove(0);
+
+            match head {
+                Task::Scavenge { target } => {
+                    let Some(scav_tile) = scavenge_target_tile else {
+                        history.push(chosen_id, MethodOutcome::FailedTarget, now);
+                        return;
+                    };
+                    // Pass `target_entity = Some(target)` so
+                    // `goal_update_system`'s Scavenge target validation
+                    // (`goals.rs:286-293`) doesn't flag the task invalid.
+                    // GatherFood has no JobClaim bypass like Stockpile/Wood, so
+                    // `goal_update_system` runs the validation arm. Mirrors the
+                    // `htn_acquire_food_dispatch_system` Scavenge branch's
+                    // target_entity passthrough.
+                    let dispatched = assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx, cur_ty),
+                        cur_chunk,
+                        scav_tile,
+                        TaskKind::Scavenge,
+                        Some(target),
+                        &chunk_graph,
+                        &chunk_router,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    );
+                    if !dispatched {
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                        return;
+                    }
+                    aq.dispatch(Task::Scavenge { target });
+                }
+                Task::Explore { kind } => {
+                    let home = faction_registry
+                        .home_tile(member.faction_id)
+                        .unwrap_or((cur_tx, cur_ty));
+                    let Some(dest) = pick_explore_tile(
+                        home,
+                        cur_chunk,
+                        ai.current_z,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    ) else {
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                        return;
+                    };
+                    let dispatched = assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx, cur_ty),
+                        cur_chunk,
+                        dest,
+                        TaskKind::Explore,
+                        None,
+                        &chunk_graph,
+                        &chunk_router,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    );
+                    if !dispatched {
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                        return;
+                    }
+                    aq.dispatch(Task::Explore { kind });
+                }
+                Task::Gather { tile: gather_tile } => {
+                    // Forage dispatch under StockpileFood. The trailing leg
+                    // is `Task::DepositToFactionStorage { good }`; the existing
+                    // `finish_gather` exit handoff routes to the nearest
+                    // faction storage tile and primes
+                    // `TaskKind::DepositResource`.
+                    let dispatched = assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx, cur_ty),
+                        cur_chunk,
+                        gather_tile,
+                        TaskKind::Gather,
+                        None,
+                        &chunk_graph,
+                        &chunk_router,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    );
+                    if !dispatched {
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                        return;
+                    }
+                    aq.dispatch(Task::Gather { tile: gather_tile });
+                }
+                _ => {
+                    // No registered StockpileFood method returns a non-Scavenge,
+                    // non-Explore, non-Gather head today. Defensive fallthrough.
+                    return;
+                }
+            }
+
+            for task in tasks {
+                let _ = aq.enqueue(task);
+            }
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── MethodHistory (Phase 6a scaffolding) ──────────────────────────────
+
+    #[test]
+    fn method_history_default_empty() {
+        let h = MethodHistory::default();
+        assert_eq!(h.recently_failed_count(MethodId::SLEEP, 0), 0);
+        assert_eq!(h.recently_failed_count(MethodId::GATHER_FROM_KNOWN, 1000), 0);
+    }
+
+    #[test]
+    fn method_history_counts_recent_failure() {
+        let mut h = MethodHistory::default();
+        h.push(MethodId::GATHER_FROM_KNOWN, MethodOutcome::FailedRouting, 50);
+        assert_eq!(
+            h.recently_failed_count(MethodId::GATHER_FROM_KNOWN, 100),
+            1
+        );
+        // Different method — no penalty.
+        assert_eq!(h.recently_failed_count(MethodId::SLEEP, 100), 0);
+    }
+
+    #[test]
+    fn method_history_success_does_not_count() {
+        let mut h = MethodHistory::default();
+        h.push(MethodId::SLEEP, MethodOutcome::Success, 50);
+        assert_eq!(h.recently_failed_count(MethodId::SLEEP, 100), 0);
+    }
+
+    #[test]
+    fn method_history_expires_by_ttl() {
+        let mut h = MethodHistory::default();
+        h.push(MethodId::SLEEP, MethodOutcome::FailedTarget, 0);
+        // Inside TTL.
+        assert_eq!(
+            h.recently_failed_count(MethodId::SLEEP, METHOD_HISTORY_TTL_TICKS),
+            1
+        );
+        // Past TTL.
+        assert_eq!(
+            h.recently_failed_count(MethodId::SLEEP, METHOD_HISTORY_TTL_TICKS + 1),
+            0
+        );
+    }
+
+    #[test]
+    fn method_history_ring_overwrites_oldest() {
+        let mut h = MethodHistory::default();
+        // METHOD_HISTORY_LEN=2, so a third push evicts the first.
+        h.push(MethodId::SLEEP, MethodOutcome::FailedTarget, 10);
+        h.push(MethodId::SLEEP, MethodOutcome::FailedTarget, 20);
+        h.push(MethodId::SLEEP, MethodOutcome::FailedTarget, 30);
+        assert_eq!(h.recently_failed_count(MethodId::SLEEP, 35), 2);
+    }
+
+    #[test]
+    fn score_helper_subtracts_failure_penalty() {
+        // Use the registered Sleep method as a stand-in: its raw utility is
+        // a constant 1.0, so the helper's output is exactly
+        // `1.0 - failures * METHOD_FAILURE_PENALTY`.
+        let m = SleepMethod;
+        let ctx = ctx_solo_in_place();
+        let mut h = MethodHistory::default();
+
+        let raw = score_method_with_history(&m, AbstractTask::Sleep, &ctx, &h, 0);
+        assert!((raw - 1.0).abs() < 1e-6);
+
+        h.push(MethodId::SLEEP, MethodOutcome::FailedRouting, 0);
+        let one_failure = score_method_with_history(&m, AbstractTask::Sleep, &ctx, &h, 50);
+        assert!((one_failure - (1.0 - METHOD_FAILURE_PENALTY)).abs() < 1e-6);
+
+        h.push(MethodId::SLEEP, MethodOutcome::FailedTarget, 50);
+        let two_failures = score_method_with_history(&m, AbstractTask::Sleep, &ctx, &h, 60);
+        assert!((two_failures - (1.0 - 2.0 * METHOD_FAILURE_PENALTY)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn score_helper_ignores_expired_failures() {
+        let m = SleepMethod;
+        let ctx = ctx_solo_in_place();
+        let mut h = MethodHistory::default();
+        h.push(MethodId::SLEEP, MethodOutcome::FailedRouting, 0);
+        // Past TTL — penalty should be zero.
+        let s = score_method_with_history(
+            &m,
+            AbstractTask::Sleep,
+            &ctx,
+            &h,
+            METHOD_HISTORY_TTL_TICKS + 1,
+        );
+        assert!((s - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn score_helper_ignores_other_methods_failures() {
+        // SLEEP failures should not penalise EatFromInventory's score.
+        let m = EatFromInventoryMethod;
+        let mut ctx = ctx_solo_in_place();
+        ctx.edible_count = 1;
+        ctx.hunger = 200.0;
+        let mut h = MethodHistory::default();
+        h.push(MethodId::SLEEP, MethodOutcome::FailedRouting, 0);
+        let s = score_method_with_history(&m, AbstractTask::Eat, &ctx, &h, 50);
+        assert!((s - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn registered_method_ids_are_unique() {
+        let mut reg = MethodRegistry::default();
+        register_builtin_methods(&mut reg);
+        let mut ids = std::collections::HashSet::new();
+        for kind in [
+            AbstractTaskKind::Sleep,
+            AbstractTaskKind::Eat,
+            AbstractTaskKind::AcquireFood,
+            AbstractTaskKind::AcquireGood,
+            AbstractTaskKind::StockpileFood,
+        ] {
+            for m in reg.methods_for(kind) {
+                assert!(ids.insert(m.id()), "duplicate MethodId for {}", m.name());
+            }
+        }
+    }
 
     fn ctx_solo_in_place() -> PlannerCtx {
         PlannerCtx {
@@ -2261,9 +3324,14 @@ mod tests {
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
+            claimed_blueprint_tile: None,
             gather_target_tile: None,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
         }
     }
 
@@ -2281,9 +3349,14 @@ mod tests {
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
+            claimed_blueprint_tile: None,
             gather_target_tile: None,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
         }
     }
 
@@ -2301,9 +3374,14 @@ mod tests {
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
+            claimed_blueprint_tile: None,
             gather_target_tile: None,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
         }
     }
 
@@ -2325,9 +3403,14 @@ mod tests {
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
+            claimed_blueprint_tile: None,
             gather_target_tile: None,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
         }
     }
 
@@ -2348,9 +3431,14 @@ mod tests {
             material_storage_tile: storage_tile,
             material_stock_for_target: material_stock,
             claimed_blueprint: None,
+            claimed_blueprint_tile: None,
             gather_target_tile: None,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
         }
     }
 
@@ -2358,6 +3446,15 @@ mod tests {
         storage_tile: Option<(i32, i32)>,
         material_stock: u32,
         blueprint: Option<Entity>,
+    ) -> PlannerCtx {
+        ctx_with_haul_claim_at(storage_tile, material_stock, blueprint, None)
+    }
+
+    fn ctx_with_haul_claim_at(
+        storage_tile: Option<(i32, i32)>,
+        material_stock: u32,
+        blueprint: Option<Entity>,
+        blueprint_tile: Option<(i32, i32)>,
     ) -> PlannerCtx {
         PlannerCtx {
             tile: (0, 0),
@@ -2372,9 +3469,14 @@ mod tests {
             material_storage_tile: storage_tile,
             material_stock_for_target: material_stock,
             claimed_blueprint: blueprint,
+            claimed_blueprint_tile: blueprint_tile,
             gather_target_tile: None,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
         }
     }
 
@@ -2466,14 +3568,13 @@ mod tests {
     }
 
     #[test]
-    fn registry_reports_three_acquire_food_methods() {
-        // 5c-ii-d-iv-i: `ExploreForFoodMethod` registered alongside
-        // `WithdrawFromStorageMethod` (1.0) and `ScavengeFoodFromGroundMethod`
-        // (1.5) as the fallback method (utility 0.3). Renamed from
-        // `registry_reports_two_acquire_food_methods`.
+    fn registry_reports_four_acquire_food_methods() {
+        // Forage migration: `ForageFromKnownMethod` (utility 1.0) joins
+        // `WithdrawFromStorageMethod` (1.0), `ScavengeFoodFromGroundMethod`
+        // (1.5), and `ExploreForFoodMethod` (0.3) under AcquireFood.
         let mut reg = MethodRegistry::default();
         register_builtin_methods(&mut reg);
-        assert_eq!(reg.method_count(AbstractTaskKind::AcquireFood), 3);
+        assert_eq!(reg.method_count(AbstractTaskKind::AcquireFood), 4);
     }
 
     #[test]
@@ -2665,9 +3766,14 @@ mod tests {
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
+            claimed_blueprint_tile: None,
             gather_target_tile: tile,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
         }
     }
 
@@ -2777,9 +3883,14 @@ mod tests {
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
+            claimed_blueprint_tile: None,
             gather_target_tile: None,
             scavenge_target_entity: target,
             scavenge_target_tile: tile,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
         }
     }
 
@@ -2912,9 +4023,14 @@ mod tests {
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
+            claimed_blueprint_tile: None,
             gather_target_tile: None,
             scavenge_target_entity: target,
             scavenge_target_tile: tile,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
         }
     }
 
@@ -3103,9 +4219,14 @@ mod tests {
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
+            claimed_blueprint_tile: None,
             gather_target_tile: None,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
         }
     }
 
@@ -3309,6 +4430,86 @@ mod tests {
         assert!(u_haul > u_bare, "haul {} should beat bare-withdraw {}", u_haul, u_bare);
     }
 
+    // ── Full-trip distance discount (Phase 5c-ii-d-vii) ──────────────────
+    //
+    // `WithdrawAndHaulToBlueprintMethod` discounts on agent→storage *plus*
+    // storage→blueprint when both tiles are in ctx. Tests pin (a) closer
+    // blueprints outscore farther ones for the same storage; (b) the cap
+    // still preserves the haul-vs-bare-withdraw inter-method ranking; (c) a
+    // missing blueprint tile silently falls back to the storage-only signal
+    // (same numeric output as the 5c-ii-d-v shape).
+
+    #[test]
+    fn haul_closer_blueprint_outscores_farther_blueprint_same_storage() {
+        // Same agent + same storage; only the blueprint tile differs.
+        // Agent at (0,0), storage at (5,0): agent→storage = 5 tiles.
+        // Near blueprint at (10,0): storage→bp = 5 tiles, total 10 → 0.20.
+        // Far  blueprint at (20,0): storage→bp = 15 tiles, total 20 → 0.30 cap.
+        let m = WithdrawAndHaulToBlueprintMethod;
+        let bp = Entity::from_raw(99);
+        let near = ctx_with_haul_claim_at(Some((5, 0)), 5, Some(bp), Some((10, 0)));
+        let far = ctx_with_haul_claim_at(Some((5, 0)), 5, Some(bp), Some((20, 0)));
+        let u_near = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &near);
+        let u_far = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &far);
+        assert!(
+            u_near > u_far,
+            "near-bp {} should outscore far-bp {} when storage is identical",
+            u_near,
+            u_far
+        );
+    }
+
+    #[test]
+    fn haul_full_trip_falls_back_to_storage_when_blueprint_tile_missing() {
+        // `claimed_blueprint = Some` but `claimed_blueprint_tile = None`
+        // (e.g. the blueprint despawned between dispatch and ctx-build).
+        // Method must fall back to the 5c-ii-d-v shape (storage-only
+        // distance) rather than skipping the discount entirely.
+        let m = WithdrawAndHaulToBlueprintMethod;
+        let bp = Entity::from_raw(7);
+        // storage at chebyshev=10 from agent. Storage-only path: 2.0 - 0.20.
+        let ctx = ctx_with_haul_claim(Some((10, 0)), 5, Some(bp));
+        let u = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        assert!((u - (2.0 - 0.20)).abs() < 1e-6, "expected 1.80, got {}", u);
+    }
+
+    #[test]
+    fn haul_full_trip_capped_at_max_penalty() {
+        // Agent at (0,0), storage at (20,0), blueprint at (40,0):
+        // total chebyshev = 20 + 20 = 40 tiles, raw penalty 0.80, capped at
+        // MAX_DIST_PENALTY = 0.30. Utility = 2.0 - 0.30 = 1.70.
+        let m = WithdrawAndHaulToBlueprintMethod;
+        let bp = Entity::from_raw(7);
+        let ctx = ctx_with_haul_claim_at(Some((20, 0)), 5, Some(bp), Some((40, 0)));
+        let u = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        assert!(
+            (u - (2.0 - MAX_DIST_PENALTY)).abs() < 1e-6,
+            "expected {}, got {}",
+            2.0 - MAX_DIST_PENALTY,
+            u
+        );
+    }
+
+    #[test]
+    fn haul_full_trip_cap_preserves_ranking_over_bare_withdraw() {
+        // Cap-preserves-ranking after the full-trip switch: even with both
+        // legs at max distance (40-tile total clamped to 0.30), the haul
+        // method still beats a zero-distance bare withdraw.
+        let haul = WithdrawAndHaulToBlueprintMethod;
+        let bp = Entity::from_raw(99);
+        let ctx = ctx_with_haul_claim_at(Some((20, 0)), 5, Some(bp), Some((40, 0)));
+        let bare = WithdrawMaterialFromStorageMethod;
+        let bare_ctx = ctx_with_material_storage(Some((0, 0)), 5);
+        let u_haul = haul.utility(AbstractTask::AcquireGood { good: Good::Wood }, &ctx);
+        let u_bare = bare.utility(AbstractTask::AcquireGood { good: Good::Wood }, &bare_ctx);
+        assert!(
+            u_haul > u_bare,
+            "full-trip haul {} should still beat bare-withdraw {}",
+            u_haul,
+            u_bare
+        );
+    }
+
     #[test]
     fn gather_from_known_utility_decreases_with_distance() {
         let m = GatherFromKnownMethod;
@@ -3361,5 +4562,495 @@ mod tests {
         let u_scav = scav.utility(AbstractTask::AcquireFood, &ctx);
         assert!(u_exp < u_wd);
         assert!(u_exp < u_scav);
+    }
+
+    // ── ScavengeFoodForStorageMethod (Phase 5c-ii-d-vi) ───────────────────
+    //
+    // Sibling of `ScavengeFoodFromGroundMethod` under `StockpileFood`. Same
+    // ctx fields plus `scavenge_food_good`; expansion ends in
+    // `DepositToFactionStorage` rather than `Eat`. No hunger gate — chief
+    // -driven storage-fill fires regardless of personal hunger.
+
+    fn ctx_with_food_scavenge_for_storage(
+        target: Option<Entity>,
+        tile: Option<(i32, i32)>,
+        good: Option<Good>,
+    ) -> PlannerCtx {
+        PlannerCtx {
+            tile: (0, 0),
+            faction_id: 1,
+            faction_home: Some((0, 0)),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: None,
+            scavenge_target_entity: target,
+            scavenge_target_tile: tile,
+            scavenge_food_good: good,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+        }
+    }
+
+    #[test]
+    fn registry_reports_three_stockpile_food_methods() {
+        // Forage migration: `ForageFromKnownForStorageMethod` (utility 1.0)
+        // joins `ScavengeFoodForStorageMethod` (1.5) and
+        // `ExploreForFoodForStorageMethod` (0.3) under StockpileFood.
+        let mut reg = MethodRegistry::default();
+        register_builtin_methods(&mut reg);
+        assert_eq!(reg.method_count(AbstractTaskKind::StockpileFood), 3);
+    }
+
+    #[test]
+    fn scavenge_food_for_storage_precondition_true_when_target_and_good_known() {
+        let m = ScavengeFoodForStorageMethod;
+        let ctx = ctx_with_food_scavenge_for_storage(
+            Some(Entity::from_raw(11)),
+            Some((4, 7)),
+            Some(Good::Fruit),
+        );
+        assert!(m.precondition(AbstractTask::StockpileFood, &ctx));
+    }
+
+    #[test]
+    fn scavenge_food_for_storage_precondition_false_without_entity() {
+        let m = ScavengeFoodForStorageMethod;
+        let ctx =
+            ctx_with_food_scavenge_for_storage(None, Some((4, 7)), Some(Good::Fruit));
+        assert!(!m.precondition(AbstractTask::StockpileFood, &ctx));
+    }
+
+    #[test]
+    fn scavenge_food_for_storage_precondition_false_without_tile() {
+        let m = ScavengeFoodForStorageMethod;
+        let ctx = ctx_with_food_scavenge_for_storage(
+            Some(Entity::from_raw(11)),
+            None,
+            Some(Good::Fruit),
+        );
+        assert!(!m.precondition(AbstractTask::StockpileFood, &ctx));
+    }
+
+    #[test]
+    fn scavenge_food_for_storage_precondition_false_without_good() {
+        // The good payload is the deposit's parameter — without it the chain
+        // can't know what to deposit, so the method opts out cleanly even
+        // though entity + tile are populated.
+        let m = ScavengeFoodForStorageMethod;
+        let ctx =
+            ctx_with_food_scavenge_for_storage(Some(Entity::from_raw(11)), Some((4, 7)), None);
+        assert!(!m.precondition(AbstractTask::StockpileFood, &ctx));
+    }
+
+    #[test]
+    fn scavenge_food_for_storage_precondition_false_for_wrong_abstract_task() {
+        // Defensive: AcquireFood / AcquireGood / Sleep / Eat all rejected
+        // even when every storage ctx field is populated.
+        let m = ScavengeFoodForStorageMethod;
+        let ctx = ctx_with_food_scavenge_for_storage(
+            Some(Entity::from_raw(11)),
+            Some((1, 1)),
+            Some(Good::Fruit),
+        );
+        assert!(!m.precondition(AbstractTask::AcquireFood, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::Sleep, &ctx));
+        assert!(!m.precondition(AbstractTask::Eat, &ctx));
+    }
+
+    #[test]
+    fn scavenge_food_for_storage_no_hunger_gate() {
+        // The whole point of the StockpileFood split: the chief-driven case
+        // fires even when the worker isn't hungry. Hunger 0 + populated
+        // scavenge fields → precondition true.
+        let m = ScavengeFoodForStorageMethod;
+        let mut ctx = ctx_with_food_scavenge_for_storage(
+            Some(Entity::from_raw(11)),
+            Some((4, 7)),
+            Some(Good::Fruit),
+        );
+        ctx.hunger = 0.0;
+        assert!(m.precondition(AbstractTask::StockpileFood, &ctx));
+    }
+
+    #[test]
+    fn scavenge_food_for_storage_expands_to_scavenge_then_deposit() {
+        let m = ScavengeFoodForStorageMethod;
+        let target = Entity::from_raw(13);
+        let ctx = ctx_with_food_scavenge_for_storage(
+            Some(target),
+            Some((6, 9)),
+            Some(Good::Fruit),
+        );
+        let tasks = m.expand(AbstractTask::StockpileFood, &ctx);
+        assert_eq!(
+            tasks,
+            vec![
+                Task::Scavenge { target },
+                Task::DepositToFactionStorage { good: Good::Fruit },
+            ]
+        );
+    }
+
+    #[test]
+    fn scavenge_food_for_storage_threads_good_through_to_deposit() {
+        // Mirrors the cross-good parameterisation contract from
+        // `scavenge_from_ground_threads_good_through_to_deposit`. Round-trip
+        // Fruit + Meat in the same test to prove the good payload threads
+        // through rather than being short-circuited on a hardcoded value.
+        let m = ScavengeFoodForStorageMethod;
+        let target = Entity::from_raw(21);
+        let fruit_ctx =
+            ctx_with_food_scavenge_for_storage(Some(target), Some((0, 0)), Some(Good::Fruit));
+        let meat_ctx =
+            ctx_with_food_scavenge_for_storage(Some(target), Some((0, 0)), Some(Good::Meat));
+        let fruit = m.expand(AbstractTask::StockpileFood, &fruit_ctx);
+        let meat = m.expand(AbstractTask::StockpileFood, &meat_ctx);
+        assert_eq!(
+            fruit,
+            vec![
+                Task::Scavenge { target },
+                Task::DepositToFactionStorage { good: Good::Fruit },
+            ]
+        );
+        assert_eq!(
+            meat,
+            vec![
+                Task::Scavenge { target },
+                Task::DepositToFactionStorage { good: Good::Meat },
+            ]
+        );
+    }
+
+    #[test]
+    fn scavenge_food_for_storage_expand_returns_empty_without_target_or_good() {
+        let m = ScavengeFoodForStorageMethod;
+        let ctx = ctx_with_food_scavenge_for_storage(None, Some((1, 1)), Some(Good::Fruit));
+        assert!(m.expand(AbstractTask::StockpileFood, &ctx).is_empty());
+        let ctx =
+            ctx_with_food_scavenge_for_storage(Some(Entity::from_raw(7)), None, Some(Good::Fruit));
+        assert!(m.expand(AbstractTask::StockpileFood, &ctx).is_empty());
+        let ctx =
+            ctx_with_food_scavenge_for_storage(Some(Entity::from_raw(7)), Some((1, 1)), None);
+        assert!(m.expand(AbstractTask::StockpileFood, &ctx).is_empty());
+    }
+
+    #[test]
+    fn scavenge_food_for_storage_expand_returns_empty_for_wrong_abstract_task() {
+        let m = ScavengeFoodForStorageMethod;
+        let ctx = ctx_with_food_scavenge_for_storage(
+            Some(Entity::from_raw(7)),
+            Some((1, 1)),
+            Some(Good::Fruit),
+        );
+        assert!(m.expand(AbstractTask::AcquireFood, &ctx).is_empty());
+        assert!(m
+            .expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx)
+            .is_empty());
+    }
+
+    // ── ExploreForFoodForStorageMethod (Phase 5c-ii-d-vi) ─────────────────
+    //
+    // Mirrors `ExploreForFoodMethod` but under `StockpileFood` and with no
+    // hunger gate. Utility 0.3 (loses to the concrete scavenge method).
+
+    #[test]
+    fn explore_for_food_for_storage_precondition_true_for_stockpile_food() {
+        let m = ExploreForFoodForStorageMethod;
+        let ctx = ctx_empty();
+        assert!(m.precondition(AbstractTask::StockpileFood, &ctx));
+    }
+
+    #[test]
+    fn explore_for_food_for_storage_precondition_false_for_wrong_abstract_task() {
+        let m = ExploreForFoodForStorageMethod;
+        let ctx = ctx_empty();
+        assert!(!m.precondition(AbstractTask::AcquireFood, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::Sleep, &ctx));
+        assert!(!m.precondition(AbstractTask::Eat, &ctx));
+    }
+
+    #[test]
+    fn explore_for_food_for_storage_no_hunger_gate() {
+        let m = ExploreForFoodForStorageMethod;
+        let mut ctx = ctx_empty();
+        ctx.hunger = 0.0;
+        // Storage-fill fires regardless of hunger — that's the whole point of
+        // the StockpileFood split.
+        assert!(m.precondition(AbstractTask::StockpileFood, &ctx));
+    }
+
+    #[test]
+    fn explore_for_food_for_storage_utility_below_concrete_method() {
+        // Pin the 0.3 < 1.5 (scavenge) ordering so a future tuning PR can't
+        // silently invert the fallback ranking.
+        let exp = ExploreForFoodForStorageMethod;
+        let scav = ScavengeFoodForStorageMethod;
+        let ctx = ctx_with_food_scavenge_for_storage(
+            Some(Entity::from_raw(1)),
+            Some((30, 30)), // max-penalty distance
+            Some(Good::Fruit),
+        );
+        let u_exp = exp.utility(AbstractTask::StockpileFood, &ctx);
+        let u_scav = scav.utility(AbstractTask::StockpileFood, &ctx);
+        assert!(u_exp < u_scav, "explore {} should lose to scavenge {}", u_exp, u_scav);
+    }
+
+    #[test]
+    fn explore_for_food_for_storage_expands_to_explore_food() {
+        let m = ExploreForFoodForStorageMethod;
+        let ctx = ctx_empty();
+        let tasks = m.expand(AbstractTask::StockpileFood, &ctx);
+        assert_eq!(
+            tasks,
+            vec![Task::Explore {
+                kind: MemoryKind::Food
+            }]
+        );
+    }
+
+    #[test]
+    fn explore_for_food_for_storage_expand_returns_empty_for_wrong_abstract_task() {
+        let m = ExploreForFoodForStorageMethod;
+        let ctx = ctx_empty();
+        assert!(m.expand(AbstractTask::AcquireFood, &ctx).is_empty());
+        assert!(m
+            .expand(AbstractTask::AcquireGood { good: Good::Wood }, &ctx)
+            .is_empty());
+        assert!(m.expand(AbstractTask::Sleep, &ctx).is_empty());
+        assert!(m.expand(AbstractTask::Eat, &ctx).is_empty());
+    }
+
+    #[test]
+    fn abstract_task_kind_round_trips_for_stockpile_food() {
+        assert_eq!(
+            AbstractTask::StockpileFood.kind(),
+            AbstractTaskKind::StockpileFood
+        );
+    }
+
+    // ── Forage methods (Phase 5d-i) ────────────────────────────────────────
+
+    #[test]
+    fn forage_from_known_precondition_true_when_target_tile_known() {
+        let m = ForageFromKnownMethod;
+        let ctx = ctx_with_gather_target(Some((4, 7)));
+        assert!(m.precondition(AbstractTask::AcquireFood, &ctx));
+    }
+
+    #[test]
+    fn forage_from_known_precondition_false_without_target_tile() {
+        let m = ForageFromKnownMethod;
+        let ctx = ctx_with_gather_target(None);
+        assert!(!m.precondition(AbstractTask::AcquireFood, &ctx));
+    }
+
+    #[test]
+    fn forage_from_known_precondition_false_for_wrong_abstract_task() {
+        let m = ForageFromKnownMethod;
+        let ctx = ctx_with_gather_target(Some((1, 1)));
+        // Defensive: only AcquireFood drives this method. AcquireGood would
+        // double-fire alongside `GatherFromKnownMethod` if this gate slipped.
+        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::Sleep, &ctx));
+        assert!(!m.precondition(AbstractTask::Eat, &ctx));
+        assert!(!m.precondition(AbstractTask::StockpileFood, &ctx));
+    }
+
+    #[test]
+    fn forage_from_known_expands_to_gather_then_eat_chain() {
+        let m = ForageFromKnownMethod;
+        let ctx = ctx_with_gather_target(Some((6, 9)));
+        let tasks = m.expand(AbstractTask::AcquireFood, &ctx);
+        // Two-task chain: gather at the known plant, then eat in place.
+        // The trailing `Eat` is what makes this method differ from
+        // `ForageFromKnownForStorageMethod` (whose chain ends in
+        // `DepositToFactionStorage`).
+        assert_eq!(tasks, vec![Task::Gather { tile: (6, 9) }, Task::Eat]);
+    }
+
+    #[test]
+    fn forage_from_known_utility_at_baseline_with_zero_distance() {
+        let m = ForageFromKnownMethod;
+        // Same tile as agent → zero distance → no penalty → exactly baseline.
+        let ctx = ctx_with_gather_target(Some((0, 0)));
+        let u = m.utility(AbstractTask::AcquireFood, &ctx);
+        assert!((u - UTIL_BASELINE).abs() < 1e-6);
+    }
+
+    #[test]
+    fn forage_from_known_closer_target_outscores_farther() {
+        let m = ForageFromKnownMethod;
+        let near = ctx_with_gather_target(Some((1, 0)));
+        let far = ctx_with_gather_target(Some((20, 0)));
+        let u_near = m.utility(AbstractTask::AcquireFood, &near);
+        let u_far = m.utility(AbstractTask::AcquireFood, &far);
+        assert!(u_near > u_far, "near {} should beat far {}", u_near, u_far);
+    }
+
+    fn ctx_with_forage_for_storage(
+        gather: Option<(i32, i32)>,
+        deposit: Option<(i32, i32)>,
+        good: Option<Good>,
+    ) -> PlannerCtx {
+        let mut ctx = ctx_with_gather_target(gather);
+        ctx.gather_deposit_tile = deposit;
+        ctx.forage_food_good = good;
+        ctx
+    }
+
+    #[test]
+    fn forage_from_known_for_storage_precondition_true_with_target_and_good() {
+        let m = ForageFromKnownForStorageMethod;
+        let ctx = ctx_with_forage_for_storage(Some((4, 7)), None, Some(Good::Fruit));
+        assert!(m.precondition(AbstractTask::StockpileFood, &ctx));
+    }
+
+    #[test]
+    fn forage_from_known_for_storage_precondition_false_without_good() {
+        let m = ForageFromKnownForStorageMethod;
+        // Tile populated but plant kind couldn't be resolved (e.g. dispatcher
+        // saw an immature plant) — fail the precondition rather than emit a
+        // chain with no deposit good.
+        let ctx = ctx_with_forage_for_storage(Some((4, 7)), None, None);
+        assert!(!m.precondition(AbstractTask::StockpileFood, &ctx));
+    }
+
+    #[test]
+    fn forage_from_known_for_storage_precondition_false_for_wrong_abstract_task() {
+        let m = ForageFromKnownForStorageMethod;
+        let ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(Good::Grain));
+        assert!(!m.precondition(AbstractTask::AcquireFood, &ctx));
+        assert!(!m.precondition(AbstractTask::AcquireGood { good: Good::Wood }, &ctx));
+        assert!(!m.precondition(AbstractTask::Sleep, &ctx));
+        assert!(!m.precondition(AbstractTask::Eat, &ctx));
+    }
+
+    #[test]
+    fn forage_from_known_for_storage_expands_to_gather_then_deposit_chain() {
+        let m = ForageFromKnownForStorageMethod;
+        let ctx = ctx_with_forage_for_storage(Some((6, 9)), Some((0, 0)), Some(Good::Fruit));
+        let tasks = m.expand(AbstractTask::StockpileFood, &ctx);
+        assert_eq!(
+            tasks,
+            vec![
+                Task::Gather { tile: (6, 9) },
+                Task::DepositToFactionStorage { good: Good::Fruit },
+            ]
+        );
+    }
+
+    #[test]
+    fn forage_from_known_for_storage_threads_good_through_to_deposit() {
+        // The good payload from ctx flows through to the trailing deposit —
+        // this is the Forage analogue of `gather_from_known_threads_good_through`,
+        // except the good comes from `ctx.forage_food_good` (resolved at
+        // dispatch from the plant kind) instead of the abstract task.
+        let m = ForageFromKnownForStorageMethod;
+        let grain_ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(Good::Grain));
+        let fruit_ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(Good::Fruit));
+        assert_eq!(
+            m.expand(AbstractTask::StockpileFood, &grain_ctx).last(),
+            Some(&Task::DepositToFactionStorage { good: Good::Grain })
+        );
+        assert_eq!(
+            m.expand(AbstractTask::StockpileFood, &fruit_ctx).last(),
+            Some(&Task::DepositToFactionStorage { good: Good::Fruit })
+        );
+    }
+
+    #[test]
+    fn forage_from_known_for_storage_full_trip_capped_preserves_ranking_over_explore() {
+        // 1.0 base, 40-tile total → 0.30 cap → 0.70 effective. Still
+        // outranks `ExploreForFoodForStorageMethod` (0.3 flat) so the
+        // tier-preserving invariant holds for forage→deposit chains too.
+        let m = ForageFromKnownForStorageMethod;
+        let ctx = ctx_with_forage_for_storage(Some((20, 0)), Some((40, 0)), Some(Good::Fruit));
+        let u = m.utility(AbstractTask::StockpileFood, &ctx);
+        assert!(
+            u >= UTIL_EXPLORE_FALLBACK,
+            "forage {} should remain above explore fallback {}",
+            u,
+            UTIL_EXPLORE_FALLBACK,
+        );
+    }
+
+    // ── Cross-leg distance discount for gather/scavenge chains ────────────
+
+    fn ctx_with_gather_full_trip(
+        gather: Option<(i32, i32)>,
+        deposit: Option<(i32, i32)>,
+    ) -> PlannerCtx {
+        let mut ctx = ctx_with_gather_target(gather);
+        ctx.gather_deposit_tile = deposit;
+        ctx
+    }
+
+    fn ctx_with_scavenge_full_trip(
+        target: Option<Entity>,
+        tile: Option<(i32, i32)>,
+        deposit: Option<(i32, i32)>,
+    ) -> PlannerCtx {
+        let mut ctx = ctx_with_scavenge_target(target, tile);
+        ctx.scavenge_deposit_tile = deposit;
+        ctx
+    }
+
+    #[test]
+    fn gather_closer_deposit_outscores_farther_deposit_same_target() {
+        let m = GatherFromKnownMethod;
+        let near = ctx_with_gather_full_trip(Some((5, 0)), Some((6, 0)));
+        let far = ctx_with_gather_full_trip(Some((5, 0)), Some((20, 0)));
+        let u_near = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &near);
+        let u_far = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &far);
+        assert!(u_near > u_far, "near {} should beat far {}", u_near, u_far);
+    }
+
+    #[test]
+    fn gather_full_trip_falls_back_to_target_only_when_deposit_missing() {
+        let m = GatherFromKnownMethod;
+        let with_dep = ctx_with_gather_full_trip(Some((5, 0)), Some((5, 0))); // 0-cost second leg
+        let no_dep = ctx_with_gather_full_trip(Some((5, 0)), None);
+        let u_a = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &with_dep);
+        let u_b = m.utility(AbstractTask::AcquireGood { good: Good::Wood }, &no_dep);
+        assert!((u_a - u_b).abs() < 1e-6, "{} vs {}", u_a, u_b);
+    }
+
+    #[test]
+    fn scavenge_full_trip_capped_preserves_ranking_over_gather() {
+        // 1.5 base, 40-tile total → raw 0.80 capped at 0.30 → 1.20.
+        // Still > 1.0 - 0 = 1.0 (zero-distance gather) so the cap-preserves-
+        // ranking invariant survives the full-trip switch.
+        let scav = ScavengeFromGroundMethod;
+        let target = Entity::from_raw(1);
+        let scav_ctx = ctx_with_scavenge_full_trip(Some(target), Some((20, 0)), Some((40, 0)));
+        let gather_ctx = ctx_with_gather_target(Some((0, 0)));
+        let u_scav = scav.utility(AbstractTask::AcquireGood { good: Good::Wood }, &scav_ctx);
+        let u_gat = GatherFromKnownMethod
+            .utility(AbstractTask::AcquireGood { good: Good::Wood }, &gather_ctx);
+        assert!(u_scav > u_gat, "scav {} should beat gather {}", u_scav, u_gat);
+    }
+
+    #[test]
+    fn full_trip_penalty_helper_caps_and_falls_back() {
+        assert!((full_trip_penalty((0, 0), Some((5, 0)), Some((5, 0))) - 0.10).abs() < 1e-6);
+        assert!(
+            (full_trip_penalty((0, 0), Some((20, 0)), Some((40, 0))) - MAX_DIST_PENALTY).abs()
+                < 1e-6
+        );
+        // Fallback: no deposit → single-leg agent→target.
+        assert!((full_trip_penalty((0, 0), Some((10, 0)), None) - 0.20).abs() < 1e-6);
+        // No target → 0.
+        assert_eq!(full_trip_penalty((0, 0), None, Some((5, 0))), 0.0);
     }
 }

@@ -171,12 +171,15 @@ impl Plugin for SimulationPlugin {
                         .after(htn::htn_eat_dispatch_system),
                     htn::htn_acquire_good_dispatch_system
                         .after(htn::htn_acquire_food_dispatch_system),
+                    htn::htn_stockpile_food_dispatch_system
+                        .after(htn::htn_acquire_good_dispatch_system),
                     terraform::terraform_dispatch_system
                         .after(tasks::goal_dispatch_system)
                         .after(htn::htn_dispatch_system)
                         .after(htn::htn_eat_dispatch_system)
                         .after(htn::htn_acquire_food_dispatch_system)
-                        .after(htn::htn_acquire_good_dispatch_system),
+                        .after(htn::htn_acquire_good_dispatch_system)
+                        .after(htn::htn_stockpile_food_dispatch_system),
                 )
                     .in_set(SimulationSet::ParallelB),
             )

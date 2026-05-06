@@ -21,6 +21,7 @@ use super::memory::{AgentMemory, RelationshipMemory};
 use super::mood::Mood;
 use super::movement::MovementState;
 use super::needs::Needs;
+use super::htn::MethodHistory;
 use super::plan::{KnownPlans, PlanHistory, PlanId, PlanScoringMethod};
 use super::reproduction::BiologicalSex;
 use super::schedule::{BucketSlot, SimClock};
@@ -472,11 +473,11 @@ pub fn spawn_population(
                     AgentMemory::default(),
                     RelationshipMemory::default(),
                     KnownPlans::with_innate(&[
-                        PlanId::FORAGE_FOOD,
+                        // FORAGE_FOOD retired in the Forage→HTN migration.
                         PlanId::FARM_FOOD,
                         // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
                         PlanId::HUNT_FOOD,
-                        PlanId::SCAVENGE_FOOD,
+                        // SCAVENGE_FOOD retired 5c-ii-d-vi.
                         PlanId::BUILD_BLUEPRINT,
                         PlanId::TAME_HORSE,
                         PlanId::DELIVER_HIDE_TO_CRAFT_ORDER,
@@ -492,7 +493,7 @@ pub fn spawn_population(
                         PlanId::PLAY_BY_THROWING_ROCKS,
                         PlanId::PLAY_WITH_STORED_TOY,
                         PlanId::CLAIMED_BUILD,
-                        PlanId::EXPLORE_FOR_FOOD,
+                        // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
                         // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
                         // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
                         PlanId::SOCIALIZE,
@@ -503,6 +504,7 @@ pub fn spawn_population(
                         PlanId::SCOUT_FOR_PREY,
                     ]),
                     PlanHistory::default(),
+                    MethodHistory::default(),
                     PlanScoringMethod::Weighted,
                     Name::new(generate_person_name(sex)),
                     PathFollow::default(),

@@ -37,7 +37,15 @@ static FOREST_TILES: &[TileKind] = &[TileKind::Forest];
 // (Phase 5b-iii-ii). Chaining Eat into gather plans would drop the whole
 // plan when the worker isn't yet hungry, leaving food stranded in hand and
 // no deposit run.
-static PLAN_STEPS_0: &[StepId] = &[StepId(0), StepId(12)]; // ForageFood → DepositGoods
+// PLAN_STEPS_0 (ForageFood) was retired in the Forage→HTN migration. The
+// `[Gather, Eat]` chain (under `AgentGoal::Survive`) is now driven by
+// `ForageFromKnownMethod` and the `[Gather, DepositToFactionStorage]` chain
+// (under `AgentGoal::GatherFood`) by `ForageFromKnownForStorageMethod`
+// (see `htn.rs`). StepId(0) (ForageGrass) and StepId(12) (DepositGoods) are
+// still defined: StepId(12) is shared by other deposit plans and the HTN
+// gather handoff routes via `TaskKind::DepositResource`; StepId(0) is no
+// longer referenced by any plan but kept for in-flight ActivePlan
+// compatibility (mirrors the StepId 41/42 ClaimedHaul pattern).
 static PLAN_STEPS_1: &[StepId] = &[StepId(1), StepId(12)]; // FarmFood → DepositGoods
 // PLAN_STEPS_2 (GatherWood) and PLAN_STEPS_3 (GatherStone) were retired in
 // Phase 5c-ii-c-ii — the gather → deposit chain is now driven by HTN
@@ -56,7 +64,14 @@ static PLAN_STEPS_5: &[StepId] =
     &[StepId(57), StepId(58), StepId(5), StepId(53), StepId(54), StepId(55)]; // MusterAtHearth → TravelToHuntArea → Hunt → PickUpCorpse → HaulCorpse → Butcher
 static PLAN_STEPS_HUNTER_ARM: &[StepId] = &[StepId(52), StepId(56)]; // AcquireHuntingSpear: WithdrawSpear → EquipMainHand
 static PLAN_STEPS_SCOUT: &[StepId] = &[StepId(59)]; // ScoutForPrey: WanderForPrey (single step, ends on prey memory)
-static PLAN_STEPS_6: &[StepId] = &[StepId(6), StepId(12)]; // ScavengeFood → DepositGoods
+// PLAN_STEPS_6 (ScavengeFood) was retired in Phase 5c-ii-d-vi — the
+// scavenge-then-deposit chain is now driven by `ScavengeFoodForStorageMethod`
+// under `StockpileFood` (see `htn.rs`). StepId(6) (CollectFood) and StepId(12)
+// (DepositGoods) are still defined: StepId(12) is shared by other deposit
+// plans (24 ReturnSurplusFood) and the HTN scavenge handoff routes via
+// `TaskKind::DepositResource`; StepId(6) is no longer referenced by any plan
+// but kept for in-flight ActivePlan compatibility (mirrors the StepId 41/42
+// ClaimedHaul pattern).
 static PLAN_STEPS_7: &[StepId] = &[StepId(2), StepId(28), StepId(25)]; // GatherWood, HaulToBlueprint, BuildAnyBlueprint
 static PLAN_STEPS_29: &[StepId] = &[StepId(32), StepId(28), StepId(25)]; // FetchMaterialFromStorage, HaulToBlueprint, BuildAnyBlueprint
 // PLAN_STEPS_9 (WithdrawAndEat) was retired in Phase 5b-iii-ii — the
@@ -68,7 +83,12 @@ static PLAN_STEPS_29: &[StepId] = &[StepId(32), StepId(28), StepId(25)]; // Fetc
 static PLAN_STEPS_10: &[StepId] = &[StepId(11)]; // TameHorse: TameAnimal
 
 static SURVIVE_GOALS: &[AgentGoal] = &[AgentGoal::Survive];
-static GATHER_FOOD_GOALS: &[AgentGoal] = &[AgentGoal::GatherFood];
+// GATHER_FOOD_GOALS was retired in Phase 5c-ii-d-vi when the last two
+// GatherFood-only plans (PlanId 6 ScavengeFood, PlanId 35 ExploreForFood)
+// were deleted. The HTN registry's StockpileFood methods own the goal now
+// via `htn_stockpile_food_dispatch_system`. SURVIVE_AND_GATHER_FOOD_GOALS
+// stays — Forage (PlanId 0) and HuntFood (PlanId 5) both serve Survive +
+// GatherFood and remain plan-driven for now.
 static TAME_HORSE_GOALS: &[AgentGoal] = &[AgentGoal::TameHorse];
 // PlanId 2/3 (GatherWood/GatherStone) were retired in 5c-ii-c-ii, and
 // PlanId 38/39 (ScavengeWood/ScavengeStone) were retired in 5c-ii-d-ii-b.
@@ -93,7 +113,11 @@ static PLAN_STEPS_24: &[StepId] = &[StepId(12)]; // ReturnSurplusFood: DepositGo
 // step of Forage/Scavenge/WithdrawAndEat plans.
 static PLAN_STEPS_26: &[StepId] = &[StepId(29)]; // PlaySocial: PlayWithPartner (resolves partner inline)
 static PLAN_STEPS_27: &[StepId] = &[StepId(30)]; // PlaySolo: PlayWithItem (resolves item inline)
-static PLAN_STEPS_28: &[StepId] = &[StepId(31)]; // Explore: walk to a random reachable tile near home
+// PLAN_STEPS_28 (Explore: walk to a random reachable tile near home) was
+// retired in Phase 5c-ii-d-vi — the last consumer was PlanId 35 (ExploreForFood),
+// itself retired in this PR. StepId(31) (Explore) survives in the StepRegistry
+// as the legacy executor that HTN's `Task::Explore` dispatchers prime via
+// `assign_task_with_routing(... TaskKind::Explore, None ...)`.
 static PLAN_STEPS_30: &[StepId] = &[StepId(33), StepId(36)]; // PlayByPlanting: WithdrawSeed → PlantSeedAsPlay
 static PLAN_STEPS_31: &[StepId] = &[StepId(34), StepId(37)]; // PlayByThrowingRocks: WithdrawStone → ThrowRocksAsPlay
 static PLAN_STEPS_32: &[StepId] = &[StepId(35), StepId(30)]; // PlayWithStoredToy: WithdrawPlayItem → PlayWithItem (step 30, plays in place when held)
@@ -887,22 +911,22 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
     // visibility, memory, skills, and faction-storage stocks (slots 29-32).
     registry.0 = vec![
         PlanDef {
-            // Visibility/memory drive the score; STORAGE_FOOD is a soft brake
-            // so foragers stop wandering out when the granary is already full
-            // and let HTN AcquireFood handle hungry siblings instead.
+            // Forage→HTN migration: the legacy `ForageFood` plan
+            // (`[ForageGrass, DepositGoods]`, served Survive + GatherFood) is
+            // now driven by `ForageFromKnownMethod` (AcquireFood, ends in
+            // `Eat`) and `ForageFromKnownForStorageMethod` (StockpileFood,
+            // ends in `DepositToFactionStorage`). PlanId 0 is retired with no
+            // successor; the const survives as a stable sentinel for
+            // PlanHistory ring-buffer entries (`faction.rs::hunter_demote`
+            // uses it as a placeholder write).
             id: PlanId(0),
-            name: "ForageFood",
-            steps: PLAN_STEPS_0,
-            state_weights: mk_weights(&[
-                (SI_VIS_PLANT_FOOD, 1.0),
-                (SI_MEM_FOOD, 0.4),
-                (SI_HAS_FOOD, -0.3),
-                (SI_STORAGE_FOOD, -0.4),
-            ]),
-            bias: 0.0,
-            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
-            memory_target_kind: Some(MemoryKind::Food),
+            memory_target_kind: None,
             flags: PF_NONE,
             requires_profession: None,
         },
@@ -970,35 +994,13 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_UNINTERRUPTIBLE,
             requires_profession: Some(Profession::Hunter),
         },
-        PlanDef {
-            // Phase 5c-ii-d-iii-ii: `serves_goals` retargeted from
-            // `SURVIVE_AND_GATHER_FOOD_GOALS` to `GATHER_FOOD_GOALS` — the
-            // hunger-driven Survive case is now owned by the HTN registry's
-            // `ScavengeFoodFromGroundMethod` (chain `[Scavenge, Eat]`,
-            // dispatched by `htn_acquire_food_dispatch_system`'s scavenge
-            // branch). The chief-driven GatherFood path still produces the
-            // legacy `[CollectFood, DepositGoods]` chain through this plan
-            // — chiefs want loose food in storage, not eaten on the spot,
-            // so the deposit-tail expansion is the right shape there.
-            // Migrating GatherFood to HTN needs a `ScavengeFoodForStorage`
-            // method whose expansion is `[Scavenge, DepositToFactionStorage]`
-            // and a per-good ctx field that threads the food good through;
-            // deferred until the wiring substrate stabilises.
-            id: PlanId(6),
-            name: "ScavengeFood",
-            steps: PLAN_STEPS_6,
-            state_weights: mk_weights(&[
-                (SI_VIS_GROUND_FOOD, 1.5),
-                (SI_HAS_FOOD, -0.3),
-                (SI_STORAGE_FOOD, -0.3),
-            ]),
-            bias: 0.1,
-            serves_goals: GATHER_FOOD_GOALS,
-            tech_gate: None,
-            memory_target_kind: Some(MemoryKind::Food),
-            flags: PF_SCAVENGE | PF_TARGETS_FOOD,
-            requires_profession: None,
-        },
+        // Phase 5c-ii-d-vi: PlanId 6 (`ScavengeFood`) deleted. The HTN
+        // registry's `ScavengeFoodForStorageMethod` under `StockpileFood`
+        // (utility 1.5) replaces the GatherFood path; the
+        // `ScavengeFoodFromGroundMethod` under `AcquireFood` (5c-ii-d-iii-ii)
+        // covered the Survive path. PlanId 6 is retired with no successor;
+        // ID is kept reserved by the constant in `plan/mod.rs` for
+        // PlanHistory ring-buffer stability.
         PlanDef {
             // Gather-then-build sibling: only worth picking when storage is
             // dry and the agent can actually see/remember wood. Otherwise
@@ -1290,25 +1292,12 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         // gather branch dispatches `Task::Explore { kind }` whenever no
         // concrete method's precondition fires.
         //
-        // PlanId 35 (`ExploreForFood`) retargeted from `SURVIVE_AND_GATHER_FOOD_GOALS`
-        // to `GATHER_FOOD_GOALS` only — HTN owns the Survive case via
-        // `ExploreForFoodMethod` under `AcquireFood`; the chief-driven
-        // GatherFood case still uses the legacy plan path because
-        // `htn_acquire_food_dispatch_system` only fires under Survive (no
-        // hunger gate exists for GatherFood). Mirrors the PlanId 6
-        // `ScavengeFood` retargeting in 5c-ii-d-iii-ii.
-        PlanDef {
-            id: PlanId(35),
-            name: "ExploreForFood",
-            steps: PLAN_STEPS_28,
-            state_weights: mk_weights(&[]),
-            bias: 0.3,
-            serves_goals: GATHER_FOOD_GOALS,
-            tech_gate: None,
-            memory_target_kind: Some(MemoryKind::Food),
-            flags: PF_EXPLORE | PF_TARGETS_FOOD,
-            requires_profession: None,
-        },
+        // Phase 5c-ii-d-vi: PlanId 35 (`ExploreForFood`) deleted. The HTN
+        // `ExploreForFoodForStorageMethod` (utility 0.3) under `StockpileFood`
+        // replaces the GatherFood case; the `ExploreForFoodMethod` under
+        // `AcquireFood` (5c-ii-d-iv-ii) covered the Survive case. ID is kept
+        // reserved by the constant in `plan/mod.rs` for PlanHistory
+        // ring-buffer stability.
         PlanDef {
             // Sibling of BuildBlueprint that pulls materials out of communal
             // storage instead of gathering fresh from the world. Keeps in-progress

@@ -226,7 +226,12 @@ impl PlanId {
     // unused range (>= 70).
     pub const PLANT_FROM_STORAGE: Self = Self(4);
     pub const HUNT_FOOD: Self = Self(5);
-    pub const SCAVENGE_FOOD: Self = Self(6);
+    // Self(6) "ScavengeFood" was retired in Phase 5c-ii-d-vi — the
+    // scavenge-then-deposit chain is now produced by
+    // `ScavengeFoodForStorageMethod` under `StockpileFood` (chief-driven
+    // GatherFood case) and `ScavengeFoodFromGroundMethod` under `AcquireFood`
+    // (Survive case, 5c-ii-d-iii-ii). The PlanId is reserved by this
+    // comment; future plans pick from >= 70.
     pub const BUILD_BLUEPRINT: Self = Self(7);
     pub const BUILD_BED: Self = Self(8);
     // 9: unused — WithdrawAndEat retired in Phase 5b-iii-ii (HTN
@@ -256,14 +261,14 @@ impl PlanId {
     // through `htn_acquire_good_dispatch_system` driven by
     // `WithdrawAndHaulToBlueprintMethod`.
     pub const CLAIMED_BUILD: Self = Self(34);
-    pub const EXPLORE_FOR_FOOD: Self = Self(35);
+    // Self(35) "ExploreForFood" was retired in Phase 5c-ii-d-vi — the
+    // random-walk-near-home fallback for hungry/storage-fill agents now flows
+    // through `htn_acquire_food_dispatch_system` driven by
+    // `ExploreForFoodMethod` (Survive) and `htn_stockpile_food_dispatch_system`
+    // driven by `ExploreForFoodForStorageMethod` (GatherFood).
     // Self(36) "ExploreForWood" and Self(37) "ExploreForStone" were retired in
     // Phase 5c-ii-d-iv-ii — the random-walk fallback now flows through
     // `htn_acquire_good_dispatch_system` driven by `ExploreForMaterialMethod`.
-    // PlanId 35 survives but its `serves_goals` was retargeted from
-    // `SURVIVE_AND_GATHER_FOOD_GOALS` to `GATHER_FOOD_GOALS` only — HTN owns
-    // the Survive case via `ExploreForFoodMethod`; the GatherFood case is
-    // still plan-driven (no hunger gate in `htn_acquire_food_dispatch_system`).
     // Self(38) "ScavengeWood" and Self(39) "ScavengeStone" were retired in
     // Phase 5c-ii-d-ii-b — the vision-based `[Scavenge, DepositToFactionStorage]`
     // chain now flows through `htn_acquire_good_dispatch_system` driven by

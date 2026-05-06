@@ -43,7 +43,7 @@ ParallelA → ParallelB → Sequential → Economy
 ```
 
 - **ParallelA** — read-heavy systems (needs ticks, mood, LOD, goal updates, animal sensing)
-- **ParallelB** — `goal_dispatch_system` (Sleep-only fallback; every other goal is plan-driven)
+- **ParallelB** — HTN dispatchers (`htn_dispatch_system` for Sleep, then `htn_eat`, `htn_acquire_food`, `htn_acquire_good`, `htn_stockpile_food`); `goal_dispatch_system` runs alongside them as the no-plan stale-reset / Explore-cleanup catch-all for plan-driven goals
 - **Sequential** — mutating systems with tight ordering: `gather` → `dig` / `construction` → `movement` → `combat` → `production` → `plan_execution`
 - **Economy** — post-simulation: gossip, faction storage rollup, reproduction, raids, technology, market price updates
 

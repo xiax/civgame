@@ -11,6 +11,7 @@ use super::needs::Needs;
 use super::person::{
     generate_person_name, AiState, HairColor, Person, PersonAI, Profession, SkinTone,
 };
+use super::htn::MethodHistory;
 use super::plan::{KnownPlans, PlanHistory, PlanId, PlanScoringMethod};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
@@ -498,11 +499,11 @@ pub fn pregnancy_system(
                 AgentMemory::default(),
                 RelationshipMemory::default(),
                 KnownPlans::with_innate(&[
-                    PlanId::FORAGE_FOOD,
+                    // FORAGE_FOOD retired in the Forage→HTN migration.
                     PlanId::FARM_FOOD,
                     // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
                     PlanId::HUNT_FOOD,
-                    PlanId::SCAVENGE_FOOD,
+                    // SCAVENGE_FOOD retired 5c-ii-d-vi.
                     PlanId::BUILD_BLUEPRINT,
                     PlanId::DELIVER_HIDE_TO_CRAFT_ORDER,
                     PlanId::DELIVER_GRAIN_TO_CRAFT_ORDER,
@@ -516,7 +517,7 @@ pub fn pregnancy_system(
                     PlanId::PLAY_BY_THROWING_ROCKS,
                     PlanId::PLAY_WITH_STORED_TOY,
                     PlanId::CLAIMED_BUILD,
-                    PlanId::EXPLORE_FOR_FOOD,
+                    // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
                     // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
                     // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
                     PlanId::SOCIALIZE,
@@ -525,6 +526,7 @@ pub fn pregnancy_system(
                     PlanId::LEAD,
                 ]),
                 PlanHistory::default(),
+                MethodHistory::default(),
                 PlanScoringMethod::Weighted,
                 Name::new(child_name),
                 PathFollow::default(),

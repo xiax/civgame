@@ -109,40 +109,52 @@ fn finish_gather(
     ai.work_progress = 0;
     aq.advance();
 
-    // Chain handoff: if the next task in the prefetch ring is
-    // DepositToFactionStorage, route there and prime the legacy channel for
-    // `drop_items_at_destination_system`.
-    if matches!(aq.current, Task::DepositToFactionStorage { .. }) {
-        let Some(fid) = faction_id else {
-            // SOLO agent — no faction storage. The dispatcher already filters
-            // SOLO out, so this is defensive.
-            aq.cancel();
-            return;
-        };
-        let Some(storage_tile) = routing.storage_tile_map.nearest_for_faction(fid, cur_tile) else {
-            // No storage tiles for this faction — drop the chain, hands stay
-            // full. They'll be eligible to gather again next tick (the legacy
-            // gather plan registry never had a "where do I dump this" answer
-            // either; the agent just held the haul cap until something else
-            // happened).
-            aq.cancel();
-            return;
-        };
-        let dispatched = assign_task_with_routing(
-            ai,
-            cur_tile,
-            cur_chunk,
-            storage_tile,
-            TaskKind::DepositResource,
-            None,
-            &routing.chunk_graph,
-            &routing.chunk_router,
-            chunk_map,
-            &routing.chunk_connectivity,
-        );
-        if !dispatched {
-            aq.cancel();
+    // Chain handoff: route based on what the prefetch ring promoted.
+    match aq.current {
+        Task::DepositToFactionStorage { .. } => {
+            let Some(fid) = faction_id else {
+                // SOLO agent — no faction storage. The dispatcher already
+                // filters SOLO out, so this is defensive.
+                aq.cancel();
+                return;
+            };
+            let Some(storage_tile) =
+                routing.storage_tile_map.nearest_for_faction(fid, cur_tile)
+            else {
+                // No storage tiles for this faction — drop the chain, hands
+                // stay full. They'll be eligible to gather again next tick
+                // (the legacy gather plan registry never had a "where do I
+                // dump this" answer either; the agent just held the haul
+                // cap until something else happened).
+                aq.cancel();
+                return;
+            };
+            let dispatched = assign_task_with_routing(
+                ai,
+                cur_tile,
+                cur_chunk,
+                storage_tile,
+                TaskKind::DepositResource,
+                None,
+                &routing.chunk_graph,
+                &routing.chunk_router,
+                chunk_map,
+                &routing.chunk_connectivity,
+            );
+            if !dispatched {
+                aq.cancel();
+            }
         }
+        Task::Eat => {
+            // Forage chain trailing leg under AcquireFood — eat in place.
+            // Mirrors `production::finish_withdraw_food`'s Eat handoff: prime
+            // the legacy channel directly so `eat_task_system` picks up next
+            // tick. The Gather executor leaves harvested food in
+            // hands/inventory; `eat_task_system` reads from both.
+            ai.state = AiState::Working;
+            ai.task_id = TaskKind::Eat as u16;
+        }
+        _ => {}
     }
 }
 

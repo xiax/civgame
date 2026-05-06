@@ -36,6 +36,7 @@ use crate::simulation::needs::Needs;
 use crate::simulation::person::{
     AiState, HairColor, Person, PersonAI, Profession, SkinTone,
 };
+use crate::simulation::htn::MethodHistory;
 use crate::simulation::plan::{KnownPlans, PlanHistory, PlanId, PlanScoringMethod};
 use crate::simulation::reproduction::BiologicalSex;
 use crate::simulation::schedule::{BucketSlot, SimClock};
@@ -292,11 +293,11 @@ impl PersonBuilder {
             // Match the live spawn_population innate-plan list so
             // candidate filtering behaves identically.
             known_plan_ids: vec![
-                PlanId::FORAGE_FOOD,
+                // FORAGE_FOOD retired in the Forage→HTN migration.
                 PlanId::FARM_FOOD,
                 // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
                 PlanId::HUNT_FOOD,
-                PlanId::SCAVENGE_FOOD,
+                // SCAVENGE_FOOD retired 5c-ii-d-vi.
                 PlanId::BUILD_BLUEPRINT,
                 PlanId::TAME_HORSE,
                 PlanId::DELIVER_HIDE_TO_CRAFT_ORDER,
@@ -312,7 +313,7 @@ impl PersonBuilder {
                 PlanId::PLAY_BY_THROWING_ROCKS,
                 PlanId::PLAY_WITH_STORED_TOY,
                 PlanId::CLAIMED_BUILD,
-                PlanId::EXPLORE_FOR_FOOD,
+                // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
                 // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
                 // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
                 PlanId::SOCIALIZE,
@@ -428,6 +429,7 @@ impl PersonBuilder {
                     RelationshipMemory::default(),
                     KnownPlans::with_innate(&self.known_plan_ids),
                     PlanHistory::default(),
+                    MethodHistory::default(),
                     PlanScoringMethod::Weighted,
                     Name::new("TestPerson"),
                     PathFollow::default(),
@@ -2114,6 +2116,140 @@ mod baseline_behaviour {
              WithdrawMaterialFromStorageMethod, WithdrawAndHaulToBlueprintMethod, \
              GatherFromKnownMethod, ScavengeFromGroundMethod, and \
              ExploreForMaterialMethod under AcquireGood at 5c-ii-d-iv-i"
+        );
+        assert_eq!(
+            registry.method_count(AbstractTaskKind::StockpileFood),
+            3,
+            "register_builtin_methods should register \
+             ScavengeFoodForStorageMethod, ForageFromKnownForStorageMethod, \
+             and ExploreForFoodForStorageMethod under StockpileFood"
+        );
+        assert_eq!(
+            registry.method_count(AbstractTaskKind::AcquireFood),
+            4,
+            "register_builtin_methods should register \
+             WithdrawFromStorageMethod, ScavengeFoodFromGroundMethod, \
+             ForageFromKnownMethod, and ExploreForFoodMethod under AcquireFood"
+        );
+    }
+
+    /// Phase 5c-ii-d-vi: HTN-driven StockpileFood chain dispatch under
+    /// `AgentGoal::GatherFood`. Replaces the legacy `ScavengeFood` plan
+    /// (PlanId 6, GatherFood case). Mirrors the
+    /// `acquire_food_scavenge_dispatches_scavenge_then_eat_chain` pattern
+    /// (5c-ii-d-iii-ii) but for the chief-driven storage-fill goal: agent
+    /// not hungry, goal pinned to GatherFood, fruit on the ground →
+    /// `htn_stockpile_food_dispatch_system` dispatches
+    /// `Task::Scavenge { target }` with `Task::DepositToFactionStorage { Fruit }`
+    /// queued behind it.
+    ///
+    /// Pins the goal across `goal_update_system` ticks via a
+    /// `JobClaim::Stockpile` + `JobPosting{Stockpile, Fruit}` hack — same
+    /// pattern as `gather_wood_goal_dispatches_gather_then_deposit_chain`
+    /// (5c-ii-c-ii). Without the JobClaim, `goal_update_system` re-evaluates
+    /// idle agents every tick and would flip the goal away from GatherFood.
+    #[test]
+    fn gather_food_goal_dispatches_scavenge_then_deposit_chain() {
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::jobs::{
+            ClaimTarget, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+        };
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(13);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Storage tile far enough away that VIEW_RADIUS=15 still excludes it
+        // from the scavenge scan (`storage_tile_map.tiles.contains_key` filter
+        // would skip it anyway, but distance keeps the test intent legible).
+        let storage_tile = (-10, 0);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+
+        // Spawn a chief so the auto-promoted FactionChief doesn't pin our
+        // agent's goal to Lead. Mirrors the gather/scavenge fixture pattern.
+        let _chief = sim.spawn_person(sim.player_faction_id, (-9, 0), |_| {});
+
+        // Spawn a Fruit GroundItem at (5, 0) — within VIEW_RADIUS=15 of the
+        // worker at (0, 0) and outside the storage tile filter.
+        let fruit_entity = sim.spawn_ground_item((5, 0), Good::Fruit, 3);
+
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.hunger(0.0);
+        });
+
+        // Warmup so SpatialIndex picks up the GroundItem.
+        sim.tick_n(5);
+
+        // Inject a Stockpile/Fruit posting + JobClaim so `posting_goal(p)`
+        // (`jobs.rs:1264`) maps Stockpile + Fruit → GatherFood and
+        // `job_goal_lock_system` re-pins the goal every Economy tick. This
+        // also makes `goal_update_system` skip the agent (line 237 — JobClaim
+        // present), preventing goal churn.
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            let posting = JobPosting {
+                id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Stockpile {
+                    good: Good::Fruit,
+                    deposited: 0,
+                    target: 5,
+                },
+                claimants: vec![worker],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+            };
+            board
+                .postings
+                .entry(sim.player_faction_id)
+                .or_default()
+                .push(posting);
+            id
+        };
+
+        sim.app.world_mut().entity_mut(worker).insert((
+            JobClaim {
+                job_id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                posted_tick: 0,
+                fail_count: 0,
+            },
+            ClaimTarget {
+                good: Some(Good::Fruit),
+                blueprint: None,
+            },
+            AgentGoal::GatherFood,
+        ));
+
+        // Two ticks: ParallelA → ParallelB → dispatcher fires.
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(worker)
+            .expect("worker should have ActionQueue");
+
+        assert_eq!(
+            aq.current,
+            Task::Scavenge {
+                target: fruit_entity
+            },
+            "htn_stockpile_food_dispatch_system should dispatch Scavenge \
+             toward the visible Fruit GroundItem under GatherFood; \
+             current = {:?}",
+            aq.current,
+        );
+        assert_eq!(
+            aq.peek_next(),
+            Some(Task::DepositToFactionStorage { good: Good::Fruit }),
+            "the trailing DepositToFactionStorage{{Fruit}} should be queued \
+             behind the Scavenge head"
         );
     }
 }

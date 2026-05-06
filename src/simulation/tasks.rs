@@ -679,6 +679,22 @@ pub fn goal_dispatch_system(
                     {
                         Some(TaskKind::Explore as u16)
                     }
+                    // Phase 5c-ii-d-vi: HTN-driven StockpileFood chain runs
+                    // without an ActivePlan under GatherFood. Scavenge head,
+                    // DepositResource tail, Explore fallback — all need to
+                    // survive across goal-dispatch ticks. Mirrors the
+                    // GatherWood/GatherStone arms above.
+                    AgentGoal::GatherFood if ai.task_id == TaskKind::Scavenge as u16 => {
+                        Some(TaskKind::Scavenge as u16)
+                    }
+                    AgentGoal::GatherFood
+                        if ai.task_id == TaskKind::DepositResource as u16 =>
+                    {
+                        Some(TaskKind::DepositResource as u16)
+                    }
+                    AgentGoal::GatherFood if ai.task_id == TaskKind::Explore as u16 => {
+                        Some(TaskKind::Explore as u16)
+                    }
                     _ => None,
                 };
 
