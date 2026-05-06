@@ -184,7 +184,12 @@ pub fn hover_info_system(
                     ui.label("Deposits:");
                     for i in 0..bp.deposit_count as usize {
                         let d = bp.deposits[i];
-                        let line = format!("  {:?}: {}/{}", d.good, d.deposited, d.needed);
+                        let line = format!(
+                            "  {}: {}/{}",
+                            crate::economy::core_ids::display_name(d.resource_id),
+                            d.deposited,
+                            d.needed
+                        );
                         if d.deposited < d.needed {
                             ui.label(egui::RichText::new(line).color(egui::Color32::LIGHT_RED));
                         } else {
@@ -247,9 +252,8 @@ pub fn hover_info_system(
                             if need.deposited >= need.needed {
                                 continue;
                             }
-                            let qty = carrier.quantity_of_resource(
-                                crate::economy::core_ids::good_to_resource_id(need.good),
-                            ) + agent.quantity_of(need.good);
+                            let qty = carrier.quantity_of_resource(need.resource_id)
+                                + agent.quantity_of_resource(need.resource_id);
                             if qty > 0 {
                                 slot_carriers[i] += 1;
                             }
@@ -279,7 +283,11 @@ pub fn hover_info_system(
                         if need.deposited >= need.needed {
                             continue;
                         }
-                        let line = format!("  {:?} carriers: {}", need.good, slot_carriers[i]);
+                        let line = format!(
+                            "  {} carriers: {}",
+                            crate::economy::core_ids::display_name(need.resource_id),
+                            slot_carriers[i]
+                        );
                         if slot_carriers[i] == 0 {
                             ui.label(egui::RichText::new(line).color(egui::Color32::LIGHT_RED));
                         } else {
@@ -325,7 +333,12 @@ pub fn hover_info_system(
                     ui.label("Deposits:");
                     for i in 0..order.deposit_count as usize {
                         let d = order.deposits[i];
-                        let line = format!("  {:?}: {}/{}", d.good, d.deposited, d.needed);
+                        let line = format!(
+                            "  {}: {}/{}",
+                            crate::economy::core_ids::display_name(d.resource_id),
+                            d.deposited,
+                            d.needed
+                        );
                         if d.deposited < d.needed {
                             ui.label(egui::RichText::new(line).color(egui::Color32::LIGHT_RED));
                         } else {

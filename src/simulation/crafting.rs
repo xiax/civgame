@@ -303,14 +303,8 @@ impl CraftOrder {
         let mut deposits = [GoodNeed::default(); MAX_CRAFT_INPUTS];
         let count = recipe.inputs.len().min(MAX_CRAFT_INPUTS);
         for (i, &(id, qty)) in recipe.inputs.iter().take(count).enumerate() {
-            // GoodNeed stores legacy `Good`. Resource catalog is the
-            // source of truth for the recipe; reverse-resolve to the
-            // matching legacy enum variant. Recipes only reference core
-            // resources, so the lookup never returns None.
-            let good = resource_id_to_good(id)
-                .expect("recipe input is not in the legacy Good enum");
             deposits[i] = GoodNeed {
-                good,
+                resource_id: id,
                 needed: qty.min(u8::MAX as u32) as u8,
                 deposited: 0,
             };
@@ -621,9 +615,9 @@ pub fn craft_order_system(
                     .needed
                     .saturating_sub(order.deposits[i].deposited) as u32;
                 if still > 0 {
-                    let id = crate::economy::core_ids::good_to_resource_id(order.deposits[i].good);
+                    let id = order.deposits[i].resource_id;
                     let in_hand = carrier.quantity_of_resource(id);
-                    let in_inv = agent.quantity_of(order.deposits[i].good);
+                    let in_inv = agent.quantity_of_resource(id);
                     snap[i] = in_hand.saturating_add(in_inv);
                     if snap[i] > 0 {
                         useful = true;
@@ -654,8 +648,8 @@ pub fn craft_order_system(
     let mut hauler_done: Vec<Entity> = Vec::new();
     let mut orphaned_agents: Vec<Entity> = Vec::new();
     let mut xp_grants: Vec<Entity> = Vec::new();
-    // (agent_entity, good, qty_to_remove)
-    let mut good_removals: Vec<(Entity, Good, u32)> = Vec::new();
+    // (agent_entity, resource_id, qty_to_remove)
+    let mut good_removals: Vec<(Entity, crate::economy::resource_catalog::ResourceId, u32)> = Vec::new();
     // (agent_entity, recipe_id, tech_payload) — paid out as inventory at end of pass.
     let mut output_grants: Vec<(Entity, u8, Option<TechId>)> = Vec::new();
     // Job board credits to apply (recipe, qty) per worker entity.
@@ -690,7 +684,7 @@ pub fn craft_order_system(
                         continue;
                     }
                     let take = still.min(snap[i]);
-                    good_removals.push((agent_e, need.good, take));
+                    good_removals.push((agent_e, need.resource_id, take));
                     order.deposits[i].deposited =
                         order.deposits[i].deposited.saturating_add(take as u8);
                 }
@@ -770,9 +764,8 @@ pub fn craft_order_system(
     for (entity, mut ai, mut agent, mut carrier, mut skills, _member, _slot, _lod, _t, claim, mut plan_opt) in
         agent_query.iter_mut()
     {
-        for &(ae, good, qty) in &good_removals {
+        for &(ae, id, qty) in &good_removals {
             if ae == entity {
-                let id = crate::economy::core_ids::good_to_resource_id(good);
                 let from_hand = carrier.remove_resource(id, qty);
                 let still = qty - from_hand;
                 if still > 0 {

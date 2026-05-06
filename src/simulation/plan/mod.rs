@@ -888,9 +888,13 @@ fn resolve_withdraw_for_faction_need(
                         .needed
                         .saturating_sub(bp.deposits[i].deposited);
                     if still > 0 {
-                        let g = bp.deposits[i].good as usize;
-                        still_need_by_good[g] = still_need_by_good[g].saturating_add(still as u32);
-                        any_needed = true;
+                        if let Some(good) = crate::economy::core_ids::resource_id_to_good(
+                            bp.deposits[i].resource_id,
+                        ) {
+                            let g = good as usize;
+                            still_need_by_good[g] = still_need_by_good[g].saturating_add(still as u32);
+                            any_needed = true;
+                        }
                     }
                 }
             }
@@ -908,9 +912,13 @@ fn resolve_withdraw_for_faction_need(
                         .needed
                         .saturating_sub(order.deposits[i].deposited);
                     if still > 0 {
-                        let g = order.deposits[i].good as usize;
-                        still_need_by_good[g] = still_need_by_good[g].saturating_add(still as u32);
-                        any_needed = true;
+                        if let Some(good) = crate::economy::core_ids::resource_id_to_good(
+                            order.deposits[i].resource_id,
+                        ) {
+                            let g = good as usize;
+                            still_need_by_good[g] = still_need_by_good[g].saturating_add(still as u32);
+                            any_needed = true;
+                        }
                     }
                 }
             }
@@ -1619,10 +1627,10 @@ fn resolve_target(
                     let still = bp.deposits[i]
                         .needed
                         .saturating_sub(bp.deposits[i].deposited);
-                    let id = crate::economy::core_ids::good_to_resource_id(bp.deposits[i].good);
+                    let id = bp.deposits[i].resource_id;
                     let held = carrier
                         .quantity_of_resource(id)
-                        .saturating_add(agent.quantity_of(bp.deposits[i].good));
+                        .saturating_add(agent.quantity_of_resource(id));
                     if still > 0 && held > 0 {
                         useful = true;
                         break;
@@ -1654,10 +1662,10 @@ fn resolve_target(
                     let still = order.deposits[i]
                         .needed
                         .saturating_sub(order.deposits[i].deposited);
-                    let id = crate::economy::core_ids::good_to_resource_id(order.deposits[i].good);
+                    let id = order.deposits[i].resource_id;
                     let held = carrier
                         .quantity_of_resource(id)
-                        .saturating_add(agent.quantity_of(order.deposits[i].good));
+                        .saturating_add(agent.quantity_of_resource(id));
                     if still > 0 && held > 0 {
                         useful = true;
                         break;

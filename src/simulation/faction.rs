@@ -1614,8 +1614,7 @@ pub fn resource_demand_system(
                     let need = bp.deposits[i];
                     let unmet = need.needed.saturating_sub(need.deposited) as u32;
                     if unmet > 0 {
-                        let id = crate::economy::core_ids::good_to_resource_id(need.good);
-                        *faction.resource_demand.entry(id).or_insert(0) += unmet;
+                        *faction.resource_demand.entry(need.resource_id).or_insert(0) += unmet;
                     }
                 }
             }

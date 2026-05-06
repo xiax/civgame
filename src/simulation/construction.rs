@@ -407,10 +407,11 @@ impl BuildSiteKind {
 }
 
 /// A single ingredient slot inside a `Blueprint`. `needed` is fixed at spawn
-/// from the recipe; `deposited` advances as workers contribute the matching good.
+/// from the recipe; `deposited` advances as workers contribute the matching
+/// resource.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GoodNeed {
-    pub good: Good,
+    pub resource_id: crate::economy::resource_catalog::ResourceId,
     pub needed: u8,
     pub deposited: u8,
 }
@@ -453,7 +454,7 @@ impl Blueprint {
         let count = recipe.inputs.len().min(MAX_BUILD_INPUTS);
         for (i, &(good, qty)) in recipe.inputs.iter().take(count).enumerate() {
             deposits[i] = GoodNeed {
-                good,
+                resource_id: good.into(),
                 needed: qty,
                 deposited: 0,
             };
@@ -2607,9 +2608,9 @@ pub fn construction_system(
             for i in 0..count as usize {
                 let still = deposits[i].needed.saturating_sub(deposits[i].deposited) as u32;
                 if still > 0 {
-                    let id = crate::economy::core_ids::good_to_resource_id(deposits[i].good);
+                    let id = deposits[i].resource_id;
                     let in_hand = carrier.quantity_of_resource(id);
-                    let in_inv = agent.quantity_of(deposits[i].good);
+                    let in_inv = agent.quantity_of_resource(id);
                     snap[i] = in_hand.saturating_add(in_inv);
                     if snap[i] > 0 {
                         useful = true;
@@ -2647,7 +2648,7 @@ pub fn construction_system(
     // satisfied blueprint). Building XP is granted in pass 3.
     let mut xp_grants: Vec<Entity> = Vec::new();
     // (agent_entity, good, qty_to_remove)
-    let mut good_removals: Vec<(Entity, Good, u32)> = Vec::new();
+    let mut good_removals: Vec<(Entity, crate::economy::resource_catalog::ResourceId, u32)> = Vec::new();
 
     // Pass 2: deposit hauler goods, advance worker progress, check completion.
     let mut bp_entities: Vec<Entity> = bp_haulers
@@ -2680,7 +2681,7 @@ pub fn construction_system(
                         continue;
                     }
                     let take = still.min(snap[i]);
-                    good_removals.push((*agent_e, need.good, take));
+                    good_removals.push((*agent_e, need.resource_id, take));
                     bp.deposits[i].deposited = bp.deposits[i].deposited.saturating_add(take as u8);
                     if let Some(claim) = claim_opt {
                         if claim.kind == JobKind::Haul {
@@ -2690,7 +2691,7 @@ pub fn construction_system(
                                 &mut job_completed,
                                 claim,
                                 JobKind::Haul,
-                                Some(need.good),
+                                crate::economy::core_ids::resource_id_to_good(need.resource_id),
                                 take,
                             );
                         }
@@ -3016,11 +3017,10 @@ pub fn construction_system(
     for (entity, mut ai, mut aq, mut agent, mut carrier, mut skills, _, _, mut plan_opt, _) in
         agent_query.iter_mut()
     {
-        for &(ae, good, qty) in &good_removals {
+        for &(ae, id, qty) in &good_removals {
             if ae == entity {
                 // Consume from hands first (where haulers typically carry the load),
                 // fall back to personal inventory.
-                let id = crate::economy::core_ids::good_to_resource_id(good);
                 let from_hand = carrier.remove_resource(id, qty);
                 let still = qty - from_hand;
                 if still > 0 {

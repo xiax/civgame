@@ -29,6 +29,15 @@ use super::goods::Bulk;
 #[derive(Copy, Clone, Eq, Hash, PartialEq, Debug)]
 pub struct ResourceId(pub u16);
 
+/// Default resolves to the `NONE` sentinel so newtype consumers using
+/// `Default::default()` (e.g. `[GoodNeed::default(); N]` array seeds) get
+/// an unambiguous "no resource" marker that callers must overwrite.
+impl Default for ResourceId {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
 impl ResourceId {
     /// Reserved sentinel meaning "no resource". Matches the `PersonAI`
     /// sentinel pattern (`u16::MAX = UNEMPLOYED`) so future migrations can

@@ -202,14 +202,16 @@ fn blueprint_deposited_total(bp: &Blueprint) -> u32 {
     total
 }
 
-/// Sum the unmet input quantities for a blueprint, grouped by Good.
-pub fn blueprint_remaining_inputs(bp: &Blueprint) -> AHashMap<Good, u32> {
-    let mut out: AHashMap<Good, u32> = AHashMap::new();
+/// Sum the unmet input quantities for a blueprint, grouped by `ResourceId`.
+pub fn blueprint_remaining_inputs(
+    bp: &Blueprint,
+) -> AHashMap<crate::economy::resource_catalog::ResourceId, u32> {
+    let mut out: AHashMap<crate::economy::resource_catalog::ResourceId, u32> = AHashMap::new();
     for i in 0..bp.deposit_count as usize {
         let slot = &bp.deposits[i];
         let remaining = (slot.needed.saturating_sub(slot.deposited)) as u32;
         if remaining > 0 {
-            *out.entry(slot.good).or_insert(0) += remaining;
+            *out.entry(slot.resource_id).or_insert(0) += remaining;
         }
     }
     out
@@ -688,7 +690,14 @@ pub fn project_stagnation_system(
 
     // Cull projects that have stalled for too long. We collect cancellations
     // first to avoid mutating `projects` while iterating it.
-    let mut to_cancel: Vec<(ProjectId, Entity, u32, Good, (i32, i32))> = Vec::new();
+    let mut to_cancel: Vec<(
+        ProjectId,
+        Entity,
+        u32,
+        Good,
+        crate::economy::resource_catalog::ResourceId,
+        (i32, i32),
+    )> = Vec::new();
     for project in projects.projects.values() {
         if project.phase != ProjectPhase::GatherMaterials {
             continue;
@@ -718,21 +727,24 @@ pub fn project_stagnation_system(
         let Ok(bp) = bp_query.get(project.blueprint) else {
             continue;
         };
-        // Pick the most-needed unmet good — the one likely blocking progress.
+        // Pick the most-needed unmet resource — the one likely blocking progress.
         let remaining = blueprint_remaining_inputs(bp);
-        let Some((&good, _)) = remaining.iter().max_by_key(|(_, qty)| **qty) else {
+        let Some((&resource_id, _)) = remaining.iter().max_by_key(|(_, qty)| **qty) else {
             continue;
         };
-        to_cancel.push((project.id, project.blueprint, project.faction_id, good, bp.tile));
+        // ProjectEvent still carries `Good`; reverse-resolve at the boundary.
+        let Some(good) = crate::economy::core_ids::resource_id_to_good(resource_id) else {
+            continue;
+        };
+        to_cancel.push((project.id, project.blueprint, project.faction_id, good, resource_id, bp.tile));
     }
 
-    for (project_id, blueprint, faction_id, good, tile) in to_cancel {
-        // Bump the faction's deficit EMA for the stalled good.
+    for (project_id, blueprint, faction_id, good, resource_id, tile) in to_cancel {
+        // Bump the faction's deficit EMA for the stalled resource.
         if let Some(faction) = registry.factions.get_mut(&faction_id) {
-            let id = crate::economy::core_ids::good_to_resource_id(good);
-            let prev = faction.material_deficit_ema.get(&id).copied().unwrap_or(0) as f32;
+            let prev = faction.material_deficit_ema.get(&resource_id).copied().unwrap_or(0) as f32;
             let next = (prev + (255.0 - prev) * DEFICIT_EMA_ALPHA).round() as u8;
-            faction.material_deficit_ema.insert(id, next);
+            faction.material_deficit_ema.insert(resource_id, next);
         }
         // Despawn the blueprint and unregister it from the BlueprintMap so
         // the chief's one-project-at-a-time gate releases.

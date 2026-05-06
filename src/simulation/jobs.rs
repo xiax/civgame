@@ -540,7 +540,7 @@ pub fn chief_job_posting_system(
                         continue;
                     };
                     for slot in &bp.deposits[..bp.deposit_count as usize] {
-                        if slot.good == good {
+                        if slot.resource_id == good.into() {
                             bp_demand = bp_demand
                                 .saturating_add((slot.needed.saturating_sub(slot.deposited)) as u32);
                         }
@@ -594,10 +594,11 @@ pub fn chief_job_posting_system(
         //     Storage availability is shared across blueprints: the chief
         //     allocates greedily by blueprint iteration order.
         if faction.member_count > 0 {
-            // Phase 2d: storage_remaining now mirrors `storage.totals` —
-            // also ResourceId-keyed. Haul-posting deposit slots still
-            // carry legacy `Good` (`GoodNeed.good`); we convert at the
-            // few lookup sites below.
+            // Phase 2d: storage_remaining mirrors `storage.totals` and
+            // is ResourceId-keyed. Haul-posting deposit slots are
+            // ResourceId-keyed too since the `GoodNeed` migration; the
+            // Haul JobProgress payload is the last `Good`-typed surface
+            // here, converted at the boundary below.
             let mut storage_remaining: AHashMap<
                 crate::economy::resource_catalog::ResourceId,
                 u32,
@@ -627,19 +628,19 @@ pub fn chief_job_posting_system(
                     if remaining == 0 {
                         continue;
                     }
-                    // Already a live Haul posting for (this BP, this good)?
+                    // Already a live Haul posting for (this BP, this resource)?
                     let already = board.faction_postings(faction_id).iter().any(|p| {
                         matches!(
                             &p.progress,
                             JobProgress::Haul { blueprint: b, good: g, .. }
-                                if *b == bp_entity && *g == slot.good
+                                if *b == bp_entity
+                                    && Into::<crate::economy::resource_catalog::ResourceId>::into(*g) == slot.resource_id
                         )
                     });
                     if already {
                         continue;
                     }
-                    let slot_id =
-                        crate::economy::core_ids::good_to_resource_id(slot.good);
+                    let slot_id = slot.resource_id;
                     let avail = storage_remaining.get(&slot_id).copied().unwrap_or(0);
                     if avail == 0 {
                         continue;
@@ -650,10 +651,19 @@ pub fn chief_job_posting_system(
                     }
                     let entry = storage_remaining.entry(slot_id).or_insert(0);
                     *entry = entry.saturating_sub(target);
+                    // The Haul JobProgress payload still keys on `Good`;
+                    // reverse-resolve here. Safe for every slot that came
+                    // from a recipe-defined deposit (only legacy resources
+                    // appear in Build recipes today).
+                    let Some(slot_good) =
+                        crate::economy::core_ids::resource_id_to_good(slot.resource_id)
+                    else {
+                        continue;
+                    };
                     let id = board.alloc_id();
                     let progress = JobProgress::Haul {
                         blueprint: bp_entity,
-                        good: slot.good,
+                        good: slot_good,
                         delivered: 0,
                         target,
                     };
