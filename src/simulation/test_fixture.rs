@@ -303,13 +303,13 @@ impl PersonBuilder {
                 PlanId::HUNT_FOOD,
                 // SCAVENGE_FOOD retired 5c-ii-d-vi.
                 PlanId::BUILD_BLUEPRINT,
-                PlanId::TAME_HORSE,
+                // TAME_HORSE retired in Phase 5e-iv (HTN method).
                 PlanId::DELIVER_HIDE_TO_CRAFT_ORDER,
                 PlanId::DELIVER_GRAIN_TO_CRAFT_ORDER,
                 PlanId::DELIVER_FROM_STORAGE_TO_CRAFT_ORDER,
                 PlanId::WORK_ON_CRAFT,
                 PlanId::RESCUE_ALLY,
-                PlanId::RETURN_SURPLUS_FOOD,
+                // RETURN_SURPLUS_FOOD retired in Phase 5e-iii (HTN method).
                 PlanId::PLAY_SOCIAL,
                 PlanId::PLAY_SOLO,
                 PlanId::HAUL_FROM_STORAGE_AND_BUILD,
@@ -324,8 +324,8 @@ impl PersonBuilder {
                 PlanId::RAID,
                 PlanId::DEFEND,
                 PlanId::LEAD,
-                PlanId::ACQUIRE_HUNTING_SPEAR,
-                PlanId::SCOUT_FOR_PREY,
+                // ACQUIRE_HUNTING_SPEAR retired in Phase 5e-ii (HTN method).
+                // SCOUT_FOR_PREY retired in Phase 5e (HTN method).
             ],
             bucket: 0,
         }

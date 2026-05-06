@@ -442,11 +442,6 @@ pub enum StepTarget {
     /// The chief's chosen hunting-area tile (centroid of detected prey).
     /// Resolves to None when no `Hunt` order is active.
     HuntArea,
-    /// Random reachable tile near `home_tile` used by the `ScoutForPrey`
-    /// plan. Mirrors `ExploreTile` resolver but selects only when no `Scout`
-    /// order is active. We reuse ExploreTile's resolver via this variant so
-    /// scout movement matches explore movement.
-    ScoutForPrey,
 }
 
 #[derive(Clone, Debug)]
@@ -1835,39 +1830,6 @@ fn resolve_target(
                 _ => None,
             }
         }
-        StepTarget::ScoutForPrey => {
-            // Reuse the ExploreTile random-reachable-tile logic so scouts
-            // wander outward and dump memory along the way; `vision_system`
-            // writes `MemoryKind::Prey` whenever a hunter sees Wolf/Deer,
-            // and the candidate filter removes ScoutForPrey from contention
-            // the moment that memory is populated.
-            let has_scout = matches!(
-                faction_registry
-                    .factions
-                    .get(&faction_id)
-                    .and_then(|f| f.hunt_order.as_ref()),
-                Some(crate::simulation::faction::HuntOrder::Scout { .. })
-            );
-            if !has_scout {
-                return None;
-            }
-            let home = faction_registry
-                .home_tile(faction_id)
-                .unwrap_or((pos.0 as i32, pos.1 as i32));
-            let cur_chunk = chunk_coord(pos.0, pos.1);
-            for _ in 0..8 {
-                let dx = fastrand::i32(-96..=96);
-                let dy = fastrand::i32(-96..=96);
-                let tx = (home.0 as i32 + dx).max(0) as i32;
-                let ty = (home.1 as i32 + dy).max(0) as i32;
-                let to_chunk = chunk_coord(tx as i32, ty as i32);
-                let to_z = chunk_map.surface_z_at(tx as i32, ty as i32) as i8;
-                if chunk_connectivity.is_reachable((cur_chunk, pos_z), (to_chunk, to_z)) {
-                    return Some((None, tx, ty));
-                }
-            }
-            None
-        }
     }
 }
 
@@ -2167,11 +2129,12 @@ pub fn plan_execution_system(
                         }
                     })
                     .filter(|p| {
-                        // Hunt-order gate: HuntFood (5) requires a Hunt order;
-                        // ScoutForPrey (65) requires a Scout order. The chief
-                        // sets the order; without it, hunters fall through to
-                        // their normal plan competition (gather, haul, etc.)
-                        // and stay flexible labour. AcquireHuntingSpear (64)
+                        // Hunt-order gate: HuntFood (5) requires a Hunt order.
+                        // The chief sets the order; without it, hunters fall
+                        // through to their normal plan competition (gather,
+                        // haul, etc.) and stay flexible labour. The Scout
+                        // counterpart now lives in `htn_scout_dispatch_system`
+                        // (Phase 5e). AcquireHuntingSpear (64)
                         // is uncoupled from the order so a hunter who picks
                         // up the role mid-day can arm before the next muster.
                         match p.id {
@@ -2182,13 +2145,8 @@ pub fn plan_execution_system(
                                     .and_then(|f| f.hunt_order.as_ref()),
                                 Some(crate::simulation::faction::HuntOrder::Hunt { .. })
                             ),
-                            PlanId::SCOUT_FOR_PREY => matches!(
-                                faction_registry
-                                    .factions
-                                    .get(&member.faction_id)
-                                    .and_then(|f| f.hunt_order.as_ref()),
-                                Some(crate::simulation::faction::HuntOrder::Scout { .. })
-                            ),
+                            // PlanId::SCOUT_FOR_PREY retired in Phase 5e —
+                            // gating now lives in `htn_scout_dispatch_system`.
                             _ => true,
                         }
                     })

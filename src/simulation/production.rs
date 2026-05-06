@@ -624,13 +624,24 @@ fn finish_withdraw_material(
                 ai.target_entity = None;
             }
         }
+        Task::Equip { .. } => {
+            // Phase 5e-ii: hunter-arm chain. `WithdrawAndEquipHuntingSpearMethod`
+            // expands to [WithdrawMaterial, Equip]; once the spear is in hand
+            // (or inventory), the trailing Equip is in-place — no routing
+            // needed. Prime the legacy channel so `equip_task_system` picks
+            // up next tick. Mirrors `finish_withdraw_food`'s priming pattern
+            // for the AcquireFood Eat tail.
+            ai.state = AiState::Working;
+            ai.task_id = TaskKind::Equip as u16;
+            ai.work_progress = 0;
+        }
         Task::Idle => {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
         }
         _ => {
             // No other task family is expected as a chained follow-up to
-            // WithdrawMaterial at 5c-ii-b. Drop the entire chain to Idle so a
+            // WithdrawMaterial. Drop the entire chain to Idle so a
             // mis-built expansion can't strand the agent.
             aq.cancel();
             ai.state = AiState::Idle;
@@ -1000,7 +1011,13 @@ pub fn tame_task_system(
     mut commands: Commands,
     clock: Res<SimClock>,
     faction_registry: Res<FactionRegistry>,
-    mut query: Query<(&mut PersonAI, &FactionMember, &BucketSlot, &LodLevel)>,
+    mut query: Query<(
+        &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
+        &FactionMember,
+        &BucketSlot,
+        &LodLevel,
+    )>,
     untamed_horses: Query<(), (With<Horse>, Without<Tamed>)>,
     untamed_cows: Query<(), (With<Cow>, Without<Tamed>)>,
     untamed_pigs: Query<(), (With<Pig>, Without<Tamed>)>,
@@ -1008,7 +1025,7 @@ pub fn tame_task_system(
 ) {
     const TICKS_TAME: u8 = 100;
 
-    for (mut ai, member, slot, lod) in query.iter_mut() {
+    for (mut ai, mut aq, member, slot, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -1016,11 +1033,14 @@ pub fn tame_task_system(
             continue;
         }
 
-        // Identify species + required tech for the current target
-        let Some(target) = ai.target_entity else {
+        // Phase 5e-iv: prefer the typed task's target for chain-integrity;
+        // fall back to legacy `ai.target_entity` so the plan-driven path
+        // (still the only producer pre-migration) keeps working.
+        let Some(target) = aq.current.as_tame_animal().or(ai.target_entity) else {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
+            aq.advance();
             continue;
         };
         let required_tech = if untamed_horses.get(target).is_ok() {
@@ -1039,6 +1059,7 @@ pub fn tame_task_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             ai.target_entity = None;
+            aq.advance();
             continue;
         };
 
@@ -1052,6 +1073,7 @@ pub fn tame_task_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             ai.target_entity = None;
+            aq.advance();
             continue;
         }
 
@@ -1063,6 +1085,7 @@ pub fn tame_task_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             ai.target_entity = None;
+            aq.advance();
         }
     }
 }

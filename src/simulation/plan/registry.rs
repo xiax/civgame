@@ -61,8 +61,11 @@ static PLAN_STEPS_67: &[StepId] = &[StepId(60), StepId(62)]; // PlayByPlantingBe
 // hunters depart together rather than each agent independently sniping prey.
 static PLAN_STEPS_5: &[StepId] =
     &[StepId(57), StepId(58), StepId(5), StepId(53), StepId(54), StepId(55)]; // MusterAtHearth → TravelToHuntArea → Hunt → PickUpCorpse → HaulCorpse → Butcher
-static PLAN_STEPS_HUNTER_ARM: &[StepId] = &[StepId(52), StepId(56)]; // AcquireHuntingSpear: WithdrawSpear → EquipMainHand
-static PLAN_STEPS_SCOUT: &[StepId] = &[StepId(59)]; // ScoutForPrey: WanderForPrey (single step, ends on prey memory)
+// PLAN_STEPS_HUNTER_ARM retired in Phase 5e-ii — `htn_equip_hunting_spear_dispatch_system`
+// + `WithdrawAndEquipHuntingSpearMethod` own the [WithdrawSpear, EquipMainHand]
+// expansion now.
+// PLAN_STEPS_SCOUT retired in Phase 5e — `htn_scout_dispatch_system` +
+// `ScoutForPreyMethod` own the wander-for-prey expansion now.
 // PLAN_STEPS_6 (ScavengeFood) was retired in Phase 5c-ii-d-vi — the
 // scavenge-then-deposit chain is now driven by `ScavengeFoodForStorageMethod`
 // under `StockpileFood` (see `htn.rs`). StepId(6) (CollectFood) and StepId(12)
@@ -79,7 +82,8 @@ static PLAN_STEPS_29: &[StepId] = &[StepId(32), StepId(28), StepId(25)]; // Fetc
 // StepId(10) (WithdrawFood) and StepId(9) (Eat) are still defined because
 // the legacy Forage / ScavengeFood plans embed the shared Eat step and the
 // HTN dispatcher reuses the WithdrawFood `TaskKind` executor.
-static PLAN_STEPS_10: &[StepId] = &[StepId(11)]; // TameHorse: TameAnimal
+// PLAN_STEPS_10 retired in Phase 5e-iv — `htn_tame_horse_dispatch_system`
+// + `TameWildHorseMethod` own the single-step TameAnimal dispatch now.
 
 static SURVIVE_GOALS: &[AgentGoal] = &[AgentGoal::Survive];
 // GATHER_FOOD_GOALS was retired in Phase 5c-ii-d-vi when the last two
@@ -105,7 +109,9 @@ static CRAFT_GOALS: &[AgentGoal] = &[AgentGoal::Craft];
 static RESCUE_GOALS: &[AgentGoal] = &[AgentGoal::Rescue];
 
 static PLAN_STEPS_23: &[StepId] = &[StepId(27)]; // RescueAlly: EngageRescue
-static PLAN_STEPS_24: &[StepId] = &[StepId(12)]; // ReturnSurplusFood: DepositGoods at faction storage
+// PLAN_STEPS_24 retired in Phase 5e-iii — `htn_return_surplus_dispatch_system`
+// + `DepositSurplusAtStorageMethod` own the deposit-at-storage chain. StepId(12)
+// is still defined and shared by FarmFood (PlanId 1) + WorkOnCraft (PlanId 16).
 // PLAN_STEPS_25 (EatFromInventory) was retired in Phase 5b-ii — the in-place
 // eat-with-food-on-hand dispatch is now driven by `EatFromInventoryMethod`
 // (see `htn.rs`). The shared StepId(9) Eat step is still used as the final
@@ -283,16 +289,10 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             plant_filter: None,
             withdraw_filter: None,
         },
-        StepDef {
-            // 11: TameAnimal — work adjacent to a wild horse for ~100 ticks
-            id: StepId(11),
-            task: TaskKind::TameAnimal,
-            target: StepTarget::NearestWildHorse,
-            preconditions: StepPreconditions::none(),
-            reward_scale: 1.5,
-            plant_filter: None,
-            withdraw_filter: None,
-        },
+        // StepId 11 (TameAnimal) retired in Phase 5e-iv — the HTN
+        // `TameWildHorseMethod` emits `Task::TameAnimal { target }` directly.
+        // The const `StepId::TAME_ANIMAL = StepId(11)` survives only as a
+        // stable sentinel.
         // ── Crafting steps ────────────────────────────────────────────────────
         StepDef {
             // 12: DepositGoods — deposit crafted items at faction storage
@@ -761,22 +761,10 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             plant_filter: None,
             withdraw_filter: None,
         },
-        StepDef {
-            // 52: Hunter pulls a Spear (Weapon resource) from faction storage.
-            // Used by `AcquireHuntingSpear` plan; the plan-level `forbids_good`
-            // precondition ensures armed hunters skip this entirely.
-            id: StepId(52),
-            task: TaskKind::WithdrawGood,
-            target: StepTarget::NearestFactionStorageWithGood(crate::economy::core_ids::weapon()),
-            preconditions: StepPreconditions::forbids(crate::economy::core_ids::weapon()),
-            reward_scale: 0.4,
-            plant_filter: None,
-            withdraw_filter: Some(
-                crate::simulation::typed_task::WithdrawGoodFilter::Specific(
-                    crate::economy::core_ids::weapon(),
-                ),
-            ),
-        },
+        // StepId 52 (WithdrawSpear) retired in Phase 5e-ii — the HTN
+        // `WithdrawAndEquipHuntingSpearMethod` emits `Task::WithdrawMaterial`
+        // directly. The const `StepId::WITHDRAW_SPEAR = StepId(52)` survives
+        // only as a stable sentinel.
         StepDef {
             // 53: Walk adjacent to a fresh Corpse and attach it to the
             // hunter via `PersonAI.carried_corpse`. No-op for non-hunters.
@@ -811,25 +799,10 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             plant_filter: None,
             withdraw_filter: None,
         },
-        StepDef {
-            // 56: Equip a Weapon (Spear) into the MainHand slot. Instant
-            // in-place transfer from inventory or hands → Equipment.MainHand.
-            // Used as the second step of `AcquireHuntingSpear` (plan 64) so a
-            // hunter who fetched the spear actually wields it for combat
-            // damage. The plan-level `forbids_good(Weapon)` check now also
-            // counts the equipped slot, so the plan self-deselects after this
-            // step completes.
-            id: StepId(56),
-            task: TaskKind::Equip,
-            target: StepTarget::EquipItem {
-                slot: EquipmentSlot::MainHand,
-                resource_id: crate::economy::core_ids::weapon(),
-            },
-            preconditions: StepPreconditions::needs_good(crate::economy::core_ids::weapon(), 1),
-            reward_scale: 0.5,
-            plant_filter: None,
-            withdraw_filter: None,
-        },
+        // StepId 56 (EquipMainHand) retired in Phase 5e-ii — the HTN
+        // `WithdrawAndEquipHuntingSpearMethod` emits `Task::Equip { MainHand,
+        // weapon }` directly. The const `StepId::EQUIP_WEAPON = StepId(56)`
+        // survives only as a stable sentinel.
         StepDef {
             // 57: Muster for hunt. Walk to the hearth tile selected by the
             // chief's HuntOrder (closest campfire to the hunt area, or
@@ -861,19 +834,10 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             plant_filter: None,
             withdraw_filter: None,
         },
-        StepDef {
-            // 59: Wander for prey. Used by the ScoutForPrey plan when the
-            // chief has no prey near the home tile; the agent ranges out to
-            // unmapped tiles and `vision_system` writes prey memory along
-            // the way, which the chief's next decision cycle picks up.
-            id: StepId(59),
-            task: TaskKind::Explore,
-            target: StepTarget::ScoutForPrey,
-            preconditions: StepPreconditions::none(),
-            reward_scale: 0.1,
-            plant_filter: None,
-            withdraw_filter: None,
-        },
+        // StepId 59 (WanderForPrey) retired in Phase 5e — replaced by
+        // `htn_scout_dispatch_system` + `ScoutForPreyMethod`. The
+        // `StepId::WANDER_FOR_PREY = StepId(59)` const survives only as a
+        // stable sentinel; no PlanDef references it.
         StepDef {
             // 60: WithdrawBerrySeed — pull one BerrySeed from faction storage.
             id: StepId(60),
@@ -1064,14 +1028,18 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_NONE,
             requires_profession: None,
         },
+        // Phase 5e-iv: PlanId 10 (`TameHorse`) retired. The HTN
+        // `TameWildHorseMethod` under `AbstractTaskKind::TameWildHorse`
+        // (`htn_tame_horse_dispatch_system`) owns the wild-horse-taming
+        // dispatch end-to-end. Const survives as a PlanHistory sentinel.
         PlanDef {
             id: PlanId(10),
-            name: "TameHorse",
-            steps: PLAN_STEPS_10,
+            name: "(unused)",
+            steps: &[],
             state_weights: mk_weights(&[]),
-            bias: 0.1,
-            serves_goals: TAME_HORSE_GOALS,
-            tech_gate: Some(technology::HORSE_TAMING),
+            bias: -10.0,
+            serves_goals: &[],
+            tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
             requires_profession: None,
@@ -1256,16 +1224,21 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_NONE,
             requires_profession: None,
         },
+        // Phase 5e-iii: PlanId 24 (`ReturnSurplusFood`) retired. The HTN
+        // `DepositSurplusAtStorageMethod` under `AbstractTaskKind::ReturnSurplus`
+        // (`htn_return_surplus_dispatch_system`) owns the walk-back-to-storage
+        // path. The const `PlanId::RETURN_SURPLUS_FOOD = PlanId(24)` survives
+        // only as a stable sentinel for `PlanHistory` ring-buffer entries.
         PlanDef {
             id: PlanId(24),
-            name: "ReturnSurplusFood",
-            steps: PLAN_STEPS_24,
-            state_weights: mk_weights(&[(SI_HAS_FOOD, 0.3), (SI_IN_FACTION, 0.3)]),
-            bias: 0.0,
-            serves_goals: RETURN_CAMP_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
-            flags: PF_DROP_FOOD_ON_TIMEOUT,
+            flags: PF_NONE,
             requires_profession: None,
         },
         // PlanId(25) "EatFromInventory" was retired in Phase 5b-ii. The
@@ -1468,39 +1441,46 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_NONE,
             requires_profession: None,
         },
+        // Phase 5e-ii: PlanId 64 (`AcquireHuntingSpear`) retired. The HTN
+        // `WithdrawAndEquipHuntingSpearMethod` under
+        // `AbstractTaskKind::EquipHuntingSpear`
+        // (`htn_equip_hunting_spear_dispatch_system`) owns the hunter-arming
+        // path end-to-end — the dispatcher runs ahead of the food path so an
+        // unarmed hunter prefers fetching their spear, then the typed
+        // [WithdrawMaterial, Equip] chain auto-promotes via
+        // `finish_withdraw_material`'s Equip arm. The const
+        // `PlanId::ACQUIRE_HUNTING_SPEAR = PlanId(64)` survives only as a
+        // stable sentinel for `PlanHistory` ring-buffer entries.
         PlanDef {
-            // Hunter-only fetch plan: pull a Spear (Weapon resource) from
-            // faction storage when unarmed. The step's `forbids_good`
-            // precondition means the plan auto-deselects the moment the
-            // hunter is armed, so HuntFood (id 5) takes over from there.
             id: PlanId(64),
-            name: "AcquireHuntingSpear",
-            steps: PLAN_STEPS_HUNTER_ARM,
+            name: "(unused)",
+            steps: &[],
             state_weights: mk_weights(&[]),
-            bias: 5.0,
-            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
-            tech_gate: Some(technology::HUNTING_SPEAR),
-            memory_target_kind: None,
-            flags: PF_UNINTERRUPTIBLE,
-            requires_profession: Some(Profession::Hunter),
-        },
-        PlanDef {
-            // Hunter-only scout plan: chief posts `HuntOrder::Scout` when no
-            // prey is visible from camp; hunters wander outward writing prey
-            // memory. The candidate filter gates this plan on the faction
-            // holding a Scout order (HuntFood gates on Hunt), so a single
-            // chief flip swaps the active plan. NOT uninterruptible — a
-            // scouting hunter can still be peeled off by survival pressures.
-            id: PlanId(65),
-            name: "ScoutForPrey",
-            steps: PLAN_STEPS_SCOUT,
-            state_weights: mk_weights(&[]),
-            bias: 1.0,
-            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
-            tech_gate: Some(technology::HUNTING_SPEAR),
+            bias: -10.0,
+            serves_goals: &[],
+            tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
-            requires_profession: Some(Profession::Hunter),
+            requires_profession: None,
+        },
+        // Phase 5e: PlanId 65 (`ScoutForPrey`) retired. The HTN
+        // `ScoutForPreyMethod` under `AbstractTaskKind::Scout`
+        // (`htn_scout_dispatch_system`) owns the chief-Scout flow end-to-end —
+        // hunters with `HuntOrder::Scout` dispatch via the typed Explore
+        // channel instead of competing in the plan registry. The const
+        // `PlanId::SCOUT_FOR_PREY = PlanId(65)` survives only as a stable
+        // sentinel for `PlanHistory` ring-buffer entries.
+        PlanDef {
+            id: PlanId(65),
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
+            tech_gate: None,
+            memory_target_kind: None,
+            flags: PF_NONE,
+            requires_profession: None,
         },
         PlanDef {
             // Withdraw a BerrySeed from faction storage and plant it on the

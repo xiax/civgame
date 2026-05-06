@@ -165,21 +165,36 @@ impl Plugin for SimulationPlugin {
                     jobs::job_board_command_system.before(jobs::job_claim_system),
                     tasks::goal_dispatch_system,
                     htn::htn_dispatch_system.after(tasks::goal_dispatch_system),
-                    htn::htn_eat_dispatch_system
+                    // Equip-hunting-spear runs ahead of the food dispatchers
+                    // so an unarmed hunter prefers fetching their spear over
+                    // eating (mirrors legacy plan bias 5.0 + PF_UNINTERRUPTIBLE).
+                    htn::htn_equip_hunting_spear_dispatch_system
                         .after(htn::htn_dispatch_system),
+                    htn::htn_eat_dispatch_system
+                        .after(htn::htn_equip_hunting_spear_dispatch_system),
                     htn::htn_acquire_food_dispatch_system
                         .after(htn::htn_eat_dispatch_system),
                     htn::htn_acquire_good_dispatch_system
                         .after(htn::htn_acquire_food_dispatch_system),
                     htn::htn_stockpile_food_dispatch_system
                         .after(htn::htn_acquire_good_dispatch_system),
+                    htn::htn_scout_dispatch_system
+                        .after(htn::htn_stockpile_food_dispatch_system),
+                    htn::htn_return_surplus_dispatch_system
+                        .after(htn::htn_scout_dispatch_system),
+                    htn::htn_tame_horse_dispatch_system
+                        .after(htn::htn_return_surplus_dispatch_system),
                     terraform::terraform_dispatch_system
                         .after(tasks::goal_dispatch_system)
                         .after(htn::htn_dispatch_system)
+                        .after(htn::htn_equip_hunting_spear_dispatch_system)
                         .after(htn::htn_eat_dispatch_system)
                         .after(htn::htn_acquire_food_dispatch_system)
                         .after(htn::htn_acquire_good_dispatch_system)
-                        .after(htn::htn_stockpile_food_dispatch_system),
+                        .after(htn::htn_stockpile_food_dispatch_system)
+                        .after(htn::htn_scout_dispatch_system)
+                        .after(htn::htn_return_surplus_dispatch_system)
+                        .after(htn::htn_tame_horse_dispatch_system),
                 )
                     .in_set(SimulationSet::ParallelB),
             )

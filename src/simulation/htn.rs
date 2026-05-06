@@ -101,6 +101,31 @@ pub enum AbstractTask {
     /// for the legacy `ScavengeFood` (PlanId 6) and `ExploreForFood`
     /// (PlanId 35) plans, both now retired.
     StockpileFood,
+    /// Walk somewhere new in the hope of recording a `MemoryKind::Prey`
+    /// sighting. Chief-driven: only applicable when the agent's faction
+    /// holds a `HuntOrder::Scout` (the chief flips to `Hunt` the moment any
+    /// hunter records prey memory). One method (`ScoutForPreyMethod`) — the
+    /// abstract task is parameterless because the memory kind is fixed.
+    /// Replaces the legacy `ScoutForPrey` plan (PlanId 65).
+    Scout,
+    /// Hunter who is missing a Weapon (in inventory / hands / MainHand) walks
+    /// to faction storage, withdraws one Spear, and equips it. Single
+    /// expansion `[WithdrawMaterial { weapon, 1 }, Equip { MainHand, weapon }]`.
+    /// `MF_UNINTERRUPTIBLE` so a hungry hunter mid-fetch doesn't peel off to
+    /// eat before they're armed (mirrors the legacy plan's bias 5.0 +
+    /// `PF_UNINTERRUPTIBLE`). Replaces the legacy `AcquireHuntingSpear` plan
+    /// (PlanId 64).
+    EquipHuntingSpear,
+    /// Agent carrying surplus food walks to the nearest faction storage tile
+    /// and dumps everything in hands + inventory. Single-method registry —
+    /// `DepositSurplusAtStorageMethod` always wins. Replaces the legacy
+    /// `ReturnSurplusFood` plan (PlanId 24).
+    ReturnSurplus,
+    /// Agent walks to the nearest visible wild Horse and works adjacent until
+    /// it accepts a `Tamed` marker. Single-method registry —
+    /// `TameWildHorseMethod` always wins. Faction-tech-gated on
+    /// `HORSE_TAMING`. Replaces the legacy `TameHorse` plan (PlanId 10).
+    TameWildHorse,
 }
 
 /// Discriminant-only key for `MethodRegistry` lookups. `AbstractTask` itself
@@ -114,6 +139,10 @@ pub enum AbstractTaskKind {
     AcquireFood,
     AcquireGood,
     StockpileFood,
+    Scout,
+    EquipHuntingSpear,
+    ReturnSurplus,
+    TameWildHorse,
 }
 
 impl AbstractTask {
@@ -124,6 +153,10 @@ impl AbstractTask {
             AbstractTask::AcquireFood => AbstractTaskKind::AcquireFood,
             AbstractTask::AcquireGood { .. } => AbstractTaskKind::AcquireGood,
             AbstractTask::StockpileFood => AbstractTaskKind::StockpileFood,
+            AbstractTask::Scout => AbstractTaskKind::Scout,
+            AbstractTask::EquipHuntingSpear => AbstractTaskKind::EquipHuntingSpear,
+            AbstractTask::ReturnSurplus => AbstractTaskKind::ReturnSurplus,
+            AbstractTask::TameWildHorse => AbstractTaskKind::TameWildHorse,
         }
     }
 }
@@ -156,6 +189,10 @@ impl MethodId {
     pub const EXPLORE_FOR_FOOD_FOR_STORAGE: MethodId = MethodId(11);
     pub const FORAGE_FROM_KNOWN: MethodId = MethodId(12);
     pub const FORAGE_FROM_KNOWN_FOR_STORAGE: MethodId = MethodId(13);
+    pub const SCOUT_FOR_PREY: MethodId = MethodId(14);
+    pub const WITHDRAW_AND_EQUIP_HUNTING_SPEAR: MethodId = MethodId(15);
+    pub const DEPOSIT_SURPLUS_AT_STORAGE: MethodId = MethodId(16);
+    pub const TAME_WILD_HORSE: MethodId = MethodId(17);
 
     pub fn raw(self) -> u16 {
         self.0
@@ -587,6 +624,19 @@ pub fn register_builtin_methods(reg: &mut MethodRegistry) {
     reg.register(
         AbstractTaskKind::StockpileFood,
         Box::new(ExploreForFoodForStorageMethod),
+    );
+    reg.register(AbstractTaskKind::Scout, Box::new(ScoutForPreyMethod));
+    reg.register(
+        AbstractTaskKind::EquipHuntingSpear,
+        Box::new(WithdrawAndEquipHuntingSpearMethod),
+    );
+    reg.register(
+        AbstractTaskKind::ReturnSurplus,
+        Box::new(DepositSurplusAtStorageMethod),
+    );
+    reg.register(
+        AbstractTaskKind::TameWildHorse,
+        Box::new(TameWildHorseMethod),
     );
 }
 
@@ -1546,6 +1596,216 @@ impl Method for ForageFromKnownForStorageMethod {
 
     fn id(&self) -> MethodId {
         MethodId::FORAGE_FROM_KNOWN_FOR_STORAGE
+    }
+}
+
+/// Sole method for `AbstractTask::Scout`. Single-step expansion to
+/// `Task::Explore { kind: MemoryKind::Prey }` — the agent walks toward a
+/// random reachable tile near faction home and `vision_system` writes prey
+/// memory along the way. Hunter-only, gated by the chief flipping
+/// `HuntOrder::Scout` (gating is enforced by `htn_scout_dispatch_system`,
+/// not the precondition, because the order lives on `FactionData` and isn't
+/// part of `PlannerCtx`).
+///
+/// Replaces the legacy `ScoutForPrey` plan (PlanId 65) and its `WanderForPrey`
+/// step (StepId 59) + `StepTarget::ScoutForPrey` resolver. Single-method
+/// registry — no scoring competition. `UTIL_BASELINE` is arbitrary; the
+/// dispatcher always picks the sole applicable method.
+pub struct ScoutForPreyMethod;
+
+impl Method for ScoutForPreyMethod {
+    fn precondition(&self, abstract_task: AbstractTask, _ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::Scout)
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, _ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::Scout) {
+            return Vec::new();
+        }
+        vec![Task::Explore {
+            kind: MemoryKind::Prey,
+        }]
+    }
+
+    fn tech_gate(&self) -> Option<TechId> {
+        Some(crate::simulation::technology::HUNTING_SPEAR)
+    }
+
+    fn profession_gate(&self) -> Option<Profession> {
+        Some(Profession::Hunter)
+    }
+
+    fn name(&self) -> &'static str {
+        "ScoutForPrey"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::SCOUT_FOR_PREY
+    }
+}
+
+/// Sole method for `AbstractTask::EquipHuntingSpear`. Two-leg expansion:
+/// `[Task::WithdrawMaterial { weapon, 1 }, Task::Equip { MainHand, weapon }]`.
+/// `MF_UNINTERRUPTIBLE` so a hungry hunter mid-fetch doesn't peel off mid-trip
+/// (mirrors the legacy plan's bias 5.0 + `PF_UNINTERRUPTIBLE`).
+///
+/// Replaces the legacy `AcquireHuntingSpear` plan (PlanId 64) and its two
+/// step defs (StepId 52 WithdrawSpear, StepId 56 EquipMainHand). Single-method
+/// registry — no scoring competition; the dispatcher's gating (agent unarmed
+/// + faction has spear stock) is what governs whether the chain fires.
+///
+/// Distance discount on `material_storage_tile` so a hunter near storage
+/// arms slightly faster than one on the far side of camp; the cap-preserving
+/// invariant keeps the relative ranking inside the tier.
+pub struct WithdrawAndEquipHuntingSpearMethod;
+
+impl Method for WithdrawAndEquipHuntingSpearMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::EquipHuntingSpear) {
+            return false;
+        }
+        // Need a faction storage tile that holds at least one Weapon. The
+        // dispatcher populates `material_storage_tile` + `material_stock_for_target`
+        // from a per-good lookup over `StorageTileMap.by_faction`.
+        ctx.material_storage_tile.is_some() && ctx.material_stock_for_target > 0
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.material_storage_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, _ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::EquipHuntingSpear) {
+            return Vec::new();
+        }
+        let weapon = crate::economy::core_ids::weapon();
+        vec![
+            Task::WithdrawMaterial {
+                resource_id: weapon,
+                qty: 1,
+            },
+            Task::Equip {
+                slot: crate::simulation::items::EquipmentSlot::MainHand,
+                resource_id: weapon,
+            },
+        ]
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn tech_gate(&self) -> Option<TechId> {
+        Some(crate::simulation::technology::HUNTING_SPEAR)
+    }
+
+    fn profession_gate(&self) -> Option<Profession> {
+        Some(Profession::Hunter)
+    }
+
+    fn name(&self) -> &'static str {
+        "WithdrawAndEquipHuntingSpear"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::WITHDRAW_AND_EQUIP_HUNTING_SPEAR
+    }
+}
+
+/// Sole method for `AbstractTask::ReturnSurplus`. Single-leg expansion
+/// `[Task::DepositToFactionStorage { resource_id: <picked food> }]` — the
+/// agent is holding food from a foraging trip and walks back to faction
+/// storage to drop it off. The `resource_id` payload is informational (the
+/// `drop_items_at_destination_system` executor dumps everything in hands +
+/// surplus inventory regardless of payload); threading the actual carried
+/// food good through keeps the chain inspectable in the same shape as
+/// `ScavengeFoodForStorageMethod`.
+///
+/// Replaces the legacy `ReturnSurplusFood` plan (PlanId 24) and its single
+/// step (StepId 12 DepositGoods). Distance discount on `nearest_storage_tile`.
+pub struct DepositSurplusAtStorageMethod;
+
+impl Method for DepositSurplusAtStorageMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::ReturnSurplus) {
+            return false;
+        }
+        // Need a target tile and *something* to deposit. The dispatcher only
+        // builds a valid ctx when the agent actually has surplus food — the
+        // `scavenge_food_good` ctx field doubles as the deposit good for this
+        // method (mirrors `ScavengeFoodForStorageMethod`'s usage).
+        ctx.nearest_storage_tile.is_some() && ctx.scavenge_food_good.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.nearest_storage_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::ReturnSurplus) {
+            return Vec::new();
+        }
+        let Some(resource_id) = ctx.scavenge_food_good else {
+            return Vec::new();
+        };
+        vec![Task::DepositToFactionStorage { resource_id }]
+    }
+
+    fn name(&self) -> &'static str {
+        "DepositSurplusAtStorage"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::DEPOSIT_SURPLUS_AT_STORAGE
+    }
+}
+
+/// Sole method for `AbstractTask::TameWildHorse`. Single-leg expansion
+/// `[Task::TameAnimal { target }]` — agent walks to the wild horse's tile
+/// and works adjacent until `tame_task_system` fires. Reuses the
+/// `scavenge_target_entity`/`scavenge_target_tile` ctx fields to carry the
+/// horse entity + tile (semantically "an entity the agent walks to and
+/// interacts with" — same shape regardless of whether the entity is a
+/// GroundItem to scavenge or a wild Horse to tame). Replaces the legacy
+/// `TameHorse` plan (PlanId 10) and its `TameAnimal` step (StepId 11).
+pub struct TameWildHorseMethod;
+
+impl Method for TameWildHorseMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::TameWildHorse) {
+            return false;
+        }
+        ctx.scavenge_target_entity.is_some() && ctx.scavenge_target_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.scavenge_target_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::TameWildHorse) {
+            return Vec::new();
+        }
+        let Some(target) = ctx.scavenge_target_entity else {
+            return Vec::new();
+        };
+        vec![Task::TameAnimal { target }]
+    }
+
+    fn tech_gate(&self) -> Option<TechId> {
+        Some(crate::simulation::technology::HORSE_TAMING)
+    }
+
+    fn name(&self) -> &'static str {
+        "TameWildHorse"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::TAME_WILD_HORSE
     }
 }
 
@@ -3248,6 +3508,844 @@ pub fn htn_stockpile_food_dispatch_system(
             }
         },
     );
+}
+
+/// Hunter-only spear-arming dispatcher. Replaces the legacy
+/// `AcquireHuntingSpear` plan (PlanId 64). Runs *before* `htn_eat_dispatch_system`
+/// so an unarmed hunter prefers fetching their spear over eating — mirrors
+/// the legacy plan's bias 5.0 outranking the hunger-driven `EatFromInventory`
+/// (bias ≈ 1.0) under shared `Survive` / `GatherFood` arenas. Once the chain
+/// is dispatched, the (Idle, UNEMPLOYED) gate on every later HTN dispatcher
+/// keeps them from preempting it. `MF_UNINTERRUPTIBLE` semantics for the
+/// chain-survives-goal-flip part live on the goal-dispatch reset arms
+/// (`tasks::goal_dispatch_system` Survive/GatherFood + WithdrawMaterial / Equip).
+///
+/// Gates: `Profession::Hunter` + Learned `HUNTING_SPEAR` + agent has no
+/// Weapon anywhere (inventory / hands / equipped) + faction has Weapon stock
+/// in some storage tile (effective stock after reservations > 0). SOLO
+/// agents are skipped (no faction storage).
+pub fn htn_equip_hunting_spear_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    storage_tile_map: Res<StorageTileMap>,
+    storage_reservations: Res<crate::simulation::faction::StorageReservations>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    clock: Res<SimClock>,
+    item_query: Query<&crate::simulation::items::GroundItem>,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
+            &Profession,
+            &EconomicAgent,
+            &Carrier,
+            Option<&crate::simulation::items::Equipment>,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+            Option<&ActivePlan>,
+            Option<&crate::simulation::knowledge::PersonKnowledge>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    let weapon_id = crate::economy::core_ids::weapon();
+    let now = clock.tick;
+    for (
+        mut ai,
+        mut aq,
+        mut history,
+        goal,
+        profession,
+        agent,
+        carrier,
+        equipment_opt,
+        transform,
+        member,
+        lod,
+        active_plan_opt,
+        knowledge_opt,
+    ) in query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::Survive | AgentGoal::GatherFood) {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+        if member.faction_id == SOLO {
+            continue;
+        }
+        if *profession != Profession::Hunter {
+            continue;
+        }
+        let has_spear_tech = knowledge_opt
+            .map(|k| k.has_learned(crate::simulation::technology::HUNTING_SPEAR))
+            .unwrap_or(false);
+        if !has_spear_tech {
+            continue;
+        }
+        // Already-armed check: any Weapon in inventory, hands, or an
+        // equipment slot self-deselects the chain. Mirrors the legacy
+        // `StepPreconditions::forbids_resource(weapon)` gate plus the
+        // plan-level forbids_good check.
+        if agent.quantity_of_resource(weapon_id) > 0
+            || carrier.quantity_of_resource(weapon_id) > 0
+        {
+            continue;
+        }
+        if let Some(eq) = equipment_opt {
+            if eq.has_resource(weapon_id) {
+                continue;
+            }
+        }
+
+        // Faction-level stock check — short-circuits before the per-tile
+        // SpatialIndex walk on a dry armoury.
+        let stock = faction_registry
+            .factions
+            .get(&member.faction_id)
+            .and_then(|f| f.storage.totals.get(&weapon_id).copied())
+            .unwrap_or(0);
+        if stock == 0 {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Walk faction storage tiles to find the nearest one with a Weapon
+        // in stock (effective after reservations). Mirrors the per-tile scan
+        // in the AcquireGood Haul branch.
+        let Some(tiles) = storage_tile_map.by_faction.get(&member.faction_id) else {
+            continue;
+        };
+        let mut best_tile: Option<(i32, i32)> = None;
+        let mut best_dist = i32::MAX;
+        let mut best_tile_stock: u32 = 0;
+        for &(tx, ty) in tiles {
+            let mut tile_stock: u32 = 0;
+            for &gi_entity in spatial.get(tx, ty) {
+                if let Ok(gi) = item_query.get(gi_entity) {
+                    if gi.item.resource_id == weapon_id && gi.qty > 0 {
+                        tile_stock = tile_stock.saturating_add(gi.qty);
+                    }
+                }
+            }
+            let reserved = storage_reservations.get((tx, ty), weapon_id);
+            let effective = tile_stock.saturating_sub(reserved);
+            if effective == 0 {
+                continue;
+            }
+            let dist = (tx - cur_tx).abs() + (ty - cur_ty).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best_tile = Some((tx, ty));
+                best_tile_stock = effective;
+            }
+        }
+        let Some(storage_tile) = best_tile else {
+            continue;
+        };
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home: faction_registry.home_tile(member.faction_id),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: Some(storage_tile),
+            material_stock_for_target: best_tile_stock,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: None,
+            scavenge_target_entity: None,
+            scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+        };
+
+        let abstract_task = AbstractTask::EquipHuntingSpear;
+        let methods = method_registry.methods_for(AbstractTaskKind::EquipHuntingSpear);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        match head {
+            Task::WithdrawMaterial { resource_id: head_resource, qty } => {
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    storage_tile,
+                    TaskKind::WithdrawMaterial,
+                    None,
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                let reserved_tile = storage_tile;
+                storage_reservations.add(reserved_tile, head_resource, qty as u32);
+                ai.reserved_tile = reserved_tile;
+                ai.reserved_resource = Some(head_resource);
+                ai.reserved_qty = qty;
+                aq.dispatch(Task::WithdrawMaterial { resource_id: head_resource, qty });
+            }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
+}
+
+/// Hunter-only scout dispatcher. Replaces the legacy `ScoutForPrey` plan
+/// (PlanId 65, single-step `WanderForPrey`). Fires when the agent's
+/// `Profession == Hunter`, has Learned `HUNTING_SPEAR`, and the faction's
+/// chief has flipped `HuntOrder::Scout` (the chief switches back to `Hunt`
+/// the moment any hunter records prey memory, naturally ending the scout).
+///
+/// Single-method registry — `ScoutForPreyMethod` always wins. The dispatcher
+/// expands to a head `Task::Explore { kind: MemoryKind::Prey }`, picks a
+/// random reachable tile near faction home (mirrors the legacy
+/// `StepTarget::ScoutForPrey` resolver), routes via
+/// `assign_task_with_routing(... TaskKind::Explore ...)`, and `aq.dispatch`s
+/// the typed task. The `vision_system` writes `MemoryKind::Prey` whenever a
+/// hunter sees Wolf/Deer along the way; the chief's next decision cycle
+/// picks that up and posts a `Hunt` order, naturally peeling the hunter
+/// off scouting via `chief_hunt_order_system`.
+///
+/// Goal arena: `Survive | GatherFood` — same as the legacy
+/// `SURVIVE_AND_GATHER_FOOD_GOALS` arrays. The scout dispatcher runs after
+/// `htn_acquire_food_dispatch_system` and `htn_stockpile_food_dispatch_system`
+/// so a hunter mid-Scout doesn't preempt their own food-gathering chain.
+/// In practice the (Idle, UNEMPLOYED) gate makes ordering moot — the food
+/// dispatchers above leave the agent in a non-Idle state once they fire.
+pub fn htn_scout_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    clock: Res<SimClock>,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
+            &Profession,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+            Option<&ActivePlan>,
+            Option<&crate::simulation::knowledge::PersonKnowledge>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    use crate::simulation::faction::HuntOrder;
+    let now = clock.tick;
+    query.par_iter_mut().for_each(
+        |(
+            mut ai,
+            mut aq,
+            mut history,
+            goal,
+            profession,
+            transform,
+            member,
+            lod,
+            active_plan_opt,
+            knowledge_opt,
+        )| {
+            if *lod == LodLevel::Dormant {
+                return;
+            }
+            if !matches!(*goal, AgentGoal::Survive | AgentGoal::GatherFood) {
+                return;
+            }
+            if active_plan_opt.is_some() {
+                return;
+            }
+            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+                return;
+            }
+            if *profession != Profession::Hunter {
+                return;
+            }
+            // Tech gate: a hunter without HUNTING_SPEAR Learned shouldn't
+            // scout. Mirrors PlanDef::tech_gate on the legacy plan.
+            let has_spear = knowledge_opt
+                .map(|k| k.has_learned(crate::simulation::technology::HUNTING_SPEAR))
+                .unwrap_or(false);
+            if !has_spear {
+                return;
+            }
+            // Faction must hold a Scout order. Mirrors the candidate filter
+            // gate on `PlanId::SCOUT_FOR_PREY` in `plan_execution_system`.
+            let has_scout = matches!(
+                faction_registry
+                    .factions
+                    .get(&member.faction_id)
+                    .and_then(|f| f.hunt_order.as_ref()),
+                Some(HuntOrder::Scout { .. })
+            );
+            if !has_scout {
+                return;
+            }
+
+            let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+            let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+            let cur_chunk = ChunkCoord(
+                cur_tx.div_euclid(CHUNK_SIZE as i32),
+                cur_ty.div_euclid(CHUNK_SIZE as i32),
+            );
+
+            let ctx = PlannerCtx {
+                tile: (cur_tx, cur_ty),
+                faction_id: member.faction_id,
+                faction_home: faction_registry.home_tile(member.faction_id),
+                home_bed: None,
+                home_bed_tile: None,
+                edible_count: 0,
+                hunger: 0.0,
+                nearest_storage_tile: None,
+                faction_food_stock: 0,
+                material_storage_tile: None,
+                material_stock_for_target: 0,
+                claimed_blueprint: None,
+                claimed_blueprint_tile: None,
+                gather_target_tile: None,
+                scavenge_target_entity: None,
+                scavenge_target_tile: None,
+                scavenge_food_good: None,
+                gather_deposit_tile: None,
+                scavenge_deposit_tile: None,
+                forage_food_good: None,
+            };
+
+            let abstract_task = AbstractTask::Scout;
+            let methods = method_registry.methods_for(AbstractTaskKind::Scout);
+            let chosen = methods
+                .iter()
+                .filter(|m| m.precondition(abstract_task, &ctx))
+                .max_by(|a, b| {
+                    let ua = score_method_with_history(
+                        a.as_ref(),
+                        abstract_task,
+                        &ctx,
+                        &history,
+                        now,
+                    );
+                    let ub = score_method_with_history(
+                        b.as_ref(),
+                        abstract_task,
+                        &ctx,
+                        &history,
+                        now,
+                    );
+                    ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            let Some(method) = chosen else {
+                return;
+            };
+            let chosen_id = method.id();
+            ai.active_method = Some(chosen_id);
+            let mut tasks = method.expand(abstract_task, &ctx);
+            if tasks.is_empty() {
+                ai.active_method = None;
+                return;
+            }
+            let head = tasks.remove(0);
+            match head {
+                Task::Explore { kind } => {
+                    let home = faction_registry
+                        .home_tile(member.faction_id)
+                        .unwrap_or((cur_tx, cur_ty));
+                    let Some(dest) = pick_explore_tile(
+                        home,
+                        cur_chunk,
+                        ai.current_z,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    ) else {
+                        ai.active_method = None;
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                        return;
+                    };
+                    let dispatched = assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx, cur_ty),
+                        cur_chunk,
+                        dest,
+                        TaskKind::Explore,
+                        None,
+                        &chunk_graph,
+                        &chunk_router,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    );
+                    if !dispatched {
+                        ai.active_method = None;
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                        return;
+                    }
+                    aq.dispatch(Task::Explore { kind });
+                }
+                _ => {
+                    // No registered Scout method returns a non-Explore head.
+                    ai.active_method = None;
+                    return;
+                }
+            }
+            for task in tasks {
+                let _ = aq.enqueue(task);
+            }
+        },
+    );
+}
+
+/// `AgentGoal::ReturnCamp` dispatcher. The agent is carrying surplus food
+/// from a foraging trip; walk back to the nearest faction storage tile and
+/// dump everything in hands + inventory. Single-method registry —
+/// `DepositSurplusAtStorageMethod` always wins.
+///
+/// Mirrors the Haul / hunter-arm dispatchers' shape: scan a faction-side
+/// resource (here, the nearest storage tile), find a candidate food good in
+/// the agent's hands or inventory to thread through the deposit chain's
+/// payload, build a `PlannerCtx` snapshot, argmax over the registered
+/// methods, and route the head via `assign_task_with_routing(...
+/// TaskKind::DepositResource ...)`. Replaces the legacy `ReturnSurplusFood`
+/// plan (PlanId 24) and its single step (StepId 12 DepositGoods).
+///
+/// SOLO agents are skipped (no faction storage). The chain executes via the
+/// existing `drop_items_at_destination_system` (Economy, after movement) so
+/// no chain handoff is needed — the deposit is the entire chain.
+pub fn htn_return_surplus_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    storage_tile_map: Res<StorageTileMap>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    clock: Res<SimClock>,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
+            &EconomicAgent,
+            &Carrier,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+            Option<&ActivePlan>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    let now = clock.tick;
+    query.par_iter_mut().for_each(
+        |(
+            mut ai,
+            mut aq,
+            mut history,
+            goal,
+            agent,
+            carrier,
+            transform,
+            member,
+            lod,
+            active_plan_opt,
+        )| {
+            if *lod == LodLevel::Dormant {
+                return;
+            }
+            if !matches!(*goal, AgentGoal::ReturnCamp) {
+                return;
+            }
+            if active_plan_opt.is_some() {
+                return;
+            }
+            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+                return;
+            }
+            if member.faction_id == SOLO {
+                return;
+            }
+
+            // Pick any edible the agent is currently carrying — the deposit
+            // executor dumps everything regardless, but we thread the actual
+            // good through `Task::DepositToFactionStorage` for chain
+            // inspectability (mirrors `ScavengeFoodForStorageMethod`).
+            let mut surplus_food: Option<crate::economy::resource_catalog::ResourceId> = None;
+            if let Some(s) = carrier.left {
+                if s.qty > 0 && s.item.resource_id.is_edible() {
+                    surplus_food = Some(s.item.resource_id);
+                }
+            }
+            if surplus_food.is_none() {
+                if let Some(s) = carrier.right {
+                    if s.qty > 0 && s.item.resource_id.is_edible() {
+                        surplus_food = Some(s.item.resource_id);
+                    }
+                }
+            }
+            if surplus_food.is_none() {
+                for (it, q) in agent.inventory.iter() {
+                    if *q > 0 && it.resource_id.is_edible() {
+                        surplus_food = Some(it.resource_id);
+                        break;
+                    }
+                }
+            }
+            // No food on agent — `goal_update_system` will flip the goal next
+            // tick. Skip so the dispatcher doesn't strand the agent.
+            let Some(food_id) = surplus_food else {
+                return;
+            };
+
+            let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+            let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+            let cur_chunk = ChunkCoord(
+                cur_tx.div_euclid(CHUNK_SIZE as i32),
+                cur_ty.div_euclid(CHUNK_SIZE as i32),
+            );
+
+            let nearest_storage_tile =
+                storage_tile_map.nearest_for_faction(member.faction_id, (cur_tx, cur_ty));
+            let Some(storage_tile) = nearest_storage_tile else {
+                return;
+            };
+
+            let ctx = PlannerCtx {
+                tile: (cur_tx, cur_ty),
+                faction_id: member.faction_id,
+                faction_home: faction_registry.home_tile(member.faction_id),
+                home_bed: None,
+                home_bed_tile: None,
+                edible_count: 0,
+                hunger: 0.0,
+                nearest_storage_tile: Some(storage_tile),
+                faction_food_stock: 0,
+                material_storage_tile: None,
+                material_stock_for_target: 0,
+                claimed_blueprint: None,
+                claimed_blueprint_tile: None,
+                gather_target_tile: None,
+                scavenge_target_entity: None,
+                scavenge_target_tile: None,
+                // Reuses `scavenge_food_good` as the "food being deposited"
+                // payload — same role as in `ScavengeFoodForStorageMethod`.
+                scavenge_food_good: Some(food_id),
+                gather_deposit_tile: None,
+                scavenge_deposit_tile: None,
+                forage_food_good: None,
+            };
+
+            let abstract_task = AbstractTask::ReturnSurplus;
+            let methods = method_registry.methods_for(AbstractTaskKind::ReturnSurplus);
+            let chosen = methods
+                .iter()
+                .filter(|m| m.precondition(abstract_task, &ctx))
+                .max_by(|a, b| {
+                    let ua = score_method_with_history(
+                        a.as_ref(),
+                        abstract_task,
+                        &ctx,
+                        &history,
+                        now,
+                    );
+                    let ub = score_method_with_history(
+                        b.as_ref(),
+                        abstract_task,
+                        &ctx,
+                        &history,
+                        now,
+                    );
+                    ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            let Some(method) = chosen else {
+                return;
+            };
+            let chosen_id = method.id();
+            ai.active_method = Some(chosen_id);
+            let mut tasks = method.expand(abstract_task, &ctx);
+            if tasks.is_empty() {
+                ai.active_method = None;
+                return;
+            }
+            let head = tasks.remove(0);
+            match head {
+                Task::DepositToFactionStorage { resource_id } => {
+                    let dispatched = assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx, cur_ty),
+                        cur_chunk,
+                        storage_tile,
+                        TaskKind::DepositResource,
+                        None,
+                        &chunk_graph,
+                        &chunk_router,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    );
+                    if !dispatched {
+                        ai.active_method = None;
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                        return;
+                    }
+                    aq.dispatch(Task::DepositToFactionStorage { resource_id });
+                }
+                _ => {
+                    ai.active_method = None;
+                    return;
+                }
+            }
+            for task in tasks {
+                let _ = aq.enqueue(task);
+            }
+        },
+    );
+}
+
+/// `AgentGoal::TameHorse` dispatcher. Replaces the legacy `TameHorse` plan
+/// (PlanId 10). Single-method registry — `TameWildHorseMethod` always wins.
+/// Faction tech-gated on `HORSE_TAMING` (`tame_task_system` re-validates,
+/// but the dispatcher gate avoids dispatching a chain doomed to bail on the
+/// first executor tick).
+///
+/// Scans `SpatialIndex` within `VIEW_RADIUS=15` for the nearest live
+/// `With<Horse> Without<Tamed>` entity, snapshots `(entity, tile)` into the
+/// shared `scavenge_target_entity`/`scavenge_target_tile` ctx slots, and
+/// routes via `assign_task_with_routing(... TaskKind::TameAnimal,
+/// Some(horse_entity) ...)` so the executor can read `target_entity` for
+/// backwards compatibility. The typed `Task::TameAnimal { target }` carries
+/// the same entity for chain-integrity inspection.
+pub fn htn_tame_horse_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    clock: Res<SimClock>,
+    wild_horse_q: Query<
+        (),
+        (
+            With<crate::simulation::animals::Horse>,
+            Without<crate::simulation::animals::Tamed>,
+        ),
+    >,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+            Option<&ActivePlan>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    const VIEW_RADIUS: i32 = 15;
+    let now = clock.tick;
+    for (
+        mut ai,
+        mut aq,
+        mut history,
+        goal,
+        transform,
+        member,
+        lod,
+        active_plan_opt,
+    ) in query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::TameHorse) {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+        // Faction-tech gate. The executor double-checks per-target on each
+        // tick (different species need different techs), but gating up here
+        // avoids dispatching a chain that would immediately bail.
+        let has_tech = faction_registry
+            .factions
+            .get(&member.faction_id)
+            .map(|f| f.techs.has(crate::simulation::technology::HORSE_TAMING))
+            .unwrap_or(false);
+        if !has_tech {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Scan SpatialIndex for the nearest wild horse. Mirrors the legacy
+        // `StepTarget::NearestWildHorse` resolver (chebyshev within
+        // VIEW_RADIUS, manhattan tiebreak).
+        let mut best_horse: Option<(Entity, (i32, i32))> = None;
+        let mut best_dist = i32::MAX;
+        for dy in -VIEW_RADIUS..=VIEW_RADIUS {
+            for dx in -VIEW_RADIUS..=VIEW_RADIUS {
+                let tx = cur_tx + dx;
+                let ty = cur_ty + dy;
+                for &candidate in spatial.get(tx, ty) {
+                    if wild_horse_q.get(candidate).is_ok() {
+                        let dist = dx.abs() + dy.abs();
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_horse = Some((candidate, (tx, ty)));
+                        }
+                    }
+                }
+            }
+        }
+        let Some((horse_entity, horse_tile)) = best_horse else {
+            continue;
+        };
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home: faction_registry.home_tile(member.faction_id),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: None,
+            // The `scavenge_target_*` ctx slots double as "any entity to walk
+            // to and interact with" — the TameWildHorseMethod reads them.
+            scavenge_target_entity: Some(horse_entity),
+            scavenge_target_tile: Some(horse_tile),
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+        };
+
+        let abstract_task = AbstractTask::TameWildHorse;
+        let methods = method_registry.methods_for(AbstractTaskKind::TameWildHorse);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        match head {
+            Task::TameAnimal { target } => {
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    horse_tile,
+                    TaskKind::TameAnimal,
+                    Some(target),
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                aq.dispatch(Task::TameAnimal { target });
+            }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
 }
 
 /// Phase 6b-ii chain-completion. When an HTN-dispatched chain drains to

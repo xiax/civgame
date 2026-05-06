@@ -644,6 +644,37 @@ pub fn goal_dispatch_system(
                     AgentGoal::Haul if ai.task_id == TaskKind::HaulMaterials as u16 => {
                         Some(TaskKind::HaulMaterials as u16)
                     }
+                    // Phase 5e-ii: hunter-arm chain (`htn_equip_hunting_spear_dispatch_system`)
+                    // runs without an ActivePlan under Survive / GatherFood.
+                    // Both legs (WithdrawMaterial + Equip) survive goal-dispatch
+                    // ticks until completion or external preempt — mirrors the
+                    // legacy plan's `PF_UNINTERRUPTIBLE`.
+                    AgentGoal::Survive | AgentGoal::GatherFood
+                        if ai.task_id == TaskKind::WithdrawMaterial as u16 =>
+                    {
+                        Some(TaskKind::WithdrawMaterial as u16)
+                    }
+                    AgentGoal::Survive | AgentGoal::GatherFood
+                        if ai.task_id == TaskKind::Equip as u16 =>
+                    {
+                        Some(TaskKind::Equip as u16)
+                    }
+                    // Phase 5e-iii: HTN-driven ReturnSurplus chain runs without
+                    // an ActivePlan under ReturnCamp. The DepositResource walk
+                    // needs to survive across goal-dispatch ticks until
+                    // `drop_items_at_destination_system` fires.
+                    AgentGoal::ReturnCamp
+                        if ai.task_id == TaskKind::DepositResource as u16 =>
+                    {
+                        Some(TaskKind::DepositResource as u16)
+                    }
+                    // Phase 5e-iv: HTN-driven TameWildHorse chain runs without
+                    // an ActivePlan under TameHorse. The TameAnimal walk +
+                    // 100-tick adjacency work need to survive across
+                    // goal-dispatch ticks until `tame_task_system` finalises.
+                    AgentGoal::TameHorse if ai.task_id == TaskKind::TameAnimal as u16 => {
+                        Some(TaskKind::TameAnimal as u16)
+                    }
                     // Phase 5c-ii-c-ii: AcquireGood gather chain runs without
                     // an ActivePlan. Both legs (gather + deposit at faction
                     // storage) need to survive across goal-dispatch ticks

@@ -173,6 +173,19 @@ pub enum Task {
     PickUpCorpse {
         corpse: bevy::prelude::Entity,
     },
+    /// Work adjacent to a wild tameable animal (horse / cow / pig / cat) for
+    /// `TICKS_TAME` accumulating ticks, then insert `Tamed { owner_faction }`
+    /// on the target. Per-species tech gates (`HORSE_TAMING`,
+    /// `ANIMAL_HUSBANDRY`, `DOG_DOMESTICATION`) checked inside
+    /// `tame_task_system` against the agent's faction. Routing happens via
+    /// `assign_task_with_routing` to the target's tile; the legacy executor
+    /// reads `target_entity` for backwards compatibility — the typed variant
+    /// is what the HTN dispatcher (`htn_tame_horse_dispatch_system`) emits
+    /// for chain-integrity inspection. Replaces the legacy `TameHorse` plan
+    /// (PlanId 10).
+    TameAnimal {
+        target: bevy::prelude::Entity,
+    },
     /// Agent is tired and is either routing toward a bed / faction home or
     /// already asleep in place. The Sleep "executor" is a state transition
     /// (`AiState::Sleeping`) rather than a per-tick task system, so this
@@ -504,6 +517,14 @@ impl Task {
     pub fn as_pickup_corpse(&self) -> Option<bevy::prelude::Entity> {
         match *self {
             Task::PickUpCorpse { corpse } => Some(corpse),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the TameAnimal variant.
+    pub fn as_tame_animal(&self) -> Option<bevy::prelude::Entity> {
+        match *self {
+            Task::TameAnimal { target } => Some(target),
             _ => None,
         }
     }
