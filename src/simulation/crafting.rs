@@ -794,11 +794,10 @@ pub fn craft_order_system(
                 continue;
             };
             let quality = quality_for_skill(skills.get(SkillKind::Crafting));
-            let output_good = recipe.output_good_legacy();
             let mut output_item = if let Some(mat) = recipe.output_material {
-                Item::new_manufactured(output_good, mat, quality)
+                Item::new_manufactured(recipe.output_resource, mat, quality)
             } else {
-                Item::new_commodity(output_good)
+                Item::new_commodity(recipe.output_resource)
             };
             output_item.display_name = Some(recipe.name);
             // Stamp tech payload onto Clay Tablet / Book outputs. Equality
