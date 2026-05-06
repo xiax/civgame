@@ -52,8 +52,17 @@ static PLAN_STEPS_1: &[StepId] = &[StepId(1), StepId(12)]; // FarmFood → Depos
 // (ChopForest) and StepId(3) (MineStone) are still defined because BuildBlueprint
 // (PLAN_STEPS_7) embeds StepId(2) as its first step, and external dispatchers
 // can reuse `TaskKind::Gather`.
-static PLAN_STEPS_4: &[StepId] = &[StepId(33), StepId(4)]; // PlantGrainFromStorage: WithdrawGrainSeed → PlantGrainSeed
-static PLAN_STEPS_66: &[StepId] = &[StepId(60), StepId(61)]; // PlantBerryFromStorage: WithdrawBerrySeed → PlantBerrySeed
+// PLAN_STEPS_4 (PlantFromStorage) and PLAN_STEPS_66 (PlantBerryFromStorage)
+// retired in Phase 5e-v — `htn_plant_from_storage_dispatch_system` +
+// `WithdrawAndPlantSeedMethod` own the [WithdrawMaterial { seed, 1 },
+// Planter { tile }] expansion now. Both plans were dead code (registered but
+// never seeded into any agent's KnownPlans, so chiefs posting JobKind::Farm
+// could only drive harvesting via FarmFood). StepId(4) (PlantGrainSeed) and
+// StepId(61) (PlantBerrySeed) are no longer referenced by any plan but kept
+// as `(unused)` placeholders for in-flight ActivePlan compatibility.
+// StepId(33) (WithdrawGrainSeed) and StepId(60) (WithdrawBerrySeed) survive —
+// PlayByPlanting (PlanId 30) and PlayByPlantingBerry (PlanId 67) still embed
+// them as the first leg of their play-driven planting chains.
 static PLAN_STEPS_67: &[StepId] = &[StepId(60), StepId(62)]; // PlayByPlantingBerry: WithdrawBerrySeed → PlantBerrySeedAsPlay
 // HuntFood: muster at hearth → wait for party → travel to chief's area →
 // engage prey → corpse pickup/haul/butcher. The first three steps fold the
@@ -219,12 +228,15 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             withdraw_filter: None,
         },
         StepDef {
-            // 4: PlantGrainSeed (requires GrainSeed in inventory)
+            // 4: (unused — was PlantGrainSeed; retired in Phase 5e-v.
+            // `htn_plant_from_storage_dispatch_system` + `WithdrawAndPlantSeedMethod`
+            // emit `Task::Planter { tile }` directly. ID kept for in-flight
+            // ActivePlan compatibility.)
             id: StepId(4),
-            task: TaskKind::Planter,
-            target: StepTarget::NearestTile(GRASS_TILES),
-            preconditions: StepPreconditions::needs_good(crate::economy::core_ids::grain_seed(), 1),
-            reward_scale: 0.2,
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
             withdraw_filter: None,
         },
@@ -853,12 +865,15 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             ),
         },
         StepDef {
-            // 61: PlantBerrySeed (requires BerrySeed in inventory)
+            // 61: (unused — was PlantBerrySeed; retired in Phase 5e-v alongside
+            // StepId(4) PlantGrainSeed. The HTN `WithdrawAndPlantSeedMethod`
+            // emits `Task::Planter { tile }` directly. ID kept for in-flight
+            // ActivePlan compatibility.)
             id: StepId(61),
-            task: TaskKind::Planter,
-            target: StepTarget::NearestTile(GRASS_TILES),
-            preconditions: StepPreconditions::needs_good(crate::economy::core_ids::berry_seed(), 1),
-            reward_scale: 0.2,
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
+            preconditions: StepPreconditions::none(),
+            reward_scale: 0.0,
             plant_filter: None,
             withdraw_filter: None,
         },
@@ -935,20 +950,20 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         // `GATHER_WOOD_GOALS` / `GATHER_STONE_GOALS` static arrays are also
         // retired (their only consumers were these two PlanDefs).
         PlanDef {
-            // Withdraw a GrainSeed from faction storage, then plant it on the
-            // nearest Grass tile. Scores high when grain seeds are stockpiled
-            // and food supply is low.
+            // 4: (unused — was PlantFromStorage; retired in Phase 5e-v. The
+            // [WithdrawGrainSeed, PlantGrainSeed] chain is now produced by
+            // `htn_plant_from_storage_dispatch_system` +
+            // `WithdrawAndPlantSeedMethod` under `AgentGoal::Farm`. The plan
+            // was dead code anyway — never seeded into any KnownPlans. ID
+            // kept for PlanHistory ring-buffer stability; bias is wired so
+            // the candidate filter never selects it.)
             id: PlanId(4),
-            name: "PlantFromStorage",
-            steps: PLAN_STEPS_4,
-            state_weights: mk_weights(&[
-                (SI_STORAGE_GRAIN_SEED, 1.0),
-                (SI_SKILL_FARMING, 0.2),
-                (SI_STORAGE_FOOD, -0.3),
-            ]),
-            bias: 0.0,
-            serves_goals: FARM_GOALS,
-            tech_gate: Some(technology::CROP_CULTIVATION),
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
+            tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
             requires_profession: None,
@@ -1483,20 +1498,19 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            // Withdraw a BerrySeed from faction storage and plant it on the
-            // nearest Grass tile, spawning a BerryBush. Scores high when berry
-            // seeds are stockpiled and food supply is low.
+            // 66: (unused — was PlantBerryFromStorage; retired in Phase 5e-v
+            // alongside PlanId(4) PlantFromStorage. The HTN
+            // `htn_plant_from_storage_dispatch_system` argmaxes across
+            // grain/berry seed stocks to pick the higher-stocked seed and
+            // emits the same chain. Dead code historically — never seeded
+            // into any KnownPlans. ID kept for PlanHistory stability.)
             id: PlanId(66),
-            name: "PlantBerryFromStorage",
-            steps: PLAN_STEPS_66,
-            state_weights: mk_weights(&[
-                (SI_STORAGE_BERRY_SEED, 1.0),
-                (SI_SKILL_FARMING, 0.2),
-                (SI_STORAGE_FOOD, -0.3),
-            ]),
-            bias: 0.0,
-            serves_goals: FARM_GOALS,
-            tech_gate: Some(technology::CROP_CULTIVATION),
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
+            tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
             requires_profession: None,

@@ -126,6 +126,14 @@ pub enum AbstractTask {
     /// `TameWildHorseMethod` always wins. Faction-tech-gated on
     /// `HORSE_TAMING`. Replaces the legacy `TameHorse` plan (PlanId 10).
     TameWildHorse,
+    /// Withdraw one of `resource_id` (a seed) from faction storage and plant it
+    /// on the nearest unplanted Farmland tile. Single expansion
+    /// `[WithdrawMaterial { seed, 1 }, Planter { tile }]`. `MF_UNINTERRUPTIBLE`
+    /// so a hungry farmer mid-fetch doesn't peel off before the seed is in the
+    /// ground. Replaces the legacy (and dead — never seeded into KnownPlans)
+    /// `PlantFromStorage` (PlanId 4) and `PlantBerryFromStorage` (PlanId 66)
+    /// plans, restoring chief-driven planting under the Farm goal.
+    PlantFromStorage { resource_id: ResourceId },
 }
 
 /// Discriminant-only key for `MethodRegistry` lookups. `AbstractTask` itself
@@ -143,6 +151,7 @@ pub enum AbstractTaskKind {
     EquipHuntingSpear,
     ReturnSurplus,
     TameWildHorse,
+    PlantFromStorage,
 }
 
 impl AbstractTask {
@@ -157,6 +166,7 @@ impl AbstractTask {
             AbstractTask::EquipHuntingSpear => AbstractTaskKind::EquipHuntingSpear,
             AbstractTask::ReturnSurplus => AbstractTaskKind::ReturnSurplus,
             AbstractTask::TameWildHorse => AbstractTaskKind::TameWildHorse,
+            AbstractTask::PlantFromStorage { .. } => AbstractTaskKind::PlantFromStorage,
         }
     }
 }
@@ -193,6 +203,7 @@ impl MethodId {
     pub const WITHDRAW_AND_EQUIP_HUNTING_SPEAR: MethodId = MethodId(15);
     pub const DEPOSIT_SURPLUS_AT_STORAGE: MethodId = MethodId(16);
     pub const TAME_WILD_HORSE: MethodId = MethodId(17);
+    pub const WITHDRAW_AND_PLANT_SEED: MethodId = MethodId(18);
 
     pub fn raw(self) -> u16 {
         self.0
@@ -637,6 +648,10 @@ pub fn register_builtin_methods(reg: &mut MethodRegistry) {
     reg.register(
         AbstractTaskKind::TameWildHorse,
         Box::new(TameWildHorseMethod),
+    );
+    reg.register(
+        AbstractTaskKind::PlantFromStorage,
+        Box::new(WithdrawAndPlantSeedMethod),
     );
 }
 
@@ -1806,6 +1821,71 @@ impl Method for TameWildHorseMethod {
 
     fn id(&self) -> MethodId {
         MethodId::TAME_WILD_HORSE
+    }
+}
+
+/// Sole method for `AbstractTask::PlantFromStorage`. Two-leg expansion:
+/// `[Task::WithdrawMaterial { seed, 1 }, Task::Planter { tile }]`.
+/// `MF_UNINTERRUPTIBLE` so a hungry farmer mid-fetch doesn't peel off before
+/// the seed is in the ground (mirrors `WithdrawAndEquipHuntingSpearMethod`'s
+/// chain integrity).
+///
+/// Replaces the dead legacy `PlantFromStorage` (PlanId 4, `[StepId(33)
+/// WithdrawGrainSeed, StepId(4) PlantGrainSeed]`) and `PlantBerryFromStorage`
+/// (PlanId 66, `[StepId(60) WithdrawBerrySeed, StepId(61) PlantBerrySeed]`)
+/// plans. Both were registered but never seeded into any `KnownPlans` —
+/// chiefs posting `JobKind::Farm` could only drive harvesting via `FarmFood`
+/// (PlanId 1). This method restores the planting half of the Farm goal.
+///
+/// Distance discount on `material_storage_tile` so the farmer prefers the
+/// storage tile closer to them; the `gather_target_tile` is the destination
+/// farmland tile threaded through `Task::Planter { tile }`.
+pub struct WithdrawAndPlantSeedMethod;
+
+impl Method for WithdrawAndPlantSeedMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::PlantFromStorage { .. }) {
+            return false;
+        }
+        ctx.material_storage_tile.is_some()
+            && ctx.material_stock_for_target > 0
+            && ctx.gather_target_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.material_storage_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        let AbstractTask::PlantFromStorage { resource_id } = abstract_task else {
+            return Vec::new();
+        };
+        let Some(tile) = ctx.gather_target_tile else {
+            return Vec::new();
+        };
+        vec![
+            Task::WithdrawMaterial {
+                resource_id,
+                qty: 1,
+            },
+            Task::Planter { tile },
+        ]
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn tech_gate(&self) -> Option<TechId> {
+        Some(crate::simulation::technology::CROP_CULTIVATION)
+    }
+
+    fn name(&self) -> &'static str {
+        "WithdrawAndPlantSeed"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::WITHDRAW_AND_PLANT_SEED
     }
 }
 
@@ -4336,6 +4416,267 @@ pub fn htn_tame_horse_dispatch_system(
                     continue;
                 }
                 aq.dispatch(Task::TameAnimal { target });
+            }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
+}
+
+/// Farm-goal dispatcher. Replaces the dead legacy `PlantFromStorage` (PlanId 4,
+/// Grain) and `PlantBerryFromStorage` (PlanId 66, BerrySeed) plans, neither of
+/// which was ever seeded into any agent's `KnownPlans` — chiefs posting
+/// `JobKind::Farm` could only drive harvesting via `FarmFood` (PlanId 1). This
+/// dispatcher restores the planting half of the Farm goal end-to-end:
+///
+/// 1. Walk `PlantKind::ALL` to find a plantable seed; among those whose
+///    catalog id is stocked in faction storage, pick the one with highest
+///    stock — mirrors the legacy "highest `SI_STORAGE_*_SEED` weight wins"
+///    selection.
+/// 2. Find the nearest faction storage tile that holds the chosen seed
+///    (effective stock after `StorageReservations`).
+/// 3. Find the nearest unplanted Farmland tile within `VIEW_RADIUS=15` of the
+///    agent.
+/// 4. Build `AbstractTask::PlantFromStorage { resource_id }` with both tiles
+///    snapshotted into ctx; `WithdrawAndPlantSeedMethod` expands to
+///    `[WithdrawMaterial { seed, 1 }, Planter { tile }]` with
+///    `MF_UNINTERRUPTIBLE`.
+/// 5. Routes the head WithdrawMaterial leg via
+///    `assign_task_with_routing(... TaskKind::WithdrawMaterial ...)` and
+///    reserves the seed at the storage tile; the trailing Planter leg lives in
+///    the prefetch ring and is promoted by `production::finish_withdraw_material`'s
+///    Planter arm, which routes via `TaskKind::Planter` to the destination
+///    farmland tile carried in `Task::Planter { tile }`.
+///
+/// Goal arena: `Farm` only. Faction-tech-gated on `CROP_CULTIVATION` (the
+/// method's `tech_gate`). The dispatcher runs after `htn_tame_horse_dispatch_system`
+/// in ParallelB; it doesn't compete with food/haul/scout/spear/return-surplus
+/// dispatchers because Farm is a distinct goal arena.
+pub fn htn_plant_from_storage_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    storage_tile_map: Res<StorageTileMap>,
+    storage_reservations: Res<crate::simulation::faction::StorageReservations>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    plant_map: Res<crate::simulation::plants::PlantMap>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    clock: Res<SimClock>,
+    item_query: Query<&crate::simulation::items::GroundItem>,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+            Option<&ActivePlan>,
+            Option<&crate::simulation::knowledge::PersonKnowledge>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    use crate::simulation::plants::PlantKind;
+    use crate::simulation::tasks::find_nearest_unplanted_farmland;
+    const VIEW_RADIUS: i32 = 15;
+    let now = clock.tick;
+    for (
+        mut ai,
+        mut aq,
+        mut history,
+        goal,
+        transform,
+        member,
+        lod,
+        active_plan_opt,
+        knowledge_opt,
+    ) in query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::Farm) {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+        if member.faction_id == SOLO {
+            continue;
+        }
+        // Per-person tech gate. Mirrors the legacy plan candidate filter
+        // (`p.tech_gate.map_or(true, |tid| knowledge.has_learned(tid))`).
+        let has_tech = knowledge_opt
+            .map(|k| k.has_learned(crate::simulation::technology::CROP_CULTIVATION))
+            .unwrap_or(false);
+        if !has_tech {
+            continue;
+        }
+
+        // Walk PlantKind::ALL for the seed with the highest faction stock.
+        // Adding a new plantable seed = new PlantKind::ALL entry + arm in
+        // `PlantKind::seed_resource()`; this loop stays unchanged.
+        let Some(faction) = faction_registry.factions.get(&member.faction_id) else {
+            continue;
+        };
+        let mut best_seed: Option<(crate::economy::resource_catalog::ResourceId, u32)> = None;
+        for kind in PlantKind::ALL.iter().copied() {
+            let Some(seed_id) = kind.seed_resource() else {
+                continue;
+            };
+            let stock = faction.storage.totals.get(&seed_id).copied().unwrap_or(0);
+            if stock == 0 {
+                continue;
+            }
+            if best_seed.map_or(true, |(_, b)| stock > b) {
+                best_seed = Some((seed_id, stock));
+            }
+        }
+        let Some((seed_id, _)) = best_seed else {
+            continue;
+        };
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Find nearest storage tile holding the chosen seed (effective after
+        // reservations). Mirrors the per-tile scan in the AcquireGood Haul
+        // and EquipHuntingSpear branches.
+        let Some(tiles) = storage_tile_map.by_faction.get(&member.faction_id) else {
+            continue;
+        };
+        let mut best_tile: Option<(i32, i32)> = None;
+        let mut best_dist = i32::MAX;
+        let mut best_tile_stock: u32 = 0;
+        for &(tx, ty) in tiles {
+            let mut tile_stock: u32 = 0;
+            for &gi_entity in spatial.get(tx, ty) {
+                if let Ok(gi) = item_query.get(gi_entity) {
+                    if gi.item.resource_id == seed_id && gi.qty > 0 {
+                        tile_stock = tile_stock.saturating_add(gi.qty);
+                    }
+                }
+            }
+            let reserved = storage_reservations.get((tx, ty), seed_id);
+            let effective = tile_stock.saturating_sub(reserved);
+            if effective == 0 {
+                continue;
+            }
+            let dist = (tx - cur_tx).abs() + (ty - cur_ty).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best_tile = Some((tx, ty));
+                best_tile_stock = effective;
+            }
+        }
+        let Some(storage_tile) = best_tile else {
+            continue;
+        };
+
+        // Find nearest unplanted farmland tile near the agent. Reuses the
+        // legacy resolver from `tasks.rs` so behaviour matches the dead plans'
+        // `StepTarget::NearestTile(GRASS_TILES)` override.
+        let Some(plant_tile) = find_nearest_unplanted_farmland(
+            &chunk_map,
+            &plant_map,
+            (cur_tx, cur_ty),
+            VIEW_RADIUS,
+        ) else {
+            continue;
+        };
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home: faction_registry.home_tile(member.faction_id),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: Some(storage_tile),
+            material_stock_for_target: best_tile_stock,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            // Reuse `gather_target_tile` for the destination farmland tile —
+            // semantically "go work at this tile" matches the slot's existing
+            // role in gather/forage chains.
+            gather_target_tile: Some(plant_tile),
+            scavenge_target_entity: None,
+            scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+        };
+
+        let abstract_task = AbstractTask::PlantFromStorage {
+            resource_id: seed_id,
+        };
+        let methods = method_registry.methods_for(AbstractTaskKind::PlantFromStorage);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        match head {
+            Task::WithdrawMaterial { resource_id: head_resource, qty } => {
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    storage_tile,
+                    TaskKind::WithdrawMaterial,
+                    None,
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                storage_reservations.add(storage_tile, head_resource, qty as u32);
+                ai.reserved_tile = storage_tile;
+                ai.reserved_resource = Some(head_resource);
+                ai.reserved_qty = qty;
+                aq.dispatch(Task::WithdrawMaterial {
+                    resource_id: head_resource,
+                    qty,
+                });
             }
             _ => {
                 ai.active_method = None;

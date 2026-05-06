@@ -96,6 +96,7 @@ pub fn production_system(
     mut query: Query<(
         Entity,
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut EconomicAgent,
         &mut Carrier,
         &mut Skills,
@@ -109,6 +110,7 @@ pub fn production_system(
     for (
         actor,
         mut ai,
+        mut aq,
         mut agent,
         mut carrier,
         mut skills,
@@ -196,11 +198,18 @@ pub fn production_system(
                 }
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
+                // Phase 5e-v: drain the typed channel so an HTN
+                // PlantFromStorage chain (or PlayPlant — both use this branch)
+                // doesn't leave a stale `Task::Planter` / `Task::Idle`
+                // mismatch behind. PlayPlant doesn't yet emit a typed task,
+                // so `advance()` is a no-op for that path; harmless.
+                aq.advance();
             } else {
                 // Check if tile is still valid for planting
                 if plant_map.0.contains_key(&(tx, ty)) {
                     ai.state = AiState::Idle;
                     ai.task_id = PersonAI::UNEMPLOYED;
+                    aq.advance();
                 }
             }
         }
@@ -225,6 +234,7 @@ pub fn production_system(
                 }
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
+                aq.advance();
             }
         }
 
@@ -634,6 +644,33 @@ fn finish_withdraw_material(
             ai.state = AiState::Working;
             ai.task_id = TaskKind::Equip as u16;
             ai.work_progress = 0;
+        }
+        Task::Planter { tile } => {
+            // Phase 5e-v: PlantFromStorage chain. `WithdrawAndPlantSeedMethod`
+            // expands to [WithdrawMaterial, Planter { tile }]; once the seed is
+            // in hand (or inventory) the agent walks to the destination
+            // farmland tile picked at dispatch time, then plants.
+            // Routing is required because the planter executor works on the
+            // tile itself (not in-place) and the destination differs from the
+            // storage tile.
+            let dispatched = assign_task_with_routing(
+                ai,
+                cur_tile,
+                cur_chunk,
+                tile,
+                TaskKind::Planter,
+                None,
+                chunk_graph,
+                chunk_router,
+                chunk_map,
+                chunk_connectivity,
+            );
+            if !dispatched {
+                aq.cancel();
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
+            }
         }
         Task::Idle => {
             ai.state = AiState::Idle;

@@ -675,6 +675,19 @@ pub fn goal_dispatch_system(
                     AgentGoal::TameHorse if ai.task_id == TaskKind::TameAnimal as u16 => {
                         Some(TaskKind::TameAnimal as u16)
                     }
+                    // Phase 5e-v: HTN-driven PlantFromStorage chain runs without
+                    // an ActivePlan under Farm. Both legs (WithdrawMaterial +
+                    // Planter) survive across goal-dispatch ticks until
+                    // completion or external preempt — mirrors the method's
+                    // `MF_UNINTERRUPTIBLE` and the dead legacy plans'
+                    // `PF_NONE` (the legacy plans were never reachable
+                    // anyway, so the new HTN path defines the contract).
+                    AgentGoal::Farm if ai.task_id == TaskKind::WithdrawMaterial as u16 => {
+                        Some(TaskKind::WithdrawMaterial as u16)
+                    }
+                    AgentGoal::Farm if ai.task_id == TaskKind::Planter as u16 => {
+                        Some(TaskKind::Planter as u16)
+                    }
                     // Phase 5c-ii-c-ii: AcquireGood gather chain runs without
                     // an ActivePlan. Both legs (gather + deposit at faction
                     // storage) need to survive across goal-dispatch ticks

@@ -186,6 +186,19 @@ pub enum Task {
     TameAnimal {
         target: bevy::prelude::Entity,
     },
+    /// Plant one seed (Grain / Berry / …) from the agent's inventory or hands
+    /// onto an unplanted Farmland tile. The executor (`production_system`'s
+    /// Planter branch) walks `PlantKind::ALL` to pick the matching plant for
+    /// whichever seed is held, so the variant only needs the destination tile.
+    /// Routing happens via `assign_task_with_routing` (set up by the HTN chain
+    /// handoff in `production::finish_withdraw_material`); the legacy executor
+    /// reads `dest_tile` for backwards compatibility — the typed variant is
+    /// what the HTN dispatcher (`htn_plant_from_storage_dispatch_system`)
+    /// emits for chain-integrity inspection. Replaces the dead legacy
+    /// `PlantFromStorage` / `PlantBerryFromStorage` plans (PlanIds 4, 66).
+    Planter {
+        tile: (i32, i32),
+    },
     /// Agent is tired and is either routing toward a bed / faction home or
     /// already asleep in place. The Sleep "executor" is a state transition
     /// (`AiState::Sleeping`) rather than a per-tick task system, so this
@@ -522,6 +535,13 @@ impl Task {
     }
 
     /// Convenience accessor for the TameAnimal variant.
+    pub fn as_planter(&self) -> Option<(i32, i32)> {
+        match self {
+            Task::Planter { tile } => Some(*tile),
+            _ => None,
+        }
+    }
+
     pub fn as_tame_animal(&self) -> Option<bevy::prelude::Entity> {
         match *self {
             Task::TameAnimal { target } => Some(target),
