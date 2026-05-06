@@ -522,7 +522,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 33: WithdrawGrainSeed — pull one GrainSeed from faction storage.
             id: StepId(33),
             task: TaskKind::WithdrawGood,
-            target: StepTarget::NearestFactionStorageWithGood(Good::GrainSeed),
+            target: StepTarget::NearestFactionStorageWithGood(Good::GrainSeed.into()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.2,
             plant_filter: None,
@@ -533,7 +533,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // the agent can throw it as recreation in step 37.
             id: StepId(34),
             task: TaskKind::WithdrawGood,
-            target: StepTarget::NearestFactionStorageWithGood(Good::Stone),
+            target: StepTarget::NearestFactionStorageWithGood(Good::Stone.into()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.2,
             plant_filter: None,
@@ -761,7 +761,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // precondition ensures armed hunters skip this entirely.
             id: StepId(52),
             task: TaskKind::WithdrawGood,
-            target: StepTarget::NearestFactionStorageWithGood(Good::Weapon),
+            target: StepTarget::NearestFactionStorageWithGood(Good::Weapon.into()),
             preconditions: StepPreconditions::forbids(Good::Weapon),
             reward_scale: 0.4,
             plant_filter: None,
@@ -868,7 +868,7 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             // 60: WithdrawBerrySeed — pull one BerrySeed from faction storage.
             id: StepId(60),
             task: TaskKind::WithdrawGood,
-            target: StepTarget::NearestFactionStorageWithGood(Good::BerrySeed),
+            target: StepTarget::NearestFactionStorageWithGood(Good::BerrySeed.into()),
             preconditions: StepPreconditions::none(),
             reward_scale: 0.2,
             plant_filter: None,

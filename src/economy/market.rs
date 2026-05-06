@@ -184,7 +184,7 @@ impl Market {
         let mut best_mult = -1.0;
 
         for (idx, (item, stock)) in self.listings.iter().enumerate() {
-            if item.good() == good && *stock > 0 {
+            if item.resource_id == id && *stock > 0 {
                 let price = self.calculate_price(item);
                 if price <= *currency {
                     let mult = item.multiplier();

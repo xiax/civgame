@@ -188,7 +188,7 @@ impl Item {
 
     /// Weight of one unit, in grams. Material nudges base weight (iron > wood).
     pub fn unit_weight_g(&self) -> u32 {
-        let base = self.good().unit_weight_g() as f32;
+        let base = self.resource_id.unit_weight_g() as f32;
         let mult = self.material.map(|m| m.weight_multiplier()).unwrap_or(1.0);
         (base * mult).round() as u32
     }

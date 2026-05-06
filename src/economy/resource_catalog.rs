@@ -86,6 +86,24 @@ impl ResourceId {
             .map(|d| d.bulk.as_bulk())
             .unwrap_or(super::goods::Bulk::Small)
     }
+
+    /// Per-unit weight in grams. Mirrors `Good::unit_weight_g`; returns
+    /// 0 for unknown ids.
+    pub fn unit_weight_g(self) -> u32 {
+        super::core_ids::catalog()
+            .get(self)
+            .map(|d| d.weight_g)
+            .unwrap_or(0)
+    }
+
+    /// True if this resource is a planting seed (catalog `class == Seed`).
+    /// Mirrors `Good::is_seed`.
+    pub fn is_seed(self) -> bool {
+        matches!(
+            super::core_ids::catalog().get(self).map(|d| d.class),
+            Some(ResourceClass::Seed)
+        )
+    }
 }
 
 /// High-level functional category. Used by HTN methods to enumerate "all

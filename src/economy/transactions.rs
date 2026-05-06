@@ -31,7 +31,7 @@ pub fn market_sell_system(
                 continue;
             }
 
-            let sell_qty = if item.good().is_edible() {
+            let sell_qty = if item.resource_id.is_edible() {
                 if qty > FOOD_KEEP_RESERVE {
                     qty - FOOD_KEEP_RESERVE
                 } else {

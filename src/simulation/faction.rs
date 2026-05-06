@@ -1208,13 +1208,14 @@ pub fn drop_items_at_destination_system(
         let food_qty = agent.total_food();
         if food_qty > CAMP_KEEP {
             let mut deposit = food_qty - CAMP_KEEP;
-            let mut drops: Vec<(Good, u32)> = Vec::new();
+            let mut drops: Vec<(crate::economy::resource_catalog::ResourceId, u32)> =
+                Vec::new();
             for (it, q) in agent.inventory.iter_mut() {
-                if it.good().is_edible() && *q > 0 {
+                if it.resource_id.is_edible() && *q > 0 {
                     let to_remove = (*q).min(deposit);
                     *q -= to_remove;
                     deposit -= to_remove;
-                    drops.push((it.good(), to_remove));
+                    drops.push((it.resource_id, to_remove));
                 }
                 if deposit == 0 {
                     break;
@@ -1223,18 +1224,18 @@ pub fn drop_items_at_destination_system(
             // Sum calories of food deposited at faction storage so a Gather
             // job posting (if this worker holds one) can be credited.
             let mut deposited_calories: u32 = 0;
-            for (good, qty) in drops {
+            for (rid, qty) in drops {
                 spawn_or_merge_ground_item(
                     &mut commands,
                     &spatial,
                     &mut ground_items,
                     deposit_tx,
                     deposit_ty,
-                    good,
+                    rid,
                     qty,
                 );
                 deposited_calories =
-                    deposited_calories.saturating_add(qty * good.nutrition() as u32);
+                    deposited_calories.saturating_add(qty * rid.nutrition() as u32);
             }
             if deposited_calories > 0 {
                 if let Some(claim) = claim_opt {
@@ -1264,9 +1265,10 @@ pub fn drop_items_at_destination_system(
             .unwrap_or(false);
         if has_cultivation {
             for seed_good in PlantKind::ALL.iter().filter_map(|k| k.seed_good()) {
+                let seed_id: crate::economy::resource_catalog::ResourceId = seed_good.into();
                 let mut qty: u32 = 0;
                 for (it, q) in agent.inventory.iter_mut() {
-                    if it.good() == seed_good && *q > 0 {
+                    if it.resource_id == seed_id && *q > 0 {
                         qty += *q;
                         *q = 0;
                     }
@@ -1278,7 +1280,7 @@ pub fn drop_items_at_destination_system(
                         &mut ground_items,
                         deposit_tx,
                         deposit_ty,
-                        seed_good,
+                        seed_id,
                         qty,
                     );
                 }

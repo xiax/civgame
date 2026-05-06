@@ -142,18 +142,22 @@ pub fn recompute_inventory_capacity_system(
     }
 }
 
-/// True if this good is "personal" — small enough and useful enough that the agent
-/// keeps it in their personal inventory rather than carrying it in their hands.
-/// Hungry agents personalize edibles too (so they can eat them later).
-fn personal_pickup(good: Good, needs: &Needs) -> bool {
-    if good.is_seed() {
+/// True if this resource is "personal" — small enough and useful enough that
+/// the agent keeps it in their personal inventory rather than carrying it in
+/// their hands. Hungry agents personalize edibles too (so they can eat them
+/// later).
+fn personal_pickup(rid: crate::economy::resource_catalog::ResourceId, needs: &Needs) -> bool {
+    use crate::economy::core_ids;
+    if rid.is_seed() {
         return true;
     }
-    match good {
-        Good::Tools => true,
-        Good::Fruit | Good::Meat | Good::Grain => needs.hunger > 80.0,
-        _ => false,
+    if Some(rid) == core_ids::Tools.get().copied() {
+        return true;
     }
+    if rid.is_edible() {
+        return needs.hunger > 80.0;
+    }
+    false
 }
 
 /// Phase 5c-ii-d-ii-a chain handoff: called by every `item_pickup_system`
@@ -322,7 +326,7 @@ pub fn item_pickup_system(
 
             // Personal goods → inventory; hauling goods → hands. Fall back to the other
             // bucket if the primary is full (e.g. inventory cap exceeded).
-            let leftover = if personal_pickup(item.item.good(), needs) {
+            let leftover = if personal_pickup(item.item.resource_id, needs) {
                 let inv_left = agent.add_item(item.item, take_qty);
                 if inv_left > 0 {
                     carrier.try_pick_up(item.item, inv_left)

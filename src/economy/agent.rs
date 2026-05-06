@@ -36,7 +36,7 @@ impl EconomicAgent {
     pub fn total_food(&self) -> u32 {
         self.inventory
             .iter()
-            .filter(|(it, _)| it.good().is_edible())
+            .filter(|(it, _)| it.resource_id.is_edible())
             .fold(0u32, |acc, (_, q)| acc.saturating_add(*q))
     }
 

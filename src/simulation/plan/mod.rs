@@ -373,7 +373,7 @@ pub enum StepTarget {
     },
     /// Nearest faction storage tile holding ≥1 of the given Good. Used by play
     /// plans that fetch a specific good (Seed, Stone) before recreating.
-    NearestFactionStorageWithGood(Good),
+    NearestFactionStorageWithGood(crate::economy::resource_catalog::ResourceId),
     /// Nearest faction storage tile holding ≥1 of any good with non-zero
     /// `entertainment_value`. Used by the PlayWithStoredToy plan so an agent
     /// can grab a luxury/cloth/tool from the stockpile and play with it.
@@ -1379,7 +1379,7 @@ fn resolve_target(
             carrier,
             withdraw_intent_out,
         ),
-        StepTarget::NearestFactionStorageWithGood(target_good) => {
+        StepTarget::NearestFactionStorageWithGood(target_resource) => {
             let tiles = storage_tile_map.by_faction.get(&faction_id)?;
             let mut best: Option<(i32, i32)> = None;
             let mut best_dist = i32::MAX;
@@ -1387,7 +1387,7 @@ fn resolve_target(
                 let mut has = false;
                 for &gi_entity in spatial.get(tx as i32, ty as i32) {
                     if let Ok(gi) = item_query.get(gi_entity) {
-                        if gi.qty > 0 && gi.item.good() == *target_good {
+                        if gi.qty > 0 && gi.item.resource_id == *target_resource {
                             has = true;
                             break;
                         }
@@ -1412,7 +1412,7 @@ fn resolve_target(
                 let mut has = false;
                 for &gi_entity in spatial.get(tx as i32, ty as i32) {
                     if let Ok(gi) = item_query.get(gi_entity) {
-                        if gi.qty > 0 && gi.item.good().entertainment_value() > 0 {
+                        if gi.qty > 0 && gi.item.resource_id.entertainment_value() > 0 {
                             has = true;
                             break;
                         }
@@ -1574,11 +1574,11 @@ fn resolve_target(
             // Already holding something fun? Play in place.
             let held_l = carrier
                 .left
-                .map(|s| s.item.good().entertainment_value())
+                .map(|s| s.item.resource_id.entertainment_value())
                 .unwrap_or(0);
             let held_r = carrier
                 .right
-                .map(|s| s.item.good().entertainment_value())
+                .map(|s| s.item.resource_id.entertainment_value())
                 .unwrap_or(0);
             if held_l > 0 || held_r > 0 {
                 return Some((None, pos.0 as i32, pos.1 as i32));
@@ -1592,7 +1592,7 @@ fn resolve_target(
                     let ty = pos.1 + dy;
                     for &e in spatial.get(tx, ty) {
                         if let Ok(item) = item_query.get(e) {
-                            let v = item.item.good().entertainment_value() as i32;
+                            let v = item.item.resource_id.entertainment_value() as i32;
                             if v == 0 {
                                 continue;
                             }
@@ -2988,21 +2988,21 @@ pub fn drop_abandoned_food_system(
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
 
-        let mut drops: Vec<(Good, u32)> = Vec::new();
+        let mut drops: Vec<(crate::economy::resource_catalog::ResourceId, u32)> = Vec::new();
         for (it, q) in agent.inventory.iter_mut() {
-            if it.good().is_edible() && *q > 0 {
-                drops.push((it.good(), *q));
+            if it.resource_id.is_edible() && *q > 0 {
+                drops.push((it.resource_id, *q));
                 *q = 0;
             }
         }
-        for (good, qty) in drops {
+        for (rid, qty) in drops {
             crate::simulation::items::spawn_or_merge_ground_item(
                 &mut commands,
                 &spatial,
                 &mut ground_items,
                 tx,
                 ty,
-                good,
+                rid,
                 qty,
             );
         }
