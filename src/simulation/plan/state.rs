@@ -15,7 +15,6 @@ use super::{
 };
 use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
 use crate::simulation::faction::{FactionMember, FactionStorage, SOLO};
 use crate::simulation::items::GroundItem;
 use crate::simulation::memory::{AgentMemory, MemoryKind};
@@ -62,28 +61,31 @@ pub fn build_state_vec(
     s[5] = needs.reproduction as f32 / 255.0;
 
     // 6-10: inventory has (Food, Wood, Stone, GrainSeed, Coal)
+    use crate::economy::core_ids;
     s[6] = if agent.total_food() > 0 { 1.0 } else { 0.0 };
-    s[7] = if agent.quantity_of_resource(Good::Wood.into()) > 0 {
+    s[7] = if agent.quantity_of_resource(*core_ids::Wood.get().unwrap()) > 0 {
         1.0
     } else {
         0.0
     };
-    s[8] = if agent.quantity_of_resource(Good::Stone.into()) > 0 {
+    s[8] = if agent.quantity_of_resource(*core_ids::Stone.get().unwrap()) > 0 {
         1.0
     } else {
         0.0
     };
-    s[SI_HAS_GRAIN_SEED] = if agent.quantity_of_resource(Good::GrainSeed.into()) > 0 {
-        1.0
-    } else {
-        0.0
-    };
-    s[SI_HAS_BERRY_SEED] = if agent.quantity_of_resource(Good::BerrySeed.into()) > 0 {
-        1.0
-    } else {
-        0.0
-    };
-    s[10] = if agent.quantity_of_resource(Good::Coal.into()) > 0 {
+    s[SI_HAS_GRAIN_SEED] =
+        if agent.quantity_of_resource(*core_ids::GrainSeed.get().unwrap()) > 0 {
+            1.0
+        } else {
+            0.0
+        };
+    s[SI_HAS_BERRY_SEED] =
+        if agent.quantity_of_resource(*core_ids::BerrySeed.get().unwrap()) > 0 {
+            1.0
+        } else {
+            0.0
+        };
+    s[10] = if agent.quantity_of_resource(*core_ids::Coal.get().unwrap()) > 0 {
         1.0
     } else {
         0.0
@@ -150,10 +152,12 @@ pub fn build_state_vec(
     // DeliverFromStorageToCraftOrder).
     if let Some(st) = storage {
         s[SI_STORAGE_FOOD] = (st.food_total() / STORAGE_SATURATE).clamp(0.0, 1.0);
-        s[SI_STORAGE_WOOD] =
-            (st.stock_of(Good::Wood.into()) as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
-        s[SI_STORAGE_STONE] =
-            (st.stock_of(Good::Stone.into()) as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
+        s[SI_STORAGE_WOOD] = (st.stock_of(*core_ids::Wood.get().unwrap()) as f32
+            / STORAGE_SATURATE)
+            .clamp(0.0, 1.0);
+        s[SI_STORAGE_STONE] = (st.stock_of(*core_ids::Stone.get().unwrap()) as f32
+            / STORAGE_SATURATE)
+            .clamp(0.0, 1.0);
         s[SI_STORAGE_GRAIN_SEED] = (st.grain_seed_total() as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
         s[SI_STORAGE_BERRY_SEED] = (st.berry_seed_total() as f32 / STORAGE_SATURATE).clamp(0.0, 1.0);
     }
@@ -327,7 +331,7 @@ pub fn count_visible_ground_wood(
 ) -> u8 {
     let r = VISIBILITY_RADIUS;
     let r2 = r * r;
-    let wood_id: crate::economy::resource_catalog::ResourceId = Good::Wood.into();
+    let wood_id = *crate::economy::core_ids::Wood.get().unwrap();
     let mut n: u8 = 0;
     for dy in -r..=r {
         for dx in -r..=r {
@@ -359,7 +363,7 @@ pub fn count_visible_ground_stone(
 ) -> u8 {
     let r = VISIBILITY_RADIUS;
     let r2 = r * r;
-    let stone_id: crate::economy::resource_catalog::ResourceId = Good::Stone.into();
+    let stone_id = *crate::economy::core_ids::Stone.get().unwrap();
     let mut n: u8 = 0;
     for dy in -r..=r {
         for dx in -r..=r {

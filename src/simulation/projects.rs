@@ -22,7 +22,6 @@
 use ahash::AHashMap;
 use bevy::prelude::*;
 
-use crate::economy::goods::Good;
 use crate::simulation::construction::{Blueprint, BlueprintMap};
 use crate::simulation::faction::FactionData;
 use crate::simulation::jobs::{faction_can_perform, JobBoard, JobKind, JobProgress};
@@ -63,7 +62,9 @@ pub enum ProjectEventKind {
 
 #[derive(Clone, Copy, Debug)]
 pub enum ProjectCancelReason {
-    StalledGather { good: Good },
+    StalledGather {
+        resource_id: crate::economy::resource_catalog::ResourceId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -329,7 +330,9 @@ pub fn farm_pressure(faction: &FactionData) -> u8 {
     if !faction_can_perform(faction, JobKind::Farm) {
         return 0;
     }
-    let grain = faction.storage.stock_of(Good::Grain.into());
+    let grain = faction
+        .storage
+        .stock_of(*crate::economy::core_ids::Grain.get().unwrap());
     let target = faction.member_count.saturating_mul(4);
     if grain >= target || target == 0 {
         return 0;
@@ -341,18 +344,9 @@ pub fn farm_pressure(faction: &FactionData) -> u8 {
 
 /// 0..=100: craft-supply gap pressure across all craftable goods.
 pub fn craft_pressure(faction: &FactionData) -> u8 {
-    const CRAFTABLE: &[Good] = &[
-        Good::Tools,
-        Good::Weapon,
-        Good::Cloth,
-        Good::Luxury,
-        Good::Shield,
-        Good::Armor,
-    ];
-    let max_gap = CRAFTABLE
+    let max_gap = craftable_resources()
         .iter()
-        .map(|g| {
-            let id: crate::economy::resource_catalog::ResourceId = (*g).into();
+        .map(|&id| {
             let s = faction.supply_of(id);
             let d = faction.demand_of(id);
             d.saturating_sub(s)
@@ -360,6 +354,25 @@ pub fn craft_pressure(faction: &FactionData) -> u8 {
         .max()
         .unwrap_or(0);
     (max_gap.saturating_mul(4)).min(100) as u8
+}
+
+/// The set of legacy craftable resources (Tools / Weapon / Cloth / Luxury
+/// / Shield / Armor). Lazy because `ResourceId`s resolve at runtime.
+fn craftable_resources() -> &'static [crate::economy::resource_catalog::ResourceId] {
+    use crate::economy::core_ids;
+    use crate::economy::resource_catalog::ResourceId;
+    static IDS: std::sync::OnceLock<[ResourceId; 6]> = std::sync::OnceLock::new();
+    IDS.get_or_init(|| {
+        let _ = core_ids::catalog();
+        [
+            *core_ids::Tools.get().unwrap(),
+            *core_ids::Weapon.get().unwrap(),
+            *core_ids::Cloth.get().unwrap(),
+            *core_ids::Luxury.get().unwrap(),
+            *core_ids::Shield.get().unwrap(),
+            *core_ids::Armor.get().unwrap(),
+        ]
+    })
 }
 
 // ── Workforce budget (Stage 2) ───────────────────────────────────────────────
@@ -499,8 +512,10 @@ pub fn compute_workforce_budget(
         deficit_ratio * 70.0 + project_term * 30.0
     };
     let stockpile_food_pressure = food;
-    let stockpile_wood_pressure = material_urgency(Good::Wood.into());
-    let stockpile_stone_pressure = material_urgency(Good::Stone.into());
+    let stockpile_wood_pressure =
+        material_urgency(*crate::economy::core_ids::Wood.get().unwrap());
+    let stockpile_stone_pressure =
+        material_urgency(*crate::economy::core_ids::Stone.get().unwrap());
 
     // Haul + Build urgency on the same 0..100 scale, saturating at modest
     // queue depths since beyond that the bottleneck is throughput not
@@ -617,18 +632,9 @@ pub fn compute_workforce_budget(
     // allocation can otherwise send the full workforce to crafting when it is
     // the only active pressure and other jobs are quiet.
     if eligible[6] && faction.member_count > 0 {
-        const CRAFTABLE: &[Good] = &[
-            Good::Tools,
-            Good::Weapon,
-            Good::Cloth,
-            Good::Luxury,
-            Good::Shield,
-            Good::Armor,
-        ];
-        let max_gap = CRAFTABLE
+        let max_gap = craftable_resources()
             .iter()
-            .map(|g| {
-                let id: crate::economy::resource_catalog::ResourceId = (*g).into();
+            .map(|&id| {
                 let s = faction.supply_of(id);
                 let d = faction.demand_of(id);
                 d.saturating_sub(s)
@@ -706,7 +712,6 @@ pub fn project_stagnation_system(
         ProjectId,
         Entity,
         u32,
-        Good,
         crate::economy::resource_catalog::ResourceId,
         (i32, i32),
     )> = Vec::new();
@@ -744,14 +749,10 @@ pub fn project_stagnation_system(
         let Some((&resource_id, _)) = remaining.iter().max_by_key(|(_, qty)| **qty) else {
             continue;
         };
-        // ProjectEvent still carries `Good`; reverse-resolve at the boundary.
-        let Some(good) = crate::economy::core_ids::resource_id_to_good(resource_id) else {
-            continue;
-        };
-        to_cancel.push((project.id, project.blueprint, project.faction_id, good, resource_id, bp.tile));
+        to_cancel.push((project.id, project.blueprint, project.faction_id, resource_id, bp.tile));
     }
 
-    for (project_id, blueprint, faction_id, good, resource_id, tile) in to_cancel {
+    for (project_id, blueprint, faction_id, resource_id, tile) in to_cancel {
         // Bump the faction's deficit EMA for the stalled resource.
         if let Some(faction) = registry.factions.get_mut(&faction_id) {
             let prev = faction.material_deficit_ema.get(&resource_id).copied().unwrap_or(0) as f32;
@@ -769,7 +770,7 @@ pub fn project_stagnation_system(
             faction_id,
             blueprint,
             kind: ProjectEventKind::Cancelled {
-                reason: ProjectCancelReason::StalledGather { good },
+                reason: ProjectCancelReason::StalledGather { resource_id },
             },
         });
     }

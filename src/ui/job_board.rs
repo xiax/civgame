@@ -181,10 +181,13 @@ pub fn job_board_panel_system(
                         for event in recent_events {
                             let label = match &event.kind {
                                 ProjectEventKind::Cancelled { reason } => match reason {
-                                    ProjectCancelReason::StalledGather { good } => format!(
-                                        "t{} cancelled — stalled gathering {:?}",
-                                        event.tick, good
-                                    ),
+                                    ProjectCancelReason::StalledGather { resource_id } => {
+                                        format!(
+                                            "t{} cancelled — stalled gathering {}",
+                                            event.tick,
+                                            crate::economy::core_ids::display_name(*resource_id),
+                                        )
+                                    }
                                 },
                             };
                             ui.label(label);

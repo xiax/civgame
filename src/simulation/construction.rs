@@ -1,5 +1,4 @@
 use crate::economy::agent::EconomicAgent;
-use crate::economy::goods::Good;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
@@ -452,9 +451,9 @@ impl Blueprint {
         let recipe = recipe_for(kind);
         let mut deposits = [GoodNeed::default(); MAX_BUILD_INPUTS];
         let count = recipe.inputs.len().min(MAX_BUILD_INPUTS);
-        for (i, &(good, qty)) in recipe.inputs.iter().take(count).enumerate() {
+        for (i, &(rid, qty)) in recipe.inputs.iter().take(count).enumerate() {
             deposits[i] = GoodNeed {
-                resource_id: good.into(),
+                resource_id: rid,
                 needed: qty,
                 deposited: 0,
             };
@@ -483,135 +482,177 @@ impl Blueprint {
 
 // ── Build recipes ─────────────────────────────────────────────────────────────
 
-/// Static description of how to build a single structure kind: ingredients,
+/// Description of how to build a single structure kind: ingredients,
 /// labour ticks, optional tech gate, and what is refunded on deconstruction.
+/// Inputs/refunds are `ResourceId`-keyed; the recipe table is built lazily
+/// via [`build_recipes`] because `ResourceId`s resolve through the runtime
+/// catalog and can't be expressed in `const`.
 pub struct BuildRecipe {
     pub name: &'static str,
-    pub inputs: &'static [(Good, u8)],
+    pub inputs: Vec<(crate::economy::resource_catalog::ResourceId, u8)>,
     pub work_ticks: u8,
     pub tech_gate: Option<TechId>,
-    pub deconstruct_refund: &'static [(Good, u8)],
+    pub deconstruct_refund: Vec<(crate::economy::resource_catalog::ResourceId, u8)>,
 }
 
-const RECIPE_PALISADE: BuildRecipe = BuildRecipe {
-    name: "Palisade Wall",
-    inputs: &[(Good::Wood, 2)],
-    work_ticks: 60,
-    tech_gate: None,
-    deconstruct_refund: &[(Good::Wood, 1)],
-};
-const RECIPE_WATTLE_DAUB: BuildRecipe = BuildRecipe {
-    name: "Wattle & Daub Wall",
-    inputs: &[(Good::Wood, 2), (Good::Grain, 1)],
-    work_ticks: 70,
-    tech_gate: Some(PERM_SETTLEMENT),
-    deconstruct_refund: &[(Good::Wood, 1)],
-};
-const RECIPE_STONE_WALL: BuildRecipe = BuildRecipe {
-    name: "Stone Wall",
-    inputs: &[(Good::Stone, 3)],
-    work_ticks: 90,
-    tech_gate: Some(FLINT_KNAPPING),
-    deconstruct_refund: &[(Good::Stone, 2)],
-};
-const RECIPE_MUDBRICK: BuildRecipe = BuildRecipe {
-    name: "Mudbrick Wall",
-    inputs: &[(Good::Stone, 2), (Good::Wood, 1)],
-    work_ticks: 80,
-    tech_gate: Some(FIRED_POTTERY),
-    deconstruct_refund: &[(Good::Stone, 1)],
-};
-const RECIPE_CUT_STONE: BuildRecipe = BuildRecipe {
-    name: "Cut Stone Wall",
-    inputs: &[(Good::Stone, 4)],
-    work_ticks: 120,
-    tech_gate: Some(MONUMENTAL_BUILDING),
-    deconstruct_refund: &[(Good::Stone, 3)],
-};
-const RECIPE_WORKBENCH: BuildRecipe = BuildRecipe {
-    name: "Workbench",
-    inputs: &[(Good::Wood, 3), (Good::Stone, 1)],
-    work_ticks: 60,
-    tech_gate: Some(FLINT_KNAPPING),
-    deconstruct_refund: &[(Good::Wood, 2)],
-};
-const RECIPE_LOOM: BuildRecipe = BuildRecipe {
-    name: "Loom",
-    inputs: &[(Good::Wood, 4)],
-    work_ticks: 70,
-    tech_gate: Some(LOOM_WEAVING),
-    deconstruct_refund: &[(Good::Wood, 2)],
-};
-const RECIPE_TABLE: BuildRecipe = BuildRecipe {
-    name: "Table",
-    inputs: &[(Good::Wood, 3)],
-    work_ticks: 50,
-    tech_gate: None,
-    deconstruct_refund: &[(Good::Wood, 2)],
-};
-const RECIPE_CHAIR: BuildRecipe = BuildRecipe {
-    name: "Chair",
-    inputs: &[(Good::Wood, 2)],
-    work_ticks: 40,
-    tech_gate: None,
-    deconstruct_refund: &[(Good::Wood, 1)],
-};
-const RECIPE_DOOR: BuildRecipe = BuildRecipe {
-    name: "Door",
-    inputs: &[(Good::Wood, 2)],
-    work_ticks: 50,
-    tech_gate: None,
-    deconstruct_refund: &[(Good::Wood, 1)],
-};
-const RECIPE_BED: BuildRecipe = BuildRecipe {
-    name: "Bed",
-    inputs: &[(Good::Wood, 3)],
-    work_ticks: 80,
-    tech_gate: None,
-    deconstruct_refund: &[(Good::Wood, 2)],
-};
-const RECIPE_CAMPFIRE: BuildRecipe = BuildRecipe {
-    name: "Campfire",
-    inputs: &[(Good::Wood, 2)],
-    work_ticks: 40,
-    tech_gate: Some(FIRE_MAKING),
-    deconstruct_refund: &[(Good::Wood, 1)],
-};
-const RECIPE_GRANARY: BuildRecipe = BuildRecipe {
-    name: "Granary",
-    inputs: &[(Good::Wood, 4), (Good::Stone, 2)],
-    work_ticks: 120,
-    tech_gate: Some(GRANARY),
-    deconstruct_refund: &[(Good::Wood, 2), (Good::Stone, 1)],
-};
-const RECIPE_SHRINE: BuildRecipe = BuildRecipe {
-    name: "Shrine",
-    inputs: &[(Good::Stone, 3), (Good::Wood, 2)],
-    work_ticks: 140,
-    tech_gate: Some(SACRED_RITUAL),
-    deconstruct_refund: &[(Good::Stone, 1), (Good::Wood, 1)],
-};
-const RECIPE_MARKET: BuildRecipe = BuildRecipe {
-    name: "Market",
-    inputs: &[(Good::Wood, 5), (Good::Stone, 2)],
-    work_ticks: 160,
-    tech_gate: Some(LONG_DIST_TRADE),
-    deconstruct_refund: &[(Good::Wood, 2), (Good::Stone, 1)],
-};
-const RECIPE_BARRACKS: BuildRecipe = BuildRecipe {
-    name: "Barracks",
-    inputs: &[(Good::Wood, 4), (Good::Stone, 3)],
-    work_ticks: 180,
-    tech_gate: Some(PROFESSIONAL_ARMY),
-    deconstruct_refund: &[(Good::Wood, 2), (Good::Stone, 1)],
-};
-const RECIPE_MONUMENT: BuildRecipe = BuildRecipe {
-    name: "Monument",
-    inputs: &[(Good::Stone, 6), (Good::Wood, 2)],
-    work_ticks: 220,
-    tech_gate: Some(MONUMENTAL_BUILDING),
-    deconstruct_refund: &[(Good::Stone, 3), (Good::Wood, 1)],
-};
+/// Stable index into the lazy build-recipe table. One entry per
+/// `BuildSiteKind` variant (wall variants flatten via `WallMaterial`).
+#[derive(Copy, Clone, Debug)]
+#[repr(usize)]
+enum BuildRecipeIdx {
+    Palisade = 0,
+    WattleDaub,
+    StoneWall,
+    Mudbrick,
+    CutStone,
+    Workbench,
+    Loom,
+    Table,
+    Chair,
+    Door,
+    Bed,
+    Campfire,
+    Granary,
+    Shrine,
+    Market,
+    Barracks,
+    Monument,
+}
+
+fn build_recipes_table() -> Vec<BuildRecipe> {
+    use crate::economy::core_ids;
+    let _ = core_ids::catalog();
+    let wood = *core_ids::Wood.get().unwrap();
+    let stone = *core_ids::Stone.get().unwrap();
+    let grain = *core_ids::Grain.get().unwrap();
+
+    vec![
+        BuildRecipe {
+            name: "Palisade Wall",
+            inputs: vec![(wood, 2)],
+            work_ticks: 60,
+            tech_gate: None,
+            deconstruct_refund: vec![(wood, 1)],
+        },
+        BuildRecipe {
+            name: "Wattle & Daub Wall",
+            inputs: vec![(wood, 2), (grain, 1)],
+            work_ticks: 70,
+            tech_gate: Some(PERM_SETTLEMENT),
+            deconstruct_refund: vec![(wood, 1)],
+        },
+        BuildRecipe {
+            name: "Stone Wall",
+            inputs: vec![(stone, 3)],
+            work_ticks: 90,
+            tech_gate: Some(FLINT_KNAPPING),
+            deconstruct_refund: vec![(stone, 2)],
+        },
+        BuildRecipe {
+            name: "Mudbrick Wall",
+            inputs: vec![(stone, 2), (wood, 1)],
+            work_ticks: 80,
+            tech_gate: Some(FIRED_POTTERY),
+            deconstruct_refund: vec![(stone, 1)],
+        },
+        BuildRecipe {
+            name: "Cut Stone Wall",
+            inputs: vec![(stone, 4)],
+            work_ticks: 120,
+            tech_gate: Some(MONUMENTAL_BUILDING),
+            deconstruct_refund: vec![(stone, 3)],
+        },
+        BuildRecipe {
+            name: "Workbench",
+            inputs: vec![(wood, 3), (stone, 1)],
+            work_ticks: 60,
+            tech_gate: Some(FLINT_KNAPPING),
+            deconstruct_refund: vec![(wood, 2)],
+        },
+        BuildRecipe {
+            name: "Loom",
+            inputs: vec![(wood, 4)],
+            work_ticks: 70,
+            tech_gate: Some(LOOM_WEAVING),
+            deconstruct_refund: vec![(wood, 2)],
+        },
+        BuildRecipe {
+            name: "Table",
+            inputs: vec![(wood, 3)],
+            work_ticks: 50,
+            tech_gate: None,
+            deconstruct_refund: vec![(wood, 2)],
+        },
+        BuildRecipe {
+            name: "Chair",
+            inputs: vec![(wood, 2)],
+            work_ticks: 40,
+            tech_gate: None,
+            deconstruct_refund: vec![(wood, 1)],
+        },
+        BuildRecipe {
+            name: "Door",
+            inputs: vec![(wood, 2)],
+            work_ticks: 50,
+            tech_gate: None,
+            deconstruct_refund: vec![(wood, 1)],
+        },
+        BuildRecipe {
+            name: "Bed",
+            inputs: vec![(wood, 3)],
+            work_ticks: 80,
+            tech_gate: None,
+            deconstruct_refund: vec![(wood, 2)],
+        },
+        BuildRecipe {
+            name: "Campfire",
+            inputs: vec![(wood, 2)],
+            work_ticks: 40,
+            tech_gate: Some(FIRE_MAKING),
+            deconstruct_refund: vec![(wood, 1)],
+        },
+        BuildRecipe {
+            name: "Granary",
+            inputs: vec![(wood, 4), (stone, 2)],
+            work_ticks: 120,
+            tech_gate: Some(GRANARY),
+            deconstruct_refund: vec![(wood, 2), (stone, 1)],
+        },
+        BuildRecipe {
+            name: "Shrine",
+            inputs: vec![(stone, 3), (wood, 2)],
+            work_ticks: 140,
+            tech_gate: Some(SACRED_RITUAL),
+            deconstruct_refund: vec![(stone, 1), (wood, 1)],
+        },
+        BuildRecipe {
+            name: "Market",
+            inputs: vec![(wood, 5), (stone, 2)],
+            work_ticks: 160,
+            tech_gate: Some(LONG_DIST_TRADE),
+            deconstruct_refund: vec![(wood, 2), (stone, 1)],
+        },
+        BuildRecipe {
+            name: "Barracks",
+            inputs: vec![(wood, 4), (stone, 3)],
+            work_ticks: 180,
+            tech_gate: Some(PROFESSIONAL_ARMY),
+            deconstruct_refund: vec![(wood, 2), (stone, 1)],
+        },
+        BuildRecipe {
+            name: "Monument",
+            inputs: vec![(stone, 6), (wood, 2)],
+            work_ticks: 220,
+            tech_gate: Some(MONUMENTAL_BUILDING),
+            deconstruct_refund: vec![(stone, 3), (wood, 1)],
+        },
+    ]
+}
+
+fn build_recipes() -> &'static [BuildRecipe] {
+    static TABLE: std::sync::OnceLock<Vec<BuildRecipe>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(build_recipes_table).as_slice()
+}
 
 /// Most advanced wall material a faction's tech bitset allows. Used by the
 /// chief to upgrade defensive walls automatically; the player may still pick
@@ -686,27 +727,28 @@ pub fn faction_can_build(kind: BuildSiteKind, techs: &FactionTechs) -> bool {
     }
 }
 
-/// Returns the static recipe for a given build site kind.
+/// Returns the recipe for a given build site kind from the lazy table.
 pub fn recipe_for(kind: BuildSiteKind) -> &'static BuildRecipe {
-    match kind {
-        BuildSiteKind::Wall(WallMaterial::Palisade) => &RECIPE_PALISADE,
-        BuildSiteKind::Wall(WallMaterial::WattleDaub) => &RECIPE_WATTLE_DAUB,
-        BuildSiteKind::Wall(WallMaterial::Stone) => &RECIPE_STONE_WALL,
-        BuildSiteKind::Wall(WallMaterial::Mudbrick) => &RECIPE_MUDBRICK,
-        BuildSiteKind::Wall(WallMaterial::CutStone) => &RECIPE_CUT_STONE,
-        BuildSiteKind::Door => &RECIPE_DOOR,
-        BuildSiteKind::Bed => &RECIPE_BED,
-        BuildSiteKind::Campfire => &RECIPE_CAMPFIRE,
-        BuildSiteKind::Workbench => &RECIPE_WORKBENCH,
-        BuildSiteKind::Loom => &RECIPE_LOOM,
-        BuildSiteKind::Table => &RECIPE_TABLE,
-        BuildSiteKind::Chair => &RECIPE_CHAIR,
-        BuildSiteKind::Granary => &RECIPE_GRANARY,
-        BuildSiteKind::Shrine => &RECIPE_SHRINE,
-        BuildSiteKind::Market => &RECIPE_MARKET,
-        BuildSiteKind::Barracks => &RECIPE_BARRACKS,
-        BuildSiteKind::Monument => &RECIPE_MONUMENT,
-    }
+    let idx = match kind {
+        BuildSiteKind::Wall(WallMaterial::Palisade) => BuildRecipeIdx::Palisade,
+        BuildSiteKind::Wall(WallMaterial::WattleDaub) => BuildRecipeIdx::WattleDaub,
+        BuildSiteKind::Wall(WallMaterial::Stone) => BuildRecipeIdx::StoneWall,
+        BuildSiteKind::Wall(WallMaterial::Mudbrick) => BuildRecipeIdx::Mudbrick,
+        BuildSiteKind::Wall(WallMaterial::CutStone) => BuildRecipeIdx::CutStone,
+        BuildSiteKind::Door => BuildRecipeIdx::Door,
+        BuildSiteKind::Bed => BuildRecipeIdx::Bed,
+        BuildSiteKind::Campfire => BuildRecipeIdx::Campfire,
+        BuildSiteKind::Workbench => BuildRecipeIdx::Workbench,
+        BuildSiteKind::Loom => BuildRecipeIdx::Loom,
+        BuildSiteKind::Table => BuildRecipeIdx::Table,
+        BuildSiteKind::Chair => BuildRecipeIdx::Chair,
+        BuildSiteKind::Granary => BuildRecipeIdx::Granary,
+        BuildSiteKind::Shrine => BuildRecipeIdx::Shrine,
+        BuildSiteKind::Market => BuildRecipeIdx::Market,
+        BuildSiteKind::Barracks => BuildRecipeIdx::Barracks,
+        BuildSiteKind::Monument => BuildRecipeIdx::Monument,
+    };
+    &build_recipes()[idx as usize]
 }
 
 /// Count how many of the 4 cardinal directions have a wall (or higher-z terrain)
@@ -1535,11 +1577,13 @@ impl BuildIntent {
     /// blueprint it would spawn. Used by the deficit-EMA feedback loop in
     /// `generate_candidates` so candidates that need a chronically-scarce
     /// good get down-scored.
-    fn required_goods(self) -> ahash::AHashMap<crate::economy::goods::Good, u32> {
+    fn required_goods(
+        self,
+    ) -> ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32> {
         let mut totals: ahash::AHashMap<_, u32> = ahash::AHashMap::new();
         let mut add = |kind: BuildSiteKind, multiplier: u32| {
-            for &(good, qty) in recipe_for(kind).inputs {
-                *totals.entry(good).or_insert(0) += qty as u32 * multiplier;
+            for &(rid, qty) in &recipe_for(kind).inputs {
+                *totals.entry(rid).or_insert(0) += qty as u32 * multiplier;
             }
         };
         match self {
@@ -1627,11 +1671,11 @@ pub fn chief_directive_system(
         for candidate in candidates.iter_mut() {
             let required = candidate.intent.required_goods();
             let mut penalty = 0.0f32;
-            for (good, qty) in required {
+            for (rid, qty) in required {
                 if qty == 0 {
                     continue;
                 }
-                let ema = faction.material_deficit_ema_of(good.into());
+                let ema = faction.material_deficit_ema_of(rid);
                 if ema >= crate::simulation::projects::DEFICIT_EMA_RARE_THRESHOLD {
                     penalty += 600.0;
                 } else if ema >= 80 {
@@ -2444,9 +2488,8 @@ pub fn building_upgrade_system(
         let has_stock = recipe
             .inputs
             .iter()
-            .all(|&(good, qty)| {
-                let id = crate::economy::core_ids::good_to_resource_id(good);
-                storage.get(&id).copied().unwrap_or(0) >= (qty as u32) * 2
+            .all(|&(rid, qty)| {
+                storage.get(&rid).copied().unwrap_or(0) >= (qty as u32) * 2
             });
         if !has_stock {
             continue;
@@ -3595,9 +3638,9 @@ pub fn deconstruct_system(
             // Recovered materials prefer the agent's hands so they can be hauled to
             // storage; fall back to inventory; spill any remainder at the deconstructed
             // tile as a GroundItem.
-            for &(good, qty) in recipe_for(kind).deconstruct_refund {
+            for &(rid, qty) in &recipe_for(kind).deconstruct_refund {
                 let qty = qty as u32;
-                let item = crate::economy::item::Item::new_commodity(good);
+                let item = crate::economy::item::Item::new_commodity(rid);
                 let after_hand = carrier.try_pick_up(item, qty);
                 let after_inv = if after_hand > 0 {
                     economic_agent.add_item(item, after_hand)
