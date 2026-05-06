@@ -523,13 +523,12 @@ pub fn enforce_hand_state_system(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::economy::goods::Good;
     use crate::economy::item::Item;
 
     #[test]
     fn small_items_stack_in_one_hand() {
         let mut c = Carrier::default();
-        let item = Item::new_commodity(Good::Fruit);
+        let item = Item::new_commodity(crate::economy::core_ids::fruit());
         let leftover = c.try_pick_up(item, 3);
         assert_eq!(leftover, 0);
         assert_eq!(c.quantity_of(item), 3);
@@ -539,7 +538,7 @@ mod tests {
     #[test]
     fn small_items_capped_at_three_per_hand() {
         let mut c = Carrier::default();
-        let item = Item::new_commodity(Good::Fruit);
+        let item = Item::new_commodity(crate::economy::core_ids::fruit());
         let leftover = c.try_pick_up(item, 10);
         assert_eq!(leftover, 4, "qty cap fills both hands at 3 each = 6");
         assert_eq!(c.quantity_of(item), 6);
@@ -549,7 +548,7 @@ mod tests {
     #[test]
     fn two_handed_log_takes_both_hands() {
         let mut c = Carrier::default();
-        let log = Item::new_commodity(Good::Wood);
+        let log = Item::new_commodity(crate::economy::core_ids::wood());
         let leftover = c.try_pick_up(log, 3);
         assert_eq!(leftover, 0);
         assert_eq!(c.free_hands(), 0);
@@ -559,7 +558,7 @@ mod tests {
     #[test]
     fn two_handed_capped_at_three() {
         let mut c = Carrier::default();
-        let log = Item::new_commodity(Good::Wood);
+        let log = Item::new_commodity(crate::economy::core_ids::wood());
         let leftover = c.try_pick_up(log, 4);
         assert_eq!(leftover, 1, "two-handed stack caps at HAND_QTY_CAP");
         assert_eq!(c.quantity_of(log), 3);
@@ -568,8 +567,8 @@ mod tests {
     #[test]
     fn two_handed_blocked_when_a_hand_occupied() {
         let mut c = Carrier::default();
-        let _ = c.try_pick_up(Item::new_commodity(Good::Fruit), 1);
-        let log = Item::new_commodity(Good::Wood);
+        let _ = c.try_pick_up(Item::new_commodity(crate::economy::core_ids::fruit()), 1);
+        let log = Item::new_commodity(crate::economy::core_ids::wood());
         let leftover = c.try_pick_up(log, 1);
         assert_eq!(
             leftover, 1,
@@ -581,7 +580,7 @@ mod tests {
     fn over_cap_returns_leftover() {
         // Stone is TwoHand; qty cap (3) binds before the weight cap.
         let mut c = Carrier::default();
-        let stone = Item::new_commodity(Good::Stone);
+        let stone = Item::new_commodity(crate::economy::core_ids::stone());
         let leftover = c.try_pick_up(stone, 100);
         assert_eq!(leftover, 97);
         assert_eq!(c.quantity_of(stone), 3);
@@ -591,7 +590,7 @@ mod tests {
     #[test]
     fn is_at_haul_cap_triggers_when_two_handed_full() {
         let mut c = Carrier::default();
-        let log = Item::new_commodity(Good::Wood);
+        let log = Item::new_commodity(crate::economy::core_ids::wood());
         let _ = c.try_pick_up(log, 3);
         assert!(c.is_at_haul_cap());
     }
@@ -600,7 +599,7 @@ mod tests {
     fn is_at_haul_cap_triggers_for_partial_two_handed() {
         // A single log already pins both hands — can't pick up more, so deposit.
         let mut c = Carrier::default();
-        let log = Item::new_commodity(Good::Wood);
+        let log = Item::new_commodity(crate::economy::core_ids::wood());
         let _ = c.try_pick_up(log, 1);
         assert!(c.is_at_haul_cap());
     }
@@ -608,7 +607,7 @@ mod tests {
     #[test]
     fn is_at_haul_cap_requires_both_hands_for_one_hand_goods() {
         let mut c = Carrier::default();
-        let coal = Item::new_commodity(Good::Coal); // OneHand
+        let coal = Item::new_commodity(crate::economy::core_ids::coal()); // OneHand
         let _ = c.try_pick_up(coal, 3);
         assert!(!c.is_at_haul_cap(), "one filled hand isn't enough");
         let _ = c.try_pick_up(coal, 3);
@@ -620,16 +619,17 @@ mod tests {
         // Read-only capacity must agree with what try_pick_up actually accepts,
         // across bulk classes and partial-hand states. This guards the resolver
         // from committing units the executor would refuse.
-        let cases = [
-            Good::Stone,  // TwoHand, 5000g (binds qty cap before weight)
-            Good::Wood,   // TwoHand, 3000g
-            Good::Coal,   // OneHand, 2000g
-            Good::Fruit,  // Small, 250g
-            Good::GrainSeed,   // Small, 20g
-            Good::BerrySeed,   // Small, 20g
+        let cases: [crate::economy::resource_catalog::ResourceId; 6] = [
+            crate::economy::core_ids::stone(),       // TwoHand, 5000g
+            crate::economy::core_ids::wood(),        // TwoHand, 3000g
+            crate::economy::core_ids::coal(),        // OneHand, 2000g
+            crate::economy::core_ids::fruit(),       // Small, 250g
+            crate::economy::core_ids::grain_seed(),  // Small, 20g
+            crate::economy::core_ids::berry_seed(),  // Small, 20g
         ];
-        for good in cases {
-            let item = Item::new_commodity(good);
+        let fruit_id = crate::economy::core_ids::fruit();
+        for rid in cases {
+            let item = Item::new_commodity(rid);
 
             // Empty carrier.
             let mut probe = Carrier::default();
@@ -639,22 +639,21 @@ mod tests {
                 cap.saturating_add(5).saturating_sub(leftover),
                 cap,
                 "empty carrier accepted != reported capacity for {:?}",
-                good
+                rid
             );
 
             // Half-full carrier (one Fruit pre-loaded). Skip when good IS Fruit
-            // since the test would just be a top-up of the same stack, which
-            // is fine but redundant with the small-stack case below.
-            if good != Good::Fruit {
+            // since the test would just be a top-up of the same stack.
+            if rid != fruit_id {
                 let mut c = Carrier::default();
-                let _ = c.try_pick_up(Item::new_commodity(Good::Fruit), 1);
+                let _ = c.try_pick_up(Item::new_commodity(fruit_id), 1);
                 let cap = c.pickup_capacity(item);
                 let leftover = c.try_pick_up(item, cap.saturating_add(5));
                 assert_eq!(
                     cap.saturating_add(5).saturating_sub(leftover),
                     cap,
                     "half-full carrier accepted != reported capacity for {:?}",
-                    good
+                    rid
                 );
             }
         }
@@ -663,8 +662,8 @@ mod tests {
     #[test]
     fn pickup_capacity_zero_when_twohand_blocked() {
         let mut c = Carrier::default();
-        let _ = c.try_pick_up(Item::new_commodity(Good::Fruit), 1);
-        let stone = Item::new_commodity(Good::Stone);
+        let _ = c.try_pick_up(Item::new_commodity(crate::economy::core_ids::fruit()), 1);
+        let stone = Item::new_commodity(crate::economy::core_ids::stone());
         assert_eq!(
             c.pickup_capacity(stone),
             0,
@@ -675,9 +674,9 @@ mod tests {
     #[test]
     fn drop_one_hand_prefers_heaviest() {
         let mut c = Carrier::default();
-        let _ = c.try_pick_up(Item::new_commodity(Good::Coal), 3); // ~10 kg per hand
-        let _ = c.try_pick_up(Item::new_commodity(Good::Skin), 3); // ~4.5 kg per hand
+        let _ = c.try_pick_up(Item::new_commodity(crate::economy::core_ids::coal()), 3); // ~10 kg per hand
+        let _ = c.try_pick_up(Item::new_commodity(crate::economy::core_ids::skin()), 3); // ~4.5 kg per hand
         let dropped = c.drop_one_hand().expect("should drop something");
-        assert_eq!(dropped.item.good(), Good::Coal);
+        assert_eq!(dropped.item.resource_id, crate::economy::core_ids::coal());
     }
 }

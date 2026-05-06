@@ -226,14 +226,19 @@ impl TestSim {
     /// Drop a stack of `good` × `qty` directly on `(tx, ty)`. Spawned as
     /// a `GroundItem` with the standard `Indexed` hook so spatial-index
     /// queries find it on the next sync.
-    pub fn spawn_ground_item(&mut self, tile: (i32, i32), good: Good, qty: u32) -> Entity {
+    pub fn spawn_ground_item(
+        &mut self,
+        tile: (i32, i32),
+        resource: impl Into<crate::economy::resource_catalog::ResourceId>,
+        qty: u32,
+    ) -> Entity {
         use crate::simulation::items::GroundItem;
         let world_pos = tile_to_world(tile.0, tile.1);
         self.app
             .world_mut()
             .spawn((
                 GroundItem {
-                    item: Item::new_commodity(good),
+                    item: Item::new_commodity(resource.into()),
                     qty,
                 },
                 Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
@@ -274,7 +279,7 @@ pub struct PersonBuilder {
     skills: Skills,
     profession: Profession,
     goal: AgentGoal,
-    inventory: Vec<(Good, u32)>,
+    inventory: Vec<(crate::economy::resource_catalog::ResourceId, u32)>,
     known_plan_ids: Vec<PlanId>,
     bucket: u32,
 }
@@ -352,8 +357,12 @@ impl PersonBuilder {
         self
     }
 
-    pub fn add_inventory(&mut self, good: Good, qty: u32) -> &mut Self {
-        self.inventory.push((good, qty));
+    pub fn add_inventory(
+        &mut self,
+        resource: impl Into<crate::economy::resource_catalog::ResourceId>,
+        qty: u32,
+    ) -> &mut Self {
+        self.inventory.push((resource.into(), qty));
         self
     }
 
@@ -372,8 +381,8 @@ impl PersonBuilder {
         let sex = BiologicalSex::random();
 
         let mut economic = EconomicAgent::default();
-        for (good, qty) in &self.inventory {
-            economic.add_item(Item::new_commodity(*good), *qty);
+        for (rid, qty) in &self.inventory {
+            economic.add_item(Item::new_commodity(*rid), *qty);
         }
 
         let now_tick = world.resource::<SimClock>().tick;
@@ -470,8 +479,12 @@ pub fn person_task(app: &App, entity: Entity) -> crate::simulation::typed_task::
         .current
 }
 
-/// Quick accessor for an agent's EconomicAgent (returns a clone).
-pub fn person_inventory(app: &App, entity: Entity) -> AHashMap<Good, u32> {
+/// Quick accessor for an agent's EconomicAgent inventory totals keyed by
+/// `ResourceId` (returns a clone).
+pub fn person_inventory(
+    app: &App,
+    entity: Entity,
+) -> AHashMap<crate::economy::resource_catalog::ResourceId, u32> {
     let econ = app
         .world()
         .get::<EconomicAgent>(entity)
@@ -479,7 +492,7 @@ pub fn person_inventory(app: &App, entity: Entity) -> AHashMap<Good, u32> {
     let mut out = AHashMap::new();
     for (item, qty) in econ.inventory.iter() {
         if *qty > 0 {
-            *out.entry(item.good()).or_insert(0) += *qty;
+            *out.entry(item.resource_id).or_insert(0) += *qty;
         }
     }
     out
@@ -658,7 +671,7 @@ mod baseline_behaviour {
         });
 
         let initial_food = person_inventory(&sim.app, person)
-            .get(&Good::Fruit)
+            .get(&crate::economy::core_ids::fruit())
             .copied()
             .unwrap_or(0);
         assert_eq!(initial_food, 10);
@@ -669,7 +682,7 @@ mod baseline_behaviour {
         sim.tick_n(400);
 
         let final_food = person_inventory(&sim.app, person)
-            .get(&Good::Fruit)
+            .get(&crate::economy::core_ids::fruit())
             .copied()
             .unwrap_or(0);
         assert!(
@@ -747,7 +760,7 @@ mod baseline_behaviour {
             .factions
             .get(&sim.player_faction_id)
             .expect("player faction missing");
-        let wood_total = faction.storage.stock_of(Good::Wood.into());
+        let wood_total = faction.storage.stock_of(crate::economy::core_ids::wood());
         assert!(
             wood_total > 0,
             "expected wood at storage tile to register on faction storage; got {}",
@@ -827,7 +840,7 @@ mod baseline_behaviour {
                 .get_mut::<crate::simulation::typed_task::ActionQueue>(person)
                 .unwrap();
             aq.current = Task::WithdrawGood {
-                filter: WithdrawGoodFilter::Specific(Good::Wood.into()),
+                filter: WithdrawGoodFilter::Specific(crate::economy::core_ids::wood()),
             };
         }
         sim.tick();
@@ -835,7 +848,7 @@ mod baseline_behaviour {
         let ai = person_ai(&sim.app, person);
         let task = person_task(&sim.app, person);
         let inv = person_inventory(&sim.app, person);
-        let wood_in_hand = inv.get(&Good::Wood).copied().unwrap_or(0);
+        let wood_in_hand = inv.get(&crate::economy::core_ids::wood()).copied().unwrap_or(0);
 
         assert!(
             wood_in_hand >= 1,
@@ -988,7 +1001,7 @@ mod baseline_behaviour {
                 .unwrap();
             aq.current = Task::Equip {
                 slot: EquipmentSlot::MainHand,
-                resource_id: Good::Weapon.into(),
+                resource_id: crate::economy::core_ids::weapon(),
             };
         }
         sim.tick();
@@ -1049,7 +1062,7 @@ mod baseline_behaviour {
                 .get_mut::<crate::simulation::typed_task::ActionQueue>(person)
                 .unwrap();
             aq.current = Task::WithdrawMaterial {
-                resource_id: Good::Wood.into(),
+                resource_id: crate::economy::core_ids::wood(),
                 qty: 1,
             };
         }
@@ -1059,7 +1072,7 @@ mod baseline_behaviour {
         let task = person_task(&sim.app, person);
         let inv = person_inventory(&sim.app, person);
         // Wood is Bulk::TwoHand 5kg — fits in either hands or inventory.
-        let wood_total = inv.get(&Good::Wood).copied().unwrap_or(0);
+        let wood_total = inv.get(&crate::economy::core_ids::wood()).copied().unwrap_or(0);
         let in_hand = sim
             .app
             .world()
@@ -1611,7 +1624,7 @@ mod baseline_behaviour {
             let stock = registry
                 .factions
                 .get(&sim.player_faction_id)
-                .map(|f| f.storage.stock_of(Good::Wood.into()))
+                .map(|f| f.storage.stock_of(crate::economy::core_ids::wood()))
                 .unwrap_or(0);
             assert!(
                 stock > 0,
@@ -1635,7 +1648,7 @@ mod baseline_behaviour {
                 kind: JobKind::Haul,
                 progress: JobProgress::Haul {
                     blueprint,
-                    resource_id: Good::Wood.into(),
+                    resource_id: crate::economy::core_ids::wood(),
                     delivered: 0,
                     target: 2,
                 },
@@ -1666,7 +1679,7 @@ mod baseline_behaviour {
             });
             entity.insert(ClaimTarget {
                 blueprint: Some(blueprint),
-                resource_id: Some(Good::Wood.into()),
+                resource_id: Some(crate::economy::core_ids::wood()),
             });
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::Haul;
@@ -1688,7 +1701,7 @@ mod baseline_behaviour {
             Task::WithdrawMaterial { resource_id, qty } => {
                 assert_eq!(
                     resource_id,
-                    Good::Wood.into(),
+                    crate::economy::core_ids::wood(),
                     "head resource should match ClaimTarget"
                 );
                 assert_eq!(qty, 1, "5c-ii-b uses the qty:1 unit-acquisition contract");
@@ -1774,7 +1787,7 @@ mod baseline_behaviour {
                 faction_id: sim.player_faction_id,
                 kind: JobKind::Stockpile,
                 progress: JobProgress::Stockpile {
-                    resource_id: Good::Wood.into(),
+                    resource_id: crate::economy::core_ids::wood(),
                     deposited: 0,
                     target: 8,
                 },
@@ -1845,7 +1858,7 @@ mod baseline_behaviour {
             Some(Task::DepositToFactionStorage { resource_id }) => {
                 assert_eq!(
                     resource_id,
-                    Good::Wood.into(),
+                    crate::economy::core_ids::wood(),
                     "queued deposit resource should match GatherWood goal"
                 );
             }
@@ -1902,7 +1915,7 @@ mod baseline_behaviour {
                 faction_id: sim.player_faction_id,
                 kind: JobKind::Stockpile,
                 progress: JobProgress::Stockpile {
-                    resource_id: Good::Wood.into(),
+                    resource_id: crate::economy::core_ids::wood(),
                     deposited: 0,
                     target: 8,
                 },
@@ -1969,7 +1982,7 @@ mod baseline_behaviour {
             Some(Task::DepositToFactionStorage { resource_id }) => {
                 assert_eq!(
                     resource_id,
-                    Good::Wood.into(),
+                    crate::economy::core_ids::wood(),
                     "queued deposit resource should match GatherWood goal"
                 );
             }
@@ -2016,7 +2029,7 @@ mod baseline_behaviour {
                 faction_id: sim.player_faction_id,
                 kind: JobKind::Stockpile,
                 progress: JobProgress::Stockpile {
-                    resource_id: Good::Wood.into(),
+                    resource_id: crate::economy::core_ids::wood(),
                     deposited: 0,
                     target: 8,
                 },
@@ -2197,7 +2210,7 @@ mod baseline_behaviour {
                 faction_id: sim.player_faction_id,
                 kind: JobKind::Stockpile,
                 progress: JobProgress::Stockpile {
-                    resource_id: Good::Fruit.into(),
+                    resource_id: crate::economy::core_ids::fruit(),
                     deposited: 0,
                     target: 5,
                 },
@@ -2224,7 +2237,7 @@ mod baseline_behaviour {
                 fail_count: 0,
             },
             ClaimTarget {
-                resource_id: Some(Good::Fruit.into()),
+                resource_id: Some(crate::economy::core_ids::fruit()),
                 blueprint: None,
             },
             AgentGoal::GatherFood,
@@ -2251,7 +2264,7 @@ mod baseline_behaviour {
         );
         assert_eq!(
             aq.peek_next(),
-            Some(Task::DepositToFactionStorage { resource_id: Good::Fruit.into() }),
+            Some(Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::fruit() }),
             "the trailing DepositToFactionStorage{{Fruit}} should be queued \
              behind the Scavenge head"
         );
