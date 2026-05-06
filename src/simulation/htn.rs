@@ -840,7 +840,7 @@ impl Method for ScavengeFoodFromGroundMethod {
 /// Sole pre-Phase-5c-ii method for `AbstractTask::AcquireGood { good }`. The
 /// material analogue of `WithdrawFromStorageMethod`: reads the target good from
 /// the abstract task, gates on the per-good ctx fields the dispatcher will
-/// populate, and expands to a single `Task::WithdrawMaterial { good, qty: 1 }`.
+/// populate, and expands to a single `Task::WithdrawMaterial { resource_id: good.into(), qty: 1 }`.
 ///
 /// Three things to flag for the 5c-ii dispatcher PR:
 ///
@@ -894,7 +894,7 @@ impl Method for WithdrawMaterialFromStorageMethod {
         if ctx.material_storage_tile.is_none() {
             return Vec::new();
         }
-        vec![Task::WithdrawMaterial { good, qty: 1 }]
+        vec![Task::WithdrawMaterial { resource_id: good.into(), qty: 1 }]
     }
 
     fn name(&self) -> &'static str {
@@ -971,7 +971,7 @@ impl Method for WithdrawAndHaulToBlueprintMethod {
             return Vec::new();
         }
         vec![
-            Task::WithdrawMaterial { good, qty: 1 },
+            Task::WithdrawMaterial { resource_id: good.into(), qty: 1 },
             Task::HaulToBlueprint { blueprint },
         ]
     }
@@ -1052,7 +1052,7 @@ impl Method for GatherFromKnownMethod {
         };
         vec![
             Task::Gather { tile },
-            Task::DepositToFactionStorage { good },
+            Task::DepositToFactionStorage { resource_id: good.into() },
         ]
     }
 
@@ -1150,7 +1150,7 @@ impl Method for ScavengeFromGroundMethod {
         }
         vec![
             Task::Scavenge { target },
-            Task::DepositToFactionStorage { good },
+            Task::DepositToFactionStorage { resource_id: good.into() },
         ]
     }
 
@@ -1384,7 +1384,7 @@ impl Method for ScavengeFoodForStorageMethod {
         };
         vec![
             Task::Scavenge { target },
-            Task::DepositToFactionStorage { good },
+            Task::DepositToFactionStorage { resource_id: good.into() },
         ]
     }
 
@@ -1533,7 +1533,7 @@ impl Method for ForageFromKnownForStorageMethod {
         };
         vec![
             Task::Gather { tile },
-            Task::DepositToFactionStorage { good },
+            Task::DepositToFactionStorage { resource_id: good.into() },
         ]
     }
 
@@ -2841,7 +2841,7 @@ pub fn htn_acquire_good_dispatch_system(
         let head = tasks.remove(0);
 
         match head {
-            Task::WithdrawMaterial { good: head_good, qty } => {
+            Task::WithdrawMaterial { resource_id: head_resource, qty } => {
                 let dispatched = assign_task_with_routing(
                     &mut ai,
                     (cur_tx, cur_ty),
@@ -2862,13 +2862,22 @@ pub fn htn_acquire_good_dispatch_system(
                 // Reserve the qty against the chosen tile so a parallel
                 // dispatch in the same tick sees a smaller effective stock.
                 // Mirrors `plan_execution_system`'s WithdrawMaterial dispatch
-                // site (`plan/mod.rs:2724`).
+                // site (`plan/mod.rs:2724`). `StorageReservations` and
+                // `PersonAI.reserved_good` still take legacy `Good`; reverse-
+                // resolve at the boundary until those APIs migrate.
+                let head_good = match crate::economy::core_ids::resource_id_to_good(head_resource) {
+                    Some(g) => g,
+                    None => {
+                        ai.active_method = None;
+                        continue;
+                    }
+                };
                 let reserved_tile = (storage_tile.0, storage_tile.1);
                 storage_reservations.add(reserved_tile, head_good, qty as u32);
                 ai.reserved_tile = reserved_tile;
                 ai.reserved_good = Some(head_good);
                 ai.reserved_qty = qty;
-                aq.dispatch(Task::WithdrawMaterial { good: head_good, qty });
+                aq.dispatch(Task::WithdrawMaterial { resource_id: head_resource, qty });
             }
             _ => {
                 // No registered AcquireGood method returns a non-WithdrawMaterial
@@ -3788,7 +3797,7 @@ mod tests {
         assert_eq!(
             tasks,
             vec![Task::WithdrawMaterial {
-                good: Good::Stone,
+                resource_id: Good::Stone.into(),
                 qty: 1
             }]
         );
@@ -3806,14 +3815,14 @@ mod tests {
         assert_eq!(
             wood,
             vec![Task::WithdrawMaterial {
-                good: Good::Wood,
+                resource_id: Good::Wood.into(),
                 qty: 1
             }]
         );
         assert_eq!(
             iron,
             vec![Task::WithdrawMaterial {
-                good: Good::Iron,
+                resource_id: Good::Iron.into(),
                 qty: 1
             }]
         );
@@ -3901,7 +3910,7 @@ mod tests {
             tasks,
             vec![
                 Task::Gather { tile: (6, 9) },
-                Task::DepositToFactionStorage { good: Good::Wood },
+                Task::DepositToFactionStorage { resource_id: Good::Wood.into() },
             ]
         );
     }
@@ -3921,14 +3930,14 @@ mod tests {
             wood,
             vec![
                 Task::Gather { tile: (0, 0) },
-                Task::DepositToFactionStorage { good: Good::Wood },
+                Task::DepositToFactionStorage { resource_id: Good::Wood.into() },
             ]
         );
         assert_eq!(
             stone,
             vec![
                 Task::Gather { tile: (0, 0) },
-                Task::DepositToFactionStorage { good: Good::Stone },
+                Task::DepositToFactionStorage { resource_id: Good::Stone.into() },
             ]
         );
     }
@@ -4028,7 +4037,7 @@ mod tests {
             tasks,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage { good: Good::Wood },
+                Task::DepositToFactionStorage { resource_id: Good::Wood.into() },
             ]
         );
     }
@@ -4048,14 +4057,14 @@ mod tests {
             wood,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage { good: Good::Wood },
+                Task::DepositToFactionStorage { resource_id: Good::Wood.into() },
             ]
         );
         assert_eq!(
             stone,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage { good: Good::Stone },
+                Task::DepositToFactionStorage { resource_id: Good::Stone.into() },
             ]
         );
     }
@@ -4781,7 +4790,7 @@ mod tests {
             tasks,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage { good: Good::Fruit },
+                Task::DepositToFactionStorage { resource_id: Good::Fruit.into() },
             ]
         );
     }
@@ -4804,14 +4813,14 @@ mod tests {
             fruit,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage { good: Good::Fruit },
+                Task::DepositToFactionStorage { resource_id: Good::Fruit.into() },
             ]
         );
         assert_eq!(
             meat,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage { good: Good::Meat },
+                Task::DepositToFactionStorage { resource_id: Good::Meat.into() },
             ]
         );
     }
@@ -5030,7 +5039,7 @@ mod tests {
             tasks,
             vec![
                 Task::Gather { tile: (6, 9) },
-                Task::DepositToFactionStorage { good: Good::Fruit },
+                Task::DepositToFactionStorage { resource_id: Good::Fruit.into() },
             ]
         );
     }
@@ -5046,11 +5055,11 @@ mod tests {
         let fruit_ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(Good::Fruit));
         assert_eq!(
             m.expand(AbstractTask::StockpileFood, &grain_ctx).last(),
-            Some(&Task::DepositToFactionStorage { good: Good::Grain })
+            Some(&Task::DepositToFactionStorage { resource_id: Good::Grain.into() })
         );
         assert_eq!(
             m.expand(AbstractTask::StockpileFood, &fruit_ctx).last(),
-            Some(&Task::DepositToFactionStorage { good: Good::Fruit })
+            Some(&Task::DepositToFactionStorage { resource_id: Good::Fruit.into() })
         );
     }
 

@@ -297,7 +297,7 @@ pub fn withdraw_good_task_system(
                     WithdrawGoodFilter::AnyEntertainment => {
                         gi.item.good().entertainment_value() > 0
                     }
-                    WithdrawGoodFilter::Specific(good) => gi.item.good() == good,
+                    WithdrawGoodFilter::Specific(rid) => gi.item.resource_id == rid,
                 };
                 if !matches {
                     continue;
@@ -400,7 +400,7 @@ pub fn withdraw_material_task_system(
         // Phase 3b-ii: target good + qty come from the typed variant. If the
         // typed task disagrees with task_id, the dispatcher forgot to populate
         // it — bail rather than fall back to stale legacy intent.
-        let Some((target_good, target_qty)) = aq.current.as_withdraw_material() else {
+        let Some((target_resource, target_qty)) = aq.current.as_withdraw_material() else {
             finish_withdraw_material(
                 &mut ai,
                 &mut aq,
@@ -462,12 +462,12 @@ pub fn withdraw_material_task_system(
             // borrowing issues across the spawn call.
             let mut to_drop: Vec<(Good, u32)> = Vec::new();
             if let Some(s) = carrier.left {
-                if s.item.good() != target_good {
+                if s.item.resource_id != target_resource {
                     to_drop.push((s.item.good(), s.qty));
                 }
             }
             if let Some(s) = carrier.right {
-                if s.item.good() != target_good {
+                if s.item.resource_id != target_resource {
                     to_drop.push((s.item.good(), s.qty));
                 }
             }
@@ -487,14 +487,14 @@ pub fn withdraw_material_task_system(
 
         let mut remaining = target_qty as u32;
         let promised = target_qty as u32;
-        let pickup_item = Item::new_commodity(target_good);
+        let pickup_item = Item::new_commodity(target_resource);
 
         for &gi_entity in spatial.get(tx as i32, ty as i32) {
             if remaining == 0 {
                 break;
             }
             if let Ok(mut gi) = ground_items.get_mut(gi_entity) {
-                if gi.qty == 0 || gi.item.good() != target_good {
+                if gi.qty == 0 || gi.item.resource_id != target_resource {
                     continue;
                 }
                 let want = remaining.min(gi.qty);
@@ -507,7 +507,7 @@ pub fn withdraw_material_task_system(
                 let after_hands = carrier.try_pick_up(pickup_item, want);
                 let in_hands = want - after_hands;
                 let after_inv = if after_hands > 0 {
-                    agent.add_good(target_good, after_hands)
+                    agent.add_resource(target_resource, after_hands)
                 } else {
                     0
                 };

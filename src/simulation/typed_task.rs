@@ -46,7 +46,7 @@
 
 use bevy::prelude::Component;
 
-use crate::economy::goods::Good;
+use crate::economy::resource_catalog::ResourceId;
 use crate::simulation::items::EquipmentSlot;
 use crate::simulation::memory::MemoryKind;
 use crate::simulation::technology::TechId;
@@ -69,10 +69,9 @@ pub enum WalkReason {
 /// dispatchers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WithdrawGoodFilter {
-    /// Pull exactly this good from the tile (matched by `Good as u8` today;
-    /// will become `ResourceId` equality once the `Item.good → resource_id`
-    /// migration lands in Phase 2 residuals).
-    Specific(Good),
+    /// Pull exactly this resource from the tile (catalog `ResourceId` equality
+    /// against `GroundItem.item.resource_id`).
+    Specific(ResourceId),
     /// Pull any item whose `entertainment_value() > 0`. Used by `PLAY_WITH_STORED_TOY`
     /// to scavenge whatever toy is on the tile rather than committing to a
     /// specific good at plan-author time.
@@ -98,14 +97,15 @@ pub enum Task {
     WithdrawGood {
         filter: WithdrawGoodFilter,
     },
-    /// Withdraw `qty` units of `good` for a faction-blueprint / craft-order /
-    /// haul-claim need. Replaces `PersonAI.{withdraw_good, withdraw_qty}`.
-    /// The reservation against the storage tile still lives on the legacy
-    /// `reserved_*` fields because every cleanup path goes through
-    /// `release_reservation` — Phase 3 collapses that into a `Drop` guard
-    /// once the loose-target fields are fully retired.
+    /// Withdraw `qty` units of `resource_id` for a faction-blueprint /
+    /// craft-order / haul-claim need. Replaces
+    /// `PersonAI.{withdraw_good, withdraw_qty}`. The reservation against the
+    /// storage tile still lives on the legacy `reserved_*` fields because
+    /// every cleanup path goes through `release_reservation` — Phase 3
+    /// collapses that into a `Drop` guard once the loose-target fields are
+    /// fully retired.
     WithdrawMaterial {
-        good: Good,
+        resource_id: ResourceId,
         qty: u8,
     },
     /// Move a matching `Item` from inventory or hands into `Equipment[slot]`.
@@ -113,7 +113,7 @@ pub enum Task {
     /// usage of `craft_recipe_id` (good as u8).
     Equip {
         slot: EquipmentSlot,
-        good: Good,
+        resource_id: ResourceId,
     },
     /// Build a wall / bed / other structure from a `Blueprint` entity. The
     /// `task_id` discriminates `Construct` vs `ConstructBed` for reward
@@ -235,7 +235,7 @@ pub enum Task {
     /// dispatcher consumes the typed channel yet — the legacy `GatherWood` /
     /// `GatherStone` plans (PlanId 2/3) remain authoritative.
     DepositToFactionStorage {
-        good: Good,
+        resource_id: ResourceId,
     },
     /// Walk to a random reachable tile near the agent's faction home, hoping
     /// to record a `MemoryKind::{kind}` sighting along the way. Produced by
@@ -439,17 +439,17 @@ impl Task {
     }
 
     /// Convenience accessor for the WithdrawMaterial variant.
-    pub fn as_withdraw_material(&self) -> Option<(Good, u8)> {
+    pub fn as_withdraw_material(&self) -> Option<(ResourceId, u8)> {
         match *self {
-            Task::WithdrawMaterial { good, qty } => Some((good, qty)),
+            Task::WithdrawMaterial { resource_id, qty } => Some((resource_id, qty)),
             _ => None,
         }
     }
 
     /// Convenience accessor for the Equip variant.
-    pub fn as_equip(&self) -> Option<(EquipmentSlot, Good)> {
+    pub fn as_equip(&self) -> Option<(EquipmentSlot, ResourceId)> {
         match *self {
-            Task::Equip { slot, good } => Some((slot, good)),
+            Task::Equip { slot, resource_id } => Some((slot, resource_id)),
             _ => None,
         }
     }
@@ -542,12 +542,12 @@ impl Task {
     }
 
     /// Convenience accessor for the DepositToFactionStorage variant. Returns
-    /// the `good` payload — the executor itself is parameterless (the legacy
+    /// the resource payload — the executor itself is parameterless (the legacy
     /// `TaskKind::DepositResource` path dumps whatever is in hand) but the
     /// typed task records what the chain produced for inspection.
-    pub fn as_deposit_to_faction_storage(&self) -> Option<Good> {
+    pub fn as_deposit_to_faction_storage(&self) -> Option<ResourceId> {
         match *self {
-            Task::DepositToFactionStorage { good } => Some(good),
+            Task::DepositToFactionStorage { resource_id } => Some(resource_id),
             _ => None,
         }
     }

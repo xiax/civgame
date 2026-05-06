@@ -46,10 +46,10 @@ Current variants:
 
 - `Idle` — between tasks.
 - `WalkTo { tile, z, why: WalkReason }` — pure movement; `WalkReason` tags the dispatch context (currently `MilitaryMove` and reserved `Gather`).
-- `WithdrawGood { filter: WithdrawGoodFilter }` — `Specific(Good)` or `AnyEntertainment`.
-- `WithdrawMaterial { good, qty }` — withdraw N of a specific material from storage.
+- `WithdrawGood { filter: WithdrawGoodFilter }` — `Specific(ResourceId)` or `AnyEntertainment`.
+- `WithdrawMaterial { resource_id, qty }` — withdraw N of a specific catalog resource from storage.
 - `WithdrawFood { tile }` — pull one edible off the named faction-storage tile.
-- `Equip { slot: EquipmentSlot, good: Good }`.
+- `Equip { slot: EquipmentSlot, resource_id: ResourceId }`.
 - `Construct { blueprint: Entity }` — covers Construct + ConstructBed (the `task_id` discriminant survives for reward scaling).
 - `Gather { tile }`, `Dig { tile }`, `Scavenge { target: Entity }`.
 - `Read { tech }`, `Teach { tech }`, `HoldLecture { tech }`, `AttendLecture { tech }` — all in `teaching.rs`.
@@ -57,7 +57,7 @@ Current variants:
 - `Sleep { bed: Option<Entity> }` — bookkeeping only (the executor is a state transition, not a per-tick task system).
 - `Eat` — parameterless, in-place. Executor (`production::eat_task_system`) inspects inventory + hands for the smallest-cover-then-largest selection.
 - `HaulToBlueprint { blueprint }` — carry hand contents to the named `Blueprint` and drop into deposit slots. Trailing leg of `[WithdrawMaterial, HaulToBlueprint]`.
-- `DepositToFactionStorage { good }` — carry hand contents to the nearest faction storage tile and drop. Trailing leg of gather/scavenge chains.
+- `DepositToFactionStorage { resource_id }` — carry hand contents to the nearest faction storage tile and drop. Trailing leg of gather/scavenge chains.
 - `Explore { kind: MemoryKind }` — walk to a random reachable tile near faction home, hoping to record a matching sighting.
 
 **Rules of the road:**

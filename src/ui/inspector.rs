@@ -808,10 +808,11 @@ pub fn inspector_panel_system(
                                 } else if ai.task_id == TaskKind::Scavenge as u16 {
                                     work_str = "Picking up item".to_string();
                                 } else if ai.task_id == TaskKind::WithdrawMaterial as u16 {
-                                    if let Some((good, qty)) = aq.current.as_withdraw_material() {
+                                    if let Some((rid, qty)) = aq.current.as_withdraw_material() {
                                         work_str = format!(
-                                            "Withdrawing {:?} \u{00d7} {}",
-                                            good, qty
+                                            "Withdrawing {} \u{00d7} {}",
+                                            crate::economy::core_ids::display_name(rid),
+                                            qty
                                         );
                                     } else {
                                         work_str = "Withdrawing".to_string();
@@ -830,11 +831,8 @@ pub fn inspector_panel_system(
                                         Some(WithdrawGoodFilter::AnyEntertainment) => {
                                             "entertainment good".to_owned()
                                         }
-                                        Some(WithdrawGoodFilter::Specific(g)) => {
-                                            crate::economy::core_ids::display_name(
-                                                crate::economy::core_ids::good_to_resource_id(g),
-                                            )
-                                            .to_owned()
+                                        Some(WithdrawGoodFilter::Specific(rid)) => {
+                                            crate::economy::core_ids::display_name(rid).to_owned()
                                         }
                                         None => "good".to_owned(),
                                     };
@@ -859,10 +857,13 @@ pub fn inspector_panel_system(
                             "Target: {}, {}",
                             ai.target_tile.0, ai.target_tile.1
                         ));
-                        if let Some((good, qty)) = aq.current.as_withdraw_material() {
+                        if let Some((rid, qty)) = aq.current.as_withdraw_material() {
                             ui.label(format!(
-                                "Withdraw intent: {:?} \u{00d7} {} from ({}, {})",
-                                good, qty, ai.dest_tile.0, ai.dest_tile.1
+                                "Withdraw intent: {} \u{00d7} {} from ({}, {})",
+                                crate::economy::core_ids::display_name(rid),
+                                qty,
+                                ai.dest_tile.0,
+                                ai.dest_tile.1
                             ));
                         }
                         if let Ok(carrying) = task_display.carrying_q.get(entity) {

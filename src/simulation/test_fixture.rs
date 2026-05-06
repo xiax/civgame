@@ -827,7 +827,7 @@ mod baseline_behaviour {
                 .get_mut::<crate::simulation::typed_task::ActionQueue>(person)
                 .unwrap();
             aq.current = Task::WithdrawGood {
-                filter: WithdrawGoodFilter::Specific(Good::Wood),
+                filter: WithdrawGoodFilter::Specific(Good::Wood.into()),
             };
         }
         sim.tick();
@@ -988,7 +988,7 @@ mod baseline_behaviour {
                 .unwrap();
             aq.current = Task::Equip {
                 slot: EquipmentSlot::MainHand,
-                good: Good::Weapon,
+                resource_id: Good::Weapon.into(),
             };
         }
         sim.tick();
@@ -1049,7 +1049,7 @@ mod baseline_behaviour {
                 .get_mut::<crate::simulation::typed_task::ActionQueue>(person)
                 .unwrap();
             aq.current = Task::WithdrawMaterial {
-                good: Good::Wood,
+                resource_id: Good::Wood.into(),
                 qty: 1,
             };
         }
@@ -1685,8 +1685,12 @@ mod baseline_behaviour {
             .expect("ActionQueue missing");
 
         match aq.current {
-            Task::WithdrawMaterial { good, qty } => {
-                assert_eq!(good, Good::Wood, "head good should match ClaimTarget");
+            Task::WithdrawMaterial { resource_id, qty } => {
+                assert_eq!(
+                    resource_id,
+                    Good::Wood.into(),
+                    "head resource should match ClaimTarget"
+                );
                 assert_eq!(qty, 1, "5c-ii-b uses the qty:1 unit-acquisition contract");
             }
             other => panic!(
@@ -1838,11 +1842,11 @@ mod baseline_behaviour {
             "expected exactly one queued task (DepositToFactionStorage) behind Gather"
         );
         match aq.peek_next() {
-            Some(Task::DepositToFactionStorage { good }) => {
+            Some(Task::DepositToFactionStorage { resource_id }) => {
                 assert_eq!(
-                    good,
-                    Good::Wood,
-                    "queued deposit good should match GatherWood goal"
+                    resource_id,
+                    Good::Wood.into(),
+                    "queued deposit resource should match GatherWood goal"
                 );
             }
             other => panic!(
@@ -1962,11 +1966,11 @@ mod baseline_behaviour {
             "expected exactly one queued task (DepositToFactionStorage) behind Scavenge"
         );
         match aq.peek_next() {
-            Some(Task::DepositToFactionStorage { good }) => {
+            Some(Task::DepositToFactionStorage { resource_id }) => {
                 assert_eq!(
-                    good,
-                    Good::Wood,
-                    "queued deposit good should match GatherWood goal"
+                    resource_id,
+                    Good::Wood.into(),
+                    "queued deposit resource should match GatherWood goal"
                 );
             }
             other => panic!(
@@ -2247,7 +2251,7 @@ mod baseline_behaviour {
         );
         assert_eq!(
             aq.peek_next(),
-            Some(Task::DepositToFactionStorage { good: Good::Fruit }),
+            Some(Task::DepositToFactionStorage { resource_id: Good::Fruit.into() }),
             "the trailing DepositToFactionStorage{{Fruit}} should be queued \
              behind the Scavenge head"
         );

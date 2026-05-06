@@ -382,12 +382,12 @@ pub fn item_pickup_system(
 fn find_best_matching_item(
     agent: &EconomicAgent,
     carrier: &Carrier,
-    wanted: Good,
+    wanted: crate::economy::resource_catalog::ResourceId,
 ) -> Option<(Item, EquipSource)> {
     let mut best: Option<(Item, EquipSource)> = None;
     let mut best_mult = f32::NEG_INFINITY;
     for (item, qty) in &agent.inventory {
-        if *qty == 0 || item.good() != wanted {
+        if *qty == 0 || item.resource_id != wanted {
             continue;
         }
         let m = item.multiplier();
@@ -397,7 +397,7 @@ fn find_best_matching_item(
         }
     }
     for stack in [carrier.left, carrier.right].iter().flatten() {
-        if stack.item.good() != wanted {
+        if stack.item.resource_id != wanted {
             continue;
         }
         let m = stack.item.multiplier();

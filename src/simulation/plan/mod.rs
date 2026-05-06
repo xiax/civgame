@@ -2709,7 +2709,9 @@ pub fn plan_execution_system(
                         } else {
                             match crate::economy::goods::Good::try_from_u8(step_def.extra as u8) {
                                 Some(g) => {
-                                    crate::simulation::typed_task::WithdrawGoodFilter::Specific(g)
+                                    crate::simulation::typed_task::WithdrawGoodFilter::Specific(
+                                        crate::economy::core_ids::good_to_resource_id(g),
+                                    )
                                 }
                                 None => crate::simulation::typed_task::WithdrawGoodFilter::AnyEntertainment,
                             }
@@ -2720,7 +2722,10 @@ pub fn plan_execution_system(
                     // Phase 3d-i retired the `equip_slot` legacy field; the
                     // executor reads slot + good from `aq.current.as_equip()`.
                     if let StepTarget::EquipItem { slot, good } = step_def.target {
-                        aq.dispatch(crate::simulation::typed_task::Task::Equip { slot, good });
+                        aq.dispatch(crate::simulation::typed_task::Task::Equip {
+                            slot,
+                            resource_id: crate::economy::core_ids::good_to_resource_id(good),
+                        });
                     }
                     // Commit the resolver-chosen withdraw intent into the typed
                     // `Task::WithdrawMaterial` variant (Phase 3b-iii: legacy
@@ -2735,7 +2740,7 @@ pub fn plan_execution_system(
                             Some((good, qty)) => {
                                 aq.dispatch(
                                     crate::simulation::typed_task::Task::WithdrawMaterial {
-                                        good,
+                                        resource_id: crate::economy::core_ids::good_to_resource_id(good),
                                         qty,
                                     },
                                 );
