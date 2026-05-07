@@ -315,6 +315,8 @@ impl Plugin for SimulationPlugin {
                         .after(movement::movement_system),
                     teaching::apply_teach_order_system
                         .after(teaching::apply_player_knowledge_orders_system),
+                    tasks::apply_move_order_system
+                        .after(teaching::apply_teach_order_system),
                     teaching::read_task_system
                         .after(teaching::apply_player_knowledge_orders_system)
                         .before(plan::plan_execution_system),

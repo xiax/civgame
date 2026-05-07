@@ -4,7 +4,7 @@ use super::items::GroundItem;
 use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::needs::Needs;
-use super::person::PlayerOrder;
+use super::person::{PlayerOrder, PlayerOrderKind};
 use super::person::{AiState, Drafted, PersonAI};
 use super::plan::ActivePlan;
 use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
@@ -831,6 +831,26 @@ pub fn goal_dispatch_system(
                     AgentGoal::Play if ai.task_id == TaskKind::Play as u16 => {
                         Some(TaskKind::Play as u16)
                     }
+                    // Phase 5e-xii-b: HTN-driven `WithdrawAndThrowStonesAsPlayMethod`
+                    // chain runs without an ActivePlan under Play. Both legs
+                    // (WithdrawMaterial + PlayThrow) survive across
+                    // goal-dispatch ticks until completion or external
+                    // preempt — mirrors the method's `MF_UNINTERRUPTIBLE`.
+                    AgentGoal::Play if ai.task_id == TaskKind::WithdrawMaterial as u16 => {
+                        Some(TaskKind::WithdrawMaterial as u16)
+                    }
+                    AgentGoal::Play if ai.task_id == TaskKind::PlayThrow as u16 => {
+                        Some(TaskKind::PlayThrow as u16)
+                    }
+                    // Phase 5e-xii-d: HTN-driven `WithdrawAndPlantGrainSeedAsPlayMethod`
+                    // / `WithdrawAndPlantBerrySeedAsPlayMethod` chains run
+                    // without an ActivePlan under Play. The trailing PlayPlant
+                    // leg walks to the destination grass tile and plants;
+                    // survives across goal-dispatch ticks until completion or
+                    // external preempt — mirrors the methods' `MF_UNINTERRUPTIBLE`.
+                    AgentGoal::Play if ai.task_id == TaskKind::PlayPlant as u16 => {
+                        Some(TaskKind::PlayPlant as u16)
+                    }
                     AgentGoal::Socialize if ai.task_id == TaskKind::Socialize as u16 => {
                         Some(TaskKind::Socialize as u16)
                     }
@@ -891,6 +911,49 @@ pub fn goal_dispatch_system(
                 aq.advance();
             }
         });
+}
+
+/// Consume `PlayerOrder { Move }` and dispatch the routing once. The right-click
+/// UI handler in `ui/orders.rs` only inserts the marker for the Move arm; this
+/// system owns the actual `assign_task_with_routing` call so programmatic
+/// callers (tests, future scripting / network-issued orders) get the same
+/// behaviour without duplicating the dispatch in the UI layer.
+///
+/// Fires on `Changed<PlayerOrder>` so a fresh insert (or a re-targeted order)
+/// re-routes; once the agent reaches the target and `task_id` returns to
+/// `UNEMPLOYED`, `player_order_completion_system` (in `ui/orders.rs`) removes
+/// the marker.
+pub fn apply_move_order_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    mut query: Query<(&PlayerOrder, &mut PersonAI, &Transform), Changed<PlayerOrder>>,
+) {
+    for (order, mut ai, transform) in query.iter_mut() {
+        if !matches!(order.order, PlayerOrderKind::Move) {
+            continue;
+        }
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+        assign_task_with_routing(
+            &mut ai,
+            (cur_tx, cur_ty),
+            cur_chunk,
+            order.target_tile,
+            TaskKind::Idle,
+            None,
+            &chunk_graph,
+            &chunk_router,
+            &chunk_map,
+            &chunk_connectivity,
+        );
+        ai.target_z = order.target_z;
+    }
 }
 
 // ── Play task system ──────────────────────────────────────────────────────────

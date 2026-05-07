@@ -516,9 +516,12 @@ pub fn pregnancy_system(
                     // PLAY_SOCIAL / PLAY_SOLO retired in Phase 5e-xii-a
                     // (HTN methods PlayWithPartnerMethod / PlaySoloMethod).
                     PlanId::HAUL_FROM_STORAGE_AND_BUILD,
-                    PlanId::PLAY_BY_PLANTING,
-                    PlanId::PLAY_BY_THROWING_ROCKS,
-                    PlanId::PLAY_WITH_STORED_TOY,
+                    // PLAY_BY_PLANTING retired in Phase 5e-xii-d
+                    // (HTN method `WithdrawAndPlantGrainSeedAsPlayMethod`).
+                    // PLAY_BY_THROWING_ROCKS retired in Phase 5e-xii-b
+                    // (HTN method `WithdrawAndThrowStonesAsPlayMethod`).
+                    // PLAY_WITH_STORED_TOY retired in Phase 5e-xii-c
+                    // (HTN method `WithdrawAndPlayWithToyMethod`).
                     // CLAIMED_BUILD retired in Phase 5e-vi (HTN method).
                     // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
                     // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.

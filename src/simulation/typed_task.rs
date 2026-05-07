@@ -358,6 +358,34 @@ pub enum Task {
     Play {
         partner: Option<bevy::prelude::Entity>,
     },
+    /// Recreational rock-throwing in place. Consumes one Stone from inventory
+    /// (or hands), awards Combat XP + `ActivityKind::Combat`, bursts willpower.
+    /// Parameterless because the executor (`production_system`'s PlayThrow
+    /// branch) acts in place at the agent's current tile and reads the stone
+    /// from `EconomicAgent`. Produced by `WithdrawAndThrowStonesAsPlayMethod`
+    /// (Phase 5e-xii-b — replaces the legacy `PlayByThrowingRocks` plan,
+    /// PlanId 31) as the trailing leg of a
+    /// `[WithdrawMaterial { stone, 1 }, PlayThrow]` chain. The chain handoff
+    /// in `production::finish_withdraw_material` primes the legacy channel
+    /// with `task_id = TaskKind::PlayThrow` once the stone is in hand — the
+    /// throw is in-place, no routing required.
+    PlayThrow,
+    /// Recreational seed-planting on an unplanted grass tile. Consumes one
+    /// Grain or Berry seed from inventory or hands, spawns the matching
+    /// `PlantKind` at `tile`, awards Farming XP + `ActivityKind::Farming`,
+    /// bursts willpower. Shares `production_system`'s Planter branch with
+    /// `Task::Planter { tile }` — the only difference is `is_play = true`
+    /// for the willpower burst on completion. Produced by
+    /// `WithdrawAndPlantSeedAsPlayMethod` / `WithdrawAndPlantBerrySeedAsPlayMethod`
+    /// (Phase 5e-xii-d — replaces the legacy `PlayByPlanting` plan, PlanId 30,
+    /// and `PlayByPlantingBerry` plan, PlanId 67) as the trailing leg of a
+    /// `[WithdrawMaterial { seed, 1 }, PlayPlant { tile }]` chain. The chain
+    /// handoff in `production::finish_withdraw_material` routes via
+    /// `TaskKind::PlayPlant` to the destination grass tile carried by the
+    /// typed variant once the seed is in hand.
+    PlayPlant {
+        tile: (i32, i32),
+    },
     /// Work adjacent to a satisfied `CraftOrder` until the recipe completes.
     /// Produced by `WorkOnSatisfiedCraftOrderMethod` (Phase 5e-xi-b — replaces
     /// the legacy `WorkOnCraft` plan, PlanId 16) as the head of a
@@ -803,6 +831,21 @@ impl Task {
     pub fn as_play(&self) -> Option<Option<bevy::prelude::Entity>> {
         match *self {
             Task::Play { partner } => Some(partner),
+            _ => None,
+        }
+    }
+
+    /// True if this task is the in-place `PlayThrow` variant. Carries no
+    /// parameters so a discriminant check is sufficient.
+    pub fn is_play_throw(&self) -> bool {
+        matches!(*self, Task::PlayThrow)
+    }
+
+    /// Convenience accessor for the PlayPlant variant. Returns the destination
+    /// grass tile the agent should plant on.
+    pub fn as_play_plant(&self) -> Option<(i32, i32)> {
+        match *self {
+            Task::PlayPlant { tile } => Some(tile),
             _ => None,
         }
     }

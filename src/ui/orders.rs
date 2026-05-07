@@ -494,19 +494,12 @@ pub fn right_click_context_menu_system(
 
             match action {
                 PlayerOrderKind::Move => {
-                    assign_task_with_routing(
-                        &mut ai,
-                        (cur_tx as i32, cur_ty as i32),
-                        cur_chunk,
-                        target_tile,
-                        TaskKind::Idle,
-                        None,
-                        &routing.chunk_graph,
-                        &routing.chunk_router,
-                        &chunk_map,
-                        &routing.chunk_connectivity,
-                    );
-                    ai.target_z = target_z;
+                    // Routing is dispatched by `apply_move_order_system`
+                    // (`simulation/tasks.rs`) one tick after the `PlayerOrder`
+                    // marker lands, so the same code path serves both UI
+                    // right-clicks and programmatic insertions (tests,
+                    // scripting). One-tick latency is negligible for player
+                    // input.
                 }
                 PlayerOrderKind::Mine | PlayerOrderKind::Gather => {
                     assign_task_with_routing(

@@ -315,9 +315,12 @@ impl PersonBuilder {
                 // PLAY_SOCIAL / PLAY_SOLO retired in Phase 5e-xii-a
                 // (HTN methods PlayWithPartnerMethod / PlaySoloMethod).
                 PlanId::HAUL_FROM_STORAGE_AND_BUILD,
-                PlanId::PLAY_BY_PLANTING,
-                PlanId::PLAY_BY_THROWING_ROCKS,
-                PlanId::PLAY_WITH_STORED_TOY,
+                // PLAY_BY_PLANTING retired in Phase 5e-xii-d
+                // (HTN method `WithdrawAndPlantGrainSeedAsPlayMethod`).
+                // PLAY_BY_THROWING_ROCKS retired in Phase 5e-xii-b
+                // (HTN method `WithdrawAndThrowStonesAsPlayMethod`).
+                // PLAY_WITH_STORED_TOY retired in Phase 5e-xii-c
+                // (HTN method `WithdrawAndPlayWithToyMethod`).
                 // CLAIMED_BUILD retired in Phase 5e-vi (HTN method).
                 // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
                 // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
@@ -3227,6 +3230,232 @@ mod baseline_behaviour {
             "Play is single-leg — nothing should be queued"
         );
         // Verify the goal actually settled on Play during the dispatch tick.
+        let goal = sim.app.world().get::<AgentGoal>(actor).expect("goal missing");
+        assert_eq!(*goal, AgentGoal::Play, "expected goal to be Play");
+    }
+
+    /// Phase 5e-xii-b: an agent under `AgentGoal::Play` with no nearby partner
+    /// or held entertainment item but with Stone in faction storage dispatches
+    /// the `[Task::WithdrawMaterial { stone, 1 }, Task::PlayThrow]` chain via
+    /// `htn_play_dispatch_system` + `WithdrawAndThrowStonesAsPlayMethod`.
+    /// Replaces the legacy `PlayByThrowingRocks` plan (PlanId 31).
+    #[test]
+    fn play_goal_dispatches_withdraw_then_throw_stones_chain_when_alone() {
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::needs::Needs;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(142);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Storage tile with Stone, far enough away that the actor has to walk.
+        let storage_tile = (4, 4);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+        sim.spawn_ground_item(storage_tile, crate::economy::core_ids::stone(), 3);
+
+        // Solo actor — no partner spawned, hands empty (no entertainment item),
+        // no adjacent ground items besides the stone in storage. Low willpower
+        // pins AgentGoal::Play.
+        let actor = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.needs(Needs {
+                hunger: 20.0,
+                sleep: 20.0,
+                shelter: 20.0,
+                safety: 20.0,
+                social: 20.0,
+                reproduction: 20.0,
+                willpower: 30.0, // below PLAY_THRESHOLD so Play goal naturally fires
+            });
+        });
+
+        // Seven ticks: SpatialIndex / Added<Indexed> settle, FactionStorage
+        // rollup populates `totals[Stone] > 0`, goal_update_system flips to
+        // Play, ParallelB dispatcher argmaxes the registry, and routes to the
+        // storage tile. WithdrawAndThrowStonesAsPlayMethod (UTIL_BASELINE=1.0)
+        // is the only applicable Play method since no partner is in range and
+        // the actor holds no entertainment item.
+        sim.tick_n(7);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(actor)
+            .expect("ActionQueue missing");
+
+        match aq.current {
+            Task::WithdrawMaterial { resource_id, qty } => {
+                assert_eq!(
+                    resource_id,
+                    crate::economy::core_ids::stone(),
+                    "head WithdrawMaterial should target Stone"
+                );
+                assert_eq!(qty, 1, "throw chain withdraws exactly one stone");
+            }
+            other => panic!(
+                "expected Task::WithdrawMaterial{{Stone}} as head of throw chain, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(
+            aq.queued_len(),
+            1,
+            "trailing Task::PlayThrow should be queued"
+        );
+        match aq.peek_next() {
+            Some(Task::PlayThrow) => {}
+            other => panic!(
+                "expected queued Task::PlayThrow as trailing leg, got {:?}",
+                other
+            ),
+        }
+        let goal = sim.app.world().get::<AgentGoal>(actor).expect("goal missing");
+        assert_eq!(*goal, AgentGoal::Play, "expected goal to be Play");
+    }
+
+    /// Phase 5e-xii-c: an agent under `AgentGoal::Play` with no nearby partner
+    /// and no held entertainment item but with a Luxury (entertainment_value=50)
+    /// in faction storage dispatches the
+    /// `[Task::WithdrawMaterial { luxury, 1 }, Task::Play { partner: None }]`
+    /// chain via `htn_play_dispatch_system` + `WithdrawAndPlayWithToyMethod`.
+    /// Replaces the legacy `PlayWithStoredToy` plan (PlanId 32).
+    #[test]
+    fn play_goal_dispatches_withdraw_then_solo_play_chain_when_only_toy_in_storage() {
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::needs::Needs;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(143);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Storage tile holding Luxury — no Stone, so the throw-rocks method
+        // can't fire. Toy method should win as the only applicable Play
+        // method (besides PlaySolo, which requires a held / adjacent
+        // entertainment item — the actor has neither).
+        let storage_tile = (4, 4);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+        sim.spawn_ground_item(storage_tile, crate::economy::core_ids::luxury(), 2);
+
+        // Solo actor — no partner spawned, hands empty. Low willpower pins
+        // AgentGoal::Play.
+        let actor = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.needs(Needs {
+                hunger: 20.0,
+                sleep: 20.0,
+                shelter: 20.0,
+                safety: 20.0,
+                social: 20.0,
+                reproduction: 20.0,
+                willpower: 30.0,
+            });
+        });
+
+        sim.tick_n(7);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(actor)
+            .expect("ActionQueue missing");
+
+        match aq.current {
+            Task::WithdrawMaterial { resource_id, qty } => {
+                assert_eq!(
+                    resource_id,
+                    crate::economy::core_ids::luxury(),
+                    "head WithdrawMaterial should target the toy resource"
+                );
+                assert_eq!(qty, 1, "toy chain withdraws exactly one");
+            }
+            other => panic!(
+                "expected Task::WithdrawMaterial{{Luxury}} as head of toy chain, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(
+            aq.queued_len(),
+            1,
+            "trailing Task::Play{{partner: None}} should be queued"
+        );
+        match aq.peek_next() {
+            Some(Task::Play { partner: None }) => {}
+            other => panic!(
+                "expected queued Task::Play{{partner: None}} as trailing leg, got {:?}",
+                other
+            ),
+        }
+        let goal = sim.app.world().get::<AgentGoal>(actor).expect("goal missing");
+        assert_eq!(*goal, AgentGoal::Play, "expected goal to be Play");
+    }
+
+    /// Phase 5e-xii-d: an agent under `AgentGoal::Play` with a Grain seed in
+    /// faction storage and unplanted Grass tiles in range dispatches the
+    /// `[Task::WithdrawMaterial { grain_seed, 1 }, Task::PlayPlant { tile }]`
+    /// chain via `htn_play_dispatch_system` +
+    /// `WithdrawAndPlantGrainSeedAsPlayMethod`. Replaces the legacy
+    /// `PlayByPlanting` plan (PlanId 30).
+    #[test]
+    fn play_goal_dispatches_withdraw_then_plant_grain_seed_chain() {
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::needs::Needs;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(144);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Storage tile holding a Grain seed — only resource available, so
+        // the plant-as-play method is the only applicable Play option
+        // (besides PlaySolo, which gates on held / adjacent entertainment
+        // items — the actor has neither).
+        let storage_tile = (4, 4);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+        sim.spawn_ground_item(storage_tile, crate::economy::core_ids::grain_seed(), 2);
+
+        let actor = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.needs(Needs {
+                hunger: 20.0,
+                sleep: 20.0,
+                shelter: 20.0,
+                safety: 20.0,
+                social: 20.0,
+                reproduction: 20.0,
+                willpower: 30.0,
+            });
+        });
+
+        sim.tick_n(7);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(actor)
+            .expect("ActionQueue missing");
+
+        match aq.current {
+            Task::WithdrawMaterial { resource_id, qty } => {
+                assert_eq!(
+                    resource_id,
+                    crate::economy::core_ids::grain_seed(),
+                    "head WithdrawMaterial should target grain_seed"
+                );
+                assert_eq!(qty, 1, "play-plant chain withdraws exactly one seed");
+            }
+            other => panic!(
+                "expected Task::WithdrawMaterial{{GrainSeed}} as head of plant chain, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(
+            aq.queued_len(),
+            1,
+            "trailing Task::PlayPlant should be queued"
+        );
+        match aq.peek_next() {
+            Some(Task::PlayPlant { .. }) => {}
+            other => panic!(
+                "expected queued Task::PlayPlant as trailing leg, got {:?}",
+                other
+            ),
+        }
         let goal = sim.app.world().get::<AgentGoal>(actor).expect("goal missing");
         assert_eq!(*goal, AgentGoal::Play, "expected goal to be Play");
     }

@@ -356,6 +356,10 @@ impl MethodId {
     pub const HARVEST_AND_HAUL_GRAIN_TO_CRAFT_ORDER: MethodId = MethodId(32);
     pub const PLAY_WITH_PARTNER: MethodId = MethodId(33);
     pub const PLAY_SOLO_WITH_ITEM: MethodId = MethodId(34);
+    pub const WITHDRAW_AND_THROW_STONES_AS_PLAY: MethodId = MethodId(35);
+    pub const WITHDRAW_AND_PLAY_WITH_TOY: MethodId = MethodId(36);
+    pub const WITHDRAW_AND_PLANT_GRAIN_SEED_AS_PLAY: MethodId = MethodId(37);
+    pub const WITHDRAW_AND_PLANT_BERRY_SEED_AS_PLAY: MethodId = MethodId(38);
 
     pub fn raw(self) -> u16 {
         self.0
@@ -734,6 +738,43 @@ pub struct PlannerCtx {
     /// `true` when the agent has an entertainment-valued item in hand or
     /// adjacent on the ground. Read by `PlaySoloMethod` (Phase 5e-xii-a).
     pub play_solo_eligible: bool,
+    /// Nearest faction storage tile holding at least one Stone. Read by
+    /// `WithdrawAndThrowStonesAsPlayMethod` (Phase 5e-xii-b) to seed the
+    /// `WithdrawMaterial` head of a `[WithdrawMaterial, PlayThrow]` chain.
+    /// `None` for SOLO agents, factions without storage, or storage without
+    /// stone (after `StorageReservations` deduction). Other dispatchers
+    /// leave it at `None`.
+    pub play_stone_storage_tile: Option<(i32, i32)>,
+    /// Nearest faction storage tile holding at least one entertainment-valued
+    /// resource (`entertainment_value() > 0`). Read by
+    /// `WithdrawAndPlayWithToyMethod` (Phase 5e-xii-c) to seed the
+    /// `WithdrawMaterial` head of a `[WithdrawMaterial, Play { None }]` chain.
+    /// Pairs with `play_toy_resource` (the specific resource picked at
+    /// decision time). `None` for SOLO agents, factions without storage, or
+    /// storage without any entertainment-valued resource. Other dispatchers
+    /// leave it at `None`.
+    pub play_toy_storage_tile: Option<(i32, i32)>,
+    /// Specific entertainment-valued resource picked from the storage tile
+    /// snapshot. Read by `WithdrawAndPlayWithToyMethod` so the typed
+    /// `WithdrawMaterial { resource_id }` head carries the right resource
+    /// payload. `None` when no toy was found. Other dispatchers leave it at
+    /// `None`.
+    pub play_toy_resource: Option<ResourceId>,
+    /// Nearest faction storage tile holding at least one Grain seed. Read by
+    /// `WithdrawAndPlantGrainSeedAsPlayMethod` (Phase 5e-xii-d) to seed the
+    /// `WithdrawMaterial` head of a `[WithdrawMaterial, PlayPlant { tile }]`
+    /// chain. `None` when SOLO / no storage / no grain seeds.
+    pub play_grain_seed_storage_tile: Option<(i32, i32)>,
+    /// Nearest faction storage tile holding at least one Berry seed. Read by
+    /// `WithdrawAndPlantBerrySeedAsPlayMethod` (Phase 5e-xii-d). `None` when
+    /// SOLO / no storage / no berry seeds.
+    pub play_berry_seed_storage_tile: Option<(i32, i32)>,
+    /// Nearest unplanted Grass tile within `VIEW_RADIUS=15` of the agent.
+    /// Read by `WithdrawAndPlantGrainSeedAsPlayMethod` /
+    /// `WithdrawAndPlantBerrySeedAsPlayMethod` (Phase 5e-xii-d) as the
+    /// destination of the trailing `Task::PlayPlant { tile }` leg. `None`
+    /// when no unplanted grass is in range.
+    pub play_plant_destination_tile: Option<(i32, i32)>,
 }
 
 /// A single decomposition rule for an `AbstractTask`. Scoring (`utility`) and
@@ -918,6 +959,22 @@ pub fn register_builtin_methods(reg: &mut MethodRegistry) {
     );
     reg.register(AbstractTaskKind::Play, Box::new(PlayWithPartnerMethod));
     reg.register(AbstractTaskKind::Play, Box::new(PlaySoloMethod));
+    reg.register(
+        AbstractTaskKind::Play,
+        Box::new(WithdrawAndThrowStonesAsPlayMethod),
+    );
+    reg.register(
+        AbstractTaskKind::Play,
+        Box::new(WithdrawAndPlayWithToyMethod),
+    );
+    reg.register(
+        AbstractTaskKind::Play,
+        Box::new(WithdrawAndPlantGrainSeedAsPlayMethod),
+    );
+    reg.register(
+        AbstractTaskKind::Play,
+        Box::new(WithdrawAndPlantBerrySeedAsPlayMethod),
+    );
 }
 
 /// Sole method for `AbstractTask::Sleep`. Mirrors the three-branch decision
@@ -2845,6 +2902,12 @@ pub fn htn_dispatch_system(
                 craft_output_resource: None,
                 play_partner_entity: None,
                 play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
             };
 
             // Argmax over applicable methods. f32 has no total order; ties
@@ -3067,6 +3130,12 @@ pub fn htn_eat_dispatch_system(
                 craft_output_resource: None,
                 play_partner_entity: None,
                 play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
             };
 
             let abstract_task = AbstractTask::Eat;
@@ -3341,6 +3410,12 @@ pub fn htn_acquire_food_dispatch_system(
                 craft_output_resource: None,
                 play_partner_entity: None,
                 play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
             };
 
             let abstract_task = AbstractTask::AcquireFood;
@@ -3759,6 +3834,12 @@ pub fn htn_acquire_good_dispatch_system(
                     craft_output_resource: None,
                     play_partner_entity: None,
                     play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
                 };
 
                 let abstract_task = AbstractTask::AcquireGood {
@@ -4017,6 +4098,12 @@ pub fn htn_acquire_good_dispatch_system(
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         };
 
         let abstract_task = AbstractTask::AcquireGood { resource_id };
@@ -4316,6 +4403,12 @@ pub fn htn_stockpile_food_dispatch_system(
                 craft_output_resource: None,
                 play_partner_entity: None,
                 play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
             };
 
             let abstract_task = AbstractTask::StockpileFood;
@@ -4638,6 +4731,12 @@ pub fn htn_equip_hunting_spear_dispatch_system(
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         };
 
         let abstract_task = AbstractTask::EquipHuntingSpear;
@@ -4836,6 +4935,12 @@ pub fn htn_scout_dispatch_system(
                 craft_output_resource: None,
                 play_partner_entity: None,
                 play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
             };
 
             let abstract_task = AbstractTask::Scout;
@@ -5070,6 +5175,12 @@ pub fn htn_return_surplus_dispatch_system(
                 craft_output_resource: None,
                 play_partner_entity: None,
                 play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
             };
 
             let abstract_task = AbstractTask::ReturnSurplus;
@@ -5285,6 +5396,12 @@ pub fn htn_tame_horse_dispatch_system(
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         };
 
         let abstract_task = AbstractTask::TameWildHorse;
@@ -5550,6 +5667,12 @@ pub fn htn_plant_from_storage_dispatch_system(
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         };
 
         let abstract_task = AbstractTask::PlantFromStorage {
@@ -5752,6 +5875,12 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         };
 
         let abstract_task = AbstractTask::ConstructBlueprint;
@@ -5920,6 +6049,12 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         };
 
         let abstract_task = AbstractTask::DeliverHuntKill;
@@ -6201,6 +6336,12 @@ pub fn htn_engage_prey_dispatch_system(
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         };
 
         let abstract_task = AbstractTask::EngagePrey;
@@ -6439,6 +6580,12 @@ pub fn htn_join_hunt_party_dispatch_system(
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         };
 
         let abstract_task = AbstractTask::JoinHuntParty;
@@ -6656,6 +6803,12 @@ pub fn htn_socialize_dispatch_system(
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         };
 
         let abstract_task = AbstractTask::Socialize;
@@ -6892,6 +7045,12 @@ pub fn htn_combat_faction_dispatch_system(
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         };
 
         let methods = method_registry.methods_for(abstract_kind);
@@ -7271,6 +7430,12 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         };
 
         let abstract_task = AbstractTask::DeliverMaterialToCraftOrder {
@@ -7526,6 +7691,12 @@ pub fn htn_work_on_craft_order_dispatch_system(
             craft_output_resource: Some(output_resource),
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         };
 
         let abstract_task = AbstractTask::WorkOnCraftOrder;
@@ -7799,6 +7970,12 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         };
 
         let abstract_task = AbstractTask::HarvestGrainForCraftOrder;
@@ -7922,6 +8099,217 @@ impl Method for PlaySoloMethod {
     }
 }
 
+/// Phase 5e-xii-b method: agent under `AgentGoal::Play` withdraws one Stone
+/// from faction storage and throws it as recreation. Two-leg expansion
+/// `[WithdrawMaterial { stone, 1 }, PlayThrow]`. The chain handoff in
+/// `production::finish_withdraw_material` primes `task_id = TaskKind::PlayThrow`
+/// once the stone is in hand (in-place — no routing); `production_system`'s
+/// PlayThrow branch then consumes one stone, awards Combat XP +
+/// `ActivityKind::Combat`, and bursts willpower.
+///
+/// Replaces the legacy `PlayByThrowingRocks` plan (PlanId 31) +
+/// `[StepId(34) WithdrawStone, StepId(37) ThrowRocksAsPlay]`.
+///
+/// `MF_UNINTERRUPTIBLE` so a goal flip mid-fetch (e.g. willpower partially
+/// recovered before the agent reaches storage) doesn't strand them with a
+/// reservation. The chain ends naturally on completion or via
+/// `goal_dispatch_system`'s no-plan stale-reset reseeding the same plan.
+pub struct WithdrawAndThrowStonesAsPlayMethod;
+
+impl Method for WithdrawAndThrowStonesAsPlayMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::Play) && ctx.play_stone_storage_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        // Throwing rocks is a baseline Play option — outranked by social play
+        // (1.5) but on par with solo-with-item (1.0). The legacy plan had
+        // bias 0.0 with state weights centred on willpower distress + combat
+        // skill; mapping that to UTIL_BASELINE preserves the rough rank.
+        UTIL_BASELINE
+    }
+
+    fn expand(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> Vec<Task> {
+        let stone_id = crate::economy::core_ids::stone();
+        vec![
+            Task::WithdrawMaterial {
+                resource_id: stone_id,
+                qty: 1,
+            },
+            Task::PlayThrow,
+        ]
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn name(&self) -> &'static str {
+        "WithdrawAndThrowStonesAsPlay"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::WITHDRAW_AND_THROW_STONES_AS_PLAY
+    }
+}
+
+/// Phase 5e-xii-c method: agent under `AgentGoal::Play` withdraws an
+/// entertainment-valued item (luxury / cloth / tools / book / toy) from
+/// faction storage and plays with it solo. Two-leg expansion
+/// `[WithdrawMaterial { toy, 1 }, Play { partner: None }]`. The chain handoff
+/// in `production::finish_withdraw_material` primes `task_id = TaskKind::Play`
+/// once the item is in hand (in-place — no routing); `play_system`'s solo
+/// branch then accumulates willpower per-tick scaled by the toy's
+/// `entertainment_value`.
+///
+/// Replaces the legacy `PlayWithStoredToy` plan (PlanId 32) +
+/// `[StepId(35) WithdrawPlayItem, StepId(30) PlayWithItem]`.
+///
+/// `MF_UNINTERRUPTIBLE` so a goal flip mid-fetch doesn't strand the agent
+/// with a reservation.
+pub struct WithdrawAndPlayWithToyMethod;
+
+impl Method for WithdrawAndPlayWithToyMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::Play)
+            && ctx.play_toy_storage_tile.is_some()
+            && ctx.play_toy_resource.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        // Solo play with a stored toy is on par with held / adjacent solo
+        // play (both 1.0). Social play (1.5) wins when a partner is around;
+        // otherwise this method ties with the throw-rocks fallback (1.0) and
+        // is selected by registry-insertion order — toy beats throw, which
+        // matches the legacy plan ranking (the toy's entertainment-scaled
+        // willpower fill outproduces a one-shot throw burst).
+        UTIL_BASELINE
+    }
+
+    fn expand(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        let Some(rid) = ctx.play_toy_resource else {
+            return Vec::new();
+        };
+        vec![
+            Task::WithdrawMaterial {
+                resource_id: rid,
+                qty: 1,
+            },
+            Task::Play { partner: None },
+        ]
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn name(&self) -> &'static str {
+        "WithdrawAndPlayWithToy"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::WITHDRAW_AND_PLAY_WITH_TOY
+    }
+}
+
+/// Phase 5e-xii-d method: agent under `AgentGoal::Play` withdraws one
+/// Grain seed from faction storage and plants it on the nearest unplanted
+/// grass tile as recreation. Two-leg expansion
+/// `[WithdrawMaterial { grain_seed, 1 }, PlayPlant { tile }]`. The chain
+/// handoff in `production::finish_withdraw_material` routes via
+/// `TaskKind::PlayPlant` to the destination tile carried by the typed
+/// variant once the seed is in hand. `production_system`'s Planter branch
+/// (shared with `Task::Planter`) handles the actual plant on the destination
+/// tile, awarding Farming XP + `ActivityKind::Farming` plus a one-shot
+/// willpower burst (because `is_play = true`).
+///
+/// Replaces the legacy `PlayByPlanting` plan (PlanId 30) +
+/// `[StepId(33) WithdrawGrainSeed, StepId(36) PlantGrainSeedAsPlay]`.
+///
+/// `MF_UNINTERRUPTIBLE` so a goal flip mid-fetch doesn't strand the agent
+/// with a reservation.
+pub struct WithdrawAndPlantGrainSeedAsPlayMethod;
+
+impl Method for WithdrawAndPlantGrainSeedAsPlayMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::Play)
+            && ctx.play_grain_seed_storage_tile.is_some()
+            && ctx.play_plant_destination_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE
+    }
+
+    fn expand(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        let Some(tile) = ctx.play_plant_destination_tile else {
+            return Vec::new();
+        };
+        vec![
+            Task::WithdrawMaterial {
+                resource_id: crate::economy::core_ids::grain_seed(),
+                qty: 1,
+            },
+            Task::PlayPlant { tile },
+        ]
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn name(&self) -> &'static str {
+        "WithdrawAndPlantGrainSeedAsPlay"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::WITHDRAW_AND_PLANT_GRAIN_SEED_AS_PLAY
+    }
+}
+
+/// Phase 5e-xii-d method: same shape as
+/// `WithdrawAndPlantGrainSeedAsPlayMethod` but for Berry seeds. Replaces the
+/// legacy `PlayByPlantingBerry` plan (PlanId 67) +
+/// `[StepId(60) WithdrawBerrySeed, StepId(62) PlantBerrySeedAsPlay]`.
+pub struct WithdrawAndPlantBerrySeedAsPlayMethod;
+
+impl Method for WithdrawAndPlantBerrySeedAsPlayMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::Play)
+            && ctx.play_berry_seed_storage_tile.is_some()
+            && ctx.play_plant_destination_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE
+    }
+
+    fn expand(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        let Some(tile) = ctx.play_plant_destination_tile else {
+            return Vec::new();
+        };
+        vec![
+            Task::WithdrawMaterial {
+                resource_id: crate::economy::core_ids::berry_seed(),
+                qty: 1,
+            },
+            Task::PlayPlant { tile },
+        ]
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn name(&self) -> &'static str {
+        "WithdrawAndPlantBerrySeedAsPlay"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::WITHDRAW_AND_PLANT_BERRY_SEED_AS_PLAY
+    }
+}
+
 /// Phase 5e-xii-a dispatcher. Owns `AgentGoal::Play` end-to-end via the `Play`
 /// abstract task. Replaces the legacy `PlaySocial` (PlanId 26) and `PlaySolo`
 /// (PlanId 27) plans.
@@ -7943,8 +8331,11 @@ pub fn htn_play_dispatch_system(
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
     chunk_connectivity: Res<ChunkConnectivity>,
+    storage_tile_map: Res<StorageTileMap>,
+    storage_reservations: Res<crate::simulation::faction::StorageReservations>,
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
+    plant_map: Res<crate::simulation::plants::PlantMap>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     person_query: Query<(), With<crate::simulation::person::Person>>,
     bp_query: Query<(), With<crate::simulation::construction::Blueprint>>,
@@ -8070,7 +8461,157 @@ pub fn htn_play_dispatch_system(
             }
         }
 
-        if play_partner_entity.is_none() && !play_solo_eligible {
+        // Phase 5e-xii-b: scan faction storage for Stone so
+        // `WithdrawAndThrowStonesAsPlayMethod` becomes selectable. Mirrors the
+        // per-tile scan in `htn_plant_from_storage_dispatch_system` — same
+        // `effective = stock - reservations` filter so two agents can't commit
+        // to the same one-unit stack. SOLO agents skip (no faction storage).
+        //
+        // Phase 5e-xii-c: in the same pass also scan for any
+        // entertainment-valued resource so `WithdrawAndPlayWithToyMethod`
+        // becomes selectable. The argmax over toys picks the highest
+        // `entertainment_value` (tie-break by nearest tile, stable by
+        // `ResourceId.0`); ties between Stone and a toy at the same tile are
+        // resolved at method-utility time (both 1.0 today; the throw method
+        // wins on insertion order, mirroring `register_builtin_methods`).
+        let mut play_stone_storage_tile: Option<(i32, i32)> = None;
+        let mut play_toy_storage_tile: Option<(i32, i32)> = None;
+        let mut play_toy_resource: Option<ResourceId> = None;
+        let mut play_grain_seed_storage_tile: Option<(i32, i32)> = None;
+        let mut play_berry_seed_storage_tile: Option<(i32, i32)> = None;
+        if let Some(member) = member_opt {
+            if member.faction_id != SOLO {
+                let stone_id = crate::economy::core_ids::stone();
+                let grain_seed_id = crate::economy::core_ids::grain_seed();
+                let berry_seed_id = crate::economy::core_ids::berry_seed();
+                if let Some(tiles) = storage_tile_map.by_faction.get(&member.faction_id) {
+                    let mut best_stone_dist = i32::MAX;
+                    let mut best_toy_value: u8 = 0;
+                    let mut best_toy_dist = i32::MAX;
+                    let mut best_toy_rid: Option<ResourceId> = None;
+                    let mut best_grain_dist = i32::MAX;
+                    let mut best_berry_dist = i32::MAX;
+                    for &(tx, ty) in tiles {
+                        let dist = (tx - cur_tx).abs() + (ty - cur_ty).abs();
+                        // Aggregate per-tile stocks: stone (one resource),
+                        // grain seed, berry seed, and toy (any non-stone
+                        // resource with entertainment_value > 0, pick the
+                        // highest-valued one on this tile).
+                        let mut tile_stone_stock: u32 = 0;
+                        let mut tile_grain_stock: u32 = 0;
+                        let mut tile_berry_stock: u32 = 0;
+                        let mut tile_best_toy: Option<(ResourceId, u8)> = None;
+                        for &gi_entity in spatial.get(tx, ty) {
+                            let Ok(gi) = item_query.get(gi_entity) else {
+                                continue;
+                            };
+                            if gi.qty == 0 {
+                                continue;
+                            }
+                            if gi.item.resource_id == stone_id {
+                                tile_stone_stock = tile_stone_stock.saturating_add(gi.qty);
+                            }
+                            if gi.item.resource_id == grain_seed_id {
+                                tile_grain_stock = tile_grain_stock.saturating_add(gi.qty);
+                            }
+                            if gi.item.resource_id == berry_seed_id {
+                                tile_berry_stock = tile_berry_stock.saturating_add(gi.qty);
+                            }
+                            // Stone has entertainment_value > 0 (rock-throwing
+                            // is recreation), but it's specifically the throw
+                            // method's domain. Exclude it from the toy scan
+                            // so the two methods don't double-count the same
+                            // resource — `WithdrawAndPlayWithToyMethod` is for
+                            // luxuries / cloth / tools / books / etc.
+                            if gi.item.resource_id == stone_id {
+                                continue;
+                            }
+                            let ent = gi.item.resource_id.entertainment_value();
+                            if ent > 0 {
+                                let reserved =
+                                    storage_reservations.get((tx, ty), gi.item.resource_id);
+                                if gi.qty.saturating_sub(reserved) == 0 {
+                                    continue;
+                                }
+                                if tile_best_toy.map_or(true, |(_, v)| ent > v) {
+                                    tile_best_toy = Some((gi.item.resource_id, ent));
+                                }
+                            }
+                        }
+                        let stone_reserved = storage_reservations.get((tx, ty), stone_id);
+                        let stone_effective = tile_stone_stock.saturating_sub(stone_reserved);
+                        if stone_effective > 0 && dist < best_stone_dist {
+                            best_stone_dist = dist;
+                            play_stone_storage_tile = Some((tx, ty));
+                        }
+                        let grain_reserved = storage_reservations.get((tx, ty), grain_seed_id);
+                        let grain_effective = tile_grain_stock.saturating_sub(grain_reserved);
+                        if grain_effective > 0 && dist < best_grain_dist {
+                            best_grain_dist = dist;
+                            play_grain_seed_storage_tile = Some((tx, ty));
+                        }
+                        let berry_reserved = storage_reservations.get((tx, ty), berry_seed_id);
+                        let berry_effective = tile_berry_stock.saturating_sub(berry_reserved);
+                        if berry_effective > 0 && dist < best_berry_dist {
+                            best_berry_dist = dist;
+                            play_berry_seed_storage_tile = Some((tx, ty));
+                        }
+                        if let Some((rid, value)) = tile_best_toy {
+                            // Argmax: highest entertainment_value first, then
+                            // nearest tile.
+                            let better = value > best_toy_value
+                                || (value == best_toy_value && dist < best_toy_dist);
+                            if better {
+                                best_toy_value = value;
+                                best_toy_dist = dist;
+                                best_toy_rid = Some(rid);
+                                play_toy_storage_tile = Some((tx, ty));
+                            }
+                        }
+                    }
+                    play_toy_resource = best_toy_rid;
+                }
+            }
+        }
+
+        // Phase 5e-xii-d: nearest unplanted Grass tile destination for the
+        // PlayPlant chain. The legacy plans used `StepTarget::NearestTile(GRASS_TILES)`
+        // which scanned 15 tiles around the agent for any Grass tile; the
+        // production_system Planter branch silently bailed if the tile was
+        // already planted. Inline the unplanted-grass scan here so the
+        // dispatcher only commits when an actually-plantable destination
+        // exists.
+        let mut play_plant_destination_tile: Option<(i32, i32)> = None;
+        if play_grain_seed_storage_tile.is_some() || play_berry_seed_storage_tile.is_some() {
+            const GRASS_RADIUS: i32 = 15;
+            let mut best_dist = i32::MAX;
+            for dy in -GRASS_RADIUS..=GRASS_RADIUS {
+                for dx in -GRASS_RADIUS..=GRASS_RADIUS {
+                    let tx = cur_tx + dx;
+                    let ty = cur_ty + dy;
+                    if plant_map.0.contains_key(&(tx, ty)) {
+                        continue;
+                    }
+                    if chunk_map.tile_kind_at(tx, ty)
+                        != Some(crate::world::tile::TileKind::Grass)
+                    {
+                        continue;
+                    }
+                    let dist = dx.abs() + dy.abs();
+                    if dist < best_dist {
+                        best_dist = dist;
+                        play_plant_destination_tile = Some((tx, ty));
+                    }
+                }
+            }
+        }
+
+        if play_partner_entity.is_none()
+            && !play_solo_eligible
+            && play_stone_storage_tile.is_none()
+            && play_toy_storage_tile.is_none()
+            && play_plant_destination_tile.is_none()
+        {
             continue;
         }
 
@@ -8108,6 +8649,12 @@ pub fn htn_play_dispatch_system(
             craft_output_resource: None,
             play_partner_entity,
             play_solo_eligible,
+            play_stone_storage_tile,
+            play_toy_storage_tile,
+            play_toy_resource,
+            play_grain_seed_storage_tile,
+            play_berry_seed_storage_tile,
+            play_plant_destination_tile,
         };
 
         let abstract_task = AbstractTask::Play;
@@ -8156,6 +8703,59 @@ pub fn htn_play_dispatch_system(
                     continue;
                 }
                 aq.dispatch(Task::Play { partner });
+            }
+            Task::WithdrawMaterial {
+                resource_id: head_resource,
+                qty,
+            } => {
+                // Phase 5e-xii-b/c: storage-fed Play chains. Routes the agent
+                // to the storage tile picked at decision time, reserves the qty
+                // so concurrent dispatchers can't commit to the same stack,
+                // and dispatches the typed head. The chain handoff in
+                // `production::finish_withdraw_material`'s
+                // `Task::PlayThrow` / `Task::Play { partner: None }` arms
+                // primes the legacy channel for the in-place play action once
+                // the resource is in hand. Dispatcher selects the storage tile
+                // by matching the head resource: stone → throw-rocks tile;
+                // anything else → toy tile.
+                let storage_tile_opt = if head_resource == crate::economy::core_ids::stone() {
+                    play_stone_storage_tile
+                } else if head_resource == crate::economy::core_ids::grain_seed() {
+                    play_grain_seed_storage_tile
+                } else if head_resource == crate::economy::core_ids::berry_seed() {
+                    play_berry_seed_storage_tile
+                } else {
+                    play_toy_storage_tile
+                };
+                let Some(storage_tile) = storage_tile_opt else {
+                    ai.active_method = None;
+                    continue;
+                };
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    storage_tile,
+                    TaskKind::WithdrawMaterial,
+                    None,
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                storage_reservations.add(storage_tile, head_resource, qty as u32);
+                ai.reserved_tile = storage_tile;
+                ai.reserved_resource = Some(head_resource);
+                ai.reserved_qty = qty;
+                aq.dispatch(Task::WithdrawMaterial {
+                    resource_id: head_resource,
+                    qty,
+                });
             }
             _ => {
                 ai.active_method = None;
@@ -8364,6 +8964,12 @@ mod tests {
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         }
     }
 
@@ -8402,6 +9008,12 @@ mod tests {
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         }
     }
 
@@ -8440,6 +9052,12 @@ mod tests {
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         }
     }
 
@@ -8482,6 +9100,12 @@ mod tests {
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         }
     }
 
@@ -8523,6 +9147,12 @@ mod tests {
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         }
     }
 
@@ -8574,6 +9204,12 @@ mod tests {
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         }
     }
 
@@ -8884,6 +9520,12 @@ mod tests {
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         }
     }
 
@@ -9014,6 +9656,12 @@ mod tests {
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         }
     }
 
@@ -9167,6 +9815,12 @@ mod tests {
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         }
     }
 
@@ -9376,6 +10030,12 @@ mod tests {
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         }
     }
 
@@ -9759,6 +10419,12 @@ mod tests {
             craft_output_resource: None,
             play_partner_entity: None,
             play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
         }
     }
 

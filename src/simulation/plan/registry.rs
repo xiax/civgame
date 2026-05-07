@@ -60,10 +60,10 @@ static PLAN_STEPS_1: &[StepId] = &[StepId(1), StepId(12)]; // FarmFood → Depos
 // could only drive harvesting via FarmFood). StepId(4) (PlantGrainSeed) and
 // StepId(61) (PlantBerrySeed) are no longer referenced by any plan but kept
 // as `(unused)` placeholders for in-flight ActivePlan compatibility.
-// StepId(33) (WithdrawGrainSeed) and StepId(60) (WithdrawBerrySeed) survive —
-// PlayByPlanting (PlanId 30) and PlayByPlantingBerry (PlanId 67) still embed
-// them as the first leg of their play-driven planting chains.
-static PLAN_STEPS_67: &[StepId] = &[StepId(60), StepId(62)]; // PlayByPlantingBerry: WithdrawBerrySeed → PlantBerrySeedAsPlay
+// Phase 5e-xii-d: StepIds 33 (WithdrawGrainSeed), 60 (WithdrawBerrySeed),
+// 36 (PlantGrainSeedAsPlay), 62 (PlantBerrySeedAsPlay) all survive as
+// orphans — their consumers PlanId 30 / 67 retired into HTN methods.
+// PLAN_STEPS_67 (PlayByPlantingBerry) deleted with that migration.
 // HuntFood: muster at hearth → wait for party → travel to chief's area →
 // PLAN_STEPS_5 retired in Phase 5e-viii-c — the legacy `HuntFood` plan
 // (PlanId 5) is fully replaced by three HTN abstract tasks:
@@ -140,9 +140,17 @@ static RESCUE_GOALS: &[AgentGoal] = &[AgentGoal::Rescue];
 // itself retired in this PR. StepId(31) (Explore) survives in the StepRegistry
 // as the legacy executor that HTN's `Task::Explore` dispatchers prime via
 // `assign_task_with_routing(... TaskKind::Explore, None ...)`.
-static PLAN_STEPS_30: &[StepId] = &[StepId(33), StepId(36)]; // PlayByPlanting: WithdrawSeed → PlantSeedAsPlay
-static PLAN_STEPS_31: &[StepId] = &[StepId(34), StepId(37)]; // PlayByThrowingRocks: WithdrawStone → ThrowRocksAsPlay
-static PLAN_STEPS_32: &[StepId] = &[StepId(35), StepId(30)]; // PlayWithStoredToy: WithdrawPlayItem → PlayWithItem (step 30, plays in place when held)
+// Phase 5e-xii-d: PLAN_STEPS_30 (PlayByPlanting) retired — see PlanId 30
+// definition below for the migration notes. StepIds 33 (WithdrawGrainSeed)
+// and 36 (PlantGrainSeedAsPlay) survive in the StepRegistry as orphans.
+// Phase 5e-xii-b: PLAN_STEPS_31 (PlayByThrowingRocks) retired — see PlanId 31
+// definition below for the migration notes. StepIds 34 (WithdrawStone) and 37
+// (ThrowRocksAsPlay) survive in the StepRegistry as orphans for in-flight
+// ActivePlan compatibility.
+// Phase 5e-xii-c: PLAN_STEPS_32 (PlayWithStoredToy) retired — see PlanId 32
+// definition below. StepId 35 (WithdrawPlayItem) and StepId 30 (PlayWithItem,
+// shared with retired PlanId 27 PlaySolo) survive in the StepRegistry as
+// orphans for in-flight ActivePlan compatibility.
 
 static PLAY_GOALS: &[AgentGoal] = &[AgentGoal::Play];
 
@@ -1370,57 +1378,68 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_UNINTERRUPTIBLE,
             requires_profession: None,
         },
+        // Phase 5e-xii-d: PlanId 30 (`PlayByPlanting`) retired. The HTN
+        // `WithdrawAndPlantGrainSeedAsPlayMethod` under
+        // `AbstractTaskKind::Play` (`htn_play_dispatch_system`) owns the
+        // dispatch end-to-end — withdraws a Grain seed from faction storage
+        // and routes via `TaskKind::PlayPlant` to the nearest unplanted
+        // grass tile. The const `PlanId::PLAY_BY_PLANTING = PlanId(30)`
+        // survives only as a stable sentinel for `PlanHistory` ring-buffer
+        // entries. StepIds 33 (WithdrawGrainSeed) and 36 (PlantSeedAsPlay)
+        // survive as orphans for in-flight ActivePlan compatibility.
         PlanDef {
-            // Take a Seed from faction storage and plant it as recreation.
-            // Doubles as low-effort farming progress: each completion spawns a
-            // Grain plant and feeds Farming activity for tech discovery.
             id: PlanId(30),
-            name: "PlayByPlanting",
-            steps: PLAN_STEPS_30,
-            state_weights: mk_weights(&[
-                (SI_WILLPOWER_DISTRESS, 0.6),
-                (SI_SKILL_FARMING, 0.4),
-                (SI_SEASON_FOOD, 0.3),
-            ]),
-            bias: 0.0,
-            serves_goals: PLAY_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
             requires_profession: None,
         },
+        // Phase 5e-xii-b: PlanId 31 (`PlayByThrowingRocks`) retired. The HTN
+        // `WithdrawAndThrowStonesAsPlayMethod` under `AbstractTaskKind::Play`
+        // (`htn_play_dispatch_system`) owns the dispatch end-to-end —
+        // withdraws one Stone from faction storage, primes the legacy channel
+        // for the in-place PlayThrow on arrival, consumes the stone and
+        // bursts willpower. The const `PlanId::PLAY_BY_THROWING_ROCKS = PlanId(31)`
+        // survives only as a stable sentinel for `PlanHistory` ring-buffer
+        // entries. StepIds 34 (WithdrawStone) and 37 (ThrowRocksAsPlay)
+        // survive as orphans in the registry — neither is consumed by any
+        // live PlanDef, but the IDs stay reserved for in-flight ActivePlan
+        // compatibility.
         PlanDef {
-            // Take a Stone from faction storage and throw it as recreation.
-            // Each completion increments ActivityKind::Combat (driving combat
-            // tech discovery) and grants a small Combat XP bump.
             id: PlanId(31),
-            name: "PlayByThrowingRocks",
-            steps: PLAN_STEPS_31,
-            state_weights: mk_weights(&[
-                (SI_WILLPOWER_DISTRESS, 0.6),
-                (SI_SKILL_COMBAT, 0.4),
-            ]),
-            bias: 0.0,
-            serves_goals: PLAY_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
             requires_profession: None,
         },
+        // Phase 5e-xii-c: PlanId 32 (`PlayWithStoredToy`) retired. The HTN
+        // `WithdrawAndPlayWithToyMethod` under `AbstractTaskKind::Play`
+        // (`htn_play_dispatch_system`) owns the dispatch end-to-end —
+        // withdraws the highest-entertainment-valued resource from faction
+        // storage, primes the legacy channel for solo Play once the toy is in
+        // hand, and `play_system` accumulates willpower scaled by the toy's
+        // `entertainment_value`. The const `PlanId::PLAY_WITH_STORED_TOY = PlanId(32)`
+        // survives only as a stable sentinel for `PlanHistory` ring-buffer
+        // entries. StepIds 35 (WithdrawPlayItem) and 30 (PlayWithItem) survive
+        // as orphans — StepId 30 is shared with the retired PlanId 27
+        // PlaySolo, also unconsumed today.
         PlanDef {
-            // Pull an entertainment-valued good (luxury, cloth, tools, …) from
-            // faction storage and play with it in place. Chains into PlaySolo's
-            // PlayWithItem step so the willpower-per-tick refill scales by the
-            // toy's `entertainment_value`.
             id: PlanId(32),
-            name: "PlayWithStoredToy",
-            steps: PLAN_STEPS_32,
-            state_weights: mk_weights(&[
-                (SI_WILLPOWER_DISTRESS, 0.7),
-                (SI_SOCIAL, 0.3),
-            ]),
-            bias: 0.0,
-            serves_goals: PLAY_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
@@ -1573,19 +1592,21 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_NONE,
             requires_profession: None,
         },
+        // Phase 5e-xii-d: PlanId 67 (`PlayByPlantingBerry`) retired. The HTN
+        // `WithdrawAndPlantBerrySeedAsPlayMethod` under
+        // `AbstractTaskKind::Play` (`htn_play_dispatch_system`) owns the
+        // dispatch end-to-end. PlanId 67 was already dead code (never seeded
+        // into any agent's `KnownPlans`); the HTN method restores planting
+        // berry seeds end-to-end. The const survives as a PlanHistory
+        // sentinel; StepIds 60 (WithdrawBerrySeed) and 62 (PlantBerrySeedAsPlay)
+        // survive as orphans for in-flight ActivePlan compatibility.
         PlanDef {
-            // Take a BerrySeed from faction storage and plant it as recreation,
-            // spawning a BerryBush. Awards Farming XP + willpower burst.
             id: PlanId(67),
-            name: "PlayByPlantingBerry",
-            steps: PLAN_STEPS_67,
-            state_weights: mk_weights(&[
-                (SI_WILLPOWER_DISTRESS, 0.6),
-                (SI_SKILL_FARMING, 0.4),
-                (SI_SEASON_FOOD, 0.3),
-            ]),
-            bias: 0.0,
-            serves_goals: PLAY_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,

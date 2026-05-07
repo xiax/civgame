@@ -711,6 +711,64 @@ fn finish_withdraw_material(
                 ai.target_entity = None;
             }
         }
+        Task::PlayThrow => {
+            // Phase 5e-xii-b: PlayByThrowingRocks chain.
+            // `WithdrawAndThrowStonesAsPlayMethod` expands to
+            // [WithdrawMaterial { stone, 1 }, PlayThrow]; once the stone is
+            // in hand (or inventory), the throw is in-place — no routing.
+            // Prime the legacy channel so `production_system`'s PlayThrow
+            // branch picks up next tick. Mirrors `Equip`'s priming pattern
+            // for the hunter-arm chain.
+            ai.state = AiState::Working;
+            ai.task_id = TaskKind::PlayThrow as u16;
+            ai.work_progress = 0;
+        }
+        Task::Play { partner: _ } => {
+            // Phase 5e-xii-c: PlayWithStoredToy chain.
+            // `WithdrawAndPlayWithToyMethod` expands to
+            // [WithdrawMaterial { toy, 1 }, Play { partner: None }]; once the
+            // toy is in hand, solo play is in-place — no routing.
+            // `play_system`'s solo branch reads the held entertainment value
+            // from `Carrier`. Prime the legacy channel so the play_system
+            // executor picks up next tick.
+            ai.state = AiState::Working;
+            ai.task_id = TaskKind::Play as u16;
+            ai.work_progress = 0;
+            // target_entity should already be None (the WithdrawMaterial head
+            // dispatch passed None to `assign_task_with_routing`) — the solo
+            // branch in play_system needs target_entity = None to fall through
+            // to the held-item path.
+            ai.target_entity = None;
+        }
+        Task::PlayPlant { tile } => {
+            // Phase 5e-xii-d: PlayByPlanting / PlayByPlantingBerry chain.
+            // `WithdrawAndPlantGrainSeedAsPlayMethod` /
+            // `WithdrawAndPlantBerrySeedAsPlayMethod` expand to
+            // [WithdrawMaterial { seed, 1 }, PlayPlant { tile }]; once the
+            // seed is in hand, the agent walks to the destination grass tile
+            // picked at dispatch time and plants. Mirrors the Planter chain
+            // handoff but routes via `TaskKind::PlayPlant` so the
+            // production_system Planter branch fires the willpower burst
+            // (`is_play = true`).
+            let dispatched = assign_task_with_routing(
+                ai,
+                cur_tile,
+                cur_chunk,
+                tile,
+                TaskKind::PlayPlant,
+                None,
+                chunk_graph,
+                chunk_router,
+                chunk_map,
+                chunk_connectivity,
+            );
+            if !dispatched {
+                aq.cancel();
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
+            }
+        }
         Task::Idle => {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
