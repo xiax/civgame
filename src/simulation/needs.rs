@@ -30,6 +30,19 @@ pub struct Needs {
     // `avg_distress()` add (255 - willpower) so it still counts as distress
     // when low.
     pub willpower: f32,
+    /// Pluralist Economy R8 — Maslow Tier 4: status, recognition,
+    /// accumulated wealth, social rank. Inverted polarity like
+    /// willpower (0 = unfulfilled, 255 = satiated). Inert in R8;
+    /// the goal-selection rewrite that consumes it (drives Esteem-
+    /// seeking behaviour like commissioning prestigious craft
+    /// contracts, accumulating Luxury) lands as a follow-on
+    /// alongside R12.
+    pub esteem: f32,
+    /// Pluralist Economy R8 — Maslow Tier 5: knowledge mastery,
+    /// teaching, descendants. Inverted polarity. Inert in R8;
+    /// the goal-selection rewrite reuses existing `teaching.rs`
+    /// infrastructure when it consumes this need.
+    pub self_actualization: f32,
 }
 
 impl Needs {
@@ -49,6 +62,11 @@ impl Needs {
             social,
             reproduction: 0.0,
             willpower,
+            // R8: Maslow tiers default to 0 (unfulfilled) — they
+            // accumulate via lifetime activity rather than starting
+            // satiated.
+            esteem: 0.0,
+            self_actualization: 0.0,
         }
     }
 

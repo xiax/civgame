@@ -1348,6 +1348,28 @@ pub fn chief_tablet_posting_system(
     }
 }
 
+/// Pluralist Economy R9 — distance discount per tile in `U_bid`'s
+/// `C_action` term. Same magnitude as the legacy formula's
+/// `dist * 0.001` so paid postings compete on a similar geographic
+/// footprint to communal ones, but with reward as the dominant
+/// signal.
+pub const BID_DIST_DISCOUNT: f32 = 0.001;
+
+/// R9 — wealth modifier in `U_bid`'s `E(R)` term. Poor agents
+/// value $1 more than rich ones — captures the diminishing marginal
+/// utility of currency. Linear schedule: floor 1.0, additional
+/// `+0.5 / (currency + 50)` boost (so an agent with 0 currency gets
+/// 1.0 + 0.5/50 = 1.01 ≈ same as 50; an agent with 200 gets
+/// 1.0 + 0.5/250 ≈ 1.002 — flatter at higher wealth). The constant
+/// is small on purpose: R9 doesn't want wealth modifiers to swamp
+/// the absolute reward signal — that's R12's contract-pricing
+/// territory.
+pub fn wealth_modifier(currency: f32) -> f32 {
+    let baseline = 1.0_f32;
+    let boost = 0.5 / (currency.max(0.0) + 50.0);
+    baseline + boost
+}
+
 /// Skill axis used when scoring a candidate job for a worker.
 fn skill_for(kind: JobKind) -> SkillKind {
     match kind {
@@ -1434,6 +1456,8 @@ pub fn job_claim_system(
             Option<&Profession>,
             &Transform,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
+            // Pluralist Economy R9: needed by `U_bid`'s wealth_modifier.
+            &crate::economy::agent::EconomicAgent,
         ),
         Without<JobClaim>,
     >,
@@ -1459,8 +1483,18 @@ pub fn job_claim_system(
         }
     }
 
-    for (worker, member, ai, lod, skills, personality, profession_opt, transform, knowledge_opt) in
-        workers.iter()
+    for (
+        worker,
+        member,
+        ai,
+        lod,
+        skills,
+        personality,
+        profession_opt,
+        transform,
+        knowledge_opt,
+        agent_econ,
+    ) in workers.iter()
     {
         if *lod == LodLevel::Dormant {
             continue;
@@ -1533,11 +1567,31 @@ pub fn job_claim_system(
                 }
                 None => 0.0,
             };
-            let score = (p.priority as f32) * 0.01
-                + skill_norm
-                + personality_bias(*personality, p.kind)
-                + profession_bias(profession, p.kind)
-                - dist * 0.001;
+            // Pluralist Economy R9: U_bid scoring for paid postings.
+            // Postings with `reward == 0.0` (chief / legacy
+            // communal-labor postings under default policy) keep
+            // today's `priority + skill + bias - distance` formula.
+            // Paid postings (R10+ household / bureaucrat / individual)
+            // score on `U_bid = E(R) - C_action - C_opportunity`.
+            //
+            // The C_opportunity term is stubbed to 0.0 in R9 — proper
+            // wiring (calling `score_method_with_history` against the
+            // agent's other applicable methods) lands when R10+
+            // method paths come online. Until then, paid postings
+            // are scored purely on reward + walk cost.
+            let score = if p.reward > 0.0 {
+                let wealth_mod = wealth_modifier(agent_econ.currency);
+                let expected_reward = p.reward * wealth_mod;
+                let c_action = dist * BID_DIST_DISCOUNT;
+                let c_opportunity = 0.0_f32; // R9 stub; R10+ wires this
+                expected_reward - c_action - c_opportunity
+            } else {
+                (p.priority as f32) * 0.01
+                    + skill_norm
+                    + personality_bias(*personality, p.kind)
+                    + profession_bias(profession, p.kind)
+                    - dist * 0.001
+            };
             match best {
                 Some((_, s)) if s >= score => {}
                 _ => best = Some((idx, score)),

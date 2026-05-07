@@ -1479,6 +1479,259 @@ mod smoke {
 
     // ─── R6-e — chief Farm gated on Grain policy ───
 
+    // ─── Pluralist Economy R7 — per-settlement market activation ───
+
+    #[test]
+    fn two_settlements_in_same_megachunk_develop_independent_prices() {
+        // R7: spawn two factions, each gets an auto-founded
+        // settlement in the same megachunk. Add Cloth supply to
+        // settlement A's market and Cloth demand to settlement B's;
+        // tick `settlement_price_update_system` 100 times; assert
+        // A's Cloth price < B's Cloth price (supply pushes A down,
+        // demand pushes B up).
+        use crate::economy::core_ids;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::settlement::{Settlement, SettlementMap};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Faction A is the player faction (auto-created by TestSim::new
+        // at home_tile (0, 0)). Add a second faction at (5, 5).
+        let faction_b = {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.create_faction((5, 5))
+        };
+
+        // Tick a few times so both settlements auto-found.
+        sim.tick_n(3);
+
+        let (settlement_a_entity, settlement_b_entity) = {
+            let map = sim.app.world().resource::<SettlementMap>();
+            let a_id = map
+                .first_for_faction(sim.player_faction_id)
+                .expect("settlement A not founded");
+            let b_id = map
+                .first_for_faction(faction_b)
+                .expect("settlement B not founded");
+            let a = *map.by_id.get(&a_id).unwrap();
+            let b = *map.by_id.get(&b_id).unwrap();
+            assert_ne!(a, b, "expected two distinct settlement entities");
+            (a, b)
+        };
+
+        let cloth = core_ids::cloth();
+        // Seed Cloth: A heavy supply, B heavy demand. Both start at
+        // empty (no seeded prices); after the first update they
+        // diverge.
+        {
+            let mut a = sim
+                .app
+                .world_mut()
+                .get_mut::<Settlement>(settlement_a_entity)
+                .unwrap();
+            a.market.add_supply(cloth, 100.0);
+        }
+        {
+            let mut b = sim
+                .app
+                .world_mut()
+                .get_mut::<Settlement>(settlement_b_entity)
+                .unwrap();
+            b.market.add_demand(cloth, 100.0);
+        }
+
+        // Tick the per-settlement price update enough to see divergence.
+        sim.tick_n(100);
+
+        let a_price = sim
+            .app
+            .world()
+            .get::<Settlement>(settlement_a_entity)
+            .unwrap()
+            .market
+            .price_of(cloth);
+        let b_price = sim
+            .app
+            .world()
+            .get::<Settlement>(settlement_b_entity)
+            .unwrap()
+            .market
+            .price_of(cloth);
+
+        assert!(
+            a_price < b_price,
+            "expected A's price < B's after supply/demand split: a={a_price}, b={b_price}",
+        );
+    }
+
+    // ─── Pluralist Economy R9 — U_bid scoring at job-claim layer ───
+
+    #[test]
+    fn paid_posting_outscores_unpaid_chief_posting_for_unsatisfied_agent() {
+        // R9: post two competing Stockpile{Wood} jobs at the same
+        // distance — one chief-default (reward=0.0, scored via
+        // legacy formula); one paid (reward=10.0, poster_class=
+        // HouseholdHead). Spawn one None-profession agent. Tick the
+        // claim system; assert the agent claimed the paid posting.
+        use crate::economy::core_ids;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{
+            JobBoard, JobKind, JobPosting, JobProgress, JobSource, PosterClass,
+        };
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        // Member-count > 0 so worker isn't filtered out by faction
+        // checks elsewhere (some upstream systems gate on it).
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(sim.player_faction_id);
+        }
+
+        // Tick a couple times so the claim system schedules and
+        // SimClock advances past tick 0.
+        sim.tick_n(2);
+
+        let unpaid_id;
+        let paid_id;
+        {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            unpaid_id = board.alloc_id();
+            board.faction_postings_mut(sim.player_faction_id).push(JobPosting {
+                id: unpaid_id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Stockpile {
+                    resource_id: core_ids::wood(),
+                    deposited: 0,
+                    target: 5,
+                },
+                claimants: Vec::new(),
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+            paid_id = board.alloc_id();
+            board.faction_postings_mut(sim.player_faction_id).push(JobPosting {
+                id: paid_id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Stockpile {
+                    resource_id: core_ids::stone(),
+                    deposited: 0,
+                    target: 5,
+                },
+                claimants: Vec::new(),
+                priority: 100,
+                source: JobSource::Player,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::HouseholdHead,
+                reward: 10.0,
+                settlement_id: None,
+            });
+        }
+
+        // Tick the claim system. job_claim_system runs each tick;
+        // a few ticks should suffice.
+        sim.tick_n(5);
+
+        // Inspect the JobClaim on the worker.
+        use crate::simulation::jobs::JobClaim;
+        let claim = sim.app.world().get::<JobClaim>(worker);
+        assert!(claim.is_some(), "worker should have claimed something");
+        let claim = claim.unwrap();
+        assert_eq!(
+            claim.job_id, paid_id,
+            "worker should claim the paid posting (id={paid_id}); got {claim:?}",
+        );
+    }
+
+    #[test]
+    fn wealth_modifier_decays_with_currency() {
+        // R9 unit test: wealthy agents apply a smaller multiplier
+        // than poor ones to the same reward.
+        use crate::simulation::jobs::wealth_modifier;
+        let poor = wealth_modifier(0.0);
+        let middle = wealth_modifier(50.0);
+        let rich = wealth_modifier(1000.0);
+        assert!(poor > middle);
+        assert!(middle > rich);
+        assert!(rich >= 1.0, "modifier never drops below 1.0");
+    }
+
+    // ─── Pluralist Economy R8 — VisitedSettlements + Maslow needs (data layer) ───
+
+    #[test]
+    fn record_settlement_idempotent_and_evicts_lowest_freshness() {
+        // R8: record up to 8 settlement ids; recording a 9th evicts
+        // the lowest-freshness slot. Re-recording an existing id
+        // refreshes its freshness to 255 without adding a duplicate.
+        use crate::simulation::memory::AgentMemory;
+        use crate::simulation::settlement::SettlementId;
+
+        let mut mem = AgentMemory::default();
+        for i in 0..8 {
+            mem.record_settlement(SettlementId(i));
+        }
+        // All 8 slots full; each at freshness 255.
+        let known: Vec<_> = mem.known_settlements().collect();
+        assert_eq!(known.len(), 8);
+        for (_, f) in &known {
+            assert_eq!(*f, 255);
+        }
+
+        // Idempotent re-record.
+        mem.record_settlement(SettlementId(3));
+        let known2: Vec<_> = mem.known_settlements().collect();
+        assert_eq!(known2.len(), 8, "re-record must not add duplicate");
+
+        // Manually drop the freshness of slot 0 to force eviction.
+        if let Some(slot) = mem.visited_settlements.iter_mut().find(|s| {
+            matches!(s, Some((id, _)) if *id == SettlementId(0))
+        }) {
+            if let Some((_, f)) = slot {
+                *f = 1;
+            }
+        }
+        // New id should evict the freshness=1 slot.
+        mem.record_settlement(SettlementId(99));
+        let ids: Vec<_> = mem.known_settlements().map(|(id, _)| id).collect();
+        assert!(ids.contains(&SettlementId(99)), "new id must be recorded");
+        assert!(
+            !ids.contains(&SettlementId(0)),
+            "lowest-freshness slot must have been evicted",
+        );
+    }
+
+    #[test]
+    fn maslow_need_fields_default_to_zero() {
+        // R8 inert-data check: every newly-spawned Person has
+        // esteem=0 and self_actualization=0 — Maslow tiers start
+        // unfulfilled, accumulate via lifetime activity (R9+
+        // wires the goal-selection rewrite that consumes them).
+        use crate::simulation::needs::Needs;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        sim.tick_n(2);
+
+        let needs = sim
+            .app
+            .world()
+            .get::<Needs>(person)
+            .expect("Needs missing");
+        assert_eq!(needs.esteem, 0.0);
+        assert_eq!(needs.self_actualization, 0.0);
+    }
+
     #[test]
     fn chief_skips_farm_when_grain_policy_capitalist() {
         // Flip Grain to capitalist; the chief stops posting Farm.
@@ -2155,6 +2408,8 @@ mod baseline_behaviour {
                 social: 0.0,
                 reproduction: 0.0,
                 willpower: 200.0,
+                esteem: 0.0,
+                self_actualization: 0.0,
             });
         });
 
@@ -4100,6 +4355,8 @@ mod baseline_behaviour {
                 social: 220.0,
                 reproduction: 20.0,
                 willpower: 220.0,
+                esteem: 0.0,
+                self_actualization: 0.0,
             });
         });
         let partner = sim.spawn_person(sim.player_faction_id, (3, 0), |_| {});
@@ -4790,6 +5047,8 @@ mod baseline_behaviour {
                 social: 20.0,
                 reproduction: 20.0,
                 willpower: 30.0, // below PLAY_THRESHOLD so Play goal naturally fires
+                esteem: 0.0,
+                self_actualization: 0.0,
             });
         });
         let partner = sim.spawn_person(sim.player_faction_id, (3, 0), |_| {});
@@ -4858,6 +5117,8 @@ mod baseline_behaviour {
                 social: 20.0,
                 reproduction: 20.0,
                 willpower: 30.0, // below PLAY_THRESHOLD so Play goal naturally fires
+                esteem: 0.0,
+                self_actualization: 0.0,
             });
         });
 
@@ -4939,6 +5200,8 @@ mod baseline_behaviour {
                 social: 20.0,
                 reproduction: 20.0,
                 willpower: 30.0,
+                esteem: 0.0,
+                self_actualization: 0.0,
             });
         });
 
@@ -5012,6 +5275,8 @@ mod baseline_behaviour {
                 social: 20.0,
                 reproduction: 20.0,
                 willpower: 30.0,
+                esteem: 0.0,
+                self_actualization: 0.0,
             });
         });
 

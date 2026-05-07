@@ -83,6 +83,38 @@ Government officials physically employed by the settlement treasury. Demote when
 
 **R6 ships only the gates, not the alternative posters.** Capitalist factions today have *no* postings for the gated resources — household-head / bureaucrat / individual posting paths land in R10+ with the validation worked examples. The gate keeps the parallel-path discipline: legacy chief postings still fire under default policy, capitalist factions opt out cleanly.
 
+## Per-settlement markets (Pluralist Economy R7)
+
+Production trade routes through the agent's faction's first settlement market when one exists; SOLO / unsettled agents fall back to the global `Market` resource.
+
+- **`SettlementMarket`** (`economy/market.rs`) gains full feature parity with the global `Market`: `calculate_price`, `sell_item`, `try_buy_item`, plus a new `clear_flow` for the per-settlement update tick.
+- **`market_sell_system` / `market_buy_system`** (`economy/transactions.rs`) take a `Res<SettlementMap>` + `Query<&mut Settlement>` + `&FactionMember` on the agent query. Each tick: look up the agent's first settlement via `SettlementMap::first_for_faction`; trade against `settlement.market` if found, else the global `Market`. Disjoint mutable borrows (Persons don't have Settlement, Settlements don't have EconomicAgent) so Bevy schedules them in parallel.
+- **`settlement_price_update_system`** (`economy/market.rs`, Economy schedule, alongside global `price_update_system`): iterates every Settlement, adds the same baseline food demand as the global market, ticks `update_prices`, then clears flow. A fresh settlement converges to the same resting prices as the global Market with no agent traffic.
+- **`ui/economy_panel.rs`** prefers the player faction's first settlement market over the global one when displaying prices and listings. Title flips to "Economy (Local Market)" when reading from a settlement.
+- The global `Market` resource stays alive as the SOLO / unsettled fallback (per invariant 6) and as the bootstrap source until `auto_found_default_settlements_system` registers a settlement on the very first tick.
+
+## VisitedSettlements + Maslow needs (Pluralist Economy R8 — data layer)
+
+Two additive layers; both ship as inert data with helpers. The systems that *consume* them (Trader R10 walks `visited_settlements`; Maslow goal-priority spine consumes `esteem` / `self_actualization`) land in subsequent phases.
+
+- **`AgentMemory.visited_settlements: [Option<(SettlementId, u8)>; 8]`** (`memory.rs`) — additive slot alongside the existing 32-entry tile array. Helpers: `record_settlement(id)` (idempotent re-record, lowest-freshness eviction when full); `known_settlements()` iterator. Existing tile-keyed `gather_target_tile` / `scavenge_target_*` paths are unchanged.
+- **`Needs.esteem: f32`** — Maslow Tier 4 (status, mastery, recognition). Inverted polarity (0 = unfulfilled, 255 = satiated). Default 0.
+- **`Needs.self_actualization: f32`** — Maslow Tier 5 (knowledge, teaching, descendants). Inverted polarity. Default 0.
+- **`Needs::new(...)` signature unchanged.** The new fields default to 0 in the constructor; struct-literal sites set them explicitly. Existing 287 baseline tests stay green because no system reads the new fields yet.
+- **Deferred to follow-on**: gossip propagation of `visited_settlements` via `awareness_gossip_system`; the `MaslowGate` helper in `goals.rs`; new `EsteemSeeking` / `SelfActualizing` `AgentGoal` variants; the goal_update_system Maslow re-ordering. These are wired when their consumers (R10/R12) come online.
+
+## U_bid scoring at job-claim layer (Pluralist Economy R9)
+
+`job_claim_system` (`jobs.rs:1421`) now branches on `posting.reward`:
+
+- **Paid postings (`reward > 0.0`)**: `U_bid = E(R) - C_action - C_opportunity` where:
+  - `E(R) = posting.reward * wealth_modifier(agent.currency)`. The `wealth_modifier(c) = 1.0 + 0.5 / (c + 50)` schedule decays with wealth — poor agents value the same reward more, capturing diminishing marginal utility. Modifier is bounded at `1.0` so it never penalises an agent.
+  - `C_action = euclidean(agent_tile, work_tile) * BID_DIST_DISCOUNT` (same magnitude as the legacy distance penalty so geographic competition is preserved).
+  - `C_opportunity = 0.0` — **stubbed in R9**. Proper wiring (calling `score_method_with_history` against the agent's other applicable HTN methods, taking the max) lands when R10+ paid posters come online.
+- **Unpaid postings (`reward == 0.0`, today's chief / legacy postings)**: keep the legacy `priority + skill + bias - distance` formula verbatim. Default factions are unaffected — every existing chief posting carries `reward = 0.0` so the scorer takes the legacy branch.
+- The workers query gains `&EconomicAgent` for the `wealth_modifier` lookup.
+- R10+ household / bureaucrat / individual posters set `reward > 0.0` so the U_bid branch fires; their postings outscore equidistant chief ones (assuming a non-trivial reward).
+
 ## Agent AI (Goals → HTN → Tasks)
 
 The legacy plan registry (`plan/`) was deleted in Phase 7. AI dispatch runs end-to-end through HTN; the plan registry, `PlanRegistry`/`StepRegistry`/`PlanDef`/`StepDef`/`PlanFlags`/`StepTarget` types, `KnownPlans`/`ActivePlan`/`PlanHistory`/`PlanScoringMethod` components, `state.rs` (`build_state_vec` + `count_visible_*`), and `plan_execution_system` are all gone. `PersonAI.last_plan_id` is gone; `PathRequest` no longer carries a `plan_id` diagnostic field. The awareness-gossip half of the deleted `plan_gossip_system` survives as `knowledge::awareness_gossip_system`.

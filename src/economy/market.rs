@@ -94,6 +94,89 @@ impl SettlementMarket {
             self.prices.insert(id, next);
         }
     }
+
+    /// Reset per-tick supply/demand counters. Called by
+    /// `settlement_price_update_system` after `update_prices`. Mirrors
+    /// the global `price_update_system`'s post-tick clear.
+    pub fn clear_flow(&mut self) {
+        self.supply.clear();
+        self.demand.clear();
+    }
+
+    pub fn calculate_price(&self, item: &Item) -> f32 {
+        self.price_id(item.resource_id) * item.multiplier()
+    }
+
+    /// Mirrors `Market::sell_item`. Agent sells an item; returns
+    /// currency earned.
+    pub fn sell_item(&mut self, item: Item, qty: u32) -> f32 {
+        let price = self.calculate_price(&item);
+        let total_earned = price * qty as f32;
+        let id = item.resource_id;
+        if item.is_manufactured() {
+            if let Some(entry) = self.listings.iter_mut().find(|(it, _)| *it == item) {
+                entry.1 += qty;
+            } else {
+                self.listings.push((item, qty));
+            }
+        } else {
+            *self.market_stock.entry(id).or_insert(0.0) += qty as f32;
+        }
+        *self.supply.entry(id).or_insert(0.0) += qty as f32;
+        total_earned
+    }
+
+    /// Mirrors `Market::try_buy_item`.
+    pub fn try_buy_item(
+        &mut self,
+        id: ResourceId,
+        qty: u32,
+        currency: &mut f32,
+    ) -> (Option<Item>, u32) {
+        let mut best_idx: Option<usize> = None;
+        let mut best_mult = -1.0;
+        for (idx, (item, stock)) in self.listings.iter().enumerate() {
+            if item.resource_id == id && *stock > 0 {
+                let price = self.calculate_price(item);
+                if price <= *currency {
+                    let mult = item.multiplier();
+                    if mult > best_mult {
+                        best_mult = mult;
+                        best_idx = Some(idx);
+                    }
+                }
+            }
+        }
+        if let Some(idx) = best_idx {
+            let item = self.listings[idx].0;
+            let price = self.calculate_price(&item);
+            let buy_qty = qty.min(self.listings[idx].1);
+            let total_cost = price * buy_qty as f32;
+            if total_cost <= *currency {
+                *currency -= total_cost;
+                self.listings[idx].1 -= buy_qty;
+                let bought_item = item;
+                *self.demand.entry(id).or_insert(0.0) += buy_qty as f32;
+                return (Some(bought_item), buy_qty);
+            }
+        }
+        let stock = self.market_stock.get(&id).copied().unwrap_or(0.0);
+        let available = stock.min(qty as f32);
+        if available <= 0.0 {
+            return (None, 0);
+        }
+        let item = Item::new_commodity(id);
+        let price = self.calculate_price(&item);
+        let buy_qty = (available.floor() as u32).min(qty);
+        let total_cost = price * buy_qty as f32;
+        if total_cost > *currency || buy_qty == 0 {
+            return (None, 0);
+        }
+        *currency -= total_cost;
+        self.market_stock.insert(id, stock - buy_qty as f32);
+        *self.demand.entry(id).or_insert(0.0) += buy_qty as f32;
+        (Some(item), buy_qty)
+    }
 }
 
 const DEFAULT_PRICE_FLOOR: f32 = 0.1;
@@ -308,6 +391,28 @@ pub fn price_update_system(mut market: ResMut<Market>, mode: Res<EconomicMode>) 
     market.update_prices();
     market.supply.clear();
     market.demand.clear();
+}
+
+/// Pluralist Economy R7: per-settlement price update. Mirrors
+/// `price_update_system` for the global Market: adds background food
+/// demand, ticks supply/demand → prices, then clears flow counters.
+/// Runs in Economy alongside the global one. Uses the same baseline
+/// food-demand values so a fresh settlement converges to the same
+/// resting prices as the global market.
+pub fn settlement_price_update_system(
+    mode: Res<EconomicMode>,
+    mut settlements: Query<&mut crate::simulation::settlement::Settlement>,
+) {
+    if matches!(*mode, EconomicMode::Command) {
+        return;
+    }
+    for mut settlement in settlements.iter_mut() {
+        settlement.market.add_demand(core_ids::fruit(), 2.0);
+        settlement.market.add_demand(core_ids::meat(), 1.0);
+        settlement.market.add_demand(core_ids::grain(), 2.0);
+        settlement.market.update_prices();
+        settlement.market.clear_flow();
+    }
 }
 
 #[cfg(test)]

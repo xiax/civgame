@@ -85,6 +85,17 @@ pub struct MemoryEntry {
 #[derive(Component, Clone, Default)]
 pub struct AgentMemory {
     pub entries: [Option<MemoryEntry>; 32],
+    /// Pluralist Economy R8 — region-aware memory. Tracks
+    /// `(SettlementId, freshness)` for up to 8 settlements the
+    /// agent has visited or heard about (gossip propagation in
+    /// `awareness_gossip_system` extension lands as a follow-on).
+    /// **Additive**: the existing 32-entry tile array is unchanged
+    /// — `gather_target_tile` / `scavenge_target_*` still drive
+    /// every existing dispatcher. `visited_settlements` only
+    /// informs region-aware queries (Trader R10's
+    /// `ParticipateInMarket` walks pairs in this slot).
+    pub visited_settlements:
+        [Option<(crate::simulation::settlement::SettlementId, u8)>; 8],
 }
 
 impl AgentMemory {
@@ -145,6 +156,54 @@ impl AgentMemory {
 
     pub fn record_entity(&mut self, tile: (i32, i32), kind: MemoryKind, entity: Entity) {
         self.insert_with_freshness(tile, kind, Some(entity), 255);
+    }
+
+    /// Pluralist Economy R8: record a visited / heard-about
+    /// settlement. Idempotent — re-recording the same id resets the
+    /// freshness to 255. When the slot ring is full, evicts the
+    /// lowest-freshness entry (mirrors the tile-ring eviction
+    /// pattern in `insert_with_freshness`).
+    pub fn record_settlement(
+        &mut self,
+        id: crate::simulation::settlement::SettlementId,
+    ) {
+        // Update existing entry.
+        for slot in &mut self.visited_settlements {
+            if let Some((existing, fresh)) = slot {
+                if *existing == id {
+                    *fresh = 255;
+                    return;
+                }
+            }
+        }
+        // Find empty slot.
+        for slot in &mut self.visited_settlements {
+            if slot.is_none() {
+                *slot = Some((id, 255));
+                return;
+            }
+        }
+        // Evict the lowest-freshness slot.
+        let mut min_fresh = u8::MAX;
+        let mut min_idx = 0usize;
+        for (i, slot) in self.visited_settlements.iter().enumerate() {
+            if let Some((_, f)) = slot {
+                if *f < min_fresh {
+                    min_fresh = *f;
+                    min_idx = i;
+                }
+            }
+        }
+        self.visited_settlements[min_idx] = Some((id, 255));
+    }
+
+    /// Pluralist Economy R8: read every remembered settlement,
+    /// freshest first. Used by R10's Trader dispatcher to walk
+    /// pairs of remembered markets for arbitrage decisions.
+    pub fn known_settlements(
+        &self,
+    ) -> impl Iterator<Item = (crate::simulation::settlement::SettlementId, u8)> + '_ {
+        self.visited_settlements.iter().filter_map(|s| *s)
     }
 
     // Bug 4 fix: remove ALL matching entries, not just the first one.

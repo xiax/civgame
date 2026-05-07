@@ -25,7 +25,11 @@ impl Plugin for EconomyPlugin {
             .insert_resource(EconomicMode::default())
             .add_systems(
                 FixedUpdate,
-                (market::price_update_system,).in_set(SimulationSet::Economy),
+                (
+                    market::price_update_system,
+                    market::settlement_price_update_system,
+                )
+                    .in_set(SimulationSet::Economy),
             );
     }
 }
