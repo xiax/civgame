@@ -305,7 +305,8 @@ impl PersonBuilder {
                 // BUILD_BLUEPRINT retired in Phase 5e-xiii-b
                 // (HTN method `GatherAndHaulToPersonalBlueprintMethod`).
                 // TAME_HORSE retired in Phase 5e-iv (HTN method).
-                PlanId::DELIVER_HIDE_TO_CRAFT_ORDER,
+                // DELIVER_HIDE_TO_CRAFT_ORDER retired in Phase 5e-xiv
+                // (generalized Stockpile pipeline).
                 // DELIVER_GRAIN_TO_CRAFT_ORDER retired in Phase 5e-xi-c
                 // (HTN method `HarvestAndHaulGrainToCraftOrderMethod`).
                 // DELIVER_FROM_STORAGE_TO_CRAFT_ORDER retired in Phase 5e-xi-a
@@ -2601,6 +2602,119 @@ mod baseline_behaviour {
             }
             other => panic!(
                 "expected queued Task::HaulToBlueprint, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Phase 5e-xiv: a worker holding a `JobClaim::Stockpile { Skin }` claim
+    /// (set by `posting_claim_target` for the chief-posted CraftOrder demand)
+    /// scavenges a visible loose Skin GroundItem via
+    /// `htn_acquire_good_dispatch_system`'s extended Stockpile branch and
+    /// dispatches `[Task::Scavenge { target }, Task::DepositToFactionStorage { Skin }]`.
+    /// Replaces the legacy `DeliverHideToCraftOrder` plan (PlanId 13) which
+    /// chained Hunt → CollectSkin → HaulToCraftOrder; the new flow has skin
+    /// land in storage first, then a separate worker delivers via
+    /// `WithdrawAndHaulToCraftOrderMethod`.
+    #[test]
+    fn stockpile_goal_dispatches_scavenge_then_deposit_chain_for_skin() {
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::jobs::{
+            ClaimTarget, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+        };
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(93);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let storage_tile = (-10, 0);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+
+        // Spawn a chief at (1, 1) (auto-promoted) so the worker isn't
+        // chosen as chief.
+        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |_| {});
+
+        // Spawn a Skin GroundItem at (5, 0) — within VIEW_RADIUS=15 of the
+        // worker at (0, 0) and outside the storage tile filter.
+        let skin_id = crate::economy::core_ids::skin();
+        let skin_entity = sim.spawn_ground_item((5, 0), skin_id, 1);
+
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        sim.tick_n(10);
+
+        // Post a `JobKind::Stockpile { Skin }` posting + claim onto the
+        // worker. `posting_goal()` maps Stockpile{Skin} → AgentGoal::Stockpile;
+        // `posting_claim_target()` sets `ClaimTarget.resource_id = Skin`.
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            let posting = JobPosting {
+                id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Stockpile {
+                    resource_id: skin_id,
+                    deposited: 0,
+                    target: 4,
+                },
+                claimants: vec![worker],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+            };
+            board
+                .postings
+                .entry(sim.player_faction_id)
+                .or_default()
+                .push(posting);
+            id
+        };
+        {
+            let mut entity = sim.app.world_mut().entity_mut(worker);
+            entity.insert(JobClaim {
+                job_id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                posted_tick: 0,
+                fail_count: 0,
+            });
+            entity.insert(ClaimTarget {
+                blueprint: None,
+                resource_id: Some(skin_id),
+            });
+            let mut goal = entity.get_mut::<AgentGoal>().unwrap();
+            *goal = AgentGoal::Stockpile;
+        }
+
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(worker)
+            .expect("ActionQueue missing");
+        match aq.current {
+            Task::Scavenge { target } => {
+                assert_eq!(
+                    target, skin_entity,
+                    "head Scavenge should target the visible Skin GroundItem"
+                );
+            }
+            other => panic!(
+                "expected Task::Scavenge as head of Stockpile chain, got {:?}",
+                other
+            ),
+        }
+        match aq.peek_next() {
+            Some(Task::DepositToFactionStorage { resource_id }) => {
+                assert_eq!(
+                    resource_id, skin_id,
+                    "queued DepositToFactionStorage should carry the Skin resource"
+                );
+            }
+            other => panic!(
+                "expected queued Task::DepositToFactionStorage, got {:?}",
                 other
             ),
         }

@@ -491,7 +491,9 @@ pub fn spawn_population(
                         // BUILD_BLUEPRINT retired in Phase 5e-xiii-b
                         // (HTN method `GatherAndHaulToPersonalBlueprintMethod`).
                         // TAME_HORSE retired in Phase 5e-iv (HTN method).
-                        PlanId::DELIVER_HIDE_TO_CRAFT_ORDER,
+                        // DELIVER_HIDE_TO_CRAFT_ORDER retired in Phase 5e-xiv
+                        // (generalized Stockpile pipeline; chief posts
+                        // `Stockpile { Skin }` for CraftOrder demand).
                         // DELIVER_GRAIN_TO_CRAFT_ORDER retired in Phase 5e-xi-c
                         // (HTN method `HarvestAndHaulGrainToCraftOrderMethod`).
                         // DELIVER_FROM_STORAGE_TO_CRAFT_ORDER retired in Phase 5e-xi-a

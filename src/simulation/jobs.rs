@@ -370,6 +370,8 @@ pub fn chief_job_posting_system(
     bp_query: Query<&Blueprint>,
     workbench_map: Res<crate::simulation::construction::WorkbenchMap>,
     loom_map: Res<crate::simulation::construction::LoomMap>,
+    co_map: Res<crate::simulation::crafting::CraftOrderMap>,
+    co_query: Query<&crate::simulation::crafting::CraftOrder>,
     projects: Res<Projects>,
     mut board: ResMut<JobBoard>,
 ) {
@@ -561,6 +563,88 @@ pub fn chief_job_posting_system(
                     continue;
                 }
                 let deficit = target_total.saturating_sub(stored);
+                let already = board.faction_postings(faction_id).iter().any(|p| {
+                    matches!(
+                        &p.progress,
+                        JobProgress::Stockpile { resource_id, .. } if *resource_id == target_rid
+                    )
+                });
+                if already {
+                    continue;
+                }
+                let target = deficit.clamp(MATERIAL_GATHER_MIN, MATERIAL_GATHER_CAP);
+                let id = board.alloc_id();
+                let progress = JobProgress::Stockpile {
+                    resource_id: target_rid,
+                    deposited: 0,
+                    target,
+                };
+                let priority =
+                    compute_priority(faction, faction_id, JobKind::Stockpile, &progress, &projects);
+                board.faction_postings_mut(faction_id).push(JobPosting {
+                    id,
+                    faction_id,
+                    kind: JobKind::Stockpile,
+                    progress,
+                    claimants: Vec::new(),
+                    priority,
+                    source: JobSource::Chief,
+                    posted_tick,
+                    expiry_tick: None,
+                });
+            }
+        }
+
+        // 3b-ii. Phase 5e-xiv: Stockpile postings driven by open `CraftOrder`
+        //        demand for any resource not already covered by 3b's
+        //        Wood/Stone iteration. Replaces the legacy `DeliverHide` plan
+        //        (PlanId 13) for the Skin path: when a faction CraftOrder
+        //        needs Skin (Bow / Leather Armor) and storage doesn't yet
+        //        have it, the chief posts `Stockpile { Skin }` and a worker
+        //        scavenges ambient hide drops (from butchery at the hearth)
+        //        into storage. The existing Haul posting (3c) then fires
+        //        once storage has stock.
+        if faction.member_count > 0 {
+            // Aggregate per-resource still-needed across all open faction
+            // CraftOrders. Only process resources NOT already handled by 3b.
+            let wood_id = crate::economy::core_ids::wood();
+            let stone_id = crate::economy::core_ids::stone();
+            let mut co_demand: AHashMap<
+                crate::economy::resource_catalog::ResourceId,
+                u32,
+            > = AHashMap::new();
+            for (_, &order_entity) in &co_map.0 {
+                let Ok(order) = co_query.get(order_entity) else {
+                    continue;
+                };
+                if order.faction_id != faction_id {
+                    continue;
+                }
+                for slot in &order.deposits[..order.deposit_count as usize] {
+                    if slot.resource_id == wood_id || slot.resource_id == stone_id {
+                        continue;
+                    }
+                    let still = slot.needed.saturating_sub(slot.deposited) as u32;
+                    if still == 0 {
+                        continue;
+                    }
+                    *co_demand.entry(slot.resource_id).or_insert(0) =
+                        co_demand
+                            .get(&slot.resource_id)
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_add(still);
+                }
+            }
+            for (target_rid, demand) in co_demand {
+                if demand == 0 {
+                    continue;
+                }
+                let stored = faction.storage.stock_of(target_rid);
+                if stored >= demand {
+                    continue;
+                }
+                let deficit = demand.saturating_sub(stored);
                 let already = board.faction_postings(faction_id).iter().any(|p| {
                     matches!(
                         &p.progress,
@@ -1281,7 +1365,12 @@ pub fn posting_goal(p: &JobPosting) -> AgentGoal {
             } else if Some(*resource_id) == stone {
                 AgentGoal::GatherStone
             } else {
-                AgentGoal::GatherFood
+                // Phase 5e-xiv: any non-Wood/Stone Stockpile posting maps to
+                // the generalized `Stockpile` goal. The specific resource
+                // travels via `ClaimTarget.resource_id` so the dispatcher
+                // (`htn_acquire_good_dispatch_system`'s Stockpile branch) can
+                // scavenge ambient ground items of the right kind.
+                AgentGoal::Stockpile
             }
         }
         (JobKind::Stockpile, JobProgress::Calories { .. }) => AgentGoal::GatherFood,

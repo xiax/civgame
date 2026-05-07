@@ -168,7 +168,10 @@ static RETURN_CAMP_GOALS: &[AgentGoal] = &[AgentGoal::ReturnCamp];
 // a fresh hunt/harvest because no storage-fetch path exists for those.
 //   38 = HaulToCraftOrder, 39 = WorkOnCraftOrder,
 //   40 = FetchCraftOrderMaterialFromStorage (most-deficient good).
-static PLAN_STEPS_13: &[StepId] = &[StepId(5), StepId(13), StepId(38)]; // DeliverHideToCraftOrder
+// PLAN_STEPS_13 retired in Phase 5e-xiv along with PlanId 13
+// (`DeliverHideToCraftOrder`). The generalized chief Stockpile pipeline +
+// `htn_acquire_good_dispatch_system`'s extended `AgentGoal::Stockpile`
+// branch covers the Skin path end-to-end via storage.
 // PLAN_STEPS_14 (DeliverGrainToCraftOrder) retired in Phase 5e-xi-c —
 // `htn_harvest_grain_for_craft_order_dispatch_system` +
 // `HarvestAndHaulGrainToCraftOrderMethod` own the chain end-to-end.
@@ -1140,16 +1143,30 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_NONE,
             requires_profession: None,
         },
+        // Phase 5e-xiv: PlanId 13 (`DeliverHideToCraftOrder`) retired. The
+        // legacy `[Hunt → CollectSkin → HaulToCraftOrder]` chain was
+        // structurally inconsistent — Hunt drops a Corpse, not a Skin, so the
+        // CollectSkin scavenge depended on someone else's prior butchery. The
+        // generalized Stockpile pipeline (chief posts `Stockpile { Skin }`
+        // when an open CraftOrder needs Skin → workers under
+        // `AgentGoal::Stockpile` scavenge ambient hides via
+        // `htn_acquire_good_dispatch_system`'s extended branch → deposit at
+        // faction storage) replaces it cleanly. Once Skin is in storage, the
+        // existing `WithdrawAndHaulToCraftOrderMethod` (5e-xi-a) delivers it
+        // to the CraftOrder. The const `PlanId::DELIVER_HIDE_TO_CRAFT_ORDER`
+        // survives only as a `PlanHistory` ring-buffer sentinel. StepIds 5
+        // (Hunt), 13 (CollectSkin), and 38 (HaulToCraftOrder) survive — 5
+        // and 38 are referenced by other plans / systems; 13 is orphaned.
         PlanDef {
             id: PlanId(13),
-            name: "DeliverHideToCraftOrder",
-            steps: PLAN_STEPS_13,
-            state_weights: mk_weights(&[(SI_SKILL_COMBAT, 0.5), (SI_HAS_FOOD, -0.1)]),
-            bias: 0.0,
-            serves_goals: CRAFT_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
-            memory_target_kind: Some(MemoryKind::Prey),
-            flags: PF_UNINTERRUPTIBLE,
+            memory_target_kind: None,
+            flags: PF_NONE,
             requires_profession: None,
         },
         // PlanId 14 retired in Phase 5e-xi-c — the HTN

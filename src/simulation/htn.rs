@@ -3912,14 +3912,26 @@ pub fn htn_acquire_good_dispatch_system(
             AgentGoal::Haul => {
                 // existing haul logic below
             }
-            AgentGoal::GatherWood | AgentGoal::GatherStone => {
+            AgentGoal::GatherWood | AgentGoal::GatherStone | AgentGoal::Stockpile => {
                 const VIEW_RADIUS: i32 = 15;
+                // Phase 5e-xiv: `Stockpile` is the generalized counterpart to
+                // GatherWood/GatherStone — the specific resource lives on the
+                // `ClaimTarget.resource_id` companion of the agent's
+                // `JobKind::Stockpile` claim. Without a claim target the
+                // dispatcher silently skips (the agent stays Idle and
+                // `goal_update_system` will reassign the goal next tick).
                 let (target_rid, memory_kind): (
                     crate::economy::resource_catalog::ResourceId,
                     MemoryKind,
                 ) = match *goal {
                     AgentGoal::GatherWood => (crate::economy::core_ids::wood(), MemoryKind::wood()),
                     AgentGoal::GatherStone => (crate::economy::core_ids::stone(), MemoryKind::stone()),
+                    AgentGoal::Stockpile => {
+                        let Some(rid) = claim_target_opt.and_then(|c| c.resource_id) else {
+                            continue;
+                        };
+                        (rid, MemoryKind::Resource(rid))
+                    }
                     _ => unreachable!(),
                 };
 

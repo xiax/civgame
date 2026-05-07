@@ -126,6 +126,13 @@ pub enum AgentGoal {
     /// Withdraw materials from faction storage and carry them to a specific
     /// blueprint. Set exclusively by `JobClaim` of `JobKind::Haul`.
     Haul = 17,
+    /// Phase 5e-xiv: scavenge ambient ground items matching a chief-posted
+    /// `JobKind::Stockpile { resource_id }` and deposit at faction storage.
+    /// Generalizes the Wood/Stone-only `GatherWood`/`GatherStone` pattern to
+    /// any catalog resource — the specific resource lives on the
+    /// `ClaimTarget.resource_id` companion. Set exclusively by `JobClaim` of
+    /// `JobKind::Stockpile` for resources outside the Wood/Stone fallback.
+    Stockpile = 18,
 }
 
 impl AgentGoal {
@@ -148,6 +155,7 @@ impl AgentGoal {
             AgentGoal::Play => "Play",
             AgentGoal::Farm => "Farm",
             AgentGoal::Haul => "Haul",
+            AgentGoal::Stockpile => "Stockpile",
         }
     }
 }

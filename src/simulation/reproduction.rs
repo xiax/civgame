@@ -507,7 +507,8 @@ pub fn pregnancy_system(
                     // SCAVENGE_FOOD retired 5c-ii-d-vi.
                     // BUILD_BLUEPRINT retired in Phase 5e-xiii-b
                     // (HTN method `GatherAndHaulToPersonalBlueprintMethod`).
-                    PlanId::DELIVER_HIDE_TO_CRAFT_ORDER,
+                    // DELIVER_HIDE_TO_CRAFT_ORDER retired in Phase 5e-xiv
+                    // (generalized Stockpile pipeline).
                     // DELIVER_GRAIN_TO_CRAFT_ORDER retired in Phase 5e-xi-c
                     // (HTN method `HarvestAndHaulGrainToCraftOrderMethod`).
                     // DELIVER_FROM_STORAGE_TO_CRAFT_ORDER retired in Phase 5e-xi-a

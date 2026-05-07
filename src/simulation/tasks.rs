@@ -734,6 +734,22 @@ pub fn goal_dispatch_system(
                     {
                         Some(TaskKind::Scavenge as u16)
                     }
+                    // Phase 5e-xiv: Stockpile chain — scavenge ambient ground
+                    // items of any catalog resource the chief has posted
+                    // (Skin etc.) and deposit at faction storage. Mirrors
+                    // GatherWood/GatherStone preserve arms.
+                    AgentGoal::Stockpile if ai.task_id == TaskKind::Scavenge as u16 => {
+                        Some(TaskKind::Scavenge as u16)
+                    }
+                    AgentGoal::Stockpile if ai.task_id == TaskKind::Gather as u16 => {
+                        Some(TaskKind::Gather as u16)
+                    }
+                    AgentGoal::Stockpile if ai.task_id == TaskKind::DepositResource as u16 => {
+                        Some(TaskKind::DepositResource as u16)
+                    }
+                    AgentGoal::Stockpile if ai.task_id == TaskKind::Explore as u16 => {
+                        Some(TaskKind::Explore as u16)
+                    }
                     // Phase 5c-ii-d-iv-ii: HTN Explore fallback (`ExploreForFoodMethod`
                     // / `ExploreForMaterialMethod`) runs without an ActivePlan.
                     // The walk-to-random-tile leg shouldn't be reset every
