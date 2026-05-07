@@ -548,11 +548,17 @@ pub fn craft_order_system(
     mut board: ResMut<JobBoard>,
     mut job_completed: EventWriter<JobCompletedEvent>,
     mut activity_log: EventWriter<crate::ui::activity_log::ActivityLogEvent>,
+    storage_tile_map: Res<crate::simulation::faction::StorageTileMap>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    chunk_graph: Res<crate::pathfinding::chunk_graph::ChunkGraph>,
+    chunk_router: Res<crate::pathfinding::chunk_router::ChunkRouter>,
+    chunk_connectivity: Res<crate::pathfinding::connectivity::ChunkConnectivity>,
     mut order_query: Query<&mut CraftOrder>,
     member_query: Query<&FactionMember>,
     mut agent_query: Query<(
         Entity,
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut EconomicAgent,
         &mut crate::simulation::carry::Carrier,
         &mut Skills,
@@ -568,8 +574,20 @@ pub fn craft_order_system(
         AHashMap::new();
     let mut order_workers: AHashMap<Entity, Vec<Entity>> = AHashMap::new();
 
-    for (entity, mut ai, agent, carrier, _skills, _member, slot, lod, _transform, _claim, _ap) in
-        agent_query.iter_mut()
+    for (
+        entity,
+        mut ai,
+        mut aq,
+        agent,
+        carrier,
+        _skills,
+        _member,
+        slot,
+        lod,
+        _transform,
+        _claim,
+        _ap,
+    ) in agent_query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
@@ -587,6 +605,10 @@ pub fn craft_order_system(
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
+            // Phase 5e-xi-a: drain typed channel for HTN-driven HaulToCraftOrder
+            // chains. Legacy plan-driven flow leaves `aq.current = Idle`, so
+            // this is a benign no-op there.
+            aq.advance();
             continue;
         };
         let Ok(order) = order_query.get(order_entity) else {
@@ -594,6 +616,7 @@ pub fn craft_order_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             ai.target_entity = None;
+            aq.advance();
             continue;
         };
         if is_hauler {
@@ -750,8 +773,20 @@ pub fn craft_order_system(
         return;
     }
 
-    for (entity, mut ai, mut agent, mut carrier, mut skills, _member, _slot, _lod, _t, claim, mut plan_opt) in
-        agent_query.iter_mut()
+    for (
+        entity,
+        mut ai,
+        mut aq,
+        mut agent,
+        mut carrier,
+        mut skills,
+        member,
+        _slot,
+        _lod,
+        transform,
+        claim,
+        mut plan_opt,
+    ) in agent_query.iter_mut()
     {
         for &(ae, id, qty) in &good_removals {
             if ae == entity {
@@ -836,6 +871,55 @@ pub fn craft_order_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.work_progress = 0;
+            // Phase 5e-xi-a: drain the typed channel so HTN-driven
+            // HaulToCraftOrder chains complete cleanly. Legacy plan-driven
+            // flows leave `aq.current = Idle`, so this is a benign no-op there.
+            aq.advance();
+
+            // Phase 5e-xi-b: chain handoff for the WorkOnCraftOrder method.
+            // After `aq.advance()` promotes the queued
+            // `Task::DepositToFactionStorage`, route the lead worker to the
+            // nearest faction storage tile and prime
+            // `task_id = TaskKind::DepositResource` so
+            // `drop_items_at_destination_system` (Economy) deposits the
+            // crafted output goods from inventory on arrival. Hauler chains
+            // (5e-xi-a) end at HaulToCraftOrder with no trailing deposit, so
+            // this branch only fires for completed workers.
+            if matches!(aq.current, crate::simulation::typed_task::Task::DepositToFactionStorage { .. }) {
+                use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
+                use crate::world::terrain::TILE_SIZE;
+                let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+                let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+                let cur_chunk = ChunkCoord(
+                    cur_tx.div_euclid(CHUNK_SIZE as i32),
+                    cur_ty.div_euclid(CHUNK_SIZE as i32),
+                );
+                if let Some(storage_tile) =
+                    storage_tile_map.nearest_for_faction(member.faction_id, (cur_tx, cur_ty))
+                {
+                    let dispatched = crate::simulation::tasks::assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx, cur_ty),
+                        cur_chunk,
+                        storage_tile,
+                        TaskKind::DepositResource,
+                        None,
+                        &chunk_graph,
+                        &chunk_router,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    );
+                    if !dispatched {
+                        aq.cancel();
+                    }
+                } else {
+                    // No faction storage — drop the chain. Output stays in
+                    // inventory until something else evicts it (matches the
+                    // legacy plan's silent degradation when storage is
+                    // unreachable).
+                    aq.cancel();
+                }
+            }
         }
     }
 

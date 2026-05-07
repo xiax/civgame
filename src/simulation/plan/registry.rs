@@ -129,8 +129,12 @@ static RESCUE_GOALS: &[AgentGoal] = &[AgentGoal::Rescue];
 // eat-with-food-on-hand dispatch is now driven by `EatFromInventoryMethod`
 // (see `htn.rs`). The shared StepId(9) Eat step is still used as the final
 // step of Forage/Scavenge/WithdrawAndEat plans.
-static PLAN_STEPS_26: &[StepId] = &[StepId(29)]; // PlaySocial: PlayWithPartner (resolves partner inline)
-static PLAN_STEPS_27: &[StepId] = &[StepId(30)]; // PlaySolo: PlayWithItem (resolves item inline)
+// PLAN_STEPS_26 (PlaySocial) and PLAN_STEPS_27 (PlaySolo) retired in Phase
+// 5e-xii-a — `htn_play_dispatch_system` + `PlayWithPartnerMethod` /
+// `PlaySoloMethod` own both branches end-to-end. PlanIds 26/27 flipped to
+// `(unused)`. StepId(29) (PlayWithPartner) and StepId(30) (PlayWithItem)
+// stay defined as orphans — StepId(30) is shared with PlanId 32
+// (PlayWithStoredToy) which still runs through the legacy plan registry.
 // PLAN_STEPS_28 (Explore: walk to a random reachable tile near home) was
 // retired in Phase 5c-ii-d-vi — the last consumer was PlanId 35 (ExploreForFood),
 // itself retired in this PR. StepId(31) (Explore) survives in the StepRegistry
@@ -153,9 +157,23 @@ static RETURN_CAMP_GOALS: &[AgentGoal] = &[AgentGoal::ReturnCamp];
 //   38 = HaulToCraftOrder, 39 = WorkOnCraftOrder,
 //   40 = FetchCraftOrderMaterialFromStorage (most-deficient good).
 static PLAN_STEPS_13: &[StepId] = &[StepId(5), StepId(13), StepId(38)]; // DeliverHideToCraftOrder
-static PLAN_STEPS_14: &[StepId] = &[StepId(1), StepId(38)]; // DeliverGrainToCraftOrder
-static PLAN_STEPS_15: &[StepId] = &[StepId(40), StepId(38)]; // DeliverFromStorageToCraftOrder
-static PLAN_STEPS_16: &[StepId] = &[StepId(39), StepId(12)]; // WorkOnCraft → DepositGoods
+// PLAN_STEPS_14 (DeliverGrainToCraftOrder) retired in Phase 5e-xi-c —
+// `htn_harvest_grain_for_craft_order_dispatch_system` +
+// `HarvestAndHaulGrainToCraftOrderMethod` own the chain end-to-end.
+// PlanId(14) is flipped to `(unused)`. StepId(1) (FarmFood) is shared with
+// PlanId 1 (FarmFood), and StepId(38) is shared with PlanId 13 — both
+// survive.
+// PLAN_STEPS_15 (DeliverFromStorageToCraftOrder) retired in Phase 5e-xi-a —
+// `htn_deliver_material_to_craft_order_dispatch_system` +
+// `WithdrawAndHaulToCraftOrderMethod` own the chain end-to-end. PlanId(15) is
+// flipped to `(unused)`. StepId(40) (FetchCraftOrderMaterialFromStorage) was
+// the only consumer of `MaterialNeed::CraftOrder` from plan-driven dispatch; it
+// stays defined as an Idle placeholder for in-flight ActivePlan compatibility.
+// PLAN_STEPS_16 (WorkOnCraft) retired in Phase 5e-xi-b —
+// `htn_work_on_craft_order_dispatch_system` + `WorkOnSatisfiedCraftOrderMethod`
+// own the labor leg + trailing deposit chain. PlanId(16) is flipped to
+// `(unused)`. StepId(39) (WorkOnCraftOrder) and StepId(12) (DepositGoods) stay
+// defined as orphans — StepId(12) is shared with FarmFood (PlanId 1).
 
 // Faction-directed Build pipeline. The Haul half of this pipeline (PLAN_STEPS_H,
 // PlanId 33 ClaimedHaul) was retired in Phase 5c-ii-b — the claim-driven
@@ -611,30 +629,32 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             withdraw_filter: None,
         },
         StepDef {
-            // 39: WorkOnCraftOrder — adjacent to a satisfied CraftOrder,
-            // advance work_progress until the recipe completes.
+            // 39: (unused — was WorkOnCraftOrder; retired in Phase 5e-xi-b
+            // along with PlanId 16. The HTN
+            // `htn_work_on_craft_order_dispatch_system` does the equivalent
+            // satisfied-order scan inline before snapshotting into
+            // `PlannerCtx.target_craft_order`. ID kept as Idle placeholder for
+            // in-flight ActivePlan compat.)
             id: StepId(39),
-            task: TaskKind::WorkOnCraftOrder,
-            target: StepTarget::NearestSatisfiedCraftOrder,
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
-            reward_scale: 1.0,
+            reward_scale: 0.0,
             plant_filter: None,
             withdraw_filter: None,
         },
         StepDef {
-            // 40: FetchCraftOrderMaterialFromStorage — withdraw the most-
-            // deficient good across open CraftOrders from a faction storage
-            // tile so it can be hauled to the order. The faction's open
-            // orders drive the choice; the agent doesn't need a per-good
-            // plan variant.
+            // 40: (unused — was FetchCraftOrderMaterialFromStorage; retired in
+            // Phase 5e-xi-a along with PlanId 15. The HTN
+            // `htn_deliver_material_to_craft_order_dispatch_system` does the
+            // equivalent demand-aggregation + most-deficient-resource pick
+            // inline before snapshotting into `PlannerCtx.target_craft_order`.
+            // ID kept as Idle placeholder for in-flight ActivePlan compat.)
             id: StepId(40),
-            task: TaskKind::WithdrawMaterial,
-            target: StepTarget::WithdrawForFactionNeed {
-                need: MaterialNeed::CraftOrder,
-                selector: GoodSelector::MostDeficient,
-            },
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
-            reward_scale: 0.3,
+            reward_scale: 0.0,
             plant_filter: None,
             withdraw_filter: None,
         },
@@ -1118,50 +1138,55 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_UNINTERRUPTIBLE,
             requires_profession: None,
         },
+        // PlanId 14 retired in Phase 5e-xi-c — the HTN
+        // `htn_harvest_grain_for_craft_order_dispatch_system` +
+        // `HarvestAndHaulGrainToCraftOrderMethod` own the chain end-to-end.
+        // The const `PlanId::DELIVER_GRAIN_TO_CRAFT_ORDER` survives only as a
+        // PlanHistory ring-buffer sentinel.
         PlanDef {
             id: PlanId(14),
-            name: "DeliverGrainToCraftOrder",
-            steps: PLAN_STEPS_14,
-            state_weights: mk_weights(&[(SI_SKILL_FARMING, 0.5), (SI_SEASON_FOOD, 0.4)]),
-            bias: 0.0,
-            serves_goals: CRAFT_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
-            memory_target_kind: Some(MemoryKind::AnyEdible),
-            flags: PF_UNINTERRUPTIBLE,
+            memory_target_kind: None,
+            flags: PF_NONE,
             requires_profession: None,
         },
+        // PlanId 15 retired in Phase 5e-xi-a — the HTN
+        // `htn_deliver_material_to_craft_order_dispatch_system` +
+        // `WithdrawAndHaulToCraftOrderMethod` own the deliver-from-storage
+        // chain. The const `PlanId::DELIVER_FROM_STORAGE_TO_CRAFT_ORDER`
+        // survives only as a stable PlanHistory ring-buffer sentinel.
         PlanDef {
-            // Scores on SI_CRAFT_ORDER_NEEDS_MATERIAL (1.0 when any faction
-            // CraftOrder has unmet deposits) so the plan only wins when hauling
-            // work actually exists. The negative bias means that without an open
-            // order the plan scores ≈ -0.6, which loses to WorkOnCraft (≈ 0.55)
-            // and breaks the FailedNoTarget loop seen when no CraftOrders spawn.
             id: PlanId(15),
-            name: "DeliverFromStorageToCraftOrder",
-            steps: PLAN_STEPS_15,
-            state_weights: mk_weights(&[
-                (SI_CRAFT_ORDER_NEEDS_MATERIAL, 2.0),
-                (SI_STORAGE_WOOD, 0.3),
-                (SI_STORAGE_STONE, 0.3),
-                (SI_IN_FACTION, 0.3),
-            ]),
-            bias: -1.5,
-            serves_goals: CRAFT_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
-            flags: PF_UNINTERRUPTIBLE,
+            flags: PF_NONE,
             requires_profession: None,
         },
         PlanDef {
+            // PlanId 16 retired in Phase 5e-xi-b — the HTN
+            // `htn_work_on_craft_order_dispatch_system` +
+            // `WorkOnSatisfiedCraftOrderMethod` own the labor leg + trailing
+            // deposit. The const `PlanId::WORK_ON_CRAFT` survives only as a
+            // PlanHistory ring-buffer sentinel.
             id: PlanId(16),
-            name: "WorkOnCraft",
-            steps: PLAN_STEPS_16,
-            state_weights: mk_weights(&[(SI_SKILL_CRAFTING, 0.5)]),
-            bias: 0.3,
-            serves_goals: CRAFT_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
-            flags: PF_UNINTERRUPTIBLE,
+            flags: PF_NONE,
             requires_profession: None,
         },
         PlanDef {
@@ -1281,13 +1306,18 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         // + `WithdrawFromStorageMethod`. Other Survive plans (Forage,
         // ScavengeFood) still embed `StepId(9)` Eat as their final step and
         // dispatch through `plan_execution_system`.
+        // PlanIds 26 (PlaySocial) and 27 (PlaySolo) retired in Phase 5e-xii-a
+        // — the HTN `htn_play_dispatch_system` + `PlayWithPartnerMethod` /
+        // `PlaySoloMethod` own both branches under `AgentGoal::Play`. The
+        // consts `PlanId::PLAY_SOCIAL` / `PlanId::PLAY_SOLO` survive only as
+        // PlanHistory ring-buffer sentinels.
         PlanDef {
             id: PlanId(26),
-            name: "PlaySocial",
-            steps: PLAN_STEPS_26,
-            state_weights: mk_weights(&[(SI_SOCIAL, 1.5), (SI_WILLPOWER_DISTRESS, 0.5)]),
-            bias: 0.0,
-            serves_goals: PLAY_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
@@ -1295,11 +1325,11 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         },
         PlanDef {
             id: PlanId(27),
-            name: "PlaySolo",
-            steps: PLAN_STEPS_27,
-            state_weights: mk_weights(&[(SI_SOCIAL, 0.6), (SI_WILLPOWER_DISTRESS, 0.7)]),
-            bias: 0.0,
-            serves_goals: PLAY_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,

@@ -364,6 +364,7 @@ pub fn withdraw_material_task_system(
     chunk_router: Res<crate::pathfinding::chunk_router::ChunkRouter>,
     chunk_connectivity: Res<crate::pathfinding::connectivity::ChunkConnectivity>,
     bp_query: Query<&crate::simulation::construction::Blueprint>,
+    co_query: Query<&crate::simulation::crafting::CraftOrder>,
     mut ground_items: Query<&mut GroundItem>,
     mut query: Query<(
         Entity,
@@ -423,6 +424,7 @@ pub fn withdraw_material_task_system(
                 &chunk_router,
                 &chunk_connectivity,
                 &bp_query,
+                &co_query,
                 cur_tile,
                 cur_chunk,
             );
@@ -439,6 +441,7 @@ pub fn withdraw_material_task_system(
                 &chunk_router,
                 &chunk_connectivity,
                 &bp_query,
+                &co_query,
                 cur_tile,
                 cur_chunk,
             );
@@ -458,6 +461,7 @@ pub fn withdraw_material_task_system(
                 &chunk_router,
                 &chunk_connectivity,
                 &bp_query,
+                &co_query,
                 cur_tile,
                 cur_chunk,
             );
@@ -563,6 +567,7 @@ pub fn withdraw_material_task_system(
             &chunk_router,
             &chunk_connectivity,
             &bp_query,
+            &co_query,
             cur_tile,
             cur_chunk,
         );
@@ -592,6 +597,7 @@ fn finish_withdraw_material(
     chunk_router: &crate::pathfinding::chunk_router::ChunkRouter,
     chunk_connectivity: &crate::pathfinding::connectivity::ChunkConnectivity,
     bp_query: &Query<&crate::simulation::construction::Blueprint>,
+    co_query: &Query<&crate::simulation::crafting::CraftOrder>,
     cur_tile: (i32, i32),
     cur_chunk: crate::world::chunk::ChunkCoord,
 ) {
@@ -622,6 +628,39 @@ fn finish_withdraw_material(
                 bp_tile,
                 TaskKind::HaulMaterials,
                 Some(blueprint),
+                chunk_graph,
+                chunk_router,
+                chunk_map,
+                chunk_connectivity,
+            );
+            if !dispatched {
+                aq.cancel();
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
+            }
+        }
+        Task::HaulToCraftOrder { order } => {
+            // Phase 5e-xi-a: DeliverMaterialToCraftOrder chain.
+            // `WithdrawAndHaulToCraftOrderMethod` expands to
+            // `[WithdrawMaterial, HaulToCraftOrder]`; once the material is in
+            // hand, route to the order's anchor tile. Despawned/satisfied
+            // orders silently degrade to Idle so the agent re-evaluates.
+            let Ok(order_data) = co_query.get(order) else {
+                aq.cancel();
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
+                return;
+            };
+            let dest = order_data.anchor_tile;
+            let dispatched = assign_task_with_routing(
+                ai,
+                cur_tile,
+                cur_chunk,
+                dest,
+                TaskKind::HaulToCraftOrder,
+                Some(order),
                 chunk_graph,
                 chunk_router,
                 chunk_map,

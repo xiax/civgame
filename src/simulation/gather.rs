@@ -82,11 +82,16 @@ fn mining_activity(id: ResourceId) -> Option<ActivityKind> {
 /// 16-tuple `IntoSystem` ceiling after the 5c-ii-c-ii additions. `gather_system`
 /// itself doesn't read these — only `finish_gather`, the chain-handoff helper.
 #[derive(SystemParam)]
-pub struct GatherRoutingResources<'w> {
+pub struct GatherRoutingResources<'w, 's> {
     pub storage_tile_map: Res<'w, StorageTileMap>,
     pub chunk_graph: Res<'w, ChunkGraph>,
     pub chunk_router: Res<'w, ChunkRouter>,
     pub chunk_connectivity: Res<'w, ChunkConnectivity>,
+    /// Phase 5e-xi-c: read by `finish_gather` to look up `CraftOrder.anchor_tile`
+    /// when the prefetch ring promotes a `Task::HaulToCraftOrder { order }`
+    /// (the trailing leg of the harvest-grain-for-craft chain produced by
+    /// `HarvestAndHaulGrainToCraftOrderMethod`).
+    pub co_query: Query<'w, 's, &'static crate::simulation::crafting::CraftOrder>,
 }
 
 /// Phase 5c-ii-c-ii chain handoff: called by every `gather_system` exit path
@@ -168,6 +173,33 @@ fn finish_gather(
             // hands/inventory; `eat_task_system` reads from both.
             ai.state = AiState::Working;
             ai.task_id = TaskKind::Eat as u16;
+        }
+        Task::HaulToCraftOrder { order } => {
+            // Phase 5e-xi-c: harvest-grain-for-craft chain trailing leg. The
+            // `HarvestAndHaulGrainToCraftOrderMethod` expansion is
+            // `[Gather { plant }, HaulToCraftOrder { order }]`; once the grain
+            // is in hand, route to the order's anchor tile. Despawned/satisfied
+            // orders silently degrade to Idle.
+            let Ok(order_data) = routing.co_query.get(order) else {
+                aq.cancel();
+                return;
+            };
+            let dest = order_data.anchor_tile;
+            let dispatched = assign_task_with_routing(
+                ai,
+                cur_tile,
+                cur_chunk,
+                dest,
+                TaskKind::HaulToCraftOrder,
+                Some(order),
+                &routing.chunk_graph,
+                &routing.chunk_router,
+                chunk_map,
+                &routing.chunk_connectivity,
+            );
+            if !dispatched {
+                aq.cancel();
+            }
         }
         _ => {}
     }

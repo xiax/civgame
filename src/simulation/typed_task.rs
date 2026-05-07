@@ -332,6 +332,44 @@ pub enum Task {
     HaulToBlueprint {
         blueprint: bevy::prelude::Entity,
     },
+    /// Carry the agent's hand contents to the named `CraftOrder` anchor and
+    /// drop matching held goods into its deposit slots. Produced by
+    /// `WithdrawAndHaulToCraftOrderMethod` (Phase 5e-xi-a — replaces the legacy
+    /// `DeliverFromStorageToCraftOrder` plan, PlanId 15) as the second leg of
+    /// a `[WithdrawMaterial, HaulToCraftOrder]` chain. The executor is
+    /// `craft_order_system`'s hauler branch, which already knows how to
+    /// deposit-on-arrival via `task_id == TaskKind::HaulToCraftOrder` and
+    /// `target_entity = Some(order)`. The typed variant carries the order so
+    /// the chain handoff in `production::finish_withdraw_material` has
+    /// everything it needs to route the agent to the order's anchor tile
+    /// without re-entering plan selection.
+    HaulToCraftOrder {
+        order: bevy::prelude::Entity,
+    },
+    /// Recreational play. `partner = Some(e)` for social play (the agent walks
+    /// adjacent to another `Person` and plays together — `play_system` reads
+    /// the partner from `ai.target_entity` set up by routing); `partner = None`
+    /// for solo play with a held or adjacent entertainment item. Produced by
+    /// `PlayWithPartnerMethod` / `PlaySoloMethod` (Phase 5e-xii-a — replaces
+    /// the legacy `PlaySocial` plan PlanId 26 + `PlaySolo` plan PlanId 27).
+    /// The executor `play_system` already handles both cases via the legacy
+    /// `task_id == TaskKind::Play` channel; the typed variant only owns the
+    /// partner reference for chain inspection and `aq.advance()` drainage.
+    Play {
+        partner: Option<bevy::prelude::Entity>,
+    },
+    /// Work adjacent to a satisfied `CraftOrder` until the recipe completes.
+    /// Produced by `WorkOnSatisfiedCraftOrderMethod` (Phase 5e-xi-b — replaces
+    /// the legacy `WorkOnCraft` plan, PlanId 16) as the head of a
+    /// `[WorkOnCraftOrder, DepositToFactionStorage]` chain. The executor is
+    /// `craft_order_system`'s worker branch, which already advances
+    /// `work_progress` per tick once the order's deposits are full and pays
+    /// out the recipe output to the lead worker on completion. The typed
+    /// variant carries the order so dispatch / chain handoff has the right
+    /// target without re-querying.
+    WorkOnCraftOrder {
+        order: bevy::prelude::Entity,
+    },
     /// Carry the agent's hand contents to the nearest faction storage tile and
     /// drop them. Produced by `GatherFromKnownMethod` (Phase 5c-ii-c) as the
     /// trailing leg of an `AcquireGood → Gather → DepositToFactionStorage`
@@ -738,6 +776,33 @@ impl Task {
     pub fn as_haul_to_blueprint(&self) -> Option<bevy::prelude::Entity> {
         match *self {
             Task::HaulToBlueprint { blueprint } => Some(blueprint),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the HaulToCraftOrder variant. Returns the
+    /// craft order entity the agent should deliver their hand contents to.
+    pub fn as_haul_to_craft_order(&self) -> Option<bevy::prelude::Entity> {
+        match *self {
+            Task::HaulToCraftOrder { order } => Some(order),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the WorkOnCraftOrder variant. Returns the
+    /// satisfied craft order entity the agent should labor at.
+    pub fn as_work_on_craft_order(&self) -> Option<bevy::prelude::Entity> {
+        match *self {
+            Task::WorkOnCraftOrder { order } => Some(order),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the Play variant. Returns the partner entity
+    /// for social play, or `None` for solo play.
+    pub fn as_play(&self) -> Option<Option<bevy::prelude::Entity>> {
+        match *self {
+            Task::Play { partner } => Some(partner),
             _ => None,
         }
     }

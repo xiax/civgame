@@ -305,12 +305,15 @@ impl PersonBuilder {
                 PlanId::BUILD_BLUEPRINT,
                 // TAME_HORSE retired in Phase 5e-iv (HTN method).
                 PlanId::DELIVER_HIDE_TO_CRAFT_ORDER,
-                PlanId::DELIVER_GRAIN_TO_CRAFT_ORDER,
-                PlanId::DELIVER_FROM_STORAGE_TO_CRAFT_ORDER,
-                PlanId::WORK_ON_CRAFT,
+                // DELIVER_GRAIN_TO_CRAFT_ORDER retired in Phase 5e-xi-c
+                // (HTN method `HarvestAndHaulGrainToCraftOrderMethod`).
+                // DELIVER_FROM_STORAGE_TO_CRAFT_ORDER retired in Phase 5e-xi-a
+                // (HTN method `WithdrawAndHaulToCraftOrderMethod`).
+                // WORK_ON_CRAFT retired in Phase 5e-xi-b
+                // (HTN method `WorkOnSatisfiedCraftOrderMethod`).
                 // RETURN_SURPLUS_FOOD retired in Phase 5e-iii (HTN method).
-                PlanId::PLAY_SOCIAL,
-                PlanId::PLAY_SOLO,
+                // PLAY_SOCIAL / PLAY_SOLO retired in Phase 5e-xii-a
+                // (HTN methods PlayWithPartnerMethod / PlaySoloMethod).
                 PlanId::HAUL_FROM_STORAGE_AND_BUILD,
                 PlanId::PLAY_BY_PLANTING,
                 PlanId::PLAY_BY_THROWING_ROCKS,
@@ -2710,5 +2713,521 @@ mod baseline_behaviour {
             0,
             "Socialize is single-leg — nothing should be queued"
         );
+    }
+
+    /// Phase 5e-xi-a: an agent under `AgentGoal::Craft` with an open faction
+    /// `CraftOrder` needing Wood and Wood in storage dispatches the chain
+    /// `[WithdrawMaterial { Wood, 1 }, HaulToCraftOrder { order }]` via
+    /// `htn_deliver_material_to_craft_order_dispatch_system` +
+    /// `WithdrawAndHaulToCraftOrderMethod`. Replaces the legacy
+    /// `DeliverFromStorageToCraftOrder` plan (PlanId 15).
+    #[test]
+    fn craft_goal_dispatches_withdraw_then_haul_to_craft_order_chain() {
+        use crate::simulation::crafting::{CraftOrder, CraftOrderMap};
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(123);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let storage_tile = (4, 4);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+        sim.spawn_ground_item(storage_tile, crate::economy::core_ids::wood(), 5);
+
+        // Spawn a craft order at a distinct tile. Recipe 1 (Spear) needs
+        // 2 wood + 1 stone; we leave deposits empty so both legs see unmet
+        // demand. The dispatcher will resolve to Wood (most-deficient on the
+        // tile we stocked).
+        let order_tile = (10, 10);
+        let order_world = tile_to_world(order_tile.0, order_tile.1);
+        let order = CraftOrder::new(
+            sim.player_faction_id,
+            /* recipe_id = Spear */ 1,
+            /* workbench_tile */ None,
+            order_tile,
+            /* spawn_tick */ 0,
+            /* tech_payload */ None,
+        )
+        .expect("recipe 1 (Spear) should construct");
+        let order_entity = sim
+            .app
+            .world_mut()
+            .spawn((
+                order,
+                Transform::from_xyz(order_world.x, order_world.y, 0.32),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<CraftOrderMap>()
+            .0
+            .insert(order_tile, order_entity);
+
+        // Spawn the agent with empty hands so the WithdrawMaterial path is
+        // the only viable expansion.
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Warm-up ticks: storage rollup must populate
+        // `FactionData.storage.totals[Wood] > 0` and `StorageTileMap` must
+        // know the storage tile before the dispatcher's tile scan can find
+        // it. `Added<Indexed>` for the GroundItem also needs a few
+        // FixedUpdate frames.
+        sim.tick_n(80);
+
+        {
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            let stock = registry
+                .factions
+                .get(&sim.player_faction_id)
+                .map(|f| f.storage.stock_of(crate::economy::core_ids::wood()))
+                .unwrap_or(0);
+            assert!(
+                stock > 0,
+                "faction storage rollup should report Wood stock > 0 after warm-up; got {}",
+                stock
+            );
+        }
+
+        // Pin the goal to Craft right before the dispatch tick.
+        // `goal_update_system` re-derives every tick — pinning here is
+        // resilient to the bucketed cooldown.
+        {
+            let mut goal = sim.app.world_mut().get_mut::<AgentGoal>(person).unwrap();
+            *goal = AgentGoal::Craft;
+        }
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+
+        match aq.current {
+            Task::WithdrawMaterial { resource_id, qty } => {
+                assert_eq!(
+                    resource_id,
+                    crate::economy::core_ids::wood(),
+                    "head resource should be Wood (most-deficient on the stocked tile)"
+                );
+                assert_eq!(qty, 1, "DeliverMaterialToCraftOrder uses qty:1 contract");
+            }
+            other => panic!(
+                "expected Task::WithdrawMaterial as head of DeliverMaterialToCraftOrder chain, got {:?}",
+                other
+            ),
+        }
+
+        assert_eq!(
+            aq.queued_len(),
+            1,
+            "expected exactly one queued task (HaulToCraftOrder) behind WithdrawMaterial"
+        );
+        match aq.peek_next() {
+            Some(Task::HaulToCraftOrder { order: o }) => {
+                assert_eq!(
+                    o, order_entity,
+                    "queued HaulToCraftOrder should target the spawned order entity"
+                );
+            }
+            other => panic!(
+                "expected Task::HaulToCraftOrder queued behind WithdrawMaterial, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Phase 5e-xi-b: an agent under `AgentGoal::Craft` with a satisfied
+    /// faction `CraftOrder` (deposits filled) dispatches the chain
+    /// `[WorkOnCraftOrder { order }, DepositToFactionStorage { output }]`
+    /// via `htn_work_on_craft_order_dispatch_system` +
+    /// `WorkOnSatisfiedCraftOrderMethod`. Replaces the legacy `WorkOnCraft`
+    /// plan (PlanId 16).
+    #[test]
+    fn craft_goal_dispatches_work_on_craft_order_chain_when_order_satisfied() {
+        use crate::simulation::crafting::{CraftOrder, CraftOrderMap};
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::jobs::{
+            ClaimTarget, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+        };
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(124);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Spawn a Spear (recipe 1) order at (10, 10) and pre-fill its
+        // deposits so `is_satisfied()` is true the moment the dispatcher
+        // sees it. Recipe 1 needs 2 Wood + 1 Stone.
+        let order_tile = (10, 10);
+        let order_world = tile_to_world(order_tile.0, order_tile.1);
+        let mut order = CraftOrder::new(
+            sim.player_faction_id,
+            /* recipe_id = Spear */ 1,
+            None,
+            order_tile,
+            0,
+            None,
+        )
+        .expect("recipe 1 should construct");
+        for i in 0..order.deposit_count as usize {
+            order.deposits[i].deposited = order.deposits[i].needed;
+        }
+        assert!(order.is_satisfied());
+        let order_entity = sim
+            .app
+            .world_mut()
+            .spawn((
+                order,
+                Transform::from_xyz(order_world.x, order_world.y, 0.32),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<CraftOrderMap>()
+            .0
+            .insert(order_tile, order_entity);
+
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Brief warm-up so SpatialIndex / Indexed insertion settles.
+        sim.tick_n(5);
+
+        // Post a `JobKind::Craft` posting + claim onto the agent so
+        // `job_goal_lock_system` pins `AgentGoal::Craft` deterministically
+        // (the test faction has no craft-tech, so `should_craft` would
+        // return false and `goal_update_system` would re-derive the goal).
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            let posting = JobPosting {
+                id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Craft,
+                progress: JobProgress::Crafting {
+                    crafted: 0,
+                    target: 1,
+                    recipe: 1,
+                    bench: None,
+                    tech_payload: None,
+                },
+                claimants: vec![person],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+            };
+            board
+                .postings
+                .entry(sim.player_faction_id)
+                .or_default()
+                .push(posting);
+            id
+        };
+        {
+            let mut entity = sim.app.world_mut().entity_mut(person);
+            entity.insert(JobClaim {
+                job_id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Craft,
+                posted_tick: 0,
+                fail_count: 0,
+            });
+            entity.insert(ClaimTarget::default());
+            let mut goal = entity.get_mut::<AgentGoal>().unwrap();
+            *goal = AgentGoal::Craft;
+        }
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+
+        match aq.current {
+            Task::WorkOnCraftOrder { order: o } => {
+                assert_eq!(
+                    o, order_entity,
+                    "head Task::WorkOnCraftOrder should target the spawned satisfied order"
+                );
+            }
+            other => panic!(
+                "expected Task::WorkOnCraftOrder as head of WorkOnCraft chain, got {:?}",
+                other
+            ),
+        }
+
+        assert_eq!(
+            aq.queued_len(),
+            1,
+            "expected exactly one queued task (DepositToFactionStorage) behind WorkOnCraftOrder"
+        );
+        match aq.peek_next() {
+            Some(Task::DepositToFactionStorage { resource_id }) => {
+                assert_eq!(
+                    resource_id,
+                    crate::economy::core_ids::weapon(),
+                    "queued deposit should carry the recipe output (Spear → Weapon class)"
+                );
+            }
+            other => panic!(
+                "expected Task::DepositToFactionStorage queued behind WorkOnCraftOrder, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Phase 5e-xi-c: an agent under `AgentGoal::Craft` with an open faction
+    /// `CraftOrder` needing Grain and a remembered mature Grain plant
+    /// dispatches `[Gather { plant_tile }, HaulToCraftOrder { order }]` via
+    /// `htn_harvest_grain_for_craft_order_dispatch_system` +
+    /// `HarvestAndHaulGrainToCraftOrderMethod`. Replaces the legacy
+    /// `DeliverGrainToCraftOrder` plan (PlanId 14).
+    #[test]
+    fn craft_goal_dispatches_harvest_grain_then_haul_to_craft_order_chain() {
+        use crate::simulation::construction::GoodNeed;
+        use crate::simulation::crafting::{CraftOrder, CraftOrderMap, MAX_CRAFT_INPUTS};
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::jobs::{
+            ClaimTarget, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+        };
+        use crate::simulation::memory::{AgentMemory, MemoryKind};
+        use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(125);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Spawn a mature Grain plant outside VIEW_RADIUS=15 so injected
+        // memory survives `vision_system` clearing on the dispatch tick.
+        // (Memory-driven test targets must be outside VIEW_RADIUS — see
+        // test_fixture quirks.)
+        let grain_tile = (40, 0);
+        let grain_world = tile_to_world(grain_tile.0, grain_tile.1);
+        let grain_entity = sim
+            .app
+            .world_mut()
+            .spawn((
+                Plant {
+                    kind: PlantKind::Grain,
+                    stage: GrowthStage::Mature,
+                    growth_ticks: 0,
+                    tile_pos: grain_tile,
+                },
+                Transform::from_xyz(grain_world.x, grain_world.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<PlantMap>()
+            .0
+            .insert(grain_tile, grain_entity);
+
+        // Spawn a CraftOrder needing Grain (Woven Cloth, recipe 4 — needs
+        // 3 Grain, station Loom, but tech_gate isn't checked at order-spawn
+        // time; the dispatcher just walks the deposits). To bypass any
+        // station-availability concerns and keep the test focused on the
+        // dispatcher, hand-construct an order whose deposit is Grain.
+        let order_tile = (10, 10);
+        let order_world = tile_to_world(order_tile.0, order_tile.1);
+        let mut deposits = [GoodNeed::default(); MAX_CRAFT_INPUTS];
+        deposits[0] = GoodNeed {
+            resource_id: crate::economy::core_ids::grain(),
+            needed: 3,
+            deposited: 0,
+        };
+        let order = CraftOrder {
+            faction_id: sim.player_faction_id,
+            workbench_tile: None,
+            anchor_tile: order_tile,
+            recipe_id: 4, // Woven Cloth
+            deposits,
+            deposit_count: 1,
+            work_progress: 0,
+            spawn_tick: 0,
+            tech_payload: None,
+        };
+        let order_entity = sim
+            .app
+            .world_mut()
+            .spawn((
+                order,
+                Transform::from_xyz(order_world.x, order_world.y, 0.32),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<CraftOrderMap>()
+            .0
+            .insert(order_tile, order_entity);
+
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Inject `AgentMemory::AnyEdible` pointing at the grain tile so the
+        // dispatcher's `best_for(AnyEdible)` lookup finds it.
+        {
+            let mut mem = sim
+                .app
+                .world_mut()
+                .get_mut::<AgentMemory>(person)
+                .expect("AgentMemory missing");
+            mem.record(grain_tile, MemoryKind::AnyEdible);
+        }
+
+        // Pin AgentGoal::Craft via JobClaim::Craft so `job_goal_lock_system`
+        // keeps it stuck across dispatch ticks (test faction has no craft
+        // tech, so `should_craft` would return false).
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            let posting = JobPosting {
+                id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Craft,
+                progress: JobProgress::Crafting {
+                    crafted: 0,
+                    target: 1,
+                    recipe: 4,
+                    bench: None,
+                    tech_payload: None,
+                },
+                claimants: vec![person],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+            };
+            board
+                .postings
+                .entry(sim.player_faction_id)
+                .or_default()
+                .push(posting);
+            id
+        };
+        {
+            let mut entity = sim.app.world_mut().entity_mut(person);
+            entity.insert(JobClaim {
+                job_id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Craft,
+                posted_tick: 0,
+                fail_count: 0,
+            });
+            entity.insert(ClaimTarget::default());
+            let mut goal = entity.get_mut::<AgentGoal>().unwrap();
+            *goal = AgentGoal::Craft;
+        }
+
+        sim.tick_n(7);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+
+        match aq.current {
+            Task::Gather { tile } => {
+                assert_eq!(
+                    tile, grain_tile,
+                    "head Task::Gather should target the remembered grain plant tile"
+                );
+            }
+            other => panic!(
+                "expected Task::Gather as head of HarvestGrainForCraftOrder chain, got {:?}",
+                other
+            ),
+        }
+
+        assert_eq!(
+            aq.queued_len(),
+            1,
+            "expected one queued task (HaulToCraftOrder) behind Gather"
+        );
+        match aq.peek_next() {
+            Some(Task::HaulToCraftOrder { order: o }) => {
+                assert_eq!(
+                    o, order_entity,
+                    "queued HaulToCraftOrder should target the spawned grain order"
+                );
+            }
+            other => panic!(
+                "expected Task::HaulToCraftOrder queued behind Gather, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Phase 5e-xii-a: an agent under `AgentGoal::Play` with a nearby other
+    /// Person dispatches `Task::Play { partner: Some(e) }` via
+    /// `htn_play_dispatch_system` + `PlayWithPartnerMethod`. Replaces the
+    /// legacy `PlaySocial` plan (PlanId 26).
+    #[test]
+    fn play_goal_dispatches_play_with_partner_when_partner_in_range() {
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::needs::Needs;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(141);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Two people: actor at (0, 0) with low willpower so goal_update_system
+        // settles on AgentGoal::Play; partner at (3, 0) within PLAY_RADIUS=12.
+        let actor = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.needs(Needs {
+                hunger: 20.0,
+                sleep: 20.0,
+                shelter: 20.0,
+                safety: 20.0,
+                social: 20.0,
+                reproduction: 20.0,
+                willpower: 30.0, // below PLAY_THRESHOLD so Play goal naturally fires
+            });
+        });
+        let partner = sim.spawn_person(sim.player_faction_id, (3, 0), |_| {});
+
+        // Seven ticks: SpatialIndex / Added<Indexed> settle for both spawn
+        // sites, goal_update_system flips to Play, ParallelB dispatcher
+        // argmaxes the registry and routes to partner.
+        sim.tick_n(7);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(actor)
+            .expect("ActionQueue missing");
+
+        match aq.current {
+            Task::Play { partner: Some(p) } => {
+                assert_eq!(
+                    p, partner,
+                    "head Task::Play should target the nearest other Person"
+                );
+            }
+            other => panic!(
+                "expected Task::Play with partner as head of Play chain, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(
+            aq.queued_len(),
+            0,
+            "Play is single-leg — nothing should be queued"
+        );
+        // Verify the goal actually settled on Play during the dispatch tick.
+        let goal = sim.app.world().get::<AgentGoal>(actor).expect("goal missing");
+        assert_eq!(*goal, AgentGoal::Play, "expected goal to be Play");
     }
 }

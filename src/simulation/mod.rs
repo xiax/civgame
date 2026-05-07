@@ -224,6 +224,24 @@ impl Plugin for SimulationPlugin {
                     .in_set(SimulationSet::ParallelB),
             )
             .add_systems(
+                // Phase 5e-xi-a/b: split-off because the main ParallelB tuple
+                // is already at Bevy's 20-element IntoSystemConfigs ceiling.
+                // Same SimulationSet, ordered after the combat dispatcher to
+                // keep the HTN chain semantically contiguous.
+                FixedUpdate,
+                (
+                    htn::htn_deliver_material_to_craft_order_dispatch_system
+                        .after(htn::htn_combat_faction_dispatch_system),
+                    htn::htn_work_on_craft_order_dispatch_system
+                        .after(htn::htn_deliver_material_to_craft_order_dispatch_system),
+                    htn::htn_harvest_grain_for_craft_order_dispatch_system
+                        .after(htn::htn_work_on_craft_order_dispatch_system),
+                    htn::htn_play_dispatch_system
+                        .after(htn::htn_harvest_grain_for_craft_order_dispatch_system),
+                )
+                    .in_set(SimulationSet::ParallelB),
+            )
+            .add_systems(
                 FixedUpdate,
                 (
                     carry::enforce_hand_state_system.before(gather::gather_system),

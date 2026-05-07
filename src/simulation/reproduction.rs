@@ -507,11 +507,14 @@ pub fn pregnancy_system(
                     // SCAVENGE_FOOD retired 5c-ii-d-vi.
                     PlanId::BUILD_BLUEPRINT,
                     PlanId::DELIVER_HIDE_TO_CRAFT_ORDER,
-                    PlanId::DELIVER_GRAIN_TO_CRAFT_ORDER,
-                    PlanId::DELIVER_FROM_STORAGE_TO_CRAFT_ORDER,
-                    PlanId::WORK_ON_CRAFT,
-                    PlanId::PLAY_SOCIAL,
-                    PlanId::PLAY_SOLO,
+                    // DELIVER_GRAIN_TO_CRAFT_ORDER retired in Phase 5e-xi-c
+                    // (HTN method `HarvestAndHaulGrainToCraftOrderMethod`).
+                    // DELIVER_FROM_STORAGE_TO_CRAFT_ORDER retired in Phase 5e-xi-a
+                    // (HTN method `WithdrawAndHaulToCraftOrderMethod`).
+                    // WORK_ON_CRAFT retired in Phase 5e-xi-b
+                    // (HTN method `WorkOnSatisfiedCraftOrderMethod`).
+                    // PLAY_SOCIAL / PLAY_SOLO retired in Phase 5e-xii-a
+                    // (HTN methods PlayWithPartnerMethod / PlaySoloMethod).
                     PlanId::HAUL_FROM_STORAGE_AND_BUILD,
                     PlanId::PLAY_BY_PLANTING,
                     PlanId::PLAY_BY_THROWING_ROCKS,

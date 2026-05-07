@@ -205,6 +205,43 @@ pub enum AbstractTask {
     /// adjacency. Replaces legacy `RescueAlly` plan PlanId 23 + StepId 27
     /// (`StepTarget::RescueAttacker`).
     RescueAlly,
+    /// Worker under `AgentGoal::Craft` walks to faction storage, withdraws one
+    /// unit of `resource_id`, then carries it to a faction `CraftOrder` whose
+    /// deposit slots still need that resource. Single expansion
+    /// `[WithdrawMaterial { resource_id, qty: 1 }, HaulToCraftOrder { order }]`.
+    /// `MF_UNINTERRUPTIBLE` so a goal flip mid-fetch doesn't strand the
+    /// reservation — mirrors the legacy plan's `PF_UNINTERRUPTIBLE`. Replaces
+    /// the legacy `DeliverFromStorageToCraftOrder` plan (PlanId 15) +
+    /// `[StepId(40) FetchCraftOrderMaterialFromStorage, StepId(38)
+    /// HaulToCraftOrder]`.
+    DeliverMaterialToCraftOrder { resource_id: ResourceId },
+    /// Worker under `AgentGoal::Craft` walks adjacent to a satisfied faction
+    /// `CraftOrder` and labors at it until `craft_order_system` produces the
+    /// output and despawns the order. Single expansion
+    /// `[Task::WorkOnCraftOrder { order }, Task::DepositToFactionStorage
+    /// { resource_id: output }]`. `MF_UNINTERRUPTIBLE` so a goal flip mid-
+    /// labor doesn't drop the worker (mirrors the legacy plan's
+    /// `PF_UNINTERRUPTIBLE`). Replaces the legacy `WorkOnCraft` plan
+    /// (PlanId 16) + `[StepId(39) WorkOnCraftOrder, StepId(12) DepositGoods]`.
+    WorkOnCraftOrder,
+    /// Worker under `AgentGoal::Craft` harvests a mature grain plant (in
+    /// memory) and hauls the harvested grain to a faction `CraftOrder` whose
+    /// deposits still need it. Single expansion `[Task::Gather { tile },
+    /// Task::HaulToCraftOrder { order }]`. `MF_UNINTERRUPTIBLE` so a goal flip
+    /// mid-harvest doesn't drop the chain (mirrors the legacy plan's
+    /// `PF_UNINTERRUPTIBLE`). Replaces the legacy `DeliverGrainToCraftOrder`
+    /// plan (PlanId 14) + `[StepId(1) FarmFood, StepId(38) HaulToCraftOrder]`.
+    HarvestGrainForCraftOrder,
+    /// Agent under `AgentGoal::Play` recreates — either with a nearby Person
+    /// (`PlayWithPartnerMethod`, social play) or solo with an entertainment-
+    /// valued item held or adjacent (`PlaySoloMethod`). Single expansion
+    /// `[Task::Play { partner }]` from each method; `play_system` reads the
+    /// partner from `ai.target_entity` (set by routing) and accumulates
+    /// willpower until `PLAY_DURATION_TICKS` or `PLAY_FULL_WILLPOWER`. Not
+    /// `MF_UNINTERRUPTIBLE` — Play is the lowest-priority need-driven activity
+    /// and freely yields to hunger / sleep / external preempts. Replaces
+    /// legacy `PlaySocial` plan PlanId 26 + `PlaySolo` plan PlanId 27.
+    Play,
 }
 
 /// Discriminant-only key for `MethodRegistry` lookups. `AbstractTask` itself
@@ -232,6 +269,10 @@ pub enum AbstractTaskKind {
     Defend,
     Lead,
     RescueAlly,
+    DeliverMaterialToCraftOrder,
+    WorkOnCraftOrder,
+    HarvestGrainForCraftOrder,
+    Play,
 }
 
 impl AbstractTask {
@@ -256,6 +297,12 @@ impl AbstractTask {
             AbstractTask::Defend => AbstractTaskKind::Defend,
             AbstractTask::Lead => AbstractTaskKind::Lead,
             AbstractTask::RescueAlly => AbstractTaskKind::RescueAlly,
+            AbstractTask::DeliverMaterialToCraftOrder { .. } => {
+                AbstractTaskKind::DeliverMaterialToCraftOrder
+            }
+            AbstractTask::WorkOnCraftOrder => AbstractTaskKind::WorkOnCraftOrder,
+            AbstractTask::HarvestGrainForCraftOrder => AbstractTaskKind::HarvestGrainForCraftOrder,
+            AbstractTask::Play => AbstractTaskKind::Play,
         }
     }
 }
@@ -304,6 +351,11 @@ impl MethodId {
     pub const DEFEND_CAMP: MethodId = MethodId(27);
     pub const LEAD_CAMP: MethodId = MethodId(28);
     pub const ENGAGE_RESCUE_ATTACKER: MethodId = MethodId(29);
+    pub const WITHDRAW_AND_HAUL_TO_CRAFT_ORDER: MethodId = MethodId(30);
+    pub const WORK_ON_SATISFIED_CRAFT_ORDER: MethodId = MethodId(31);
+    pub const HARVEST_AND_HAUL_GRAIN_TO_CRAFT_ORDER: MethodId = MethodId(32);
+    pub const PLAY_WITH_PARTNER: MethodId = MethodId(33);
+    pub const PLAY_SOLO_WITH_ITEM: MethodId = MethodId(34);
 
     pub fn raw(self) -> u16 {
         self.0
@@ -660,6 +712,28 @@ pub struct PlannerCtx {
     /// an under-strength party — mirrors `wait_for_party_task_system`'s
     /// staleness exit.
     pub hunt_party_stale: bool,
+    /// Open faction `CraftOrder` entity. Read by
+    /// `WithdrawAndHaulToCraftOrderMethod` (Phase 5e-xi-a) for the
+    /// haul-to-order chain (precondition: deposits unmet) and by
+    /// `WorkOnSatisfiedCraftOrderMethod` (Phase 5e-xi-b) for the work-on-order
+    /// chain (precondition: deposits satisfied). The dispatcher picks the
+    /// nearest applicable order at decision time. `None` for non-Craft
+    /// dispatchers and ctx-build sites that don't populate it.
+    pub target_craft_order: Option<Entity>,
+    /// Output `ResourceId` of the recipe attached to `target_craft_order`,
+    /// snapshot by `htn_work_on_craft_order_dispatch_system` so
+    /// `WorkOnSatisfiedCraftOrderMethod`'s expansion can carry it on the
+    /// trailing `Task::DepositToFactionStorage`. Other dispatchers leave it
+    /// at `None`.
+    pub craft_output_resource: Option<ResourceId>,
+    /// Nearest other Person within play radius (12 tiles), filtered to
+    /// exclude blueprints/items/animals. Read by `PlayWithPartnerMethod`
+    /// (Phase 5e-xii-a). `None` if no partner is in range. Other dispatchers
+    /// leave it at `None`.
+    pub play_partner_entity: Option<Entity>,
+    /// `true` when the agent has an entertainment-valued item in hand or
+    /// adjacent on the ground. Read by `PlaySoloMethod` (Phase 5e-xii-a).
+    pub play_solo_eligible: bool,
 }
 
 /// A single decomposition rule for an `AbstractTask`. Scoring (`utility`) and
@@ -830,6 +904,20 @@ pub fn register_builtin_methods(reg: &mut MethodRegistry) {
         AbstractTaskKind::RescueAlly,
         Box::new(EngageRescueAttackerMethod),
     );
+    reg.register(
+        AbstractTaskKind::DeliverMaterialToCraftOrder,
+        Box::new(WithdrawAndHaulToCraftOrderMethod),
+    );
+    reg.register(
+        AbstractTaskKind::WorkOnCraftOrder,
+        Box::new(WorkOnSatisfiedCraftOrderMethod),
+    );
+    reg.register(
+        AbstractTaskKind::HarvestGrainForCraftOrder,
+        Box::new(HarvestAndHaulGrainToCraftOrderMethod),
+    );
+    reg.register(AbstractTaskKind::Play, Box::new(PlayWithPartnerMethod));
+    reg.register(AbstractTaskKind::Play, Box::new(PlaySoloMethod));
 }
 
 /// Sole method for `AbstractTask::Sleep`. Mirrors the three-branch decision
@@ -2753,6 +2841,10 @@ pub fn htn_dispatch_system(
                 hunt_area_tile: None,
                 hunt_party_deployed: false,
                 hunt_party_stale: false,
+                target_craft_order: None,
+                craft_output_resource: None,
+                play_partner_entity: None,
+                play_solo_eligible: false,
             };
 
             // Argmax over applicable methods. f32 has no total order; ties
@@ -2971,6 +3063,10 @@ pub fn htn_eat_dispatch_system(
                 hunt_area_tile: None,
                 hunt_party_deployed: false,
                 hunt_party_stale: false,
+                target_craft_order: None,
+                craft_output_resource: None,
+                play_partner_entity: None,
+                play_solo_eligible: false,
             };
 
             let abstract_task = AbstractTask::Eat;
@@ -3241,6 +3337,10 @@ pub fn htn_acquire_food_dispatch_system(
                 hunt_area_tile: None,
                 hunt_party_deployed: false,
                 hunt_party_stale: false,
+                target_craft_order: None,
+                craft_output_resource: None,
+                play_partner_entity: None,
+                play_solo_eligible: false,
             };
 
             let abstract_task = AbstractTask::AcquireFood;
@@ -3655,6 +3755,10 @@ pub fn htn_acquire_good_dispatch_system(
                     hunt_area_tile: None,
                     hunt_party_deployed: false,
                     hunt_party_stale: false,
+                    target_craft_order: None,
+                    craft_output_resource: None,
+                    play_partner_entity: None,
+                    play_solo_eligible: false,
                 };
 
                 let abstract_task = AbstractTask::AcquireGood {
@@ -3909,6 +4013,10 @@ pub fn htn_acquire_good_dispatch_system(
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         };
 
         let abstract_task = AbstractTask::AcquireGood { resource_id };
@@ -4204,6 +4312,10 @@ pub fn htn_stockpile_food_dispatch_system(
                 hunt_area_tile: None,
                 hunt_party_deployed: false,
                 hunt_party_stale: false,
+                target_craft_order: None,
+                craft_output_resource: None,
+                play_partner_entity: None,
+                play_solo_eligible: false,
             };
 
             let abstract_task = AbstractTask::StockpileFood;
@@ -4522,6 +4634,10 @@ pub fn htn_equip_hunting_spear_dispatch_system(
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         };
 
         let abstract_task = AbstractTask::EquipHuntingSpear;
@@ -4716,6 +4832,10 @@ pub fn htn_scout_dispatch_system(
                 hunt_area_tile: None,
                 hunt_party_deployed: false,
                 hunt_party_stale: false,
+                target_craft_order: None,
+                craft_output_resource: None,
+                play_partner_entity: None,
+                play_solo_eligible: false,
             };
 
             let abstract_task = AbstractTask::Scout;
@@ -4946,6 +5066,10 @@ pub fn htn_return_surplus_dispatch_system(
                 hunt_area_tile: None,
                 hunt_party_deployed: false,
                 hunt_party_stale: false,
+                target_craft_order: None,
+                craft_output_resource: None,
+                play_partner_entity: None,
+                play_solo_eligible: false,
             };
 
             let abstract_task = AbstractTask::ReturnSurplus;
@@ -5157,6 +5281,10 @@ pub fn htn_tame_horse_dispatch_system(
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         };
 
         let abstract_task = AbstractTask::TameWildHorse;
@@ -5418,6 +5546,10 @@ pub fn htn_plant_from_storage_dispatch_system(
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         };
 
         let abstract_task = AbstractTask::PlantFromStorage {
@@ -5616,6 +5748,10 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         };
 
         let abstract_task = AbstractTask::ConstructBlueprint;
@@ -5780,6 +5916,10 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         };
 
         let abstract_task = AbstractTask::DeliverHuntKill;
@@ -6057,6 +6197,10 @@ pub fn htn_engage_prey_dispatch_system(
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         };
 
         let abstract_task = AbstractTask::EngagePrey;
@@ -6291,6 +6435,10 @@ pub fn htn_join_hunt_party_dispatch_system(
             hunt_area_tile: Some(area_tile),
             hunt_party_deployed: deployed,
             hunt_party_stale: stale,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         };
 
         let abstract_task = AbstractTask::JoinHuntParty;
@@ -6504,6 +6652,10 @@ pub fn htn_socialize_dispatch_system(
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         };
 
         let abstract_task = AbstractTask::Socialize;
@@ -6736,6 +6888,10 @@ pub fn htn_combat_faction_dispatch_system(
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         };
 
         let methods = method_registry.methods_for(abstract_kind);
@@ -6788,6 +6944,1224 @@ pub fn htn_combat_faction_dispatch_system(
             continue;
         }
         aq.dispatch(head);
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
+}
+
+/// Phase 5e-xi-a method: withdraw one unit of `resource_id` from faction
+/// storage and haul it into a `CraftOrder` whose deposit slots still need it.
+/// Replaces the legacy `DeliverFromStorageToCraftOrder` plan (PlanId 15) +
+/// `[StepId(40) FetchCraftOrderMaterialFromStorage, StepId(38) HaulToCraftOrder]`.
+///
+/// Mirrors `WithdrawAndHaulToBlueprintMethod`'s shape — the only difference is
+/// the trailing leg's destination (a `CraftOrder` anchor tile vs. a
+/// `Blueprint` tile). Both legs together survive a goal flip via
+/// `MF_UNINTERRUPTIBLE` (mirrors the legacy plan's `PF_UNINTERRUPTIBLE`) so a
+/// transient hunger spike doesn't strand the storage reservation mid-fetch.
+///
+/// The dispatcher (`htn_deliver_material_to_craft_order_dispatch_system`)
+/// populates `material_storage_tile` (where we withdraw from) and
+/// `target_craft_order` (where the trailing leg delivers).
+pub struct WithdrawAndHaulToCraftOrderMethod;
+
+impl Method for WithdrawAndHaulToCraftOrderMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::DeliverMaterialToCraftOrder { .. }) {
+            return false;
+        }
+        ctx.material_stock_for_target > 0
+            && ctx.material_storage_tile.is_some()
+            && ctx.target_craft_order.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        // Single-method registry under DeliverMaterialToCraftOrder. Use the
+        // baseline tier — there's no sibling to outrank, and the chain only
+        // fires when both ctx pre-reqs are populated, which mirrors the
+        // legacy plan's "open craft order + storage stock" gate.
+        UTIL_BASELINE
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        let AbstractTask::DeliverMaterialToCraftOrder { resource_id } = abstract_task else {
+            return Vec::new();
+        };
+        let Some(order) = ctx.target_craft_order else {
+            return Vec::new();
+        };
+        if ctx.material_storage_tile.is_none() {
+            return Vec::new();
+        }
+        vec![
+            Task::WithdrawMaterial { resource_id, qty: 1 },
+            Task::HaulToCraftOrder { order },
+        ]
+    }
+
+    fn name(&self) -> &'static str {
+        "WithdrawAndHaulToCraftOrder"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::WITHDRAW_AND_HAUL_TO_CRAFT_ORDER
+    }
+}
+
+/// Phase 5e-xi-a dispatcher. Owns the `AgentGoal::Craft` deliver-from-storage
+/// case via the `DeliverMaterialToCraftOrder` abstract task. Replaces the
+/// legacy `DeliverFromStorageToCraftOrder` plan (PlanId 15) — the
+/// `[FetchCraftOrderMaterialFromStorage → HaulToCraftOrder]` chain.
+///
+/// Gates on:
+/// - `AgentGoal::Craft` (set by `should_craft` in `goal_update_system` or by a
+///   `JobClaim::Craft` companion via `job_goal_lock_system`).
+/// - No `ActivePlan` and Idle (the legacy `WorkOnCraft` plan, PlanId 16, still
+///   runs through `plan_execution_system` for the labor leg of a satisfied
+///   order, so we stay out of its way until it completes).
+/// - Non-SOLO faction.
+///
+/// Resolution mirrors `resolve_withdraw_for_faction_need`'s `MaterialNeed::CraftOrder`
+/// branch:
+/// 1. Aggregate per-resource still-needed demand across the faction's open
+///    `CraftOrder`s.
+/// 2. Walk faction storage tiles to find the nearest one whose ground items
+///    cover any demanded resource (effective stock after `StorageReservations`).
+/// 3. On that tile, pick the most-deficient resource (the legacy
+///    `GoodSelector::MostDeficient` behaviour). Stable tiebreak by `ResourceId.0`.
+/// 4. Pick the nearest `CraftOrder` whose deposits still need the chosen
+///    resource. Carry that order entity through the chain so the trailing
+///    `Task::HaulToCraftOrder { order }` knows where to deliver.
+///
+/// The chain handoff lives in `production::finish_withdraw_material`'s
+/// `Task::HaulToCraftOrder` arm, which routes to `order.anchor_tile` via
+/// `assign_task_with_routing(... TaskKind::HaulToCraftOrder, Some(order) ...)`.
+/// `craft_order_system`'s hauler branch already deposits-on-arrival; this PR
+/// teaches it to also `aq.advance()` so the typed channel drains on completion.
+pub fn htn_deliver_material_to_craft_order_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    storage_tile_map: Res<StorageTileMap>,
+    storage_reservations: Res<crate::simulation::faction::StorageReservations>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    co_map: Res<crate::simulation::crafting::CraftOrderMap>,
+    co_query: Query<&crate::simulation::crafting::CraftOrder>,
+    item_query: Query<&crate::simulation::items::GroundItem>,
+    clock: Res<SimClock>,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
+            &FactionMember,
+            &Transform,
+            &LodLevel,
+            Option<&ActivePlan>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    let now = clock.tick;
+    for (mut ai, mut aq, mut history, goal, member, transform, lod, active_plan_opt) in
+        query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::Craft) {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+        if member.faction_id == SOLO {
+            continue;
+        }
+
+        // 1. Aggregate per-resource demand across the faction's open orders.
+        let mut still_need: AHashMap<ResourceId, u32> = AHashMap::new();
+        for (_, &order_entity) in &co_map.0 {
+            let Ok(order) = co_query.get(order_entity) else {
+                continue;
+            };
+            if order.faction_id != member.faction_id {
+                continue;
+            }
+            for i in 0..order.deposit_count as usize {
+                let still =
+                    order.deposits[i].needed.saturating_sub(order.deposits[i].deposited);
+                if still > 0 {
+                    let rid = order.deposits[i].resource_id;
+                    let slot = still_need.entry(rid).or_insert(0);
+                    *slot = slot.saturating_add(still as u32);
+                }
+            }
+        }
+        if still_need.is_empty() {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // 2. Find the nearest faction storage tile holding at least one
+        //    demanded resource (intersection of demand & effective stock).
+        let Some(tiles) = storage_tile_map.by_faction.get(&member.faction_id) else {
+            continue;
+        };
+        let effective_stock = |tx: i32, ty: i32, rid: ResourceId| -> u32 {
+            let mut stock = 0u32;
+            for &gi_entity in spatial.get(tx, ty) {
+                if let Ok(gi) = item_query.get(gi_entity) {
+                    if gi.item.resource_id == rid {
+                        stock = stock.saturating_add(gi.qty);
+                    }
+                }
+            }
+            stock.saturating_sub(storage_reservations.get((tx, ty), rid))
+        };
+        let mut best_tile: Option<(i32, i32)> = None;
+        let mut best_dist = i32::MAX;
+        for &(tx, ty) in tiles {
+            let mut has_useful = false;
+            for &gi_entity in spatial.get(tx, ty) {
+                if let Ok(gi) = item_query.get(gi_entity) {
+                    if gi.qty == 0 {
+                        continue;
+                    }
+                    let rid = gi.item.resource_id;
+                    if still_need.get(&rid).copied().unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    if effective_stock(tx, ty, rid) > 0 {
+                        has_useful = true;
+                        break;
+                    }
+                }
+            }
+            if !has_useful {
+                continue;
+            }
+            let dist = (tx - cur_tx).abs() + (ty - cur_ty).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best_tile = Some((tx, ty));
+            }
+        }
+        let Some((stx, sty)) = best_tile else {
+            continue;
+        };
+
+        // 3. Pick the most-deficient resource on the chosen tile (legacy
+        //    `GoodSelector::MostDeficient` behaviour). Stable tiebreak by
+        //    `ResourceId.0` for deterministic dispatch.
+        let mut chosen: Option<(ResourceId, u32, u32)> = None; // (rid, deficit, stock)
+        for &gi_entity in spatial.get(stx, sty) {
+            if let Ok(gi) = item_query.get(gi_entity) {
+                if gi.qty == 0 {
+                    continue;
+                }
+                let rid = gi.item.resource_id;
+                let deficit = still_need.get(&rid).copied().unwrap_or(0);
+                if deficit == 0 {
+                    continue;
+                }
+                let stock = effective_stock(stx, sty, rid);
+                if stock == 0 {
+                    continue;
+                }
+                chosen = Some(match chosen {
+                    None => (rid, deficit, stock),
+                    Some(prev) => {
+                        if deficit > prev.1 || (deficit == prev.1 && rid.0 < prev.0 .0) {
+                            (rid, deficit, stock)
+                        } else {
+                            prev
+                        }
+                    }
+                });
+            }
+        }
+        let Some((target_rid, _deficit, tile_stock)) = chosen else {
+            continue;
+        };
+
+        // 4. Pick the nearest `CraftOrder` of the agent's faction whose
+        //    deposits still need `target_rid`.
+        let mut order_pick: Option<(Entity, i32)> = None;
+        for (_, &order_entity) in &co_map.0 {
+            let Ok(order) = co_query.get(order_entity) else {
+                continue;
+            };
+            if order.faction_id != member.faction_id {
+                continue;
+            }
+            let mut needs_it = false;
+            for i in 0..order.deposit_count as usize {
+                if order.deposits[i].resource_id == target_rid
+                    && order.deposits[i].needed > order.deposits[i].deposited
+                {
+                    needs_it = true;
+                    break;
+                }
+            }
+            if !needs_it {
+                continue;
+            }
+            let dist =
+                (order.anchor_tile.0 - cur_tx).abs() + (order.anchor_tile.1 - cur_ty).abs();
+            order_pick = Some(match order_pick {
+                None => (order_entity, dist),
+                Some((_, prev_dist)) if dist < prev_dist => (order_entity, dist),
+                Some(prev) => prev,
+            });
+        }
+        let Some((order_entity, _)) = order_pick else {
+            continue;
+        };
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home: faction_registry.home_tile(member.faction_id),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: Some((stx, sty)),
+            material_stock_for_target: tile_stock,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: None,
+            scavenge_target_entity: None,
+            scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
+            target_craft_order: Some(order_entity),
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
+        };
+
+        let abstract_task = AbstractTask::DeliverMaterialToCraftOrder {
+            resource_id: target_rid,
+        };
+        let methods =
+            method_registry.methods_for(AbstractTaskKind::DeliverMaterialToCraftOrder);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        match head {
+            Task::WithdrawMaterial { resource_id: head_resource, qty } => {
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    (stx, sty),
+                    TaskKind::WithdrawMaterial,
+                    None,
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                // Reserve the qty against the chosen tile so a parallel
+                // dispatch in the same tick sees a smaller effective stock.
+                storage_reservations.add((stx, sty), head_resource, qty as u32);
+                ai.reserved_tile = (stx, sty);
+                ai.reserved_resource = Some(head_resource);
+                ai.reserved_qty = qty;
+                aq.dispatch(Task::WithdrawMaterial {
+                    resource_id: head_resource,
+                    qty,
+                });
+            }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
+}
+
+/// Phase 5e-xi-b method: walk adjacent to a satisfied faction `CraftOrder`
+/// and labor at it until completion. Replaces the legacy `WorkOnCraft` plan
+/// (PlanId 16) + `[StepId(39) WorkOnCraftOrder, StepId(12) DepositGoods]`.
+///
+/// Single-method registry under `AbstractTaskKind::WorkOnCraftOrder` —
+/// dispatcher fires only when at least one satisfied order exists, so there
+/// are no siblings to outrank. Expansion is `[Task::WorkOnCraftOrder { order
+/// }, Task::DepositToFactionStorage { resource_id: output }]`. The trailing
+/// deposit chain handoff lives in `craft_order_system`'s completion path —
+/// after `aq.advance()` promotes the queued deposit, the system routes the
+/// agent to the nearest faction storage tile and primes
+/// `task_id = TaskKind::DepositResource`. `drop_items_at_destination_system`
+/// (Economy) already deposits crafted output goods (Tools / Weapon / Armor /
+/// Shield / Cloth / Luxury) from inventory at the destination tile.
+///
+/// `MF_UNINTERRUPTIBLE` so a goal flip mid-labor doesn't drop the worker —
+/// mirrors the legacy plan's `PF_UNINTERRUPTIBLE`.
+pub struct WorkOnSatisfiedCraftOrderMethod;
+
+impl Method for WorkOnSatisfiedCraftOrderMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::WorkOnCraftOrder)
+            && ctx.target_craft_order.is_some()
+            && ctx.craft_output_resource.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn expand(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        let Some(order) = ctx.target_craft_order else {
+            return Vec::new();
+        };
+        let Some(output) = ctx.craft_output_resource else {
+            return Vec::new();
+        };
+        vec![
+            Task::WorkOnCraftOrder { order },
+            Task::DepositToFactionStorage { resource_id: output },
+        ]
+    }
+
+    fn name(&self) -> &'static str {
+        "WorkOnSatisfiedCraftOrder"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::WORK_ON_SATISFIED_CRAFT_ORDER
+    }
+}
+
+/// Phase 5e-xi-b dispatcher. Owns the `AgentGoal::Craft` work-on-satisfied-
+/// order case via the `WorkOnCraftOrder` abstract task. Replaces the legacy
+/// `WorkOnCraft` plan (PlanId 16).
+///
+/// Gates on `AgentGoal::Craft` + no `ActivePlan` + Idle + non-SOLO. Scans
+/// `CraftOrderMap` for the nearest faction-owned order whose `is_satisfied()`
+/// is true (deposits filled). Snapshots the order entity and its recipe's
+/// `output_resource` into ctx.
+///
+/// Routes via `assign_task_with_routing(... TaskKind::WorkOnCraftOrder,
+/// Some(order) ...)` to the order's `anchor_tile` and dispatches the head
+/// `Task::WorkOnCraftOrder { order }`; the trailing
+/// `Task::DepositToFactionStorage { resource_id: output }` rides the prefetch
+/// ring. The chain handoff lives in `craft_order_system`'s completion path:
+/// after producing the output and calling `aq.advance()`, if the new
+/// `current` is a `DepositToFactionStorage`, route to the nearest faction
+/// storage tile and prime `task_id = TaskKind::DepositResource`.
+pub fn htn_work_on_craft_order_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    co_map: Res<crate::simulation::crafting::CraftOrderMap>,
+    co_query: Query<&crate::simulation::crafting::CraftOrder>,
+    clock: Res<SimClock>,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
+            &FactionMember,
+            &Transform,
+            &LodLevel,
+            Option<&ActivePlan>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    let now = clock.tick;
+    for (mut ai, mut aq, mut history, goal, member, transform, lod, active_plan_opt) in
+        query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::Craft) {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+        if member.faction_id == SOLO {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Scan for the nearest faction-owned satisfied order. Mirrors the
+        // legacy `StepTarget::NearestSatisfiedCraftOrder` resolver.
+        let mut best: Option<(Entity, (i32, i32), u8)> = None; // (entity, anchor, recipe_id)
+        let mut best_dist = i32::MAX;
+        for (&_anchor_tile, &order_entity) in &co_map.0 {
+            let Ok(order) = co_query.get(order_entity) else {
+                continue;
+            };
+            if order.faction_id != member.faction_id {
+                continue;
+            }
+            if !order.is_satisfied() {
+                continue;
+            }
+            let dist = (order.anchor_tile.0 - cur_tx).abs() + (order.anchor_tile.1 - cur_ty).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best = Some((order_entity, order.anchor_tile, order.recipe_id));
+            }
+        }
+        let Some((order_entity, anchor, recipe_id)) = best else {
+            continue;
+        };
+
+        let recipes = crate::simulation::crafting::craft_recipes();
+        let Some(recipe) = recipes.get(recipe_id as usize) else {
+            continue;
+        };
+        let output_resource = recipe.output_resource;
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home: faction_registry.home_tile(member.faction_id),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: None,
+            scavenge_target_entity: None,
+            scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
+            target_craft_order: Some(order_entity),
+            craft_output_resource: Some(output_resource),
+            play_partner_entity: None,
+            play_solo_eligible: false,
+        };
+
+        let abstract_task = AbstractTask::WorkOnCraftOrder;
+        let methods = method_registry.methods_for(AbstractTaskKind::WorkOnCraftOrder);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        match head {
+            Task::WorkOnCraftOrder { order } => {
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    anchor,
+                    TaskKind::WorkOnCraftOrder,
+                    Some(order),
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                aq.dispatch(Task::WorkOnCraftOrder { order });
+            }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
+}
+
+/// Phase 5e-xi-c method: harvest a mature grain plant in memory and haul
+/// the harvested grain to a faction `CraftOrder` whose deposits still need
+/// it. Replaces the legacy `DeliverGrainToCraftOrder` plan (PlanId 14) +
+/// `[StepId(1) FarmFood, StepId(38) HaulToCraftOrder]`.
+///
+/// Single-method registry under `AbstractTaskKind::HarvestGrainForCraftOrder`.
+/// Expansion: `[Task::Gather { tile }, Task::HaulToCraftOrder { order }]`.
+/// The trailing haul's chain handoff lives in `gather::finish_gather`'s
+/// `Task::HaulToCraftOrder` arm — looks up `CraftOrder.anchor_tile` and
+/// routes via `assign_task_with_routing(... TaskKind::HaulToCraftOrder,
+/// Some(order) ...)`. `craft_order_system`'s hauler branch consumes the
+/// typed task on arrival and `aq.advance()`s on completion.
+///
+/// `MF_UNINTERRUPTIBLE` so a goal flip mid-harvest doesn't drop the chain.
+pub struct HarvestAndHaulGrainToCraftOrderMethod;
+
+impl Method for HarvestAndHaulGrainToCraftOrderMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::HarvestGrainForCraftOrder)
+            && ctx.gather_target_tile.is_some()
+            && ctx.target_craft_order.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn expand(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        let Some(tile) = ctx.gather_target_tile else {
+            return Vec::new();
+        };
+        let Some(order) = ctx.target_craft_order else {
+            return Vec::new();
+        };
+        vec![
+            Task::Gather { tile },
+            Task::HaulToCraftOrder { order },
+        ]
+    }
+
+    fn name(&self) -> &'static str {
+        "HarvestAndHaulGrainToCraftOrder"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::HARVEST_AND_HAUL_GRAIN_TO_CRAFT_ORDER
+    }
+}
+
+/// Phase 5e-xi-c dispatcher. Owns the harvest-grain-for-craft case under
+/// `AgentGoal::Craft`. Replaces the legacy `DeliverGrainToCraftOrder` plan
+/// (PlanId 14).
+///
+/// Gates on `AgentGoal::Craft` + no `ActivePlan` + Idle + non-SOLO + at least
+/// one open faction `CraftOrder` whose deposits still need Grain. Walks
+/// `AgentMemory::best_for(MemoryKind::AnyEdible)` paired with `PlantMap` to
+/// find a mature Grain plant tile. Picks the nearest such craft order.
+/// Snapshots `(gather_target_tile, target_craft_order)` into ctx and dispatches
+/// the head `Task::Gather { tile }` via `assign_task_with_routing(...
+/// TaskKind::Gather, None ...)`. The trailing `Task::HaulToCraftOrder { order }`
+/// rides the prefetch ring; `gather::finish_gather` routes it on harvest
+/// completion.
+pub fn htn_harvest_grain_for_craft_order_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    co_map: Res<crate::simulation::crafting::CraftOrderMap>,
+    co_query: Query<&crate::simulation::crafting::CraftOrder>,
+    plant_map: Res<PlantMap>,
+    plant_query: Query<&Plant>,
+    clock: Res<SimClock>,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
+            &FactionMember,
+            &Transform,
+            &LodLevel,
+            Option<&ActivePlan>,
+            Option<&AgentMemory>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    let now = clock.tick;
+    let grain_id = crate::economy::core_ids::grain();
+    for (
+        mut ai,
+        mut aq,
+        mut history,
+        goal,
+        member,
+        transform,
+        lod,
+        active_plan_opt,
+        memory_opt,
+    ) in query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::Craft) {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+        if member.faction_id == SOLO {
+            continue;
+        }
+
+        // Find the nearest faction-owned CraftOrder whose deposits still need
+        // grain. Mirrors `MaterialNeed::CraftOrder` resolver but filtered to
+        // a specific resource (grain).
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+        let mut order_pick: Option<(Entity, i32)> = None;
+        for (_, &order_entity) in &co_map.0 {
+            let Ok(order) = co_query.get(order_entity) else {
+                continue;
+            };
+            if order.faction_id != member.faction_id {
+                continue;
+            }
+            let mut needs_grain = false;
+            for i in 0..order.deposit_count as usize {
+                if order.deposits[i].resource_id == grain_id
+                    && order.deposits[i].needed > order.deposits[i].deposited
+                {
+                    needs_grain = true;
+                    break;
+                }
+            }
+            if !needs_grain {
+                continue;
+            }
+            let dist =
+                (order.anchor_tile.0 - cur_tx).abs() + (order.anchor_tile.1 - cur_ty).abs();
+            order_pick = Some(match order_pick {
+                None => (order_entity, dist),
+                Some((_, prev_dist)) if dist < prev_dist => (order_entity, dist),
+                Some(prev) => prev,
+            });
+        }
+        let Some((order_entity, _)) = order_pick else {
+            continue;
+        };
+
+        // Find a remembered mature Grain plant tile. Mirrors the legacy
+        // `StepTarget::FromMemory(AnyEdible)` resolver with `plant_filter:
+        // Some(PlantKind::Grain)`.
+        let gather_target_tile = memory_opt.and_then(|m| {
+            m.best_for(MemoryKind::AnyEdible).and_then(|tile| {
+                let entity = plant_map.0.get(&tile).copied()?;
+                let plant = plant_query.get(entity).ok()?;
+                if plant.kind == crate::simulation::plants::PlantKind::Grain
+                    && plant.stage == GrowthStage::Mature
+                {
+                    Some(tile)
+                } else {
+                    None
+                }
+            })
+        });
+        let Some(grain_tile) = gather_target_tile else {
+            continue;
+        };
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home: faction_registry.home_tile(member.faction_id),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: Some(grain_tile),
+            scavenge_target_entity: None,
+            scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
+            target_craft_order: Some(order_entity),
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
+        };
+
+        let abstract_task = AbstractTask::HarvestGrainForCraftOrder;
+        let methods = method_registry.methods_for(AbstractTaskKind::HarvestGrainForCraftOrder);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        match head {
+            Task::Gather { tile } => {
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    tile,
+                    TaskKind::Gather,
+                    None,
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                aq.dispatch(Task::Gather { tile });
+            }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
+}
+
+/// Phase 5e-xii-a method: agent under `AgentGoal::Play` plays with another
+/// Person within play radius. Single-leg expansion `[Task::Play { partner:
+/// Some(e) }]`. The dispatcher routes the agent adjacent to the partner via
+/// `assign_task_with_routing(... TaskKind::Play, Some(partner) ...)`.
+/// `play_system` reads the partner from `ai.target_entity` and accumulates
+/// willpower / social need fill on adjacency. Replaces the legacy `PlaySocial`
+/// plan (PlanId 26).
+pub struct PlayWithPartnerMethod;
+
+impl Method for PlayWithPartnerMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::Play) && ctx.play_partner_entity.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        // Social play is the higher-value Play branch (the legacy plan
+        // weighted PlaySocial reward_scale 1.0 vs PlaySolo 0.4); use the
+        // visible-ground tier so it outranks the solo fallback.
+        UTIL_VISIBLE_GROUND
+    }
+
+    fn expand(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        let Some(partner) = ctx.play_partner_entity else {
+            return Vec::new();
+        };
+        vec![Task::Play { partner: Some(partner) }]
+    }
+
+    fn name(&self) -> &'static str {
+        "PlayWithPartner"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::PLAY_WITH_PARTNER
+    }
+}
+
+/// Phase 5e-xii-a method: agent under `AgentGoal::Play` plays solo with a
+/// held or adjacent entertainment item. Single-leg expansion
+/// `[Task::Play { partner: None }]`. The dispatcher routes the agent in place
+/// (or to an adjacent entertainment ground item) via
+/// `assign_task_with_routing(... TaskKind::Play, None ...)`. `play_system`
+/// detects the absence of a partner and falls back to the solo branch.
+/// Replaces the legacy `PlaySolo` plan (PlanId 27).
+pub struct PlaySoloMethod;
+
+impl Method for PlaySoloMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::Play) && ctx.play_solo_eligible
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE
+    }
+
+    fn expand(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> Vec<Task> {
+        vec![Task::Play { partner: None }]
+    }
+
+    fn name(&self) -> &'static str {
+        "PlaySolo"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::PLAY_SOLO_WITH_ITEM
+    }
+}
+
+/// Phase 5e-xii-a dispatcher. Owns `AgentGoal::Play` end-to-end via the `Play`
+/// abstract task. Replaces the legacy `PlaySocial` (PlanId 26) and `PlaySolo`
+/// (PlanId 27) plans.
+///
+/// Gates on `AgentGoal::Play` + no `ActivePlan` + Idle. Scans `SpatialIndex`
+/// within `PLAY_RADIUS=12` for the nearest other Person (mirrors the legacy
+/// `StepTarget::NearestPlayPartner` resolver — filters out blueprints, items,
+/// animals via component checks). Checks the agent's hands for any held
+/// entertainment good and within `ITEM_RADIUS=8` for visible entertainment
+/// ground items (mirrors `StepTarget::NearestPlayItem`).
+///
+/// Argmax: `PlayWithPartnerMethod` (1.5) wins when a partner is in range;
+/// `PlaySoloMethod` (1.0) is the fallback when only an entertainment item is
+/// available. Both methods emit a single `Task::Play` task; routing is to the
+/// partner entity (or in-place for solo). `play_system` is unchanged — it
+/// reads `ai.target_entity` for partner adjacency.
+pub fn htn_play_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    person_query: Query<(), With<crate::simulation::person::Person>>,
+    bp_query: Query<(), With<crate::simulation::construction::Blueprint>>,
+    item_query: Query<&crate::simulation::items::GroundItem>,
+    animal_query: Query<
+        (),
+        Or<(
+            With<crate::simulation::animals::Wolf>,
+            With<crate::simulation::animals::Deer>,
+            With<crate::simulation::animals::Horse>,
+        )>,
+    >,
+    clock: Res<SimClock>,
+    mut query: Query<
+        (
+            Entity,
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
+            &Transform,
+            &Carrier,
+            &LodLevel,
+            Option<&ActivePlan>,
+            Option<&FactionMember>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    const PLAY_RADIUS: i32 = 12;
+    const ITEM_RADIUS: i32 = 8;
+
+    let now = clock.tick;
+    for (
+        agent,
+        mut ai,
+        mut aq,
+        mut history,
+        goal,
+        transform,
+        carrier,
+        lod,
+        active_plan_opt,
+        member_opt,
+    ) in query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::Play) {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Scan for nearest play partner.
+        let mut play_partner_entity: Option<Entity> = None;
+        let mut play_partner_tile: Option<(i32, i32)> = None;
+        let mut best_dist = i32::MAX;
+        for dy in -PLAY_RADIUS..=PLAY_RADIUS {
+            for dx in -PLAY_RADIUS..=PLAY_RADIUS {
+                let tx = cur_tx + dx;
+                let ty = cur_ty + dy;
+                for &other in spatial.get(tx, ty) {
+                    if other == agent {
+                        continue;
+                    }
+                    if person_query.get(other).is_err() {
+                        continue;
+                    }
+                    if bp_query.get(other).is_ok()
+                        || item_query.get(other).is_ok()
+                        || animal_query.get(other).is_ok()
+                    {
+                        continue;
+                    }
+                    let dist = dx.abs() + dy.abs();
+                    if dist < best_dist {
+                        best_dist = dist;
+                        play_partner_entity = Some(other);
+                        play_partner_tile = Some((tx, ty));
+                    }
+                }
+            }
+        }
+
+        // Check hands for entertainment items, then scan for adjacent ground
+        // entertainment items. Mirrors the legacy `NearestPlayItem` resolver.
+        let held_l = carrier
+            .left
+            .map(|s| s.item.resource_id.entertainment_value())
+            .unwrap_or(0);
+        let held_r = carrier
+            .right
+            .map(|s| s.item.resource_id.entertainment_value())
+            .unwrap_or(0);
+        let mut play_solo_eligible = held_l > 0 || held_r > 0;
+        if !play_solo_eligible {
+            'item_scan: for dy in -ITEM_RADIUS..=ITEM_RADIUS {
+                for dx in -ITEM_RADIUS..=ITEM_RADIUS {
+                    let tx = cur_tx + dx;
+                    let ty = cur_ty + dy;
+                    for &e in spatial.get(tx, ty) {
+                        if let Ok(item) = item_query.get(e) {
+                            if item.item.resource_id.entertainment_value() > 0 && item.qty > 0 {
+                                play_solo_eligible = true;
+                                break 'item_scan;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if play_partner_entity.is_none() && !play_solo_eligible {
+            continue;
+        }
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member_opt.map(|m| m.faction_id).unwrap_or(SOLO),
+            faction_home: member_opt.and_then(|m| faction_registry.home_tile(m.faction_id)),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: None,
+            scavenge_target_entity: None,
+            scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity,
+            play_solo_eligible,
+        };
+
+        let abstract_task = AbstractTask::Play;
+        let methods = method_registry.methods_for(AbstractTaskKind::Play);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        match head {
+            Task::Play { partner } => {
+                let dest = match (partner, play_partner_tile) {
+                    (Some(_), Some(tile)) => tile,
+                    // Solo play: route to current tile (in-place).
+                    _ => (cur_tx, cur_ty),
+                };
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    dest,
+                    TaskKind::Play,
+                    partner,
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                aq.dispatch(Task::Play { partner });
+            }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
         for task in tasks {
             let _ = aq.enqueue(task);
         }
@@ -6986,6 +8360,10 @@ mod tests {
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         }
     }
 
@@ -7020,6 +8398,10 @@ mod tests {
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         }
     }
 
@@ -7054,6 +8436,10 @@ mod tests {
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         }
     }
 
@@ -7092,6 +8478,10 @@ mod tests {
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         }
     }
 
@@ -7129,6 +8519,10 @@ mod tests {
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         }
     }
 
@@ -7176,6 +8570,10 @@ mod tests {
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         }
     }
 
@@ -7482,6 +8880,10 @@ mod tests {
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         }
     }
 
@@ -7608,6 +9010,10 @@ mod tests {
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         }
     }
 
@@ -7757,6 +9163,10 @@ mod tests {
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         }
     }
 
@@ -7962,6 +9372,10 @@ mod tests {
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         }
     }
 
@@ -8341,6 +9755,10 @@ mod tests {
             hunt_area_tile: None,
             hunt_party_deployed: false,
             hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
         }
     }
 

@@ -793,6 +793,44 @@ pub fn goal_dispatch_system(
                     // until `goal_update_system` flips the agent off
                     // `AgentGoal::Socialize` (typically when needs.social
                     // has dropped enough to defuse the trigger).
+                    // Phase 5e-xi-a: HTN-driven DeliverMaterialToCraftOrder
+                    // chain runs without an ActivePlan under Craft. Both legs
+                    // (WithdrawMaterial + HaulToCraftOrder) survive across
+                    // goal-dispatch ticks until completion or external preempt
+                    // — mirrors the legacy plan's `PF_UNINTERRUPTIBLE`.
+                    AgentGoal::Craft if ai.task_id == TaskKind::WithdrawMaterial as u16 => {
+                        Some(TaskKind::WithdrawMaterial as u16)
+                    }
+                    AgentGoal::Craft if ai.task_id == TaskKind::HaulToCraftOrder as u16 => {
+                        Some(TaskKind::HaulToCraftOrder as u16)
+                    }
+                    // Phase 5e-xi-b: HTN-driven WorkOnCraftOrder chain runs
+                    // without an ActivePlan under Craft. WorkOnCraftOrder labors
+                    // in place; the trailing DepositResource walks to faction
+                    // storage and is finalised by drop_items_at_destination_system.
+                    // Both must survive across goal-dispatch ticks until
+                    // completion or external preempt — mirrors the legacy plan's
+                    // `PF_UNINTERRUPTIBLE`.
+                    AgentGoal::Craft if ai.task_id == TaskKind::WorkOnCraftOrder as u16 => {
+                        Some(TaskKind::WorkOnCraftOrder as u16)
+                    }
+                    AgentGoal::Craft if ai.task_id == TaskKind::DepositResource as u16 => {
+                        Some(TaskKind::DepositResource as u16)
+                    }
+                    // Phase 5e-xi-c: HTN-driven HarvestGrainForCraftOrder
+                    // chain runs without an ActivePlan under Craft. Gather +
+                    // HaulToCraftOrder must survive across goal-dispatch ticks.
+                    AgentGoal::Craft if ai.task_id == TaskKind::Gather as u16 => {
+                        Some(TaskKind::Gather as u16)
+                    }
+                    // Phase 5e-xii-a: HTN-driven Play (PlaySocial / PlaySolo)
+                    // chain runs without an ActivePlan under the Play goal.
+                    // Single Task::Play survives across goal-dispatch ticks
+                    // until `play_system` finalises on duration / willpower
+                    // or the goal flips off Play.
+                    AgentGoal::Play if ai.task_id == TaskKind::Play as u16 => {
+                        Some(TaskKind::Play as u16)
+                    }
                     AgentGoal::Socialize if ai.task_id == TaskKind::Socialize as u16 => {
                         Some(TaskKind::Socialize as u16)
                     }
@@ -928,6 +966,7 @@ pub fn play_system(
     mut query: Query<(
         Entity,
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut Needs,
         &Personality,
         &Carrier,
@@ -942,7 +981,9 @@ pub fn play_system(
     // borrow-checker conflicts.
     let mut affinity_pairs: Vec<(Entity, Entity)> = Vec::new();
 
-    for (entity, mut ai, mut needs, personality, carrier, transform, lod) in query.iter_mut() {
+    for (entity, mut ai, mut aq, mut needs, personality, carrier, transform, lod) in
+        query.iter_mut()
+    {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -1010,6 +1051,10 @@ pub fn play_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.work_progress = 0;
+            // Phase 5e-xii-a: drain the typed channel so HTN-driven Play
+            // chains complete cleanly. Legacy plan-driven flows leave
+            // `aq.current = Idle`, so this is a benign no-op there.
+            aq.advance();
         }
     }
 
