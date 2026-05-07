@@ -4,16 +4,133 @@
 //! The planner system that populates these is added in Phase 2; this module
 //! defines the data model so other systems (debug panel, build selector) can
 //! reference the types now.
+//!
+//! Pluralist Economy R1: this module also owns the `Settlement` entity —
+//! the *economic* unit (market + treasury + market_tile). A faction can
+//! own multiple settlements (colonies), and a megachunk can host
+//! settlements from multiple competing factions. `SettlementPlan` (above)
+//! is the *layout* of buildings around a hearth and is keyed per-faction;
+//! `Settlement` (below) is the economic unit and has its own ID space.
 
 use ahash::AHashMap;
 use bevy::prelude::*;
 
+use crate::economy::market::SettlementMarket;
 use crate::simulation::faction::{FactionData, FactionRegistry, LayoutStyle, PlayerFaction, SOLO};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::technology::{
     CROP_CULTIVATION, FLINT_KNAPPING, LONG_DIST_TRADE, PERM_SETTLEMENT, SACRED_RITUAL,
 };
 use crate::world::terrain::TILE_SIZE;
+
+// ─── Pluralist Economy R1: Settlement entity ────────────────────────
+
+/// Stable per-settlement identity, allocated by `SettlementMap::alloc_id`.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct SettlementId(pub u32);
+
+/// A settlement is owned by exactly one faction. A megachunk can host
+/// many competing settlements (different factions, different
+/// ideologies). `market_tile` is the canonical access point for trade;
+/// `treasury` is the settlement-level currency pool that funds public
+/// works (R5+); `market` is the per-settlement Walrasian price/supply/
+/// demand state (activated in R7 — until then it's seeded empty and
+/// idle).
+#[derive(Component, Clone, Debug)]
+pub struct Settlement {
+    pub id: SettlementId,
+    pub owner_faction: u32,
+    pub market_tile: (i32, i32),
+    pub founding_tick: u64,
+    pub name: String,
+    pub treasury: f32,
+    pub market: SettlementMarket,
+}
+
+/// Resource indexing every live `Settlement` entity by id, megachunk,
+/// and owner faction. Maintained by the auto-found system + future
+/// chief/player-driven settlement spawning.
+#[derive(Resource, Default)]
+pub struct SettlementMap {
+    pub by_id: AHashMap<SettlementId, Entity>,
+    pub by_megachunk: AHashMap<(i32, i32), Vec<SettlementId>>,
+    pub by_faction: AHashMap<u32, Vec<SettlementId>>,
+    pub next_id: u32,
+}
+
+impl SettlementMap {
+    pub fn alloc_id(&mut self) -> SettlementId {
+        let id = SettlementId(self.next_id);
+        self.next_id += 1;
+        id
+    }
+
+    pub fn register(
+        &mut self,
+        id: SettlementId,
+        entity: Entity,
+        megachunk: (i32, i32),
+        owner_faction: u32,
+    ) {
+        self.by_id.insert(id, entity);
+        self.by_megachunk.entry(megachunk).or_default().push(id);
+        self.by_faction.entry(owner_faction).or_default().push(id);
+    }
+
+    /// First settlement registered under `faction_id`, or None.
+    pub fn first_for_faction(&self, faction_id: u32) -> Option<SettlementId> {
+        self.by_faction.get(&faction_id).and_then(|v| v.first().copied())
+    }
+
+    /// Every settlement registered under `faction_id`.
+    pub fn for_faction(&self, faction_id: u32) -> &[SettlementId] {
+        self.by_faction
+            .get(&faction_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
+/// Auto-found a default settlement for any non-SOLO faction that has a
+/// known `home_tile` but no settlement registered yet. Runs every
+/// Sequential tick — cheap because most factions already have one.
+///
+/// This keeps the existing 287 tests green: the test fixture creates a
+/// player faction at `(0, 0)` and assumes faction-storage / chief
+/// systems work as before. Once auto-founding has run for one tick,
+/// the faction has a Settlement entity at its home tile that future
+/// phases can attach treasury / market / job-board behavior to without
+/// retrofitting every existing test.
+pub fn auto_found_default_settlements_system(
+    mut commands: Commands,
+    mut map: ResMut<SettlementMap>,
+    registry: Res<FactionRegistry>,
+    clock: Res<SimClock>,
+) {
+    for (faction_id, data) in registry.factions.iter() {
+        if *faction_id == SOLO {
+            continue;
+        }
+        if map.by_faction.contains_key(faction_id) {
+            continue;
+        }
+        let home = data.home_tile;
+        let mc = crate::simulation::region::MegaChunkCoord::from_tile(home.0, home.1);
+        let id = map.alloc_id();
+        let entity = commands
+            .spawn(Settlement {
+                id,
+                owner_faction: *faction_id,
+                market_tile: home,
+                founding_tick: clock.tick,
+                name: format!("Settlement {}", id.0),
+                treasury: 0.0,
+                market: SettlementMarket::default(),
+            })
+            .id();
+        map.register(id, entity, mc, *faction_id);
+    }
+}
 
 /// Inclusive-exclusive rectangle in tile coordinates: tiles `(x, y)` with
 /// `x0 <= x < x0+w`, `y0 <= y < y0+h`.

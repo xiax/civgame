@@ -462,6 +462,34 @@ pub fn score_method_with_history(
     raw - failures * METHOD_FAILURE_PENALTY
 }
 
+/// Pluralist Economy R4: check whether a method's `policy_gate` is
+/// satisfied by the agent's effective faction. Returns `true` when:
+///
+/// - the method declares no gate (today: every existing method), or
+/// - every gate entry's `RequiredFlag` is satisfied by the faction's
+///   `policy_for(resource)`.
+///
+/// `faction_data` is `None` for SOLO / unsettled agents, in which case
+/// only methods with empty gates pass — SOLO agents have no
+/// policy table, so any policy-gated method is filtered out. R6+
+/// dispatchers call this alongside `precondition` before scoring.
+pub fn method_passes_policy_gate(
+    method: &dyn Method,
+    faction_data: Option<&crate::simulation::faction::FactionData>,
+) -> bool {
+    let gate = method.policy_gate();
+    if gate.is_empty() {
+        return true;
+    }
+    let Some(data) = faction_data else {
+        // Method declares a non-empty gate; SOLO agent has no
+        // policy table to satisfy it. Reject.
+        return false;
+    };
+    gate.iter()
+        .all(|(rid, flag)| data.policy_for(*rid).satisfies(*flag))
+}
+
 /// Mirrors `PLAN_HISTORY_LEN` / `PLAN_HISTORY_TTL_TICKS` from `plan/mod.rs`
 /// (per `feedback_plan_history_design.md`: ring length stays short; failures
 /// expire by tick age, not buffer eviction).
@@ -829,6 +857,18 @@ pub trait Method: Send + Sync + 'static {
 
     fn profession_gate(&self) -> Option<Profession> {
         None
+    }
+
+    /// Pluralist Economy R4: per-resource policy preconditions. Each
+    /// entry says "to fire, the agent's effective faction must have
+    /// `flag` set on its `economic_policy` for `resource`". Methods
+    /// that don't care about per-resource policy (today: every
+    /// existing method) leave this as the default empty slice.
+    /// New methods registered in R6+ (Trader, household-driven
+    /// posting paths, P2P contract producers) declare non-empty
+    /// gates so they only fire under the right policy mix.
+    fn policy_gate(&self) -> &'static [crate::economy::policy::PolicyGateEntry] {
+        &[]
     }
 
     /// Static name for debug / inspector display. Keep these short and

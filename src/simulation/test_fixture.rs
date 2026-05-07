@@ -117,6 +117,7 @@ impl TestSim {
         // Region resources (normally inserted in main.rs).
         app.insert_resource(crate::simulation::region::SettledRegions::default());
         app.insert_resource(crate::simulation::region::SimulationFocus::default());
+        // SettlementMap is inserted below by SimulationPlugin::build.
 
         // Rendering-side resources that sim systems read but don't write.
         // (lod.rs reads CameraState to compute LOD distance.)
@@ -453,6 +454,114 @@ pub fn person_inventory(
     out
 }
 
+/// Set an agent's `EconomicAgent.currency`. Used by the Pluralist Economy
+/// rewrite (R0): tests pin currency before / after pay+escrow flows to
+/// assert the system-wide currency invariant.
+pub fn set_currency(app: &mut App, entity: Entity, amount: f32) {
+    let mut econ = app
+        .world_mut()
+        .get_mut::<EconomicAgent>(entity)
+        .expect("EconomicAgent missing");
+    econ.currency = amount;
+}
+
+/// Read an agent's `EconomicAgent.currency`.
+pub fn get_currency(app: &App, entity: Entity) -> f32 {
+    app.world()
+        .get::<EconomicAgent>(entity)
+        .expect("EconomicAgent missing")
+        .currency
+}
+
+/// Assert an agent's currency equals `expected` within a small epsilon
+/// (currency is `f32`, escrow refunds may carry trivial FP error).
+pub fn assert_currency(app: &App, entity: Entity, expected: f32) {
+    let actual = get_currency(app, entity);
+    let diff = (actual - expected).abs();
+    assert!(
+        diff < 1e-3,
+        "currency mismatch: actual={actual}, expected={expected}, diff={diff}",
+    );
+}
+
+/// Sum every entity's `EconomicAgent.currency` across the world.
+pub fn total_system_currency(app: &mut App) -> f32 {
+    let mut q = app.world_mut().query::<&EconomicAgent>();
+    q.iter(app.world()).map(|a| a.currency).sum()
+}
+
+/// Sum every faction's `treasury` field. Pluralist Economy R2.
+pub fn total_faction_treasury(app: &App) -> f32 {
+    let registry = app
+        .world()
+        .resource::<crate::simulation::faction::FactionRegistry>();
+    registry.factions.values().map(|f| f.treasury).sum()
+}
+
+/// Sum every settlement's `treasury` field. Pluralist Economy R1.
+pub fn total_settlement_treasury(app: &mut App) -> f32 {
+    let mut q = app
+        .world_mut()
+        .query::<&crate::simulation::settlement::Settlement>();
+    q.iter(app.world()).map(|s| s.treasury).sum()
+}
+
+/// Sum every live `JobEscrow.amount`. Pluralist Economy R2.
+pub fn total_escrowed_currency(app: &mut App) -> f32 {
+    crate::simulation::jobs::total_escrowed_currency(app.world_mut())
+}
+
+/// Snapshot the system-wide currency for invariant comparisons. Sums
+/// every accounted-for slot: per-agent currency, faction treasuries,
+/// settlement treasuries, and live escrow deposits. Conservative
+/// operations (`pay`, `JobEscrow` post + cancel, treasury transfers)
+/// must leave `total()` unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CurrencySnapshot {
+    pub agents_total: f32,
+    pub faction_treasuries: f32,
+    pub settlement_treasuries: f32,
+    pub escrowed: f32,
+}
+
+impl CurrencySnapshot {
+    pub fn capture(app: &mut App) -> Self {
+        Self {
+            agents_total: total_system_currency(app),
+            faction_treasuries: total_faction_treasury(&app),
+            settlement_treasuries: total_settlement_treasury(app),
+            escrowed: total_escrowed_currency(app),
+        }
+    }
+
+    /// Total system currency (sum of every accounted-for slot).
+    pub fn total(&self) -> f32 {
+        self.agents_total
+            + self.faction_treasuries
+            + self.settlement_treasuries
+            + self.escrowed
+    }
+}
+
+/// Assert that the system-wide currency total has not drifted from
+/// `baseline` by more than `epsilon`. Use after any operation that
+/// purports to be currency-conservative (pay, escrow post + cancel,
+/// market trade).
+pub fn assert_total_currency_invariant(
+    app: &mut App,
+    baseline: CurrencySnapshot,
+    epsilon: f32,
+) {
+    let now = CurrencySnapshot::capture(app);
+    let diff = (now.total() - baseline.total()).abs();
+    assert!(
+        diff <= epsilon,
+        "system-wide currency drifted: baseline={:?}, now={:?}, diff={diff}",
+        baseline,
+        now,
+    );
+}
+
 #[cfg(test)]
 mod smoke {
     use super::*;
@@ -467,6 +576,460 @@ mod smoke {
         let _person = sim.spawn_person(sim.player_faction_id, (4, 4), |_| {});
         sim.tick_n(5);
         assert!(sim.tick_count() > 0);
+    }
+
+    // ─── Pluralist Economy rewrite — R0 currency-helper unit tests ───
+
+    #[test]
+    fn set_currency_writes_through_to_economic_agent() {
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        // Default `EconomicAgent::default()` is 50.0; sanity-check the
+        // helper actually writes a different value.
+        set_currency(&mut sim.app, person, 123.5);
+        assert_currency(&sim.app, person, 123.5);
+    }
+
+    #[test]
+    fn get_currency_reads_default_seed() {
+        // EconomicAgent::default() seeds 50.0; pin this so a future
+        // change to the default trips a regression.
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        assert_currency(&sim.app, person, 50.0);
+    }
+
+    #[test]
+    fn total_system_currency_sums_across_agents() {
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let a = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let b = sim.spawn_person(sim.player_faction_id, (1, 0), |_| {});
+        set_currency(&mut sim.app, a, 100.0);
+        set_currency(&mut sim.app, b, 250.0);
+        let total = total_system_currency(&mut sim.app);
+        assert!((total - 350.0).abs() < 1e-3, "total={total}");
+    }
+
+    #[test]
+    fn currency_invariant_passes_after_zero_op() {
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let _ = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+        // Nothing happens — invariant should hold trivially.
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+    }
+
+    #[test]
+    fn currency_invariant_holds_under_p2p_swap() {
+        // Manually move 25.0 from A to B and back; the helper must
+        // accept this as conservative.
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let a = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let b = sim.spawn_person(sim.player_faction_id, (1, 0), |_| {});
+        set_currency(&mut sim.app, a, 100.0);
+        set_currency(&mut sim.app, b, 100.0);
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+        // A → B
+        set_currency(&mut sim.app, a, 75.0);
+        set_currency(&mut sim.app, b, 125.0);
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+        // B → A (round trip)
+        set_currency(&mut sim.app, a, 100.0);
+        set_currency(&mut sim.app, b, 100.0);
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+    }
+
+    #[test]
+    #[should_panic(expected = "system-wide currency drifted")]
+    fn currency_invariant_catches_unconservative_change() {
+        // Conjure 50.0 out of thin air; helper must panic.
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let a = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        set_currency(&mut sim.app, a, 100.0);
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+        set_currency(&mut sim.app, a, 150.0);
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+    }
+
+    // ─── Pluralist Economy R1 — Settlement primitive ───
+
+    #[test]
+    fn default_settlement_auto_founded_at_faction_home() {
+        // After a few ticks, the auto-found system should have spawned a
+        // Settlement entity at the player faction's home_tile, indexed
+        // in `SettlementMap.by_faction`. Treasury defaults to 0; market
+        // is empty.
+        use crate::simulation::settlement::{Settlement, SettlementMap};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        // Spawn one person so the bucketing / clock has work; the
+        // settlement auto-found doesn't actually need a person, only
+        // the FactionRegistry entry that TestSim::new already created.
+        let _person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Tick enough that auto_found_default_settlements_system fires
+        // and Commands flush.
+        sim.tick_n(2);
+
+        let map = sim.app.world().resource::<SettlementMap>();
+        let ids = map.for_faction(sim.player_faction_id);
+        assert_eq!(
+            ids.len(),
+            1,
+            "expected exactly one auto-founded settlement for player faction"
+        );
+
+        let entity = *map.by_id.get(&ids[0]).expect("settlement entity missing");
+        let settlement = sim
+            .app
+            .world()
+            .get::<Settlement>(entity)
+            .expect("Settlement component missing");
+        assert_eq!(settlement.owner_faction, sim.player_faction_id);
+        assert_eq!(settlement.market_tile, (0, 0)); // home_tile from TestSim::new
+        assert_eq!(settlement.treasury, 0.0);
+        assert_eq!(settlement.market.price_of(crate::economy::core_ids::cloth()), 1.0);
+    }
+
+    #[test]
+    fn auto_found_is_idempotent_across_ticks() {
+        // Running for many ticks must not spawn a second settlement.
+        use crate::simulation::settlement::SettlementMap;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let _person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        sim.tick_n(20);
+
+        let map = sim.app.world().resource::<SettlementMap>();
+        let ids = map.for_faction(sim.player_faction_id);
+        assert_eq!(ids.len(), 1, "auto-found must be idempotent");
+    }
+
+    // ─── Pluralist Economy R2 — pay() + JobEscrow refund hook ───
+
+    #[test]
+    fn pay_atomically_moves_currency_between_agents() {
+        use crate::economy::transactions::pay;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let a = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let b = sim.spawn_person(sim.player_faction_id, (1, 0), |_| {});
+        set_currency(&mut sim.app, a, 100.0);
+        set_currency(&mut sim.app, b, 50.0);
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        let ok = pay(sim.app.world_mut(), a, b, 30.0);
+        assert!(ok);
+        assert_currency(&sim.app, a, 70.0);
+        assert_currency(&sim.app, b, 80.0);
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+    }
+
+    #[test]
+    fn pay_refuses_insufficient_funds() {
+        use crate::economy::transactions::pay;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let a = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let b = sim.spawn_person(sim.player_faction_id, (1, 0), |_| {});
+        set_currency(&mut sim.app, a, 10.0);
+        set_currency(&mut sim.app, b, 0.0);
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        let ok = pay(sim.app.world_mut(), a, b, 30.0);
+        assert!(!ok);
+        // Balances unchanged.
+        assert_currency(&sim.app, a, 10.0);
+        assert_currency(&sim.app, b, 0.0);
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+    }
+
+    #[test]
+    fn total_currency_invariant_holds_through_post_and_cancel() {
+        // R2 keystone test: post a job-escrow sidecar entity (debits
+        // employer's wallet manually + spawns the JobEscrow), then
+        // despawn the sidecar (simulates cancellation). The on_remove
+        // hook must refund. Total currency unchanged.
+        use crate::simulation::jobs::JobEscrow;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let employer = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        set_currency(&mut sim.app, employer, 100.0);
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        // Post: debit employer, spawn the escrow sidecar.
+        let amount = 25.0;
+        {
+            let mut econ = sim
+                .app
+                .world_mut()
+                .get_mut::<EconomicAgent>(employer)
+                .unwrap();
+            econ.currency -= amount;
+        }
+        let escrow_entity = sim
+            .app
+            .world_mut()
+            .spawn(JobEscrow {
+                amount,
+                beneficiary: employer,
+            })
+            .id();
+
+        // Mid-flight: invariant still holds (the 25 is in escrow now).
+        assert_currency(&sim.app, employer, 75.0);
+        let mid = CurrencySnapshot::capture(&mut sim.app);
+        assert!(
+            (mid.total() - baseline.total()).abs() < 1e-3,
+            "invariant broken mid-flight: baseline={baseline:?}, mid={mid:?}",
+        );
+
+        // Cancel: despawn the sidecar; on_remove hook refunds.
+        sim.app.world_mut().despawn(escrow_entity);
+
+        assert_currency(&sim.app, employer, 100.0);
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+    }
+
+    #[test]
+    fn payout_clears_escrow_amount_so_no_refund_on_despawn() {
+        // Successful-payout shape: the producer credits the worker via
+        // pay(), zeroes the escrow.amount, then despawns the sidecar.
+        // The hook sees amount=0 and is a no-op.
+        use crate::economy::transactions::pay;
+        use crate::simulation::jobs::JobEscrow;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let employer = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let worker = sim.spawn_person(sim.player_faction_id, (1, 0), |_| {});
+        set_currency(&mut sim.app, employer, 100.0);
+        set_currency(&mut sim.app, worker, 0.0);
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        let amount = 25.0;
+        // Debit + escrow
+        {
+            let mut econ = sim
+                .app
+                .world_mut()
+                .get_mut::<EconomicAgent>(employer)
+                .unwrap();
+            econ.currency -= amount;
+        }
+        let escrow_entity = sim
+            .app
+            .world_mut()
+            .spawn(JobEscrow {
+                amount,
+                beneficiary: employer,
+            })
+            .id();
+
+        // Pay the worker their wage by drawing from a separate stash
+        // (the escrow itself is just a refund record). For this test
+        // we credit the worker manually to simulate the successful-
+        // payout hook clearing the amount.
+        {
+            let mut wm = sim
+                .app
+                .world_mut()
+                .get_mut::<EconomicAgent>(worker)
+                .unwrap();
+            wm.currency += amount;
+        }
+        // Zero the escrow before despawn so the hook doesn't refund.
+        {
+            let mut esc = sim
+                .app
+                .world_mut()
+                .get_mut::<JobEscrow>(escrow_entity)
+                .unwrap();
+            esc.amount = 0.0;
+        }
+        sim.app.world_mut().despawn(escrow_entity);
+
+        // Net: employer down 25, worker up 25 — invariant holds, no
+        // double-refund.
+        assert_currency(&sim.app, employer, 75.0);
+        assert_currency(&sim.app, worker, 25.0);
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+
+        // Suppress unused-binding warning for `pay`: real production
+        // call sites in R5+ will use it for treasury-funded postings.
+        let _ = pay;
+    }
+
+    // ─── Pluralist Economy R4 — economic_policy machinery ───
+
+    #[test]
+    fn default_factions_have_all_communist_policy() {
+        // R4 invariant: a freshly-created faction has an empty
+        // `economic_policy` map, and `policy_for(any_resource)`
+        // returns the all-communist preset (chief allocates labor,
+        // private actors not allowed). This is what keeps the 287
+        // baseline tests green.
+        use crate::economy::core_ids;
+        use crate::simulation::faction::FactionRegistry;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let data = registry
+            .factions
+            .get(&sim.player_faction_id)
+            .expect("player faction missing");
+        assert!(data.economic_policy.is_empty(), "default map is empty");
+
+        // Verify a few resources fall through to the default.
+        for rid in [
+            core_ids::wood(),
+            core_ids::stone(),
+            core_ids::cloth(),
+            core_ids::weapon(),
+        ] {
+            let p = data.policy_for(rid);
+            assert!(p.chief_allocates_labor, "rid={rid:?} not chief-allocated");
+            assert!(!p.private_actors_allowed, "rid={rid:?} private-allowed");
+        }
+    }
+
+    #[test]
+    fn method_passes_policy_gate_returns_true_for_empty_gate() {
+        // Every existing method has an empty gate; the helper must
+        // accept them under any faction's policy. We sample a few
+        // representative AbstractTaskKinds since the registry's
+        // `by_kind` map is private.
+        use crate::economy::core_ids;
+        use crate::economy::policy::{RequiredFlag, ResourceControlPolicy};
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::htn::{
+            method_passes_policy_gate, AbstractTaskKind, MethodRegistry,
+        };
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let data = registry.factions.get(&sim.player_faction_id);
+        let methods = sim.app.world().resource::<MethodRegistry>();
+
+        let kinds = [
+            AbstractTaskKind::Sleep,
+            AbstractTaskKind::Eat,
+            AbstractTaskKind::AcquireFood,
+            AbstractTaskKind::AcquireGood,
+            AbstractTaskKind::Play,
+        ];
+        let mut total = 0usize;
+        for kind in kinds {
+            for m in methods.methods_for(kind) {
+                total += 1;
+                assert!(
+                    method_passes_policy_gate(m.as_ref(), data),
+                    "method '{}' rejected by default policy",
+                    m.name(),
+                );
+            }
+        }
+        assert!(total > 0, "no methods registered for sampled kinds");
+
+        // Negative path: directly construct a synthetic policy gate
+        // and check the helper rejects when the flag isn't set.
+        struct FakeGated;
+        impl crate::simulation::htn::Method for FakeGated {
+            fn precondition(
+                &self,
+                _: crate::simulation::htn::AbstractTask,
+                _: &crate::simulation::htn::PlannerCtx,
+            ) -> bool {
+                true
+            }
+            fn utility(
+                &self,
+                _: crate::simulation::htn::AbstractTask,
+                _: &crate::simulation::htn::PlannerCtx,
+            ) -> f32 {
+                1.0
+            }
+            fn expand(
+                &self,
+                _: crate::simulation::htn::AbstractTask,
+                _: &crate::simulation::htn::PlannerCtx,
+            ) -> Vec<crate::simulation::typed_task::Task> {
+                vec![]
+            }
+            fn name(&self) -> &'static str {
+                "FakeGated"
+            }
+            fn id(&self) -> crate::simulation::htn::MethodId {
+                crate::simulation::htn::MethodId(0xFFFF)
+            }
+            fn policy_gate(
+                &self,
+            ) -> &'static [crate::economy::policy::PolicyGateEntry] {
+                static GATE: [crate::economy::policy::PolicyGateEntry; 1] = [(
+                    crate::economy::resource_catalog::ResourceId(0),
+                    RequiredFlag::PrivateActorsAllowed,
+                )];
+                &GATE
+            }
+        }
+        let fake = FakeGated;
+        // Default policy: PrivateActorsAllowed=false → rejected.
+        assert!(!method_passes_policy_gate(&fake, data));
+        // Override that resource to capitalist → accepted.
+        let cloth = core_ids::cloth();
+        let _ = cloth;
+        // Use the same ResourceId(0) the gate references — it falls
+        // through to default for an unmapped resource. Stamp policy
+        // explicitly on that id.
+        let mut over = sim.app.world_mut().resource_mut::<FactionRegistry>();
+        let f = over.factions.get_mut(&sim.player_faction_id).unwrap();
+        f.economic_policy.insert(
+            crate::economy::resource_catalog::ResourceId(0),
+            ResourceControlPolicy::capitalist(),
+        );
+        let registry2 = sim.app.world().resource::<FactionRegistry>();
+        let data2 = registry2.factions.get(&sim.player_faction_id);
+        assert!(method_passes_policy_gate(&fake, data2));
+    }
+
+    #[test]
+    fn explicit_policy_override_takes_precedence_over_default() {
+        // Stamp a capitalist policy on Cloth and confirm
+        // `policy_for(cloth)` returns it; other resources still default.
+        use crate::economy::core_ids;
+        use crate::economy::policy::ResourceControlPolicy;
+        use crate::simulation::faction::FactionRegistry;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let data = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            data.economic_policy
+                .insert(core_ids::cloth(), ResourceControlPolicy::capitalist());
+        }
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let data = registry.factions.get(&sim.player_faction_id).unwrap();
+        let cloth_policy = data.policy_for(core_ids::cloth());
+        assert!(cloth_policy.private_actors_allowed);
+        assert!(!cloth_policy.chief_allocates_labor);
+        // Wood unaffected.
+        let wood_policy = data.policy_for(core_ids::wood());
+        assert!(wood_policy.chief_allocates_labor);
+        assert!(!wood_policy.private_actors_allowed);
     }
 }
 

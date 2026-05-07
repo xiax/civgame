@@ -873,6 +873,39 @@ pub struct FactionData {
     /// `faction_hunter_assignment_system`'s density scaling so factions in
     /// game-rich areas grow more hunters above the 20% floor.
     pub nearby_prey_count: u32,
+    /// Faction-level wealth pool. Distinct from per-settlement
+    /// treasuries (which fund settlement bureaucrats). Pluralist
+    /// Economy R2: defaults to 0; later phases credit/debit during
+    /// tribute (R11), public-works funding (R5+), and inter-faction
+    /// transfers.
+    pub treasury: f32,
+    /// Per-resource economic policy. Pluralist Economy R4: each entry
+    /// is `ResourceId → ResourceControlPolicy` (composable flags
+    /// describing whether the chief allocates labor, private actors
+    /// are allowed, the state sells at market, etc.). Resources
+    /// **not** in the map fall through to
+    /// `ResourceControlPolicy::default()` — the all-communist preset
+    /// matching today's behaviour. So an empty map is observationally
+    /// identical to a pre-R4 faction.
+    pub economic_policy: ahash::AHashMap<
+        crate::economy::resource_catalog::ResourceId,
+        crate::economy::policy::ResourceControlPolicy,
+    >,
+}
+
+impl FactionData {
+    /// Look up the policy for `resource_id`, falling back to the
+    /// all-communist default for unmapped resources. Hot-path call
+    /// site; never allocates.
+    pub fn policy_for(
+        &self,
+        resource_id: crate::economy::resource_catalog::ResourceId,
+    ) -> crate::economy::policy::ResourceControlPolicy {
+        self.economic_policy
+            .get(&resource_id)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Resource, Default)]
@@ -922,6 +955,8 @@ impl FactionRegistry {
                 material_targets: ahash::AHashMap::default(),
                 hunt_order: None,
                 nearby_prey_count: 0,
+                treasury: 0.0,
+                economic_policy: ahash::AHashMap::default(),
             },
         );
         id

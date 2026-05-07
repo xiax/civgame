@@ -97,6 +97,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(terraform::TerraformMap::default())
             .insert_resource(terraform::PendingFootprints::default())
             .insert_resource(settlement::SettlementPlans::default())
+            .insert_resource(settlement::SettlementMap::default())
             .insert_resource(settlement::ZoneOverlayToggle::default())
             .insert_resource(military::ActiveRallyPoints::default())
             .insert_resource(corpse::CorpseMap::default())
@@ -406,6 +407,8 @@ impl Plugin for SimulationPlugin {
                 (
                     settlement::settlement_planner_system
                         .before(construction::chief_directive_system),
+                    settlement::auto_found_default_settlements_system
+                        .before(settlement::settlement_planner_system),
                     construction::building_upgrade_system
                         .after(settlement::settlement_planner_system)
                         .before(construction::chief_directive_system),

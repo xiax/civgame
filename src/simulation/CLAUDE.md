@@ -10,6 +10,32 @@ Headless `App` harness for asserting AI behaviour without rendering / UI / globe
 - Game state stays in `SpawnSelect` so `OnEnter(Playing)` systems (which spawn 200 people on the real globe) never fire; FixedUpdate sim systems run regardless of state.
 - A camera entity is spawned at world origin so `update_lod_levels_system` doesn't drop every test agent to `Dormant`.
 - Test helper: `test_fixture::person_task(&app, entity) -> Task` reads `ActionQueue.current`. Use it instead of any defunct `PersonAI.task` field.
+- Currency-invariant helpers (Pluralist Economy R0): `set_currency` / `get_currency` / `assert_currency` for per-agent reads/writes; `total_system_currency` + `CurrencySnapshot::capture` + `assert_total_currency_invariant(app, baseline, eps)` for the system-wide conservation check. The R0 baseline only sums `EconomicAgent.currency` across all entities; later phases extend `CurrencySnapshot` with faction treasuries, settlement treasuries, and live `JobEscrow` deposits, so call sites pinning the invariant don't break.
+
+## Settlement entity (`settlement.rs`, Pluralist Economy R1)
+
+A `Settlement` is the **economic** unit (market + treasury + market_tile), distinct from `SettlementPlan` (the *layout* of zones around a hearth). One faction can own many settlements (colonies); a megachunk can host many competing settlements (different factions, different ideologies).
+
+- `Settlement` (Component): `id`, `owner_faction`, `market_tile`, `founding_tick`, `name`, `treasury: f32` (default 0), `market: SettlementMarket` (R7 activates).
+- `SettlementId(u32)` newtype.
+- `SettlementMap` (Resource): `by_id` / `by_megachunk` / `by_faction` indices + `next_id`. Helpers: `alloc_id`, `register`, `first_for_faction`, `for_faction`.
+- `auto_found_default_settlements_system` (FixedUpdate, before `settlement_planner_system`): spawns one Settlement entity per non-SOLO faction at its `home_tile` if the faction doesn't yet have one. Idempotent — no-op once a faction has any settlement registered. Keeps existing 287 tests green by giving every default faction a settlement before later phases assume one exists.
+- `SettlementMarket` (`economy/market.rs`): same shape and methods as the global `Market` minus the `Resource` impl. Lives on the `Settlement` component. R7 routes buy/sell calls here for settled agents; SOLO/unsettled keep using the global `Market` resource.
+
+## P2P currency + escrow (Pluralist Economy R2)
+
+- **`pay(world, from, to, amount) -> bool`** (`economy/transactions.rs`): atomic agent-to-agent transfer. Returns false on non-positive amount, insufficient funds, or missing `EconomicAgent` on either side. The **only** sanctioned way to move currency between agents.
+- **`FactionData.treasury: f32`** (`faction.rs`): faction-level wealth pool, distinct from per-settlement treasuries. Defaults to 0; later phases credit/debit during tribute (R11), public-works funding (R5+), and inter-faction transfers.
+- **`JobEscrow { amount, beneficiary }`** Bevy component (`jobs.rs`): attaches to a sidecar entity per funded posting. Posting lifecycle: producer debits wallet manually + spawns the sidecar; on **successful payout** the producer calls `pay()` to credit the worker, zeros `escrow.amount`, then despawns the sidecar (hook is a no-op); on **cancellation/expiry** the sidecar despawns with the original amount intact and the `on_job_escrow_remove` hook refunds `amount` to `beneficiary`. Component-driven cleanup means **all 25 existing `aq.cancel()` sites stay untouched** — refund piggybacks on entity despawn, the same way `Indexed::on_remove` cleans the spatial index.
+- **Hook registration:** `JobsPlugin::build` calls `app.world_mut().register_component_hooks::<JobEscrow>().on_remove(on_job_escrow_remove)`. Mirrors `WorldPlugin`'s `Indexed` registration pattern. `TestSim::new` inherits the hook through `add_plugins(SimulationPlugin)`.
+- **Currency invariant:** the system-wide `CurrencySnapshot` (in `test_fixture.rs`) sums `EconomicAgent.currency` (every entity) + `FactionData.treasury` (every faction) + `Settlement.treasury` (every settlement) + `JobEscrow.amount` (every live escrow). Conservative operations leave `total()` unchanged; `assert_total_currency_invariant(app, baseline, eps)` is the test rubric.
+
+## Per-resource economic policy (Pluralist Economy R4)
+
+- **`ResourceControlPolicy`** (`economy/policy.rs`): composable flags per resource — `chief_allocates_labor`, `private_actors_allowed`, `state_sells_at_market`, `prices_fixed_by_state`, `fixed_price`. `Default::default()` = all-communist (matches today's behaviour); `capitalist()` = the household / private-actor preset.
+- **`FactionData.economic_policy: AHashMap<ResourceId, ResourceControlPolicy>`**: per-faction per-resource policy table. Empty by default — `policy_for(rid)` falls through to the all-communist default for unmapped resources, so a freshly-created faction is observationally identical to a pre-R4 faction. Communism / Capitalism / Wartime / Mixed are *combinations* of flag entries, not first-class enums.
+- **`Method.policy_gate(&self) -> &'static [(ResourceId, RequiredFlag)]`**: trait method, default `&[]`. Methods that require a specific policy flag for a specific resource (R6+ household / Trader / contract methods) declare it here; the helper `method_passes_policy_gate(method, faction)` returns true iff every gate entry is satisfied. SOLO agents with no faction reject any non-empty gate.
+- **R4 ships only the machinery.** No existing method declares a non-empty gate; `method_passes_policy_gate` is not yet wired into any dispatcher's loop. Behaviour is identical to pre-R4. R6 sub-PRs flip individual chief-posting branches to per-class posters and at the same time wire the gate filter for the new branches.
 
 ## Agent AI (Goals → HTN → Tasks)
 

@@ -6,6 +6,38 @@ use crate::simulation::person::{AiState, PersonAI};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use bevy::prelude::*;
 
+/// Atomic agent-to-agent currency transfer. Returns false if `amount` is
+/// non-positive, `from` has insufficient funds, or either entity lacks
+/// an `EconomicAgent`. On success, currency is debited from `from` and
+/// credited to `to` in the same call — no observer can see a state
+/// where the system-wide currency invariant is broken.
+///
+/// Pluralist Economy R2: this is the **only** way agents pay each
+/// other. Wages, tribute, escrow refunds, and contract payments all
+/// go through here.
+pub fn pay(world: &mut World, from: Entity, to: Entity, amount: f32) -> bool {
+    if !(amount > 0.0) {
+        return false;
+    }
+    let from_balance = match world.get::<EconomicAgent>(from) {
+        Some(a) => a.currency,
+        None => return false,
+    };
+    if from_balance < amount {
+        return false;
+    }
+    if world.get::<EconomicAgent>(to).is_none() {
+        return false;
+    }
+    if let Some(mut from_agent) = world.get_mut::<EconomicAgent>(from) {
+        from_agent.currency -= amount;
+    }
+    if let Some(mut to_agent) = world.get_mut::<EconomicAgent>(to) {
+        to_agent.currency += amount;
+    }
+    true
+}
+
 const FOOD_KEEP_RESERVE: u32 = 2;
 const HUNGER_BUY_THRESHOLD: u8 = 170;
 const TOOL_BUY_CURRENCY_FACTOR: f32 = 1.5;

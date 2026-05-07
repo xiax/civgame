@@ -8,6 +8,7 @@ pub mod goods;
 pub mod item;
 pub mod market;
 pub mod mode;
+pub mod policy;
 pub mod resource_catalog;
 pub mod transactions;
 

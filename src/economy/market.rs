@@ -12,6 +12,12 @@ use bevy::prelude::*;
 /// `AHashMap<ResourceId, f32>` keyed by catalog id — same shape used by
 /// `FactionStorage.totals` (Phase 2d-ii). Lookups go through helper methods
 /// that accept legacy `Good`; new code should index by `ResourceId` directly.
+///
+/// Pluralist Economy R1: `Market` is the **global SOLO/fallback** market;
+/// settled factions get per-settlement `SettlementMarket`s (the same shape
+/// minus the `Resource` impl) which take over in R7. The two share method
+/// surface so call sites can swap the underlying instance with no logic
+/// change.
 #[derive(Resource)]
 pub struct Market {
     prices: AHashMap<ResourceId, f32>,
@@ -23,6 +29,71 @@ pub struct Market {
     market_stock: AHashMap<ResourceId, f32>,
     /// Specific manufactured items available for purchase.
     pub listings: Vec<(Item, u32)>,
+}
+
+/// Per-settlement market state. Same fields and methods as `Market` but
+/// not a `Resource` — lives on a Settlement entity. Activated in R7.
+/// Defaults to fully empty (no seeded prices, no stock); a fresh
+/// settlement's first sale establishes the initial price.
+#[derive(Clone, Debug, Default)]
+pub struct SettlementMarket {
+    prices: AHashMap<ResourceId, f32>,
+    supply: AHashMap<ResourceId, f32>,
+    demand: AHashMap<ResourceId, f32>,
+    price_floor: AHashMap<ResourceId, f32>,
+    price_ceiling: AHashMap<ResourceId, f32>,
+    market_stock: AHashMap<ResourceId, f32>,
+    pub listings: Vec<(Item, u32)>,
+}
+
+impl SettlementMarket {
+    fn price_id(&self, id: ResourceId) -> f32 {
+        self.prices.get(&id).copied().unwrap_or(1.0)
+    }
+
+    fn floor_id(&self, id: ResourceId) -> f32 {
+        self.price_floor.get(&id).copied().unwrap_or(DEFAULT_PRICE_FLOOR)
+    }
+
+    fn ceiling_id(&self, id: ResourceId) -> f32 {
+        self.price_ceiling.get(&id).copied().unwrap_or(f32::INFINITY)
+    }
+
+    pub fn price_of(&self, id: ResourceId) -> f32 {
+        self.price_id(id)
+    }
+
+    pub fn add_supply(&mut self, id: ResourceId, qty: f32) {
+        *self.supply.entry(id).or_insert(0.0) += qty;
+    }
+
+    pub fn add_demand(&mut self, id: ResourceId, qty: f32) {
+        *self.demand.entry(id).or_insert(0.0) += qty;
+    }
+
+    pub fn stock_of(&self, id: ResourceId) -> f32 {
+        self.market_stock.get(&id).copied().unwrap_or(0.0)
+    }
+
+    /// Tick prices. Mirrors `Market::update_prices` exactly so the two
+    /// can swap places transparently in R7.
+    pub fn update_prices(&mut self) {
+        let mut active: Vec<ResourceId> = self.prices.keys().copied().collect();
+        for id in self.supply.keys().chain(self.demand.keys()) {
+            if !active.contains(id) {
+                active.push(*id);
+            }
+        }
+        for id in active {
+            let supply = self.supply.get(&id).copied().unwrap_or(0.0);
+            let demand = self.demand.get(&id).copied().unwrap_or(0.0);
+            let ratio = (demand + 1.0) / (supply + 1.0);
+            let cur = self.price_id(id);
+            let next =
+                (cur * ratio.powf(0.05)).clamp(self.floor_id(id), self.ceiling_id(id));
+            self.prices.insert(id, next);
+        }
+    }
 }
 
 const DEFAULT_PRICE_FLOOR: f32 = 0.1;

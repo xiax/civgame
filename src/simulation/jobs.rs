@@ -257,6 +257,60 @@ pub struct ClaimTarget {
     pub resource_id: Option<crate::economy::resource_catalog::ResourceId>,
 }
 
+/// Pluralist Economy R2: an escrow record attached to a sidecar
+/// entity for each funded posting. The producer of the posting (a
+/// household-head, bureaucrat, or wealthy individual under R6+) debits
+/// `amount` from their wallet at posting time, the sidecar entity is
+/// spawned with this component, and:
+///
+/// - On successful job completion: a `pay()` call (R5+ poster paths)
+///   credits the worker, then the sidecar is despawned with
+///   `amount = 0.0` so the `on_remove` hook is a no-op.
+/// - On cancellation / expiry: the sidecar is despawned with the
+///   original amount intact; the `on_job_escrow_remove` hook refunds
+///   `amount` to `beneficiary`.
+///
+/// All 25 existing `aq.cancel()` sites stay untouched: cancellation
+/// still happens by removing the `JobClaim` from the worker; the
+/// posting cleanup that follows then despawns this sidecar, which
+/// refunds via the hook. No per-cancel-site refund logic anywhere.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct JobEscrow {
+    pub amount: f32,
+    pub beneficiary: Entity,
+}
+
+pub fn on_job_escrow_remove(
+    mut world: bevy::ecs::world::DeferredWorld<'_>,
+    entity: Entity,
+    _: bevy::ecs::component::ComponentId,
+) {
+    let Some(escrow) = world.get::<JobEscrow>(entity).copied() else {
+        return;
+    };
+    if !(escrow.amount > 0.0) {
+        // Cleared on successful payout; nothing to refund.
+        return;
+    }
+    if let Some(mut econ) = world
+        .get_mut::<crate::economy::agent::EconomicAgent>(escrow.beneficiary)
+    {
+        econ.currency += escrow.amount;
+    }
+    // Beneficiary may have despawned (e.g. employer died mid-job).
+    // In that case the escrowed currency is lost — same semantics as
+    // GroundItems on chunk unload. The system-wide invariant snapshots
+    // capture this drift.
+}
+
+/// Sum of `amount` across every live `JobEscrow` in the world. R2
+/// extends `CurrencySnapshot` with this term so the system-wide
+/// invariant accounts for funds-in-flight.
+pub fn total_escrowed_currency(world: &mut World) -> f32 {
+    let mut q = world.query::<&JobEscrow>();
+    q.iter(world).map(|e| e.amount).sum()
+}
+
 /// Global resource holding all postings, sharded internally by faction.
 #[derive(Resource, Default)]
 pub struct JobBoard {
@@ -326,6 +380,14 @@ pub struct JobsPlugin;
 
 impl Plugin for JobsPlugin {
     fn build(&self, app: &mut App) {
+        // Pluralist Economy R2: refund hook for escrowed postings.
+        // Mirrors `world::spatial::Indexed`'s on_remove pattern: the
+        // hook fires for `despawn` / `despawn_recursive` / explicit
+        // component removal, so every teardown path refunds without
+        // touching the 25 existing `aq.cancel()` sites.
+        app.world_mut()
+            .register_component_hooks::<JobEscrow>()
+            .on_remove(on_job_escrow_remove);
         app.insert_resource(JobBoard::default())
             .add_event::<JobBoardCommand>()
             .add_event::<JobCompletedEvent>();
