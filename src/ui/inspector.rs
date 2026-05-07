@@ -18,10 +18,6 @@ use crate::simulation::memory::{AgentMemory, RelEntry, RelationshipMemory};
 use crate::simulation::mood::Mood;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, PersonAI, PlayerOrder, Profession};
-use crate::simulation::plan::{
-    build_state_vec, score_weighted, ActivePlan, KnownPlans, PlanHistory, PlanOutcome,
-    PlanRegistry, StepRegistry,
-};
 use crate::simulation::corpse::Corpse;
 use crate::simulation::plants::{Plant, PlantMap};
 use crate::simulation::reproduction::{
@@ -91,8 +87,6 @@ pub fn inspector_panel_system(
     player_faction: Res<PlayerFaction>,
     chunk_map: Res<ChunkMap>,
     plant_map: Res<PlantMap>,
-    plan_registry: Res<PlanRegistry>,
-    step_registry: Res<StepRegistry>,
     calendar: Res<Calendar>,
     mut path_params: PathInspectorParams,
     task_display: TaskDisplayParams,
@@ -123,12 +117,9 @@ pub fn inspector_panel_system(
             Option<&Body>,
             Option<&PlayerOrder>,
             &Transform,
-            Option<&ActivePlan>,
-            Option<&KnownPlans>,
             Option<&AgentMemory>,
             Option<&GoalReason>,
             Option<&crate::simulation::carry::Carrier>,
-            Option<&PlanHistory>,
             Option<&crate::simulation::items::Equipment>,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
             &crate::simulation::typed_task::ActionQueue,
@@ -143,12 +134,9 @@ pub fn inspector_panel_system(
             body,
             order,
             transform,
-            active_plan,
-            known_plans,
             memory,
             goal_reason,
             carrier,
-            plan_history,
             equipment,
             knowledge,
             aq,
@@ -899,103 +887,6 @@ pub fn inspector_panel_system(
                             }
                         }
                     });
-                egui::CollapsingHeader::new(egui::RichText::new("Active Plan").strong())
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        let active_pair = active_plan.and_then(|ap| {
-                            plan_registry
-                                .0
-                                .iter()
-                                .find(|p| p.id == ap.plan_id)
-                                .map(|pd| (ap, pd))
-                        });
-                        match active_pair {
-                            Some((ap, plan_def)) => {
-                                ui.label(
-                                    egui::RichText::new(format!("Active Plan: {}", plan_def.name))
-                                        .strong()
-                                        .color(egui::Color32::LIGHT_BLUE),
-                                );
-                                ui.label(format!(
-                                    "  Step: {}/{}",
-                                    ap.current_step + 1,
-                                    plan_def.steps.len()
-                                ));
-                                ui.label(format!("  Reward: {:.2}", ap.reward_acc));
-                            }
-                            None => {
-                                ui.label(
-                                    egui::RichText::new("Active Plan: None")
-                                        .italics()
-                                        .color(egui::Color32::GRAY),
-                                );
-                                ui.label(
-                                    egui::RichText::new("  Step: —")
-                                        .italics()
-                                        .color(egui::Color32::GRAY),
-                                );
-                                ui.label(
-                                    egui::RichText::new("  Reward: —")
-                                        .italics()
-                                        .color(egui::Color32::GRAY),
-                                );
-                            }
-                        }
-
-                        if let Some(history) = plan_history {
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new("Recent Outcomes (oldest → newest):").strong(),
-                            );
-                            // Walk the ring oldest-to-newest starting at `head`.
-                            let len = history.entries.len();
-                            let mut any = false;
-                            for i in 0..len {
-                                let idx = (history.head as usize + i) % len;
-                                let Some((plan_id, outcome, _tick)) = history.entries[idx] else {
-                                    continue;
-                                };
-                                any = true;
-                                let plan_name = plan_registry
-                                    .0
-                                    .iter()
-                                    .find(|p| p.id == plan_id)
-                                    .map(|p| p.name)
-                                    .unwrap_or("?");
-                                let (label, color) = match outcome {
-                                    PlanOutcome::Success => {
-                                        ("Success", egui::Color32::from_rgb(120, 220, 120))
-                                    }
-                                    PlanOutcome::FailedNoTarget => {
-                                        ("FailedNoTarget", egui::Color32::from_rgb(240, 100, 100))
-                                    }
-                                    PlanOutcome::FailedPrecondition => (
-                                        "FailedPrecondition",
-                                        egui::Color32::from_rgb(240, 100, 100),
-                                    ),
-                                    PlanOutcome::Aborted => {
-                                        ("Aborted", egui::Color32::from_rgb(220, 200, 80))
-                                    }
-                                    PlanOutcome::Interrupted => {
-                                        ("Interrupted", egui::Color32::from_rgb(220, 200, 80))
-                                    }
-                                };
-                                ui.label(
-                                    egui::RichText::new(format!("  {}: {}", plan_name, label))
-                                        .small()
-                                        .color(color),
-                                );
-                            }
-                            if !any {
-                                ui.label(
-                                    egui::RichText::new("  (none)")
-                                        .small()
-                                        .italics()
-                                        .color(egui::Color32::GRAY),
-                                );
-                            }
-                        }
-                    });
                 egui::CollapsingHeader::new(
                     egui::RichText::new("Pathing")
                         .strong()
@@ -1182,150 +1073,6 @@ pub fn inspector_panel_system(
                         );
                     }
                 });
-
-                if let Some(kp) = known_plans {
-                    egui::CollapsingHeader::new("Available Plans").show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("plans")
-                            .max_height(160.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                // Inspector preview doesn't have the spatial queries to
-                                // compute visibility; pass zeros. Storage stocks come
-                                // from FactionRegistry directly so the SI_STORAGE_* slots
-                                // reflect reality. Live agent scoring still uses real
-                                // visibility in plan_execution_system.
-                                let storage_opt = registry
-                                    .factions
-                                    .get(&member.faction_id)
-                                    .map(|f| &f.storage);
-                                let state = build_state_vec(
-                                    needs,
-                                    agent,
-                                    skills,
-                                    member,
-                                    memory,
-                                    &calendar,
-                                    plan_history,
-                                    storage_opt,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    false,
-                                );
-                                let cur_tx = (transform.translation.x
-                                    / crate::world::terrain::TILE_SIZE)
-                                    .floor() as i32;
-                                let cur_ty = (transform.translation.y
-                                    / crate::world::terrain::TILE_SIZE)
-                                    .floor() as i32;
-                                let camp_pos = registry.home_tile(member.faction_id);
-
-                                for plan_def in &plan_registry.0 {
-                                    // Viability checks
-                                    let serving_goal = plan_def.serves_goals.contains(goal);
-                                    let known = kp.knows(plan_def.id);
-                                    let tech_unlocked = plan_def.tech_gate.map_or(true, |tid| {
-                                        registry
-                                            .factions
-                                            .get(&member.faction_id)
-                                            .map(|f| f.techs.has(tid))
-                                            .unwrap_or(false)
-                                    });
-                                    let first_step_ready = plan_def
-                                        .steps
-                                        .first()
-                                        .and_then(|&sid| {
-                                            step_registry.0.iter().find(|s| s.id == sid)
-                                        })
-                                        .map_or(true, |s| {
-                                            let carrier_default =
-                                                crate::simulation::carry::Carrier::default();
-                                            let c = carrier.unwrap_or(&carrier_default);
-                                            s.preconditions.is_satisfied(
-                                                agent,
-                                                c,
-                                                equipment,
-                                                needs.hunger,
-                                            )
-                                        });
-
-                                    let mut rejection = None;
-                                    if !serving_goal {
-                                        rejection = Some("Wrong Goal");
-                                    } else if !known {
-                                        rejection = Some("Not Learned");
-                                    } else if !tech_unlocked {
-                                        rejection = Some("Tech Locked");
-                                    } else if !first_step_ready {
-                                        rejection = Some("Preconditions Unmet");
-                                    }
-
-                                    if let Some(reason) = rejection {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{}: Rejected ({})",
-                                                plan_def.name, reason
-                                            ))
-                                            .small()
-                                            .color(egui::Color32::from_gray(120)),
-                                        );
-                                    } else {
-                                        let base = score_weighted(&state, plan_def);
-                                        let mut score = base;
-                                        let mut bonus_str = format!(
-                                            "= base {:.2} ({:+.2} weights, {:+.2} bias)",
-                                            base,
-                                            base - plan_def.bias,
-                                            plan_def.bias,
-                                        );
-                                        if plan_def.id.raw() == ai.last_plan_id {
-                                            score += 0.0;
-                                            bonus_str += " +0.0 persist";
-                                        }
-
-                                        let target_tile =
-                                            plan_def.memory_target_kind.and_then(|k| {
-                                                memory.and_then(|m| {
-                                                    m.best_for_dist_weighted(k, (cur_tx, cur_ty))
-                                                })
-                                            });
-
-                                        if let Some(target) = target_tile {
-                                            let dist_agent = (target.0 as i32 - cur_tx).abs()
-                                                + (target.1 as i32 - cur_ty).abs();
-                                            let dist_camp = camp_pos.map_or(0, |c| {
-                                                (target.0 as i32 - c.0 as i32).abs()
-                                                    + (target.1 as i32 - c.1 as i32).abs()
-                                            });
-                                            let penalty = (dist_agent + dist_camp) as f32 * 0.002;
-                                            score -= penalty;
-                                            bonus_str += &format!(" -{:.2} dist", penalty);
-                                        } else if plan_def.memory_target_kind.is_some() {
-                                            score -= 0.1;
-                                            bonus_str += " -0.1 no target";
-                                        }
-
-                                        ui.horizontal(|ui| {
-                                            ui.label(format!("{}: ", plan_def.name));
-                                            ui.label(
-                                                egui::RichText::new(format!("{:.2}", score))
-                                                    .color(egui::Color32::YELLOW),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(bonus_str)
-                                                    .small()
-                                                    .color(egui::Color32::from_gray(160)),
-                                            );
-                                        });
-                                    }
-                                }
-                            });
-                    });
-                }
 
                 egui::CollapsingHeader::new(egui::RichText::new("Reproduction").strong())
                     .default_open(false)

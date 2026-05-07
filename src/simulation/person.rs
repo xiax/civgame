@@ -22,7 +22,6 @@ use super::mood::Mood;
 use super::movement::MovementState;
 use super::needs::Needs;
 use super::htn::{MethodHistory, MethodId};
-use super::plan::{KnownPlans, PlanHistory, PlanId, PlanScoringMethod};
 use super::reproduction::BiologicalSex;
 use super::schedule::{BucketSlot, SimClock};
 use super::knowledge::PersonKnowledge;
@@ -137,7 +136,6 @@ pub struct PersonAI {
     pub target_tile: (i32, i32),
     pub dest_tile: (i32, i32),
     pub ticks_idle: u8,
-    pub last_plan_id: u16,
     pub last_goal_eval_tick: u64,
     pub target_entity: Option<Entity>,
     /// The agent's current foot Z (the floor they stand on). Set at spawn
@@ -180,7 +178,6 @@ impl Default for PersonAI {
             target_tile: (0, 0),
             dest_tile: (0, 0),
             ticks_idle: 0,
-            last_plan_id: 0,
             last_goal_eval_tick: 0,
             target_entity: None,
             current_z: 0,
@@ -448,7 +445,6 @@ pub fn spawn_population(
                         state: AiState::Idle,
                         target_tile: (tx as i32, ty as i32),
                         dest_tile: (tx as i32, ty as i32),
-                        last_plan_id: PersonAI::UNEMPLOYED,
                         current_z: chunk_map.surface_z_at(tx, ty) as i8,
                         target_z: chunk_map.surface_z_at(tx, ty) as i8,
                         ..PersonAI::default()
@@ -481,49 +477,7 @@ pub fn spawn_population(
                 (
                     AgentMemory::default(),
                     RelationshipMemory::default(),
-                    KnownPlans::with_innate(&[
-                        // FORAGE_FOOD retired in the Forage→HTN migration.
-                        // FARM_FOOD retired with the closing of Phase 5
-                        // (HTN method `HarvestMaturePlantForStorageMethod`).
-                        // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
-                        // HUNT_FOOD retired in Phase 5e-viii-c (HTN abstract
-                        // tasks JoinHuntParty / EngagePrey / DeliverHuntKill).
-                        // SCAVENGE_FOOD retired 5c-ii-d-vi.
-                        // BUILD_BLUEPRINT retired in Phase 5e-xiii-b
-                        // (HTN method `GatherAndHaulToPersonalBlueprintMethod`).
-                        // TAME_HORSE retired in Phase 5e-iv (HTN method).
-                        // DELIVER_HIDE_TO_CRAFT_ORDER retired in Phase 5e-xiv
-                        // (generalized Stockpile pipeline; chief posts
-                        // `Stockpile { Skin }` for CraftOrder demand).
-                        // DELIVER_GRAIN_TO_CRAFT_ORDER retired in Phase 5e-xi-c
-                        // (HTN method `HarvestAndHaulGrainToCraftOrderMethod`).
-                        // DELIVER_FROM_STORAGE_TO_CRAFT_ORDER retired in Phase 5e-xi-a
-                        // (HTN method `WithdrawAndHaulToCraftOrderMethod`).
-                        // WORK_ON_CRAFT retired in Phase 5e-xi-b
-                        // (HTN method `WorkOnSatisfiedCraftOrderMethod`).
-                        // RETURN_SURPLUS_FOOD retired in Phase 5e-iii (HTN method).
-                        // PLAY_SOCIAL / PLAY_SOLO retired in Phase 5e-xii-a
-                        // (HTN methods PlayWithPartnerMethod / PlaySoloMethod).
-                        // HAUL_FROM_STORAGE_AND_BUILD retired in Phase 5e-xiii-a
-                        // (HTN method `WithdrawAndHaulToPersonalBlueprintMethod`).
-                        // PLAY_BY_PLANTING retired in Phase 5e-xii-d
-                        // (HTN method `WithdrawAndPlantGrainSeedAsPlayMethod`).
-                        // PLAY_BY_THROWING_ROCKS retired in Phase 5e-xii-b
-                        // (HTN method `WithdrawAndThrowStonesAsPlayMethod`).
-                        // PLAY_WITH_STORED_TOY retired in Phase 5e-xii-c
-                        // (HTN method `WithdrawAndPlayWithToyMethod`).
-                        // CLAIMED_BUILD retired in Phase 5e-vi (HTN method).
-                        // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
-                        // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
-                        // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
-                        // SOCIALIZE retired in Phase 5e-ix (HTN method).
-                        // RESCUE_ALLY / RAID / DEFEND / LEAD retired in Phase 5e-x (HTN method).
-                        // ACQUIRE_HUNTING_SPEAR retired in Phase 5e-ii (HTN method).
-                        // SCOUT_FOR_PREY retired in Phase 5e (HTN method).
-                    ]),
-                    PlanHistory::default(),
                     MethodHistory::default(),
-                    PlanScoringMethod::Weighted,
                     Name::new(generate_person_name(sex)),
                     PathFollow::default(),
                     Carrier::default(),

@@ -349,10 +349,9 @@ pub fn withdraw_good_task_system(
 /// On entry the executor first drops any hand stack whose good doesn't match
 /// the target so the agent's hands are free for the deposit step that
 /// usually follows. If the spatial scan finds zero of the target good (race
-/// — another agent already drained the stack), the active plan is marked
-/// failed via `PlanHistory` so the agent doesn't immediately walk back to
-/// the same dry tile next tick. Every exit path releases the storage
-/// reservation tracked on `PersonAI`.
+/// — another agent already drained the stack), the chain bails and
+/// `MethodHistory` records the failure for HTN-driven dispatches. Every exit
+/// path releases the storage reservation tracked on `PersonAI`.
 pub fn withdraw_material_task_system(
     mut commands: Commands,
     clock: Res<SimClock>,
@@ -376,16 +375,13 @@ pub fn withdraw_material_task_system(
         &FactionMember,
         &BucketSlot,
         &LodLevel,
-        Option<&mut crate::simulation::plan::PlanHistory>,
-        Option<&crate::simulation::plan::ActivePlan>,
     )>,
 ) {
-    use crate::simulation::plan::PlanOutcome;
     use crate::simulation::typed_task::Task;
     use crate::world::terrain::world_to_tile;
 
     for (
-        entity,
+        _entity,
         mut ai,
         mut aq,
         mut agent,
@@ -394,8 +390,6 @@ pub fn withdraw_material_task_system(
         member,
         slot,
         lod,
-        mut plan_history_opt,
-        active_plan_opt,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -543,20 +537,13 @@ pub fn withdraw_material_task_system(
             }
         }
 
-        let taken = promised.saturating_sub(remaining);
-        if taken == 0 {
-            // Race: the stack we reserved was emptied between dispatch and
-            // arrival. Mark the active plan failed so PlanHistory penalizes
-            // it briefly — without this the next step (HaulTo*) silently
-            // no-ops with empty hands and the agent walks back to the same
-            // dry tile on the next dispatch cycle.
-            if let Some(plan) = active_plan_opt {
-                if let Some(history) = plan_history_opt.as_deref_mut() {
-                    history.push(plan.plan_id, PlanOutcome::FailedNoTarget, clock.tick);
-                }
-                commands.entity(entity).remove::<crate::simulation::plan::ActivePlan>();
-            }
-        }
+        // Race: the stack we reserved may have been emptied between dispatch
+        // and arrival. The chain handoff in `finish_withdraw_material` drops
+        // the trailing leg (cancel via `aq.cancel()`); the HTN dispatcher
+        // already records `MethodOutcome::FailedRouting` on failed dispatches
+        // and the agent re-evaluates next tick. No legacy PlanHistory write
+        // remains.
+        let _taken = promised.saturating_sub(remaining);
 
         finish_withdraw_material(
             &mut ai,

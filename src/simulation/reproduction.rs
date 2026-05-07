@@ -12,7 +12,6 @@ use super::person::{
     generate_person_name, AiState, HairColor, Person, PersonAI, Profession, SkinTone,
 };
 use super::htn::MethodHistory;
-use super::plan::{KnownPlans, PlanHistory, PlanId, PlanScoringMethod};
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::Skills;
 use super::stats::Stats;
@@ -468,7 +467,6 @@ pub fn pregnancy_system(
                     state: AiState::Idle,
                     target_tile: (tx as i32, ty as i32),
                     dest_tile: (tx as i32, ty as i32),
-                    last_plan_id: PersonAI::UNEMPLOYED,
                     current_z: chunk_map.surface_z_at(tx, ty) as i8,
                     target_z: chunk_map.surface_z_at(tx, ty) as i8,
                     ..PersonAI::default()
@@ -498,44 +496,7 @@ pub fn pregnancy_system(
                 CombatCooldown::default(),
                 AgentMemory::default(),
                 RelationshipMemory::default(),
-                KnownPlans::with_innate(&[
-                    // FORAGE_FOOD retired in the Forage→HTN migration.
-                    // FARM_FOOD retired with the closing of Phase 5
-                    // (HTN method `HarvestMaturePlantForStorageMethod`).
-                    // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
-                    // HUNT_FOOD retired in Phase 5e-viii-c (HTN abstract
-                    // tasks JoinHuntParty / EngagePrey / DeliverHuntKill).
-                    // SCAVENGE_FOOD retired 5c-ii-d-vi.
-                    // BUILD_BLUEPRINT retired in Phase 5e-xiii-b
-                    // (HTN method `GatherAndHaulToPersonalBlueprintMethod`).
-                    // DELIVER_HIDE_TO_CRAFT_ORDER retired in Phase 5e-xiv
-                    // (generalized Stockpile pipeline).
-                    // DELIVER_GRAIN_TO_CRAFT_ORDER retired in Phase 5e-xi-c
-                    // (HTN method `HarvestAndHaulGrainToCraftOrderMethod`).
-                    // DELIVER_FROM_STORAGE_TO_CRAFT_ORDER retired in Phase 5e-xi-a
-                    // (HTN method `WithdrawAndHaulToCraftOrderMethod`).
-                    // WORK_ON_CRAFT retired in Phase 5e-xi-b
-                    // (HTN method `WorkOnSatisfiedCraftOrderMethod`).
-                    // PLAY_SOCIAL / PLAY_SOLO retired in Phase 5e-xii-a
-                    // (HTN methods PlayWithPartnerMethod / PlaySoloMethod).
-                    // HAUL_FROM_STORAGE_AND_BUILD retired in Phase 5e-xiii-a
-                    // (HTN method `WithdrawAndHaulToPersonalBlueprintMethod`).
-                    // PLAY_BY_PLANTING retired in Phase 5e-xii-d
-                    // (HTN method `WithdrawAndPlantGrainSeedAsPlayMethod`).
-                    // PLAY_BY_THROWING_ROCKS retired in Phase 5e-xii-b
-                    // (HTN method `WithdrawAndThrowStonesAsPlayMethod`).
-                    // PLAY_WITH_STORED_TOY retired in Phase 5e-xii-c
-                    // (HTN method `WithdrawAndPlayWithToyMethod`).
-                    // CLAIMED_BUILD retired in Phase 5e-vi (HTN method).
-                    // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
-                    // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
-                    // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
-                    // SOCIALIZE retired in Phase 5e-ix (HTN method).
-                    // RESCUE_ALLY / RAID / DEFEND / LEAD retired in Phase 5e-x (HTN method).
-                ]),
-                PlanHistory::default(),
                 MethodHistory::default(),
-                PlanScoringMethod::Weighted,
                 Name::new(child_name),
                 PathFollow::default(),
                 Carrier::default(),

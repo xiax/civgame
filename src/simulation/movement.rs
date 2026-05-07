@@ -242,7 +242,6 @@ pub fn movement_system(
                         PathKind::BestEffort,
                         DEFAULT_PATH_BUDGET,
                         ai.task_id,
-                        ai.last_plan_id,
                     );
                     pf.status = FollowStatus::Pending;
                     pf.goal = goal3;
@@ -305,7 +304,6 @@ pub fn movement_system(
                             PathKind::BestEffort,
                             DEFAULT_PATH_BUDGET,
                             ai.task_id,
-                            ai.last_plan_id,
                         );
                         pf.status = FollowStatus::Pending;
                         pf.goal = goal3;
@@ -341,7 +339,6 @@ pub fn movement_system(
                             PathKind::BestEffort,
                             DEFAULT_PATH_BUDGET,
                             ai.task_id,
-                            ai.last_plan_id,
                         );
                         pf.status = FollowStatus::Pending;
                         continue;

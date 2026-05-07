@@ -36,7 +36,6 @@ use crate::simulation::person::{
     AiState, HairColor, Person, PersonAI, Profession, SkinTone,
 };
 use crate::simulation::htn::MethodHistory;
-use crate::simulation::plan::{KnownPlans, PlanHistory, PlanId, PlanScoringMethod};
 use crate::simulation::reproduction::BiologicalSex;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::Skills;
@@ -279,7 +278,6 @@ pub struct PersonBuilder {
     profession: Profession,
     goal: AgentGoal,
     inventory: Vec<(crate::economy::resource_catalog::ResourceId, u32)>,
-    known_plan_ids: Vec<PlanId>,
     bucket: u32,
 }
 
@@ -294,46 +292,6 @@ impl PersonBuilder {
             profession: Profession::None,
             goal: AgentGoal::default(),
             inventory: Vec::new(),
-            // Match the live spawn_population innate-plan list so
-            // candidate filtering behaves identically.
-            known_plan_ids: vec![
-                // FORAGE_FOOD retired in the Forage→HTN migration.
-                // FARM_FOOD retired with the closing of Phase 5
-                // (HTN method `HarvestMaturePlantForStorageMethod`).
-                // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
-                // HUNT_FOOD retired in Phase 5e-viii-c (HTN abstract tasks).
-                // SCAVENGE_FOOD retired 5c-ii-d-vi.
-                // BUILD_BLUEPRINT retired in Phase 5e-xiii-b
-                // (HTN method `GatherAndHaulToPersonalBlueprintMethod`).
-                // TAME_HORSE retired in Phase 5e-iv (HTN method).
-                // DELIVER_HIDE_TO_CRAFT_ORDER retired in Phase 5e-xiv
-                // (generalized Stockpile pipeline).
-                // DELIVER_GRAIN_TO_CRAFT_ORDER retired in Phase 5e-xi-c
-                // (HTN method `HarvestAndHaulGrainToCraftOrderMethod`).
-                // DELIVER_FROM_STORAGE_TO_CRAFT_ORDER retired in Phase 5e-xi-a
-                // (HTN method `WithdrawAndHaulToCraftOrderMethod`).
-                // WORK_ON_CRAFT retired in Phase 5e-xi-b
-                // (HTN method `WorkOnSatisfiedCraftOrderMethod`).
-                // RETURN_SURPLUS_FOOD retired in Phase 5e-iii (HTN method).
-                // PLAY_SOCIAL / PLAY_SOLO retired in Phase 5e-xii-a
-                // (HTN methods PlayWithPartnerMethod / PlaySoloMethod).
-                // HAUL_FROM_STORAGE_AND_BUILD retired in Phase 5e-xiii-a
-                // (HTN method `WithdrawAndHaulToPersonalBlueprintMethod`).
-                // PLAY_BY_PLANTING retired in Phase 5e-xii-d
-                // (HTN method `WithdrawAndPlantGrainSeedAsPlayMethod`).
-                // PLAY_BY_THROWING_ROCKS retired in Phase 5e-xii-b
-                // (HTN method `WithdrawAndThrowStonesAsPlayMethod`).
-                // PLAY_WITH_STORED_TOY retired in Phase 5e-xii-c
-                // (HTN method `WithdrawAndPlayWithToyMethod`).
-                // CLAIMED_BUILD retired in Phase 5e-vi (HTN method).
-                // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
-                // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
-                // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
-                // SOCIALIZE retired in Phase 5e-ix (HTN method).
-                // RESCUE_ALLY / RAID / DEFEND / LEAD retired in Phase 5e-x (HTN method).
-                // ACQUIRE_HUNTING_SPEAR retired in Phase 5e-ii (HTN method).
-                // SCOUT_FOR_PREY retired in Phase 5e (HTN method).
-            ],
             bucket: 0,
         }
     }
@@ -372,11 +330,6 @@ impl PersonBuilder {
         self
     }
 
-    pub fn known_plans(&mut self, plans: Vec<PlanId>) -> &mut Self {
-        self.known_plan_ids = plans;
-        self
-    }
-
     pub fn bucket(&mut self, bucket: u32) -> &mut Self {
         self.bucket = bucket;
         self
@@ -410,7 +363,6 @@ impl PersonBuilder {
                         state: AiState::Idle,
                         target_tile: self.tile,
                         dest_tile: self.tile,
-                        last_plan_id: PersonAI::UNEMPLOYED,
                         current_z: self.surface_z,
                         target_z: self.surface_z,
                         ..PersonAI::default()
@@ -442,10 +394,7 @@ impl PersonBuilder {
                 (
                     AgentMemory::default(),
                     RelationshipMemory::default(),
-                    KnownPlans::with_innate(&self.known_plan_ids),
-                    PlanHistory::default(),
                     MethodHistory::default(),
-                    PlanScoringMethod::Weighted,
                     Name::new("TestPerson"),
                     PathFollow::default(),
                     Carrier::default(),

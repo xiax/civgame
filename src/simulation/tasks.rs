@@ -6,7 +6,6 @@ use super::memory::RelationshipMemory;
 use super::needs::Needs;
 use super::person::{PlayerOrder, PlayerOrderKind};
 use super::person::{AiState, Drafted, PersonAI};
-use super::plan::ActivePlan;
 use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
 
 use crate::pathfinding::chunk_graph::ChunkGraph;
@@ -582,16 +581,15 @@ pub fn assign_task_with_routing(
 }
 
 /// Stale-task reset + Explore cleanup. The Sleep arm that used to live here
-/// moved to `htn::htn_dispatch_system` in Phase 5a-ii; every other goal is
-/// plan-driven. This system now just handles the two pieces that don't
-/// belong anywhere else:
+/// moved to `htn::htn_dispatch_system` in Phase 5a-ii. With `plan_execution_system`
+/// retired in Phase 7, every goal is HTN-driven, so this system just handles
+/// the two pieces that don't belong anywhere else:
 ///
-/// 1. **No-plan stale-reset.** When `ActivePlan` is gone but the agent's
-///    `task_id` is non-empty, the task is leftover from the abandoned plan.
-///    Clear it (and `aq.cancel()` the prefetched queue) unless the goal
-///    legitimately keeps the task alive (Sleep keeps `TaskKind::Sleep`,
-///    Survive keeps an in-progress `Eat`).
-/// 2. **Explore cleanup.** Gather/Survive/Build share the Explore plan, so
+/// 1. **Stale-task reset.** A leftover `task_id` from an abandoned dispatch
+///    is cleared (and `aq.cancel()` drops the prefetched queue) unless the
+///    goal legitimately keeps the task alive (e.g. Sleep keeps
+///    `TaskKind::Sleep`, Survive keeps an in-progress `Eat`).
+/// 2. **Explore cleanup.** Gather/Survive/Build share the Explore method, so
 ///    when one of those goals flips and a stale `Explore` task is still
 ///    Working, drop it back to Idle.
 pub fn goal_dispatch_system(
@@ -601,19 +599,18 @@ pub fn goal_dispatch_system(
             &mut crate::simulation::typed_task::ActionQueue,
             &AgentGoal,
             &LodLevel,
-            Option<&ActivePlan>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
 ) {
     query
         .par_iter_mut()
-        .for_each(|(mut ai, mut aq, goal, lod, plan_opt)| {
+        .for_each(|(mut ai, mut aq, goal, lod)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
 
-            if plan_opt.is_none() && ai.task_id != PersonAI::UNEMPLOYED {
+            if ai.task_id != PersonAI::UNEMPLOYED {
                 // Sleep dispatches via `htn_dispatch_system`, not a plan, so its
                 // task is expected to outlive the plan reset. Everything else
                 // is plan-driven — when an agent has no `ActivePlan`, any

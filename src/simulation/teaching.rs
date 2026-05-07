@@ -31,7 +31,6 @@ use crate::simulation::knowledge::{
 };
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, Drafted, PersonAI, PlayerOrder, PlayerOrderKind};
-use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::stats::{modifier, Stats};
 use crate::simulation::tasks::TaskKind;
@@ -175,9 +174,6 @@ pub fn apply_player_knowledge_orders_system(
                 ai.work_progress = 0;
                 aq.dispatch(crate::simulation::typed_task::Task::Read { tech });
                 if let Some(mut ec) = commands.get_entity(entity) {
-                    // Drop any in-flight plan so the read task is not
-                    // immediately overwritten by `plan_execution_system`.
-                    ec.remove::<ActivePlan>();
                     // Pin the agent in place so autonomous goal dispatch
                     // doesn't re-assign them mid-read.
                     ec.insert(Drafted);
@@ -456,7 +452,6 @@ pub fn apply_lecture_request_system(
                     continue;
                 }
                 if let Some(mut ec) = commands.get_entity(candidate) {
-                    ec.remove::<ActivePlan>();
                     ec.insert(Attending {
                         lecturer: lecturer_e,
                         ends_tick,

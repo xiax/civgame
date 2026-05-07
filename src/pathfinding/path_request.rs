@@ -113,10 +113,10 @@ pub enum PathReadyKind {
 
 /// One queued request, owned by the request queue until the worker pops it.
 ///
-/// `task_id` and `plan_id` are diagnostic-only: snapshots of the requesting
-/// agent's `PersonAI.task_id` / `last_plan_id` at enqueue time. They flow into
-/// the `UnreachableAstar` dump so the user can see which task/plan asked for
-/// the failing goal even after dispatch has moved on.
+/// `task_id` is diagnostic-only: a snapshot of the requesting agent's
+/// `PersonAI.task_id` at enqueue time. It flows into the `UnreachableAstar`
+/// dump so the user can see which task asked for the failing goal even after
+/// dispatch has moved on.
 #[derive(Clone, Debug)]
 pub struct PathRequest {
     pub id: u64,
@@ -126,7 +126,6 @@ pub struct PathRequest {
     pub kind: PathKind,
     pub max_budget: u32,
     pub task_id: u16,
-    pub plan_id: u16,
 }
 
 /// Lifecycle of an agent's `PathFollow`.
@@ -264,7 +263,6 @@ impl PathRequestQueue {
         kind: PathKind,
         max_budget: u32,
         task_id: u16,
-        plan_id: u16,
     ) -> u64 {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
@@ -276,7 +274,6 @@ impl PathRequestQueue {
             kind,
             max_budget,
             task_id,
-            plan_id,
         };
         if self.pending.contains(&agent) {
             for slot in self.queue.iter_mut() {
@@ -404,7 +401,6 @@ mod tests {
             PathKind::Strict,
             DEFAULT_PATH_BUDGET,
             0,
-            0,
         );
         assert_eq!(q.len(), 1);
         assert!(q.is_pending(a));
@@ -425,7 +421,6 @@ mod tests {
             PathKind::Strict,
             DEFAULT_PATH_BUDGET,
             0,
-            0,
         );
         q.enqueue(
             a,
@@ -433,7 +428,6 @@ mod tests {
             (9, 9, 0),
             PathKind::Strict,
             DEFAULT_PATH_BUDGET,
-            0,
             0,
         );
         assert_eq!(q.len(), 1, "dedupe should keep one entry per agent");
@@ -444,8 +438,8 @@ mod tests {
     #[test]
     fn distinct_agents_keep_distinct_requests() {
         let mut q = PathRequestQueue::default();
-        q.enqueue(dummy(1), (0, 0, 0), (1, 0, 0), PathKind::Strict, 1000, 0, 0);
-        q.enqueue(dummy(2), (0, 0, 0), (2, 0, 0), PathKind::Strict, 1000, 0, 0);
+        q.enqueue(dummy(1), (0, 0, 0), (1, 0, 0), PathKind::Strict, 1000, 0);
+        q.enqueue(dummy(2), (0, 0, 0), (2, 0, 0), PathKind::Strict, 1000, 0);
         assert_eq!(q.len(), 2);
     }
 

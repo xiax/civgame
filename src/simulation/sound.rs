@@ -10,7 +10,6 @@ use crate::simulation::line_of_sight::has_los;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::RelationshipMemory;
 use crate::simulation::person::{AiState, Person, PersonAI, Profession};
-use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::SimClock;
 use crate::world::chunk::ChunkMap;
 use crate::world::spatial::SpatialIndex;
@@ -96,7 +95,6 @@ pub fn respond_to_distress_system(
             Option<&Body>,
             Option<&Health>,
             Option<&mut GoalReason>,
-            Option<&ActivePlan>,
             Option<&Profession>,
             Option<&FactionMember>,
             Option<&mut crate::simulation::typed_task::ActionQueue>,
@@ -144,7 +142,7 @@ pub fn respond_to_distress_system(
         // Hunters always rally to allied distress regardless of LOS / audibility —
         // they're the faction's combat-trained standing force.
         if let Some(victim_faction_id) = victim_faction {
-            for (e, _, _, _, t, _, _, _, _, _, _, prof_opt, member_opt, _) in responders.iter() {
+            for (e, _, _, _, t, _, _, _, _, _, prof_opt, member_opt, _) in responders.iter() {
                 if e == ev.victim || e == ev.attacker {
                     continue;
                 }
@@ -175,7 +173,6 @@ pub fn respond_to_distress_system(
                 body_opt,
                 health_opt,
                 reason_opt,
-                active_plan_opt,
                 prof_opt,
                 member_opt,
                 aq_opt,
@@ -274,10 +271,6 @@ pub fn respond_to_distress_system(
                 attacker_tile,
                 set_tick: clock.tick,
             });
-
-            if active_plan_opt.is_some() {
-                commands.entity(entity).remove::<ActivePlan>();
-            }
 
             *goal = AgentGoal::Rescue;
             if let Some(mut r) = reason_opt {

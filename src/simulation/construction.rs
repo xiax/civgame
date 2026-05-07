@@ -12,7 +12,6 @@ use crate::simulation::jobs::{
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, Person, PersonAI};
-use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
@@ -2579,7 +2578,6 @@ pub fn construction_system(
         &mut Skills,
         &BucketSlot,
         &LodLevel,
-        Option<&mut ActivePlan>,
         Option<&JobClaim>,
     )>,
 ) {
@@ -2593,7 +2591,7 @@ pub fn construction_system(
     > = AHashMap::new();
     let mut bp_workers: AHashMap<Entity, Vec<Entity>> = AHashMap::new();
 
-    for (entity, mut ai, mut aq, agent, carrier, _skills, slot, lod, _, claim_opt) in
+    for (entity, mut ai, mut aq, agent, carrier, _skills, slot, lod, claim_opt) in
         agent_query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -3057,7 +3055,7 @@ pub fn construction_system(
 
     // Pass 3: remove deposited goods from agents, grant Building XP to workers
     // whose labour actually advanced progress, and reset completed/hauler/orphaned agents.
-    for (entity, mut ai, mut aq, mut agent, mut carrier, mut skills, _, _, mut plan_opt, _) in
+    for (entity, mut ai, mut aq, mut agent, mut carrier, mut skills, _, _, _) in
         agent_query.iter_mut()
     {
         for &(ae, id, qty) in &good_removals {
@@ -3081,17 +3079,6 @@ pub fn construction_system(
         let is_orphaned = orphaned_agents.contains(&entity);
 
         if is_completed || is_hauler_done || is_orphaned {
-            if is_completed {
-                if let Some(ref mut plan) = plan_opt {
-                    plan.reward_acc += if ai.task_id == TaskKind::ConstructBed as u16 {
-                        2.0
-                    } else if ai.task_id == TaskKind::HaulMaterials as u16 {
-                        0.4
-                    } else {
-                        1.0
-                    };
-                }
-            }
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;

@@ -51,7 +51,6 @@ use crate::simulation::memory::{AgentMemory, MemoryKind};
 use crate::simulation::plants::{GrowthStage, Plant, PlantMap};
 use crate::simulation::needs::{Needs, EAT_TRIGGER_HUNGER};
 use crate::simulation::person::{AiState, Drafted, PersonAI, PlayerOrder, Profession};
-use crate::simulation::plan::ActivePlan;
 use crate::simulation::production::total_edible;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
@@ -3248,13 +3247,12 @@ pub fn htn_eat_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&ActivePlan>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
 ) {
     query.par_iter_mut().for_each(
-        |(mut ai, mut aq, goal, needs, agent, carrier, transform, member, lod, active_plan_opt)| {
+        |(mut ai, mut aq, goal, needs, agent, carrier, transform, member, lod)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -3268,9 +3266,6 @@ pub fn htn_eat_dispatch_system(
             // `plan_execution_system`. We only fire when the agent has no
             // plan and an idle task slot — the same gate
             // `plan_execution_system` uses to start a fresh plan.
-            if active_plan_opt.is_some() {
-                return;
-            }
             if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
                 return;
             }
@@ -3452,7 +3447,6 @@ pub fn htn_acquire_food_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&ActivePlan>,
             Option<&AgentMemory>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
@@ -3463,7 +3457,7 @@ pub fn htn_acquire_food_dispatch_system(
     const VIEW_RADIUS: i32 = 15;
     let now = clock.tick;
     query.par_iter_mut().for_each(
-        |(mut ai, mut aq, mut history, goal, needs, agent, carrier, transform, member, lod, active_plan_opt, memory_opt)| {
+        |(mut ai, mut aq, mut history, goal, needs, agent, carrier, transform, member, lod, memory_opt)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -3473,9 +3467,6 @@ pub fn htn_acquire_food_dispatch_system(
 
             // Same gating as `htn_eat_dispatch_system`: don't preempt an
             // in-flight plan, only fire on a clean (Idle, UNEMPLOYED) slot.
-            if active_plan_opt.is_some() {
-                return;
-            }
             if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
                 return;
             }
@@ -3880,7 +3871,6 @@ pub fn htn_acquire_good_dispatch_system(
             &FactionMember,
             &Transform,
             &LodLevel,
-            Option<&ActivePlan>,
             Option<&crate::simulation::jobs::ClaimTarget>,
             Option<&crate::simulation::jobs::JobClaim>,
             Option<&crate::simulation::memory::AgentMemory>,
@@ -3899,16 +3889,12 @@ pub fn htn_acquire_good_dispatch_system(
         member,
         transform,
         lod,
-        active_plan_opt,
         claim_target_opt,
         job_claim_opt,
         memory_opt,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -4443,7 +4429,6 @@ pub fn htn_stockpile_food_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&ActivePlan>,
             Option<&crate::simulation::jobs::JobClaim>,
             Option<&crate::simulation::jobs::ClaimTarget>,
             Option<&AgentMemory>,
@@ -4464,7 +4449,6 @@ pub fn htn_stockpile_food_dispatch_system(
             transform,
             member,
             lod,
-            active_plan_opt,
             job_claim_opt,
             claim_target_opt,
             memory_opt,
@@ -4473,9 +4457,6 @@ pub fn htn_stockpile_food_dispatch_system(
                 return;
             }
             if !matches!(*goal, AgentGoal::GatherFood) {
-                return;
-            }
-            if active_plan_opt.is_some() {
                 return;
             }
             if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -4795,7 +4776,6 @@ pub fn htn_equip_hunting_spear_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&ActivePlan>,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
@@ -4815,7 +4795,6 @@ pub fn htn_equip_hunting_spear_dispatch_system(
         transform,
         member,
         lod,
-        active_plan_opt,
         knowledge_opt,
     ) in query.iter_mut()
     {
@@ -4823,9 +4802,6 @@ pub fn htn_equip_hunting_spear_dispatch_system(
             continue;
         }
         if !matches!(*goal, AgentGoal::Survive | AgentGoal::GatherFood) {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -5051,7 +5027,6 @@ pub fn htn_scout_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&ActivePlan>,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
@@ -5069,16 +5044,12 @@ pub fn htn_scout_dispatch_system(
             transform,
             member,
             lod,
-            active_plan_opt,
             knowledge_opt,
         )| {
             if *lod == LodLevel::Dormant {
                 return;
             }
             if !matches!(*goal, AgentGoal::Survive | AgentGoal::GatherFood) {
-                return;
-            }
-            if active_plan_opt.is_some() {
                 return;
             }
             if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -5275,7 +5246,6 @@ pub fn htn_return_surplus_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&ActivePlan>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -5292,15 +5262,11 @@ pub fn htn_return_surplus_dispatch_system(
             transform,
             member,
             lod,
-            active_plan_opt,
         )| {
             if *lod == LodLevel::Dormant {
                 return;
             }
             if !matches!(*goal, AgentGoal::ReturnCamp) {
-                return;
-            }
-            if active_plan_opt.is_some() {
                 return;
             }
             if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -5503,7 +5469,6 @@ pub fn htn_tame_horse_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&ActivePlan>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -5518,16 +5483,12 @@ pub fn htn_tame_horse_dispatch_system(
         transform,
         member,
         lod,
-        active_plan_opt,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
             continue;
         }
         if !matches!(*goal, AgentGoal::TameHorse) {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -5725,7 +5686,6 @@ pub fn htn_plant_from_storage_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&ActivePlan>,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
@@ -5743,7 +5703,6 @@ pub fn htn_plant_from_storage_dispatch_system(
         transform,
         member,
         lod,
-        active_plan_opt,
         knowledge_opt,
     ) in query.iter_mut()
     {
@@ -5751,9 +5710,6 @@ pub fn htn_plant_from_storage_dispatch_system(
             continue;
         }
         if !matches!(*goal, AgentGoal::Farm) {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -6014,7 +5970,6 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&ActivePlan>,
             Option<&crate::simulation::jobs::JobClaim>,
             Option<&crate::simulation::jobs::ClaimTarget>,
             Option<&AgentMemory>,
@@ -6033,7 +5988,6 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
         transform,
         member,
         lod,
-        active_plan_opt,
         job_claim_opt,
         claim_target_opt,
         memory_opt,
@@ -6043,9 +5997,6 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             continue;
         }
         if !matches!(*goal, AgentGoal::Build) {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -6398,20 +6349,16 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&ActivePlan>,
             &crate::simulation::corpse::Carrying,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
 ) {
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, transform, member, lod, active_plan_opt, _carrying) in
+    for (mut ai, mut aq, mut history, transform, member, lod, _carrying) in
         query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -6584,7 +6531,6 @@ pub fn htn_engage_prey_dispatch_system(
             &FactionMember,
             &Profession,
             &LodLevel,
-            Option<&ActivePlan>,
             Option<&AgentMemory>,
             Option<&crate::simulation::corpse::Carrying>,
         ),
@@ -6605,7 +6551,6 @@ pub fn htn_engage_prey_dispatch_system(
         member,
         profession,
         lod,
-        active_plan_opt,
         memory_opt,
         carrying_opt,
     ) in query.iter_mut()
@@ -6614,9 +6559,6 @@ pub fn htn_engage_prey_dispatch_system(
             continue;
         }
         if !matches!(*profession, Profession::Hunter) {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if carrying_opt.is_some() {
@@ -6893,7 +6835,6 @@ pub fn htn_join_hunt_party_dispatch_system(
             &FactionMember,
             &Profession,
             &LodLevel,
-            Option<&ActivePlan>,
             Option<&crate::simulation::corpse::Carrying>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
@@ -6911,7 +6852,6 @@ pub fn htn_join_hunt_party_dispatch_system(
         member,
         profession,
         lod,
-        active_plan_opt,
         carrying_opt,
     ) in query.iter_mut()
     {
@@ -6919,9 +6859,6 @@ pub fn htn_join_hunt_party_dispatch_system(
             continue;
         }
         if !matches!(*profession, Profession::Hunter) {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if carrying_opt.is_some() {
@@ -7134,7 +7071,6 @@ pub fn htn_socialize_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&ActivePlan>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -7150,16 +7086,12 @@ pub fn htn_socialize_dispatch_system(
         transform,
         member,
         lod,
-        active_plan_opt,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
             continue;
         }
         if !matches!(*goal, AgentGoal::Socialize) {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -7331,7 +7263,6 @@ pub fn htn_combat_faction_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&ActivePlan>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -7347,13 +7278,9 @@ pub fn htn_combat_faction_dispatch_system(
         transform,
         member,
         lod,
-        active_plan_opt,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -7657,22 +7584,18 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
             &FactionMember,
             &Transform,
             &LodLevel,
-            Option<&ActivePlan>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
 ) {
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, goal, member, transform, lod, active_plan_opt) in
+    for (mut ai, mut aq, mut history, goal, member, transform, lod) in
         query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
             continue;
         }
         if !matches!(*goal, AgentGoal::Craft) {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -8028,22 +7951,18 @@ pub fn htn_work_on_craft_order_dispatch_system(
             &FactionMember,
             &Transform,
             &LodLevel,
-            Option<&ActivePlan>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
 ) {
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, goal, member, transform, lod, active_plan_opt) in
+    for (mut ai, mut aq, mut history, goal, member, transform, lod) in
         query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
             continue;
         }
         if !matches!(*goal, AgentGoal::Craft) {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -8273,7 +8192,6 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             &FactionMember,
             &Transform,
             &LodLevel,
-            Option<&ActivePlan>,
             Option<&AgentMemory>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
@@ -8289,7 +8207,6 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
         member,
         transform,
         lod,
-        active_plan_opt,
         memory_opt,
     ) in query.iter_mut()
     {
@@ -8297,9 +8214,6 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             continue;
         }
         if !matches!(*goal, AgentGoal::Craft) {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -8554,7 +8468,6 @@ pub fn htn_harvest_plant_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&ActivePlan>,
             Option<&AgentMemory>,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
         ),
@@ -8570,7 +8483,6 @@ pub fn htn_harvest_plant_dispatch_system(
         transform,
         member,
         lod,
-        active_plan_opt,
         memory_opt,
         knowledge_opt,
     ) in query.iter_mut()
@@ -8579,9 +8491,6 @@ pub fn htn_harvest_plant_dispatch_system(
             continue;
         }
         if !matches!(*goal, AgentGoal::Farm) {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
@@ -9048,7 +8957,6 @@ pub fn htn_play_dispatch_system(
             &Transform,
             &Carrier,
             &LodLevel,
-            Option<&ActivePlan>,
             Option<&FactionMember>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
@@ -9067,7 +8975,6 @@ pub fn htn_play_dispatch_system(
         transform,
         carrier,
         lod,
-        active_plan_opt,
         member_opt,
     ) in query.iter_mut()
     {
@@ -9075,9 +8982,6 @@ pub fn htn_play_dispatch_system(
             continue;
         }
         if !matches!(*goal, AgentGoal::Play) {
-            continue;
-        }
-        if active_plan_opt.is_some() {
             continue;
         }
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {

@@ -567,7 +567,6 @@ pub fn craft_order_system(
         &LodLevel,
         &Transform,
         Option<&JobClaim>,
-        Option<&mut crate::simulation::plan::ActivePlan>,
     )>,
 ) {
     let mut order_haulers: AHashMap<Entity, Vec<(Entity, [u32; MAX_CRAFT_INPUTS])>> =
@@ -586,7 +585,6 @@ pub fn craft_order_system(
         lod,
         _transform,
         _claim,
-        _ap,
     ) in agent_query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -785,7 +783,6 @@ pub fn craft_order_system(
         _lod,
         transform,
         claim,
-        mut plan_opt,
     ) in agent_query.iter_mut()
     {
         for &(ae, id, qty) in &good_removals {
@@ -858,15 +855,6 @@ pub fn craft_order_system(
         let is_orphaned = orphaned_agents.contains(&entity);
 
         if is_completed || is_hauler_done || is_orphaned {
-            if is_completed {
-                if let Some(ref mut plan) = plan_opt {
-                    plan.reward_acc += if ai.task_id == TaskKind::HaulToCraftOrder as u16 {
-                        0.4
-                    } else {
-                        1.0
-                    };
-                }
-            }
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;

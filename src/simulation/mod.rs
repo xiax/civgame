@@ -23,7 +23,6 @@ pub mod mood;
 pub mod movement;
 pub mod needs;
 pub mod person;
-pub mod plan;
 pub mod plants;
 pub mod production;
 pub mod projects;
@@ -59,11 +58,6 @@ pub struct SimulationPlugin;
 
 impl Plugin for SimulationPlugin {
     fn build(&self, app: &mut App) {
-        let mut step_registry = plan::StepRegistry::default();
-        let mut plan_registry = plan::PlanRegistry::default();
-        plan::register_builtin_steps(&mut step_registry);
-        plan::register_builtin_plans(&mut plan_registry);
-
         let mut method_registry = htn::MethodRegistry::default();
         htn::register_builtin_methods(&mut method_registry);
 
@@ -72,7 +66,6 @@ impl Plugin for SimulationPlugin {
             .add_event::<combat::CombatEvent>()
             .add_event::<combat::DistressCallEvent>()
             .add_event::<combat::HandDropEvent>()
-            .add_event::<plan::DropAbandonedFoodEvent>()
             .add_event::<knowledge::DiscoveryActionEvent>()
             .insert_resource(SimClock::default())
             .insert_resource(faction::FactionRegistry::default())
@@ -82,8 +75,6 @@ impl Plugin for SimulationPlugin {
             .insert_resource(production::TileDepletion::default())
             .insert_resource(plants::PlantMap::default())
             .insert_resource(plants::PlantSpriteIndex::default())
-            .insert_resource(step_registry)
-            .insert_resource(plan_registry)
             .insert_resource(method_registry)
             .insert_resource(construction::AutonomousBuildingToggle(true))
             .insert_resource(construction::BedMap::default())
@@ -107,7 +98,6 @@ impl Plugin for SimulationPlugin {
             .insert_resource(terraform::PendingFootprints::default())
             .insert_resource(settlement::SettlementPlans::default())
             .insert_resource(settlement::ZoneOverlayToggle::default())
-            .insert_resource(plan::RelInfluence::default())
             .insert_resource(military::ActiveRallyPoints::default())
             .insert_resource(corpse::CorpseMap::default())
             .insert_resource(military::MusterHuntersRequest::default())
@@ -250,22 +240,13 @@ impl Plugin for SimulationPlugin {
                     gather::gather_system
                         .after(carry::enforce_hand_state_system)
                         .before(production::production_system),
-                    dig::dig_system
-                        .after(gather::gather_system)
-                        .before(plan::plan_execution_system),
-                    terraform::terraform_system
-                        .after(gather::gather_system)
-                        .before(plan::plan_execution_system),
-                    terraform::footprint_completion_system
-                        .after(terraform::terraform_system)
-                        .before(plan::plan_execution_system),
+                    dig::dig_system.after(gather::gather_system),
+                    terraform::terraform_system.after(gather::gather_system),
+                    terraform::footprint_completion_system.after(terraform::terraform_system),
                     construction::construction_system
                         .after(gather::gather_system)
-                        .after(terraform::footprint_completion_system)
-                        .before(plan::plan_execution_system),
-                    construction::deconstruct_system
-                        .after(construction::construction_system)
-                        .before(plan::plan_execution_system),
+                        .after(terraform::footprint_completion_system),
+                    construction::deconstruct_system.after(construction::construction_system),
                     construction::road_carve_system.after(construction::construction_system),
                     construction::door_proximity_system.after(construction::construction_system),
                     movement::movement_system,
@@ -293,8 +274,7 @@ impl Plugin for SimulationPlugin {
                     reproduction::cosleep_observation_system
                         .after(movement::sync_indexed_after_move_system),
                     tasks::play_system
-                        .after(movement::sync_indexed_after_move_system)
-                        .before(plan::plan_execution_system),
+                        .after(movement::sync_indexed_after_move_system),
                 )
                     .in_set(SimulationSet::Sequential),
             )
@@ -320,22 +300,11 @@ impl Plugin for SimulationPlugin {
                     tasks::apply_move_order_system
                         .after(teaching::apply_teach_order_system),
                     teaching::read_task_system
-                        .after(teaching::apply_player_knowledge_orders_system)
-                        .before(plan::plan_execution_system),
+                        .after(teaching::apply_player_knowledge_orders_system),
                     teaching::teach_task_system
-                        .after(teaching::apply_teach_order_system)
-                        .before(plan::plan_execution_system),
-                    teaching::lecture_tick_system
-                        .after(movement::movement_system)
-                        .before(plan::plan_execution_system),
+                        .after(teaching::apply_teach_order_system),
+                    teaching::lecture_tick_system.after(movement::movement_system),
                 )
-                    .in_set(SimulationSet::Sequential),
-            )
-            .add_systems(
-                FixedUpdate,
-                (plan::explore_satisfaction_system
-                    .after(memory::vision_system)
-                    .before(plan::plan_execution_system),)
                     .in_set(SimulationSet::Sequential),
             )
             .add_systems(
@@ -351,38 +320,25 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 (
                     items::item_pickup_system.after(combat::death_system),
-                    items::equip_task_system
-                        .after(items::item_pickup_system)
-                        .before(plan::plan_execution_system),
+                    items::equip_task_system.after(items::item_pickup_system),
                     plants::deer_graze_system.after(movement::sync_indexed_after_move_system),
                     production::production_system.after(movement::movement_system),
-                    crafting::craft_order_system
-                        .after(gather::gather_system)
-                        .before(plan::plan_execution_system),
+                    crafting::craft_order_system.after(gather::gather_system),
                     production::eat_task_system.after(movement::movement_system),
                     production::withdraw_food_task_system.after(movement::movement_system),
                     production::withdraw_material_task_system.after(movement::movement_system),
                     production::withdraw_good_task_system.after(movement::movement_system),
-                    production::tame_task_system
-                        .after(movement::movement_system)
-                        .before(plan::plan_execution_system),
+                    production::tame_task_system.after(movement::movement_system),
                     (
                         corpse::pickup_corpse_task_system,
                         corpse::haul_corpse_task_system,
                         corpse::butcher_task_system,
                         corpse::wait_for_party_task_system,
                     )
-                        .after(movement::movement_system)
-                        .before(plan::plan_execution_system),
-                    plan::rel_influence_system.after(movement::sync_indexed_after_move_system),
-                    plan::plan_execution_system
+                        .after(movement::movement_system),
+                    reproduction::wake_up_conception_system
                         .after(production::production_system)
-                        .after(production::eat_task_system)
-                        .after(production::withdraw_food_task_system)
-                        .after(production::withdraw_material_task_system)
-                        .after(production::withdraw_good_task_system)
-                        .after(plan::rel_influence_system),
-                    reproduction::wake_up_conception_system.after(plan::plan_execution_system),
+                        .after(production::eat_task_system),
                     faction::bonding_system.after(movement::sync_indexed_after_move_system),
                     production::tile_regen_system,
                     schedule::advance_sim_clock,
@@ -396,8 +352,7 @@ impl Plugin for SimulationPlugin {
                     memory::memory_decay_system,
                     faction::social_fill_system,
                     memory::conversation_memory_system.after(faction::social_fill_system),
-                    plan::plan_gossip_system.after(memory::conversation_memory_system),
-                    plan::plan_decay_system,
+                    knowledge::awareness_gossip_system.after(memory::conversation_memory_system),
                     faction::faction_profession_system,
                     faction::drop_items_at_destination_system,
                     htn::htn_method_completion_system
@@ -464,13 +419,11 @@ impl Plugin for SimulationPlugin {
                     knowledge::discovery_system
                         .after(faction::compute_faction_storage_system),
                     knowledge::tech_teaching_system
-                        .after(plan::plan_gossip_system),
+                        .after(knowledge::awareness_gossip_system),
                     faction::sync_faction_techs_from_chief_system
                         .after(faction::chief_selection_system)
                         .after(knowledge::discovery_system)
                         .after(knowledge::tech_teaching_system),
-                    plan::drop_abandoned_food_system
-                        .after(faction::drop_items_at_destination_system),
                     military::expire_rally_points_system,
                     military::apply_muster_hunters_system,
                     teaching::apply_lecture_request_system

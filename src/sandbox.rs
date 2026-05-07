@@ -15,7 +15,6 @@ use crate::simulation::mood::Mood;
 use crate::simulation::movement::MovementState;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, Person, PersonAI};
-use crate::simulation::plan::{KnownPlans, PlanHistory, PlanId, PlanScoringMethod};
 use crate::simulation::plants::{
     spawn_plant_at, DeerGrazer, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
@@ -73,7 +72,6 @@ fn setup_sandbox(
                 state: AiState::Idle,
                 target_tile: (cx as i32, cy as i32),
                 dest_tile: (cx as i32, cy as i32),
-                last_plan_id: PersonAI::UNEMPLOYED,
                 current_z: chunk_map.surface_z_at(cx, cy) as i8,
                 target_z: chunk_map.surface_z_at(cx, cy) as i8,
                 ..PersonAI::default()
@@ -97,34 +95,6 @@ fn setup_sandbox(
         (
             AgentMemory::default(),
             RelationshipMemory::default(),
-            KnownPlans::with_innate(&[
-                // FORAGE_FOOD retired in the Forage→HTN migration.
-                // FARM_FOOD retired with the closing of Phase 5
-                // (HTN method `HarvestMaturePlantForStorageMethod`).
-                // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
-                PlanId::HUNT_FOOD,
-                // SCAVENGE_FOOD retired 5c-ii-d-vi.
-                // BUILD_BLUEPRINT retired in Phase 5e-xiii-b
-                // (HTN method `GatherAndHaulToPersonalBlueprintMethod`).
-                // PLAY_SOCIAL / PLAY_SOLO retired in Phase 5e-xii-a
-                // (HTN methods PlayWithPartnerMethod / PlaySoloMethod).
-                // HAUL_FROM_STORAGE_AND_BUILD retired in Phase 5e-xiii-a
-                // (HTN method `WithdrawAndHaulToPersonalBlueprintMethod`).
-                // PLAY_BY_PLANTING retired in Phase 5e-xii-d
-                // (HTN method `WithdrawAndPlantGrainSeedAsPlayMethod`).
-                // PLAY_BY_THROWING_ROCKS retired in Phase 5e-xii-b
-                // (HTN method `WithdrawAndThrowStonesAsPlayMethod`).
-                // PLAY_WITH_STORED_TOY retired in Phase 5e-xii-c
-                // (HTN method `WithdrawAndPlayWithToyMethod`).
-                // CLAIMED_BUILD retired in Phase 5e-vi (HTN method).
-                // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
-                // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
-                // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
-                // SOCIALIZE retired in Phase 5e-ix (HTN method).
-                // RESCUE_ALLY / RAID / DEFEND / LEAD retired in Phase 5e-x (HTN method).
-            ]),
-            PlanHistory::default(),
-            PlanScoringMethod::Weighted,
             Carrier::default(),
             crate::simulation::reproduction::CoSleepTracker::default(),
             crate::simulation::reproduction::MaleConceptionCooldown::default(),

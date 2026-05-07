@@ -29,7 +29,7 @@ CivGame is a Dwarf Fortress-style civilization simulation built on **Bevy 0.15**
 
 The detailed subsystem rules live next to the code they describe. Claude Code auto-loads these when you read or edit files in those trees:
 
-- `src/simulation/CLAUDE.md` — Agent AI (Goals → Plans → Tasks), plan-design rules, faction systems, knowledge & technology, hunting pipeline, typed-task variants, behavioural test fixture, game lifecycle / regions.
+- `src/simulation/CLAUDE.md` — Agent AI (Goals → HTN → Tasks), method-design rules, faction systems, knowledge & technology, hunting pipeline, typed-task variants, behavioural test fixture, game lifecycle / regions.
 - `src/economy/CLAUDE.md` — Resource catalog, `Good`/`ResourceId` coexistence, recipes, carrying & item routing, equipment.
 - `src/world/CLAUDE.md` — World generation, climate, geology & mining.
 - `src/ui/CLAUDE.md` — Right-click menu, inspector, tech panel, activity log, world map, muster.
@@ -44,7 +44,7 @@ ParallelA → ParallelB → Sequential → Economy
 
 - **ParallelA** — read-heavy systems (needs ticks, mood, LOD, goal updates, animal sensing)
 - **ParallelB** — HTN dispatchers (`htn_dispatch_system` for Sleep, then `htn_eat`, `htn_acquire_food`, `htn_acquire_good`, `htn_stockpile_food`); `goal_dispatch_system` runs alongside them as the no-plan stale-reset / Explore-cleanup catch-all for plan-driven goals
-- **Sequential** — mutating systems with tight ordering: `gather` → `dig` / `construction` → `movement` → `combat` → `production` → `plan_execution`
+- **Sequential** — mutating systems with tight ordering: `gather` → `dig` / `construction` → `movement` → `combat` → `production`
 - **Economy** — post-simulation: gossip, faction storage rollup, reproduction, raids, technology, market price updates
 
 ### Spatial / tile / rendering conventions

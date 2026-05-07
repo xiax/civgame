@@ -7,7 +7,6 @@ use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::needs::Needs;
 use super::person::{AiState, PersonAI, Profession};
-use super::plan::{ActivePlan, PlanHistory, PlanId, PlanOutcome};
 use super::plants::PlantKind;
 use super::schedule::{BucketSlot, SimClock};
 use super::skills::{SkillKind, Skills};
@@ -99,7 +98,7 @@ impl HuntOrder {
 /// - Under target → promote the highest-Combat-skill `Profession::None` adult.
 ///   Skips Farmers (don't poach an established role).
 /// - Over target → demote the lowest-Combat-skill `Hunter`, tear down their
-///   `ActivePlan`, release any storage reservation, drop any carried corpse.
+///   in-flight chain, release any storage reservation, drop any carried corpse.
 ///
 /// Density is read off `FactionData::nearby_prey_count`, which `chief_hunt_order_system`
 /// refreshes alongside its decision cycle. We don't re-scan the spatial index
@@ -117,7 +116,6 @@ pub fn faction_hunter_assignment_system(
         &Skills,
         Option<&mut PersonAI>,
         Option<&mut crate::simulation::typed_task::ActionQueue>,
-        Option<&mut PlanHistory>,
         Option<&crate::simulation::knowledge::PersonKnowledge>,
     )>,
 ) {
@@ -170,7 +168,7 @@ pub fn faction_hunter_assignment_system(
     // who lost the tech via LRU eviction.
     let mut by_faction_hunters: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
     let mut by_faction_none: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
-    for (entity, prof, member, skills, _, _, _, knowledge_opt) in query.iter() {
+    for (entity, prof, member, skills, _, _, knowledge_opt) in query.iter() {
         if member.faction_id == SOLO {
             continue;
         }
@@ -221,9 +219,7 @@ pub fn faction_hunter_assignment_system(
         return;
     }
 
-    for (entity, mut prof, _member, _skills, ai_opt, aq_opt, history_opt, _knowledge) in
-        query.iter_mut()
-    {
+    for (entity, mut prof, _member, _skills, ai_opt, aq_opt, _knowledge) in query.iter_mut() {
         if promote.contains(&entity) {
             *prof = Profession::Hunter;
         } else if demote.contains(&entity) {
@@ -241,18 +237,11 @@ pub fn faction_hunter_assignment_system(
                 // Phase 4b-ii: hunter demote tears down an in-flight hunt
                 // chain entirely. `cancel()` drops both `current` and the
                 // prefetched queue so a chained hunt method can't leak into
-                // the next plan.
+                // the next dispatch.
                 aq.cancel();
-            }
-            if let Some(mut h) = history_opt {
-                // Pre-existing: pushes PlanId(0) (FORAGE_FOOD) as a placeholder
-                // since we don't track which plan was active at demotion. The
-                // soft penalty against FORAGE_FOOD is incidental and small.
-                h.push(PlanId(0), PlanOutcome::Aborted, clock.tick);
             }
             commands
                 .entity(entity)
-                .remove::<ActivePlan>()
                 .remove::<crate::simulation::corpse::Carrying>();
         }
     }

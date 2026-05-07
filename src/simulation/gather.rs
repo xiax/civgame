@@ -11,7 +11,6 @@ use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::{AgentMemory, MemoryKind};
 use crate::simulation::person::{AiState, PersonAI};
-use crate::simulation::plan::ActivePlan;
 use crate::simulation::plants::{GrowthStage, PlantKind, PlantMap, PlantSpriteIndex};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
@@ -264,7 +263,6 @@ pub fn gather_system(
         &LodLevel,
         &Transform,
         Option<&mut AgentMemory>,
-        Option<&mut ActivePlan>,
         Option<&FactionMember>,
         &AgentGoal,
     )>,
@@ -280,7 +278,6 @@ pub fn gather_system(
         lod,
         transform,
         mut memory_opt,
-        mut plan_opt,
         faction_member,
         _goal,
     ) in agent_query.iter_mut()
@@ -415,9 +412,6 @@ pub fn gather_system(
             if let Some(ref mut mem) = memory_opt {
                 mem.record((tx as i32, ty as i32), kind.harvest_memory_kind());
             }
-            if let Some(ref mut plan) = plan_opt {
-                plan.reward_acc += qty as f32 * kind.harvest_reward_per_unit();
-            }
 
             for (drop_id, drop_qty) in kind.harvest_ground_drops(has_tool) {
                 spawn_ground_drop(&mut commands, tx, ty, drop_id, drop_qty);
@@ -512,9 +506,6 @@ pub fn gather_system(
 
                 if let Some(ref mut mem) = memory_opt {
                     mem.record((tx as i32, ty as i32), MemoryKind::stone());
-                }
-                if let Some(ref mut plan) = plan_opt {
-                    plan.reward_acc += total_qty as f32 * 0.3;
                 }
                 finish_gather(
                     &mut ai,

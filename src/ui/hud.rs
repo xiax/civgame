@@ -348,11 +348,6 @@ pub fn apply_draft_toggle_system(
     if any_undrafted {
         for e in player_only {
             commands.entity(e).insert(Drafted);
-            // Strip in-flight forage / haul plans so the agent doesn't
-            // resume them when later undrafted.
-            commands
-                .entity(e)
-                .remove::<crate::simulation::plan::ActivePlan>();
         }
     } else {
         for e in player_only {

@@ -9,7 +9,6 @@ use crate::simulation::line_of_sight::has_los;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::RelationshipMemory;
 use crate::simulation::person::{AiState, Person, PersonAI};
-use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::stats::{self, Stats};
 use crate::simulation::technology::ActivityKind;
@@ -180,7 +179,6 @@ pub fn combat_system(
         &BucketSlot,
         Option<&Equipment>,
         Option<&mut CombatCooldown>,
-        Option<&mut ActivePlan>,
         Option<&FactionMember>,
         Option<&mut crate::simulation::carry::Carrier>,
         Option<&Stats>,
@@ -216,7 +214,6 @@ pub fn combat_system(
         slot,
         attacker_eq,
         mut cd,
-        _active_plan_opt,
         attacker_fm,
         mut attacker_carrier,
         attacker_stats,
@@ -414,7 +411,7 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _, _)) =
+        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _)) =
             attacker_query.get_mut(target)
         {
             if target_combat.0.is_none() {
@@ -444,7 +441,7 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _, _)) =
+        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _)) =
             attacker_query.get_mut(target)
         {
             if target_combat.0.is_none() {

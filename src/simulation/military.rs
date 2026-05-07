@@ -9,7 +9,6 @@ use crate::simulation::combat::{CombatTarget, Health};
 use crate::simulation::faction::{release_reservation, FactionMember, PlayerFaction, StorageReservations};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, Drafted, PersonAI, Profession};
-use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::typed_task::{Task, WalkReason};
@@ -196,14 +195,13 @@ pub fn apply_muster_hunters_system(
         &FactionMember,
         &mut PersonAI,
         &mut crate::simulation::typed_task::ActionQueue,
-        Option<&ActivePlan>,
     )>,
 ) {
     if !request.pending {
         return;
     }
     request.pending = false;
-    for (entity, prof, member, mut ai, mut aq, plan_opt) in hunters.iter_mut() {
+    for (entity, prof, member, mut ai, mut aq) in hunters.iter_mut() {
         if *prof != Profession::Hunter || member.faction_id != player_faction.faction_id {
             continue;
         }
@@ -215,13 +213,10 @@ pub fn apply_muster_hunters_system(
         ai.target_entity = None;
         ai.work_progress = 0;
         // Phase 4b-ii: muster is an external preempt (player drops every
-        // in-flight hunter plan to draft them). Use `cancel()` so any
-        // prefetched tasks queued behind `current` are dropped along with the
-        // plan, not promoted into `current` next tick.
+        // in-flight hunter task to draft them). Use `cancel()` so any
+        // prefetched tasks queued behind `current` are dropped along with
+        // the cancellation, not promoted into `current` next tick.
         aq.cancel();
-        if plan_opt.is_some() {
-            commands.entity(entity).remove::<ActivePlan>();
-        }
         commands
             .entity(entity)
             .remove::<crate::simulation::corpse::Carrying>()

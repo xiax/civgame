@@ -7,7 +7,6 @@ use crate::simulation::gather::GatherRoutingResources;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, Person, PersonAI};
-use crate::simulation::plan::ActivePlan;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::typed_task::{ActionQueue, Task};
@@ -263,7 +262,6 @@ pub fn item_pickup_system(
             &LodLevel,
             &Transform,
             Option<&FactionMember>,
-            Option<&mut ActivePlan>,
         ),
         With<Person>,
     >,
@@ -280,7 +278,6 @@ pub fn item_pickup_system(
         lod,
         transform,
         faction_member,
-        mut active_plan_opt,
     ) in pickers.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -349,10 +346,6 @@ pub fn item_pickup_system(
                 }
             };
             let actually_taken = take_qty - leftover;
-
-            if let Some(ref mut plan) = active_plan_opt {
-                plan.reward_acc += actually_taken as f32 * plan.reward_scale;
-            }
 
             if actually_taken >= item.qty {
                 commands.entity(target_ent).despawn_recursive();

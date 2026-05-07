@@ -295,6 +295,65 @@ pub struct DiscoveryActionEvent {
     pub activity: ActivityKind,
 }
 
+/// Tech-awareness gossip between agents within 3 tiles whose goal is
+/// `Socialize`. Awareness is free (single bit) and propagates only between
+/// socializing agents; mastery (Learned) only spreads via the explicit
+/// `tech_teaching_system` chance roll.
+///
+/// Lifted from the deleted `plan_gossip_system` which also gossiped
+/// `KnownPlans` entries — that half is gone with the plan/ module retirement
+/// in Phase 7. Runs in `SimulationSet::Economy` after
+/// `conversation_memory_system`, before `tech_teaching_system`.
+pub fn awareness_gossip_system(
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    mut q: Query<(
+        Entity,
+        &Transform,
+        &super::goals::AgentGoal,
+        &super::lod::LodLevel,
+        &mut PersonKnowledge,
+    )>,
+) {
+    use super::goals::AgentGoal;
+    use super::lod::LodLevel;
+
+    let snapshots: ahash::AHashMap<Entity, u64> = q
+        .iter()
+        .filter(|(_, _, goal, lod, _)| {
+            matches!(goal, AgentGoal::Socialize) && **lod != LodLevel::Dormant
+        })
+        .map(|(e, _, _, _, k)| (e, k.aware | k.learned))
+        .collect();
+
+    if snapshots.is_empty() {
+        return;
+    }
+
+    for (entity, transform, goal, lod, mut knowledge) in q.iter_mut() {
+        if *lod == LodLevel::Dormant || !matches!(goal, AgentGoal::Socialize) {
+            continue;
+        }
+        let tx = (transform.translation.x / TILE_SIZE_LOCAL).floor() as i32;
+        let ty = (transform.translation.y / TILE_SIZE_LOCAL).floor() as i32;
+        let mut aware_received: u64 = 0;
+        for dy in -3i32..=3 {
+            for dx in -3i32..=3 {
+                for &other in spatial.get(tx + dx, ty + dy) {
+                    if other == entity {
+                        continue;
+                    }
+                    if let Some(&snap) = snapshots.get(&other) {
+                        aware_received |= snap;
+                    }
+                }
+            }
+        }
+        if aware_received != 0 {
+            knowledge.merge_awareness(aware_received);
+        }
+    }
+}
+
 /// Teaching: if two socializing agents are within 3 tiles and one has Learned
 /// a tech the other is aware-of-but-not-Learned, roll a small per-tick chance
 /// to transfer mastery. Mirrors `plan_gossip_system`'s spatial scan; the teach
