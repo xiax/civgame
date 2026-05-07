@@ -300,7 +300,7 @@ impl PersonBuilder {
                 // FORAGE_FOOD retired in the Forage→HTN migration.
                 PlanId::FARM_FOOD,
                 // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
-                PlanId::HUNT_FOOD,
+                // HUNT_FOOD retired in Phase 5e-viii-c (HTN abstract tasks).
                 // SCAVENGE_FOOD retired 5c-ii-d-vi.
                 PlanId::BUILD_BLUEPRINT,
                 // TAME_HORSE retired in Phase 5e-iv (HTN method).
@@ -308,7 +308,6 @@ impl PersonBuilder {
                 PlanId::DELIVER_GRAIN_TO_CRAFT_ORDER,
                 PlanId::DELIVER_FROM_STORAGE_TO_CRAFT_ORDER,
                 PlanId::WORK_ON_CRAFT,
-                PlanId::RESCUE_ALLY,
                 // RETURN_SURPLUS_FOOD retired in Phase 5e-iii (HTN method).
                 PlanId::PLAY_SOCIAL,
                 PlanId::PLAY_SOLO,
@@ -320,10 +319,8 @@ impl PersonBuilder {
                 // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
                 // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
                 // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
-                PlanId::SOCIALIZE,
-                PlanId::RAID,
-                PlanId::DEFEND,
-                PlanId::LEAD,
+                // SOCIALIZE retired in Phase 5e-ix (HTN method).
+                // RESCUE_ALLY / RAID / DEFEND / LEAD retired in Phase 5e-x (HTN method).
                 // ACQUIRE_HUNTING_SPEAR retired in Phase 5e-ii (HTN method).
                 // SCOUT_FOR_PREY retired in Phase 5e (HTN method).
             ],
@@ -2148,6 +2145,12 @@ mod baseline_behaviour {
 
         let mut sim = TestSim::new(42);
         sim.flat_world(1, 0, TileKind::Grass);
+        // Spawn a chief first so the test agent doesn't get auto-promoted
+        // to chief and locked into Goal::Lead (Phase 5e-x: Lead is now an
+        // HTN method — its `Task::Lead { dest }` has no executor, so once
+        // an agent enters it, `aq.current` never returns to Idle and the
+        // chain-completion system can't observe the drain).
+        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |_| {});
         let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
             b.hunger(210.0).add_inventory(crate::economy::core_ids::fruit(), 10);
         });
@@ -2318,6 +2321,394 @@ mod baseline_behaviour {
             aq.queued_len(),
             0,
             "ConstructBlueprint is single-leg — nothing should be queued behind Construct"
+        );
+    }
+
+    /// Phase 5e-viii-c: a hunter under a fresh `HuntOrder::Hunt` (party not
+    /// yet deployed, not stale) dispatches `Task::HuntPartyMuster { hearth }`
+    /// via `htn_join_hunt_party_dispatch_system` + `MusterAtHearthMethod`.
+    /// `TravelToHuntAreaMethod` rejects (deployed=false, stale=false). The
+    /// hearth tile resolves to the faction's `home_tile` because no campfires
+    /// exist in the fixture.
+    #[test]
+    fn join_hunt_party_dispatches_muster_when_not_deployed() {
+        use crate::simulation::corpse::CorpseSpecies;
+        use crate::simulation::faction::HuntOrder;
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::person::Profession;
+        use crate::simulation::technology::HUNTING_SPEAR;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(57);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Hunter at (5, 5); faction home is (0, 0). Area at (10, 10) (hunt
+        // target). With no campfires in the fixture, hearth resolves to the
+        // home tile (0, 0).
+        let person = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
+            b.profession(Profession::Hunter);
+        });
+        {
+            let mut knowledge = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonKnowledge>(person)
+                .unwrap();
+            knowledge.aware |= 1u64 << HUNTING_SPEAR;
+            knowledge.learned |= 1u64 << HUNTING_SPEAR;
+        }
+        // Post a fresh HuntOrder::Hunt with an empty mustered list and
+        // deployed_tick = None — the muster phase precondition.
+        {
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<crate::simulation::faction::FactionRegistry>();
+            let faction = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            faction.hunt_order = Some(HuntOrder::Hunt {
+                species: CorpseSpecies::Deer,
+                area_tile: (10, 10),
+                target_party_size: 4,
+                mustered: Vec::new(),
+                deployed_tick: None,
+                posted_tick: 1,
+            });
+        }
+
+        sim.tick_n(5);
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+        match aq.current {
+            Task::HuntPartyMuster { hearth } => {
+                assert_eq!(
+                    hearth,
+                    (0, 0),
+                    "muster hearth should fall back to faction home_tile"
+                );
+            }
+            other => panic!(
+                "expected Task::HuntPartyMuster as head of JoinHuntParty chain, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Phase 5e-viii-b: a hunter (Profession::Hunter, Learned HUNTING_SPEAR)
+    /// in a faction with a live `HuntOrder::Hunt`, with a fresh corpse within
+    /// VIEW_RADIUS, dispatches `Task::PickUpCorpse { corpse }` via
+    /// `htn_engage_prey_dispatch_system` + `PickUpFreshCorpseMethod` (which
+    /// outscores `HuntPreyMethod` since no live prey is in range).
+    #[test]
+    fn engage_prey_method_dispatches_pickup_when_corpse_in_range() {
+        use crate::simulation::corpse::{Corpse, CorpseMap, CorpseSpecies};
+        use crate::simulation::faction::HuntOrder;
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::person::Profession;
+        use crate::simulation::technology::HUNTING_SPEAR;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(42);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Hunter at (5, 5); fresh corpse at (10, 10) — within VIEW_RADIUS=15 but
+        // far enough that the agent can't walk-and-pickup before the assertion.
+        let person = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
+            b.profession(Profession::Hunter);
+        });
+
+        // Mark HUNTING_SPEAR Learned on the hunter (paleolithic_seed only sets
+        // Paleolithic techs; HUNTING_SPEAR is also Paleolithic so it's already
+        // there, but assert explicitly to make the test legible).
+        {
+            let mut knowledge = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonKnowledge>(person)
+                .unwrap();
+            knowledge.aware |= 1u64 << HUNTING_SPEAR;
+            knowledge.learned |= 1u64 << HUNTING_SPEAR;
+        }
+
+        // Spawn corpse + insert into CorpseMap (the dispatcher reads the map
+        // directly, mirroring the legacy `NearestFreshCorpse` resolver).
+        let corpse_tile = (10, 10);
+        let corpse_world = tile_to_world(corpse_tile.0, corpse_tile.1);
+        let corpse = sim
+            .app
+            .world_mut()
+            .spawn((
+                Corpse {
+                    species: CorpseSpecies::Deer,
+                    fresh_until_tick: 1_000_000,
+                },
+                Transform::from_xyz(corpse_world.x, corpse_world.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<CorpseMap>()
+            .insert(corpse_tile, corpse);
+
+        // Faction needs a live HuntOrder::Hunt — the dispatcher gates on it.
+        {
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<crate::simulation::faction::FactionRegistry>();
+            let faction = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            faction.hunt_order = Some(HuntOrder::Hunt {
+                species: CorpseSpecies::Deer,
+                area_tile: (5, 5),
+                target_party_size: 1,
+                mustered: vec![person],
+                deployed_tick: Some(0),
+                posted_tick: 0,
+            });
+        }
+
+        sim.tick_n(5);
+
+        // Two ticks: ParallelB's `htn_engage_prey_dispatch_system` resolves
+        // the corpse, scores `PickUpFreshCorpseMethod` (1.5) above
+        // `HuntPreyMethod` (no prey → precondition fails), routes the agent
+        // toward the corpse tile, and dispatches `Task::PickUpCorpse`.
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+
+        match aq.current {
+            Task::PickUpCorpse { corpse: c } => {
+                assert_eq!(
+                    c, corpse,
+                    "head Task::PickUpCorpse should target the spawned corpse entity"
+                );
+            }
+            other => panic!(
+                "expected Task::PickUpCorpse as head of EngagePrey chain, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(
+            aq.queued_len(),
+            0,
+            "PickUpFreshCorpseMethod is single-leg — nothing should be queued"
+        );
+    }
+
+    /// Phase 5e-viii-a: a hunter holding a `Carrying` component (the corpse)
+    /// with no `ActivePlan` triggers `htn_deliver_hunt_kill_dispatch_system` →
+    /// `DeliverHuntKillMethod`, which dispatches `Task::HaulCorpse { dest }`
+    /// as the head and prefetches `Task::Butcher` on the queue. Replaces the
+    /// trailing two steps (`HaulCorpse` + `Butcher`) of the legacy `HuntFood`
+    /// plan (PlanId 5).
+    #[test]
+    fn carrying_agent_dispatches_haul_corpse_then_butcher_chain() {
+        use crate::simulation::corpse::{Carrying, Corpse, CorpseSpecies};
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(31);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Put person at (5, 5); faction home is (0, 0) so the butcher site
+        // resolves via `faction_registry.home_tile` fallback (no campfires
+        // in the fixture). Agent has work to do reaching the destination.
+        let person = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+
+        // Spawn a corpse at the agent's tile (the legacy pickup_corpse_task
+        // would have placed it there; we shortcut to skip routing).
+        let corpse_world = tile_to_world(5, 5);
+        let corpse = sim
+            .app
+            .world_mut()
+            .spawn((
+                Corpse {
+                    species: CorpseSpecies::Deer,
+                    fresh_until_tick: 1_000_000,
+                },
+                Transform::from_xyz(corpse_world.x, corpse_world.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .entity_mut(person)
+            .insert(Carrying(corpse));
+
+        // Warm-up so SpatialIndex / `Added<Indexed>` settle. The dispatcher
+        // doesn't read the spatial index for the corpse lookup, but routing
+        // does.
+        sim.tick_n(5);
+
+        // Two ticks: ParallelB's `htn_deliver_hunt_kill_dispatch_system`
+        // resolves the butcher site, scores `DeliverHuntKillMethod`, routes
+        // the agent toward home, and dispatches `Task::HaulCorpse` as head
+        // + queues `Task::Butcher`.
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+
+        match aq.current {
+            Task::HaulCorpse { dest } => {
+                assert_eq!(
+                    dest,
+                    (0, 0),
+                    "head Task::HaulCorpse should target the faction home tile (no campfires in fixture)"
+                );
+            }
+            other => panic!(
+                "expected Task::HaulCorpse as head of DeliverHuntKill chain, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(
+            aq.queued_len(),
+            1,
+            "DeliverHuntKill is two-leg — Task::Butcher should be queued behind HaulCorpse"
+        );
+        assert!(
+            aq.peek_next().map(|t| t.is_butcher()).unwrap_or(false),
+            "queued tail should be Task::Butcher; got {:?}",
+            aq.peek_next()
+        );
+    }
+
+    /// Phase 5e-x: a chief with `AgentGoal::Lead` dispatches
+    /// `Task::Lead { dest }` via `htn_combat_faction_dispatch_system` +
+    /// `LeadCampMethod`, walking to faction `home_tile`. Lead is the
+    /// simplest of the four combat/faction goals (single-method, single-leg,
+    /// no faction-state lookups beyond `home_tile`).
+    #[test]
+    fn lead_goal_dispatches_typed_lead_task() {
+        use crate::simulation::faction::FactionChief;
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(101);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Spawn a chief at (5, 5) and explicitly mark them as FactionChief.
+        // Faction home defaults to (0, 0) in the fixture's `create_faction`.
+        let chief = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+        sim.app.world_mut().entity_mut(chief).insert(FactionChief);
+
+        // Warm up SpatialIndex.
+        sim.tick_n(5);
+
+        // Pin the goal to Lead. `goal_update_system` re-derives every tick,
+        // and the FactionChief + peacetime + low-need conditions normally
+        // produce Lead — but `last_goal_eval_tick` cooldown can keep an
+        // older goal pinned. Pinning right before the dispatch tick makes
+        // the assertion deterministic.
+        {
+            let mut goal = sim.app.world_mut().get_mut::<AgentGoal>(chief).unwrap();
+            *goal = AgentGoal::Lead;
+        }
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(chief)
+            .expect("ActionQueue missing");
+        match aq.current {
+            Task::Lead { dest } => {
+                assert_eq!(
+                    dest,
+                    (0, 0),
+                    "head Task::Lead should target the faction home tile"
+                );
+            }
+            other => panic!(
+                "expected Task::Lead as head of Lead chain, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(
+            aq.queued_len(),
+            0,
+            "Lead is single-leg — nothing should be queued"
+        );
+    }
+
+    /// Phase 5e-ix: an agent with `AgentGoal::Socialize` and another Person
+    /// within 12 tiles dispatches `Task::Socialize { partner }` via
+    /// `htn_socialize_dispatch_system` + `SocializeWithPartnerMethod`.
+    /// Drives the goal naturally via high `needs.social` so
+    /// `goal_update_system` settles on `Socialize` and stays there across
+    /// dispatch ticks.
+    #[test]
+    fn socialize_goal_dispatches_typed_socialize_task() {
+        use crate::simulation::needs::Needs;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(91);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Two people in the same faction: the actor at (0, 0) and a partner
+        // at (3, 0) — well within PARTNER_RADIUS=12 and not adjacent so the
+        // dispatcher actually has to route. Actor needs `social > 160` to
+        // beat the default Survive goal in `goal_update_system`; everything
+        // else stays at default (low) so Survive / Sleep / Tired don't
+        // preempt.
+        let actor = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.needs(Needs {
+                hunger: 20.0,
+                sleep: 20.0,
+                shelter: 20.0,
+                safety: 20.0,
+                social: 220.0,
+                reproduction: 20.0,
+                willpower: 220.0,
+            });
+        });
+        let partner = sim.spawn_person(sim.player_faction_id, (3, 0), |_| {});
+
+        // Seven ticks: SpatialIndex / `Added<Indexed>` settle for both spawn
+        // sites, `goal_update_system` sees high social need and flips to
+        // Socialize, ParallelB's `htn_socialize_dispatch_system` argmaxes
+        // the registry, routes the agent toward the partner, and dispatches
+        // `Task::Socialize { partner }`.
+        sim.tick_n(7);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(actor)
+            .expect("ActionQueue missing");
+        match aq.current {
+            Task::Socialize { partner: p } => {
+                assert_eq!(
+                    p, partner,
+                    "head Task::Socialize should target the nearest other Person"
+                );
+            }
+            other => panic!(
+                "expected Task::Socialize as head of Socialize chain, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(
+            aq.queued_len(),
+            0,
+            "Socialize is single-leg — nothing should be queued"
         );
     }
 }

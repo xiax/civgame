@@ -99,6 +99,7 @@ pub fn respond_to_distress_system(
             Option<&ActivePlan>,
             Option<&Profession>,
             Option<&FactionMember>,
+            Option<&mut crate::simulation::typed_task::ActionQueue>,
         ),
         With<Person>,
     >,
@@ -143,7 +144,7 @@ pub fn respond_to_distress_system(
         // Hunters always rally to allied distress regardless of LOS / audibility —
         // they're the faction's combat-trained standing force.
         if let Some(victim_faction_id) = victim_faction {
-            for (e, _, _, _, t, _, _, _, _, _, _, prof_opt, member_opt) in responders.iter() {
+            for (e, _, _, _, t, _, _, _, _, _, _, prof_opt, member_opt, _) in responders.iter() {
                 if e == ev.victim || e == ev.attacker {
                     continue;
                 }
@@ -177,6 +178,7 @@ pub fn respond_to_distress_system(
                 active_plan_opt,
                 prof_opt,
                 member_opt,
+                aq_opt,
             )) = responders.get_mut(cand)
             else {
                 continue;
@@ -249,6 +251,12 @@ pub fn respond_to_distress_system(
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
+            // Phase 5e-vii: rescue is an external preempt — drop any
+            // typed-channel task so the rescued agent doesn't fall back
+            // into a stale Hunt / Haul / Butcher chain after the fight.
+            if let Some(mut aq) = aq_opt {
+                aq.cancel();
+            }
             commands
                 .entity(entity)
                 .remove::<crate::simulation::corpse::Carrying>();

@@ -188,20 +188,39 @@ impl Plugin for SimulationPlugin {
                         .after(htn::htn_tame_horse_dispatch_system),
                     htn::htn_build_claimed_blueprint_dispatch_system
                         .after(htn::htn_plant_from_storage_dispatch_system),
-                    terraform::terraform_dispatch_system
-                        .after(tasks::goal_dispatch_system)
-                        .after(htn::htn_dispatch_system)
-                        .after(htn::htn_equip_hunting_spear_dispatch_system)
-                        .after(htn::htn_eat_dispatch_system)
-                        .after(htn::htn_acquire_food_dispatch_system)
-                        .after(htn::htn_acquire_good_dispatch_system)
-                        .after(htn::htn_stockpile_food_dispatch_system)
-                        .after(htn::htn_scout_dispatch_system)
-                        .after(htn::htn_return_surplus_dispatch_system)
-                        .after(htn::htn_tame_horse_dispatch_system)
-                        .after(htn::htn_plant_from_storage_dispatch_system)
+                    htn::htn_deliver_hunt_kill_dispatch_system
                         .after(htn::htn_build_claimed_blueprint_dispatch_system),
+                    htn::htn_engage_prey_dispatch_system
+                        .after(htn::htn_deliver_hunt_kill_dispatch_system),
+                    htn::htn_join_hunt_party_dispatch_system
+                        .after(htn::htn_engage_prey_dispatch_system),
+                    htn::htn_socialize_dispatch_system
+                        .after(htn::htn_join_hunt_party_dispatch_system),
+                    htn::htn_combat_faction_dispatch_system
+                        .after(htn::htn_socialize_dispatch_system),
                 )
+                    .in_set(SimulationSet::ParallelB),
+            )
+            .add_systems(
+                FixedUpdate,
+                (terraform::terraform_dispatch_system
+                    .after(tasks::goal_dispatch_system)
+                    .after(htn::htn_dispatch_system)
+                    .after(htn::htn_equip_hunting_spear_dispatch_system)
+                    .after(htn::htn_eat_dispatch_system)
+                    .after(htn::htn_acquire_food_dispatch_system)
+                    .after(htn::htn_acquire_good_dispatch_system)
+                    .after(htn::htn_stockpile_food_dispatch_system)
+                    .after(htn::htn_scout_dispatch_system)
+                    .after(htn::htn_return_surplus_dispatch_system)
+                    .after(htn::htn_tame_horse_dispatch_system)
+                    .after(htn::htn_plant_from_storage_dispatch_system)
+                    .after(htn::htn_build_claimed_blueprint_dispatch_system)
+                    .after(htn::htn_deliver_hunt_kill_dispatch_system)
+                    .after(htn::htn_engage_prey_dispatch_system)
+                    .after(htn::htn_join_hunt_party_dispatch_system)
+                    .after(htn::htn_socialize_dispatch_system)
+                    .after(htn::htn_combat_faction_dispatch_system),)
                     .in_set(SimulationSet::ParallelB),
             )
             .add_systems(

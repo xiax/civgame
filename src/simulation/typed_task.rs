@@ -167,12 +167,100 @@ pub enum Task {
     /// Walk adjacent to a `Corpse` entity and attach it to
     /// `PersonAI.carried_corpse`. Replaces `target_entity` reads in
     /// `pickup_corpse_task_system`. The downstream HaulCorpse + Butcher tasks
-    /// don't need typed variants — they read the corpse from
-    /// `carried_corpse`, which is component-level state spanning all three
-    /// tasks (not task-local params).
+    /// also have typed variants for chain-integrity inspection — they read
+    /// the corpse from the `Carrying` component (which spans pickup → haul →
+    /// butcher) rather than per-task params, so the typed variants only
+    /// document the phase.
     PickUpCorpse {
         corpse: bevy::prelude::Entity,
     },
+    /// Walk adjacent to another Person and converse — `social_fill_system`
+    /// reduces `needs.social` for any agent with neighbours within
+    /// `SOCIAL_RADIUS`, and `needs.rs`'s table+chair bonus reads
+    /// `task_id == TaskKind::Socialize` for furniture-assisted recovery.
+    /// There is no dedicated executor — the dispatcher routes via
+    /// `assign_task_with_routing(... TaskKind::Socialize, Some(partner) ...)`
+    /// and the agent simply sits in the task until `goal_update_system`
+    /// flips them off `AgentGoal::Socialize`. Produced by HTN
+    /// `SocializeWithPartnerMethod` (replaces legacy `Socialize` plan
+    /// PlanId 60 + StepId 48).
+    Socialize {
+        partner: bevy::prelude::Entity,
+    },
+    /// Walk to the home tile of the faction this agent is raiding (per
+    /// `FactionRegistry::raid_target`). On arrival the legacy executor's
+    /// task entry, `task_requires_free_hands`, and `task_interacts_from_adjacent`
+    /// govern the engagement; `combat_system` picks fights with any enemy
+    /// faction member encountered along the way. Produced by HTN
+    /// `RaidEnemyHomeMethod` (replaces legacy `Raid` plan PlanId 61 +
+    /// StepId 49).
+    Raid {
+        dest: (i32, i32),
+    },
+    /// Walk to the agent's faction home tile and stand watch. No dedicated
+    /// executor — the agent stays in `TaskKind::Defend` until
+    /// `goal_update_system` flips them off `AgentGoal::Defend` (typically
+    /// when the faction is no longer `is_under_raid`). Produced by HTN
+    /// `DefendCampMethod` (replaces legacy `Defend` plan PlanId 62 +
+    /// StepId 50).
+    Defend {
+        dest: (i32, i32),
+    },
+    /// Tribal chief in peacetime walks to the faction home tile and runs
+    /// `TaskKind::Lead` — used by `chief_*` systems as a "chief is on duty"
+    /// signal. No dedicated executor; the chief stays here until
+    /// `goal_update_system` peels them off `AgentGoal::Lead` (crisis,
+    /// hunger, sleep). Produced by HTN `LeadCampMethod` (replaces legacy
+    /// `Lead` plan PlanId 63 + StepId 51).
+    Lead {
+        dest: (i32, i32),
+    },
+    /// Distress responder routes to the attacker carried on the agent's
+    /// `RescueTarget` component. The dispatcher mirrors the legacy
+    /// `StepTarget::RescueAttacker` resolver: writes `CombatTarget(Some(attacker))`
+    /// before routing so `combat_system` engages on adjacency. The variant
+    /// carries the attacker entity for chain-integrity inspection; the
+    /// destination tile lives on `dest`. Produced by HTN
+    /// `EngageRescueAttackerMethod` (replaces legacy `RescueAlly` plan
+    /// PlanId 23 + StepId 27 EngageRescue).
+    RescueAlly {
+        attacker: bevy::prelude::Entity,
+        dest: (i32, i32),
+    },
+    /// Walk to the chief's chosen muster hearth tile and register the agent
+    /// into the faction's `HuntOrder::Hunt::mustered` list. The executor
+    /// (`wait_for_party_task_system`) blocks on arrival until the party fills
+    /// (`mustered.len() >= target_party_size`) or the order goes stale. The
+    /// `hearth` tile is also written to legacy `dest_tile` for routing.
+    /// Produced by the future HTN `MusterAtHearthMethod` and by the legacy
+    /// `HuntFood` plan's StepId(57).
+    HuntPartyMuster {
+        hearth: (i32, i32),
+    },
+    /// Hunt down the named prey entity. There is no dedicated executor — the
+    /// dispatcher routes the agent to the prey via
+    /// `assign_task_with_routing(... TaskKind::Hunter, Some(prey) ...)` and
+    /// sets `CombatTarget`, then `combat_system` engages the moment the
+    /// agent is adjacent. The variant carries the prey entity for chain
+    /// inspection (the future HTN `EngagePreyMethod` will read it; the
+    /// legacy `HuntFood` plan's StepId(5) writes it for parity).
+    Hunt {
+        prey: bevy::prelude::Entity,
+    },
+    /// Drag the carried corpse to the named butcher-site tile. The corpse
+    /// itself follows via `corpse_follow_system` (no typed-task input). The
+    /// `dest` tile is also written to legacy `dest_tile` for routing.
+    /// Produced by the future HTN `HaulCorpseMethod` and by the legacy
+    /// `HuntFood` plan's StepId(54).
+    HaulCorpse {
+        dest: (i32, i32),
+    },
+    /// Butcher the carried corpse in place. The corpse comes from the
+    /// `Carrying` component (set at PickUpCorpse arrival, cleared on butcher
+    /// completion). Parameterless because every input is component-level
+    /// state. Produced by the future HTN `ButcherCorpseMethod` and by the
+    /// legacy `HuntFood` plan's StepId(55).
+    Butcher,
     /// Work adjacent to a wild tameable animal (horse / cow / pig / cat) for
     /// `TICKS_TAME` accumulating ticks, then insert `Tamed { owner_faction }`
     /// on the target. Per-species tech gates (`HORSE_TAMING`,
@@ -534,6 +622,78 @@ impl Task {
         }
     }
 
+    /// Convenience accessor for the Socialize variant. Returns the partner
+    /// entity the agent should sit adjacent to.
+    pub fn as_socialize(&self) -> Option<bevy::prelude::Entity> {
+        match *self {
+            Task::Socialize { partner } => Some(partner),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the Raid variant.
+    pub fn as_raid(&self) -> Option<(i32, i32)> {
+        match *self {
+            Task::Raid { dest } => Some(dest),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the Defend variant.
+    pub fn as_defend(&self) -> Option<(i32, i32)> {
+        match *self {
+            Task::Defend { dest } => Some(dest),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the Lead variant.
+    pub fn as_lead(&self) -> Option<(i32, i32)> {
+        match *self {
+            Task::Lead { dest } => Some(dest),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the RescueAlly variant. Returns
+    /// `(attacker, dest)`.
+    pub fn as_rescue_ally(&self) -> Option<(bevy::prelude::Entity, (i32, i32))> {
+        match *self {
+            Task::RescueAlly { attacker, dest } => Some((attacker, dest)),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the HuntPartyMuster variant.
+    pub fn as_hunt_party_muster(&self) -> Option<(i32, i32)> {
+        match *self {
+            Task::HuntPartyMuster { hearth } => Some(hearth),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the Hunt variant.
+    pub fn as_hunt(&self) -> Option<bevy::prelude::Entity> {
+        match *self {
+            Task::Hunt { prey } => Some(prey),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the HaulCorpse variant.
+    pub fn as_haul_corpse(&self) -> Option<(i32, i32)> {
+        match *self {
+            Task::HaulCorpse { dest } => Some(dest),
+            _ => None,
+        }
+    }
+
+    /// True if this task is the in-place `Butcher` variant. Carries no
+    /// parameters so a discriminant check is sufficient.
+    pub fn is_butcher(&self) -> bool {
+        matches!(*self, Task::Butcher)
+    }
+
     /// Convenience accessor for the TameAnimal variant.
     pub fn as_planter(&self) -> Option<(i32, i32)> {
         match self {
@@ -716,5 +876,69 @@ mod tests {
         assert!(aq.queued_is_full());
         assert!(!aq.dispatch(dig(99)));
         assert_eq!(aq.queued_len(), ACTION_QUEUE_CAP);
+    }
+
+    // Phase 5e-vii: typed-task scaffolding for the HuntFood chain. Variants
+    // are produced by `plan_execution_system` in parallel with the legacy
+    // `task_id` channel and consumed by future HTN dispatchers. Today they're
+    // informational; the accessor tests pin the discriminant + payload shapes
+    // so a future migration can refactor the executor reads without losing
+    // chain-integrity inspection.
+    #[test]
+    fn hunt_party_muster_accessor_returns_hearth_tile() {
+        let task = Task::HuntPartyMuster { hearth: (3, -7) };
+        assert_eq!(task.as_hunt_party_muster(), Some((3, -7)));
+        assert_eq!(Task::Idle.as_hunt_party_muster(), None);
+    }
+
+    #[test]
+    fn hunt_accessor_returns_prey_entity() {
+        let prey = bevy::prelude::Entity::from_raw(42);
+        let task = Task::Hunt { prey };
+        assert_eq!(task.as_hunt(), Some(prey));
+        assert_eq!(Task::Idle.as_hunt(), None);
+    }
+
+    #[test]
+    fn haul_corpse_accessor_returns_dest_tile() {
+        let task = Task::HaulCorpse { dest: (12, 4) };
+        assert_eq!(task.as_haul_corpse(), Some((12, 4)));
+        assert_eq!(Task::Idle.as_haul_corpse(), None);
+    }
+
+    #[test]
+    fn butcher_is_butcher_discriminates() {
+        assert!(Task::Butcher.is_butcher());
+        assert!(!Task::Idle.is_butcher());
+        assert!(!dig(1).is_butcher());
+    }
+
+    #[test]
+    fn socialize_accessor_returns_partner_entity() {
+        let partner = bevy::prelude::Entity::from_raw(17);
+        let task = Task::Socialize { partner };
+        assert_eq!(task.as_socialize(), Some(partner));
+        assert_eq!(Task::Idle.as_socialize(), None);
+    }
+
+    #[test]
+    fn raid_defend_lead_accessors_return_dest_tile() {
+        assert_eq!(Task::Raid { dest: (5, -3) }.as_raid(), Some((5, -3)));
+        assert_eq!(Task::Defend { dest: (0, 0) }.as_defend(), Some((0, 0)));
+        assert_eq!(Task::Lead { dest: (-2, 4) }.as_lead(), Some((-2, 4)));
+        assert_eq!(Task::Idle.as_raid(), None);
+        assert_eq!(Task::Idle.as_defend(), None);
+        assert_eq!(Task::Idle.as_lead(), None);
+    }
+
+    #[test]
+    fn rescue_ally_accessor_returns_attacker_and_dest() {
+        let attacker = bevy::prelude::Entity::from_raw(99);
+        let task = Task::RescueAlly {
+            attacker,
+            dest: (7, 8),
+        };
+        assert_eq!(task.as_rescue_ally(), Some((attacker, (7, 8))));
+        assert_eq!(Task::Idle.as_rescue_ally(), None);
     }
 }

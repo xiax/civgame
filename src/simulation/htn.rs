@@ -142,6 +142,69 @@ pub enum AbstractTask {
     /// (`BuildBlueprint`, `HaulFromStorageAndBuild`) own the gather/haul work.
     /// Replaces the legacy `ClaimedBuild` plan (PlanId 34).
     ConstructBlueprint,
+    /// Hunter carrying a fresh corpse hauls it to the nearest butcher site
+    /// (campfire or faction home) and butchers it in place. Single expansion
+    /// `[HaulCorpse { dest }, Butcher]`. `MF_UNINTERRUPTIBLE` so a hunger
+    /// spike mid-haul doesn't peel the agent off — the corpse decays in
+    /// `CORPSE_FRESHNESS_TICKS=600` and the carrier is the only one who can
+    /// finish the job. Replaces the trailing two steps of the legacy
+    /// `HuntFood` plan (PlanId 5): `[StepId(54) HaulCorpse, StepId(55) Butcher]`.
+    /// The remaining four steps (Muster, Travel, Hunt, PickUp) still run
+    /// through the legacy plan; once PickUp ends, the plan completes and the
+    /// agent's `Carrying` component triggers this method on the next dispatch
+    /// tick.
+    DeliverHuntKill,
+    /// Hunter at the chief's chosen hunt area engages prey or picks up a
+    /// fresh kill. Two methods compete via argmax: `HuntPreyMethod` fires
+    /// when a live prey entity is in vision (or memory) and emits
+    /// `[Task::Hunt { prey }]`; `PickUpFreshCorpseMethod` fires when a fresh
+    /// corpse is nearby and emits `[Task::PickUpCorpse { corpse }]`. The
+    /// dispatcher re-fires between phases — there's no chain handoff because
+    /// each method emits a single task, and the world-state transition (prey
+    /// alive → prey dead → corpse) drives method selection. Replaces the
+    /// middle two steps of the legacy `HuntFood` plan (PlanId 5):
+    /// `[StepId(5) Hunt, StepId(53) PickUpCorpse]`. The remaining two steps
+    /// (Muster, Travel) still run through the legacy plan; once Travel ends,
+    /// the plan completes and this dispatcher takes over.
+    EngagePrey,
+    /// Hunter joining the chief's hunt party — first walks to the muster
+    /// hearth and waits for the party to fill (`MusterAtHearthMethod`), then
+    /// travels to the chief's chosen `area_tile` (`TravelToHuntAreaMethod`).
+    /// Two methods gated on the `HuntOrder::Hunt`'s `deployed_tick` state:
+    /// muster fires while the party hasn't deployed (and isn't stale),
+    /// travel fires once deployed or stale. Replaces the leading two steps
+    /// of the legacy `HuntFood` plan (PlanId 5): `[StepId(57)
+    /// HuntPartyMuster, StepId(58) TravelToHuntArea]`. Together with
+    /// `EngagePrey` and `DeliverHuntKill` this retires PlanId 5 entirely —
+    /// the full hunting pipeline runs through HTN.
+    JoinHuntParty,
+    /// Agent under `AgentGoal::Socialize` walks to the nearest other Person
+    /// and converses. Single expansion `[Task::Socialize { partner }]`.
+    /// Single-method registry — `SocializeWithPartnerMethod` always wins.
+    /// Replaces the legacy `Socialize` plan (PlanId 60) and its single step
+    /// (StepId 48 NearestPlayPartner). Not `MF_UNINTERRUPTIBLE`: a sudden
+    /// hunger spike or external preempt should be free to take precedence.
+    Socialize,
+    /// Agent under `AgentGoal::Raid` walks to the home tile of their
+    /// faction's `raid_target` faction. Single-method registry —
+    /// `RaidEnemyHomeMethod` always wins. Replaces legacy `Raid` plan
+    /// PlanId 61 + StepId 49 (`StepTarget::FactionRaidTarget`).
+    Raid,
+    /// Agent under `AgentGoal::Defend` walks to faction home and stands
+    /// watch. Single-method registry — `DefendCampMethod` always wins.
+    /// Replaces legacy `Defend` plan PlanId 62 + StepId 50 (FactionCamp).
+    Defend,
+    /// Tribal chief under `AgentGoal::Lead` walks to faction home.
+    /// Single-method registry — `LeadCampMethod` always wins. Replaces
+    /// legacy `Lead` plan PlanId 63 + StepId 51 (FactionCamp).
+    Lead,
+    /// Distress responder under `AgentGoal::Rescue` engages the attacker
+    /// stored on their `RescueTarget` component. Single expansion
+    /// `[Task::RescueAlly { attacker, dest }]`. The dispatcher writes
+    /// `CombatTarget(Some(attacker))` so `combat_system` engages on
+    /// adjacency. Replaces legacy `RescueAlly` plan PlanId 23 + StepId 27
+    /// (`StepTarget::RescueAttacker`).
+    RescueAlly,
 }
 
 /// Discriminant-only key for `MethodRegistry` lookups. `AbstractTask` itself
@@ -161,6 +224,14 @@ pub enum AbstractTaskKind {
     TameWildHorse,
     PlantFromStorage,
     ConstructBlueprint,
+    DeliverHuntKill,
+    EngagePrey,
+    JoinHuntParty,
+    Socialize,
+    Raid,
+    Defend,
+    Lead,
+    RescueAlly,
 }
 
 impl AbstractTask {
@@ -177,6 +248,14 @@ impl AbstractTask {
             AbstractTask::TameWildHorse => AbstractTaskKind::TameWildHorse,
             AbstractTask::PlantFromStorage { .. } => AbstractTaskKind::PlantFromStorage,
             AbstractTask::ConstructBlueprint => AbstractTaskKind::ConstructBlueprint,
+            AbstractTask::DeliverHuntKill => AbstractTaskKind::DeliverHuntKill,
+            AbstractTask::EngagePrey => AbstractTaskKind::EngagePrey,
+            AbstractTask::JoinHuntParty => AbstractTaskKind::JoinHuntParty,
+            AbstractTask::Socialize => AbstractTaskKind::Socialize,
+            AbstractTask::Raid => AbstractTaskKind::Raid,
+            AbstractTask::Defend => AbstractTaskKind::Defend,
+            AbstractTask::Lead => AbstractTaskKind::Lead,
+            AbstractTask::RescueAlly => AbstractTaskKind::RescueAlly,
         }
     }
 }
@@ -215,6 +294,16 @@ impl MethodId {
     pub const TAME_WILD_HORSE: MethodId = MethodId(17);
     pub const WITHDRAW_AND_PLANT_SEED: MethodId = MethodId(18);
     pub const BUILD_CLAIMED_BLUEPRINT: MethodId = MethodId(19);
+    pub const DELIVER_HUNT_KILL: MethodId = MethodId(20);
+    pub const HUNT_PREY: MethodId = MethodId(21);
+    pub const PICK_UP_FRESH_CORPSE: MethodId = MethodId(22);
+    pub const MUSTER_AT_HEARTH: MethodId = MethodId(23);
+    pub const TRAVEL_TO_HUNT_AREA: MethodId = MethodId(24);
+    pub const SOCIALIZE_WITH_PARTNER: MethodId = MethodId(25);
+    pub const RAID_ENEMY_HOME: MethodId = MethodId(26);
+    pub const DEFEND_CAMP: MethodId = MethodId(27);
+    pub const LEAD_CAMP: MethodId = MethodId(28);
+    pub const ENGAGE_RESCUE_ATTACKER: MethodId = MethodId(29);
 
     pub fn raw(self) -> u16 {
         self.0
@@ -526,6 +615,51 @@ pub struct PlannerCtx {
     /// `None` for non-forage dispatches and AcquireFood (whose chain ends in
     /// `Eat`, not `DepositToFactionStorage`).
     pub forage_food_good: Option<crate::economy::resource_catalog::ResourceId>,
+    /// Nearest butcher-site tile (campfire / faction home) for the agent's
+    /// faction. Read by `DeliverHuntKillMethod` (Phase 5e-viii-a) to seed
+    /// the head `Task::HaulCorpse { dest }` of the haul → butcher chain.
+    /// Mirrors the legacy `StepTarget::NearestButcherSite` resolver. `None`
+    /// when the faction has no campfires and no `home_tile`. Other dispatchers
+    /// leave it at `None`.
+    pub butcher_site_tile: Option<(i32, i32)>,
+    /// Nearest live prey entity within vision (LOS-checked) or memory. Read
+    /// by `HuntPreyMethod` (Phase 5e-viii-b). Mirrors the legacy
+    /// `StepTarget::HuntPrey` resolver — vision first, memory fallback. `None`
+    /// when no prey is reachable. Other dispatchers leave it at `None`.
+    pub prey_target_entity: Option<Entity>,
+    /// World tile of `prey_target_entity`, snapshot at decision time. Used
+    /// by `HuntPreyMethod`'s utility for distance discount and by the
+    /// dispatcher for `assign_task_with_routing` destination.
+    pub prey_target_tile: Option<(i32, i32)>,
+    /// Nearest fresh `Corpse` entity within `VIEW_RADIUS` of the agent. Read
+    /// by `PickUpFreshCorpseMethod` (Phase 5e-viii-b). Mirrors the legacy
+    /// `StepTarget::NearestFreshCorpse` resolver — direct `CorpseMap` scan,
+    /// no LOS check. `None` when no fresh corpse is in range. Other
+    /// dispatchers leave it at `None`.
+    pub fresh_corpse_entity: Option<Entity>,
+    /// World tile of `fresh_corpse_entity`. Used by
+    /// `PickUpFreshCorpseMethod`'s utility for distance discount and by the
+    /// dispatcher for routing.
+    pub fresh_corpse_tile: Option<(i32, i32)>,
+    /// Muster hearth tile for `JoinHuntParty` (Phase 5e-viii-c). Mirrors the
+    /// legacy `StepTarget::HearthForHunt` resolver — nearest campfire to
+    /// the chief's `area_tile` with `home_tile` fallback. Read by
+    /// `MusterAtHearthMethod`. `None` if no campfires and no faction home.
+    pub hunt_hearth_tile: Option<(i32, i32)>,
+    /// Hunt area tile from the faction's `HuntOrder::Hunt`. Read by
+    /// `TravelToHuntAreaMethod`. `None` outside the JoinHuntParty
+    /// dispatcher's scope.
+    pub hunt_area_tile: Option<(i32, i32)>,
+    /// `true` when the faction's `HuntOrder::Hunt` has its `deployed_tick`
+    /// set — the party has reached `target_party_size` and may travel.
+    /// `MusterAtHearthMethod` requires this to be `false`;
+    /// `TravelToHuntAreaMethod` accepts it `true` (or `hunt_party_stale`).
+    pub hunt_party_deployed: bool,
+    /// `true` when the faction's hunt order has been posted longer than
+    /// `HUNT_PARTY_TIMEOUT` ticks without filling. Triggers travel even on
+    /// an under-strength party — mirrors `wait_for_party_task_system`'s
+    /// staleness exit.
+    pub hunt_party_stale: bool,
 }
 
 /// A single decomposition rule for an `AbstractTask`. Scoring (`utility`) and
@@ -667,6 +801,34 @@ pub fn register_builtin_methods(reg: &mut MethodRegistry) {
     reg.register(
         AbstractTaskKind::ConstructBlueprint,
         Box::new(BuildClaimedBlueprintMethod),
+    );
+    reg.register(
+        AbstractTaskKind::DeliverHuntKill,
+        Box::new(DeliverHuntKillMethod),
+    );
+    reg.register(AbstractTaskKind::EngagePrey, Box::new(HuntPreyMethod));
+    reg.register(
+        AbstractTaskKind::EngagePrey,
+        Box::new(PickUpFreshCorpseMethod),
+    );
+    reg.register(
+        AbstractTaskKind::JoinHuntParty,
+        Box::new(MusterAtHearthMethod),
+    );
+    reg.register(
+        AbstractTaskKind::JoinHuntParty,
+        Box::new(TravelToHuntAreaMethod),
+    );
+    reg.register(
+        AbstractTaskKind::Socialize,
+        Box::new(SocializeWithPartnerMethod),
+    );
+    reg.register(AbstractTaskKind::Raid, Box::new(RaidEnemyHomeMethod));
+    reg.register(AbstractTaskKind::Defend, Box::new(DefendCampMethod));
+    reg.register(AbstractTaskKind::Lead, Box::new(LeadCampMethod));
+    reg.register(
+        AbstractTaskKind::RescueAlly,
+        Box::new(EngageRescueAttackerMethod),
     );
 }
 
@@ -1950,6 +2112,477 @@ impl Method for BuildClaimedBlueprintMethod {
     }
 }
 
+/// Sole method for `AbstractTask::DeliverHuntKill`. The dispatcher gates on
+/// the agent holding a `Carrying` component (set by `pickup_corpse_task_system`
+/// on arrival at a fresh corpse). Emits the two-leg expansion
+/// `[Task::HaulCorpse { dest }, Task::Butcher]`. `MF_UNINTERRUPTIBLE` so a
+/// hunger spike mid-haul doesn't peel the agent off — the corpse decays at
+/// `CORPSE_FRESHNESS_TICKS=600` and the carrier is the only one who can
+/// finish the job. Replaces the trailing two steps of the legacy `HuntFood`
+/// plan (PlanId 5): `[StepId(54) HaulCorpse, StepId(55) Butcher]`. The plan
+/// is truncated to `[Muster, Travel, Hunt, PickUp]` in the same sub-PR; once
+/// PickUp ends, the plan completes and this method picks up via the
+/// `Carrying` gate on the next dispatch tick.
+pub struct DeliverHuntKillMethod;
+
+impl Method for DeliverHuntKillMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::DeliverHuntKill) {
+            return false;
+        }
+        ctx.butcher_site_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        // Tier: obligation. Once the agent picks up a corpse the only sensible
+        // next step is to deliver it; baseline (1.0) suffices because the
+        // dispatcher gates on `Carrying` and there are no sibling methods
+        // competing for the slot. Distance discount on the haul leg.
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.butcher_site_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::DeliverHuntKill) {
+            return Vec::new();
+        }
+        let Some(dest) = ctx.butcher_site_tile else {
+            return Vec::new();
+        };
+        vec![Task::HaulCorpse { dest }, Task::Butcher]
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn name(&self) -> &'static str {
+        "DeliverHuntKill"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::DELIVER_HUNT_KILL
+    }
+}
+
+/// First method for `AbstractTask::EngagePrey`. Fires when the dispatcher
+/// finds a live prey entity within vision (LOS) or memory and emits the
+/// single-task expansion `[Task::Hunt { prey }]`. The dispatcher pre-routes
+/// the agent toward the prey's tile and sets `CombatTarget`; once adjacent,
+/// `combat_system` engages and resolves the kill (after which it calls
+/// `aq.advance()` to drain the typed channel — the dispatcher then re-fires
+/// next tick, and `PickUpFreshCorpseMethod` typically wins because the new
+/// corpse is right at the agent's feet). `MF_UNINTERRUPTIBLE` so a hunger
+/// spike mid-combat doesn't peel the agent off; the legacy plan's
+/// `PF_UNINTERRUPTIBLE` flag did the same.
+pub struct HuntPreyMethod;
+
+impl Method for HuntPreyMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::EngagePrey) {
+            return false;
+        }
+        ctx.prey_target_entity.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.prey_target_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::EngagePrey) {
+            return Vec::new();
+        }
+        let Some(prey) = ctx.prey_target_entity else {
+            return Vec::new();
+        };
+        vec![Task::Hunt { prey }]
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn tech_gate(&self) -> Option<TechId> {
+        Some(crate::simulation::technology::HUNTING_SPEAR)
+    }
+
+    fn profession_gate(&self) -> Option<Profession> {
+        Some(Profession::Hunter)
+    }
+
+    fn name(&self) -> &'static str {
+        "HuntPrey"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::HUNT_PREY
+    }
+}
+
+/// Second method for `AbstractTask::EngagePrey`. Fires when a fresh `Corpse`
+/// is within `VIEW_RADIUS` of the agent (set by `combat_system`'s death path
+/// just moments earlier, ideally at the agent's own tile after their kill).
+/// Single-task expansion `[Task::PickUpCorpse { corpse }]`. `pickup_corpse_task_system`
+/// inserts `Carrying(corpse)` on arrival, after which the next dispatch tick's
+/// `htn_deliver_hunt_kill_dispatch_system` (5e-viii-a) takes over for the
+/// haul → butcher tail. `MF_UNINTERRUPTIBLE` so a transient goal flip doesn't
+/// peel the hunter off a kill they just made (the corpse decays in
+/// `CORPSE_FRESHNESS_TICKS=600` and they're closest).
+///
+/// Utility tier: `UTIL_VISIBLE_GROUND=1.5` — once a kill is on the ground,
+/// picking it up beats starting a new hunt. Mirrors the legacy reward_scale
+/// hierarchy where the corpse-pickup step (0.4) sat at the same priority
+/// tier as the hunt step (0.4) but the actual game-time priority came from
+/// the plan being committed (`PF_UNINTERRUPTIBLE`); under HTN the explicit
+/// utility lift makes the priority legible.
+pub struct PickUpFreshCorpseMethod;
+
+impl Method for PickUpFreshCorpseMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::EngagePrey) {
+            return false;
+        }
+        ctx.fresh_corpse_entity.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_VISIBLE_GROUND - dist_penalty(ctx.tile, ctx.fresh_corpse_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::EngagePrey) {
+            return Vec::new();
+        }
+        let Some(corpse) = ctx.fresh_corpse_entity else {
+            return Vec::new();
+        };
+        vec![Task::PickUpCorpse { corpse }]
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn tech_gate(&self) -> Option<TechId> {
+        Some(crate::simulation::technology::HUNTING_SPEAR)
+    }
+
+    fn profession_gate(&self) -> Option<Profession> {
+        Some(Profession::Hunter)
+    }
+
+    fn name(&self) -> &'static str {
+        "PickUpFreshCorpse"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::PICK_UP_FRESH_CORPSE
+    }
+}
+
+/// First method for `AbstractTask::JoinHuntParty`. Fires while the chief's
+/// hunt party hasn't yet deployed (`!hunt_party_deployed`) and the order
+/// isn't stale. Emits `[Task::HuntPartyMuster { hearth }]` — agent walks to
+/// the muster hearth and `wait_for_party_task_system` registers them in the
+/// `HuntOrder::Hunt::mustered` Vec, blocking until the party fills or stales.
+/// `MF_UNINTERRUPTIBLE` mirrors the legacy plan's `PF_UNINTERRUPTIBLE`. The
+/// dispatcher resolves the hearth via `CampfireMap` (nearest to area_tile,
+/// faction `home_tile` fallback), mirroring `StepTarget::HearthForHunt`.
+pub struct MusterAtHearthMethod;
+
+impl Method for MusterAtHearthMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::JoinHuntParty) {
+            return false;
+        }
+        ctx.hunt_hearth_tile.is_some() && !ctx.hunt_party_deployed && !ctx.hunt_party_stale
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.hunt_hearth_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::JoinHuntParty) {
+            return Vec::new();
+        }
+        let Some(hearth) = ctx.hunt_hearth_tile else {
+            return Vec::new();
+        };
+        vec![Task::HuntPartyMuster { hearth }]
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn tech_gate(&self) -> Option<TechId> {
+        Some(crate::simulation::technology::HUNTING_SPEAR)
+    }
+
+    fn profession_gate(&self) -> Option<Profession> {
+        Some(Profession::Hunter)
+    }
+
+    fn name(&self) -> &'static str {
+        "MusterAtHearth"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::MUSTER_AT_HEARTH
+    }
+}
+
+/// Second method for `AbstractTask::JoinHuntParty`. Fires once the chief's
+/// hunt party has deployed (`hunt_party_deployed`) or the order has gone
+/// stale (`hunt_party_stale`). Emits `[Task::Explore { kind: Prey }]` — the
+/// agent walks toward the chief's `area_tile` while `vision_system` records
+/// any prey memory along the path. The semantically-overloaded use of
+/// `Task::Explore` is intentional: this leg combines "walk to specific
+/// tile" + "scan for prey memory en route," which is exactly what the
+/// `Explore` typed task does (the dispatcher routes to the chief's tile
+/// rather than a random one). On arrival, `goal_dispatch_system`'s
+/// catch-all flips the typed channel back to Idle and the next dispatch
+/// tick lets `htn_engage_prey_dispatch_system` take over for engagement.
+/// `MF_UNINTERRUPTIBLE` mirrors the legacy plan's `PF_UNINTERRUPTIBLE`.
+pub struct TravelToHuntAreaMethod;
+
+impl Method for TravelToHuntAreaMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::JoinHuntParty) {
+            return false;
+        }
+        ctx.hunt_area_tile.is_some() && (ctx.hunt_party_deployed || ctx.hunt_party_stale)
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.hunt_area_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, _ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::JoinHuntParty) {
+            return Vec::new();
+        }
+        vec![Task::Explore {
+            kind: MemoryKind::Prey,
+        }]
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn tech_gate(&self) -> Option<TechId> {
+        Some(crate::simulation::technology::HUNTING_SPEAR)
+    }
+
+    fn profession_gate(&self) -> Option<Profession> {
+        Some(Profession::Hunter)
+    }
+
+    fn name(&self) -> &'static str {
+        "TravelToHuntArea"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::TRAVEL_TO_HUNT_AREA
+    }
+}
+
+/// Sole method for `AbstractTask::Socialize`. Single-leg expansion
+/// `[Task::Socialize { partner }]`. Replaces the legacy `Socialize` plan
+/// (PlanId 60) and its single step (StepId 48 NearestPlayPartner).
+///
+/// The dispatcher scans `SpatialIndex` within 12 tiles for the nearest other
+/// Person (filtering out blueprints / ground items / animals), populates
+/// `scavenge_target_entity` + `scavenge_target_tile` with the partner, and
+/// the method's `expand` reads the entity. Distance discount on the
+/// scavenge-target tile keeps "nearest partner" semantics inside the
+/// argmax — though there is only one method, the dist penalty makes the
+/// inspector readout reflect proximity.
+///
+/// Not `MF_UNINTERRUPTIBLE`: a sudden hunger spike or external preempt
+/// (player order, distress response) is free to take precedence —
+/// socialization is the lowest-priority need-driven activity.
+pub struct SocializeWithPartnerMethod;
+
+impl Method for SocializeWithPartnerMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::Socialize) {
+            return false;
+        }
+        ctx.scavenge_target_entity.is_some() && ctx.scavenge_target_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.scavenge_target_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::Socialize) {
+            return Vec::new();
+        }
+        let Some(partner) = ctx.scavenge_target_entity else {
+            return Vec::new();
+        };
+        vec![Task::Socialize { partner }]
+    }
+
+    fn name(&self) -> &'static str {
+        "SocializeWithPartner"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::SOCIALIZE_WITH_PARTNER
+    }
+}
+
+/// Sole method for `AbstractTask::Raid`. Single-leg expansion
+/// `[Task::Raid { dest }]`. Replaces the legacy `Raid` plan (PlanId 61) and
+/// its single step (StepId 49 FactionRaidTarget). The dispatcher reads
+/// `FactionRegistry::raid_target` and threads the target faction's
+/// `home_tile` through `gather_target_tile`. Solo agents and peacetime
+/// factions resolve to `None` and the method's precondition fails — the
+/// agent stays Idle and the next dispatch tick re-evaluates.
+pub struct RaidEnemyHomeMethod;
+
+impl Method for RaidEnemyHomeMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::Raid) && ctx.gather_target_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        // Distance discount intentionally omitted: the raid target is one
+        // fixed tile per faction-tick, so any inter-method ordering would
+        // be vacuous (single-method registry).
+        UTIL_BASELINE
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::Raid) {
+            return Vec::new();
+        }
+        let Some(dest) = ctx.gather_target_tile else {
+            return Vec::new();
+        };
+        vec![Task::Raid { dest }]
+    }
+
+    fn name(&self) -> &'static str {
+        "RaidEnemyHome"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::RAID_ENEMY_HOME
+    }
+}
+
+/// Sole method for `AbstractTask::Defend`. Single-leg expansion
+/// `[Task::Defend { dest }]`. Replaces legacy `Defend` plan (PlanId 62) +
+/// StepId 50 (FactionCamp). The dispatcher threads the faction's
+/// `home_tile` through `gather_target_tile`.
+pub struct DefendCampMethod;
+
+impl Method for DefendCampMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::Defend) && ctx.gather_target_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::Defend) {
+            return Vec::new();
+        }
+        let Some(dest) = ctx.gather_target_tile else {
+            return Vec::new();
+        };
+        vec![Task::Defend { dest }]
+    }
+
+    fn name(&self) -> &'static str {
+        "DefendCamp"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::DEFEND_CAMP
+    }
+}
+
+/// Sole method for `AbstractTask::Lead`. Single-leg expansion
+/// `[Task::Lead { dest }]`. Replaces legacy `Lead` plan (PlanId 63) +
+/// StepId 51 (FactionCamp).
+pub struct LeadCampMethod;
+
+impl Method for LeadCampMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::Lead) && ctx.gather_target_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, _ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::Lead) {
+            return Vec::new();
+        }
+        let Some(dest) = ctx.gather_target_tile else {
+            return Vec::new();
+        };
+        vec![Task::Lead { dest }]
+    }
+
+    fn name(&self) -> &'static str {
+        "LeadCamp"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::LEAD_CAMP
+    }
+}
+
+/// Sole method for `AbstractTask::RescueAlly`. Single-leg expansion
+/// `[Task::RescueAlly { attacker, dest }]`. The dispatcher reads the
+/// agent's `RescueTarget` (`(attacker, attacker_tile)`), populates
+/// `scavenge_target_entity` / `scavenge_target_tile`, and writes
+/// `CombatTarget(Some(attacker))` so `combat_system` engages on adjacency.
+/// Replaces legacy `RescueAlly` plan (PlanId 23) + StepId 27 EngageRescue.
+pub struct EngageRescueAttackerMethod;
+
+impl Method for EngageRescueAttackerMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::RescueAlly)
+            && ctx.scavenge_target_entity.is_some()
+            && ctx.scavenge_target_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.scavenge_target_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::RescueAlly) {
+            return Vec::new();
+        }
+        let (Some(attacker), Some(dest)) = (ctx.scavenge_target_entity, ctx.scavenge_target_tile)
+        else {
+            return Vec::new();
+        };
+        vec![Task::RescueAlly { attacker, dest }]
+    }
+
+    fn name(&self) -> &'static str {
+        "EngageRescueAttacker"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::ENGAGE_RESCUE_ATTACKER
+    }
+}
+
 /// Pick a random reachable explore destination near the agent's faction home.
 /// Mirrors the legacy `StepTarget::ExploreTile` resolver in `plan/mod.rs`:
 /// roll up to 8 random offsets in `[-96, 96]` from `home`, return the first
@@ -2111,6 +2744,15 @@ pub fn htn_dispatch_system(
                 gather_deposit_tile: None,
                 scavenge_deposit_tile: None,
                 forage_food_good: None,
+                butcher_site_tile: None,
+                prey_target_entity: None,
+                prey_target_tile: None,
+                fresh_corpse_entity: None,
+                fresh_corpse_tile: None,
+                hunt_hearth_tile: None,
+                hunt_area_tile: None,
+                hunt_party_deployed: false,
+                hunt_party_stale: false,
             };
 
             // Argmax over applicable methods. f32 has no total order; ties
@@ -2320,6 +2962,15 @@ pub fn htn_eat_dispatch_system(
                 gather_deposit_tile: None,
                 scavenge_deposit_tile: None,
                 forage_food_good: None,
+                butcher_site_tile: None,
+                prey_target_entity: None,
+                prey_target_tile: None,
+                fresh_corpse_entity: None,
+                fresh_corpse_tile: None,
+                hunt_hearth_tile: None,
+                hunt_area_tile: None,
+                hunt_party_deployed: false,
+                hunt_party_stale: false,
             };
 
             let abstract_task = AbstractTask::Eat;
@@ -2581,6 +3232,15 @@ pub fn htn_acquire_food_dispatch_system(
                 // AcquireFood's forage chain ends in `Eat`, not
                 // `DepositToFactionStorage`, so no good payload is needed.
                 forage_food_good: None,
+                butcher_site_tile: None,
+                prey_target_entity: None,
+                prey_target_tile: None,
+                fresh_corpse_entity: None,
+                fresh_corpse_tile: None,
+                hunt_hearth_tile: None,
+                hunt_area_tile: None,
+                hunt_party_deployed: false,
+                hunt_party_stale: false,
             };
 
             let abstract_task = AbstractTask::AcquireFood;
@@ -2986,6 +3646,15 @@ pub fn htn_acquire_good_dispatch_system(
                     gather_deposit_tile,
                     scavenge_deposit_tile,
                     forage_food_good: None,
+                    butcher_site_tile: None,
+                    prey_target_entity: None,
+                    prey_target_tile: None,
+                    fresh_corpse_entity: None,
+                    fresh_corpse_tile: None,
+                    hunt_hearth_tile: None,
+                    hunt_area_tile: None,
+                    hunt_party_deployed: false,
+                    hunt_party_stale: false,
                 };
 
                 let abstract_task = AbstractTask::AcquireGood {
@@ -3231,6 +3900,15 @@ pub fn htn_acquire_good_dispatch_system(
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         };
 
         let abstract_task = AbstractTask::AcquireGood { resource_id };
@@ -3517,6 +4195,15 @@ pub fn htn_stockpile_food_dispatch_system(
                 gather_deposit_tile,
                 scavenge_deposit_tile,
                 forage_food_good,
+                butcher_site_tile: None,
+                prey_target_entity: None,
+                prey_target_tile: None,
+                fresh_corpse_entity: None,
+                fresh_corpse_tile: None,
+                hunt_hearth_tile: None,
+                hunt_area_tile: None,
+                hunt_party_deployed: false,
+                hunt_party_stale: false,
             };
 
             let abstract_task = AbstractTask::StockpileFood;
@@ -3826,6 +4513,15 @@ pub fn htn_equip_hunting_spear_dispatch_system(
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         };
 
         let abstract_task = AbstractTask::EquipHuntingSpear;
@@ -4011,6 +4707,15 @@ pub fn htn_scout_dispatch_system(
                 gather_deposit_tile: None,
                 scavenge_deposit_tile: None,
                 forage_food_good: None,
+                butcher_site_tile: None,
+                prey_target_entity: None,
+                prey_target_tile: None,
+                fresh_corpse_entity: None,
+                fresh_corpse_tile: None,
+                hunt_hearth_tile: None,
+                hunt_area_tile: None,
+                hunt_party_deployed: false,
+                hunt_party_stale: false,
             };
 
             let abstract_task = AbstractTask::Scout;
@@ -4232,6 +4937,15 @@ pub fn htn_return_surplus_dispatch_system(
                 gather_deposit_tile: None,
                 scavenge_deposit_tile: None,
                 forage_food_good: None,
+                butcher_site_tile: None,
+                prey_target_entity: None,
+                prey_target_tile: None,
+                fresh_corpse_entity: None,
+                fresh_corpse_tile: None,
+                hunt_hearth_tile: None,
+                hunt_area_tile: None,
+                hunt_party_deployed: false,
+                hunt_party_stale: false,
             };
 
             let abstract_task = AbstractTask::ReturnSurplus;
@@ -4434,6 +5148,15 @@ pub fn htn_tame_horse_dispatch_system(
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         };
 
         let abstract_task = AbstractTask::TameWildHorse;
@@ -4686,6 +5409,15 @@ pub fn htn_plant_from_storage_dispatch_system(
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         };
 
         let abstract_task = AbstractTask::PlantFromStorage {
@@ -4875,6 +5607,15 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         };
 
         let abstract_task = AbstractTask::ConstructBlueprint;
@@ -4924,6 +5665,1129 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                 continue;
             }
         }
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
+}
+
+/// Phase 5e-viii-a `DeliverHuntKill` dispatcher. Fires when an agent holds a
+/// `Carrying` component (set by `pickup_corpse_task_system` after a hunter
+/// picks up a fresh corpse) and is otherwise Idle without an `ActivePlan` —
+/// i.e. the legacy `HuntFood` plan has just completed at StepId(53) PickUp,
+/// leaving the carrier free for HTN to take over the haul→butcher tail.
+///
+/// Resolves the butcher site by scanning `CampfireMap` for the nearest
+/// hearth (mirrors `StepTarget::NearestButcherSite`); falls back to the
+/// faction's `home_tile`. SOLO agents have no home and no campfires, so the
+/// dispatcher silently skips them — the corpse decays in place.
+///
+/// Routes the head `Task::HaulCorpse { dest }` via
+/// `assign_task_with_routing(... TaskKind::HaulCorpse, None ...)` and prefetches
+/// the trailing `Task::Butcher`. Chain handoff lives in
+/// `corpse::haul_corpse_task_system`'s arrival exit (Phase 5e-vii-ii): when
+/// the queued head is `Task::Butcher`, prime `task_id = TaskKind::Butcher` +
+/// `state = Working` so `butcher_task_system` picks up next tick (Butcher is
+/// in-place — no routing).
+pub fn htn_deliver_hunt_kill_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    campfire_map: Res<crate::simulation::construction::CampfireMap>,
+    clock: Res<SimClock>,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+            Option<&ActivePlan>,
+            &crate::simulation::corpse::Carrying,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    let now = clock.tick;
+    for (mut ai, mut aq, mut history, transform, member, lod, active_plan_opt, _carrying) in
+        query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Resolve butcher site: nearest campfire, falling back to faction home.
+        // Mirrors `StepTarget::NearestButcherSite`.
+        let mut best: Option<(i32, i32)> = None;
+        let mut best_dist = i32::MAX;
+        for (&tile, _e) in campfire_map.0.iter() {
+            let dist = (tile.0 - cur_tx).abs() + (tile.1 - cur_ty).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best = Some(tile);
+            }
+        }
+        let butcher_site_tile = best.or_else(|| faction_registry.home_tile(member.faction_id));
+        let Some(dest) = butcher_site_tile else {
+            // SOLO / unsettled: no destination; corpse decays in place.
+            continue;
+        };
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home: faction_registry.home_tile(member.faction_id),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: None,
+            scavenge_target_entity: None,
+            scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+            butcher_site_tile: Some(dest),
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
+        };
+
+        let abstract_task = AbstractTask::DeliverHuntKill;
+        let methods = method_registry.methods_for(AbstractTaskKind::DeliverHuntKill);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        match head {
+            Task::HaulCorpse { dest } => {
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    dest,
+                    TaskKind::HaulCorpse,
+                    None,
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                aq.dispatch(Task::HaulCorpse { dest });
+            }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
+}
+
+/// Phase 5e-viii-b `EngagePrey` dispatcher. Fires when a hunter at the chief's
+/// hunt area finds a live prey entity (vision or memory) or a fresh corpse to
+/// pick up. Two methods compete via argmax: `HuntPreyMethod` emits
+/// `[Task::Hunt { prey }]` when prey is targetable; `PickUpFreshCorpseMethod`
+/// emits `[Task::PickUpCorpse { corpse }]` when a fresh kill is on the
+/// ground. World-state transitions (prey alive → prey dead → corpse) drive
+/// method selection between dispatch ticks — there's no chain handoff
+/// because each method emits a single task.
+///
+/// Gating: hunter profession + `HUNTING_SPEAR` learned + faction holds
+/// `HuntOrder::Hunt` + agent carries no `Carrying` (delivery phase belongs
+/// to `htn_deliver_hunt_kill_dispatch_system`) + no `ActivePlan`
+/// (truncated `HuntFood` plan owns `[Muster, Travel]` then completes —
+/// HTN takes over here). Replaces the middle two steps of the legacy
+/// `HuntFood` plan (PlanId 5): `[StepId(5) Hunt, StepId(53) PickUpCorpse]`.
+pub fn htn_engage_prey_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    door_map: Res<crate::simulation::construction::DoorMap>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    corpse_map: Res<crate::simulation::corpse::CorpseMap>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    clock: Res<SimClock>,
+    prey_query: Query<
+        (&Transform, &crate::simulation::combat::Health),
+        Or<(
+            With<crate::simulation::animals::Wolf>,
+            With<crate::simulation::animals::Deer>,
+        )>,
+    >,
+    corpse_query: Query<&crate::simulation::corpse::Corpse>,
+    knowledge_query: Query<&crate::simulation::knowledge::PersonKnowledge>,
+    mut query: Query<
+        (
+            Entity,
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &mut crate::simulation::combat::CombatTarget,
+            &Transform,
+            &FactionMember,
+            &Profession,
+            &LodLevel,
+            Option<&ActivePlan>,
+            Option<&AgentMemory>,
+            Option<&crate::simulation::corpse::Carrying>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    use crate::simulation::faction::HuntOrder;
+    use crate::simulation::technology::HUNTING_SPEAR;
+    const VIEW_RADIUS: i32 = 15;
+    let now = clock.tick;
+    for (
+        agent,
+        mut ai,
+        mut aq,
+        mut history,
+        mut combat_target,
+        transform,
+        member,
+        profession,
+        lod,
+        active_plan_opt,
+        memory_opt,
+        carrying_opt,
+    ) in query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*profession, Profession::Hunter) {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if carrying_opt.is_some() {
+            // Delivery phase belongs to `htn_deliver_hunt_kill_dispatch_system`.
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+        // Per-person tech gate: matches the legacy plan's tech_gate +
+        // `faction_hunter_assignment_system`'s personal Learned check.
+        let Ok(knowledge) = knowledge_query.get(agent) else {
+            continue;
+        };
+        if !knowledge.has_learned(HUNTING_SPEAR) {
+            continue;
+        }
+        // Faction must be in Hunt phase (not Scout). Without a Hunt order
+        // there's no "hunt area" semantics, so the dispatcher has nothing
+        // to do.
+        let Some(faction) = faction_registry.factions.get(&member.faction_id) else {
+            continue;
+        };
+        let Some(hunt_order) = faction.hunt_order.as_ref() else {
+            continue;
+        };
+        if !matches!(hunt_order, HuntOrder::Hunt { .. }) {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_z = ai.current_z;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Scan for prey within VIEW_RADIUS (LOS-checked). Mirrors
+        // `StepTarget::HuntPrey` resolver — vision first, memory fallback.
+        let mut prey: Option<(Entity, (i32, i32))> = None;
+        let mut prey_dist = i32::MAX;
+        for dy in -VIEW_RADIUS..=VIEW_RADIUS {
+            for dx in -VIEW_RADIUS..=VIEW_RADIUS {
+                if dx * dx + dy * dy > VIEW_RADIUS * VIEW_RADIUS {
+                    continue;
+                }
+                let tx = cur_tx + dx;
+                let ty = cur_ty + dy;
+                let to_z = chunk_map.surface_z_at(tx, ty) as i8;
+                if !crate::simulation::line_of_sight::has_los(
+                    &chunk_map,
+                    &door_map,
+                    (cur_tx, cur_ty, cur_z),
+                    (tx, ty, to_z),
+                ) {
+                    continue;
+                }
+                for &candidate in spatial.get(tx, ty) {
+                    if let Ok((_t, health)) = prey_query.get(candidate) {
+                        if !health.is_dead() {
+                            let dist = dx.abs() + dy.abs();
+                            if dist < prey_dist {
+                                prey_dist = dist;
+                                prey = Some((candidate, (tx, ty)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if prey.is_none() {
+            if let Some(mem) = memory_opt {
+                if let Some((entity, tx, ty)) =
+                    mem.best_entity_for_dist_weighted(MemoryKind::Prey, (cur_tx, cur_ty))
+                {
+                    prey = Some((entity, (tx, ty)));
+                }
+            }
+        }
+
+        // Scan CorpseMap for the nearest fresh corpse within VIEW_RADIUS.
+        // Mirrors `StepTarget::NearestFreshCorpse` resolver.
+        let mut corpse: Option<(Entity, (i32, i32))> = None;
+        let mut corpse_dist = i32::MAX;
+        for dy in -VIEW_RADIUS..=VIEW_RADIUS {
+            for dx in -VIEW_RADIUS..=VIEW_RADIUS {
+                if dx * dx + dy * dy > VIEW_RADIUS * VIEW_RADIUS {
+                    continue;
+                }
+                let tx = cur_tx + dx;
+                let ty = cur_ty + dy;
+                if let Some(entities) = corpse_map.0.get(&(tx, ty)) {
+                    for &e in entities {
+                        if corpse_query.get(e).is_err() {
+                            continue;
+                        }
+                        let dist = dx.abs() + dy.abs();
+                        if dist < corpse_dist {
+                            corpse_dist = dist;
+                            corpse = Some((e, (tx, ty)));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cheap reject: if neither prey nor corpse is in range, no method's
+        // precondition can fire.
+        if prey.is_none() && corpse.is_none() {
+            continue;
+        }
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home: faction_registry.home_tile(member.faction_id),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: None,
+            scavenge_target_entity: None,
+            scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: prey.map(|(e, _)| e),
+            prey_target_tile: prey.map(|(_, t)| t),
+            fresh_corpse_entity: corpse.map(|(e, _)| e),
+            fresh_corpse_tile: corpse.map(|(_, t)| t),
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
+        };
+
+        let abstract_task = AbstractTask::EngagePrey;
+        let methods = method_registry.methods_for(AbstractTaskKind::EngagePrey);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        match head {
+            Task::Hunt { prey } => {
+                let Some((_, prey_tile)) = ctx
+                    .prey_target_entity
+                    .zip(ctx.prey_target_tile)
+                else {
+                    ai.active_method = None;
+                    continue;
+                };
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    prey_tile,
+                    TaskKind::Hunter,
+                    Some(prey),
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                combat_target.0 = Some(prey);
+                aq.dispatch(Task::Hunt { prey });
+            }
+            Task::PickUpCorpse { corpse } => {
+                let Some(corpse_tile) = ctx.fresh_corpse_tile else {
+                    ai.active_method = None;
+                    continue;
+                };
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    corpse_tile,
+                    TaskKind::PickUpCorpse,
+                    Some(corpse),
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                aq.dispatch(Task::PickUpCorpse { corpse });
+            }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
+}
+
+/// Phase 5e-viii-c `JoinHuntParty` dispatcher. Fires for any hunter with
+/// Learned `HUNTING_SPEAR` while the chief holds `HuntOrder::Hunt` and the
+/// agent doesn't yet carry a corpse. Two methods compete via argmax based
+/// on the order's `deployed_tick` state: `MusterAtHearthMethod` walks to
+/// the muster hearth while the party hasn't yet deployed (and isn't
+/// stale); `TravelToHuntAreaMethod` walks to the chief's `area_tile` once
+/// deployed (or stale). Replaces the leading two steps of the legacy
+/// `HuntFood` plan (PlanId 5): `[StepId(57) HuntPartyMuster, StepId(58)
+/// TravelToHuntArea]`.
+///
+/// On the Travel leg, routing destination is the area_tile but the typed
+/// task is `Task::Explore { kind: Prey }` — the agent IS scanning for prey
+/// memory along the path (which `vision_system` records), and on arrival
+/// `goal_dispatch_system`'s catch-all flips Idle, freeing the next dispatch
+/// tick for `htn_engage_prey_dispatch_system` to take over.
+pub fn htn_join_hunt_party_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    campfire_map: Res<crate::simulation::construction::CampfireMap>,
+    clock: Res<SimClock>,
+    knowledge_query: Query<&crate::simulation::knowledge::PersonKnowledge>,
+    mut query: Query<
+        (
+            Entity,
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &Transform,
+            &FactionMember,
+            &Profession,
+            &LodLevel,
+            Option<&ActivePlan>,
+            Option<&crate::simulation::corpse::Carrying>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    use crate::simulation::faction::{HuntOrder, HUNT_PARTY_TIMEOUT};
+    use crate::simulation::technology::HUNTING_SPEAR;
+    let now = clock.tick;
+    for (
+        agent,
+        mut ai,
+        mut aq,
+        mut history,
+        transform,
+        member,
+        profession,
+        lod,
+        active_plan_opt,
+        carrying_opt,
+    ) in query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*profession, Profession::Hunter) {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if carrying_opt.is_some() {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+        let Ok(knowledge) = knowledge_query.get(agent) else {
+            continue;
+        };
+        if !knowledge.has_learned(HUNTING_SPEAR) {
+            continue;
+        }
+        let Some(faction) = faction_registry.factions.get(&member.faction_id) else {
+            continue;
+        };
+        let Some(hunt_order) = faction.hunt_order.as_ref() else {
+            continue;
+        };
+        let HuntOrder::Hunt {
+            area_tile,
+            deployed_tick,
+            posted_tick,
+            ..
+        } = hunt_order
+        else {
+            continue;
+        };
+        let area_tile = *area_tile;
+        let deployed = deployed_tick.is_some();
+        let stale = now.saturating_sub(*posted_tick) > HUNT_PARTY_TIMEOUT;
+
+        // Resolve hearth: nearest campfire to area_tile, falling back to
+        // faction home_tile. Mirrors `StepTarget::HearthForHunt`.
+        let mut best: Option<(i32, i32)> = None;
+        let mut best_dist = i32::MAX;
+        for (&tile, _e) in campfire_map.0.iter() {
+            let dist = (tile.0 - area_tile.0).abs() + (tile.1 - area_tile.1).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best = Some(tile);
+            }
+        }
+        let hearth = best.or_else(|| faction_registry.home_tile(member.faction_id));
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home: faction_registry.home_tile(member.faction_id),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: None,
+            scavenge_target_entity: None,
+            scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: hearth,
+            hunt_area_tile: Some(area_tile),
+            hunt_party_deployed: deployed,
+            hunt_party_stale: stale,
+        };
+
+        let abstract_task = AbstractTask::JoinHuntParty;
+        let methods = method_registry.methods_for(AbstractTaskKind::JoinHuntParty);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        match head {
+            Task::HuntPartyMuster { hearth } => {
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    hearth,
+                    TaskKind::HuntPartyMuster,
+                    None,
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                aq.dispatch(Task::HuntPartyMuster { hearth });
+            }
+            Task::Explore { kind } => {
+                // Travel: route destination is the chief's area_tile, even
+                // though the typed variant is the generic Explore (which
+                // semantically also wants memory of `kind` along the way —
+                // `vision_system` records as the agent walks).
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    area_tile,
+                    TaskKind::Explore,
+                    None,
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                aq.dispatch(Task::Explore { kind });
+            }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
+}
+
+/// `AgentGoal::Socialize` dispatcher. The agent walks to the nearest other
+/// Person within 12 tiles and sits adjacent to converse. Single-method
+/// registry — `SocializeWithPartnerMethod` always wins. Replaces the legacy
+/// `Socialize` plan (PlanId 60) and its single step (StepId 48
+/// NearestPlayPartner).
+///
+/// Filtering: scans `SpatialIndex` and rejects entities that aren't a
+/// `Person` (blueprints, ground items, animals all lack the marker), and
+/// excludes the agent itself. The legacy resolver double-checked via
+/// `prey_query` / `wild_horse_q` etc; with the explicit `Person` filter
+/// here the rejection list collapses to one component check.
+///
+/// Goal-agnostic about lifecycle: there's no chain handoff (single-leg),
+/// `task_drops_hand_load` already drops carried items at task entry, and
+/// the agent stays in `TaskKind::Socialize` until `goal_update_system`
+/// flips them off `AgentGoal::Socialize` (typically when `needs.social`
+/// has dropped enough to defuse the trigger). The
+/// `goal_dispatch_system` stale-reset arm preserves the task across
+/// dispatch ticks while the goal stays Socialize.
+pub fn htn_socialize_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    clock: Res<SimClock>,
+    person_query: Query<(), With<crate::simulation::person::Person>>,
+    mut query: Query<
+        (
+            Entity,
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+            Option<&ActivePlan>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    const PARTNER_RADIUS: i32 = 12;
+    let now = clock.tick;
+    for (
+        agent,
+        mut ai,
+        mut aq,
+        mut history,
+        goal,
+        transform,
+        member,
+        lod,
+        active_plan_opt,
+    ) in query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::Socialize) {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Scan SpatialIndex within PARTNER_RADIUS for the nearest other Person.
+        // Mirrors the legacy `NearestPlayPartner` resolver; the explicit
+        // `Person` marker filter collapses the resolver's blueprint / item /
+        // animal rejection list into a single component check.
+        let mut best: Option<(Entity, (i32, i32))> = None;
+        let mut best_dist = i32::MAX;
+        for dy in -PARTNER_RADIUS..=PARTNER_RADIUS {
+            for dx in -PARTNER_RADIUS..=PARTNER_RADIUS {
+                let tx = cur_tx + dx;
+                let ty = cur_ty + dy;
+                for &candidate in spatial.get(tx, ty) {
+                    if candidate == agent {
+                        continue;
+                    }
+                    if person_query.get(candidate).is_err() {
+                        continue;
+                    }
+                    let dist = dx.abs() + dy.abs();
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best = Some((candidate, (tx, ty)));
+                    }
+                }
+            }
+        }
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home: faction_registry.home_tile(member.faction_id),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: None,
+            scavenge_target_entity: best.map(|(e, _)| e),
+            scavenge_target_tile: best.map(|(_, t)| t),
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
+        };
+
+        let abstract_task = AbstractTask::Socialize;
+        let methods = method_registry.methods_for(AbstractTaskKind::Socialize);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        match head {
+            Task::Socialize { partner } => {
+                let Some((_, partner_tile)) = best else {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedTarget, now);
+                    continue;
+                };
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    partner_tile,
+                    TaskKind::Socialize,
+                    Some(partner),
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                aq.dispatch(Task::Socialize { partner });
+            }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
+}
+
+/// `AgentGoal::{Raid, Defend, Lead, Rescue}` dispatcher (Phase 5e-x).
+/// Single system covers the four single-step combat/faction goals because
+/// they share a near-identical shape: gate on goal, resolve a destination
+/// tile from `FactionRegistry` (or the agent's `RescueTarget`), expand a
+/// sole-method registry, route via `assign_task_with_routing`, dispatch
+/// the typed variant. Rescue alone writes `CombatTarget` for engagement.
+///
+/// Replaces legacy plans `RescueAlly` (PlanId 23 + StepId 27 EngageRescue),
+/// `Raid` (PlanId 61 + StepId 49 FactionRaidTarget), `Defend` (PlanId 62
+/// + StepId 50 FactionCamp), `Lead` (PlanId 63 + StepId 51 FactionCamp).
+pub fn htn_combat_faction_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    clock: Res<SimClock>,
+    chief_query: Query<(), With<crate::simulation::faction::FactionChief>>,
+    rescue_query: Query<&crate::simulation::goals::RescueTarget>,
+    mut query: Query<
+        (
+            Entity,
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &mut crate::simulation::combat::CombatTarget,
+            &AgentGoal,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+            Option<&ActivePlan>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    let now = clock.tick;
+    for (
+        agent,
+        mut ai,
+        mut aq,
+        mut history,
+        mut combat_target,
+        goal,
+        transform,
+        member,
+        lod,
+        active_plan_opt,
+    ) in query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+
+        // Per-goal target resolution.
+        let (abstract_task, abstract_kind, dest, target_entity, task_kind) = match *goal {
+            AgentGoal::Raid => {
+                let Some(target_faction) = faction_registry.raid_target(member.faction_id) else {
+                    continue;
+                };
+                let Some(dest) = faction_registry.home_tile(target_faction) else {
+                    continue;
+                };
+                (
+                    AbstractTask::Raid,
+                    AbstractTaskKind::Raid,
+                    dest,
+                    None,
+                    TaskKind::Raid,
+                )
+            }
+            AgentGoal::Defend => {
+                let Some(dest) = faction_registry.home_tile(member.faction_id) else {
+                    continue;
+                };
+                (
+                    AbstractTask::Defend,
+                    AbstractTaskKind::Defend,
+                    dest,
+                    None,
+                    TaskKind::Defend,
+                )
+            }
+            AgentGoal::Lead => {
+                if chief_query.get(agent).is_err() {
+                    continue;
+                }
+                let Some(dest) = faction_registry.home_tile(member.faction_id) else {
+                    continue;
+                };
+                (
+                    AbstractTask::Lead,
+                    AbstractTaskKind::Lead,
+                    dest,
+                    None,
+                    TaskKind::Lead,
+                )
+            }
+            AgentGoal::Rescue => {
+                let Ok(rt) = rescue_query.get(agent) else {
+                    continue;
+                };
+                (
+                    AbstractTask::RescueAlly,
+                    AbstractTaskKind::RescueAlly,
+                    rt.attacker_tile,
+                    Some(rt.attacker),
+                    // RescueAlly's legacy step used TaskKind::Defend so the
+                    // existing stale-reset / hands-checks behave the same;
+                    // the typed variant is the discriminator for executor
+                    // logic that needs to differentiate.
+                    TaskKind::Defend,
+                )
+            }
+            _ => continue,
+        };
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home: faction_registry.home_tile(member.faction_id),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            // Raid / Defend / Lead use the gather_target_tile slot for the
+            // single destination tile.
+            gather_target_tile: if matches!(*goal, AgentGoal::Rescue) {
+                None
+            } else {
+                Some(dest)
+            },
+            // RescueAlly carries (attacker_entity, attacker_tile) via the
+            // scavenge slots — semantically "any entity to walk to".
+            scavenge_target_entity: target_entity,
+            scavenge_target_tile: if matches!(*goal, AgentGoal::Rescue) {
+                Some(dest)
+            } else {
+                None
+            },
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
+        };
+
+        let methods = method_registry.methods_for(abstract_kind);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        // For Rescue, set CombatTarget so combat_system engages on adjacency.
+        if matches!(*goal, AgentGoal::Rescue) {
+            combat_target.0 = target_entity;
+        }
+        let route_target_entity = if matches!(*goal, AgentGoal::Rescue) {
+            target_entity
+        } else {
+            None
+        };
+        let dispatched = assign_task_with_routing(
+            &mut ai,
+            (cur_tx, cur_ty),
+            cur_chunk,
+            dest,
+            task_kind,
+            route_target_entity,
+            &chunk_graph,
+            &chunk_router,
+            &chunk_map,
+            &chunk_connectivity,
+        );
+        if !dispatched {
+            ai.active_method = None;
+            history.push(chosen_id, MethodOutcome::FailedRouting, now);
+            if matches!(*goal, AgentGoal::Rescue) {
+                combat_target.0 = None;
+            }
+            continue;
+        }
+        aq.dispatch(head);
         for task in tasks {
             let _ = aq.enqueue(task);
         }
@@ -5113,6 +6977,15 @@ mod tests {
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         }
     }
 
@@ -5138,6 +7011,15 @@ mod tests {
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         }
     }
 
@@ -5163,6 +7045,15 @@ mod tests {
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         }
     }
 
@@ -5192,6 +7083,15 @@ mod tests {
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         }
     }
 
@@ -5220,6 +7120,15 @@ mod tests {
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         }
     }
 
@@ -5258,6 +7167,15 @@ mod tests {
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         }
     }
 
@@ -5555,6 +7473,15 @@ mod tests {
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         }
     }
 
@@ -5672,6 +7599,15 @@ mod tests {
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         }
     }
 
@@ -5812,6 +7748,15 @@ mod tests {
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         }
     }
 
@@ -6008,6 +7953,15 @@ mod tests {
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         }
     }
 
@@ -6378,6 +8332,15 @@ mod tests {
             gather_deposit_tile: None,
             scavenge_deposit_tile: None,
             forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
         }
     }
 

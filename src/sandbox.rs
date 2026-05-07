@@ -104,7 +104,6 @@ fn setup_sandbox(
                 PlanId::HUNT_FOOD,
                 // SCAVENGE_FOOD retired 5c-ii-d-vi.
                 PlanId::BUILD_BLUEPRINT,
-                PlanId::RESCUE_ALLY,
                 PlanId::PLAY_SOCIAL,
                 PlanId::PLAY_SOLO,
                 PlanId::HAUL_FROM_STORAGE_AND_BUILD,
@@ -115,10 +114,8 @@ fn setup_sandbox(
                 // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
                 // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
                 // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
-                PlanId::SOCIALIZE,
-                PlanId::RAID,
-                PlanId::DEFEND,
-                PlanId::LEAD,
+                // SOCIALIZE retired in Phase 5e-ix (HTN method).
+                // RESCUE_ALLY / RAID / DEFEND / LEAD retired in Phase 5e-x (HTN method).
             ]),
             PlanHistory::default(),
             PlanScoringMethod::Weighted,

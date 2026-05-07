@@ -485,7 +485,8 @@ pub fn spawn_population(
                         // FORAGE_FOOD retired in the Forage→HTN migration.
                         PlanId::FARM_FOOD,
                         // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
-                        PlanId::HUNT_FOOD,
+                        // HUNT_FOOD retired in Phase 5e-viii-c (HTN abstract
+                        // tasks JoinHuntParty / EngagePrey / DeliverHuntKill).
                         // SCAVENGE_FOOD retired 5c-ii-d-vi.
                         PlanId::BUILD_BLUEPRINT,
                         // TAME_HORSE retired in Phase 5e-iv (HTN method).
@@ -493,7 +494,6 @@ pub fn spawn_population(
                         PlanId::DELIVER_GRAIN_TO_CRAFT_ORDER,
                         PlanId::DELIVER_FROM_STORAGE_TO_CRAFT_ORDER,
                         PlanId::WORK_ON_CRAFT,
-                        PlanId::RESCUE_ALLY,
                         // RETURN_SURPLUS_FOOD retired in Phase 5e-iii (HTN method).
                         PlanId::PLAY_SOCIAL,
                         PlanId::PLAY_SOLO,
@@ -505,10 +505,8 @@ pub fn spawn_population(
                         // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
                         // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
                         // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
-                        PlanId::SOCIALIZE,
-                        PlanId::RAID,
-                        PlanId::DEFEND,
-                        PlanId::LEAD,
+                        // SOCIALIZE retired in Phase 5e-ix (HTN method).
+                        // RESCUE_ALLY / RAID / DEFEND / LEAD retired in Phase 5e-x (HTN method).
                         // ACQUIRE_HUNTING_SPEAR retired in Phase 5e-ii (HTN method).
                         // SCOUT_FOR_PREY retired in Phase 5e (HTN method).
                     ]),

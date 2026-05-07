@@ -162,9 +162,14 @@ pub fn pickup_corpse_task_system(
 /// abort the plan cleanly.
 pub fn haul_corpse_task_system(
     clock: Res<SimClock>,
-    mut agents: Query<(&mut PersonAI, &BucketSlot, &LodLevel)>,
+    mut agents: Query<(
+        &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
+        &BucketSlot,
+        &LodLevel,
+    )>,
 ) {
-    for (mut ai, slot, lod) in agents.iter_mut() {
+    for (mut ai, mut aq, slot, lod) in agents.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -173,6 +178,21 @@ pub fn haul_corpse_task_system(
         }
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
+        aq.advance();
+        // Phase 5e-viii-a chain handoff: when the queued head was
+        // `Task::Butcher` (DeliverHuntKillMethod's tail), `aq.advance()`
+        // just promoted it into `aq.current`. Prime the legacy channel so
+        // `butcher_task_system` picks up next tick (Butcher is in-place —
+        // no routing). Mirrors `production::finish_withdraw_food`'s Eat
+        // handoff. Plan-driven dispatch (legacy PlanId 5 was truncated, but
+        // any in-flight plan with stale step state would land here too)
+        // will re-prime via `plan_execution_system` next tick anyway, so
+        // this in-place priming is HTN-specific and benign for legacy.
+        if aq.current.is_butcher() {
+            ai.state = AiState::Working;
+            ai.task_id = TaskKind::Butcher as u16;
+            ai.work_progress = 0;
+        }
     }
 }
 
@@ -194,6 +214,7 @@ pub fn butcher_task_system(
     mut agents: Query<(
         Entity,
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &Transform,
         &BucketSlot,
         &LodLevel,
@@ -202,7 +223,9 @@ pub fn butcher_task_system(
         Option<&Carrying>,
     )>,
 ) {
-    for (entity, mut ai, transform, slot, lod, mut skills, member, carrying) in agents.iter_mut() {
+    for (entity, mut ai, mut aq, transform, slot, lod, mut skills, member, carrying) in
+        agents.iter_mut()
+    {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -215,6 +238,7 @@ pub fn butcher_task_system(
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
+            aq.advance();
             continue;
         };
 
@@ -224,6 +248,7 @@ pub fn butcher_task_system(
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
+            aq.advance();
             continue;
         };
 
@@ -257,6 +282,7 @@ pub fn butcher_task_system(
         ai.state = AiState::Idle;
         ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
+        aq.advance();
     }
 }
 
@@ -277,12 +303,13 @@ pub fn wait_for_party_task_system(
     mut agents: Query<(
         Entity,
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &FactionMember,
         &BucketSlot,
         &LodLevel,
     )>,
 ) {
-    for (entity, mut ai, member, slot, lod) in agents.iter_mut() {
+    for (entity, mut ai, mut aq, member, slot, lod) in agents.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -292,12 +319,14 @@ pub fn wait_for_party_task_system(
         let Some(faction) = registry.factions.get_mut(&member.faction_id) else {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
+            aq.advance();
             continue;
         };
         let Some(order) = faction.hunt_order.as_mut() else {
             // Chief cleared the order — abort the wait.
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
+            aq.advance();
             continue;
         };
         match order {
@@ -320,6 +349,7 @@ pub fn wait_for_party_task_system(
                 if ready || stale {
                     ai.state = AiState::Idle;
                     ai.task_id = PersonAI::UNEMPLOYED;
+                    aq.advance();
                 }
                 // else: keep waiting (state stays Working).
             }
@@ -328,6 +358,7 @@ pub fn wait_for_party_task_system(
                 // Bail so the plan ends and the next pick can be ScoutForPrey.
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
+                aq.advance();
             }
         }
     }

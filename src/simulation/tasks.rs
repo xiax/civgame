@@ -750,6 +750,74 @@ pub fn goal_dispatch_system(
                     AgentGoal::GatherFood if ai.task_id == TaskKind::Explore as u16 => {
                         Some(TaskKind::Explore as u16)
                     }
+                    // Phase 5e-viii-a: HTN-driven DeliverHuntKill chain runs
+                    // without an ActivePlan after the truncated `HuntFood`
+                    // plan completes at PickUp. Both legs (HaulCorpse +
+                    // Butcher) survive across goal-dispatch ticks regardless
+                    // of the agent's goal — `Carrying` is a per-agent
+                    // obligation that takes precedence over need-driven goal
+                    // flips. Mirrors the method's `MF_UNINTERRUPTIBLE` flag.
+                    _ if ai.task_id == TaskKind::HaulCorpse as u16 => {
+                        Some(TaskKind::HaulCorpse as u16)
+                    }
+                    _ if ai.task_id == TaskKind::Butcher as u16 => {
+                        Some(TaskKind::Butcher as u16)
+                    }
+                    // Phase 5e-viii-b: HTN-driven EngagePrey runs without an
+                    // ActivePlan after the truncated `HuntFood` plan completes
+                    // at Travel. Hunt walks to prey + engages combat;
+                    // PickUpCorpse retrieves a fresh kill. Both survive across
+                    // dispatch ticks regardless of `AgentGoal` — chief's
+                    // `HuntOrder::Hunt` is the standing obligation that
+                    // overrides need-driven goal flips. Mirrors the methods'
+                    // `MF_UNINTERRUPTIBLE` flag.
+                    _ if ai.task_id == TaskKind::Hunter as u16 => {
+                        Some(TaskKind::Hunter as u16)
+                    }
+                    _ if ai.task_id == TaskKind::PickUpCorpse as u16 => {
+                        Some(TaskKind::PickUpCorpse as u16)
+                    }
+                    // Phase 5e-viii-c: HTN-driven JoinHuntParty's Muster leg
+                    // runs without an ActivePlan. The Travel leg uses
+                    // TaskKind::Explore which is already preserved by the
+                    // existing Survive / GatherFood arms above (and the
+                    // catch-all below flips Idle on arrival). Goal-agnostic
+                    // because the chief's HuntOrder::Hunt is a faction-level
+                    // obligation that overrides need-driven goal flips.
+                    _ if ai.task_id == TaskKind::HuntPartyMuster as u16 => {
+                        Some(TaskKind::HuntPartyMuster as u16)
+                    }
+                    // Phase 5e-ix: HTN-driven Socialize runs without an
+                    // ActivePlan under the Socialize goal. The single
+                    // Socialize task survives across goal-dispatch ticks
+                    // until `goal_update_system` flips the agent off
+                    // `AgentGoal::Socialize` (typically when needs.social
+                    // has dropped enough to defuse the trigger).
+                    AgentGoal::Socialize if ai.task_id == TaskKind::Socialize as u16 => {
+                        Some(TaskKind::Socialize as u16)
+                    }
+                    // Phase 5e-x: HTN-driven combat/faction tasks run
+                    // without an ActivePlan. Each survives across
+                    // goal-dispatch ticks while the goal stays the same;
+                    // `goal_update_system` is what eventually peels the
+                    // agent off (faction stops being under raid /
+                    // raid_target clears / RescueTarget timeout / chief
+                    // hunger).
+                    AgentGoal::Raid if ai.task_id == TaskKind::Raid as u16 => {
+                        Some(TaskKind::Raid as u16)
+                    }
+                    AgentGoal::Defend if ai.task_id == TaskKind::Defend as u16 => {
+                        Some(TaskKind::Defend as u16)
+                    }
+                    AgentGoal::Lead if ai.task_id == TaskKind::Lead as u16 => {
+                        Some(TaskKind::Lead as u16)
+                    }
+                    // RescueAlly's HTN method dispatches with
+                    // TaskKind::Defend (mirrors the legacy step's
+                    // task field) so the same arm shape covers it.
+                    AgentGoal::Rescue if ai.task_id == TaskKind::Defend as u16 => {
+                        Some(TaskKind::Defend as u16)
+                    }
                     _ => None,
                 };
 

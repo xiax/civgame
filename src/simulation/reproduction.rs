@@ -502,14 +502,14 @@ pub fn pregnancy_system(
                     // FORAGE_FOOD retired in the Forage→HTN migration.
                     PlanId::FARM_FOOD,
                     // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
-                    PlanId::HUNT_FOOD,
+                    // HUNT_FOOD retired in Phase 5e-viii-c (HTN abstract
+                    // tasks JoinHuntParty / EngagePrey / DeliverHuntKill).
                     // SCAVENGE_FOOD retired 5c-ii-d-vi.
                     PlanId::BUILD_BLUEPRINT,
                     PlanId::DELIVER_HIDE_TO_CRAFT_ORDER,
                     PlanId::DELIVER_GRAIN_TO_CRAFT_ORDER,
                     PlanId::DELIVER_FROM_STORAGE_TO_CRAFT_ORDER,
                     PlanId::WORK_ON_CRAFT,
-                    PlanId::RESCUE_ALLY,
                     PlanId::PLAY_SOCIAL,
                     PlanId::PLAY_SOLO,
                     PlanId::HAUL_FROM_STORAGE_AND_BUILD,
@@ -520,10 +520,8 @@ pub fn pregnancy_system(
                     // EXPLORE_FOR_FOOD retired 5c-ii-d-vi.
                     // EXPLORE_FOR_WOOD / EXPLORE_FOR_STONE retired 5c-ii-d-iv-ii.
                     // SCAVENGE_WOOD / SCAVENGE_STONE retired 5c-ii-d-ii-b.
-                    PlanId::SOCIALIZE,
-                    PlanId::RAID,
-                    PlanId::DEFEND,
-                    PlanId::LEAD,
+                    // SOCIALIZE retired in Phase 5e-ix (HTN method).
+                    // RESCUE_ALLY / RAID / DEFEND / LEAD retired in Phase 5e-x (HTN method).
                 ]),
                 PlanHistory::default(),
                 MethodHistory::default(),

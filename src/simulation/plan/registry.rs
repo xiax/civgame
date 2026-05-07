@@ -65,11 +65,14 @@ static PLAN_STEPS_1: &[StepId] = &[StepId(1), StepId(12)]; // FarmFood → Depos
 // them as the first leg of their play-driven planting chains.
 static PLAN_STEPS_67: &[StepId] = &[StepId(60), StepId(62)]; // PlayByPlantingBerry: WithdrawBerrySeed → PlantBerrySeedAsPlay
 // HuntFood: muster at hearth → wait for party → travel to chief's area →
-// engage prey → corpse pickup/haul/butcher. The first three steps fold the
-// chief's hunting-party formation into the existing hunter pipeline so all
-// hunters depart together rather than each agent independently sniping prey.
-static PLAN_STEPS_5: &[StepId] =
-    &[StepId(57), StepId(58), StepId(5), StepId(53), StepId(54), StepId(55)]; // MusterAtHearth → TravelToHuntArea → Hunt → PickUpCorpse → HaulCorpse → Butcher
+// PLAN_STEPS_5 retired in Phase 5e-viii-c — the legacy `HuntFood` plan
+// (PlanId 5) is fully replaced by three HTN abstract tasks:
+// `JoinHuntParty` (Muster + Travel), `EngagePrey` (Hunt + PickUpCorpse), and
+// `DeliverHuntKill` (HaulCorpse + Butcher). StepDefs 5/53/54/55/57/58 survive
+// in the registry as orphans for in-flight ActivePlan compatibility;
+// `StepId::HUNT` / `StepId::PICK_UP_CORPSE` / `StepId::HAUL_CORPSE` /
+// `StepId::BUTCHER` / `StepId::MUSTER_AT_HEARTH` / `StepId::TRAVEL_TO_HUNT_AREA`
+// consts are kept as PlanHistory ring-buffer sentinels.
 // PLAN_STEPS_HUNTER_ARM retired in Phase 5e-ii — `htn_equip_hunting_spear_dispatch_system`
 // + `WithdrawAndEquipHuntingSpearMethod` own the [WithdrawSpear, EquipMainHand]
 // expansion now.
@@ -117,7 +120,8 @@ static HAUL_GOALS: &[AgentGoal] = &[AgentGoal::Haul];
 static CRAFT_GOALS: &[AgentGoal] = &[AgentGoal::Craft];
 static RESCUE_GOALS: &[AgentGoal] = &[AgentGoal::Rescue];
 
-static PLAN_STEPS_23: &[StepId] = &[StepId(27)]; // RescueAlly: EngageRescue
+// Phase 5e-x: PLAN_STEPS_23 retired. The HTN
+// `htn_combat_faction_dispatch_system` dispatches the rescue chain directly.
 // PLAN_STEPS_24 retired in Phase 5e-iii — `htn_return_surplus_dispatch_system`
 // + `DepositSurplusAtStorageMethod` own the deposit-at-storage chain. StepId(12)
 // is still defined and shared by FarmFood (PlanId 1) + WorkOnCraft (PlanId 16).
@@ -177,18 +181,11 @@ static PLAN_STEPS_16: &[StepId] = &[StepId(39), StepId(12)]; // WorkOnCraft → 
 // referenced by any plan but kept in the StepRegistry for in-flight
 // ActivePlan compatibility (mirrors the StepId(41/42) ClaimedHaul pattern).
 
-// Social-goal plans (60-63). Each is a single-step plan whose target lookup
-// matches what `goal_dispatch_system` used to do inline — see the StepDef
-// notes at IDs 48-51 for resolver details.
-static PLAN_STEPS_SOCIALIZE: &[StepId] = &[StepId(48)];
-static PLAN_STEPS_RAID: &[StepId] = &[StepId(49)];
-static PLAN_STEPS_DEFEND: &[StepId] = &[StepId(50)];
-static PLAN_STEPS_LEAD: &[StepId] = &[StepId(51)];
-
-static SOCIALIZE_GOALS: &[AgentGoal] = &[AgentGoal::Socialize];
-static RAID_GOALS: &[AgentGoal] = &[AgentGoal::Raid];
-static DEFEND_GOALS: &[AgentGoal] = &[AgentGoal::Defend];
-static LEAD_GOALS: &[AgentGoal] = &[AgentGoal::Lead];
+// Phase 5e-ix retired PLAN_STEPS_SOCIALIZE / SOCIALIZE_GOALS;
+// Phase 5e-x retired PLAN_STEPS_RAID / DEFEND / LEAD + corresponding
+// *_GOALS arrays. All four social/military single-step plans now dispatch
+// via `htn_combat_faction_dispatch_system` (Raid / Defend / Lead) and
+// `htn_socialize_dispatch_system` (Socialize).
 
 pub fn register_builtin_steps(registry: &mut StepRegistry) {
     registry.0 = vec![
@@ -456,14 +453,16 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             withdraw_filter: None,
         },
         StepDef {
-            // 27: EngageRescue — route to the attacker stored on RescueTarget and engage.
-            // CombatTarget is already set by respond_to_distress_system; combat_system
-            // takes over as soon as the responder is adjacent.
+            // 27: (unused — Phase 5e-x retired the legacy `RescueAlly`
+            // plan (PlanId 23) and its `EngageRescue` step. The HTN
+            // `htn_combat_faction_dispatch_system` reads `RescueTarget`
+            // directly. The const `StepId::ENGAGE_RESCUE = StepId(27)`
+            // survives only as a stable sentinel.)
             id: StepId(27),
-            task: TaskKind::Defend,
-            target: StepTarget::RescueAttacker,
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
-            reward_scale: 1.5,
+            reward_scale: 0.0,
             plant_filter: None,
             withdraw_filter: None,
         },
@@ -735,49 +734,50 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
         // goal arms in `tasks::goal_dispatch_system`. Now plan-driven so
         // every goal flows through `plan_execution_system`.
         StepDef {
-            // 48: Socialize at the nearest other Person. Reuses
-            // `NearestPlayPartner` (radius 12 spatial scan filtering out
-            // animals/blueprints) — the resolver returns a partner entity
-            // and tile, then `assign_task_with_routing` walks the agent
-            // there with TaskKind::Socialize.
+            // 48: (unused — Phase 5e-ix retired the legacy `Socialize` plan
+            // (PlanId 60) and its `NearestPlayPartner` step. The HTN
+            // `htn_socialize_dispatch_system` does the equivalent
+            // `SpatialIndex` scan and dispatches `Task::Socialize { partner }`
+            // directly. The const `StepId::SOCIALIZE = StepId(48)` survives
+            // only as a stable sentinel for in-flight ActivePlan
+            // compatibility.)
             id: StepId(48),
-            task: TaskKind::Socialize,
-            target: StepTarget::NearestPlayPartner,
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
-            reward_scale: 0.5,
+            reward_scale: 0.0,
             plant_filter: None,
             withdraw_filter: None,
         },
+        // 49-51: Phase 5e-x retired the Raid / Defend / Lead StepDefs.
+        // The HTN `htn_combat_faction_dispatch_system` resolves the
+        // destination tile directly from `FactionRegistry`. Consts
+        // `StepId::RAID_TARGET / DEFEND_CAMP / LEAD_CAMP` survive only
+        // as stable sentinels.
         StepDef {
-            // 49: Walk to the home tile of the faction we're raiding (per
-            // `FactionRegistry::raid_target`). Solo agents and peacetime
-            // factions resolve to None and the plan aborts harmlessly.
             id: StepId(49),
-            task: TaskKind::Raid,
-            target: StepTarget::FactionRaidTarget,
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
-            reward_scale: 0.5,
+            reward_scale: 0.0,
             plant_filter: None,
             withdraw_filter: None,
         },
         StepDef {
-            // 50: Walk to faction camp and run TaskKind::Defend. Reuses
-            // `FactionCamp` — the resolver returns home_tile.
             id: StepId(50),
-            task: TaskKind::Defend,
-            target: StepTarget::FactionCamp,
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
-            reward_scale: 0.5,
+            reward_scale: 0.0,
             plant_filter: None,
             withdraw_filter: None,
         },
         StepDef {
-            // 51: Walk to faction camp and run TaskKind::Lead.
             id: StepId(51),
-            task: TaskKind::Lead,
-            target: StepTarget::FactionCamp,
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
-            reward_scale: 0.5,
+            reward_scale: 0.0,
             plant_filter: None,
             withdraw_filter: None,
         },
@@ -976,24 +976,29 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_NONE,
             requires_profession: None,
         },
+        // Phase 5e-viii-c (2026-05-06): PlanId 5 (`HuntFood`) fully retired.
+        // The complete hunting pipeline now runs through HTN:
+        // - `JoinHuntParty` (`htn_join_hunt_party_dispatch_system`):
+        //   `MusterAtHearthMethod` + `TravelToHuntAreaMethod`
+        // - `EngagePrey` (`htn_engage_prey_dispatch_system`):
+        //   `HuntPreyMethod` + `PickUpFreshCorpseMethod`
+        // - `DeliverHuntKill` (`htn_deliver_hunt_kill_dispatch_system`):
+        //   `DeliverHuntKillMethod`
+        // The const `PlanId::HUNT_FOOD = PlanId(5)` survives only as a stable
+        // sentinel for `PlanHistory` ring-buffer entries (e.g.
+        // `faction.rs::hunter_demote`). bias is wired so the candidate filter
+        // never selects this entry.
         PlanDef {
             id: PlanId(5),
-            name: "HuntFood",
-            steps: PLAN_STEPS_5,
-            state_weights: mk_weights(&[
-                (SI_SKILL_COMBAT, 0.6),
-                (SI_HAS_FOOD, -0.2),
-                (SI_STORAGE_FOOD, -0.3),
-            ]),
-            bias: 0.5,
-            serves_goals: SURVIVE_AND_GATHER_FOOD_GOALS,
-            tech_gate: Some(technology::HUNTING_SPEAR),
-            memory_target_kind: Some(MemoryKind::Prey),
-            // Multi-step faction commitment — survival need spikes shouldn't
-            // peel a hunter off a corpse mid-haul. The plan still ends via
-            // completion / timeout / target invalidation / rescue preempt.
-            flags: PF_UNINTERRUPTIBLE,
-            requires_profession: Some(Profession::Hunter),
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
+            tech_gate: None,
+            memory_target_kind: None,
+            flags: PF_NONE,
+            requires_profession: None,
         },
         // Phase 5c-ii-d-vi: PlanId 6 (`ScavengeFood`) deleted. The HTN
         // registry's `ScavengeFoodForStorageMethod` under `StockpileFood`
@@ -1231,17 +1236,21 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             flags: PF_NONE,
             requires_profession: None,
         },
+        // Phase 5e-x: PlanId 23 (`RescueAlly`) retired. The HTN
+        // `EngageRescueAttackerMethod` under `AbstractTaskKind::RescueAlly`
+        // (`htn_combat_faction_dispatch_system`) owns the dispatch end-to-end:
+        // reads the agent's `RescueTarget`, writes `CombatTarget`, routes via
+        // `assign_task_with_routing(... TaskKind::Defend, Some(attacker) ...)`,
+        // and dispatches `Task::RescueAlly { attacker, dest }`. The const
+        // `PlanId::RESCUE_ALLY = PlanId(23)` survives only as a stable
+        // sentinel for `PlanHistory` ring-buffer entries.
         PlanDef {
-            // Sole candidate under Rescue goal; weights only need to keep
-            // combat-skilled responders preferred. Old `SI_SAFETY=0.5` was
-            // perversely scoring the *agent's own* safety need, biasing AWAY
-            // from rescue under threat — dropped.
             id: PlanId(23),
-            name: "RescueAlly",
-            steps: PLAN_STEPS_23,
-            state_weights: mk_weights(&[(SI_SKILL_COMBAT, 0.3)]),
-            bias: 0.5,
-            serves_goals: RESCUE_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
@@ -1416,27 +1425,36 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         // goal is active (Socialize/Raid/Defend/Lead) and the agent is the
         // sole plan serving that goal. A high `bias` keeps them dominant
         // against any future siblings.
+        // Phase 5e-ix: PlanId 60 (`Socialize`) retired. The HTN
+        // `SocializeWithPartnerMethod` under `AbstractTaskKind::Socialize`
+        // (`htn_socialize_dispatch_system`) owns the dispatch end-to-end —
+        // scans `SpatialIndex` for the nearest other Person, routes via
+        // `assign_task_with_routing(... TaskKind::Socialize ...)`, and
+        // dispatches `Task::Socialize { partner }`. The const
+        // `PlanId::SOCIALIZE = PlanId(60)` survives only as a stable
+        // sentinel for `PlanHistory` ring-buffer entries.
         PlanDef {
-            // Sole candidate under Socialize goal — bias alone wins.
-            // Old SI_SOCIAL=1.5 was the goal-trigger need re-amplified.
             id: PlanId(60),
-            name: "Socialize",
-            steps: PLAN_STEPS_SOCIALIZE,
+            name: "(unused)",
+            steps: &[],
             state_weights: mk_weights(&[]),
-            bias: 1.0,
-            serves_goals: SOCIALIZE_GOALS,
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
             requires_profession: None,
         },
+        // Phase 5e-x: PlanIds 61/62/63 (Raid/Defend/Lead) retired. The HTN
+        // methods under `htn_combat_faction_dispatch_system` own the
+        // dispatch end-to-end. Consts survive as PlanHistory sentinels.
         PlanDef {
             id: PlanId(61),
-            name: "Raid",
-            steps: PLAN_STEPS_RAID,
-            state_weights: mk_weights(&[(SI_SKILL_COMBAT, 0.5)]),
-            bias: 1.0,
-            serves_goals: RAID_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
@@ -1444,11 +1462,11 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         },
         PlanDef {
             id: PlanId(62),
-            name: "Defend",
-            steps: PLAN_STEPS_DEFEND,
-            state_weights: mk_weights(&[(SI_SKILL_COMBAT, 0.5)]),
-            bias: 1.0,
-            serves_goals: DEFEND_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,
@@ -1456,11 +1474,11 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         },
         PlanDef {
             id: PlanId(63),
-            name: "Lead",
-            steps: PLAN_STEPS_LEAD,
+            name: "(unused)",
+            steps: &[],
             state_weights: mk_weights(&[]),
-            bias: 1.0,
-            serves_goals: LEAD_GOALS,
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
             flags: PF_NONE,

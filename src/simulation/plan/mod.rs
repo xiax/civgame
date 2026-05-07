@@ -2037,15 +2037,10 @@ pub fn plan_execution_system(
                     | AgentGoal::Build
                     | AgentGoal::Haul
                     | AgentGoal::TameHorse
-                    | AgentGoal::Rescue
                     | AgentGoal::ReturnCamp
                     | AgentGoal::Play
                     | AgentGoal::Farm
                     | AgentGoal::Craft
-                    | AgentGoal::Socialize
-                    | AgentGoal::Raid
-                    | AgentGoal::Defend
-                    | AgentGoal::Lead
             ) {
                 return;
             }
@@ -2660,6 +2655,30 @@ pub fn plan_execution_system(
                                 corpse,
                             });
                         }
+                    }
+                    // Phase 5e-vii (scaffolding): hunt-step typed variants
+                    // mirror the legacy `task_id` channel for chain-integrity
+                    // inspection. Executors fall back to legacy fields, so
+                    // these dispatches are behaviour-neutral today; the
+                    // future HTN HuntFood split (Muster / Engage / Deliver
+                    // methods) will produce these variants directly.
+                    if step_def.task == TaskKind::HuntPartyMuster {
+                        aq.dispatch(crate::simulation::typed_task::Task::HuntPartyMuster {
+                            hearth: (target_tx, target_ty),
+                        });
+                    }
+                    if step_def.task == TaskKind::Hunter {
+                        if let Some(prey) = ent {
+                            aq.dispatch(crate::simulation::typed_task::Task::Hunt { prey });
+                        }
+                    }
+                    if step_def.task == TaskKind::HaulCorpse {
+                        aq.dispatch(crate::simulation::typed_task::Task::HaulCorpse {
+                            dest: (target_tx, target_ty),
+                        });
+                    }
+                    if step_def.task == TaskKind::Butcher {
+                        aq.dispatch(crate::simulation::typed_task::Task::Butcher);
                     }
                     // Phase 3b-i: populate the typed `Task::WithdrawGood`
                     // variant from the StepDef's typed `withdraw_filter`

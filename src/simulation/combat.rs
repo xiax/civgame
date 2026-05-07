@@ -184,6 +184,7 @@ pub fn combat_system(
         Option<&FactionMember>,
         Option<&mut crate::simulation::carry::Carrier>,
         Option<&Stats>,
+        Option<&mut crate::simulation::typed_task::ActionQueue>,
     )>,
     mut health_query: Query<&mut Health>,
     mut body_query: Query<(&mut Body, Option<&Stats>)>,
@@ -219,6 +220,7 @@ pub fn combat_system(
         attacker_fm,
         mut attacker_carrier,
         attacker_stats,
+        mut attacker_aq,
     ) in &mut attacker_query
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -266,6 +268,14 @@ pub fn combat_system(
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
+            }
+            // Phase 5e-vii: drain the typed channel after a kill so a stale
+            // `Task::Hunt { prey: <dead> }` doesn't linger in `aq.current`.
+            // For non-hunt combat (Defend / brawl) `aq.current` is unrelated
+            // and `advance()` is a no-op transition out of whatever else was
+            // there — the next dispatcher tick re-establishes the right task.
+            if let Some(ref mut aq) = attacker_aq {
+                aq.advance();
             }
             if let Ok((mut animal_ai, _)) = animal_ai_query.get_mut(attacker) {
                 animal_ai.state = AnimalState::Wander;
@@ -386,6 +396,9 @@ pub fn combat_system(
                 if ai.state == AiState::Attacking {
                     ai.state = AiState::Idle;
                     ai.task_id = PersonAI::UNEMPLOYED;
+                    if let Some(ref mut aq) = attacker_aq {
+                        aq.advance();
+                    }
                 }
             }
         }
@@ -401,7 +414,7 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _)) =
+        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _, _)) =
             attacker_query.get_mut(target)
         {
             if target_combat.0.is_none() {
@@ -431,7 +444,7 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _)) =
+        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _, _)) =
             attacker_query.get_mut(target)
         {
             if target_combat.0.is_none() {
