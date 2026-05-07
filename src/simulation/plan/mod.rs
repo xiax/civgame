@@ -408,10 +408,9 @@ pub enum StepTarget {
     /// (the destination for hauled materials). Resolves to None if the agent
     /// has no Haul claim or the blueprint despawned.
     HaulClaimBlueprint,
-    /// The specific blueprint named in the agent's active `JobClaim::Build`.
-    /// Resolves to None if the agent has no Build claim or the blueprint
-    /// despawned.
-    BuildClaimBlueprint,
+    // BuildClaimBlueprint retired in Phase 5e-vi — `htn_build_claimed_blueprint_dispatch_system`
+    // owns the walk-to-claimed-bp + on-site labor path under
+    // `AbstractTaskKind::ConstructBlueprint`.
     /// Home tile of the faction this agent's faction is raiding (resolved via
     /// `FactionRegistry::raid_target` then `home_tile`). Used by the Raid
     /// plan; resolves to None for solo agents or when no raid is queued.
@@ -1451,17 +1450,10 @@ fn resolve_target(
             }
             Some((Some(bp_entity), bp.tile.0, bp.tile.1))
         }
-        StepTarget::BuildClaimBlueprint => {
-            // Route directly to the blueprint named in the agent's Build claim,
-            // but only when its deposits are all in (so the build_progress
-            // counter actually advances when the agent works).
-            let bp_entity = claim_target.and_then(|c| c.blueprint)?;
-            let bp = bp_query.get(bp_entity).ok()?;
-            if !bp.is_satisfied() {
-                return None;
-            }
-            Some((Some(bp_entity), bp.tile.0, bp.tile.1))
-        }
+        // StepTarget::BuildClaimBlueprint resolver retired in Phase 5e-vi —
+        // `htn_build_claimed_blueprint_dispatch_system` does the equivalent
+        // bp_query lookup + `bp.is_satisfied()` gate inline before snapshotting
+        // into `PlannerCtx.claimed_blueprint`.
         StepTarget::NearestBuildSite(_) => None, // Legacy; construction is handled via faction_blueprint_system
         StepTarget::NearestBlueprint(kind) => {
             // Find the nearest active Blueprint this agent is allowed to build.
