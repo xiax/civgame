@@ -54,6 +54,12 @@ pub enum Profession {
     None,
     Farmer,
     Hunter,
+    /// Pluralist Economy R5: physical government official. Appointed
+    /// by the chief when the faction's `state_funds_public_works`
+    /// flag is true; paid a per-day wage from the settlement
+    /// treasury. Posts public-works jobs (R6+). Demotes when the
+    /// treasury empty-streak crosses `BUREAUCRAT_QUIT_DAYS`.
+    Bureaucrat,
 }
 
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]

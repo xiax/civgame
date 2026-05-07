@@ -1031,6 +1031,499 @@ mod smoke {
         assert!(wood_policy.chief_allocates_labor);
         assert!(!wood_policy.private_actors_allowed);
     }
+
+    // ─── Pluralist Economy R3 — sub-factions / households ───
+
+    #[test]
+    fn spawn_household_creates_sub_faction_with_capitalist_policy() {
+        // Form a household sub-faction under the player village; verify
+        // the parent/child link, the policy preset, and `root_faction`.
+        use crate::economy::core_ids;
+        use crate::economy::resource_catalog::ResourceCatalog;
+        use crate::simulation::faction::FactionRegistry;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let head = sim.spawn_person(sim.player_faction_id, (2, 2), |_| {});
+
+        let catalog = sim.app.world().resource::<ResourceCatalog>().clone();
+        let village_id = sim.player_faction_id;
+        let household_id = {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.spawn_household(village_id, (2, 2), head, &catalog)
+        };
+
+        let registry = sim.app.world().resource::<FactionRegistry>();
+
+        // Parent/child link is reciprocal.
+        let household = registry.factions.get(&household_id).unwrap();
+        assert_eq!(household.parent_faction, Some(village_id));
+        assert_eq!(household.household_head, Some(head));
+        let village = registry.factions.get(&village_id).unwrap();
+        assert!(
+            village.children_factions.contains(&household_id),
+            "village must list household as child"
+        );
+
+        // Root walks back to the village.
+        assert_eq!(registry.root_faction(household_id), village_id);
+        assert_eq!(registry.root_faction(village_id), village_id);
+
+        // Capitalist policy stamped on every catalog resource.
+        for rid in [
+            core_ids::wood(),
+            core_ids::stone(),
+            core_ids::cloth(),
+            core_ids::weapon(),
+        ] {
+            let p = household.policy_for(rid);
+            assert!(p.private_actors_allowed, "rid={rid:?} not capitalist");
+            assert!(!p.chief_allocates_labor);
+        }
+
+        // Village's policy is unchanged (still all-communist).
+        for rid in [core_ids::wood(), core_ids::cloth()] {
+            let p = village.policy_for(rid);
+            assert!(p.chief_allocates_labor);
+            assert!(!p.private_actors_allowed);
+        }
+    }
+
+    #[test]
+    fn household_storage_isolated_from_village_storage() {
+        // Spawn one storage tile for the village and one for the
+        // household at distinct positions. Because `FactionStorage` is
+        // already indexed per faction_id, a member of the household
+        // queries only the household's tile, not the village's.
+        use crate::economy::resource_catalog::ResourceCatalog;
+        use crate::simulation::faction::{FactionRegistry, StorageTileMap};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let head = sim.spawn_person(sim.player_faction_id, (1, 1), |_| {});
+
+        let catalog = sim.app.world().resource::<ResourceCatalog>().clone();
+        let village_id = sim.player_faction_id;
+        let household_id = {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.spawn_household(village_id, (1, 1), head, &catalog)
+        };
+
+        // One storage tile per faction at distinct tiles.
+        let _village_tile = sim.spawn_storage_tile(village_id, (5, 0));
+        let _household_tile = sim.spawn_storage_tile(household_id, (-5, 0));
+
+        // Tick a few times so the StorageTileMap rebuild observes both.
+        sim.tick_n(5);
+
+        let map = sim.app.world().resource::<StorageTileMap>();
+
+        // Per-faction lookup must not bleed across.
+        let village_tiles: Vec<(i32, i32)> = map
+            .by_faction
+            .get(&village_id)
+            .cloned()
+            .unwrap_or_default();
+        let household_tiles: Vec<(i32, i32)> = map
+            .by_faction
+            .get(&household_id)
+            .cloned()
+            .unwrap_or_default();
+
+        assert!(
+            village_tiles.contains(&(5, 0)),
+            "village list missing village tile: {village_tiles:?}",
+        );
+        assert!(
+            !village_tiles.contains(&(-5, 0)),
+            "village list leaked household tile: {village_tiles:?}",
+        );
+        assert!(
+            household_tiles.contains(&(-5, 0)),
+            "household list missing household tile: {household_tiles:?}",
+        );
+        assert!(
+            !household_tiles.contains(&(5, 0)),
+            "household list leaked village tile: {household_tiles:?}",
+        );
+    }
+
+    // ─── Pluralist Economy R5 — Bureaucrat profession ───
+
+    #[test]
+    fn bureaucrat_promoted_then_demotes_when_treasury_drains() {
+        // Government Collapse Test: spawn a faction with
+        // `state_funds_public_works=true`, seed the settlement
+        // treasury with enough to fund one bureaucrat for a few
+        // ticks, then run for `BUREAUCRAT_QUIT_DAYS` days. Assert
+        // that:
+        // 1. The chief promotes a None adult to Bureaucrat.
+        // 2. After the treasury empty-streak crosses the quit
+        //    threshold, the bureaucrat demotes back to None.
+        use crate::simulation::faction::{
+            FactionRegistry, BUREAUCRAT_ASSIGNMENT_CADENCE, BUREAUCRAT_QUIT_DAYS,
+        };
+        use crate::simulation::person::Profession;
+        use crate::simulation::settlement::{Settlement, SettlementMap};
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+
+        // Spawn a few adults so the appointment system has someone
+        // to promote. `BUREAUCRAT_MIN_RATIO * 4` rounds to 1, so
+        // 4 None adults yields 1 promotion.
+        let _a = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let _b = sim.spawn_person(sim.player_faction_id, (1, 0), |_| {});
+        let _c = sim.spawn_person(sim.player_faction_id, (2, 0), |_| {});
+        let _d = sim.spawn_person(sim.player_faction_id, (3, 0), |_| {});
+        // FactionRegistry tracks member count via add_member.
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                registry.add_member(sim.player_faction_id);
+            }
+            let f = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            f.state_funds_public_works = true;
+        }
+
+        // Tick once so auto_found_default_settlements_system spawns a
+        // settlement, then seed the treasury directly.
+        sim.tick_n(2);
+        let settlement_entity = {
+            let map = sim.app.world().resource::<SettlementMap>();
+            let id = map
+                .first_for_faction(sim.player_faction_id)
+                .expect("settlement not founded");
+            *map.by_id.get(&id).unwrap()
+        };
+        // Seed enough for ~half a day: `BUREAUCRAT_DAILY_WAGE / 24`
+        // is paid every BUREAUCRAT_SALARY_INTERVAL ticks; 0.5 covers
+        // ~12 hourly ticks for one bureaucrat.
+        {
+            let mut s = sim
+                .app
+                .world_mut()
+                .get_mut::<Settlement>(settlement_entity)
+                .unwrap();
+            s.treasury = 0.5;
+        }
+
+        // Drive the appointment cadence so the chief promotes.
+        sim.tick_n(BUREAUCRAT_ASSIGNMENT_CADENCE as u32 + 5);
+
+        let bureaucrat_count = {
+            let mut q = sim.app.world_mut().query::<&Profession>();
+            q.iter(sim.app.world())
+                .filter(|p| **p == Profession::Bureaucrat)
+                .count()
+        };
+        assert!(
+            bureaucrat_count >= 1,
+            "expected at least one bureaucrat after promote tick",
+        );
+
+        // Fast-forward past the quit threshold. With the treasury at
+        // ~0.5, salary ticks drain it within an hour; from there,
+        // streak advances every salary tick. After
+        // `BUREAUCRAT_QUIT_DAYS` game-days, the appointment system
+        // forces target=0 and demotes everyone.
+        let total_ticks = (BUREAUCRAT_QUIT_DAYS as u64 + 1) * TICKS_PER_DAY as u64
+            + BUREAUCRAT_ASSIGNMENT_CADENCE;
+        sim.tick_n(total_ticks as u32);
+
+        let bureaucrat_count_after = {
+            let mut q = sim.app.world_mut().query::<&Profession>();
+            q.iter(sim.app.world())
+                .filter(|p| **p == Profession::Bureaucrat)
+                .count()
+        };
+        assert_eq!(
+            bureaucrat_count_after, 0,
+            "all bureaucrats must demote when treasury stays empty for BUREAUCRAT_QUIT_DAYS",
+        );
+    }
+
+    // ─── Pluralist Economy R6-a — chief Stockpile gated on policy ───
+
+    #[test]
+    fn chief_skips_food_stockpile_when_policy_flipped_to_capitalist() {
+        // R6-a: when the chief's faction has flipped Fruit (the
+        // representative food resource) to
+        // `chief_allocates_labor=false`, the chief skips the
+        // Stockpile{Calories} posting entirely. Default
+        // (all-communist) factions still post — invariance verified
+        // by the 287 baseline.
+        use crate::economy::core_ids;
+        use crate::economy::policy::ResourceControlPolicy;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{JobBoard, JobProgress};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+
+        for i in 0..4 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                registry.add_member(sim.player_faction_id);
+            }
+            let f = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            f.economic_policy
+                .insert(core_ids::fruit(), ResourceControlPolicy::capitalist());
+        }
+
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let food_postings: usize = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| matches!(p.progress, JobProgress::Calories { .. }))
+            .count();
+        assert_eq!(
+            food_postings, 0,
+            "capitalist food policy must block chief Stockpile{{Calories}}",
+        );
+    }
+
+    #[test]
+    fn chief_still_posts_food_stockpile_under_default_policy() {
+        // Companion: default (all-communist) policy must still post
+        // Stockpile{Calories} when food is low. Pins R6-a's
+        // invariance: the gate doesn't affect default factions.
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{JobBoard, JobProgress};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        for i in 0..4 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                registry.add_member(sim.player_faction_id);
+            }
+        }
+
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let food_postings: usize = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| matches!(p.progress, JobProgress::Calories { .. }))
+            .count();
+        assert!(
+            food_postings >= 1,
+            "default communist policy should still post chief Stockpile{{Calories}}",
+        );
+    }
+
+    // ─── R6-b — chief Haul gated on resource policy ───
+
+    #[test]
+    fn chief_skips_wood_haul_when_wood_policy_capitalist() {
+        // Set Wood to capitalist; the chief's per-blueprint Haul
+        // posting for Wood deposits is skipped. (Other resources
+        // unaffected.)
+        use crate::economy::core_ids;
+        use crate::economy::policy::ResourceControlPolicy;
+        use crate::simulation::faction::{FactionRegistry, FactionStorage};
+        use crate::simulation::jobs::{JobBoard, JobProgress};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        for i in 0..4 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+
+        // Pre-stock Wood in faction storage so the haul branch has
+        // material to allocate; flip Wood policy to capitalist.
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                registry.add_member(sim.player_faction_id);
+            }
+            let f = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            f.storage = FactionStorage::default();
+            f.storage.totals.insert(core_ids::wood(), 50);
+            f.economic_policy
+                .insert(core_ids::wood(), ResourceControlPolicy::capitalist());
+        }
+
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let wood_haul_postings: usize = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| matches!(
+                &p.progress,
+                JobProgress::Haul { resource_id, .. } if *resource_id == core_ids::wood()
+            ))
+            .count();
+        assert_eq!(
+            wood_haul_postings, 0,
+            "capitalist Wood policy must block chief Haul{{Wood}} postings",
+        );
+    }
+
+    // ─── R6-c — chief Build gated on state_funds_public_works ───
+
+    #[test]
+    fn chief_skips_builds_when_state_funds_public_works_is_true() {
+        // R6-c: when the faction has flipped on bureaucratic
+        // public works, the chief stops posting Build jobs. The
+        // bureaucrat takes over (R10+). For now, capitalist
+        // factions just have no Build postings until R10+ ships.
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{JobBoard, JobKind};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        for i in 0..4 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                registry.add_member(sim.player_faction_id);
+            }
+            let f = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            f.state_funds_public_works = true;
+        }
+
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let build_count: usize = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| matches!(p.kind, JobKind::Build))
+            .count();
+        assert_eq!(
+            build_count, 0,
+            "state_funds_public_works=true must block chief Build postings",
+        );
+    }
+
+    // ─── R6-d — chief Craft gated on output-resource policy ───
+
+    #[test]
+    fn chief_skips_craft_when_output_resource_capitalist() {
+        // Flip every craft-output resource to capitalist; the
+        // chief stops posting Craft. Default factions still post
+        // (covered by the existing 287 baseline).
+        use crate::economy::core_ids;
+        use crate::economy::policy::ResourceControlPolicy;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{JobBoard, JobKind};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        for i in 0..4 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                registry.add_member(sim.player_faction_id);
+            }
+            let f = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            // Flip the common craft-output resources to capitalist.
+            for rid in [
+                core_ids::tools(),
+                core_ids::cloth(),
+                core_ids::weapon(),
+                core_ids::armor(),
+                core_ids::shield(),
+                core_ids::luxury(),
+            ] {
+                f.economic_policy
+                    .insert(rid, ResourceControlPolicy::capitalist());
+            }
+        }
+
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let craft_count: usize = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| matches!(p.kind, JobKind::Craft))
+            .count();
+        assert_eq!(
+            craft_count, 0,
+            "capitalist craft-output policy must block chief Craft postings",
+        );
+    }
+
+    // ─── R6-e — chief Farm gated on Grain policy ───
+
+    #[test]
+    fn chief_skips_farm_when_grain_policy_capitalist() {
+        // Flip Grain to capitalist; the chief stops posting Farm.
+        use crate::economy::core_ids;
+        use crate::economy::policy::ResourceControlPolicy;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{JobBoard, JobKind};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        for i in 0..4 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                registry.add_member(sim.player_faction_id);
+            }
+            let f = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            // Pretend the faction has CROP_CULTIVATION + grain seeds
+            // so the only thing blocking the post would be the policy
+            // gate. (Default test factions don't have either, so this
+            // test's negative assertion is over-determined; it pins
+            // behaviour for the future when farm-capable factions
+            // exist.)
+            f.economic_policy
+                .insert(core_ids::grain(), ResourceControlPolicy::capitalist());
+        }
+
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let farm_count: usize = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| matches!(p.kind, JobKind::Farm))
+            .count();
+        assert_eq!(
+            farm_count, 0,
+            "capitalist Grain policy must block chief Farm postings",
+        );
+    }
 }
 
 /// Behavioural baselines pinned by Phase 0. These fixtures lock in the
@@ -2041,6 +2534,9 @@ mod baseline_behaviour {
                 source: JobSource::Chief,
                 posted_tick: 0,
                 expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
             };
             board
                 .postings
@@ -2180,6 +2676,9 @@ mod baseline_behaviour {
                 source: JobSource::Chief,
                 posted_tick: 0,
                 expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
             };
             board
                 .postings
@@ -2308,6 +2807,9 @@ mod baseline_behaviour {
                 source: JobSource::Chief,
                 posted_tick: 0,
                 expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
             };
             board
                 .postings
@@ -2422,6 +2924,9 @@ mod baseline_behaviour {
                 source: JobSource::Chief,
                 posted_tick: 0,
                 expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
             };
             board
                 .postings
@@ -2603,6 +3108,9 @@ mod baseline_behaviour {
                 source: JobSource::Chief,
                 posted_tick: 0,
                 expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
             };
             board
                 .postings
@@ -2791,6 +3299,9 @@ mod baseline_behaviour {
                 source: JobSource::Chief,
                 posted_tick: 0,
                 expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
             };
             board
                 .postings
@@ -3175,6 +3686,9 @@ mod baseline_behaviour {
                 source: JobSource::Chief,
                 posted_tick: 0,
                 expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
             };
             board
                 .postings
@@ -3827,6 +4341,9 @@ mod baseline_behaviour {
                 source: JobSource::Chief,
                 posted_tick: 0,
                 expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
             };
             board
                 .postings
@@ -4014,6 +4531,9 @@ mod baseline_behaviour {
                 source: JobSource::Chief,
                 posted_tick: 0,
                 expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
             };
             board
                 .postings
@@ -4180,6 +4700,9 @@ mod baseline_behaviour {
                 source: JobSource::Chief,
                 posted_tick: 0,
                 expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
             };
             board
                 .postings

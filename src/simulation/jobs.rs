@@ -217,6 +217,31 @@ impl JobProgress {
     }
 }
 
+/// Pluralist Economy R6: who posted a job. The chief retains
+/// today's communal-labor postings (Stockpile/Haul/Build/Craft/Farm)
+/// for any resource still flagged `chief_allocates_labor=true`.
+/// Bureaucrats post public-works infrastructure when
+/// `state_funds_public_works=true`. Household heads and individuals
+/// post family-needs / P2P contracts under capitalist policy.
+///
+/// `Chief` postings carry `reward = 0.0` and no settlement id —
+/// today's communist labor allocation has no monetary signal. The
+/// other variants always carry `reward > 0` and a sidecar `JobEscrow`
+/// entity funded from the relevant treasury / wallet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PosterClass {
+    Chief,
+    Bureaucrat,
+    HouseholdHead,
+    Individual,
+}
+
+impl Default for PosterClass {
+    fn default() -> Self {
+        PosterClass::Chief
+    }
+}
+
 /// A faction-directed work order. Multiple workers can claim the same posting
 /// and contribute to its `progress`; the per-worker `JobClaim` lock ensures
 /// each worker holds only one job at a time.
@@ -231,6 +256,62 @@ pub struct JobPosting {
     pub source: JobSource,
     pub posted_tick: u32,
     pub expiry_tick: Option<u32>,
+    /// Pluralist Economy R6: who posted this job. Defaults to
+    /// `Chief` to preserve today's behaviour at every existing
+    /// posting site.
+    pub poster_class: PosterClass,
+    /// R6: monetary reward for completing this posting. Chief
+    /// postings carry 0.0 (communal labor — no payment); other
+    /// classes carry the funded amount. `0.0` is the legacy
+    /// (non-paid) signal R9's `U_bid` scorer uses to fall back to
+    /// the `priority + skill + bias - distance` formula.
+    pub reward: f32,
+    /// R6: which settlement the posting is anchored at. `None` for
+    /// Chief postings (today's faction-scoped behaviour); `Some(id)`
+    /// for per-poster-class postings under R6+. R7's per-settlement
+    /// market lookup uses this to find the relevant market when the
+    /// posting fulfils a market-driven need.
+    pub settlement_id: Option<crate::simulation::settlement::SettlementId>,
+}
+
+impl JobPosting {
+    /// Pluralist Economy R6 — values for the three new fields when
+    /// the posting is a chief / legacy posting. Use via `..` syntax
+    /// at every existing JobPosting construction site to avoid
+    /// repeating three lines per call:
+    ///
+    /// ```ignore
+    /// JobPosting {
+    ///     id, faction_id, kind, progress, claimants, priority,
+    ///     source, posted_tick, expiry_tick,
+    ///     ..JobPosting::chief_defaults()
+    /// }
+    /// ```
+    ///
+    /// The non-R6 fields in the returned stub are placeholders;
+    /// the caller's `..` syntax overrides every field they set
+    /// explicitly, so only `poster_class / reward / settlement_id`
+    /// are read from the stub.
+    pub fn chief_defaults() -> Self {
+        JobPosting {
+            id: 0,
+            faction_id: 0,
+            kind: JobKind::Stockpile,
+            // Using `Calories` (the simplest progress variant) so
+            // `chief_defaults()` doesn't depend on the resource
+            // catalog being installed at call time. Any caller using
+            // this stub should override `progress` explicitly.
+            progress: JobProgress::Calories { deposited: 0, target: 1 },
+            claimants: Vec::new(),
+            priority: 0,
+            source: JobSource::Chief,
+            posted_tick: 0,
+            expiry_tick: None,
+            poster_class: PosterClass::Chief,
+            reward: 0.0,
+            settlement_id: None,
+        }
+    }
 }
 
 /// Component attached to a worker holding an active claim. A worker holds at
@@ -512,7 +593,14 @@ pub fn chief_job_posting_system(
 
         // 2. Build postings — only for blueprints whose project has advanced
         //    to Build phase (deposits filled). Suppressed during GatherMaterials.
-        let needed_builds: Vec<Entity> = {
+        // Pluralist Economy R6-c: when `state_funds_public_works`
+        // is true, the bureaucrat is the public-works poster
+        // (R10+); the chief steps back. Default factions
+        // (`state_funds_public_works=false`) keep chief-posting
+        // Builds, preserving today's behaviour.
+        let needed_builds: Vec<Entity> = if faction.state_funds_public_works {
+            Vec::new()
+        } else {
             let postings = board.faction_postings_mut(faction_id);
             live_bps
                 .iter()
@@ -548,11 +636,24 @@ pub fn chief_job_posting_system(
                 source: JobSource::Chief,
                 posted_tick,
                 expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
             });
         }
 
         // 3. Stockpile (food) posting — one if storage food per-head is below threshold.
-        if faction.member_count > 0 {
+        // Pluralist Economy R6-a: gate on the chief's food policy.
+        // If the faction has flipped Fruit (representative food) to
+        // `chief_allocates_labor=false`, the chief no longer posts
+        // communal food drives — private hunters/farmers sell food
+        // at the regional market instead (R7+). Skipping this branch
+        // is what gives capitalist factions their distinct labor
+        // structure.
+        let food_chief_allocates = faction
+            .policy_for(crate::economy::core_ids::fruit())
+            .chief_allocates_labor;
+        if faction.member_count > 0 && food_chief_allocates {
             let already_food = board
                 .faction_postings(faction_id)
                 .iter()
@@ -589,6 +690,9 @@ pub fn chief_job_posting_system(
                         source: JobSource::Chief,
                         posted_tick,
                         expiry_tick: None,
+                        poster_class: crate::simulation::jobs::PosterClass::Chief,
+                        reward: 0.0,
+                        settlement_id: None,
                     });
                 }
             }
@@ -598,10 +702,17 @@ pub fn chief_job_posting_system(
         //     for each tracked Good is `max(faction.material_targets, Σ unmet
         //     across active blueprints)`. Posted whenever current storage is
         //     below target. One posting per (faction, good).
+        // Pluralist Economy R6-a: gate per-resource on
+        // `chief_allocates_labor`. Capitalist factions skip this
+        // branch for any flipped resource — private actors handle
+        // it via market trade.
         if faction.member_count > 0 {
             let wood_id = crate::economy::core_ids::wood();
             let stone_id = crate::economy::core_ids::stone();
             for &target_rid in &[wood_id, stone_id] {
+                if !faction.policy_for(target_rid).chief_allocates_labor {
+                    continue;
+                }
                 // Sum unmet blueprint demand for this resource (reactive component).
                 let mut bp_demand: u32 = 0;
                 for &bp_entity in &live_bps {
@@ -653,6 +764,9 @@ pub fn chief_job_posting_system(
                     source: JobSource::Chief,
                     posted_tick,
                     expiry_tick: None,
+                    poster_class: crate::simulation::jobs::PosterClass::Chief,
+                    reward: 0.0,
+                    settlement_id: None,
                 });
             }
         }
@@ -702,6 +816,10 @@ pub fn chief_job_posting_system(
                 if demand == 0 {
                     continue;
                 }
+                // R6-a: skip when the resource is privately handled.
+                if !faction.policy_for(target_rid).chief_allocates_labor {
+                    continue;
+                }
                 let stored = faction.storage.stock_of(target_rid);
                 if stored >= demand {
                     continue;
@@ -735,6 +853,9 @@ pub fn chief_job_posting_system(
                     source: JobSource::Chief,
                     posted_tick,
                     expiry_tick: None,
+                    poster_class: crate::simulation::jobs::PosterClass::Chief,
+                    reward: 0.0,
+                    settlement_id: None,
                 });
             }
         }
@@ -774,6 +895,13 @@ pub fn chief_job_posting_system(
                 for slot in &bp.deposits[..bp.deposit_count as usize] {
                     let remaining = slot.needed.saturating_sub(slot.deposited) as u32;
                     if remaining == 0 {
+                        continue;
+                    }
+                    // R6-b: skip when the resource is privately
+                    // allocated. Capitalist hauls are organised by
+                    // household-heads / individuals (R10+), not the
+                    // chief.
+                    if !faction.policy_for(slot.resource_id).chief_allocates_labor {
                         continue;
                     }
                     // Already a live Haul posting for (this BP, this resource)?
@@ -817,13 +945,26 @@ pub fn chief_job_posting_system(
                         source: JobSource::Chief,
                         posted_tick,
                         expiry_tick: None,
+                        poster_class: crate::simulation::jobs::PosterClass::Chief,
+                        reward: 0.0,
+                        settlement_id: None,
                     });
                 }
             }
         }
 
         // 4. Farm posting — capability gated (Agriculture / CROP_CULTIVATION).
-        if faction_can_perform(faction, JobKind::Farm) && faction.member_count > 0 {
+        // Pluralist Economy R6-e: gate on Grain's policy. When the
+        // chief has flipped Grain to `chief_allocates_labor=false`,
+        // private farmers handle planting and selling at the
+        // regional market; no chief Farm posting.
+        let farm_chief_allocates = faction
+            .policy_for(crate::economy::core_ids::grain())
+            .chief_allocates_labor;
+        if farm_chief_allocates
+            && faction_can_perform(faction, JobKind::Farm)
+            && faction.member_count > 0
+        {
             let already_farm = board
                 .faction_postings(faction_id)
                 .iter()
@@ -862,6 +1003,9 @@ pub fn chief_job_posting_system(
                     source: JobSource::Chief,
                     posted_tick,
                     expiry_tick: None,
+                    poster_class: crate::simulation::jobs::PosterClass::Chief,
+                    reward: 0.0,
+                    settlement_id: None,
                 });
             }
         }
@@ -897,6 +1041,16 @@ pub fn chief_job_posting_system(
                         if !faction.techs.has(tech) {
                             continue;
                         }
+                    }
+                    // R6-d: skip recipes whose output resource is
+                    // privately allocated. Capitalist factions let
+                    // smiths self-direct toward profitable recipes
+                    // (R10+) or fulfil P2P contracts (R12).
+                    if !faction
+                        .policy_for(recipe.output_resource)
+                        .chief_allocates_labor
+                    {
+                        continue;
                     }
                     let bench_ref = match recipe.requires_station {
                         Some(crate::simulation::crafting::StationKind::Workbench) => {
@@ -974,6 +1128,9 @@ pub fn chief_job_posting_system(
                         source: JobSource::Chief,
                         posted_tick,
                         expiry_tick: None,
+                        poster_class: crate::simulation::jobs::PosterClass::Chief,
+                        reward: 0.0,
+                        settlement_id: None,
                     });
                 }
             }
@@ -1051,6 +1208,9 @@ pub fn chief_tablet_posting_system(
                         source: JobSource::Player,
                         posted_tick,
                         expiry_tick: None,
+                        poster_class: crate::simulation::jobs::PosterClass::Chief,
+                        reward: 0.0,
+                        settlement_id: None,
                     });
                 }
             }
@@ -1181,6 +1341,9 @@ pub fn chief_tablet_posting_system(
             source: JobSource::Chief,
             posted_tick,
             expiry_tick: None,
+            poster_class: crate::simulation::jobs::PosterClass::Chief,
+            reward: 0.0,
+            settlement_id: None,
         });
     }
 }

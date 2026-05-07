@@ -37,6 +37,52 @@ A `Settlement` is the **economic** unit (market + treasury + market_tile), disti
 - **`Method.policy_gate(&self) -> &'static [(ResourceId, RequiredFlag)]`**: trait method, default `&[]`. Methods that require a specific policy flag for a specific resource (R6+ household / Trader / contract methods) declare it here; the helper `method_passes_policy_gate(method, faction)` returns true iff every gate entry is satisfied. SOLO agents with no faction reject any non-empty gate.
 - **R4 ships only the machinery.** No existing method declares a non-empty gate; `method_passes_policy_gate` is not yet wired into any dispatcher's loop. Behaviour is identical to pre-R4. R6 sub-PRs flip individual chief-posting branches to per-class posters and at the same time wire the gate filter for the new branches.
 
+## Sub-factions / households (Pluralist Economy R3)
+
+A household is a `FactionData` with `parent_faction = Some(village_id)`. Reuses the entire faction primitive — storage, treasury, chief-equivalent (`household_head`), member tracking, appointment systems. The "effective economic faction" of an agent is just `FactionMember.faction_id` (always the deepest faction the agent is in).
+
+- **`FactionData.parent_faction: Option<u32>`** — `None` = top-level (village), `Some(id)` = sub-faction (household).
+- **`FactionData.household_head: Option<Entity>`** — analogue to `chief_entity` for households.
+- **`FactionData.children_factions: Vec<u32>`** — reverse pointer; villages list every household nested under them. Maintained alongside `parent_faction` by `spawn_household`.
+- **`FactionRegistry::spawn_household(parent, home_tile, head, &catalog)`** — creates the sub-faction (via `create_faction`), wires the parent/child links, sets `household_head`, and stamps `ResourceControlPolicy::capitalist()` on every catalog resource so the household is observationally capitalist by default. Caller still moves member `FactionMember.faction_id`s, calls `add_member`, and spawns a `FactionStorageTile` for the household.
+- **`FactionRegistry::root_faction(id)`** — walks the `parent_faction` chain to the top-level village. Used wherever code needs the "tribe" of a household (raid mechanics, region affiliation).
+- **R3 ships only the primitive.** Household *formation* (the trigger condition — cosleep duration / marriage / player command) is deferred to a follow-on sub-PR; today, households exist only in tests. R5+ phases that depend on households can wire whichever trigger fits their semantics. The existing `bonding_system` is village-formation, not household-formation.
+
+## Bureaucrat profession (Pluralist Economy R5)
+
+Government officials physically employed by the settlement treasury. Demote when the treasury can't fund them — "infrastructure decays" without code-level magic.
+
+- **`Profession::Bureaucrat`** (`person.rs`): fourth variant alongside `None / Farmer / Hunter`.
+- **`FactionData.state_funds_public_works: bool`** (default false) — faction-wide governance flag. Today's communist factions never appoint bureaucrats unless this is flipped to true.
+- **`FactionData.bureaucrat_treasury_empty_streak: u32`** — running tally of ticks since the settlement treasury was last "healthy" (≥ `BUREAUCRAT_DAILY_WAGE/24`). **Decoupled from bureaucrat count**: even after a demote-to-zero, the streak keeps advancing if the treasury is still empty, blocking immediate re-promotion until funds actually arrive.
+- **`chief_bureaucrat_appointment_system`** (Economy, every `BUREAUCRAT_ASSIGNMENT_CADENCE = TICKS_PER_DAY/4`): mirrors `faction_hunter_assignment_system` for promote/demote. Target = `max(1, member_count * BUREAUCRAT_MIN_RATIO)` rounded; ranks candidates by Social skill. When `bureaucrat_treasury_empty_streak >= BUREAUCRAT_QUIT_DAYS * TICKS_PER_DAY`, target=0 → all bureaucrats demote with full teardown (clears `task_id`, releases reservations, drops `Carrying`, cancels `aq`). Mirrors the hunter demote pattern exactly.
+- **`bureaucrat_salary_tick_system`** (Economy, every `BUREAUCRAT_SALARY_INTERVAL = TICKS_PER_DAY/24`): debits the faction's first settlement's treasury and credits each bureaucrat's `EconomicAgent.currency` by `BUREAUCRAT_DAILY_WAGE/24`. Two-pass to keep the borrow checker happy: pass 1 = read counts + decide pay; pass 2 = mutate. Treasury bottoms at 0 (clamped); shortfall doesn't go negative.
+- **R5 ships behaviour, not HTN dispatch.** Bureaucrats exist, get paid, and demote when funds dry up — but they don't yet *do* anything in the world (no town-hall HTN method). The `WorkAtTownHallMethod` reusing `Task::Lead` is deferred to R6 where it integrates with the public-works posting flow. R5's regression test (`bureaucrat_promoted_then_demotes_when_treasury_drains`) only needs the appointment + salary mechanic.
+
+## Chief postings gated on policy (Pluralist Economy R6)
+
+`JobPosting` gains three new fields — all default to today's communist-chief shape so existing 287 baseline tests remain unchanged:
+
+- **`poster_class: PosterClass`** ∈ `{Chief, Bureaucrat, HouseholdHead, Individual}`. Defaults to `Chief`. R10+ posters set the other variants.
+- **`reward: f32`** — monetary reward. Chief postings carry `0.0` (communal labor); paid postings (R10+) carry > 0. R9's `U_bid` scorer uses `reward == 0.0` as the legacy fallback signal.
+- **`settlement_id: Option<SettlementId>`** — anchors the posting to a specific settlement (R7+). `None` for chief / faction-scoped postings.
+
+`JobPosting::chief_defaults()` returns a stub with R6 fields filled but other fields placeholder; existing construction sites use `..JobPosting::chief_defaults()` to inherit only the new fields.
+
+**Per-resource gates in `chief_job_posting_system`:** every chief-posting branch reads `faction.policy_for(resource).chief_allocates_labor` and skips the post when false. Default factions have an empty policy map → all resources fall through to `chief_allocates_labor=true` → today's behaviour. Capitalist factions flip individual resources to skip selectively.
+
+| Branch | Gate condition |
+|---|---|
+| **R6-a** Stockpile Calories (food) | `policy_for(Fruit).chief_allocates_labor` |
+| **R6-a** Stockpile Wood/Stone | `policy_for(target_rid).chief_allocates_labor` per-resource |
+| **R6-a** Stockpile (CraftOrder demand) | per `target_rid` |
+| **R6-b** Haul (per-blueprint deposit) | `policy_for(slot.resource_id).chief_allocates_labor` |
+| **R6-c** Build | `!faction.state_funds_public_works` (when bureaucrats exist, chief steps back) |
+| **R6-d** Craft | `policy_for(recipe.output_resource).chief_allocates_labor` |
+| **R6-e** Farm | `policy_for(Grain).chief_allocates_labor` |
+
+**R6 ships only the gates, not the alternative posters.** Capitalist factions today have *no* postings for the gated resources — household-head / bureaucrat / individual posting paths land in R10+ with the validation worked examples. The gate keeps the parallel-path discipline: legacy chief postings still fire under default policy, capitalist factions opt out cleanly.
+
 ## Agent AI (Goals → HTN → Tasks)
 
 The legacy plan registry (`plan/`) was deleted in Phase 7. AI dispatch runs end-to-end through HTN; the plan registry, `PlanRegistry`/`StepRegistry`/`PlanDef`/`StepDef`/`PlanFlags`/`StepTarget` types, `KnownPlans`/`ActivePlan`/`PlanHistory`/`PlanScoringMethod` components, `state.rs` (`build_state_vec` + `count_visible_*`), and `plan_execution_system` are all gone. `PersonAI.last_plan_id` is gone; `PathRequest` no longer carries a `plan_id` diagnostic field. The awareness-gossip half of the deleted `plan_gossip_system` survives as `knowledge::awareness_gossip_system`.

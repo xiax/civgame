@@ -61,6 +61,30 @@ pub const HUNT_INVALIDATE_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
 /// counts. ~Once per quarter game-day; re-rolling every tick churns plans.
 pub const HUNTER_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
 
+// ── Pluralist Economy R5: Bureaucrat constants ─────────────────────────
+
+/// Floor proportion of adults the chief tries to maintain as
+/// `Profession::Bureaucrat` whenever `state_funds_public_works` is true
+/// AND the settlement treasury can fund the wage. Min 1 promoted as
+/// long as there's an eligible None adult.
+pub const BUREAUCRAT_MIN_RATIO: f32 = 0.05;
+
+/// Per-day wage paid to each bureaucrat from their settlement's
+/// treasury. Anchored at 1.0/day; tune later as economy balance lands.
+pub const BUREAUCRAT_DAILY_WAGE: f32 = 1.0;
+
+/// Salary tick cadence — every `TICKS_PER_DAY/24` ticks (~hourly).
+/// Each tick pays `BUREAUCRAT_DAILY_WAGE / 24` per bureaucrat.
+pub const BUREAUCRAT_SALARY_INTERVAL: u64 = (TICKS_PER_DAY / 24) as u64;
+
+/// Number of consecutive game-days the settlement treasury must be
+/// unable to fund full wages before bureaucrats are forcibly demoted.
+pub const BUREAUCRAT_QUIT_DAYS: u32 = 3;
+
+/// Cadence at which `chief_bureaucrat_appointment_system` reconciles
+/// bureaucrat headcount. Mirrors `HUNTER_ASSIGNMENT_CADENCE`.
+pub const BUREAUCRAT_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
+
 /// A chief-issued hunting directive. Lives on `FactionData::hunt_order` and is
 /// either a concrete `Hunt` (with mustering bookkeeping) or a fallback
 /// `Scout` order to find new game.
@@ -243,6 +267,270 @@ pub fn faction_hunter_assignment_system(
             commands
                 .entity(entity)
                 .remove::<crate::simulation::corpse::Carrying>();
+        }
+    }
+}
+
+/// Pluralist Economy R5: chief-driven bureaucrat assignment. Runs in
+/// Economy on `BUREAUCRAT_ASSIGNMENT_CADENCE`. Mirrors the hunter
+/// pattern (promote highest-skill None, demote lowest-skill on
+/// over-target / treasury bust).
+///
+/// Gating:
+/// - Faction must have `state_funds_public_works = true`.
+/// - Treasury empty-streak below the quit threshold (otherwise forces
+///   full demotion regardless of target).
+///
+/// Target headcount: `max(1, adults * BUREAUCRAT_MIN_RATIO)` rounded.
+/// Skill: ranked by Social skill (bureaucracy is paperwork). Existing
+/// Hunters / Farmers are skipped — bureaucracy doesn't poach
+/// established roles.
+pub fn chief_bureaucrat_appointment_system(
+    clock: Res<SimClock>,
+    registry: Res<FactionRegistry>,
+    reservations: Res<StorageReservations>,
+    mut commands: Commands,
+    mut query: Query<(
+        Entity,
+        &mut Profession,
+        &FactionMember,
+        &Skills,
+        Option<&mut PersonAI>,
+        Option<&mut crate::simulation::typed_task::ActionQueue>,
+    )>,
+) {
+    if clock.tick % BUREAUCRAT_ASSIGNMENT_CADENCE != 0 {
+        return;
+    }
+
+    // Per-faction target headcount, snapshotted to avoid borrowing the
+    // registry during the mutable query iteration. Treasury bust forces
+    // target=0 so all bureaucrats demote.
+    let quit_threshold = BUREAUCRAT_QUIT_DAYS.saturating_mul(TICKS_PER_DAY);
+    let mut targets: AHashMap<u32, usize> = AHashMap::default();
+    for (&fid, faction) in registry.factions.iter() {
+        if fid == SOLO || !faction.state_funds_public_works {
+            continue;
+        }
+        let mut target = if faction.member_count > 0 {
+            (faction.member_count as f32 * BUREAUCRAT_MIN_RATIO).round().max(1.0) as usize
+        } else {
+            0
+        };
+        if faction.bureaucrat_treasury_empty_streak >= quit_threshold {
+            target = 0;
+        }
+        target = target.min((faction.member_count as usize) / 2);
+        targets.insert(fid, target);
+    }
+
+    if targets.is_empty() {
+        return;
+    }
+
+    let mut by_faction_bureaucrats: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
+    let mut by_faction_none: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
+    for (entity, prof, member, skills, _, _) in query.iter() {
+        if member.faction_id == SOLO || !targets.contains_key(&member.faction_id) {
+            continue;
+        }
+        let social = skills.0[SkillKind::Social as usize];
+        match *prof {
+            Profession::Bureaucrat => by_faction_bureaucrats
+                .entry(member.faction_id)
+                .or_default()
+                .push((entity, social)),
+            Profession::None => by_faction_none
+                .entry(member.faction_id)
+                .or_default()
+                .push((entity, social)),
+            _ => {}
+        }
+    }
+
+    let mut promote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut demote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    for (&fid, &want) in &targets {
+        let mut bureaucrats = by_faction_bureaucrats.remove(&fid).unwrap_or_default();
+        let mut none = by_faction_none.remove(&fid).unwrap_or_default();
+        if bureaucrats.len() < want {
+            none.sort_by(|a, b| b.1.cmp(&a.1));
+            for (e, _) in none.into_iter().take(want - bureaucrats.len()) {
+                promote.insert(e);
+            }
+        } else if bureaucrats.len() > want {
+            bureaucrats.sort_by(|a, b| a.1.cmp(&b.1));
+            let extra = bureaucrats.len() - want;
+            for (e, _) in bureaucrats.into_iter().take(extra) {
+                demote.insert(e);
+            }
+        }
+    }
+
+    if promote.is_empty() && demote.is_empty() {
+        return;
+    }
+
+    for (entity, mut prof, _member, _skills, ai_opt, aq_opt) in query.iter_mut() {
+        if promote.contains(&entity) {
+            *prof = Profession::Bureaucrat;
+        } else if demote.contains(&entity) {
+            *prof = Profession::None;
+            if let Some(mut ai) = ai_opt {
+                if ai.reserved_resource.is_some() {
+                    release_reservation(&reservations, &mut ai);
+                }
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.target_entity = None;
+                ai.work_progress = 0;
+            }
+            if let Some(mut aq) = aq_opt {
+                aq.cancel();
+            }
+            commands
+                .entity(entity)
+                .remove::<crate::simulation::corpse::Carrying>();
+        }
+    }
+}
+
+/// Pluralist Economy R5: per-bureaucrat salary tick. Every
+/// `BUREAUCRAT_SALARY_INTERVAL` ticks, find each bureaucrat's
+/// faction's first settlement, debit `BUREAUCRAT_DAILY_WAGE / 24`
+/// from `Settlement.treasury`, and credit it to the bureaucrat's
+/// `EconomicAgent.currency`.
+///
+/// Empty-treasury accounting: when a settlement can't fully pay all
+/// its bureaucrats, the parent faction's
+/// `bureaucrat_treasury_empty_streak` advances by
+/// `BUREAUCRAT_SALARY_INTERVAL` ticks. A successful full pay resets
+/// the streak. The appointment system reads this streak and demotes
+/// once it crosses `BUREAUCRAT_QUIT_DAYS * TICKS_PER_DAY`.
+pub fn bureaucrat_salary_tick_system(
+    clock: Res<SimClock>,
+    mut registry: ResMut<FactionRegistry>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    mut settlements: Query<&mut crate::simulation::settlement::Settlement>,
+    mut bureaucrats: Query<(
+        &Profession,
+        &FactionMember,
+        &mut crate::economy::agent::EconomicAgent,
+    )>,
+) {
+    if clock.tick % BUREAUCRAT_SALARY_INTERVAL != 0 {
+        return;
+    }
+    let wage_per_tick = BUREAUCRAT_DAILY_WAGE / 24.0;
+
+    // Build per-faction bureaucrat counts so we can compute the total
+    // wage demand per settlement before mutating treasuries. Two-pass
+    // pattern to keep borrow-checker happy: pass 1 = read-only counts,
+    // pass 2 = mutate treasuries + agent currencies based on each
+    // faction's pay-rate (full or shorted).
+    let mut bureaucrats_per_faction: AHashMap<u32, u32> = AHashMap::default();
+    for (prof, member, _) in bureaucrats.iter() {
+        if *prof != Profession::Bureaucrat || member.faction_id == SOLO {
+            continue;
+        }
+        *bureaucrats_per_faction
+            .entry(member.faction_id)
+            .or_insert(0) += 1;
+    }
+    if bureaucrats_per_faction.is_empty() {
+        // Still need to run the streak-update loop for factions that
+        // *should* have bureaucrats but don't yet (treasury empty
+        // before any promote). Iterate registry separately below.
+    }
+
+    // For each faction with `state_funds_public_works=true`, decide
+    // whether the settlement treasury covers the full per-tick wage
+    // for its bureaucrats. Output: (faction_id, pay_per_bureaucrat,
+    // treasury_healthy). `treasury_healthy` is decoupled from
+    // bureaucrat count — it tracks whether the settlement treasury
+    // could fund the appointed-or-target headcount this tick.
+    // Decoupling matters: after a demote-to-zero, count drops to 0
+    // but the underlying treasury is still empty, so the streak must
+    // keep advancing to block immediate re-promotion.
+    let mut pay_decision: AHashMap<u32, (f32, bool)> = AHashMap::default();
+    for (&fid, faction) in registry.factions.iter() {
+        if !faction.state_funds_public_works || fid == SOLO {
+            continue;
+        }
+        let count = bureaucrats_per_faction.get(&fid).copied().unwrap_or(0);
+
+        // Find the faction's first settlement and read its treasury.
+        let settlement_entity = settlement_map
+            .by_faction
+            .get(&fid)
+            .and_then(|ids| ids.first().copied())
+            .and_then(|sid| settlement_map.by_id.get(&sid).copied());
+        let Some(settlement_entity) = settlement_entity else {
+            // No settlement → can't fund. Treasury vacuously empty.
+            pay_decision.insert(fid, (0.0, false));
+            continue;
+        };
+        let treasury = settlements
+            .get(settlement_entity)
+            .map(|s| s.treasury)
+            .unwrap_or(0.0);
+
+        // Treasury health: enough to fund a hypothetical headcount of
+        // at least 1 bureaucrat for one salary interval. Independent
+        // of current `count`, so a zero-bureaucrat empty-treasury
+        // faction keeps its streak advancing.
+        let healthy = treasury >= wage_per_tick;
+
+        let pay = if count == 0 {
+            0.0
+        } else if treasury >= wage_per_tick * count as f32 {
+            wage_per_tick
+        } else {
+            // Partial pay: split whatever's there evenly.
+            (treasury / count as f32).max(0.0)
+        };
+        pay_decision.insert(fid, (pay, healthy));
+    }
+
+    // Apply: debit settlements, credit bureaucrats, advance / reset
+    // empty-streaks.
+    for (&fid, &(pay, full)) in pay_decision.iter() {
+        if pay > 0.0 {
+            // Debit settlement.
+            let count = bureaucrats_per_faction.get(&fid).copied().unwrap_or(0);
+            let debit = pay * count as f32;
+            if let Some(settlement_entity) = settlement_map
+                .by_faction
+                .get(&fid)
+                .and_then(|ids| ids.first().copied())
+                .and_then(|sid| settlement_map.by_id.get(&sid).copied())
+            {
+                if let Ok(mut settlement) = settlements.get_mut(settlement_entity) {
+                    settlement.treasury -= debit;
+                    if settlement.treasury < 0.0 {
+                        settlement.treasury = 0.0;
+                    }
+                }
+            }
+
+            // Credit each bureaucrat.
+            for (prof, member, mut econ) in bureaucrats.iter_mut() {
+                if *prof != Profession::Bureaucrat || member.faction_id != fid {
+                    continue;
+                }
+                econ.currency += pay;
+            }
+        }
+
+        // Update empty-streak.
+        if let Some(faction) = registry.factions.get_mut(&fid) {
+            if full {
+                faction.bureaucrat_treasury_empty_streak = 0;
+            } else {
+                faction.bureaucrat_treasury_empty_streak = faction
+                    .bureaucrat_treasury_empty_streak
+                    .saturating_add(BUREAUCRAT_SALARY_INTERVAL as u32);
+            }
         }
     }
 }
@@ -891,6 +1179,28 @@ pub struct FactionData {
         crate::economy::resource_catalog::ResourceId,
         crate::economy::policy::ResourceControlPolicy,
     >,
+    /// Pluralist Economy R3: parent faction id, set on household
+    /// sub-factions. `None` = top-level (village). Households nest
+    /// under villages and reuse the entire faction infrastructure.
+    pub parent_faction: Option<u32>,
+    /// R3: head of the household sub-faction (analogous to `chief_entity`
+    /// for villages). `None` for villages or sub-factions whose head
+    /// has died / not yet been appointed.
+    pub household_head: Option<Entity>,
+    /// R3: reverse pointer for villages — every household whose
+    /// `parent_faction == Some(self_id)`. Maintained alongside
+    /// `parent_faction` by `FactionRegistry::spawn_household`.
+    pub children_factions: Vec<u32>,
+    /// Pluralist Economy R5: when true, the chief appoints
+    /// bureaucrats and the settlement treasury pays their wage.
+    /// Faction-wide governance flag (not per-resource). Defaults to
+    /// false — today's communist factions don't have bureaucrats.
+    pub state_funds_public_works: bool,
+    /// R5: how many ticks the faction's settlement treasury has been
+    /// empty (i.e. unable to pay full salaries). When this crosses
+    /// `BUREAUCRAT_QUIT_DAYS * TICKS_PER_DAY`, all bureaucrats
+    /// demote. Reset to 0 whenever a salary tick succeeds.
+    pub bureaucrat_treasury_empty_streak: u32,
 }
 
 impl FactionData {
@@ -957,9 +1267,74 @@ impl FactionRegistry {
                 nearby_prey_count: 0,
                 treasury: 0.0,
                 economic_policy: ahash::AHashMap::default(),
+                parent_faction: None,
+                household_head: None,
+                children_factions: Vec::new(),
+                state_funds_public_works: false,
+                bureaucrat_treasury_empty_streak: 0,
             },
         );
         id
+    }
+
+    /// Pluralist Economy R3: spawn a household sub-faction nested
+    /// under `parent_faction_id`. Returns the new sub-faction id.
+    ///
+    /// The sub-faction reuses every faction primitive (storage,
+    /// treasury, member count, chief-equivalent via `household_head`).
+    /// Its `economic_policy` is stamped with `ResourceControlPolicy::
+    /// capitalist()` for every catalog resource so households default
+    /// to private-actor-friendly behaviour even when the parent
+    /// village runs all-communist defaults. The parent faction's
+    /// `children_factions` vector is updated reciprocally.
+    ///
+    /// Caller is responsible for:
+    /// - moving the head + initial members' `FactionMember.faction_id`
+    ///   to the new id,
+    /// - calling `add_member` for each migrated member,
+    /// - spawning a `FactionStorageTile` for the household at its
+    ///   chosen home tile.
+    ///
+    /// R3 ships only this primitive; the actual *trigger* (cosleep
+    /// duration, marriage rite, player command) lands in a follow-on
+    /// sub-PR once a system needs households to exist.
+    pub fn spawn_household(
+        &mut self,
+        parent_faction_id: u32,
+        home_tile: (i32, i32),
+        head: Entity,
+        catalog: &crate::economy::resource_catalog::ResourceCatalog,
+    ) -> u32 {
+        let new_id = self.create_faction(home_tile);
+        let cap_policy = crate::economy::policy::ResourceControlPolicy::capitalist();
+        if let Some(data) = self.factions.get_mut(&new_id) {
+            data.parent_faction = Some(parent_faction_id);
+            data.household_head = Some(head);
+            // Stamp the capitalist preset on every catalog resource
+            // so the household is observationally capitalist by
+            // default. The map is per-faction so this only affects
+            // the household, not the parent village.
+            for (rid, _def) in catalog.iter() {
+                data.economic_policy.insert(rid, cap_policy);
+            }
+        }
+        if let Some(parent) = self.factions.get_mut(&parent_faction_id) {
+            parent.children_factions.push(new_id);
+        }
+        new_id
+    }
+
+    /// Pluralist Economy R3: walk the parent chain and return the
+    /// top-level (root) village faction id. Returns `faction_id`
+    /// itself if it has no parent.
+    pub fn root_faction(&self, mut faction_id: u32) -> u32 {
+        while let Some(data) = self.factions.get(&faction_id) {
+            match data.parent_faction {
+                Some(parent) => faction_id = parent,
+                None => return faction_id,
+            }
+        }
+        faction_id
     }
 
     pub fn add_member(&mut self, faction_id: u32) {

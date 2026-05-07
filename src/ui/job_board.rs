@@ -452,6 +452,9 @@ fn build_player_posting(
         source: JobSource::Player,
         posted_tick,
         expiry_tick: Some(posted_tick + 600),
+        poster_class: crate::simulation::jobs::PosterClass::Chief,
+        reward: 0.0,
+        settlement_id: None,
     })
 }
 
