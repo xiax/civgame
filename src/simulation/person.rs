@@ -483,7 +483,8 @@ pub fn spawn_population(
                     RelationshipMemory::default(),
                     KnownPlans::with_innate(&[
                         // FORAGE_FOOD retired in the Forage→HTN migration.
-                        PlanId::FARM_FOOD,
+                        // FARM_FOOD retired with the closing of Phase 5
+                        // (HTN method `HarvestMaturePlantForStorageMethod`).
                         // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
                         // HUNT_FOOD retired in Phase 5e-viii-c (HTN abstract
                         // tasks JoinHuntParty / EngagePrey / DeliverHuntKill).

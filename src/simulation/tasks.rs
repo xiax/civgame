@@ -688,6 +688,17 @@ pub fn goal_dispatch_system(
                     AgentGoal::Farm if ai.task_id == TaskKind::Planter as u16 => {
                         Some(TaskKind::Planter as u16)
                     }
+                    // FarmFood (PlanId 1) → HTN migration: harvest chain
+                    // (`HarvestMaturePlantForStorageMethod` emits `[Gather,
+                    // DepositToFactionStorage]`) runs without an ActivePlan
+                    // under Farm. Both legs need to survive across goal-dispatch
+                    // ticks until completion or external preempt.
+                    AgentGoal::Farm if ai.task_id == TaskKind::Gather as u16 => {
+                        Some(TaskKind::Gather as u16)
+                    }
+                    AgentGoal::Farm if ai.task_id == TaskKind::DepositResource as u16 => {
+                        Some(TaskKind::DepositResource as u16)
+                    }
                     // Phase 5e-vi: HTN-driven ConstructBlueprint chain runs without
                     // an ActivePlan under Build. The Construct walk + on-site
                     // labor must survive across goal-dispatch ticks until

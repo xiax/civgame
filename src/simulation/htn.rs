@@ -232,6 +232,15 @@ pub enum AbstractTask {
     /// `PF_UNINTERRUPTIBLE`). Replaces the legacy `DeliverGrainToCraftOrder`
     /// plan (PlanId 14) + `[StepId(1) FarmFood, StepId(38) HaulToCraftOrder]`.
     HarvestGrainForCraftOrder,
+    /// Farmer under `AgentGoal::Farm` harvests a remembered mature edible
+    /// plant (Grain / BerryBush) and deposits the harvest at faction storage.
+    /// Single expansion `[Task::Gather { tile },
+    /// Task::DepositToFactionStorage { resource_id }]`. Replaces the legacy
+    /// `FarmFood` plan (PlanId 1) + `[StepId(1) FarmFarmland, StepId(12)
+    /// DepositGoods]`. The companion `htn_plant_from_storage_dispatch_system`
+    /// owns the planting half of `AgentGoal::Farm`; together they retire the
+    /// last plan-driven flow.
+    HarvestPlant,
     /// Agent under `AgentGoal::Play` recreates — either with a nearby Person
     /// (`PlayWithPartnerMethod`, social play) or solo with an entertainment-
     /// valued item held or adjacent (`PlaySoloMethod`). Single expansion
@@ -272,6 +281,7 @@ pub enum AbstractTaskKind {
     DeliverMaterialToCraftOrder,
     WorkOnCraftOrder,
     HarvestGrainForCraftOrder,
+    HarvestPlant,
     Play,
 }
 
@@ -302,6 +312,7 @@ impl AbstractTask {
             }
             AbstractTask::WorkOnCraftOrder => AbstractTaskKind::WorkOnCraftOrder,
             AbstractTask::HarvestGrainForCraftOrder => AbstractTaskKind::HarvestGrainForCraftOrder,
+            AbstractTask::HarvestPlant => AbstractTaskKind::HarvestPlant,
             AbstractTask::Play => AbstractTaskKind::Play,
         }
     }
@@ -362,6 +373,7 @@ impl MethodId {
     pub const WITHDRAW_AND_PLANT_BERRY_SEED_AS_PLAY: MethodId = MethodId(38);
     pub const WITHDRAW_AND_HAUL_TO_PERSONAL_BLUEPRINT: MethodId = MethodId(39);
     pub const GATHER_AND_HAUL_TO_PERSONAL_BLUEPRINT: MethodId = MethodId(40);
+    pub const HARVEST_MATURE_PLANT_FOR_STORAGE: MethodId = MethodId(41);
 
     pub fn raw(self) -> u16 {
         self.0
@@ -976,6 +988,10 @@ pub fn register_builtin_methods(reg: &mut MethodRegistry) {
     reg.register(
         AbstractTaskKind::HarvestGrainForCraftOrder,
         Box::new(HarvestAndHaulGrainToCraftOrderMethod),
+    );
+    reg.register(
+        AbstractTaskKind::HarvestPlant,
+        Box::new(HarvestMaturePlantForStorageMethod),
     );
     reg.register(AbstractTaskKind::Play, Box::new(PlayWithPartnerMethod));
     reg.register(AbstractTaskKind::Play, Box::new(PlaySoloMethod));
@@ -8399,6 +8415,260 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
 
         let abstract_task = AbstractTask::HarvestGrainForCraftOrder;
         let methods = method_registry.methods_for(AbstractTaskKind::HarvestGrainForCraftOrder);
+        let chosen = methods
+            .iter()
+            .filter(|m| m.precondition(abstract_task, &ctx))
+            .max_by(|a, b| {
+                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(method) = chosen else {
+            continue;
+        };
+        let chosen_id = method.id();
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+        match head {
+            Task::Gather { tile } => {
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    tile,
+                    TaskKind::Gather,
+                    None,
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                aq.dispatch(Task::Gather { tile });
+            }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
+}
+
+/// Method for `AbstractTask::HarvestPlant`: harvest a remembered mature edible
+/// plant under `AgentGoal::Farm` and deposit at faction storage. Replaces the
+/// legacy `FarmFood` plan (PlanId 1) — the last live legacy plan.
+///
+/// `forage_food_good` carries the plant's primary harvest yield so the trailing
+/// `Task::DepositToFactionStorage { resource_id }` reflects what's about to land
+/// in the agent's hands (informational — the deposit executor itself dumps
+/// everything in inventory regardless). Utility is `UTIL_BASELINE` (1.0) with a
+/// full-trip distance discount across agent → plant → storage when both ctx tiles
+/// are populated.
+pub struct HarvestMaturePlantForStorageMethod;
+
+impl Method for HarvestMaturePlantForStorageMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::HarvestPlant) {
+            return false;
+        }
+        ctx.gather_target_tile.is_some() && ctx.forage_food_good.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE
+            - full_trip_penalty(ctx.tile, ctx.gather_target_tile, ctx.gather_deposit_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::HarvestPlant) {
+            return Vec::new();
+        }
+        let Some(tile) = ctx.gather_target_tile else {
+            return Vec::new();
+        };
+        let Some(resource_id) = ctx.forage_food_good else {
+            return Vec::new();
+        };
+        vec![
+            Task::Gather { tile },
+            Task::DepositToFactionStorage { resource_id },
+        ]
+    }
+
+    fn tech_gate(&self) -> Option<TechId> {
+        Some(crate::simulation::technology::CROP_CULTIVATION)
+    }
+
+    fn name(&self) -> &'static str {
+        "HarvestMaturePlantForStorage"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::HARVEST_MATURE_PLANT_FOR_STORAGE
+    }
+}
+
+/// Farm-goal harvest dispatcher. Owns the harvest half of `AgentGoal::Farm`
+/// (the planting half lives in `htn_plant_from_storage_dispatch_system`).
+/// Replaces the last live legacy plan, `FarmFood` (PlanId 1) +
+/// `[StepId(1) FarmFarmland, StepId(12) DepositGoods]`.
+///
+/// Gates on `AgentGoal::Farm` + Learned `CROP_CULTIVATION` + non-SOLO + no
+/// `ActivePlan` + Idle. Walks `AgentMemory::best_for(MemoryKind::AnyEdible)`
+/// paired with `PlantMap` to find a remembered live mature plant (Grain or
+/// BerryBush — whichever the agent remembers); reads the plant's
+/// `harvest_yield(false).0` to thread the resource through to the trailing
+/// deposit. Snapshots `gather_target_tile` + `forage_food_good` +
+/// `gather_deposit_tile` into ctx and dispatches the head `Task::Gather { tile }`.
+/// `gather::finish_gather`'s existing `DepositToFactionStorage` arm routes to
+/// the nearest faction storage tile on harvest completion.
+pub fn htn_harvest_plant_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    storage_tile_map: Res<StorageTileMap>,
+    faction_registry: Res<FactionRegistry>,
+    method_registry: Res<MethodRegistry>,
+    plant_map: Res<PlantMap>,
+    plant_query: Query<&Plant>,
+    clock: Res<SimClock>,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+            Option<&ActivePlan>,
+            Option<&AgentMemory>,
+            Option<&crate::simulation::knowledge::PersonKnowledge>,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    let now = clock.tick;
+    for (
+        mut ai,
+        mut aq,
+        mut history,
+        goal,
+        transform,
+        member,
+        lod,
+        active_plan_opt,
+        memory_opt,
+        knowledge_opt,
+    ) in query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::Farm) {
+            continue;
+        }
+        if active_plan_opt.is_some() {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+        if member.faction_id == SOLO {
+            continue;
+        }
+        let has_tech = knowledge_opt
+            .map(|k| k.has_learned(crate::simulation::technology::CROP_CULTIVATION))
+            .unwrap_or(false);
+        if !has_tech {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Find a remembered mature edible plant. Mirrors the legacy
+        // `StepTarget::FromMemory(AnyEdible)` resolver — checks memory first,
+        // confirms the plant is live and Mature via `PlantMap` + `Plant.stage`.
+        let harvest_candidate = memory_opt
+            .and_then(|m| m.best_for(MemoryKind::AnyEdible))
+            .and_then(|tile| {
+                let entity = plant_map.0.get(&tile).copied()?;
+                let plant = plant_query.get(entity).ok()?;
+                if plant.stage != GrowthStage::Mature {
+                    return None;
+                }
+                let (id, _) = plant.kind.harvest_yield(false);
+                Some((tile, id))
+            });
+        let Some((plant_tile, harvest_id)) = harvest_candidate else {
+            continue;
+        };
+        let deposit_tile =
+            storage_tile_map.nearest_for_faction(member.faction_id, plant_tile);
+
+        let ctx = PlannerCtx {
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home: faction_registry.home_tile(member.faction_id),
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: Some(plant_tile),
+            scavenge_target_entity: None,
+            scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: deposit_tile,
+            scavenge_deposit_tile: None,
+            forage_food_good: Some(harvest_id),
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
+            personal_bp_resource: None,
+        };
+
+        let abstract_task = AbstractTask::HarvestPlant;
+        let methods = method_registry.methods_for(AbstractTaskKind::HarvestPlant);
         let chosen = methods
             .iter()
             .filter(|m| m.precondition(abstract_task, &ctx))

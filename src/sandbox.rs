@@ -99,7 +99,8 @@ fn setup_sandbox(
             RelationshipMemory::default(),
             KnownPlans::with_innate(&[
                 // FORAGE_FOOD retired in the Forage→HTN migration.
-                PlanId::FARM_FOOD,
+                // FARM_FOOD retired with the closing of Phase 5
+                // (HTN method `HarvestMaturePlantForStorageMethod`).
                 // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
                 PlanId::HUNT_FOOD,
                 // SCAVENGE_FOOD retired 5c-ii-d-vi.

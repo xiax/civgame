@@ -236,8 +236,10 @@ impl Plugin for SimulationPlugin {
                         .after(htn::htn_deliver_material_to_craft_order_dispatch_system),
                     htn::htn_harvest_grain_for_craft_order_dispatch_system
                         .after(htn::htn_work_on_craft_order_dispatch_system),
-                    htn::htn_play_dispatch_system
+                    htn::htn_harvest_plant_dispatch_system
                         .after(htn::htn_harvest_grain_for_craft_order_dispatch_system),
+                    htn::htn_play_dispatch_system
+                        .after(htn::htn_harvest_plant_dispatch_system),
                 )
                     .in_set(SimulationSet::ParallelB),
             )

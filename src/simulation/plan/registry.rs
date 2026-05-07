@@ -45,7 +45,12 @@ static FOREST_TILES: &[TileKind] = &[TileKind::Forest];
 // gather handoff routes via `TaskKind::DepositResource`; StepId(0) is no
 // longer referenced by any plan but kept for in-flight ActivePlan
 // compatibility (mirrors the StepId 41/42 ClaimedHaul pattern).
-static PLAN_STEPS_1: &[StepId] = &[StepId(1), StepId(12)]; // FarmFood → DepositGoods
+// PLAN_STEPS_1 (FarmFood) retired — `htn_harvest_plant_dispatch_system` +
+// `HarvestMaturePlantForStorageMethod` own the [Gather { tile },
+// DepositToFactionStorage { resource_id }] expansion now under `AgentGoal::Farm`.
+// Was the last live legacy plan; its retirement closes Phase 5. StepId(1)
+// (FarmFarmland) and StepId(12) (DepositGoods) survive as orphans — StepId(12)
+// is shared with the HTN gather handoff path (`TaskKind::DepositResource`).
 // PLAN_STEPS_2 (GatherWood) and PLAN_STEPS_3 (GatherStone) were retired in
 // Phase 5c-ii-c-ii — the gather → deposit chain is now driven by HTN
 // `htn_acquire_good_dispatch_system` + `GatherFromKnownMethod`. Both StepId(2)
@@ -118,7 +123,9 @@ static TAME_HORSE_GOALS: &[AgentGoal] = &[AgentGoal::TameHorse];
 static GATHER_WOOD_GOALS: &[AgentGoal] = &[AgentGoal::GatherWood];
 static GATHER_STONE_GOALS: &[AgentGoal] = &[AgentGoal::GatherStone];
 static SURVIVE_AND_GATHER_FOOD_GOALS: &[AgentGoal] = &[AgentGoal::Survive, AgentGoal::GatherFood];
-static FARM_GOALS: &[AgentGoal] = &[AgentGoal::Farm];
+// FARM_GOALS retired alongside PlanId 1 (FarmFood) — the only consumer.
+// The HTN Farm-goal flow (planting + harvesting) lives in
+// `htn_plant_from_storage_dispatch_system` and `htn_harvest_plant_dispatch_system`.
 static BUILD_GOALS: &[AgentGoal] = &[AgentGoal::Build];
 static HAUL_GOALS: &[AgentGoal] = &[AgentGoal::Haul];
 static CRAFT_GOALS: &[AgentGoal] = &[AgentGoal::Craft];
@@ -964,22 +971,19 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
             requires_profession: None,
         },
         PlanDef {
-            // Farming is a deferred-payoff plan; weight it on skill + season,
-            // and let it fade as storage fills. Hunger weight removed — under
-            // Survive the eating plans now dominate via bias, and under
-            // GatherFood hunger is moderate anyway.
+            // 1: (unused — was FarmFood; retired with the closing of Phase 5.
+            // `htn_harvest_plant_dispatch_system` + `HarvestMaturePlantForStorageMethod`
+            // own the [Gather, DepositToFactionStorage] chain now under
+            // `AgentGoal::Farm`. ID kept as a PlanHistory ring-buffer sentinel;
+            // bias wired so the candidate filter never selects it.)
             id: PlanId(1),
-            name: "FarmFood",
-            steps: PLAN_STEPS_1,
-            state_weights: mk_weights(&[
-                (SI_SKILL_FARMING, 0.4),
-                (SI_SEASON_FOOD, 0.6),
-                (SI_STORAGE_FOOD, -0.2),
-            ]),
-            bias: 0.0,
-            serves_goals: FARM_GOALS,
-            tech_gate: Some(technology::CROP_CULTIVATION),
-            memory_target_kind: Some(MemoryKind::AnyEdible),
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
+            tech_gate: None,
+            memory_target_kind: None,
             flags: PF_NONE,
             requires_profession: None,
         },

@@ -298,7 +298,8 @@ impl PersonBuilder {
             // candidate filtering behaves identically.
             known_plan_ids: vec![
                 // FORAGE_FOOD retired in the Forage→HTN migration.
-                PlanId::FARM_FOOD,
+                // FARM_FOOD retired with the closing of Phase 5
+                // (HTN method `HarvestMaturePlantForStorageMethod`).
                 // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
                 // HUNT_FOOD retired in Phase 5e-viii-c (HTN abstract tasks).
                 // SCAVENGE_FOOD retired 5c-ii-d-vi.
@@ -3558,6 +3559,173 @@ mod baseline_behaviour {
             }
             other => panic!(
                 "expected Task::HaulToCraftOrder queued behind Gather, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Phase 5 closure: an agent under `AgentGoal::Farm` (set via
+    /// `JobClaim::Farm`) with Learned `CROP_CULTIVATION` and a remembered
+    /// mature edible plant dispatches a `[Gather { tile },
+    /// DepositToFactionStorage { resource_id }]` chain via
+    /// `htn_harvest_plant_dispatch_system` +
+    /// `HarvestMaturePlantForStorageMethod`. Replaces the legacy `FarmFood`
+    /// plan (PlanId 1) — the last live legacy plan.
+    #[test]
+    fn farm_goal_dispatches_harvest_then_deposit_chain_when_memory_has_grain() {
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::jobs::{
+            ClaimTarget, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+            TileAabb,
+        };
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::memory::{AgentMemory, MemoryKind};
+        use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+        use crate::simulation::technology::CROP_CULTIVATION;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(173);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Storage tile so the trailing DepositToFactionStorage's deposit-tile
+        // resolution succeeds; without it the dispatcher still chooses the
+        // method (deposit_tile is informational), but the chain handoff at
+        // gather completion would route nowhere. Place at (4, 4) — within
+        // the agent's chunk for routing.
+        let storage_tile = (4, 4);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+
+        // Mature Grain plant outside VIEW_RADIUS=15 so injected memory survives
+        // the vision_system clear on the dispatch tick (test_fixture quirk).
+        let grain_tile = (40, 0);
+        let grain_world = tile_to_world(grain_tile.0, grain_tile.1);
+        let grain_entity = sim
+            .app
+            .world_mut()
+            .spawn((
+                Plant {
+                    kind: PlantKind::Grain,
+                    stage: GrowthStage::Mature,
+                    growth_ticks: 0,
+                    tile_pos: grain_tile,
+                },
+                Transform::from_xyz(grain_world.x, grain_world.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<PlantMap>()
+            .0
+            .insert(grain_tile, grain_entity);
+
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Grant CROP_CULTIVATION (Neolithic — not in `paleolithic_seed`).
+        // Setting both aware and learned so `has_learned` returns true.
+        {
+            let mut knowledge = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonKnowledge>(person)
+                .unwrap();
+            knowledge.aware |= 1u64 << CROP_CULTIVATION;
+            knowledge.learned |= 1u64 << CROP_CULTIVATION;
+        }
+
+        // Inject memory of the grain tile.
+        {
+            let mut mem = sim
+                .app
+                .world_mut()
+                .get_mut::<AgentMemory>(person)
+                .expect("AgentMemory missing");
+            mem.record(grain_tile, MemoryKind::AnyEdible);
+        }
+
+        // Pin AgentGoal::Farm via JobClaim::Farm so `job_goal_lock_system`
+        // keeps it stuck across dispatch ticks (the test faction's chief
+        // wouldn't otherwise post Farm jobs in the harness).
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            let posting = JobPosting {
+                id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Farm,
+                progress: JobProgress::Planting {
+                    planted: 0,
+                    target: 1,
+                    area: TileAabb {
+                        min: (-10, -10),
+                        max: (10, 10),
+                    },
+                },
+                claimants: vec![person],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+            };
+            board
+                .postings
+                .entry(sim.player_faction_id)
+                .or_default()
+                .push(posting);
+            id
+        };
+        {
+            let mut entity = sim.app.world_mut().entity_mut(person);
+            entity.insert(JobClaim {
+                job_id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Farm,
+                posted_tick: 0,
+                fail_count: 0,
+            });
+            entity.insert(ClaimTarget::default());
+            let mut goal = entity.get_mut::<AgentGoal>().unwrap();
+            *goal = AgentGoal::Farm;
+        }
+
+        sim.tick_n(7);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+
+        match aq.current {
+            Task::Gather { tile } => {
+                assert_eq!(
+                    tile, grain_tile,
+                    "head Task::Gather should target the remembered grain plant tile"
+                );
+            }
+            other => panic!(
+                "expected Task::Gather as head of HarvestPlant chain, got {:?}",
+                other
+            ),
+        }
+
+        assert_eq!(
+            aq.queued_len(),
+            1,
+            "expected one queued task (DepositToFactionStorage) behind Gather"
+        );
+        match aq.peek_next() {
+            Some(Task::DepositToFactionStorage { resource_id }) => {
+                assert_eq!(
+                    resource_id,
+                    crate::economy::core_ids::grain(),
+                    "queued DepositToFactionStorage should carry the grain resource"
+                );
+            }
+            other => panic!(
+                "expected Task::DepositToFactionStorage queued behind Gather, got {:?}",
                 other
             ),
         }
