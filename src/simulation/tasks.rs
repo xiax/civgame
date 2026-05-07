@@ -699,6 +699,19 @@ pub fn goal_dispatch_system(
                     AgentGoal::Build if ai.task_id == TaskKind::ConstructBed as u16 => {
                         Some(TaskKind::ConstructBed as u16)
                     }
+                    // Phase 5e-xiii-a: HTN-driven personal-blueprint chain
+                    // (`WithdrawAndHaulToPersonalBlueprintMethod`) runs without
+                    // an ActivePlan under Build. Both legs (WithdrawMaterial +
+                    // HaulMaterials) must survive across goal-dispatch ticks
+                    // until completion or external preempt — mirrors the
+                    // method's `MF_UNINTERRUPTIBLE` and the legacy
+                    // `HaulFromStorageAndBuild` plan's `PF_UNINTERRUPTIBLE`.
+                    AgentGoal::Build if ai.task_id == TaskKind::WithdrawMaterial as u16 => {
+                        Some(TaskKind::WithdrawMaterial as u16)
+                    }
+                    AgentGoal::Build if ai.task_id == TaskKind::HaulMaterials as u16 => {
+                        Some(TaskKind::HaulMaterials as u16)
+                    }
                     // Phase 5c-ii-c-ii: AcquireGood gather chain runs without
                     // an ActivePlan. Both legs (gather + deposit at faction
                     // storage) need to survive across goal-dispatch ticks

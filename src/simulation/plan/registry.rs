@@ -86,8 +86,12 @@ static PLAN_STEPS_1: &[StepId] = &[StepId(1), StepId(12)]; // FarmFood → Depos
 // `TaskKind::DepositResource`; StepId(6) is no longer referenced by any plan
 // but kept for in-flight ActivePlan compatibility (mirrors the StepId 41/42
 // ClaimedHaul pattern).
-static PLAN_STEPS_7: &[StepId] = &[StepId(2), StepId(28), StepId(25)]; // GatherWood, HaulToBlueprint, BuildAnyBlueprint
-static PLAN_STEPS_29: &[StepId] = &[StepId(32), StepId(28), StepId(25)]; // FetchMaterialFromStorage, HaulToBlueprint, BuildAnyBlueprint
+// PLAN_STEPS_7 / PLAN_STEPS_29 retired in Phase 5e-xiii-{a,b} along with
+// PlanIds 7 (`BuildBlueprint`) and 29 (`HaulFromStorageAndBuild`). The HTN
+// `WithdrawAndHaulToPersonalBlueprintMethod` and
+// `GatherAndHaulToPersonalBlueprintMethod` (under
+// `AbstractTaskKind::ConstructBlueprint`) cover the personal-blueprint
+// pipeline end-to-end.
 // PLAN_STEPS_9 (WithdrawAndEat) was retired in Phase 5b-iii-ii — the
 // walk-to-storage-then-eat path is now driven by HTN
 // `htn_acquire_food_dispatch_system` + `WithdrawFromStorageMethod`. Both
@@ -542,20 +546,17 @@ pub fn register_builtin_steps(registry: &mut StepRegistry) {
             withdraw_filter: None,
         },
         StepDef {
-            // 32: FetchMaterialFromStorage — route to the nearest faction
-            // storage tile that holds a good currently needed by an unsatisfied
-            // blueprint and pull the most-deficient material into the agent's
-            // inventory. Pairs with step 28 (HaulToBlueprint) so stockpiled
-            // wood/stone can ferry into in-progress build sites without a
-            // fresh gather wave.
+            // 32: (unused — was FetchMaterialFromStorage; retired in Phase
+            // 5e-xiii-a along with its sole consumer PlanId 29
+            // (`HaulFromStorageAndBuild`). The HTN
+            // `WithdrawAndHaulToPersonalBlueprintMethod` resolves the same
+            // most-deficient lookup inline in
+            // `htn_build_claimed_blueprint_dispatch_system` Path B.)
             id: StepId(32),
-            task: TaskKind::WithdrawMaterial,
-            target: StepTarget::WithdrawForFactionNeed {
-                need: MaterialNeed::Blueprint,
-                selector: GoodSelector::MostDeficient,
-            },
+            task: TaskKind::Idle,
+            target: StepTarget::SelfPosition,
             preconditions: StepPreconditions::none(),
-            reward_scale: 0.4,
+            reward_scale: 0.0,
             plant_filter: None,
             withdraw_filter: None,
         },
@@ -1035,24 +1036,29 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         // covered the Survive path. PlanId 6 is retired with no successor;
         // ID is kept reserved by the constant in `plan/mod.rs` for
         // PlanHistory ring-buffer stability.
+        // Phase 5e-xiii-b: PlanId 7 (`BuildBlueprint`) retired. The HTN
+        // `GatherAndHaulToPersonalBlueprintMethod` under
+        // `AbstractTaskKind::ConstructBlueprint`
+        // (`htn_build_claimed_blueprint_dispatch_system` Path B) owns the
+        // gather-fed personal-blueprint flow end-to-end. Together with
+        // `WithdrawAndHaulToPersonalBlueprintMethod` (5e-xiii-a) and the
+        // existing `BuildClaimedBlueprintMethod`, the entire personal-bp
+        // pipeline is HTN-driven. The const `PlanId::BUILD_BLUEPRINT =
+        // PlanId(7)` survives only as a stable sentinel for `PlanHistory`
+        // ring-buffer entries. StepIds 2 (ChopForest), 28 (HaulToBlueprint),
+        // and 25 (BuildAnyBlueprint) survive: StepId 2 is still used
+        // implicitly via the catch-all gather plumbing, and 28/25 are
+        // orphaned legacy steps kept for in-flight ActivePlan compatibility.
         PlanDef {
-            // Gather-then-build sibling: only worth picking when storage is
-            // dry and the agent can actually see/remember wood. Otherwise
-            // HaulFromStorageAndBuild (29) is the cheaper path.
             id: PlanId(7),
-            name: "BuildBlueprint",
-            steps: PLAN_STEPS_7,
-            state_weights: mk_weights(&[
-                (SI_SKILL_BUILDING, 0.5),
-                (SI_VIS_TREE, 0.4),
-                (SI_MEM_WOOD, 0.3),
-                (SI_STORAGE_WOOD, -0.5),
-            ]),
-            bias: 0.2,
-            serves_goals: BUILD_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
-            flags: PF_UNINTERRUPTIBLE,
+            flags: PF_NONE,
             requires_profession: None,
         },
         PlanDef {
@@ -1355,27 +1361,32 @@ pub fn register_builtin_plans(registry: &mut PlanRegistry) {
         // `AcquireFood` (5c-ii-d-iv-ii) covered the Survive case. ID is kept
         // reserved by the constant in `plan/mod.rs` for PlanHistory
         // ring-buffer stability.
+        // Phase 5e-xiii-a: PlanId 29 (`HaulFromStorageAndBuild`) retired. The
+        // HTN `WithdrawAndHaulToPersonalBlueprintMethod` under
+        // `AbstractTaskKind::ConstructBlueprint`
+        // (`htn_build_claimed_blueprint_dispatch_system` Path B) owns the
+        // storage-fed personal-blueprint flow end-to-end. The chief job
+        // pipeline (Stockpile + Haul postings) covers the *faction*-bp case
+        // via the AcquireGood haul branch + the existing
+        // `BuildClaimedBlueprintMethod`, and chiefs explicitly skip
+        // personal blueprints (`jobs.rs:386`), so this plan was the
+        // unclaimed-fallback path for personal bps only. The const
+        // `PlanId::HAUL_FROM_STORAGE_AND_BUILD = PlanId(29)` survives only as
+        // a stable sentinel for `PlanHistory` ring-buffer entries. StepId 32
+        // (FetchMaterialFromStorage) is flipped to `(unused)` placeholder —
+        // its only consumer was this plan. StepIds 28 (HaulToBlueprint) and
+        // 25 (BuildAnyBlueprint) survive as orphans because PlanId 7
+        // (`BuildBlueprint`) still embeds them; both retire in 5e-xiii-b.
         PlanDef {
-            // Sibling of BuildBlueprint that pulls materials out of communal
-            // storage instead of gathering fresh from the world. Keeps in-progress
-            // build sites moving once the initial gather wave has dropped its
-            // surplus into granaries — without this plan, blueprints stall at
-            // the "haulers can only deliver what they happen to be carrying"
-            // step (NearestBlueprintNeedingHeldMaterial).
             id: PlanId(29),
-            name: "HaulFromStorageAndBuild",
-            steps: PLAN_STEPS_29,
-            state_weights: mk_weights(&[
-                (SI_SKILL_BUILDING, 0.5),
-                (SI_STORAGE_WOOD, 0.6),
-                (SI_STORAGE_STONE, 0.4),
-                (SI_IN_FACTION, 0.3),
-            ]),
-            bias: 0.2,
-            serves_goals: BUILD_GOALS,
+            name: "(unused)",
+            steps: &[],
+            state_weights: mk_weights(&[]),
+            bias: -10.0,
+            serves_goals: &[],
             tech_gate: None,
             memory_target_kind: None,
-            flags: PF_UNINTERRUPTIBLE,
+            flags: PF_NONE,
             requires_profession: None,
         },
         // Phase 5e-xii-d: PlanId 30 (`PlayByPlanting`) retired. The HTN

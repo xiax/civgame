@@ -103,10 +103,12 @@ fn setup_sandbox(
                 // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
                 PlanId::HUNT_FOOD,
                 // SCAVENGE_FOOD retired 5c-ii-d-vi.
-                PlanId::BUILD_BLUEPRINT,
+                // BUILD_BLUEPRINT retired in Phase 5e-xiii-b
+                // (HTN method `GatherAndHaulToPersonalBlueprintMethod`).
                 // PLAY_SOCIAL / PLAY_SOLO retired in Phase 5e-xii-a
                 // (HTN methods PlayWithPartnerMethod / PlaySoloMethod).
-                PlanId::HAUL_FROM_STORAGE_AND_BUILD,
+                // HAUL_FROM_STORAGE_AND_BUILD retired in Phase 5e-xiii-a
+                // (HTN method `WithdrawAndHaulToPersonalBlueprintMethod`).
                 // PLAY_BY_PLANTING retired in Phase 5e-xii-d
                 // (HTN method `WithdrawAndPlantGrainSeedAsPlayMethod`).
                 // PLAY_BY_THROWING_ROCKS retired in Phase 5e-xii-b

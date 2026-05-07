@@ -92,6 +92,11 @@ pub struct GatherRoutingResources<'w, 's> {
     /// (the trailing leg of the harvest-grain-for-craft chain produced by
     /// `HarvestAndHaulGrainToCraftOrderMethod`).
     pub co_query: Query<'w, 's, &'static crate::simulation::crafting::CraftOrder>,
+    /// Phase 5e-xiii-b: read by `finish_gather` to look up `Blueprint.tile`
+    /// when the prefetch ring promotes a `Task::HaulToBlueprint { blueprint }`
+    /// (the trailing leg of the gather-for-personal-build chain produced by
+    /// `GatherAndHaulToPersonalBlueprintMethod`).
+    pub bp_query: Query<'w, 's, &'static crate::simulation::construction::Blueprint>,
 }
 
 /// Phase 5c-ii-c-ii chain handoff: called by every `gather_system` exit path
@@ -173,6 +178,35 @@ fn finish_gather(
             // hands/inventory; `eat_task_system` reads from both.
             ai.state = AiState::Working;
             ai.task_id = TaskKind::Eat as u16;
+        }
+        Task::HaulToBlueprint { blueprint } => {
+            // Phase 5e-xiii-b: gather-for-personal-build chain trailing leg.
+            // The `GatherAndHaulToPersonalBlueprintMethod` expansion is
+            // `[Gather { tile }, HaulToBlueprint { blueprint }]`; once the
+            // material is in hand, route to the bp's tile via
+            // TaskKind::HaulMaterials (mirrors
+            // `production::finish_withdraw_material`'s HaulToBlueprint arm).
+            // Despawned/satisfied bps silently degrade to Idle.
+            let Ok(bp) = routing.bp_query.get(blueprint) else {
+                aq.cancel();
+                return;
+            };
+            let bp_tile = (bp.tile.0, bp.tile.1);
+            let dispatched = assign_task_with_routing(
+                ai,
+                cur_tile,
+                cur_chunk,
+                bp_tile,
+                TaskKind::HaulMaterials,
+                Some(blueprint),
+                &routing.chunk_graph,
+                &routing.chunk_router,
+                chunk_map,
+                &routing.chunk_connectivity,
+            );
+            if !dispatched {
+                aq.cancel();
+            }
         }
         Task::HaulToCraftOrder { order } => {
             // Phase 5e-xi-c: harvest-grain-for-craft chain trailing leg. The

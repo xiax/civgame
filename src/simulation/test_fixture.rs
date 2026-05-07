@@ -302,7 +302,8 @@ impl PersonBuilder {
                 // GATHER_WOOD / GATHER_STONE retired 5c-ii-c-ii.
                 // HUNT_FOOD retired in Phase 5e-viii-c (HTN abstract tasks).
                 // SCAVENGE_FOOD retired 5c-ii-d-vi.
-                PlanId::BUILD_BLUEPRINT,
+                // BUILD_BLUEPRINT retired in Phase 5e-xiii-b
+                // (HTN method `GatherAndHaulToPersonalBlueprintMethod`).
                 // TAME_HORSE retired in Phase 5e-iv (HTN method).
                 PlanId::DELIVER_HIDE_TO_CRAFT_ORDER,
                 // DELIVER_GRAIN_TO_CRAFT_ORDER retired in Phase 5e-xi-c
@@ -314,7 +315,8 @@ impl PersonBuilder {
                 // RETURN_SURPLUS_FOOD retired in Phase 5e-iii (HTN method).
                 // PLAY_SOCIAL / PLAY_SOLO retired in Phase 5e-xii-a
                 // (HTN methods PlayWithPartnerMethod / PlaySoloMethod).
-                PlanId::HAUL_FROM_STORAGE_AND_BUILD,
+                // HAUL_FROM_STORAGE_AND_BUILD retired in Phase 5e-xiii-a
+                // (HTN method `WithdrawAndHaulToPersonalBlueprintMethod`).
                 // PLAY_BY_PLANTING retired in Phase 5e-xii-d
                 // (HTN method `WithdrawAndPlantGrainSeedAsPlayMethod`).
                 // PLAY_BY_THROWING_ROCKS retired in Phase 5e-xii-b
@@ -2328,6 +2330,280 @@ mod baseline_behaviour {
             0,
             "ConstructBlueprint is single-leg — nothing should be queued behind Construct"
         );
+    }
+
+    /// Phase 5e-xiii-a: an agent owning a *personal* blueprint (deposits NOT
+    /// satisfied) under `AgentGoal::Build`, with the faction's storage holding
+    /// the resource the bp still needs, dispatches the
+    /// `[Task::WithdrawMaterial { wood, 1 }, Task::HaulToBlueprint { bp }]`
+    /// chain via `htn_build_claimed_blueprint_dispatch_system` Path B +
+    /// `WithdrawAndHaulToPersonalBlueprintMethod`. Replaces the legacy
+    /// `HaulFromStorageAndBuild` plan (PlanId 29).
+    #[test]
+    fn personal_build_dispatches_withdraw_then_haul_chain_when_storage_has_wood() {
+        use crate::simulation::construction::{Blueprint, BlueprintMap, BuildSiteKind};
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::person::Drafted;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(91);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Storage tile holding 5 wood at (4, 4) — within range of (0, 0).
+        let storage_tile = (4, 4);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+        sim.spawn_ground_item(storage_tile, crate::economy::core_ids::wood(), 5);
+
+        // Spawn a chief at (-5, -5) and explicitly mark them as FactionChief
+        // so `goal_update_system`'s chief override doesn't pin our test
+        // agent's goal to `Lead`. Mirrors `lead_goal_dispatches_typed_lead_task`
+        // setup.
+        let chief = sim.spawn_person(sim.player_faction_id, (-5, -5), |_| {});
+        sim.app
+            .world_mut()
+            .entity_mut(chief)
+            .insert(crate::simulation::faction::FactionChief);
+
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        // Mark the agent `Drafted` during warm-up so neither plan_execution
+        // nor any HTN dispatcher fires. Without this, the agent's auto Build
+        // goal (`has_personal_build_site = true`) would let the dispatcher
+        // run and partially complete the haul during warm-up, leaving the
+        // bp deposits filled before we can capture the WithdrawMaterial head.
+        sim.app.world_mut().entity_mut(person).insert(Drafted);
+
+        // Spawn a personal Bed blueprint owned by this agent. Bed needs 3
+        // wood; deposits start empty (not satisfied), so Path B's haul branch
+        // wins.
+        let blueprint_tile = (10, 10);
+        let blueprint_world = tile_to_world(blueprint_tile.0, blueprint_tile.1);
+        let blueprint = sim
+            .app
+            .world_mut()
+            .spawn((
+                Blueprint::new(
+                    sim.player_faction_id,
+                    Some(person),
+                    BuildSiteKind::Bed,
+                    blueprint_tile,
+                    0,
+                ),
+                Transform::from_xyz(blueprint_world.x, blueprint_world.y, 0.5),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<BlueprintMap>()
+            .0
+            .insert(blueprint_tile, blueprint);
+
+        // Warm-up: SpatialIndex needs `Added<Indexed>` for the GroundItem to
+        // settle and StorageTileMap must register the storage tile. Mirrors
+        // `acquire_good_haul_goal_dispatches_withdraw_then_haul_chain` (80
+        // ticks). Drafted blocks dispatch so the agent stays inert.
+        sim.tick_n(80);
+
+        // After warm-up, ensure the chief assignment landed on `chief` (not
+        // our test agent) and pin the registry's `chief_entity` field
+        // accordingly. The chief override in `goal_update_system` keys off
+        // the `FactionChief` component, so any stale assignment on `person`
+        // would force it into `Lead` and pre-empt our Build dispatch.
+        {
+            sim.app
+                .world_mut()
+                .entity_mut(person)
+                .remove::<crate::simulation::faction::FactionChief>();
+            sim.app
+                .world_mut()
+                .entity_mut(chief)
+                .insert(crate::simulation::faction::FactionChief);
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<crate::simulation::faction::FactionRegistry>();
+            if let Some(faction) = registry.factions.get_mut(&sim.player_faction_id) {
+                faction.chief_entity = Some(chief);
+            }
+        }
+
+        // Lift the draft and pin AgentGoal::Build (mirrors goal_update_system's
+        // `has_personal_build_site` branch — already true for this agent, but
+        // the explicit set is deterministic).
+        {
+            let mut entity = sim.app.world_mut().entity_mut(person);
+            entity.remove::<Drafted>();
+            let mut goal = entity.get_mut::<AgentGoal>().unwrap();
+            *goal = AgentGoal::Build;
+        }
+
+        // Two ticks: ParallelB's dispatcher runs, picks Path B's
+        // WithdrawAndHaulToPersonalBlueprintMethod (UTIL_CLAIMED_HAUL=2.0),
+        // routes the agent toward the storage tile, dispatches WithdrawMaterial
+        // and prefetches HaulToBlueprint.
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+        match aq.current {
+            Task::WithdrawMaterial { resource_id, qty } => {
+                assert_eq!(
+                    resource_id,
+                    crate::economy::core_ids::wood(),
+                    "head must withdraw the bp's needed resource (Wood)"
+                );
+                assert_eq!(qty, 1, "WithdrawAndHaulToPersonalBlueprint withdraws qty=1");
+            }
+            other => panic!(
+                "expected Task::WithdrawMaterial as head of personal-build chain, got {:?}",
+                other
+            ),
+        }
+        match aq.peek_next() {
+            Some(Task::HaulToBlueprint { blueprint: bp }) => {
+                assert_eq!(
+                    bp, blueprint,
+                    "queued tail HaulToBlueprint should target the personal bp"
+                );
+            }
+            other => panic!(
+                "expected queued Task::HaulToBlueprint targeting the personal bp, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Phase 5e-xiii-b: an agent owning a personal blueprint with NO faction
+    /// storage of the needed resource but a remembered gather source
+    /// (`MemoryKind::Resource(wood)`) dispatches the
+    /// `[Task::Gather { tile }, Task::HaulToBlueprint { bp }]` chain via
+    /// `htn_build_claimed_blueprint_dispatch_system` Path B +
+    /// `GatherAndHaulToPersonalBlueprintMethod`. Replaces the legacy
+    /// `BuildBlueprint` plan (PlanId 7).
+    #[test]
+    fn personal_build_dispatches_gather_then_haul_chain_when_storage_empty_but_memory_has_wood() {
+        use crate::simulation::construction::{Blueprint, BlueprintMap, BuildSiteKind};
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::memory::{AgentMemory, MemoryKind};
+        use crate::simulation::person::Drafted;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(92);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Storage tile but NO wood — forces gather method over withdraw.
+        let storage_tile = (4, 4);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+
+        // Spawn a chief at (-5, -5) and lock chief assignment to them so the
+        // test agent's goal isn't flipped to `Lead`.
+        let chief = sim.spawn_person(sim.player_faction_id, (-5, -5), |_| {});
+        sim.app
+            .world_mut()
+            .entity_mut(chief)
+            .insert(crate::simulation::faction::FactionChief);
+
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        sim.app.world_mut().entity_mut(person).insert(Drafted);
+
+        // Personal Bed blueprint owned by this agent. Bed needs 3 wood.
+        let blueprint_tile = (10, 10);
+        let blueprint_world = tile_to_world(blueprint_tile.0, blueprint_tile.1);
+        let blueprint = sim
+            .app
+            .world_mut()
+            .spawn((
+                Blueprint::new(
+                    sim.player_faction_id,
+                    Some(person),
+                    BuildSiteKind::Bed,
+                    blueprint_tile,
+                    0,
+                ),
+                Transform::from_xyz(blueprint_world.x, blueprint_world.y, 0.5),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<BlueprintMap>()
+            .0
+            .insert(blueprint_tile, blueprint);
+
+        // Warm-up so SpatialIndex / StorageTileMap settle. Drafted blocks
+        // dispatch.
+        sim.tick_n(80);
+
+        // Inject `MemoryKind::Resource(wood)` outside `VIEW_RADIUS=15` so
+        // `vision_system` doesn't clear it (mirrors the AcquireGood gather
+        // test's pattern).
+        let memory_tile = (-25, 0);
+        {
+            let mut entity = sim.app.world_mut().entity_mut(person);
+            entity.remove::<Drafted>();
+            entity
+                .remove::<crate::simulation::faction::FactionChief>();
+            if let Some(mut mem) = entity.get_mut::<AgentMemory>() {
+                mem.record(memory_tile, MemoryKind::wood());
+            } else {
+                panic!("Person should have AgentMemory");
+            }
+            let mut goal = entity.get_mut::<AgentGoal>().unwrap();
+            *goal = AgentGoal::Build;
+        }
+        // Pin chief_entity AFTER warm-up so it doesn't drift.
+        {
+            sim.app
+                .world_mut()
+                .entity_mut(chief)
+                .insert(crate::simulation::faction::FactionChief);
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<crate::simulation::faction::FactionRegistry>();
+            if let Some(faction) = registry.factions.get_mut(&sim.player_faction_id) {
+                faction.chief_entity = Some(chief);
+            }
+        }
+
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+        match aq.current {
+            Task::Gather { tile } => {
+                assert_eq!(
+                    tile, memory_tile,
+                    "head Gather tile should match the injected MemoryKind::wood() entry"
+                );
+            }
+            other => panic!(
+                "expected Task::Gather as head of personal-build gather chain, got {:?}",
+                other
+            ),
+        }
+        match aq.peek_next() {
+            Some(Task::HaulToBlueprint { blueprint: bp }) => {
+                assert_eq!(
+                    bp, blueprint,
+                    "queued HaulToBlueprint should target the personal bp"
+                );
+            }
+            other => panic!(
+                "expected queued Task::HaulToBlueprint, got {:?}",
+                other
+            ),
+        }
     }
 
     /// Phase 5e-viii-c: a hunter under a fresh `HuntOrder::Hunt` (party not

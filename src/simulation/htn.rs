@@ -360,6 +360,8 @@ impl MethodId {
     pub const WITHDRAW_AND_PLAY_WITH_TOY: MethodId = MethodId(36);
     pub const WITHDRAW_AND_PLANT_GRAIN_SEED_AS_PLAY: MethodId = MethodId(37);
     pub const WITHDRAW_AND_PLANT_BERRY_SEED_AS_PLAY: MethodId = MethodId(38);
+    pub const WITHDRAW_AND_HAUL_TO_PERSONAL_BLUEPRINT: MethodId = MethodId(39);
+    pub const GATHER_AND_HAUL_TO_PERSONAL_BLUEPRINT: MethodId = MethodId(40);
 
     pub fn raw(self) -> u16 {
         self.0
@@ -775,6 +777,16 @@ pub struct PlannerCtx {
     /// destination of the trailing `Task::PlayPlant { tile }` leg. `None`
     /// when no unplanted grass is in range.
     pub play_plant_destination_tile: Option<(i32, i32)>,
+    /// Phase 5e-xiii-a: when the agent is committed to building a personal
+    /// blueprint (`bp.personal_owner == Some(self)`) whose deposits are
+    /// *not* yet satisfied, the dispatcher snapshots the most-deficient
+    /// resource the bp still needs here. Read by
+    /// `WithdrawAndHaulToPersonalBlueprintMethod` so the typed
+    /// `WithdrawMaterial { resource_id }` head carries the right resource
+    /// payload. Set only on the personal-build path; left `None` on the
+    /// JobClaim::Build path (which only fires once `bp.is_satisfied()`) so
+    /// the existing `BuildClaimedBlueprintMethod` wins as before.
+    pub personal_bp_resource: Option<ResourceId>,
 }
 
 /// A single decomposition rule for an `AbstractTask`. Scoring (`utility`) and
@@ -916,6 +928,14 @@ pub fn register_builtin_methods(reg: &mut MethodRegistry) {
     reg.register(
         AbstractTaskKind::ConstructBlueprint,
         Box::new(BuildClaimedBlueprintMethod),
+    );
+    reg.register(
+        AbstractTaskKind::ConstructBlueprint,
+        Box::new(WithdrawAndHaulToPersonalBlueprintMethod),
+    );
+    reg.register(
+        AbstractTaskKind::ConstructBlueprint,
+        Box::new(GatherAndHaulToPersonalBlueprintMethod),
     );
     reg.register(
         AbstractTaskKind::DeliverHuntKill,
@@ -2227,7 +2247,16 @@ impl Method for BuildClaimedBlueprintMethod {
         if !matches!(abstract_task, AbstractTask::ConstructBlueprint) {
             return false;
         }
-        ctx.claimed_blueprint.is_some()
+        // The bp must exist *and* its deposits must be satisfied. The
+        // Path A (JobClaim::Build) dispatcher gate already guarantees
+        // satisfaction (it `continue`s on `!bp.is_satisfied()`). The Path B
+        // (personal-build) dispatcher only populates `personal_bp_resource`
+        // when deposits are unmet — so `personal_bp_resource.is_none()`
+        // means either Path A or Path B with `bp.is_satisfied()`. This keeps
+        // BuildClaimed from firing on an unsatisfied personal bp where
+        // `WithdrawAndHaulToPersonalBlueprintMethod` /
+        // `GatherAndHaulToPersonalBlueprintMethod` should win.
+        ctx.claimed_blueprint.is_some() && ctx.personal_bp_resource.is_none()
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
@@ -2254,6 +2283,156 @@ impl Method for BuildClaimedBlueprintMethod {
 
     fn id(&self) -> MethodId {
         MethodId::BUILD_CLAIMED_BLUEPRINT
+    }
+}
+
+/// Phase 5e-xiii-a method for `AbstractTask::ConstructBlueprint`. Fires when
+/// the agent owns a personal blueprint (`bp.personal_owner == Some(self)`) whose
+/// deposits are *not* yet satisfied and the faction's storage holds at least
+/// one unit of the most-deficient resource the bp still needs. Replaces the
+/// storage-fed legacy `HaulFromStorageAndBuild` plan (PlanId 29) for the
+/// personal-blueprint path.
+///
+/// The expansion is a 2-task chain `[WithdrawMaterial, HaulToBlueprint]`,
+/// matching the AcquireGood haul method's shape but routed off the
+/// `personal_blueprint`/`personal_bp_resource` ctx slots instead of the
+/// JobClaim::Haul `ClaimTarget`. The chain handoff lives in
+/// `production::finish_withdraw_material`'s existing
+/// `Task::HaulToBlueprint { blueprint }` arm — once the resource is in hand,
+/// the agent routes to the bp's tile via `TaskKind::HaulMaterials` and the
+/// hauler branch of `construction_system` deposits-on-arrival. After the
+/// deposit, the agent returns to Idle; the next dispatch tick re-evaluates
+/// (either dispatching a fresh withdraw chain for the next deficit slot, or
+/// the existing `BuildClaimedBlueprintMethod` if the bp is now satisfied).
+///
+/// `MF_UNINTERRUPTIBLE` mirrors the legacy `PF_UNINTERRUPTIBLE` on PlanId 29 —
+/// once committed to a haul leg, a transient goal flip mid-trip shouldn't
+/// strand the agent. The dispatcher only populates `personal_bp_resource` on
+/// the personal-build path with deposits unmet; the JobClaim::Build path
+/// leaves it `None`, so this method never wins on a chief-driven build.
+pub struct WithdrawAndHaulToPersonalBlueprintMethod;
+
+impl Method for WithdrawAndHaulToPersonalBlueprintMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::ConstructBlueprint) {
+            return false;
+        }
+        ctx.personal_bp_resource.is_some()
+            && ctx.material_storage_tile.is_some()
+            && ctx.material_stock_for_target > 0
+            && ctx.claimed_blueprint.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        // Claimed-haul tier minus the full agent→storage→blueprint trip,
+        // capped at `MAX_DIST_PENALTY`. Mirrors `WithdrawAndHaulToBlueprintMethod`.
+        UTIL_CLAIMED_HAUL
+            - full_trip_penalty(ctx.tile, ctx.material_storage_tile, ctx.claimed_blueprint_tile)
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::ConstructBlueprint) {
+            return Vec::new();
+        }
+        let Some(blueprint) = ctx.claimed_blueprint else {
+            return Vec::new();
+        };
+        let Some(resource_id) = ctx.personal_bp_resource else {
+            return Vec::new();
+        };
+        if ctx.material_storage_tile.is_none() {
+            return Vec::new();
+        }
+        vec![
+            Task::WithdrawMaterial { resource_id, qty: 1 },
+            Task::HaulToBlueprint { blueprint },
+        ]
+    }
+
+    fn name(&self) -> &'static str {
+        "WithdrawAndHaulToPersonalBlueprint"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::WITHDRAW_AND_HAUL_TO_PERSONAL_BLUEPRINT
+    }
+}
+
+/// Phase 5e-xiii-b method for `AbstractTask::ConstructBlueprint`. Mirrors
+/// `WithdrawAndHaulToPersonalBlueprintMethod` but harvests from a memory-known
+/// gather source instead of pulling from faction storage. Replaces the legacy
+/// `BuildBlueprint` plan (PlanId 7) which encoded
+/// `[GatherWood, HaulToBlueprint, BuildAnyBlueprint]` end-to-end.
+///
+/// Personal blueprints today need wood (Bed = 3 wood), but the method is
+/// resource-agnostic: the dispatcher derives the gather memory key from
+/// `personal_bp_resource` via `MemoryKind::Resource(rid)`, so any future
+/// gather-able material (stone/etc.) added as a personal-bp ingredient flows
+/// through automatically.
+///
+/// The expansion is a 2-task chain `[Gather { tile }, HaulToBlueprint { bp }]`.
+/// The chain handoff lives in `gather::finish_gather`'s `Task::HaulToBlueprint`
+/// arm — once the resource is in hand, the agent routes to the bp's tile via
+/// `TaskKind::HaulMaterials` and the hauler branch of `construction_system`
+/// deposits-on-arrival.
+///
+/// Utility-vs-`WithdrawAndHaulToPersonalBlueprintMethod`: the withdraw method
+/// sits at `UTIL_CLAIMED_HAUL=2.0` (cheap haul from settled stock); this
+/// method sits at `UTIL_BASELINE=1.0` (full chop-then-haul). When both fire
+/// (storage holds wood AND the agent remembers a tree), the withdraw method
+/// wins by ranking. Only when storage is dry does the gather method take
+/// over. `MF_UNINTERRUPTIBLE` mirrors the legacy `PF_UNINTERRUPTIBLE` on
+/// PlanId 7.
+pub struct GatherAndHaulToPersonalBlueprintMethod;
+
+impl Method for GatherAndHaulToPersonalBlueprintMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        if !matches!(abstract_task, AbstractTask::ConstructBlueprint) {
+            return false;
+        }
+        ctx.personal_bp_resource.is_some()
+            && ctx.gather_target_tile.is_some()
+            && ctx.claimed_blueprint.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE
+            - full_trip_penalty(ctx.tile, ctx.gather_target_tile, ctx.claimed_blueprint_tile)
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_UNINTERRUPTIBLE
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::ConstructBlueprint) {
+            return Vec::new();
+        }
+        let Some(blueprint) = ctx.claimed_blueprint else {
+            return Vec::new();
+        };
+        let Some(tile) = ctx.gather_target_tile else {
+            return Vec::new();
+        };
+        if ctx.personal_bp_resource.is_none() {
+            return Vec::new();
+        }
+        vec![
+            Task::Gather { tile },
+            Task::HaulToBlueprint { blueprint },
+        ]
+    }
+
+    fn name(&self) -> &'static str {
+        "GatherAndHaulToPersonalBlueprint"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::GATHER_AND_HAUL_TO_PERSONAL_BLUEPRINT
     }
 }
 
@@ -2908,6 +3087,7 @@ pub fn htn_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
             };
 
             // Argmax over applicable methods. f32 has no total order; ties
@@ -3136,6 +3316,7 @@ pub fn htn_eat_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
             };
 
             let abstract_task = AbstractTask::Eat;
@@ -3416,6 +3597,7 @@ pub fn htn_acquire_food_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
             };
 
             let abstract_task = AbstractTask::AcquireFood;
@@ -3840,6 +4022,7 @@ pub fn htn_acquire_good_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
                 };
 
                 let abstract_task = AbstractTask::AcquireGood {
@@ -4104,6 +4287,7 @@ pub fn htn_acquire_good_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         };
 
         let abstract_task = AbstractTask::AcquireGood { resource_id };
@@ -4409,6 +4593,7 @@ pub fn htn_stockpile_food_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
             };
 
             let abstract_task = AbstractTask::StockpileFood;
@@ -4737,6 +4922,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         };
 
         let abstract_task = AbstractTask::EquipHuntingSpear;
@@ -4941,6 +5127,7 @@ pub fn htn_scout_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
             };
 
             let abstract_task = AbstractTask::Scout;
@@ -5181,6 +5368,7 @@ pub fn htn_return_surplus_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
             };
 
             let abstract_task = AbstractTask::ReturnSurplus;
@@ -5402,6 +5590,7 @@ pub fn htn_tame_horse_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         };
 
         let abstract_task = AbstractTask::TameWildHorse;
@@ -5673,6 +5862,7 @@ pub fn htn_plant_from_storage_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         };
 
         let abstract_task = AbstractTask::PlantFromStorage {
@@ -5737,25 +5927,41 @@ pub fn htn_plant_from_storage_dispatch_system(
     }
 }
 
-/// Build-goal dispatcher. Replaces the legacy `ClaimedBuild` plan (PlanId 34) +
-/// its `BuildClaimedBlueprint` step (StepId 43). Single-method registry —
+/// Build-goal dispatcher. Owns `AgentGoal::Build` end-to-end via two paths
+/// sharing the same `AbstractTaskKind::ConstructBlueprint` registry:
+///
+/// **Path A — JobClaim::Build (chief-driven)**: held `JobClaim::Build` +
+/// companion `ClaimTarget.blueprint = Some(_)` + `bp.is_satisfied()` (every
+/// deposit slot full). Replaces the legacy `ClaimedBuild` plan (PlanId 34) +
+/// its `BuildClaimedBlueprint` step (StepId 43). The chief-job pipeline
+/// supplies the agent with a Build claim only after deposits are filled (chief
+/// posts `JobKind::Haul` until then), so the satisfied gate is cheap and
 /// `BuildClaimedBlueprintMethod` always wins.
 ///
-/// Gates on `AgentGoal::Build` + held `JobClaim::Build` + companion
-/// `ClaimTarget.blueprint = Some(_)` + `bp.is_satisfied()` (every deposit slot
-/// full). Until the blueprint is satisfied the legacy build plans
-/// (`BuildBlueprint`, `HaulFromStorageAndBuild`) keep doing the gather/haul
-/// work; this dispatcher takes over for the final labor leg only. Snapshots
-/// `(blueprint, blueprint.tile)` into the existing `claimed_blueprint` /
-/// `claimed_blueprint_tile` ctx slots (semantically "the blueprint this agent
-/// is committed to" — same usage as the haul branch in
-/// `htn_acquire_good_dispatch_system`), routes via
-/// `assign_task_with_routing(... TaskKind::Construct, Some(bp_entity) ...)`, and
-/// dispatches `Task::Construct { blueprint }` (the existing typed variant —
-/// `construction_system` reads `aq.current.as_construct().or(target_entity)`).
-/// `aq.advance()` on completion lives in `construction_system`'s pass-3 cleanup,
-/// so the chain naturally drains and `htn_method_completion_system` records
-/// Success.
+/// **Path B — Personal blueprint (`bp.personal_owner == Some(self)`)**: phase
+/// 5e-xiii-a, replaces the storage-fed legacy `HaulFromStorageAndBuild` plan
+/// (PlanId 29) for the personal-blueprint flow. Personal blueprints are
+/// auto-placed (e.g. `BedBlueprint` for bedless agents in
+/// `construction.rs::HOMING`) and player-commissioned via the inspector;
+/// chief postings explicitly skip them (`jobs.rs:386`), so they have no
+/// JobClaim companion. This dispatcher path scans `BlueprintMap` for the
+/// agent's personal blueprint, walks the bp's deposit slots to find the
+/// most-deficient resource, and (when storage holds at least one unit of that
+/// resource) populates `personal_bp_resource` + `material_storage_tile` so
+/// `WithdrawAndHaulToPersonalBlueprintMethod` can fire its
+/// `[WithdrawMaterial, HaulToBlueprint]` chain. When the personal bp's
+/// deposits are *already* satisfied, `personal_bp_resource` stays `None` and
+/// the existing `BuildClaimedBlueprintMethod` fires its single-task
+/// `[Construct]` expansion — same shape as Path A's terminal leg.
+///
+/// Path A and Path B share one ctx-build site and one method argmax. The
+/// dispatch tail handles both `Task::Construct` and `Task::WithdrawMaterial`
+/// heads. `aq.advance()` on Construct completion lives in
+/// `construction_system`'s pass-3 cleanup; the WithdrawMaterial→HaulToBlueprint
+/// chain handoff lives in `production::finish_withdraw_material`'s existing
+/// `Task::HaulToBlueprint { blueprint }` arm. After a single haul, the agent
+/// returns to Idle; the next dispatch tick re-evaluates (next deficit slot or
+/// terminal Construct).
 pub fn htn_build_claimed_blueprint_dispatch_system(
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
@@ -5763,10 +5969,16 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
     chunk_connectivity: Res<ChunkConnectivity>,
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
+    storage_tile_map: Res<StorageTileMap>,
+    storage_reservations: Res<crate::simulation::faction::StorageReservations>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    bp_map: Res<crate::simulation::construction::BlueprintMap>,
     clock: Res<SimClock>,
     bp_query: Query<&crate::simulation::construction::Blueprint>,
+    item_query: Query<&crate::simulation::items::GroundItem>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -5777,6 +5989,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             Option<&ActivePlan>,
             Option<&crate::simulation::jobs::JobClaim>,
             Option<&crate::simulation::jobs::ClaimTarget>,
+            Option<&AgentMemory>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -5784,6 +5997,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
     use crate::simulation::jobs::JobKind;
     let now = clock.tick;
     for (
+        agent_entity,
         mut ai,
         mut aq,
         mut history,
@@ -5794,6 +6008,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
         active_plan_opt,
         job_claim_opt,
         claim_target_opt,
+        memory_opt,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -5808,30 +6023,41 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
             continue;
         }
-        // Need both a Build claim and the ClaimTarget pointing at a concrete
-        // blueprint. Mirrors the legacy `StepTarget::BuildClaimBlueprint`
-        // resolver's claim_target.blueprint lookup.
-        let Some(claim) = job_claim_opt else {
-            continue;
+
+        // Path A — JobClaim::Build with satisfied bp. Mirrors the legacy
+        // `StepTarget::BuildClaimBlueprint` resolver's claim_target.blueprint
+        // lookup + the `if !bp.is_satisfied() { return None; }` gate.
+        let path_a: Option<Entity> = match (job_claim_opt, claim_target_opt) {
+            (Some(claim), Some(target)) if claim.kind == JobKind::Build => {
+                target.blueprint.filter(|&bp_e| {
+                    bp_query.get(bp_e).map(|bp| bp.is_satisfied()).unwrap_or(false)
+                })
+            }
+            _ => None,
         };
-        if claim.kind != JobKind::Build {
-            continue;
-        }
-        let Some(target) = claim_target_opt else {
-            continue;
+
+        // Path B — personal-owner blueprint. Personal bps bypass the chief
+        // job pipeline; the agent's only signal is `bp.personal_owner ==
+        // Some(self)`. Pick the first matching live entry (in practice the
+        // agent owns at most one personal bp at a time — auto-bed
+        // `construction.rs::HOMING` checks `has_personal_bp` before placing).
+        let path_b: Option<Entity> = if path_a.is_some() {
+            None
+        } else {
+            bp_map.0.values().copied().find(|&bp_e| {
+                bp_query
+                    .get(bp_e)
+                    .map(|bp| bp.personal_owner == Some(agent_entity))
+                    .unwrap_or(false)
+            })
         };
-        let Some(bp_entity) = target.blueprint else {
+
+        let Some(bp_entity) = path_a.or(path_b) else {
             continue;
         };
         let Ok(bp) = bp_query.get(bp_entity) else {
             continue;
         };
-        // Gate on materials-in. Until the bp is satisfied the legacy build
-        // plans (BuildBlueprint, HaulFromStorageAndBuild) own the gather/haul
-        // work — mirrors the legacy resolver's `if !bp.is_satisfied() { return None; }`.
-        if !bp.is_satisfied() {
-            continue;
-        }
         let bp_tile = bp.tile;
 
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
@@ -5840,6 +6066,118 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             cur_tx.div_euclid(CHUNK_SIZE as i32),
             cur_ty.div_euclid(CHUNK_SIZE as i32),
         );
+
+        // For Path B with deposits unmet, resolve the most-deficient resource
+        // + nearest faction storage tile holding it. Mirrors the legacy
+        // `StepTarget::WithdrawForFactionNeed { Blueprint, MostDeficient }`
+        // resolver collapsed to the personal-bp slot list. Path A always has
+        // `bp.is_satisfied()`, so we skip the lookup there.
+        let (personal_bp_resource, material_storage_tile, material_stock_for_target) =
+            if path_b.is_some() && !bp.is_satisfied() {
+                // Walk deposit slots in order, picking the first slot whose
+                // (still-needed > 0) AND (storage holds it). Most-deficient
+                // tiebreak: prefer the slot with largest still-needed, then
+                // stable by ResourceId. Single-deposit recipes (Bed = wood
+                // only) collapse to the only choice.
+                let mut best_resource = None;
+                let mut best_storage_tile: Option<(i32, i32)> = None;
+                let mut best_storage_stock: u32 = 0;
+                let mut best_still_needed: u32 = 0;
+
+                let storage_tiles = storage_tile_map.by_faction.get(&member.faction_id);
+                for i in 0..bp.deposit_count as usize {
+                    let still = bp.deposits[i]
+                        .needed
+                        .saturating_sub(bp.deposits[i].deposited)
+                        as u32;
+                    if still == 0 {
+                        continue;
+                    }
+                    let rid = bp.deposits[i].resource_id;
+                    let Some(tiles) = storage_tiles else {
+                        continue;
+                    };
+                    // Find the nearest storage tile holding this resource
+                    // (effective stock after reservations > 0).
+                    let mut tile_pick: Option<(i32, i32)> = None;
+                    let mut tile_pick_dist = i32::MAX;
+                    let mut tile_pick_stock: u32 = 0;
+                    for &(tx, ty) in tiles {
+                        let mut tile_stock: u32 = 0;
+                        for &gi_entity in spatial.get(tx, ty) {
+                            if let Ok(gi) = item_query.get(gi_entity) {
+                                if gi.item.resource_id == rid && gi.qty > 0 {
+                                    tile_stock = tile_stock.saturating_add(gi.qty);
+                                }
+                            }
+                        }
+                        let reserved = storage_reservations.get((tx, ty), rid);
+                        let effective = tile_stock.saturating_sub(reserved);
+                        if effective == 0 {
+                            continue;
+                        }
+                        let dist = (tx - cur_tx).abs() + (ty - cur_ty).abs();
+                        if dist < tile_pick_dist {
+                            tile_pick_dist = dist;
+                            tile_pick = Some((tx, ty));
+                            tile_pick_stock = effective;
+                        }
+                    }
+                    let Some(tile) = tile_pick else {
+                        continue;
+                    };
+                    // Argmax across slots: largest still_needed wins; stable
+                    // tiebreak by ResourceId.0.
+                    if still > best_still_needed
+                        || (still == best_still_needed
+                            && best_resource
+                                .map(|r: ResourceId| rid.0 < r.0)
+                                .unwrap_or(true))
+                    {
+                        best_still_needed = still;
+                        best_resource = Some(rid);
+                        best_storage_tile = Some(tile);
+                        best_storage_stock = tile_pick_stock;
+                    }
+                }
+                (best_resource, best_storage_tile, best_storage_stock)
+            } else {
+                (None, None, 0)
+            };
+
+        // Phase 5e-xiii-b: when the bp is unsatisfied, also probe the agent's
+        // memory for a gather source matching the most-deficient resource.
+        // We take the resource the storage scan settled on (when storage held
+        // it) OR walk the deposit slots once more to find a still-needed one
+        // even when storage is dry. For Bed (only personal bp today) the
+        // deposit is wood; the legacy `BuildBlueprint` plan keyed off
+        // `MemoryKind::wood()` exclusively. Generalising to any
+        // `personal_bp_resource` lets future personal-bp recipes flow through
+        // automatically.
+        let gather_resource: Option<ResourceId> = if path_b.is_some() && !bp.is_satisfied() {
+            personal_bp_resource.or_else(|| {
+                for i in 0..bp.deposit_count as usize {
+                    let still = bp.deposits[i]
+                        .needed
+                        .saturating_sub(bp.deposits[i].deposited);
+                    if still > 0 {
+                        return Some(bp.deposits[i].resource_id);
+                    }
+                }
+                None
+            })
+        } else {
+            None
+        };
+        let gather_target_tile = gather_resource.and_then(|rid| {
+            memory_opt.and_then(|m| m.best_for(MemoryKind::Resource(rid)))
+        });
+        // Surface `gather_resource` through `personal_bp_resource` so the
+        // gather method's expand can carry it (the withdraw method already
+        // had the field set when storage matched). Without storage stock,
+        // the storage-fed scan returned None for `personal_bp_resource`;
+        // the gather-fed branch needs the slot info regardless.
+        let personal_bp_resource = personal_bp_resource.or(gather_resource);
 
         let ctx = PlannerCtx {
             tile: (cur_tx, cur_ty),
@@ -5851,11 +6189,11 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
-            material_storage_tile: None,
-            material_stock_for_target: 0,
+            material_storage_tile,
+            material_stock_for_target,
             claimed_blueprint: Some(bp_entity),
             claimed_blueprint_tile: Some((bp_tile.0, bp_tile.1)),
-            gather_target_tile: None,
+            gather_target_tile,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -5881,6 +6219,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource,
         };
 
         let abstract_task = AbstractTask::ConstructBlueprint;
@@ -5924,6 +6263,66 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                     continue;
                 }
                 aq.dispatch(Task::Construct { blueprint });
+            }
+            Task::WithdrawMaterial { resource_id: head_resource, qty } => {
+                // Path B haul leg. Route to the resolved storage tile, reserve
+                // the qty against `StorageReservations`, dispatch the head.
+                // Mirrors the AcquireGood haul branch's reservation
+                // bookkeeping (`htn_acquire_good_dispatch_system`).
+                let Some(storage_tile) = material_storage_tile else {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedTarget, now);
+                    continue;
+                };
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    storage_tile,
+                    TaskKind::WithdrawMaterial,
+                    None,
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                storage_reservations.add(storage_tile, head_resource, qty as u32);
+                ai.reserved_tile = storage_tile;
+                ai.reserved_resource = Some(head_resource);
+                ai.reserved_qty = qty;
+                aq.dispatch(Task::WithdrawMaterial {
+                    resource_id: head_resource,
+                    qty,
+                });
+            }
+            Task::Gather { tile } => {
+                // Phase 5e-xiii-b gather leg. Route to the memory-known
+                // gather tile via TaskKind::Gather; the chain's trailing
+                // HaulToBlueprint is handled by `gather::finish_gather`'s
+                // new HaulToBlueprint arm.
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    tile,
+                    TaskKind::Gather,
+                    None,
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if !dispatched {
+                    ai.active_method = None;
+                    history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                    continue;
+                }
+                aq.dispatch(Task::Gather { tile });
             }
             _ => {
                 ai.active_method = None;
@@ -6055,6 +6454,7 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         };
 
         let abstract_task = AbstractTask::DeliverHuntKill;
@@ -6342,6 +6742,7 @@ pub fn htn_engage_prey_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         };
 
         let abstract_task = AbstractTask::EngagePrey;
@@ -6586,6 +6987,7 @@ pub fn htn_join_hunt_party_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         };
 
         let abstract_task = AbstractTask::JoinHuntParty;
@@ -6809,6 +7211,7 @@ pub fn htn_socialize_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         };
 
         let abstract_task = AbstractTask::Socialize;
@@ -7051,6 +7454,7 @@ pub fn htn_combat_faction_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         };
 
         let methods = method_registry.methods_for(abstract_kind);
@@ -7436,6 +7840,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         };
 
         let abstract_task = AbstractTask::DeliverMaterialToCraftOrder {
@@ -7697,6 +8102,7 @@ pub fn htn_work_on_craft_order_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         };
 
         let abstract_task = AbstractTask::WorkOnCraftOrder;
@@ -7976,6 +8382,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         };
 
         let abstract_task = AbstractTask::HarvestGrainForCraftOrder;
@@ -8655,6 +9062,7 @@ pub fn htn_play_dispatch_system(
             play_grain_seed_storage_tile,
             play_berry_seed_storage_tile,
             play_plant_destination_tile,
+            personal_bp_resource: None,
         };
 
         let abstract_task = AbstractTask::Play;
@@ -8970,6 +9378,7 @@ mod tests {
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         }
     }
 
@@ -9014,6 +9423,7 @@ mod tests {
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         }
     }
 
@@ -9058,6 +9468,7 @@ mod tests {
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         }
     }
 
@@ -9106,6 +9517,7 @@ mod tests {
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         }
     }
 
@@ -9153,6 +9565,7 @@ mod tests {
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         }
     }
 
@@ -9210,6 +9623,7 @@ mod tests {
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         }
     }
 
@@ -9526,6 +9940,7 @@ mod tests {
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         }
     }
 
@@ -9662,6 +10077,7 @@ mod tests {
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         }
     }
 
@@ -9821,6 +10237,7 @@ mod tests {
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         }
     }
 
@@ -10036,6 +10453,7 @@ mod tests {
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         }
     }
 
@@ -10425,6 +10843,7 @@ mod tests {
             play_grain_seed_storage_tile: None,
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
+            personal_bp_resource: None,
         }
     }
 
