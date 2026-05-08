@@ -36,6 +36,7 @@ pub mod sound;
 pub mod stats;
 pub mod tasks;
 pub mod teaching;
+pub mod trader;
 pub mod typed_task;
 #[cfg(test)]
 pub mod test_fixture;
@@ -222,9 +223,22 @@ impl Plugin for SimulationPlugin {
             // priority over bureaucrat town-hall stationing.
             .add_systems(
                 FixedUpdate,
-                htn::bureaucrat_admin_dispatch_system
-                    .in_set(SimulationSet::ParallelB)
-                    .after(htn::htn_combat_faction_dispatch_system),
+                (
+                    htn::bureaucrat_admin_dispatch_system
+                        .after(htn::htn_combat_faction_dispatch_system),
+                    // Pluralist Economy R10 follow-on: trader route
+                    // dispatcher. Same ParallelB shape as bureaucrat
+                    // admin (idle + UNEMPLOYED gate + Lead routing);
+                    // gated additionally on `TraderPlan` so only
+                    // mid-cycle traders route via this path. Ordered
+                    // after bureaucrat dispatch for deterministic
+                    // ordering — neither system writes to the same
+                    // agent (Bureaucrats and Traders are disjoint
+                    // professions).
+                    trader::trader_route_dispatch_system
+                        .after(htn::bureaucrat_admin_dispatch_system),
+                )
+                    .in_set(SimulationSet::ParallelB),
             )
             .add_systems(
                 // Phase 5e-xi-a/b: split-off because the main ParallelB tuple
@@ -474,6 +488,15 @@ impl Plugin for SimulationPlugin {
                     teaching::self_actualization_teaching_system
                         .after(jobs::esteem_driven_posting_system)
                         .before(teaching::apply_lecture_request_system),
+                    // Pluralist Economy R10 follow-on: trader trade
+                    // execution + plan creation. Exclusive system —
+                    // calls `trader_buy_at_settlement` /
+                    // `trader_sell_at_settlement` which require
+                    // `&mut World`. Ordered after household contracts
+                    // so trade traffic settles into market state
+                    // before the next tick's price update.
+                    trader::trader_market_step_system
+                        .after(teaching::self_actualization_teaching_system),
                 )
                     .in_set(SimulationSet::Economy),
             );

@@ -63,12 +63,32 @@ pub enum Profession {
     /// Pluralist Economy R10: market arbitrageur. Walks between
     /// settlements with price gaps, buying low and selling high.
     /// Currency settles via `pay()` against settlement market state.
-    /// R10 ships the profession + buy/sell helpers + a primitives
-    /// validation test; full HTN-autonomous dispatch (the
-    /// `ParticipateInMarket` abstract task + dispatcher with
-    /// `VisitedSettlements` walking) is a follow-on once a Trader
-    /// `AgentGoal` lands or the dispatcher piggybacks on `Haul`.
+    /// Autonomous dispatch lives in `trader::autonomous_trader_dispatch_system`
+    /// (R10 follow-on): a deterministic state machine driven by
+    /// `TraderPlan` mirroring the Bureaucrat single-system pattern.
     Trader,
+}
+
+/// Pluralist Economy R10 follow-on: per-trader arbitrage state. Tracks
+/// which settlement pair the trader is shuttling between, what
+/// resource, and which leg of the cycle they're on. Removed when the
+/// cycle completes (after the sell leg) so the next dispatch tick
+/// re-scans for the best gap.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TraderPlan {
+    pub phase: TraderPhase,
+    pub buy_settlement: crate::simulation::settlement::SettlementId,
+    pub sell_settlement: crate::simulation::settlement::SettlementId,
+    pub resource_id: crate::economy::resource_catalog::ResourceId,
+    pub qty: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraderPhase {
+    /// Heading to the cheap market with currency.
+    TravelingToBuy,
+    /// Heading to the expensive market with bought goods.
+    TravelingToSell,
 }
 
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]

@@ -465,6 +465,46 @@ pub fn set_currency(app: &mut App, entity: Entity, amount: f32) {
     econ.currency = amount;
 }
 
+/// Reset a trader-profession agent to fully idle so the
+/// autonomous trader dispatcher's plan-creation gate
+/// (`aq.current==Idle && task_id==UNEMPLOYED && goal not preempted`)
+/// fires on the next tick. Other systems (goal_update, HTN) may have
+/// stamped a task / pushed the agent onto Survive during bootstrap;
+/// this clears it deterministically for the dispatch-gate regression
+/// tests by zeroing all need pressures + pinning a non-preempting
+/// goal alongside the task / aq reset.
+pub fn clear_trader_for_dispatch(app: &mut App, entity: Entity) {
+    use crate::simulation::goals::AgentGoal;
+    use crate::simulation::needs::Needs;
+    use crate::simulation::person::{AiState, PersonAI};
+    use crate::simulation::typed_task::{ActionQueue, Task};
+    if let Some(mut aq) = app.world_mut().get_mut::<ActionQueue>(entity) {
+        aq.cancel();
+        aq.current = Task::Idle;
+    }
+    if let Some(mut ai) = app.world_mut().get_mut::<PersonAI>(entity) {
+        ai.task_id = PersonAI::UNEMPLOYED;
+        ai.state = AiState::Idle;
+    }
+    if let Some(mut needs) = app.world_mut().get_mut::<Needs>(entity) {
+        *needs = Needs {
+            hunger: 0.0,
+            sleep: 0.0,
+            shelter: 0.0,
+            safety: 0.0,
+            social: 0.0,
+            reproduction: 0.0,
+            willpower: 255.0,
+            esteem: 0.0,
+            self_actualization: 0.0,
+        };
+    }
+    if let Some(mut goal) = app.world_mut().get_mut::<AgentGoal>(entity) {
+        // GatherFood is the default and is NOT in `goal_preempts_trade`.
+        *goal = AgentGoal::GatherFood;
+    }
+}
+
 /// Read an agent's `EconomicAgent.currency`.
 pub fn get_currency(app: &App, entity: Entity) -> f32 {
     app.world()
@@ -2993,6 +3033,279 @@ mod smoke {
         // credit A treasury; sells at B credit agent + debit B
         // treasury. Net: total system currency unchanged.
         assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+    }
+
+    #[test]
+    fn autonomous_trader_completes_buy_sell_cycle_via_dispatch() {
+        // R10 follow-on: with two settlements at diverging Cloth
+        // prices and a Trader who knows both, the autonomous
+        // dispatch state machine should:
+        //   1. Install a `TraderPlan` (TravelingToBuy → cheap mkt).
+        //   2. On arrival at the buy market, execute the buy +
+        //      advance phase to TravelingToSell.
+        //   3. On arrival at the sell market, execute the sell +
+        //      remove the plan.
+        // Currency invariant holds across the full cycle.
+        //
+        // We bypass pathfinding by teleporting the trader between
+        // legs (writing `Transform.translation` directly) so the
+        // test exercises the dispatch state machine without
+        // depending on the routing pipeline.
+        use crate::economy::core_ids;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::memory::AgentMemory;
+        use crate::simulation::person::{Profession, TraderPhase, TraderPlan};
+        use crate::simulation::settlement::{Settlement, SettlementMap};
+
+        let mut sim = TestSim::new(0xC0FFEE_42);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let faction_a = sim.player_faction_id;
+        let faction_b = {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.create_faction((10, 10))
+        };
+        let trader = sim.spawn_person(faction_a, (0, 0), |b| {
+            b.profession(Profession::Trader);
+        });
+        set_currency(&mut sim.app, trader, 200.0);
+        sim.tick_n(3);
+
+        // Resolve settlement ids + entities.
+        let (sid_a, sid_b, settlement_a, settlement_b) = {
+            let map = sim.app.world().resource::<SettlementMap>();
+            let a = map.first_for_faction(faction_a).unwrap();
+            let b = map.first_for_faction(faction_b).unwrap();
+            (a, b, *map.by_id.get(&a).unwrap(), *map.by_id.get(&b).unwrap())
+        };
+
+        let cloth = core_ids::cloth();
+        // Seed price gap: A cheap (high stock + supply bias);
+        // B expensive (high demand bias + funded treasury).
+        {
+            let mut a = sim
+                .app
+                .world_mut()
+                .get_mut::<Settlement>(settlement_a)
+                .unwrap();
+            a.market.set_stock(cloth, 50.0);
+            a.market.add_supply(cloth, 50.0);
+            a.treasury = 100.0;
+        }
+        {
+            let mut b = sim
+                .app
+                .world_mut()
+                .get_mut::<Settlement>(settlement_b)
+                .unwrap();
+            b.market.add_demand(cloth, 50.0);
+            b.treasury = 1000.0;
+        }
+        sim.tick_n(50);
+
+        // Teach the trader about both settlements.
+        {
+            let mut mem = sim
+                .app
+                .world_mut()
+                .get_mut::<AgentMemory>(trader)
+                .unwrap();
+            mem.record_settlement(sid_a);
+            mem.record_settlement(sid_b);
+        }
+
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+        let trader_currency_pre = get_currency(&mut sim.app, trader);
+
+        // Resolve market tiles.
+        let (buy_tile, sell_tile) = {
+            let a = sim.app.world().get::<Settlement>(settlement_a).unwrap();
+            let b = sim.app.world().get::<Settlement>(settlement_b).unwrap();
+            (a.market_tile, b.market_tile)
+        };
+
+        // Sanity check: the price gap must exceed `TRADER_MIN_GAP`
+        // for the dispatcher to commit to a cycle.
+        let p_a = sim
+            .app
+            .world()
+            .get::<Settlement>(settlement_a)
+            .unwrap()
+            .market
+            .price_of(cloth);
+        let p_b = sim
+            .app
+            .world()
+            .get::<Settlement>(settlement_b)
+            .unwrap()
+            .market
+            .price_of(cloth);
+        assert!(
+            p_b - p_a > crate::simulation::trader::TRADER_MIN_GAP,
+            "test bug: seeded gap too small for dispatcher: a={p_a} b={p_b}",
+        );
+
+        // Pin the trader fully idle so the plan-creation gate fires.
+        // Other systems (goal_update / HTN) may have given the
+        // trader a task during settlement bootstrap; clear it and
+        // invoke `trader_market_step_system` directly to exercise
+        // the dispatcher's logic without scheduling perturbation
+        // re-stamping a task within the same tick.
+        clear_trader_for_dispatch(&mut sim.app, trader);
+        crate::simulation::trader::trader_market_step_system(sim.app.world_mut());
+        let plan_after_install = sim
+            .app
+            .world()
+            .get::<TraderPlan>(trader)
+            .copied()
+            .expect("market step should install TraderPlan when arbitrage exists");
+        assert_eq!(plan_after_install.phase, TraderPhase::TravelingToBuy);
+        assert_eq!(plan_after_install.buy_settlement, sid_a);
+        assert_eq!(plan_after_install.sell_settlement, sid_b);
+        assert_eq!(plan_after_install.resource_id, cloth);
+
+        // Teleport trader to the buy market and step the dispatcher
+        // directly — the buy leg should fire.
+        {
+            let mut t = sim
+                .app
+                .world_mut()
+                .get_mut::<Transform>(trader)
+                .unwrap();
+            t.translation.x = buy_tile.0 as f32 * crate::world::terrain::TILE_SIZE
+                + crate::world::terrain::TILE_SIZE * 0.5;
+            t.translation.y = buy_tile.1 as f32 * crate::world::terrain::TILE_SIZE
+                + crate::world::terrain::TILE_SIZE * 0.5;
+        }
+        crate::simulation::trader::trader_market_step_system(sim.app.world_mut());
+        let plan_after_buy = sim
+            .app
+            .world()
+            .get::<TraderPlan>(trader)
+            .copied()
+            .expect("plan should still exist with phase advanced after buy");
+        assert_eq!(plan_after_buy.phase, TraderPhase::TravelingToSell);
+        let trader_currency_after_buy = get_currency(&mut sim.app, trader);
+        assert!(
+            trader_currency_after_buy < trader_currency_pre,
+            "currency must drop after buy: pre={trader_currency_pre} post={trader_currency_after_buy}",
+        );
+        let trader_cloth_after_buy = sim
+            .app
+            .world()
+            .get::<crate::economy::agent::EconomicAgent>(trader)
+            .unwrap()
+            .quantity_of_resource(cloth);
+        assert_eq!(
+            trader_cloth_after_buy, plan_after_install.qty,
+            "trader should hold the bought quantity",
+        );
+
+        // Teleport to the sell market — the sell leg should fire and
+        // remove the plan.
+        {
+            let mut t = sim
+                .app
+                .world_mut()
+                .get_mut::<Transform>(trader)
+                .unwrap();
+            t.translation.x = sell_tile.0 as f32 * crate::world::terrain::TILE_SIZE
+                + crate::world::terrain::TILE_SIZE * 0.5;
+            t.translation.y = sell_tile.1 as f32 * crate::world::terrain::TILE_SIZE
+                + crate::world::terrain::TILE_SIZE * 0.5;
+        }
+        crate::simulation::trader::trader_market_step_system(sim.app.world_mut());
+        assert!(
+            sim.app.world().get::<TraderPlan>(trader).is_none(),
+            "plan should be cleared after sell leg",
+        );
+        let trader_cloth_after_sell = sim
+            .app
+            .world()
+            .get::<crate::economy::agent::EconomicAgent>(trader)
+            .unwrap()
+            .quantity_of_resource(cloth);
+        assert_eq!(
+            trader_cloth_after_sell, 0,
+            "trader's cloth inventory should be sold off",
+        );
+        let trader_currency_after_sell = get_currency(&mut sim.app, trader);
+        assert!(
+            trader_currency_after_sell > trader_currency_after_buy,
+            "currency must rise after sell: post-buy={trader_currency_after_buy} post-sell={trader_currency_after_sell}",
+        );
+
+        // Currency invariant: agent + faction treasuries + settlement
+        // treasuries + escrow stays constant across the cycle.
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+    }
+
+    #[test]
+    fn autonomous_trader_skips_install_when_no_capital() {
+        // Capital floor: a Trader with currency < TRADER_MIN_CAPITAL
+        // and a known price gap should NOT install a plan — the
+        // dispatcher waits for funding rather than committing to a
+        // cycle the trader can't afford.
+        use crate::economy::core_ids;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::memory::AgentMemory;
+        use crate::simulation::person::{Profession, TraderPlan};
+        use crate::simulation::settlement::{Settlement, SettlementMap};
+
+        let mut sim = TestSim::new(0xC0FFEE_43);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let faction_a = sim.player_faction_id;
+        let faction_b = {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.create_faction((10, 10))
+        };
+        let trader = sim.spawn_person(faction_a, (0, 0), |b| {
+            b.profession(Profession::Trader);
+        });
+        // Below TRADER_MIN_CAPITAL.
+        set_currency(&mut sim.app, trader, 5.0);
+        sim.tick_n(3);
+        let (sid_a, sid_b, settlement_a, settlement_b) = {
+            let map = sim.app.world().resource::<SettlementMap>();
+            let a = map.first_for_faction(faction_a).unwrap();
+            let b = map.first_for_faction(faction_b).unwrap();
+            (a, b, *map.by_id.get(&a).unwrap(), *map.by_id.get(&b).unwrap())
+        };
+        let cloth = core_ids::cloth();
+        {
+            let mut a = sim
+                .app
+                .world_mut()
+                .get_mut::<Settlement>(settlement_a)
+                .unwrap();
+            a.market.set_stock(cloth, 50.0);
+            a.market.add_supply(cloth, 50.0);
+        }
+        {
+            let mut b = sim
+                .app
+                .world_mut()
+                .get_mut::<Settlement>(settlement_b)
+                .unwrap();
+            b.market.add_demand(cloth, 50.0);
+            b.treasury = 1000.0;
+        }
+        sim.tick_n(50);
+        {
+            let mut mem = sim
+                .app
+                .world_mut()
+                .get_mut::<AgentMemory>(trader)
+                .unwrap();
+            mem.record_settlement(sid_a);
+            mem.record_settlement(sid_b);
+        }
+        clear_trader_for_dispatch(&mut sim.app, trader);
+        crate::simulation::trader::trader_market_step_system(sim.app.world_mut());
+        assert!(
+            sim.app.world().get::<TraderPlan>(trader).is_none(),
+            "plan must NOT install when trader currency is below floor",
+        );
     }
 
     #[test]
