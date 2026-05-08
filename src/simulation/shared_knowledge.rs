@@ -167,9 +167,13 @@ impl ResourceCluster {
         removed
     }
 
-    /// Closest representative tile to `from` by chebyshev. Falls back to
-    /// `center` if all rep slots are empty.
-    pub fn nearest_target_tile(&self, from: (i32, i32)) -> (i32, i32) {
+    /// Closest representative tile to `from` by chebyshev. Returns `None` when
+    /// every rep slot is empty — callers should treat the cluster as exhausted
+    /// and either drop it or wait for a fresh sighting to repopulate the LRU.
+    /// Previously fell back to `self.center`, but that pinned every querier to
+    /// the cluster's first-ever-sighted tile (typically the first thing
+    /// harvested), causing a stale-tile loop after the LRU drained.
+    pub fn nearest_target_tile(&self, from: (i32, i32)) -> Option<(i32, i32)> {
         let mut best: Option<((i32, i32), i32)> = None;
         for slot in self.representative_tiles.iter() {
             if let Some(t) = *slot {
@@ -179,7 +183,7 @@ impl ResourceCluster {
                 }
             }
         }
-        best.map(|(t, _)| t).unwrap_or(self.center)
+        best.map(|(t, _)| t)
     }
 
     fn chunk_of(tile: (i32, i32)) -> ChunkCoord {
@@ -320,7 +324,7 @@ impl KnowledgeMap {
                         if c.kind != kind || !owner_filter(c.owner) {
                             continue;
                         }
-                        let target = c.nearest_target_tile(from);
+                        let Some(target) = c.nearest_target_tile(from) else { continue };
                         let raw = (target.0 - from.0).abs().max((target.1 - from.1).abs());
                         let score = raw + claim_penalty(target);
                         if best.map_or(true, |(_, bs)| score < bs) {
@@ -401,8 +405,15 @@ impl SharedKnowledge {
                 let already = c.representative_tiles.iter().any(|s| *s == Some(tile));
                 c.push_rep(tile);
                 c.last_seen_tick = now;
+                // estimated_count tracks rep-slot occupancy, capped at
+                // REPRESENTATIVE_TILES. Decoupling the two (the previous
+                // behaviour incremented per distinct sighting up to u16::MAX)
+                // let `estimated_count` outlive every concrete rep tile,
+                // leaving the cluster un-despawnable after the LRU drained
+                // and routing every gatherer to `c.center` forever.
+                c.estimated_count =
+                    c.representative_tiles.iter().filter(|s| s.is_some()).count() as u16;
                 if !already {
-                    c.estimated_count = c.estimated_count.saturating_add(1);
                     // Grow radius to fit the new tile.
                     let dx = (c.center.0 - tile.0).abs();
                     let dy = (c.center.1 - tile.1).abs();
@@ -495,7 +506,12 @@ impl SharedKnowledge {
         for tier in tier_set.tiers() {
             let Some(m) = self.tiers.get(&tier) else { continue };
             if let Some(cid) = m.nearest(kind, from, &owner_filter, &claim_penalty, max_chunk_radius) {
-                let target = m.clusters.get(&cid).map(|c| c.nearest_target_tile(from)).unwrap_or(from);
+                // `nearest` already filters out clusters whose LRU is empty,
+                // so `nearest_target_tile` is expected to return Some here;
+                // skip defensively if a race or future change makes it None.
+                let Some(target) = m.clusters.get(&cid).and_then(|c| c.nearest_target_tile(from)) else {
+                    continue;
+                };
                 return Some((tier, cid, target));
             }
         }
@@ -687,6 +703,50 @@ mod tests {
         assert!(m.clusters.is_empty(), "cluster should despawn at count 0");
         assert!(m.by_kind.is_empty());
         assert!(m.by_chunk.is_empty());
+    }
+
+    #[test]
+    fn lru_overflow_caps_estimated_count_and_drains_to_despawn() {
+        // Regression: prior to the fix, `report_sighting` incremented
+        // `estimated_count` per distinct sighting (uncapped), while the LRU
+        // only tracked the 4 most recent. After the LRU overflowed, the
+        // cluster still claimed e.g. count=6 with 4 reps; once depletion
+        // drained those 4 reps, count stayed >0 and `nearest_target_tile`
+        // fell back to `c.center` forever — the "all gatherers loop on one
+        // stale tile" bug. Now `estimated_count` mirrors rep occupancy.
+        let mut sk = SharedKnowledge::default();
+        let tiles = [(10, 10), (11, 10), (12, 11), (13, 11), (14, 12), (15, 12)];
+        for t in tiles {
+            sk.report_sighting(faction_tier(1), t, fake_kind(), ResourceOwner::Public, 0);
+        }
+        let m = sk.map(faction_tier(1)).unwrap();
+        let cid = *m.clusters.keys().next().unwrap();
+        let c = &m.clusters[&cid];
+        assert_eq!(
+            c.estimated_count as usize, REPRESENTATIVE_TILES,
+            "estimated_count must mirror rep-slot occupancy, not raw sighting count"
+        );
+        // Drain every currently-occupied rep slot — cluster must despawn.
+        let live_reps: Vec<(i32, i32)> = c.representative_tiles.iter().filter_map(|s| *s).collect();
+        for t in live_reps {
+            sk.report_depleted(faction_tier(1), t, fake_kind());
+        }
+        let m = sk.map(faction_tier(1)).unwrap();
+        assert!(
+            m.clusters.is_empty(),
+            "draining the LRU must despawn the cluster (no zombie clusters pinned to center)"
+        );
+    }
+
+    #[test]
+    fn nearest_target_tile_returns_none_when_lru_empty() {
+        // `nearest_target_tile` used to fall back to `c.center` when every
+        // rep slot was None, which routed every querier to the same stale
+        // tile. The new contract: empty LRU ⇒ None.
+        let mut c = ResourceCluster::new(ClusterId(0), fake_kind(), ResourceOwner::Public, (5, 5), 0);
+        c.drop_rep((5, 5));
+        assert!(c.representative_tiles.iter().all(|s| s.is_none()));
+        assert_eq!(c.nearest_target_tile((0, 0)), None);
     }
 
     #[test]

@@ -552,6 +552,7 @@ pub fn pregnancy_system(
                 AgentMemory::default(),
                 RelationshipMemory::default(),
                 MethodHistory::default(),
+                crate::simulation::memory::CurrentVision::default(),
                 Name::new(child_name),
                 PathFollow::default(),
                 Carrier::default(),

@@ -16,8 +16,11 @@ pub fn has_los(
 ) -> bool {
     let (mut x0, mut y0) = (from.0, from.1);
     let (x1, y1) = (to.0, to.1);
-    let from_z = from.2 as f32;
-    let to_z = to.2 as f32;
+    // Eye height: ray walks 1 voxel above the standing tile at both endpoints,
+    // so a 1-tile terrain rise doesn't read as below-surface Wall and block sight.
+    // i32 widening keeps Z_MAX safely below i8::MAX after the +1 bump.
+    let from_z = (from.2 as i32 + 1) as f32;
+    let to_z = (to.2 as i32 + 1) as f32;
 
     let dx = (x1 - x0).abs();
     let dy = (y1 - y0).abs();
@@ -94,6 +97,21 @@ mod tests {
         let m = flat_chunk_map();
         let d = DoorMap::default();
         assert!(has_los(&m, &d, (0, 0, 0), (10, 5, 0)));
+    }
+
+    #[test]
+    fn small_terrain_rise_does_not_block_los() {
+        let mut m = ChunkMap::default();
+        let mut surface_z = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
+        surface_z[0][5] = 1;
+        let surface_kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_fertility = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
+        m.0.insert(
+            ChunkCoord(0, 0),
+            Chunk::new(surface_z, surface_kind, surface_fertility),
+        );
+        let d = DoorMap::default();
+        assert!(has_los(&m, &d, (0, 0, 0), (10, 0, 0)));
     }
 
     #[test]

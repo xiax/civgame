@@ -828,13 +828,17 @@ pub const PLAYER_PRIORITY: u8 = PRIORITY_PLAYER;
 const GATHER_TARGET_PER_HEAD: u32 = 8;
 
 /// Maximum target size for any single Gather posting, so progress is visible
-/// and partial completions release some workers earlier.
-const GATHER_TARGET_CAP: u32 = 600;
+/// and partial completions release some workers earlier. Lifted from 600 → 1500
+/// so a 20-person tribe in autumn can stockpile multiple weeks of food in one
+/// posting instead of fragmenting the work into 60-tick re-postings.
+const GATHER_TARGET_CAP: u32 = 1500;
 const GATHER_TARGET_MIN: u32 = 80;
 
-/// Item-count clamps for material (Wood/Stone) Gather postings.
+/// Item-count clamps for material (Wood/Stone) Gather postings. Lifted from
+/// 32 → 96 so a 12-tile palisade run draws a single fat Stockpile posting
+/// rather than three or four chained re-postings.
 const MATERIAL_GATHER_MIN: u32 = 4;
-const MATERIAL_GATHER_CAP: u32 = 32;
+const MATERIAL_GATHER_CAP: u32 = 96;
 
 /// Farm posting target: number of tiles to plant in one posting.
 const FARM_TILES_PER_POST: u32 = 6;
@@ -858,11 +862,21 @@ pub fn chief_job_posting_system(
     projects: Res<Projects>,
     shared: Res<crate::simulation::shared_knowledge::SharedKnowledge>,
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    calendar: Res<crate::world::seasons::Calendar>,
     mut board: ResMut<JobBoard>,
 ) {
     if clock.tick % CHIEF_POSTING_INTERVAL != 0 {
         return;
     }
+    // Anticipatory food buffer: tribes need a fatter reserve heading into
+    // winter than they do at the height of summer foraging. Multiplier is
+    // applied to the food deficit target before the GATHER_TARGET_CAP clamp.
+    let food_seasonal_multiplier: f32 = match calendar.season {
+        crate::world::seasons::Season::Spring => 1.0,
+        crate::world::seasons::Season::Summer => 1.0,
+        crate::world::seasons::Season::Autumn => 1.5,
+        crate::world::seasons::Season::Winter => 1.3,
+    };
 
     // Group all live, non-personal blueprints by faction.
     let mut bps_by_faction: AHashMap<u32, Vec<Entity>> = AHashMap::new();
@@ -1024,7 +1038,8 @@ pub fn chief_job_posting_system(
                     // finishing the posting faster.
                     let calories =
                         deficit_units * crate::economy::core_ids::min_edible_calories();
-                    let target = calories.clamp(GATHER_TARGET_MIN, GATHER_TARGET_CAP);
+                    let scaled = (calories as f32 * food_seasonal_multiplier) as u32;
+                    let target = scaled.clamp(GATHER_TARGET_MIN, GATHER_TARGET_CAP);
                     let id = board.alloc_id();
                     let progress = JobProgress::Calories {
                         deposited: 0,
@@ -1400,7 +1415,16 @@ pub fn chief_job_posting_system(
                     .find(|(t, _)| in_home_zone(t))
                     .map(|(_, e)| *e);
 
+                // Track the best ingredient-ready recipe (eligible for an
+                // immediate Craft posting) and, in parallel, the best
+                // ingredient-blocked recipe (used to drive pull-posting of the
+                // missing Stockpile inputs).
                 let mut best: Option<(u8, u32, Option<Entity>)> = None;
+                let mut blocked_demand: AHashMap<
+                    crate::economy::resource_catalog::ResourceId,
+                    u32,
+                > = AHashMap::new();
+                let mut best_blocked_deficit: u32 = 0;
                 for (idx, recipe) in crate::simulation::crafting::craft_recipes().iter().enumerate() {
                     if let Some(tech) = recipe.tech_gate {
                         if !faction.techs.has(tech) {
@@ -1451,20 +1475,30 @@ pub fn chief_job_posting_system(
                         continue;
                     }
                     let deficit = demand - supply;
-                    // Only post when ingredients are actually available;
-                    // otherwise workers adopt Craft goal with no CraftOrder.
-                    let mut has_ingredients = true;
+                    // Ingredient gate uses **storage stock**, not
+                    // `resource_supply` (which includes member inventories).
+                    // Only deposited inputs can be withdrawn to the bench, so a
+                    // hunter holding 1 Skin must not green-light a Bow craft.
+                    let mut missing: Vec<(crate::economy::resource_catalog::ResourceId, u32)> =
+                        Vec::new();
                     for &(id, qty) in recipe.inputs.iter() {
-                        if faction.resource_supply.get(&id).copied().unwrap_or(0) < qty {
-                            has_ingredients = false;
-                            break;
+                        let stocked = faction.storage.stock_of(id);
+                        if stocked < qty {
+                            missing.push((id, qty - stocked));
                         }
                     }
-                    if !has_ingredients {
-                        continue;
-                    }
-                    if best.map_or(true, |(_, d, _)| deficit > d) {
-                        best = Some((idx as u8, deficit, bench_ref));
+                    if missing.is_empty() {
+                        if best.map_or(true, |(_, d, _)| deficit > d) {
+                            best = Some((idx as u8, deficit, bench_ref));
+                        }
+                    } else if deficit > best_blocked_deficit {
+                        // Track the most-demanded blocked recipe; its missing
+                        // inputs become the chief's pull demand below.
+                        best_blocked_deficit = deficit;
+                        blocked_demand.clear();
+                        for (id, qty) in missing {
+                            blocked_demand.insert(id, qty);
+                        }
                     }
                 }
 
@@ -1497,6 +1531,62 @@ pub fn chief_job_posting_system(
                         reward: 0.0,
                         settlement_id: None,
                     });
+                } else if !blocked_demand.is_empty() {
+                    // Pull-schedule: the chief wants to craft something but
+                    // ingredients aren't deposited yet. Post a Stockpile
+                    // posting for each missing input the chief allocates
+                    // labour for. The next chief-posting cycle re-evaluates
+                    // and emits the actual Craft once stocks land.
+                    let wood_id = crate::economy::core_ids::wood();
+                    let stone_id = crate::economy::core_ids::stone();
+                    for (target_rid, qty_needed) in blocked_demand {
+                        // Wood/Stone are already covered by the dedicated
+                        // anticipatory branch (3b) so let that path own them.
+                        if target_rid == wood_id || target_rid == stone_id {
+                            continue;
+                        }
+                        if !faction.policy_for(target_rid).chief_allocates_labor {
+                            continue;
+                        }
+                        let already = board.faction_postings(faction_id).iter().any(|p| {
+                            matches!(
+                                &p.progress,
+                                JobProgress::Stockpile { resource_id, .. }
+                                    if *resource_id == target_rid
+                            )
+                        });
+                        if already {
+                            continue;
+                        }
+                        let target = qty_needed.clamp(MATERIAL_GATHER_MIN, MATERIAL_GATHER_CAP);
+                        let id = board.alloc_id();
+                        let progress = JobProgress::Stockpile {
+                            resource_id: target_rid,
+                            deposited: 0,
+                            target,
+                        };
+                        let priority = compute_priority(
+                            faction,
+                            faction_id,
+                            JobKind::Stockpile,
+                            &progress,
+                            &projects,
+                        );
+                        board.faction_postings_mut(faction_id).push(JobPosting {
+                            id,
+                            faction_id,
+                            kind: JobKind::Stockpile,
+                            progress,
+                            claimants: Vec::new(),
+                            priority,
+                            source: JobSource::Chief,
+                            posted_tick,
+                            expiry_tick: None,
+                            poster_class: crate::simulation::jobs::PosterClass::Chief,
+                            reward: 0.0,
+                            settlement_id: None,
+                        });
+                    }
                 }
             }
         }
@@ -1788,6 +1878,29 @@ fn cap_bucket(p: &JobPosting) -> (JobKind, Option<crate::economy::resource_catal
     }
 }
 
+/// Soft per-posting headcount target. Layered on top of the per-bucket budget
+/// cap (`cap_bucket` × `bucket_share`) so workers spread across multiple
+/// postings of the same kind instead of piling onto one. Examples:
+/// - A 4-tile palisade run admits 4 builders; a single hearth admits 2.
+/// - A Stockpile target of 24 stone admits up to 6 haulers; a target of 4
+///   admits 2.
+/// - Craft / Farm are intrinsically single-claimant per posting today.
+fn posting_target_workers(p: &JobPosting) -> u32 {
+    match (&p.kind, &p.progress) {
+        (JobKind::Build, _) => 3,
+        (JobKind::Stockpile, JobProgress::Stockpile { target, .. }) => {
+            ((*target / 4).max(2)).min(6)
+        }
+        (JobKind::Stockpile, JobProgress::Calories { target, .. }) => {
+            ((*target / 80).max(2)).min(8)
+        }
+        (JobKind::Haul, _) => 2,
+        (JobKind::Farm, _) => 3,
+        (JobKind::Craft, _) => 1,
+        _ => 1,
+    }
+}
+
 /// Per-bucket workforce share. For Stockpile, dispatches to the per-resource
 /// slice; otherwise the kind-level share.
 fn bucket_share(
@@ -1897,6 +2010,11 @@ pub fn job_claim_system(
                 .copied()
                 .unwrap_or(0);
             if count >= cap {
+                continue;
+            }
+            // Per-posting cap so workers spread across multiple Build / Stockpile
+            // postings of the same kind instead of all piling onto one.
+            if (p.claimants.len() as u32) >= posting_target_workers(p) {
                 continue;
             }
             // Skip postings that completed but haven't been removed yet.
@@ -2462,5 +2580,99 @@ pub fn job_claim_release_system(
             commands.entity(worker).remove::<ClaimTarget>();
             release_claimant(&mut board, job_id, worker);
         }
+    }
+}
+
+#[cfg(test)]
+mod posting_target_workers_tests {
+    use super::*;
+    use bevy::prelude::Entity;
+
+    fn stub_posting(kind: JobKind, progress: JobProgress) -> JobPosting {
+        JobPosting {
+            id: 0,
+            faction_id: 0,
+            kind,
+            progress,
+            claimants: Vec::new(),
+            priority: 0,
+            source: JobSource::Chief,
+            posted_tick: 0,
+            expiry_tick: None,
+            poster_class: PosterClass::Chief,
+            reward: 0.0,
+            settlement_id: None,
+        }
+    }
+
+    #[test]
+    fn build_posting_admits_three_workers() {
+        let p = stub_posting(
+            JobKind::Build,
+            JobProgress::Building {
+                blueprint: Entity::from_raw(1),
+            },
+        );
+        assert_eq!(posting_target_workers(&p), 3);
+    }
+
+    #[test]
+    fn small_stockpile_admits_two_workers() {
+        // target=4 → (4/4).max(2).min(6) = 2.
+        let rid = crate::economy::core_ids::wood();
+        let p = stub_posting(
+            JobKind::Stockpile,
+            JobProgress::Stockpile {
+                resource_id: rid,
+                deposited: 0,
+                target: 4,
+            },
+        );
+        assert_eq!(posting_target_workers(&p), 2);
+    }
+
+    #[test]
+    fn large_stockpile_admits_six_workers() {
+        // target=96 → (96/4).max(2).min(6) = 6.
+        let rid = crate::economy::core_ids::stone();
+        let p = stub_posting(
+            JobKind::Stockpile,
+            JobProgress::Stockpile {
+                resource_id: rid,
+                deposited: 0,
+                target: 96,
+            },
+        );
+        assert_eq!(posting_target_workers(&p), 6);
+    }
+
+    #[test]
+    fn calorie_posting_scales_with_target() {
+        // target=80 → (80/80).max(2).min(8) = 2; target=800 → 8 (clamp).
+        let small = stub_posting(
+            JobKind::Stockpile,
+            JobProgress::Calories { deposited: 0, target: 80 },
+        );
+        let large = stub_posting(
+            JobKind::Stockpile,
+            JobProgress::Calories { deposited: 0, target: 800 },
+        );
+        assert_eq!(posting_target_workers(&small), 2);
+        assert_eq!(posting_target_workers(&large), 8);
+    }
+
+    #[test]
+    fn craft_posting_admits_one_worker() {
+        let p = stub_posting(
+            JobKind::Craft,
+            JobProgress::Crafting {
+                crafted: 0,
+                target: 1,
+                recipe: 0,
+                bench: None,
+                tech_payload: None,
+            },
+        );
+        assert_eq!(posting_target_workers(&p), 1);
     }
 }

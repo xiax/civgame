@@ -12,6 +12,16 @@ cargo check                # Fast type check
 cargo test --bin civgame   # Run tests (binary crate — `cargo test` alone errors)
 ```
 
+## Game-start options
+
+`GameStartOptions` (resource in `game_state.rs`) drives the spawn-select screen and is read once by `spawn_population` + `seed_starting_buildings_system`:
+- `era: Era` — every spawned member starts with all techs through this era Aware+Learned (`PersonKnowledge::seeded_through_era`); structures and walls scale up accordingly.
+- `player_population: u32` — group size for `group_idx == 0` (player faction). Other factions stay at hardcoded `GROUP_SIZE=20`.
+- `economy: EconomyPreset` — `Subsistence` (empty policy map = all-communist), `Mixed` (`mixed()` on non-staples; chief still allocates food/wood/stone), `Market` (`capitalist()` on every catalog resource). Applied per-faction in `spawn_population` via `policy::apply_preset`.
+- `seed_buildings: bool` — sandbox sets false to skip pre-built seeding.
+
+Chief assignment fix: `spawn_population` now sets `FactionData.chief_entity` and inserts `FactionChief` on the first spawned member. Without this, chief-driven systems waited for an unrelated runtime bonding event.
+
 ## Architecture
 
 CivGame is a Dwarf Fortress-style civilization simulation on **Bevy 0.15** (ECS). Six plugins:

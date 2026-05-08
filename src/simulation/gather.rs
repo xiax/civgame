@@ -22,6 +22,7 @@ use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use bevy::ecs::system::SystemParam;
 use crate::simulation::knowledge::DiscoveryActionEvent;
+use crate::simulation::htn::{MethodHistory, MethodOutcome};
 use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::chunk_streaming::TileChangedEvent;
@@ -266,6 +267,7 @@ pub fn gather_system(
         Option<&FactionMember>,
         Option<&crate::simulation::reproduction::HouseholdMember>,
         &AgentGoal,
+        &mut MethodHistory,
     )>,
 ) {
     use crate::simulation::shared_knowledge::KnowledgeTier;
@@ -282,6 +284,7 @@ pub fn gather_system(
         faction_member,
         household_member,
         _goal,
+        mut method_history,
     ) in agent_query.iter_mut()
     {
         // Resolve the finest tier the agent writes to — same rule as
@@ -331,6 +334,13 @@ pub fn gather_system(
                 plant_map.0.remove(&(tx, ty));
                 shared.report_depleted(agent_tier, (tx, ty), MemoryKind::AnyEdible);
                 shared.report_depleted(agent_tier, (tx, ty), MemoryKind::wood());
+                // Arrival-time target failure: bias the next dispatch away
+                // from the method that picked this stale tile. Without this,
+                // the deposit leg always succeeds and `htn_method_completion_system`
+                // logs a spurious `Success`, never penalising the bad pick.
+                if let Some(method_id) = ai.active_method.take() {
+                    method_history.push(method_id, MethodOutcome::FailedTarget, clock.tick);
+                }
                 finish_gather(
                     &mut ai,
                     &mut aq,
@@ -348,6 +358,9 @@ pub fn gather_system(
                     PlantKind::Tree => MemoryKind::wood(),
                 };
                 shared.report_depleted(agent_tier, (tx, ty), kind);
+                if let Some(method_id) = ai.active_method.take() {
+                    method_history.push(method_id, MethodOutcome::FailedTarget, clock.tick);
+                }
                 finish_gather(
                     &mut ai,
                     &mut aq,
@@ -534,6 +547,9 @@ pub fn gather_system(
                 shared.report_depleted(agent_tier, (tx, ty), MemoryKind::stone());
                 shared.report_depleted(agent_tier, (tx, ty), MemoryKind::AnyEdible);
                 shared.report_depleted(agent_tier, (tx, ty), MemoryKind::wood());
+                if let Some(method_id) = ai.active_method.take() {
+                    method_history.push(method_id, MethodOutcome::FailedTarget, clock.tick);
+                }
                 finish_gather(
                     &mut ai,
                     &mut aq,

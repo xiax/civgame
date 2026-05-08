@@ -375,6 +375,42 @@ fn craftable_resources() -> &'static [crate::economy::resource_catalog::Resource
     })
 }
 
+/// Whether the chief will actually post jobs for this budget slot under the
+/// faction's current `economic_policy`. Mirrors the per-resource gates inside
+/// `chief_job_posting_system` so the budget can't allocate share to a slot
+/// that won't see postings.
+///
+/// Slot indices match the `kinds` / `raws` arrays in
+/// `compute_workforce_budget`:
+///   0 = stockpile_food, 1 = stockpile_wood, 2 = stockpile_stone,
+///   3 = haul, 4 = farm, 5 = build, 6 = craft.
+fn chief_will_post_for_slot(faction: &FactionData, slot: usize) -> bool {
+    use crate::economy::core_ids;
+    match slot {
+        0 => faction.policy_for(core_ids::fruit()).chief_allocates_labor,
+        1 => faction.policy_for(core_ids::wood()).chief_allocates_labor,
+        2 => faction.policy_for(core_ids::stone()).chief_allocates_labor,
+        // Haul postings spawn per blueprint deposit slot, gated by the slot
+        // resource's policy. As long as at least one of food/wood/stone is
+        // chief-allocated, the chief can post Haul; full-capitalist factions
+        // don't post Haul.
+        3 => {
+            faction.policy_for(core_ids::fruit()).chief_allocates_labor
+                || faction.policy_for(core_ids::wood()).chief_allocates_labor
+                || faction.policy_for(core_ids::stone()).chief_allocates_labor
+        }
+        4 => faction.policy_for(core_ids::grain()).chief_allocates_labor,
+        // Build is gated on `state_funds_public_works` (when true, the
+        // bureaucrat path takes over public works and the chief steps back).
+        5 => !faction.state_funds_public_works,
+        // Craft posts when at least one craftable output is chief-allocated.
+        6 => craftable_resources()
+            .iter()
+            .any(|&id| faction.policy_for(id).chief_allocates_labor),
+        _ => false,
+    }
+}
+
 // ── Workforce budget (Stage 2) ───────────────────────────────────────────────
 
 /// Per-faction allocation across job kinds. Sums to 1.0. Computed from the
@@ -566,40 +602,61 @@ pub fn compute_workforce_budget(
         raw_food, raw_wood, raw_stone, raw_haul, raw_farm, raw_build, raw_craft,
     ];
     let mut raw = [0.0f32; 7];
-    let mut eligible = [false; 7];
+    // `capacity_eligible[i]`: faction has the techs/state to do this kind at all.
+    let mut capacity_eligible = [false; 7];
+    // `chief_eligible[i]`: capacity_eligible AND the chief will actually post
+    // this kind under the faction's current `economic_policy`. Slots that are
+    // capacity-eligible but policy-disabled (`chief_allocates_labor=false`)
+    // don't draw budget — their share is rerouted to `free` so workers fall
+    // through to autonomous goals / personal stockpile / market sell.
+    let mut chief_eligible = [false; 7];
     for i in 0..7 {
-        let ok = match kinds[i] {
+        let cap_ok = match kinds[i] {
             None => stockpile_eligible,
             Some(kind) => faction_can_perform(faction, kind),
         };
-        eligible[i] = ok;
-        if ok {
+        capacity_eligible[i] = cap_ok;
+        chief_eligible[i] = cap_ok && chief_will_post_for_slot(faction, i);
+        if chief_eligible[i] {
             raw[i] = raws[i].max(0.0).min(CULTURE_RAW_CAP);
         }
     }
 
-    // Linear proportional allocation with per-slot floor. Every eligible
+    // Policy-dormant share: capacity-eligible slots whose chief isn't posting
+    // give up their proportional slice of `usable` to `free`. Computed as the
+    // dormant fraction of capacity-eligible slots so default-communist
+    // factions (no policy gating, all chief_eligible == capacity_eligible)
+    // see no behavioural change.
+    let n_capacity_eligible = capacity_eligible.iter().filter(|&&e| e).count() as f32;
+    let n_chief_eligible = chief_eligible.iter().filter(|&&e| e).count() as f32;
+    let usable = 1.0 - FREE_FLOOR;
+    let policy_dormant_share = if n_capacity_eligible > 0.0 {
+        usable * ((n_capacity_eligible - n_chief_eligible) / n_capacity_eligible)
+    } else {
+        0.0
+    };
+    let active_usable = (usable - policy_dormant_share).max(0.0);
+
+    // Linear proportional allocation with per-slot floor. Every chief-eligible
     // slot gets `SHARE_FLOOR` baseline; the remaining `weight_budget` is
     // split proportionally to raw pressure. If all pressures are ~0,
     // distribute the weight budget equally so the faction doesn't sit on
     // floors alone.
-    let n_eligible = eligible.iter().filter(|&&e| e).count() as f32;
-    let usable = 1.0 - FREE_FLOOR;
     let mut shares = [0.0f32; 7];
-    if n_eligible > 0.0 {
-        let floor_total = (SHARE_FLOOR * n_eligible).min(usable);
-        let weight_budget = (usable - floor_total).max(0.0);
+    if n_chief_eligible > 0.0 {
+        let floor_total = (SHARE_FLOOR * n_chief_eligible).min(active_usable);
+        let weight_budget = (active_usable - floor_total).max(0.0);
         let sum_raw: f32 = raw.iter().sum();
         if sum_raw < 1e-3 {
-            let each_extra = weight_budget / n_eligible;
+            let each_extra = weight_budget / n_chief_eligible;
             for i in 0..7 {
-                if eligible[i] {
+                if chief_eligible[i] {
                     shares[i] = SHARE_FLOOR + each_extra;
                 }
             }
         } else {
             for i in 0..7 {
-                if eligible[i] {
+                if chief_eligible[i] {
                     shares[i] = SHARE_FLOOR + (raw[i] / sum_raw) * weight_budget;
                 }
             }
@@ -609,17 +666,19 @@ pub fn compute_workforce_budget(
     // Critical-food override: if per-head food is dire, guarantee
     // `stockpile_food` ≥ `CRITICAL_FOOD_FLOOR` by lifting it from the
     // other eligible slots (excluding `free`) proportionally to their
-    // current shares.
-    if eligible[0] && food >= CRITICAL_FOOD_TRIGGER && shares[0] < CRITICAL_FOOD_FLOOR {
+    // current shares. Only fires when the chief actually posts food
+    // (capitalist food → emergency reserve happens via buy-orders, not
+    // workforce reallocation).
+    if chief_eligible[0] && food >= CRITICAL_FOOD_TRIGGER && shares[0] < CRITICAL_FOOD_FLOOR {
         let lift = CRITICAL_FOOD_FLOOR - shares[0];
         let donor_total: f32 = (1..7)
-            .filter(|&i| eligible[i])
+            .filter(|&i| chief_eligible[i])
             .map(|i| shares[i])
             .sum();
         if donor_total > 1e-6 {
             let take_ratio = (lift / donor_total).min(1.0);
             for i in 1..7 {
-                if eligible[i] {
+                if chief_eligible[i] {
                     shares[i] -= shares[i] * take_ratio;
                 }
             }
@@ -631,7 +690,7 @@ pub fn compute_workforce_budget(
     // craft job at min(deficit, CRAFT_MAX_BATCH) units; proportional
     // allocation can otherwise send the full workforce to crafting when it is
     // the only active pressure and other jobs are quiet.
-    if eligible[6] && faction.member_count > 0 {
+    if chief_eligible[6] && faction.member_count > 0 {
         let max_gap = craftable_resources()
             .iter()
             .map(|&id| {
@@ -656,7 +715,7 @@ pub fn compute_workforce_budget(
         farm: shares[4],
         build: shares[5],
         craft: shares[6],
-        free: FREE_FLOOR,
+        free: FREE_FLOOR + policy_dormant_share,
     };
 
     // EMA hysteresis: smooths step changes from discrete project events.

@@ -130,6 +130,9 @@ impl Plugin for SimulationPlugin {
                     faction::center_camera_on_player_faction
                         .after(person::spawn_population)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    construction::seed_starting_buildings_system
+                        .after(person::spawn_population)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                 ),
             )
             .add_systems(

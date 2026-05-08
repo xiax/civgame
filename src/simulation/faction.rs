@@ -2,6 +2,7 @@ use super::goals::Personality;
 use super::items::{spawn_or_merge_ground_item, GroundItem};
 use super::jobs::{
     record_progress, record_progress_filtered, JobBoard, JobClaim, JobCompletedEvent, JobKind,
+    RecipeId,
 };
 use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
@@ -109,6 +110,16 @@ pub const HOUSEHOLD_CONTRACT_REWARD: f32 = 5.0;
 /// system to commission a contract. Households with less than this
 /// stay quiet rather than posting micro-contracts.
 pub const HOUSEHOLD_MIN_TREASURY_FOR_POSTING: f32 = 10.0;
+
+/// Initial treasury seeded into a household when it's spawned at game-start
+/// under the `EconomyPreset::Market` path (`spawn_population` in
+/// `person.rs`). Set above `HOUSEHOLD_MIN_TREASURY_FOR_POSTING` so the
+/// household can post its first paid contract on the next
+/// `HOUSEHOLD_POSTING_CADENCE` cycle without having to first earn money —
+/// otherwise capitalist factions sit dormant for hours of game time.
+/// Cosleep-bond households (`household_formation_system`) keep starting at
+/// 0 — they accumulate via market earnings instead.
+pub const HOUSEHOLD_SEED_TREASURY: f32 = 15.0;
 
 /// Cadence at which `household_contract_posting_system` runs. Once
 /// per game-day; each qualifying household posts one contract per
@@ -635,12 +646,24 @@ pub fn tribute_payment_system(
 /// today's small populations; per-household stagger is a future
 /// optimisation.
 ///
-/// **Posting target**: today, every household commissions
-/// recipe id 0 (Tools). Future versions can scan household needs
-/// (no bed for kids → Build a bed; head lacks a weapon → contract
-/// for one) and pick the most pressing recipe; for R6's narrow
-/// validation a fixed Tools commission proves the path works.
+/// **Posting target**: M3 — the head's `MaslowTier::next_unmet`
+/// picks the recipe. Tier-3 Belonging households commission Woven
+/// Cloth (recipe 4); Tier-4 Esteem households commission Tools
+/// (recipe 0); other tiers fall back to Tools as the always-buildable
+/// safety net so the household isn't a dead poster while higher tiers
+/// are dormant. Recipes whose `tech_gate` the *village* hasn't
+/// learned are skipped; if the picked recipe is gated and unavailable
+/// the system falls through to Tools (always recipe 0, ungated by
+/// FLINT_KNAPPING in fresh paleolithic factions). Food/Bed/Wall
+/// contracts will land alongside `post_stockpile_contract_from_treasury`
+/// / `post_build_contract_from_treasury` (M3 follow-on) — until those
+/// helpers exist, food demand routes through M4's chief buy-orders +
+/// M5's market-buy path instead of household contracts.
 pub fn household_contract_posting_system(world: &mut World) {
+    use crate::simulation::crafting::craft_recipes;
+    use crate::simulation::goals::MaslowTier;
+    use crate::simulation::needs::Needs;
+
     let now = match world.get_resource::<SimClock>() {
         Some(c) => c.tick,
         None => return,
@@ -651,8 +674,8 @@ pub fn household_contract_posting_system(world: &mut World) {
 
     // Snapshot eligible households so we can later mutate the
     // registry + JobBoard without long-lived borrows. Each entry:
-    // (household_id, parent_village_id, head_entity).
-    let intents: Vec<(u32, u32, Entity)> = {
+    // (household_id, parent_village_id, head_entity, recipe_id).
+    let intents: Vec<(u32, u32, Entity, RecipeId)> = {
         let registry = world.resource::<FactionRegistry>();
         let mut out = Vec::new();
         for (&hid, data) in registry.factions.iter() {
@@ -669,21 +692,40 @@ pub fn household_contract_posting_system(world: &mut World) {
             let Some(head) = data.household_head else {
                 continue;
             };
-            out.push((hid, parent, head));
+            // Read the village's tech awareness (tech_gate is keyed on
+            // chief-awareness — see `sync_faction_techs_from_chief_system`).
+            let village_techs = match registry.factions.get(&parent) {
+                Some(v) => v.techs.clone(),
+                None => continue,
+            };
+            // Pick the recipe driven by the head's Maslow tier. Read
+            // `Needs` directly from the world; if missing (e.g. head
+            // entity already despawned) the household sits idle this
+            // cycle.
+            let needs = match world.get::<Needs>(head) {
+                Some(n) => n,
+                None => continue,
+            };
+            let tier = MaslowTier::next_unmet(needs);
+            let recipe = pick_household_recipe(tier, &village_techs);
+            out.push((hid, parent, head, recipe));
         }
         out
     };
 
-    for (household_id, village_id, head) in intents {
-        // Recipe 0 = Tools. Always-valid in the catalog. Posted
-        // onto the village's job board (parent_faction) so any
-        // village-resident smith can claim it.
+    for (household_id, village_id, head, recipe) in intents {
+        // Validate the recipe one last time before posting (defence
+        // in depth: pick_household_recipe should never return an
+        // invalid id, but the recipe table is decoupled).
+        if craft_recipes().get(recipe as usize).is_none() {
+            continue;
+        }
         let _escrow = crate::simulation::jobs::post_craft_contract_from_treasury(
             world,
             household_id,
             village_id,
             head,
-            0,
+            recipe,
             1,
             HOUSEHOLD_CONTRACT_REWARD,
             None,
@@ -692,6 +734,43 @@ pub fn household_contract_posting_system(world: &mut World) {
         // insufficient treasury / invalid recipe. Either way we
         // proceed — if a contract didn't post this tick, the next
         // cadence cycle will retry once funds permit.
+    }
+}
+
+/// Maslow-tier → craft-recipe selection for `household_contract_posting_system`.
+/// Tier-3 Belonging → Woven Cloth (recipe 4) for clothing/social
+/// signalling. Tier-4 Esteem → Stone Tools (recipe 0). Lower tiers
+/// (Physiological / Safety) currently have no household-craftable
+/// remedy — they fall through to Tools too so the household isn't a
+/// dead poster while M4 buy-orders + M5 market-buy paths handle the
+/// food/build supply side. Recipes whose `tech_gate` isn't met by the
+/// village fall back to Tools (recipe 0 — gated on FLINT_KNAPPING which
+/// every starting faction learns).
+pub(crate) fn pick_household_recipe(
+    tier: Option<crate::simulation::goals::MaslowTier>,
+    village_techs: &FactionTechs,
+) -> RecipeId {
+    use crate::simulation::crafting::craft_recipes;
+    use crate::simulation::goals::MaslowTier;
+
+    let preferred: RecipeId = match tier {
+        Some(MaslowTier::Belonging) => 4, // Woven Cloth
+        Some(MaslowTier::Esteem) => 0,    // Stone Tools
+        _ => 0,                           // Stone Tools default
+    };
+    // Tech-gate check against the village's `FactionTechs`. A village
+    // without LOOM_WEAVING can't fulfil a Cloth contract → fall back
+    // to Tools. Tools is recipe 0 — gated on FLINT_KNAPPING which
+    // every faction learns at spawn (paleolithic seed).
+    if let Some(recipe) = craft_recipes().get(preferred as usize) {
+        if let Some(tech) = recipe.tech_gate {
+            if !village_techs.has(tech) {
+                return 0;
+            }
+        }
+        preferred
+    } else {
+        0
     }
 }
 
@@ -881,32 +960,52 @@ fn decide_for_faction(
     });
 }
 
+/// Per-head food reserve threshold for farmer recruitment. Below this we ramp
+/// up farmers; above `FARMER_DEMOTE_RATIO * threshold` we ramp them down.
+/// Hysteresis prevents the role from flapping while reserves hover at target.
+const FARMER_PROMOTE_PER_HEAD: f32 = 32.0;
+const FARMER_DEMOTE_RATIO: f32 = 1.6;
+/// Anchor farmer reassignment to game time, not every tick. Six game-hours
+/// (~`TICKS_PER_DAY/4`) is enough to react to harvest spikes without flapping.
+pub const FARMER_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
+
 pub fn faction_profession_system(
+    clock: Res<SimClock>,
     mut registry: ResMut<FactionRegistry>,
     mut query: Query<(&mut Profession, &FactionMember)>,
 ) {
+    if clock.tick % FARMER_ASSIGNMENT_CADENCE != 0 {
+        return;
+    }
     for (&faction_id, faction) in registry.factions.iter_mut() {
         if !faction.techs.has(CROP_CULTIVATION) {
             continue;
         }
 
-        // Target: 1 farmer per 5 members if food is low.
-        // Let's keep it simple for now: 20% of the population as farmers if food stock is below 100.
-        let target_farmers = if faction.storage.food_total() < 100.0 {
-            (faction.member_count / 5).max(1)
-        } else {
-            0
-        };
-
-        let mut current_farmers = 0;
-
+        // Anticipatory recruitment: ramp up farmers when per-head food reserves
+        // fall below FARMER_PROMOTE_PER_HEAD; ramp down when reserves climb past
+        // FARMER_PROMOTE_PER_HEAD * FARMER_DEMOTE_RATIO. Target = ~20% of adults
+        // when low. The previous threshold (food_total < 100) only fired during
+        // outright starvation for any tribe larger than ~5.
+        let members = faction.member_count.max(1);
+        let per_head = faction.storage.food_total() / members as f32;
+        let promote_threshold = FARMER_PROMOTE_PER_HEAD;
+        let demote_threshold = FARMER_PROMOTE_PER_HEAD * FARMER_DEMOTE_RATIO;
+        let mut current_farmers_for_target = 0u32;
         for (prof, member) in query.iter() {
-            if member.faction_id == faction_id {
-                if *prof == Profession::Farmer {
-                    current_farmers += 1;
-                }
+            if member.faction_id == faction_id && *prof == Profession::Farmer {
+                current_farmers_for_target += 1;
             }
         }
+        let target_farmers = if per_head < promote_threshold {
+            (faction.member_count / 5).max(1)
+        } else if per_head > demote_threshold {
+            0
+        } else {
+            current_farmers_for_target
+        };
+
+        let current_farmers = current_farmers_for_target;
 
         if current_farmers < target_farmers {
             let to_assign = target_farmers - current_farmers;
@@ -1488,17 +1587,28 @@ impl FactionRegistry {
         head: Entity,
         catalog: &crate::economy::resource_catalog::ResourceCatalog,
     ) -> u32 {
+        // Inherit the parent village's policy stance: a default-communist
+        // village (empty economic_policy map) spawns households that are
+        // structurally distinct (storage / treasury / household_head) but
+        // remain communist — they don't auto-post Tools contracts. Villages
+        // that have flipped any resource toward capitalism stamp the full
+        // capitalist preset on the household so private behaviour is
+        // observationally consistent across the catalog.
+        let parent_is_capitalist = self
+            .factions
+            .get(&parent_faction_id)
+            .map(|p| !p.economic_policy.is_empty())
+            .unwrap_or(false);
         let new_id = self.create_faction(home_tile);
-        let cap_policy = crate::economy::policy::ResourceControlPolicy::capitalist();
         if let Some(data) = self.factions.get_mut(&new_id) {
             data.parent_faction = Some(parent_faction_id);
             data.household_head = Some(head);
-            // Stamp the capitalist preset on every catalog resource
-            // so the household is observationally capitalist by
-            // default. The map is per-faction so this only affects
-            // the household, not the parent village.
-            for (rid, _def) in catalog.iter() {
-                data.economic_policy.insert(rid, cap_policy);
+            if parent_is_capitalist {
+                let cap_policy =
+                    crate::economy::policy::ResourceControlPolicy::capitalist();
+                for (rid, _def) in catalog.iter() {
+                    data.economic_policy.insert(rid, cap_policy);
+                }
             }
         }
         if let Some(parent) = self.factions.get_mut(&parent_faction_id) {
@@ -1539,6 +1649,8 @@ pub fn bonding_system(
     mut commands: Commands,
     spatial: Res<SpatialIndex>,
     mut registry: ResMut<FactionRegistry>,
+    options: Res<crate::game_state::GameStartOptions>,
+    catalog: Res<crate::economy::resource_catalog::ResourceCatalog>,
     mut query: Query<(Entity, &mut FactionMember, &Personality, &Transform)>,
     mut rel_query: Query<Option<&mut RelationshipMemory>>,
 ) {
@@ -1612,6 +1724,18 @@ pub fn bonding_system(
 
             let faction_id = if nb_faction == SOLO {
                 let new_id = registry.create_faction((home_tx, home_ty));
+                // Apply the world's economy preset so bonding-spawned
+                // factions don't silently fall back to all-communist
+                // defaults — without this, every new faction's chief
+                // would post Stockpile/Farm/Craft regardless of the
+                // player's `EconomyPreset` selection.
+                if let Some(fd) = registry.factions.get_mut(&new_id) {
+                    crate::economy::policy::apply_preset(
+                        &mut fd.economic_policy,
+                        options.economy,
+                        &catalog,
+                    );
+                }
                 nb_fm.faction_id = new_id;
                 nb_fm.bond_timer = 0;
                 nb_fm.bond_target = None;

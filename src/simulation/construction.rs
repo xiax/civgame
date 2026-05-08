@@ -173,7 +173,7 @@ pub struct HomeBed(pub Option<Entity>);
 /// Wall construction material. Each tier requires a tech and resource mix;
 /// see `BUILD_RECIPES`. All variants render as a `Wall` entity that overwrites
 /// the underlying tile with `TileKind::Wall`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WallMaterial {
     Palisade,
     WattleDaub,
@@ -367,7 +367,7 @@ pub struct Monument {
 }
 
 /// What kind of structure is being built.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BuildSiteKind {
     Wall(WallMaterial),
     Door,
@@ -1626,16 +1626,28 @@ pub fn chief_directive_system(
         return;
     }
 
-    let leading_factions: AHashSet<u32> = chief_query
-        .iter()
-        .filter(|(_, goal)| **goal == AgentGoal::Lead)
-        .map(|(m, _)| m.faction_id)
-        .collect();
+    // Chief AgentGoal::Lead is no longer required — construction queueing reads
+    // FactionData and shouldn't pause when the chief eats or sleeps.
+    let _ = chief_query;
 
     let mut faction_bp_count: AHashMap<u32, usize> = AHashMap::new();
+    // Pending-blueprint kind counters per faction. Every civic gate inside
+    // `generate_candidates` previously checked *built* counts only, so a
+    // structure already queued in `GatherMaterials` didn't satisfy its own
+    // gate — every chief tick the same kind got re-queued (visible as "3
+    // campfires queued at once" once Phase 1 lifted the one-bp-at-a-time
+    // cap). The PendingKindCounts table is consulted alongside the built
+    // counts so an in-flight blueprint counts toward fulfillment.
+    let mut pending_kinds_per_faction: AHashMap<u32, AHashMap<BuildSiteKind, u32>> =
+        AHashMap::new();
     for &bp_entity in bp_map.0.values() {
         if let Ok(bp) = bp_query.get(bp_entity) {
             *faction_bp_count.entry(bp.faction_id).or_insert(0) += 1;
+            *pending_kinds_per_faction
+                .entry(bp.faction_id)
+                .or_default()
+                .entry(bp.kind)
+                .or_insert(0) += 1;
         }
     }
     // Pending footprints (mid-terraform, no walls yet) also count as
@@ -1645,24 +1657,37 @@ pub fn chief_directive_system(
         *faction_bp_count.entry(pending.faction_id).or_insert(0) += 1;
     }
 
+    let empty_pending: AHashMap<BuildSiteKind, u32> = AHashMap::new();
     for (&faction_id, faction) in faction_registry.factions.iter() {
         if faction_id == SOLO || faction.member_count == 0 {
-            continue;
-        }
-        if !leading_factions.contains(&faction_id) {
             continue;
         }
         let count = faction_bp_count.get(&faction_id).copied().unwrap_or(0);
         if count >= MAX_BLUEPRINTS_SAFETY_CAP {
             continue;
         }
-        // One project at a time per faction.
-        if count > 0 {
+        // Population-scaled concurrency cap: ~1 concurrent project per 6 members,
+        // floor 2, ceiling MAX_BLUEPRINTS_SAFETY_CAP - 1. Keeps small bands moving
+        // without flooding workers; lets larger settlements parallelise civic work.
+        let concurrent_cap = ((faction.member_count as usize / 6).max(2))
+            .min(MAX_BLUEPRINTS_SAFETY_CAP - 1);
+        if count >= concurrent_cap {
             continue;
         }
 
         let plan = plans.0.get(&faction_id);
-        let mut candidates = generate_candidates(faction_id, faction, plan, &chunk_map, &maps, &bp_map);
+        let pending_kinds = pending_kinds_per_faction
+            .get(&faction_id)
+            .unwrap_or(&empty_pending);
+        let mut candidates = generate_candidates(
+            faction_id,
+            faction,
+            plan,
+            &chunk_map,
+            &maps,
+            &bp_map,
+            pending_kinds,
+        );
         // Stage 3 feedback: penalize candidates whose required inputs include
         // a chronically-deficient good (per `material_deficit_ema`). Skips the
         // upgrade-rebuild path which short-circuits with score 5000 from
@@ -1714,7 +1739,20 @@ fn generate_candidates(
     chunk_map: &ChunkMap,
     maps: &BuildingMapsRO,
     bp_map: &BlueprintMap,
+    pending_kinds: &AHashMap<BuildSiteKind, u32>,
 ) -> Vec<BuildCandidate> {
+    let pending_of = |k: BuildSiteKind| -> u32 {
+        pending_kinds.get(&k).copied().unwrap_or(0)
+    };
+    // Walls are tracked per-material (`Wall(Palisade)`, `Wall(Stone)`, …);
+    // the wall-deficit gate cares only about total wall blueprints in flight.
+    let pending_walls_total: u32 = pending_kinds
+        .iter()
+        .filter_map(|(k, n)| match k {
+            BuildSiteKind::Wall(_) => Some(*n),
+            _ => None,
+        })
+        .sum();
     use crate::simulation::settlement::ZoneKind;
 
     let mut out: Vec<BuildCandidate> = Vec::with_capacity(8);
@@ -1770,8 +1808,14 @@ fn generate_candidates(
             .max(1),
         _ => 1,
     };
-    let existing_hearths = count_campfires_near(&maps.campfire_map, home, 30) as u32;
-    let bed_count = count_beds_near(&maps.bed_map, home, 30) as i32;
+    // Counts include both built structures *and* in-flight blueprints, so a
+    // structure already queued in `GatherMaterials` is treated as fulfilling
+    // its own gate — without this, every chief tick re-queues another of the
+    // same kind until the first one finishes building.
+    let built_hearths = count_campfires_near(&maps.campfire_map, home, 30) as u32;
+    let existing_hearths = built_hearths.saturating_add(pending_of(BuildSiteKind::Campfire));
+    let built_beds = count_beds_near(&maps.bed_map, home, 30) as i32;
+    let bed_count = built_beds + pending_of(BuildSiteKind::Bed) as i32;
     let bed_deficit_pre = (members as i32 - bed_count).max(0);
     let gate_ok = if existing_hearths == 0 {
         true
@@ -1970,7 +2014,8 @@ fn generate_candidates(
     //    Neolithic farming villages were typically unwalled. Defensive
     //    perimeters become standard with Chalcolithic/Bronze Age city-states.
     if matches!(era, Era::Chalcolithic | Era::BronzeAge) {
-        let walls_count = count_walls_near(&maps.wall_map, home, 25) as i32;
+        let walls_count =
+            count_walls_near(&maps.wall_map, home, 25) as i32 + pending_walls_total as i32;
         let target_walls = (members as i32 * 2 + 8).min(48);
         let defense_deficit = (target_walls - walls_count).max(0) as f32;
         if defense_deficit > 0.0 && bed_count > 0 {
@@ -1987,7 +2032,9 @@ fn generate_candidates(
 
     // 4. Crafting — Workbench when FLINT_KNAPPING and we have somewhere to live.
     if techs.has(FLINT_KNAPPING)
-        && count_workbenches_near(&maps.workbench_map, home, 25) == 0
+        && count_workbenches_near(&maps.workbench_map, home, 25)
+            + pending_of(BuildSiteKind::Workbench) as usize
+            == 0
         && bed_count >= 2
     {
         if let Some(tile) = find_clear_tile_in_zone(
@@ -2009,7 +2056,9 @@ fn generate_candidates(
 
     // 5. Granary — gated by GRANARY tech. Mercantile cultures prioritise.
     if techs.has(GRANARY)
-        && count_granaries_near(&maps.granary_map, home, 25) == 0
+        && count_granaries_near(&maps.granary_map, home, 25)
+            + pending_of(BuildSiteKind::Granary) as usize
+            == 0
         && bed_count >= 2
     {
         if let Some(tile) = find_clear_tile_in_zone(
@@ -2032,7 +2081,9 @@ fn generate_candidates(
 
     // 6. Shrine — gated by SACRED_RITUAL. Ceremonial cultures push hard.
     if techs.has(SACRED_RITUAL)
-        && count_shrines_near(&maps.shrine_map, home, 25) == 0
+        && count_shrines_near(&maps.shrine_map, home, 25)
+            + pending_of(BuildSiteKind::Shrine) as usize
+            == 0
         && bed_count >= 2
     {
         if let Some(tile) = find_clear_tile_in_zone(
@@ -2056,7 +2107,9 @@ fn generate_candidates(
     // 7. Market — LONG_DIST_TRADE. Mercantile cultures aim for two; others one.
     if techs.has(LONG_DIST_TRADE) && bed_count >= 3 {
         let target_count = if culture.mercantile > 180 { 2 } else { 1 };
-        if count_markets_near(&maps.market_map, home, 25) < target_count {
+        let market_count = count_markets_near(&maps.market_map, home, 25)
+            + pending_of(BuildSiteKind::Market) as usize;
+        if market_count < target_count {
             if let Some(tile) = find_clear_tile_in_zone(
                 chunk_map,
                 &maps.bed_map,
@@ -2078,7 +2131,9 @@ fn generate_candidates(
 
     // 8. Barracks — PROFESSIONAL_ARMY. Martial cultures prioritise.
     if techs.has(PROFESSIONAL_ARMY)
-        && count_barracks_near(&maps.barracks_map, home, 25) == 0
+        && count_barracks_near(&maps.barracks_map, home, 25)
+            + pending_of(BuildSiteKind::Barracks) as usize
+            == 0
         && bed_count >= 3
     {
         if let Some(tile) = find_clear_tile_in_zone(
@@ -2101,7 +2156,9 @@ fn generate_candidates(
 
     // 9. Monument — MONUMENTAL_BUILDING. Ceremonial cultures invest heavily.
     if techs.has(MONUMENTAL_BUILDING)
-        && count_monuments_near(&maps.monument_map, home, 30) == 0
+        && count_monuments_near(&maps.monument_map, home, 30)
+            + pending_of(BuildSiteKind::Monument) as usize
+            == 0
         && bed_count >= 4
     {
         if let Some(tile) = find_clear_tile_in_zone(
@@ -3712,6 +3769,474 @@ pub fn door_proximity_system(
         if door.open != nearby {
             door.open = nearby;
             entry.open = nearby;
+        }
+    }
+}
+
+// ── Game-start building seeding ───────────────────────────────────────────────
+//
+// Places era-appropriate, fully-built structures around each faction's home
+// tile when the game starts. Skips the blueprint pipeline entirely — agents
+// don't gather materials, the structures are simply spawned and registered
+// in their respective tile maps.
+//
+// Per-era layout (additive — each era adds to all prior eras' structures):
+//   Paleolithic: 1 Open Campfire, 4 Crude Beds
+//   Mesolithic:  +2 Beds (6 total)
+//   Neolithic:   Hearth tier→Lined; +Granary, +Workbench, +Loom, beds→8
+//   Chalcolithic: +Shrine, +Palisade ring with one Door (radius 4)
+//   Bronze Age:  +Market, +Barracks, +Monument; walls upgrade to Mudbrick
+//
+// Placement uses simple radial spirals from the home tile, gating each tile
+// on `chunk_map.is_passable`. The chief planner's per-kind counters
+// (`count_beds_near`, `count_campfires_near`, …) are radius-based, so
+// structures placed within radius 6 of home register correctly and the
+// chief won't re-queue them as blueprints.
+
+/// Iterate tiles outward from `home` in increasing chebyshev rings, skipping
+/// any tile that's already in `used` or fails `keep`. Yields up to
+/// `MAX_PLACEMENT_ATTEMPTS` candidates before giving up.
+pub(crate) fn next_clear_tile(
+    home: (i32, i32),
+    used: &AHashSet<(i32, i32)>,
+    chunk_map: &ChunkMap,
+    max_radius: i32,
+) -> Option<(i32, i32)> {
+    let (hx, hy) = home;
+    for ring in 1..=max_radius {
+        for dy in -ring..=ring {
+            for dx in -ring..=ring {
+                if dx.abs().max(dy.abs()) != ring {
+                    continue;
+                }
+                let pos = (hx + dx, hy + dy);
+                if used.contains(&pos) {
+                    continue;
+                }
+                if !chunk_map.is_passable(pos.0, pos.1) {
+                    continue;
+                }
+                let Some(k) = chunk_map.tile_kind_at(pos.0, pos.1) else {
+                    continue;
+                };
+                if k == TileKind::Wall || k == TileKind::Stone {
+                    continue;
+                }
+                return Some(pos);
+            }
+        }
+    }
+    None
+}
+
+/// Spawn one `BuildSiteKind` instance at the next radial slot. Inserts into
+/// the matching map and emits a `TileChangedEvent`.
+fn spawn_seeded_structure(
+    commands: &mut Commands,
+    maps: &mut FurnitureMaps,
+    chunk_map: &mut ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    home: (i32, i32),
+    faction_id: u32,
+    kind: BuildSiteKind,
+) {
+    let max_radius = 8;
+    let Some(tile) = next_clear_tile(home, used, chunk_map, max_radius) else {
+        return;
+    };
+    used.insert(tile);
+    let world_pos = tile_to_world(tile.0, tile.1);
+
+    match kind {
+        BuildSiteKind::Bed => {
+            let e = commands
+                .spawn((
+                    Bed::default(),
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Bed),
+                ))
+                .id();
+            maps.bed_map.0.insert(tile, e);
+        }
+        BuildSiteKind::Campfire => {
+            let e = commands
+                .spawn((
+                    Campfire::default(),
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            maps.campfire_map.0.insert(tile, e);
+        }
+        BuildSiteKind::Workbench => {
+            let e = commands
+                .spawn((
+                    Workbench {
+                        faction_id,
+                        tier: WorkbenchTier::default(),
+                    },
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            maps.workbench_map.0.insert(tile, e);
+        }
+        BuildSiteKind::Loom => {
+            let e = commands
+                .spawn((
+                    Loom { faction_id },
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            maps.loom_map.0.insert(tile, e);
+        }
+        BuildSiteKind::Granary => {
+            let e = commands
+                .spawn((
+                    Granary { faction_id },
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            maps.granary_map.0.insert(tile, e);
+        }
+        BuildSiteKind::Shrine => {
+            let e = commands
+                .spawn((
+                    Shrine { faction_id },
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            maps.shrine_map.0.insert(tile, e);
+        }
+        BuildSiteKind::Market => {
+            let e = commands
+                .spawn((
+                    Market { faction_id },
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            maps.market_map.0.insert(tile, e);
+        }
+        BuildSiteKind::Barracks => {
+            let e = commands
+                .spawn((
+                    Barracks { faction_id },
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            maps.barracks_map.0.insert(tile, e);
+        }
+        BuildSiteKind::Monument => {
+            let e = commands
+                .spawn((
+                    Monument { faction_id },
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.45),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            maps.monument_map.0.insert(tile, e);
+        }
+        // Wall and Door are placed by `seed_perimeter`, not here.
+        _ => return,
+    }
+
+    tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+        tx: tile.0,
+        ty: tile.1,
+    });
+}
+
+/// Lay a square `Wall` perimeter of side `2*half+1` centred on `home`, with one
+/// `Door` on the perimeter facing east. Skips tiles that aren't passable
+/// (rivers, existing walls, etc.) — those gaps just become passive openings.
+fn seed_perimeter(
+    commands: &mut Commands,
+    maps: &mut FurnitureMaps,
+    chunk_map: &mut ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    home: (i32, i32),
+    half: i32,
+    material: WallMaterial,
+    faction_id: u32,
+) {
+    let (hx, hy) = home;
+    // Door tile: east side, mid-height. Other perimeter tiles get walls.
+    let door_tile = (hx + half, hy);
+
+    for dy in -half..=half {
+        for dx in -half..=half {
+            // Only perimeter tiles.
+            if dx.abs() != half && dy.abs() != half {
+                continue;
+            }
+            let tile = (hx + dx, hy + dy);
+            if used.contains(&tile) {
+                continue;
+            }
+            if !chunk_map.is_passable(tile.0, tile.1) {
+                continue;
+            }
+            let Some(k) = chunk_map.tile_kind_at(tile.0, tile.1) else {
+                continue;
+            };
+            if k == TileKind::Wall {
+                continue;
+            }
+
+            let world_pos = tile_to_world(tile.0, tile.1);
+
+            if tile == door_tile {
+                let e = commands
+                    .spawn((
+                        Door {
+                            faction_id,
+                            open: false,
+                            tier: DoorTier::default(),
+                        },
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id();
+                maps.door_map.0.insert(
+                    tile,
+                    DoorEntry {
+                        entity: e,
+                        open: false,
+                    },
+                );
+            } else {
+                let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
+                chunk_map.set_tile(
+                    tile.0,
+                    tile.1,
+                    surf_z + 1,
+                    TileData {
+                        kind: TileKind::Wall,
+                        elevation: 0,
+                        fertility: 0,
+                        flags: 0b0001,
+                        ore: 0,
+                    },
+                );
+                let e = commands
+                    .spawn((
+                        Wall { material },
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id();
+                maps.wall_map.0.insert(tile, e);
+            }
+            used.insert(tile);
+            tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+                tx: tile.0,
+                ty: tile.1,
+            });
+        }
+    }
+}
+
+/// Per-faction starting structures, dispatched on `OnEnter(GameState::Playing)`
+/// after `spawn_population`. Reads `GameStartOptions::era` and
+/// `GameStartOptions::seed_buildings` (sandbox mode disables seeding).
+pub fn seed_starting_buildings_system(
+    mut commands: Commands,
+    mut chunk_map: ResMut<ChunkMap>,
+    mut maps: FurnitureMaps,
+    mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    registry: Res<FactionRegistry>,
+    options: Res<crate::GameStartOptions>,
+) {
+    if !options.seed_buildings {
+        return;
+    }
+
+    let era = options.era;
+    let bed_count: i32 = match era {
+        Era::Paleolithic => 4,
+        Era::Mesolithic => 6,
+        Era::Neolithic | Era::Chalcolithic | Era::BronzeAge => 8,
+    };
+    let hearth_tier = match era {
+        Era::Paleolithic | Era::Mesolithic => HearthTier::Open,
+        Era::Neolithic => HearthTier::Ringed,
+        Era::Chalcolithic | Era::BronzeAge => HearthTier::Lined,
+    };
+    let wall_material = match era {
+        Era::Chalcolithic => Some(WallMaterial::Palisade),
+        Era::BronzeAge => Some(WallMaterial::Mudbrick),
+        _ => None,
+    };
+
+    for (&faction_id, faction) in registry.factions.iter() {
+        if faction_id == SOLO || faction.member_count == 0 {
+            continue;
+        }
+        let home = faction.home_tile;
+        let mut used: AHashSet<(i32, i32)> = AHashSet::new();
+        // Reserve the home tile itself — it carries the FactionStorageTile.
+        used.insert(home);
+
+        // Hearth (1) — spawned via Campfire, with the era-appropriate tier.
+        if let Some(tile) = next_clear_tile(home, &used, &chunk_map, 8) {
+            used.insert(tile);
+            let world_pos = tile_to_world(tile.0, tile.1);
+            let e = commands
+                .spawn((
+                    Campfire { tier: hearth_tier },
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            maps.campfire_map.0.insert(tile, e);
+            tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+                tx: tile.0,
+                ty: tile.1,
+            });
+        }
+
+        // Beds.
+        for _ in 0..bed_count {
+            spawn_seeded_structure(
+                &mut commands,
+                &mut maps,
+                &mut chunk_map,
+                &mut tile_changed,
+                &mut used,
+                home,
+                faction_id,
+                BuildSiteKind::Bed,
+            );
+        }
+
+        // Neolithic+ workshops & storage.
+        if (era as u8) >= (Era::Neolithic as u8) {
+            spawn_seeded_structure(
+                &mut commands,
+                &mut maps,
+                &mut chunk_map,
+                &mut tile_changed,
+                &mut used,
+                home,
+                faction_id,
+                BuildSiteKind::Workbench,
+            );
+            spawn_seeded_structure(
+                &mut commands,
+                &mut maps,
+                &mut chunk_map,
+                &mut tile_changed,
+                &mut used,
+                home,
+                faction_id,
+                BuildSiteKind::Granary,
+            );
+            spawn_seeded_structure(
+                &mut commands,
+                &mut maps,
+                &mut chunk_map,
+                &mut tile_changed,
+                &mut used,
+                home,
+                faction_id,
+                BuildSiteKind::Loom,
+            );
+        }
+
+        // Chalcolithic+ adds a shrine.
+        if (era as u8) >= (Era::Chalcolithic as u8) {
+            spawn_seeded_structure(
+                &mut commands,
+                &mut maps,
+                &mut chunk_map,
+                &mut tile_changed,
+                &mut used,
+                home,
+                faction_id,
+                BuildSiteKind::Shrine,
+            );
+        }
+
+        // Bronze Age civic structures.
+        if (era as u8) >= (Era::BronzeAge as u8) {
+            spawn_seeded_structure(
+                &mut commands,
+                &mut maps,
+                &mut chunk_map,
+                &mut tile_changed,
+                &mut used,
+                home,
+                faction_id,
+                BuildSiteKind::Market,
+            );
+            spawn_seeded_structure(
+                &mut commands,
+                &mut maps,
+                &mut chunk_map,
+                &mut tile_changed,
+                &mut used,
+                home,
+                faction_id,
+                BuildSiteKind::Barracks,
+            );
+            spawn_seeded_structure(
+                &mut commands,
+                &mut maps,
+                &mut chunk_map,
+                &mut tile_changed,
+                &mut used,
+                home,
+                faction_id,
+                BuildSiteKind::Monument,
+            );
+        }
+
+        // Defensive perimeter (Chalco onward). Built last so all furniture
+        // is already inside it.
+        if let Some(material) = wall_material {
+            seed_perimeter(
+                &mut commands,
+                &mut maps,
+                &mut chunk_map,
+                &mut tile_changed,
+                &mut used,
+                home,
+                5,
+                material,
+                faction_id,
+            );
         }
     }
 }

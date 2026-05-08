@@ -33,6 +33,12 @@ pub struct SandboxPlugin;
 impl Plugin for SandboxPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(SandboxMode)
+            .insert_resource(crate::GameStartOptions {
+                era: crate::simulation::technology::Era::Paleolithic,
+                player_population: 1,
+                economy: crate::EconomyPreset::Subsistence,
+                seed_buildings: false,
+            })
             .add_systems(Startup, sandbox_auto_skip_spawn_select)
             .add_systems(OnEnter(crate::GameState::Playing), setup_sandbox);
     }

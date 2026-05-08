@@ -11,7 +11,7 @@ use crate::world::tile::TileKind;
 use super::carry::Carrier;
 use super::combat::{Body, CombatCooldown, CombatTarget};
 use super::faction::{
-    FactionCenter, FactionMember, FactionRegistry, FactionStorageTile, PlayerFaction,
+    FactionCenter, FactionChief, FactionMember, FactionRegistry, FactionStorageTile, PlayerFaction,
     PlayerFactionMarker,
 };
 use super::goals::{AgentGoal, Personality};
@@ -333,6 +333,8 @@ pub fn spawn_population(
     mut player_faction: ResMut<PlayerFaction>,
     mut settled: ResMut<crate::simulation::region::SettledRegions>,
     pending: Res<crate::PendingSpawn>,
+    options: Res<crate::GameStartOptions>,
+    catalog: Res<crate::economy::resource_catalog::ResourceCatalog>,
 ) {
     let now = Instant::now();
     use crate::simulation::region::MegaChunkCoord;
@@ -427,6 +429,15 @@ pub fn spawn_population(
 
         let faction_id = registry.create_faction((home_tx as i32, home_ty as i32));
 
+        // Apply economy preset to this faction's `economic_policy` map.
+        if let Some(faction_data) = registry.factions.get_mut(&faction_id) {
+            crate::economy::policy::apply_preset(
+                &mut faction_data.economic_policy,
+                options.economy,
+                &catalog,
+            );
+        }
+
         let home_world = tile_to_world(home_tx, home_ty);
 
         // Spawn a storage tile marker for every faction at its home tile
@@ -462,7 +473,22 @@ pub fn spawn_population(
             );
         }
 
-        for _ in 0..GROUP_SIZE {
+        // Player faction respects the user-chosen population; AI factions
+        // stay at the hardcoded GROUP_SIZE.
+        let group_size = if group_idx == 0 {
+            options.player_population
+        } else {
+            GROUP_SIZE
+        };
+
+        let mut first_member: Option<Entity> = None;
+        // M2 (Market-preset households): collect every spawned adult so we can
+        // form a one-member household per worker after the spawn loop. Each
+        // capitalist worker then has its own storage tile + seeded treasury
+        // at tick 0, so household contracts can post immediately rather than
+        // waiting on cosleep-bond formation (which takes a full game-week).
+        let mut spawned_members: Vec<Entity> = Vec::with_capacity(group_size as usize);
+        for _ in 0..group_size {
             let Some((tx, ty)) = find_tile(&mut rng, home_tx, home_ty) else {
                 continue;
             };
@@ -470,7 +496,7 @@ pub fn spawn_population(
             let world_pos = tile_to_world(tx, ty);
             let sex = BiologicalSex::random();
 
-            commands.spawn((
+            let person_entity = commands.spawn((
                 (
                     Person,
                     Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
@@ -519,19 +545,54 @@ pub fn spawn_population(
                     AgentMemory::default(),
                     RelationshipMemory::default(),
                     MethodHistory::default(),
+                    crate::simulation::memory::CurrentVision::default(),
                     Name::new(generate_person_name(sex)),
                     PathFollow::default(),
                     Carrier::default(),
                     crate::simulation::reproduction::CoSleepTracker::default(),
                     crate::simulation::reproduction::MaleConceptionCooldown::default(),
                     Indexed::new(IndexedKind::Person),
-                    PersonKnowledge::paleolithic_seed(clock.tick as u32),
+                    PersonKnowledge::seeded_through_era(options.era, clock.tick as u32),
                     crate::simulation::typed_task::ActionQueue::idle(),
                 ),
-            ));
+            )).id();
 
+            if first_member.is_none() {
+                first_member = Some(person_entity);
+            }
+            spawned_members.push(person_entity);
             registry.add_member(faction_id);
             spawned += 1;
+        }
+
+        // Designate the first spawned member as chief. Without this,
+        // chief-driven systems (chief_directive_system, chief_job_posting,
+        // chief_hunt_order, chief_tablet_posting) wait for a runtime
+        // bonding event that may never fire on freshly seeded factions.
+        if let Some(chief) = first_member {
+            if let Some(faction_data) = registry.factions.get_mut(&faction_id) {
+                faction_data.chief_entity = Some(chief);
+            }
+            commands.entity(chief).insert(FactionChief);
+        }
+
+        // M2: under Market preset, every spawned adult founds a one-person
+        // household with its own home tile near the village center, its own
+        // `FactionStorageTile`, and a seeded treasury so it can post paid
+        // contracts on the next `HOUSEHOLD_POSTING_CADENCE` cycle. Cosleep
+        // bond households continue to form later via
+        // `household_formation_system`. Subsistence/Mixed presets skip this
+        // — those villages keep household formation gated on bonding.
+        if matches!(options.economy, crate::game_state::EconomyPreset::Market) {
+            seed_market_households(
+                &mut commands,
+                &mut registry,
+                &chunk_map,
+                &catalog,
+                faction_id,
+                (home_tx as i32, home_ty as i32),
+                &spawned_members,
+            );
         }
     }
 
@@ -545,4 +606,59 @@ pub fn spawn_population(
         GROUP_SIZE,
         now.elapsed()
     );
+}
+
+/// Form one household per spawned adult under the Market preset, each with
+/// its own plot tile near the village home, a `FactionStorageTile`, and a
+/// `HOUSEHOLD_SEED_TREASURY` so contract posting can fire on the first
+/// cadence cycle.
+///
+/// Caller (the Market branch of `spawn_population`) owns the iteration; this
+/// helper just executes the per-household side-effects so it can be unit-
+/// tested without driving the full spawn pipeline.
+pub(crate) fn seed_market_households(
+    commands: &mut Commands,
+    registry: &mut FactionRegistry,
+    chunk_map: &ChunkMap,
+    catalog: &crate::economy::resource_catalog::ResourceCatalog,
+    village_faction_id: u32,
+    village_home: (i32, i32),
+    members: &[Entity],
+) {
+    use ahash::AHashSet;
+    let mut used: AHashSet<(i32, i32)> = AHashSet::new();
+    used.insert(village_home);
+    for &member in members {
+        let plot = match crate::simulation::construction::next_clear_tile(
+            village_home,
+            &used,
+            chunk_map,
+            16,
+        ) {
+            Some(t) => t,
+            None => continue,
+        };
+        used.insert(plot);
+        let household_id =
+            registry.spawn_household(village_faction_id, plot, member, catalog);
+        if let Some(hh) = registry.factions.get_mut(&household_id) {
+            hh.treasury = crate::simulation::faction::HOUSEHOLD_SEED_TREASURY;
+            hh.member_count = 1;
+        }
+        let plot_world = tile_to_world(plot.0, plot.1);
+        commands.spawn((
+            FactionStorageTile {
+                faction_id: household_id,
+            },
+            Transform::from_xyz(plot_world.x, plot_world.y, 0.5),
+            GlobalTransform::default(),
+            Visibility::Hidden,
+            InheritedVisibility::default(),
+        ));
+        commands
+            .entity(member)
+            .insert(crate::simulation::reproduction::HouseholdMember {
+                household_id,
+            });
+    }
 }

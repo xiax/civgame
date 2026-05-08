@@ -8,11 +8,12 @@
 //!
 //! Progress is accumulated in `PersonKnowledge::study_progress`. When the
 //! threshold (`study_threshold(tech) = complexity * STUDY_TICKS_PER_COMPLEXITY`)
-//! is met, `PersonKnowledge::try_learn` runs and on success the tech moves to
-//! Learned. Awareness is granted on the first study tick — even a failed roll
-//! at least confirms that the tech exists.
+//! is met, `PersonKnowledge::try_learn` runs and the tech moves to Learned —
+//! there is no cap. Awareness is granted on the first study tick.
 //!
-//! Per-tick study rates (multiplied by `int_scale = 1.0 + INT_mod * 0.1`):
+//! Per-tick study rates (multiplied by `int_scale = 1.0 + INT_mod * 0.1`,
+//! then divided by the student's `learning_slowdown` so heavy stacks absorb
+//! more slowly):
 //! - Solo read: 1
 //! - Lecture attendance: 2
 //! - 1-on-1 teach: 3
@@ -26,9 +27,7 @@ use bevy::prelude::*;
 use crate::economy::agent::EconomicAgent;
 
 use crate::simulation::faction::{FactionMember, PlayerFaction};
-use crate::simulation::knowledge::{
-    capacity_for, study_threshold, PersonKnowledge, StudyOutcome,
-};
+use crate::simulation::knowledge::{study_threshold, PersonKnowledge, StudyOutcome};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, Drafted, PersonAI, PlayerOrder, PlayerOrderKind};
 use crate::simulation::schedule::SimClock;
@@ -238,13 +237,12 @@ pub fn read_task_system(
         }
 
         let amount = study_amount(stats, 1.0);
-        let capacity = capacity_for(stats);
-        let outcome = knowledge.add_study_progress(tech, amount, capacity, now);
+        let outcome = knowledge.add_study_progress(tech, amount, stats, now);
 
         ai.work_progress = ai.work_progress.saturating_add(1);
 
         let session_done = ai.work_progress >= 60;
-        let learned = matches!(outcome, StudyOutcome::Learned { .. });
+        let learned = matches!(outcome, StudyOutcome::Learned);
         if learned {
             if let Some(fm) = fm {
                 if fm.faction_id == player.faction_id {
@@ -332,9 +330,8 @@ pub fn teach_task_system(
         let mut learned = false;
         if let Ok((mut k, stats)) = students_kn.get_mut(student_e) {
             let amount = study_amount(stats, 3.0);
-            let capacity = capacity_for(stats);
-            let outcome = k.add_study_progress(tech, amount, capacity, now);
-            learned = matches!(outcome, StudyOutcome::Learned { .. });
+            let outcome = k.add_study_progress(tech, amount, stats, now);
+            learned = matches!(outcome, StudyOutcome::Learned);
         }
 
         if learned {
@@ -529,9 +526,8 @@ pub fn lecture_tick_system(
         aq.current = crate::simulation::typed_task::Task::AttendLecture { tech: att.tech };
 
         let amount = study_amount(stats, 2.0);
-        let capacity = capacity_for(stats);
-        let outcome = knowledge.add_study_progress(att.tech, amount, capacity, now);
-        if matches!(outcome, StudyOutcome::Learned { .. }) {
+        let outcome = knowledge.add_study_progress(att.tech, amount, stats, now);
+        if matches!(outcome, StudyOutcome::Learned) {
             if let Ok(fm) = members.get(student_e) {
                 if fm.faction_id == player.faction_id {
                     let student_name = name_query

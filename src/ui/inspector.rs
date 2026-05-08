@@ -378,14 +378,21 @@ pub fn inspector_panel_system(
                     .default_open(false)
                     .show(ui, |ui| {
                         if let Some(k) = knowledge {
-                            let cap = stats
-                                .map(|s| stats::knowledge_capacity(s.intelligence))
-                                .unwrap_or(0);
                             let used = k.complexity_used();
+                            let learned_count = (0..crate::simulation::technology::TECH_COUNT
+                                as crate::simulation::technology::TechId)
+                                .filter(|id| k.has_learned(*id))
+                                .count();
+                            let speed = stats
+                                .map(|s| {
+                                    1.0 / crate::simulation::knowledge::learning_slowdown(s, k)
+                                })
+                                .unwrap_or(1.0);
                             ui.label(format!(
-                                "Capacity: {}/{} pts (INT × 2)",
-                                used, cap
+                                "Knowledge: {} complexity pts ({} techs)",
+                                used, learned_count
                             ));
+                            ui.label(format!("Learning speed: {:.2}×", speed));
                             let mut learned: Vec<crate::simulation::technology::TechId> =
                                 Vec::new();
                             let mut aware_only: Vec<crate::simulation::technology::TechId> =

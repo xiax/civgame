@@ -90,6 +90,11 @@ impl TestSim {
         // agents using the real globe / world generator).
         app.init_state::<crate::GameState>();
         app.insert_resource(crate::PendingSpawn::default());
+        // GameStartOptions is consumed by `bonding_system` (to apply
+        // the world's `EconomyPreset` to bonding-formed factions) in
+        // addition to spawn_population. Tests that want non-default
+        // presets mutate this resource before ticking.
+        app.insert_resource(crate::game_state::GameStartOptions::default());
 
         // Resource catalog must be inserted before any system queries
         // it. Idempotent across test runs because OnceLock::set on a
@@ -428,6 +433,7 @@ impl PersonBuilder {
                     AgentMemory::default(),
                     RelationshipMemory::default(),
                     MethodHistory::default(),
+                    crate::simulation::memory::CurrentVision::default(),
                     Name::new("TestPerson"),
                     PathFollow::default(),
                     Carrier::default(),
@@ -1107,10 +1113,13 @@ mod smoke {
     // ─── Pluralist Economy R3 — sub-factions / households ───
 
     #[test]
-    fn spawn_household_creates_sub_faction_with_capitalist_policy() {
-        // Form a household sub-faction under the player village; verify
-        // the parent/child link, the policy preset, and `root_faction`.
+    fn spawn_household_under_capitalist_parent_inherits_capitalist_policy() {
+        // Form a household under a *capitalist* village (parent has at least
+        // one resource flipped). The household is stamped with the full
+        // capitalist preset so private behaviour is observationally
+        // consistent across the catalog.
         use crate::economy::core_ids;
+        use crate::economy::policy::ResourceControlPolicy;
         use crate::economy::resource_catalog::ResourceCatalog;
         use crate::simulation::faction::FactionRegistry;
 
@@ -1120,6 +1129,16 @@ mod smoke {
 
         let catalog = sim.app.world().resource::<ResourceCatalog>().clone();
         let village_id = sim.player_faction_id;
+        // Flip the parent village to capitalist on Cloth so its policy map
+        // is non-empty — that's the trigger for stamping capitalist on the
+        // child household.
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let village = registry.factions.get_mut(&village_id).unwrap();
+            village
+                .economic_policy
+                .insert(core_ids::cloth(), ResourceControlPolicy::capitalist());
+        }
         let household_id = {
             let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
             registry.spawn_household(village_id, (2, 2), head, &catalog)
@@ -1153,10 +1172,46 @@ mod smoke {
             assert!(!p.chief_allocates_labor);
         }
 
-        // Village's policy is unchanged (still all-communist).
-        for rid in [core_ids::wood(), core_ids::cloth()] {
-            let p = village.policy_for(rid);
-            assert!(p.chief_allocates_labor);
+        // Village's policy is only flipped on Cloth — Wood remains communist.
+        let p = village.policy_for(core_ids::wood());
+        assert!(p.chief_allocates_labor);
+        assert!(!p.private_actors_allowed);
+    }
+
+    #[test]
+    fn spawn_household_under_communist_parent_inherits_communist_policy() {
+        // Form a household under a default-communist village. The household
+        // exists structurally (parent/child link, household_head, treasury,
+        // storage) but its `economic_policy` map remains empty, so all
+        // resources fall back to the all-communist defaults — private
+        // contracts won't fire on it.
+        use crate::economy::core_ids;
+        use crate::economy::resource_catalog::ResourceCatalog;
+        use crate::simulation::faction::FactionRegistry;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let head = sim.spawn_person(sim.player_faction_id, (2, 2), |_| {});
+
+        let catalog = sim.app.world().resource::<ResourceCatalog>().clone();
+        let village_id = sim.player_faction_id;
+        let household_id = {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.spawn_household(village_id, (2, 2), head, &catalog)
+        };
+
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let household = registry.factions.get(&household_id).unwrap();
+        assert_eq!(household.parent_faction, Some(village_id));
+        assert!(
+            household.economic_policy.is_empty(),
+            "communist parent must not stamp explicit policy on household"
+        );
+        // Default-empty policy means each resource resolves to the all-
+        // communist defaults: chief_allocates_labor=true, private actors off.
+        for rid in [core_ids::wood(), core_ids::cloth(), core_ids::weapon()] {
+            let p = household.policy_for(rid);
+            assert!(p.chief_allocates_labor, "rid={rid:?} not communist");
             assert!(!p.private_actors_allowed);
         }
     }
@@ -2660,8 +2715,9 @@ mod smoke {
         // `HOUSEHOLD_BOND_THRESHOLD` for two pair-bonded agents in
         // the same village; assert `household_formation_system`
         // spawns a sub-faction, marks both agents as
-        // `HouseholdMember`, and stamps the capitalist policy on
-        // every catalog resource for the household.
+        // `HouseholdMember`, and inherits the parent village's
+        // policy stance (communist by default — capitalist only when
+        // the village has flipped at least one resource).
         use crate::simulation::faction::FactionRegistry;
         use crate::simulation::reproduction::{
             CoSleepTracker, HouseholdMember, HOUSEHOLD_BOND_THRESHOLD,
@@ -2738,11 +2794,17 @@ mod smoke {
         let village = registry.factions.get(&sim.player_faction_id).unwrap();
         assert!(village.children_factions.contains(&head_marker.household_id));
 
-        // Capitalist on a sample resource; village still communist.
+        // Default-communist parent → household inherits communist
+        // defaults (empty economic_policy map). Both Wood policies
+        // resolve to chief_allocates_labor=true / private_actors=false.
         use crate::economy::core_ids;
+        assert!(
+            household.economic_policy.is_empty(),
+            "communist parent must not stamp explicit policy on household",
+        );
         let h_wood = household.policy_for(core_ids::wood());
-        assert!(h_wood.private_actors_allowed);
-        assert!(!h_wood.chief_allocates_labor);
+        assert!(h_wood.chief_allocates_labor);
+        assert!(!h_wood.private_actors_allowed);
         let v_wood = village.policy_for(core_ids::wood());
         assert!(v_wood.chief_allocates_labor);
         assert!(!v_wood.private_actors_allowed);
@@ -3619,6 +3681,464 @@ mod smoke {
             farm_count, 0,
             "capitalist Grain policy must block chief Farm postings",
         );
+    }
+
+    #[test]
+    fn market_preset_chief_posts_no_stockpile_farm_or_craft() {
+        // End-to-end: drive `apply_preset(EconomyPreset::Market)` exactly
+        // the way `spawn_population` does in `person.rs:432-439`, then run
+        // a full chief-posting cadence and assert zero Stockpile / Farm /
+        // Craft / Haul postings emerge under `JobSource::Chief`.
+        //
+        // The per-resource gate tests (`chief_skips_food_stockpile_*`,
+        // `chief_skips_wood_haul_*`, `chief_skips_craft_*`,
+        // `chief_skips_farm_*`) all hand-flip a single resource. This
+        // pins the integration: `apply_preset` populates the map for
+        // every catalog resource, and the catalog has at least one of
+        // each gated kind. Designed to catch:
+        //   - silent regression where `apply_preset` walks an empty
+        //     catalog.iter() (catalog not loaded yet);
+        //   - any later code path that re-stamps `economic_policy`
+        //     back to default-communist after `apply_preset`.
+        use crate::economy::policy::apply_preset;
+        use crate::economy::resource_catalog::ResourceCatalog;
+        use crate::game_state::EconomyPreset;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{JobBoard, JobKind, JobSource};
+        use crate::simulation::memory::MemoryKind;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+
+        // Spawn enough adults that chief postings have a member_count > 0
+        // gate to clear and food deficit math computes a real target.
+        for i in 0..6 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+
+        // Apply Market preset to the player faction the same way
+        // `spawn_population` does it.
+        {
+            let catalog = sim
+                .app
+                .world()
+                .resource::<ResourceCatalog>()
+                .clone();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..6 {
+                registry.add_member(sim.player_faction_id);
+            }
+            let f = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            apply_preset(&mut f.economic_policy, EconomyPreset::Market, &catalog);
+            assert!(
+                !f.economic_policy.is_empty(),
+                "apply_preset(Market) must populate economic_policy",
+            );
+        }
+
+        // Inject a known edible cluster so the food-cluster gate
+        // (`faction_knows_cluster`) wouldn't be the reason a Stockpile
+        // posting is missing — we want the *policy* to be the only
+        // gate that could refuse. (Outside VIEW_RADIUS=15 so vision
+        // sweeps don't deplete it.)
+        sim.inject_faction_sighting(sim.player_faction_id, (40, 40), MemoryKind::AnyEdible);
+
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let mut offenders: Vec<(JobKind, JobSource)> = Vec::new();
+        for p in board.faction_postings(sim.player_faction_id) {
+            if p.source != JobSource::Chief {
+                continue;
+            }
+            if matches!(
+                p.kind,
+                JobKind::Stockpile | JobKind::Farm | JobKind::Craft | JobKind::Haul,
+            ) {
+                offenders.push((p.kind, p.source));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "Market preset chief should not post Stockpile/Farm/Craft/Haul, got: {:?}",
+            offenders,
+        );
+    }
+
+    #[test]
+    fn market_preset_workforce_budget_collapses_dormant_slots_to_free() {
+        // M1 regression: `compute_workforce_budget` must consult
+        // `economic_policy` and route the budget share of any slot whose
+        // chief won't post (`chief_allocates_labor=false`) to `free`.
+        // Subsistence (default-communist) keeps today's allocation
+        // identical; Market collapses six of seven slots to ~0 and
+        // grows free to ≥ 0.75. Build remains chief-posting under
+        // Market (`state_funds_public_works=false` by default), so it
+        // keeps a small positive share, but `free` should dominate.
+        use crate::economy::policy::apply_preset;
+        use crate::economy::resource_catalog::ResourceCatalog;
+        use crate::game_state::EconomyPreset;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::projects::{compute_workforce_budget, Projects, WorkforceBudget};
+
+        let mut sim = TestSim::new(0xB0DDE7);
+        sim.flat_world(1, 0, TileKind::Grass);
+        for i in 0..6 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+
+        // Subsistence baseline: empty `economic_policy` map → all-communist
+        // defaults → every slot chief-eligible → free stays at FREE_FLOOR
+        // (modulo capacity gating of Farm by CROP_CULTIVATION).
+        let baseline = {
+            let world = sim.app.world();
+            let registry = world.resource::<FactionRegistry>();
+            let projects = world.resource::<Projects>();
+            let faction = registry.factions.get(&sim.player_faction_id).unwrap();
+            compute_workforce_budget(
+                faction,
+                projects,
+                sim.player_faction_id,
+                WorkforceBudget::default(),
+            )
+        };
+        // free is EMA-blended from the prior tick's value (default 0.15);
+        // a single computation against an all-communist policy must not
+        // drift it upward.
+        assert!(
+            baseline.free <= 0.16,
+            "default-communist faction free share drifted: {:?}",
+            baseline,
+        );
+        assert!(
+            baseline.stockpile_food + baseline.haul + baseline.build > 0.30,
+            "default-communist faction must allocate to chief slots: {:?}",
+            baseline,
+        );
+
+        // Apply Market preset: every catalog resource flips to capitalist.
+        {
+            let catalog = sim
+                .app
+                .world()
+                .resource::<ResourceCatalog>()
+                .clone();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let f = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            apply_preset(&mut f.economic_policy, EconomyPreset::Market, &catalog);
+        }
+
+        // Run the budget computation against a `previous` of `default()` so
+        // EMA blending is the same on both sides — only the policy state
+        // differs. With α = 0.15 and target free ≈ 0.85, blended free
+        // lands ≈ 0.15 + 0.15*(0.85 - 0.15) = 0.255 after one tick.
+        // Iterate a handful of times to converge past EMA hysteresis.
+        let mut budget = WorkforceBudget::default();
+        for _ in 0..30 {
+            let world = sim.app.world();
+            let registry = world.resource::<FactionRegistry>();
+            let projects = world.resource::<Projects>();
+            let faction = registry.factions.get(&sim.player_faction_id).unwrap();
+            budget = compute_workforce_budget(
+                faction,
+                projects,
+                sim.player_faction_id,
+                budget,
+            );
+        }
+
+        assert!(
+            budget.free >= 0.75,
+            "Market faction should redirect dormant slots to free, got {:?}",
+            budget,
+        );
+        // Build is the only remaining chief-eligible kind under Market
+        // (state_funds_public_works defaults to false). It should still
+        // hold a positive share, but well below `free`.
+        assert!(
+            budget.build > 0.0 && budget.build < 0.20,
+            "Market Build share should be positive but small, got {:?}",
+            budget,
+        );
+        // Every policy-disabled slot collapses near zero (just EMA tail
+        // from the default starting value).
+        for (name, share) in [
+            ("stockpile_food", budget.stockpile_food),
+            ("stockpile_wood", budget.stockpile_wood),
+            ("stockpile_stone", budget.stockpile_stone),
+            ("haul", budget.haul),
+            ("farm", budget.farm),
+            ("craft", budget.craft),
+        ] {
+            assert!(
+                share <= 0.02,
+                "Market {} should collapse to ~0, got {} (full: {:?})",
+                name,
+                share,
+                budget,
+            );
+        }
+    }
+
+    #[test]
+    fn household_picks_cloth_recipe_at_belonging_tier_when_loom_known() {
+        // M3 regression: `pick_household_recipe` should select recipe 4
+        // (Woven Cloth) when the head is Belonging-tier AND the village
+        // has LOOM_WEAVING; fall back to recipe 0 (Stone Tools) when the
+        // tech is missing or the tier is Esteem/lower.
+        use crate::simulation::faction::{pick_household_recipe, FactionTechs};
+        use crate::simulation::goals::MaslowTier;
+        use crate::simulation::technology::LOOM_WEAVING;
+
+        let mut techs = FactionTechs::default();
+        // Without LOOM_WEAVING, the Cloth recipe is unfulfillable → Tools.
+        assert_eq!(
+            pick_household_recipe(Some(MaslowTier::Belonging), &techs),
+            0,
+            "village without LOOM_WEAVING must fall back to Tools at Belonging tier",
+        );
+
+        // Add LOOM_WEAVING and the same tier picks Cloth.
+        techs.unlock(LOOM_WEAVING);
+        assert_eq!(
+            pick_household_recipe(Some(MaslowTier::Belonging), &techs),
+            4,
+            "village with LOOM_WEAVING must commission Cloth at Belonging tier",
+        );
+
+        // Esteem and lower tiers always pick Tools.
+        for tier in [
+            None,
+            Some(MaslowTier::Physiological),
+            Some(MaslowTier::Safety),
+            Some(MaslowTier::Esteem),
+            Some(MaslowTier::SelfActualization),
+        ] {
+            assert_eq!(
+                pick_household_recipe(tier, &techs),
+                0,
+                "tier {:?} should pick Tools (recipe 0)",
+                tier,
+            );
+        }
+    }
+
+    #[test]
+    fn market_preset_seeds_household_per_member_with_treasury_and_storage() {
+        // M2 regression: under Market preset, every spawned adult founds
+        // a one-person household with `HouseholdMember`, a dedicated
+        // `FactionStorageTile` registered in `StorageTileMap`, and
+        // treasury == HOUSEHOLD_SEED_TREASURY at tick 0.
+        use bevy::ecs::system::RunSystemOnce;
+        use crate::simulation::faction::{
+            FactionRegistry, FactionStorageTile, HOUSEHOLD_SEED_TREASURY,
+        };
+        use crate::simulation::person::seed_market_households;
+        use crate::simulation::reproduction::HouseholdMember;
+        use crate::world::chunk::ChunkMap;
+
+        let mut sim = TestSim::new(0xDEFACE);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Spawn five members of the player faction (already created by
+        // TestSim's bootstrap). Capture their entities so we can drive
+        // the helper directly.
+        let mut members: Vec<Entity> = Vec::new();
+        for i in 0..5 {
+            let e = sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+            members.push(e);
+        }
+        let village_id = sim.player_faction_id;
+        let village_home = (-1, 0);
+        let members_clone = members.clone();
+
+        // Drive the helper through a one-shot system so it can hold
+        // `Commands` + `ResMut<FactionRegistry>` + `Res<ChunkMap>`
+        // simultaneously. Using a closure system avoids hoisting
+        // resources out by hand.
+        sim.app
+            .world_mut()
+            .run_system_once(
+                move |mut commands: Commands,
+                      mut registry: ResMut<FactionRegistry>,
+                      chunk_map: Res<ChunkMap>,
+                      catalog: Res<crate::economy::resource_catalog::ResourceCatalog>| {
+                    seed_market_households(
+                        &mut commands,
+                        registry.as_mut(),
+                        chunk_map.as_ref(),
+                        catalog.as_ref(),
+                        village_id,
+                        village_home,
+                        &members_clone,
+                    );
+                },
+            )
+            .expect("run_system_once should complete");
+
+        // Each member must now carry a `HouseholdMember` pointing at a
+        // unique sub-faction of the village.
+        let world = sim.app.world_mut();
+        let mut household_ids: Vec<u32> = Vec::new();
+        for &m in &members {
+            let hh = world
+                .get::<HouseholdMember>(m)
+                .expect("M2: every Market-preset member must be a HouseholdMember");
+            household_ids.push(hh.household_id);
+        }
+        {
+            let registry = world.resource::<FactionRegistry>();
+            for hid in &household_ids {
+                let data = registry
+                    .factions
+                    .get(hid)
+                    .expect("household sub-faction must be registered");
+                assert_eq!(
+                    data.parent_faction,
+                    Some(village_id),
+                    "household must point at the village as parent",
+                );
+                assert!(
+                    (data.treasury - HOUSEHOLD_SEED_TREASURY).abs() < 1e-3,
+                    "household treasury should be seeded; got {}",
+                    data.treasury,
+                );
+            }
+        }
+        // Households must be unique per member.
+        let unique: ahash::AHashSet<u32> = household_ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            members.len(),
+            "every member should have its own household, got duplicates",
+        );
+
+        // Each household needs its own `FactionStorageTile` entity so
+        // private deposits land separately from the village storage.
+        let mut tile_q = world.query::<&FactionStorageTile>();
+        let mut household_tile_count: ahash::AHashMap<u32, u32> = ahash::AHashMap::new();
+        for tile in tile_q.iter(world) {
+            *household_tile_count.entry(tile.faction_id).or_insert(0) += 1;
+        }
+        for hid in &household_ids {
+            assert!(
+                household_tile_count.get(hid).copied().unwrap_or(0) >= 1,
+                "household {hid} must own a FactionStorageTile",
+            );
+        }
+    }
+
+    #[test]
+    fn bonding_formed_faction_inherits_economy_preset() {
+        // Regression: `bonding_system` creates a fresh faction when two
+        // SOLO agents bond. Prior to this fix it silently skipped
+        // `apply_preset`, so the new faction's `economic_policy` map
+        // stayed empty and `policy_for(_).chief_allocates_labor`
+        // returned the all-communist default — its chief would post
+        // Stockpile/Farm/Craft regardless of the player's Market
+        // preset selection. Pin the fix: bonding-formed factions
+        // adopt the world's `EconomyPreset`.
+        use crate::economy::core_ids;
+        use crate::game_state::EconomyPreset;
+        use crate::simulation::faction::{
+            bonding_system, FactionMember, FactionRegistry, BOND_THRESHOLD, SOLO,
+        };
+        use crate::simulation::goals::Personality;
+
+        let mut sim = TestSim::new(0xB0_ED_BD);
+        sim.flat_world(1, 0, TileKind::Grass);
+
+        // Configure the world for Market mode.
+        sim.app
+            .world_mut()
+            .resource_mut::<crate::game_state::GameStartOptions>()
+            .economy = EconomyPreset::Market;
+
+        // Two SOLO agents adjacent on the grid. We don't use
+        // spawn_person — that requires a faction context and threads
+        // through PersonBuilder bundles. Spawning a minimal entity
+        // pair is cleaner: bonding only reads FactionMember +
+        // Personality + Transform.
+        let world_pos_a = tile_to_world(0, 0);
+        let world_pos_b = tile_to_world(1, 0);
+        let a = sim
+            .app
+            .world_mut()
+            .spawn((
+                FactionMember {
+                    faction_id: SOLO,
+                    bond_timer: 0,
+                    bond_target: None,
+                },
+                Personality::Gatherer,
+                Transform::from_xyz(world_pos_a.x, world_pos_a.y, 0.5),
+                GlobalTransform::default(),
+                Indexed::new(IndexedKind::Person),
+            ))
+            .id();
+        let _b = sim
+            .app
+            .world_mut()
+            .spawn((
+                FactionMember {
+                    faction_id: SOLO,
+                    bond_timer: 0,
+                    bond_target: None,
+                },
+                Personality::Gatherer,
+                Transform::from_xyz(world_pos_b.x, world_pos_b.y, 0.5),
+                GlobalTransform::default(),
+                Indexed::new(IndexedKind::Person),
+            ))
+            .id();
+
+        // Run bonding_system directly until threshold hits and a
+        // faction is allocated. Driving via tick() also works but
+        // costs more ticks since SpatialIndex needs to populate.
+        // Use sim.tick() so the spatial index sync runs first.
+        for _ in 0..(BOND_THRESHOLD as u32 + 5) {
+            sim.tick();
+        }
+
+        // The initiating agent's faction_id should now be > SOLO and
+        // its `economic_policy` should be non-empty (Market preset).
+        let new_faction_id = sim
+            .app
+            .world()
+            .get::<FactionMember>(a)
+            .map(|fm| fm.faction_id)
+            .expect("FactionMember missing on bonded agent");
+        assert_ne!(
+            new_faction_id, SOLO,
+            "expected SOLO agents to have bonded into a fresh faction within BOND_THRESHOLD ticks",
+        );
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let new_faction = registry
+            .factions
+            .get(&new_faction_id)
+            .expect("registry missing newly bonded faction");
+        assert!(
+            !new_faction.economic_policy.is_empty(),
+            "bonding-formed faction must inherit Market preset (economic_policy populated), got empty map",
+        );
+        // Spot-check that Fruit policy is capitalist (chief shouldn't
+        // post communal Stockpile food drives).
+        let fruit_policy = new_faction.policy_for(core_ids::fruit());
+        assert!(
+            !fruit_policy.chief_allocates_labor,
+            "Market preset Fruit policy should be chief_allocates_labor=false, got: {:?}",
+            fruit_policy,
+        );
+
+        // Sanity: keep `bonding_system` referenced so the test fails
+        // loudly if it gets renamed instead of compiling-around.
+        let _ = bonding_system;
     }
 }
 
@@ -7540,5 +8060,217 @@ mod baseline_behaviour {
         }
         let goal = sim.app.world().get::<AgentGoal>(actor).expect("goal missing");
         assert_eq!(*goal, AgentGoal::Play, "expected goal to be Play");
+    }
+
+    /// Vision-first selection (`htn_acquire_good_dispatch_system`): a real
+    /// mature Tree visible at (12, 0) outranks a remembered (but phantom)
+    /// wood sighting at (3, 0). Memory says (3, 0) is closer; vision says
+    /// (12, 0) is the only tile that actually holds a tree. After this PR,
+    /// the dispatcher consults `CurrentVision` before `SharedKnowledge` and
+    /// routes the worker to the visible tile.
+    #[test]
+    fn worker_prefers_visible_tree_over_remembered_one() {
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+        };
+        use crate::simulation::memory::MemoryKind;
+        use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Real mature Tree at (12, 0) — within VIEW_RADIUS=15 of the worker
+        // at (0, 0). Vision will pick it up.
+        let tree_tile = (12, 0);
+        let tree_world = tile_to_world(tree_tile.0, tree_tile.1);
+        let tree_entity = sim
+            .app
+            .world_mut()
+            .spawn((
+                Plant {
+                    kind: PlantKind::Tree,
+                    stage: GrowthStage::Mature,
+                    growth_ticks: 0,
+                    tile_pos: tree_tile,
+                },
+                Transform::from_xyz(tree_world.x, tree_world.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<PlantMap>()
+            .0
+            .insert(tree_tile, tree_entity);
+
+        // Phantom wood sighting at (3, 0) — closer to the worker than the
+        // real tree. plant_map has nothing here, so vision_system's
+        // additive sweep does NOT depopulate the cluster (plant depletion
+        // is gather-arrival driven, not vision-driven).
+        sim.inject_faction_sighting(sim.player_faction_id, (3, 0), MemoryKind::wood());
+
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Warmup ticks: populate `CurrentVision` from `vision_system`
+        // (Sequential) and sync `SpatialIndex` before the JobClaim drops in.
+        // Dispatchers run in ParallelB which is *before* Sequential in the
+        // same tick — without a warmup, the first dispatch reads an empty
+        // CurrentVision and falls back to memory.
+        sim.tick_n(2);
+
+        let wood_id = crate::economy::core_ids::wood();
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board
+                .postings
+                .entry(sim.player_faction_id)
+                .or_default()
+                .push(JobPosting {
+                    id,
+                    faction_id: sim.player_faction_id,
+                    kind: JobKind::Stockpile,
+                    progress: JobProgress::Stockpile {
+                        resource_id: wood_id,
+                        deposited: 0,
+                        target: 8,
+                    },
+                    claimants: vec![worker],
+                    priority: 100,
+                    source: JobSource::Chief,
+                    posted_tick: 0,
+                    expiry_tick: None,
+                    poster_class: crate::simulation::jobs::PosterClass::Chief,
+                    reward: 0.0,
+                    settlement_id: None,
+                });
+            id
+        };
+        sim.app.world_mut().entity_mut(worker).insert(JobClaim {
+            job_id,
+            faction_id: sim.player_faction_id,
+            kind: JobKind::Stockpile,
+            posted_tick: 0,
+            fail_count: 0,
+        });
+
+        // Tick enough for: SpatialIndex sync of tree, vision_system to fill
+        // CurrentVision, job_goal_lock_system to set AgentGoal::GatherWood,
+        // and htn_acquire_good_dispatch_system to dispatch.
+        sim.tick_n(5);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(worker)
+            .expect("ActionQueue missing");
+        match aq.current {
+            Task::Gather { tile } => assert_eq!(
+                tile, tree_tile,
+                "vision-first dispatch should target the visible tree at {:?}, not the \
+                 remembered phantom at (3, 0); got {:?}",
+                tree_tile, tile
+            ),
+            other => panic!(
+                "expected Task::Gather targeting the visible tree, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Vision-first selection (`htn_acquire_food_dispatch_system`): a real
+    /// mature BerryBush visible at (12, 0) outranks a remembered (but phantom)
+    /// AnyEdible sighting at (3, 0). Mirrors the wood test on the Forage
+    /// branch.
+    #[test]
+    fn hungry_worker_prefers_visible_berry_over_remembered_one() {
+        use crate::simulation::memory::MemoryKind;
+        use crate::simulation::needs::Needs;
+        use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Real mature BerryBush at (12, 0) — within VIEW_RADIUS=15.
+        let berry_tile = (12, 0);
+        let berry_world = tile_to_world(berry_tile.0, berry_tile.1);
+        let berry_entity = sim
+            .app
+            .world_mut()
+            .spawn((
+                Plant {
+                    kind: PlantKind::BerryBush,
+                    stage: GrowthStage::Mature,
+                    growth_ticks: 0,
+                    tile_pos: berry_tile,
+                },
+                Transform::from_xyz(berry_world.x, berry_world.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<PlantMap>()
+            .0
+            .insert(berry_tile, berry_entity);
+
+        // Phantom AnyEdible sighting at (3, 0) — closer than the real bush.
+        sim.inject_faction_sighting(sim.player_faction_id, (3, 0), MemoryKind::AnyEdible);
+
+        // Spawn a faction storage tile so the food dispatcher's
+        // `nearest_storage_tile` resolves; SOLO/unsettled agents skip this
+        // dispatcher entirely. Place outside the worker's vision so it
+        // doesn't pollute the test.
+        sim.spawn_storage_tile(sim.player_faction_id, (-30, 0));
+
+        // Spawn the worker non-hungry first so warmup ticks let
+        // `vision_system` populate `CurrentVision` without the food
+        // dispatcher firing (it gates on `hunger >= EAT_TRIGGER_HUNGER`).
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.needs(Needs::new(20.0, 20.0, 10.0, 5.0, 40.0, 200.0));
+        });
+
+        // Warmup: vision_system runs in Sequential after the dispatchers
+        // (ParallelB), so CurrentVision starts empty on the first tick. A
+        // couple of warmup ticks populate it before we trip the hunger gate.
+        sim.tick_n(2);
+
+        // Bump hunger above EAT_TRIGGER and force the goal to Survive — the
+        // AcquireFood dispatcher will fire next tick with a populated
+        // CurrentVision.
+        {
+            let mut needs = sim.app.world_mut().get_mut::<Needs>(worker).unwrap();
+            needs.hunger = 220.0;
+        }
+        sim.app
+            .world_mut()
+            .entity_mut(worker)
+            .insert(AgentGoal::Survive);
+
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(worker)
+            .expect("ActionQueue missing");
+        match aq.current {
+            Task::Gather { tile } => assert_eq!(
+                tile, berry_tile,
+                "vision-first forage should target the visible berry at {:?}, not the \
+                 remembered phantom at (3, 0); got {:?}",
+                berry_tile, tile
+            ),
+            other => panic!(
+                "expected Task::Gather targeting the visible berry, got {:?}",
+                other
+            ),
+        }
     }
 }

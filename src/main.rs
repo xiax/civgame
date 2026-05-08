@@ -9,7 +9,7 @@ mod simulation;
 mod ui;
 mod world;
 
-pub use game_state::{GameState, PendingSpawn};
+pub use game_state::{EconomyPreset, GameStartOptions, GameState, PendingSpawn};
 
 fn main() {
     let is_sandbox = std::env::args().any(|a| a == "--sandbox");
@@ -31,6 +31,7 @@ fn main() {
     }))
     .init_state::<GameState>()
     .insert_resource(PendingSpawn::default())
+    .insert_resource(GameStartOptions::default())
     .insert_resource(simulation::region::SettledRegions::default())
     .insert_resource(simulation::region::SimulationFocus::default())
     .add_plugins(world::WorldPlugin)

@@ -70,6 +70,19 @@ impl ResourceControlPolicy {
         }
     }
 
+    /// Mixed preset: chief still allocates labour, but private actors may
+    /// also produce/sell. Used by the `EconomyPreset::Mixed` game-start
+    /// option for non-staple resources.
+    pub fn mixed() -> Self {
+        Self {
+            chief_allocates_labor: true,
+            private_actors_allowed: true,
+            state_sells_at_market: false,
+            prices_fixed_by_state: false,
+            fixed_price: None,
+        }
+    }
+
     /// Check whether this policy satisfies a specific required flag.
     pub fn satisfies(&self, flag: RequiredFlag) -> bool {
         match flag {
@@ -95,6 +108,40 @@ pub enum RequiredFlag {
 /// One entry in a method's policy gate: "to fire, the agent's
 /// faction must have `flag` set on its policy for `resource`".
 pub type PolicyGateEntry = (ResourceId, RequiredFlag);
+
+/// Apply a `GameStartOptions::EconomyPreset` to a faction's
+/// `economic_policy` map. Called once per faction by `spawn_population`.
+///
+/// - `Subsistence`: leave the map empty — every resource falls through to
+///   the all-communist default (today's pre-pluralist behaviour).
+/// - `Mixed`: insert `mixed()` (chief + private both allowed) for every
+///   non-staple resource. Wood, Stone, and edibles stay communal.
+/// - `Market`: insert `capitalist()` for every catalog resource.
+pub fn apply_preset(
+    map: &mut ahash::AHashMap<ResourceId, ResourceControlPolicy>,
+    preset: crate::game_state::EconomyPreset,
+    catalog: &crate::economy::resource_catalog::ResourceCatalog,
+) {
+    use crate::game_state::EconomyPreset;
+    match preset {
+        EconomyPreset::Subsistence => {}
+        EconomyPreset::Mixed => {
+            let wood = crate::economy::core_ids::wood();
+            let stone = crate::economy::core_ids::stone();
+            for (id, _def) in catalog.iter() {
+                if id == wood || id == stone || id.is_edible() {
+                    continue;
+                }
+                map.insert(id, ResourceControlPolicy::mixed());
+            }
+        }
+        EconomyPreset::Market => {
+            for (id, _def) in catalog.iter() {
+                map.insert(id, ResourceControlPolicy::capitalist());
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -3518,11 +3518,9 @@ pub fn htn_acquire_food_dispatch_system(
     storage_tile_map: Res<StorageTileMap>,
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
-    spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<SimClock>,
     plant_map: Res<PlantMap>,
     gk: crate::simulation::shared_knowledge::GatherKnowledge,
-    item_query: Query<&crate::simulation::items::GroundItem>,
     plant_query: Query<&Plant>,
     mut query: Query<
         (
@@ -3538,16 +3536,14 @@ pub fn htn_acquire_food_dispatch_system(
             &FactionMember,
             &LodLevel,
             Option<&crate::simulation::reproduction::HouseholdMember>,
+            &crate::simulation::memory::CurrentVision,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
 ) {
-    // The food-scavenge scan reuses the AcquireGood scavenge branch's radius
-    // so the two HTN scavenge paths search out to the same vis range.
-    const VIEW_RADIUS: i32 = 15;
     let now = clock.tick;
     query.par_iter_mut().for_each(
-        |(actor, mut ai, mut aq, mut history, goal, needs, agent, carrier, transform, member, lod, household_member)| {
+        |(actor, mut ai, mut aq, mut history, goal, needs, agent, carrier, transform, member, lod, household_member, current_vision)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -3596,54 +3592,39 @@ pub fn htn_acquire_food_dispatch_system(
             // safer side for the precondition gate.
             let faction_food_stock = faction_registry.food_stock(member.faction_id) as u32;
 
-            // Phase 5c-ii-d-iii-ii: scan SpatialIndex for visible loose edible
-            // GroundItems within VIEW_RADIUS, excluding faction storage tiles
-            // (mirrors the legacy `StepTarget::NearestEdible` resolver, which
-            // also excludes storage so the agent doesn't try to "scavenge"
-            // their own deposit). Same scan pattern as the AcquireGood
-            // scavenge branch in `htn_acquire_good_dispatch_system`, but
-            // filters on `is_edible()` instead of a specific good.
-            let mut scavenge_target_entity: Option<Entity> = None;
-            let mut scavenge_target_tile: Option<(i32, i32)> = None;
-            {
-                let mut best_dist_sq = i32::MAX;
-                for dx in -VIEW_RADIUS..=VIEW_RADIUS {
-                    for dy in -VIEW_RADIUS..=VIEW_RADIUS {
-                        let d2 = dx * dx + dy * dy;
-                        if d2 > VIEW_RADIUS * VIEW_RADIUS {
-                            continue;
-                        }
-                        let tx = cur_tx + dx;
-                        let ty = cur_ty + dy;
-                        if storage_tile_map.tiles.contains_key(&(tx, ty)) {
-                            continue;
-                        }
-                        for &gi_entity in spatial.get(tx, ty) {
-                            if let Ok(gi) = item_query.get(gi_entity) {
-                                if gi.item.resource_id.is_edible()
-                                    && gi.qty > 0
-                                    && d2 < best_dist_sq
-                                {
-                                    best_dist_sq = d2;
-                                    scavenge_target_entity = Some(gi_entity);
-                                    scavenge_target_tile = Some((tx, ty));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Vision-first scavenge target: nearest visible loose edible
+            // GroundItem within the agent's current vision (LOS-checked by
+            // `vision_system`), excluding storage tiles so the agent doesn't
+            // try to "scavenge" their own deposit.
+            let scavenge = current_vision.nearest_scavenge_target(
+                MemoryKind::AnyEdible,
+                (cur_tx, cur_ty),
+                |t| storage_tile_map.tiles.contains_key(&t),
+            );
+            let scavenge_target_entity = scavenge.map(|(e, _)| e);
+            let scavenge_target_tile = scavenge.map(|(_, t)| t);
 
-            // Forage candidate: nearest accessible AnyEdible cluster from
-            // SharedKnowledge whose representative tile still holds a live
-            // mature plant. `ForageFromKnownMethod` (utility 1.0) picks
-            // this up. Empty knowledge leaves the field None — the argmax
-            // falls through to scavenge / withdraw / explore.
-            let gather_target_tile = gk
-                .nearest_target_tile(
+            // Vision-first forage candidate: nearest visible mature edible
+            // plant. Vision_system only writes mature-stage edible plants, so
+            // no extra stage filter needed. Falls back to SharedKnowledge
+            // when vision shows nothing.
+            let viewer_household = household_member.map(|h| h.household_id);
+            let viewer_settlement = gk
+                .settlement_map
+                .first_for_faction(member.faction_id);
+            let visible_forage = current_vision.nearest_gather_target(
+                MemoryKind::AnyEdible,
+                (cur_tx, cur_ty),
+                actor,
+                viewer_household,
+                viewer_settlement,
+                member.faction_id,
+            );
+            let gather_target_tile = visible_forage.or_else(|| {
+                gk.nearest_target_tile(
                     actor,
                     member.faction_id,
-                    household_member.map(|h| h.household_id),
+                    viewer_household,
                     MemoryKind::AnyEdible,
                     (cur_tx, cur_ty),
                     now,
@@ -3655,7 +3636,8 @@ pub fn htn_acquire_food_dispatch_system(
                         return None;
                     }
                     Some(tile)
-                });
+                })
+            });
 
             let ctx = PlannerCtx {
                 tile: (cur_tx, cur_ty),
@@ -3972,6 +3954,7 @@ pub fn htn_acquire_good_dispatch_system(
             Option<&crate::simulation::jobs::ClaimTarget>,
             Option<&crate::simulation::jobs::JobClaim>,
             Option<&crate::simulation::reproduction::HouseholdMember>,
+            &crate::simulation::memory::CurrentVision,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -3991,6 +3974,7 @@ pub fn htn_acquire_good_dispatch_system(
         claim_target_opt,
         job_claim_opt,
         household_member,
+        current_vision,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -4014,7 +3998,6 @@ pub fn htn_acquire_good_dispatch_system(
                 // existing haul logic below
             }
             AgentGoal::GatherWood | AgentGoal::GatherStone | AgentGoal::Stockpile => {
-                const VIEW_RADIUS: i32 = 15;
                 // Phase 5e-xiv: `Stockpile` is the generalized counterpart to
                 // GatherWood/GatherStone — the specific resource lives on the
                 // `ClaimTarget.resource_id` companion of the agent's
@@ -4043,53 +4026,45 @@ pub fn htn_acquire_good_dispatch_system(
                     cur_ty.div_euclid(CHUNK_SIZE as i32),
                 );
 
-                // SharedKnowledge gather target. Empty knowledge doesn't kill
-                // the dispatch — a visible scavenge target may still drive a
-                // chain. Filters on owner accessibility so a faction can't
-                // poach another household's planted resources.
-                let gather_target_tile = gk.nearest_target_tile(
-                    actor,
-                    member.faction_id,
-                    household_member.map(|h| h.household_id),
+                // Vision-first: prefer a target the agent can see right now
+                // over a remembered one. Vision is refreshed by `vision_system`
+                // once per agent's bucket (~1s), with LOS already enforced.
+                // Memory is only consulted when vision shows nothing of the
+                // requested kind.
+                let viewer_household = household_member.map(|h| h.household_id);
+                let viewer_settlement = gk
+                    .settlement_map
+                    .first_for_faction(member.faction_id);
+                let visible_gather = current_vision.nearest_gather_target(
                     memory_kind,
                     (cur_tx, cur_ty),
-                    now,
+                    actor,
+                    viewer_household,
+                    viewer_settlement,
+                    member.faction_id,
                 );
+                let gather_target_tile = visible_gather.or_else(|| {
+                    gk.nearest_target_tile(
+                        actor,
+                        member.faction_id,
+                        viewer_household,
+                        memory_kind,
+                        (cur_tx, cur_ty),
+                        now,
+                    )
+                });
 
-                // Vision-based scavenge target (Phase 5c-ii-d-ii-a). Scan
-                // SpatialIndex for the nearest matching `GroundItem` within
-                // VIEW_RADIUS, excluding faction storage tiles (matches the
-                // legacy `StepTarget::NearestItem` resolver in `plan/mod.rs`,
-                // which also excludes storage so an agent doesn't try to
-                // "scavenge" their own deposit).
-                let mut scavenge_target_entity: Option<Entity> = None;
-                let mut scavenge_target_tile: Option<(i32, i32)> = None;
-                let mut best_dist_sq = i32::MAX;
-                for dx in -VIEW_RADIUS..=VIEW_RADIUS {
-                    for dy in -VIEW_RADIUS..=VIEW_RADIUS {
-                        let d2 = dx * dx + dy * dy;
-                        if d2 > VIEW_RADIUS * VIEW_RADIUS {
-                            continue;
-                        }
-                        let tx = cur_tx + dx;
-                        let ty = cur_ty + dy;
-                        if storage_tile_map.tiles.contains_key(&(tx, ty)) {
-                            continue;
-                        }
-                        for &gi_entity in spatial.get(tx, ty) {
-                            if let Ok(gi) = item_query.get(gi_entity) {
-                                if gi.item.resource_id == target_rid
-                                    && gi.qty > 0
-                                    && d2 < best_dist_sq
-                                {
-                                    best_dist_sq = d2;
-                                    scavenge_target_entity = Some(gi_entity);
-                                    scavenge_target_tile = Some((tx, ty));
-                                }
-                            }
-                        }
-                    }
-                }
+                // Visible loose-item scavenge target — the buffer already
+                // mirrors what the previous in-dispatcher SpatialIndex scan
+                // produced (LOS-checked sightings of GroundItems), with the
+                // storage-tile exclusion applied at read time.
+                let scavenge = current_vision.nearest_scavenge_target(
+                    memory_kind,
+                    (cur_tx, cur_ty),
+                    |t| storage_tile_map.tiles.contains_key(&t),
+                );
+                let scavenge_target_entity = scavenge.map(|(e, _)| e);
+                let scavenge_target_tile = scavenge.map(|(_, t)| t);
 
                 // Phase 5c-ii-d-iv-ii: no early-return when both targets are
                 // None. The argmax now picks `ExploreForMaterialMethod`
@@ -4521,7 +4496,6 @@ pub fn htn_stockpile_food_dispatch_system(
     storage_tile_map: Res<StorageTileMap>,
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
-    spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<SimClock>,
     plant_map: Res<PlantMap>,
     gk: crate::simulation::shared_knowledge::GatherKnowledge,
@@ -4540,13 +4514,13 @@ pub fn htn_stockpile_food_dispatch_system(
             Option<&crate::simulation::jobs::JobClaim>,
             Option<&crate::simulation::jobs::ClaimTarget>,
             Option<&crate::simulation::reproduction::HouseholdMember>,
+            &crate::simulation::memory::CurrentVision,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
 ) {
     use crate::simulation::jobs::JobKind;
 
-    const VIEW_RADIUS: i32 = 15;
     let now = clock.tick;
     query.par_iter_mut().for_each(
         |(
@@ -4561,6 +4535,7 @@ pub fn htn_stockpile_food_dispatch_system(
             job_claim_opt,
             claim_target_opt,
             household_member,
+            current_vision,
         )| {
             if *lod == LodLevel::Dormant {
                 return;
@@ -4607,58 +4582,57 @@ pub fn htn_stockpile_food_dispatch_system(
                 cur_ty.div_euclid(CHUNK_SIZE as i32),
             );
 
-            // Scan SpatialIndex for the nearest visible loose edible
-            // `GroundItem` within VIEW_RADIUS, excluding faction storage tiles
-            // (mirrors `htn_acquire_food_dispatch_system`'s scavenge scan).
-            // The picked-up good threads through to the trailing deposit, so
-            // the scan records (entity, tile, good) per decision.
-            let mut scavenge_target_entity: Option<Entity> = None;
-            let mut scavenge_target_tile: Option<(i32, i32)> = None;
-            let mut scavenge_food_good: Option<crate::economy::resource_catalog::ResourceId> =
-                None;
-            {
-                let mut best_dist_sq = i32::MAX;
-                for dx in -VIEW_RADIUS..=VIEW_RADIUS {
-                    for dy in -VIEW_RADIUS..=VIEW_RADIUS {
-                        let d2 = dx * dx + dy * dy;
-                        if d2 > VIEW_RADIUS * VIEW_RADIUS {
-                            continue;
-                        }
-                        let tx = cur_tx + dx;
-                        let ty = cur_ty + dy;
-                        if storage_tile_map.tiles.contains_key(&(tx, ty)) {
-                            continue;
-                        }
-                        for &gi_entity in spatial.get(tx, ty) {
-                            if let Ok(gi) = item_query.get(gi_entity) {
-                                if gi.item.resource_id.is_edible()
-                                    && gi.qty > 0
-                                    && d2 < best_dist_sq
-                                {
-                                    best_dist_sq = d2;
-                                    scavenge_target_entity = Some(gi_entity);
-                                    scavenge_target_tile = Some((tx, ty));
-                                    scavenge_food_good = Some(gi.item.resource_id);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Vision-first scavenge target: nearest visible loose edible
+            // GroundItem within the agent's current vision (LOS-checked by
+            // `vision_system`), excluding storage tiles. Resolve the good's
+            // resource id from `item_query` so the trailing deposit carries
+            // the right payload.
+            let scavenge = current_vision.nearest_scavenge_target(
+                MemoryKind::AnyEdible,
+                (cur_tx, cur_ty),
+                |t| storage_tile_map.tiles.contains_key(&t),
+            );
+            let (scavenge_target_entity, scavenge_target_tile, scavenge_food_good) =
+                if let Some((entity, tile)) = scavenge {
+                    let good = item_query.get(entity).ok().map(|gi| gi.item.resource_id);
+                    (Some(entity), Some(tile), good)
+                } else {
+                    (None, None, None)
+                };
 
             let scavenge_deposit_tile = scavenge_target_tile
                 .and_then(|t| storage_tile_map.nearest_for_faction(member.faction_id, t));
 
-            // Forage candidate: nearest accessible AnyEdible cluster from
-            // SharedKnowledge whose representative tile still holds a live
-            // mature plant. Threads the plant's harvest resource through
-            // `forage_food_good` so the trailing `Task::DepositToFactionStorage`
-            // carries the right payload.
-            let forage_candidate = gk
-                .nearest_target_tile(
+            // Vision-first forage candidate: nearest visible mature edible
+            // plant. Vision_system only writes mature-stage plant sightings,
+            // so the stage filter is implicit. Falls back to SharedKnowledge
+            // when vision shows nothing. Threads the plant's harvest resource
+            // through `forage_food_good` so the trailing
+            // `Task::DepositToFactionStorage` carries the right payload.
+            let viewer_household = household_member.map(|h| h.household_id);
+            let viewer_settlement = gk
+                .settlement_map
+                .first_for_faction(member.faction_id);
+            let visible_forage = current_vision
+                .nearest_gather_target(
+                    MemoryKind::AnyEdible,
+                    (cur_tx, cur_ty),
+                    actor,
+                    viewer_household,
+                    viewer_settlement,
+                    member.faction_id,
+                )
+                .and_then(|tile| {
+                    let entity = plant_map.0.get(&tile).copied()?;
+                    let plant = plant_query.get(entity).ok()?;
+                    let (id, _) = plant.kind.harvest_yield(false);
+                    Some((tile, id))
+                });
+            let forage_candidate = visible_forage.or_else(|| {
+                gk.nearest_target_tile(
                     actor,
                     member.faction_id,
-                    household_member.map(|h| h.household_id),
+                    viewer_household,
                     MemoryKind::AnyEdible,
                     (cur_tx, cur_ty),
                     now,
@@ -4671,7 +4645,8 @@ pub fn htn_stockpile_food_dispatch_system(
                     }
                     let (id, _) = plant.kind.harvest_yield(false);
                     Some((tile, id))
-                });
+                })
+            });
             let gather_target_tile = forage_candidate.map(|(tile, _)| tile);
             let forage_food_good = forage_candidate.map(|(_, id)| id);
             let gather_deposit_tile = gather_target_tile
@@ -8438,6 +8413,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             &Transform,
             &LodLevel,
             Option<&crate::simulation::reproduction::HouseholdMember>,
+            &crate::simulation::memory::CurrentVision,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -8454,6 +8430,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
         transform,
         lod,
         household_member,
+        current_vision,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -8510,12 +8487,35 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             continue;
         };
 
-        // Find a remembered mature Grain plant tile via SharedKnowledge.
-        let gather_target_tile = gk
-            .nearest_target_tile(
+        // Vision-first: prefer a visible mature Grain plant the agent can
+        // see right now over a remembered one. SharedKnowledge is consulted
+        // only when vision shows none.
+        let viewer_household = household_member.map(|h| h.household_id);
+        let viewer_settlement = gk
+            .settlement_map
+            .first_for_faction(member.faction_id);
+        let visible_grain = current_vision
+            .nearest_gather_target(
+                MemoryKind::AnyEdible,
+                (cur_tx, cur_ty),
+                actor,
+                viewer_household,
+                viewer_settlement,
+                member.faction_id,
+            )
+            .filter(|tile| {
+                plant_map
+                    .0
+                    .get(tile)
+                    .and_then(|e| plant_query.get(*e).ok())
+                    .map(|p| p.kind == crate::simulation::plants::PlantKind::Grain)
+                    .unwrap_or(false)
+            });
+        let gather_target_tile = visible_grain.or_else(|| {
+            gk.nearest_target_tile(
                 actor,
                 member.faction_id,
-                household_member.map(|h| h.household_id),
+                viewer_household,
                 MemoryKind::AnyEdible,
                 (cur_tx, cur_ty),
                 now,
@@ -8530,7 +8530,8 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
                 } else {
                     None
                 }
-            });
+            })
+        });
         let Some(grain_tile) = gather_target_tile else {
             continue;
         };

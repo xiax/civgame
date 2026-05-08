@@ -2,9 +2,11 @@
 //!
 //! Each Person carries a `PersonKnowledge` component holding two bitsets:
 //! `aware` (heard of it, no capacity cost, gossiped freely) and `learned`
-//! (can perform/teach, costs complexity points, subset of `aware`). Capacity is
-//! intelligence-driven; learning past capacity demotes the least-recently-used
-//! Learned tech back to Aware-only.
+//! (can perform/teach, subset of `aware`). There is no hard cap on Learned
+//! techs; instead, learning *speed* slows as the agent's stack of Learned
+//! complexity grows: `slowdown = 1 + complexity_used / (intelligence × 2)`.
+//! Applied to study (Read/Lecture/Teach via `add_study_progress`) and to the
+//! passive teaching per-tick roll. Per-action discovery is unaffected.
 //!
 //! Discovery is driven per-action by `try_discover_from_action`, called from
 //! the existing yield/combat hooks (gather, production, combat, plants).
@@ -57,9 +59,17 @@ impl Default for PersonKnowledge {
 impl PersonKnowledge {
     /// Seed a brand-new agent with all Paleolithic techs both Aware and Learned.
     pub fn paleolithic_seed(now: u32) -> Self {
+        Self::seeded_through_era(super::technology::Era::Paleolithic, now)
+    }
+
+    /// Seed a brand-new agent with every tech whose era is at or below
+    /// `target` set both Aware and Learned. Used by `spawn_population` to
+    /// honour the player's chosen starting era.
+    pub fn seeded_through_era(target: super::technology::Era, now: u32) -> Self {
         let mut k = Self::default();
+        let target_rank = target as u8;
         for def in TECH_TREE.iter() {
-            if matches!(def.era, super::technology::Era::Paleolithic) {
+            if (def.era as u8) <= target_rank {
                 k.aware |= 1u64 << def.id;
                 k.learned |= 1u64 << def.id;
                 k.learned_at[def.id as usize] = now;
@@ -94,64 +104,28 @@ impl PersonKnowledge {
         total
     }
 
-    /// Attempt to add `id` to Learned. If capacity is exceeded, demote the
-    /// least-recently-used Learned tech back to Aware-only and retry.
-    /// Returns the demoted tech (if any) so callers can log it.
-    /// No-op if the tech is already Learned (still refreshes recency).
-    pub fn try_learn(&mut self, id: TechId, capacity: u16, now: u32) -> LearnOutcome {
+    /// Add `id` to Learned. No-op if already Learned (still refreshes
+    /// `learned_at`). There is no hard cap; learning *speed* slows with
+    /// stack size — see `learning_slowdown`.
+    pub fn try_learn(&mut self, id: TechId, now: u32) -> LearnOutcome {
         if self.has_learned(id) {
             self.learned_at[id as usize] = now;
             return LearnOutcome::AlreadyKnown;
         }
-        let cost = complexity(id) as u16;
-        let mut demoted: Option<TechId> = None;
-        // Evict LRU until adding `id` fits under capacity. Each eviction
-        // demotes one Learned tech; the awareness bit is retained.
-        while self.complexity_used().saturating_add(cost) > capacity {
-            let Some(victim) = self.lru_learned(id) else {
-                // Nothing to evict (capacity is too small for even this one
-                // tech). Refuse the learn rather than infinite-looping.
-                return LearnOutcome::CapacityTooSmall;
-            };
-            self.learned &= !(1u64 << victim);
-            self.learned_at[victim as usize] = 0;
-            demoted = Some(victim);
-        }
         self.aware |= 1u64 << id;
         self.learned |= 1u64 << id;
         self.learned_at[id as usize] = now;
-        LearnOutcome::Learned { demoted }
-    }
-
-    /// LRU among currently-Learned techs, excluding `exclude` (the tech being
-    /// added). Lowest `learned_at` wins; ties broken by lowest id.
-    fn lru_learned(&self, exclude: TechId) -> Option<TechId> {
-        let mut best: Option<(TechId, u32)> = None;
-        for id in 0..TECH_COUNT as TechId {
-            if id == exclude || !self.has_learned(id) {
-                continue;
-            }
-            let t = self.learned_at[id as usize];
-            match best {
-                None => best = Some((id, t)),
-                Some((_, bt)) if t < bt => best = Some((id, t)),
-                _ => {}
-            }
-        }
-        best.map(|(id, _)| id)
+        LearnOutcome::Learned
     }
 }
 
 /// Outcome of a `try_learn` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LearnOutcome {
-    /// Newly learned. `demoted` is the LRU tech evicted to make room (if any).
-    Learned { demoted: Option<TechId> },
+    /// Newly learned.
+    Learned,
     /// Already in the Learned set; recency was refreshed.
     AlreadyKnown,
-    /// Capacity is too small to fit even this single tech (no eviction helps).
-    /// Caller should leave the bitset unchanged.
-    CapacityTooSmall,
 }
 
 /// Outcome of a single `add_study_progress` call.
@@ -160,9 +134,7 @@ pub enum StudyOutcome {
     /// Progress accumulated, threshold not yet met.
     InProgress { progress: u32, threshold: u32 },
     /// Threshold reached; tech is now Learned.
-    Learned { demoted: Option<TechId> },
-    /// Threshold reached but capacity refused the learn.
-    CapacityTooSmall,
+    Learned,
     /// Already in Learned set; nothing to do.
     AlreadyLearned,
 }
@@ -177,13 +149,15 @@ pub fn study_threshold(tech: TechId) -> u32 {
 impl PersonKnowledge {
     /// Add `amount` study points toward learning `tech`. Always grants
     /// awareness (mirrors "I cracked open the book" — you've now heard of it).
+    /// `amount` is divided by `learning_slowdown(stats, self)` before
+    /// accumulating, so heavy stacks make slower per-tick progress.
     /// On reaching `study_threshold(tech)`, runs `try_learn` and clears
     /// progress. Returns the StudyOutcome so callers can log.
     pub fn add_study_progress(
         &mut self,
         tech: TechId,
         amount: u32,
-        capacity: u16,
+        stats: &Stats,
         now: u32,
     ) -> StudyOutcome {
         if self.has_learned(tech) {
@@ -192,15 +166,19 @@ impl PersonKnowledge {
         }
         // Awareness is free.
         self.aware |= 1u64 << tech;
+        let slowdown = learning_slowdown(stats, self);
+        let scaled = ((amount as f32) / slowdown).round() as u32;
+        // Floor at 1 so a single study tick still nudges progress at extreme
+        // stacks; otherwise zero-amount ticks would stall heavy learners.
+        let scaled = scaled.max(1);
         let entry = self.study_progress.entry(tech).or_insert(0);
-        *entry = entry.saturating_add(amount);
+        *entry = entry.saturating_add(scaled);
         let threshold = study_threshold(tech);
         if *entry >= threshold {
             self.study_progress.remove(&tech);
-            return match self.try_learn(tech, capacity, now) {
-                LearnOutcome::Learned { demoted } => StudyOutcome::Learned { demoted },
+            return match self.try_learn(tech, now) {
+                LearnOutcome::Learned => StudyOutcome::Learned,
                 LearnOutcome::AlreadyKnown => StudyOutcome::AlreadyLearned,
-                LearnOutcome::CapacityTooSmall => StudyOutcome::CapacityTooSmall,
             };
         }
         let progress = *entry;
@@ -209,6 +187,15 @@ impl PersonKnowledge {
             threshold,
         }
     }
+}
+
+/// Multiplier applied to learning *time*. 1.0 = full speed (empty stack);
+/// 2.0 at the old `intelligence × 2` baseline; 3.0 at twice that. Smooth in
+/// both `complexity_used` and `intelligence` — no threshold cliffs.
+#[inline]
+pub fn learning_slowdown(stats: &Stats, k: &PersonKnowledge) -> f32 {
+    let baseline = (stats.intelligence as f32) * 2.0;
+    1.0 + (k.complexity_used() as f32) / baseline.max(1.0)
 }
 
 // ── Discovery ────────────────────────────────────────────────────────────────
@@ -240,7 +227,6 @@ pub fn try_discover_from_action(
     stats: &Stats,
     skills: &Skills,
     activity: ActivityKind,
-    capacity: u16,
     now: u32,
 ) -> Option<TechId> {
     let int_mod = modifier(stats.intelligence) as f32;
@@ -269,10 +255,9 @@ pub fn try_discover_from_action(
         }
         let chance = (trigger_chance * int_scale * skill_scale).min(0.5);
         if fastrand::f32() < chance {
-            // Discovery yields Learned directly. If capacity blocks it, the
-            // LRU-eviction handles the trade-off.
-            match knowledge.try_learn(def.id, capacity, now) {
-                LearnOutcome::Learned { .. } => return Some(def.id),
+            // Discovery yields Learned directly; no cap.
+            match knowledge.try_learn(def.id, now) {
+                LearnOutcome::Learned => return Some(def.id),
                 _ => {}
             }
         }
@@ -636,10 +621,11 @@ pub fn tech_teaching_system(
         }
 
         // Per-tick teach chance: very small base rate, scaled by intelligence
-        // modifier. Even a brilliant student needs many social ticks to pick
-        // up a complex technique.
+        // modifier and divided by the student's learning slowdown so heavily
+        // loaded students absorb new techs more slowly.
         let int_scale = 1.0 + (modifier(stats.intelligence) as f32 * 0.15).max(-0.5);
-        let chance = 0.004f32 * int_scale;
+        let slowdown = learning_slowdown(stats, &knowledge);
+        let chance = 0.004f32 * int_scale / slowdown;
         if fastrand::f32() >= chance {
             continue;
         }
@@ -659,8 +645,7 @@ pub fn tech_teaching_system(
         }
         let Some(tech_id) = chosen else { continue };
 
-        let capacity = capacity_for(stats);
-        if let LearnOutcome::Learned { .. } = knowledge.try_learn(tech_id, capacity, now) {
+        if let LearnOutcome::Learned = knowledge.try_learn(tech_id, now) {
             // Player-facing notification mirrors discovery channel.
             if let Some(fm) = fm {
                 if fm.faction_id == player.faction_id {
@@ -704,13 +689,11 @@ pub fn discovery_system(
         let Ok((entity, stats, skills, mut knowledge, fm)) = q.get_mut(ev.actor) else {
             continue;
         };
-        let capacity = capacity_for(stats);
         if let Some(tech_id) = try_discover_from_action(
             &mut knowledge,
             stats,
             skills,
             ev.activity,
-            capacity,
             clock.tick as u32,
         ) {
             // Emit a tech-discovery activity entry for the player faction.

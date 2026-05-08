@@ -2,6 +2,7 @@ use super::goals::AgentGoal;
 use super::lod::LodLevel;
 use super::person::Person;
 use super::schedule::{BucketSlot, SimClock};
+use super::shared_knowledge::ResourceOwner;
 use crate::economy::core_ids;
 use crate::economy::resource_catalog::ResourceId;
 use crate::world::chunk::ChunkMap;
@@ -130,6 +131,87 @@ impl AgentMemory {
     }
 }
 
+/// One entry in `CurrentVision`. Records what an agent saw during its most
+/// recent `vision_system` pass: kind + tile + (optional) entity + owner. The
+/// `entity` slot is `Some` for entity-anchored sightings (`GroundItem`, prey)
+/// where dispatchers need the entity handle, and `None` for tile-anchored
+/// sightings (mature plant, stone tile) where only the tile matters.
+#[derive(Clone, Copy, Debug)]
+pub struct VisionEntry {
+    pub kind: MemoryKind,
+    pub tile: (i32, i32),
+    pub entity: Option<Entity>,
+    pub owner: ResourceOwner,
+}
+
+/// Per-agent "what I see right now" buffer. Refilled each time the agent's
+/// `BucketSlot` fires (≤20 ticks ≈ 1s old at dispatch time). Dispatchers
+/// consult this *before* `SharedKnowledge` so a worker standing within sight
+/// of a viable target picks it deterministically rather than walking to a
+/// stale remembered cluster.
+///
+/// Vision still writes through to `SharedKnowledge` (additively) so other
+/// agents can benefit via gossip / tier promotion. This buffer is a separate,
+/// agent-private channel — it never feeds depletion semantics, preserving
+/// the "vision is additive" invariant.
+#[derive(Component, Clone, Default)]
+pub struct CurrentVision {
+    pub entries: Vec<VisionEntry>,
+}
+
+impl CurrentVision {
+    pub fn iter_kind(&self, kind: MemoryKind) -> impl Iterator<Item = &VisionEntry> + '_ {
+        self.entries.iter().filter(move |v| v.kind == kind)
+    }
+
+    /// Pick the nearest visible tile-anchored target (`entity == None`) of the
+    /// requested kind that the viewer can harvest without theft. Used as the
+    /// vision-first short-circuit for gather methods before falling back to
+    /// `SharedKnowledge`.
+    pub fn nearest_gather_target(
+        &self,
+        kind: MemoryKind,
+        from: (i32, i32),
+        viewer: Entity,
+        viewer_household: Option<u32>,
+        viewer_settlement: Option<crate::simulation::settlement::SettlementId>,
+        viewer_faction: u32,
+    ) -> Option<(i32, i32)> {
+        self.iter_kind(kind)
+            .filter(|v| v.entity.is_none())
+            .filter(|v| {
+                v.owner.is_accessible_to(
+                    viewer,
+                    viewer_household,
+                    viewer_settlement,
+                    viewer_faction,
+                )
+            })
+            .min_by_key(|v| {
+                (v.tile.0 - from.0).abs().max((v.tile.1 - from.1).abs())
+            })
+            .map(|v| v.tile)
+    }
+
+    /// Pick the nearest visible entity-anchored target (`entity == Some`) of
+    /// the requested kind, excluding entries on storage tiles (so an agent
+    /// doesn't try to "scavenge" their own deposit). Used as the vision-first
+    /// short-circuit for scavenge methods.
+    pub fn nearest_scavenge_target(
+        &self,
+        kind: MemoryKind,
+        from: (i32, i32),
+        is_storage_tile: impl Fn((i32, i32)) -> bool,
+    ) -> Option<(Entity, (i32, i32))> {
+        self.iter_kind(kind)
+            .filter_map(|v| v.entity.map(|e| (e, v.tile)))
+            .filter(|(_, tile)| !is_storage_tile(*tile))
+            .min_by_key(|(_, tile)| {
+                (tile.0 - from.0).abs().max((tile.1 - from.1).abs())
+            })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RelEntry {
     pub entity: Entity,
@@ -247,7 +329,7 @@ pub fn vision_system(
         )>,
     >,
     mut shared: ResMut<crate::simulation::shared_knowledge::SharedKnowledge>,
-    query: Query<
+    mut query: Query<
         (
             &Transform,
             &BucketSlot,
@@ -255,18 +337,23 @@ pub fn vision_system(
             &crate::simulation::person::PersonAI,
             Option<&crate::simulation::faction::FactionMember>,
             Option<&crate::simulation::reproduction::HouseholdMember>,
+            &mut CurrentVision,
         ),
         With<Person>,
     >,
 ) {
-    use crate::simulation::shared_knowledge::{KnowledgeTier, ResourceOwner};
+    use crate::simulation::shared_knowledge::KnowledgeTier;
     const VIEW_RADIUS: i32 = 15;
 
     let now = clock.tick;
-    for (transform, slot, lod, ai, faction_member, household_member) in query.iter() {
+    for (transform, slot, lod, ai, faction_member, household_member, mut current_vision) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
+        // Refresh the per-agent buffer every time the bucket fires. Dispatchers
+        // read this slot in the same tick (ParallelB after vision's pass) and
+        // short-circuit `SharedKnowledge` when a matching entry exists.
+        current_vision.entries.clear();
 
         // The agent writes to its *finest* tier — Household if a member,
         // otherwise Faction. Settlement and faction-wide knowledge are
@@ -318,6 +405,12 @@ pub fn vision_system(
                                 .map(|lc| lc.owner)
                                 .unwrap_or(ResourceOwner::Public);
                             shared.report_sighting(write_tier, (ntx, nty), kind, owner, now);
+                            current_vision.entries.push(VisionEntry {
+                                kind,
+                                tile: (ntx, nty),
+                                entity: None,
+                                owner,
+                            });
                         }
                     }
                 }
@@ -326,23 +419,58 @@ pub fn vision_system(
                 for &entity in spatial.get(ntx, nty) {
                     if let Ok(item) = item_query.get(entity) {
                         let resource_id = item.item.resource_id;
-                        let kind = catalog.get(resource_id).and_then(|def| match def.class {
-                            crate::economy::resource_catalog::ResourceClass::Food => {
-                                Some(MemoryKind::AnyEdible)
-                            }
-                            crate::economy::resource_catalog::ResourceClass::Material
-                            | crate::economy::resource_catalog::ResourceClass::Seed => {
-                                Some(MemoryKind::Resource(resource_id))
-                            }
-                            _ => None,
-                        });
-                        if let Some(k) = kind {
+                        // SharedKnowledge keeps the legacy class filter (Food
+                        // canonicalises to AnyEdible; Material/Seed clusters
+                        // by Resource(rid); other classes don't seed
+                        // clusters). CurrentVision is broader — every visible
+                        // GroundItem the agent could harvest under a chief
+                        // Stockpile{rid} posting goes in by Resource(rid),
+                        // matching the old in-dispatcher SpatialIndex scan
+                        // that filtered on `gi.item.resource_id == target_rid`
+                        // regardless of class.
+                        let shared_kind =
+                            catalog.get(resource_id).and_then(|def| match def.class {
+                                crate::economy::resource_catalog::ResourceClass::Food => {
+                                    Some(MemoryKind::AnyEdible)
+                                }
+                                crate::economy::resource_catalog::ResourceClass::Material
+                                | crate::economy::resource_catalog::ResourceClass::Seed => {
+                                    Some(MemoryKind::Resource(resource_id))
+                                }
+                                _ => None,
+                            });
+                        if let Some(k) = shared_kind {
                             // Loose ground items belong to no one — Public.
                             shared.report_sighting(write_tier, (ntx, nty), k, ResourceOwner::Public, now);
+                        }
+                        // Vision-first: dispatchers look up entries by
+                        // MemoryKind. Push Resource(rid) for every item, plus
+                        // an extra AnyEdible row for foods so the food
+                        // dispatchers can iterate them by class without
+                        // knowing the specific resource id.
+                        current_vision.entries.push(VisionEntry {
+                            kind: MemoryKind::Resource(resource_id),
+                            tile: (ntx, nty),
+                            entity: Some(entity),
+                            owner: ResourceOwner::Public,
+                        });
+                        if shared_kind == Some(MemoryKind::AnyEdible) {
+                            current_vision.entries.push(VisionEntry {
+                                kind: MemoryKind::AnyEdible,
+                                tile: (ntx, nty),
+                                entity: Some(entity),
+                                owner: ResourceOwner::Public,
+                            });
                         }
                     } else if let Ok((_, health)) = prey_query.get(entity) {
                         if !health.is_dead() {
                             shared.report_sighting(write_tier, (ntx, nty), MemoryKind::Prey, ResourceOwner::Public, now);
+                            current_vision.entries.push(VisionEntry {
+                                kind: MemoryKind::Prey,
+                                tile: (ntx, nty),
+                                entity: Some(entity),
+                                owner: ResourceOwner::Public,
+                            });
                         }
                     }
                 }
@@ -350,6 +478,12 @@ pub fn vision_system(
                 if let Some(tile_kind) = chunk_map.tile_kind_at(ntx, nty) {
                     if tile_kind == crate::world::tile::TileKind::Stone {
                         shared.report_sighting(write_tier, (ntx, nty), MemoryKind::stone(), ResourceOwner::Public, now);
+                        current_vision.entries.push(VisionEntry {
+                            kind: MemoryKind::stone(),
+                            tile: (ntx, nty),
+                            entity: None,
+                            owner: ResourceOwner::Public,
+                        });
                     } else {
                         shared.report_depleted(write_tier, (ntx, nty), MemoryKind::stone());
                     }

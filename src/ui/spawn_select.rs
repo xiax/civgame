@@ -5,8 +5,9 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::game_state::{GameState, PendingSpawn};
+use crate::game_state::{EconomyPreset, GameStartOptions, GameState, PendingSpawn};
 use crate::simulation::region::MegaChunkCoord;
+use crate::simulation::technology::Era;
 use crate::ui::world_map::build_globe_image;
 use crate::world::globe::{
     Biome, Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH, MEGACHUNK_SIZE_CHUNKS,
@@ -22,9 +23,68 @@ pub fn spawn_select_system(
     globe: Res<Globe>,
     mut tex_cache: ResMut<SpawnSelectTexture>,
     mut pending: ResMut<PendingSpawn>,
+    mut options: ResMut<GameStartOptions>,
     mut next_state: ResMut<NextState<GameState>>,
 ) {
     let ctx = contexts.ctx_mut();
+
+    // Left side-panel: starting options (era, population, economy). The
+    // values are committed when the player clicks a habitable mega-chunk.
+    egui::SidePanel::left("spawn_options")
+        .resizable(false)
+        .default_width(240.0)
+        .show(ctx, |ui| {
+            ui.add_space(10.0);
+            ui.heading("Starting options");
+            ui.add_space(8.0);
+
+            ui.label(egui::RichText::new("Era").strong());
+            for era in [
+                Era::Paleolithic,
+                Era::Mesolithic,
+                Era::Neolithic,
+                Era::Chalcolithic,
+                Era::BronzeAge,
+            ] {
+                ui.radio_value(&mut options.era, era, era.name());
+            }
+            ui.add_space(12.0);
+
+            ui.label(egui::RichText::new("Player population").strong());
+            ui.add(
+                egui::Slider::new(&mut options.player_population, 5..=100)
+                    .text("members"),
+            );
+            ui.add_space(12.0);
+
+            ui.label(egui::RichText::new("Economy").strong());
+            ui.radio_value(
+                &mut options.economy,
+                EconomyPreset::Subsistence,
+                "Subsistence",
+            );
+            ui.label(
+                egui::RichText::new("Chief allocates all labor; no private trade.")
+                    .small()
+                    .weak(),
+            );
+            ui.radio_value(&mut options.economy, EconomyPreset::Mixed, "Mixed");
+            ui.label(
+                egui::RichText::new(
+                    "Households craft tools/cloth privately; staples stay communal.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.radio_value(&mut options.economy, EconomyPreset::Market, "Market");
+            ui.label(
+                egui::RichText::new(
+                    "Every resource fully privatised; agents bid on chief postings.",
+                )
+                .small()
+                .weak(),
+            );
+        });
 
     if tex_cache.handle.is_none() {
         let pixels = build_globe_image(&globe, false);
