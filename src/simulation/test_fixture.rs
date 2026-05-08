@@ -1653,6 +1653,87 @@ mod smoke {
         );
     }
 
+    // ─── Pluralist Economy R3 follow-on b — HouseholdMember birth inheritance ───
+
+    #[test]
+    fn newborn_inherits_household_membership_from_mother() {
+        // R3 follow-on b: when a HouseholdMember mother gives
+        // birth, the newborn is automatically inserted into the
+        // same household. Validates that pregnancy_system's birth
+        // path threads `mother_household` through to the spawn
+        // and inserts the marker on the child entity.
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::person::Person;
+        use crate::simulation::reproduction::{HouseholdMember, Pregnancy};
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        // Pregnancy is inserted directly; sex isn't checked at the
+        // pregnancy_system birth-spawn site — only at the
+        // conception-attempt site we're bypassing.
+        let mother = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+        // Stamp HouseholdMember on the mother manually (the
+        // formation system would do this in real gameplay).
+        let village = sim.player_faction_id;
+        let catalog = sim
+            .app
+            .world()
+            .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+            .clone();
+        let household_id = {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.spawn_household(village, (5, 5), mother, &catalog)
+        };
+        sim.app
+            .world_mut()
+            .entity_mut(mother)
+            .insert(HouseholdMember { household_id });
+
+        // Insert a Pregnancy with a tiny ticks_remaining so birth
+        // fires on the next active tick. The faction_id matches
+        // the mother's faction (R3's primitive doesn't change
+        // FactionMember at household formation, so the mother is
+        // still a village member; the newborn likewise lands in
+        // the village's faction by `pregnancy_system` while
+        // additionally getting a HouseholdMember marker).
+        sim.app
+            .world_mut()
+            .entity_mut(mother)
+            .insert(Pregnancy {
+                ticks_remaining: 5,
+                father: None,
+                father_stats: None,
+                father_known: 0,
+                faction_id: village,
+            });
+
+        // Tick enough for the pregnancy timer + birth + Commands
+        // flush. pregnancy_system runs in Economy schedule. The
+        // bucket cadence may delay firing; tick a generous amount.
+        sim.tick_n((TICKS_PER_DAY / 4) as u32);
+
+        // Find the child: the newest Person whose entity isn't the mother.
+        let child_with_household: Option<HouseholdMember> = {
+            let mut q = sim.app.world_mut().query_filtered::<
+                (Entity, &HouseholdMember),
+                With<Person>,
+            >();
+            q.iter(sim.app.world())
+                .filter(|(e, _)| *e != mother)
+                .map(|(_, hh)| *hh)
+                .next()
+        };
+
+        let child_hh = child_with_household.expect(
+            "newborn should have inherited HouseholdMember from mother",
+        );
+        assert_eq!(
+            child_hh.household_id, household_id,
+            "newborn should be in same household as mother",
+        );
+    }
+
     // ─── Pluralist Economy R8 follow-on — SelfActualization teaching ───
 
     #[test]

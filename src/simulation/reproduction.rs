@@ -431,12 +431,25 @@ pub fn pregnancy_system(
         &LodLevel,
         Option<&Stats>,
         Option<&crate::simulation::knowledge::PersonKnowledge>,
+        // Pluralist Economy R3 follow-on b: pass the mother's
+        // HouseholdMember through to the birth-spawn site so the
+        // newborn inherits.
+        Option<&HouseholdMember>,
     )>,
 ) {
-    let mut births: Vec<(Entity, Transform, u32, Stats, u64)> = Vec::new();
+    let mut births: Vec<(Entity, Transform, u32, Stats, u64, Option<HouseholdMember>)> =
+        Vec::new();
 
-    for (mother, mut preg, transform, slot, lod, mother_stats, mother_knowledge) in
-        query.iter_mut()
+    for (
+        mother,
+        mut preg,
+        transform,
+        slot,
+        lod,
+        mother_stats,
+        mother_knowledge,
+        mother_household,
+    ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
@@ -458,10 +471,19 @@ pub fn pregnancy_system(
             preg.faction_id,
             child_stats,
             inherited_aware,
+            mother_household.copied(),
         ));
     }
 
-    for (mother, parent_transform, faction_id, child_stats, inherited_aware) in births {
+    for (
+        mother,
+        parent_transform,
+        faction_id,
+        child_stats,
+        inherited_aware,
+        mother_household,
+    ) in births
+    {
         commands.entity(mother).remove::<Pregnancy>();
 
         let new_slot = clock.population;
@@ -484,7 +506,7 @@ pub fn pregnancy_system(
             mother_name, child_name, faction_id
         );
 
-        commands.spawn((
+        let child_entity = commands.spawn((
             (
                 Person,
                 Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
@@ -546,7 +568,16 @@ pub fn pregnancy_system(
                 },
                 crate::simulation::typed_task::ActionQueue::idle(),
             ),
-        ));
+        )).id();
+
+        // Pluralist Economy R3 follow-on b: inherit
+        // `HouseholdMember` from the mother. The child of two
+        // pair-bonded parents is born into the household, not just
+        // the village. This is what lets households grow over
+        // generations.
+        if let Some(mother_hh) = mother_household {
+            commands.entity(child_entity).insert(mother_hh);
+        }
     }
 }
 
