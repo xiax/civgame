@@ -87,6 +87,8 @@ All run in `ParallelB`, ordered after `goal_dispatch_system`. Each system serial
 
 Each dispatcher: gates on goal + Idle + non-Dormant + `task_id == UNEMPLOYED`, builds `PlannerCtx`, runs argmax across registered methods, routes the head via `assign_task_with_routing`, prefetches the tail on `ActionQueue`. SOLO/unsettled agents skip storage-dependent methods.
 
+**`ClaimTarget.kind: ClaimKind`** (`jobs.rs`) — `None | Specific(ResourceId) | AnyEdible`. Mirrors `MemoryKind`. Stockpile/Haul postings yield `Specific(rid)`; chief `Calories` postings yield `AnyEdible`; Build yields `None`. Food dispatchers gate on `ClaimTarget::is_food()` (true for `AnyEdible` or `Specific(rid)` where `rid.is_edible()`), so adding a new edible to `assets/data/resources/*.ron` automatically participates without code changes.
+
 ### Chain handoffs
 
 Trailing legs of multi-task chains live in exit helpers on the head executor:
@@ -131,6 +133,7 @@ Headless `App` harness for AI assertions without rendering/UI/globe gen. `TestSi
 - `test_fixture::person_task(&app, entity) -> Task` reads `ActionQueue.current`.
 - Currency-invariant helpers: `set_currency` / `get_currency` / `assert_currency`; `total_system_currency` + `CurrencySnapshot::capture` + `assert_total_currency_invariant(app, baseline, eps)`. Snapshot sums `EconomicAgent.currency` + `FactionData.treasury` + `Settlement.treasury` + `JobEscrow.amount`.
 - `test_fixture::inject_faction_sighting` pre-populates a faction-tier cluster. Inject **outside** `VIEW_RADIUS=15` of any test agent or vision will deplete the singleton cluster.
+- E2E gather chains (`gather_{wood,stone,food}_goal_completes_to_storage_deposit`, `hungry_agent_forages_then_eats`) drive the full Forage/Scavenge → Deposit chain through hundreds of ticks. All four pass. The food chain works because `posting_claim_target(JobProgress::Calories)` yields `ClaimKind::AnyEdible`, which `ClaimTarget::is_food()` accepts — see ClaimKind below.
 
 ## Faction systems
 

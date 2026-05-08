@@ -327,15 +327,61 @@ pub struct JobClaim {
     pub fail_count: u8,
 }
 
+/// What kind of resource a `ClaimTarget` accepts. Mirrors the design of
+/// `MemoryKind` in `memory.rs`. `Specific(rid)` covers Stockpile/Haul of one
+/// good; `AnyEdible` covers chief Calorie postings (intrinsically multi-
+/// resource — Fruit/Meat/Grain/etc. all satisfy it); `None` covers Build/Plant
+/// claims that don't bind to a single resource identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ClaimKind {
+    #[default]
+    None,
+    Specific(crate::economy::resource_catalog::ResourceId),
+    AnyEdible,
+}
+
 /// Companion component to `JobClaim` carrying the concrete target of the
 /// currently held posting. Populated/refreshed by `job_goal_lock_system` so
 /// plan resolvers can route to the claimed blueprint or resource without
-/// re-querying the `JobBoard`. `None` fields mean the claim's posting kind
-/// doesn't carry that target (e.g. food Stockpile claims have no blueprint).
+/// re-querying the `JobBoard`. `kind = None` means the claim's posting kind
+/// doesn't bind a resource (e.g. Build); `AnyEdible` means any catalog
+/// resource with `edible_calories` satisfies the claim.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct ClaimTarget {
     pub blueprint: Option<Entity>,
-    pub resource_id: Option<crate::economy::resource_catalog::ResourceId>,
+    pub kind: ClaimKind,
+}
+
+impl ClaimTarget {
+    /// Back-compat accessor: returns `Some(rid)` only for `Specific`. Callers
+    /// that want "the one resource this claim binds" should use this instead
+    /// of pattern-matching `kind` directly.
+    pub fn resource_id(&self) -> Option<crate::economy::resource_catalog::ResourceId> {
+        match self.kind {
+            ClaimKind::Specific(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// True if a deposit of `rid` would credit this claim.
+    pub fn accepts(&self, rid: crate::economy::resource_catalog::ResourceId) -> bool {
+        match self.kind {
+            ClaimKind::Specific(r) => r == rid,
+            ClaimKind::AnyEdible => rid.is_edible(),
+            ClaimKind::None => false,
+        }
+    }
+
+    /// True if this claim binds to food — either `AnyEdible` (chief Calories
+    /// postings) or a `Specific(rid)` where `rid.is_edible()` (Stockpile of a
+    /// specific food good). Drives `htn_stockpile_food_dispatch_system`'s gate.
+    pub fn is_food(&self) -> bool {
+        match self.kind {
+            ClaimKind::AnyEdible => true,
+            ClaimKind::Specific(r) => r.is_edible(),
+            ClaimKind::None => false,
+        }
+    }
 }
 
 /// Pluralist Economy R2: an escrow record attached to a sidecar
@@ -971,15 +1017,13 @@ pub fn chief_job_posting_system(
                 );
                 if food_total < target_supply && knows_food {
                     let deficit_units = target_supply.saturating_sub(food_total);
-                    // Convert deficit units to a calorie target (use Fruit nutrition
-                    // as a conservative average; deposits contribute their actual
-                    // good's nutrition).
-                    let calories = deficit_units
-                        * crate::economy::core_ids::Fruit
-                            .get()
-                            .copied()
-                            .unwrap()
-                            .nutrition() as u32;
+                    // Convert deficit units to a calorie target. Use the catalog's
+                    // minimum edible-calorie value as a conservative baseline so
+                    // adding richer foods (e.g. Fish, Cheese) doesn't change the
+                    // target — deposits credit their actual nutrition, just
+                    // finishing the posting faster.
+                    let calories =
+                        deficit_units * crate::economy::core_ids::min_edible_calories();
                     let target = calories.clamp(GATHER_TARGET_MIN, GATHER_TARGET_CAP);
                     let id = board.alloc_id();
                     let progress = JobProgress::Calories {
@@ -2021,13 +2065,16 @@ pub fn job_goal_lock_system(
 }
 
 /// Snapshot a posting's concrete target into a `ClaimTarget`. Returns the
-/// blueprint and good a hauler/builder should route to; non-targeted postings
-/// (food stockpile, planting) yield `ClaimTarget::default()`.
+/// blueprint and resource a hauler/builder should route to. `Calories`
+/// postings yield `ClaimKind::AnyEdible` so the food dispatcher's gate
+/// passes for any catalog edible. Other multi-step variants (Planting,
+/// Crafting) yield `ClaimTarget::default()` — they don't drive a single
+/// resource-routed dispatcher.
 pub fn posting_claim_target(p: &JobPosting) -> ClaimTarget {
     match &p.progress {
         JobProgress::Stockpile { resource_id, .. } => ClaimTarget {
             blueprint: None,
-            resource_id: Some(*resource_id),
+            kind: ClaimKind::Specific(*resource_id),
         },
         JobProgress::Haul {
             blueprint,
@@ -2035,11 +2082,15 @@ pub fn posting_claim_target(p: &JobPosting) -> ClaimTarget {
             ..
         } => ClaimTarget {
             blueprint: Some(*blueprint),
-            resource_id: Some(*resource_id),
+            kind: ClaimKind::Specific(*resource_id),
         },
         JobProgress::Building { blueprint } => ClaimTarget {
             blueprint: Some(*blueprint),
-            resource_id: None,
+            kind: ClaimKind::None,
+        },
+        JobProgress::Calories { .. } => ClaimTarget {
+            blueprint: None,
+            kind: ClaimKind::AnyEdible,
         },
         _ => ClaimTarget::default(),
     }

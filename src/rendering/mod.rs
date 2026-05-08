@@ -52,6 +52,14 @@ impl Plugin for RenderingPlugin {
                     entity_sprites::toggle_art_mode,
                     entity_sprites::handle_art_mode_change,
                     chunk_streaming::update_tile_z_view_system.after(camera::camera_input_system),
+                    // fog_update_system stays in Update: it owns
+                    // `fog_map.dirty_tiles`, which `apply_fog_to_tiles_system`
+                    // (PostUpdate) consumes. If fog moved to FixedUpdate
+                    // and FixedUpdate ran twice in one frame, the second
+                    // run's `dirty_tiles.clear()` would wipe the first
+                    // run's diff before PostUpdate ever applied it —
+                    // visibility changes get silently dropped.
+                    fog::fog_update_system,
                     chunk_streaming::toggle_chunk_boundary_overlay_system,
                     chunk_streaming::chunk_boundary_gizmo_system,
                     path_debug::selected_agent_path_gizmo_system,
@@ -63,12 +71,12 @@ impl Plugin for RenderingPlugin {
                 )
                     .run_if(in_state(crate::GameState::Playing)),
             )
-            // Chunk streaming pipeline runs on FixedUpdate (20 Hz)
-            // rather than per-frame Update (60+ Hz). The unload pass
-            // walks `chunk_map.0.keys()` and the load pass scans every
-            // focus disc — at 60 Hz that's enough to spike frame time
-            // even when nothing is moving. One fixed-tick (≤50 ms)
-            // load lag is imperceptible.
+            // Chunk streaming pipeline runs on FixedUpdate (20 Hz) —
+            // the unload pass walks `chunk_map.0.keys()` and the load
+            // pass scans every focus disc; at 60+ Hz that's enough to
+            // spike frame time. fog_update_system intentionally stays
+            // on Update (see comment above); it tolerates a stale
+            // chunk_map for one fixed-tick on the chunk-load boundary.
             .add_systems(
                 FixedUpdate,
                 (
@@ -77,7 +85,6 @@ impl Plugin for RenderingPlugin {
                     chunk_streaming::update_simulation_focus_system
                         .before(chunk_streaming::chunk_streaming_system),
                     chunk_streaming::chunk_streaming_system,
-                    fog::fog_update_system.after(chunk_streaming::chunk_streaming_system),
                 )
                     .run_if(in_state(crate::GameState::Playing)),
             )

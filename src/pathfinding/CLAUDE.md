@@ -9,7 +9,14 @@ Graph node = **`(ChunkCoord, ComponentId)`** — `ComponentId` is a chunk-local 
 - **`ChunkComponents { at: AHashMap<(u8,u8,i8), ComponentId>, count: u8 }`** per chunk on `ChunkGraph::components`. Sparse — only standable foot tiles classify.
 - **`ChunkEdge`** carries `from_component`, `to_component` so the router can't collapse a surface band and a disconnected cave into the same Dijkstra node.
 - **`ChunkGraph::component_for_tile(world_x, world_y, z)`** is the agent-side lookup. Returns `None` when not standable or chunk not built — surface as `component_lookup_failed_at_*` in `PathfindingDiagnostics`.
-- Rebuild runs in `PostUpdate` on `TileChangedEvent` / `ChunkLoadedEvent` / `ChunkUnloadedEvent`. `ChunkGraph::generation` bump invalidates every cached router tree.
+
+### Rebuild pipeline
+
+- **Startup** (after `terrain::spawn_world_system`): `startup_initial_build_system` runs a synchronous full rebuild of the pre-generated 32×32 spawn area — one-time main-thread cost, then connectivity rebuilds.
+- **Runtime**: events drive an **async incremental** pipeline. `enqueue_graph_dirty_system` (PostUpdate) drains `TileChangedEvent` / `ChunkLoadedEvent` / `ChunkUnloadedEvent` into `GraphDirty { chunks, unloaded }`. `spawn_rebuild_task_system` snapshots `dirty ∪ cardinal_neighbors(dirty)` into a fresh `ChunkMap` (Chunk derives Clone) and hands it to `AsyncComputeTaskPool`. `poll_rebuild_task_system` (PreUpdate) merges the result into `ChunkGraph` once the future resolves; only one task in flight at a time, fresh events accumulate in `GraphDirty` for the next task.
+- **Connectivity** rebuilds only when the graph is *settled* (`task.is_none() && dirty empty && graph.generation != conn.generation`) via the `connectivity_needs_rebuild` run condition — avoids spamming the global union-find during multi-tick steady-state activity.
+- **Tests** that populate `ChunkMap` directly call `rebuild_chunk_graph_sync` (e.g. via `TestSim::flat_world`) since they bypass chunk streaming and never emit load events.
+- `ChunkGraph::generation` bump invalidates every cached router tree.
 
 ## Router (`chunk_router.rs`)
 
@@ -23,7 +30,7 @@ Z-mismatch penalty is gone — components are exact, no "wrong z" choice to pena
 
 ## Connectivity (`connectivity.rs`)
 
-`ChunkConnectivity` is a self-contained reachability snapshot built by `rebuild_connectivity_system` (after `build_chunk_graph_system`). `is_reachable((c1, z1), (c2, z2)) -> bool` so callers in `simulation/` don't need to thread a `&ChunkGraph`.
+`ChunkConnectivity` is a self-contained reachability snapshot built by `rebuild_connectivity_system`, gated on `connectivity_needs_rebuild` (graph settled + generation mismatch). `is_reachable((c1, z1), (c2, z2)) -> bool` so callers in `simulation/` don't need to thread a `&ChunkGraph`.
 
 Internally: per-(chunk, z) → list of inter-chunk CC ids; reachability = set intersection.
 

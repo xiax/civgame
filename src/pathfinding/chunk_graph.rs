@@ -1,10 +1,12 @@
 use ahash::{AHashMap, AHashSet};
 use bevy::prelude::*;
+use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
 use std::collections::VecDeque;
 use std::time::Instant;
 
 use crate::pathfinding::tile_cost::{tile_step_cost, IMPASSABLE};
-use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE, Z_MIN};
+use crate::world::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE, Z_MIN};
+use crate::world::chunk_streaming::{ChunkLoadedEvent, ChunkUnloadedEvent, TileChangedEvent};
 
 /// All 26 neighbour offsets in (dx, dy, dz). Used by intra-chunk
 /// component flood-fill — same set the old `connectivity` module used.
@@ -189,167 +191,429 @@ fn classify_components(
     }
 }
 
-pub fn build_chunk_graph_system(chunk_map: Res<ChunkMap>, mut graph: ResMut<ChunkGraph>) {
-    let now = Instant::now();
-    // Cardinal direction offsets and which border row/col to scan
-    let borders: [(i32, i32, bool, bool); 4] = [
-        // (dx, dy, scan_x_axis, at_max_edge)
-        (0, -1, true, false),  // North (top row, ty=0 in this chunk)
-        (0, 1, true, true),    // South (bottom row, ty=CHUNK_SIZE-1)
-        (-1, 0, false, false), // West  (left col, tx=0)
-        (1, 0, false, true),   // East  (right col, tx=CHUNK_SIZE-1)
-    ];
+/// Cardinal-only border directions for cross-chunk edge scanning.
+/// `(dx, dy, scan_x_axis, at_max_edge)`.
+const BORDER_DIRS: [(i32, i32, bool, bool); 4] = [
+    (0, -1, true, false),  // North
+    (0, 1, true, true),    // South
+    (-1, 0, false, false), // West
+    (1, 0, false, true),   // East
+];
 
-    // Drop stale entries for chunks that have been unloaded since the last
-    // rebuild. Without this, edges to unloaded neighbors would linger and
-    // produce false-positive routes through chunks that no longer exist.
-    graph
-        .edges
-        .retain(|coord, _| chunk_map.0.contains_key(coord));
-    graph
-        .components
-        .retain(|coord, _| chunk_map.0.contains_key(coord));
+/// Pending rebuild work accumulated between tasks. `classify` holds chunks
+/// whose tile state changed (TileChanged / ChunkLoaded) — they need fresh
+/// component classification. `unloaded` holds chunks to drop. Cardinals of
+/// these get edge-only rebuilds, computed at task-spawn time. Events that
+/// arrive while a task is in flight accumulate here for the next task.
+#[derive(Resource, Default)]
+pub struct GraphDirty {
+    pub classify: AHashSet<ChunkCoord>,
+    pub unloaded: AHashSet<ChunkCoord>,
+}
 
-    // Pass 1 — classify components per chunk via 3D flood-fill. Must run
-    // before edge building since edges carry their endpoint components.
-    for (coord, chunk) in &chunk_map.0 {
-        let cc = classify_components(&chunk_map, *coord, chunk);
-        graph.components.insert(*coord, cc);
+/// Snapshot passed to the off-thread rebuild.
+///
+/// - `chunks` covers two rings around `classify_dirty` so edge scans (which
+///   read across one chunk boundary) have all the tile data they need.
+/// - `live_components` carries the live `ChunkGraph` classification for every
+///   chunk in `chunks` that's NOT in `classify_dirty`, so edge scans don't
+///   re-classify (which would produce non-deterministic IDs that mismatch
+///   the live graph and break router lookups).
+struct RebuildSnapshot {
+    chunks: ChunkMap,
+    classify_dirty: AHashSet<ChunkCoord>,
+    edge_dirty: AHashSet<ChunkCoord>,
+    live_components: AHashMap<ChunkCoord, ChunkComponents>,
+    unloaded: AHashSet<ChunkCoord>,
+}
+
+/// Result merged into `ChunkGraph` on the main thread.
+pub struct RebuildResult {
+    pub components_delta: AHashMap<ChunkCoord, ChunkComponents>,
+    pub edges_delta: AHashMap<ChunkCoord, Vec<ChunkEdge>>,
+    pub unloaded: AHashSet<ChunkCoord>,
+    pub edge_count: usize,
+    pub classify_count: usize,
+    pub edge_chunks: usize,
+    pub elapsed: std::time::Duration,
+}
+
+/// Holds the in-flight rebuild future, if any.
+#[derive(Resource, Default)]
+pub struct GraphRebuildTask(pub Option<Task<RebuildResult>>);
+
+fn cardinal_neighbors(coord: ChunkCoord) -> [ChunkCoord; 4] {
+    [
+        ChunkCoord(coord.0, coord.1 - 1),
+        ChunkCoord(coord.0, coord.1 + 1),
+        ChunkCoord(coord.0 - 1, coord.1),
+        ChunkCoord(coord.0 + 1, coord.1),
+    ]
+}
+
+fn coord_for_tile(tx: i32, ty: i32) -> ChunkCoord {
+    let csz = CHUNK_SIZE as i32;
+    ChunkCoord(tx.div_euclid(csz), ty.div_euclid(csz))
+}
+
+/// Drains all three event readers into the `GraphDirty` accumulator. Only
+/// chunks whose own tile state changed (or that just loaded) go into
+/// `classify`; their cardinal neighbours are derived at task-spawn time.
+pub fn enqueue_graph_dirty_system(
+    mut dirty: ResMut<GraphDirty>,
+    mut tile_changes: EventReader<TileChangedEvent>,
+    mut loads: EventReader<ChunkLoadedEvent>,
+    mut unloads: EventReader<ChunkUnloadedEvent>,
+) {
+    for ev in tile_changes.read() {
+        dirty
+            .classify
+            .insert(coord_for_tile(ev.tx as i32, ev.ty as i32));
+    }
+    for ev in loads.read() {
+        dirty.classify.insert(ev.coord);
+    }
+    for ev in unloads.read() {
+        dirty.unloaded.insert(ev.coord);
+    }
+}
+
+/// Spawns a background rebuild task when there's pending work and no task
+/// already in flight. Builds a snapshot covering two rings around the
+/// classify-dirty set so cardinals (one ring) can have their edges re-emitted
+/// using live IDs, and outer cardinals (two rings) provide tile data for
+/// those edge scans.
+pub fn spawn_rebuild_task_system(
+    chunk_map: Res<ChunkMap>,
+    graph: Res<ChunkGraph>,
+    mut dirty: ResMut<GraphDirty>,
+    mut task: ResMut<GraphRebuildTask>,
+) {
+    if task.0.is_some() {
+        return;
+    }
+    if dirty.classify.is_empty() && dirty.unloaded.is_empty() {
+        return;
     }
 
-    let mut edge_count = 0usize;
+    // Drop classify entries for chunks that have since been unloaded.
+    dirty.classify.retain(|c| chunk_map.0.contains_key(c));
 
-    // Pass 2 — border scan, now component-aware.
-    for (coord, chunk) in &chunk_map.0 {
-        let mut chunk_edges: Vec<ChunkEdge> = Vec::new();
-
-        // Build a map of (lx, ly) → Vec<z> from this chunk's deltas so we
-        // know which underground Z slices to consider for each border tile.
-        let mut deltas_by_xy: AHashMap<(u8, u8), Vec<i8>> = AHashMap::new();
-        for &(lx, ly, z_local) in chunk.deltas.keys() {
-            let z = (z_local as i32 + Z_MIN) as i8;
-            deltas_by_xy.entry((lx, ly)).or_default().push(z);
-        }
-
-        for (ddx, ddy, scan_x, at_max) in &borders {
-            let nb = ChunkCoord(coord.0 + ddx, coord.1 + ddy);
-            let Some(nb_chunk) = chunk_map.0.get(&nb) else {
-                continue;
-            };
-
-            // Gather neighbor's deltas-by-xy on its border too.
-            let mut nb_deltas_by_xy: AHashMap<(u8, u8), Vec<i8>> = AHashMap::new();
-            for &(lx, ly, z_local) in nb_chunk.deltas.keys() {
-                let z = (z_local as i32 + Z_MIN) as i8;
-                nb_deltas_by_xy.entry((lx, ly)).or_default().push(z);
-            }
-
-            let size = CHUNK_SIZE as i32;
-            let edge_idx = if *at_max { size - 1 } else { 0 };
-            // Neighbor's border is the opposite edge
-            let nb_edge_idx = if *at_max { 0 } else { size - 1 };
-
-            for i in 0..size {
-                let (lx, ly) = if *scan_x {
-                    (i, edge_idx)
-                } else {
-                    (edge_idx, i)
-                };
-                let (nb_lx, nb_ly) = if *scan_x {
-                    (i, nb_edge_idx)
-                } else {
-                    (nb_edge_idx, i)
-                };
-
-                let tx = coord.0 * size + lx;
-                let ty = coord.1 * size + ly;
-                let nb_tx = nb.0 * size + nb_lx;
-                let nb_ty = nb.1 * size + nb_ly;
-
-                // Candidate Z slices: this side's surface + carved deltas at
-                // this border tile (and same for neighbor).
-                let surf_z = chunk.surface_z[ly as usize][lx as usize];
-                let mut zs: Vec<i8> = vec![surf_z];
-                if let Some(extra) = deltas_by_xy.get(&(lx as u8, ly as u8)) {
-                    for &z in extra {
-                        if !zs.contains(&z) {
-                            zs.push(z);
-                        }
-                    }
-                }
-                let nb_surf_z = nb_chunk.surface_z[nb_ly as usize][nb_lx as usize];
-                let mut nb_zs: Vec<i8> = vec![nb_surf_z];
-                if let Some(extra) = nb_deltas_by_xy.get(&(nb_lx as u8, nb_ly as u8)) {
-                    for &z in extra {
-                        if !nb_zs.contains(&z) {
-                            nb_zs.push(z);
-                        }
-                    }
-                }
-
-                for &z in &zs {
-                    if !chunk_map.passable_at(tx, ty, z as i32) {
-                        continue;
-                    }
-                    let from_component =
-                        match graph.components.get(coord).and_then(|cc| {
-                            cc.component_at(lx as u8, ly as u8, z)
-                        }) {
-                            Some(cid) => cid,
-                            None => continue,
-                        };
-                    for &nz in &nb_zs {
-                        if (nz as i32 - z as i32).abs() > 1 {
-                            continue;
-                        }
-                        if !chunk_map.passable_at(nb_tx, nb_ty, nz as i32) {
-                            continue;
-                        }
-                        let to_component = match graph.components.get(&nb).and_then(|cc| {
-                            cc.component_at(nb_lx as u8, nb_ly as u8, nz)
-                        }) {
-                            Some(cid) => cid,
-                            None => continue,
-                        };
-                        let entry_kind = chunk_map.tile_at(nb_tx, nb_ty, nz as i32).kind;
-                        let base = tile_step_cost(entry_kind);
-                        let traverse_cost = if base == IMPASSABLE {
-                            IMPASSABLE
-                        } else {
-                            let mut c = base as u32;
-                            if (nz as i32 - z as i32).abs() == 1 {
-                                c = c.saturating_add(8);
-                            }
-                            c.min(IMPASSABLE as u32) as u16
-                        };
-                        chunk_edges.push(ChunkEdge {
-                            neighbor: nb,
-                            exit_local: (lx as u8, ly as u8),
-                            exit_z: z,
-                            entry_local: (nb_lx as u8, nb_ly as u8),
-                            entry_z: nz,
-                            traverse_cost,
-                            from_component,
-                            to_component,
-                        });
-                        edge_count += 1;
-                    }
-                }
+    // Edge-dirty = classify ∪ cardinals_of(classify ∪ unloaded), restricted
+    // to currently-loaded chunks. These need their edges re-emitted so they
+    // reflect the latest IDs of classify-dirty neighbours and drop edges to
+    // unloaded ones.
+    let mut edge_dirty: AHashSet<ChunkCoord> = AHashSet::new();
+    for &c in &dirty.classify {
+        edge_dirty.insert(c);
+        for nb in cardinal_neighbors(c) {
+            if chunk_map.0.contains_key(&nb) {
+                edge_dirty.insert(nb);
             }
         }
-
-        graph.edges.insert(*coord, chunk_edges);
+    }
+    for &c in &dirty.unloaded {
+        for nb in cardinal_neighbors(c) {
+            if chunk_map.0.contains_key(&nb) {
+                edge_dirty.insert(nb);
+            }
+        }
     }
 
+    // Snapshot tile-data set: edge_dirty ∪ cardinals_of(edge_dirty). Edge
+    // scans cross one chunk boundary so we need outer cardinals for tile
+    // reads (passable_at on the far side of the border).
+    let mut snapshot_coords: AHashSet<ChunkCoord> = AHashSet::new();
+    for &c in &edge_dirty {
+        snapshot_coords.insert(c);
+        for nb in cardinal_neighbors(c) {
+            if chunk_map.0.contains_key(&nb) {
+                snapshot_coords.insert(nb);
+            }
+        }
+    }
+
+    let mut snap_map = ChunkMap::default();
+    let mut live_components: AHashMap<ChunkCoord, ChunkComponents> = AHashMap::new();
+    for coord in &snapshot_coords {
+        if let Some(chunk) = chunk_map.0.get(coord) {
+            snap_map.0.insert(*coord, chunk.clone());
+        }
+        // Live components for everything in the snapshot that we won't
+        // re-classify. Edges from edge-dirty chunks reference these IDs.
+        if !dirty.classify.contains(coord) {
+            if let Some(cc) = graph.components.get(coord) {
+                live_components.insert(*coord, cc.clone());
+            }
+        }
+    }
+
+    let snapshot = RebuildSnapshot {
+        chunks: snap_map,
+        classify_dirty: std::mem::take(&mut dirty.classify),
+        edge_dirty,
+        live_components,
+        unloaded: std::mem::take(&mut dirty.unloaded),
+    };
+
+    let pool = AsyncComputeTaskPool::get();
+    task.0 = Some(pool.spawn(async move { rebuild_offthread(snapshot) }));
+}
+
+/// Polls the in-flight task; when ready, merges the result into `ChunkGraph`
+/// and clears the task slot so the next tick can spawn a new one.
+pub fn poll_rebuild_task_system(
+    mut task: ResMut<GraphRebuildTask>,
+    mut graph: ResMut<ChunkGraph>,
+) {
+    let Some(t) = task.0.as_mut() else {
+        return;
+    };
+    let Some(result) = block_on(future::poll_once(t)) else {
+        return; // still running
+    };
+    task.0 = None;
+
+    for coord in &result.unloaded {
+        graph.components.remove(coord);
+        graph.edges.remove(coord);
+    }
+    for (coord, cc) in result.components_delta {
+        graph.components.insert(coord, cc);
+    }
+    for (coord, edges) in result.edges_delta {
+        graph.edges.insert(coord, edges);
+    }
     graph.generation = graph.generation.wrapping_add(1);
 
     info!(
-        "ChunkGraph built: {} edges, {} chunks classified in {:?}",
-        edge_count,
-        graph.components.len(),
-        now.elapsed()
+        "ChunkGraph rebuilt async: classify={} edge_chunks={} edges={} elapsed={:?}",
+        result.classify_count, result.edge_chunks, result.edge_count, result.elapsed,
     );
 }
+
+fn rebuild_offthread(snap: RebuildSnapshot) -> RebuildResult {
+    let now = Instant::now();
+    let chunk_map = &snap.chunks;
+
+    // 1. Classify only chunks whose tile state actually changed. Their IDs
+    // may shift; cardinal neighbours' edge re-emission below picks up the
+    // new IDs.
+    let mut components_delta: AHashMap<ChunkCoord, ChunkComponents> = AHashMap::new();
+    for &coord in &snap.classify_dirty {
+        if let Some(chunk) = chunk_map.0.get(&coord) {
+            components_delta.insert(coord, classify_components(chunk_map, coord, chunk));
+        }
+    }
+
+    // 2. Re-emit edges for the entire edge_dirty set (classify_dirty ∪
+    // cardinals). Self-components come from `components_delta` for
+    // classify_dirty chunks and from `live_components` for cardinals; that
+    // way cardinals' IDs stay stable across the rebuild.
+    let mut edges_delta: AHashMap<ChunkCoord, Vec<ChunkEdge>> = AHashMap::new();
+    let mut edge_count = 0usize;
+
+    for &coord in &snap.edge_dirty {
+        let Some(chunk) = chunk_map.0.get(&coord) else {
+            continue;
+        };
+        let chunk_edges = scan_edges_for_chunk(
+            chunk_map,
+            coord,
+            chunk,
+            &components_delta,
+            &snap.live_components,
+        );
+        edge_count += chunk_edges.len();
+        edges_delta.insert(coord, chunk_edges);
+    }
+
+    let classify_count = components_delta.len();
+    let edge_chunks = edges_delta.len();
+
+    RebuildResult {
+        components_delta,
+        edges_delta,
+        unloaded: snap.unloaded,
+        edge_count,
+        classify_count,
+        edge_chunks,
+        elapsed: now.elapsed(),
+    }
+}
+
+/// Border edge scan for one chunk. `fresh_components` carries the just-
+/// classified entries for `classify_dirty` chunks; `live_components`
+/// carries the live `ChunkGraph` classification for any chunk in the
+/// snapshot that we did NOT re-classify. The combined lookup keeps IDs
+/// consistent: edges into a re-classified chunk use its new IDs, and
+/// edges into an untouched chunk use the live IDs the rest of the graph
+/// already references.
+fn scan_edges_for_chunk(
+    chunk_map: &ChunkMap,
+    coord: ChunkCoord,
+    chunk: &Chunk,
+    fresh_components: &AHashMap<ChunkCoord, ChunkComponents>,
+    live_components: &AHashMap<ChunkCoord, ChunkComponents>,
+) -> Vec<ChunkEdge> {
+    let mut chunk_edges: Vec<ChunkEdge> = Vec::new();
+
+    // Self-components: prefer fresh (we just re-classified this chunk),
+    // fall back to live (this is an edge-only chunk that wasn't re-classified).
+    // Last-resort classify is a defensive fallback for the test/Startup full
+    // rebuild path; in the runtime async path one of the two maps always hits.
+    let self_components = match fresh_components
+        .get(&coord)
+        .or_else(|| live_components.get(&coord))
+    {
+        Some(cc) => cc.clone(),
+        None => classify_components(chunk_map, coord, chunk),
+    };
+
+    // Build a map of (lx, ly) → Vec<z> from this chunk's deltas so we know
+    // which underground Z slices to consider for each border tile.
+    let mut deltas_by_xy: AHashMap<(u8, u8), Vec<i8>> = AHashMap::new();
+    for &(lx, ly, z_local) in chunk.deltas.keys() {
+        let z = (z_local as i32 + Z_MIN) as i8;
+        deltas_by_xy.entry((lx, ly)).or_default().push(z);
+    }
+
+    for (ddx, ddy, scan_x, at_max) in &BORDER_DIRS {
+        let nb = ChunkCoord(coord.0 + ddx, coord.1 + ddy);
+        let Some(nb_chunk) = chunk_map.0.get(&nb) else {
+            continue;
+        };
+        let nb_components = match fresh_components
+            .get(&nb)
+            .or_else(|| live_components.get(&nb))
+        {
+            Some(cc) => cc.clone(),
+            None => classify_components(chunk_map, nb, nb_chunk),
+        };
+
+        let mut nb_deltas_by_xy: AHashMap<(u8, u8), Vec<i8>> = AHashMap::new();
+        for &(lx, ly, z_local) in nb_chunk.deltas.keys() {
+            let z = (z_local as i32 + Z_MIN) as i8;
+            nb_deltas_by_xy.entry((lx, ly)).or_default().push(z);
+        }
+
+        let size = CHUNK_SIZE as i32;
+        let edge_idx = if *at_max { size - 1 } else { 0 };
+        let nb_edge_idx = if *at_max { 0 } else { size - 1 };
+
+        for i in 0..size {
+            let (lx, ly) = if *scan_x {
+                (i, edge_idx)
+            } else {
+                (edge_idx, i)
+            };
+            let (nb_lx, nb_ly) = if *scan_x {
+                (i, nb_edge_idx)
+            } else {
+                (nb_edge_idx, i)
+            };
+
+            let tx = coord.0 * size + lx;
+            let ty = coord.1 * size + ly;
+            let nb_tx = nb.0 * size + nb_lx;
+            let nb_ty = nb.1 * size + nb_ly;
+
+            let surf_z = chunk.surface_z[ly as usize][lx as usize];
+            let mut zs: Vec<i8> = vec![surf_z];
+            if let Some(extra) = deltas_by_xy.get(&(lx as u8, ly as u8)) {
+                for &z in extra {
+                    if !zs.contains(&z) {
+                        zs.push(z);
+                    }
+                }
+            }
+            let nb_surf_z = nb_chunk.surface_z[nb_ly as usize][nb_lx as usize];
+            let mut nb_zs: Vec<i8> = vec![nb_surf_z];
+            if let Some(extra) = nb_deltas_by_xy.get(&(nb_lx as u8, nb_ly as u8)) {
+                for &z in extra {
+                    if !nb_zs.contains(&z) {
+                        nb_zs.push(z);
+                    }
+                }
+            }
+
+            for &z in &zs {
+                if !chunk_map.passable_at(tx, ty, z as i32) {
+                    continue;
+                }
+                let from_component = match self_components.component_at(lx as u8, ly as u8, z) {
+                    Some(cid) => cid,
+                    None => continue,
+                };
+                for &nz in &nb_zs {
+                    if (nz as i32 - z as i32).abs() > 1 {
+                        continue;
+                    }
+                    if !chunk_map.passable_at(nb_tx, nb_ty, nz as i32) {
+                        continue;
+                    }
+                    let to_component =
+                        match nb_components.component_at(nb_lx as u8, nb_ly as u8, nz) {
+                            Some(cid) => cid,
+                            None => continue,
+                        };
+                    let entry_kind = chunk_map.tile_at(nb_tx, nb_ty, nz as i32).kind;
+                    let base = tile_step_cost(entry_kind);
+                    let traverse_cost = if base == IMPASSABLE {
+                        IMPASSABLE
+                    } else {
+                        let mut c = base as u32;
+                        if (nz as i32 - z as i32).abs() == 1 {
+                            c = c.saturating_add(8);
+                        }
+                        c.min(IMPASSABLE as u32) as u16
+                    };
+                    chunk_edges.push(ChunkEdge {
+                        neighbor: nb,
+                        exit_local: (lx as u8, ly as u8),
+                        exit_z: z,
+                        entry_local: (nb_lx as u8, nb_ly as u8),
+                        entry_z: nz,
+                        traverse_cost,
+                        from_component,
+                        to_component,
+                    });
+                }
+            }
+        }
+    }
+
+    chunk_edges
+}
+
+/// Synchronous full-rebuild on the main thread. Used at Startup (after
+/// `terrain::spawn_world_system` populates `ChunkMap`) and by tests that
+/// populate `ChunkMap` directly without going through chunk streaming.
+/// Treats every chunk in `chunk_map` as dirty.
+pub fn rebuild_chunk_graph_sync(chunk_map: &ChunkMap, graph: &mut ChunkGraph) {
+    graph.components.clear();
+    graph.edges.clear();
+
+    let mut components: AHashMap<ChunkCoord, ChunkComponents> = AHashMap::new();
+    for (coord, chunk) in &chunk_map.0 {
+        components.insert(*coord, classify_components(chunk_map, *coord, chunk));
+    }
+    let empty: AHashMap<ChunkCoord, ChunkComponents> = AHashMap::new();
+    for (coord, chunk) in &chunk_map.0 {
+        let edges = scan_edges_for_chunk(chunk_map, *coord, chunk, &components, &empty);
+        graph.edges.insert(*coord, edges);
+    }
+    graph.components = components;
+    graph.generation = graph.generation.wrapping_add(1);
+}
+
+/// Bevy Startup system wrapper for `rebuild_chunk_graph_sync`. Runs after
+/// `terrain::spawn_world_system` so the initial 32×32 spawn area is
+/// classified before any agent queries the graph.
+pub fn startup_initial_build_system(chunk_map: Res<ChunkMap>, mut graph: ResMut<ChunkGraph>) {
+    rebuild_chunk_graph_sync(&chunk_map, &mut graph);
+}
+
 
 #[cfg(test)]
 mod tests {

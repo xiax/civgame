@@ -36,6 +36,7 @@ pub struct ChunkAggregate {
     pub employed_count: u32,
 }
 
+#[derive(Clone)]
 pub struct Chunk {
     /// Sparse overrides from procedurally generated state.
     /// Key: (local_x as u8, local_y as u8, z_local as u8) where z_local = z - Z_MIN.
@@ -163,7 +164,7 @@ impl Chunk {
     }
 }
 
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Clone)]
 pub struct ChunkMap(pub AHashMap<ChunkCoord, Chunk>);
 
 impl ChunkMap {

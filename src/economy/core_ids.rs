@@ -45,6 +45,40 @@ pub fn catalog() -> &'static ResourceCatalog {
     })
 }
 
+/// All catalog ResourceIds with `edible_calories` set, computed once. Drives
+/// every "any food works" path (chief calorie postings via `ClaimKind::AnyEdible`,
+/// `FactionStorage::food_total`, the chief's calorie-unit baseline). Adding a
+/// new edible to `assets/data/resources/*.ron` automatically appears here on
+/// next run — no Rust changes needed.
+pub fn edibles() -> &'static [ResourceId] {
+    static CACHE: OnceLock<Vec<ResourceId>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        catalog()
+            .iter()
+            .filter(|(_, d)| d.edible_calories.is_some())
+            .map(|(id, _)| id)
+            .collect()
+    })
+}
+
+/// Conservative per-unit calorie baseline used by the chief's food-deficit
+/// posting math. Picks the *minimum* edible calorie value in the catalog so
+/// the chief never under-targets — depositing higher-calorie food just finishes
+/// the posting faster. Falls back to 50 when the catalog has no edibles
+/// (defensive; production catalogs always carry at least Fruit/Meat/Grain).
+pub fn min_edible_calories() -> u32 {
+    static CACHE: OnceLock<u32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let cat = catalog();
+        edibles()
+            .iter()
+            .filter_map(|id| cat.get(*id).and_then(|d| d.edible_calories))
+            .map(|c| c as u32)
+            .min()
+            .unwrap_or(50)
+    })
+}
+
 /// Catalog-backed display name for a resource, returned with `'static`
 /// lifetime so UI call sites can pass it directly to `format!` without
 /// owning a `String`. The borrow is sound: `catalog()` returns

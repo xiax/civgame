@@ -1062,18 +1062,11 @@ impl FactionStorage {
     }
 
     pub fn food_total(&self) -> f32 {
-        // Iterate by core_ids so the migration accessors keep working;
-        // a future refactor could read `catalog.with_tag("food")` to
-        // avoid the per-good list, once tag enumeration is hot enough
-        // to matter.
-        let ids = [
-            crate::economy::core_ids::Fruit.get(),
-            crate::economy::core_ids::Meat.get(),
-            crate::economy::core_ids::Grain.get(),
-        ];
-        ids.iter()
-            .filter_map(|opt| opt.copied())
-            .map(|id| self.totals.get(&id).copied().unwrap_or(0) as f32)
+        // Sum every catalog edible — adding a new food to
+        // `assets/data/resources/*.ron` is automatically counted here.
+        crate::economy::core_ids::edibles()
+            .iter()
+            .map(|id| self.totals.get(id).copied().unwrap_or(0) as f32)
             .sum()
     }
     pub fn grain_seed_total(&self) -> u32 {

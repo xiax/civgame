@@ -190,13 +190,22 @@ impl TestSim {
     /// Insert a flat patch of `kind`-tiles at `surface_z` covering
     /// chunks `[(-radius, -radius)..=(radius, radius)]` (inclusive).
     pub fn flat_world(&mut self, radius: i32, surface_z: i8, kind: TileKind) {
-        let mut chunk_map = self.app.world_mut().resource_mut::<ChunkMap>();
-        for cy in -radius..=radius {
-            for cx in -radius..=radius {
-                let chunk = flat_chunk(surface_z, kind);
-                chunk_map.0.insert(ChunkCoord(cx, cy), chunk);
+        {
+            let mut chunk_map = self.app.world_mut().resource_mut::<ChunkMap>();
+            for cy in -radius..=radius {
+                for cx in -radius..=radius {
+                    let chunk = flat_chunk(surface_z, kind);
+                    chunk_map.0.insert(ChunkCoord(cx, cy), chunk);
+                }
             }
         }
+        // Sync rebuild so tests have a populated ChunkGraph before they
+        // call tick(). The runtime path is async, but tests bypass chunk
+        // streaming and don't emit ChunkLoadedEvents.
+        let world = self.app.world_mut();
+        let chunk_map_clone = world.resource::<ChunkMap>().clone();
+        let mut graph = world.resource_mut::<crate::pathfinding::chunk_graph::ChunkGraph>();
+        crate::pathfinding::chunk_graph::rebuild_chunk_graph_sync(&chunk_map_clone, &mut graph);
     }
 
     /// Spawn a `Person` at world tile `(tx, ty)` belonging to `faction_id`.
@@ -4648,7 +4657,9 @@ mod baseline_behaviour {
             });
             entity.insert(ClaimTarget {
                 blueprint: Some(blueprint),
-                resource_id: Some(crate::economy::core_ids::wood()),
+                kind: crate::simulation::jobs::ClaimKind::Specific(
+                    crate::economy::core_ids::wood(),
+                ),
             });
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::Haul;
@@ -5214,7 +5225,9 @@ mod baseline_behaviour {
                 fail_count: 0,
             },
             ClaimTarget {
-                resource_id: Some(crate::economy::core_ids::fruit()),
+                kind: crate::simulation::jobs::ClaimKind::Specific(
+                    crate::economy::core_ids::fruit(),
+                ),
                 blueprint: None,
             },
             AgentGoal::GatherFood,
@@ -5406,7 +5419,7 @@ mod baseline_behaviour {
             });
             entity.insert(ClaimTarget {
                 blueprint: Some(blueprint),
-                resource_id: None,
+                kind: crate::simulation::jobs::ClaimKind::None,
             });
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::Build;
@@ -5789,7 +5802,7 @@ mod baseline_behaviour {
             });
             entity.insert(ClaimTarget {
                 blueprint: None,
-                resource_id: Some(skin_id),
+                kind: crate::simulation::jobs::ClaimKind::Specific(skin_id),
             });
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::Stockpile;
@@ -6833,6 +6846,405 @@ mod baseline_behaviour {
                 other
             ),
         }
+    }
+
+    /// End-to-end: a worker on `AgentGoal::GatherFood` (chief-driven via a
+    /// `JobProgress::Calories` posting, the production path —
+    /// `chief_job_posting_system` posts `Calories` for food) walks to a
+    /// remembered mature `BerryBush`, harvests Fruit, hauls to faction
+    /// storage, and deposits. Pins the full chain handoff:
+    /// `htn_stockpile_food_dispatch_system` → `gather::finish_gather` →
+    /// routed `DepositToFactionStorage` → `drop_items_at_destination_system`
+    /// → storage rollup. `posting_claim_target(JobProgress::Calories)` yields
+    /// `ClaimKind::AnyEdible`, which the `htn_stockpile_food_dispatch_system`
+    /// gate accepts via `ClaimTarget::is_food()`.
+    #[test]
+    fn gather_food_goal_completes_to_storage_deposit() {
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+        };
+        use crate::simulation::memory::MemoryKind;
+        use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+
+        let mut sim = TestSim::new(901);
+        sim.flat_world(4, 0, TileKind::Grass);
+
+        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |_| {});
+
+        let storage_tile = (4, 4);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+
+        let berry_tile = (40, 0);
+        let berry_world = tile_to_world(berry_tile.0, berry_tile.1);
+        let berry_entity = sim
+            .app
+            .world_mut()
+            .spawn((
+                Plant {
+                    kind: PlantKind::BerryBush,
+                    stage: GrowthStage::Mature,
+                    growth_ticks: 0,
+                    tile_pos: berry_tile,
+                },
+                Transform::from_xyz(berry_world.x, berry_world.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<PlantMap>()
+            .0
+            .insert(berry_tile, berry_entity);
+
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        sim.inject_faction_sighting(sim.player_faction_id, berry_tile, MemoryKind::AnyEdible);
+
+        // Production-shape posting: chief posts `JobProgress::Calories` for
+        // food (jobs.rs:985). `posting_goal(Calories)` → `GatherFood` and
+        // `job_goal_lock_system` keeps the goal pinned each tick.
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            let posting = JobPosting {
+                id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Calories {
+                    deposited: 0,
+                    target: 100,
+                },
+                claimants: vec![worker],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            };
+            board
+                .postings
+                .entry(sim.player_faction_id)
+                .or_default()
+                .push(posting);
+            id
+        };
+        sim.app.world_mut().entity_mut(worker).insert(JobClaim {
+            job_id,
+            faction_id: sim.player_faction_id,
+            kind: JobKind::Stockpile,
+            posted_tick: 0,
+            fail_count: 0,
+        });
+
+        let fruit_id = crate::economy::core_ids::fruit();
+        let mut completed = false;
+        for _ in 0..1200 {
+            sim.tick();
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            let stock = registry
+                .factions
+                .get(&sim.player_faction_id)
+                .map(|f| f.storage.stock_of(fruit_id))
+                .unwrap_or(0);
+            if stock >= 1 {
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "expected fruit deposited to faction storage within 1200 ticks via \
+             chief Calories posting → GatherFood → Forage chain"
+        );
+    }
+
+    /// End-to-end: a worker on `AgentGoal::GatherWood` (chief-driven via
+    /// `JobProgress::Stockpile{wood}`) walks to a remembered mature `Tree`,
+    /// harvests Wood, hauls to faction storage, and deposits. Mirror of
+    /// `gather_food_goal_completes_to_storage_deposit` for wood — the
+    /// `posting_goal` mapping for `Stockpile{Wood}` returns `GatherWood`
+    /// and `posting_claim_target` populates `ClaimTarget.resource_id`,
+    /// so `htn_acquire_good_dispatch_system`'s GatherWood branch fires
+    /// without the food-path's `claim_is_food` mismatch.
+    #[test]
+    fn gather_wood_goal_completes_to_storage_deposit() {
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+        };
+        use crate::simulation::memory::MemoryKind;
+        use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+
+        let mut sim = TestSim::new(902);
+        sim.flat_world(4, 0, TileKind::Grass);
+
+        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |_| {});
+
+        let storage_tile = (4, 4);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+
+        // Mature Tree at (40, 0) — `harvest_yield(false)` returns
+        // `(wood, 1)`; harvest_work_ticks for Tree is 0.
+        let tree_tile = (40, 0);
+        let tree_world = tile_to_world(tree_tile.0, tree_tile.1);
+        let tree_entity = sim
+            .app
+            .world_mut()
+            .spawn((
+                Plant {
+                    kind: PlantKind::Tree,
+                    stage: GrowthStage::Mature,
+                    growth_ticks: 0,
+                    tile_pos: tree_tile,
+                },
+                Transform::from_xyz(tree_world.x, tree_world.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<PlantMap>()
+            .0
+            .insert(tree_tile, tree_entity);
+
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        let wood_id = crate::economy::core_ids::wood();
+        sim.inject_faction_sighting(sim.player_faction_id, tree_tile, MemoryKind::wood());
+
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            let posting = JobPosting {
+                id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Stockpile {
+                    resource_id: wood_id,
+                    deposited: 0,
+                    target: 8,
+                },
+                claimants: vec![worker],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            };
+            board
+                .postings
+                .entry(sim.player_faction_id)
+                .or_default()
+                .push(posting);
+            id
+        };
+        sim.app.world_mut().entity_mut(worker).insert(JobClaim {
+            job_id,
+            faction_id: sim.player_faction_id,
+            kind: JobKind::Stockpile,
+            posted_tick: 0,
+            fail_count: 0,
+        });
+
+        let mut completed = false;
+        for _ in 0..1200 {
+            sim.tick();
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            let stock = registry
+                .factions
+                .get(&sim.player_faction_id)
+                .map(|f| f.storage.stock_of(wood_id))
+                .unwrap_or(0);
+            if stock >= 1 {
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "expected wood deposited to faction storage within 1200 ticks via \
+             chief Stockpile{{wood}} posting → GatherWood → Forage chain"
+        );
+    }
+
+    /// End-to-end: a worker on `AgentGoal::GatherStone` (chief-driven via
+    /// `JobProgress::Stockpile{stone}`) scavenges a loose Stone
+    /// `GroundItem` within `VIEW_RADIUS=15` and hauls it to faction
+    /// storage. Stone has no plant kind, so this exercises the Scavenge
+    /// branch of `htn_acquire_good_dispatch_system` instead of Forage —
+    /// `[Task::Scavenge { target }, Task::DepositToFactionStorage { stone }]`.
+    #[test]
+    fn gather_stone_goal_completes_to_storage_deposit() {
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+        };
+
+        let mut sim = TestSim::new(903);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |_| {});
+
+        let storage_tile = (-10, 0);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+
+        let stone_id = crate::economy::core_ids::stone();
+        // Loose Stone GroundItem at (5, 0) — within VIEW_RADIUS=15 of the
+        // worker at (0, 0) and away from the storage tile so the
+        // dispatcher's storage-tile filter doesn't skip it.
+        let _stone_pile = sim.spawn_ground_item((5, 0), stone_id, 3);
+
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Warmup so `sync_indexed_after_move_system` (Sequential) registers
+        // the GroundItem in `SpatialIndex` before the dispatcher's scavenge
+        // scan runs in ParallelB. Without this the first dispatch picks
+        // Explore (utility 0.3) and the worker drifts off across the map.
+        sim.tick_n(2);
+
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            let posting = JobPosting {
+                id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Stockpile {
+                    resource_id: stone_id,
+                    deposited: 0,
+                    target: 3,
+                },
+                claimants: vec![worker],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            };
+            board
+                .postings
+                .entry(sim.player_faction_id)
+                .or_default()
+                .push(posting);
+            id
+        };
+        sim.app.world_mut().entity_mut(worker).insert(JobClaim {
+            job_id,
+            faction_id: sim.player_faction_id,
+            kind: JobKind::Stockpile,
+            posted_tick: 0,
+            fail_count: 0,
+        });
+
+        let mut completed = false;
+        for _ in 0..600 {
+            sim.tick();
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            let stock = registry
+                .factions
+                .get(&sim.player_faction_id)
+                .map(|f| f.storage.stock_of(stone_id))
+                .unwrap_or(0);
+            if stock >= 1 {
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "expected stone deposited to faction storage within 600 ticks via \
+             chief Stockpile{{stone}} posting → GatherStone → Scavenge chain"
+        );
+    }
+
+    /// End-to-end: a hungry worker on autonomous `AgentGoal::Survive`
+    /// (no `JobClaim`) walks to a remembered mature `BerryBush`, harvests,
+    /// then eats — `Needs.hunger` drops below the starting value. Pins
+    /// `htn_acquire_food_dispatch_system` → Forage chain
+    /// `[Gather, Eat]` → `gather_system::finish_gather` priming
+    /// `Task::Eat` → `eat_task_system`. Empty starting inventory keeps
+    /// `EatFromInventoryMethod` from short-circuiting the Gather leg.
+    #[test]
+    fn hungry_agent_forages_then_eats() {
+        use crate::simulation::memory::MemoryKind;
+        use crate::simulation::needs::Needs;
+        use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+
+        let mut sim = TestSim::new(902);
+        sim.flat_world(4, 0, TileKind::Grass);
+
+        // Dummy chief absorbs Lead auto-promotion (same guard as Test A).
+        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |_| {});
+
+        // Mature BerryBush at (40, 0), outside VIEW_RADIUS so the injected
+        // sighting survives the first vision sweep.
+        let berry_tile = (40, 0);
+        let berry_world = tile_to_world(berry_tile.0, berry_tile.1);
+        let berry_entity = sim
+            .app
+            .world_mut()
+            .spawn((
+                Plant {
+                    kind: PlantKind::BerryBush,
+                    stage: GrowthStage::Mature,
+                    growth_ticks: 0,
+                    tile_pos: berry_tile,
+                },
+                Transform::from_xyz(berry_world.x, berry_world.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<PlantMap>()
+            .0
+            .insert(berry_tile, berry_entity);
+
+        // Hungry worker with no inventory food. `goal_update_system`
+        // selects `Survive` from `hunger >= EAT_TRIGGER_HUNGER (180)`;
+        // `htn_acquire_food_dispatch_system`'s `total_edible == 0` gate
+        // forces the Forage chain (no inventory short-circuit via
+        // `EatFromInventoryMethod`).
+        let initial_hunger: f32 = 210.0;
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.hunger(initial_hunger);
+        });
+
+        sim.inject_faction_sighting(sim.player_faction_id, berry_tile, MemoryKind::AnyEdible);
+
+        // Analytic budget: walk (0,0)→(40,0) (~267 ticks) + instant harvest
+        // + ~8-tick Eat + dispatch latency ≈ 285. Cap at 800 for safety.
+        let mut ate = false;
+        for _ in 0..800 {
+            sim.tick();
+            let hunger = sim
+                .app
+                .world()
+                .get::<Needs>(worker)
+                .expect("worker should have Needs")
+                .hunger;
+            if hunger < initial_hunger - 1.0 {
+                ate = true;
+                break;
+            }
+        }
+        assert!(
+            ate,
+            "expected hunger to drop after Survive→[Gather, Eat] chain within 800 ticks"
+        );
     }
 
     /// Phase 5e-xii-a: an agent under `AgentGoal::Play` with a nearby other

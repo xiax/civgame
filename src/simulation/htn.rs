@@ -4028,7 +4028,7 @@ pub fn htn_acquire_good_dispatch_system(
                     AgentGoal::GatherWood => (crate::economy::core_ids::wood(), MemoryKind::wood()),
                     AgentGoal::GatherStone => (crate::economy::core_ids::stone(), MemoryKind::stone()),
                     AgentGoal::Stockpile => {
-                        let Some(rid) = claim_target_opt.and_then(|c| c.resource_id) else {
+                        let Some(rid) = claim_target_opt.and_then(|c| c.resource_id()) else {
                             continue;
                         };
                         (rid, MemoryKind::Resource(rid))
@@ -4304,7 +4304,7 @@ pub fn htn_acquire_good_dispatch_system(
         let Some(target) = claim_target_opt else {
             continue;
         };
-        let (Some(resource_id), Some(blueprint)) = (target.resource_id, target.blueprint) else {
+        let (Some(resource_id), Some(blueprint)) = (target.resource_id(), target.blueprint) else {
             continue;
         };
 
@@ -4591,12 +4591,11 @@ pub fn htn_stockpile_food_dispatch_system(
             if claim.kind != JobKind::Stockpile {
                 return;
             }
-            // Confirm the claim targets an edible — `Stockpile{Wood}` would
-            // route through the AcquireGood gather branch, not here.
-            let claim_is_food = claim_target_opt
-                .and_then(|t| t.resource_id)
-                .map(|rid| rid.is_edible())
-                .unwrap_or(false);
+            // Confirm the claim is food-bearing — either chief `Calories`
+            // postings (`ClaimKind::AnyEdible`) or any `Specific(rid)` where
+            // `rid.is_edible()`. `Stockpile{Wood}` routes through the
+            // AcquireGood gather branch, not here.
+            let claim_is_food = claim_target_opt.map(|t| t.is_food()).unwrap_or(false);
             if !claim_is_food {
                 return;
             }

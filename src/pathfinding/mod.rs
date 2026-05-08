@@ -1,5 +1,5 @@
 use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
-use crate::world::chunk_streaming::{ChunkLoadedEvent, ChunkUnloadedEvent, TileChangedEvent};
+use crate::world::chunk_streaming::TileChangedEvent;
 use crate::world::terrain;
 use bevy::prelude::*;
 
@@ -20,6 +20,8 @@ pub struct PathfindingPlugin;
 impl Plugin for PathfindingPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(chunk_graph::ChunkGraph::default())
+            .insert_resource(chunk_graph::GraphDirty::default())
+            .insert_resource(chunk_graph::GraphRebuildTask::default())
             .insert_resource(connectivity::ChunkConnectivity::default())
             .insert_resource(chunk_router::ChunkRouter::default())
             .insert_resource(hotspots::HotspotFlowFields::default())
@@ -30,25 +32,39 @@ impl Plugin for PathfindingPlugin {
             .insert_resource(worker::PathfindingDiagnostics::default())
             .add_event::<path_request::PathReady>()
             .add_event::<path_request::PathFailed>()
+            // Sync full rebuild fires when ChunkMap first gets populated.
+            // `terrain::spawn_world_system` runs on OnEnter(Playing) (or
+            // Startup in sandbox mode via SandboxPlugin), so we mirror it
+            // there. Connectivity follows immediately so `is_reachable`
+            // queries on tick 1 see a coherent snapshot.
             .add_systems(
-                Startup,
+                OnEnter(crate::GameState::Playing),
                 (
-                    chunk_graph::build_chunk_graph_system.after(terrain::spawn_world_system),
+                    chunk_graph::startup_initial_build_system
+                        .after(terrain::spawn_world_system),
                     connectivity::rebuild_connectivity_system
-                        .after(chunk_graph::build_chunk_graph_system),
+                        .after(chunk_graph::startup_initial_build_system),
                 ),
             )
-            .add_systems(PreUpdate, worker::drain_path_requests_system)
+            .add_systems(
+                PreUpdate,
+                (
+                    chunk_graph::poll_rebuild_task_system,
+                    worker::drain_path_requests_system
+                        .after(chunk_graph::poll_rebuild_task_system),
+                ),
+            )
             .add_systems(
                 PostUpdate,
                 (
                     invalidate_pathing_on_tile_change_system,
-                    chunk_graph::build_chunk_graph_system
-                        .run_if(needs_graph_rebuild)
+                    chunk_graph::enqueue_graph_dirty_system
                         .after(invalidate_pathing_on_tile_change_system),
+                    chunk_graph::spawn_rebuild_task_system
+                        .after(chunk_graph::enqueue_graph_dirty_system),
                     connectivity::rebuild_connectivity_system
-                        .run_if(needs_graph_rebuild)
-                        .after(chunk_graph::build_chunk_graph_system),
+                        .run_if(connectivity_needs_rebuild)
+                        .after(chunk_graph::spawn_rebuild_task_system),
                     hotspots::rebuild_dirty_hotspots_system
                         .after(invalidate_pathing_on_tile_change_system),
                 ),
@@ -56,17 +72,15 @@ impl Plugin for PathfindingPlugin {
     }
 }
 
-/// Run condition for `build_chunk_graph_system` and `rebuild_connectivity_system`.
-/// Fires when terrain mutates (`TileChangedEvent`) OR when chunk streaming
-/// loads/unloads a chunk — the graph and connectivity union-find both depend
-/// on which chunks are currently in `ChunkMap`, so a streaming change has to
-/// trigger the same rebuild path as a dig.
-fn needs_graph_rebuild(
-    tile_changes: EventReader<TileChangedEvent>,
-    loads: EventReader<ChunkLoadedEvent>,
-    unloads: EventReader<ChunkUnloadedEvent>,
+/// Run condition for `rebuild_connectivity_system`. Fires whenever the
+/// graph generation has advanced past connectivity's last snapshot.
+/// Each `poll_rebuild_task_system` merge is atomic, so any post-merge
+/// state is consistent — no need to gate on task / dirty being empty.
+fn connectivity_needs_rebuild(
+    graph: Res<chunk_graph::ChunkGraph>,
+    conn: Res<connectivity::ChunkConnectivity>,
 ) -> bool {
-    !tile_changes.is_empty() || !loads.is_empty() || !unloads.is_empty()
+    graph.generation != conn.generation
 }
 
 /// Drops hotspot flow fields for any chunk touched by a `TileChangedEvent`
