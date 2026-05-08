@@ -439,6 +439,8 @@ impl Plugin for SimulationPlugin {
                         .after(faction::compute_faction_storage_system),
                     faction::bureaucrat_salary_tick_system
                         .after(faction::chief_bureaucrat_appointment_system),
+                    faction::tribute_payment_system
+                        .after(faction::bureaucrat_salary_tick_system),
                     corpse::corpse_decay_system,
                 )
                     .in_set(SimulationSet::Economy),

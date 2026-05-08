@@ -29,8 +29,8 @@ CivGame is a Dwarf Fortress-style civilization simulation built on **Bevy 0.15**
 
 The detailed subsystem rules live next to the code they describe. Claude Code auto-loads these when you read or edit files in those trees:
 
-- `src/simulation/CLAUDE.md` — Agent AI (Goals → HTN → Tasks), method-design rules, faction systems, knowledge & technology, hunting pipeline, typed-task variants, behavioural test fixture, game lifecycle / regions.
-- `src/economy/CLAUDE.md` — Resource catalog, `Good`/`ResourceId` coexistence, recipes, carrying & item routing, equipment.
+- `src/simulation/CLAUDE.md` — Agent AI (Goals → HTN → Tasks), method-design rules, faction systems, knowledge & technology, hunting pipeline, typed-task variants, behavioural test fixture, game lifecycle / regions, **Pluralist Economy** (per-resource policy flags, sub-faction households, settlements, Bureaucrat/Trader professions, P2P currency + escrow, U_bid scoring, tribute, craft contracts).
+- `src/economy/CLAUDE.md` — Resource catalog, `Good`/`ResourceId` coexistence, recipes, carrying & item routing, equipment, per-settlement markets, P2P transfer + escrow primitives, ResourceControlPolicy.
 - `src/world/CLAUDE.md` — World generation, climate, geology & mining.
 - `src/ui/CLAUDE.md` — Right-click menu, inspector, tech panel, activity log, world map, muster.
 

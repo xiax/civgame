@@ -60,6 +60,15 @@ pub enum Profession {
     /// treasury. Posts public-works jobs (R6+). Demotes when the
     /// treasury empty-streak crosses `BUREAUCRAT_QUIT_DAYS`.
     Bureaucrat,
+    /// Pluralist Economy R10: market arbitrageur. Walks between
+    /// settlements with price gaps, buying low and selling high.
+    /// Currency settles via `pay()` against settlement market state.
+    /// R10 ships the profession + buy/sell helpers + a primitives
+    /// validation test; full HTN-autonomous dispatch (the
+    /// `ParticipateInMarket` abstract task + dispatcher with
+    /// `VisitedSettlements` walking) is a follow-on once a Trader
+    /// `AgentGoal` lands or the dispatcher piggybacks on `Haul`.
+    Trader,
 }
 
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]

@@ -8,6 +8,140 @@ use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::settlement::{Settlement, SettlementMap};
 use bevy::prelude::*;
 
+/// Pluralist Economy R10: trader buys `qty` of `resource_id` from
+/// the named settlement's market at the market's current price.
+/// Updates settlement.treasury (credit), agent.currency (debit), and
+/// the settlement market's commodity stock (decrement). Returns the
+/// per-unit price actually paid on success, or None on insufficient
+/// funds / insufficient stock / settlement missing.
+///
+/// Currency invariant: every dollar leaving the agent enters the
+/// settlement treasury — no money is created or destroyed. Stock
+/// invariant: every unit leaving the market lands in the agent's
+/// inventory.
+pub fn trader_buy_at_settlement(
+    world: &mut World,
+    trader: Entity,
+    settlement: Entity,
+    resource_id: crate::economy::resource_catalog::ResourceId,
+    qty: u32,
+) -> Option<f32> {
+    if qty == 0 {
+        return None;
+    }
+    // Read settlement state for the price + stock check.
+    let (price_per_unit, stock_available) = {
+        let s = world
+            .get::<crate::simulation::settlement::Settlement>(settlement)?;
+        (s.market.price_of(resource_id), s.market.stock_of(resource_id))
+    };
+    let total = price_per_unit * qty as f32;
+    if stock_available < qty as f32 {
+        return None;
+    }
+    // Currency check.
+    let agent_currency = world.get::<EconomicAgent>(trader)?.currency;
+    if agent_currency < total {
+        return None;
+    }
+    // Capacity check via add_item dry-run is awkward; we just attempt
+    // the add and roll back the debit if the agent can't carry it.
+    let item = crate::economy::item::Item::new_commodity(resource_id);
+    let leftover = world
+        .get_mut::<EconomicAgent>(trader)?
+        .add_item(item, qty);
+    let acquired = qty - leftover;
+    if acquired == 0 {
+        return None;
+    }
+    // Debit agent currency for the actually-acquired qty.
+    let actual_total = price_per_unit * acquired as f32;
+    {
+        let mut econ = world.get_mut::<EconomicAgent>(trader)?;
+        econ.currency -= actual_total;
+    }
+    // Update settlement: stock down, treasury up, demand up so the
+    // price tick reflects the trade.
+    {
+        let mut s = world
+            .get_mut::<crate::simulation::settlement::Settlement>(settlement)?;
+        s.market.add_demand(resource_id, acquired as f32);
+        // Decrement stock by drawing through `try_buy_item`'s
+        // commodity branch — but we already debited the agent, so we
+        // bypass the helper's currency mutation by manipulating the
+        // sparse map directly through a fresh `add_supply` of the
+        // negative qty would be wrong. Instead, sell-side: we mirror
+        // `try_buy_item`'s commodity-stock side-effect manually.
+        let new_stock = (stock_available - acquired as f32).max(0.0);
+        // SettlementMarket exposes `stock_of` and `add_supply` but
+        // not a direct stock setter; route through `add_supply` with
+        // the negative delta. Add a small public mutator for this.
+        s.market.set_stock(resource_id, new_stock);
+        s.treasury += actual_total;
+    }
+    Some(price_per_unit)
+}
+
+/// Pluralist Economy R10: trader sells `qty` of `resource_id` at the
+/// named settlement's market at the market's current price. Settlement
+/// treasury is debited (or capped at 0 if insufficient — the trader
+/// receives only what the treasury can pay). Returns the per-unit
+/// price actually received on success, or None on missing inventory /
+/// missing settlement.
+pub fn trader_sell_at_settlement(
+    world: &mut World,
+    trader: Entity,
+    settlement: Entity,
+    resource_id: crate::economy::resource_catalog::ResourceId,
+    qty: u32,
+) -> Option<f32> {
+    if qty == 0 {
+        return None;
+    }
+    let agent_qty = world.get::<EconomicAgent>(trader)?.quantity_of_resource(resource_id);
+    if agent_qty < qty {
+        return None;
+    }
+    let price_per_unit = {
+        let s = world
+            .get::<crate::simulation::settlement::Settlement>(settlement)?;
+        s.market.price_of(resource_id)
+    };
+    let asking = price_per_unit * qty as f32;
+    let treasury_available = world
+        .get::<crate::simulation::settlement::Settlement>(settlement)?
+        .treasury;
+    let actual_payout = asking.min(treasury_available);
+    let actual_qty = if asking > 0.0 {
+        ((actual_payout / price_per_unit).floor() as u32).min(qty)
+    } else {
+        0
+    };
+    if actual_qty == 0 {
+        return None;
+    }
+    let actual_total = price_per_unit * actual_qty as f32;
+    // Agent: remove inventory, credit currency.
+    {
+        let mut econ = world.get_mut::<EconomicAgent>(trader)?;
+        econ.remove_resource(resource_id, actual_qty);
+        econ.currency += actual_total;
+    }
+    // Settlement: treasury down, market stock up, supply up.
+    {
+        let mut s = world
+            .get_mut::<crate::simulation::settlement::Settlement>(settlement)?;
+        s.treasury -= actual_total;
+        if s.treasury < 0.0 {
+            s.treasury = 0.0;
+        }
+        let cur_stock = s.market.stock_of(resource_id);
+        s.market.set_stock(resource_id, cur_stock + actual_qty as f32);
+        s.market.add_supply(resource_id, actual_qty as f32);
+    }
+    Some(price_per_unit)
+}
+
 /// Atomic agent-to-agent currency transfer. Returns false if `amount` is
 /// non-positive, `from` has insufficient funds, or either entity lacks
 /// an `EconomicAgent`. On success, currency is debited from `from` and

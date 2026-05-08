@@ -115,6 +115,40 @@ Two additive layers; both ship as inert data with helpers. The systems that *con
 - The workers query gains `&EconomicAgent` for the `wealth_modifier` lookup.
 - R10+ household / bureaucrat / individual posters set `reward > 0.0` so the U_bid branch fires; their postings outscore equidistant chief ones (assuming a non-trivial reward).
 
+## Trader / market arbitrage (Pluralist Economy R10 — validation)
+
+**Validation gate for the architecture's generality.** R10 is the first Phase-8 worked example: an agent moves goods between settlements based on price differentials, with **zero changes to `tasks.rs` / `typed_task.rs` / the `ActionQueue` runtime / any executor**. `git diff --stat` confirms the runtime is unchanged.
+
+- **`Profession::Trader`** (`person.rs`): the only new variant.
+- **`trader_buy_at_settlement(world, trader, settlement, resource_id, qty) -> Option<f32>`** (`economy/transactions.rs`): atomic — debits agent currency, credits settlement treasury, decrements market stock, adds market demand. Returns the per-unit price actually paid on success. Currency invariant holds.
+- **`trader_sell_at_settlement(world, trader, settlement, resource_id, qty) -> Option<f32>`** (`economy/transactions.rs`): symmetric — debits settlement treasury (capped at 0; trader receives only what's available), credits agent currency, increments market stock, adds market supply.
+- **`SettlementMarket::set_stock(id, qty)`** (`economy/market.rs`): direct stock setter used by the buy/sell helpers so they don't double-mutate currency by routing through `try_buy_item` / `sell_item` (those mutate currency too — the trader path manages currency itself).
+- **R10 ships primitives + a primitives-validation test.** Full HTN-autonomous trader dispatch (the `AbstractTask::ParticipateInMarket` + dispatcher walking `VisitedSettlements` for arbitrage decisions) is a follow-on. The autonomous path requires either a new `AgentGoal::PursueProfit` (R6's deferred companion) or piggybacking on `Haul`. R10's gate test (`trader_arbitrage_cycle_converges_settlement_prices`) drives the cycle manually to validate the **primitives** without committing to a specific dispatch shape.
+- **Convergence test:** seeds two settlements with a 50-cloth supply (A) vs 50-cloth demand (B) bias, ticks the price update to materialise a price gap, then runs 5 cycles of buy-at-A → sell-at-B with price updates between each. Asserts the final gap is narrower than the initial gap, and the system-wide currency invariant holds (agent currency + faction treasuries + settlement treasuries + escrow == const) across the full cycle.
+
+## Tribute (Pluralist Economy R11 — validation)
+
+**Second Phase-8 worked example.** A faction designated as `subordinate_to` another transfers `TRIBUTE_PER_DAY` from its treasury to the overlord's treasury once per game-day. Treasury-to-treasury — agent currency is untouched, so the system-wide currency invariant holds trivially. Hard guardrail confirmed: zero diff in `tasks.rs` / `typed_task.rs`.
+
+- **`FactionData.dominance_over: Vec<u32>`** + **`FactionData.subordinate_to: Option<u32>`**: the relationship primitive (no existing layer).
+- **`FactionRegistry::set_dominance(dominant, subordinate)`**: idempotent; maintains both ends of the link.
+- **`tribute_payment_system`** (Economy schedule, after `bureaucrat_salary_tick_system`, runs every `TRIBUTE_CADENCE = TICKS_PER_DAY`): walks every faction with `subordinate_to.is_some()`; transfers `min(TRIBUTE_PER_DAY, subordinate.treasury)` to the overlord's treasury. Destitute subordinates pay 0 — no debt accrual.
+- **R11 ships the relationship + transfer mechanic.** The bureaucrat-driven `JobKind::Tribute` posting (where a hauler physically moves goods between settlements while martial agents escort them) is a follow-on. The R11 gate test validates the treasury-level transfer + invariant; the goods-and-escort layer is mechanical narrative on top of it.
+- **Tests:** `subordinate_faction_pays_tribute_to_dominant_per_day` (asserts ≥ 2 days of tribute over 3 days; invariant holds); `destitute_subordinate_pays_no_tribute` (treasury stays at 0; no debt).
+
+## P2P craft contracts (Pluralist Economy R12 — validation)
+
+**Third Phase-8 worked example.** A wealthy agent posts a paid craft contract; the existing `JobKind::Craft` infrastructure (job board, claim, U_bid scoring from R9) handles everything from there. **Zero new TaskKind / Task / JobKind variants** — the contract is just a `Craft` posting with `poster_class=Individual` + `reward > 0`.
+
+- **`post_craft_contract(world, poster, faction_id, recipe, qty, reward, deadline)`** (`jobs.rs`): atomic — debits poster's currency, pushes a `JobPosting` with the contract terms, spawns a `JobEscrow` sidecar entity. Returns the escrow entity for the caller to track. Refuses on insufficient funds / invalid recipe / qty=0 / non-positive reward.
+- **Lifecycle:** completion = caller zeros `escrow.amount` then despawns (no-op refund). Cancellation/expiry = caller despawns with the original amount intact; the R2 `on_job_escrow_remove` hook refunds the poster automatically. The 25 existing `aq.cancel()` sites remain untouched.
+- **U_bid integration:** posted contracts carry `reward > 0`, so R9's `U_bid = E(R) - C_action - C_opportunity` branch fires for smiths claiming them; chief-posted communal craft jobs still use the legacy `priority + skill + bias - dist` formula. A wealthy poster's contract outscores an equidistant chief Craft posting.
+- **Tests:** `wealthy_agent_posts_craft_contract_and_escrow_lifecycle_holds` (validates the full post→cancel cycle: currency debited at post, refund on despawn, system-wide invariant holds across both); `post_craft_contract_refuses_insufficient_funds` (no state mutation on rejection).
+
+## End of Era III
+
+Phases 0–12 (Pluralist Economy R0–R12) are complete. **324 tests passing, hard guardrail unbroken: `tasks.rs` / `typed_task.rs` / executor framework unchanged from pre-rewrite baseline.** The architecture has been validated against three economic-activity worked examples (Trader / Tribute / Craft contracts) and demonstrated to support pluralist policy combinations without leaking outside `methods/`-equivalent surfaces. Cleanup phase (R13) is now unblocked.
+
 ## Agent AI (Goals → HTN → Tasks)
 
 The legacy plan registry (`plan/`) was deleted in Phase 7. AI dispatch runs end-to-end through HTN; the plan registry, `PlanRegistry`/`StepRegistry`/`PlanDef`/`StepDef`/`PlanFlags`/`StepTarget` types, `KnownPlans`/`ActivePlan`/`PlanHistory`/`PlanScoringMethod` components, `state.rs` (`build_state_vec` + `count_visible_*`), and `plan_execution_system` are all gone. `PersonAI.last_plan_id` is gone; `PathRequest` no longer carries a `plan_id` diagnostic field. The awareness-gossip half of the deleted `plan_gossip_system` survives as `knowledge::awareness_gossip_system`.

@@ -1653,6 +1653,392 @@ mod smoke {
         );
     }
 
+    // ─── Pluralist Economy R12 — P2P craft contracts (Phase 8c) ───
+
+    #[test]
+    fn wealthy_agent_posts_craft_contract_and_escrow_lifecycle_holds() {
+        // R12 worked example: a wealthy agent posts a P2P craft
+        // contract paying a reward. Validates:
+        // - Currency is debited from the poster at post time.
+        // - A JobEscrow sidecar exists with the right amount +
+        //   beneficiary.
+        // - The posting carries `poster_class=Individual` and
+        //   `reward > 0`, so R9's U_bid scorer routes through the
+        //   paid branch when smiths claim it.
+        // - On cancellation (despawning the escrow entity), the
+        //   on_remove hook refunds the poster.
+        // - System-wide currency invariant holds across post and
+        //   cancel.
+        //
+        // Hard guardrail: zero diff in tasks.rs / typed_task.rs.
+        // Zero new TaskKind / Task variant. The contract reuses
+        // the existing JobKind::Craft + JobProgress::Crafting +
+        // JobEscrow primitives.
+        use crate::simulation::jobs::{
+            post_craft_contract, JobBoard, JobEscrow, JobKind, PosterClass,
+        };
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let poster = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        set_currency(&mut sim.app, poster, 100.0);
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        // Recipe id 0 is always valid (Tools).
+        let reward = 25.0;
+        let escrow_entity = post_craft_contract(
+            sim.app.world_mut(),
+            poster,
+            sim.player_faction_id,
+            0,
+            1,
+            reward,
+            None,
+        )
+        .expect("post_craft_contract should succeed for funded agent + valid recipe");
+
+        // Poster's wallet debited.
+        assert_currency(&sim.app, poster, 75.0);
+
+        // Escrow sidecar reflects the right state.
+        let escrow = sim
+            .app
+            .world()
+            .get::<JobEscrow>(escrow_entity)
+            .expect("JobEscrow component missing on sidecar");
+        assert_eq!(escrow.amount, reward);
+        assert_eq!(escrow.beneficiary, poster);
+
+        // Posting landed on the board with the right shape.
+        let board = sim.app.world().resource::<JobBoard>();
+        let posting = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .find(|p| p.kind == JobKind::Craft && p.poster_class == PosterClass::Individual)
+            .expect("contract posting not found on board");
+        assert_eq!(posting.reward, reward);
+        assert!(posting.claimants.is_empty(), "fresh contract has no claimants");
+
+        // Mid-flight invariant: 25 currency in escrow + 75 on poster
+        // = 100 baseline. Total system currency unchanged.
+        let mid = CurrencySnapshot::capture(&mut sim.app);
+        assert!(
+            (mid.total() - baseline.total()).abs() < 1e-3,
+            "invariant must hold mid-flight: baseline={baseline:?}, mid={mid:?}",
+        );
+
+        // Cancel: despawning the escrow triggers the on_remove
+        // refund hook (R2). Poster gets their 25 back.
+        sim.app.world_mut().despawn(escrow_entity);
+
+        assert_currency(&sim.app, poster, 100.0);
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+    }
+
+    #[test]
+    fn post_craft_contract_refuses_insufficient_funds() {
+        // A poor agent can't post a contract they can't fund.
+        use crate::simulation::jobs::post_craft_contract;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let poster = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        set_currency(&mut sim.app, poster, 10.0);
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        let result = post_craft_contract(
+            sim.app.world_mut(),
+            poster,
+            sim.player_faction_id,
+            0,
+            1,
+            50.0,
+            None,
+        );
+        assert!(result.is_none(), "should refuse insufficient funds");
+        assert_currency(&sim.app, poster, 10.0); // unchanged
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+    }
+
+    // ─── Pluralist Economy R11 — Tribute (Phase 8b) ───
+
+    #[test]
+    fn subordinate_faction_pays_tribute_to_dominant_per_day() {
+        // R11 worked example: configure faction A as dominant over
+        // B; seed B's treasury; tick a few game-days; assert B's
+        // treasury was debited and A's treasury credited by
+        // `TRIBUTE_PER_DAY` per cycle. Currency invariant holds
+        // (faction-treasury-to-faction-treasury transfer is
+        // conservative).
+        //
+        // Hard guardrail: this test imports nothing from tasks.rs /
+        // typed_task.rs / executors. The only new surfaces are:
+        // FactionData.dominance_over / subordinate_to (relationship
+        // primitive) + FactionRegistry::set_dominance + the
+        // periodic tribute_payment_system.
+        use crate::simulation::faction::{
+            FactionRegistry, TRIBUTE_PER_DAY,
+        };
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Two factions: A is the player faction (auto-created) and
+        // B is a new one. Set A dominant over B; seed B's treasury.
+        let dominant = sim.player_faction_id;
+        let subordinate = {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let id = registry.create_faction((10, 10));
+            registry.set_dominance(dominant, id);
+            registry.factions.get_mut(&id).unwrap().treasury = 100.0;
+            id
+        };
+
+        // Verify reciprocal relationship recorded.
+        {
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            assert!(
+                registry
+                    .factions
+                    .get(&dominant)
+                    .unwrap()
+                    .dominance_over
+                    .contains(&subordinate)
+            );
+            assert_eq!(
+                registry.factions.get(&subordinate).unwrap().subordinate_to,
+                Some(dominant),
+            );
+        }
+
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        // Tick 3 game-days. tribute_payment_system fires on
+        // `tick % TICKS_PER_DAY == 0`, which is at ticks 0, 3600,
+        // 7200, 10800 — but tick 0 is the bootstrap tick before
+        // anything is set up, and the relationship was just stamped.
+        // To be safe, ensure the system fires multiple times.
+        sim.tick_n((TICKS_PER_DAY * 3) as u32 + 5);
+
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let dom_treasury = registry.factions.get(&dominant).unwrap().treasury;
+        let sub_treasury = registry.factions.get(&subordinate).unwrap().treasury;
+
+        // Subordinate paid at least 2 days of tribute; dominant
+        // received the corresponding amount.
+        assert!(
+            sub_treasury <= 100.0 - 2.0 * TRIBUTE_PER_DAY,
+            "subordinate treasury must have paid at least 2 days: now={sub_treasury}",
+        );
+        assert!(
+            dom_treasury >= 2.0 * TRIBUTE_PER_DAY,
+            "dominant treasury must have received at least 2 days: now={dom_treasury}",
+        );
+
+        // Currency invariant: per-faction transfer is conservative.
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+    }
+
+    #[test]
+    fn destitute_subordinate_pays_no_tribute() {
+        // Edge case: a subordinate with empty treasury pays
+        // nothing — no debt accrual.
+        use crate::simulation::faction::FactionRegistry;
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let dominant = sim.player_faction_id;
+        let subordinate = {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let id = registry.create_faction((10, 10));
+            registry.set_dominance(dominant, id);
+            // Subordinate's treasury stays at 0 (default).
+            id
+        };
+
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+        sim.tick_n((TICKS_PER_DAY * 3) as u32 + 5);
+
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        assert_eq!(
+            registry.factions.get(&subordinate).unwrap().treasury,
+            0.0,
+            "subordinate must not go into debt",
+        );
+        assert_eq!(
+            registry.factions.get(&dominant).unwrap().treasury,
+            0.0,
+            "dominant must not have received money from a destitute subordinate",
+        );
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+    }
+
+    // ─── Pluralist Economy R10 — Trader / market arbitrage (Phase 8a) ───
+
+    #[test]
+    fn trader_arbitrage_cycle_converges_settlement_prices() {
+        // R10 worked example: with two settlements at very
+        // different Cloth prices, a Trader's buy-low/sell-high
+        // cycle moves goods from cheap to expensive and the prices
+        // converge. Validates:
+        // - `Profession::Trader` variant
+        // - `trader_buy_at_settlement` primitive (currency + stock
+        //   move atomically; treasury credited)
+        // - `trader_sell_at_settlement` primitive (treasury debited
+        //   if available; agent currency credited)
+        // - Currency invariant holds across the full cycle (sum of
+        //   agent + faction + settlement treasury + escrow == const)
+        // - `settlement_price_update_system` ratchets prices toward
+        //   equilibrium based on per-settlement supply/demand
+        //
+        // Hard guardrail check: this test imports nothing from
+        // tasks.rs / typed_task.rs / executors. The only new
+        // surfaces touched are: Profession::Trader (one variant) +
+        // trader_buy_at_settlement / trader_sell_at_settlement (two
+        // helpers in transactions.rs).
+        use crate::economy::core_ids;
+        use crate::economy::transactions::{
+            trader_buy_at_settlement, trader_sell_at_settlement,
+        };
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::person::Profession;
+        use crate::simulation::settlement::{Settlement, SettlementMap};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Two factions, two settlements. Spawn the trader as a
+        // member of faction A.
+        let faction_a = sim.player_faction_id;
+        let faction_b = {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.create_faction((10, 10))
+        };
+        let trader = sim.spawn_person(faction_a, (0, 0), |b| {
+            b.profession(Profession::Trader);
+        });
+        // Bootstrap currency so the trader can fund the first buy.
+        set_currency(&mut sim.app, trader, 200.0);
+
+        // Tick a few times so both settlements auto-found.
+        sim.tick_n(3);
+
+        let (settlement_a, settlement_b) = {
+            let map = sim.app.world().resource::<SettlementMap>();
+            let a_id = map.first_for_faction(faction_a).unwrap();
+            let b_id = map.first_for_faction(faction_b).unwrap();
+            (
+                *map.by_id.get(&a_id).unwrap(),
+                *map.by_id.get(&b_id).unwrap(),
+            )
+        };
+
+        let cloth = core_ids::cloth();
+        // Seed initial conditions:
+        //   A: lots of cloth, low price; modest treasury.
+        //   B: no cloth, high price; large treasury (it'll buy at
+        //      premium).
+        {
+            let mut a = sim
+                .app
+                .world_mut()
+                .get_mut::<Settlement>(settlement_a)
+                .unwrap();
+            a.market.set_stock(cloth, 50.0);
+            a.market.add_supply(cloth, 50.0); // bias price down
+            a.treasury = 100.0;
+        }
+        {
+            let mut b = sim
+                .app
+                .world_mut()
+                .get_mut::<Settlement>(settlement_b)
+                .unwrap();
+            b.market.add_demand(cloth, 50.0); // bias price up
+            b.treasury = 1000.0;
+        }
+        // Tick price update so the supply/demand bias materialises
+        // into divergent prices before the trader acts.
+        sim.tick_n(50);
+
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+        let p_a_initial = sim
+            .app
+            .world()
+            .get::<Settlement>(settlement_a)
+            .unwrap()
+            .market
+            .price_of(cloth);
+        let p_b_initial = sim
+            .app
+            .world()
+            .get::<Settlement>(settlement_b)
+            .unwrap()
+            .market
+            .price_of(cloth);
+        assert!(
+            p_a_initial < p_b_initial,
+            "expected initial price gap: a={p_a_initial}, b={p_b_initial}",
+        );
+
+        // Run the arbitrage cycle several times — buy 5 cloth at A,
+        // sell at B, observe prices converge.
+        for _ in 0..5 {
+            let bought = trader_buy_at_settlement(
+                sim.app.world_mut(),
+                trader,
+                settlement_a,
+                cloth,
+                5,
+            );
+            assert!(bought.is_some(), "buy must succeed when stock + funds available");
+
+            let sold = trader_sell_at_settlement(
+                sim.app.world_mut(),
+                trader,
+                settlement_b,
+                cloth,
+                5,
+            );
+            assert!(sold.is_some(), "sell must succeed when treasury funds it");
+
+            // Tick the per-settlement price update so prices
+            // ratchet on each side.
+            sim.tick_n(20);
+        }
+
+        // Convergence check: gap should narrow.
+        let p_a_final = sim
+            .app
+            .world()
+            .get::<Settlement>(settlement_a)
+            .unwrap()
+            .market
+            .price_of(cloth);
+        let p_b_final = sim
+            .app
+            .world()
+            .get::<Settlement>(settlement_b)
+            .unwrap()
+            .market
+            .price_of(cloth);
+        let gap_initial = p_b_initial - p_a_initial;
+        let gap_final = p_b_final - p_a_final;
+        assert!(
+            gap_final < gap_initial,
+            "expected price gap to narrow: initial={gap_initial}, final={gap_final}",
+        );
+
+        // Currency invariant: the trader's buys at A debit agent +
+        // credit A treasury; sells at B credit agent + debit B
+        // treasury. Net: total system currency unchanged.
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+    }
+
     #[test]
     fn wealth_modifier_decays_with_currency() {
         // R9 unit test: wealthy agents apply a smaller multiplier

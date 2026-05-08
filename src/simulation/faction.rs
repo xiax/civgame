@@ -85,6 +85,19 @@ pub const BUREAUCRAT_QUIT_DAYS: u32 = 3;
 /// bureaucrat headcount. Mirrors `HUNTER_ASSIGNMENT_CADENCE`.
 pub const BUREAUCRAT_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
 
+// ── Pluralist Economy R11: Tribute constants ──────────────────────────
+
+/// Per-subordinate-per-day tribute amount transferred from the
+/// subordinate's faction treasury to the overlord's faction treasury.
+/// Anchored at 5.0/day; tune as economy balance lands. The transfer
+/// is capped at the subordinate's available treasury — a destitute
+/// vassal pays nothing rather than going into debt.
+pub const TRIBUTE_PER_DAY: f32 = 5.0;
+
+/// Cadence at which `tribute_payment_system` runs. Once per game-day,
+/// staggered per faction to spread workload.
+pub const TRIBUTE_CADENCE: u64 = TICKS_PER_DAY as u64;
+
 /// A chief-issued hunting directive. Lives on `FactionData::hunt_order` and is
 /// either a concrete `Hunt` (with mustering bookkeeping) or a fallback
 /// `Scout` order to find new game.
@@ -530,6 +543,59 @@ pub fn bureaucrat_salary_tick_system(
                 faction.bureaucrat_treasury_empty_streak = faction
                     .bureaucrat_treasury_empty_streak
                     .saturating_add(BUREAUCRAT_SALARY_INTERVAL as u32);
+            }
+        }
+    }
+}
+
+/// Pluralist Economy R11: per-day tribute payment from each
+/// subordinate faction's treasury to its overlord's treasury.
+/// Treasury-to-treasury transfer; agent currency untouched. The
+/// amount is capped at the subordinate's available treasury (no
+/// debt). Total system currency is conserved.
+pub fn tribute_payment_system(
+    clock: Res<SimClock>,
+    mut registry: ResMut<FactionRegistry>,
+) {
+    if clock.tick % TRIBUTE_CADENCE != 0 {
+        return;
+    }
+
+    // Collect (subordinate, dominant) pairs from `subordinate_to` so
+    // we can mutate both treasuries safely. Snapshot first to avoid
+    // double-borrow during the transfer pass.
+    let pairs: Vec<(u32, u32)> = registry
+        .factions
+        .iter()
+        .filter_map(|(id, data)| data.subordinate_to.map(|d| (*id, d)))
+        .collect();
+
+    for (subordinate, dominant) in pairs {
+        // Decide the transfer amount: min(TRIBUTE_PER_DAY,
+        // subordinate's treasury). Read first.
+        let avail = match registry.factions.get(&subordinate) {
+            Some(s) => s.treasury,
+            None => continue,
+        };
+        if avail <= 0.0 {
+            continue;
+        }
+        let amount = TRIBUTE_PER_DAY.min(avail);
+
+        // Debit subordinate.
+        if let Some(s) = registry.factions.get_mut(&subordinate) {
+            s.treasury -= amount;
+            if s.treasury < 0.0 {
+                s.treasury = 0.0;
+            }
+        }
+        // Credit dominant.
+        if let Some(d) = registry.factions.get_mut(&dominant) {
+            d.treasury += amount;
+        } else {
+            // Overlord vanished; refund subordinate to keep invariant.
+            if let Some(s) = registry.factions.get_mut(&subordinate) {
+                s.treasury += amount;
             }
         }
     }
@@ -1201,6 +1267,16 @@ pub struct FactionData {
     /// `BUREAUCRAT_QUIT_DAYS * TICKS_PER_DAY`, all bureaucrats
     /// demote. Reset to 0 whenever a salary tick succeeds.
     pub bureaucrat_treasury_empty_streak: u32,
+    /// Pluralist Economy R11: faction-relationship primitive for
+    /// tribute. Every entry is the id of a subordinate faction that
+    /// pays tribute to this faction. Maintained in tandem with the
+    /// subordinate's `subordinate_to`.
+    pub dominance_over: Vec<u32>,
+    /// R11: id of this faction's overlord (who receives tribute), or
+    /// None if independent. The relationship is one-to-many:
+    /// dominant→subordinates, but each subordinate has exactly one
+    /// overlord.
+    pub subordinate_to: Option<u32>,
 }
 
 impl FactionData {
@@ -1272,9 +1348,29 @@ impl FactionRegistry {
                 children_factions: Vec::new(),
                 state_funds_public_works: false,
                 bureaucrat_treasury_empty_streak: 0,
+                dominance_over: Vec::new(),
+                subordinate_to: None,
             },
         );
         id
+    }
+
+    /// Pluralist Economy R11: configure `subordinate` as paying
+    /// tribute to `dominant`. Maintains both ends of the
+    /// relationship (overlord's `dominance_over` list + subordinate's
+    /// `subordinate_to` slot). Idempotent on re-call.
+    pub fn set_dominance(&mut self, dominant: u32, subordinate: u32) {
+        if dominant == subordinate {
+            return;
+        }
+        if let Some(d) = self.factions.get_mut(&dominant) {
+            if !d.dominance_over.contains(&subordinate) {
+                d.dominance_over.push(subordinate);
+            }
+        }
+        if let Some(s) = self.factions.get_mut(&subordinate) {
+            s.subordinate_to = Some(dominant);
+        }
     }
 
     /// Pluralist Economy R3: spawn a household sub-faction nested

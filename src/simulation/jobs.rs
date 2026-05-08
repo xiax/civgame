@@ -392,6 +392,102 @@ pub fn total_escrowed_currency(world: &mut World) -> f32 {
     q.iter(world).map(|e| e.amount).sum()
 }
 
+/// Pluralist Economy R12: post a P2P craft contract. The `poster`
+/// (an individual agent with surplus currency, typically Esteem-
+/// driven) commissions a craft job paying `reward` on completion.
+/// On success: poster's currency is debited; a `JobPosting` is
+/// added to the board with `poster_class=Individual`; a sidecar
+/// entity carrying `JobEscrow { amount: reward, beneficiary: poster }`
+/// is spawned. Returns the spawned escrow entity (so the caller can
+/// pair the posting with its escrow for completion / cancellation).
+///
+/// On insufficient funds, missing `EconomicAgent`, or invalid recipe:
+/// returns `None` and does not mutate state.
+///
+/// Lifecycle: when the smith completes the craft, the poster (or
+/// the completion system) clears `escrow.amount = 0.0` then despawns
+/// the escrow — the `on_job_escrow_remove` hook is a no-op. On
+/// cancellation/expiry, despawning the escrow refunds `amount` to
+/// `poster` automatically. All 25 existing `aq.cancel()` sites stay
+/// untouched.
+pub fn post_craft_contract(
+    world: &mut World,
+    poster: Entity,
+    faction_id: u32,
+    recipe: RecipeId,
+    qty: u32,
+    reward: f32,
+    deadline_tick: Option<u32>,
+) -> Option<Entity> {
+    if !(reward > 0.0) || qty == 0 {
+        return None;
+    }
+    if crate::simulation::crafting::craft_recipes()
+        .get(recipe as usize)
+        .is_none()
+    {
+        return None;
+    }
+    // Funds check + atomic debit.
+    let poster_currency = world
+        .get::<crate::economy::agent::EconomicAgent>(poster)?
+        .currency;
+    if poster_currency < reward {
+        return None;
+    }
+    {
+        let mut econ = world
+            .get_mut::<crate::economy::agent::EconomicAgent>(poster)?;
+        econ.currency -= reward;
+    }
+
+    // Allocate posting id + push.
+    let posted_tick = world
+        .get_resource::<SimClock>()
+        .map(|c| c.tick as u32)
+        .unwrap_or(0);
+    let job_id = {
+        let mut board = world.resource_mut::<JobBoard>();
+        let id = board.alloc_id();
+        let progress = JobProgress::Crafting {
+            crafted: 0,
+            target: qty,
+            recipe,
+            // Bench/tech_payload: P2P contracts don't pre-pick a
+            // bench; the smith's claim path resolves a Workbench
+            // within range. tech_payload is None — knowledge
+            // recipes (tablet/book) don't go through this path.
+            bench: None,
+            tech_payload: None,
+        };
+        board.faction_postings_mut(faction_id).push(JobPosting {
+            id,
+            faction_id,
+            kind: JobKind::Craft,
+            progress,
+            claimants: Vec::new(),
+            priority: PLAYER_PRIORITY,
+            source: JobSource::Player,
+            posted_tick,
+            expiry_tick: deadline_tick,
+            poster_class: PosterClass::Individual,
+            reward,
+            settlement_id: None,
+        });
+        id
+    };
+
+    // Spawn the escrow sidecar. The hook handles refund on despawn.
+    let escrow = world
+        .spawn(JobEscrow {
+            amount: reward,
+            beneficiary: poster,
+        })
+        .id();
+    let _ = job_id; // job_id pairing tracked by the caller; not stored on escrow today
+    Some(escrow)
+}
+
 /// Global resource holding all postings, sharded internally by faction.
 #[derive(Resource, Default)]
 pub struct JobBoard {

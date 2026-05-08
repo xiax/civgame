@@ -75,6 +75,19 @@ impl SettlementMarket {
         self.market_stock.get(&id).copied().unwrap_or(0.0)
     }
 
+    /// Pluralist Economy R10: direct stock setter. Used by the
+    /// trader buy/sell helpers so they can update the commodity
+    /// stock without round-tripping through `try_buy_item` /
+    /// `sell_item` (which also mutate currency / listings — the
+    /// trader path needs only the stock side-effect).
+    pub fn set_stock(&mut self, id: ResourceId, qty: f32) {
+        if qty <= 0.0 {
+            self.market_stock.remove(&id);
+        } else {
+            self.market_stock.insert(id, qty);
+        }
+    }
+
     /// Tick prices. Mirrors `Market::update_prices` exactly so the two
     /// can swap places transparently in R7.
     pub fn update_prices(&mut self) {
