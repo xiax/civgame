@@ -10,13 +10,13 @@ use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::simulation::animals::{Horse, Tamed};
 use crate::simulation::items::{GroundItem, TargetItem};
-use crate::simulation::plants::{GrowthStage, Plant, PlantMap};
+use crate::simulation::plants::Plant;
 use crate::simulation::tasks::TaskKind;
 use crate::simulation::technology::{
     BOW_AND_ARROW, BRONZE_WEAPONS, COPPER_TOOLS, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING,
     HORSE_TAMING, HUNTING_SPEAR, LOOM_WEAVING,
 };
-use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
+use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
 use crate::world::seasons::{Calendar, Season};
 use crate::world::terrain::TILE_SIZE;
 use bevy::ecs::system::SystemParam;
@@ -252,9 +252,7 @@ pub fn goal_update_system(
     registry: Res<FactionRegistry>,
     calendar: Res<Calendar>,
     auto_build: Res<AutonomousBuildingToggle>,
-    chunk_map: Res<ChunkMap>,
     storage: StorageReachability,
-    plant_map: Res<PlantMap>,
     plant_query: Query<&Plant>,
     item_query: Query<(), With<GroundItem>>,
     bp_map: Res<BlueprintMap>,
@@ -320,66 +318,57 @@ pub fn goal_update_system(
             continue;
         }
 
-        // 1. Cooldown & Staggered Update Fix
+        // 1. Cooldown & Staggered Update Fix.
+        //
+        // Active agents only re-evaluate every ~10 s (200 ticks at 20 Hz).
+        // The previous 32-tick (1.6 s) cadence interacted badly with the
+        // soft-invalidation block below: any momentary mismatch (entity
+        // briefly missing from a query during LOD/chunk churn, plant
+        // mid-stage transition, blueprint completed by another worker)
+        // would clear `task_id`, causing the HTN dispatcher to install
+        // a fresh `target_tile` next tick. `movement_system` then sees
+        // `pf.goal != goal3` and re-enqueues the path, parking the
+        // agent in `FollowStatus::Pending` — the visible "move one
+        // tile, pause" symptom.
         if ai.task_id != PersonAI::UNEMPLOYED
-            && clock.tick.saturating_sub(ai.last_goal_eval_tick) < 32
+            && clock.tick.saturating_sub(ai.last_goal_eval_tick) < 200
         {
             continue;
         }
         ai.last_goal_eval_tick = clock.tick;
 
-        // 2. Target Validation (for moving agents)
+        // 2. Target Validation — narrow form.
+        //
+        // Only invalidate when the target *entity* has truly despawned.
+        // Stage / kind drift on a still-alive target is not actionable
+        // from here: the executors (`gather::finish_gather`,
+        // `items::finish_scavenge`, `construction::*`) detect arrival-
+        // time failure and feed `MethodOutcome::FailedTarget` into
+        // `MethodHistory` for failure-biased rescoring. Re-checking
+        // here just races those paths and thrashes movement.
         if matches!(ai.state, AiState::Routing | AiState::Seeking) {
-            let mut invalid = false;
             let tid = ai.task_id;
+            let mut invalid = false;
 
             if tid == TaskKind::Gather as u16 {
-                // If targeting a plant, check if it still exists and is mature
                 if let Some(ent) = ai.target_entity {
-                    if let Ok(plant) = plant_query.get(ent) {
-                        if plant.stage != GrowthStage::Mature {
-                            invalid = true;
-                        }
-                    } else {
+                    if plant_query.get(ent).is_err() {
                         invalid = true;
                     }
-                } else {
-                    // Targeting a tile (Stone)
-                    let tx = ai.dest_tile.0 as i32;
-                    let ty = ai.dest_tile.1 as i32;
-                    if !matches!(
-                        chunk_map.tile_kind_at(tx, ty),
-                        Some(crate::world::tile::TileKind::Stone)
-                    ) {
-                        invalid = true;
-                    }
-                }
-            } else if tid == TaskKind::Planter as u16 {
-                let tx = ai.dest_tile.0 as i32;
-                let ty = ai.dest_tile.1 as i32;
-                if plant_map.0.contains_key(&(tx, ty)) {
-                    invalid = true;
                 }
             } else if tid == TaskKind::Scavenge as u16 {
-                if let Some(ent) = ai.target_entity {
-                    if item_query.get(ent).is_err() {
-                        invalid = true;
-                    }
-                } else {
-                    invalid = true;
+                match ai.target_entity {
+                    Some(ent) if item_query.get(ent).is_err() => invalid = true,
+                    None => invalid = true,
+                    _ => {}
                 }
             } else if tid == TaskKind::Construct as u16
                 || tid == TaskKind::ConstructBed as u16
                 || tid == TaskKind::HaulMaterials as u16
             {
-                // Invalidate if the target blueprint entity no longer exists.
                 match ai.target_entity {
-                    Some(ent) if bp_query.get(ent).is_err() => {
-                        invalid = true;
-                    }
-                    None => {
-                        invalid = true;
-                    }
+                    Some(ent) if bp_query.get(ent).is_err() => invalid = true,
+                    None => invalid = true,
                     _ => {}
                 }
             }

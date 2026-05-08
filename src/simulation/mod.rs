@@ -499,8 +499,15 @@ impl Plugin for SimulationPlugin {
                     // `&mut World`. Ordered after household contracts
                     // so trade traffic settles into market state
                     // before the next tick's price update.
+                    //
+                    // Rate-limited to 1 Hz (every 20 ticks at 20 Hz
+                    // fixed update). Arbitrage opportunities don't
+                    // shift within a single tick, and the O(N²) gap
+                    // scan + exclusive-world borrow makes this a
+                    // measurable per-frame cost when run every tick.
                     trader::trader_market_step_system
-                        .after(teaching::self_actualization_teaching_system),
+                        .after(teaching::self_actualization_teaching_system)
+                        .run_if(|clock: Res<schedule::SimClock>| clock.tick % 20 == 0),
                     gather_claims::gather_claim_expiry_system,
                     shared_knowledge::cluster_decay_system,
                     knowledge::cluster_tier_promotion_system

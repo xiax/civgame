@@ -75,3 +75,13 @@ X implement willpower system. Work decreases willpower, fun stuff increases will
 
 
 Need to fix gathering and memory for resources. Can you come up with a better more reliable system?
+
+ /Users/xiao1/.claude/plans/audit-the-htn-system-nested-moonbeam.md
+
+- score_method_with_history (htn.rs:501) = method.utility(task, ctx) - failures * METHOD_FAILURE_PENALTY.
+ - Every Method::utility() impl returns a const tier (UTIL_BASELINE=1.0, UTIL_VISIBLE_GROUND=1.5,
+ UTIL_CLAIMED_HAUL=2.0, UTIL_EXPLORE_FALLBACK=0.3) minus a Chebyshev distance penalty capped at 0.30.
+ - No global weights, no bias vector, no online updates. Several method-utility comments hint at "future
+ ε-greedy" / "future tuning" but none of it exists today.
+ - Memory project_no_nn_scoring.md already calls this out: "scorer is dot(state, weights) + bias" is itself
+ aspirational — the real code has no scorer at all, just const tiers.

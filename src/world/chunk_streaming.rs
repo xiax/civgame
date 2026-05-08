@@ -142,6 +142,23 @@ fn chunk_coord_from_world(x: f32, y: f32) -> ChunkCoord {
 
 const PLANT_HASH_SEED: u32 = 42;
 
+/// Coarse-cell size (in tiles) for resource patch masking. A `patch_hash` lookup
+/// at this granularity decides whether a tile is inside a patch; when it is, the
+/// per-tile hash gates spawn density at a much higher rate. The result: discrete
+/// groves / berry patches / rock fields rather than a uniform carpet.
+const PATCH_CELL_SIZE: i32 = 6;
+const ROCK_PATCH_SEED: u32 = 0xCAFE_F00D;
+const TREE_PATCH_SEED: u32 = 0xB0A7_C0DE;
+const BERRY_PATCH_SEED: u32 = 0x5EED_B41D;
+
+fn patch_hash(gx: i32, gy: i32, cell: i32, seed: u32) -> u32 {
+    let cx = gx.div_euclid(cell);
+    let cy = gy.div_euclid(cell);
+    (cx.wrapping_mul(2_654_435_761_u32 as i32)
+        ^ cy.wrapping_mul(2_246_822_519_u32 as i32)
+        ^ seed as i32) as u32
+}
+
 /// One ColorMaterial per (TileKind, OreKind, z_bucket) tuple.
 /// `OreKind` is `None` (0) for non-ore tiles. `TileKind::Ore` fans out into one
 /// material per non-None OreKind so per-ore colors render distinctly.
@@ -486,7 +503,21 @@ pub fn spawn_chunk_plants(
                 }
                 TileKind::Grass if tile.fertility > 100 => {
                     let pct = h % 100;
-                    if pct < 2 {
+                    let berry_patch = patch_hash(
+                        global_tx,
+                        global_ty,
+                        PATCH_CELL_SIZE,
+                        BERRY_PATCH_SEED,
+                    ) % 100
+                        < 6;
+                    let tree_patch = patch_hash(
+                        global_tx,
+                        global_ty,
+                        PATCH_CELL_SIZE,
+                        TREE_PATCH_SEED,
+                    ) % 100
+                        < 12;
+                    if berry_patch && pct < 40 {
                         spawn_plant_at(
                             commands,
                             plant_map,
@@ -496,7 +527,7 @@ pub fn spawn_chunk_plants(
                             PlantKind::BerryBush,
                             initial_stage(h),
                         );
-                    } else if pct < 7 {
+                    } else if tree_patch && pct < 50 {
                         spawn_plant_at(
                             commands,
                             plant_map,
@@ -550,11 +581,16 @@ pub fn spawn_chunk_loose_rocks(commands: &mut Commands, chunk_map: &ChunkMap, co
             let global_tx = coord.0 * CHUNK_SIZE as i32 + tx as i32;
             let global_ty = coord.1 * CHUNK_SIZE as i32 + ty as i32;
 
+            if patch_hash(global_tx, global_ty, PATCH_CELL_SIZE, ROCK_PATCH_SEED) % 100 >= 30
+            {
+                continue;
+            }
+
             let h = (global_tx.wrapping_mul(2_654_435_761_u32 as i32)
                 ^ global_ty.wrapping_mul(2_246_822_519_u32 as i32)
                 ^ ROCK_HASH_SEED as i32) as u32;
 
-            if h % 100 >= 35 {
+            if h % 100 >= 70 {
                 continue;
             }
 
@@ -861,8 +897,16 @@ pub fn refresh_changed_tiles_system(
 
 /// Update: when CameraViewZ changes, update all TileSprite materials and visibility
 /// to reflect the new viewing depth.
+///
+/// Bevy's `is_changed()` fires on first-tick-after-insert and on any
+/// `set_changed()` write — including same-value writes. The
+/// `Local<Option<i32>>` guard suppresses runs where `view_z` did not
+/// actually move, since this system walks the full loaded-sprite set
+/// (~640K entries at LOAD_RADIUS=12) and any spurious trigger lands
+/// as a visible frame stall.
 pub fn update_tile_z_view_system(
     mut has_run: Local<bool>,
+    mut last_view_z: Local<Option<i32>>,
     camera_view_z: Res<CameraViewZ>,
     chunk_map: Res<ChunkMap>,
     tile_materials: Res<TileMaterials>,
@@ -873,12 +917,13 @@ pub fn update_tile_z_view_system(
     sprite_index: Res<TileSpriteIndex>,
     mut query: Query<(&mut MeshMaterial2d<ColorMaterial>, &mut Visibility), With<TileSprite>>,
 ) {
-    if !camera_view_z.is_changed() {
+    let view_z = camera_view_z.0;
+    if *last_view_z == Some(view_z) {
         return;
     }
+    *last_view_z = Some(view_z);
 
     let now = Instant::now();
-    let view_z = camera_view_z.0;
 
     for (&(tx, ty), &entity) in &sprite_index.by_tile {
         let Ok((mut material, mut vis)) = query.get_mut(entity) else {

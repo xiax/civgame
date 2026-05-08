@@ -456,8 +456,21 @@ fn record_bid_outcome(
     }
 }
 
-pub fn price_update_system(mut market: ResMut<Market>, mode: Res<EconomicMode>) {
+/// Run cadence for both price-update systems. Bid signals accumulate
+/// over the window so trajectory is preserved at 1/PRICE_UPDATE_INTERVAL
+/// the cost. Tick-rate sensitivity isn't a goal here — `update_prices`
+/// nudges by ±5% per call regardless of interval.
+const PRICE_UPDATE_INTERVAL: u64 = 5;
+
+pub fn price_update_system(
+    clock: Res<crate::simulation::schedule::SimClock>,
+    mut market: ResMut<Market>,
+    mode: Res<EconomicMode>,
+) {
     if matches!(*mode, EconomicMode::Command) {
+        return;
+    }
+    if clock.tick % PRICE_UPDATE_INTERVAL != 0 {
         return;
     }
     market.update_prices();
@@ -468,10 +481,14 @@ pub fn price_update_system(mut market: ResMut<Market>, mode: Res<EconomicMode>) 
 /// no synthetic baseline demand. Walks every Settlement, ticks
 /// `update_prices`, clears bid counters.
 pub fn settlement_price_update_system(
+    clock: Res<crate::simulation::schedule::SimClock>,
     mode: Res<EconomicMode>,
     mut settlements: Query<&mut crate::simulation::settlement::Settlement>,
 ) {
     if matches!(*mode, EconomicMode::Command) {
+        return;
+    }
+    if clock.tick % PRICE_UPDATE_INTERVAL != 0 {
         return;
     }
     for mut settlement in settlements.iter_mut() {

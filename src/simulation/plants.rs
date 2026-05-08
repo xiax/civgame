@@ -273,17 +273,22 @@ pub fn spawn_plant_at(
 }
 
 /// Advance plant growth stages based on tile fertility.
+///
+/// Bucketed across a 5-tick window: each plant updates once every 5
+/// ticks (same effective rate as a `tick % 5 == 0` gate), but only
+/// 1/5 of plants run per tick — peak per-frame cost ÷5.
 pub fn plant_growth_system(
     clock: Res<SimClock>,
     calendar: Res<Calendar>,
     chunk_map: Res<ChunkMap>,
     mut query: Query<(Entity, &mut Plant)>,
 ) {
-    if clock.tick % 5 != 0 {
-        return;
-    }
-
-    for (_entity, mut plant) in query.iter_mut() {
+    let bucket = (clock.tick % 5) as u32;
+    for (entity, mut plant) in query.iter_mut() {
+        if entity.index() % 5 != bucket {
+            continue;
+        }
+        // Pre-existing logic; tx assignment moved here intact.
         let tx = plant.tile_pos.0 as i32;
         let ty = plant.tile_pos.1 as i32;
 
@@ -316,7 +321,8 @@ pub fn plant_growth_system(
     }
 }
 
-/// Overripe plants scatter seeds to adjacent tiles, then die.
+/// Overripe plants either reset (Tree → Mature, BerryBush → Harvested — perennial,
+/// no wild reproduction or wood drops) or scatter seeds and die (Grain only).
 pub fn seed_scatter_system(
     mut commands: Commands,
     clock: Res<SimClock>,
@@ -325,46 +331,26 @@ pub fn seed_scatter_system(
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
     mut query: Query<(Entity, &mut Plant)>,
 ) {
-    if clock.tick % 5 != 0 {
-        return;
-    }
+    let bucket = (clock.tick % 5) as u32;
 
     let mut overripe_entities = Vec::new();
     for (entity, mut plant) in query.iter_mut() {
+        if entity.index() % 5 != bucket {
+            continue;
+        }
         if plant.stage == GrowthStage::Overripe {
             let tx = plant.tile_pos.0 as i32;
             let ty = plant.tile_pos.1 as i32;
             let kind = plant.kind;
 
             if kind == PlantKind::Tree || kind == PlantKind::BerryBush {
-                // Perennials: return to a previous stage instead of dying
-                if kind == PlantKind::Tree {
-                    // Trees drop branches and return to Mature
-                    let (dx, dy) = adjacent_offset();
-                    let sx = tx + dx;
-                    let sy = ty + dy;
-                    let pos = tile_to_world(sx, sy);
-                    commands.spawn((
-                        GroundItem {
-                            item: Item::new_commodity(
-                                crate::economy::core_ids::wood(),
-                            ),
-                            qty: 1,
-                        },
-                        Transform::from_xyz(pos.x, pos.y, 0.3),
-                        GlobalTransform::default(),
-                        Visibility::Visible,
-                        InheritedVisibility::default(),
-                        crate::world::spatial::Indexed::new(
-                            crate::world::spatial::IndexedKind::GroundItem,
-                        ),
-                    ));
-
-                    plant.stage = GrowthStage::Mature;
+                // Perennials: return to a previous stage instead of dying.
+                // Wood comes only from chopping; berry bushes do not reproduce in the wild.
+                plant.stage = if kind == PlantKind::Tree {
+                    GrowthStage::Mature
                 } else {
-                    // Berry bushes revert to Harvested (fruit fell off)
-                    plant.stage = GrowthStage::Harvested;
-                }
+                    GrowthStage::Harvested
+                };
                 plant.growth_ticks = 0;
             } else {
                 overripe_entities.push((entity, (tx, ty), kind));
@@ -377,10 +363,10 @@ pub fn seed_scatter_system(
             continue;
         }
 
+        // Only Grain reaches this loop: Tree and BerryBush short-circuit above as perennials.
         let (count, radius): (u8, i32) = match kind {
-            PlantKind::BerryBush => (1, 1),
             PlantKind::Grain => (1, 2),
-            PlantKind::Tree => (0, 0), // Should not reach here
+            _ => (0, 0),
         };
 
         for _ in 0..count {

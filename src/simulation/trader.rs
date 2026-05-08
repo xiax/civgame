@@ -125,44 +125,52 @@ fn pick_arbitrage(
     world: &World,
 ) -> Option<(SettlementId, SettlementId)> {
     let map = world.resource::<SettlementMap>();
-    let mut best: Option<(SettlementId, SettlementId, f32)> = None;
-    for &cheap in visited.iter() {
-        let cheap_entity = match map.by_id.get(&cheap) {
+    // Single pass: snapshot (price, stock, treasury) once per settlement,
+    // then run the O(N²) gap scan over the snapshot. Eliminates redundant
+    // `world.get::<Settlement>()` lookups from the inner loop.
+    struct Snap {
+        id: SettlementId,
+        price: f32,
+        stock: f32,
+        treasury: f32,
+    }
+    let mut snaps: Vec<Snap> = Vec::with_capacity(visited.len());
+    for &id in visited.iter() {
+        let entity = match map.by_id.get(&id) {
             Some(e) => *e,
             None => continue,
         };
-        let cheap_s = match world.get::<Settlement>(cheap_entity) {
+        let s = match world.get::<Settlement>(entity) {
             Some(s) => s,
             None => continue,
         };
-        let p_cheap = cheap_s.market.price_of(resource_id);
-        let stock = cheap_s.market.stock_of(resource_id);
-        if stock < qty as f32 {
+        snaps.push(Snap {
+            id,
+            price: s.market.price_of(resource_id),
+            stock: s.market.stock_of(resource_id),
+            treasury: s.treasury,
+        });
+    }
+
+    let mut best: Option<(SettlementId, SettlementId, f32)> = None;
+    for cheap in &snaps {
+        if cheap.stock < qty as f32 {
             continue;
         }
-        for &expensive in visited.iter() {
-            if expensive == cheap {
+        for expensive in &snaps {
+            if expensive.id == cheap.id {
                 continue;
             }
-            let exp_entity = match map.by_id.get(&expensive) {
-                Some(e) => *e,
-                None => continue,
-            };
-            let exp_s = match world.get::<Settlement>(exp_entity) {
-                Some(s) => s,
-                None => continue,
-            };
-            let p_exp = exp_s.market.price_of(resource_id);
-            let gap = p_exp - p_cheap;
+            let gap = expensive.price - cheap.price;
             if gap < TRADER_MIN_GAP {
                 continue;
             }
-            if exp_s.treasury < p_exp * qty as f32 {
+            if expensive.treasury < expensive.price * qty as f32 {
                 continue;
             }
             match best {
                 Some((_, _, prev_gap)) if prev_gap >= gap => {}
-                _ => best = Some((cheap, expensive, gap)),
+                _ => best = Some((cheap.id, expensive.id, gap)),
             }
         }
     }
