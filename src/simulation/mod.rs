@@ -361,6 +361,7 @@ impl Plugin for SimulationPlugin {
                     faction::compute_faction_storage_system
                         .after(faction::drop_items_at_destination_system),
                     reproduction::pregnancy_system,
+                    reproduction::household_formation_system,
                     animals::animal_reproduction_cooldown_system,
                     animals::animal_reproduction_system
                         .after(animals::animal_reproduction_cooldown_system),

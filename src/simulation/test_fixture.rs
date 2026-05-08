@@ -1653,6 +1653,176 @@ mod smoke {
         );
     }
 
+    // ─── Pluralist Economy R3 follow-on — household formation trigger ───
+
+    #[test]
+    fn cosleep_bond_above_threshold_spawns_household() {
+        // R3 follow-on: drive `CoSleepTracker.bond_strength` past
+        // `HOUSEHOLD_BOND_THRESHOLD` for two pair-bonded agents in
+        // the same village; assert `household_formation_system`
+        // spawns a sub-faction, marks both agents as
+        // `HouseholdMember`, and stamps the capitalist policy on
+        // every catalog resource for the household.
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::reproduction::{
+            CoSleepTracker, HouseholdMember, HOUSEHOLD_BOND_THRESHOLD,
+        };
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let head = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+        let partner = sim.spawn_person(sim.player_faction_id, (5, 6), |_| {});
+
+        // Tick a couple times so spawns settle.
+        sim.tick_n(2);
+
+        // Manually drive the bond_strength past threshold for both
+        // agents (the cosleep_observation_system would do this
+        // organically over a game-week, but headless tests would
+        // need to put both agents into Sleeping AiState which is
+        // outside the harness's quick-setup vocabulary).
+        {
+            let mut head_tracker = sim
+                .app
+                .world_mut()
+                .get_mut::<CoSleepTracker>(head)
+                .expect("CoSleepTracker missing on head");
+            head_tracker.partner = Some(partner);
+            head_tracker.bond_strength = HOUSEHOLD_BOND_THRESHOLD + 1;
+        }
+        {
+            let mut partner_tracker = sim
+                .app
+                .world_mut()
+                .get_mut::<CoSleepTracker>(partner)
+                .expect("CoSleepTracker missing on partner");
+            partner_tracker.partner = Some(head);
+            partner_tracker.bond_strength = HOUSEHOLD_BOND_THRESHOLD + 1;
+        }
+
+        // Tick the household formation system (Economy schedule).
+        sim.tick_n(2);
+
+        // Both parents should now carry HouseholdMember.
+        let head_marker = sim
+            .app
+            .world()
+            .get::<HouseholdMember>(head)
+            .expect("head should have HouseholdMember inserted");
+        let partner_marker = sim
+            .app
+            .world()
+            .get::<HouseholdMember>(partner)
+            .expect("partner should have HouseholdMember inserted");
+        assert_eq!(
+            head_marker.household_id, partner_marker.household_id,
+            "both pair members must be in the same household",
+        );
+
+        // Household exists in the registry with capitalist policy +
+        // village as parent.
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let household = registry
+            .factions
+            .get(&head_marker.household_id)
+            .expect("household FactionData missing");
+        assert_eq!(household.parent_faction, Some(sim.player_faction_id));
+        // System iterates query in arbitrary order; either pair
+        // member could be the head. The other is then a member by
+        // virtue of also having `HouseholdMember` inserted.
+        assert!(
+            household.household_head == Some(head)
+                || household.household_head == Some(partner),
+            "household head should be one of the pair: got {:?}",
+            household.household_head,
+        );
+        let village = registry.factions.get(&sim.player_faction_id).unwrap();
+        assert!(village.children_factions.contains(&head_marker.household_id));
+
+        // Capitalist on a sample resource; village still communist.
+        use crate::economy::core_ids;
+        let h_wood = household.policy_for(core_ids::wood());
+        assert!(h_wood.private_actors_allowed);
+        assert!(!h_wood.chief_allocates_labor);
+        let v_wood = village.policy_for(core_ids::wood());
+        assert!(v_wood.chief_allocates_labor);
+        assert!(!v_wood.private_actors_allowed);
+    }
+
+    #[test]
+    fn cosleep_below_threshold_does_not_spawn_household() {
+        // Negative case: bond_strength below threshold → no
+        // household formation.
+        use crate::simulation::reproduction::{
+            CoSleepTracker, HouseholdMember, HOUSEHOLD_BOND_THRESHOLD,
+        };
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let head = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+        let partner = sim.spawn_person(sim.player_faction_id, (5, 6), |_| {});
+        sim.tick_n(2);
+
+        {
+            let mut t = sim.app.world_mut().get_mut::<CoSleepTracker>(head).unwrap();
+            t.partner = Some(partner);
+            t.bond_strength = HOUSEHOLD_BOND_THRESHOLD / 2;
+        }
+        sim.tick_n(2);
+
+        assert!(
+            sim.app.world().get::<HouseholdMember>(head).is_none(),
+            "below-threshold bond must not form a household",
+        );
+    }
+
+    #[test]
+    fn household_formation_idempotent_across_ticks() {
+        // After formation, ticking many more times must not form a
+        // second household for the same pair (HouseholdMember
+        // marker is the gate).
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::reproduction::{
+            CoSleepTracker, HouseholdMember, HOUSEHOLD_BOND_THRESHOLD,
+        };
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let head = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+        let partner = sim.spawn_person(sim.player_faction_id, (5, 6), |_| {});
+        sim.tick_n(2);
+
+        {
+            let mut t = sim.app.world_mut().get_mut::<CoSleepTracker>(head).unwrap();
+            t.partner = Some(partner);
+            t.bond_strength = HOUSEHOLD_BOND_THRESHOLD + 5;
+        }
+        {
+            let mut t = sim.app.world_mut().get_mut::<CoSleepTracker>(partner).unwrap();
+            t.partner = Some(head);
+            t.bond_strength = HOUSEHOLD_BOND_THRESHOLD + 5;
+        }
+        sim.tick_n(20);
+
+        let households_under_village = {
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            registry
+                .factions
+                .get(&sim.player_faction_id)
+                .unwrap()
+                .children_factions
+                .len()
+        };
+        assert_eq!(
+            households_under_village, 1,
+            "pair must form exactly one household even after many ticks",
+        );
+
+        let head_id = sim.app.world().get::<HouseholdMember>(head).unwrap().household_id;
+        let partner_id = sim.app.world().get::<HouseholdMember>(partner).unwrap().household_id;
+        assert_eq!(head_id, partner_id);
+    }
+
     // ─── Pluralist Economy R12 — P2P craft contracts (Phase 8c) ───
 
     #[test]

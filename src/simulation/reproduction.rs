@@ -102,7 +102,30 @@ pub struct CoSleepTracker {
     /// `wake_up_conception_system`. Initialised to `Idle` so newly-spawned
     /// agents register their first sleep cycle naturally.
     pub prev_state: AiState,
+    /// Pluralist Economy R3 follow-on: cumulative cosleep ticks
+    /// across all sleep cycles with the current partner. Unlike
+    /// `ticks_co_slept` (which resets per partner-switch via
+    /// `wake_up_conception_system`), this counter accumulates as long
+    /// as the partner is the same. Crossing
+    /// `HOUSEHOLD_BOND_THRESHOLD` triggers
+    /// `household_formation_system` to spawn a sub-faction.
+    pub bond_strength: u16,
 }
+
+/// Marker that an agent has founded or joined a household sub-faction.
+/// Prevents `household_formation_system` from re-spawning a sub-faction
+/// for the same pair every tick. Cleared on death (via `Indexed`'s
+/// despawn cascade) but otherwise persistent.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct HouseholdMember {
+    pub household_id: u32,
+}
+
+/// Pluralist Economy R3 follow-on: ticks of cumulative cosleep with
+/// the same partner needed to trigger household formation. Anchored
+/// at one game-week (`TICKS_PER_DAY * 7 = 25200`) — a long enough
+/// signal that the bond is genuinely stable, not just a one-off.
+pub const HOUSEHOLD_BOND_THRESHOLD: u16 = 25200;
 
 /// Refractory period for a male after participating in a conception attempt.
 /// Set to `MALE_ATTEMPT_COOLDOWN_TICKS` at attempt time, decremented each tick.
@@ -184,8 +207,18 @@ pub fn cosleep_observation_system(
         }
 
         if let Some((partner, _)) = closest {
+            // Pluralist Economy R3 follow-on: bond_strength
+            // accumulates across sleep cycles with the same
+            // partner. Reset when the partner changes (different
+            // entity).
+            let same_partner = tracker.partner == Some(partner);
             tracker.partner = Some(partner);
             tracker.ticks_co_slept = tracker.ticks_co_slept.saturating_add(1);
+            if same_partner {
+                tracker.bond_strength = tracker.bond_strength.saturating_add(1);
+            } else {
+                tracker.bond_strength = 1;
+            }
         }
     }
 }
@@ -531,5 +564,93 @@ fn child_name_for(faction_id: u32, sex: BiologicalSex, registry: &FactionRegistr
         base.to_string()
     } else {
         format!("{base} of {root}")
+    }
+}
+
+/// Pluralist Economy R3 follow-on: spawn a household sub-faction
+/// when a stable cosleep bond crosses `HOUSEHOLD_BOND_THRESHOLD`.
+///
+/// Trigger: an agent's `CoSleepTracker.bond_strength` crosses the
+/// threshold AND neither the agent nor their partner is already a
+/// `HouseholdMember`. The agent who crosses first is the household
+/// head; the partner becomes a household member alongside them.
+///
+/// Side-effects:
+/// - Calls `FactionRegistry::spawn_household` (parent = the shared
+///   village faction) — stamps capitalist policy on every catalog
+///   resource for the household.
+/// - Inserts `HouseholdMember { household_id }` on **both** parents
+///   so the system doesn't re-trigger.
+/// - Does **not** modify `FactionMember.faction_id` on either
+///   parent. They remain village members; the household is a
+///   container for private storage / treasury that R6's
+///   household-poster path will consume.
+///
+/// Future extensions: when a child is born to a household pair,
+/// inherit `HouseholdMember` from the mother. (Wired alongside
+/// `pregnancy_system` when the household-poster path lands.)
+pub fn household_formation_system(
+    mut commands: Commands,
+    catalog: Res<crate::economy::resource_catalog::ResourceCatalog>,
+    mut registry: ResMut<crate::simulation::faction::FactionRegistry>,
+    transforms: Query<&Transform>,
+    members: Query<&FactionMember>,
+    households: Query<&HouseholdMember>,
+    candidates: Query<(Entity, &CoSleepTracker, &FactionMember), With<Person>>,
+) {
+    use crate::world::terrain::TILE_SIZE;
+    // Dedupe pairs: when iterating candidates, (a, b) and (b, a)
+    // represent the same household. Track `seen` so we only emit
+    // one spawn intent per pair.
+    let mut spawn_intents: Vec<(Entity, Entity, u32, (i32, i32))> = Vec::new();
+    let mut seen: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    for (entity, tracker, member) in candidates.iter() {
+        if tracker.bond_strength < HOUSEHOLD_BOND_THRESHOLD {
+            continue;
+        }
+        let Some(partner) = tracker.partner else {
+            continue;
+        };
+        if member.faction_id == crate::simulation::faction::SOLO {
+            continue;
+        }
+        // Both must already not be in a household.
+        if households.get(entity).is_ok() || households.get(partner).is_ok() {
+            continue;
+        }
+        // Skip if this pair was already queued this tick.
+        if seen.contains(&entity) || seen.contains(&partner) {
+            continue;
+        }
+        // Both must share a village. The partner must still exist.
+        let Ok(partner_member) = members.get(partner) else {
+            continue;
+        };
+        if partner_member.faction_id != member.faction_id {
+            continue;
+        }
+        // Pick a home tile near the head's current position.
+        let home = match transforms.get(entity) {
+            Ok(t) => (
+                (t.translation.x / TILE_SIZE).floor() as i32,
+                (t.translation.y / TILE_SIZE).floor() as i32,
+            ),
+            Err(_) => continue,
+        };
+        seen.insert(entity);
+        seen.insert(partner);
+        spawn_intents.push((entity, partner, member.faction_id, home));
+    }
+    for (head, partner, village, home) in spawn_intents {
+        let household_id = registry.spawn_household(village, home, head, &catalog);
+        commands
+            .entity(head)
+            .insert(HouseholdMember { household_id });
+        commands
+            .entity(partner)
+            .insert(HouseholdMember { household_id });
+        info!(
+            "Household {household_id} formed from village {village}: head={head:?}, partner={partner:?}",
+        );
     }
 }
