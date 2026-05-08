@@ -318,13 +318,8 @@ pub fn vision_system(
                                 .map(|lc| lc.owner)
                                 .unwrap_or(ResourceOwner::Public);
                             shared.report_sighting(write_tier, (ntx, nty), kind, owner, now);
-                        } else {
-                            shared.report_depleted(write_tier, (ntx, nty), kind);
                         }
                     }
-                } else {
-                    shared.report_depleted(write_tier, (ntx, nty), MemoryKind::AnyEdible);
-                    shared.report_depleted(write_tier, (ntx, nty), MemoryKind::wood());
                 }
 
                 let catalog = core_ids::catalog();

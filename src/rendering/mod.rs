@@ -24,11 +24,13 @@ impl Plugin for RenderingPlugin {
             .insert_resource(path_debug::PathDebugOverlay::default())
             .insert_resource(fog::FogMap::default())
             .insert_resource(fog::FogTileMaterials::default())
+            .insert_resource(pixel_art::AnimalTextures::default())
             .add_systems(
                 Startup,
                 (
                     camera::setup_camera,
                     pixel_art::setup_pixel_art,
+                    pixel_art::setup_animal_textures,
                     sprite_library::setup_sprite_library,
                 ),
             )

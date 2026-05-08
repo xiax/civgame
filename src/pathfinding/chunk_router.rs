@@ -4,43 +4,139 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 use std::sync::Mutex;
 
-use crate::pathfinding::chunk_graph::{ChunkEdge, ChunkGraph};
+use crate::pathfinding::chunk_graph::{ChunkGraph, ComponentId};
 use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
 
-/// Distance from every reachable chunk to a fixed destination chunk,
-/// computed by running Dijkstra outward from the destination over the
-/// (undirected) chunk graph using `ChunkEdge::traverse_cost`. Lookup
-/// during `first_waypoint` is then O(degree) per call.
+/// (chunk, component) — graph nodes are component-typed so the router
+/// cannot collapse a surface band and a disconnected cave into the
+/// same Dijkstra node and produce A→B→A oscillations.
+pub type RouterNode = (ChunkCoord, ComponentId);
+
+/// Distance from every reachable router-node to a fixed destination
+/// node, computed by Dijkstra outward from the destination over the
+/// component-typed chunk graph.
 pub struct ShortestPathTree {
-    pub dist: AHashMap<ChunkCoord, u32>,
+    pub dist: AHashMap<RouterNode, u32>,
+    /// For each reachable node, the next-hop edge toward the goal —
+    /// stored as (next_chunk, next_component, entry_local, entry_z,
+    /// edge_traverse_cost) so callers can reconstruct waypoints
+    /// without re-querying the edge list.
+    pub next_hop: AHashMap<RouterNode, NextHop>,
+}
+
+#[derive(Clone)]
+pub struct NextHop {
+    pub neighbor: ChunkCoord,
+    pub neighbor_component: ComponentId,
+    pub entry_local: (u8, u8),
+    pub entry_z: i8,
+}
+
+#[derive(Clone)]
+pub struct Waypoint {
+    pub neighbor: ChunkCoord,
+    pub neighbor_component: ComponentId,
+    pub entry_x: i32,
+    pub entry_y: i32,
+    pub entry_z: i8,
 }
 
 const ROUTER_CAPACITY: usize = 64;
 
 #[derive(Default)]
 struct RouterState {
-    trees: AHashMap<ChunkCoord, ShortestPathTree>,
+    trees: AHashMap<RouterNode, ShortestPathTree>,
     /// Insertion order, oldest first. Used for FIFO eviction at capacity.
-    order: VecDeque<ChunkCoord>,
+    order: VecDeque<RouterNode>,
     /// Tracks which chunk-graph generation the cached trees are valid for.
     /// Mismatch ⇒ wholesale-drop on next access.
     last_seen_generation: u32,
 }
 
 /// Cached chunk-level Dijkstra. Wrapped in a `Mutex` so it can be accessed
-/// from parallel queries (`par_iter_mut` in `goal_dispatch_system`); the
-/// cache is small and the critical section is short, so contention is
-/// negligible.
+/// from parallel queries. Cache is small and the critical section short,
+/// so contention is negligible.
 #[derive(Resource, Default)]
 pub struct ChunkRouter {
     state: Mutex<RouterState>,
 }
 
 impl ChunkRouter {
-    /// Returns the global tile coord of the entry tile of the next chunk
-    /// the agent should head toward. Z-aware: prefers an edge whose
-    /// `exit_z` matches the agent's `current_z`. None when `cur == dest`
-    /// or when `dest` is unreachable.
+    /// Component-precise route from `start` to `goal`, returned as the
+    /// sequence of chunks the agent will visit (start at index 0, goal
+    /// at the back). `None` when goal is unreachable.
+    ///
+    /// Used by the worker, which knows both endpoints' (lx, ly, z) and
+    /// can derive the precise component on each side.
+    pub fn compute_route(
+        &self,
+        graph: &ChunkGraph,
+        start: RouterNode,
+        goal: RouterNode,
+    ) -> Option<Vec<ChunkCoord>> {
+        if start == goal {
+            return Some(vec![start.0]);
+        }
+        let mut state = lock_state(&self.state, start, goal);
+        maybe_invalidate(&mut state, graph);
+        ensure_tree(&mut state, graph, goal)?;
+        let tree = state.trees.get(&goal)?;
+        if !tree.dist.contains_key(&start) {
+            return None;
+        }
+        // Walk next_hop from start to goal.
+        let mut route: Vec<ChunkCoord> = vec![start.0];
+        let mut cur = start;
+        while cur != goal {
+            let hop = tree.next_hop.get(&cur)?;
+            route.push(hop.neighbor);
+            cur = (hop.neighbor, hop.neighbor_component);
+            // Defensive cap: tree.next_hop forms a strict descent toward
+            // `goal`, so the loop must terminate. The bound is just to
+            // prevent any pathological cycle from hanging the worker.
+            if route.len() > 4096 {
+                return None;
+            }
+        }
+        Some(route)
+    }
+
+    /// Like `compute_route` but returns the first cross-chunk waypoint
+    /// (with full entry coords + neighbour component) instead of the
+    /// chunk-id list. None when start == goal.
+    pub fn first_waypoint_full(
+        &self,
+        graph: &ChunkGraph,
+        start: RouterNode,
+        goal: RouterNode,
+    ) -> Option<Waypoint> {
+        if start == goal {
+            return None;
+        }
+        let mut state = lock_state(&self.state, start, goal);
+        maybe_invalidate(&mut state, graph);
+        ensure_tree(&mut state, graph, goal)?;
+        let tree = state.trees.get(&goal)?;
+        let hop = tree.next_hop.get(&start)?;
+        Some(Waypoint {
+            neighbor: hop.neighbor,
+            neighbor_component: hop.neighbor_component,
+            entry_x: hop.neighbor.0 * CHUNK_SIZE as i32 + hop.entry_local.0 as i32,
+            entry_y: hop.neighbor.1 * CHUNK_SIZE as i32 + hop.entry_local.1 as i32,
+            entry_z: hop.entry_z,
+        })
+    }
+
+    /// Legacy API: returns the global tile coord of the entry tile of
+    /// the next chunk to visit. Resolves component identity by trying
+    /// every component present at `current_z` in `cur` and `dest`,
+    /// picking the cheapest first hop. None when cur == dest, when
+    /// `current_z` doesn't classify into any component, or when no
+    /// route exists.
+    ///
+    /// Used by external callers (HTN, tasks) that don't track component
+    /// ids. The worker uses `compute_route` / `first_waypoint_full`
+    /// directly.
     pub fn first_waypoint(
         &self,
         graph: &ChunkGraph,
@@ -51,69 +147,92 @@ impl ChunkRouter {
         if cur == dest {
             return None;
         }
-        let mut state = match self.state.lock() {
-            Ok(s) => s,
-            Err(poisoned) => {
-                warn!(
-                    "[path] ChunkRouter mutex poisoned (cur={:?} dest={:?}); recovering",
-                    cur, dest
-                );
-                poisoned.into_inner()
-            }
-        };
-        maybe_invalidate(&mut state, graph);
-
-        // Build (or fetch) the tree for `dest`. We don't hold a ref into the
-        // map across the edge scan because `tree_for` may mutate; instead
-        // copy the relevant `dist[neighbor]` values out.
-        if !state.trees.contains_key(&dest) {
-            let tree = match build_tree(graph, dest) {
-                Some(t) => t,
-                None => return None,
-            };
-            while state.trees.len() >= ROUTER_CAPACITY {
-                if let Some(victim) = state.order.pop_front() {
-                    state.trees.remove(&victim);
-                } else {
-                    break;
-                }
-            }
-            state.trees.insert(dest, tree);
-            state.order.push_back(dest);
+        let cur_comps = graph.components_at_z(cur, current_z);
+        if cur_comps.is_empty() {
+            return None;
         }
-        let tree = state.trees.get(&dest)?;
-        if !tree.dist.contains_key(&cur) {
-            debug!(
-                "[path] router: no dist entry for cur={:?} dest={:?} (disconnected component)",
-                cur, dest
-            );
+        let dest_comps = graph.components_at_z(dest, current_z);
+        if dest_comps.is_empty() {
             return None;
         }
 
-        let edges = graph.edges.get(&cur)?;
-        let mut best: Option<&ChunkEdge> = None;
-        let mut best_score: u64 = u64::MAX;
-        for e in edges {
-            let neighbor_dist = match tree.dist.get(&e.neighbor) {
-                Some(&d) => d,
+        let mut best: Option<(u32, Waypoint)> = None;
+        for &dc in &dest_comps {
+            let goal = (dest, dc);
+            let mut state = lock_state(&self.state, (cur, ComponentId(0)), goal);
+            maybe_invalidate(&mut state, graph);
+            if ensure_tree(&mut state, graph, goal).is_none() {
+                continue;
+            }
+            let tree = match state.trees.get(&goal) {
+                Some(t) => t,
                 None => continue,
             };
-            let mut score: u64 = (e.traverse_cost as u64).saturating_add(neighbor_dist as u64);
-            let z_pen = ((e.exit_z as i32 - current_z as i32).abs() as u64) * 32;
-            score = score.saturating_add(z_pen);
-            if score < best_score {
-                best_score = score;
-                best = Some(e);
+            for &cc in &cur_comps {
+                let start = (cur, cc);
+                let Some(&d) = tree.dist.get(&start) else {
+                    continue;
+                };
+                let Some(hop) = tree.next_hop.get(&start) else {
+                    continue;
+                };
+                let wp = Waypoint {
+                    neighbor: hop.neighbor,
+                    neighbor_component: hop.neighbor_component,
+                    entry_x: hop.neighbor.0 * CHUNK_SIZE as i32 + hop.entry_local.0 as i32,
+                    entry_y: hop.neighbor.1 * CHUNK_SIZE as i32 + hop.entry_local.1 as i32,
+                    entry_z: hop.entry_z,
+                };
+                match best {
+                    Some((bd, _)) if bd <= d => {}
+                    _ => best = Some((d, wp)),
+                }
             }
         }
-        let chosen = best?;
-        let gx = chosen.neighbor.0 * CHUNK_SIZE as i32 + chosen.entry_local.0 as i32;
-        let gy = chosen.neighbor.1 * CHUNK_SIZE as i32 + chosen.entry_local.1 as i32;
-        Some((gx as i32, gy as i32))
+        best.map(|(_, wp)| (wp.entry_x, wp.entry_y))
+    }
+
+    /// Reachability test in the component graph: are `start` and `goal`
+    /// in the same connected component? O(degree) using a cached tree.
+    pub fn is_reachable(
+        &self,
+        graph: &ChunkGraph,
+        start: RouterNode,
+        goal: RouterNode,
+    ) -> bool {
+        if start == goal {
+            return true;
+        }
+        let mut state = lock_state(&self.state, start, goal);
+        maybe_invalidate(&mut state, graph);
+        if ensure_tree(&mut state, graph, goal).is_none() {
+            return false;
+        }
+        match state.trees.get(&goal) {
+            Some(tree) => tree.dist.contains_key(&start),
+            None => false,
+        }
     }
 
     pub fn cached_destination_count(&self) -> usize {
         self.state.lock().map(|s| s.trees.len()).unwrap_or(0)
+    }
+}
+
+fn lock_state<'a>(
+    mu: &'a Mutex<RouterState>,
+    cur: RouterNode,
+    dest: RouterNode,
+) -> std::sync::MutexGuard<'a, RouterState> {
+    match mu.lock() {
+        Ok(s) => s,
+        Err(poisoned) => {
+            warn!(
+                "[path] ChunkRouter mutex poisoned (cur={:?} dest={:?}); recovering",
+                cur, dest
+            );
+            poisoned.into_inner()
+        }
     }
 }
 
@@ -125,49 +244,108 @@ fn maybe_invalidate(state: &mut RouterState, graph: &ChunkGraph) {
     }
 }
 
-fn build_tree(graph: &ChunkGraph, dest: ChunkCoord) -> Option<ShortestPathTree> {
-    if !graph.edges.contains_key(&dest) {
+fn ensure_tree(state: &mut RouterState, graph: &ChunkGraph, goal: RouterNode) -> Option<()> {
+    if state.trees.contains_key(&goal) {
+        return Some(());
+    }
+    let tree = build_tree(graph, goal)?;
+    while state.trees.len() >= ROUTER_CAPACITY {
+        if let Some(victim) = state.order.pop_front() {
+            state.trees.remove(&victim);
+        } else {
+            break;
+        }
+    }
+    state.trees.insert(goal, tree);
+    state.order.push_back(goal);
+    Some(())
+}
+
+fn build_tree(graph: &ChunkGraph, goal: RouterNode) -> Option<ShortestPathTree> {
+    if !graph.components.contains_key(&goal.0) {
         return None;
     }
-    let mut dist: AHashMap<ChunkCoord, u32> = AHashMap::new();
-    // ChunkCoord doesn't impl Ord, so we put the coord components inline
-    // in the heap key — Dijkstra only needs the distance for ordering.
-    let mut heap: BinaryHeap<Reverse<(u32, i32, i32)>> = BinaryHeap::new();
-    dist.insert(dest, 0);
-    heap.push(Reverse((0, dest.0, dest.1)));
+    let mut dist: AHashMap<RouterNode, u32> = AHashMap::new();
+    let mut next_hop: AHashMap<RouterNode, NextHop> = AHashMap::new();
+    // ChunkCoord doesn't impl Ord, so we put the coord/component inline
+    // in the heap key.
+    let mut heap: BinaryHeap<Reverse<(u32, i32, i32, u8)>> = BinaryHeap::new();
+    dist.insert(goal, 0);
+    heap.push(Reverse((0, goal.0 .0, goal.0 .1, goal.1 .0)));
 
-    while let Some(Reverse((cur_d, cx, cy))) = heap.pop() {
-        let cur = ChunkCoord(cx, cy);
+    while let Some(Reverse((cur_d, cx, cy, cc))) = heap.pop() {
+        let cur: RouterNode = (ChunkCoord(cx, cy), ComponentId(cc));
         let known = *dist.get(&cur).unwrap_or(&u32::MAX);
         if cur_d > known {
             continue;
         }
-        let edges = match graph.edges.get(&cur) {
+        // Walk edges leaving this chunk; we relax edges that *arrive* at
+        // (cur). Since the graph is symmetric (every A→B has a paired
+        // B→A produced by the build's per-chunk border scan), an edge
+        // `(neighbor → cur)` lives in `graph.edges[neighbor]` with
+        // `to_component = cur.1`. For Dijkstra we want the predecessor
+        // distance, so iterate neighbours' edges that target `cur` —
+        // that's expensive. Easier: the symmetric paired edge in
+        // `graph.edges[cur.0]` has `from_component = cur.1` and
+        // points to (neighbor, neighbor_component) — the same back-edge.
+        let edges = match graph.edges.get(&cur.0) {
             Some(e) => e,
             None => continue,
         };
         for e in edges {
-            // Graphs are symmetric (every A→B edge has a paired B→A); we
-            // approximate the reverse traversal cost using the forward
-            // edge's traverse_cost.
+            if e.from_component != cur.1 {
+                continue;
+            }
+            let neighbor: RouterNode = (e.neighbor, e.to_component);
             let new_d = cur_d.saturating_add(e.traverse_cost as u32);
-            let prev = *dist.get(&e.neighbor).unwrap_or(&u32::MAX);
+            let prev = *dist.get(&neighbor).unwrap_or(&u32::MAX);
             if new_d < prev {
-                dist.insert(e.neighbor, new_d);
-                heap.push(Reverse((new_d, e.neighbor.0, e.neighbor.1)));
+                dist.insert(neighbor, new_d);
+                // The next-hop FROM `neighbor` toward `goal` is the
+                // paired reverse edge: it crosses from `neighbor` chunk
+                // back into `cur.0`, entering cur's chunk at the tile
+                // recorded as `e.exit_local`/`e.exit_z` (that's where the
+                // forward edge departed, so the reverse edge arrives there).
+                next_hop.insert(
+                    neighbor,
+                    NextHop {
+                        neighbor: cur.0,
+                        neighbor_component: cur.1,
+                        entry_local: e.exit_local,
+                        entry_z: e.exit_z,
+                    },
+                );
+                heap.push(Reverse((new_d, e.neighbor.0, e.neighbor.1, e.to_component.0)));
             }
         }
     }
 
-    Some(ShortestPathTree { dist })
+    Some(ShortestPathTree { dist, next_hop })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pathfinding::chunk_graph::ChunkEdge;
+    use crate::pathfinding::chunk_graph::{ChunkComponents, ChunkEdge, ChunkGraph};
 
-    fn edge(neighbor: ChunkCoord, exit_z: i8, entry_z: i8, exit_local: (u8, u8)) -> ChunkEdge {
+    fn comp_one(coord: ChunkCoord, count: u8) -> ChunkComponents {
+        let mut at = AHashMap::new();
+        // Just put a single sentinel cell at (0,0,0) — tests use compute_route
+        // which doesn't read individual cells, only the edge list.
+        for c in 0..count {
+            at.insert((c, 0, 0), ComponentId(c));
+        }
+        ChunkComponents { at, count }
+    }
+
+    fn edge(
+        neighbor: ChunkCoord,
+        exit_z: i8,
+        entry_z: i8,
+        exit_local: (u8, u8),
+        from_c: u8,
+        to_c: u8,
+    ) -> ChunkEdge {
         ChunkEdge {
             neighbor,
             exit_local,
@@ -175,92 +353,114 @@ mod tests {
             entry_local: (0, exit_local.1),
             entry_z,
             traverse_cost: 100,
+            from_component: ComponentId(from_c),
+            to_component: ComponentId(to_c),
         }
     }
 
     #[test]
-    fn first_waypoint_prefers_same_z_edge() {
+    fn compute_route_through_one_intermediate() {
         let mut graph = ChunkGraph::default();
+        graph.components.insert(ChunkCoord(0, 0), comp_one(ChunkCoord(0, 0), 1));
+        graph.components.insert(ChunkCoord(1, 0), comp_one(ChunkCoord(1, 0), 1));
+        graph.components.insert(ChunkCoord(2, 0), comp_one(ChunkCoord(2, 0), 1));
+        graph
+            .edges
+            .insert(ChunkCoord(0, 0), vec![edge(ChunkCoord(1, 0), 0, 0, (31, 5), 0, 0)]);
         graph.edges.insert(
-            ChunkCoord(0, 0),
+            ChunkCoord(1, 0),
             vec![
-                edge(ChunkCoord(1, 0), 0, 0, (31, 5)),
-                edge(ChunkCoord(1, 0), -3, -3, (31, 6)),
+                edge(ChunkCoord(0, 0), 0, 0, (0, 5), 0, 0),
+                edge(ChunkCoord(2, 0), 0, 0, (31, 5), 0, 0),
             ],
         );
         graph
             .edges
-            .insert(ChunkCoord(1, 0), vec![edge(ChunkCoord(0, 0), 0, 0, (0, 5))]);
+            .insert(ChunkCoord(2, 0), vec![edge(ChunkCoord(1, 0), 0, 0, (0, 5), 0, 0)]);
         graph.generation = 1;
 
         let router = ChunkRouter::default();
-        let wp = router
-            .first_waypoint(&graph, ChunkCoord(0, 0), ChunkCoord(1, 0), -3)
-            .unwrap();
-        assert_eq!(wp.1, 6);
+        let route = router
+            .compute_route(
+                &graph,
+                (ChunkCoord(0, 0), ComponentId(0)),
+                (ChunkCoord(2, 0), ComponentId(0)),
+            )
+            .expect("route exists");
+        assert_eq!(
+            route,
+            vec![ChunkCoord(0, 0), ChunkCoord(1, 0), ChunkCoord(2, 0)]
+        );
     }
 
     #[test]
-    fn first_waypoint_returns_none_for_unreachable() {
+    fn unreachable_components_within_chunk_dont_oscillate() {
+        // Chunk B has two components: surface (0) and cave (1). Edge from
+        // A surface (0) goes to B surface (0). Edge from A cave (1) goes
+        // to B cave (1). Trying to route from A surface to B cave must
+        // return None (not bounce A→B→A).
         let mut graph = ChunkGraph::default();
-        graph.edges.insert(ChunkCoord(0, 0), vec![]);
-        graph.edges.insert(ChunkCoord(5, 5), vec![]);
+        graph.components.insert(ChunkCoord(0, 0), comp_one(ChunkCoord(0, 0), 2));
+        graph.components.insert(ChunkCoord(1, 0), comp_one(ChunkCoord(1, 0), 2));
+        graph.edges.insert(
+            ChunkCoord(0, 0),
+            vec![
+                edge(ChunkCoord(1, 0), 0, 0, (31, 5), 0, 0),
+                edge(ChunkCoord(1, 0), -5, -5, (31, 6), 1, 1),
+            ],
+        );
+        graph.edges.insert(
+            ChunkCoord(1, 0),
+            vec![
+                edge(ChunkCoord(0, 0), 0, 0, (0, 5), 0, 0),
+                edge(ChunkCoord(0, 0), -5, -5, (0, 6), 1, 1),
+            ],
+        );
         graph.generation = 1;
 
         let router = ChunkRouter::default();
-        assert!(router
-            .first_waypoint(&graph, ChunkCoord(0, 0), ChunkCoord(5, 5), 0)
-            .is_none());
+        let route = router.compute_route(
+            &graph,
+            (ChunkCoord(0, 0), ComponentId(0)), // A surface
+            (ChunkCoord(1, 0), ComponentId(1)), // B cave
+        );
+        assert!(
+            route.is_none(),
+            "surface and cave components must not connect through a 2D chunk node"
+        );
     }
 
     #[test]
     fn router_caches_then_invalidates_on_generation_bump() {
         let mut graph = ChunkGraph::default();
-        graph.edges.insert(
-            ChunkCoord(0, 0),
-            vec![edge(ChunkCoord(1, 0), 0, 0, (31, 5))],
-        );
+        graph.components.insert(ChunkCoord(0, 0), comp_one(ChunkCoord(0, 0), 1));
+        graph.components.insert(ChunkCoord(1, 0), comp_one(ChunkCoord(1, 0), 1));
         graph
             .edges
-            .insert(ChunkCoord(1, 0), vec![edge(ChunkCoord(0, 0), 0, 0, (0, 5))]);
+            .insert(ChunkCoord(0, 0), vec![edge(ChunkCoord(1, 0), 0, 0, (31, 5), 0, 0)]);
+        graph
+            .edges
+            .insert(ChunkCoord(1, 0), vec![edge(ChunkCoord(0, 0), 0, 0, (0, 5), 0, 0)]);
         graph.generation = 1;
 
         let router = ChunkRouter::default();
         router
-            .first_waypoint(&graph, ChunkCoord(0, 0), ChunkCoord(1, 0), 0)
+            .compute_route(
+                &graph,
+                (ChunkCoord(0, 0), ComponentId(0)),
+                (ChunkCoord(1, 0), ComponentId(0)),
+            )
             .unwrap();
         assert_eq!(router.cached_destination_count(), 1);
 
         graph.generation = 2;
         router
-            .first_waypoint(&graph, ChunkCoord(0, 0), ChunkCoord(1, 0), 0)
+            .compute_route(
+                &graph,
+                (ChunkCoord(0, 0), ComponentId(0)),
+                (ChunkCoord(1, 0), ComponentId(0)),
+            )
             .unwrap();
         assert_eq!(router.cached_destination_count(), 1);
-    }
-
-    #[test]
-    fn router_picks_shortest_route_through_intermediate_chunk() {
-        let mut graph = ChunkGraph::default();
-        graph.edges.insert(
-            ChunkCoord(0, 0),
-            vec![edge(ChunkCoord(1, 0), 0, 0, (31, 5))],
-        );
-        graph.edges.insert(
-            ChunkCoord(1, 0),
-            vec![
-                edge(ChunkCoord(0, 0), 0, 0, (0, 5)),
-                edge(ChunkCoord(2, 0), 0, 0, (31, 5)),
-            ],
-        );
-        graph
-            .edges
-            .insert(ChunkCoord(2, 0), vec![edge(ChunkCoord(1, 0), 0, 0, (0, 5))]);
-        graph.generation = 1;
-
-        let router = ChunkRouter::default();
-        let wp = router
-            .first_waypoint(&graph, ChunkCoord(0, 0), ChunkCoord(2, 0), 0)
-            .unwrap();
-        assert_eq!(wp.0, CHUNK_SIZE as i32);
     }
 }

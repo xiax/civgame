@@ -377,6 +377,54 @@ impl MethodId {
     pub fn raw(self) -> u16 {
         self.0
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::SLEEP => "Sleep",
+            Self::EAT_FROM_INVENTORY => "EatFromInventory",
+            Self::WITHDRAW_FROM_STORAGE => "WithdrawFromStorage",
+            Self::SCAVENGE_FOOD_FROM_GROUND => "ScavengeFoodFromGround",
+            Self::EXPLORE_FOR_FOOD => "ExploreForFood",
+            Self::WITHDRAW_MATERIAL_FROM_STORAGE => "WithdrawMaterialFromStorage",
+            Self::WITHDRAW_AND_HAUL_TO_BLUEPRINT => "WithdrawAndHaulToBlueprint",
+            Self::GATHER_FROM_KNOWN => "GatherFromKnown",
+            Self::SCAVENGE_FROM_GROUND => "ScavengeFromGround",
+            Self::EXPLORE_FOR_MATERIAL => "ExploreForMaterial",
+            Self::SCAVENGE_FOOD_FOR_STORAGE => "ScavengeFoodForStorage",
+            Self::EXPLORE_FOR_FOOD_FOR_STORAGE => "ExploreForFoodForStorage",
+            Self::FORAGE_FROM_KNOWN => "ForageFromKnown",
+            Self::FORAGE_FROM_KNOWN_FOR_STORAGE => "ForageFromKnownForStorage",
+            Self::SCOUT_FOR_PREY => "ScoutForPrey",
+            Self::WITHDRAW_AND_EQUIP_HUNTING_SPEAR => "WithdrawAndEquipHuntingSpear",
+            Self::DEPOSIT_SURPLUS_AT_STORAGE => "DepositSurplusAtStorage",
+            Self::TAME_WILD_HORSE => "TameWildHorse",
+            Self::WITHDRAW_AND_PLANT_SEED => "WithdrawAndPlantSeed",
+            Self::BUILD_CLAIMED_BLUEPRINT => "BuildClaimedBlueprint",
+            Self::DELIVER_HUNT_KILL => "DeliverHuntKill",
+            Self::HUNT_PREY => "HuntPrey",
+            Self::PICK_UP_FRESH_CORPSE => "PickUpFreshCorpse",
+            Self::MUSTER_AT_HEARTH => "MusterAtHearth",
+            Self::TRAVEL_TO_HUNT_AREA => "TravelToHuntArea",
+            Self::SOCIALIZE_WITH_PARTNER => "SocializeWithPartner",
+            Self::RAID_ENEMY_HOME => "RaidEnemyHome",
+            Self::DEFEND_CAMP => "DefendCamp",
+            Self::LEAD_CAMP => "LeadCamp",
+            Self::ENGAGE_RESCUE_ATTACKER => "EngageRescueAttacker",
+            Self::WITHDRAW_AND_HAUL_TO_CRAFT_ORDER => "WithdrawAndHaulToCraftOrder",
+            Self::WORK_ON_SATISFIED_CRAFT_ORDER => "WorkOnSatisfiedCraftOrder",
+            Self::HARVEST_AND_HAUL_GRAIN_TO_CRAFT_ORDER => "HarvestAndHaulGrainToCraftOrder",
+            Self::PLAY_WITH_PARTNER => "PlayWithPartner",
+            Self::PLAY_SOLO_WITH_ITEM => "PlaySoloWithItem",
+            Self::WITHDRAW_AND_THROW_STONES_AS_PLAY => "WithdrawAndThrowStonesAsPlay",
+            Self::WITHDRAW_AND_PLAY_WITH_TOY => "WithdrawAndPlayWithToy",
+            Self::WITHDRAW_AND_PLANT_GRAIN_SEED_AS_PLAY => "WithdrawAndPlantGrainSeedAsPlay",
+            Self::WITHDRAW_AND_PLANT_BERRY_SEED_AS_PLAY => "WithdrawAndPlantBerrySeedAsPlay",
+            Self::WITHDRAW_AND_HAUL_TO_PERSONAL_BLUEPRINT => "WithdrawAndHaulToPersonalBlueprint",
+            Self::GATHER_AND_HAUL_TO_PERSONAL_BLUEPRINT => "GatherAndHaulToPersonalBlueprint",
+            Self::HARVEST_MATURE_PLANT_FOR_STORAGE => "HarvestMaturePlantForStorage",
+            _ => "Unknown",
+        }
+    }
 }
 
 /// Outcome of a method expansion once it stops running. Pushed onto

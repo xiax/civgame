@@ -439,6 +439,11 @@ pub fn gather_system(
             } else {
                 plant.stage = GrowthStage::Harvested;
                 plant.growth_ticks = 0;
+                let depleted_kind = match plant.kind {
+                    PlantKind::BerryBush | PlantKind::Grain => MemoryKind::AnyEdible,
+                    PlantKind::Tree => MemoryKind::wood(),
+                };
+                shared.report_depleted(agent_tier, (tx, ty), depleted_kind);
             }
         } else {
             // ── Tile harvest (stone / wall) ───────────────────────────────────

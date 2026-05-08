@@ -1725,16 +1725,16 @@ mod smoke {
         };
 
         let cloth = core_ids::cloth();
-        // Seed Cloth: A heavy supply, B heavy demand. Both start at
-        // empty (no seeded prices); after the first update they
-        // diverge.
+        // Seed bid signals: A heavy unaffordable (push price down), B
+        // heavy stockout (push price up). Both start at empty (no
+        // seeded prices); after the first update they diverge.
         {
             let mut a = sim
                 .app
                 .world_mut()
                 .get_mut::<Settlement>(settlement_a_entity)
                 .unwrap();
-            a.market.add_supply(cloth, 100.0);
+            a.market.add_bid_unaffordable(cloth, 100.0);
         }
         {
             let mut b = sim
@@ -1742,7 +1742,7 @@ mod smoke {
                 .world_mut()
                 .get_mut::<Settlement>(settlement_b_entity)
                 .unwrap();
-            b.market.add_demand(cloth, 100.0);
+            b.market.add_bid_stockout(cloth, 100.0);
         }
 
         // Tick the per-settlement price update enough to see divergence.
@@ -3098,18 +3098,19 @@ mod smoke {
         };
 
         let cloth = core_ids::cloth();
-        // Seed initial conditions:
-        //   A: lots of cloth, low price; modest treasury.
-        //   B: no cloth, high price; large treasury (it'll buy at
-        //      premium).
+        // Seed initial conditions via direct price overrides (test
+        // shortcut — bypasses bid-driven discovery so we can stand up
+        // a divergent gap without simulating sustained buyer activity):
+        //   A: limited cloth stock, low forced price, modest treasury.
+        //   B: no cloth, high forced price, large treasury.
         {
             let mut a = sim
                 .app
                 .world_mut()
                 .get_mut::<Settlement>(settlement_a)
                 .unwrap();
-            a.market.set_stock(cloth, 50.0);
-            a.market.add_supply(cloth, 50.0); // bias price down
+            a.market.set_stock(cloth, 20.0);
+            a.market.set_price(cloth, 0.5);
             a.treasury = 100.0;
         }
         {
@@ -3118,12 +3119,9 @@ mod smoke {
                 .world_mut()
                 .get_mut::<Settlement>(settlement_b)
                 .unwrap();
-            b.market.add_demand(cloth, 50.0); // bias price up
+            b.market.set_price(cloth, 1.5);
             b.treasury = 1000.0;
         }
-        // Tick price update so the supply/demand bias materialises
-        // into divergent prices before the trader acts.
-        sim.tick_n(50);
 
         let baseline = CurrencySnapshot::capture(&mut sim.app);
         let p_a_initial = sim
@@ -3145,9 +3143,12 @@ mod smoke {
             "expected initial price gap: a={p_a_initial}, b={p_b_initial}",
         );
 
-        // Run the arbitrage cycle several times — buy 5 cloth at A,
-        // sell at B, observe prices converge.
-        for _ in 0..5 {
+        // Run the arbitrage cycle. Cycles 1–4 succeed (A has 20 cloth,
+        // 4 × buy_5 = 20 depletes it). Cycle 5's buy fails — A is empty
+        // — and the failed attempt records a stockout signal that pushes
+        // A's price up under the bid-driven model. That stockout-driven
+        // rise is the convergence mechanism.
+        for _ in 0..4 {
             let bought = trader_buy_at_settlement(
                 sim.app.world_mut(),
                 trader,
@@ -3170,6 +3171,20 @@ mod smoke {
             // ratchet on each side.
             sim.tick_n(20);
         }
+        // Cycle 5: A is empty. The failed buy registers a stockout bid
+        // signal at A; the next price tick rises A's price.
+        let bought_after_depletion = trader_buy_at_settlement(
+            sim.app.world_mut(),
+            trader,
+            settlement_a,
+            cloth,
+            5,
+        );
+        assert!(
+            bought_after_depletion.is_none(),
+            "5th buy must fail — A's stock has been exhausted by prior cycles"
+        );
+        sim.tick_n(20);
 
         // Convergence check: gap should narrow.
         let p_a_final = sim
@@ -3244,8 +3259,10 @@ mod smoke {
         };
 
         let cloth = core_ids::cloth();
-        // Seed price gap: A cheap (high stock + supply bias);
-        // B expensive (high demand bias + funded treasury).
+        // Seed a divergent price gap directly via `set_price` (test
+        // shortcut). The dispatcher only commits when
+        // `p_b - p_a > TRADER_MIN_GAP (0.25)`, so a 0.5/1.5 gap is
+        // comfortably above the threshold.
         {
             let mut a = sim
                 .app
@@ -3253,7 +3270,7 @@ mod smoke {
                 .get_mut::<Settlement>(settlement_a)
                 .unwrap();
             a.market.set_stock(cloth, 50.0);
-            a.market.add_supply(cloth, 50.0);
+            a.market.set_price(cloth, 0.5);
             a.treasury = 100.0;
         }
         {
@@ -3262,10 +3279,9 @@ mod smoke {
                 .world_mut()
                 .get_mut::<Settlement>(settlement_b)
                 .unwrap();
-            b.market.add_demand(cloth, 50.0);
+            b.market.set_price(cloth, 1.5);
             b.treasury = 1000.0;
         }
-        sim.tick_n(50);
 
         // Teach the trader about both settlements.
         {
@@ -3443,7 +3459,7 @@ mod smoke {
                 .get_mut::<Settlement>(settlement_a)
                 .unwrap();
             a.market.set_stock(cloth, 50.0);
-            a.market.add_supply(cloth, 50.0);
+            a.market.set_price(cloth, 0.5);
         }
         {
             let mut b = sim
@@ -3451,10 +3467,9 @@ mod smoke {
                 .world_mut()
                 .get_mut::<Settlement>(settlement_b)
                 .unwrap();
-            b.market.add_demand(cloth, 50.0);
+            b.market.set_price(cloth, 1.5);
             b.treasury = 1000.0;
         }
-        sim.tick_n(50);
         {
             let mut mem = sim
                 .app

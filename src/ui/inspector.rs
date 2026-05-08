@@ -17,7 +17,9 @@ use crate::simulation::items::{
 use crate::simulation::memory::{RelEntry, RelationshipMemory};
 use crate::simulation::mood::Mood;
 use crate::simulation::needs::Needs;
+use crate::simulation::htn::{MethodHistory, MethodOutcome, METHOD_HISTORY_TTL_TICKS};
 use crate::simulation::person::{AiState, PersonAI, PlayerOrder, Profession};
+use crate::simulation::schedule::SimClock;
 use crate::simulation::corpse::Corpse;
 use crate::simulation::plants::{Plant, PlantMap};
 use crate::simulation::reproduction::{
@@ -88,6 +90,7 @@ pub fn inspector_panel_system(
     chunk_map: Res<ChunkMap>,
     plant_map: Res<PlantMap>,
     calendar: Res<Calendar>,
+    sim_clock: Res<SimClock>,
     mut path_params: PathInspectorParams,
     task_display: TaskDisplayParams,
     rel_query: Query<&RelationshipMemory>,
@@ -122,6 +125,7 @@ pub fn inspector_panel_system(
             Option<&crate::simulation::items::Equipment>,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
             &crate::simulation::typed_task::ActionQueue,
+            Option<&MethodHistory>,
         ),
     )>,
 ) {
@@ -138,6 +142,7 @@ pub fn inspector_panel_system(
             equipment,
             knowledge,
             aq,
+            method_history,
         ),
     )) = query.get(entity)
     else {
@@ -755,6 +760,84 @@ pub fn inspector_panel_system(
                     .show(ui, |ui| {
                         let task_name = task_kind_label(ai.task_id);
                         ui.label(format!("Task: {}", task_name));
+                        use crate::simulation::typed_task::Task;
+                        let method_label = match ai.active_method {
+                            Some(m) => m.name().to_string(),
+                            None if aq.current != Task::Idle => {
+                                "(direct dispatch — no HTN method)".to_string()
+                            }
+                            None => "(none — see HTN history)".to_string(),
+                        };
+                        ui.label(format!("Method: {}", method_label));
+
+                        let now = sim_clock.tick;
+                        if ai.task_id == PersonAI::UNEMPLOYED && aq.current == Task::Idle {
+                            let last_attempt = method_history
+                                .and_then(|h| {
+                                    h.entries.iter().filter_map(|e| *e).max_by_key(|(_, _, t)| *t)
+                                })
+                                .filter(|(_, _, tick)| {
+                                    now.saturating_sub(*tick) <= METHOD_HISTORY_TTL_TICKS
+                                });
+                            let attempt_str = match last_attempt {
+                                Some((mid, outcome, tick)) => format!(
+                                    "last attempt: {} → {:?} ({}t ago)",
+                                    mid.name(),
+                                    outcome,
+                                    now.saturating_sub(tick)
+                                ),
+                                None => "last attempt: none — preconditions failing".to_string(),
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Idle: ticks_idle={}  •  last_goal_eval={}  •  {}",
+                                    ai.ticks_idle, ai.last_goal_eval_tick, attempt_str
+                                ))
+                                .color(egui::Color32::from_rgb(220, 140, 120)),
+                            );
+                        }
+
+                        if let Some(history) = method_history {
+                            let mut live: Vec<(MethodOutcome, &'static str, u64)> = history
+                                .entries
+                                .iter()
+                                .filter_map(|e| *e)
+                                .filter(|(_, _, t)| {
+                                    now.saturating_sub(*t) <= METHOD_HISTORY_TTL_TICKS
+                                })
+                                .map(|(mid, outcome, t)| (outcome, mid.name(), t))
+                                .collect();
+                            live.sort_by(|a, b| b.2.cmp(&a.2));
+                            if !live.is_empty() {
+                                egui::CollapsingHeader::new("HTN history")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        for (outcome, name, tick) in &live {
+                                            let color = match outcome {
+                                                MethodOutcome::Success => {
+                                                    egui::Color32::from_rgb(140, 200, 140)
+                                                }
+                                                MethodOutcome::FailedRouting
+                                                | MethodOutcome::FailedTarget => {
+                                                    egui::Color32::from_rgb(220, 110, 110)
+                                                }
+                                                MethodOutcome::Interrupted => {
+                                                    egui::Color32::from_gray(160)
+                                                }
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{}  {:?}  ({}t ago)",
+                                                    name,
+                                                    outcome,
+                                                    now.saturating_sub(*tick)
+                                                ))
+                                                .color(color),
+                                            );
+                                        }
+                                    });
+                            }
+                        }
 
                         let state_desc = match ai.state {
                             AiState::Idle => "Idling".to_string(),

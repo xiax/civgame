@@ -1,4 +1,4 @@
-use crate::rendering::pixel_art::{ArtMode, EntityTextures};
+use crate::rendering::pixel_art::{AnimalTextures, ArtMode, EntityTextures};
 use crate::rendering::sprite_library::SpriteLibrary;
 use crate::simulation::animals::{Cat, Cow, Deer, Fox, Horse, Pig, Rabbit, Wolf};
 use crate::simulation::construction::{
@@ -145,21 +145,63 @@ impl Default for ClothingVisual {
 pub struct LastPos(pub Vec2);
 
 #[derive(Component, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub enum FacingDirection {
     #[default]
-    South,
-    North,
-    East,
-    West,
+    South = 0,
+    SouthEast = 1,
+    East = 2,
+    NorthEast = 3,
+    North = 4,
+    NorthWest = 5,
+    West = 6,
+    SouthWest = 7,
 }
 
 impl FacingDirection {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::South => "s",
+            Self::SouthEast => "se",
+            Self::East => "e",
+            Self::NorthEast => "ne",
             Self::North => "n",
+            Self::NorthWest => "nw",
+            Self::West => "w",
+            Self::SouthWest => "sw",
+        }
+    }
+
+    /// Cardinal-only suffix used by the legacy procedural sprite library
+    /// (`anim_<species>_{s,n,e,w}_<frame>`). Diagonals collapse to their
+    /// dominant cardinal so existing 4-way ASCII art keeps working.
+    pub fn cardinal_str(self) -> &'static str {
+        match self {
+            Self::South | Self::SouthEast | Self::SouthWest => "s",
+            Self::North | Self::NorthEast | Self::NorthWest => "n",
             Self::East => "e",
             Self::West => "w",
+        }
+    }
+
+    /// 8-sector bucketing of a movement vector. Returns `current` when the
+    /// movement magnitude is below the noise threshold so idle animals keep
+    /// their last-known facing.
+    pub fn from_velocity(diff: Vec2, current: FacingDirection) -> FacingDirection {
+        if diff.length_squared() < 0.25 {
+            return current;
+        }
+        let angle = diff.y.atan2(diff.x);
+        let sector = ((angle / std::f32::consts::FRAC_PI_4).round() as i32).rem_euclid(8);
+        match sector {
+            0 => Self::East,
+            1 => Self::NorthEast,
+            2 => Self::North,
+            3 => Self::NorthWest,
+            4 => Self::West,
+            5 => Self::SouthWest,
+            6 => Self::South,
+            _ => Self::SouthEast,
         }
     }
 }
@@ -450,17 +492,14 @@ pub fn spawn_wolf_sprites(
         (With<Wolf>, Without<WolfVisual>),
     >,
     textures: Res<EntityTextures>,
-    sprite_lib: Res<SpriteLibrary>,
+    animal_tex: Res<AnimalTextures>,
     art_mode: Res<ArtMode>,
 ) {
     for (entity, sex_opt) in query.iter() {
         let img = if *art_mode == ArtMode::Ascii {
             textures.wolf_ascii.clone()
         } else {
-            sprite_lib
-                .get("anim_wolf_s_a")
-                .cloned()
-                .unwrap_or_else(|| textures.wolf_ascii.clone())
+            animal_tex.wolf[FacingDirection::South as usize].clone()
         };
 
         // Male wolves are slightly grey; females are reference white
@@ -503,15 +542,12 @@ pub fn spawn_deer_sprites(
         (With<Deer>, Without<DeerVisual>),
     >,
     textures: Res<EntityTextures>,
-    sprite_lib: Res<SpriteLibrary>,
+    animal_tex: Res<AnimalTextures>,
     art_mode: Res<ArtMode>,
 ) {
     for (entity, sex_opt) in query.iter() {
         let img = if *art_mode == ArtMode::Pixel {
-            sprite_lib
-                .get("anim_deer_s_a")
-                .cloned()
-                .unwrap_or_else(|| textures.deer_ascii.clone())
+            animal_tex.deer[FacingDirection::South as usize].clone()
         } else {
             textures.deer_ascii.clone()
         };
@@ -835,92 +871,50 @@ pub fn animate_person_sprites(
 pub fn animate_wolves_system(
     time: Res<Time>,
     art_mode: Res<ArtMode>,
-    sprite_lib: Res<SpriteLibrary>,
+    animal_tex: Res<AnimalTextures>,
     mut wolves: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Wolf>>,
-    mut child_sprites: Query<&mut Sprite, With<VisualChild>>,
+    mut child_sprites: Query<
+        (&mut Sprite, &mut Transform),
+        (With<VisualChild>, Without<Wolf>, Without<Deer>, Without<Horse>),
+    >,
 ) {
     if *art_mode == ArtMode::Ascii {
         return;
     }
-    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
     for (transform, children, mut facing, mut last_pos) in wolves.iter_mut() {
         let pos = transform.translation.truncate();
         let diff = pos - last_pos.0;
         let is_moving = diff.length() > 0.5;
-        if is_moving {
-            *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 {
-                    FacingDirection::East
-                } else {
-                    FacingDirection::West
-                }
-            } else {
-                if diff.y > 0.0 {
-                    FacingDirection::North
-                } else {
-                    FacingDirection::South
-                }
-            };
-        }
+        *facing = FacingDirection::from_velocity(diff, *facing);
         last_pos.0 = pos;
-        let dir = facing.as_str();
-        let frame_str = if is_moving && frame_b { "b" } else { "a" };
-        let key = format!("anim_wolf_{dir}_{frame_str}");
-        for &child in children.iter() {
-            if let Ok(mut sprite) = child_sprites.get_mut(child) {
-                if let Some(img) = sprite_lib.get(&key) {
-                    if sprite.image != *img {
-                        sprite.image = img.clone();
-                    }
-                }
-            }
-        }
+
+        let img = animal_tex.wolf[*facing as usize].clone();
+        update_animal_visual(&mut child_sprites, children, img, is_moving, time.elapsed_secs());
     }
 }
 
 pub fn animate_deer_system(
     time: Res<Time>,
     art_mode: Res<ArtMode>,
-    sprite_lib: Res<SpriteLibrary>,
+    animal_tex: Res<AnimalTextures>,
     mut deer: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Deer>>,
-    mut child_sprites: Query<&mut Sprite, With<VisualChild>>,
+    mut child_sprites: Query<
+        (&mut Sprite, &mut Transform),
+        (With<VisualChild>, Without<Wolf>, Without<Deer>, Without<Horse>),
+    >,
 ) {
     if *art_mode == ArtMode::Ascii {
         return;
     }
-    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
     for (transform, children, mut facing, mut last_pos) in deer.iter_mut() {
         let pos = transform.translation.truncate();
         let diff = pos - last_pos.0;
         let is_moving = diff.length() > 0.5;
-        if is_moving {
-            *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 {
-                    FacingDirection::East
-                } else {
-                    FacingDirection::West
-                }
-            } else {
-                if diff.y > 0.0 {
-                    FacingDirection::North
-                } else {
-                    FacingDirection::South
-                }
-            };
-        }
+        *facing = FacingDirection::from_velocity(diff, *facing);
         last_pos.0 = pos;
-        let dir = facing.as_str();
-        let frame_str = if is_moving && frame_b { "b" } else { "a" };
-        let key = format!("anim_deer_{dir}_{frame_str}");
-        for &child in children.iter() {
-            if let Ok(mut sprite) = child_sprites.get_mut(child) {
-                if let Some(img) = sprite_lib.get(&key) {
-                    if sprite.image != *img {
-                        sprite.image = img.clone();
-                    }
-                }
-            }
-        }
+
+        let img = animal_tex.deer[*facing as usize].clone();
+        update_animal_visual(&mut child_sprites, children, img, is_moving, time.elapsed_secs());
     }
 }
 
@@ -934,18 +928,14 @@ pub fn spawn_horse_sprites(
         (With<Horse>, Without<HorseVisual>),
     >,
     sprite_lib: Res<SpriteLibrary>,
+    animal_tex: Res<AnimalTextures>,
     art_mode: Res<ArtMode>,
 ) {
     for (entity, sex_opt) in query.iter() {
-        let pixel_key = "anim_horse_anim_s_a";
-        let ascii_key = "creature_horse";
         let img = if *art_mode == ArtMode::Pixel {
-            sprite_lib
-                .get(pixel_key)
-                .cloned()
-                .or_else(|| sprite_lib.get(ascii_key).cloned())
+            Some(animal_tex.horse[FacingDirection::South as usize].clone())
         } else {
-            sprite_lib.get(ascii_key).cloned()
+            sprite_lib.get("creature_horse").cloned()
         };
         let Some(img) = img else { continue };
 
@@ -981,44 +971,54 @@ pub fn spawn_horse_sprites(
 pub fn animate_horses_system(
     time: Res<Time>,
     art_mode: Res<ArtMode>,
-    sprite_lib: Res<SpriteLibrary>,
+    animal_tex: Res<AnimalTextures>,
     mut horses: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Horse>>,
-    mut child_sprites: Query<&mut Sprite, With<VisualChild>>,
+    mut child_sprites: Query<
+        (&mut Sprite, &mut Transform),
+        (With<VisualChild>, Without<Wolf>, Without<Deer>, Without<Horse>),
+    >,
 ) {
     if *art_mode == ArtMode::Ascii {
         return;
     }
-    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
     for (transform, children, mut facing, mut last_pos) in horses.iter_mut() {
         let pos = transform.translation.truncate();
         let diff = pos - last_pos.0;
         let is_moving = diff.length() > 0.5;
-        if is_moving {
-            *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 {
-                    FacingDirection::East
-                } else {
-                    FacingDirection::West
-                }
-            } else {
-                if diff.y > 0.0 {
-                    FacingDirection::North
-                } else {
-                    FacingDirection::South
-                }
-            };
-        }
+        *facing = FacingDirection::from_velocity(diff, *facing);
         last_pos.0 = pos;
-        let dir = facing.as_str();
-        let frame_str = if is_moving && frame_b { "b" } else { "a" };
-        let key = format!("anim_horse_anim_{dir}_{frame_str}");
-        for &child in children.iter() {
-            if let Ok(mut sprite) = child_sprites.get_mut(child) {
-                if let Some(img) = sprite_lib.get(&key) {
-                    if sprite.image != *img {
-                        sprite.image = img.clone();
-                    }
-                }
+
+        let img = animal_tex.horse[*facing as usize].clone();
+        update_animal_visual(&mut child_sprites, children, img, is_moving, time.elapsed_secs());
+    }
+}
+
+/// Shared sprite swap + procedural bob/sway helper for PNG-textured animals.
+/// Uses sin-wave Y bob (always positive — feet stay grounded) and small Z sway.
+fn update_animal_visual(
+    child_sprites: &mut Query<(&mut Sprite, &mut Transform), (With<VisualChild>, Without<Wolf>, Without<Deer>, Without<Horse>)>,
+    children: &Children,
+    img: Handle<Image>,
+    is_moving: bool,
+    elapsed: f32,
+) {
+    const BASE_Y: f32 = -8.0;
+    const STRIDE_HZ: f32 = 4.0;
+    const BOB_AMP: f32 = 1.5;
+    const SWAY_AMP_RAD: f32 = 0.0524; // ~3 degrees
+
+    for &child in children.iter() {
+        if let Ok((mut sprite, mut tf)) = child_sprites.get_mut(child) {
+            if sprite.image != img {
+                sprite.image = img.clone();
+            }
+            if is_moving {
+                let phase = elapsed * STRIDE_HZ * std::f32::consts::TAU;
+                tf.translation.y = BASE_Y + (phase.sin() * BOB_AMP).abs();
+                tf.rotation = Quat::from_rotation_z(phase.cos() * SWAY_AMP_RAD);
+            } else {
+                tf.translation.y = BASE_Y;
+                tf.rotation = Quat::IDENTITY;
             }
         }
     }

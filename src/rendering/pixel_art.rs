@@ -14,6 +14,34 @@ impl Default for ArtMode {
     }
 }
 
+/// PNG-loaded directional sprites for animals that have artist-made art packs
+/// in `assets/textures/<species>/rotations/`.  Indexed by `FacingDirection as usize`
+/// (S=0, SE=1, E=2, NE=3, N=4, NW=5, W=6, SW=7).
+#[derive(Resource, Default)]
+pub struct AnimalTextures {
+    pub wolf: [Handle<Image>; 8],
+    pub deer: [Handle<Image>; 8],
+    pub horse: [Handle<Image>; 8],
+}
+
+pub fn setup_animal_textures(asset_server: Res<AssetServer>, mut tex: ResMut<AnimalTextures>) {
+    const DIRS: [&str; 8] = [
+        "south",
+        "south-east",
+        "east",
+        "north-east",
+        "north",
+        "north-west",
+        "west",
+        "south-west",
+    ];
+    for (i, d) in DIRS.iter().enumerate() {
+        tex.wolf[i] = asset_server.load(format!("textures/wolf/rotations/{d}.png"));
+        tex.deer[i] = asset_server.load(format!("textures/deer/rotations/{d}.png"));
+        tex.horse[i] = asset_server.load(format!("textures/horse/rotations/{d}.png"));
+    }
+}
+
 #[derive(Resource)]
 pub struct EntityTextures {
     // ASCII Handles

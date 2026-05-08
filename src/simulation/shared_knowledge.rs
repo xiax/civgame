@@ -156,12 +156,15 @@ impl ResourceCluster {
         self.representative_tiles[0] = Some(tile);
     }
 
-    fn drop_rep(&mut self, tile: (i32, i32)) {
+    fn drop_rep(&mut self, tile: (i32, i32)) -> bool {
+        let mut removed = false;
         for slot in self.representative_tiles.iter_mut() {
             if *slot == Some(tile) {
                 *slot = None;
+                removed = true;
             }
         }
+        removed
     }
 
     /// Closest representative tile to `from` by chebyshev. Falls back to
@@ -445,7 +448,9 @@ impl SharedKnowledge {
         let removed_cluster: Option<ResourceCluster>;
         {
             let Some(c) = m.clusters.get_mut(&cid) else { return };
-            c.drop_rep(tile);
+            if !c.drop_rep(tile) {
+                return;
+            }
             c.estimated_count = c.estimated_count.saturating_sub(1);
             despawn = c.estimated_count == 0;
         }
@@ -682,6 +687,24 @@ mod tests {
         assert!(m.clusters.is_empty(), "cluster should despawn at count 0");
         assert!(m.by_kind.is_empty());
         assert!(m.by_chunk.is_empty());
+    }
+
+    #[test]
+    fn report_depleted_ignores_non_rep_tile_in_radius() {
+        // A tile that is inside a cluster's bounding radius but was never
+        // sighted as a rep must NOT bleed the cluster's count. This guards
+        // against vision sweeps over empty grass tiles inside a forest's
+        // bounding box from collapsing the cluster.
+        let mut sk = SharedKnowledge::default();
+        sk.report_sighting(faction_tier(1), (10, 10), fake_kind(), ResourceOwner::Public, 0);
+        sk.report_sighting(faction_tier(1), (15, 13), fake_kind(), ResourceOwner::Public, 0);
+        let m = sk.map(faction_tier(1)).unwrap();
+        let cid = *m.clusters.keys().next().unwrap();
+        let count_before = m.clusters[&cid].estimated_count;
+        // Tile inside the cluster's radius but never reported as a sighting.
+        sk.report_depleted(faction_tier(1), (12, 12), fake_kind());
+        let m = sk.map(faction_tier(1)).unwrap();
+        assert_eq!(m.clusters[&cid].estimated_count, count_before);
     }
 
     #[test]

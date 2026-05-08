@@ -1,0 +1,30 @@
+{
+  "character": {
+    "id": "7c99cc5e-9c92-4a2f-aa2f-92045ca57daa",
+    "name": "deer",
+    "prompt": "deer",
+    "size": {
+      "width": 48,
+      "height": 48
+    },
+    "template_id": "horse",
+    "directions": 8,
+    "view": "high top-down",
+    "created_at": "2026-05-06T21:37:51.417963+00:00"
+  },
+  "frames": {
+    "rotations": {
+      "south": "rotations/south.png",
+      "south-east": "rotations/south-east.png",
+      "east": "rotations/east.png",
+      "north-east": "rotations/north-east.png",
+      "north": "rotations/north.png",
+      "north-west": "rotations/north-west.png",
+      "west": "rotations/west.png",
+      "south-west": "rotations/south-west.png"
+    },
+    "animations": {}
+  },
+  "export_version": "2.0",
+  "export_date": "2026-05-07T01:11:45.422503"
+}

@@ -37,11 +37,24 @@ pub fn trader_buy_at_settlement(
     };
     let total = price_per_unit * qty as f32;
     if stock_available < qty as f32 {
+        // Trader's would-buy attempt was blocked by insufficient stock.
+        // Record stockout so the market's bid-driven price update sees
+        // the buyer pressure.
+        if let Some(mut s) = world
+            .get_mut::<crate::simulation::settlement::Settlement>(settlement)
+        {
+            s.market.add_bid_stockout(resource_id, qty as f32);
+        }
         return None;
     }
     // Currency check.
     let agent_currency = world.get::<EconomicAgent>(trader)?.currency;
     if agent_currency < total {
+        if let Some(mut s) = world
+            .get_mut::<crate::simulation::settlement::Settlement>(settlement)
+        {
+            s.market.add_bid_unaffordable(resource_id, qty as f32);
+        }
         return None;
     }
     // Capacity check via add_item dry-run is awkward; we just attempt
@@ -60,22 +73,13 @@ pub fn trader_buy_at_settlement(
         let mut econ = world.get_mut::<EconomicAgent>(trader)?;
         econ.currency -= actual_total;
     }
-    // Update settlement: stock down, treasury up, demand up so the
-    // price tick reflects the trade.
+    // Update settlement: stock down, treasury up, record cleared bid
+    // so the price tick reflects the trade.
     {
         let mut s = world
             .get_mut::<crate::simulation::settlement::Settlement>(settlement)?;
-        s.market.add_demand(resource_id, acquired as f32);
-        // Decrement stock by drawing through `try_buy_item`'s
-        // commodity branch — but we already debited the agent, so we
-        // bypass the helper's currency mutation by manipulating the
-        // sparse map directly through a fresh `add_supply` of the
-        // negative qty would be wrong. Instead, sell-side: we mirror
-        // `try_buy_item`'s commodity-stock side-effect manually.
+        s.market.add_bid_cleared(resource_id, acquired as f32);
         let new_stock = (stock_available - acquired as f32).max(0.0);
-        // SettlementMarket exposes `stock_of` and `add_supply` but
-        // not a direct stock setter; route through `add_supply` with
-        // the negative delta. Add a small public mutator for this.
         s.market.set_stock(resource_id, new_stock);
         s.treasury += actual_total;
     }
@@ -132,7 +136,9 @@ pub fn trader_sell_at_settlement(
         econ.remove_resource(resource_id, actual_qty);
         econ.currency += agent_share;
     }
-    // Settlement: treasury down, market stock up, supply up.
+    // Settlement: treasury down, market stock up. Sale flow does NOT
+    // record a bid signal — sellers don't move price; only buyer
+    // outcomes do.
     {
         let mut s = world
             .get_mut::<crate::simulation::settlement::Settlement>(settlement)?;
@@ -142,7 +148,6 @@ pub fn trader_sell_at_settlement(
         }
         let cur_stock = s.market.stock_of(resource_id);
         s.market.set_stock(resource_id, cur_stock + actual_qty as f32);
-        s.market.add_supply(resource_id, actual_qty as f32);
     }
     Some(price_per_unit)
 }

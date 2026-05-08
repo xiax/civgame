@@ -2,13 +2,13 @@ use bevy::prelude::*;
 use std::time::Instant;
 
 use crate::pathfinding::astar::{find_path_in, AStarResult};
-use crate::pathfinding::chunk_graph::ChunkGraph;
+use crate::pathfinding::chunk_graph::{ChunkGraph, ComponentId};
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::pathfinding::flow_field::walk_to_goal;
 use crate::pathfinding::hotspots::HotspotFlowFields;
 use crate::pathfinding::path_request::{
-    FailReason, FailSubReason, FailureLog, FailureRecord, FollowStatus, PathDebugFlags, PathFailed,
+    FailSubReason, FailureLog, FailureRecord, FollowStatus, PathDebugFlags, PathFailed,
     PathFollow, PathKind, PathReady, PathReadyKind, PathRequest, PathRequestQueue,
 };
 use crate::pathfinding::pool::{AStarPool, AStarScratch};
@@ -20,10 +20,6 @@ use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 /// to keep worker time well under 4 ms with 2k agents (target in plan):
 /// at ~50 µs per A* segment that's ~3 ms worst case.
 pub const PATH_BUDGET_PER_TICK: usize = 64;
-
-/// Cap on chunk-route length. A route longer than this is pathological —
-/// the worker reports `NoRoute` rather than spending time fanning out.
-const MAX_CHUNK_ROUTE: usize = 64;
 
 /// Per-tick pathfinding telemetry, surfaced in the debug panel.
 /// Counters that are listed in the plan as "running totals" stay across
@@ -83,6 +79,18 @@ pub struct PathfindingDiagnostics {
     /// (e.g. diagonal-ramp rounding) — the path becomes effectively a
     /// "2-z wall" from the agent's actual position.
     pub path_drift_rejections_total: u64,
+    /// The agent's start tile (or the goal tile) didn't classify into
+    /// any chunk-graph component. Either the chunk hasn't been built
+    /// yet, or terrain mutated mid-tick and the agent is on a
+    /// freshly-modified cell. Indicates a transient race; should stay
+    /// near zero in healthy runs.
+    pub component_lookup_failed_at_start: u64,
+    pub component_lookup_failed_at_goal: u64,
+    /// Largest `chunk_route.len()` produced by a successful path build
+    /// in the last tick. Watch this for regressions: post-overhaul a
+    /// well-routed path is no longer than the chunk-Manhattan distance
+    /// between endpoints.
+    pub chunk_route_len_max_last_tick: u32,
 }
 
 impl PathfindingDiagnostics {
@@ -95,6 +103,7 @@ impl PathfindingDiagnostics {
         self.astar_iters_last_tick = 0;
         self.astar_iters_max_single = 0;
         self.boundary_rejections_per_tick = 0;
+        self.chunk_route_len_max_last_tick = 0;
     }
 }
 
@@ -158,12 +167,69 @@ enum OutcomeBody {
         ready_kind: PathReadyKind,
         flow_field_hit: bool,
     },
-    Failure {
-        sub: FailSubReason,
-        segment_target: (i32, i32, i8),
-        connectivity_reject: bool,
-        hotspot_fastpath_miss: bool,
-    },
+    Failure(FailureBody),
+}
+
+struct FailureBody {
+    sub: FailSubReason,
+    segment_target: (i32, i32, i8),
+    connectivity_reject: bool,
+    hotspot_fastpath_miss: bool,
+    /// Set when the failure is specifically "agent's start tile has no
+    /// component classification" — separately tracked because it's a
+    /// transient race (terrain mutated between request enqueue and
+    /// worker drain).
+    component_lookup_failed_start: bool,
+    component_lookup_failed_goal: bool,
+}
+
+impl FailureBody {
+    fn basic(sub: FailSubReason, segment_target: (i32, i32, i8)) -> Self {
+        Self {
+            sub,
+            segment_target,
+            connectivity_reject: false,
+            hotspot_fastpath_miss: false,
+            component_lookup_failed_start: false,
+            component_lookup_failed_goal: false,
+        }
+    }
+    fn connectivity(sub: FailSubReason, segment_target: (i32, i32, i8)) -> Self {
+        Self {
+            sub,
+            segment_target,
+            connectivity_reject: true,
+            hotspot_fastpath_miss: false,
+            component_lookup_failed_start: false,
+            component_lookup_failed_goal: false,
+        }
+    }
+}
+
+fn fail_outcome(req: PathRequest, body: FailureBody) -> ComputeOutcome {
+    ComputeOutcome {
+        body: OutcomeBody::Failure(body),
+        req,
+        astar_calls: 0,
+        astar_iters: 0,
+        astar_iters_max_single: 0,
+    }
+}
+
+fn fail_outcome_with_metrics(
+    req: PathRequest,
+    body: FailureBody,
+    astar_calls: u32,
+    astar_iters: u32,
+    astar_iters_max_single: u32,
+) -> ComputeOutcome {
+    ComputeOutcome {
+        body: OutcomeBody::Failure(body),
+        req,
+        astar_calls,
+        astar_iters,
+        astar_iters_max_single,
+    }
 }
 
 /// Drains up to `PATH_BUDGET_PER_TICK` requests from the queue and writes
@@ -288,64 +354,85 @@ fn compute_outcome(
             );
         }
         let goal = req.goal;
-        return ComputeOutcome {
-            body: OutcomeBody::Failure {
-                sub: FailSubReason::UnreachableConnectivity,
-                segment_target: goal,
-                connectivity_reject: true,
-                hotspot_fastpath_miss: false,
-            },
+        return fail_outcome(
             req,
-            astar_calls: 0,
-            astar_iters: 0,
-            astar_iters_max_single: 0,
-        };
+            FailureBody::connectivity(FailSubReason::UnreachableConnectivity, goal),
+        );
     }
 
-    if !conn.is_reachable((start_chunk, req.start.2), (goal_chunk, req.goal.2)) {
+    // Look up start/goal components in the new component-typed graph.
+    // The agent's exact (x, y, z) classifies into a single component;
+    // an A→B→A oscillation is impossible because the cache is keyed by
+    // the agent's specific component, not just by chunk + z.
+    let start_component =
+        match graph.component_for_tile(req.start.0, req.start.1, req.start.2) {
+            Some(c) => c,
+            None => {
+                if flags.verbose_logs {
+                    info!(
+                        "[path] start tile not classified agent={:?} start={:?}",
+                        req.agent, req.start
+                    );
+                }
+                let goal = req.goal;
+                let mut body =
+                    FailureBody::connectivity(FailSubReason::UnreachableConnectivity, goal);
+                body.component_lookup_failed_start = true;
+                return fail_outcome(req, body);
+            }
+        };
+    let goal_component =
+        match graph.component_for_tile(req.goal.0, req.goal.1, req.goal.2) {
+            Some(c) => c,
+            None => {
+                if flags.verbose_logs {
+                    info!(
+                        "[path] goal tile not classified agent={:?} goal={:?}",
+                        req.agent, req.goal
+                    );
+                }
+                let goal = req.goal;
+                let mut body =
+                    FailureBody::connectivity(FailSubReason::UnreachableConnectivity, goal);
+                body.component_lookup_failed_goal = true;
+                return fail_outcome(req, body);
+            }
+        };
+    // Reachability check uses the same router cache the route does, so
+    // the component-graph CC and the route are guaranteed in sync.
+    let _ = conn; // legacy resource retained for backwards-compatible APIs
+    if !router.is_reachable(graph, (start_chunk, start_component), (goal_chunk, goal_component)) {
         if flags.verbose_logs {
             info!(
-                "[path] connectivity reject agent={:?} start={:?} goal={:?}",
+                "[path] component reject agent={:?} start={:?} goal={:?}",
                 req.agent, req.start, req.goal
             );
         }
         let goal = req.goal;
-        return ComputeOutcome {
-            body: OutcomeBody::Failure {
-                sub: FailSubReason::UnreachableConnectivity,
-                segment_target: goal,
-                connectivity_reject: true,
-                hotspot_fastpath_miss: false,
-            },
+        return fail_outcome(
             req,
-            astar_calls: 0,
-            astar_iters: 0,
-            astar_iters_max_single: 0,
-        };
+            FailureBody::connectivity(FailSubReason::UnreachableConnectivity, goal),
+        );
     }
 
-    let chunk_route = match build_chunk_route(graph, router, start_chunk, goal_chunk, req.start.2) {
-        Ok(r) => r,
-        Err(_reason) => {
+    let chunk_route = match router.compute_route(
+        graph,
+        (start_chunk, start_component),
+        (goal_chunk, goal_component),
+    ) {
+        Some(r) => r,
+        None => {
             if flags.verbose_logs {
                 info!(
-                    "[path] chunk-route fail agent={:?} start_chunk={:?} goal_chunk={:?}",
-                    req.agent, start_chunk, goal_chunk
+                    "[path] chunk-route fail agent={:?} start_chunk={:?}/{:?} goal_chunk={:?}/{:?}",
+                    req.agent, start_chunk, start_component, goal_chunk, goal_component
                 );
             }
             let goal = req.goal;
-            return ComputeOutcome {
-                body: OutcomeBody::Failure {
-                    sub: FailSubReason::NoRouteRouter,
-                    segment_target: goal,
-                    connectivity_reject: false,
-                    hotspot_fastpath_miss: false,
-                },
+            return fail_outcome(
                 req,
-                astar_calls: 0,
-                astar_iters: 0,
-                astar_iters_max_single: 0,
-            };
+                FailureBody::basic(FailSubReason::NoRouteRouter, goal),
+            );
         }
     };
 
@@ -376,18 +463,10 @@ fn compute_outcome(
                             );
                         }
                         let goal = req.goal;
-                        return ComputeOutcome {
-                            body: OutcomeBody::Failure {
-                                sub: FailSubReason::NoRouteStepContinuity,
-                                segment_target: goal,
-                                connectivity_reject: false,
-                                hotspot_fastpath_miss: false,
-                            },
+                        return fail_outcome(
                             req,
-                            astar_calls: 0,
-                            astar_iters: 0,
-                            astar_iters_max_single: 0,
-                        };
+                            FailureBody::basic(FailSubReason::NoRouteStepContinuity, goal),
+                        );
                     }
                     return ComputeOutcome {
                         body: OutcomeBody::Success {
@@ -414,7 +493,14 @@ fn compute_outcome(
         }
     }
 
-    let segment_target = first_segment_target(graph, router, &chunk_route, &req);
+    let segment_target = first_segment_target(
+        graph,
+        router,
+        &chunk_route,
+        &req,
+        start_component,
+        goal_component,
+    );
     let mut astar_calls: u32 = 0;
     let mut astar_iters_total: u32 = 0;
     let mut astar_iters_max: u32 = 0;
@@ -465,18 +551,15 @@ fn compute_outcome(
                         req.agent, req.start, segment_target
                     );
                 }
-                return ComputeOutcome {
-                    body: OutcomeBody::Failure {
-                        sub: FailSubReason::BudgetExhausted,
-                        segment_target,
-                        connectivity_reject: false,
-                        hotspot_fastpath_miss: hotspot_miss,
-                    },
+                let mut body = FailureBody::basic(FailSubReason::BudgetExhausted, segment_target);
+                body.hotspot_fastpath_miss = hotspot_miss;
+                return fail_outcome_with_metrics(
                     req,
+                    body,
                     astar_calls,
-                    astar_iters: astar_iters_total,
-                    astar_iters_max_single: astar_iters_max,
-                };
+                    astar_iters_total,
+                    astar_iters_max,
+                );
             }
             // BestEffort: walk one tile toward best_so_far.
             (
@@ -491,18 +574,15 @@ fn compute_outcome(
                     req.agent, req.start, segment_target
                 );
             }
-            return ComputeOutcome {
-                body: OutcomeBody::Failure {
-                    sub: FailSubReason::UnreachableAstar,
-                    segment_target,
-                    connectivity_reject: false,
-                    hotspot_fastpath_miss: hotspot_miss,
-                },
+            let mut body = FailureBody::basic(FailSubReason::UnreachableAstar, segment_target);
+            body.hotspot_fastpath_miss = hotspot_miss;
+            return fail_outcome_with_metrics(
                 req,
+                body,
                 astar_calls,
-                astar_iters: astar_iters_total,
-                astar_iters_max_single: astar_iters_max,
-            };
+                astar_iters_total,
+                astar_iters_max,
+            );
         }
     };
 
@@ -520,18 +600,15 @@ fn compute_outcome(
                 req.agent, prev, cur
             );
         }
-        return ComputeOutcome {
-            body: OutcomeBody::Failure {
-                sub: FailSubReason::NoRouteStepContinuity,
-                segment_target,
-                connectivity_reject: false,
-                hotspot_fastpath_miss: hotspot_miss,
-            },
+        let mut body = FailureBody::basic(FailSubReason::NoRouteStepContinuity, segment_target);
+        body.hotspot_fastpath_miss = hotspot_miss;
+        return fail_outcome_with_metrics(
             req,
+            body,
             astar_calls,
-            astar_iters: astar_iters_total,
-            astar_iters_max_single: astar_iters_max,
-        };
+            astar_iters_total,
+            astar_iters_max,
+        );
     }
 
     ComputeOutcome {
@@ -578,6 +655,10 @@ fn apply_outcome(
             ready_kind,
             flow_field_hit,
         } => {
+            let route_len = chunk_route.len() as u32;
+            if route_len > diag.chunk_route_len_max_last_tick {
+                diag.chunk_route_len_max_last_tick = route_len;
+            }
             if flow_field_hit {
                 diag.flow_field_hits_per_tick += 1;
                 diag.flow_field_hits_total += 1;
@@ -593,17 +674,25 @@ fn apply_outcome(
                 diag,
             );
         }
-        OutcomeBody::Failure {
+        OutcomeBody::Failure(FailureBody {
             sub,
             segment_target,
             connectivity_reject,
             hotspot_fastpath_miss,
-        } => {
+            component_lookup_failed_start,
+            component_lookup_failed_goal,
+        }) => {
             if connectivity_reject {
                 diag.connectivity_rejections_per_tick += 1;
             }
             if hotspot_fastpath_miss {
                 diag.hotspot_fastpath_misses += 1;
+            }
+            if component_lookup_failed_start {
+                diag.component_lookup_failed_at_start += 1;
+            }
+            if component_lookup_failed_goal {
+                diag.component_lookup_failed_at_goal += 1;
             }
             match sub {
                 FailSubReason::UnreachableConnectivity => {
@@ -640,81 +729,27 @@ fn apply_outcome(
     }
 }
 
-fn build_chunk_route(
-    graph: &ChunkGraph,
-    router: &ChunkRouter,
-    start_chunk: ChunkCoord,
-    goal_chunk: ChunkCoord,
-    start_z: i8,
-) -> Result<Vec<ChunkCoord>, FailReason> {
-    let mut route: Vec<ChunkCoord> = vec![start_chunk];
-    if start_chunk == goal_chunk {
-        return Ok(route);
-    }
-    let mut cur = start_chunk;
-    let mut cur_z = start_z;
-    while cur != goal_chunk {
-        if route.len() >= MAX_CHUNK_ROUTE {
-            return Err(FailReason::NoRoute);
-        }
-        let waypoint = router.first_waypoint(graph, cur, goal_chunk, cur_z);
-        let Some((wx, wy)) = waypoint else {
-            return Err(FailReason::NoRoute);
-        };
-        let next = ChunkCoord(
-            (wx as i32).div_euclid(CHUNK_SIZE as i32),
-            (wy as i32).div_euclid(CHUNK_SIZE as i32),
-        );
-        if next == cur {
-            // Defensive: router returned a waypoint inside the current
-            // chunk. Treat as no progress to avoid an infinite loop.
-            return Err(FailReason::NoRoute);
-        }
-        route.push(next);
-        cur = next;
-        // We don't track precise entry-tile Z here; the router's Z bias
-        // tends to keep us on the agent's current band, and A* picks the
-        // exact ramp on the next segment. Leaving cur_z unchanged works
-        // adequately for shadow-mode comparison; step (f) refines this.
-        let _ = cur_z;
-    }
-    Ok(route)
-}
-
 fn first_segment_target(
     graph: &ChunkGraph,
     router: &ChunkRouter,
     chunk_route: &[ChunkCoord],
     req: &PathRequest,
+    start_component: ComponentId,
+    goal_component: ComponentId,
 ) -> (i32, i32, i8) {
     if chunk_route.len() < 2 {
         return req.goal;
     }
     let start_chunk = chunk_route[0];
     let goal_chunk = *chunk_route.last().expect("len >= 2");
-    let Some((wx, wy)) = router.first_waypoint(graph, start_chunk, goal_chunk, req.start.2) else {
+    let Some(wp) = router.first_waypoint_full(
+        graph,
+        (start_chunk, start_component),
+        (goal_chunk, goal_component),
+    ) else {
         return req.goal;
     };
-    // Use the chunk-graph edge's `entry_z` so A* searches for a tile that
-    // actually exists on the right Z. Forcing the segment target's Z to the
-    // agent's current Z (the previous behaviour) produced false `Unreachable`
-    // failures whenever the waypoint was on a ramp or different Z slice.
-    let next_chunk = chunk_route[1];
-    let entry_z = graph
-        .edges
-        .get(&start_chunk)
-        .and_then(|edges| {
-            edges
-                .iter()
-                .find(|e| {
-                    e.neighbor == next_chunk
-                        && (e.entry_local.0 as i32 + next_chunk.0 * CHUNK_SIZE as i32) == wx as i32
-                        && (e.entry_local.1 as i32 + next_chunk.1 * CHUNK_SIZE as i32) == wy as i32
-                })
-                .map(|e| e.entry_z)
-        })
-        .unwrap_or(req.start.2);
-    (wx as i32, wy as i32, entry_z)
+    (wp.entry_x, wp.entry_y, wp.entry_z)
 }
 
 #[allow(clippy::too_many_arguments)]
