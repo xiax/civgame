@@ -176,6 +176,76 @@ pub struct RescueTarget {
 #[derive(Component, Default)]
 pub struct GoalReason(pub &'static str);
 
+/// Pluralist Economy R8 follow-on: Maslow's hierarchy of needs as a
+/// 5-tier comparator. Each agent's `next_unmet_tier` is the
+/// lowest-numbered tier whose representative need is below its
+/// satisfaction threshold. Higher tiers only fire when all lower
+/// tiers are satisfied — agents with hunger pressure will not
+/// pursue Esteem postings.
+///
+/// **Critical**: this enum is *additive*. It does **not** replace
+/// or override `goal_update_system`'s existing goal-selection
+/// logic — that's the load-bearing path for lower-tier goals
+/// (Survive / Sleep / Socialize / etc.). Maslow-tier-aware systems
+/// (today: `esteem_driven_posting_system`) consult this gate to
+/// decide whether to apply their behaviour as a **side-effect**
+/// without preempting the existing goal layer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MaslowTier {
+    /// Hunger / sleep / reproduction.
+    Physiological = 1,
+    /// Shelter / safety.
+    Safety = 2,
+    /// Social / belonging (today: `Needs.social`).
+    Belonging = 3,
+    /// Esteem (status, mastery, recognition). Inverted polarity in
+    /// `Needs.esteem` — 255 = satiated.
+    Esteem = 4,
+    /// Self-actualization (knowledge, teaching, descendants).
+    /// Inverted polarity. 255 = satiated.
+    SelfActualization = 5,
+}
+
+/// Need-pressure thresholds for each tier. A need above its
+/// threshold (or below, for inverted-polarity Esteem /
+/// SelfActualization) counts as unsatisfied. Calibrated to
+/// produce sensible "all lower tiers met → higher tier fires"
+/// transitions for typical gameplay.
+const TIER_HUNGER_THRESHOLD: f32 = 100.0;
+const TIER_SLEEP_THRESHOLD: f32 = 100.0;
+const TIER_SHELTER_THRESHOLD: f32 = 100.0;
+const TIER_SAFETY_THRESHOLD: f32 = 100.0;
+const TIER_SOCIAL_THRESHOLD: f32 = 100.0;
+const TIER_ESTEEM_SATIATED: f32 = 200.0; // inverted; 255 = full
+const TIER_SELF_ACTUALIZATION_SATIATED: f32 = 200.0;
+
+impl MaslowTier {
+    /// Returns the lowest-numbered tier whose representative need
+    /// is below its satisfaction threshold. Returns `None` when
+    /// every tier is satisfied (a fully-flourishing agent).
+    pub fn next_unmet(needs: &crate::simulation::needs::Needs) -> Option<MaslowTier> {
+        if needs.hunger > TIER_HUNGER_THRESHOLD
+            || needs.sleep > TIER_SLEEP_THRESHOLD
+            || needs.reproduction > TIER_HUNGER_THRESHOLD
+        {
+            return Some(MaslowTier::Physiological);
+        }
+        if needs.shelter > TIER_SHELTER_THRESHOLD || needs.safety > TIER_SAFETY_THRESHOLD {
+            return Some(MaslowTier::Safety);
+        }
+        if needs.social > TIER_SOCIAL_THRESHOLD {
+            return Some(MaslowTier::Belonging);
+        }
+        if needs.esteem < TIER_ESTEEM_SATIATED {
+            return Some(MaslowTier::Esteem);
+        }
+        if needs.self_actualization < TIER_SELF_ACTUALIZATION_SATIATED {
+            return Some(MaslowTier::SelfActualization);
+        }
+        None
+    }
+}
+
 pub fn goal_update_system(
     mut commands: Commands,
     clock: Res<SimClock>,

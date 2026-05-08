@@ -7508,6 +7508,108 @@ pub fn htn_combat_faction_dispatch_system(
     }
 }
 
+/// Pluralist Economy R5 follow-on: idle bureaucrats walk to their
+/// faction's town hall (= the first settlement's `market_tile`) and
+/// stand there. Reuses `Task::Lead` (a no-op-on-arrival task) — no
+/// new TaskKind / Task variant. The hard guardrail holds.
+///
+/// **Gate**: `Profession::Bureaucrat` + `task_id == UNEMPLOYED` +
+/// `aq.current == Idle` + `state == Idle` + non-Dormant LOD. The
+/// last three together mean the bureaucrat has no other obligation;
+/// when goal_update_system flips them onto Survive (hungry) or any
+/// other need-driven goal, that goal's normal task chain
+/// preempts via `aq.cancel()` semantics in the goal-dispatch
+/// pipeline.
+///
+/// **No HTN method registration**. Bureaucrat behaviour is
+/// deterministic (single tile, single task) — there's no decision
+/// space for a Method to score. Direct dispatch keeps the
+/// implementation a single focused system rather than an abstract
+/// task + method + dispatcher trio for what amounts to "stand
+/// here."
+pub fn bureaucrat_admin_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    settlements: Query<&crate::simulation::settlement::Settlement>,
+    mut query: Query<
+        (
+            &crate::simulation::person::Profession,
+            &mut PersonAI,
+            &mut ActionQueue,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    for (prof, mut ai, mut aq, transform, member, lod) in query.iter_mut() {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if *prof != crate::simulation::person::Profession::Bureaucrat {
+            continue;
+        }
+        if ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+        if ai.state != AiState::Idle {
+            continue;
+        }
+        if !matches!(aq.current, Task::Idle) {
+            continue;
+        }
+
+        // Find the agent's faction's town hall = first settlement's
+        // market_tile.
+        let Some(sid) = settlement_map.first_for_faction(member.faction_id) else {
+            continue;
+        };
+        let Some(&entity) = settlement_map.by_id.get(&sid) else {
+            continue;
+        };
+        let Ok(settlement) = settlements.get(entity) else {
+            continue;
+        };
+        let dest = settlement.market_tile;
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Already at the town hall? Skip routing — just dispatch
+        // the typed task so the executor / preempt system sees a
+        // bureaucrat who is "at desk".
+        if cur_tx == dest.0 && cur_ty == dest.1 {
+            aq.dispatch(Task::Lead { dest });
+            continue;
+        }
+
+        // Route via the standard pathfinding pipeline.
+        let routed = crate::simulation::tasks::assign_task_with_routing(
+            &mut ai,
+            (cur_tx, cur_ty),
+            cur_chunk,
+            dest,
+            crate::simulation::tasks::TaskKind::Lead,
+            None,
+            &chunk_graph,
+            &chunk_router,
+            &chunk_map,
+            &chunk_connectivity,
+        );
+        if routed {
+            aq.dispatch(Task::Lead { dest });
+        }
+    }
+}
+
 /// Phase 5e-xi-a method: withdraw one unit of `resource_id` from faction
 /// storage and haul it into a `CraftOrder` whose deposit slots still need it.
 /// Replaces the legacy `DeliverFromStorageToCraftOrder` plan (PlanId 15) +

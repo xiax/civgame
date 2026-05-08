@@ -661,3 +661,94 @@ pub fn apply_teach_order_system(
         }
     }
 }
+
+// ─── Pluralist Economy R8 follow-on: SelfActualization teaching trigger ───
+
+/// Per-tick `Needs.self_actualization` increment when an agent
+/// triggers a lecture. Mirrors `ESTEEM_POSTING_GAIN` shape: the
+/// act of teaching grants the Maslow Tier-5 satisfaction.
+pub const SELF_ACTUALIZATION_LECTURE_GAIN: f32 = 30.0;
+
+/// Cadence at which `self_actualization_teaching_system` runs.
+/// Once per game-day; at most one lecture is scheduled per firing
+/// because `LectureRequest` is a single-slot resource.
+pub const SELF_ACTUALIZATION_CADENCE: u64 =
+    crate::world::seasons::TICKS_PER_DAY as u64;
+
+/// Pluralist Economy R8 follow-on: SelfActualization tier triggers
+/// teaching. When an agent's Maslow tier is `SelfActualization`
+/// (every lower tier — including Esteem — satisfied) AND they have
+/// at least one Learned tech, set `LectureRequest` to schedule a
+/// lecture. The existing `apply_lecture_request_system` (Economy)
+/// then drafts up to `LECTURE_STUDENT_CAP` nearby same-faction
+/// adults and starts the lecture loop.
+///
+/// **Critical**: like `esteem_driven_posting_system`, this system
+/// is *additive*. It does **not** preempt `goal_update_system`'s
+/// goal selection — the lecturer's `AgentGoal` is unchanged at the
+/// trigger point. The lecture mechanic itself inserts `Drafted`,
+/// which suspends the agent's normal autonomy via the existing
+/// `Without<Drafted>` filters in `goal_update_system`.
+///
+/// `LectureRequest` is a single-slot resource. Only one agent can
+/// trigger per tick — first-eligible-agent wins. The system runs
+/// at game-day cadence so contention is minimal.
+pub fn self_actualization_teaching_system(
+    clock: Res<SimClock>,
+    mut request: ResMut<LectureRequest>,
+    mut q: Query<(
+        Entity,
+        &mut crate::simulation::needs::Needs,
+        &PersonKnowledge,
+        &LodLevel,
+        &FactionMember,
+    )>,
+) {
+    use crate::simulation::goals::MaslowTier;
+
+    if clock.tick % SELF_ACTUALIZATION_CADENCE != 0 {
+        return;
+    }
+    // Already a lecture queued by the player UI? Don't override.
+    if request.0.is_some() {
+        return;
+    }
+
+    for (entity, mut needs, knowledge, lod, member) in q.iter_mut() {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if member.faction_id == crate::simulation::faction::SOLO {
+            continue;
+        }
+        if MaslowTier::next_unmet(&needs) != Some(MaslowTier::SelfActualization) {
+            continue;
+        }
+        // Pick a Learned tech to teach. Prefer the highest-complexity
+        // one (most "valuable" knowledge transferred first), mirroring
+        // `tech_teaching_system`'s teach-rate weighting.
+        let mut best: Option<(TechId, u8)> = None;
+        for tech_id in 0..64u32 {
+            if (knowledge.learned >> tech_id) & 1 == 0 {
+                continue;
+            }
+            let tech = tech_id as TechId;
+            let c = crate::simulation::technology::complexity(tech);
+            if best.map_or(true, |(_, b)| c > b) {
+                best = Some((tech, c));
+            }
+        }
+        let Some((tech, _)) = best else {
+            // Nothing Learned to teach — agent's Maslow ladder
+            // can't satisfy via lecture today. Self_actualization
+            // stays unmet; future ticks may find another agent.
+            continue;
+        };
+
+        request.0 = Some((entity, tech));
+        needs.self_actualization =
+            (needs.self_actualization + SELF_ACTUALIZATION_LECTURE_GAIN).min(255.0);
+        // Single-slot resource: stop after the first match.
+        return;
+    }
+}

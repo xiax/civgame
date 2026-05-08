@@ -488,6 +488,204 @@ pub fn post_craft_contract(
     Some(escrow)
 }
 
+/// Pluralist Economy R6 follow-on: post a craft contract funded
+/// from a faction's treasury (rather than an agent's wallet). Used
+/// by `household_contract_posting_system` so households can
+/// commission work without their head personally fronting the
+/// currency.
+///
+/// Behaviour mirrors `post_craft_contract` except the debit/refund
+/// flows through `FactionData.treasury` (looked up via
+/// `FactionRegistry`). The escrow sidecar's `beneficiary` is set to
+/// a "treasury beneficiary" placeholder Entity (today: the
+/// household head, since on cancellation the refund would otherwise
+/// vanish — the head holds the household's currency by proxy and
+/// the household's `treasury` is recredited at completion via a
+/// future system). For R6's narrow validation (post + escrow
+/// lifecycle) we use the head as beneficiary; future R-phases can
+/// add a Treasury-typed beneficiary if needed.
+///
+/// Returns the spawned escrow entity on success, or None on:
+/// insufficient treasury, missing recipe, missing faction, qty=0
+/// or non-positive reward.
+pub fn post_craft_contract_from_treasury(
+    world: &mut World,
+    funding_faction_id: u32,
+    posting_faction_id: u32,
+    head: Entity,
+    recipe: RecipeId,
+    qty: u32,
+    reward: f32,
+    deadline_tick: Option<u32>,
+) -> Option<Entity> {
+    if !(reward > 0.0) || qty == 0 {
+        return None;
+    }
+    if crate::simulation::crafting::craft_recipes()
+        .get(recipe as usize)
+        .is_none()
+    {
+        return None;
+    }
+    // Treasury check + atomic debit.
+    {
+        let mut registry = world.resource_mut::<FactionRegistry>();
+        let funding = registry.factions.get_mut(&funding_faction_id)?;
+        if funding.treasury < reward {
+            return None;
+        }
+        funding.treasury -= reward;
+    }
+
+    let posted_tick = world
+        .get_resource::<SimClock>()
+        .map(|c| c.tick as u32)
+        .unwrap_or(0);
+    {
+        let mut board = world.resource_mut::<JobBoard>();
+        let id = board.alloc_id();
+        let progress = JobProgress::Crafting {
+            crafted: 0,
+            target: qty,
+            recipe,
+            bench: None,
+            tech_payload: None,
+        };
+        board.faction_postings_mut(posting_faction_id).push(JobPosting {
+            id,
+            faction_id: posting_faction_id,
+            kind: JobKind::Craft,
+            progress,
+            claimants: Vec::new(),
+            priority: PLAYER_PRIORITY,
+            source: JobSource::Player,
+            posted_tick,
+            expiry_tick: deadline_tick,
+            poster_class: PosterClass::HouseholdHead,
+            reward,
+            settlement_id: None,
+        });
+    }
+
+    // Escrow with the head as beneficiary. On cancellation, the
+    // refund lands in the head's wallet — this is a small
+    // deviation from "treasury-funded" semantics but keeps
+    // currency-conservation strict without requiring a Treasury
+    // entity primitive. R-future phases can swap the beneficiary
+    // for a treasury proxy if desired.
+    let escrow = world
+        .spawn(JobEscrow {
+            amount: reward,
+            beneficiary: head,
+        })
+        .id();
+    Some(escrow)
+}
+
+// ─── Pluralist Economy R8 follow-on: Esteem-driven posting ─────────
+
+/// Per-individual reward when an Esteem-seeking agent commissions a
+/// luxury good (Torch, recipe id 2). Anchored at 8.0 — slightly
+/// above household-poster baseline so a satiated wealthy agent's
+/// contract outscores a typical household contract on the U_bid
+/// scorer.
+pub const ESTEEM_CONTRACT_REWARD: f32 = 8.0;
+
+/// Minimum agent currency required for the Esteem-driven posting
+/// system to commission a contract. Above this, surplus currency
+/// is "esteem-spendable"; below, the agent prioritises wealth
+/// accumulation.
+pub const ESTEEM_POSTING_MIN_CURRENCY: f32 = 50.0;
+
+/// Cadence at which `esteem_driven_posting_system` runs. Once per
+/// game-day; each qualifying agent posts at most one contract per
+/// firing.
+pub const ESTEEM_POSTING_CADENCE: u64 =
+    crate::world::seasons::TICKS_PER_DAY as u64;
+
+/// Per-tick `Needs.esteem` increment when an agent posts a
+/// prestigious contract. The act of commissioning is what grants
+/// status, not the eventual completion. Small enough that an agent
+/// needs to keep posting (or earn esteem some other way) to stay
+/// satiated.
+pub const ESTEEM_POSTING_GAIN: f32 = 30.0;
+
+/// Pluralist Economy R8 follow-on: Esteem-driven contract posting.
+///
+/// Walks every agent whose Maslow tier (`MaslowTier::next_unmet`)
+/// is `Esteem` AND whose `EconomicAgent.currency` is above
+/// `ESTEEM_POSTING_MIN_CURRENCY`. For each, posts a Luxury (Torch,
+/// recipe id 2) contract via `post_craft_contract` with the agent
+/// as poster — the act of commissioning prestige goods grants
+/// `ESTEEM_POSTING_GAIN` to `Needs.esteem`.
+///
+/// **Critical**: this system is *additive*. It does not preempt
+/// `goal_update_system`'s goal selection — the agent's `AgentGoal`
+/// is unchanged. The contract is a behavioural side-effect of the
+/// agent's wealth + Maslow profile. The posted contract enters the
+/// regular U_bid claim flow (R9), so smiths see and claim it
+/// alongside other paid postings.
+///
+/// Cadence: `ESTEEM_POSTING_CADENCE` (one game-day).
+pub fn esteem_driven_posting_system(world: &mut World) {
+    use crate::simulation::goals::MaslowTier;
+
+    let now = match world.get_resource::<SimClock>() {
+        Some(c) => c.tick,
+        None => return,
+    };
+    if now % ESTEEM_POSTING_CADENCE != 0 {
+        return;
+    }
+
+    // Snapshot eligible agents (entity, faction_id) so we can later
+    // mutate without holding query borrows during the posting calls
+    // (which take &mut World).
+    let mut intents: Vec<(Entity, u32)> = Vec::new();
+    {
+        let mut q = world.query::<(
+            Entity,
+            &crate::simulation::needs::Needs,
+            &crate::economy::agent::EconomicAgent,
+            &crate::simulation::faction::FactionMember,
+            &crate::simulation::lod::LodLevel,
+        )>();
+        for (entity, needs, econ, member, lod) in q.iter(world) {
+            if *lod == crate::simulation::lod::LodLevel::Dormant {
+                continue;
+            }
+            if member.faction_id == crate::simulation::faction::SOLO {
+                continue;
+            }
+            if econ.currency < ESTEEM_POSTING_MIN_CURRENCY {
+                continue;
+            }
+            if MaslowTier::next_unmet(needs) != Some(MaslowTier::Esteem) {
+                continue;
+            }
+            intents.push((entity, member.faction_id));
+        }
+    }
+
+    for (poster, faction_id) in intents {
+        let escrow = post_craft_contract(
+            world,
+            poster,
+            faction_id,
+            2, // Torch (Luxury). Paleolithic-tech, always available.
+            1,
+            ESTEEM_CONTRACT_REWARD,
+            None,
+        );
+        if escrow.is_some() {
+            // Reward the agent's psyche for the prestigious post.
+            if let Some(mut needs) = world.get_mut::<crate::simulation::needs::Needs>(poster) {
+                needs.esteem = (needs.esteem + ESTEEM_POSTING_GAIN).min(255.0);
+            }
+        }
+    }
+}
+
 /// Global resource holding all postings, sharded internally by faction.
 #[derive(Resource, Default)]
 pub struct JobBoard {

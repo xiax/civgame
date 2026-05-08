@@ -312,44 +312,75 @@ pub fn awareness_gossip_system(
         &super::goals::AgentGoal,
         &super::lod::LodLevel,
         &mut PersonKnowledge,
+        Option<&mut super::memory::AgentMemory>,
     )>,
 ) {
     use super::goals::AgentGoal;
     use super::lod::LodLevel;
 
-    let snapshots: ahash::AHashMap<Entity, u64> = q
+    // Snapshot each socializing agent's tech-awareness (aware|learned)
+    // AND visited settlements (Pluralist Economy R8 follow-on). Both
+    // OR-merge between adjacent socializing agents; gossip is free,
+    // teaching (Learned) is the bottleneck via tech_teaching_system.
+    let snapshots: ahash::AHashMap<
+        Entity,
+        (
+            u64,
+            Vec<crate::simulation::settlement::SettlementId>,
+        ),
+    > = q
         .iter()
-        .filter(|(_, _, goal, lod, _)| {
+        .filter(|(_, _, goal, lod, _, _)| {
             matches!(goal, AgentGoal::Socialize) && **lod != LodLevel::Dormant
         })
-        .map(|(e, _, _, _, k)| (e, k.aware | k.learned))
+        .map(|(e, _, _, _, k, mem_opt)| {
+            let aware = k.aware | k.learned;
+            let settlements: Vec<_> = mem_opt
+                .as_deref()
+                .map(|m| m.known_settlements().map(|(id, _)| id).collect())
+                .unwrap_or_default();
+            (e, (aware, settlements))
+        })
         .collect();
 
     if snapshots.is_empty() {
         return;
     }
 
-    for (entity, transform, goal, lod, mut knowledge) in q.iter_mut() {
+    for (entity, transform, goal, lod, mut knowledge, mem_opt) in q.iter_mut() {
         if *lod == LodLevel::Dormant || !matches!(goal, AgentGoal::Socialize) {
             continue;
         }
         let tx = (transform.translation.x / TILE_SIZE_LOCAL).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE_LOCAL).floor() as i32;
         let mut aware_received: u64 = 0;
+        let mut settlements_received: ahash::AHashSet<
+            crate::simulation::settlement::SettlementId,
+        > = ahash::AHashSet::default();
         for dy in -3i32..=3 {
             for dx in -3i32..=3 {
                 for &other in spatial.get(tx + dx, ty + dy) {
                     if other == entity {
                         continue;
                     }
-                    if let Some(&snap) = snapshots.get(&other) {
-                        aware_received |= snap;
+                    if let Some((snap_aware, snap_settlements)) = snapshots.get(&other) {
+                        aware_received |= snap_aware;
+                        for sid in snap_settlements {
+                            settlements_received.insert(*sid);
+                        }
                     }
                 }
             }
         }
         if aware_received != 0 {
             knowledge.merge_awareness(aware_received);
+        }
+        if !settlements_received.is_empty() {
+            if let Some(mut memory) = mem_opt {
+                for sid in settlements_received {
+                    memory.record_settlement(sid);
+                }
+            }
         }
     }
 }

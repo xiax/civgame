@@ -214,6 +214,18 @@ impl Plugin for SimulationPlugin {
                     .after(htn::htn_combat_faction_dispatch_system),)
                     .in_set(SimulationSet::ParallelB),
             )
+            // Pluralist Economy R5 follow-on: bureaucrat admin
+            // dispatcher in its own add_systems call (the main
+            // ParallelB tuple already brushes the 20-element
+            // IntoSystemConfigs ceiling). Ordered after the combat
+            // dispatcher so chief / lead / defend / raid take
+            // priority over bureaucrat town-hall stationing.
+            .add_systems(
+                FixedUpdate,
+                htn::bureaucrat_admin_dispatch_system
+                    .in_set(SimulationSet::ParallelB)
+                    .after(htn::htn_combat_faction_dispatch_system),
+            )
             .add_systems(
                 // Phase 5e-xi-a/b: split-off because the main ParallelB tuple
                 // is already at Bevy's 20-element IntoSystemConfigs ceiling.
@@ -442,7 +454,26 @@ impl Plugin for SimulationPlugin {
                         .after(faction::chief_bureaucrat_appointment_system),
                     faction::tribute_payment_system
                         .after(faction::bureaucrat_salary_tick_system),
+                    faction::household_contract_posting_system
+                        .after(faction::tribute_payment_system),
                     corpse::corpse_decay_system,
+                )
+                    .in_set(SimulationSet::Economy),
+            )
+            // Pluralist Economy R8 follow-on: Esteem-driven posting
+            // lives in its own `add_systems` call because the main
+            // Economy tuple hit Bevy's 20-element `IntoSystem`
+            // ceiling. Still ordered after household contracts so
+            // a wealthy household-head's individual prestige
+            // posting comes after their household's commission.
+            .add_systems(
+                FixedUpdate,
+                (
+                    jobs::esteem_driven_posting_system
+                        .after(faction::household_contract_posting_system),
+                    teaching::self_actualization_teaching_system
+                        .after(jobs::esteem_driven_posting_system)
+                        .before(teaching::apply_lecture_request_system),
                 )
                     .in_set(SimulationSet::Economy),
             );

@@ -1653,6 +1653,546 @@ mod smoke {
         );
     }
 
+    // ─── Pluralist Economy R8 follow-on — SelfActualization teaching ───
+
+    #[test]
+    fn self_actualizing_elder_triggers_lecture() {
+        // R8 follow-on: an agent on Maslow tier
+        // SelfActualization (every lower tier including Esteem
+        // satisfied) AND with at least one Learned tech triggers a
+        // LectureRequest once per game-day, granting them
+        // SELF_ACTUALIZATION_LECTURE_GAIN to the
+        // self_actualization need.
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::needs::Needs;
+        use crate::simulation::teaching::{
+            LectureRequest, SELF_ACTUALIZATION_LECTURE_GAIN,
+        };
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        // Spawn the elder. Default Person spawn includes a
+        // PersonKnowledge with Paleolithic Aware+Learned (per
+        // PersonKnowledge::paleolithic_seed), so they have at least
+        // one Learned tech.
+        let elder = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
+            b.needs(Needs {
+                hunger: 0.0,
+                sleep: 0.0,
+                shelter: 0.0,
+                safety: 0.0,
+                social: 0.0,
+                reproduction: 0.0,
+                willpower: 255.0,
+                esteem: 250.0, // satiated → unlocks Tier 5
+                self_actualization: 0.0,
+            });
+        });
+
+        // Confirm they have at least one Learned tech.
+        let knowledge = sim
+            .app
+            .world()
+            .get::<PersonKnowledge>(elder)
+            .unwrap();
+        assert!(knowledge.learned != 0, "elder should have Paleolithic Learned techs");
+
+        let starting_sa = sim.app.world().get::<Needs>(elder).unwrap().self_actualization;
+
+        // Tick one game-day so the cadence fires.
+        sim.tick_n(TICKS_PER_DAY as u32 + 5);
+
+        // The elder's self_actualization should have bumped (the
+        // act of triggering the lecture grants the satisfaction).
+        let new_sa = sim.app.world().get::<Needs>(elder).unwrap().self_actualization;
+        assert!(
+            new_sa > starting_sa,
+            "self_actualization should increase: {starting_sa} → {new_sa}",
+        );
+
+        // The LectureRequest may have been consumed already by
+        // apply_lecture_request_system (which runs in the same tick),
+        // OR a Lecturing component may have been inserted on the
+        // elder. Either way: a lecture was set up.
+        let request = sim.app.world().resource::<LectureRequest>();
+        let lecturing_marker = sim
+            .app
+            .world()
+            .get::<crate::simulation::teaching::Lecturing>(elder);
+        assert!(
+            request.0.is_some() || lecturing_marker.is_some(),
+            "expected either LectureRequest set or Lecturing inserted on the elder",
+        );
+        let _ = SELF_ACTUALIZATION_LECTURE_GAIN; // const reference
+    }
+
+    #[test]
+    fn esteem_unfulfilled_agent_does_not_trigger_lecture() {
+        // Maslow gate: an agent with Esteem unmet (Tier 4) does
+        // NOT skip to SelfActualization (Tier 5). The teaching
+        // trigger should NOT fire.
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::needs::Needs;
+        use crate::simulation::teaching::LectureRequest;
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let agent = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
+            b.needs(Needs {
+                hunger: 0.0,
+                sleep: 0.0,
+                shelter: 0.0,
+                safety: 0.0,
+                social: 0.0,
+                reproduction: 0.0,
+                willpower: 255.0,
+                esteem: 0.0, // UNMET → Tier 4 wins, Tier 5 doesn't fire
+                self_actualization: 0.0,
+            });
+        });
+        let _ = sim.app.world().get::<PersonKnowledge>(agent).unwrap();
+        let starting_sa = sim.app.world().get::<Needs>(agent).unwrap().self_actualization;
+
+        sim.tick_n(TICKS_PER_DAY as u32 + 5);
+
+        let new_sa = sim.app.world().get::<Needs>(agent).unwrap().self_actualization;
+        assert_eq!(
+            new_sa, starting_sa,
+            "self_actualization must not bump while Esteem unmet",
+        );
+        // No Lecturing component either.
+        assert!(
+            sim.app
+                .world()
+                .get::<crate::simulation::teaching::Lecturing>(agent)
+                .is_none(),
+        );
+        // (LectureRequest may have been triggered by some other agent
+        // — we don't assert on the resource itself in the negative
+        // case.)
+        let _ = sim.app.world().resource::<LectureRequest>();
+    }
+
+    // ─── Pluralist Economy R8 follow-on — visited_settlements gossip ───
+
+    #[test]
+    fn visited_settlement_propagates_via_gossip_to_socializer() {
+        // R8 follow-on: an agent who's visited Settlement X (slot
+        // populated in `AgentMemory.visited_settlements`) propagates
+        // that knowledge to a same-faction socializer adjacent to
+        // them. After one pass of `awareness_gossip_system`, the
+        // socializer's `known_settlements()` includes X.
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::memory::AgentMemory;
+        use crate::simulation::needs::Needs;
+        use crate::simulation::settlement::SettlementId;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        // Pin AgentGoal::Socialize by setting needs.social well
+        // above the 160 threshold so goal_update_system keeps
+        // picking Socialize each tick.
+        let high_social = Needs {
+            hunger: 0.0,
+            sleep: 0.0,
+            shelter: 0.0,
+            safety: 0.0,
+            social: 220.0,
+            reproduction: 0.0,
+            willpower: 200.0,
+            esteem: 0.0,
+            self_actualization: 0.0,
+        };
+        let traveler = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.needs(high_social).goal(AgentGoal::Socialize);
+        });
+        let listener = sim.spawn_person(sim.player_faction_id, (1, 0), |b| {
+            b.needs(high_social).goal(AgentGoal::Socialize);
+        });
+
+        // Pin the traveler's knowledge of an exotic settlement id.
+        let exotic_id = SettlementId(9999);
+        {
+            let mut mem = sim
+                .app
+                .world_mut()
+                .get_mut::<AgentMemory>(traveler)
+                .unwrap();
+            mem.record_settlement(exotic_id);
+        }
+
+        // Tick a few times so SpatialIndex sync + gossip system fires.
+        sim.tick_n(5);
+
+        // Listener should now know about the exotic settlement.
+        let listener_mem = sim
+            .app
+            .world()
+            .get::<AgentMemory>(listener)
+            .unwrap();
+        let known: Vec<_> = listener_mem
+            .known_settlements()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            known.contains(&exotic_id),
+            "listener should have learned exotic settlement {exotic_id:?} via gossip; known={known:?}",
+        );
+    }
+
+    // ─── Pluralist Economy R5 follow-on — Bureaucrat town-hall dispatch ───
+
+    #[test]
+    fn idle_bureaucrat_dispatches_lead_task_to_town_hall() {
+        // R5 follow-on validation: a Bureaucrat agent who's
+        // otherwise idle (no goal-driven task) gets a `Task::Lead`
+        // dispatched targeting their faction's first settlement's
+        // market_tile (the de-facto town hall).
+        use crate::simulation::person::Profession;
+        use crate::simulation::settlement::SettlementMap;
+        use crate::simulation::typed_task::Task;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let bureaucrat = sim.spawn_person(sim.player_faction_id, (3, 3), |b| {
+            b.profession(Profession::Bureaucrat);
+        });
+
+        // Tick a couple times so the auto-found settlement appears
+        // and the dispatcher can find a town_hall_tile.
+        sim.tick_n(10);
+
+        let town_hall = {
+            let map = sim.app.world().resource::<SettlementMap>();
+            let sid = map.first_for_faction(sim.player_faction_id).unwrap();
+            let entity = *map.by_id.get(&sid).unwrap();
+            sim.app
+                .world()
+                .get::<crate::simulation::settlement::Settlement>(entity)
+                .unwrap()
+                .market_tile
+        };
+
+        let task = person_task(&sim.app, bureaucrat);
+        match task {
+            Task::Lead { dest } => {
+                assert_eq!(
+                    dest, town_hall,
+                    "bureaucrat should be heading to the town hall ({town_hall:?}); got dest={dest:?}",
+                );
+            }
+            // The bureaucrat may have other task chains queued
+            // (Survive / Sleep) ahead of the Lead dispatch on the
+            // very first idle tick; for the regression we accept
+            // either Lead-to-town-hall OR no other dispatched task
+            // — the system never strands the bureaucrat in an
+            // inconsistent state.
+            other => {
+                // Try the next prefetched task.
+                let aq = sim
+                    .app
+                    .world()
+                    .get::<crate::simulation::typed_task::ActionQueue>(bureaucrat)
+                    .unwrap();
+                match aq.peek_next() {
+                    Some(Task::Lead { dest }) => {
+                        assert_eq!(dest, town_hall);
+                    }
+                    _ => panic!(
+                        "expected Task::Lead in current or queued slot; current={other:?}",
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_bureaucrat_idle_agent_does_not_get_lead_task() {
+        // Negative case: a regular None-profession agent must
+        // not have Task::Lead dispatched by the bureaucrat
+        // dispatcher, even when otherwise idle.
+        use crate::simulation::typed_task::Task;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let agent = sim.spawn_person(sim.player_faction_id, (3, 3), |_| {});
+        sim.tick_n(10);
+
+        let task = person_task(&sim.app, agent);
+        assert!(
+            !matches!(task, Task::Lead { .. }),
+            "non-bureaucrat should not have Task::Lead dispatched: got {task:?}",
+        );
+    }
+
+    // ─── Pluralist Economy R8 follow-on — Maslow goal-priority spine ───
+
+    #[test]
+    fn maslow_next_unmet_returns_lowest_unsatisfied_tier() {
+        // Pin the gate's contract: hunger pressure → Physiological;
+        // hunger satisfied + safety pressure → Safety; etc.
+        use crate::simulation::goals::MaslowTier;
+        use crate::simulation::needs::Needs;
+
+        let satiated = Needs {
+            hunger: 0.0,
+            sleep: 0.0,
+            shelter: 0.0,
+            safety: 0.0,
+            social: 0.0,
+            reproduction: 0.0,
+            willpower: 255.0,
+            esteem: 250.0,
+            self_actualization: 250.0,
+        };
+        assert_eq!(MaslowTier::next_unmet(&satiated), None);
+
+        let hungry = Needs { hunger: 200.0, ..satiated };
+        assert_eq!(MaslowTier::next_unmet(&hungry), Some(MaslowTier::Physiological));
+
+        let unsafe_ = Needs { safety: 200.0, ..satiated };
+        assert_eq!(MaslowTier::next_unmet(&unsafe_), Some(MaslowTier::Safety));
+
+        let lonely = Needs { social: 200.0, ..satiated };
+        assert_eq!(MaslowTier::next_unmet(&lonely), Some(MaslowTier::Belonging));
+
+        let unfulfilled = Needs { esteem: 100.0, ..satiated };
+        assert_eq!(MaslowTier::next_unmet(&unfulfilled), Some(MaslowTier::Esteem));
+
+        let mastering = Needs { self_actualization: 100.0, ..satiated };
+        assert_eq!(
+            MaslowTier::next_unmet(&mastering),
+            Some(MaslowTier::SelfActualization),
+        );
+    }
+
+    #[test]
+    fn esteem_seeking_wealthy_agent_posts_luxury_contract_per_day() {
+        // R8 follow-on validation: a wealthy agent with all lower
+        // Maslow tiers satiated AND esteem unfulfilled posts a
+        // Torch (recipe 2 = Luxury) contract per game-day. Esteem
+        // bumps on each post; system-wide currency invariant holds.
+        use crate::simulation::jobs::{
+            JobBoard, JobKind, PosterClass, ESTEEM_CONTRACT_REWARD,
+        };
+        use crate::simulation::needs::Needs;
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let agent = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
+            b.needs(Needs {
+                hunger: 0.0,
+                sleep: 0.0,
+                shelter: 0.0,
+                safety: 0.0,
+                social: 0.0,
+                reproduction: 0.0,
+                willpower: 255.0,
+                esteem: 0.0, // unfulfilled — Maslow tier 4
+                self_actualization: 0.0,
+            });
+        });
+        set_currency(&mut sim.app, agent, 100.0);
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+        let starting_esteem = sim.app.world().get::<Needs>(agent).unwrap().esteem;
+
+        sim.tick_n(TICKS_PER_DAY as u32 + 5);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let postings: Vec<_> = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| {
+                p.kind == JobKind::Craft
+                    && p.poster_class == PosterClass::Individual
+                    && (p.reward - ESTEEM_CONTRACT_REWARD).abs() < 1e-3
+            })
+            .collect();
+        assert!(
+            !postings.is_empty(),
+            "expected at least one Esteem-driven Individual contract on the board",
+        );
+
+        // Esteem bumped — agent felt prestigious.
+        let new_esteem = sim.app.world().get::<Needs>(agent).unwrap().esteem;
+        assert!(
+            new_esteem > starting_esteem,
+            "esteem should increase after posting: {starting_esteem} → {new_esteem}",
+        );
+
+        // Currency invariant holds across debit + escrow.
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+    }
+
+    #[test]
+    fn hungry_agent_does_not_post_esteem_contract() {
+        // Maslow gate negative: an agent with hunger pressure stays
+        // on Physiological tier and does NOT post an Esteem
+        // contract, even if wealthy.
+        use crate::simulation::jobs::{JobBoard, JobKind, PosterClass};
+        use crate::simulation::needs::Needs;
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let agent = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
+            b.needs(Needs {
+                hunger: 200.0, // pressure → Physiological tier
+                sleep: 0.0,
+                shelter: 0.0,
+                safety: 0.0,
+                social: 0.0,
+                reproduction: 0.0,
+                willpower: 255.0,
+                esteem: 0.0,
+                self_actualization: 0.0,
+            });
+        });
+        set_currency(&mut sim.app, agent, 100.0);
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        sim.tick_n(TICKS_PER_DAY as u32 + 5);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let count = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| {
+                p.kind == JobKind::Craft
+                    && p.poster_class == PosterClass::Individual
+            })
+            .count();
+        assert_eq!(
+            count, 0,
+            "hungry agent must not post Esteem contract while Physiological tier unmet",
+        );
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+    }
+
+    // ─── Pluralist Economy R6 follow-on — household-poster path ───
+
+    #[test]
+    fn funded_household_posts_paid_craft_contract_per_day() {
+        // R6 follow-on: spawn a household sub-faction with a
+        // pre-funded treasury; tick one game-day; assert exactly
+        // one paid `JobKind::Craft` posting with
+        // `poster_class=HouseholdHead` lands on the village's job
+        // board. Validates:
+        // - household_contract_posting_system fires per-day.
+        // - post_craft_contract_from_treasury debits the household
+        //   treasury and credits a JobEscrow sidecar.
+        // - The posting routes to the village board (parent
+        //   faction), not a separate per-household board.
+        // - System-wide currency invariant holds (debit + escrow ==
+        //   const).
+        use crate::simulation::faction::{
+            FactionRegistry, HOUSEHOLD_CONTRACT_REWARD,
+        };
+        use crate::simulation::jobs::{JobBoard, JobKind, PosterClass};
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let head = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+
+        // Spawn a household with the player faction as parent + seed
+        // treasury well above the minimum.
+        let village_id = sim.player_faction_id;
+        let household_id = {
+            let catalog = sim
+                .app
+                .world()
+                .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+                .clone();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let id = registry.spawn_household(village_id, (5, 5), head, &catalog);
+            registry.factions.get_mut(&id).unwrap().treasury = 50.0;
+            id
+        };
+        let _ = household_id;
+
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        // Tick one game-day so the cadence fires.
+        sim.tick_n(TICKS_PER_DAY as u32 + 5);
+
+        // The village's job board should now have at least one
+        // HouseholdHead-posted Craft job with the right reward.
+        let board = sim.app.world().resource::<JobBoard>();
+        let postings: Vec<_> = board
+            .faction_postings(village_id)
+            .iter()
+            .filter(|p| {
+                p.kind == JobKind::Craft
+                    && p.poster_class == PosterClass::HouseholdHead
+                    && (p.reward - HOUSEHOLD_CONTRACT_REWARD).abs() < 1e-3
+            })
+            .collect();
+        assert!(
+            !postings.is_empty(),
+            "expected at least one HouseholdHead Craft posting on village board",
+        );
+
+        // System-wide currency invariant: debit went household
+        // treasury → escrow; total preserved.
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+
+        // Household treasury debited by the reward(s).
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let h = registry.factions.get(&household_id).unwrap();
+        assert!(
+            h.treasury < 50.0,
+            "household treasury should be debited: now={}",
+            h.treasury,
+        );
+    }
+
+    #[test]
+    fn underfunded_household_posts_nothing() {
+        // Edge case: a household with treasury below
+        // HOUSEHOLD_MIN_TREASURY_FOR_POSTING posts nothing.
+        use crate::simulation::faction::{
+            FactionRegistry, HOUSEHOLD_MIN_TREASURY_FOR_POSTING,
+        };
+        use crate::simulation::jobs::{JobBoard, JobKind, PosterClass};
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let head = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+
+        let village_id = sim.player_faction_id;
+        {
+            let catalog = sim
+                .app
+                .world()
+                .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+                .clone();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let id = registry.spawn_household(village_id, (5, 5), head, &catalog);
+            // Treasury just below the threshold.
+            registry.factions.get_mut(&id).unwrap().treasury =
+                HOUSEHOLD_MIN_TREASURY_FOR_POSTING - 0.5;
+        }
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+        sim.tick_n(TICKS_PER_DAY as u32 + 5);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let house_postings = board
+            .faction_postings(village_id)
+            .iter()
+            .filter(|p| {
+                p.kind == JobKind::Craft
+                    && p.poster_class == PosterClass::HouseholdHead
+            })
+            .count();
+        assert_eq!(house_postings, 0);
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+    }
+
     // ─── Pluralist Economy R3 follow-on — household formation trigger ───
 
     #[test]

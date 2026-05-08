@@ -98,6 +98,23 @@ pub const TRIBUTE_PER_DAY: f32 = 5.0;
 /// staggered per faction to spread workload.
 pub const TRIBUTE_CADENCE: u64 = TICKS_PER_DAY as u64;
 
+// ── Pluralist Economy R6 follow-on: household-poster constants ────────
+
+/// Per-household-per-day craft-contract reward when a household
+/// commissions a Tools job from its treasury. Anchored at 5.0 — same
+/// scale as `TRIBUTE_PER_DAY`. Tune as economy balance lands.
+pub const HOUSEHOLD_CONTRACT_REWARD: f32 = 5.0;
+
+/// Minimum household treasury required for the periodic posting
+/// system to commission a contract. Households with less than this
+/// stay quiet rather than posting micro-contracts.
+pub const HOUSEHOLD_MIN_TREASURY_FOR_POSTING: f32 = 10.0;
+
+/// Cadence at which `household_contract_posting_system` runs. Once
+/// per game-day; each qualifying household posts one contract per
+/// firing.
+pub const HOUSEHOLD_POSTING_CADENCE: u64 = TICKS_PER_DAY as u64;
+
 /// A chief-issued hunting directive. Lives on `FactionData::hunt_order` and is
 /// either a concrete `Hunt` (with mustering bookkeeping) or a fallback
 /// `Scout` order to find new game.
@@ -598,6 +615,83 @@ pub fn tribute_payment_system(
                 s.treasury += amount;
             }
         }
+    }
+}
+
+/// Pluralist Economy R6 follow-on: each household with sufficient
+/// treasury posts a Tools craft contract once per game-day. The
+/// contract is funded from the household's treasury via
+/// `post_craft_contract_from_treasury` (escrowed to the household
+/// head as proxy beneficiary). The posting carries
+/// `poster_class=HouseholdHead` + `reward > 0` so R9's `U_bid`
+/// scorer routes through the paid branch when smiths claim it.
+///
+/// This is the load-bearing system that makes capitalist factions
+/// observably economically active. Without it, capitalist
+/// households exist but post nothing — workers stay idle.
+///
+/// **Cadence**: once per `HOUSEHOLD_POSTING_CADENCE` (one game-day).
+/// All qualifying households post on the same tick — adequate for
+/// today's small populations; per-household stagger is a future
+/// optimisation.
+///
+/// **Posting target**: today, every household commissions
+/// recipe id 0 (Tools). Future versions can scan household needs
+/// (no bed for kids → Build a bed; head lacks a weapon → contract
+/// for one) and pick the most pressing recipe; for R6's narrow
+/// validation a fixed Tools commission proves the path works.
+pub fn household_contract_posting_system(world: &mut World) {
+    let now = match world.get_resource::<SimClock>() {
+        Some(c) => c.tick,
+        None => return,
+    };
+    if now % HOUSEHOLD_POSTING_CADENCE != 0 {
+        return;
+    }
+
+    // Snapshot eligible households so we can later mutate the
+    // registry + JobBoard without long-lived borrows. Each entry:
+    // (household_id, parent_village_id, head_entity).
+    let intents: Vec<(u32, u32, Entity)> = {
+        let registry = world.resource::<FactionRegistry>();
+        let mut out = Vec::new();
+        for (&hid, data) in registry.factions.iter() {
+            // Only sub-faction households (those with a parent) are
+            // eligible. Top-level village factions don't post via
+            // this path — they'd post via the bureaucrat system if
+            // they had `state_funds_public_works=true` (R10+).
+            let Some(parent) = data.parent_faction else {
+                continue;
+            };
+            if data.treasury < HOUSEHOLD_MIN_TREASURY_FOR_POSTING {
+                continue;
+            }
+            let Some(head) = data.household_head else {
+                continue;
+            };
+            out.push((hid, parent, head));
+        }
+        out
+    };
+
+    for (household_id, village_id, head) in intents {
+        // Recipe 0 = Tools. Always-valid in the catalog. Posted
+        // onto the village's job board (parent_faction) so any
+        // village-resident smith can claim it.
+        let _escrow = crate::simulation::jobs::post_craft_contract_from_treasury(
+            world,
+            household_id,
+            village_id,
+            head,
+            0,
+            1,
+            HOUSEHOLD_CONTRACT_REWARD,
+            None,
+        );
+        // post_craft_contract_from_treasury returns None on
+        // insufficient treasury / invalid recipe. Either way we
+        // proceed — if a contract didn't post this tick, the next
+        // cadence cycle will retry once funds permit.
     }
 }
 
