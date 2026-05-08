@@ -198,6 +198,11 @@ pub struct PersonAI {
     /// `FailedTarget` onto `MethodHistory`. `None` when no HTN-driven chain is
     /// in flight (legacy plans, player orders, sleep states between dispatches).
     pub active_method: Option<MethodId>,
+    /// Outstanding `GatherClaims` entry held by this agent. Set by HTN
+    /// dispatchers when picking a gather/scavenge target tile from
+    /// `SharedKnowledge`, cleared by gather/scavenge finish helpers via
+    /// `release_gather_claim`. `None` when no gather chain is in flight.
+    pub active_gather_claim: Option<((i32, i32), crate::simulation::memory::MemoryKind)>,
 }
 
 impl PersonAI {
@@ -221,6 +226,7 @@ impl Default for PersonAI {
             reserved_resource: None,
             reserved_qty: 0,
             active_method: None,
+            active_gather_claim: None,
         }
     }
 }

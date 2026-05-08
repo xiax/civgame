@@ -164,6 +164,29 @@ impl TestSim {
         }
     }
 
+    /// Inject a sighting into the faction-tier `SharedKnowledge` for tests
+    /// that previously pre-populated `AgentMemory.entries` via
+    /// `mem.record(tile, kind)`. The HTN dispatchers were migrated to
+    /// `SharedKnowledge` in Phase 5 of the memory overhaul; tests that need
+    /// to plant a remembered resource for the dispatcher to find call this
+    /// helper instead.
+    pub fn inject_faction_sighting(
+        &mut self,
+        faction_id: u32,
+        tile: (i32, i32),
+        kind: crate::simulation::memory::MemoryKind,
+    ) {
+        use crate::simulation::shared_knowledge::{KnowledgeTier, ResourceOwner, SharedKnowledge};
+        let mut shared = self.app.world_mut().resource_mut::<SharedKnowledge>();
+        shared.report_sighting(
+            KnowledgeTier::Faction(faction_id),
+            tile,
+            kind,
+            ResourceOwner::Public,
+            0,
+        );
+    }
+
     /// Insert a flat patch of `kind`-tiles at `surface_z` covering
     /// chunks `[(-radius, -radius)..=(radius, radius)]` (inclusive).
     pub fn flat_world(&mut self, radius: i32, surface_z: i8, kind: TileKind) {
@@ -1342,6 +1365,7 @@ mod smoke {
         // invariance: the gate doesn't affect default factions.
         use crate::simulation::faction::FactionRegistry;
         use crate::simulation::jobs::{JobBoard, JobProgress};
+        use crate::simulation::memory::MemoryKind;
 
         let mut sim = TestSim::new(0xC0FFEE);
         sim.flat_world(1, 0, TileKind::Grass);
@@ -1354,6 +1378,12 @@ mod smoke {
                 registry.add_member(sim.player_faction_id);
             }
         }
+        // Phase 8: chief gates Stockpile{Calories} on faction-tier
+        // cluster knowledge. Inject a known edible source so the
+        // gate passes — this test pins the policy gate, not the
+        // cluster gate. (Place outside VIEW_RADIUS=15 so vision
+        // sweeps don't deplete the injected cluster.)
+        sim.inject_faction_sighting(sim.player_faction_id, (40, 40), MemoryKind::AnyEdible);
 
         sim.tick_n(120);
 
@@ -1366,6 +1396,140 @@ mod smoke {
         assert!(
             food_postings >= 1,
             "default communist policy should still post chief Stockpile{{Calories}}",
+        );
+    }
+
+    // ─── Phase 8 — chief postings gated on faction-tier cluster knowledge ───
+
+    #[test]
+    fn chief_skips_food_stockpile_when_no_food_cluster_known() {
+        // Phase 8: with default communist policy, chief still skips
+        // Stockpile{Calories} when no edible cluster is known to the
+        // faction tier. The food-scarcity problem surfaces as a market
+        // gap traders fill rather than as futile communal foraging.
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{JobBoard, JobProgress};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        for i in 0..4 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                registry.add_member(sim.player_faction_id);
+            }
+        }
+        // No food cluster injected; vision has nothing to find on flat grass.
+
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let food_postings: usize = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| matches!(p.progress, JobProgress::Calories { .. }))
+            .count();
+        assert_eq!(
+            food_postings, 0,
+            "chief should skip Stockpile{{Calories}} when no food cluster is known",
+        );
+    }
+
+    #[test]
+    fn chief_skips_wood_stockpile_when_no_wood_cluster_known() {
+        // Phase 8: chief skips per-resource Stockpile{Wood} when no
+        // wood cluster is known. Default factions are unaffected only
+        // when their members have actually seen wood.
+        use crate::simulation::faction::{FactionRegistry, FactionStorage};
+        use crate::simulation::jobs::{JobBoard, JobProgress};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        for i in 0..4 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                registry.add_member(sim.player_faction_id);
+            }
+            // Force a wood material target so the chief wants to post
+            // (otherwise anticipatory target may be 0).
+            let f = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            f.storage = FactionStorage::default();
+        }
+
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let wood_id = crate::economy::core_ids::wood();
+        let wood_postings: usize = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| matches!(
+                &p.progress,
+                JobProgress::Stockpile { resource_id, .. } if *resource_id == wood_id
+            ))
+            .count();
+        assert_eq!(
+            wood_postings, 0,
+            "chief should skip Stockpile{{Wood}} when no wood cluster is known",
+        );
+    }
+
+    #[test]
+    fn chief_posts_wood_stockpile_when_wood_cluster_known() {
+        // Phase 8 companion: with a known wood cluster injected at the
+        // faction tier, the chief posts Stockpile{Wood} as before.
+        // Pins the gate's invariance under "knowledge present".
+        use crate::simulation::faction::{FactionRegistry, FactionStorage};
+        use crate::simulation::jobs::{JobBoard, JobProgress};
+        use crate::simulation::memory::MemoryKind;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        for i in 0..4 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                registry.add_member(sim.player_faction_id);
+            }
+            let f = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            f.storage = FactionStorage::default();
+        }
+        // Inject outside vision range (VIEW_RADIUS=15) so the next
+        // vision sweep doesn't deplete it as "tile has no wood plant."
+        sim.inject_faction_sighting(
+            sim.player_faction_id,
+            (40, 40),
+            MemoryKind::wood(),
+        );
+
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let wood_id = crate::economy::core_ids::wood();
+        let wood_postings: usize = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| matches!(
+                &p.progress,
+                JobProgress::Stockpile { resource_id, .. } if *resource_id == wood_id
+            ))
+            .count();
+        assert!(
+            wood_postings >= 1,
+            "chief should post Stockpile{{Wood}} when a wood cluster is known",
         );
     }
 
@@ -4599,11 +4763,6 @@ mod baseline_behaviour {
         };
         {
             let mut entity = sim.app.world_mut().entity_mut(person);
-            if let Some(mut mem) = entity.get_mut::<AgentMemory>() {
-                mem.record(memory_tile, MemoryKind::wood());
-            } else {
-                panic!("Person should have AgentMemory");
-            }
             entity.insert(JobClaim {
                 job_id,
                 faction_id: sim.player_faction_id,
@@ -4615,6 +4774,7 @@ mod baseline_behaviour {
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::GatherWood;
         }
+        sim.inject_faction_sighting(sim.player_faction_id, memory_tile, MemoryKind::wood());
 
         // Two ticks: ParallelA's `goal_update_system` skips (JobClaim
         // present), Economy's `job_goal_lock_system` confirms goal as
@@ -5485,14 +5645,10 @@ mod baseline_behaviour {
             entity.remove::<Drafted>();
             entity
                 .remove::<crate::simulation::faction::FactionChief>();
-            if let Some(mut mem) = entity.get_mut::<AgentMemory>() {
-                mem.record(memory_tile, MemoryKind::wood());
-            } else {
-                panic!("Person should have AgentMemory");
-            }
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::Build;
         }
+        sim.inject_faction_sighting(sim.player_faction_id, memory_tile, MemoryKind::wood());
         // Pin chief_entity AFTER warm-up so it doesn't drift.
         {
             sim.app
@@ -6410,16 +6566,9 @@ mod baseline_behaviour {
 
         let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
 
-        // Inject `AgentMemory::AnyEdible` pointing at the grain tile so the
-        // dispatcher's `best_for(AnyEdible)` lookup finds it.
-        {
-            let mut mem = sim
-                .app
-                .world_mut()
-                .get_mut::<AgentMemory>(person)
-                .expect("AgentMemory missing");
-            mem.record(grain_tile, MemoryKind::AnyEdible);
-        }
+        // Inject a faction-tier sighting at the grain tile so the
+        // dispatcher's SharedKnowledge lookup finds it.
+        sim.inject_faction_sighting(sim.player_faction_id, grain_tile, MemoryKind::AnyEdible);
 
         // Pin AgentGoal::Craft via JobClaim::Craft so `job_goal_lock_system`
         // keeps it stuck across dispatch ticks (test faction has no craft
@@ -6579,15 +6728,8 @@ mod baseline_behaviour {
             knowledge.learned |= 1u64 << CROP_CULTIVATION;
         }
 
-        // Inject memory of the grain tile.
-        {
-            let mut mem = sim
-                .app
-                .world_mut()
-                .get_mut::<AgentMemory>(person)
-                .expect("AgentMemory missing");
-            mem.record(grain_tile, MemoryKind::AnyEdible);
-        }
+        // Inject a faction-tier sighting of the grain tile.
+        sim.inject_faction_sighting(sim.player_faction_id, grain_tile, MemoryKind::AnyEdible);
 
         // Pin AgentGoal::Farm via JobClaim::Farm so `job_goal_lock_system`
         // keeps it stuck across dispatch ticks (the test faction's chief

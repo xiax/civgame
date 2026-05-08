@@ -225,7 +225,9 @@ pub struct PlantSpriteIndex {
     pub by_chunk: AHashMap<ChunkCoord, Vec<(Entity, (i32, i32))>>,
 }
 
-/// Spawn a plant entity at the given tile. No-op if the tile is already occupied.
+/// Spawn a plant entity at the given tile. Returns `None` if the tile is
+/// already occupied. Callers that need to attach an ownership marker
+/// (`LandClaim`) read the returned entity.
 pub fn spawn_plant_at(
     commands: &mut Commands,
     plant_map: &mut PlantMap,
@@ -234,9 +236,9 @@ pub fn spawn_plant_at(
     tile_y: i32,
     kind: PlantKind,
     stage: GrowthStage,
-) {
+) -> Option<Entity> {
     if plant_map.0.contains_key(&(tile_x, tile_y)) {
-        return;
+        return None;
     }
 
     let world_pos = tile_to_world(tile_x, tile_y);
@@ -267,6 +269,7 @@ pub fn spawn_plant_at(
         .entry(coord)
         .or_default()
         .push((entity, (tile_x, tile_y)));
+    Some(entity)
 }
 
 /// Advance plant growth stages based on tile fertility.

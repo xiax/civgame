@@ -14,7 +14,7 @@ use crate::simulation::goals::{AgentGoal, GoalReason, Personality};
 use crate::simulation::items::{
     spawn_or_merge_ground_item_full, valid_equip_slots, Equipment, EquipmentSlot, GroundItem,
 };
-use crate::simulation::memory::{AgentMemory, RelEntry, RelationshipMemory};
+use crate::simulation::memory::{RelEntry, RelationshipMemory};
 use crate::simulation::mood::Mood;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, PersonAI, PlayerOrder, Profession};
@@ -117,7 +117,6 @@ pub fn inspector_panel_system(
             Option<&Body>,
             Option<&PlayerOrder>,
             &Transform,
-            Option<&AgentMemory>,
             Option<&GoalReason>,
             Option<&crate::simulation::carry::Carrier>,
             Option<&crate::simulation::items::Equipment>,
@@ -134,7 +133,6 @@ pub fn inspector_panel_system(
             body,
             order,
             transform,
-            memory,
             goal_reason,
             carrier,
             equipment,

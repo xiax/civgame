@@ -810,6 +810,8 @@ pub fn chief_job_posting_system(
     co_map: Res<crate::simulation::crafting::CraftOrderMap>,
     co_query: Query<&crate::simulation::crafting::CraftOrder>,
     projects: Res<Projects>,
+    shared: Res<crate::simulation::shared_knowledge::SharedKnowledge>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
     mut board: ResMut<JobBoard>,
 ) {
     if clock.tick % CHIEF_POSTING_INTERVAL != 0 {
@@ -955,7 +957,19 @@ pub fn chief_job_posting_system(
             if !already_food {
                 let food_total = faction.storage.food_total() as u32;
                 let target_supply = faction.member_count * GATHER_TARGET_PER_HEAD * 8;
-                if food_total < target_supply {
+                // Phase 8: gate on faction-tier cluster knowledge. If no
+                // edible cluster is known anywhere near home, the chief skips
+                // the communal gather posting — local scarcity surfaces as a
+                // gap that traders fill (R10) instead of futile foraging.
+                let knows_food = crate::simulation::shared_knowledge::faction_knows_cluster(
+                    &shared,
+                    &settlement_map,
+                    faction_id,
+                    crate::simulation::memory::MemoryKind::AnyEdible,
+                    (faction.home_tile.0 as i32, faction.home_tile.1 as i32),
+                    16,
+                );
+                if food_total < target_supply && knows_food {
                     let deficit_units = target_supply.saturating_sub(food_total);
                     // Convert deficit units to a calorie target (use Fruit nutrition
                     // as a conservative average; deposits contribute their actual
@@ -1005,6 +1019,19 @@ pub fn chief_job_posting_system(
             let stone_id = crate::economy::core_ids::stone();
             for &target_rid in &[wood_id, stone_id] {
                 if !faction.policy_for(target_rid).chief_allocates_labor {
+                    continue;
+                }
+                // Phase 8: gate on faction-tier cluster knowledge. No known
+                // wood/stone cluster within reach ⇒ skip the posting (real
+                // local scarcity, not a labor allocation problem).
+                if !crate::simulation::shared_knowledge::faction_knows_cluster(
+                    &shared,
+                    &settlement_map,
+                    faction_id,
+                    crate::simulation::memory::MemoryKind::Resource(target_rid),
+                    (faction.home_tile.0 as i32, faction.home_tile.1 as i32),
+                    16,
+                ) {
                     continue;
                 }
                 // Sum unmet blueprint demand for this resource (reactive component).

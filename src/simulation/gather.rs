@@ -9,7 +9,7 @@ use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
-use crate::simulation::memory::{AgentMemory, MemoryKind};
+use crate::simulation::memory::MemoryKind;
 use crate::simulation::person::{AiState, PersonAI};
 use crate::simulation::plants::{GrowthStage, PlantKind, PlantMap, PlantSpriteIndex};
 use crate::simulation::schedule::{BucketSlot, SimClock};
@@ -250,6 +250,7 @@ pub fn gather_system(
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
     mut faction_registry: ResMut<FactionRegistry>,
+    mut shared: ResMut<crate::simulation::shared_knowledge::SharedKnowledge>,
     routing: GatherRoutingResources,
     mut plant_query: Query<&mut crate::simulation::plants::Plant>,
     mut agent_query: Query<(
@@ -262,11 +263,12 @@ pub fn gather_system(
         &BucketSlot,
         &LodLevel,
         &Transform,
-        Option<&mut AgentMemory>,
         Option<&FactionMember>,
+        Option<&crate::simulation::reproduction::HouseholdMember>,
         &AgentGoal,
     )>,
 ) {
+    use crate::simulation::shared_knowledge::KnowledgeTier;
     for (
         actor,
         mut ai,
@@ -277,11 +279,21 @@ pub fn gather_system(
         slot,
         lod,
         transform,
-        mut memory_opt,
         faction_member,
+        household_member,
         _goal,
     ) in agent_query.iter_mut()
     {
+        // Resolve the finest tier the agent writes to — same rule as
+        // `vision_system`. Depletion writes only to this tier; gossip
+        // propagation handles settlement / faction visibility.
+        let agent_tier = if let Some(hm) = household_member {
+            KnowledgeTier::Household(hm.household_id)
+        } else if let Some(fm) = faction_member {
+            KnowledgeTier::Faction(fm.faction_id)
+        } else {
+            KnowledgeTier::Faction(0)
+        };
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -317,10 +329,8 @@ pub fn gather_system(
 
             let Ok(mut plant) = plant_query.get_mut(entity) else {
                 plant_map.0.remove(&(tx, ty));
-                if let Some(ref mut mem) = memory_opt {
-                    mem.forget((tx as i32, ty as i32), MemoryKind::AnyEdible);
-                    mem.forget((tx as i32, ty as i32), MemoryKind::wood());
-                }
+                shared.report_depleted(agent_tier, (tx, ty), MemoryKind::AnyEdible);
+                shared.report_depleted(agent_tier, (tx, ty), MemoryKind::wood());
                 finish_gather(
                     &mut ai,
                     &mut aq,
@@ -333,13 +343,11 @@ pub fn gather_system(
                 continue;
             };
             if plant.stage != GrowthStage::Mature {
-                if let Some(ref mut mem) = memory_opt {
-                    let kind = match plant.kind {
-                        PlantKind::BerryBush | PlantKind::Grain => MemoryKind::AnyEdible,
-                        PlantKind::Tree => MemoryKind::wood(),
-                    };
-                    mem.forget((tx as i32, ty as i32), kind);
-                }
+                let kind = match plant.kind {
+                    PlantKind::BerryBush | PlantKind::Grain => MemoryKind::AnyEdible,
+                    PlantKind::Tree => MemoryKind::wood(),
+                };
+                shared.report_depleted(agent_tier, (tx, ty), kind);
                 finish_gather(
                     &mut ai,
                     &mut aq,
@@ -409,10 +417,6 @@ pub fn gather_system(
             let (skill, xp) = kind.harvest_skill_xp(has_tool);
             skills.gain_xp(skill, xp);
 
-            if let Some(ref mut mem) = memory_opt {
-                mem.record((tx as i32, ty as i32), kind.harvest_memory_kind());
-            }
-
             for (drop_id, drop_qty) in kind.harvest_ground_drops(has_tool) {
                 spawn_ground_drop(&mut commands, tx, ty, drop_id, drop_qty);
             }
@@ -425,6 +429,13 @@ pub fn gather_system(
                     vec.retain(|(e, _)| *e != entity);
                 }
                 commands.entity(entity).despawn_recursive();
+                // Depletion: a despawning harvest removes the resource from
+                // the cluster's accounting so other agents stop routing here.
+                let depleted_kind = match kind {
+                    PlantKind::BerryBush | PlantKind::Grain => MemoryKind::AnyEdible,
+                    PlantKind::Tree => MemoryKind::wood(),
+                };
+                shared.report_depleted(agent_tier, (tx, ty), depleted_kind);
             } else {
                 plant.stage = GrowthStage::Harvested;
                 plant.growth_ticks = 0;
@@ -504,9 +515,6 @@ pub fn gather_system(
                     }
                 }
 
-                if let Some(ref mut mem) = memory_opt {
-                    mem.record((tx as i32, ty as i32), MemoryKind::stone());
-                }
                 finish_gather(
                     &mut ai,
                     &mut aq,
@@ -518,11 +526,9 @@ pub fn gather_system(
                 );
             } else {
                 // Not a stone/wall tile and not a plant -> target is invalid or already harvested
-                if let Some(ref mut mem) = memory_opt {
-                    mem.forget((tx as i32, ty as i32), MemoryKind::stone());
-                    mem.forget((tx as i32, ty as i32), MemoryKind::AnyEdible);
-                    mem.forget((tx as i32, ty as i32), MemoryKind::wood());
-                }
+                shared.report_depleted(agent_tier, (tx, ty), MemoryKind::stone());
+                shared.report_depleted(agent_tier, (tx, ty), MemoryKind::AnyEdible);
+                shared.report_depleted(agent_tier, (tx, ty), MemoryKind::wood());
                 finish_gather(
                     &mut ai,
                     &mut aq,

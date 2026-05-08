@@ -105,6 +105,7 @@ pub fn production_system(
         &LodLevel,
         Option<&FactionMember>,
         Option<&JobClaim>,
+        Option<&crate::simulation::reproduction::HouseholdMember>,
     )>,
 ) {
     for (
@@ -119,6 +120,7 @@ pub fn production_system(
         lod,
         faction_member,
         claim_opt,
+        household_member,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -152,7 +154,7 @@ pub fn production_system(
                 if !plant_map.0.contains_key(&(tx, ty)) {
                     if let Some((seed_id, plant_kind)) = seed_and_plant {
                         consume_one_resource(&mut agent, &mut carrier, seed_id);
-                        spawn_plant_at(
+                        let spawned = spawn_plant_at(
                             &mut commands,
                             &mut plant_map,
                             &mut plant_sprite_index,
@@ -161,6 +163,22 @@ pub fn production_system(
                             plant_kind,
                             GrowthStage::Seed,
                         );
+                        // Stamp ownership on the new plant. Household member
+                        // → household-owned; chief Farm posting → faction-owned;
+                        // unhoused private planter → personal. Wild reseed
+                        // (plants.rs:overripe path) leaves no LandClaim → Public.
+                        if let Some(plant_entity) = spawned {
+                            let owner = if let Some(hm) = household_member {
+                                crate::simulation::shared_knowledge::ResourceOwner::Household(hm.household_id)
+                            } else if let (Some(_), Some(fm)) = (claim_opt, faction_member) {
+                                crate::simulation::shared_knowledge::ResourceOwner::Faction(fm.faction_id)
+                            } else {
+                                crate::simulation::shared_knowledge::ResourceOwner::Person(actor)
+                            };
+                            commands
+                                .entity(plant_entity)
+                                .insert(crate::simulation::shared_knowledge::LandClaim { owner });
+                        }
                         skills.gain_xp(SkillKind::Farming, 3);
                         if let Some(fm) = faction_member {
                             if let Some(fd) = faction_registry.factions.get_mut(&fm.faction_id) {

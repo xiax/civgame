@@ -47,7 +47,7 @@ use crate::simulation::construction::{Bed, HomeBed};
 use crate::simulation::faction::{FactionMember, FactionRegistry, StorageTileMap, SOLO};
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
-use crate::simulation::memory::{AgentMemory, MemoryKind};
+use crate::simulation::memory::MemoryKind;
 use crate::simulation::plants::{GrowthStage, Plant, PlantMap};
 use crate::simulation::needs::{Needs, EAT_TRIGGER_HUNGER};
 use crate::simulation::person::{AiState, Drafted, PersonAI, PlayerOrder, Profession};
@@ -3473,10 +3473,12 @@ pub fn htn_acquire_food_dispatch_system(
     spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<SimClock>,
     plant_map: Res<PlantMap>,
+    gk: crate::simulation::shared_knowledge::GatherKnowledge,
     item_query: Query<&crate::simulation::items::GroundItem>,
     plant_query: Query<&Plant>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -3487,7 +3489,7 @@ pub fn htn_acquire_food_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&AgentMemory>,
+            Option<&crate::simulation::reproduction::HouseholdMember>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -3497,7 +3499,7 @@ pub fn htn_acquire_food_dispatch_system(
     const VIEW_RADIUS: i32 = 15;
     let now = clock.tick;
     query.par_iter_mut().for_each(
-        |(mut ai, mut aq, mut history, goal, needs, agent, carrier, transform, member, lod, memory_opt)| {
+        |(actor, mut ai, mut aq, mut history, goal, needs, agent, carrier, transform, member, lod, household_member)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -3584,14 +3586,20 @@ pub fn htn_acquire_food_dispatch_system(
                 }
             }
 
-            // Forage candidate: nearest remembered food-bearing plant whose
-            // entity is still live and mature. `ForageFromKnownMethod`
-            // (utility 1.0) picks this up. Empty memory leaves the field
-            // None — the argmax falls through to scavenge / withdraw /
-            // explore. AcquireFood ends in `Eat` (no deposit), so only
-            // the tile is consumed downstream.
-            let gather_target_tile = memory_opt
-                .and_then(|m| m.best_for(MemoryKind::AnyEdible))
+            // Forage candidate: nearest accessible AnyEdible cluster from
+            // SharedKnowledge whose representative tile still holds a live
+            // mature plant. `ForageFromKnownMethod` (utility 1.0) picks
+            // this up. Empty knowledge leaves the field None — the argmax
+            // falls through to scavenge / withdraw / explore.
+            let gather_target_tile = gk
+                .nearest_target_tile(
+                    actor,
+                    member.faction_id,
+                    household_member.map(|h| h.household_id),
+                    MemoryKind::AnyEdible,
+                    (cur_tx, cur_ty),
+                    now,
+                )
                 .and_then(|tile| {
                     let entity = plant_map.0.get(&tile).copied()?;
                     let plant = plant_query.get(entity).ok()?;
@@ -3900,10 +3908,12 @@ pub fn htn_acquire_good_dispatch_system(
     method_registry: Res<MethodRegistry>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<SimClock>,
+    gk: crate::simulation::shared_knowledge::GatherKnowledge,
     item_query: Query<&crate::simulation::items::GroundItem>,
     bp_query: Query<&crate::simulation::construction::Blueprint>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -3913,7 +3923,7 @@ pub fn htn_acquire_good_dispatch_system(
             &LodLevel,
             Option<&crate::simulation::jobs::ClaimTarget>,
             Option<&crate::simulation::jobs::JobClaim>,
-            Option<&crate::simulation::memory::AgentMemory>,
+            Option<&crate::simulation::reproduction::HouseholdMember>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -3922,6 +3932,7 @@ pub fn htn_acquire_good_dispatch_system(
 
     let now = clock.tick;
     for (
+        actor,
         mut ai,
         mut aq,
         mut history,
@@ -3931,7 +3942,7 @@ pub fn htn_acquire_good_dispatch_system(
         lod,
         claim_target_opt,
         job_claim_opt,
-        memory_opt,
+        household_member,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -3984,11 +3995,18 @@ pub fn htn_acquire_good_dispatch_system(
                     cur_ty.div_euclid(CHUNK_SIZE as i32),
                 );
 
-                // Memory-based gather target (Phase 5c-ii-c-ii). Empty memory
-                // doesn't kill the dispatch — a visible scavenge target may
-                // still drive a chain.
-                let gather_target_tile =
-                    memory_opt.and_then(|m| m.best_for(memory_kind));
+                // SharedKnowledge gather target. Empty knowledge doesn't kill
+                // the dispatch — a visible scavenge target may still drive a
+                // chain. Filters on owner accessibility so a faction can't
+                // poach another household's planted resources.
+                let gather_target_tile = gk.nearest_target_tile(
+                    actor,
+                    member.faction_id,
+                    household_member.map(|h| h.household_id),
+                    memory_kind,
+                    (cur_tx, cur_ty),
+                    now,
+                );
 
                 // Vision-based scavenge target (Phase 5c-ii-d-ii-a). Scan
                 // SpatialIndex for the nearest matching `GroundItem` within
@@ -4458,10 +4476,12 @@ pub fn htn_stockpile_food_dispatch_system(
     spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<SimClock>,
     plant_map: Res<PlantMap>,
+    gk: crate::simulation::shared_knowledge::GatherKnowledge,
     item_query: Query<&crate::simulation::items::GroundItem>,
     plant_query: Query<&Plant>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -4471,7 +4491,7 @@ pub fn htn_stockpile_food_dispatch_system(
             &LodLevel,
             Option<&crate::simulation::jobs::JobClaim>,
             Option<&crate::simulation::jobs::ClaimTarget>,
-            Option<&AgentMemory>,
+            Option<&crate::simulation::reproduction::HouseholdMember>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -4482,6 +4502,7 @@ pub fn htn_stockpile_food_dispatch_system(
     let now = clock.tick;
     query.par_iter_mut().for_each(
         |(
+            actor,
             mut ai,
             mut aq,
             mut history,
@@ -4491,7 +4512,7 @@ pub fn htn_stockpile_food_dispatch_system(
             lod,
             job_claim_opt,
             claim_target_opt,
-            memory_opt,
+            household_member,
         )| {
             if *lod == LodLevel::Dormant {
                 return;
@@ -4581,13 +4602,20 @@ pub fn htn_stockpile_food_dispatch_system(
             let scavenge_deposit_tile = scavenge_target_tile
                 .and_then(|t| storage_tile_map.nearest_for_faction(member.faction_id, t));
 
-            // Forage candidate: nearest remembered food-bearing plant whose
-            // entity is still live and mature. Threads the plant's harvest
-            // resource through `forage_food_good` so the trailing
-            // `Task::DepositToFactionStorage` carries the right payload.
-            // `ForageFromKnownForStorageMethod` (utility 1.0) consumes both.
-            let forage_candidate = memory_opt
-                .and_then(|m| m.best_for(MemoryKind::AnyEdible))
+            // Forage candidate: nearest accessible AnyEdible cluster from
+            // SharedKnowledge whose representative tile still holds a live
+            // mature plant. Threads the plant's harvest resource through
+            // `forage_food_good` so the trailing `Task::DepositToFactionStorage`
+            // carries the right payload.
+            let forage_candidate = gk
+                .nearest_target_tile(
+                    actor,
+                    member.faction_id,
+                    household_member.map(|h| h.household_id),
+                    MemoryKind::AnyEdible,
+                    (cur_tx, cur_ty),
+                    now,
+                )
                 .and_then(|tile| {
                     let entity = plant_map.0.get(&tile).copied()?;
                     let plant = plant_query.get(entity).ok()?;
@@ -5998,6 +6026,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
     spatial: Res<crate::world::spatial::SpatialIndex>,
     bp_map: Res<crate::simulation::construction::BlueprintMap>,
     clock: Res<SimClock>,
+    gk: crate::simulation::shared_knowledge::GatherKnowledge,
     bp_query: Query<&crate::simulation::construction::Blueprint>,
     item_query: Query<&crate::simulation::items::GroundItem>,
     mut query: Query<
@@ -6012,7 +6041,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             &LodLevel,
             Option<&crate::simulation::jobs::JobClaim>,
             Option<&crate::simulation::jobs::ClaimTarget>,
-            Option<&AgentMemory>,
+            Option<&crate::simulation::reproduction::HouseholdMember>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -6030,7 +6059,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
         lod,
         job_claim_opt,
         claim_target_opt,
-        memory_opt,
+        household_member,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -6189,7 +6218,14 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             None
         };
         let gather_target_tile = gather_resource.and_then(|rid| {
-            memory_opt.and_then(|m| m.best_for(MemoryKind::Resource(rid)))
+            gk.nearest_target_tile(
+                agent_entity,
+                member.faction_id,
+                household_member.map(|h| h.household_id),
+                MemoryKind::Resource(rid),
+                (cur_tx, cur_ty),
+                now,
+            )
         });
         // Surface `gather_resource` through `personal_bp_resource` so the
         // gather method's expand can carry it (the withdraw method already
@@ -6551,6 +6587,7 @@ pub fn htn_engage_prey_dispatch_system(
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
     clock: Res<SimClock>,
+    gk: crate::simulation::shared_knowledge::GatherKnowledge,
     prey_query: Query<
         (&Transform, &crate::simulation::combat::Health),
         Or<(
@@ -6571,7 +6608,7 @@ pub fn htn_engage_prey_dispatch_system(
             &FactionMember,
             &Profession,
             &LodLevel,
-            Option<&AgentMemory>,
+            Option<&crate::simulation::reproduction::HouseholdMember>,
             Option<&crate::simulation::corpse::Carrying>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
@@ -6591,7 +6628,7 @@ pub fn htn_engage_prey_dispatch_system(
         member,
         profession,
         lod,
-        memory_opt,
+        household_member,
         carrying_opt,
     ) in query.iter_mut()
     {
@@ -6671,11 +6708,28 @@ pub fn htn_engage_prey_dispatch_system(
             }
         }
         if prey.is_none() {
-            if let Some(mem) = memory_opt {
-                if let Some((entity, tx, ty)) =
-                    mem.best_entity_for_dist_weighted(MemoryKind::Prey, (cur_tx, cur_ty))
-                {
-                    prey = Some((entity, (tx, ty)));
+            // Fallback: look up the nearest accessible Prey cluster in
+            // SharedKnowledge, then scan the spatial index at the cluster's
+            // representative tile for a live prey entity. The migration from
+            // `AgentMemory.best_entity_for_dist_weighted` loses the entity
+            // binding (clusters are tile-keyed), but the rep tile + spatial
+            // re-scan recovers it for entities that are still alive. Prey
+            // that wandered off get re-discovered when the hunter arrives.
+            if let Some(tile) = gk.nearest_target_tile(
+                agent,
+                member.faction_id,
+                household_member.map(|h| h.household_id),
+                MemoryKind::Prey,
+                (cur_tx, cur_ty),
+                now,
+            ) {
+                for &candidate in spatial.get(tile.0, tile.1) {
+                    if let Ok((_, health)) = prey_query.get(candidate) {
+                        if !health.is_dead() {
+                            prey = Some((candidate, tile));
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -8325,8 +8379,10 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
     plant_map: Res<PlantMap>,
     plant_query: Query<&Plant>,
     clock: Res<SimClock>,
+    gk: crate::simulation::shared_knowledge::GatherKnowledge,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -8334,7 +8390,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             &FactionMember,
             &Transform,
             &LodLevel,
-            Option<&AgentMemory>,
+            Option<&crate::simulation::reproduction::HouseholdMember>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -8342,6 +8398,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
     let now = clock.tick;
     let grain_id = crate::economy::core_ids::grain();
     for (
+        actor,
         mut ai,
         mut aq,
         mut history,
@@ -8349,7 +8406,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
         member,
         transform,
         lod,
-        memory_opt,
+        household_member,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -8406,11 +8463,17 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             continue;
         };
 
-        // Find a remembered mature Grain plant tile. Mirrors the legacy
-        // `StepTarget::FromMemory(AnyEdible)` resolver with `plant_filter:
-        // Some(PlantKind::Grain)`.
-        let gather_target_tile = memory_opt.and_then(|m| {
-            m.best_for(MemoryKind::AnyEdible).and_then(|tile| {
+        // Find a remembered mature Grain plant tile via SharedKnowledge.
+        let gather_target_tile = gk
+            .nearest_target_tile(
+                actor,
+                member.faction_id,
+                household_member.map(|h| h.household_id),
+                MemoryKind::AnyEdible,
+                (cur_tx, cur_ty),
+                now,
+            )
+            .and_then(|tile| {
                 let entity = plant_map.0.get(&tile).copied()?;
                 let plant = plant_query.get(entity).ok()?;
                 if plant.kind == crate::simulation::plants::PlantKind::Grain
@@ -8420,8 +8483,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
                 } else {
                     None
                 }
-            })
-        });
+            });
         let Some(grain_tile) = gather_target_tile else {
             continue;
         };
@@ -8601,8 +8663,10 @@ pub fn htn_harvest_plant_dispatch_system(
     plant_map: Res<PlantMap>,
     plant_query: Query<&Plant>,
     clock: Res<SimClock>,
+    gk: crate::simulation::shared_knowledge::GatherKnowledge,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -8610,14 +8674,15 @@ pub fn htn_harvest_plant_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
-            Option<&AgentMemory>,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
+            Option<&crate::simulation::reproduction::HouseholdMember>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
 ) {
     let now = clock.tick;
     for (
+        actor,
         mut ai,
         mut aq,
         mut history,
@@ -8625,8 +8690,8 @@ pub fn htn_harvest_plant_dispatch_system(
         transform,
         member,
         lod,
-        memory_opt,
         knowledge_opt,
+        household_member,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -8655,11 +8720,17 @@ pub fn htn_harvest_plant_dispatch_system(
             cur_ty.div_euclid(CHUNK_SIZE as i32),
         );
 
-        // Find a remembered mature edible plant. Mirrors the legacy
-        // `StepTarget::FromMemory(AnyEdible)` resolver — checks memory first,
-        // confirms the plant is live and Mature via `PlantMap` + `Plant.stage`.
-        let harvest_candidate = memory_opt
-            .and_then(|m| m.best_for(MemoryKind::AnyEdible))
+        // Find a remembered mature edible plant via SharedKnowledge.
+        // Confirms the plant is live and Mature via `PlantMap` + `Plant.stage`.
+        let harvest_candidate = gk
+            .nearest_target_tile(
+                actor,
+                member.faction_id,
+                household_member.map(|h| h.household_id),
+                MemoryKind::AnyEdible,
+                (cur_tx, cur_ty),
+                now,
+            )
             .and_then(|tile| {
                 let entity = plant_map.0.get(&tile).copied()?;
                 let plant = plant_query.get(entity).ok()?;

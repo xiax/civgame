@@ -10,6 +10,7 @@ pub mod crafting;
 pub mod dig;
 pub mod faction;
 pub mod gather;
+pub mod gather_claims;
 pub mod goals;
 pub mod htn;
 pub mod items;
@@ -31,6 +32,7 @@ pub mod region;
 pub mod reproduction;
 pub mod schedule;
 pub mod settlement;
+pub mod shared_knowledge;
 pub mod skills;
 pub mod sound;
 pub mod stats;
@@ -105,6 +107,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(military::MusterHuntersRequest::default())
             .insert_resource(teaching::LectureRequest::default())
             .insert_resource(jobs::PlayerCraftRequest::default())
+            .insert_resource(shared_knowledge::SharedKnowledge::default())
+            .insert_resource(gather_claims::GatherClaims::default())
             .configure_sets(
                 FixedUpdate,
                 (
@@ -376,7 +380,7 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    memory::memory_decay_system,
+                    memory::relationship_decay_system,
                     faction::social_fill_system,
                     memory::conversation_memory_system.after(faction::social_fill_system),
                     knowledge::awareness_gossip_system.after(memory::conversation_memory_system),
@@ -497,6 +501,10 @@ impl Plugin for SimulationPlugin {
                     // before the next tick's price update.
                     trader::trader_market_step_system
                         .after(teaching::self_actualization_teaching_system),
+                    gather_claims::gather_claim_expiry_system,
+                    shared_knowledge::cluster_decay_system,
+                    knowledge::cluster_tier_promotion_system
+                        .after(knowledge::awareness_gossip_system),
                 )
                     .in_set(SimulationSet::Economy),
             );

@@ -385,6 +385,178 @@ pub fn awareness_gossip_system(
     }
 }
 
+/// Promote `SharedKnowledge` clusters up the tier ladder when constituents
+/// gossip with officials. Phase 6 of the memory overhaul.
+///
+/// **Household → Settlement.** When a `HouseholdMember` socialises within 3
+/// tiles of a `Profession::Bureaucrat` of the same root faction, every
+/// cluster in `KnowledgeTier::Household(hid)` is reported into
+/// `KnowledgeTier::Settlement(sid)` (idempotent — `report_sighting` merges
+/// nearby same-(kind, owner) clusters, so repeated bridge events don't
+/// inflate the settlement map). Models the bureaucrat as the conduit: a
+/// settlement only "knows" what its members have told an official.
+///
+/// **Settlement → Faction.** When two same-faction officials (Bureaucrats or
+/// `FactionChief`) socialise within 3 tiles, the lower's settlement-tier
+/// clusters bubble up to `KnowledgeTier::Faction(fid)`. Lets traders /
+/// cross-settlement chiefs see arbitrage geography even from settlements
+/// they've never visited.
+///
+/// Runs every `TIER_PROMOTION_CADENCE` ticks to bound cost. Reads positions,
+/// professions, household / faction membership; mutates `SharedKnowledge`.
+pub fn cluster_tier_promotion_system(
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    clock: Res<crate::simulation::schedule::SimClock>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    faction_registry: Res<crate::simulation::faction::FactionRegistry>,
+    mut shared: ResMut<crate::simulation::shared_knowledge::SharedKnowledge>,
+    q: Query<(
+        Entity,
+        &Transform,
+        &super::goals::AgentGoal,
+        &super::lod::LodLevel,
+        &super::person::Profession,
+        Option<&super::faction::FactionMember>,
+        Option<&super::faction::FactionChief>,
+        Option<&crate::simulation::reproduction::HouseholdMember>,
+    )>,
+) {
+    use super::goals::AgentGoal;
+    use super::lod::LodLevel;
+    use super::person::Profession;
+    use crate::simulation::shared_knowledge::KnowledgeTier;
+
+    const TIER_PROMOTION_CADENCE: u64 = 200; // 10s game-time
+    if clock.tick % TIER_PROMOTION_CADENCE != 0 {
+        return;
+    }
+
+    // Snapshot socializing agents with their faction / household / official
+    // status, keyed by tile for cheap neighbour lookup.
+    struct Snap {
+        entity: Entity,
+        tile: (i32, i32),
+        faction_id: u32,
+        household_id: Option<u32>,
+        is_bureaucrat: bool,
+        is_chief: bool,
+    }
+    let snaps: Vec<Snap> = q
+        .iter()
+        .filter(|(_, _, goal, lod, _, _, _, _)| {
+            matches!(goal, AgentGoal::Socialize) && **lod != LodLevel::Dormant
+        })
+        .filter_map(|(e, t, _, _, profession, fm, chief, hm)| {
+            let fm = fm?;
+            let tx = (t.translation.x / TILE_SIZE_LOCAL).floor() as i32;
+            let ty = (t.translation.y / TILE_SIZE_LOCAL).floor() as i32;
+            Some(Snap {
+                entity: e,
+                tile: (tx, ty),
+                faction_id: fm.faction_id,
+                household_id: hm.map(|h| h.household_id),
+                is_bureaucrat: matches!(profession, Profession::Bureaucrat),
+                is_chief: chief.is_some(),
+            })
+        })
+        .collect();
+    if snaps.is_empty() {
+        return;
+    }
+
+    // Pass 1: identify (household_id, settlement_id) pairs to promote.
+    // The bureaucrat's faction's *first settlement* is the target tier
+    // (mirrors `SettlementMap::first_for_faction` semantics elsewhere in
+    // the codebase). A household's root faction (walking parent chain) is
+    // what we match against the bureaucrat's faction.
+    let mut household_to_settlement: ahash::AHashSet<(u32, crate::simulation::settlement::SettlementId)> =
+        ahash::AHashSet::default();
+    let mut settlement_to_faction: ahash::AHashSet<(crate::simulation::settlement::SettlementId, u32)> =
+        ahash::AHashSet::default();
+    for s in &snaps {
+        if !(s.is_bureaucrat || s.is_chief) {
+            continue;
+        }
+        // This snap is an official. Find their settlement.
+        let Some(official_settlement) = settlement_map.first_for_faction(s.faction_id) else {
+            continue;
+        };
+        // Scan neighbours within 3 tiles for partners.
+        for dy in -3i32..=3 {
+            for dx in -3i32..=3 {
+                for &other in spatial.get(s.tile.0 + dx, s.tile.1 + dy) {
+                    if other == s.entity {
+                        continue;
+                    }
+                    let Some(o) = snaps.iter().find(|x| x.entity == other) else {
+                        continue;
+                    };
+                    // Same-faction-root check: the other agent's faction
+                    // must walk back to the official's faction (covers the
+                    // common case where a household member's
+                    // FactionMember.faction_id is still the village id —
+                    // confirmed by the existing R3 doc).
+                    if faction_registry.root_faction(o.faction_id) != s.faction_id {
+                        continue;
+                    }
+                    // Household → Settlement: o is a household member, s
+                    // is an official in the household's faction.
+                    if let Some(hid) = o.household_id {
+                        household_to_settlement.insert((hid, official_settlement));
+                    }
+                    // Settlement → Faction: both are officials of the same
+                    // faction, possibly at different settlements.
+                    if o.is_bureaucrat || o.is_chief {
+                        if let Some(o_settlement) = settlement_map.first_for_faction(o.faction_id) {
+                            settlement_to_faction.insert((o_settlement, s.faction_id));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 2: actually copy clusters between tiers. `report_sighting` is
+    // idempotent — same-(kind, owner) clusters within MERGE_RADIUS just
+    // refresh `last_seen_tick`. Re-promotion is therefore cheap.
+    let now = clock.tick;
+    for (hid, sid) in household_to_settlement {
+        let src = KnowledgeTier::Household(hid);
+        let dst = KnowledgeTier::Settlement(sid);
+        if let Some(map) = shared.tiers.get(&src) {
+            // Snapshot to avoid borrow conflict during the copy loop.
+            let entries: Vec<((i32, i32), crate::simulation::memory::MemoryKind, crate::simulation::shared_knowledge::ResourceOwner)> = map
+                .clusters
+                .values()
+                .filter_map(|c| {
+                    let rep = c.representative_tiles.iter().find_map(|s| *s).unwrap_or(c.center);
+                    Some((rep, c.kind, c.owner))
+                })
+                .collect();
+            for (tile, kind, owner) in entries {
+                shared.report_sighting(dst, tile, kind, owner, now);
+            }
+        }
+    }
+    for (sid, fid) in settlement_to_faction {
+        let src = KnowledgeTier::Settlement(sid);
+        let dst = KnowledgeTier::Faction(fid);
+        if let Some(map) = shared.tiers.get(&src) {
+            let entries: Vec<((i32, i32), crate::simulation::memory::MemoryKind, crate::simulation::shared_knowledge::ResourceOwner)> = map
+                .clusters
+                .values()
+                .filter_map(|c| {
+                    let rep = c.representative_tiles.iter().find_map(|s| *s).unwrap_or(c.center);
+                    Some((rep, c.kind, c.owner))
+                })
+                .collect();
+            for (tile, kind, owner) in entries {
+                shared.report_sighting(dst, tile, kind, owner, now);
+            }
+        }
+    }
+}
+
 /// Teaching: if two socializing agents are within 3 tiles and one has Learned
 /// a tech the other is aware-of-but-not-Learned, roll a small per-tick chance
 /// to transfer mastery. Mirrors `plan_gossip_system`'s spatial scan; the teach
