@@ -1653,6 +1653,171 @@ mod smoke {
         );
     }
 
+    // ─── Pluralist Economy R6 follow-on b — household income skim ───
+
+    #[test]
+    fn household_member_trader_sale_skims_to_household_treasury() {
+        // R6 follow-on b: when a HouseholdMember sells goods via
+        // `trader_sell_at_settlement`, 10% of earnings goes to the
+        // household treasury and 90% to their personal wallet.
+        // Validates the income flow that lets households accumulate
+        // treasury organically.
+        //
+        // (`market_sell_system` carries the same skim logic but is
+        // currently orphaned — not registered in `EconomyPlugin`.
+        // Activating it ripples through 9+ existing tests so that's
+        // a separate cleanup. The skim helper is shared between
+        // both paths via `split_market_earnings_with_household`,
+        // so when `market_sell_system` is eventually registered,
+        // households will earn from passive market activity too.)
+        use crate::economy::core_ids;
+        use crate::economy::item::Item;
+        use crate::economy::transactions::trader_sell_at_settlement;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::reproduction::HouseholdMember;
+        use crate::simulation::settlement::{Settlement, SettlementMap};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let agent = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+
+        // Build a household and stamp the agent as a member.
+        let village = sim.player_faction_id;
+        let catalog = sim
+            .app
+            .world()
+            .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+            .clone();
+        let household_id = {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.spawn_household(village, (5, 5), agent, &catalog)
+        };
+        sim.app
+            .world_mut()
+            .entity_mut(agent)
+            .insert(HouseholdMember { household_id });
+
+        // Seed the agent's inventory with Cloth.
+        {
+            let mut econ = sim
+                .app
+                .world_mut()
+                .get_mut::<crate::economy::agent::EconomicAgent>(agent)
+                .unwrap();
+            econ.currency = 0.0;
+            econ.add_item(Item::new_commodity(core_ids::cloth()), 10);
+        }
+
+        // Tick so the auto-found settlement appears.
+        sim.tick_n(3);
+
+        // Find the village's settlement, seed its treasury so the
+        // sell can be funded.
+        let settlement_entity = {
+            let map = sim.app.world().resource::<SettlementMap>();
+            let sid = map.first_for_faction(village).unwrap();
+            *map.by_id.get(&sid).unwrap()
+        };
+        {
+            let mut s = sim
+                .app
+                .world_mut()
+                .get_mut::<Settlement>(settlement_entity)
+                .unwrap();
+            s.treasury = 100.0;
+        }
+
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        // Sell 5 cloth via the R10 trader helper (which now routes
+        // through `split_market_earnings_with_household`).
+        let price = trader_sell_at_settlement(
+            sim.app.world_mut(),
+            agent,
+            settlement_entity,
+            core_ids::cloth(),
+            5,
+        )
+        .expect("trader sell should succeed");
+        let total_earned = price * 5.0;
+
+        let agent_currency = get_currency(&sim.app, agent);
+        let household_treasury = sim
+            .app
+            .world()
+            .resource::<FactionRegistry>()
+            .factions
+            .get(&household_id)
+            .unwrap()
+            .treasury;
+
+        // 10% to household, 90% to agent.
+        let expected_skim = total_earned * 0.10;
+        let expected_agent = total_earned - expected_skim;
+        assert!(
+            (household_treasury - expected_skim).abs() < 1e-3,
+            "household skim mismatch: got {household_treasury}, expected {expected_skim}",
+        );
+        assert!(
+            (agent_currency - expected_agent).abs() < 1e-3,
+            "agent share mismatch: got {agent_currency}, expected {expected_agent}",
+        );
+
+        // Currency invariant: settlement treasury debited by
+        // `total_earned`; agent + household credited by the same.
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+    }
+
+    #[test]
+    fn non_household_member_trader_sale_sends_full_earnings_to_agent() {
+        // Negative case: a non-HouseholdMember selling via
+        // `trader_sell_at_settlement` keeps 100% of earnings.
+        use crate::economy::core_ids;
+        use crate::economy::item::Item;
+        use crate::economy::transactions::trader_sell_at_settlement;
+        use crate::simulation::settlement::{Settlement, SettlementMap};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let agent = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+        {
+            let mut econ = sim
+                .app
+                .world_mut()
+                .get_mut::<crate::economy::agent::EconomicAgent>(agent)
+                .unwrap();
+            econ.currency = 0.0;
+            econ.add_item(Item::new_commodity(core_ids::cloth()), 10);
+        }
+        sim.tick_n(3);
+        let settlement_entity = {
+            let map = sim.app.world().resource::<SettlementMap>();
+            let sid = map.first_for_faction(sim.player_faction_id).unwrap();
+            *map.by_id.get(&sid).unwrap()
+        };
+        {
+            let mut s = sim
+                .app
+                .world_mut()
+                .get_mut::<Settlement>(settlement_entity)
+                .unwrap();
+            s.treasury = 100.0;
+        }
+
+        let price = trader_sell_at_settlement(
+            sim.app.world_mut(),
+            agent,
+            settlement_entity,
+            core_ids::cloth(),
+            5,
+        )
+        .expect("sell should succeed");
+        let total_earned = price * 5.0;
+        let agent_currency = get_currency(&sim.app, agent);
+        // No household → 100% to agent.
+        assert!((agent_currency - total_earned).abs() < 1e-3);
+    }
+
     // ─── Pluralist Economy R3 follow-on b — HouseholdMember birth inheritance ───
 
     #[test]

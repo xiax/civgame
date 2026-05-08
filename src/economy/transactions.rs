@@ -121,11 +121,16 @@ pub fn trader_sell_at_settlement(
         return None;
     }
     let actual_total = price_per_unit * actual_qty as f32;
-    // Agent: remove inventory, credit currency.
+    // Agent: remove inventory, credit currency. Pluralist Economy
+    // R6 follow-on b: when the trader is a household member, split
+    // earnings via `split_market_earnings_with_household` —
+    // household treasury skims `HOUSEHOLD_INCOME_SKIM`; the rest
+    // goes to the agent's wallet.
+    let agent_share = split_market_earnings_with_household(world, trader, actual_total);
     {
         let mut econ = world.get_mut::<EconomicAgent>(trader)?;
         econ.remove_resource(resource_id, actual_qty);
-        econ.currency += actual_total;
+        econ.currency += agent_share;
     }
     // Settlement: treasury down, market stock up, supply up.
     {
@@ -178,6 +183,50 @@ const FOOD_KEEP_RESERVE: u32 = 2;
 const HUNGER_BUY_THRESHOLD: u8 = 170;
 const TOOL_BUY_CURRENCY_FACTOR: f32 = 1.5;
 
+/// Pluralist Economy R6 follow-on b: fraction of a household
+/// member's market sale earnings that goes to the household
+/// treasury rather than their personal wallet. Without this,
+/// households can't accumulate treasury organically and
+/// `household_contract_posting_system` never fires outside tests
+/// that pre-seed the treasury.
+pub const HOUSEHOLD_INCOME_SKIM: f32 = 0.10;
+
+/// Pluralist Economy R6 follow-on b: split market-sale earnings
+/// between an agent's wallet and their household treasury (when
+/// they're a household member). Returns the agent's share. Caller
+/// adds the agent's share to `EconomicAgent.currency` themselves;
+/// the household-treasury credit happens here through the
+/// `FactionRegistry` resource. Currency invariant: the function
+/// debits nothing (the caller hasn't credited anything yet); it
+/// only redirects part of the would-be agent credit to the
+/// household.
+///
+/// Returns the **agent's share** of `earned`. If the agent is not
+/// a household member, returns `earned` unchanged. If the agent
+/// has no `EconomicAgent` (defensive), returns 0.
+pub fn split_market_earnings_with_household(
+    world: &mut World,
+    agent: Entity,
+    earned: f32,
+) -> f32 {
+    if earned <= 0.0 {
+        return 0.0;
+    }
+    let household_id = world
+        .get::<crate::simulation::reproduction::HouseholdMember>(agent)
+        .map(|hm| hm.household_id);
+    let Some(household_id) = household_id else {
+        return earned;
+    };
+    let skim = earned * HOUSEHOLD_INCOME_SKIM;
+    if let Some(mut registry) = world.get_resource_mut::<crate::simulation::faction::FactionRegistry>() {
+        if let Some(hh) = registry.factions.get_mut(&household_id) {
+            hh.treasury += skim;
+        }
+    }
+    earned - skim
+}
+
 /// Pluralist Economy R7: route an agent's market interaction to
 /// their faction's first settlement market when one exists,
 /// otherwise fall back to the global `Market`. SOLO and unsettled
@@ -197,15 +246,25 @@ pub fn market_sell_system(
     mut market: ResMut<Market>,
     settlement_map: Res<SettlementMap>,
     mut settlements: Query<&mut Settlement>,
+    mut faction_registry: ResMut<crate::simulation::faction::FactionRegistry>,
     mut query: Query<(
         &PersonAI,
         &mut EconomicAgent,
         &BucketSlot,
         &LodLevel,
         &FactionMember,
+        // Pluralist Economy R6 follow-on b: household members
+        // skim a fraction of market earnings into the household
+        // treasury.
+        Option<&crate::simulation::reproduction::HouseholdMember>,
     )>,
 ) {
-    for (ai, mut agent, slot, lod, member) in query.iter_mut() {
+    // Pluralist Economy R6 follow-on b: household-skim intents
+    // collected during the iter loop; applied to FactionRegistry
+    // after the iter releases its mutable borrows.
+    let mut skim_intents: Vec<(u32, f32)> = Vec::new();
+
+    for (ai, mut agent, slot, lod, member, household_opt) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -244,9 +303,34 @@ pub fn market_sell_system(
                     None => market.sell_item(item, sell_qty),
                 };
                 agent.remove_item(item, sell_qty);
-                agent.currency += earned;
+                // R6 follow-on b: split earnings between agent and
+                // household treasury when the agent is a household
+                // member. Currency invariant: skim leaves the
+                // agent → enters the household treasury → total
+                // unchanged.
+                let skim = match household_opt {
+                    Some(hm) if earned > 0.0 => {
+                        let s = earned * HOUSEHOLD_INCOME_SKIM;
+                        skim_intents.push((hm.household_id, s));
+                        s
+                    }
+                    _ => 0.0,
+                };
+                agent.currency += earned - skim;
             }
         }
+    }
+
+    // Apply household treasury skims after the query releases its
+    // borrow on EconomicAgent.
+    for (household_id, skim) in skim_intents {
+        if let Some(hh) = faction_registry.factions.get_mut(&household_id) {
+            hh.treasury += skim;
+        }
+        // If the household disappeared (despawned mid-loop), the
+        // skim is lost — same semantics as a refund-with-vanished-
+        // beneficiary in JobEscrow's on_remove. Currency invariant
+        // tolerates this drift in the same way.
     }
 }
 
