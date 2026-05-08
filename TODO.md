@@ -75,4 +75,4 @@ X implement willpower system. Work decreases willpower, fun stuff increases will
 
 Can you overhaul the construction system please? The way it is currently implemented doesn't make sense  historically and doesn't take into account farming plots and room for various buildings. 
 
-Add concept of land ownership to the game.
+I want to Add the concept of land ownership to the game. All land around a settlement belongs to the state by default but In mixed and capitalist economies the state can rent or sell land to households. Everything on a plot of land belongs to the household and the household can build or farm on the land. Land value should follow market dynamics, people desire housing next to where they work, land further away from settlement centre or other desirable resources are lower value and can be sold in larger quantities for private farmers or rented out for a tenant farmer model.

@@ -107,6 +107,46 @@ pub struct BarracksMap(pub AHashMap<(i32, i32), Entity>);
 #[derive(Resource, Default)]
 pub struct MonumentMap(pub AHashMap<(i32, i32), Entity>);
 
+/// Display name for any constructed entity (Wall, Bed, Door, Blueprint, …).
+/// The hover panel reads this directly so adding a new structure variant
+/// only needs to set the right label at its spawn site — no inspector edits.
+#[derive(Component, Copy, Clone, Debug)]
+pub struct StructureLabel(pub &'static str);
+
+/// Tile-keyed reverse index over every entity carrying `StructureLabel`.
+/// Maintained by component lifecycle hooks (`on_structure_label_add` /
+/// `on_structure_label_remove`) so spawn/despawn paths stay untouched.
+#[derive(Resource, Default)]
+pub struct StructureIndex(pub AHashMap<(i32, i32), Entity>);
+
+pub fn on_structure_label_add(
+    mut world: bevy::ecs::world::DeferredWorld<'_>,
+    entity: Entity,
+    _: bevy::ecs::component::ComponentId,
+) {
+    let Some(transform) = world.get::<Transform>(entity).copied() else {
+        return;
+    };
+    let tile = crate::world::terrain::world_to_tile(transform.translation.truncate());
+    let mut index = world.resource_mut::<StructureIndex>();
+    index.0.insert(tile, entity);
+}
+
+pub fn on_structure_label_remove(
+    mut world: bevy::ecs::world::DeferredWorld<'_>,
+    entity: Entity,
+    _: bevy::ecs::component::ComponentId,
+) {
+    let Some(transform) = world.get::<Transform>(entity).copied() else {
+        return;
+    };
+    let tile = crate::world::terrain::world_to_tile(transform.translation.truncate());
+    let mut index = world.resource_mut::<StructureIndex>();
+    if index.0.get(&tile).copied() == Some(entity) {
+        index.0.remove(&tile);
+    }
+}
+
 /// Bundle of furniture/structure maps used by `construction_system`. Bevy caps
 /// systems at 16 top-level params; bundling these stays under that limit.
 #[derive(bevy::ecs::system::SystemParam)]
@@ -2850,6 +2890,7 @@ pub fn construction_system(
                     let wall_entity = commands
                         .spawn((
                             Wall { material },
+                            StructureLabel(material.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2860,9 +2901,12 @@ pub fn construction_system(
                     wall_entity
                 }
                 BuildSiteKind::Bed => {
+                    let bed = Bed::default();
+                    let label = bed.tier.label();
                     let bed_entity = commands
                         .spawn((
-                            Bed::default(),
+                            bed,
+                            StructureLabel(label),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2876,9 +2920,12 @@ pub fn construction_system(
                     bed_entity
                 }
                 BuildSiteKind::Campfire => {
+                    let campfire = Campfire::default();
+                    let label = campfire.tier.label();
                     let campfire_entity = commands
                         .spawn((
-                            Campfire::default(),
+                            campfire,
+                            StructureLabel(label),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2892,13 +2939,16 @@ pub fn construction_system(
                     // A door does NOT write a Wall tile — the underlying
                     // terrain stays passable. The Door entity carries the
                     // open/closed state consulted by line_of_sight.
+                    let door = Door {
+                        faction_id: bp.faction_id,
+                        open: false,
+                        tier: DoorTier::default(),
+                    };
+                    let label = door.tier.label();
                     let door_entity = commands
                         .spawn((
-                            Door {
-                                faction_id: bp.faction_id,
-                                open: false,
-                                tier: DoorTier::default(),
-                            },
+                            door,
+                            StructureLabel(label),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2915,12 +2965,15 @@ pub fn construction_system(
                     door_entity
                 }
                 BuildSiteKind::Workbench => {
+                    let wb = Workbench {
+                        faction_id: bp.faction_id,
+                        tier: WorkbenchTier::default(),
+                    };
+                    let label = wb.tier.label();
                     let e = commands
                         .spawn((
-                            Workbench {
-                                faction_id: bp.faction_id,
-                                tier: WorkbenchTier::default(),
-                            },
+                            wb,
+                            StructureLabel(label),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2936,6 +2989,7 @@ pub fn construction_system(
                             Loom {
                                 faction_id: bp.faction_id,
                             },
+                            StructureLabel(BuildSiteKind::Loom.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2949,6 +3003,7 @@ pub fn construction_system(
                     let e = commands
                         .spawn((
                             Table,
+                            StructureLabel(BuildSiteKind::Table.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2962,6 +3017,7 @@ pub fn construction_system(
                     let e = commands
                         .spawn((
                             Chair,
+                            StructureLabel(BuildSiteKind::Chair.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2977,6 +3033,7 @@ pub fn construction_system(
                             Granary {
                                 faction_id: bp.faction_id,
                             },
+                            StructureLabel(BuildSiteKind::Granary.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -2992,6 +3049,7 @@ pub fn construction_system(
                             Shrine {
                                 faction_id: bp.faction_id,
                             },
+                            StructureLabel(BuildSiteKind::Shrine.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -3007,6 +3065,7 @@ pub fn construction_system(
                             Market {
                                 faction_id: bp.faction_id,
                             },
+                            StructureLabel(BuildSiteKind::Market.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -3022,6 +3081,7 @@ pub fn construction_system(
                             Barracks {
                                 faction_id: bp.faction_id,
                             },
+                            StructureLabel(BuildSiteKind::Barracks.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -3037,6 +3097,7 @@ pub fn construction_system(
                             Monument {
                                 faction_id: bp.faction_id,
                             },
+                            StructureLabel(BuildSiteKind::Monument.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.45),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -3850,9 +3911,12 @@ fn spawn_seeded_structure(
 
     match kind {
         BuildSiteKind::Bed => {
+            let bed = Bed::default();
+            let label = bed.tier.label();
             let e = commands
                 .spawn((
-                    Bed::default(),
+                    bed,
+                    StructureLabel(label),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -3863,9 +3927,12 @@ fn spawn_seeded_structure(
             maps.bed_map.0.insert(tile, e);
         }
         BuildSiteKind::Campfire => {
+            let campfire = Campfire::default();
+            let label = campfire.tier.label();
             let e = commands
                 .spawn((
-                    Campfire::default(),
+                    campfire,
+                    StructureLabel(label),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -3875,12 +3942,15 @@ fn spawn_seeded_structure(
             maps.campfire_map.0.insert(tile, e);
         }
         BuildSiteKind::Workbench => {
+            let wb = Workbench {
+                faction_id,
+                tier: WorkbenchTier::default(),
+            };
+            let label = wb.tier.label();
             let e = commands
                 .spawn((
-                    Workbench {
-                        faction_id,
-                        tier: WorkbenchTier::default(),
-                    },
+                    wb,
+                    StructureLabel(label),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -3893,6 +3963,7 @@ fn spawn_seeded_structure(
             let e = commands
                 .spawn((
                     Loom { faction_id },
+                    StructureLabel(BuildSiteKind::Loom.label()),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -3905,6 +3976,7 @@ fn spawn_seeded_structure(
             let e = commands
                 .spawn((
                     Granary { faction_id },
+                    StructureLabel(BuildSiteKind::Granary.label()),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -3917,6 +3989,7 @@ fn spawn_seeded_structure(
             let e = commands
                 .spawn((
                     Shrine { faction_id },
+                    StructureLabel(BuildSiteKind::Shrine.label()),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -3929,6 +4002,7 @@ fn spawn_seeded_structure(
             let e = commands
                 .spawn((
                     Market { faction_id },
+                    StructureLabel(BuildSiteKind::Market.label()),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -3941,6 +4015,7 @@ fn spawn_seeded_structure(
             let e = commands
                 .spawn((
                     Barracks { faction_id },
+                    StructureLabel(BuildSiteKind::Barracks.label()),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -3953,6 +4028,7 @@ fn spawn_seeded_structure(
             let e = commands
                 .spawn((
                     Monument { faction_id },
+                    StructureLabel(BuildSiteKind::Monument.label()),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.45),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -4012,13 +4088,16 @@ fn seed_perimeter(
             let world_pos = tile_to_world(tile.0, tile.1);
 
             if tile == door_tile {
+                let door = Door {
+                    faction_id,
+                    open: false,
+                    tier: DoorTier::default(),
+                };
+                let label = door.tier.label();
                 let e = commands
                     .spawn((
-                        Door {
-                            faction_id,
-                            open: false,
-                            tier: DoorTier::default(),
-                        },
+                        door,
+                        StructureLabel(label),
                         Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                         GlobalTransform::default(),
                         Visibility::Visible,
@@ -4049,6 +4128,7 @@ fn seed_perimeter(
                 let e = commands
                     .spawn((
                         Wall { material },
+                        StructureLabel(material.label()),
                         Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                         GlobalTransform::default(),
                         Visibility::Visible,
@@ -4114,6 +4194,7 @@ pub fn seed_starting_buildings_system(
             let e = commands
                 .spawn((
                     Campfire { tier: hearth_tier },
+                    StructureLabel(hearth_tier.label()),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
                     GlobalTransform::default(),
                     Visibility::Visible,

@@ -557,108 +557,115 @@ pub fn setup_pixel_art(mut commands: Commands, mut images: ResMut<Assets<Image>>
         &[('g', g), ('d', d), ('l', l_g), ('x', x), ('.', _t)],
     );
 
-    // Stone wall: rough mortared masonry — grey blocks with dark joints.
+    // Stone wall: irregular dry-stone masonry — varied fieldstones with broken
+    // mortar lines. Reads as rough/rustic. The scattered `P` highlights on
+    // individual stones distinguish it from the orderly brick/ashlar patterns.
     let wall_stone_ascii = &[
+        "kllllPkkPlllllkk",
+        "klPllllkllllllPk",
+        "klllllllllPlllPk",
         "kkkkkkkkkkkkkkkk",
-        "klllllklllllllkk",
-        "klllllklllllllkk",
-        "klllllklllllllkk",
+        "kllPllkPlllllllk",
+        "kllllPkllPlllllk",
+        "klPlllllllllPllk",
         "kkkkkkkkkkkkkkkk",
-        "kklllllllkllllkk",
-        "kklllllllkllllkk",
-        "kklllllllkllllkk",
+        "klllllPkllPllllk",
+        "klPlllkkllllllPk",
+        "klllllllllPllllk",
         "kkkkkkkkkkkkkkkk",
-        "klllllklllllllkk",
-        "klllllklllllllkk",
-        "klllllklllllllkk",
-        "kkkkkkkkkkkkkkkk",
-        "kklllllllkllllkk",
-        "kklllllllkllllkk",
+        "klllPlkllllllllk",
+        "klllllkPllllPllk",
+        "klPlPlllllllllPk",
         "kkkkkkkkkkkkkkkk",
     ];
     let wall_stone_img = ascii_to_image(wall_stone_ascii, WARM_PALETTE);
 
-    // Palisade: vertical wooden stakes, sharpened tops, dark soil base.
+    // Palisade: pointed vertical wooden stakes lashed with horizontal twine
+    // bands. Sky shows between sharpened tips.
     let wall_palisade_ascii = &[
-        "..D..D..D..D..D.",
-        ".dBd.dBd.dBd.dBd",
-        ".DBdSdBdSdBdSdBd",
-        ".DBdSdBdSdBdSdBd",
-        ".DbdSdbdSdbdSdbd",
-        ".DbdSdbdSdbdSdbd",
-        ".DBdSdBdSdBdSdBd",
-        ".DBdSdBdSdBdSdBd",
-        ".DBdSdBdSdBdSdBd",
-        ".DbdSdbdSdbdSdbd",
-        ".DbdSdbdSdbdSdbd",
-        ".DBdSdBdSdBdSdBd",
-        ".DBdSdBdSdBdSdBd",
-        ".DBdSdBdSdBdSdBd",
-        ".DBdSdBdSdBdSdBd",
+        ".D...D...D...D..",
+        "DDD.DDD.DDD.DDD.",
+        "DBt.DBt.DBt.DBt.",
+        "DBt.DBt.DBt.DBt.",
+        "DBt.DBt.DBt.DBt.",
+        "DBt.DBt.DBt.DBt.",
+        "dbtbdbtbdbtbdbtb",
+        "DBt.DBt.DBt.DBt.",
+        "DBt.DBt.DBt.DBt.",
+        "DBt.DBt.DBt.DBt.",
+        "DBt.DBt.DBt.DBt.",
+        "dbtbdbtbdbtbdbtb",
+        "DBt.DBt.DBt.DBt.",
+        "DBt.DBt.DBt.DBt.",
+        "DBdSDBdSDBdSDBdS",
         "ssssssssssssssss",
     ];
     let wall_palisade_img = ascii_to_image(wall_palisade_ascii, WARM_PALETTE);
 
-    // Wattle & daub: woven wood lattice over light plaster.
+    // Wattle & daub: half-timbered plaster wall — three dark horizontal beams,
+    // two vertical posts dividing cream plaster panels.
     let wall_wattle_ascii = &[
-        "TTTTTTTTTTTTTTTT",
-        "TbTbTbTbTbTbTbTb",
-        "TBTtTTTBTtTTTBTt",
-        "TtTBTTTtTBTTTtTB",
-        "TBTtTTTBTtTTTBTt",
-        "TtTBTTTtTBTTTtTB",
-        "TBTtTTTBTtTTTBTt",
-        "TtTBTTTtTBTTTtTB",
-        "TBTtTTTBTtTTTBTt",
-        "TtTBTTTtTBTTTtTB",
-        "TBTtTTTBTtTTTBTt",
-        "TtTBTTTtTBTTTtTB",
-        "TBTtTTTBTtTTTBTt",
-        "TtTBTTTtTBTTTtTB",
-        "TtTtTtTtTtTtTtTt",
+        "dddddddddddddddd",
+        "WTTWWWdWWWdWWTTW",
+        "TTTWWWdWWWdWWTTT",
+        "TTTWWWdWWWdWWTTT",
+        "TTTWWWdWWWdWWTTT",
+        "TTTWWWdWWWdWWTTT",
+        "TTTWWWdWWWdWWTTT",
+        "dddddddddddddddd",
+        "TTTWWWdWWWdWWTTT",
+        "TTTWWWdWWWdWWTTT",
+        "TTTWWWdWWWdWWTTT",
+        "TTTWWWdWWWdWWTTT",
+        "TTTWWWdWWWdWWTTT",
+        "WTTWWWdWWWdWWTTW",
+        "dddddddddddddddd",
         "ssssssssssssssss",
     ];
     let wall_wattle_img = ascii_to_image(wall_wattle_ascii, WARM_PALETTE);
 
-    // Mudbrick: terracotta bricks bound with dark earth mortar.
+    // Mudbrick: orderly terracotta courses in running bond. Sun-bleached `o`
+    // highlights along the top of each brick give a baked-clay 3-D feel.
     let wall_mudbrick_ascii = &[
-        "eeeeeeeeeeeeeeee",
-        "eRRRRReeRRRRRRRe",
-        "eRRRRReeRRRRRRRe",
-        "eRRRRReeRRRRRRRe",
-        "eeeeeeeeeeeeeeee",
-        "eeRRRRRRReeRRRRR",
-        "eeRRRRRRReeRRRRR",
-        "eeRRRRRRReeRRRRR",
-        "eeeeeeeeeeeeeeee",
-        "eRRRRReeRRRRRRRe",
-        "eRRRRReeRRRRRRRe",
-        "eRRRRReeRRRRRRRe",
-        "eeeeeeeeeeeeeeee",
-        "eeRRRRRRReeRRRRR",
-        "eeRRRRRRReeRRRRR",
+        "ooooSooooSooooSo",
+        "RRRRsRRRRsRRRRsR",
+        "RRRRsRRRRsRRRRsR",
+        "ssssssssssssssss",
+        "oSooooSooooSoooo",
+        "RsRRRRsRRRRsRRRR",
+        "RsRRRRsRRRRsRRRR",
+        "ssssssssssssssss",
+        "ooooSooooSooooSo",
+        "RRRRsRRRRsRRRRsR",
+        "RRRRsRRRRsRRRRsR",
+        "ssssssssssssssss",
+        "oSooooSooooSoooo",
+        "RsRRRRsRRRRsRRRR",
+        "RsRRRRsRRRRsRRRR",
         "ssssssssssssssss",
     ];
     let wall_mudbrick_img = ascii_to_image(wall_mudbrick_ascii, WARM_PALETTE);
 
-    // Cut stone: precision ashlar — light slate with crisp seams.
+    // Cut stone: precision ashlar — large monumental blocks in pale `P` with
+    // crisp `K` joints and `W` corner highlights. Brighter and far blockier
+    // than the rough Stone Wall.
     let wall_cutstone_ascii = &[
-        "PPPPPPPPPPPPPPPP",
-        "PllllllPllllllPP",
-        "PllllllPllllllPP",
-        "PllllllPllllllPP",
-        "PllllllPllllllPP",
-        "PPPPPPPPPPPPPPPP",
-        "PPllllllllPlllPP",
-        "PPllllllllPlllPP",
-        "PPllllllllPlllPP",
-        "PPllllllllPlllPP",
-        "PPPPPPPPPPPPPPPP",
-        "PllllllPllllllPP",
-        "PllllllPllllllPP",
-        "PllllllPllllllPP",
-        "PllllllPllllllPP",
-        "PPPPPPPPPPPPPPPP",
+        "PPPPPPPPKPPPPPPP",
+        "PWPPPPPPKPWPPPPP",
+        "PPPPPPPPKPPPPPPP",
+        "PPPPPPPPKPPPPPPP",
+        "PPPPPPPPKPPPPPPP",
+        "KKKKKKKKKKKKKKKK",
+        "PPPPKPPPPPPPKPPP",
+        "PWPPKPPPWPPPKPWP",
+        "PPPPKPPPPPPPKPPP",
+        "PPPPKPPPPPPPKPPP",
+        "PPPPKPPPPPPPKPPP",
+        "KKKKKKKKKKKKKKKK",
+        "PPPPPPPPKPPPPPPP",
+        "PWPPPPPPKPWPPPPP",
+        "PPPPPPPPKPPPPPPP",
+        "PPPPPPPPKPPPPPPP",
     ];
     let wall_cutstone_img = ascii_to_image(wall_cutstone_ascii, WARM_PALETTE);
 

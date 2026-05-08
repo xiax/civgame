@@ -8,7 +8,7 @@ use crate::simulation::animals::{AnimalAI, Deer, Wolf};
 use crate::simulation::carry::Carrier;
 use crate::simulation::combat::{Body, Health};
 use crate::simulation::construction::{
-    recipe_for, AutonomousBuildingToggle, Blueprint, BlueprintMap,
+    recipe_for, AutonomousBuildingToggle, Blueprint, BlueprintMap, StructureIndex, StructureLabel,
 };
 use crate::simulation::crafting::{craft_recipes, CraftOrder, CraftOrderMap};
 
@@ -19,6 +19,8 @@ pub struct SitesHoverParams<'w, 's> {
     pub bp_query: Query<'w, 's, &'static Blueprint>,
     pub co_map: Res<'w, CraftOrderMap>,
     pub co_query: Query<'w, 's, &'static CraftOrder>,
+    pub structure_index: Res<'w, StructureIndex>,
+    pub structure_label_q: Query<'w, 's, &'static StructureLabel>,
 }
 use crate::simulation::faction::FactionMember;
 use crate::simulation::items::GroundItem;
@@ -164,6 +166,14 @@ pub fn hover_info_system(
                     } else {
                         ui.label(format!("Entity: {:?}", entity));
                     }
+                }
+            }
+
+            let tile_key = (tx as i32, ty as i32);
+            if let Some(&structure_entity) = sites.structure_index.0.get(&tile_key) {
+                if let Ok(label) = sites.structure_label_q.get(structure_entity) {
+                    ui.separator();
+                    ui.label(egui::RichText::new(label.0).strong());
                 }
             }
 

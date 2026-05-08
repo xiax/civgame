@@ -64,6 +64,14 @@ impl Plugin for SimulationPlugin {
         let mut method_registry = htn::MethodRegistry::default();
         htn::register_builtin_methods(&mut method_registry);
 
+        // Mirror the `Indexed` / `JobEscrow` hook pattern so structure
+        // spawn/despawn paths stay untouched and `StructureIndex` is always
+        // in sync with live `StructureLabel` entities.
+        app.world_mut()
+            .register_component_hooks::<construction::StructureLabel>()
+            .on_add(construction::on_structure_label_add)
+            .on_remove(construction::on_structure_label_remove);
+
         app.add_plugins(jobs::JobsPlugin)
             .add_plugins(projects::ProjectsPlugin)
             .add_event::<combat::CombatEvent>()
@@ -93,6 +101,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::MarketMap::default())
             .insert_resource(construction::BarracksMap::default())
             .insert_resource(construction::MonumentMap::default())
+            .insert_resource(construction::StructureIndex::default())
             .insert_resource(construction::BlueprintMap::default())
             .insert_resource(crafting::CraftOrderMap::default())
             .insert_resource(construction::RoadCarveQueue::default())
