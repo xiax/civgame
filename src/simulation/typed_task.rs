@@ -108,6 +108,21 @@ pub enum Task {
         resource_id: ResourceId,
         qty: u8,
     },
+    /// P2b: nomadic / member-pool counterpart to `WithdrawMaterial`. Walks
+    /// the actor adjacent to `target` (a fellow faction member), then pulls
+    /// `qty` units of `resource_id` out of the target's `EconomicAgent.inventory`
+    /// (or `Carrier` hands) into the actor's. No `StorageReservations` — member
+    /// pools are claim-light today; collisions are best-effort.
+    ///
+    /// Today this variant has no dispatcher caller (nomadic factions have
+    /// `caps.posting=Disabled` and never reach `AcquireGood`), but the
+    /// executor + task are wired so the path is reachable as soon as a
+    /// caller emits the variant.
+    WalkAndTakeFromMember {
+        target: bevy::prelude::Entity,
+        resource_id: ResourceId,
+        qty: u8,
+    },
     /// Move a matching `Item` from inventory or hands into `Equipment[slot]`.
     /// Replaces `PersonAI.equip_slot` (sentinel-encoded `u8`) and the Equip
     /// usage of `craft_recipe_id` (good as u8).

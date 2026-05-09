@@ -388,6 +388,7 @@ impl Plugin for SimulationPlugin {
                     production::eat_task_system.after(movement::movement_system),
                     production::withdraw_food_task_system.after(movement::movement_system),
                     production::withdraw_material_task_system.after(movement::movement_system),
+                    production::take_from_member_task_system.after(movement::movement_system),
                     production::withdraw_good_task_system.after(movement::movement_system),
                     production::tame_task_system.after(movement::movement_system),
                     (

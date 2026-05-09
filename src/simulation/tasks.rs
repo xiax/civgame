@@ -65,6 +65,13 @@ pub enum TaskKind {
     Teach = 39,       // adjacent to a target student, both stand still while teacher transfers progress
     HoldLecture = 40, // stand at lecture anchor and broadcast progress to nearby Attending students
     AttendLecture = 41, // student rooted near a Lecturing teacher, accumulating progress per tick
+    /// P2b: nomadic / member-pool withdraw. Walks the actor adjacent
+    /// to a fellow faction member (`PersonAI.target_entity`), then
+    /// the executor moves `qty` units of `resource_id` from the
+    /// target's `EconomicAgent.inventory` (or hands) into the actor's.
+    /// Mirrors `WithdrawMaterial` for the FactionTile path; reaches
+    /// the executor by `take_from_member_task_system`.
+    TakeFromMember = 42,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -91,6 +98,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::Eat as u16 => "Eating",
         x if x == TaskKind::WithdrawFood as u16 => "Withdrawing Food",
         x if x == TaskKind::WithdrawMaterial as u16 => "Withdrawing Material",
+        x if x == TaskKind::TakeFromMember as u16 => "Taking From Teammate",
         x if x == TaskKind::TameAnimal as u16 => "Taming",
         x if x == TaskKind::Craft as u16 => "Crafter",
         x if x == TaskKind::Lead as u16 => "Leading",

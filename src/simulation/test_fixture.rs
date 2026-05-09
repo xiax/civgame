@@ -3677,6 +3677,93 @@ mod smoke {
         assert_eq!(plot.missed_payments, 0, "missed_payments should reset on eviction");
     }
 
+    /// P2b: `take_from_member_task_system` transfers `qty` units of a
+    /// resource from a target member's inventory into the actor's.
+    /// Driven directly via `Task::WalkAndTakeFromMember` since the
+    /// dispatcher path is deferred (no caller today).
+    #[test]
+    fn take_from_member_transfers_inventory() {
+        use crate::economy::core_ids;
+        use crate::simulation::person::{AiState, PersonAI};
+        use crate::simulation::production::take_from_member_task_system;
+        use crate::simulation::tasks::TaskKind;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut sim = TestSim::new(0xDADBA11);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let actor = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let target = sim.spawn_person(sim.player_faction_id, (1, 0), |_| {});
+        // Use Grain (Bulk::Small, ~50g) so 5 units fit comfortably in
+        // the target's inventory cap. Wood is TwoHand bulk and would
+        // overflow inventory weight (5 wood = 25kg).
+        let grain = core_ids::grain();
+
+        // Seed target's inventory with grain.
+        {
+            let mut t_agent = sim
+                .app
+                .world_mut()
+                .get_mut::<EconomicAgent>(target)
+                .unwrap();
+            let leftover = t_agent.add_resource(grain, 5);
+            assert_eq!(leftover, 0, "target inventory should accept 5 grain");
+        }
+        // Set actor up to take 4 grain from target.
+        {
+            let world = sim.app.world_mut();
+            let mut ai = world.get_mut::<PersonAI>(actor).unwrap();
+            ai.state = AiState::Working;
+            ai.task_id = TaskKind::TakeFromMember as u16;
+            ai.dest_tile = (1, 0);
+            ai.target_entity = Some(target);
+            let mut aq = world.get_mut::<ActionQueue>(actor).unwrap();
+            aq.current = Task::WalkAndTakeFromMember {
+                target,
+                resource_id: grain,
+                qty: 4,
+            };
+        }
+
+        sim.app
+            .world_mut()
+            .run_system_once(take_from_member_task_system)
+            .expect("take_from_member_task_system should run");
+
+        // Target lost 4; actor gained 4 (in hands first, inventory leftover).
+        let t_after = sim
+            .app
+            .world()
+            .get::<EconomicAgent>(target)
+            .unwrap()
+            .quantity_of_resource(grain);
+        let a_carrier = sim
+            .app
+            .world()
+            .get::<crate::simulation::carry::Carrier>(actor)
+            .unwrap();
+        let a_inv = sim
+            .app
+            .world()
+            .get::<EconomicAgent>(actor)
+            .unwrap()
+            .quantity_of_resource(grain);
+        let a_carry_qty = a_carrier
+            .quantity_of_resource(grain);
+        assert_eq!(t_after, 1, "target should have 1 wood left after the take");
+        assert_eq!(
+            a_carry_qty + a_inv,
+            4,
+            "actor should hold 4 wood across hands+inventory; carry={a_carry_qty} inv={a_inv}",
+        );
+
+        // Executor flips state to Idle.
+        let a_ai = sim.app.world().get::<PersonAI>(actor).unwrap();
+        assert_eq!(a_ai.state, AiState::Idle);
+        assert_eq!(a_ai.task_id, PersonAI::UNEMPLOYED);
+    }
+
     /// P7b: `EvictionPolicy::Demolish` despawns a structure inside the
     /// evicted plot's rect and drops its refund stack as a `GroundItem`.
     /// `LeaveStructures` (the default) leaves the structure in place

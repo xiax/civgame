@@ -790,6 +790,130 @@ fn finish_withdraw_material(
 }
 
 /// Withdraw one edible good from a faction storage tile into the agent's hands or inventory.
+/// P2b: nomadic / member-pool withdraw executor. Driven by
+/// `TaskKind::TakeFromMember` paired with
+/// `Task::WalkAndTakeFromMember { target, resource_id, qty }`. By the
+/// time this fires the actor has been routed adjacent to the target
+/// member by `movement_system`; this system performs the inventory
+/// transfer in one tick and drops back to Idle.
+///
+/// Transfer rules: pulls from the target's `Carrier` first (hands
+/// hold the bulky stuff like Wood/Stone), then from the target's
+/// `EconomicAgent.inventory` for the remainder. Lands in the actor's
+/// `Carrier` first (hands), inventory for leftover. No reservation /
+/// claim plumbing — member pools are claim-light; collisions are
+/// best-effort (the target may have already given goods to another
+/// teammate this tick).
+///
+/// Today this executor has no dispatcher caller (nomadic factions
+/// have `caps.posting=Disabled` and never reach `AcquireGood`); it's
+/// wired so a future caller (caravan crews / Hybrid archetypes) can
+/// emit the variant without further plumbing work.
+pub fn take_from_member_task_system(
+    clock: Res<SimClock>,
+    mut query: Query<(
+        Entity,
+        &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
+        &mut EconomicAgent,
+        &mut Carrier,
+        &FactionMember,
+        &BucketSlot,
+        &LodLevel,
+    )>,
+) {
+    use crate::simulation::typed_task::Task;
+
+    // Two-pass: collect (actor, target, rid, qty) tuples first, then
+    // perform the disjoint mutable borrows via `get_many_mut`. Avoids
+    // the long alias-windowing dance inside the iter loop.
+    let mut transfers: Vec<(Entity, Entity, crate::economy::resource_catalog::ResourceId, u32)> =
+        Vec::new();
+    let mut to_finalize: Vec<Entity> = Vec::new();
+    for (actor, ai, aq, _agent, _carrier, member, slot, lod) in query.iter() {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        if ai.state != AiState::Working || ai.task_id != TaskKind::TakeFromMember as u16 {
+            continue;
+        }
+        let Task::WalkAndTakeFromMember {
+            target,
+            resource_id,
+            qty,
+        } = aq.current
+        else {
+            to_finalize.push(actor);
+            continue;
+        };
+        if member.faction_id == SOLO {
+            to_finalize.push(actor);
+            continue;
+        }
+        transfers.push((actor, target, resource_id, qty as u32));
+    }
+
+    for (actor, target, rid, want) in transfers {
+        if actor == target {
+            to_finalize.push(actor);
+            continue;
+        }
+        // Disjoint borrows: actor + target both Persons.
+        let Ok([
+            (_, mut a_ai, mut a_aq, mut a_agent, mut a_carrier, _, _, _),
+            (_, _, _, mut t_agent, mut t_carrier, _, _, _),
+        ]) = query.get_many_mut([actor, target])
+        else {
+            to_finalize.push(actor);
+            continue;
+        };
+        let mut remaining = want;
+
+        // Pull from target's hands first.
+        let pulled_hands = t_carrier.remove_resource(rid, remaining);
+        if pulled_hands > 0 {
+            let item = Item::new_commodity(rid);
+            let leftover = a_carrier.try_pick_up(item, pulled_hands);
+            if leftover > 0 {
+                let _ = a_agent.add_resource(rid, leftover);
+            }
+            remaining = remaining.saturating_sub(pulled_hands);
+        }
+
+        // Pull from target's inventory for the remainder.
+        if remaining > 0 {
+            let pulled_inv = t_agent.remove_resource(rid, remaining);
+            if pulled_inv > 0 {
+                let item = Item::new_commodity(rid);
+                let leftover = a_carrier.try_pick_up(item, pulled_inv);
+                if leftover > 0 {
+                    let _ = a_agent.add_resource(rid, leftover);
+                }
+            }
+        }
+
+        // Done — drop the chain to Idle. The dispatcher that emitted
+        // `WalkAndTakeFromMember` is responsible for any chain handoff
+        // by enqueuing a follow-on task; the prefetch ring's `advance`
+        // promotes it.
+        a_aq.advance();
+        a_ai.state = AiState::Idle;
+        a_ai.task_id = PersonAI::UNEMPLOYED;
+        a_ai.target_entity = None;
+        a_ai.work_progress = 0;
+    }
+
+    for actor in to_finalize {
+        if let Ok((_, mut ai, mut aq, _, _, _, _, _)) = query.get_mut(actor) {
+            aq.cancel();
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
+            ai.work_progress = 0;
+        }
+    }
+}
+
 /// Driven by `TaskKind::WithdrawFood`. Agent works from a tile adjacent to the
 /// storage tile (`ai.dest_tile`) and reaches over to pull one item off the stack.
 ///
