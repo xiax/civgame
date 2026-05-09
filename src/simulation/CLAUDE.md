@@ -172,6 +172,10 @@ Headless `App` harness for AI assertions without rendering/UI/globe gen. `TestSi
 - `corpse_follow_system` (Sequential, after `movement_system`) snaps corpse Transform to carrier. `respond_to_distress_system` recruits any same-faction Hunter within `HUNTER_RESPOND_RANGE=50` regardless of LOS, removing `Carrying`.
 - **`Carrying(Entity)`** — marker for "carrying corpse E"; inserted at pickup arrival, removed at butcher / decay / rescue / muster / hunter-demote.
 
+## Animal spawn distribution (`animals.rs::spawn_animals`)
+
+Initial-condition only. Per-species `SocialPattern` picks a `(group_min..=group_max, cluster_radius)`: `HERD` (Deer/Horse/Cow — 8–15, r=5), `PACK` (Wolf/Pig/Rabbit/Fox — 3–6, r=3), `SOLITARY` (Cat — 1, r=0). `cluster_spawn_tiles` pops shuffled centers from the species' biome pool (`forest_tiles` / `grass_tiles` — full pass, no 2× cap) and lays members on tiles inside the biome `AHashSet` within `cluster_radius` of the center; falls back to the center tile if 16 random offsets all miss. Total counts (`WOLF_COUNT`, `DEER_COUNT`, …) and per-species component bundles are unchanged. Runtime cohesion is not modeled — `animal_movement_system` wanders independently, so groups disperse over time.
+
 ## Pluralist Economy
 
 Per-resource policy flags + per-settlement markets + sub-faction households + Bureaucrat/Trader professions + P2P currency + escrow + U_bid scoring + tribute + craft contracts. Currency invariant: `EconomicAgent.currency` + `FactionData.treasury` + `Settlement.treasury` + `JobEscrow.amount` is conserved across every operation.

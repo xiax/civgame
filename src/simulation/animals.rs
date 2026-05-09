@@ -9,6 +9,7 @@ use crate::world::seasons::TICKS_PER_SEASON;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use crate::world::tile::TileKind;
+use ahash::AHashSet;
 use bevy::prelude::*;
 use std::time::Instant;
 
@@ -143,6 +144,79 @@ pub struct AnimalNeeds {
 #[derive(Component, Clone, Copy, Default)]
 pub struct AnimalReproductionCooldown(pub u32);
 
+/// Initial-condition spawn distribution per species. Group members are
+/// placed within `cluster_radius` tiles of a randomly chosen center;
+/// SOLITARY collapses to one-per-cluster with radius 0.
+#[derive(Clone, Copy)]
+struct SocialPattern {
+    group_min: u32,
+    group_max: u32,
+    cluster_radius: i32,
+}
+
+const HERD: SocialPattern = SocialPattern {
+    group_min: 8,
+    group_max: 15,
+    cluster_radius: 5,
+};
+const PACK: SocialPattern = SocialPattern {
+    group_min: 3,
+    group_max: 6,
+    cluster_radius: 3,
+};
+const SOLITARY: SocialPattern = SocialPattern {
+    group_min: 1,
+    group_max: 1,
+    cluster_radius: 0,
+};
+
+/// Pops cluster centers from the (pre-shuffled) `pool` and lays out group
+/// members on tiles inside `biome_set` within `pattern.cluster_radius` of
+/// the center. Returns up to `count` spawn locations in cluster order;
+/// truncates short if `pool` runs out before `count` is satisfied.
+fn cluster_spawn_tiles(
+    pool: &mut Vec<(i32, i32)>,
+    biome_set: &AHashSet<(i32, i32)>,
+    pattern: SocialPattern,
+    count: u32,
+) -> Vec<(i32, i32)> {
+    let mut out: Vec<(i32, i32)> = Vec::with_capacity(count as usize);
+    let mut remaining = count;
+    while remaining > 0 {
+        let center = match pool.pop() {
+            Some(t) => t,
+            None => break,
+        };
+        let group_size = if pattern.group_min >= pattern.group_max {
+            pattern.group_min
+        } else {
+            fastrand::u32(pattern.group_min..=pattern.group_max)
+        }
+        .min(remaining);
+        out.push(center);
+        let mut used: Vec<(i32, i32)> = Vec::with_capacity(group_size as usize);
+        used.push(center);
+        for _ in 1..group_size {
+            let mut placed = center;
+            if pattern.cluster_radius > 0 {
+                for _ in 0..16 {
+                    let dx = fastrand::i32(-pattern.cluster_radius..=pattern.cluster_radius);
+                    let dy = fastrand::i32(-pattern.cluster_radius..=pattern.cluster_radius);
+                    let candidate = (center.0 + dx, center.1 + dy);
+                    if biome_set.contains(&candidate) && !used.contains(&candidate) {
+                        placed = candidate;
+                        break;
+                    }
+                }
+            }
+            used.push(placed);
+            out.push(placed);
+        }
+        remaining = remaining.saturating_sub(group_size);
+    }
+    out
+}
+
 pub fn spawn_animals(
     mut commands: Commands,
     chunk_map: Res<ChunkMap>,
@@ -153,10 +227,7 @@ pub fn spawn_animals(
     let mut forest_tiles: Vec<(i32, i32)> = Vec::new();
     let mut grass_tiles: Vec<(i32, i32)> = Vec::new();
 
-    let forest_target = (WOLF_COUNT + PIG_COUNT + FOX_COUNT + CAT_COUNT) as usize * 2;
-    let grass_target = (DEER_COUNT + HORSE_COUNT + COW_COUNT + RABBIT_COUNT) as usize * 2;
-
-    'tile_search: for (coord, chunk) in chunk_map.0.iter() {
+    for (coord, chunk) in chunk_map.0.iter() {
         let base_tx = coord.0 * CHUNK_SIZE as i32;
         let base_ty = coord.1 * CHUNK_SIZE as i32;
         for ly in 0..CHUNK_SIZE {
@@ -167,16 +238,9 @@ pub fn spawn_animals(
                 let tx = base_tx + lx as i32;
                 let ty = base_ty + ly as i32;
                 match chunk.surface_tile_kind(lx, ly) {
-                    TileKind::Forest if forest_tiles.len() < forest_target => {
-                        forest_tiles.push((tx, ty));
-                    }
-                    TileKind::Grass if grass_tiles.len() < grass_target => {
-                        grass_tiles.push((tx, ty));
-                    }
+                    TileKind::Forest => forest_tiles.push((tx, ty)),
+                    TileKind::Grass => grass_tiles.push((tx, ty)),
                     _ => {}
-                }
-                if forest_tiles.len() >= forest_target && grass_tiles.len() >= grass_target {
-                    break 'tile_search;
                 }
             }
         }
@@ -193,15 +257,17 @@ pub fn spawn_animals(
         warn!("spawn_animals: no forest or grass tiles found in loaded chunks — animals may not spawn!");
     }
 
+    let forest_set: AHashSet<(i32, i32)> = forest_tiles.iter().copied().collect();
+    let grass_set: AHashSet<(i32, i32)> = grass_tiles.iter().copied().collect();
+
+    fastrand::shuffle(&mut forest_tiles);
+    fastrand::shuffle(&mut grass_tiles);
+
     let mut slot = clock.population;
 
-    let wolf_step = (forest_tiles.len() / WOLF_COUNT as usize).max(1);
-    for i in 0..WOLF_COUNT as usize {
-        let idx = (i * wolf_step) % forest_tiles.len().max(1);
-        if idx >= forest_tiles.len() {
-            break;
-        }
-        let (tx, ty) = forest_tiles[idx];
+    // Wolves: pack predator, forest.
+    let wolf_tiles = cluster_spawn_tiles(&mut forest_tiles, &forest_set, PACK, WOLF_COUNT);
+    for (i, &(tx, ty)) in wolf_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
             Wolf,
@@ -210,7 +276,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i32, ty as i32),
+                target_tile: (tx, ty),
                 wander_timer: i as f32 * 0.05,
                 ..Default::default()
             },
@@ -231,13 +297,9 @@ pub fn spawn_animals(
         slot += 1;
     }
 
-    let deer_step = (grass_tiles.len() / DEER_COUNT as usize).max(1);
-    for i in 0..DEER_COUNT as usize {
-        let idx = (i * deer_step) % grass_tiles.len().max(1);
-        if idx >= grass_tiles.len() {
-            break;
-        }
-        let (tx, ty) = grass_tiles[idx];
+    // Deer: herd grazer, grass.
+    let deer_tiles = cluster_spawn_tiles(&mut grass_tiles, &grass_set, HERD, DEER_COUNT);
+    for (i, &(tx, ty)) in deer_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
             (
@@ -247,7 +309,7 @@ pub fn spawn_animals(
                 Visibility::Visible,
                 InheritedVisibility::default(),
                 AnimalAI {
-                    target_tile: (tx as i32, ty as i32),
+                    target_tile: (tx, ty),
                     wander_timer: i as f32 * 0.02,
                     ..Default::default()
                 },
@@ -272,15 +334,9 @@ pub fn spawn_animals(
         slot += 1;
     }
 
-    // Horses: spawn in grassland, staggered offset from deer to avoid overlap
-    let horse_step = (grass_tiles.len() / HORSE_COUNT as usize).max(1);
-    let horse_offset = grass_tiles.len() / 3;
-    for i in 0..HORSE_COUNT as usize {
-        let idx = (horse_offset + i * horse_step) % grass_tiles.len().max(1);
-        if idx >= grass_tiles.len() {
-            break;
-        }
-        let (tx, ty) = grass_tiles[idx];
+    // Horses: herd, grass.
+    let horse_tiles = cluster_spawn_tiles(&mut grass_tiles, &grass_set, HERD, HORSE_COUNT);
+    for (i, &(tx, ty)) in horse_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
             Horse,
@@ -289,7 +345,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i32, ty as i32),
+                target_tile: (tx, ty),
                 wander_timer: i as f32 * 0.03,
                 ..Default::default()
             },
@@ -310,15 +366,9 @@ pub fn spawn_animals(
         slot += 1;
     }
 
-    // Cows: spawn in grassland alongside deer/horses
-    let cow_step = (grass_tiles.len() / COW_COUNT as usize).max(1);
-    let cow_offset = grass_tiles.len() / 5;
-    for i in 0..COW_COUNT as usize {
-        let idx = (cow_offset + i * cow_step) % grass_tiles.len().max(1);
-        if idx >= grass_tiles.len() {
-            break;
-        }
-        let (tx, ty) = grass_tiles[idx];
+    // Cows: herd, grass.
+    let cow_tiles = cluster_spawn_tiles(&mut grass_tiles, &grass_set, HERD, COW_COUNT);
+    for (i, &(tx, ty)) in cow_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
             Cow,
@@ -327,7 +377,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i32, ty as i32),
+                target_tile: (tx, ty),
                 wander_timer: i as f32 * 0.04,
                 ..Default::default()
             },
@@ -347,14 +397,9 @@ pub fn spawn_animals(
         slot += 1;
     }
 
-    // Rabbits: spawn in grassland, dense
-    let rabbit_step = (grass_tiles.len() / RABBIT_COUNT as usize).max(1);
-    for i in 0..RABBIT_COUNT as usize {
-        let idx = (i * rabbit_step) % grass_tiles.len().max(1);
-        if idx >= grass_tiles.len() {
-            break;
-        }
-        let (tx, ty) = grass_tiles[idx];
+    // Rabbits: small warrens (pack), grass.
+    let rabbit_tiles = cluster_spawn_tiles(&mut grass_tiles, &grass_set, PACK, RABBIT_COUNT);
+    for (i, &(tx, ty)) in rabbit_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
             Rabbit,
@@ -363,7 +408,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i32, ty as i32),
+                target_tile: (tx, ty),
                 wander_timer: i as f32 * 0.01,
                 ..Default::default()
             },
@@ -383,15 +428,9 @@ pub fn spawn_animals(
         slot += 1;
     }
 
-    // Pigs: spawn in forest
-    let pig_step = (forest_tiles.len() / PIG_COUNT as usize).max(1);
-    let pig_offset = forest_tiles.len() / 4;
-    for i in 0..PIG_COUNT as usize {
-        let idx = (pig_offset + i * pig_step) % forest_tiles.len().max(1);
-        if idx >= forest_tiles.len() {
-            break;
-        }
-        let (tx, ty) = forest_tiles[idx];
+    // Pigs: small sounders (pack), forest.
+    let pig_tiles = cluster_spawn_tiles(&mut forest_tiles, &forest_set, PACK, PIG_COUNT);
+    for (i, &(tx, ty)) in pig_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
             Pig,
@@ -400,7 +439,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i32, ty as i32),
+                target_tile: (tx, ty),
                 wander_timer: i as f32 * 0.04,
                 ..Default::default()
             },
@@ -420,15 +459,9 @@ pub fn spawn_animals(
         slot += 1;
     }
 
-    // Foxes: small forest predators
-    let fox_step = (forest_tiles.len() / FOX_COUNT as usize).max(1);
-    let fox_offset = forest_tiles.len() / 2;
-    for i in 0..FOX_COUNT as usize {
-        let idx = (fox_offset + i * fox_step) % forest_tiles.len().max(1);
-        if idx >= forest_tiles.len() {
-            break;
-        }
-        let (tx, ty) = forest_tiles[idx];
+    // Foxes: small family (pack), forest.
+    let fox_tiles = cluster_spawn_tiles(&mut forest_tiles, &forest_set, PACK, FOX_COUNT);
+    for (i, &(tx, ty)) in fox_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
             Fox,
@@ -437,7 +470,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i32, ty as i32),
+                target_tile: (tx, ty),
                 wander_timer: i as f32 * 0.03,
                 ..Default::default()
             },
@@ -457,15 +490,9 @@ pub fn spawn_animals(
         slot += 1;
     }
 
-    // Cats: small forest predators
-    let cat_step = (forest_tiles.len() / CAT_COUNT as usize).max(1);
-    let cat_offset = (forest_tiles.len() * 3) / 4;
-    for i in 0..CAT_COUNT as usize {
-        let idx = (cat_offset + i * cat_step) % forest_tiles.len().max(1);
-        if idx >= forest_tiles.len() {
-            break;
-        }
-        let (tx, ty) = forest_tiles[idx];
+    // Cats: solitary, forest.
+    let cat_tiles = cluster_spawn_tiles(&mut forest_tiles, &forest_set, SOLITARY, CAT_COUNT);
+    for (i, &(tx, ty)) in cat_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
             Cat,
@@ -474,7 +501,7 @@ pub fn spawn_animals(
             Visibility::Visible,
             InheritedVisibility::default(),
             AnimalAI {
-                target_tile: (tx as i32, ty as i32),
+                target_tile: (tx, ty),
                 wander_timer: i as f32 * 0.03,
                 ..Default::default()
             },
