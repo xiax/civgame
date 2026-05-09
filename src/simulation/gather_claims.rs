@@ -19,6 +19,15 @@ use ahash::AHashMap;
 use bevy::prelude::*;
 use std::sync::Mutex;
 
+/// P4 (cluster-slot mutex): how many concurrent gatherers a single
+/// `ResourceCluster` admits before it's considered fully spoken for.
+/// Tuned conservative — three reps per cluster on average gives each
+/// claimant a distinct rep before saturation, after which the
+/// dispatcher should pick a different cluster. Above this threshold,
+/// `pressure_across_tiles` returns >= MAX and `cluster_is_saturated`
+/// flips true.
+pub const MAX_PARALLEL_GATHERERS_PER_CLUSTER: i32 = 3;
+
 /// One outstanding claim on a `(tile, kind)` pair.
 #[derive(Clone, Copy, Debug)]
 pub struct GatherClaim {
@@ -73,6 +82,32 @@ impl GatherClaims {
             .count() as i32
     }
 
+    /// P4 (cluster-slot mutex): count active claims across all `rep_tiles`
+    /// of a single cluster, excluding `viewer`. Used by dispatchers to
+    /// gate "is this cluster fully spoken for already?" — when the count
+    /// reaches `MAX_PARALLEL_GATHERERS_PER_CLUSTER`, the cluster is
+    /// effectively claimed and the dispatcher should pick a different
+    /// one. Complements the per-rep `pressure()` (P6c) which spreads
+    /// agents *within* a cluster.
+    pub fn pressure_across_tiles(
+        &self,
+        rep_tiles: impl IntoIterator<Item = (i32, i32)>,
+        now: u64,
+        viewer: Entity,
+    ) -> i32 {
+        let m = self.inner.lock().unwrap();
+        let mut total = 0i32;
+        for tile in rep_tiles {
+            if let Some(slot) = m.get(&tile) {
+                total += slot
+                    .iter()
+                    .filter(|c| c.expires_tick >= now && c.claimant != viewer)
+                    .count() as i32;
+            }
+        }
+        total
+    }
+
     /// Sweep expired entries. Called by `gather_claim_expiry_system`.
     pub fn sweep_expired(&self, now: u64) {
         let mut m = self.inner.lock().unwrap();
@@ -85,6 +120,21 @@ impl GatherClaims {
     /// Total live entries — for inspector / debug.
     pub fn total(&self) -> usize {
         self.inner.lock().unwrap().values().map(|v| v.len()).sum()
+    }
+
+    /// P4 (cluster-slot mutex): true when a cluster's rep tiles already
+    /// hold `MAX_PARALLEL_GATHERERS_PER_CLUSTER` distinct claims (after
+    /// excluding `viewer`). Dispatchers use this to skip a cluster
+    /// outright when scoring — saturated clusters lose to less-pressured
+    /// ones even when they're physically closer.
+    pub fn cluster_is_saturated(
+        &self,
+        rep_tiles: impl IntoIterator<Item = (i32, i32)>,
+        now: u64,
+        viewer: Entity,
+    ) -> bool {
+        self.pressure_across_tiles(rep_tiles, now, viewer)
+            >= MAX_PARALLEL_GATHERERS_PER_CLUSTER
     }
 }
 
@@ -170,6 +220,38 @@ mod tests {
         c.add((2, 2), MemoryKind::AnyEdible, ent(2), 500);
         c.sweep_expired(200);
         assert_eq!(c.total(), 1);
+    }
+
+    /// P4 cluster-slot: pressure_across_tiles sums claims over multiple
+    /// rep tiles, excluding the viewer.
+    #[test]
+    fn pressure_across_tiles_sums_per_rep() {
+        let c = GatherClaims::default();
+        c.add((0, 0), MemoryKind::AnyEdible, ent(1), 100);
+        c.add((1, 0), MemoryKind::AnyEdible, ent(2), 100);
+        c.add((2, 0), MemoryKind::AnyEdible, ent(3), 100);
+        let reps = vec![(0, 0), (1, 0), (2, 0)];
+        // Viewer = ent(99) (none of the claimants): sees all 3.
+        assert_eq!(
+            c.pressure_across_tiles(reps.iter().copied(), 50, ent(99)),
+            3
+        );
+        // Viewer = ent(1): excluded from the count.
+        assert_eq!(c.pressure_across_tiles(reps.iter().copied(), 50, ent(1)), 2);
+    }
+
+    /// P4 cluster-slot: cluster_is_saturated trips at MAX claims.
+    #[test]
+    fn cluster_is_saturated_at_max_parallel() {
+        let c = GatherClaims::default();
+        let reps = vec![(0, 0), (1, 0), (2, 0), (3, 0)];
+        // Below the threshold.
+        c.add((0, 0), MemoryKind::AnyEdible, ent(1), 100);
+        c.add((1, 0), MemoryKind::AnyEdible, ent(2), 100);
+        assert!(!c.cluster_is_saturated(reps.iter().copied(), 50, ent(99)));
+        // At the threshold.
+        c.add((2, 0), MemoryKind::AnyEdible, ent(3), 100);
+        assert!(c.cluster_is_saturated(reps.iter().copied(), 50, ent(99)));
     }
 
     #[test]
