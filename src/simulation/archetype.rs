@@ -275,12 +275,17 @@ pub fn derive_from_legacy(
     };
 
     let income = match preset {
-        // `split_market_earnings_with_household` is currently
-        // unconditional (10% skim regardless of preset); fixing the
-        // Subsistence skim leak is an explicit Phase 7 bug fix. P1a
-        // preserves the legacy behaviour so the regression baseline
-        // stays green.
-        EconomyPreset::Subsistence | EconomyPreset::Mixed | EconomyPreset::Market => IncomeFlow {
+        // P7a: Subsistence factions don't skim agent earnings into
+        // household treasuries — communist villages can't have
+        // households accruing private wealth and posting paid
+        // contracts against design intent. Mixed/Market keep the
+        // 10% legacy skim so household-driven contract posting
+        // still funds itself.
+        EconomyPreset::Subsistence => IncomeFlow {
+            household_skim_pct: 0.0,
+            upward_skim_to_parent_pct: 0.0,
+        },
+        EconomyPreset::Mixed | EconomyPreset::Market => IncomeFlow {
             household_skim_pct: 0.10,
             upward_skim_to_parent_pct: 0.0,
         },

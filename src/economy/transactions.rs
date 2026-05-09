@@ -189,27 +189,25 @@ const FOOD_KEEP_RESERVE: u32 = 2;
 const HUNGER_BUY_THRESHOLD: u8 = 170;
 const TOOL_BUY_CURRENCY_FACTOR: f32 = 1.5;
 
-/// Pluralist Economy R6 follow-on b: fraction of a household
-/// member's market sale earnings that goes to the household
-/// treasury rather than their personal wallet. Without this,
-/// households can't accumulate treasury organically and
-/// `household_contract_posting_system` never fires outside tests
-/// that pre-seed the treasury.
+/// Pluralist Economy R6 follow-on b: legacy default skim fraction
+/// for Mixed / Market households. Retained for documentation —
+/// `split_market_earnings_with_household` reads
+/// `caps.income.household_skim_pct` per household (P7a) so the
+/// constant is no longer load-bearing. Subsistence households now
+/// resolve to 0.0 because their parent village's archetype carries
+/// `IncomeFlow { household_skim_pct: 0.0, ... }`.
 pub const HOUSEHOLD_INCOME_SKIM: f32 = 0.10;
 
 /// Pluralist Economy R6 follow-on b: split market-sale earnings
-/// between an agent's wallet and their household treasury (when
-/// they're a household member). Returns the agent's share. Caller
-/// adds the agent's share to `EconomicAgent.currency` themselves;
-/// the household-treasury credit happens here through the
-/// `FactionRegistry` resource. Currency invariant: the function
-/// debits nothing (the caller hasn't credited anything yet); it
-/// only redirects part of the would-be agent credit to the
-/// household.
+/// between an agent's wallet and their household treasury. P7a:
+/// the skim percentage now comes from the household sub-faction's
+/// `caps.income.household_skim_pct` (set by archetype inheritance:
+/// Subsistence parents → 0.0, Mixed/Market parents → 0.10). Agents
+/// who aren't household members keep `earned` whole.
 ///
-/// Returns the **agent's share** of `earned`. If the agent is not
-/// a household member, returns `earned` unchanged. If the agent
-/// has no `EconomicAgent` (defensive), returns 0.
+/// Currency invariant: the function debits nothing (the caller
+/// hasn't credited anything yet); it only redirects part of the
+/// would-be agent credit to the household.
 pub fn split_market_earnings_with_household(
     world: &mut World,
     agent: Entity,
@@ -224,11 +222,22 @@ pub fn split_market_earnings_with_household(
     let Some(household_id) = household_id else {
         return earned;
     };
-    let skim = earned * HOUSEHOLD_INCOME_SKIM;
-    if let Some(mut registry) = world.get_resource_mut::<crate::simulation::faction::FactionRegistry>() {
-        if let Some(hh) = registry.factions.get_mut(&household_id) {
-            hh.treasury += skim;
-        }
+    let Some(mut registry) =
+        world.get_resource_mut::<crate::simulation::faction::FactionRegistry>()
+    else {
+        return earned;
+    };
+    let skim_pct = registry
+        .factions
+        .get(&household_id)
+        .map(|f| f.caps.income.household_skim_pct)
+        .unwrap_or(0.0);
+    if skim_pct <= 0.0 {
+        return earned;
+    }
+    let skim = earned * skim_pct;
+    if let Some(hh) = registry.factions.get_mut(&household_id) {
+        hh.treasury += skim;
     }
     earned - skim
 }
@@ -318,14 +327,25 @@ pub fn market_sell_system(
                 agent.remove_item(item, sell_qty);
                 // R6 follow-on b: split earnings between agent and
                 // household treasury when the agent is a household
-                // member. Currency invariant: skim leaves the
-                // agent → enters the household treasury → total
-                // unchanged.
+                // member. P7a: skim percentage comes from the
+                // household's `caps.income.household_skim_pct`
+                // (Subsistence parents → 0, Mixed/Market → 0.10).
+                // Currency invariant preserved: skim leaves the
+                // agent → enters the household treasury.
                 let skim = match household_opt {
                     Some(hm) if earned > 0.0 => {
-                        let s = earned * HOUSEHOLD_INCOME_SKIM;
-                        skim_intents.push((hm.household_id, s));
-                        s
+                        let pct = faction_registry
+                            .factions
+                            .get(&hm.household_id)
+                            .map(|f| f.caps.income.household_skim_pct)
+                            .unwrap_or(0.0);
+                        if pct > 0.0 {
+                            let s = earned * pct;
+                            skim_intents.push((hm.household_id, s));
+                            s
+                        } else {
+                            0.0
+                        }
                     }
                     _ => 0.0,
                 };

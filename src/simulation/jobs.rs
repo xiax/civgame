@@ -628,6 +628,116 @@ pub fn post_craft_contract_from_treasury(
     Some(escrow)
 }
 
+// ─── P4 (minimal): self-posted Stockpile contracts ─────────────────
+
+/// Wage margin applied to every self-posted Stockpile contract. The
+/// formula `wage = trade_base_value(rid) * target_qty * SELF_POST_MARGIN`
+/// gives a small but non-trivial reward — large enough to outscore a
+/// chief Stockpile (`reward = 0`) on the `U_bid` scorer, small enough
+/// not to drain self-posters' treasuries on a single contract. Tunable.
+pub const SELF_POST_MARGIN: f32 = 0.1;
+
+/// Self-posted Stockpile wage formula. Derives from the catalog's
+/// authored `trade_base_value` (sedentarize trace 3 finding: market
+/// price is dead code for raw resources in early game; recipe cost
+/// floors don't exist for gathered resources; `trade_base_value` is
+/// the intentional single source of truth). Returns the absolute wage
+/// in currency for `target_qty` units.
+pub fn self_post_wage(
+    catalog: &crate::economy::resource_catalog::ResourceCatalog,
+    rid: crate::economy::resource_catalog::ResourceId,
+    target_qty: u32,
+) -> f32 {
+    let base = catalog
+        .iter()
+        .find(|(id, _)| *id == rid)
+        .map(|(_, def)| def.trade_base_value as f32)
+        .unwrap_or(1.0);
+    base * target_qty as f32 * SELF_POST_MARGIN
+}
+
+/// Post a Stockpile contract funded from `author`'s wallet (or, for
+/// `PosterClass::HouseholdHead`, the household treasury — caller
+/// chooses by passing the right beneficiary). Mirrors
+/// `post_craft_contract`'s shape for the Stockpile case.
+///
+/// On insufficient funds / missing `EconomicAgent` / qty=0: returns
+/// `None`, no state mutation.
+///
+/// **P4 minimal scope: this helper is additive — it's not yet wired
+/// into `goal_update_system`'s autonomous fallback.** Closing the
+/// posting bypass at the goal level (and the Subsistence regression
+/// invariant) is a focused future session.
+pub fn post_stockpile_self(
+    world: &mut World,
+    author: Entity,
+    faction_id: u32,
+    resource_id: crate::economy::resource_catalog::ResourceId,
+    target_qty: u32,
+    poster_class: PosterClass,
+    deadline_tick: Option<u32>,
+) -> Option<Entity> {
+    if target_qty == 0 {
+        return None;
+    }
+    let catalog = world
+        .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+        .clone();
+    let reward = self_post_wage(&catalog, resource_id, target_qty);
+    if !(reward > 0.0) {
+        return None;
+    }
+
+    // Funds check + atomic debit.
+    let author_currency = world
+        .get::<crate::economy::agent::EconomicAgent>(author)?
+        .currency;
+    if author_currency < reward {
+        return None;
+    }
+    {
+        let mut econ = world
+            .get_mut::<crate::economy::agent::EconomicAgent>(author)?;
+        econ.currency -= reward;
+    }
+
+    let posted_tick = world
+        .get_resource::<SimClock>()
+        .map(|c| c.tick as u32)
+        .unwrap_or(0);
+    {
+        let mut board = world.resource_mut::<JobBoard>();
+        let id = board.alloc_id();
+        let progress = JobProgress::Stockpile {
+            resource_id,
+            deposited: 0,
+            target: target_qty,
+        };
+        board.faction_postings_mut(faction_id).push(JobPosting {
+            id,
+            faction_id,
+            kind: JobKind::Stockpile,
+            progress,
+            claimants: Vec::new(),
+            priority: PLAYER_PRIORITY,
+            source: JobSource::Player,
+            posted_tick,
+            expiry_tick: deadline_tick,
+            poster_class,
+            reward,
+            settlement_id: None,
+        });
+    }
+
+    let escrow = world
+        .spawn(JobEscrow {
+            amount: reward,
+            beneficiary: author,
+        })
+        .id();
+    Some(escrow)
+}
+
 // ─── Pluralist Economy R8 follow-on: Esteem-driven posting ─────────
 
 /// Per-individual reward when an Esteem-seeking agent commissions a
@@ -2731,5 +2841,69 @@ mod posting_target_workers_tests {
             },
         );
         assert_eq!(posting_target_workers(&p), 1);
+    }
+}
+
+#[cfg(test)]
+mod self_post_wage_tests {
+    use super::*;
+    use crate::economy::resource_catalog::load_resource_catalog;
+
+    /// P4 minimal: wage formula `trade_base_value * qty * 0.1` against
+    /// the values authored in `assets/data/resources/core.ron`.
+    /// Hard-coded against the RON to make balance changes audible.
+    #[test]
+    fn wood_wage_5cu_per_unit() {
+        let cat = load_resource_catalog();
+        crate::economy::core_ids::install_catalog(cat.clone());
+        let wood = crate::economy::core_ids::wood();
+        // wood.trade_base_value = 5; qty=10 → 5 * 10 * 0.1 = 5.0
+        let wage = self_post_wage(&cat, wood, 10);
+        assert!(
+            (wage - 5.0).abs() < 1e-6,
+            "wood wage should be 5.0 (5 * 10 * 0.1), got {wage}",
+        );
+    }
+
+    #[test]
+    fn stone_wage_8cu_per_unit() {
+        let cat = load_resource_catalog();
+        crate::economy::core_ids::install_catalog(cat.clone());
+        let stone = crate::economy::core_ids::stone();
+        // stone.trade_base_value = 8; qty=10 → 8 * 10 * 0.1 = 8.0
+        let wage = self_post_wage(&cat, stone, 10);
+        assert!(
+            (wage - 8.0).abs() < 1e-6,
+            "stone wage should be 8.0 (8 * 10 * 0.1), got {wage}",
+        );
+    }
+
+    #[test]
+    fn grain_wage_10cu_per_unit() {
+        let cat = load_resource_catalog();
+        crate::economy::core_ids::install_catalog(cat.clone());
+        let grain = crate::economy::core_ids::grain();
+        // grain.trade_base_value = 10; qty=10 → 10 * 10 * 0.1 = 10.0
+        let wage = self_post_wage(&cat, grain, 10);
+        assert!(
+            (wage - 10.0).abs() < 1e-6,
+            "grain wage should be 10.0 (10 * 10 * 0.1), got {wage}",
+        );
+    }
+
+    /// Wage scales linearly with quantity — same rid at higher qty
+    /// produces proportional wage.
+    #[test]
+    fn wage_scales_linearly_with_qty() {
+        let cat = load_resource_catalog();
+        crate::economy::core_ids::install_catalog(cat.clone());
+        let wood = crate::economy::core_ids::wood();
+        let w1 = self_post_wage(&cat, wood, 10);
+        let w5 = self_post_wage(&cat, wood, 50);
+        assert!(
+            (w5 - 5.0 * w1).abs() < 1e-6,
+            "5x qty → 5x wage; got {w5} vs {}",
+            5.0 * w1
+        );
     }
 }

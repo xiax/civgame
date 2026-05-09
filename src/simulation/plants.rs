@@ -212,6 +212,144 @@ impl PlantKind {
     }
 }
 
+/// P6a: live `PlantMap` fast path. Probes for a mature plant of a
+/// kind passing `kind_filter` within chebyshev `radius` of `from`,
+/// returning the closest hit. The original "agent stands in a wheat
+/// field with active `AcquireFood`" symptom traces to vision running
+/// once per ~20-tick bucket pass and `SharedKnowledge` requiring a
+/// reported sighting; calling this helper before vision/knowledge
+/// catches plants the agent literally arrived next to.
+///
+/// `kind_filter`: e.g. `|k| matches!(k, PlantKind::Grain | PlantKind::BerryBush)`
+/// for `AnyEdible`, `|k| k == PlantKind::Grain` for grain-only.
+pub fn nearest_mature_plant_under_agent(
+    plant_map: &PlantMap,
+    plant_query: &bevy::ecs::system::Query<&Plant>,
+    kind_filter: impl Fn(PlantKind) -> bool,
+    from: (i32, i32),
+    radius: i32,
+) -> Option<((i32, i32), bevy::prelude::Entity)> {
+    let mut best: Option<((i32, i32), bevy::prelude::Entity, i32)> = None;
+    for dx in -radius..=radius {
+        for dy in -radius..=radius {
+            let tile = (from.0 + dx, from.1 + dy);
+            let Some(&entity) = plant_map.0.get(&tile) else {
+                continue;
+            };
+            let Ok(plant) = plant_query.get(entity) else {
+                continue;
+            };
+            if plant.stage != GrowthStage::Mature {
+                continue;
+            }
+            if !kind_filter(plant.kind) {
+                continue;
+            }
+            let dist = dx.abs().max(dy.abs());
+            match best {
+                None => best = Some((tile, entity, dist)),
+                Some((_, _, d)) if dist < d => best = Some((tile, entity, dist)),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(t, e, _)| (t, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::ecs::system::SystemState;
+    use bevy::prelude::*;
+
+    fn install_catalog() {
+        let cat = crate::economy::resource_catalog::load_resource_catalog();
+        crate::economy::core_ids::install_catalog(cat);
+    }
+
+    /// Run the helper against a freshly-built `World` populated with
+    /// the named plants. Returns the matched tile (if any).
+    fn probe(
+        world: &mut World,
+        from: (i32, i32),
+        radius: i32,
+        kinds: &'static [PlantKind],
+    ) -> Option<(i32, i32)> {
+        let mut state: SystemState<(Res<PlantMap>, Query<&Plant>)> = SystemState::new(world);
+        let (plant_map, plant_q) = state.get(world);
+        let kinds_owned: Vec<PlantKind> = kinds.to_vec();
+        nearest_mature_plant_under_agent(
+            &plant_map,
+            &plant_q,
+            move |k| kinds_owned.contains(&k),
+            from,
+            radius,
+        )
+        .map(|(t, _)| t)
+    }
+
+    fn spawn_plant(world: &mut World, tile: (i32, i32), kind: PlantKind, stage: GrowthStage) {
+        let e = world
+            .spawn(Plant {
+                kind,
+                stage,
+                growth_ticks: 0,
+                tile_pos: tile,
+            })
+            .id();
+        let mut map = world.resource_mut::<PlantMap>();
+        map.0.insert(tile, e);
+    }
+
+    fn world_with_map() -> World {
+        let mut w = World::new();
+        w.insert_resource(PlantMap::default());
+        w
+    }
+
+    #[test]
+    fn fast_path_finds_mature_plant_under_agent() {
+        install_catalog();
+        let mut w = world_with_map();
+        spawn_plant(&mut w, (5, 5), PlantKind::Grain, GrowthStage::Mature);
+        let kinds: &[PlantKind] = &[PlantKind::Grain, PlantKind::BerryBush, PlantKind::Tree];
+        let kinds_static: &'static [PlantKind] = Box::leak(kinds.to_vec().into_boxed_slice());
+        assert_eq!(probe(&mut w, (5, 5), 2, kinds_static), Some((5, 5)));
+    }
+
+    #[test]
+    fn fast_path_skips_immature_plants() {
+        install_catalog();
+        let mut w = world_with_map();
+        spawn_plant(&mut w, (3, 3), PlantKind::Grain, GrowthStage::Seedling);
+        let kinds_static: &'static [PlantKind] =
+            Box::leak(vec![PlantKind::Grain].into_boxed_slice());
+        assert!(probe(&mut w, (3, 3), 2, kinds_static).is_none());
+    }
+
+    #[test]
+    fn fast_path_picks_closest_within_radius() {
+        install_catalog();
+        let mut w = world_with_map();
+        spawn_plant(&mut w, (1, 0), PlantKind::Grain, GrowthStage::Mature);
+        spawn_plant(&mut w, (2, 0), PlantKind::Grain, GrowthStage::Mature);
+        let kinds_static: &'static [PlantKind] =
+            Box::leak(vec![PlantKind::Grain].into_boxed_slice());
+        assert_eq!(probe(&mut w, (0, 0), 3, kinds_static), Some((1, 0)));
+    }
+
+    #[test]
+    fn fast_path_filters_by_kind() {
+        install_catalog();
+        let mut w = world_with_map();
+        spawn_plant(&mut w, (0, 0), PlantKind::Tree, GrowthStage::Mature);
+        // AnyEdible filter: Tree (yields Wood) is excluded.
+        let kinds_static: &'static [PlantKind] =
+            Box::leak(vec![PlantKind::Grain, PlantKind::BerryBush].into_boxed_slice());
+        assert!(probe(&mut w, (0, 0), 2, kinds_static).is_none());
+    }
+}
+
 #[derive(Component)]
 pub struct DeerGrazer {
     pub graze_timer: u16,

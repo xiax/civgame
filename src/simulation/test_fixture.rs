@@ -1931,11 +1931,12 @@ mod smoke {
 
     #[test]
     fn household_member_trader_sale_skims_to_household_treasury() {
-        // R6 follow-on b: when a HouseholdMember sells goods via
-        // `trader_sell_at_settlement`, 10% of earnings goes to the
-        // household treasury and 90% to their personal wallet.
-        // Validates the income flow that lets households accumulate
-        // treasury organically.
+        // R6 follow-on b (P7a-aware): when a HouseholdMember sells
+        // goods via `trader_sell_at_settlement`, the skim percentage
+        // comes from the household's `caps.income.household_skim_pct`
+        // (Mixed/Market parents → 0.10, Subsistence → 0.0). This test
+        // exercises the Mixed-parent path; the Subsistence parent
+        // path is `subsistence_household_no_skim_p7a` below.
         //
         // (`market_sell_system` carries the same skim logic but is
         // currently orphaned — not registered in `EconomyPlugin`.
@@ -1947,7 +1948,8 @@ mod smoke {
         use crate::economy::core_ids;
         use crate::economy::item::Item;
         use crate::economy::transactions::trader_sell_at_settlement;
-        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::archetype::derive_from_legacy;
+        use crate::simulation::faction::{FactionRegistry, Lifestyle};
         use crate::simulation::reproduction::HouseholdMember;
         use crate::simulation::settlement::{Settlement, SettlementMap};
 
@@ -1962,6 +1964,17 @@ mod smoke {
             .world()
             .resource::<crate::economy::resource_catalog::ResourceCatalog>()
             .clone();
+        // P7a: flip the village to Market so its caps carry the
+        // 10% skim. Default `TestSim` factions are Subsistence (skim 0).
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let v = registry.factions.get_mut(&village).unwrap();
+            v.caps = derive_from_legacy(
+                Lifestyle::Settled,
+                crate::game_state::EconomyPreset::Market,
+                &catalog,
+            );
+        }
         let household_id = {
             let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
             registry.spawn_household(village, (5, 5), agent, &catalog)
@@ -2039,6 +2052,101 @@ mod smoke {
 
         // Currency invariant: settlement treasury debited by
         // `total_earned`; agent + household credited by the same.
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+    }
+
+    /// P7a: Subsistence parent → 0% skim (closes the income leak).
+    /// This is the bug-fix counterpart to the Mixed/Market test
+    /// above: the same skim helper, same code path, but with a
+    /// Subsistence-archetype household whose
+    /// `caps.income.household_skim_pct = 0.0`.
+    #[test]
+    fn subsistence_household_no_skim_p7a() {
+        use crate::economy::core_ids;
+        use crate::economy::item::Item;
+        use crate::economy::transactions::trader_sell_at_settlement;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::reproduction::HouseholdMember;
+        use crate::simulation::settlement::{Settlement, SettlementMap};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let agent = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+
+        // Default TestSim faction is settled-Subsistence — what we want.
+        let village = sim.player_faction_id;
+        let catalog = sim
+            .app
+            .world()
+            .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+            .clone();
+        let household_id = {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.spawn_household(village, (5, 5), agent, &catalog)
+        };
+        sim.app
+            .world_mut()
+            .entity_mut(agent)
+            .insert(HouseholdMember { household_id });
+
+        {
+            let mut econ = sim
+                .app
+                .world_mut()
+                .get_mut::<crate::economy::agent::EconomicAgent>(agent)
+                .unwrap();
+            econ.currency = 0.0;
+            econ.add_item(Item::new_commodity(core_ids::cloth()), 10);
+        }
+        sim.tick_n(3);
+
+        let settlement_entity = {
+            let map = sim.app.world().resource::<SettlementMap>();
+            let sid = map.first_for_faction(village).unwrap();
+            *map.by_id.get(&sid).unwrap()
+        };
+        {
+            let mut s = sim
+                .app
+                .world_mut()
+                .get_mut::<Settlement>(settlement_entity)
+                .unwrap();
+            s.treasury = 100.0;
+        }
+
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        let price = trader_sell_at_settlement(
+            sim.app.world_mut(),
+            agent,
+            settlement_entity,
+            core_ids::cloth(),
+            5,
+        )
+        .expect("trader sell should succeed");
+        let total_earned = price * 5.0;
+
+        let agent_currency = get_currency(&sim.app, agent);
+        let household_treasury = sim
+            .app
+            .world()
+            .resource::<FactionRegistry>()
+            .factions
+            .get(&household_id)
+            .unwrap()
+            .treasury;
+
+        // P7a invariant: Subsistence household treasury stays 0;
+        // agent receives the full earnings.
+        assert!(
+            household_treasury < 1e-3,
+            "Subsistence household must not skim: got treasury={household_treasury}",
+        );
+        assert!(
+            (agent_currency - total_earned).abs() < 1e-3,
+            "Subsistence agent should keep 100% of earnings: got {agent_currency}, expected {total_earned}",
+        );
+
         assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
     }
 
@@ -8341,6 +8449,101 @@ mod baseline_behaviour {
         assert!(
             ate,
             "expected hunger to drop after Survive→[Gather, Eat] chain within 800 ticks"
+        );
+    }
+
+    /// P6a: a hungry agent standing next to a mature grain plant
+    /// dispatches `Task::Gather` *without* an injected sighting. Pre-P6a
+    /// the dispatcher's vision lookup ran once per ~20-tick bucket
+    /// pass and `SharedKnowledge` was empty until a sighting got
+    /// reported, so an agent who walked onto the wheat field this
+    /// tick stood there with active `AcquireFood`. The
+    /// `nearest_mature_plant_under_agent` probe wired into the
+    /// AcquireFood dispatcher catches it on the next planner tick.
+    #[test]
+    fn agent_on_wheat_tile_dispatches_gather() {
+        use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+        use crate::simulation::typed_task::Task;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Dummy chief absorbs Lead auto-promotion so the worker we
+        // care about doesn't get pulled into a Lead task.
+        let _chief = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+
+        // Mature grain plant at (1, 0) — chebyshev distance 1 from
+        // the agent. Crucially: no `inject_faction_sighting` call
+        // and no time-skip for vision to sweep.
+        let grain_tile = (1, 0);
+        let grain_world = tile_to_world(grain_tile.0, grain_tile.1);
+        let grain_entity = sim
+            .app
+            .world_mut()
+            .spawn((
+                Plant {
+                    kind: PlantKind::Grain,
+                    stage: GrowthStage::Mature,
+                    growth_ticks: 0,
+                    tile_pos: grain_tile,
+                },
+                Transform::from_xyz(grain_world.x, grain_world.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<PlantMap>()
+            .0
+            .insert(grain_tile, grain_entity);
+
+        // Hungry worker at (0, 0). `goal_update_system` selects
+        // `Survive` (hunger ≥ EAT_TRIGGER_HUNGER); the dispatcher
+        // routes via `AcquireFood` → forage chain.
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.hunger(210.0);
+        });
+
+        // Tick a window. The pre-P6a behaviour was: agent stands
+        // idle on the wheat tile because vision/SharedKnowledge
+        // hasn't reported it yet. P6a's `nearest_mature_plant_under_agent`
+        // probe surfaces the plant immediately, so the dispatcher
+        // emits `Task::Gather` (and the Forage chain harvests + eats
+        // it within a few dozen ticks). We assert two indicators:
+        // either we observe `Task::Gather { grain_tile }` directly,
+        // or hunger drops sharply (the chain ran to completion).
+        let initial_hunger: f32 = 210.0;
+        let mut observed_gather = false;
+        let mut hunger_dropped = false;
+        for _ in 0..400 {
+            sim.tick();
+            let task = person_task(&sim.app, worker);
+            if matches!(task, Task::Gather { tile } if tile == grain_tile) {
+                observed_gather = true;
+                break;
+            }
+            let hunger = sim
+                .app
+                .world()
+                .get::<crate::simulation::needs::Needs>(worker)
+                .map(|n| n.hunger)
+                .unwrap_or(0.0);
+            // Eating one Grain drops hunger by `grain.nutrition()`
+                // (~150 cal). A drop > 50 means the chain completed —
+                // could not have happened without the under-foot probe
+                // hitting because we never injected a sighting.
+            if hunger < initial_hunger - 50.0 {
+                hunger_dropped = true;
+                break;
+            }
+        }
+        assert!(
+            observed_gather || hunger_dropped,
+            "expected Task::Gather targeting the underfoot wheat OR hunger drop \
+             (chain completed within 400 ticks); pre-P6a both fail because the \
+             dispatcher can't see the plant under the agent",
         );
     }
 

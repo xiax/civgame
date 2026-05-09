@@ -49,7 +49,9 @@ use crate::simulation::gather_claims::{suggested_expiry, GatherClaims};
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::MemoryKind;
-use crate::simulation::plants::{GrowthStage, Plant, PlantMap};
+use crate::simulation::plants::{
+    nearest_mature_plant_under_agent, GrowthStage, Plant, PlantKind, PlantMap,
+};
 use crate::simulation::needs::{Needs, EAT_TRIGGER_HUNGER};
 use crate::simulation::person::{AiState, Drafted, PersonAI, PlayerOrder, Profession};
 use crate::simulation::production::total_edible;
@@ -3621,6 +3623,23 @@ pub fn htn_acquire_food_dispatch_system(
             let viewer_settlement = gk
                 .settlement_map
                 .first_for_faction(member.faction_id);
+            // P6a: live `PlantMap` fast path. Probes for a mature
+            // edible plant within chebyshev radius 2 *before* vision /
+            // SharedKnowledge — vision runs once per ~20-tick bucket
+            // and SharedKnowledge requires a reported sighting, so an
+            // agent that walked onto a wheat tile this tick may not
+            // see it via either lookup yet. Skips the probe hit if
+            // another agent already pressured the tile so the cluster
+            // mutex still spreads workers.
+            let underfoot = nearest_mature_plant_under_agent(
+                &plant_map,
+                &plant_query,
+                |k| matches!(k, PlantKind::Grain | PlantKind::BerryBush),
+                (cur_tx, cur_ty),
+                2,
+            )
+            .filter(|(t, _)| gather_claims.pressure(*t, now, actor) == 0)
+            .map(|(t, _)| t);
             let visible_forage = current_vision.nearest_gather_target(
                 MemoryKind::AnyEdible,
                 (cur_tx, cur_ty),
@@ -3630,7 +3649,7 @@ pub fn htn_acquire_food_dispatch_system(
                 member.faction_id,
                 |t| gather_claims.pressure(t, now, actor) * 4,
             );
-            let gather_target_tile = visible_forage.or_else(|| {
+            let gather_target_tile = underfoot.or(visible_forage).or_else(|| {
                 gk.nearest_target_tile(
                     actor,
                     member.faction_id,
@@ -4676,16 +4695,33 @@ pub fn htn_stockpile_food_dispatch_system(
             let scavenge_deposit_tile = scavenge_target_tile
                 .and_then(|t| storage_tile_map.nearest_for_faction(member.faction_id, t));
 
+            // P6a: live `PlantMap` fast path — see AcquireFood
+            // dispatcher comment. Same rationale: catches plants the
+            // agent walked onto this tick that vision /
+            // SharedKnowledge haven't yet reported.
+            let viewer_household = household_member.map(|h| h.household_id);
+            let viewer_settlement = gk
+                .settlement_map
+                .first_for_faction(member.faction_id);
+            let underfoot = nearest_mature_plant_under_agent(
+                &plant_map,
+                &plant_query,
+                |k| matches!(k, PlantKind::Grain | PlantKind::BerryBush),
+                (cur_tx, cur_ty),
+                2,
+            )
+            .filter(|(t, _)| gather_claims.pressure(*t, now, actor) == 0)
+            .and_then(|(tile, entity)| {
+                let plant = plant_query.get(entity).ok()?;
+                let (id, _) = plant.kind.harvest_yield(false);
+                Some((tile, id))
+            });
             // Vision-first forage candidate: nearest visible mature edible
             // plant. Vision_system only writes mature-stage plant sightings,
             // so the stage filter is implicit. Falls back to SharedKnowledge
             // when vision shows nothing. Threads the plant's harvest resource
             // through `forage_food_good` so the trailing
             // `Task::DepositToFactionStorage` carries the right payload.
-            let viewer_household = household_member.map(|h| h.household_id);
-            let viewer_settlement = gk
-                .settlement_map
-                .first_for_faction(member.faction_id);
             let visible_forage = current_vision
                 .nearest_gather_target(
                     MemoryKind::AnyEdible,
@@ -4702,7 +4738,7 @@ pub fn htn_stockpile_food_dispatch_system(
                     let (id, _) = plant.kind.harvest_yield(false);
                     Some((tile, id))
                 });
-            let forage_candidate = visible_forage.or_else(|| {
+            let forage_candidate = underfoot.or(visible_forage).or_else(|| {
                 gk.nearest_target_tile(
                     actor,
                     member.faction_id,
