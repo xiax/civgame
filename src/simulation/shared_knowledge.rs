@@ -323,6 +323,36 @@ impl KnowledgeMap {
         claim_penalty: P,
         max_chunk_radius: i32,
     ) -> Option<ClusterId> {
+        self.nearest_with_cluster_filter(
+            kind,
+            from,
+            owner_filter,
+            claim_penalty,
+            |_| true,
+            max_chunk_radius,
+        )
+    }
+
+    /// P4: nearest-cluster search with an additional per-cluster
+    /// predicate. Lets callers skip saturated clusters
+    /// (`gather_claims.cluster_is_saturated`) so the dispatcher walks
+    /// past one whose rep slots are all spoken for instead of just
+    /// over-scoring it via `claim_penalty`. Pass `|_| true` to behave
+    /// identically to `nearest`.
+    pub fn nearest_with_cluster_filter<F, P, G>(
+        &self,
+        kind: MemoryKind,
+        from: (i32, i32),
+        owner_filter: F,
+        claim_penalty: P,
+        cluster_filter: G,
+        max_chunk_radius: i32,
+    ) -> Option<ClusterId>
+    where
+        F: Fn(ResourceOwner) -> bool,
+        P: Fn((i32, i32)) -> i32,
+        G: Fn(&ResourceCluster) -> bool,
+    {
         let origin = ResourceCluster::chunk_of(from);
         let mut best: Option<(ClusterId, i32)> = None;
         for r in 0..=max_chunk_radius {
@@ -339,6 +369,9 @@ impl KnowledgeMap {
                     for &cid in set {
                         let Some(c) = self.clusters.get(&cid) else { continue };
                         if c.kind != kind || !owner_filter(c.owner) {
+                            continue;
+                        }
+                        if !cluster_filter(c) {
                             continue;
                         }
                         // P6c: apply claim_penalty during rep selection too,
@@ -528,9 +561,46 @@ impl SharedKnowledge {
         claim_penalty: P,
         max_chunk_radius: i32,
     ) -> Option<(KnowledgeTier, ClusterId, (i32, i32))> {
+        self.nearest_in_tier_set_with_cluster_filter(
+            tier_set,
+            kind,
+            from,
+            owner_filter,
+            claim_penalty,
+            |_| true,
+            max_chunk_radius,
+        )
+    }
+
+    /// P4: same as `nearest_in_tier_set` but threads a per-cluster
+    /// predicate through to `nearest_with_cluster_filter`. Callers
+    /// inject `gather_claims.cluster_is_saturated(...)` to skip
+    /// fully-claimed clusters at the dispatcher layer.
+    pub fn nearest_in_tier_set_with_cluster_filter<F, P, G>(
+        &self,
+        tier_set: TierSet,
+        kind: MemoryKind,
+        from: (i32, i32),
+        owner_filter: F,
+        claim_penalty: P,
+        cluster_filter: G,
+        max_chunk_radius: i32,
+    ) -> Option<(KnowledgeTier, ClusterId, (i32, i32))>
+    where
+        F: Fn(ResourceOwner) -> bool,
+        P: Fn((i32, i32)) -> i32,
+        G: Fn(&ResourceCluster) -> bool,
+    {
         for tier in tier_set.tiers() {
             let Some(m) = self.tiers.get(&tier) else { continue };
-            if let Some(cid) = m.nearest(kind, from, &owner_filter, &claim_penalty, max_chunk_radius) {
+            if let Some(cid) = m.nearest_with_cluster_filter(
+                kind,
+                from,
+                &owner_filter,
+                &claim_penalty,
+                &cluster_filter,
+                max_chunk_radius,
+            ) {
                 // P6c: extract the tile via the same pressure-aware
                 // selector used during cluster scoring so the returned
                 // tile actually matches the score that won the cluster.
@@ -579,8 +649,30 @@ impl<'w> GatherKnowledge<'w> {
             o.is_accessible_to(actor, household_id, viewer_settlement, faction_id)
         };
         let claim_pen = |t: (i32, i32)| self.claims.pressure(t, now, actor) * 4;
+        // P4: skip clusters whose rep slots are already saturated by
+        // peer claims. Without this, a cluster with three reps and
+        // three concurrent claims still gets picked (because the
+        // closest rep's per-tile pressure is only 1) and the
+        // dispatcher routes a fourth worker into a fully-spoken-for
+        // resource pocket. The saturation predicate trips at
+        // `MAX_PARALLEL_GATHERERS_PER_CLUSTER` (today: 3).
+        let cluster_filter = |c: &ResourceCluster| {
+            !self.claims.cluster_is_saturated(
+                c.representative_tiles.iter().filter_map(|s| *s),
+                now,
+                actor,
+            )
+        };
         self.shared
-            .nearest_in_tier_set(tier_set, kind, from, owner_filter, claim_pen, 16)
+            .nearest_in_tier_set_with_cluster_filter(
+                tier_set,
+                kind,
+                from,
+                owner_filter,
+                claim_pen,
+                cluster_filter,
+                16,
+            )
             .map(|(_, _, tile)| tile)
     }
 }
@@ -820,6 +912,56 @@ mod tests {
         // Penalty 100 on the close rep — far rep at chebyshev 20 wins on score.
         let pen = |t: (i32, i32)| if t == (5, 5) { 100 } else { 0 };
         assert_eq!(c.pick_least_pressured_rep((0, 0), pen), Some((20, 20)));
+    }
+
+    /// P4: a saturated cluster (with `cluster_filter` rejecting it) is
+    /// skipped entirely; `nearest_with_cluster_filter` walks past it
+    /// to the next candidate.
+    #[test]
+    fn nearest_with_cluster_filter_skips_rejected_clusters() {
+        let mut sk = SharedKnowledge::default();
+        let near_close = sk.report_sighting(
+            faction_tier(1),
+            (5, 5),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        let far = sk.report_sighting(
+            faction_tier(1),
+            (60, 60),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        let m = sk.map(faction_tier(1)).unwrap();
+
+        // No filter: the close cluster wins.
+        let got = m
+            .nearest_with_cluster_filter(
+                fake_kind(),
+                (0, 0),
+                |_| true,
+                |_| 0,
+                |_| true,
+                32,
+            )
+            .unwrap();
+        assert_eq!(got, near_close);
+
+        // Filter rejects the close cluster (id-based stand-in for
+        // saturation): far cluster wins.
+        let got = m
+            .nearest_with_cluster_filter(
+                fake_kind(),
+                (0, 0),
+                |_| true,
+                |_| 0,
+                |c| c.id != near_close,
+                32,
+            )
+            .unwrap();
+        assert_eq!(got, far);
     }
 
     #[test]

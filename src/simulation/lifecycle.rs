@@ -151,7 +151,9 @@ fn handle_switch_archetype(
     new_archetype_key: String,
     at_tile: (i32, i32),
 ) {
-    use crate::simulation::archetype::{derive_from_legacy, StorageBackendKind};
+    use crate::simulation::archetype::{
+        derive_from_archetype_key, FactionArchetypeRegistry, StorageBackendKind,
+    };
     use crate::simulation::faction::Lifestyle;
 
     let preset = preset_from_key(&new_archetype_key);
@@ -161,6 +163,7 @@ fn handle_switch_archetype(
         let catalog = world
             .resource::<crate::economy::resource_catalog::ResourceCatalog>()
             .clone();
+        let archetype_registry = world.resource::<FactionArchetypeRegistry>().clone();
         let mut registry = world.resource_mut::<FactionRegistry>();
         let Some(faction) = registry.factions.get_mut(&faction_id) else {
             return;
@@ -189,10 +192,17 @@ fn handle_switch_archetype(
         // re-derived elsewhere — sedentarize trace finding).
         faction.land_policy = crate::economy::policy::land_policy_for(preset);
 
-        // Step 1: full capability bundle swap. `derive_from_legacy`
-        // produces a bundle that mirrors the legacy fields we just
-        // updated, so caps + legacy stay in lock-step (P1a invariant).
-        faction.caps = derive_from_legacy(new_lifestyle, preset, &catalog);
+        // Step 1: full capability bundle swap. P5 routes through the
+        // archetype registry; legacy fallback covers any key not yet
+        // authored in the registry. The bundle mirrors the legacy
+        // fields we just updated, so caps + legacy stay in lock-step
+        // (P1a invariant).
+        faction.caps = derive_from_archetype_key(
+            &archetype_registry,
+            &new_archetype_key,
+            Some((new_lifestyle, preset, &catalog)),
+        )
+        .expect("derive_from_archetype_key with legacy fallback always returns Some");
 
         // For nomadic→settled the camp tile may differ from the
         // intended new home tile (today they're the same; future

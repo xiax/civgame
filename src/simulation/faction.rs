@@ -1750,6 +1750,7 @@ pub fn bonding_system(
     mut registry: ResMut<FactionRegistry>,
     options: Res<crate::game_state::GameStartOptions>,
     catalog: Res<crate::economy::resource_catalog::ResourceCatalog>,
+    archetype_registry: Res<crate::simulation::archetype::FactionArchetypeRegistry>,
     mut query: Query<(Entity, &mut FactionMember, &Personality, &Transform)>,
     mut rel_query: Query<Option<&mut RelationshipMemory>>,
 ) {
@@ -1834,14 +1835,22 @@ pub fn bonding_system(
                         options.economy,
                         &catalog,
                     );
-                    // P1a: derive caps for bonding-spawned factions
-                    // too. They inherit the world's preset and stay
+                    // P5: route through the registry. Bonding-spawned
+                    // factions inherit the world's preset and stay
                     // Settled (lifestyle defaults to Settled at
-                    // create_faction).
-                    fd.caps = crate::simulation::archetype::derive_from_legacy(
+                    // create_faction). Legacy fallback covers any
+                    // unauthored key.
+                    let key = crate::simulation::archetype::legacy_archetype_key(
                         fd.lifestyle,
                         options.economy,
-                        &catalog,
+                    );
+                    fd.caps = crate::simulation::archetype::derive_from_archetype_key(
+                        &archetype_registry,
+                        key,
+                        Some((fd.lifestyle, options.economy, &catalog)),
+                    )
+                    .expect(
+                        "derive_from_archetype_key with legacy fallback always returns Some",
                     );
                 }
                 nb_fm.faction_id = new_id;

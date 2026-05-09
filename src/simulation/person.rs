@@ -344,6 +344,7 @@ pub fn spawn_population(
     pending: Res<crate::PendingSpawn>,
     options: Res<crate::GameStartOptions>,
     catalog: Res<crate::economy::resource_catalog::ResourceCatalog>,
+    archetype_registry: Res<crate::simulation::archetype::FactionArchetypeRegistry>,
 ) {
     let now = Instant::now();
     use crate::simulation::region::MegaChunkCoord;
@@ -453,14 +454,23 @@ pub fn spawn_population(
             if group_idx == 0 {
                 faction_data.lifestyle = options.lifestyle;
             }
-            // P1a: derive the capability bundle that mirrors today's
-            // `(lifestyle, preset)` behaviour. Stays in lock-step with
-            // the legacy fields above.
-            faction_data.caps = crate::simulation::archetype::derive_from_legacy(
+            // P5: route through the archetype registry. `derive_from_archetype_key`
+            // hits the registry when the key is authored (today: the
+            // four supported legacy archetypes inserted by
+            // `default_registry`); falls back to `derive_from_legacy`
+            // for any caller that hands us an unknown key. The fallback
+            // is what keeps the bit-for-bit P1a invariant intact while
+            // RON loading lands.
+            let key = crate::simulation::archetype::legacy_archetype_key(
                 faction_data.lifestyle,
                 options.economy,
-                &catalog,
             );
+            faction_data.caps = crate::simulation::archetype::derive_from_archetype_key(
+                &archetype_registry,
+                key,
+                Some((faction_data.lifestyle, options.economy, &catalog)),
+            )
+            .expect("derive_from_archetype_key with legacy fallback always returns Some");
         }
 
         let home_world = tile_to_world(home_tx, home_ty);
