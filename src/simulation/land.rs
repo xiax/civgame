@@ -16,7 +16,7 @@ use bevy::prelude::*;
 use crate::simulation::faction::{FactionRegistry, SOLO};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::settlement::{
-    Settlement, SettlementMap, SettlementPlans, TileRect, ZoneKind,
+    Settlement, SettlementMap, SettlementPlans, StreetSegment, StreetSpine, TileRect, ZoneKind,
 };
 use crate::world::chunk::{ChunkMap, Z_MIN};
 use crate::world::globe::Globe;
@@ -24,6 +24,17 @@ use crate::world::seasons::TICKS_PER_DAY;
 use crate::world::terrain::{tile_at_3d, WorldGen};
 
 pub type PlotId = u32;
+
+/// Which side of a `Plot.rect` faces a carved street. Phase 2 of the
+/// Construction Overhaul: lot-driven placement (Phase 3) anchors footprints
+/// at the frontage edge so structures face their road.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileEdge {
+    North,
+    East,
+    South,
+    West,
+}
 
 /// A bounded rectangular parcel of land within a settlement. Tenure
 /// captures *how* the holder relates to the land (state, lease,
@@ -43,6 +54,20 @@ pub struct Plot {
     pub base_value: f32,
     pub last_valued_tick: u64,
     pub missed_payments: u8,
+    /// Side of `rect` that faces the nearest carved street segment, if any.
+    /// Populated by `carve_plots_system` from `SettlementPlan.spine`.
+    /// `None` for radial / pre-Neolithic settlements without a spine.
+    pub frontage_edge: Option<TileEdge>,
+    /// The exact road tile this plot opens onto, if `frontage_edge.is_some()`.
+    /// Lot-driven placement (Phase 3) anchors footprint search at the edge
+    /// adjacent to this tile.
+    pub access_tile: Option<(i32, i32)>,
+    /// Phase 6: when this plot is a household-attached subordinate (typically
+    /// an Agricultural strip claimed alongside a Residential lot), `parent_plot`
+    /// names the residential plot it belongs to. Child plots are skipped by
+    /// `land_listing_system` (not separately for sale / lease) and by
+    /// `rent_collection_system` (rent flows through the parent's tenure).
+    pub parent_plot: Option<PlotId>,
 }
 
 /// What kind of relationship the holder has with the plot.
@@ -190,6 +215,80 @@ pub const PLOT_BASE_VALUE: f32 = 50.0;
 #[inline]
 fn chebyshev_dist(a: (i32, i32), b: (i32, i32)) -> i32 {
     (a.0 - b.0).abs().max((a.1 - b.1).abs())
+}
+
+/// For a plot rect, find the adjacent edge (and a specific road tile on
+/// that edge) facing the nearest spine segment within `MAX_FRONTAGE_RANGE`
+/// tiles. Returns `(None, None)` for plots beyond range or for spines that
+/// don't run alongside any of the plot's four edges.
+///
+/// Algorithm: for each of the rect's four perimeter rows/columns, take the
+/// midpoint and walk outward up to `MAX_FRONTAGE_RANGE` tiles. The first
+/// tile that lies on any spine segment (within `SEGMENT_TOLERANCE` of the
+/// Bresenham line) wins; the corresponding `TileEdge` is returned.
+fn frontage_for_rect(
+    rect: TileRect,
+    spine: &StreetSpine,
+) -> (Option<TileEdge>, Option<(i32, i32)>) {
+    const MAX_FRONTAGE_RANGE: i32 = 4;
+    let segments = spine.segments();
+    if segments.is_empty() {
+        return (None, None);
+    }
+
+    // Mid-tile of each edge (just outside the rect on that side).
+    let cx = rect.x0 + rect.w as i32 / 2;
+    let cy = rect.y0 + rect.h as i32 / 2;
+    let candidates: [(TileEdge, (i32, i32), (i32, i32)); 4] = [
+        (TileEdge::North, (cx, rect.y0 + rect.h as i32), (0, 1)),
+        (TileEdge::South, (cx, rect.y0 - 1), (0, -1)),
+        (TileEdge::East, (rect.x0 + rect.w as i32, cy), (1, 0)),
+        (TileEdge::West, (rect.x0 - 1, cy), (-1, 0)),
+    ];
+
+    let mut best: Option<(i32, TileEdge, (i32, i32))> = None;
+    for (edge, start, dir) in candidates.iter() {
+        for step in 0..MAX_FRONTAGE_RANGE {
+            let probe = (start.0 + dir.0 * step, start.1 + dir.1 * step);
+            if segment_set_contains(segments, probe) {
+                let dist = step;
+                if best.as_ref().map_or(true, |(d, _, _)| dist < *d) {
+                    best = Some((dist, *edge, probe));
+                }
+                break;
+            }
+        }
+    }
+    match best {
+        Some((_, edge, tile)) => (Some(edge), Some(tile)),
+        None => (None, None),
+    }
+}
+
+/// True iff `tile` lies on any segment's Bresenham line (with 0 tolerance).
+/// Cheap perpendicular-distance check per segment.
+fn segment_set_contains(segments: &[StreetSegment], tile: (i32, i32)) -> bool {
+    segments.iter().any(|s| point_on_segment(*s, tile))
+}
+
+/// Standard "is `p` on the integer Bresenham line from `a` to `b`?" check
+/// using cross-product collinearity + bounding-box containment. Cheap;
+/// avoids replaying Bresenham for every probe tile.
+fn point_on_segment(seg: StreetSegment, p: (i32, i32)) -> bool {
+    let (ax, ay) = seg.start;
+    let (bx, by) = seg.end;
+    let dx = bx - ax;
+    let dy = by - ay;
+    let px = p.0 - ax;
+    let py = p.1 - ay;
+    // Collinear? Cross-product must be zero.
+    if dx * py - dy * px != 0 {
+        return false;
+    }
+    // Within bounds?
+    let in_x = (p.0 >= ax.min(bx)) && (p.0 <= ax.max(bx));
+    let in_y = (p.1 >= ay.min(by)) && (p.1 <= ay.max(by));
+    in_x && in_y
 }
 
 /// Compute the currency-denominated value of a plot. Inputs:
@@ -435,6 +534,7 @@ pub fn carve_plots_system(
         zones: Vec<(ZoneKind, TileRect)>,
         faction_home: (i32, i32),
         market_tile: (i32, i32),
+        spine: StreetSpine,
     }
     let mut work: Vec<CarveJob> = Vec::new();
     for (&fid, plan) in plans.0.iter() {
@@ -468,6 +568,7 @@ pub fn carve_plots_system(
             zones,
             faction_home: faction.home_tile,
             market_tile: sett.market_tile,
+            spine: plan.spine.clone(),
         });
     }
 
@@ -482,6 +583,7 @@ pub fn carve_plots_system(
         zones,
         faction_home,
         market_tile,
+        spine,
     } in work
     {
         // Tear down stale plots tied to this settlement.
@@ -517,6 +619,7 @@ pub fn carve_plots_system(
                     &gen,
                     &globe,
                 );
+                let (frontage_edge, access_tile) = frontage_for_rect(r, &spine);
                 let plot = Plot {
                     id: pid,
                     settlement_id: sid_u32,
@@ -529,6 +632,9 @@ pub fn carve_plots_system(
                     base_value,
                     last_valued_tick: 0,
                     missed_payments: 0,
+                    frontage_edge,
+                    access_tile,
+                    parent_plot: None,
                 };
                 let entity = commands.spawn(plot).id();
                 plot_index.by_id.insert(pid, entity);
@@ -602,6 +708,11 @@ pub fn land_listing_system(
             plot.zone_kind,
             ZoneKind::Civic | ZoneKind::Sacred | ZoneKind::Defense | ZoneKind::Market
         ) {
+            continue;
+        }
+        // Phase 6: child farm plots are bound to a parent residential lot;
+        // never listed independently.
+        if plot.parent_plot.is_some() {
             continue;
         }
         let Some(faction) = registry.factions.get(&plot.faction_id) else {
@@ -870,6 +981,8 @@ pub fn household_land_acquisition_system(
             .get(&landlord)
             .map(|f| f.land_policy)
             .unwrap_or_default();
+        let mut parent_centre: Option<(i32, i32)> = None;
+        let mut parent_is_residential = false;
         if let Some(&entity) = plot_index.by_id.get(&pid) {
             if let Ok(mut plot) = plot_q.get_mut(entity) {
                 let period_days = lp.default_lease_period_days.max(1);
@@ -890,9 +1003,78 @@ pub fn household_land_acquisition_system(
                     },
                 };
                 plot.missed_payments = 0;
+                parent_centre = Some(plot.rect.center());
+                parent_is_residential = plot.zone_kind == ZoneKind::Residential;
             }
         }
         consumed.insert(pid);
+
+        // Phase 6: Household-attached child farm plot. When a household
+        // acquires a Residential plot, claim the nearest unowned
+        // Agricultural plot of the same village within range, marking it
+        // as a child. The child mirrors the parent's tenure semantics so
+        // the household has integrated land tenure across home + yard.
+        const CHILD_FARM_MAX_DIST: i32 = 12;
+        if parent_is_residential {
+            if let Some(centre) = parent_centre {
+                let mut best_child: Option<(PlotId, i32)> = None;
+                for (&cid, &cent) in plot_index.by_id.iter() {
+                    if cid == pid || consumed.contains(&cid) {
+                        continue;
+                    }
+                    let Ok(child_plot) = plot_q.get(cent) else {
+                        continue;
+                    };
+                    if child_plot.zone_kind != ZoneKind::Agricultural {
+                        continue;
+                    }
+                    if child_plot.faction_id != cand.parent_id {
+                        continue;
+                    }
+                    if !matches!(child_plot.tenure, Tenure::StateOwned) {
+                        continue;
+                    }
+                    if child_plot.parent_plot.is_some() {
+                        continue;
+                    }
+                    let d = chebyshev_dist(child_plot.rect.center(), centre);
+                    if d > CHILD_FARM_MAX_DIST {
+                        continue;
+                    }
+                    if best_child.as_ref().map_or(true, |b| d < b.1) {
+                        best_child = Some((cid, d));
+                    }
+                }
+                if let Some((cid, _)) = best_child {
+                    if let Some(&cent) = plot_index.by_id.get(&cid) {
+                        if let Ok(mut child_plot) = plot_q.get_mut(cent) {
+                            // Mirror parent tenure (already set above).
+                            let period_days = lp.default_lease_period_days.max(1);
+                            let period_ticks =
+                                (period_days as u64) * (TICKS_PER_DAY as u64);
+                            child_plot.holder = TenureHolder::Household {
+                                faction_id: cand.household_id,
+                            };
+                            child_plot.tenure = match kind {
+                                ListingKind::Sale => Tenure::Freehold,
+                                ListingKind::Lease => Tenure::Leased {
+                                    rent_per_month: 0.0,
+                                    period_days,
+                                    paid_through_tick: now + period_ticks,
+                                },
+                                ListingKind::Sharecrop => Tenure::Sharecropping {
+                                    share_to_landlord: lp.default_share_to_landlord,
+                                    paid_through_tick: now + period_ticks,
+                                },
+                            };
+                            child_plot.parent_plot = Some(pid);
+                            child_plot.missed_payments = 0;
+                            consumed.insert(cid);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if !consumed.is_empty() {
@@ -964,6 +1146,11 @@ pub fn rent_collection_system(
         else {
             continue;
         };
+        // Phase 6: child plots inherit the parent lease; rent is collected
+        // through the parent only. Skip children to avoid double-billing.
+        if plot.parent_plot.is_some() {
+            continue;
+        }
         if now < paid_through_tick {
             continue;
         }

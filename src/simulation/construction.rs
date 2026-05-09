@@ -887,6 +887,118 @@ fn count_monuments_near(map: &MonumentMap, home: (i32, i32), radius: i32) -> usi
         .count()
 }
 
+/// Find a clear (2·hw+1) × (2·hh+1) footprint anchored at the frontage edge
+/// of a vacant lot of `kind` owned by `faction_id`. Walks every plot of the
+/// matching zone kind that has frontage info, picks the first vacant one
+/// closest to `home`, and searches inward from its `access_tile` for a clear,
+/// flat footprint. Returns the centre.
+///
+/// "Vacant" here means no Bed and no Blueprint already occupies the plot's
+/// rect — sufficient for the chief's one-building-per-residential-lot model.
+/// Returns `None` if no plot with frontage exists or none accept a footprint;
+/// callers fall back to `find_footprint_in_zone`.
+///
+/// Phase 3 of the Construction Overhaul: residential placement aligns to
+/// streets so doors face roads. Civic placement keeps zone-area scoring.
+fn find_footprint_at_frontage_lot(
+    chunk_map: &ChunkMap,
+    bed_map: &BedMap,
+    bp_map: &BlueprintMap,
+    plot_index: &crate::simulation::land::PlotIndex,
+    plot_q: &Query<&crate::simulation::land::Plot>,
+    faction_id: u32,
+    kind: crate::simulation::settlement::ZoneKind,
+    home: (i32, i32),
+    half_w: i32,
+    half_h: i32,
+) -> Option<(i32, i32)> {
+    use crate::simulation::land::TileEdge;
+
+    // Gather candidate plots: matching faction + zone kind + has frontage +
+    // vacant rect. Sort by chebyshev distance to home so we fill near-home
+    // lots first.
+    let mut plots: Vec<(i32, (i32, i32), TileEdge, crate::simulation::settlement::TileRect)> =
+        Vec::new();
+    for (&pid, &entity) in plot_index.by_id.iter() {
+        let _ = pid;
+        let Ok(plot) = plot_q.get(entity) else {
+            continue;
+        };
+        if plot.faction_id != faction_id || plot.zone_kind != kind {
+            continue;
+        }
+        let (Some(edge), Some(at)) = (plot.frontage_edge, plot.access_tile) else {
+            continue;
+        };
+        if !plot_rect_vacant(bed_map, bp_map, plot.rect) {
+            continue;
+        }
+        let d = (at.0 - home.0).abs().max((at.1 - home.1).abs());
+        plots.push((d, at, edge, plot.rect));
+    }
+    plots.sort_by_key(|(d, _, _, _)| *d);
+
+    for (_, access, edge, rect) in plots {
+        // Anchor centre near the frontage. For East frontage the door faces
+        // east; place the centre `half_w + 1` tiles inside the eastern edge.
+        let (ax_min, ax_max, ay_min, ay_max) = (
+            rect.x0 + half_w,
+            rect.x0 + rect.w as i32 - half_w - 1,
+            rect.y0 + half_h,
+            rect.y0 + rect.h as i32 - half_h - 1,
+        );
+        if ax_min > ax_max || ay_min > ay_max {
+            continue;
+        }
+        let preferred = match edge {
+            TileEdge::East => (ax_max, access.1.clamp(ay_min, ay_max)),
+            TileEdge::West => (ax_min, access.1.clamp(ay_min, ay_max)),
+            TileEdge::North => (access.0.clamp(ax_min, ax_max), ay_max),
+            TileEdge::South => (access.0.clamp(ax_min, ax_max), ay_min),
+        };
+        // Spiral outward from `preferred` within the plot rect; pick the
+        // first clear, low-spread tile.
+        let mut best: Option<(u8, i32, (i32, i32))> = None;
+        for cy in ay_min..=ay_max {
+            for cx in ax_min..=ax_max {
+                if !is_clear_footprint(chunk_map, bed_map, bp_map, cx, cy, half_w, half_h) {
+                    continue;
+                }
+                let (_, spread) = footprint_z_stats(chunk_map, cx, cy, half_w, half_h);
+                if spread > MAX_TERRAFORM_SPREAD {
+                    continue;
+                }
+                let d = (cx - preferred.0).abs() + (cy - preferred.1).abs();
+                let cand = (spread, d, (cx, cy));
+                if best.map(|b| (cand.0, cand.1) < (b.0, b.1)).unwrap_or(true) {
+                    best = Some(cand);
+                }
+            }
+        }
+        if let Some((_, _, p)) = best {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// True iff no Bed and no Blueprint sits inside `rect`. Cheap rect-scan;
+/// chief residential lots are at most 6×6 = 36 tiles.
+fn plot_rect_vacant(
+    bed_map: &BedMap,
+    bp_map: &BlueprintMap,
+    rect: crate::simulation::settlement::TileRect,
+) -> bool {
+    for ty in rect.y0..rect.y0 + rect.h as i32 {
+        for tx in rect.x0..rect.x0 + rect.w as i32 {
+            if bed_map.0.contains_key(&(tx, ty)) || bp_map.0.contains_key(&(tx, ty)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Find a clear (2·hw+1) × (2·hh+1) footprint inside the first matching zone
 /// of `plan`. Returns the centre. Falls back to `find_building_origin` (radial
 /// search around home) when no matching zone exists or the zone is full.
@@ -1663,6 +1775,8 @@ pub fn chief_directive_system(
     chief_query: Query<(&FactionMember, &AgentGoal), With<FactionChief>>,
     plot_index: Res<crate::simulation::land::PlotIndex>,
     plot_q: Query<&crate::simulation::land::Plot>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    settlement_q: Query<&crate::simulation::settlement::Settlement>,
 ) {
     if clock.tick % 60 != 0 || !auto_build.0 {
         return;
@@ -1721,6 +1835,15 @@ pub fn chief_directive_system(
         let pending_kinds = pending_kinds_per_faction
             .get(&faction_id)
             .unwrap_or(&empty_pending);
+        // Peak population for civic-milestone gates. Falls back to current
+        // member_count when the faction has no Settlement entity yet (e.g.
+        // first-tick before `auto_found_default_settlements_system` ran).
+        let peak_pop = settlement_map
+            .first_for_faction(faction_id)
+            .and_then(|sid| settlement_map.by_id.get(&sid))
+            .and_then(|&e| settlement_q.get(e).ok())
+            .map(|s| s.peak_population)
+            .unwrap_or(faction.member_count);
         let mut candidates = generate_candidates(
             faction_id,
             faction,
@@ -1729,6 +1852,9 @@ pub fn chief_directive_system(
             &maps,
             &bp_map,
             pending_kinds,
+            &plot_index,
+            &plot_q,
+            peak_pop,
         );
         // Stage 3 feedback: penalize candidates whose required inputs include
         // a chronically-deficient good (per `material_deficit_ema`). Skips the
@@ -1798,6 +1924,9 @@ fn generate_candidates(
     maps: &BuildingMapsRO,
     bp_map: &BlueprintMap,
     pending_kinds: &AHashMap<BuildSiteKind, u32>,
+    plot_index: &crate::simulation::land::PlotIndex,
+    plot_q: &Query<&crate::simulation::land::Plot>,
+    peak_pop: u32,
 ) -> Vec<BuildCandidate> {
     let pending_of = |k: BuildSiteKind| -> u32 {
         pending_kinds.get(&k).copied().unwrap_or(0)
@@ -2013,51 +2142,100 @@ fn generate_candidates(
                 }
             }
         } else if techs.has(CITY_STATE_ORG) && bed_deficit >= 2.0 {
-            if let Some(origin) = find_footprint_in_zone(
+            // Frontage-first: prefer vacant residential lots whose access tile
+            // sits on the carved spine; fall back to zone-area scoring.
+            let lh_origin = find_footprint_at_frontage_lot(
                 chunk_map,
                 &maps.bed_map,
                 bp_map,
-                plan,
+                plot_index,
+                plot_q,
+                faction_id,
                 ZoneKind::Residential,
                 home,
                 2,
                 1,
-                20,
-            ) {
+            )
+            .or_else(|| {
+                find_footprint_in_zone(
+                    chunk_map,
+                    &maps.bed_map,
+                    bp_map,
+                    plan,
+                    ZoneKind::Residential,
+                    home,
+                    2,
+                    1,
+                    20,
+                )
+            });
+            if let Some(origin) = lh_origin {
                 out.push(BuildCandidate {
                     intent: BuildIntent::Longhouse(wall_mat),
                     tile: origin,
                     score: 260.0 + bed_deficit * 25.0,
                 });
-            } else if let Some(origin) = find_footprint_in_zone(
-                chunk_map,
-                &maps.bed_map,
-                bp_map,
-                plan,
-                ZoneKind::Residential,
-                home,
-                1,
-                1,
-                18,
-            ) {
-                out.push(BuildCandidate {
-                    intent: BuildIntent::Hut(wall_mat),
-                    tile: origin,
-                    score: 230.0 + bed_deficit * 25.0,
+            } else {
+                let hut_origin = find_footprint_at_frontage_lot(
+                    chunk_map,
+                    &maps.bed_map,
+                    bp_map,
+                    plot_index,
+                    plot_q,
+                    faction_id,
+                    ZoneKind::Residential,
+                    home,
+                    1,
+                    1,
+                )
+                .or_else(|| {
+                    find_footprint_in_zone(
+                        chunk_map,
+                        &maps.bed_map,
+                        bp_map,
+                        plan,
+                        ZoneKind::Residential,
+                        home,
+                        1,
+                        1,
+                        18,
+                    )
                 });
+                if let Some(origin) = hut_origin {
+                    out.push(BuildCandidate {
+                        intent: BuildIntent::Hut(wall_mat),
+                        tile: origin,
+                        score: 230.0 + bed_deficit * 25.0,
+                    });
+                }
             }
         } else {
-            if let Some(origin) = find_footprint_in_zone(
+            let hut_origin = find_footprint_at_frontage_lot(
                 chunk_map,
                 &maps.bed_map,
                 bp_map,
-                plan,
+                plot_index,
+                plot_q,
+                faction_id,
                 ZoneKind::Residential,
                 home,
                 1,
                 1,
-                18,
-            ) {
+            )
+            .or_else(|| {
+                find_footprint_in_zone(
+                    chunk_map,
+                    &maps.bed_map,
+                    bp_map,
+                    plan,
+                    ZoneKind::Residential,
+                    home,
+                    1,
+                    1,
+                    18,
+                )
+            });
+            if let Some(origin) = hut_origin {
                 out.push(BuildCandidate {
                     intent: BuildIntent::Hut(wall_mat),
                     tile: origin,
@@ -2112,12 +2290,16 @@ fn generate_candidates(
         }
     }
 
-    // 5. Granary — gated by GRANARY tech. Mercantile cultures prioritise.
+    // 5. Granary — gated by GRANARY tech + (era, peak_pop) milestone.
     if techs.has(GRANARY)
         && count_granaries_near(&maps.granary_map, home, 25)
             + pending_of(BuildSiteKind::Granary) as usize
             == 0
-        && bed_count >= 2
+        && crate::simulation::civic_milestones::civic_milestone_allows(
+            crate::simulation::civic_milestones::CivicKind::Granary,
+            era,
+            peak_pop,
+        )
     {
         if let Some(tile) = find_clear_tile_in_zone(
             chunk_map,
@@ -2137,12 +2319,16 @@ fn generate_candidates(
         }
     }
 
-    // 6. Shrine — gated by SACRED_RITUAL. Ceremonial cultures push hard.
+    // 6. Shrine — gated by SACRED_RITUAL + (era, peak_pop) milestone.
     if techs.has(SACRED_RITUAL)
         && count_shrines_near(&maps.shrine_map, home, 25)
             + pending_of(BuildSiteKind::Shrine) as usize
             == 0
-        && bed_count >= 2
+        && crate::simulation::civic_milestones::civic_milestone_allows(
+            crate::simulation::civic_milestones::CivicKind::Shrine,
+            era,
+            peak_pop,
+        )
     {
         if let Some(tile) = find_clear_tile_in_zone(
             chunk_map,
@@ -2162,8 +2348,14 @@ fn generate_candidates(
         }
     }
 
-    // 7. Market — LONG_DIST_TRADE. Mercantile cultures aim for two; others one.
-    if techs.has(LONG_DIST_TRADE) && bed_count >= 3 {
+    // 7. Market — LONG_DIST_TRADE + (era, peak_pop) milestone.
+    if techs.has(LONG_DIST_TRADE)
+        && crate::simulation::civic_milestones::civic_milestone_allows(
+            crate::simulation::civic_milestones::CivicKind::Market,
+            era,
+            peak_pop,
+        )
+    {
         let target_count = if culture.mercantile > 180 { 2 } else { 1 };
         let market_count = count_markets_near(&maps.market_map, home, 25)
             + pending_of(BuildSiteKind::Market) as usize;
@@ -2187,12 +2379,16 @@ fn generate_candidates(
         }
     }
 
-    // 8. Barracks — PROFESSIONAL_ARMY. Martial cultures prioritise.
+    // 8. Barracks — PROFESSIONAL_ARMY + (era, peak_pop) milestone.
     if techs.has(PROFESSIONAL_ARMY)
         && count_barracks_near(&maps.barracks_map, home, 25)
             + pending_of(BuildSiteKind::Barracks) as usize
             == 0
-        && bed_count >= 3
+        && crate::simulation::civic_milestones::civic_milestone_allows(
+            crate::simulation::civic_milestones::CivicKind::Barracks,
+            era,
+            peak_pop,
+        )
     {
         if let Some(tile) = find_clear_tile_in_zone(
             chunk_map,
@@ -2212,12 +2408,16 @@ fn generate_candidates(
         }
     }
 
-    // 9. Monument — MONUMENTAL_BUILDING. Ceremonial cultures invest heavily.
+    // 9. Monument — MONUMENTAL_BUILDING + (era, peak_pop) milestone.
     if techs.has(MONUMENTAL_BUILDING)
         && count_monuments_near(&maps.monument_map, home, 30)
             + pending_of(BuildSiteKind::Monument) as usize
             == 0
-        && bed_count >= 4
+        && crate::simulation::civic_milestones::civic_milestone_allows(
+            crate::simulation::civic_milestones::CivicKind::Monument,
+            era,
+            peak_pop,
+        )
     {
         if let Some(tile) = find_clear_tile_in_zone(
             chunk_map,
@@ -4167,6 +4367,14 @@ fn seed_perimeter(
 /// Per-faction starting structures, dispatched on `OnEnter(GameState::Playing)`
 /// after `spawn_population`. Reads `GameStartOptions::era` and
 /// `GameStartOptions::seed_buildings` (sandbox mode disables seeding).
+///
+/// **Seed-vs-grow contract** (Construction Overhaul Phase 0): this system
+/// defines the *initial conditions* of a game-start settlement. The civic
+/// milestone table (Phase 5) gates *growth only* — it does not retroactively
+/// validate seeded buildings. So a Bronze-era starting settlement may seed
+/// `Market`/`Barracks`/`Monument` even at low founding population; those
+/// structures are grandfathered. Subsequent civic-building decisions go
+/// through `chief_directive_system` and obey the milestone table.
 pub fn seed_starting_buildings_system(
     mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,

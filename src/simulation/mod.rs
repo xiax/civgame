@@ -3,6 +3,7 @@ use bevy::prelude::*;
 pub mod animals;
 pub mod carry;
 pub mod carve;
+pub mod civic_milestones;
 pub mod combat;
 pub mod construction;
 pub mod corpse;
@@ -503,6 +504,8 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
+                    settlement::settlement_peak_population_system
+                        .after(settlement::auto_found_default_settlements_system),
                     land::carve_plots_system
                         .after(settlement::settlement_planner_system)
                         .before(construction::chief_directive_system),

@@ -147,6 +147,12 @@ pub fn hover_info_system(
                         if plot.base_value > 0.0 {
                             ui.label(format!("Value: {:.1}", plot.base_value));
                         }
+                        if let (Some(edge), Some(at)) = (plot.frontage_edge, plot.access_tile) {
+                            ui.label(format!("Frontage: {:?} → ({}, {})", edge, at.0, at.1));
+                        }
+                        if let Some(parent) = plot.parent_plot {
+                            ui.label(format!("Child of plot #{}", parent));
+                        }
                     }
                 }
             }

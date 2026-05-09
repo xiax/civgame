@@ -64,6 +64,12 @@ impl TestSim {
     pub fn new(seed: u64) -> Self {
         fastrand::seed(seed);
 
+        // Ensure the async compute pool exists. PathfindingPlugin's
+        // `spawn_rebuild_task_system` calls `AsyncComputeTaskPool::get()`
+        // which panics if uninitialized. Real games get this from
+        // `MinimalPlugins`/`DefaultPlugins`; the test fixture skips those.
+        bevy::tasks::AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+
         let mut app = App::new();
 
         // Time + states. We deliberately skip ScheduleRunnerPlugin /
