@@ -1661,6 +1661,8 @@ pub fn chief_directive_system(
     bp_query: Query<&Blueprint>,
     plans: Res<crate::simulation::settlement::SettlementPlans>,
     chief_query: Query<(&FactionMember, &AgentGoal), With<FactionChief>>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    plot_q: Query<&crate::simulation::land::Plot>,
 ) {
     if clock.tick % 60 != 0 || !auto_build.0 {
         return;
@@ -1755,6 +1757,22 @@ pub fn chief_directive_system(
         }) else {
             continue;
         };
+
+        // Land-tenure gate: civic blueprints (chief-posted, no
+        // requesting household) only land on `StateOwned` plots of this
+        // faction or on wild land outside any plot. Phase 3 is a no-op
+        // while every plot is StateOwned of its founding faction; once
+        // Phase 4 ships household leases, this prevents the chief from
+        // building on now-private plots.
+        if !crate::simulation::land::tile_buildable_by(
+            &plot_index,
+            &plot_q,
+            best.tile,
+            faction_id,
+            None,
+        ) {
+            continue;
+        }
 
         spawn_intent(
             &mut commands,

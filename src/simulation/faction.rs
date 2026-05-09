@@ -1431,6 +1431,12 @@ pub struct FactionData {
         crate::economy::resource_catalog::ResourceId,
         crate::economy::policy::ResourceControlPolicy,
     >,
+    /// Faction-level land tenure governance — distinct from the
+    /// per-resource `economic_policy` map because land is positional
+    /// rather than commoditised. Default (all flags false) preserves
+    /// the all-`StateOwned` behaviour; `land_policy_for(preset)` flips
+    /// the right combination for Mixed / Market.
+    pub land_policy: crate::economy::policy::LandPolicy,
     /// Pluralist Economy R3: parent faction id, set on household
     /// sub-factions. `None` = top-level (village). Households nest
     /// under villages and reuse the entire faction infrastructure.
@@ -1529,6 +1535,7 @@ impl FactionRegistry {
                 nearby_prey_count: 0,
                 treasury: 0.0,
                 economic_policy: ahash::AHashMap::default(),
+                land_policy: crate::economy::policy::LandPolicy::default(),
                 parent_faction: None,
                 household_head: None,
                 children_factions: Vec::new(),
@@ -1599,10 +1606,19 @@ impl FactionRegistry {
             .get(&parent_faction_id)
             .map(|p| !p.economic_policy.is_empty())
             .unwrap_or(false);
+        let parent_land_policy = self
+            .factions
+            .get(&parent_faction_id)
+            .map(|p| p.land_policy)
+            .unwrap_or_default();
         let new_id = self.create_faction(home_tile);
         if let Some(data) = self.factions.get_mut(&new_id) {
             data.parent_faction = Some(parent_faction_id);
             data.household_head = Some(head);
+            // Inherit the parent village's land policy so household
+            // demand systems (Phase 4+) can read "the state rents
+            // land" consistently from either tier.
+            data.land_policy = parent_land_policy;
             if parent_is_capitalist {
                 let cap_policy =
                     crate::economy::policy::ResourceControlPolicy::capitalist();

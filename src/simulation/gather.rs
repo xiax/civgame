@@ -253,6 +253,7 @@ pub fn gather_system(
     mut faction_registry: ResMut<FactionRegistry>,
     mut shared: ResMut<crate::simulation::shared_knowledge::SharedKnowledge>,
     routing: GatherRoutingResources,
+    mut sharecrop: crate::simulation::land::SharecropResources,
     mut plant_query: Query<&mut crate::simulation::plants::Plant>,
     mut agent_query: Query<(
         Entity,
@@ -405,15 +406,49 @@ pub fn gather_system(
             };
             let qty = (base_qty as f32 * yield_mul).round().max(1.0) as u32;
             let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
-            route_yield(
-                &mut commands,
-                &mut carrier,
-                &mut agent,
-                yield_id,
+
+            // Phase 6 sharecropping: if the harvested tile sits on a
+            // `Tenure::Sharecropping` plot, the landlord's share lands
+            // directly at their nearest faction storage tile and the
+            // tenant routes only their cut. Outside sharecrop plots we
+            // route the entire yield through the standard path.
+            let tenant_qty = match crate::simulation::land::lookup_sharecrop_split(
+                &sharecrop.plot_index,
+                &sharecrop.plot_q,
+                tx,
+                ty,
                 qty,
-                agent_tx,
-                agent_ty,
-            );
+            ) {
+                Some((tenant, landlord_share, landlord_faction)) => {
+                    if let Some((sx, sy)) = routing
+                        .storage_tile_map
+                        .nearest_for_faction(landlord_faction, (agent_tx, agent_ty))
+                    {
+                        crate::simulation::items::spawn_or_merge_ground_item(
+                            &mut commands,
+                            &sharecrop.spatial,
+                            &mut sharecrop.item_q,
+                            sx,
+                            sy,
+                            yield_id,
+                            landlord_share,
+                        );
+                    }
+                    tenant
+                }
+                None => qty,
+            };
+            if tenant_qty > 0 {
+                route_yield(
+                    &mut commands,
+                    &mut carrier,
+                    &mut agent,
+                    yield_id,
+                    tenant_qty,
+                    agent_tx,
+                    agent_ty,
+                );
+            }
 
             for (extra_id, extra_qty) in kind.harvest_extra_yields() {
                 route_yield(

@@ -16,6 +16,7 @@ pub mod htn;
 pub mod items;
 pub mod jobs;
 pub mod knowledge;
+pub mod land;
 pub mod line_of_sight;
 pub mod lod;
 pub mod memory;
@@ -111,6 +112,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(settlement::SettlementPlans::default())
             .insert_resource(settlement::SettlementMap::default())
             .insert_resource(settlement::ZoneOverlayToggle::default())
+            .insert_resource(land::PlotIndex::default())
+            .insert_resource(land::LandListings::default())
             .insert_resource(military::ActiveRallyPoints::default())
             .insert_resource(corpse::CorpseMap::default())
             .insert_resource(military::MusterHuntersRequest::default())
@@ -487,6 +490,28 @@ impl Plugin for SimulationPlugin {
                     faction::household_contract_posting_system
                         .after(faction::tribute_payment_system),
                     corpse::corpse_decay_system,
+                )
+                    .in_set(SimulationSet::Economy),
+            )
+            // Land ownership Phases 1 & 4: plot carving runs after the
+            // settlement planner so any new/replanned `SettlementPlan`
+            // is visible to the carve pass on the same tick. Listing +
+            // acquisition follow on, ordered listing-then-acquire so a
+            // freshly published listing can be claimed in the same
+            // tick. Split into its own `add_systems` call — the Economy
+            // tuple above sits at Bevy's 20-element ceiling.
+            .add_systems(
+                FixedUpdate,
+                (
+                    land::carve_plots_system
+                        .after(settlement::settlement_planner_system)
+                        .before(construction::chief_directive_system),
+                    land::land_listing_system
+                        .after(land::carve_plots_system),
+                    land::household_land_acquisition_system
+                        .after(land::land_listing_system),
+                    land::rent_collection_system
+                        .after(land::household_land_acquisition_system),
                 )
                     .in_set(SimulationSet::Economy),
             )

@@ -24,6 +24,7 @@ pub struct SitesHoverParams<'w, 's> {
 }
 use crate::simulation::faction::FactionMember;
 use crate::simulation::items::GroundItem;
+use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::mood::Mood;
 use crate::simulation::needs::Needs;
@@ -72,6 +73,8 @@ pub fn hover_info_system(
         ),
         With<Person>,
     >,
+    plot_index: Res<PlotIndex>,
+    plot_query: Query<&Plot>,
 ) {
     let Ok(window) = windows.get_single() else {
         return;
@@ -112,6 +115,40 @@ pub fn hover_info_system(
                 }
             } else {
                 ui.label("Unloaded Chunk");
+            }
+
+            if let Some(pid) = plot_index.plot_at(tx as i32, ty as i32) {
+                if let Some(&entity) = plot_index.by_id.get(&pid) {
+                    if let Ok(plot) = plot_query.get(entity) {
+                        ui.separator();
+                        ui.label(egui::RichText::new("Plot").strong());
+                        ui.label(format!("ID: {}  ·  Settlement: {}", plot.id, plot.settlement_id));
+                        ui.label(format!("Zone: {}", plot.zone_kind.label()));
+                        ui.label(format!(
+                            "Rect: ({}, {})  {}×{}",
+                            plot.rect.x0, plot.rect.y0, plot.rect.w, plot.rect.h
+                        ));
+                        let tenure = match plot.tenure {
+                            Tenure::StateOwned => "State-owned".to_string(),
+                            Tenure::Leased { rent_per_month, .. } => {
+                                format!("Leased ({:.1}/mo)", rent_per_month)
+                            }
+                            Tenure::Sharecropping { share_to_landlord, .. } => {
+                                format!("Sharecropping ({:.0}% to landlord)", share_to_landlord * 100.0)
+                            }
+                            Tenure::Freehold => "Freehold".to_string(),
+                        };
+                        let holder = match plot.holder {
+                            TenureHolder::State { faction_id } => format!("State (faction {})", faction_id),
+                            TenureHolder::Household { faction_id } => format!("Household {}", faction_id),
+                        };
+                        ui.label(format!("Tenure: {}", tenure));
+                        ui.label(format!("Holder: {}", holder));
+                        if plot.base_value > 0.0 {
+                            ui.label(format!("Value: {:.1}", plot.base_value));
+                        }
+                    }
+                }
             }
 
             let entities = spatial_index.get(tx, ty);

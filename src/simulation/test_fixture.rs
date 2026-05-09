@@ -3108,6 +3108,458 @@ mod smoke {
         assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
     }
 
+    // ─── Land ownership Phase 4 — household acquires a leased plot ───
+
+    #[test]
+    fn funded_household_in_market_preset_acquires_plot() {
+        // Phase 4: with the player faction stamped Market preset
+        // (state_sells_land + state_rents_land), a funded household
+        // should pick up at least one listing within a game-day,
+        // mutating the plot's holder to `Household` and conserving
+        // total currency through the faction-to-faction transfer.
+        use crate::economy::policy::land_policy_for;
+        use crate::game_state::EconomyPreset;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::land::{Plot, PlotIndex, TenureHolder};
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xCAFEBABE);
+        sim.flat_world(4, 0, TileKind::Grass);
+        let head = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        let village_id = sim.player_faction_id;
+        let household_id = {
+            let catalog = sim
+                .app
+                .world()
+                .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+                .clone();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            // Force Market preset on the village so listings publish.
+            registry.factions.get_mut(&village_id).unwrap().land_policy =
+                land_policy_for(EconomyPreset::Market);
+            // Settlement planner skips factions with `member_count == 0`,
+            // so register the head as a member to unblock the
+            // plan→carve→listing pipeline.
+            registry.add_member(village_id);
+            // Bake fertility-independent priors: spawn the household
+            // and seed treasury well above the freehold price floor
+            // (~50 base × distance falloff = single-digit at home, but
+            // 200 covers any plot in the carved set).
+            let id = registry.spawn_household(village_id, (0, 0), head, &catalog);
+            registry.factions.get_mut(&id).unwrap().treasury = 200.0;
+            id
+        };
+
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        // Tick enough for: settlement auto-found → SettlementPlan
+        // (faction-staggered ~60 ticks) → carve → ≥1 listing cycle
+        // (every TICKS_PER_DAY/4) → ≥1 acquisition cycle (TICKS_PER_DAY).
+        sim.tick_n(TICKS_PER_DAY as u32 * 2 + 200);
+
+        // Pre-check: confirm carving happened for the village.
+        {
+            let plot_index = sim.app.world().resource::<PlotIndex>();
+            let village_plot_count = plot_index
+                .by_settlement
+                .iter()
+                .map(|(_, ids)| ids.len())
+                .sum::<usize>();
+            assert!(
+                village_plot_count > 0,
+                "no plots carved at all — settlement / plan / carve pipeline broken"
+            );
+        }
+
+        let world = sim.app.world_mut();
+        let plot_entities: Vec<bevy::prelude::Entity> = world
+            .resource::<PlotIndex>()
+            .by_id
+            .values()
+            .copied()
+            .collect();
+        let mut owned_plot_count = 0usize;
+        for e in plot_entities {
+            if let Some(plot) = world.get::<Plot>(e) {
+                if matches!(plot.holder, TenureHolder::Household { faction_id } if faction_id == household_id)
+                {
+                    owned_plot_count += 1;
+                }
+            }
+        }
+        assert!(
+            owned_plot_count >= 1,
+            "household {household_id} should hold at least one plot after one game-day; got {owned_plot_count}"
+        );
+
+        // Faction-to-faction transfer is conservative — the lease /
+        // sale moved currency from household.treasury to landlord
+        // village.treasury without spawning or dropping any.
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+    }
+
+    #[test]
+    fn household_acquires_sharecrop_when_only_sharecrop_offered() {
+        // Phase 6: with only `state_sharecrops` enabled (not sale or
+        // lease), a household should pick up a sharecrop listing on
+        // an agricultural plot — no upfront cost, plot tenure flips
+        // to `Sharecropping`, faction treasuries are unchanged.
+        use crate::economy::policy::LandPolicy;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xBEEF_F005);
+        sim.flat_world(4, 0, TileKind::Grass);
+        let head = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Bump the head's awareness through the Neolithic so the
+        // settlement planner emits an `Agricultural` zone — gated on
+        // both `PERM_SETTLEMENT` (Mesolithic) and `CROP_CULTIVATION`
+        // (Neolithic). Paleolithic band camps don't carve farmland
+        // plots, so without this no sharecrop listing can fire.
+        {
+            let world = sim.app.world_mut();
+            let mut k = world
+                .get_mut::<crate::simulation::knowledge::PersonKnowledge>(head)
+                .expect("head should carry PersonKnowledge");
+            *k = crate::simulation::knowledge::PersonKnowledge::seeded_through_era(
+                crate::simulation::technology::Era::Neolithic,
+                0,
+            );
+        }
+
+        // Sharecrop-only policy on the village.
+        let village_id = sim.player_faction_id;
+        let household_id = {
+            let catalog = sim
+                .app
+                .world()
+                .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+                .clone();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.factions.get_mut(&village_id).unwrap().land_policy = LandPolicy {
+                state_sells_land: false,
+                state_rents_land: false,
+                state_sharecrops: true,
+                private_freehold_allowed: false,
+                default_lease_period_days: 30,
+                rent_yield_pct: 0.0,
+                default_share_to_landlord: 0.30,
+            };
+            registry.add_member(village_id);
+            let id = registry.spawn_household(village_id, (0, 0), head, &catalog);
+            // Just at the minimum so the candidate gate passes.
+            registry.factions.get_mut(&id).unwrap().treasury =
+                crate::simulation::land::HOUSEHOLD_MIN_TREASURY_FOR_LEASE + 0.1;
+            id
+        };
+
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        // settle settlement → plan → carve → list → acquire.
+        sim.tick_n(TICKS_PER_DAY as u32 + 200);
+
+        // Inspect: at least one Sharecropping plot held by this household,
+        // and the agricultural zone is the only one acquired.
+        let world = sim.app.world_mut();
+        let plot_entities: Vec<Entity> =
+            world.resource::<PlotIndex>().by_id.values().copied().collect();
+        let mut sharecropping_count = 0usize;
+        let mut other_household_held = 0usize;
+        for e in plot_entities {
+            if let Some(plot) = world.get::<Plot>(e) {
+                if let TenureHolder::Household { faction_id } = plot.holder {
+                    if faction_id == household_id {
+                        match plot.tenure {
+                            Tenure::Sharecropping { .. } => sharecropping_count += 1,
+                            _ => other_household_held += 1,
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            sharecropping_count >= 1,
+            "household should hold at least one Sharecropping plot; got {sharecropping_count}",
+        );
+        assert_eq!(
+            other_household_held, 0,
+            "with only state_sharecrops on, the household should not acquire any non-sharecrop plot"
+        );
+
+        // Sharecrop has zero upfront cost — currency invariant
+        // holds trivially because no transfer happened.
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+    }
+
+    #[test]
+    fn tenant_pays_rent_on_lease_anniversary() {
+        // Phase 5: a tenant household with sufficient treasury pays
+        // its monthly rent when `rent_collection_system` fires on a
+        // lease whose `paid_through_tick` has expired. Treasury moves
+        // household → landlord (currency-conservative); the lease's
+        // `paid_through_tick` advances by one period; missed_payments
+        // resets to 0.
+        use bevy::ecs::system::RunSystemOnce;
+        use crate::economy::policy::land_policy_for;
+        use crate::game_state::EconomyPreset;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::land::{
+            rent_collection_system, Plot, PlotIndex, Tenure, TenureHolder,
+        };
+        use crate::simulation::schedule::SimClock;
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xCAFE_F005);
+        sim.flat_world(4, 0, TileKind::Grass);
+        let head = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Force Mixed preset (lease only — sale flag off) so the
+        // household acquires via lease.
+        let village_id = sim.player_faction_id;
+        let household_id = {
+            let catalog = sim
+                .app
+                .world()
+                .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+                .clone();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.factions.get_mut(&village_id).unwrap().land_policy =
+                land_policy_for(EconomyPreset::Mixed);
+            registry.add_member(village_id);
+            let id = registry.spawn_household(village_id, (0, 0), head, &catalog);
+            registry.factions.get_mut(&id).unwrap().treasury = 200.0;
+            id
+        };
+
+        // Drive acquisition: tick a game-day plus a buffer.
+        sim.tick_n(TICKS_PER_DAY as u32 + 200);
+
+        // Sanity: household should now hold a Leased plot.
+        let leased_plot_entity: Entity;
+        let original_paid_through: u64;
+        let original_rent: f32;
+        let landlord_id: u32;
+        {
+            let world = sim.app.world_mut();
+            let plot_entities: Vec<Entity> = world
+                .resource::<PlotIndex>()
+                .by_id
+                .values()
+                .copied()
+                .collect();
+            let leased = plot_entities.into_iter().find_map(|e| {
+                let p = world.get::<Plot>(e)?;
+                let TenureHolder::Household { faction_id } = p.holder else {
+                    return None;
+                };
+                if faction_id != household_id {
+                    return None;
+                }
+                let Tenure::Leased {
+                    paid_through_tick,
+                    rent_per_month,
+                    ..
+                } = p.tenure
+                else {
+                    return None;
+                };
+                Some((e, paid_through_tick, rent_per_month, p.faction_id))
+            });
+            let (e, ptt, rent, lord) =
+                leased.expect("household should have leased a plot in Mixed preset");
+            leased_plot_entity = e;
+            original_paid_through = ptt;
+            original_rent = rent;
+            landlord_id = lord;
+        }
+
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+        let household_before = sim
+            .app
+            .world()
+            .resource::<FactionRegistry>()
+            .factions
+            .get(&household_id)
+            .unwrap()
+            .treasury;
+        let landlord_before = sim
+            .app
+            .world()
+            .resource::<FactionRegistry>()
+            .factions
+            .get(&landlord_id)
+            .unwrap()
+            .treasury;
+
+        // Fast-forward: set clock to a multiple of 30 game-days and
+        // make sure the plot's paid_through_tick is in the past.
+        let target_tick: u64 = (TICKS_PER_DAY as u64) * 30;
+        {
+            let world = sim.app.world_mut();
+            world.resource_mut::<SimClock>().tick = target_tick;
+            let mut plot = world.get_mut::<Plot>(leased_plot_entity).unwrap();
+            plot.tenure = Tenure::Leased {
+                rent_per_month: original_rent,
+                period_days: 30,
+                paid_through_tick: target_tick - 1, // overdue by one tick
+            };
+        }
+
+        sim.app
+            .world_mut()
+            .run_system_once(rent_collection_system)
+            .expect("rent_collection_system should run");
+
+        // Treasury moved.
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let household_after = registry.factions.get(&household_id).unwrap().treasury;
+        let landlord_after = registry.factions.get(&landlord_id).unwrap().treasury;
+        assert!(
+            (household_before - household_after - original_rent).abs() < 1e-3,
+            "household treasury should be debited by exactly one month's rent: \
+             before={household_before} after={household_after} rent={original_rent}",
+        );
+        assert!(
+            (landlord_after - landlord_before - original_rent).abs() < 1e-3,
+            "landlord treasury should be credited by exactly one month's rent",
+        );
+
+        // Plot's paid_through_tick advanced by one period; misses reset.
+        let plot = sim.app.world().get::<Plot>(leased_plot_entity).unwrap();
+        if let Tenure::Leased {
+            paid_through_tick, ..
+        } = plot.tenure
+        {
+            let one_period = (TICKS_PER_DAY as u64) * 30;
+            assert!(
+                paid_through_tick > target_tick,
+                "paid_through_tick should advance past current tick after payment; \
+                 was={original_paid_through} now={paid_through_tick} target={target_tick}",
+            );
+            // Allow off-by-1 because we set paid_through_tick = target-1.
+            let expected = target_tick - 1 + one_period;
+            assert_eq!(paid_through_tick, expected);
+        } else {
+            panic!("plot should still be Leased after successful payment, got {:?}", plot.tenure);
+        }
+        assert_eq!(plot.missed_payments, 0);
+
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+    }
+
+    #[test]
+    fn destitute_tenant_evicted_after_two_misses() {
+        // Phase 5 edge case: a tenant whose treasury is empty by the
+        // time rent comes due accumulates `missed_payments`. Once
+        // `EVICTION_MISS_THRESHOLD` is reached the plot reverts to
+        // `StateOwned` of the original landlord.
+        use bevy::ecs::system::RunSystemOnce;
+        use crate::economy::policy::land_policy_for;
+        use crate::game_state::EconomyPreset;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::land::{
+            rent_collection_system, Plot, PlotIndex, Tenure, TenureHolder,
+        };
+        use crate::simulation::schedule::SimClock;
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xDEAD_B00B);
+        sim.flat_world(4, 0, TileKind::Grass);
+        let head = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        let village_id = sim.player_faction_id;
+        let household_id = {
+            let catalog = sim
+                .app
+                .world()
+                .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+                .clone();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.factions.get_mut(&village_id).unwrap().land_policy =
+                land_policy_for(EconomyPreset::Mixed);
+            registry.add_member(village_id);
+            let id = registry.spawn_household(village_id, (0, 0), head, &catalog);
+            registry.factions.get_mut(&id).unwrap().treasury = 200.0;
+            id
+        };
+
+        sim.tick_n(TICKS_PER_DAY as u32 + 200);
+
+        // Find the leased plot, then drain household treasury so the
+        // next two rent cycles fail.
+        let leased_plot_entity: Entity = {
+            let world = sim.app.world_mut();
+            let plot_entities: Vec<Entity> = world
+                .resource::<PlotIndex>()
+                .by_id
+                .values()
+                .copied()
+                .collect();
+            plot_entities
+                .into_iter()
+                .find(|&e| {
+                    let p = match world.get::<Plot>(e) {
+                        Some(p) => p,
+                        None => return false,
+                    };
+                    matches!(p.holder, TenureHolder::Household { faction_id } if faction_id == household_id)
+                        && matches!(p.tenure, Tenure::Leased { .. })
+                })
+                .expect("household should have leased a plot")
+        };
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.factions.get_mut(&household_id).unwrap().treasury = 0.0;
+        }
+
+        // Cycle 1: rent due, household broke → miss++
+        let cycle_tick = (TICKS_PER_DAY as u64) * 30;
+        for cycle in 1..=(super::super::land::EVICTION_MISS_THRESHOLD as u64) {
+            let now = cycle_tick * cycle;
+            {
+                let world = sim.app.world_mut();
+                world.resource_mut::<SimClock>().tick = now;
+                let mut plot = world.get_mut::<Plot>(leased_plot_entity).unwrap();
+                if let Tenure::Leased {
+                    rent_per_month,
+                    period_days,
+                    ..
+                } = plot.tenure
+                {
+                    plot.tenure = Tenure::Leased {
+                        rent_per_month,
+                        period_days,
+                        paid_through_tick: now - 1,
+                    };
+                }
+            }
+            sim.app
+                .world_mut()
+                .run_system_once(rent_collection_system)
+                .expect("rent_collection_system should run");
+        }
+
+        // After EVICTION_MISS_THRESHOLD cycles of failure, plot is StateOwned.
+        let plot = sim.app.world().get::<Plot>(leased_plot_entity).unwrap();
+        assert_eq!(
+            plot.tenure,
+            Tenure::StateOwned,
+            "plot should revert to StateOwned after eviction; got {:?}",
+            plot.tenure,
+        );
+        match plot.holder {
+            TenureHolder::State { faction_id } => assert_eq!(
+                faction_id, village_id,
+                "evicted plot should revert to original landlord (village)",
+            ),
+            other => panic!("evicted plot should be held by State, got {:?}", other),
+        }
+        assert_eq!(plot.missed_payments, 0, "missed_payments should reset on eviction");
+    }
+
     // ─── Pluralist Economy R10 — Trader / market arbitrage (Phase 8a) ───
 
     #[test]

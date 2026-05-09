@@ -109,6 +109,69 @@ pub enum RequiredFlag {
 /// faction must have `flag` set on its policy for `resource`".
 pub type PolicyGateEntry = (ResourceId, RequiredFlag);
 
+/// Faction-level land tenure policy. Distinct from the per-resource
+/// `ResourceControlPolicy` because land is positional (a plot, not a
+/// commodity) and governance flips at the faction level — "this state
+/// rents farmland" applies uniformly to every plot the state owns.
+///
+/// Default = all-false (Subsistence / communal): no transfers, plots
+/// stay `Tenure::StateOwned`. Mixed/Market presets flip flags via
+/// `land_policy_for(preset)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LandPolicy {
+    pub state_sells_land: bool,
+    pub state_rents_land: bool,
+    pub state_sharecrops: bool,
+    pub private_freehold_allowed: bool,
+    pub default_lease_period_days: u32,
+    /// Monthly rent as a fraction of plot `base_value`; e.g. 0.04 ⇒ 4 %
+    /// per month, ~50 %/year.
+    pub rent_yield_pct: f32,
+    pub default_share_to_landlord: f32,
+}
+
+impl Default for LandPolicy {
+    fn default() -> Self {
+        Self {
+            state_sells_land: false,
+            state_rents_land: false,
+            state_sharecrops: false,
+            private_freehold_allowed: false,
+            default_lease_period_days: 30,
+            rent_yield_pct: 0.0,
+            default_share_to_landlord: 0.0,
+        }
+    }
+}
+
+/// Map an `EconomyPreset` to the faction-level land policy. Resource-
+/// level flags still come from `apply_preset`; this is the parallel
+/// hook for land tenure.
+pub fn land_policy_for(preset: crate::game_state::EconomyPreset) -> LandPolicy {
+    use crate::game_state::EconomyPreset;
+    match preset {
+        EconomyPreset::Subsistence => LandPolicy::default(),
+        EconomyPreset::Mixed => LandPolicy {
+            state_sells_land: false,
+            state_rents_land: true,
+            state_sharecrops: true,
+            private_freehold_allowed: false,
+            default_lease_period_days: 30,
+            rent_yield_pct: 0.04,
+            default_share_to_landlord: 0.30,
+        },
+        EconomyPreset::Market => LandPolicy {
+            state_sells_land: true,
+            state_rents_land: true,
+            state_sharecrops: true,
+            private_freehold_allowed: true,
+            default_lease_period_days: 30,
+            rent_yield_pct: 0.04,
+            default_share_to_landlord: 0.30,
+        },
+    }
+}
+
 /// Apply a `GameStartOptions::EconomyPreset` to a faction's
 /// `economic_policy` map. Called once per faction by `spawn_population`.
 ///
@@ -171,5 +234,30 @@ mod tests {
         assert!(!p.satisfies(RequiredFlag::PrivateActorsAllowed));
         p.private_actors_allowed = true;
         assert!(p.satisfies(RequiredFlag::PrivateActorsAllowed));
+    }
+
+    #[test]
+    fn land_policy_subsistence_disables_all_transfers() {
+        let p = land_policy_for(crate::game_state::EconomyPreset::Subsistence);
+        assert!(!p.state_sells_land);
+        assert!(!p.state_rents_land);
+        assert!(!p.state_sharecrops);
+        assert!(!p.private_freehold_allowed);
+    }
+
+    #[test]
+    fn land_policy_mixed_rents_but_no_sale_or_freehold() {
+        let p = land_policy_for(crate::game_state::EconomyPreset::Mixed);
+        assert!(!p.state_sells_land);
+        assert!(p.state_rents_land);
+        assert!(p.state_sharecrops);
+        assert!(!p.private_freehold_allowed);
+    }
+
+    #[test]
+    fn land_policy_market_enables_freehold_and_sale() {
+        let p = land_policy_for(crate::game_state::EconomyPreset::Market);
+        assert!(p.state_sells_land);
+        assert!(p.private_freehold_allowed);
     }
 }

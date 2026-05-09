@@ -436,6 +436,7 @@ pub fn spawn_population(
                 options.economy,
                 &catalog,
             );
+            faction_data.land_policy = crate::economy::policy::land_policy_for(options.economy);
         }
 
         let home_world = tile_to_world(home_tx, home_ty);
