@@ -8547,6 +8547,114 @@ mod baseline_behaviour {
         );
     }
 
+    /// P6b: stale-target neighbor-scan retarget. Agent walks to a planned
+    /// grain tile; we despawn the plant just before arrival; a same-kind
+    /// replacement sits 1 tile away. Pre-P6b the gather_system would push
+    /// `MethodOutcome::FailedTarget` and abandon the chain. Post-P6b the
+    /// agent's `Task::Gather` swaps to the neighbor and the chain
+    /// completes (hunger drops).
+    #[test]
+    fn empty_arrival_retargets_adjacent_grain() {
+        use crate::simulation::memory::MemoryKind;
+        use crate::simulation::needs::Needs;
+        use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+
+        let mut sim = TestSim::new(0xBADBEEF);
+        sim.flat_world(3, 0, TileKind::Grass);
+
+        // Dummy chief absorbs Lead auto-promotion.
+        let _chief = sim.spawn_person(sim.player_faction_id, (10, 10), |_| {});
+
+        // Two mature grain plants — primary at (5, 0), neighbor at (6, 0).
+        let primary_tile = (5, 0);
+        let neighbor_tile = (6, 0);
+        let spawn_grain = |sim: &mut TestSim, tile: (i32, i32)| -> Entity {
+            let world = tile_to_world(tile.0, tile.1);
+            let entity = sim
+                .app
+                .world_mut()
+                .spawn((
+                    Plant {
+                        kind: PlantKind::Grain,
+                        stage: GrowthStage::Mature,
+                        growth_ticks: 0,
+                        tile_pos: tile,
+                    },
+                    Transform::from_xyz(world.x, world.y, 0.4),
+                    GlobalTransform::default(),
+                    Visibility::Hidden,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            sim.app
+                .world_mut()
+                .resource_mut::<PlantMap>()
+                .0
+                .insert(tile, entity);
+            entity
+        };
+        let primary_entity = spawn_grain(&mut sim, primary_tile);
+        let _neighbor_entity = spawn_grain(&mut sim, neighbor_tile);
+
+        // Inject a sighting on the primary tile so the dispatcher targets it.
+        sim.inject_faction_sighting(
+            sim.player_faction_id,
+            primary_tile,
+            MemoryKind::AnyEdible,
+        );
+
+        // Hungry worker far enough to need a walk so we can despawn the
+        // plant in flight.
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.hunger(210.0);
+        });
+
+        // Tick until the agent is en-route to primary_tile or already at it.
+        let initial_hunger: f32 = 210.0;
+        let mut despawned = false;
+        let mut completed = false;
+        for _ in 0..600 {
+            sim.tick();
+            // Despawn the primary plant once the agent has it claimed —
+            // simulates "another worker arrived first" race.
+            if !despawned {
+                let claimed = sim
+                    .app
+                    .world()
+                    .get::<crate::simulation::person::PersonAI>(worker)
+                    .and_then(|ai| ai.active_gather_claim)
+                    .map(|(t, _)| t == primary_tile)
+                    .unwrap_or(false);
+                if claimed {
+                    sim.app.world_mut().despawn(primary_entity);
+                    sim.app
+                        .world_mut()
+                        .resource_mut::<PlantMap>()
+                        .0
+                        .remove(&primary_tile);
+                    despawned = true;
+                }
+            }
+            let hunger = sim
+                .app
+                .world()
+                .get::<Needs>(worker)
+                .map(|n| n.hunger)
+                .unwrap_or(0.0);
+            if hunger < initial_hunger - 50.0 {
+                completed = true;
+                break;
+            }
+        }
+        assert!(despawned, "test setup never observed primary claim");
+        assert!(
+            completed,
+            "expected the gather chain to recover by retargeting to neighbor \
+             grain at {neighbor_tile:?}; pre-P6b the agent abandons the chain \
+             after FailedTarget on stale arrival",
+        );
+    }
+
     /// Phase 5e-xii-a: an agent under `AgentGoal::Play` with a nearby other
     /// Person dispatches `Task::Play { partner: Some(e) }` via
     /// `htn_play_dispatch_system` + `PlayWithPartnerMethod`. Replaces the

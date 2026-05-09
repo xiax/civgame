@@ -77,6 +77,84 @@ fn mining_activity(id: ResourceId) -> Option<ActivityKind> {
     }
 }
 
+// ── P6b: stale-target neighbor-scan retarget ─────────────────────────────────
+
+/// Cooldown between consecutive retargets on the same agent. Conservative:
+/// one swap per chain (40 ticks ≈ 2s @ 20Hz) is enough to recover from a
+/// just-harvested neighbor's plant without looping forever on a fully depleted
+/// cluster.
+pub const P6B_RETARGET_COOLDOWN: u64 = 40;
+/// Chebyshev radius for the neighbor-scan. Mirrors the "agent stands inside
+/// the field but doesn't see it" symptom — adjacent / 2-hop plants are the
+/// realistic recovery candidates; farther afield, re-dispatch should pick a
+/// fresh cluster.
+pub const P6B_RETARGET_RADIUS: i32 = 2;
+
+/// Find the closest unclaimed mature plant matching the agent's outstanding
+/// `MemoryKind` claim within `radius` of `from`. Used by `gather_system`'s
+/// stale-arrival branch (P6b). Returns the candidate tile and entity; a hit
+/// is *not* atomic with the claim swap — caller must `release` then `add`
+/// before mutating `Task::Gather`.
+///
+/// `kind`: the agent's `active_gather_claim.kind` — drives the
+/// `MemoryKind → PlantKind` filter.  `AnyEdible` admits Grain | BerryBush;
+/// `Resource(WOOD)` admits Tree; everything else returns `None`
+/// (Resource(STONE) lives on the tile branch, not the plant branch).
+fn retarget_neighbor(
+    plant_map: &PlantMap,
+    plant_query: &Query<&mut crate::simulation::plants::Plant>,
+    kind: MemoryKind,
+    from: (i32, i32),
+    radius: i32,
+    viewer: Entity,
+    now: u64,
+    claims: &GatherClaims,
+) -> Option<((i32, i32), Entity)> {
+    use crate::simulation::plants::GrowthStage;
+    let wood = MemoryKind::wood();
+    let allows = |pk: PlantKind| -> bool {
+        if kind == MemoryKind::AnyEdible {
+            matches!(pk, PlantKind::Grain | PlantKind::BerryBush)
+        } else if kind == wood {
+            matches!(pk, PlantKind::Tree)
+        } else {
+            false
+        }
+    };
+    let mut best: Option<((i32, i32), Entity, i32)> = None;
+    for dx in -radius..=radius {
+        for dy in -radius..=radius {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let tile = (from.0 + dx, from.1 + dy);
+            let Some(&entity) = plant_map.0.get(&tile) else {
+                continue;
+            };
+            // Read-only get — caller will mutate if and only if it commits.
+            let Ok(plant) = plant_query.get(entity) else {
+                continue;
+            };
+            if plant.stage != GrowthStage::Mature {
+                continue;
+            }
+            if !allows(plant.kind) {
+                continue;
+            }
+            if claims.pressure(tile, now, viewer) > 0 {
+                continue;
+            }
+            let dist = dx.abs().max(dy.abs());
+            match best {
+                None => best = Some((tile, entity, dist)),
+                Some((_, _, d)) if dist < d => best = Some((tile, entity, dist)),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(t, e, _)| (t, e))
+}
+
 // ── gather_system ─────────────────────────────────────────────────────────────
 
 /// Routing resources bundled together so `gather_system` stays under Bevy's
@@ -343,35 +421,92 @@ pub fn gather_system(
         if let Some(entity) = plant_map.0.get(&(tx, ty)).copied() {
             // ── Plant harvest ────────────────────────────────────────────────
 
-            let Ok(mut plant) = plant_query.get_mut(entity) else {
-                plant_map.0.remove(&(tx, ty));
-                shared.report_depleted(agent_tier, (tx, ty), MemoryKind::AnyEdible);
-                shared.report_depleted(agent_tier, (tx, ty), MemoryKind::wood());
-                // Arrival-time target failure: bias the next dispatch away
-                // from the method that picked this stale tile. Without this,
-                // the deposit leg always succeeds and `htn_method_completion_system`
-                // logs a spurious `Success`, never penalising the bad pick.
-                if let Some(method_id) = ai.active_method.take() {
-                    method_history.push(method_id, MethodOutcome::FailedTarget, clock.tick);
-                }
-                finish_gather(
-                    &mut ai,
-                    &mut aq,
-                    actor,
-                    cur_tile,
-                    cur_chunk,
-                    faction_id,
-                    &chunk_map,
-                    &routing,
-                );
-                continue;
+            // P6b: stale-target neighbor-scan retarget. If the planned tile's
+            // plant is despawned or immature, scan chebyshev≤2 for a same-kind
+            // mature plant and atomically swap claim + Task::Gather { tile }.
+            // Throttled to one retarget per chain via `last_retarget_tick`
+            // (40-tick cooldown) so a depleted cluster doesn't loop forever.
+            let stale = match plant_query.get(entity) {
+                Err(_) => true,
+                Ok(p) if p.stage != GrowthStage::Mature => true,
+                _ => false,
             };
-            if plant.stage != GrowthStage::Mature {
-                let kind = match plant.kind {
-                    PlantKind::BerryBush | PlantKind::Grain => MemoryKind::AnyEdible,
-                    PlantKind::Tree => MemoryKind::wood(),
-                };
-                shared.report_depleted(agent_tier, (tx, ty), kind);
+            if stale {
+                let cooldown_ok =
+                    clock.tick.saturating_sub(ai.last_retarget_tick) >= P6B_RETARGET_COOLDOWN;
+                if cooldown_ok {
+                    if let Some((claim_tile, claim_kind)) = ai.active_gather_claim {
+                        if let Some((new_tile, _new_entity)) = retarget_neighbor(
+                            &plant_map,
+                            &plant_query,
+                            claim_kind,
+                            cur_tile,
+                            P6B_RETARGET_RADIUS,
+                            actor,
+                            clock.tick,
+                            &routing.gather_claims,
+                        ) {
+                            // Re-route the agent to the new tile via the same
+                            // helper the dispatcher uses (sets ai.state to
+                            // Seeking/Routing so movement_system walks again,
+                            // and on arrival flips back to Working). On a
+                            // routing failure we fall through to the legacy
+                            // FailedTarget path so the agent doesn't sit in
+                            // limbo.
+                            let dispatched = assign_task_with_routing(
+                                &mut ai,
+                                cur_tile,
+                                cur_chunk,
+                                new_tile,
+                                TaskKind::Gather,
+                                None,
+                                &routing.chunk_graph,
+                                &routing.chunk_router,
+                                &chunk_map,
+                                &routing.chunk_connectivity,
+                            );
+                            if dispatched {
+                                routing
+                                    .gather_claims
+                                    .release(claim_tile, claim_kind, actor);
+                                let expires =
+                                    crate::simulation::gather_claims::suggested_expiry(
+                                        clock.tick,
+                                        cur_tile,
+                                        new_tile,
+                                    );
+                                routing
+                                    .gather_claims
+                                    .add(new_tile, claim_kind, actor, expires);
+                                ai.active_gather_claim = Some((new_tile, claim_kind));
+                                ai.last_retarget_tick = clock.tick;
+                                ai.work_progress = 0;
+                                aq.current = Task::Gather { tile: new_tile };
+                                // Prune the now-stale cluster entry so subsequent
+                                // dispatches don't re-pick it.
+                                if !plant_map.0.contains_key(&(tx, ty)) {
+                                    shared.report_depleted(agent_tier, (tx, ty), claim_kind);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // Fall through: no neighbor / cooldown / no active claim.
+                // Original behavior — push FailedTarget + finish_gather.
+                let stale_plant_kind = plant_query.get(entity).ok().map(|p| p.kind);
+                if plant_query.get(entity).is_err() {
+                    plant_map.0.remove(&(tx, ty));
+                    shared.report_depleted(agent_tier, (tx, ty), MemoryKind::AnyEdible);
+                    shared.report_depleted(agent_tier, (tx, ty), MemoryKind::wood());
+                } else if let Some(k) = stale_plant_kind {
+                    let kind = match k {
+                        PlantKind::BerryBush | PlantKind::Grain => MemoryKind::AnyEdible,
+                        PlantKind::Tree => MemoryKind::wood(),
+                    };
+                    shared.report_depleted(agent_tier, (tx, ty), kind);
+                }
                 if let Some(method_id) = ai.active_method.take() {
                     method_history.push(method_id, MethodOutcome::FailedTarget, clock.tick);
                 }
@@ -387,6 +522,8 @@ pub fn gather_system(
                 );
                 continue;
             }
+            // Reborrow as &mut after the immutable peek above.
+            let mut plant = plant_query.get_mut(entity).unwrap();
 
             let kind = plant.kind;
             let has_tool = agent.has_tool();

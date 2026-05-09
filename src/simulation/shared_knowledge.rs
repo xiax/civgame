@@ -174,12 +174,29 @@ impl ResourceCluster {
     /// the cluster's first-ever-sighted tile (typically the first thing
     /// harvested), causing a stale-tile loop after the LRU drained.
     pub fn nearest_target_tile(&self, from: (i32, i32)) -> Option<(i32, i32)> {
+        self.pick_least_pressured_rep(from, |_| 0)
+    }
+
+    /// P6c: select the rep that minimises `chebyshev(rep, from) + penalty(rep)`.
+    /// Generalises `nearest_target_tile` — when callers (HTN dispatchers, the
+    /// `nearest_in_tier_set` wrapper) pass a non-trivial penalty, multiple
+    /// agents querying the same cluster fan out across its `REPRESENTATIVE_TILES`
+    /// LRU slots: the closest rep loses on score once a peer claims it, so
+    /// the next agent picks the next rep over. With a zero-penalty closure
+    /// this collapses to "closest rep wins" — bit-for-bit identical to the
+    /// pre-P6c `nearest_target_tile` behaviour.
+    pub fn pick_least_pressured_rep<P: Fn((i32, i32)) -> i32>(
+        &self,
+        from: (i32, i32),
+        penalty: P,
+    ) -> Option<(i32, i32)> {
         let mut best: Option<((i32, i32), i32)> = None;
         for slot in self.representative_tiles.iter() {
             if let Some(t) = *slot {
                 let d = (t.0 - from.0).abs().max((t.1 - from.1).abs());
-                if best.map_or(true, |(_, bd)| d < bd) {
-                    best = Some((t, d));
+                let score = d + penalty(t);
+                if best.map_or(true, |(_, bs)| score < bs) {
+                    best = Some((t, score));
                 }
             }
         }
@@ -324,7 +341,15 @@ impl KnowledgeMap {
                         if c.kind != kind || !owner_filter(c.owner) {
                             continue;
                         }
-                        let Some(target) = c.nearest_target_tile(from) else { continue };
+                        // P6c: apply claim_penalty during rep selection too,
+                        // not only after picking the closest. Otherwise a
+                        // pressured-but-closest rep wins over a free-but-far
+                        // rep on the same cluster, defeating the cluster
+                        // mutex.
+                        let Some(target) = c.pick_least_pressured_rep(from, &claim_penalty)
+                        else {
+                            continue;
+                        };
                         let raw = (target.0 - from.0).abs().max((target.1 - from.1).abs());
                         let score = raw + claim_penalty(target);
                         if best.map_or(true, |(_, bs)| score < bs) {
@@ -506,10 +531,16 @@ impl SharedKnowledge {
         for tier in tier_set.tiers() {
             let Some(m) = self.tiers.get(&tier) else { continue };
             if let Some(cid) = m.nearest(kind, from, &owner_filter, &claim_penalty, max_chunk_radius) {
-                // `nearest` already filters out clusters whose LRU is empty,
-                // so `nearest_target_tile` is expected to return Some here;
-                // skip defensively if a race or future change makes it None.
-                let Some(target) = m.clusters.get(&cid).and_then(|c| c.nearest_target_tile(from)) else {
+                // P6c: extract the tile via the same pressure-aware
+                // selector used during cluster scoring so the returned
+                // tile actually matches the score that won the cluster.
+                // Falling back to closest-only here would silently re-pick
+                // a pressured rep, defeating the cluster mutex.
+                let Some(target) = m
+                    .clusters
+                    .get(&cid)
+                    .and_then(|c| c.pick_least_pressured_rep(from, &claim_penalty))
+                else {
                     continue;
                 };
                 return Some((tier, cid, target));
@@ -765,6 +796,53 @@ mod tests {
         sk.report_depleted(faction_tier(1), (12, 12), fake_kind());
         let m = sk.map(faction_tier(1)).unwrap();
         assert_eq!(m.clusters[&cid].estimated_count, count_before);
+    }
+
+    #[test]
+    fn pick_least_pressured_rep_picks_closest_when_no_pressure() {
+        // P6c: zero-penalty closure → identical to nearest_target_tile.
+        let mut c =
+            ResourceCluster::new(ClusterId(0), fake_kind(), ResourceOwner::Public, (5, 5), 0);
+        c.push_rep((20, 20));
+        let zero = |_t: (i32, i32)| 0i32;
+        assert_eq!(c.pick_least_pressured_rep((0, 0), zero), Some((5, 5)));
+        assert_eq!(c.nearest_target_tile((0, 0)), Some((5, 5)));
+    }
+
+    #[test]
+    fn pick_least_pressured_rep_avoids_high_pressure_close_rep() {
+        // P6c: when the closest rep is heavily pressured, a farther but
+        // free rep wins. This is the cluster mutex doing its job: two
+        // workers querying the same cluster fan out across reps.
+        let mut c =
+            ResourceCluster::new(ClusterId(0), fake_kind(), ResourceOwner::Public, (5, 5), 0);
+        c.push_rep((20, 20));
+        // Penalty 100 on the close rep — far rep at chebyshev 20 wins on score.
+        let pen = |t: (i32, i32)| if t == (5, 5) { 100 } else { 0 };
+        assert_eq!(c.pick_least_pressured_rep((0, 0), pen), Some((20, 20)));
+    }
+
+    #[test]
+    fn nearest_in_tier_set_returns_pressured_aware_target() {
+        // P6c: end-to-end on `nearest_in_tier_set`. Single cluster with
+        // two reps; pressure on the closer rep flips the chosen target.
+        let mut sk = SharedKnowledge::default();
+        sk.report_sighting(faction_tier(1), (5, 5), fake_kind(), ResourceOwner::Public, 0);
+        sk.report_sighting(faction_tier(1), (12, 11), fake_kind(), ResourceOwner::Public, 0);
+        let ts = TierSet { household: None, settlement: None, faction: 1 };
+
+        // Without pressure: closest rep wins.
+        let (_, _, t0) = sk
+            .nearest_in_tier_set(ts, fake_kind(), (0, 0), |_| true, |_| 0, 32)
+            .unwrap();
+        assert_eq!(t0, (5, 5));
+
+        // With pressure on (5, 5), the farther rep wins.
+        let pen = |t: (i32, i32)| if t == (5, 5) { 100 } else { 0 };
+        let (_, _, t1) = sk
+            .nearest_in_tier_set(ts, fake_kind(), (0, 0), |_| true, pen, 32)
+            .unwrap();
+        assert_eq!(t1, (12, 11));
     }
 
     #[test]

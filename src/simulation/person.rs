@@ -203,6 +203,11 @@ pub struct PersonAI {
     /// `SharedKnowledge`, cleared by gather/scavenge finish helpers via
     /// `release_gather_claim`. `None` when no gather chain is in flight.
     pub active_gather_claim: Option<((i32, i32), crate::simulation::memory::MemoryKind)>,
+    /// Last tick `gather_system` re-targeted this agent's `Task::Gather` to a
+    /// neighboring tile after arriving to find the original plant despawned
+    /// or immature (P6b). Throttles retargeting to one swap per ~40 ticks so
+    /// a stale-cluster reflex can't loop forever.
+    pub last_retarget_tick: u64,
 }
 
 impl PersonAI {
@@ -227,6 +232,7 @@ impl Default for PersonAI {
             reserved_qty: 0,
             active_method: None,
             active_gather_claim: None,
+            last_retarget_tick: 0,
         }
     }
 }
