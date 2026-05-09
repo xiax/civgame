@@ -18,6 +18,7 @@ use crate::economy::resource_catalog::{ResourceCatalog, ResourceId};
 use crate::game_state::EconomyPreset;
 use crate::simulation::faction::Lifestyle;
 use ahash::AHashMap;
+use bevy::prelude::Resource;
 
 /// How a faction's home location is anchored. Settled factions stay put
 /// at a fixed `home_tile`; nomadic factions migrate seasonally.
@@ -317,6 +318,75 @@ pub fn derive_from_legacy(
     }
 }
 
+/// P5: per-archetype capability bundle, keyed by `archetype_key`.
+/// Constructed at startup via `default_registry(catalog)` (derives
+/// each entry from `derive_from_legacy`) and inserted as a Bevy
+/// resource by `WorldPlugin::build`. Future RON loading replaces the
+/// internal builder without touching consumers.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct FactionArchetypeRegistry {
+    entries: AHashMap<String, FactionCapabilities>,
+}
+
+impl FactionArchetypeRegistry {
+    pub fn insert(&mut self, key: String, caps: FactionCapabilities) {
+        self.entries.insert(key, caps);
+    }
+
+    /// Clone-out lookup. Returns `None` for unknown keys; callers
+    /// either fall back to `derive_from_legacy` or treat the missing
+    /// entry as a hard error depending on the call site.
+    pub fn get(&self, key: &str) -> Option<FactionCapabilities> {
+        self.entries.get(key).cloned()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(|s| s.as_str())
+    }
+}
+
+/// Build a registry populated with the four supported legacy archetypes
+/// (`settled_subsistence`, `settled_mixed`, `settled_market`,
+/// `nomadic_subsistence`). The three inert combinations
+/// (`nomadic_mixed`, `nomadic_market`, ...) are deliberately omitted —
+/// authoring them in RON is the path to enabling new archetypes;
+/// today they don't ship.
+pub fn default_registry(catalog: &ResourceCatalog) -> FactionArchetypeRegistry {
+    let mut reg = FactionArchetypeRegistry::default();
+    for (lifestyle, preset) in [
+        (Lifestyle::Settled, EconomyPreset::Subsistence),
+        (Lifestyle::Settled, EconomyPreset::Mixed),
+        (Lifestyle::Settled, EconomyPreset::Market),
+        (Lifestyle::Nomadic, EconomyPreset::Subsistence),
+    ] {
+        let caps = derive_from_legacy(lifestyle, preset, catalog);
+        reg.insert(caps.archetype_key.clone(), caps);
+    }
+    reg
+}
+
+/// P5 forward-facing entry point: look up a capability bundle by key.
+/// Falls back to `derive_from_legacy` only when the registry is missing
+/// an entry — useful during the transition while RON loading lands.
+/// New code should prefer this over `derive_from_legacy` directly.
+pub fn derive_from_archetype_key(
+    registry: &FactionArchetypeRegistry,
+    key: &str,
+    legacy_fallback: Option<(Lifestyle, EconomyPreset, &ResourceCatalog)>,
+) -> Option<FactionCapabilities> {
+    if let Some(caps) = registry.get(key) {
+        return Some(caps);
+    }
+    if let Some((lifestyle, preset, catalog)) = legacy_fallback {
+        return Some(derive_from_legacy(lifestyle, preset, catalog));
+    }
+    None
+}
+
 /// Stable archetype key for the four supported `(lifestyle, preset)`
 /// combinations. Other crosses (e.g. `Nomadic + Market`) are
 /// inert/unsupported today — labelled here so the field is
@@ -395,6 +465,61 @@ mod tests {
         assert!(caps.settlement.is_camp());
         assert!(caps.posting.is_disabled());
         assert!(!caps.land.carves_plots);
+    }
+
+    /// P5: `default_registry` populates entries for the four supported
+    /// legacy archetypes; lookup returns capability bundles
+    /// observably equal to `derive_from_legacy`.
+    #[test]
+    fn default_registry_carries_supported_archetypes() {
+        let cat = test_catalog();
+        let reg = default_registry(&cat);
+        assert_eq!(reg.len(), 4);
+        for key in [
+            "settled_subsistence",
+            "settled_mixed",
+            "settled_market",
+            "nomadic_subsistence",
+        ] {
+            assert!(reg.get(key).is_some(), "missing archetype: {key}");
+        }
+        assert!(
+            reg.get("nomadic_market").is_none(),
+            "nomadic_market is unsupported and must not be in the default registry"
+        );
+    }
+
+    /// P5: `derive_from_archetype_key` prefers the registry; the
+    /// fallback path is exercised when a key isn't authored yet.
+    #[test]
+    fn derive_from_archetype_key_prefers_registry() {
+        let cat = test_catalog();
+        let reg = default_registry(&cat);
+
+        let from_key = derive_from_archetype_key(&reg, "settled_market", None)
+            .expect("registry has settled_market");
+        let from_legacy = derive_from_legacy(Lifestyle::Settled, EconomyPreset::Market, &cat);
+        // Bundle equality where comparable: archetype_key + key flags.
+        assert_eq!(from_key.archetype_key, from_legacy.archetype_key);
+        assert_eq!(from_key.storage, from_legacy.storage);
+        assert_eq!(from_key.posting, from_legacy.posting);
+        assert_eq!(
+            from_key.income.household_skim_pct,
+            from_legacy.income.household_skim_pct
+        );
+
+        // Unknown key + no fallback → None.
+        let missing = derive_from_archetype_key(&reg, "feudal_lord", None);
+        assert!(missing.is_none());
+
+        // Unknown key + legacy fallback → returns legacy bundle.
+        let fallback = derive_from_archetype_key(
+            &reg,
+            "feudal_lord",
+            Some((Lifestyle::Settled, EconomyPreset::Market, &cat)),
+        );
+        assert!(fallback.is_some());
+        assert_eq!(fallback.unwrap().archetype_key, "settled_market");
     }
 
     #[test]

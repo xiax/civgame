@@ -32,7 +32,16 @@ impl Plugin for WorldPlugin {
         // `ResourceId::*` accessors which can't take system params.
         let catalog = crate::economy::resource_catalog::load_resource_catalog();
         crate::economy::core_ids::install_catalog(catalog.clone());
+        // P5: faction-archetype registry. Built at startup from the four
+        // supported legacy archetypes (`derive_from_legacy` is the
+        // current backing builder). Future RON loading replaces the
+        // builder without touching consumers — the registry is the new
+        // forward-facing entry point exposed via
+        // `derive_from_archetype_key`.
+        let archetype_registry =
+            crate::simulation::archetype::default_registry(&catalog);
         app.insert_resource(catalog);
+        app.insert_resource(archetype_registry);
 
         insert_globe(app);
         app.world_mut()

@@ -107,7 +107,10 @@ impl TestSim {
         // populated cell silently no-ops.
         let catalog = crate::economy::resource_catalog::load_resource_catalog();
         crate::economy::core_ids::install_catalog(catalog.clone());
+        let archetype_registry =
+            crate::simulation::archetype::default_registry(&catalog);
         app.insert_resource(catalog);
+        app.insert_resource(archetype_registry);
 
         // World resources (mirrors WorldPlugin minus the rendering
         // PostUpdate system). Globe::new is empty — enough for chunk
