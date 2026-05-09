@@ -6,6 +6,7 @@ use crate::simulation::carry::Carrier;
 use crate::simulation::carve::carve_tile;
 use crate::simulation::construction::WallMap;
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
+use crate::simulation::gather_claims::{release_gather_claim, GatherClaims};
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
@@ -97,6 +98,9 @@ pub struct GatherRoutingResources<'w, 's> {
     /// (the trailing leg of the gather-for-personal-build chain produced by
     /// `GatherAndHaulToPersonalBlueprintMethod`).
     pub bp_query: Query<'w, 's, &'static crate::simulation::construction::Blueprint>,
+    /// Read by `finish_gather` to release any active gather claim staked at
+    /// dispatch time. Mirrors the `release_reservation` plumbing for storage.
+    pub gather_claims: Res<'w, GatherClaims>,
 }
 
 /// Phase 5c-ii-c-ii chain handoff: called by every `gather_system` exit path
@@ -122,12 +126,20 @@ pub struct GatherRoutingResources<'w, 's> {
 fn finish_gather(
     ai: &mut PersonAI,
     aq: &mut ActionQueue,
+    actor: Entity,
     cur_tile: (i32, i32),
     cur_chunk: ChunkCoord,
     faction_id: Option<u32>,
     chunk_map: &ChunkMap,
     routing: &GatherRoutingResources,
 ) {
+    // Drop any active gather claim before resetting AI state. Mirrors
+    // `release_reservation` for storage: the claim was staked at dispatch
+    // time by the four resource-target dispatchers, so every Gather exit
+    // (success/fail/handoff) must release it or the cluster stays "claimed"
+    // until expiry and downstream agents over-disperse.
+    release_gather_claim(&routing.gather_claims, ai, actor);
+
     ai.state = AiState::Idle;
     ai.task_id = PersonAI::UNEMPLOYED;
     ai.target_entity = None;
@@ -345,6 +357,7 @@ pub fn gather_system(
                 finish_gather(
                     &mut ai,
                     &mut aq,
+                    actor,
                     cur_tile,
                     cur_chunk,
                     faction_id,
@@ -365,6 +378,7 @@ pub fn gather_system(
                 finish_gather(
                     &mut ai,
                     &mut aq,
+                    actor,
                     cur_tile,
                     cur_chunk,
                     faction_id,
@@ -571,6 +585,7 @@ pub fn gather_system(
                 finish_gather(
                     &mut ai,
                     &mut aq,
+                    actor,
                     cur_tile,
                     cur_chunk,
                     faction_id,
@@ -588,6 +603,7 @@ pub fn gather_system(
                 finish_gather(
                     &mut ai,
                     &mut aq,
+                    actor,
                     cur_tile,
                     cur_chunk,
                     faction_id,
@@ -603,6 +619,7 @@ pub fn gather_system(
             finish_gather(
                 &mut ai,
                 &mut aq,
+                actor,
                 cur_tile,
                 cur_chunk,
                 faction_id,

@@ -168,6 +168,11 @@ impl CurrentVision {
     /// requested kind that the viewer can harvest without theft. Used as the
     /// vision-first short-circuit for gather methods before falling back to
     /// `SharedKnowledge`.
+    ///
+    /// `claim_penalty` returns extra cost (in chebyshev tiles) to add for a
+    /// candidate tile — typically `GatherClaims::pressure(tile, now, viewer) * 4`
+    /// at the call site, mirroring `SharedKnowledge::nearest_target_tile`'s
+    /// claim weight so two paths score consistently. Pass `|_| 0` to opt out.
     pub fn nearest_gather_target(
         &self,
         kind: MemoryKind,
@@ -176,6 +181,7 @@ impl CurrentVision {
         viewer_household: Option<u32>,
         viewer_settlement: Option<crate::simulation::settlement::SettlementId>,
         viewer_faction: u32,
+        claim_penalty: impl Fn((i32, i32)) -> i32,
     ) -> Option<(i32, i32)> {
         self.iter_kind(kind)
             .filter(|v| v.entity.is_none())
@@ -188,7 +194,8 @@ impl CurrentVision {
                 )
             })
             .min_by_key(|v| {
-                (v.tile.0 - from.0).abs().max((v.tile.1 - from.1).abs())
+                let cheb = (v.tile.0 - from.0).abs().max((v.tile.1 - from.1).abs());
+                cheb + claim_penalty(v.tile)
             })
             .map(|v| v.tile)
     }

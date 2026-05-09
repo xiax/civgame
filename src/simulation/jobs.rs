@@ -851,6 +851,7 @@ const FARM_TILES_PER_POST: u32 = 6;
 /// postings whose target no longer needs work are dropped before new ones are
 /// added.
 pub fn chief_job_posting_system(
+    mut commands: Commands,
     clock: Res<SimClock>,
     registry: Res<FactionRegistry>,
     bp_map: Res<BlueprintMap>,
@@ -864,6 +865,7 @@ pub fn chief_job_posting_system(
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
     calendar: Res<crate::world::seasons::Calendar>,
     mut board: ResMut<JobBoard>,
+    mut completed_events: EventWriter<JobCompletedEvent>,
 ) {
     if clock.tick % CHIEF_POSTING_INTERVAL != 0 {
         return;
@@ -907,9 +909,57 @@ pub fn chief_job_posting_system(
         // 1. Drop stale unclaimed Chief postings whose target no longer needs work.
         //    Build postings whose project is not in the Build phase are also
         //    dropped here — the chief re-posts them once materials are in.
-        //    Haul postings whose target blueprint despawned are dropped.
+        //    Haul postings whose target blueprint despawned OR whose slot is
+        //    already satisfied are dropped (Fix 1b — periodic catch-up for
+        //    Fix 1a's per-tick eager cleanup at deposit time). Haul postings
+        //    with claimants are NOT short-circuited: a satisfied-slot posting
+        //    must drop and release its claimants regardless of claim status,
+        //    otherwise haulers thrash in withdraw-walk-noop loops.
         {
+            // Two-pass: pre-collect Haul postings to drop with claimant
+            // cleanup, then run the standard retain on the rest. Mirrors the
+            // pattern in `job_claim_release_system`.
             let postings = board.faction_postings_mut(faction_id);
+            let mut to_drop_with_claimants: Vec<(JobId, JobKind, Vec<Entity>)> =
+                Vec::new();
+            for p in postings.iter() {
+                if !matches!(p.source, JobSource::Chief) {
+                    continue;
+                }
+                if let JobProgress::Haul {
+                    blueprint,
+                    resource_id,
+                    ..
+                } = p.progress
+                {
+                    let drop = match bp_query.get(blueprint) {
+                        Err(_) => true,
+                        Ok(bp) => bp.slot_satisfied(resource_id),
+                    };
+                    if drop {
+                        to_drop_with_claimants.push((
+                            p.id,
+                            p.kind,
+                            p.claimants.clone(),
+                        ));
+                    }
+                }
+            }
+            for (job_id, kind, claimants) in to_drop_with_claimants {
+                if let Some(idx) = postings.iter().position(|p| p.id == job_id) {
+                    postings.swap_remove(idx);
+                }
+                for c in claimants {
+                    commands.entity(c).remove::<JobClaim>();
+                    commands.entity(c).remove::<ClaimTarget>();
+                }
+                completed_events.send(JobCompletedEvent {
+                    job_id,
+                    faction_id,
+                    kind,
+                });
+            }
+
             postings.retain(|p| {
                 if !matches!(p.source, JobSource::Chief) {
                     return true;
@@ -927,9 +977,8 @@ pub fn chief_job_posting_system(
                             None => false,
                         }
                     }
-                    JobProgress::Haul { blueprint, .. } => {
-                        bp_query.get(blueprint).is_ok()
-                    }
+                    // Haul postings are already handled by the two-pass above.
+                    JobProgress::Haul { .. } => true,
                     JobProgress::Calories { .. }
                     | JobProgress::Stockpile { .. }
                     | JobProgress::Planting { .. }

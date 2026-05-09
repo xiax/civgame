@@ -1,4 +1,5 @@
 use super::faction::StorageTileMap;
+use super::gather_claims::{release_gather_claim, GatherClaims};
 use super::goals::AgentGoal;
 use super::items::GroundItem;
 use super::lod::LodLevel;
@@ -593,8 +594,10 @@ pub fn assign_task_with_routing(
 ///    when one of those goals flips and a stale `Explore` task is still
 ///    Working, drop it back to Idle.
 pub fn goal_dispatch_system(
+    gather_claims: Res<GatherClaims>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut crate::simulation::typed_task::ActionQueue,
             &AgentGoal,
@@ -605,7 +608,7 @@ pub fn goal_dispatch_system(
 ) {
     query
         .par_iter_mut()
-        .for_each(|(mut ai, mut aq, goal, lod)| {
+        .for_each(|(actor, mut ai, mut aq, goal, lod)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -918,6 +921,9 @@ pub fn goal_dispatch_system(
 
                 if Some(ai.task_id) != expected_task {
                     // Goal changed or task is done; drop the current task.
+                    // A pending gather claim must release here too: a goal
+                    // flip preempts the chain before `finish_gather` runs.
+                    release_gather_claim(&gather_claims, &mut ai, actor);
                     ai.state = AiState::Idle;
                     ai.task_id = PersonAI::UNEMPLOYED;
                     // Phase 4b-ii: a goal flip is an external preempt — any

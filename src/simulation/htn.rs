@@ -45,6 +45,7 @@ use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::carry::Carrier;
 use crate::simulation::construction::{Bed, HomeBed};
 use crate::simulation::faction::{FactionMember, FactionRegistry, StorageTileMap, SOLO};
+use crate::simulation::gather_claims::{suggested_expiry, GatherClaims};
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::MemoryKind;
@@ -456,7 +457,14 @@ impl MethodOutcome {
 /// method below most siblings (1.5 → 0.5). Lower than `MAX_DIST_PENALTY`
 /// (0.30) so distance still discriminates between two siblings on the same
 /// failure count.
-pub const METHOD_FAILURE_PENALTY: f32 = 0.5;
+///
+/// Tuned 0.5 → 0.2 per `feedback_plan_history_design.md` ("PlanHistory
+/// should bias, not exclude"): the prior 0.5 + ring-of-2 was strong enough
+/// that a single failure could flip the argmax even when the failed method
+/// remained the right choice (e.g. transient routing failure on the only
+/// reachable storage tile). 0.2 still discriminates between repeat-failers
+/// and clean candidates without dominating the utility tiers.
+pub const METHOD_FAILURE_PENALTY: f32 = 0.2;
 
 // ── Method utility tiers (Phase 6c) ────────────────────────────────────
 //
@@ -3520,6 +3528,7 @@ pub fn htn_acquire_food_dispatch_system(
     method_registry: Res<MethodRegistry>,
     clock: Res<SimClock>,
     plant_map: Res<PlantMap>,
+    gather_claims: Res<GatherClaims>,
     gk: crate::simulation::shared_knowledge::GatherKnowledge,
     plant_query: Query<&Plant>,
     mut query: Query<
@@ -3619,6 +3628,7 @@ pub fn htn_acquire_food_dispatch_system(
                 viewer_household,
                 viewer_settlement,
                 member.faction_id,
+                |t| gather_claims.pressure(t, now, actor) * 4,
             );
             let gather_target_tile = visible_forage.or_else(|| {
                 gk.nearest_target_tile(
@@ -3853,6 +3863,14 @@ pub fn htn_acquire_food_dispatch_system(
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     }
+                    let kind = MemoryKind::AnyEdible;
+                    gather_claims.add(
+                        gather_tile,
+                        kind,
+                        actor,
+                        suggested_expiry(now, (cur_tx, cur_ty), gather_tile),
+                    );
+                    ai.active_gather_claim = Some((gather_tile, kind));
                     aq.dispatch(Task::Gather { tile: gather_tile });
                 }
                 _ => {
@@ -3938,6 +3956,7 @@ pub fn htn_acquire_good_dispatch_system(
     method_registry: Res<MethodRegistry>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<SimClock>,
+    gather_claims: Res<GatherClaims>,
     gk: crate::simulation::shared_knowledge::GatherKnowledge,
     item_query: Query<&crate::simulation::items::GroundItem>,
     bp_query: Query<&crate::simulation::construction::Blueprint>,
@@ -3955,6 +3974,8 @@ pub fn htn_acquire_good_dispatch_system(
             Option<&crate::simulation::jobs::JobClaim>,
             Option<&crate::simulation::reproduction::HouseholdMember>,
             &crate::simulation::memory::CurrentVision,
+            &crate::simulation::carry::Carrier,
+            &crate::economy::agent::EconomicAgent,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -3975,6 +3996,8 @@ pub fn htn_acquire_good_dispatch_system(
         job_claim_opt,
         household_member,
         current_vision,
+        carrier,
+        agent_econ,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -4042,6 +4065,7 @@ pub fn htn_acquire_good_dispatch_system(
                     viewer_household,
                     viewer_settlement,
                     member.faction_id,
+                    |t| gather_claims.pressure(t, now, actor) * 4,
                 );
                 let gather_target_tile = visible_gather.or_else(|| {
                     gk.nearest_target_tile(
@@ -4175,6 +4199,13 @@ pub fn htn_acquire_good_dispatch_system(
                             history.push(chosen_id, MethodOutcome::FailedRouting, now);
                             continue;
                         }
+                        gather_claims.add(
+                            gather_tile,
+                            memory_kind,
+                            actor,
+                            suggested_expiry(now, (cur_tx, cur_ty), gather_tile),
+                        );
+                        ai.active_gather_claim = Some((gather_tile, memory_kind));
                         aq.dispatch(Task::Gather { tile: gather_tile });
                     }
                     Task::Scavenge { target } => {
@@ -4283,6 +4314,54 @@ pub fn htn_acquire_good_dispatch_system(
             continue;
         };
 
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Fix 3a: in-hand fast-path. If the agent is already carrying the
+        // resource (in-hand or in-inventory) and the bp's slot still needs
+        // ≥1 of it, skip the storage round-trip and walk straight to the bp
+        // to deposit. Scoped strictly to dispatchers that already hold a
+        // JobClaim::Haul — never flows back into posting creation. This
+        // avoids the redundant Withdraw→walk→Withdraw cycle when an agent
+        // ends up with material in hand from a prior interrupted chain.
+        let in_hand = carrier
+            .quantity_of_resource(resource_id)
+            .saturating_add(agent_econ.quantity_of_resource(resource_id));
+        if in_hand > 0 {
+            let bp_needs_more = bp_query
+                .get(blueprint)
+                .map(|bp| !bp.slot_satisfied(resource_id))
+                .unwrap_or(false);
+            if let (Ok(bp), true) = (bp_query.get(blueprint), bp_needs_more) {
+                let bp_tile = bp.tile;
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    bp_tile,
+                    TaskKind::HaulMaterials,
+                    Some(blueprint),
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if dispatched {
+                    aq.dispatch(Task::HaulToBlueprint { blueprint });
+                    // No active method to record — direct dispatch bypasses
+                    // the Method/MethodHistory machinery.
+                    ai.active_method = None;
+                    continue;
+                }
+                // Routing failed — fall through to the standard withdraw
+                // chain so the agent can re-route via storage if reachable.
+            }
+        }
+
         // Faction-level stock check — mirrors `WithdrawAndHaulToBlueprintMethod`'s
         // precondition gate. Skipping early when the faction has no stock at
         // all avoids touching `SpatialIndex` for every tile on a dry larder.
@@ -4294,13 +4373,6 @@ pub fn htn_acquire_good_dispatch_system(
         if stock == 0 {
             continue;
         }
-
-        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
-        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-        let cur_chunk = ChunkCoord(
-            cur_tx.div_euclid(CHUNK_SIZE as i32),
-            cur_ty.div_euclid(CHUNK_SIZE as i32),
-        );
 
         // Walk the faction's storage tiles to find the nearest one with the
         // target good in stock (effective stock after reservations > 0).
@@ -4498,6 +4570,7 @@ pub fn htn_stockpile_food_dispatch_system(
     method_registry: Res<MethodRegistry>,
     clock: Res<SimClock>,
     plant_map: Res<PlantMap>,
+    gather_claims: Res<GatherClaims>,
     gk: crate::simulation::shared_knowledge::GatherKnowledge,
     item_query: Query<&crate::simulation::items::GroundItem>,
     plant_query: Query<&Plant>,
@@ -4621,6 +4694,7 @@ pub fn htn_stockpile_food_dispatch_system(
                     viewer_household,
                     viewer_settlement,
                     member.faction_id,
+                    |t| gather_claims.pressure(t, now, actor) * 4,
                 )
                 .and_then(|tile| {
                     let entity = plant_map.0.get(&tile).copied()?;
@@ -4810,6 +4884,14 @@ pub fn htn_stockpile_food_dispatch_system(
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     }
+                    let kind = MemoryKind::AnyEdible;
+                    gather_claims.add(
+                        gather_tile,
+                        kind,
+                        actor,
+                        suggested_expiry(now, (cur_tx, cur_ty), gather_tile),
+                    );
+                    ai.active_gather_claim = Some((gather_tile, kind));
                     aq.dispatch(Task::Gather { tile: gather_tile });
                 }
                 _ => {
@@ -6064,6 +6146,8 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             Option<&crate::simulation::jobs::JobClaim>,
             Option<&crate::simulation::jobs::ClaimTarget>,
             Option<&crate::simulation::reproduction::HouseholdMember>,
+            &crate::simulation::carry::Carrier,
+            &crate::economy::agent::EconomicAgent,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -6082,6 +6166,8 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
         job_claim_opt,
         claim_target_opt,
         household_member,
+        carrier,
+        agent_econ,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -6136,6 +6222,54 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             cur_tx.div_euclid(CHUNK_SIZE as i32),
             cur_ty.div_euclid(CHUNK_SIZE as i32),
         );
+
+        // Fix 3b: in-hand fast-path for Path B (personal bp, unsatisfied
+        // deposits). If the agent already carries enough of an unmet slot's
+        // resource, dispatch HaulMaterials directly to the bp tile. Skips a
+        // redundant storage round-trip when a prior interrupted chain left
+        // material in their hands. Path A's bp is already satisfied by gate,
+        // so this only fires for Path B. Scoped to dispatcher only — never
+        // affects posting creation or chief candidate scoring.
+        if path_b.is_some() && !bp.is_satisfied() {
+            let mut hauled = false;
+            for i in 0..bp.deposit_count as usize {
+                let still = bp.deposits[i]
+                    .needed
+                    .saturating_sub(bp.deposits[i].deposited)
+                    as u32;
+                if still == 0 {
+                    continue;
+                }
+                let rid = bp.deposits[i].resource_id;
+                let in_hand = carrier
+                    .quantity_of_resource(rid)
+                    .saturating_add(agent_econ.quantity_of_resource(rid));
+                if in_hand == 0 {
+                    continue;
+                }
+                let dispatched = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    bp_tile,
+                    TaskKind::HaulMaterials,
+                    Some(bp_entity),
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if dispatched {
+                    aq.dispatch(Task::HaulToBlueprint { blueprint: bp_entity });
+                    ai.active_method = None;
+                    hauled = true;
+                }
+                break;
+            }
+            if hauled {
+                continue;
+            }
+        }
 
         // For Path B with deposits unmet, resolve the most-deficient resource
         // + nearest faction storage tile holding it. Mirrors the legacy
@@ -8401,6 +8535,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
     plant_map: Res<PlantMap>,
     plant_query: Query<&Plant>,
     clock: Res<SimClock>,
+    gather_claims: Res<GatherClaims>,
     gk: crate::simulation::shared_knowledge::GatherKnowledge,
     mut query: Query<
         (
@@ -8502,6 +8637,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
                 viewer_household,
                 viewer_settlement,
                 member.faction_id,
+                |t| gather_claims.pressure(t, now, actor) * 4,
             )
             .filter(|tile| {
                 plant_map
@@ -8619,6 +8755,14 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
                     history.push(chosen_id, MethodOutcome::FailedRouting, now);
                     continue;
                 }
+                let kind = MemoryKind::Resource(grain_id);
+                gather_claims.add(
+                    tile,
+                    kind,
+                    actor,
+                    suggested_expiry(now, (cur_tx, cur_ty), tile),
+                );
+                ai.active_gather_claim = Some((tile, kind));
                 aq.dispatch(Task::Gather { tile });
             }
             _ => {

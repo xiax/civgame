@@ -7,7 +7,8 @@ use crate::simulation::faction::{
 };
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::jobs::{
-    record_progress_filtered, JobBoard, JobClaim, JobCompletedEvent, JobKind,
+    record_progress_filtered, release_claimant, ClaimTarget, JobBoard, JobClaim,
+    JobCompletedEvent, JobKind, JobProgress,
 };
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
@@ -513,6 +514,20 @@ impl Blueprint {
         for i in 0..self.deposit_count as usize {
             if self.deposits[i].deposited < self.deposits[i].needed {
                 return false;
+            }
+        }
+        true
+    }
+
+    /// True when the slot for `resource_id` is filled, or when the blueprint
+    /// has no slot for that resource (trivially nothing to deliver).
+    pub fn slot_satisfied(
+        &self,
+        resource_id: crate::economy::resource_catalog::ResourceId,
+    ) -> bool {
+        for i in 0..self.deposit_count as usize {
+            if self.deposits[i].resource_id == resource_id {
+                return self.deposits[i].deposited >= self.deposits[i].needed;
             }
         }
         true
@@ -2979,6 +2994,28 @@ pub fn construction_system(
                 ai.task_id = PersonAI::UNEMPLOYED;
                 ai.work_progress = 0;
                 ai.target_entity = None;
+                // Fix 2: also drop the Haul JobClaim if it points to this
+                // satisfied bp. Without this, `job_claim_system` would re-claim
+                // the same hauler against the same Haul posting on the next
+                // tick, trapping them in a withdraw-walk-noop loop. Only drop
+                // when the held claim is actually a Haul against THIS bp —
+                // a Haul claim against a different bp is unrelated and stays.
+                if let Some(claim) = claim_opt {
+                    if claim.kind == JobKind::Haul {
+                        let claim_bp_matches = job_board.get(claim.job_id).map_or(
+                            false,
+                            |p| matches!(
+                                &p.progress,
+                                JobProgress::Haul { blueprint, .. } if *blueprint == bp_entity
+                            ),
+                        );
+                        if claim_bp_matches {
+                            commands.entity(entity).remove::<JobClaim>();
+                            commands.entity(entity).remove::<ClaimTarget>();
+                            release_claimant(&mut job_board, claim.job_id, entity);
+                        }
+                    }
+                }
                 continue;
             }
             bp_haulers
@@ -3003,6 +3040,9 @@ pub fn construction_system(
     // Workers who actually advanced progress this tick (i.e. on-site at a
     // satisfied blueprint). Building XP is granted in pass 3.
     let mut xp_grants: Vec<Entity> = Vec::new();
+    // Workers waiting at an unsatisfied bp — clear their stale work_progress
+    // counter (Fix 5). Pass 3 zeroes these.
+    let mut work_progress_resets: Vec<Entity> = Vec::new();
     // (agent_entity, good, qty_to_remove)
     let mut good_removals: Vec<(Entity, crate::economy::resource_catalog::ResourceId, u32)> = Vec::new();
 
@@ -3028,6 +3068,15 @@ pub fn construction_system(
 
         // Deposit hauler goods first. Credit any held Haul JobClaim with the
         // delivered quantity so the posting tracks completion.
+        // Track which (resource_id) slots became satisfied this pass so we can
+        // drop the matching Haul postings eagerly (Fix 1a) — without this,
+        // postings whose `delivered` counter never matched `target` (because
+        // claimants were dropped mid-trip and credits stopped) would linger
+        // and trap fresh haulers in a withdraw-walk-noop loop.
+        let bp_faction_id = bp.faction_id;
+        let mut newly_satisfied_resources: Vec<
+            crate::economy::resource_catalog::ResourceId,
+        > = Vec::with_capacity(MAX_BUILD_INPUTS);
         if let Some(haulers) = bp_haulers.get(&bp_entity) {
             for (agent_e, snap, claim_opt) in haulers {
                 for i in 0..bp.deposit_count as usize {
@@ -3036,9 +3085,20 @@ pub fn construction_system(
                     if still == 0 || snap[i] == 0 {
                         continue;
                     }
-                    let take = still.min(snap[i]);
+                    // Cap `take` to fit the u8 deposit counter (Fix 4). `still`
+                    // is already ≤ u8::MAX today (both `needed` and `deposited`
+                    // are u8), but capping again defends future recipes.
+                    let take = still.min(snap[i]).min(u8::MAX as u32);
                     good_removals.push((*agent_e, need.resource_id, take));
-                    bp.deposits[i].deposited = bp.deposits[i].deposited.saturating_add(take as u8);
+                    let prev = bp.deposits[i].deposited;
+                    bp.deposits[i].deposited = prev.saturating_add(take as u8);
+                    let now_satisfied = prev < bp.deposits[i].needed
+                        && bp.deposits[i].deposited >= bp.deposits[i].needed;
+                    if now_satisfied
+                        && !newly_satisfied_resources.contains(&need.resource_id)
+                    {
+                        newly_satisfied_resources.push(need.resource_id);
+                    }
                     if let Some(claim) = claim_opt {
                         if claim.kind == JobKind::Haul {
                             record_progress_filtered(
@@ -3056,6 +3116,38 @@ pub fn construction_system(
                 hauler_done.push(*agent_e);
             }
         }
+        // Fix 1a: drop any Haul posting whose (blueprint, resource_id) slot
+        // just filled. Mirrors the cleanup pattern in `job_claim_release_system`
+        // (jobs.rs ~line 2548): remove the posting, strip `JobClaim` +
+        // `ClaimTarget` from every claimant, fire `JobCompletedEvent`. Without
+        // this, claimants whose contributions weren't credited via
+        // `record_progress_filtered` (e.g., crisis-goal preempt dropped their
+        // claim mid-trip) would re-cycle through Withdraw→walk→noop forever.
+        for satisfied_rid in &newly_satisfied_resources {
+            let postings = job_board.faction_postings_mut(bp_faction_id);
+            let mut idx = 0;
+            while idx < postings.len() {
+                let drop = matches!(
+                    &postings[idx].progress,
+                    JobProgress::Haul { blueprint, resource_id, .. }
+                        if *blueprint == bp_entity && *resource_id == *satisfied_rid
+                );
+                if drop {
+                    let dropped = postings.swap_remove(idx);
+                    for c in dropped.claimants {
+                        commands.entity(c).remove::<JobClaim>();
+                        commands.entity(c).remove::<ClaimTarget>();
+                    }
+                    job_completed.send(JobCompletedEvent {
+                        job_id: dropped.id,
+                        faction_id: bp_faction_id,
+                        kind: dropped.kind,
+                    });
+                } else {
+                    idx += 1;
+                }
+            }
+        }
 
         // Advance work by one tick per on-site worker — but only once all
         // materials have been deposited. Gating on `is_satisfied()` here
@@ -3071,6 +3163,13 @@ pub fn construction_system(
                     .min(recipe.work_ticks);
                 xp_grants.extend(workers.iter().copied());
             }
+        } else if let Some(workers) = bp_workers.get(&bp_entity) {
+            // Fix 5: workers on-site at an unsatisfied bp accumulate dead
+            // `ai.work_progress` from `movement_system`'s Working tick. The
+            // counter isn't read by `construction_system` (`bp.build_progress`
+            // is the real one), but it leaks into the inspector. Reset so the
+            // displayed value stays meaningful.
+            work_progress_resets.extend(workers.iter().copied());
         }
 
         if bp.build_progress >= recipe.work_ticks && bp.is_satisfied() {
@@ -3385,6 +3484,7 @@ pub fn construction_system(
         && hauler_done.is_empty()
         && orphaned_agents.is_empty()
         && xp_grants.is_empty()
+        && work_progress_resets.is_empty()
     {
         return;
     }
@@ -3408,6 +3508,10 @@ pub fn construction_system(
 
         if xp_grants.contains(&entity) {
             skills.gain_xp(SkillKind::Building, 1);
+        }
+
+        if work_progress_resets.contains(&entity) {
+            ai.work_progress = 0;
         }
 
         let is_completed = completed_agents.contains(&entity);

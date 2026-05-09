@@ -5826,6 +5826,125 @@ mod baseline_behaviour {
         }
     }
 
+    #[test]
+    fn pre_staked_claim_diverts_dispatcher_to_unclaimed_cluster() {
+        // Regression: when a `GatherClaim` is already staked on a known
+        // cluster, the dispatcher's claim-aware target selection
+        // (`SharedKnowledge::nearest_target_tile` weighted by
+        // `GatherClaims::pressure * 4`) must prefer the unclaimed cluster
+        // even when both are at the same chebyshev distance. Pre-staking by
+        // a sentinel entity keeps the test deterministic regardless of the
+        // dispatcher's iteration order.
+        use crate::simulation::gather_claims::GatherClaims;
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::jobs::{
+            ClaimTarget, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+        };
+        use crate::simulation::memory::MemoryKind;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(31);
+        sim.flat_world(2, 0, TileKind::Grass);
+        sim.spawn_storage_tile(sim.player_faction_id, (4, 4));
+
+        // Chief + one worker. The worker is the one we exercise. No warmup
+        // ticks: idle wander would push the worker out of chunk (0, 0)
+        // within 10 ticks (`IDLE_WANDER_INTERVAL=2.5s` ≈ 50 ticks but
+        // `wander_timer` defaults to 0 so the first tick fires), which
+        // shifts the spiral search origin and makes the test flaky.
+        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |_| {});
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Two wood sightings in adjacent ring-1 chunks at equal chebyshev
+        // distance from (0, 0). With no claims, the spiral search finds
+        // both in the same ring and the first-iterated wins (chunk order:
+        // dx=-1 hit before dx=+1, so cluster_b is the natural pick). With
+        // a pre-staked claim on cluster_b, the +4 penalty pushes selection
+        // to cluster_a.
+        let cluster_a = (40, 0);
+        let cluster_b = (-40, 0);
+        sim.inject_faction_sighting(sim.player_faction_id, cluster_a, MemoryKind::wood());
+        sim.inject_faction_sighting(sim.player_faction_id, cluster_b, MemoryKind::wood());
+
+        // Pre-stake a claim on cluster_b owned by a sentinel entity (the
+        // chief stand-in here — `pressure` excludes only the viewer's own
+        // claims, so any other entity works).
+        let sentinel = _chief;
+        {
+            let claims = sim.app.world().resource::<GatherClaims>();
+            claims.add(cluster_b, MemoryKind::wood(), sentinel, u64::MAX);
+        }
+
+        // Wire the worker into the GatherWood goal via a Stockpile posting.
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            let posting = JobPosting {
+                id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Stockpile {
+                    resource_id: crate::economy::core_ids::wood(),
+                    deposited: 0,
+                    target: 16,
+                },
+                claimants: vec![worker],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            };
+            board
+                .postings
+                .entry(sim.player_faction_id)
+                .or_default()
+                .push(posting);
+            id
+        };
+        {
+            let mut entity = sim.app.world_mut().entity_mut(worker);
+            entity.insert(JobClaim {
+                job_id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                posted_tick: 0,
+                fail_count: 0,
+            });
+            entity.insert(ClaimTarget::default());
+            let mut goal = entity.get_mut::<AgentGoal>().unwrap();
+            *goal = AgentGoal::GatherWood;
+        }
+
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(worker)
+            .expect("worker ActionQueue missing");
+        let picked = match aq.current {
+            Task::Gather { tile } => tile,
+            other => panic!("expected Task::Gather, got {:?}", other),
+        };
+        assert_eq!(
+            picked, cluster_a,
+            "worker should pick the unclaimed cluster_a; picking {:?} means \
+             GatherClaims pressure is not feeding nearest_target_tile",
+            picked
+        );
+
+        // Worker's own claim was staked at dispatch alongside the sentinel.
+        let claims = sim.app.world().resource::<GatherClaims>();
+        assert_eq!(
+            claims.total(),
+            2,
+            "expected sentinel claim + worker's freshly-staked claim"
+        );
+    }
+
     /// Phase 5c-ii-d-ii-a: when a `GatherWood`-goal agent has a visible loose
     /// `Wood` `GroundItem` within `VIEW_RADIUS=15`, the scavenge chain
     /// (`[Task::Scavenge { target }, Task::DepositToFactionStorage { Wood }]`)
@@ -8727,6 +8846,304 @@ mod baseline_behaviour {
             ),
             other => panic!(
                 "expected Task::Gather targeting the visible berry, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Fix 1b: a chief Haul posting whose target blueprint slot is already
+    /// satisfied is dropped on the next `chief_job_posting_system` tick, and
+    /// any claimants have their `JobClaim` + `ClaimTarget` stripped.
+    /// Exercises the periodic catch-up branch of the Haul-posting cleanup
+    /// (Fix 1a's eager branch fires during `construction_system` deposit).
+    /// Without these, claimants thrash in withdraw→walk→noop loops.
+    #[test]
+    fn chief_drops_haul_posting_when_blueprint_slot_satisfied() {
+        use crate::simulation::construction::{Blueprint, BlueprintMap, BuildSiteKind};
+        use crate::simulation::jobs::{
+            ClaimTarget, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+            PosterClass,
+        };
+
+        let mut sim = TestSim::new(2026_05_08);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Spawn a chief so chief_job_posting_system runs for this faction.
+        let chief = sim.spawn_person(sim.player_faction_id, (-3, -3), |_| {});
+        sim.app
+            .world_mut()
+            .entity_mut(chief)
+            .insert(crate::simulation::faction::FactionChief);
+
+        // The would-be hauler.
+        let hauler = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Civic blueprint (no personal_owner) at (8, 8) — Bed needs 3 wood.
+        // Pre-fill the deposit slot so it's already satisfied.
+        let bp_tile = (8, 8);
+        let bp_world = tile_to_world(bp_tile.0, bp_tile.1);
+        let blueprint = sim
+            .app
+            .world_mut()
+            .spawn((
+                {
+                    let mut bp = Blueprint::new(
+                        sim.player_faction_id,
+                        None,
+                        BuildSiteKind::Bed,
+                        bp_tile,
+                        0,
+                    );
+                    for i in 0..bp.deposit_count as usize {
+                        bp.deposits[i].deposited = bp.deposits[i].needed;
+                    }
+                    assert!(bp.is_satisfied());
+                    bp
+                },
+                Transform::from_xyz(bp_world.x, bp_world.y, 0.5),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<BlueprintMap>()
+            .0
+            .insert(bp_tile, blueprint);
+
+        // Manually post a Haul posting against the now-satisfied bp with the
+        // hauler as the only claimant. Mirrors the state the system reaches
+        // when a deposit credited the slot via a path that wasn't a
+        // JobClaim::Haul (e.g. claim was crisis-dropped mid-trip).
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board
+                .faction_postings_mut(sim.player_faction_id)
+                .push(JobPosting {
+                    id,
+                    faction_id: sim.player_faction_id,
+                    kind: JobKind::Haul,
+                    progress: JobProgress::Haul {
+                        blueprint,
+                        resource_id: crate::economy::core_ids::wood(),
+                        // Lingering: delivered < target so the standard
+                        // record_progress_filtered auto-removal never fires.
+                        delivered: 0,
+                        target: 3,
+                    },
+                    claimants: vec![hauler],
+                    priority: 100,
+                    source: JobSource::Chief,
+                    posted_tick: 0,
+                    expiry_tick: None,
+                    poster_class: PosterClass::Chief,
+                    reward: 0.0,
+                    settlement_id: None,
+                });
+            id
+        };
+        sim.app.world_mut().entity_mut(hauler).insert(JobClaim {
+            job_id,
+            faction_id: sim.player_faction_id,
+            kind: JobKind::Haul,
+            posted_tick: 0,
+            fail_count: 0,
+        });
+        sim.app.world_mut().entity_mut(hauler).insert(ClaimTarget {
+            blueprint: Some(blueprint),
+            kind: crate::simulation::jobs::ClaimKind::Specific(
+                crate::economy::core_ids::wood(),
+            ),
+        });
+
+        // Tick past CHIEF_POSTING_INTERVAL (60). Fix 1b's two-pass cleanup in
+        // chief_job_posting_system should drop the posting and strip the
+        // claimant's JobClaim + ClaimTarget.
+        sim.tick_n(80);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let still_present = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .any(|p| p.id == job_id);
+        assert!(
+            !still_present,
+            "Haul posting against satisfied bp should be dropped by chief_job_posting_system"
+        );
+        // The hauler's JobClaim referencing the dropped posting must be
+        // gone. They may have picked up an unrelated claim on a later tick
+        // (chief posts food / wood Stockpile during the warm-up), so just
+        // check the original job_id is no longer the held claim.
+        let still_holding_dead_claim = sim
+            .app
+            .world()
+            .get::<JobClaim>(hauler)
+            .map(|c| c.job_id == job_id)
+            .unwrap_or(false);
+        assert!(
+            !still_holding_dead_claim,
+            "hauler should no longer hold a JobClaim referencing the dropped Haul posting"
+        );
+    }
+
+    /// Fix 3a: the Haul-branch dispatcher uses material already in the
+    /// agent's hands/inventory and dispatches `HaulToBlueprint` directly,
+    /// skipping the redundant `WithdrawMaterial` round-trip to storage.
+    /// Scoped strictly to the dispatcher (after a JobClaim::Haul is held)
+    /// so it never feeds back into posting creation.
+    #[test]
+    fn haul_dispatcher_uses_in_hand_material_skipping_withdraw() {
+        use crate::simulation::construction::{Blueprint, BlueprintMap, BuildSiteKind};
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::jobs::{
+            ClaimTarget, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+            PosterClass,
+        };
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(2026_05_09);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Storage tile present (with some wood) so the standard withdraw
+        // branch is *available* — the test verifies the in-hand fast-path
+        // wins over it.
+        let storage_tile = (4, 4);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+        sim.spawn_ground_item(storage_tile, crate::economy::core_ids::wood(), 5);
+
+        // Chief at (-5, -5) so the test agent's goal isn't pinned to Lead.
+        let chief = sim.spawn_person(sim.player_faction_id, (-5, -5), |_| {});
+        sim.app
+            .world_mut()
+            .entity_mut(chief)
+            .insert(crate::simulation::faction::FactionChief);
+
+        // Hauler with 3 wood already in inventory at (0, 0).
+        let hauler = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.add_inventory(crate::economy::core_ids::wood(), 3);
+        });
+
+        // Civic blueprint at (10, 10) needing 3 wood (Bed). Unsatisfied.
+        let bp_tile = (10, 10);
+        let bp_world = tile_to_world(bp_tile.0, bp_tile.1);
+        let blueprint = sim
+            .app
+            .world_mut()
+            .spawn((
+                Blueprint::new(
+                    sim.player_faction_id,
+                    None,
+                    BuildSiteKind::Bed,
+                    bp_tile,
+                    0,
+                ),
+                Transform::from_xyz(bp_world.x, bp_world.y, 0.5),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<BlueprintMap>()
+            .0
+            .insert(bp_tile, blueprint);
+
+        // Warm up SpatialIndex / StorageTileMap. Lock chief assignment.
+        sim.tick_n(40);
+        {
+            sim.app
+                .world_mut()
+                .entity_mut(hauler)
+                .remove::<crate::simulation::faction::FactionChief>();
+            sim.app
+                .world_mut()
+                .entity_mut(chief)
+                .insert(crate::simulation::faction::FactionChief);
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<crate::simulation::faction::FactionRegistry>();
+            if let Some(faction) =
+                registry.factions.get_mut(&sim.player_faction_id)
+            {
+                faction.chief_entity = Some(chief);
+            }
+        }
+
+        // Inject a Haul claim + ClaimTarget naming this bp/wood. Post the
+        // matching Haul posting on the board so job_goal_lock_system keeps
+        // ClaimTarget populated.
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board
+                .faction_postings_mut(sim.player_faction_id)
+                .push(JobPosting {
+                    id,
+                    faction_id: sim.player_faction_id,
+                    kind: JobKind::Haul,
+                    progress: JobProgress::Haul {
+                        blueprint,
+                        resource_id: crate::economy::core_ids::wood(),
+                        delivered: 0,
+                        target: 3,
+                    },
+                    claimants: vec![hauler],
+                    priority: 100,
+                    source: JobSource::Chief,
+                    posted_tick: 0,
+                    expiry_tick: None,
+                    poster_class: PosterClass::Chief,
+                    reward: 0.0,
+                    settlement_id: None,
+                });
+            id
+        };
+        {
+            let mut entity = sim.app.world_mut().entity_mut(hauler);
+            entity.insert(JobClaim {
+                job_id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Haul,
+                posted_tick: 0,
+                fail_count: 0,
+            });
+            entity.insert(ClaimTarget {
+                blueprint: Some(blueprint),
+                kind: crate::simulation::jobs::ClaimKind::Specific(
+                    crate::economy::core_ids::wood(),
+                ),
+            });
+            let mut goal = entity.get_mut::<AgentGoal>().unwrap();
+            *goal = AgentGoal::Haul;
+        }
+
+        // One ParallelB tick: Fix 3a should detect 3 wood in inventory and
+        // dispatch HaulToBlueprint (not WithdrawMaterial). Tick 2 to let
+        // job_goal_lock_system refresh ClaimTarget on the prior tick.
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(hauler)
+            .expect("ActionQueue missing");
+        match aq.current {
+            Task::HaulToBlueprint { blueprint: bp } => {
+                assert_eq!(
+                    bp, blueprint,
+                    "in-hand fast-path should route directly to the bp"
+                );
+            }
+            Task::WithdrawMaterial { .. } => panic!(
+                "in-hand fast-path should skip WithdrawMaterial when the agent \
+                 already carries the needed resource; got WithdrawMaterial"
+            ),
+            other => panic!(
+                "expected Task::HaulToBlueprint as head, got {:?}",
                 other
             ),
         }
