@@ -4108,8 +4108,74 @@ pub(crate) fn next_clear_tile(
     None
 }
 
-/// Spawn one `BuildSiteKind` instance at the next radial slot. Inserts into
-/// the matching map and emits a `TileChangedEvent`.
+/// Map a seeded structure to the SettlementPlan zone where it belongs.
+/// Used by `seed_starting_buildings_system` so seeded settlements respect
+/// the same zone layout as grown ones (Phase 4 follow-on).
+fn seed_zone_for(kind: BuildSiteKind) -> Option<crate::simulation::settlement::ZoneKind> {
+    use crate::simulation::settlement::ZoneKind;
+    match kind {
+        BuildSiteKind::Bed => Some(ZoneKind::Residential),
+        BuildSiteKind::Campfire => Some(ZoneKind::Civic),
+        BuildSiteKind::Workbench | BuildSiteKind::Loom => Some(ZoneKind::Crafting),
+        BuildSiteKind::Granary => Some(ZoneKind::Storage),
+        BuildSiteKind::Shrine | BuildSiteKind::Monument => Some(ZoneKind::Sacred),
+        BuildSiteKind::Market => Some(ZoneKind::Market),
+        BuildSiteKind::Barracks => Some(ZoneKind::Defense),
+        // Furniture / non-civic kinds keep the radial fallback.
+        _ => None,
+    }
+}
+
+/// Pick a clear seed tile inside the SettlementPlan zone matching `kind`,
+/// falling back to a radial spiral around `home` when the zone is missing
+/// or full. Mirrors the layout `chief_directive_system` would produce so
+/// seeded structures land where they'd organically grow.
+fn pick_seed_tile(
+    plan: Option<&crate::simulation::settlement::SettlementPlan>,
+    kind: BuildSiteKind,
+    home: (i32, i32),
+    used: &AHashSet<(i32, i32)>,
+    chunk_map: &ChunkMap,
+) -> Option<(i32, i32)> {
+    if let (Some(plan), Some(zk)) = (plan, seed_zone_for(kind)) {
+        if let Some(rect) = plan.zones.iter().find(|z| z.kind == zk).map(|z| z.rect) {
+            // Scan within the zone rect for the first clear tile, picking
+            // the candidate closest to home for visual coherence.
+            let (hx, hy) = home;
+            let mut best: Option<(i32, (i32, i32))> = None;
+            for ty in rect.y0..rect.y0 + rect.h as i32 {
+                for tx in rect.x0..rect.x0 + rect.w as i32 {
+                    let pos = (tx, ty);
+                    if used.contains(&pos) {
+                        continue;
+                    }
+                    if !chunk_map.is_passable(tx, ty) {
+                        continue;
+                    }
+                    let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
+                        continue;
+                    };
+                    if k == TileKind::Wall || k == TileKind::Stone {
+                        continue;
+                    }
+                    let d = (tx - hx).abs() + (ty - hy).abs();
+                    if best.as_ref().map_or(true, |b| d < b.0) {
+                        best = Some((d, pos));
+                    }
+                }
+            }
+            if let Some((_, pos)) = best {
+                return Some(pos);
+            }
+        }
+    }
+    // Fallback: original radial spiral.
+    next_clear_tile(home, used, chunk_map, 8)
+}
+
+/// Spawn one `BuildSiteKind` instance, preferring the structure's target
+/// zone in `plan`; falling back to a radial slot when no plan / zone
+/// exists. Inserts into the matching map and emits a `TileChangedEvent`.
 fn spawn_seeded_structure(
     commands: &mut Commands,
     maps: &mut FurnitureMaps,
@@ -4119,9 +4185,9 @@ fn spawn_seeded_structure(
     home: (i32, i32),
     faction_id: u32,
     kind: BuildSiteKind,
+    plan: Option<&crate::simulation::settlement::SettlementPlan>,
 ) {
-    let max_radius = 8;
-    let Some(tile) = next_clear_tile(home, used, chunk_map, max_radius) else {
+    let Some(tile) = pick_seed_tile(plan, kind, home, used, chunk_map) else {
         return;
     };
     used.insert(tile);
@@ -4388,11 +4454,6 @@ pub fn seed_starting_buildings_system(
     }
 
     let era = options.era;
-    let bed_count: i32 = match era {
-        Era::Paleolithic => 4,
-        Era::Mesolithic => 6,
-        Era::Neolithic | Era::Chalcolithic | Era::BronzeAge => 8,
-    };
     let hearth_tier = match era {
         Era::Paleolithic | Era::Mesolithic => HearthTier::Open,
         Era::Neolithic => HearthTier::Ringed,
@@ -4409,43 +4470,154 @@ pub fn seed_starting_buildings_system(
             continue;
         }
         let home = faction.home_tile;
+        let members = faction.member_count;
         let mut used: AHashSet<(i32, i32)> = AHashSet::new();
         // Reserve the home tile itself — it carries the FactionStorageTile.
         used.insert(home);
 
-        // Hearth (1) — spawned via Campfire, with the era-appropriate tier.
-        if let Some(tile) = next_clear_tile(home, &used, &chunk_map, 8) {
-            used.insert(tile);
-            let world_pos = tile_to_world(tile.0, tile.1);
-            let e = commands
-                .spawn((
-                    Campfire { tier: hearth_tier },
-                    StructureLabel(hearth_tier.label()),
-                    Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
-                    GlobalTransform::default(),
-                    Visibility::Visible,
-                    InheritedVisibility::default(),
-                ))
-                .id();
-            maps.campfire_map.0.insert(tile, e);
-            tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
-                tx: tile.0,
-                ty: tile.1,
-            });
-        }
+        // Build the settlement plan inline so seeded structures land in
+        // their intended zones (Granary in Storage, Shrine in Sacred, etc.).
+        // Tick 0 is fine — the planner is pure on (faction_id, faction).
+        let plan = crate::simulation::settlement::build_settlement_plan(faction_id, faction, 0);
+        let plan_ref = Some(&plan);
 
-        // Beds.
-        for _ in 0..bed_count {
-            spawn_seeded_structure(
-                &mut commands,
-                &mut maps,
-                &mut chunk_map,
-                &mut tile_changed,
-                &mut used,
-                home,
-                faction_id,
-                BuildSiteKind::Bed,
+        // Bed count: house every founder. Per-era floor preserves the
+        // legacy minimum so very-small factions still get a basic camp.
+        let era_min: u32 = match era {
+            Era::Paleolithic => 4,
+            Era::Mesolithic => 6,
+            _ => 8,
+        };
+        let target_beds: u32 = members.max(era_min);
+
+        if (era as u8) < (Era::Neolithic as u8) {
+            // ── Paleo / Meso: multi-hearth band camp ────────────────────
+            // Use the same deterministic hearth offsets the planner +
+            // Paleolithic-hearth-cadence code use, so seeding aligns with
+            // grown-band layout.
+            let hearth_positions = crate::simulation::settlement::paleolithic_hearth_positions(
+                faction_id, home, members,
             );
+            let n_hearths = hearth_positions.len().max(1) as u32;
+            let beds_per_hearth = (target_beds + n_hearths - 1) / n_hearths;
+
+            for &offset_pos in hearth_positions.iter() {
+                // Snap offset to the nearest passable tile (offsets are
+                // float-rounded so may land on water / wall).
+                let hearth_tile = if !used.contains(&offset_pos)
+                    && chunk_map.is_passable(offset_pos.0, offset_pos.1)
+                {
+                    offset_pos
+                } else if let Some(t) = next_clear_tile(offset_pos, &used, &chunk_map, 4) {
+                    t
+                } else {
+                    continue;
+                };
+                used.insert(hearth_tile);
+                let world_pos = tile_to_world(hearth_tile.0, hearth_tile.1);
+                let e = commands
+                    .spawn((
+                        Campfire { tier: hearth_tier },
+                        StructureLabel(hearth_tier.label()),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id();
+                maps.campfire_map.0.insert(hearth_tile, e);
+                tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+                    tx: hearth_tile.0,
+                    ty: hearth_tile.1,
+                });
+
+                seed_paleo_beds_around_hearth(
+                    &mut commands,
+                    &mut maps,
+                    &chunk_map,
+                    &mut tile_changed,
+                    &mut used,
+                    hearth_tile,
+                    beds_per_hearth,
+                );
+            }
+        } else {
+            // ── Neolithic+: single civic hearth, founders in walled houses ─
+            if let Some(tile) =
+                pick_seed_tile(plan_ref, BuildSiteKind::Campfire, home, &used, &chunk_map)
+            {
+                used.insert(tile);
+                let world_pos = tile_to_world(tile.0, tile.1);
+                let e = commands
+                    .spawn((
+                        Campfire { tier: hearth_tier },
+                        StructureLabel(hearth_tier.label()),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id();
+                maps.campfire_map.0.insert(tile, e);
+                tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+                    tx: tile.0,
+                    ty: tile.1,
+                });
+            }
+
+            // House every founder. For Chalcolithic+ (CITY_STATE_ORG era),
+            // alternate Longhouse (2 beds) and Hut (1 bed) for visual
+            // variety; for Neolithic, all Huts.
+            let house_wall_mat = wall_material.unwrap_or(WallMaterial::WattleDaub);
+            let mut remaining = target_beds as i32;
+            let allow_longhouse = (era as u8) >= (Era::Chalcolithic as u8);
+            let mut alternate = false;
+            while remaining > 0 {
+                let want_longhouse = allow_longhouse && alternate && remaining >= 2;
+                let (half_w, half_h, beds_per_house): (i32, i32, &[(i32, i32)]) = if want_longhouse
+                {
+                    (2, 1, &[(-1, 0), (1, 0)])
+                } else {
+                    (1, 1, &[(0, 0)])
+                };
+                let Some((cx, cy)) = pick_seed_house_anchor(
+                    plan_ref, &chunk_map, &used, home, half_w, half_h,
+                ) else {
+                    break; // Out of room — fall through to civic seeding.
+                };
+                if !seed_walled_house_at(
+                    &mut commands,
+                    &mut maps,
+                    &mut chunk_map,
+                    &mut tile_changed,
+                    &mut used,
+                    cx,
+                    cy,
+                    half_w,
+                    half_h,
+                    beds_per_house,
+                    house_wall_mat,
+                    faction_id,
+                    home,
+                ) {
+                    break;
+                }
+                // Farmstead yard: 2×2 (Neo/Chalc) or 3×3 (Bronze).
+                let yard_side: i32 = if (era as u8) >= (Era::BronzeAge as u8) { 3 } else { 2 };
+                seed_farmstead_yard(
+                    &mut chunk_map,
+                    &mut tile_changed,
+                    &mut used,
+                    cx,
+                    cy,
+                    half_w,
+                    half_h,
+                    yard_side,
+                    yard_side,
+                );
+                remaining -= beds_per_house.len() as i32;
+                alternate = !alternate;
+            }
         }
 
         // Neolithic+ workshops & storage.
@@ -4459,6 +4631,7 @@ pub fn seed_starting_buildings_system(
                 home,
                 faction_id,
                 BuildSiteKind::Workbench,
+                plan_ref,
             );
             spawn_seeded_structure(
                 &mut commands,
@@ -4469,6 +4642,7 @@ pub fn seed_starting_buildings_system(
                 home,
                 faction_id,
                 BuildSiteKind::Granary,
+                plan_ref,
             );
             spawn_seeded_structure(
                 &mut commands,
@@ -4479,6 +4653,7 @@ pub fn seed_starting_buildings_system(
                 home,
                 faction_id,
                 BuildSiteKind::Loom,
+                plan_ref,
             );
         }
 
@@ -4493,6 +4668,7 @@ pub fn seed_starting_buildings_system(
                 home,
                 faction_id,
                 BuildSiteKind::Shrine,
+                plan_ref,
             );
         }
 
@@ -4507,6 +4683,7 @@ pub fn seed_starting_buildings_system(
                 home,
                 faction_id,
                 BuildSiteKind::Market,
+                plan_ref,
             );
             spawn_seeded_structure(
                 &mut commands,
@@ -4517,6 +4694,7 @@ pub fn seed_starting_buildings_system(
                 home,
                 faction_id,
                 BuildSiteKind::Barracks,
+                plan_ref,
             );
             spawn_seeded_structure(
                 &mut commands,
@@ -4527,23 +4705,593 @@ pub fn seed_starting_buildings_system(
                 home,
                 faction_id,
                 BuildSiteKind::Monument,
+                plan_ref,
             );
         }
 
         // Defensive perimeter (Chalco onward). Built last so all furniture
-        // is already inside it.
+        // is already inside it. Wall ring tracks the actual extent of
+        // seeded structures: take the bounding box of every used tile
+        // (houses + civic + storage + crafting) and expand by a 2-tile
+        // buffer for breathing room. Unioned with the planned Defense
+        // rect so very-small settlements still get the planner's
+        // culture.defensive padding. Falls back to the legacy r=5 ring
+        // when neither bbox nor Defense zone are available.
         if let Some(material) = wall_material {
-            seed_perimeter(
-                &mut commands,
-                &mut maps,
-                &mut chunk_map,
-                &mut tile_changed,
-                &mut used,
-                home,
-                5,
-                material,
-                faction_id,
+            let bbox = used_bbox_with_buffer(&used, 2);
+            let defense_rect = plan_ref.and_then(|p| {
+                p.zones
+                    .iter()
+                    .find(|z| z.kind == crate::simulation::settlement::ZoneKind::Defense)
+                    .map(|z| z.rect)
+            });
+            let final_rect = match (bbox, defense_rect) {
+                (Some(a), Some(b)) => Some(union_rect(a, b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            if let Some(rect) = final_rect {
+                seed_perimeter_rect(
+                    &mut commands,
+                    &mut maps,
+                    &mut chunk_map,
+                    &mut tile_changed,
+                    &mut used,
+                    rect,
+                    material,
+                    faction_id,
+                );
+            } else {
+                seed_perimeter(
+                    &mut commands,
+                    &mut maps,
+                    &mut chunk_map,
+                    &mut tile_changed,
+                    &mut used,
+                    home,
+                    5,
+                    material,
+                    faction_id,
+                );
+            }
+        }
+    }
+}
+
+/// Smallest `TileRect` that contains both `a` and `b`.
+fn union_rect(
+    a: crate::simulation::settlement::TileRect,
+    b: crate::simulation::settlement::TileRect,
+) -> crate::simulation::settlement::TileRect {
+    let x0 = a.x0.min(b.x0);
+    let y0 = a.y0.min(b.y0);
+    let x_end = (a.x0 + a.w as i32).max(b.x0 + b.w as i32);
+    let y_end = (a.y0 + a.h as i32).max(b.y0 + b.h as i32);
+    crate::simulation::settlement::TileRect::new(
+        x0,
+        y0,
+        (x_end - x0).max(1) as u16,
+        (y_end - y0).max(1) as u16,
+    )
+}
+
+/// Place a fully-built walled house at `(cx, cy)` with `half_w × half_h`
+/// footprint, mirroring `plan_building`'s perimeter+entrance+interior-beds
+/// shape but bypassing the Blueprint pipeline. Used by the seeder so
+/// Neolithic+ founders start in their own house instead of a bare bed.
+///
+/// Returns `true` if the building was placed, `false` if any tile in the
+/// footprint was unsuitable (impassable, already used, existing wall).
+fn seed_walled_house_at(
+    commands: &mut Commands,
+    maps: &mut FurnitureMaps,
+    chunk_map: &mut ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    cx: i32,
+    cy: i32,
+    half_w: i32,
+    half_h: i32,
+    interior_beds: &[(i32, i32)],
+    wall_material: WallMaterial,
+    faction_id: u32,
+    home: (i32, i32),
+) -> bool {
+    // Pre-flight: every tile in the footprint must be clear.
+    for dy in -half_h..=half_h {
+        for dx in -half_w..=half_w {
+            let tile = (cx + dx, cy + dy);
+            if used.contains(&tile) {
+                return false;
+            }
+            if !chunk_map.is_passable(tile.0, tile.1) {
+                return false;
+            }
+            let Some(k) = chunk_map.tile_kind_at(tile.0, tile.1) else {
+                return false;
+            };
+            if k == TileKind::Wall || k == TileKind::Stone {
+                return false;
+            }
+        }
+    }
+
+    // Entrance: perimeter tile (not corner) closest to home — same rule as
+    // `plan_building` so doors face inward toward camp.
+    let (hx, hy) = home;
+    let entrance: (i32, i32) = {
+        let mut best = (0i32, half_h);
+        let mut best_dist = i64::MAX;
+        for dy in -half_h..=half_h {
+            for dx in -half_w..=half_w {
+                if dx.abs() < half_w && dy.abs() < half_h {
+                    continue; // interior
+                }
+                if dx.abs() == half_w && dy.abs() == half_h {
+                    continue; // corner
+                }
+                let d = ((cx + dx - hx) as i64).pow(2) + ((cy + dy - hy) as i64).pow(2);
+                if d < best_dist {
+                    best_dist = d;
+                    best = (dx, dy);
+                }
+            }
+        }
+        best
+    };
+
+    // Place perimeter tiles: walls everywhere except the entrance (door).
+    for dy in -half_h..=half_h {
+        for dx in -half_w..=half_w {
+            if dx.abs() < half_w && dy.abs() < half_h {
+                continue; // interior — beds go here
+            }
+            let tile = (cx + dx, cy + dy);
+            let world_pos = tile_to_world(tile.0, tile.1);
+            if (dx, dy) == entrance {
+                let door = Door {
+                    faction_id,
+                    open: false,
+                    tier: DoorTier::default(),
+                };
+                let label = door.tier.label();
+                let e = commands
+                    .spawn((
+                        door,
+                        StructureLabel(label),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id();
+                maps.door_map.0.insert(
+                    tile,
+                    DoorEntry {
+                        entity: e,
+                        open: false,
+                    },
+                );
+            } else {
+                let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
+                chunk_map.set_tile(
+                    tile.0,
+                    tile.1,
+                    surf_z + 1,
+                    TileData {
+                        kind: TileKind::Wall,
+                        elevation: 0,
+                        fertility: 0,
+                        flags: 0b0001,
+                        ore: 0,
+                    },
+                );
+                let e = commands
+                    .spawn((
+                        Wall {
+                            material: wall_material,
+                        },
+                        StructureLabel(wall_material.label()),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id();
+                maps.wall_map.0.insert(tile, e);
+            }
+            used.insert(tile);
+            tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+                tx: tile.0,
+                ty: tile.1,
+            });
+        }
+    }
+
+    // Interior beds.
+    for &(bdx, bdy) in interior_beds {
+        let tile = (cx + bdx, cy + bdy);
+        let world_pos = tile_to_world(tile.0, tile.1);
+        let bed = Bed::default();
+        let label = bed.tier.label();
+        let e = commands
+            .spawn((
+                bed,
+                StructureLabel(label),
+                Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+                crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Bed),
+            ))
+            .id();
+        maps.bed_map.0.insert(tile, e);
+        used.insert(tile);
+        tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+            tx: tile.0,
+            ty: tile.1,
+        });
+    }
+    true
+}
+
+/// Find the best 3×3 (Hut, half=1) or 5×3 (Longhouse, half_w=2/half_h=1)
+/// site inside the Residential zone (or radial fallback) for a built-house
+/// seed. Returns the centre. Walks the zone in row-major order picking the
+/// closest-to-home clear footprint with z-spread ≤ 1 (seeded houses don't
+/// terraform — they need flat ground).
+fn pick_seed_house_anchor(
+    plan: Option<&crate::simulation::settlement::SettlementPlan>,
+    chunk_map: &ChunkMap,
+    used: &AHashSet<(i32, i32)>,
+    home: (i32, i32),
+    half_w: i32,
+    half_h: i32,
+) -> Option<(i32, i32)> {
+    let footprint_clear = |cx: i32, cy: i32| -> bool {
+        let mut min_z = i32::MAX;
+        let mut max_z = i32::MIN;
+        for dy in -half_h..=half_h {
+            for dx in -half_w..=half_w {
+                let t = (cx + dx, cy + dy);
+                if used.contains(&t) {
+                    return false;
+                }
+                if !chunk_map.is_passable(t.0, t.1) {
+                    return false;
+                }
+                let Some(k) = chunk_map.tile_kind_at(t.0, t.1) else {
+                    return false;
+                };
+                if k == TileKind::Wall || k == TileKind::Stone {
+                    return false;
+                }
+                let z = chunk_map.surface_z_at(t.0, t.1);
+                min_z = min_z.min(z);
+                max_z = max_z.max(z);
+            }
+        }
+        (max_z - min_z).max(0) <= 1
+    };
+
+    let (hx, hy) = home;
+    if let Some(plan) = plan {
+        if let Some(rect) = plan
+            .zones
+            .iter()
+            .find(|z| z.kind == crate::simulation::settlement::ZoneKind::Residential)
+            .map(|z| z.rect)
+        {
+            let cx_min = rect.x0 + half_w;
+            let cy_min = rect.y0 + half_h;
+            let cx_max = rect.x0 + rect.w as i32 - half_w - 1;
+            let cy_max = rect.y0 + rect.h as i32 - half_h - 1;
+            let mut best: Option<(i32, (i32, i32))> = None;
+            for cy in cy_min..=cy_max {
+                for cx in cx_min..=cx_max {
+                    if !footprint_clear(cx, cy) {
+                        continue;
+                    }
+                    let d = (cx - hx).abs() + (cy - hy).abs();
+                    if best.as_ref().map_or(true, |b| d < b.0) {
+                        best = Some((d, (cx, cy)));
+                    }
+                }
+            }
+            if let Some((_, p)) = best {
+                return Some(p);
+            }
+        }
+    }
+    // Radial fallback.
+    for ring in (half_w.max(half_h) + 1)..=20 {
+        for dy in -ring..=ring {
+            for dx in -ring..=ring {
+                if dx.abs().max(dy.abs()) != ring {
+                    continue;
+                }
+                let cx = hx + dx;
+                let cy = hy + dy;
+                if footprint_clear(cx, cy) {
+                    return Some((cx, cy));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Compute the inclusive-exclusive `TileRect` bounding box of every tile in
+/// `used`, expanded by `buffer` tiles on each side. Returns `None` for an
+/// empty set.
+fn used_bbox_with_buffer(
+    used: &AHashSet<(i32, i32)>,
+    buffer: i32,
+) -> Option<crate::simulation::settlement::TileRect> {
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+    for &(x, y) in used.iter() {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    if min_x == i32::MAX {
+        return None;
+    }
+    let x0 = min_x - buffer;
+    let y0 = min_y - buffer;
+    let w = (max_x - min_x + 1 + 2 * buffer).max(1) as u16;
+    let h = (max_y - min_y + 1 + 2 * buffer).max(1) as u16;
+    Some(crate::simulation::settlement::TileRect::new(x0, y0, w, h))
+}
+
+/// Stamp a `yard_w × yard_h` patch of `Farmland` tiles adjacent to the
+/// house centred at `(cx, cy)` with `half_w × half_h` footprint. The yard
+/// extends out from the house's east wall by default; if east is blocked,
+/// tries west, south, north in turn. Tile mutations skip Wall / Stone /
+/// already-used tiles. Returns the count of tiles flipped.
+///
+/// This is the v1 "Farmstead" template (Neolithic+): house + attached
+/// yard, mirroring the `FootprintShape::LShape` concept without yet
+/// going through a full `BuildIntent::Composite` refactor. Phase 6's
+/// `Plot.parent_plot` mechanism picks up these yards once a household
+/// acquires the residential lot they sit on.
+fn seed_farmstead_yard(
+    chunk_map: &mut ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    cx: i32,
+    cy: i32,
+    half_w: i32,
+    half_h: i32,
+    yard_w: i32,
+    yard_h: i32,
+) -> u32 {
+    // Try directions in order: east, west, south, north. First side
+    // where the full yard fits wins.
+    let candidates: [(i32, i32, i32, i32); 4] = [
+        // (yard_origin_x, yard_origin_y, dx_step, dy_step) — these are
+        // bounding-box origin offsets from the house centre.
+        (cx + half_w + 1, cy - yard_h / 2, 1, 1), // East
+        (cx - half_w - yard_w, cy - yard_h / 2, 1, 1), // West
+        (cx - yard_w / 2, cy + half_h + 1, 1, 1), // South
+        (cx - yard_w / 2, cy - half_h - yard_h, 1, 1), // North
+    ];
+
+    let yard_clear = |x0: i32, y0: i32, used: &AHashSet<(i32, i32)>, cm: &ChunkMap| -> bool {
+        for ty in y0..y0 + yard_h {
+            for tx in x0..x0 + yard_w {
+                if used.contains(&(tx, ty)) {
+                    return false;
+                }
+                if !cm.is_passable(tx, ty) {
+                    return false;
+                }
+                let Some(k) = cm.tile_kind_at(tx, ty) else {
+                    return false;
+                };
+                if k == TileKind::Wall || k == TileKind::Stone || k == TileKind::Water {
+                    return false;
+                }
+            }
+        }
+        true
+    };
+
+    let chosen = candidates
+        .iter()
+        .find(|(x0, y0, _, _)| yard_clear(*x0, *y0, used, chunk_map));
+    let Some(&(x0, y0, _, _)) = chosen else {
+        return 0;
+    };
+
+    let mut placed = 0u32;
+    for ty in y0..y0 + yard_h {
+        for tx in x0..x0 + yard_w {
+            let z = chunk_map.surface_z_at(tx, ty);
+            chunk_map.set_tile(
+                tx,
+                ty,
+                z,
+                TileData {
+                    kind: TileKind::Farmland,
+                    elevation: 0,
+                    fertility: 200,
+                    flags: 0,
+                    ore: 0,
+                },
             );
+            used.insert((tx, ty));
+            tile_changed.send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
+            placed += 1;
+        }
+    }
+    placed
+}
+
+/// Place beds in a ring of radius 2..=4 around `hearth`, up to `count`.
+/// Used by the Paleolithic/Mesolithic seeding path so each campfire gets
+/// its own bed cluster.
+fn seed_paleo_beds_around_hearth(
+    commands: &mut Commands,
+    maps: &mut FurnitureMaps,
+    chunk_map: &ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    hearth: (i32, i32),
+    count: u32,
+) {
+    let mut placed = 0u32;
+    'outer: for radius in 2i32..=5 {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx.abs().max(dy.abs()) != radius {
+                    continue;
+                }
+                if placed >= count {
+                    break 'outer;
+                }
+                let tile = (hearth.0 + dx, hearth.1 + dy);
+                if used.contains(&tile) {
+                    continue;
+                }
+                if !chunk_map.is_passable(tile.0, tile.1) {
+                    continue;
+                }
+                let Some(k) = chunk_map.tile_kind_at(tile.0, tile.1) else {
+                    continue;
+                };
+                if k == TileKind::Wall || k == TileKind::Stone {
+                    continue;
+                }
+                let world_pos = tile_to_world(tile.0, tile.1);
+                let bed = Bed::default();
+                let label = bed.tier.label();
+                let e = commands
+                    .spawn((
+                        bed,
+                        StructureLabel(label),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                        crate::world::spatial::Indexed::new(
+                            crate::world::spatial::IndexedKind::Bed,
+                        ),
+                    ))
+                    .id();
+                maps.bed_map.0.insert(tile, e);
+                used.insert(tile);
+                tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+                    tx: tile.0,
+                    ty: tile.1,
+                });
+                placed += 1;
+            }
+        }
+    }
+}
+
+/// Lay walls along the perimeter of `rect`, with one Door on the eastern
+/// edge at the rect's vertical midpoint. Mirrors `seed_perimeter` but
+/// driven by an arbitrary `TileRect` (the `Defense` zone) instead of a
+/// home-centred square ring.
+fn seed_perimeter_rect(
+    commands: &mut Commands,
+    maps: &mut FurnitureMaps,
+    chunk_map: &mut ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    rect: crate::simulation::settlement::TileRect,
+    material: WallMaterial,
+    faction_id: u32,
+) {
+    let x0 = rect.x0;
+    let y0 = rect.y0;
+    let x1 = rect.x0 + rect.w as i32 - 1;
+    let y1 = rect.y0 + rect.h as i32 - 1;
+    let door_tile = (x1, y0 + (rect.h as i32) / 2);
+
+    for ty in y0..=y1 {
+        for tx in x0..=x1 {
+            // Only perimeter tiles.
+            let on_perimeter = tx == x0 || tx == x1 || ty == y0 || ty == y1;
+            if !on_perimeter {
+                continue;
+            }
+            let tile = (tx, ty);
+            if used.contains(&tile) {
+                continue;
+            }
+            if !chunk_map.is_passable(tx, ty) {
+                continue;
+            }
+            let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
+                continue;
+            };
+            if k == TileKind::Wall {
+                continue;
+            }
+            let world_pos = tile_to_world(tx, ty);
+            if tile == door_tile {
+                let door = Door {
+                    faction_id,
+                    open: false,
+                    tier: DoorTier::default(),
+                };
+                let label = door.tier.label();
+                let e = commands
+                    .spawn((
+                        door,
+                        StructureLabel(label),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id();
+                maps.door_map.0.insert(
+                    tile,
+                    DoorEntry {
+                        entity: e,
+                        open: false,
+                    },
+                );
+            } else {
+                let surf_z = chunk_map.surface_z_at(tx, ty);
+                chunk_map.set_tile(
+                    tx,
+                    ty,
+                    surf_z + 1,
+                    TileData {
+                        kind: TileKind::Wall,
+                        elevation: 0,
+                        fertility: 0,
+                        flags: 0b0001,
+                        ore: 0,
+                    },
+                );
+                let e = commands
+                    .spawn((
+                        Wall { material },
+                        StructureLabel(material.label()),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id();
+                maps.wall_map.0.insert(tile, e);
+            }
+            used.insert(tile);
+            tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+                tx: tile.0,
+                ty: tile.1,
+            });
         }
     }
 }
