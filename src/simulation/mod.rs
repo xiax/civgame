@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 
 pub mod animals;
+pub mod building_template;
 pub mod carry;
 pub mod carve;
 pub mod civic_milestones;
