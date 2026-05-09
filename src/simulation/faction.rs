@@ -1510,6 +1510,12 @@ pub struct FactionData {
     /// deployable structures, then mutates `home_tile = target` and clears
     /// this field. `None` outside of an active migration.
     pub pending_migration: Option<(i32, i32)>,
+    /// Per-faction capability bundle (P1a). Computed at faction
+    /// creation by `derive_from_legacy(...)` once a `(lifestyle,
+    /// preset)` pair is known; mirrors the legacy fields above
+    /// observationally. Every site that previously branched on
+    /// `is_nomadic()` or `match preset` should consult this instead.
+    pub caps: crate::simulation::archetype::FactionCapabilities,
 }
 
 impl FactionData {
@@ -1587,6 +1593,14 @@ impl FactionRegistry {
                 lifestyle: Lifestyle::default(),
                 last_migration_tick: 0,
                 pending_migration: None,
+                // P1a: default = settled-Subsistence capabilities.
+                // `spawn_population` overwrites this with the
+                // archetype derived from the faction's
+                // `(lifestyle, preset)` pair as soon as it knows
+                // both. Other create_faction callers (tests,
+                // bonding-formed factions) keep the default until
+                // they apply their own preset/lifestyle.
+                caps: crate::simulation::archetype::FactionCapabilities::default(),
             },
         );
         id
@@ -1660,6 +1674,11 @@ impl FactionRegistry {
             .get(&parent_faction_id)
             .map(|p| p.lifestyle)
             .unwrap_or_default();
+        let parent_caps = self
+            .factions
+            .get(&parent_faction_id)
+            .map(|p| p.caps.clone())
+            .unwrap_or_default();
         let new_id = self.create_faction(home_tile);
         if let Some(data) = self.factions.get_mut(&new_id) {
             data.parent_faction = Some(parent_faction_id);
@@ -1679,6 +1698,17 @@ impl FactionRegistry {
                     data.economic_policy.insert(rid, cap_policy);
                 }
             }
+            // P1a: caps inherits parent, but the divergent
+            // legacy-driven fields (lifestyle, land_policy,
+            // economic_policy) are mirrored from the legacy fields
+            // we just populated above so the bundle stays in
+            // lock-step with observable behaviour. Mixed parents
+            // produce capitalist households per the legacy branch,
+            // so we clone `data.economic_policy` rather than
+            // `parent_caps.economic_policy`.
+            data.caps = parent_caps;
+            data.caps.economic_policy = data.economic_policy.clone();
+            data.caps.land.policy = data.land_policy;
         }
         if let Some(parent) = self.factions.get_mut(&parent_faction_id) {
             parent.children_factions.push(new_id);
@@ -1801,6 +1831,15 @@ pub fn bonding_system(
                 if let Some(fd) = registry.factions.get_mut(&new_id) {
                     crate::economy::policy::apply_preset(
                         &mut fd.economic_policy,
+                        options.economy,
+                        &catalog,
+                    );
+                    // P1a: derive caps for bonding-spawned factions
+                    // too. They inherit the world's preset and stay
+                    // Settled (lifestyle defaults to Settled at
+                    // create_faction).
+                    fd.caps = crate::simulation::archetype::derive_from_legacy(
+                        fd.lifestyle,
                         options.economy,
                         &catalog,
                     );
@@ -2213,16 +2252,23 @@ pub fn sync_faction_center_hotspots_system(
 
 // ── Faction storage totals computation ───────────────────────────────────────
 
-/// Build `FactionStorage.totals` for every faction. Two backends:
-/// - **Settled** factions (default): sum `GroundItem`s sitting on tiles
-///   marked by a `FactionStorageTile` belonging to that faction.
-/// - **Nomadic** factions: sum `EconomicAgent.inventory` for every member
-///   of the faction. Pack-animal inventories and `PackBundle`-marked
-///   ground tiles will fold in here once Phase 5 / Phase 7 land.
+/// Build `FactionStorage.totals` for every faction. Backend-aware
+/// (P2a): each pass gates on `FactionData.caps.storage`:
 ///
-/// Both backends populate the same `faction.storage.totals` map, so chief
-/// posting math (`faction.storage.stock_of(rid)`) and HTN food gates work
-/// unchanged in either mode.
+/// - **`FactionTile` / `Hybrid` (tile pass)**: sum `GroundItem`s
+///   sitting on tiles marked by a `FactionStorageTile` belonging to
+///   that faction.
+/// - **`MemberPool` / `Hybrid` (member pass)**: sum
+///   `EconomicAgent.inventory` for every member of the faction.
+/// - `CaravanBundles` is reserved for Phase 6+ (pack-animal `PackBundle`s).
+///
+/// Both passes write to the same `faction.storage.totals` map. Chief
+/// posting math (`faction.storage.stock_of(rid)`) and HTN food gates
+/// stay archetype-agnostic. The underlying iteration is still
+/// `O(ground_items + members)` rather than `O(factions × ground_items)`
+/// — it's a tight inner loop with a per-target faction lookup, not a
+/// per-faction call into `storage_backend::rollup_for_kind` (that
+/// helper is the off-system / test verifier).
 pub fn compute_faction_storage_system(
     storage_tile_map: Res<StorageTileMap>,
     ground_items: Query<(&GroundItem, &Transform)>,
@@ -2232,14 +2278,17 @@ pub fn compute_faction_storage_system(
     >,
     mut registry: ResMut<FactionRegistry>,
 ) {
+    use crate::simulation::archetype::StorageBackendKind;
+
     for faction in registry.factions.values_mut() {
         faction.storage.totals.clear();
     }
 
-    // Settled-backend pass: ground items on FactionStorageTile tiles.
-    // Nomadic factions never spawn storage tiles, so they fall through
-    // this loop with zero contributions and pick up their pool from the
-    // member-inventory pass below.
+    // Tile pass: only `FactionTile` / `Hybrid` backends contribute.
+    // Nomadic (`MemberPool`) factions never spawn storage tiles in the
+    // first place, so the implicit lookup miss already excluded them
+    // pre-P1a; the explicit gate makes the contract self-documenting
+    // and survives a hypothetical Hybrid-without-tiles configuration.
     for (gi, transform) in ground_items.iter() {
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
@@ -2249,6 +2298,12 @@ pub fn compute_faction_storage_system(
         let Some(faction) = registry.factions.get_mut(&faction_id) else {
             continue;
         };
+        if !matches!(
+            faction.caps.storage,
+            StorageBackendKind::FactionTile | StorageBackendKind::Hybrid
+        ) {
+            continue;
+        }
         *faction
             .storage
             .totals
@@ -2256,15 +2311,17 @@ pub fn compute_faction_storage_system(
             .or_insert(0) += gi.qty;
     }
 
-    // Nomadic-backend pass: pool each band-member's `EconomicAgent.inventory`
-    // into the parent faction's `storage.totals`. Skipped entirely for
-    // settled factions to keep their stock numbers identical to pre-refactor
-    // behavior (regression invariant for the existing 411 tests).
+    // Member pass: only `MemberPool` / `Hybrid` backends contribute.
+    // FactionTile factions stay tile-only (regression invariant for the
+    // 411-test baseline).
     for (member, agent) in members.iter() {
         let Some(faction) = registry.factions.get_mut(&member.faction_id) else {
             continue;
         };
-        if !faction.lifestyle.is_nomadic() {
+        if !matches!(
+            faction.caps.storage,
+            StorageBackendKind::MemberPool | StorageBackendKind::Hybrid
+        ) {
             continue;
         }
         for (item, qty) in agent.inventory.iter() {

@@ -5,6 +5,7 @@ use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, PersonAI};
 use crate::simulation::schedule::{BucketSlot, SimClock};
+use crate::simulation::camp::{faction_market_node, Camp, CampMap, MarketNodeRef};
 use crate::simulation::settlement::{Settlement, SettlementMap};
 use bevy::prelude::*;
 
@@ -232,25 +233,28 @@ pub fn split_market_earnings_with_household(
     earned - skim
 }
 
-/// Pluralist Economy R7: route an agent's market interaction to
-/// their faction's first settlement market when one exists,
-/// otherwise fall back to the global `Market`. SOLO and unsettled
-/// agents always hit the global fallback.
-fn settlement_for(
+/// P1b: route an agent's market interaction to their faction's
+/// economic node — first Settlement for settled archetypes, Camp for
+/// nomadic. SOLO agents and factions that haven't been auto-founded
+/// yet fall through to the global `Market`.
+fn market_node_for(
     settlement_map: &SettlementMap,
+    camp_map: &CampMap,
     member: &FactionMember,
-) -> Option<crate::simulation::settlement::SettlementId> {
+) -> Option<MarketNodeRef> {
     if member.faction_id == crate::simulation::faction::SOLO {
         return None;
     }
-    settlement_map.first_for_faction(member.faction_id)
+    faction_market_node(settlement_map, camp_map, member.faction_id)
 }
 
 pub fn market_sell_system(
     clock: Res<SimClock>,
     mut market: ResMut<Market>,
     settlement_map: Res<SettlementMap>,
-    mut settlements: Query<&mut Settlement>,
+    camp_map: Res<CampMap>,
+    mut settlements: Query<&mut Settlement, Without<Camp>>,
+    mut camps: Query<&mut Camp, Without<Settlement>>,
     mut faction_registry: ResMut<crate::simulation::faction::FactionRegistry>,
     mut query: Query<(
         &PersonAI,
@@ -277,11 +281,10 @@ pub fn market_sell_system(
             continue;
         }
 
-        // R7: pick the right market to trade against. The settlement
-        // entity may be missing if `auto_found_default_settlements_system`
-        // hasn't run yet; in that case treat as unsettled.
-        let settlement_entity = settlement_for(&settlement_map, member)
-            .and_then(|sid| settlement_map.by_id.get(&sid).copied());
+        // P1b: pick the right market to trade against. The economic
+        // node may be missing if the auto-found systems haven't run
+        // yet; in that case fall back to the global Market.
+        let node = market_node_for(&settlement_map, &camp_map, member);
 
         // Sell all items except food reserve
         let inventory = agent.inventory; // Copy to avoid borrow issues while mutably removing
@@ -301,10 +304,15 @@ pub fn market_sell_system(
             };
 
             if sell_qty > 0 {
-                let earned = match settlement_entity
-                    .and_then(|e| settlements.get_mut(e).ok())
-                {
-                    Some(mut s) => s.market.sell_item(item, sell_qty),
+                let earned = match node {
+                    Some(MarketNodeRef::Settlement(e)) => match settlements.get_mut(e) {
+                        Ok(mut s) => s.market.sell_item(item, sell_qty),
+                        Err(_) => market.sell_item(item, sell_qty),
+                    },
+                    Some(MarketNodeRef::Camp(e)) => match camps.get_mut(e) {
+                        Ok(mut c) => c.market.sell_item(item, sell_qty),
+                        Err(_) => market.sell_item(item, sell_qty),
+                    },
                     None => market.sell_item(item, sell_qty),
                 };
                 agent.remove_item(item, sell_qty);
@@ -343,7 +351,9 @@ pub fn market_buy_system(
     clock: Res<SimClock>,
     mut market: ResMut<Market>,
     settlement_map: Res<SettlementMap>,
-    mut settlements: Query<&mut Settlement>,
+    camp_map: Res<CampMap>,
+    mut settlements: Query<&mut Settlement, Without<Camp>>,
+    mut camps: Query<&mut Camp, Without<Settlement>>,
     mut query: Query<(
         &mut PersonAI,
         &mut EconomicAgent,
@@ -358,24 +368,21 @@ pub fn market_buy_system(
             continue;
         }
 
-        let settlement_entity = settlement_for(&settlement_map, member)
-            .and_then(|sid| settlement_map.by_id.get(&sid).copied());
+        let node = market_node_for(&settlement_map, &camp_map, member);
 
         // Buy Food when hungry and have no food
         if needs.hunger > HUNGER_BUY_THRESHOLD as f32 && agent.total_food() == 0 {
-            let (bought_item, qty) = match settlement_entity
-                .and_then(|e| settlements.get_mut(e).ok())
-            {
-                Some(mut s) => s.market.try_buy_item(
-                    crate::economy::core_ids::fruit(),
-                    1,
-                    &mut agent.currency,
-                ),
-                None => market.try_buy_item(
-                    crate::economy::core_ids::fruit(),
-                    1,
-                    &mut agent.currency,
-                ),
+            let fruit_id = crate::economy::core_ids::fruit();
+            let (bought_item, qty) = match node {
+                Some(MarketNodeRef::Settlement(e)) => match settlements.get_mut(e) {
+                    Ok(mut s) => s.market.try_buy_item(fruit_id, 1, &mut agent.currency),
+                    Err(_) => market.try_buy_item(fruit_id, 1, &mut agent.currency),
+                },
+                Some(MarketNodeRef::Camp(e)) => match camps.get_mut(e) {
+                    Ok(mut c) => c.market.try_buy_item(fruit_id, 1, &mut agent.currency),
+                    Err(_) => market.try_buy_item(fruit_id, 1, &mut agent.currency),
+                },
+                None => market.try_buy_item(fruit_id, 1, &mut agent.currency),
             };
             if let Some(it) = bought_item {
                 agent.add_item(it, qty);
@@ -389,15 +396,27 @@ pub fn market_buy_system(
         // Buy Tools when affordable and not already owning one
         if !agent.has_tool() {
             let tools_id = crate::economy::core_ids::tools();
-            let tool_price = match settlement_entity.and_then(|e| settlements.get(e).ok()) {
-                Some(s) => s.market.price_of(tools_id),
+            let tool_price = match node {
+                Some(MarketNodeRef::Settlement(e)) => match settlements.get(e) {
+                    Ok(s) => s.market.price_of(tools_id),
+                    Err(_) => market.price_of(tools_id),
+                },
+                Some(MarketNodeRef::Camp(e)) => match camps.get(e) {
+                    Ok(c) => c.market.price_of(tools_id),
+                    Err(_) => market.price_of(tools_id),
+                },
                 None => market.price_of(tools_id),
             };
             if agent.currency >= tool_price * TOOL_BUY_CURRENCY_FACTOR {
-                let (bought_item, qty) = match settlement_entity
-                    .and_then(|e| settlements.get_mut(e).ok())
-                {
-                    Some(mut s) => s.market.try_buy_item(tools_id, 1, &mut agent.currency),
+                let (bought_item, qty) = match node {
+                    Some(MarketNodeRef::Settlement(e)) => match settlements.get_mut(e) {
+                        Ok(mut s) => s.market.try_buy_item(tools_id, 1, &mut agent.currency),
+                        Err(_) => market.try_buy_item(tools_id, 1, &mut agent.currency),
+                    },
+                    Some(MarketNodeRef::Camp(e)) => match camps.get_mut(e) {
+                        Ok(mut c) => c.market.try_buy_item(tools_id, 1, &mut agent.currency),
+                        Err(_) => market.try_buy_item(tools_id, 1, &mut agent.currency),
+                    },
                     None => market.try_buy_item(tools_id, 1, &mut agent.currency),
                 };
                 if let Some(it) = bought_item {

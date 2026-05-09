@@ -1,0 +1,410 @@
+//! Faction archetype + capability bundle (Phase 1a of the
+//! capabilities/CommunityHub/storage-parity refactor).
+//!
+//! Replaces ad-hoc `(Lifestyle, EconomyPreset)` enum dispatch with a
+//! single per-faction `FactionCapabilities` value computed once at
+//! faction creation. Every site that previously branched on
+//! `is_nomadic()` or `match EconomyPreset` should consult a capability
+//! accessor instead.
+//!
+//! P1a is purely additive: the legacy `FactionData.lifestyle`,
+//! `economic_policy`, and `land_policy` fields are kept, and
+//! `derive_from_legacy(...)` produces a capability bundle that mirrors
+//! today's behaviour bit-for-bit. Later phases relocate the source of
+//! truth into capabilities and load archetypes from RON.
+
+use crate::economy::policy::{LandPolicy, ResourceControlPolicy};
+use crate::economy::resource_catalog::{ResourceCatalog, ResourceId};
+use crate::game_state::EconomyPreset;
+use crate::simulation::faction::Lifestyle;
+use ahash::AHashMap;
+
+/// How a faction's home location is anchored. Settled factions stay put
+/// at a fixed `home_tile`; nomadic factions migrate seasonally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HomeMobility {
+    Anchored,
+    Mobile {
+        migration_period_min_days: u32,
+    },
+}
+
+impl HomeMobility {
+    pub fn is_mobile(self) -> bool {
+        matches!(self, HomeMobility::Mobile { .. })
+    }
+    pub fn is_anchored(self) -> bool {
+        matches!(self, HomeMobility::Anchored)
+    }
+}
+
+/// Where the faction physically holds its goods.
+///
+/// - `FactionTile`: settled, deposits flow to `FactionStorageTile`s.
+/// - `MemberPool`: nomadic, goods live in member inventories.
+/// - `Hybrid`: caravan-style, both tile and member pools.
+/// - `CaravanBundles`: future, packed bundles on pack animals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageBackendKind {
+    FactionTile,
+    MemberPool,
+    Hybrid,
+    CaravanBundles,
+}
+
+/// Whether shelter structures are permanent (Hut/Longhouse) or
+/// portable (Tent/Yurt/Bedroll) on migration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShelterMode {
+    Permanent,
+    Portable,
+    Mixed,
+}
+
+/// Settlement form. `FullSettlement` is a real settled village/town;
+/// `Camp` is a stripped nomadic node (no plots, no zones); `None` is
+/// for special-case archetypes that never get an economic node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettlementMode {
+    FullSettlement { carves_plots: bool },
+    Camp,
+    None,
+}
+
+impl SettlementMode {
+    pub fn is_full_settlement(self) -> bool {
+        matches!(self, SettlementMode::FullSettlement { .. })
+    }
+    pub fn is_camp(self) -> bool {
+        matches!(self, SettlementMode::Camp)
+    }
+    pub fn carves_plots(self) -> bool {
+        matches!(
+            self,
+            SettlementMode::FullSettlement {
+                carves_plots: true
+            }
+        )
+    }
+}
+
+/// Coordination layer for productive work.
+///
+/// - `Disabled`: no posting layer; members run autonomous personal
+///   needs only (current nomadic behaviour).
+/// - `Enabled`: chief and/or private actors post jobs; per-resource
+///   `economic_policy[rid]` decides whether the chief allocates labour
+///   or workers self-post.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostingMode {
+    Disabled,
+    Enabled,
+}
+
+impl PostingMode {
+    pub fn enabled(self) -> bool {
+        matches!(self, PostingMode::Enabled)
+    }
+    pub fn is_disabled(self) -> bool {
+        matches!(self, PostingMode::Disabled)
+    }
+}
+
+/// What happens to a plot when its tenant gets evicted (rent-collection
+/// path) or when an archetype switch retires the plot system.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictionPolicy {
+    /// Today's behaviour: structures stay in place, plot reverts to
+    /// `StateOwned`.
+    LeaveStructures,
+    /// Structures stay, marked state-owned, queued for reuse.
+    RevertToState,
+    /// Despawn structures + drop refund stacks via
+    /// `Deployable::compute_refund_drop`.
+    Demolish,
+}
+
+/// Faction-wide land tenure modalities. Wraps `LandPolicy` (existing
+/// field-level governance flags) with archetype-level toggles for
+/// whether plots are carved at all and how eviction is handled.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LandModalities {
+    pub policy: LandPolicy,
+    pub carves_plots: bool,
+    pub eviction_policy: EvictionPolicy,
+}
+
+/// How currency flows between agents, household sub-factions, and
+/// parent overlords. Replaces the unconditional 10% household skim.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IncomeFlow {
+    /// Fraction of each agent's market earnings redirected to their
+    /// household sub-faction's treasury. Default 0 (Subsistence);
+    /// Mixed/Market = 0.10.
+    pub household_skim_pct: f32,
+    /// Fraction of household income passed up to a parent overlord
+    /// (feudal vassal chain). Default 0.
+    pub upward_skim_to_parent_pct: f32,
+}
+
+impl Default for IncomeFlow {
+    fn default() -> Self {
+        Self {
+            household_skim_pct: 0.0,
+            upward_skim_to_parent_pct: 0.0,
+        }
+    }
+}
+
+/// What sub-factions inherit from their parent. P1a leaves the
+/// existing `spawn_household` rules intact; later phases drive
+/// inheritance off this spec.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InheritanceSpec {
+    pub child_archetype_key: Option<String>,
+    pub seed_treasury: f32,
+    pub seed_storage_tile: bool,
+}
+
+impl Default for InheritanceSpec {
+    fn default() -> Self {
+        Self {
+            child_archetype_key: None,
+            seed_treasury: 0.0,
+            seed_storage_tile: false,
+        }
+    }
+}
+
+/// Per-faction capability bundle. One value per faction, attached to
+/// `FactionData.caps`. Computed once at faction creation by
+/// `derive_from_legacy(...)`; later phases load it from RON.
+#[derive(Clone, Debug)]
+pub struct FactionCapabilities {
+    pub archetype_key: String,
+    pub home: HomeMobility,
+    pub storage: StorageBackendKind,
+    pub shelter: ShelterMode,
+    pub settlement: SettlementMode,
+    pub posting: PostingMode,
+    pub land: LandModalities,
+    pub economic_policy: AHashMap<ResourceId, ResourceControlPolicy>,
+    pub income: IncomeFlow,
+    pub inheritance: InheritanceSpec,
+}
+
+impl Default for FactionCapabilities {
+    fn default() -> Self {
+        // Default = settled-Subsistence: matches the historical
+        // `FactionData::default()` with empty policy maps.
+        Self {
+            archetype_key: "settled_subsistence".to_string(),
+            home: HomeMobility::Anchored,
+            storage: StorageBackendKind::FactionTile,
+            shelter: ShelterMode::Permanent,
+            settlement: SettlementMode::FullSettlement {
+                carves_plots: true,
+            },
+            posting: PostingMode::Enabled,
+            land: LandModalities {
+                policy: LandPolicy::default(),
+                carves_plots: true,
+                eviction_policy: EvictionPolicy::LeaveStructures,
+            },
+            economic_policy: AHashMap::new(),
+            income: IncomeFlow::default(),
+            inheritance: InheritanceSpec::default(),
+        }
+    }
+}
+
+/// Migration-period floor for `Mobile` archetypes. Today's nomads use
+/// `TICKS_PER_SEASON` (one season) as the cooldown floor; converting
+/// roughly to ~30 in-game days for the capability metadata.
+const NOMAD_MIGRATION_PERIOD_MIN_DAYS: u32 = 30;
+
+/// Compute the capability bundle that mirrors today's
+/// `(lifestyle, preset)` behaviour. `catalog` is needed to populate
+/// the `economic_policy` map for Mixed/Market presets.
+///
+/// P1a invariant: the bundle this returns must be observationally
+/// identical to the legacy field set. Adding new capability axes is
+/// fine, but flipping any flag away from the legacy default would
+/// break the regression baseline.
+pub fn derive_from_legacy(
+    lifestyle: Lifestyle,
+    preset: EconomyPreset,
+    catalog: &ResourceCatalog,
+) -> FactionCapabilities {
+    let archetype_key = legacy_archetype_key(lifestyle, preset).to_string();
+
+    let (home, storage, shelter, settlement, posting) = match lifestyle {
+        Lifestyle::Settled => (
+            HomeMobility::Anchored,
+            StorageBackendKind::FactionTile,
+            ShelterMode::Permanent,
+            SettlementMode::FullSettlement {
+                carves_plots: true,
+            },
+            PostingMode::Enabled,
+        ),
+        Lifestyle::Nomadic => (
+            HomeMobility::Mobile {
+                migration_period_min_days: NOMAD_MIGRATION_PERIOD_MIN_DAYS,
+            },
+            StorageBackendKind::MemberPool,
+            ShelterMode::Portable,
+            SettlementMode::Camp,
+            // Phase 7 (minimal) of the nomadic plan early-outs both
+            // chief construction and chief job posting for nomadic
+            // factions. Mirror that as `Disabled` so capability
+            // checks subsume the `is_nomadic()` early-returns.
+            PostingMode::Disabled,
+        ),
+    };
+
+    let mut economic_policy = AHashMap::new();
+    crate::economy::policy::apply_preset(&mut economic_policy, preset, catalog);
+
+    let land = LandModalities {
+        policy: crate::economy::policy::land_policy_for(preset),
+        // Carving keys on Settlement existence today, which is itself
+        // gated on lifestyle. Mirror that: only settled factions carve.
+        carves_plots: matches!(lifestyle, Lifestyle::Settled),
+        eviction_policy: EvictionPolicy::LeaveStructures,
+    };
+
+    let income = match preset {
+        // `split_market_earnings_with_household` is currently
+        // unconditional (10% skim regardless of preset); fixing the
+        // Subsistence skim leak is an explicit Phase 7 bug fix. P1a
+        // preserves the legacy behaviour so the regression baseline
+        // stays green.
+        EconomyPreset::Subsistence | EconomyPreset::Mixed | EconomyPreset::Market => IncomeFlow {
+            household_skim_pct: 0.10,
+            upward_skim_to_parent_pct: 0.0,
+        },
+    };
+
+    let inheritance = InheritanceSpec {
+        child_archetype_key: Some(format!("household_{}", preset_key(preset))),
+        // Spawn-time household seeding (`seed_market_households` in
+        // person.rs) is gated on `EconomyPreset::Market` and uses
+        // `HOUSEHOLD_SEED_TREASURY = 15.0`. Mirror per preset.
+        seed_treasury: match preset {
+            EconomyPreset::Market => 15.0,
+            _ => 0.0,
+        },
+        seed_storage_tile: matches!(preset, EconomyPreset::Market),
+    };
+
+    FactionCapabilities {
+        archetype_key,
+        home,
+        storage,
+        shelter,
+        settlement,
+        posting,
+        land,
+        economic_policy,
+        income,
+        inheritance,
+    }
+}
+
+/// Stable archetype key for the four supported `(lifestyle, preset)`
+/// combinations. Other crosses (e.g. `Nomadic + Market`) are
+/// inert/unsupported today — labelled here so the field is
+/// well-defined but later phases may reject them at registry load.
+pub fn legacy_archetype_key(lifestyle: Lifestyle, preset: EconomyPreset) -> &'static str {
+    match (lifestyle, preset) {
+        (Lifestyle::Settled, EconomyPreset::Subsistence) => "settled_subsistence",
+        (Lifestyle::Settled, EconomyPreset::Mixed) => "settled_mixed",
+        (Lifestyle::Settled, EconomyPreset::Market) => "settled_market",
+        (Lifestyle::Nomadic, EconomyPreset::Subsistence) => "nomadic_subsistence",
+        (Lifestyle::Nomadic, EconomyPreset::Mixed) => "nomadic_mixed",
+        (Lifestyle::Nomadic, EconomyPreset::Market) => "nomadic_market",
+    }
+}
+
+fn preset_key(preset: EconomyPreset) -> &'static str {
+    match preset {
+        EconomyPreset::Subsistence => "subsistence",
+        EconomyPreset::Mixed => "mixed",
+        EconomyPreset::Market => "market",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::economy::resource_catalog::{load_resource_catalog, ResourceCatalog};
+
+    fn test_catalog() -> ResourceCatalog {
+        // Install the catalog into the OnceLock so `core_ids::wood()` etc.
+        // resolve in tests; idempotent for repeat callers.
+        let cat = load_resource_catalog();
+        crate::economy::core_ids::install_catalog(cat.clone());
+        cat
+    }
+
+    #[test]
+    fn settled_subsistence_matches_legacy_defaults() {
+        let cat = test_catalog();
+        let caps = derive_from_legacy(Lifestyle::Settled, EconomyPreset::Subsistence, &cat);
+        assert_eq!(caps.archetype_key, "settled_subsistence");
+        assert!(caps.home.is_anchored());
+        assert_eq!(caps.storage, StorageBackendKind::FactionTile);
+        assert_eq!(caps.shelter, ShelterMode::Permanent);
+        assert!(caps.settlement.is_full_settlement());
+        assert!(caps.posting.enabled());
+        assert!(caps.land.carves_plots);
+        assert!(caps.economic_policy.is_empty(), "Subsistence = empty map");
+        assert!(!caps.land.policy.state_sells_land);
+    }
+
+    #[test]
+    fn settled_market_capitalist_on_every_resource() {
+        let cat = test_catalog();
+        let caps = derive_from_legacy(Lifestyle::Settled, EconomyPreset::Market, &cat);
+        assert_eq!(caps.archetype_key, "settled_market");
+        assert_eq!(caps.economic_policy.len(), cat.iter().count());
+        for (_id, policy) in caps.economic_policy.iter() {
+            assert!(policy.private_actors_allowed);
+            assert!(!policy.chief_allocates_labor);
+        }
+        assert!(caps.land.policy.state_sells_land);
+        assert!(caps.land.policy.private_freehold_allowed);
+        assert!(caps.inheritance.seed_storage_tile);
+        assert_eq!(caps.inheritance.seed_treasury, 15.0);
+    }
+
+    #[test]
+    fn nomadic_disables_posting_and_uses_member_pool() {
+        let cat = test_catalog();
+        let caps = derive_from_legacy(Lifestyle::Nomadic, EconomyPreset::Subsistence, &cat);
+        assert_eq!(caps.archetype_key, "nomadic_subsistence");
+        assert!(caps.home.is_mobile());
+        assert_eq!(caps.storage, StorageBackendKind::MemberPool);
+        assert_eq!(caps.shelter, ShelterMode::Portable);
+        assert!(caps.settlement.is_camp());
+        assert!(caps.posting.is_disabled());
+        assert!(!caps.land.carves_plots);
+    }
+
+    #[test]
+    fn settled_mixed_lands_in_between() {
+        let cat = test_catalog();
+        let caps = derive_from_legacy(Lifestyle::Settled, EconomyPreset::Mixed, &cat);
+        assert_eq!(caps.archetype_key, "settled_mixed");
+        assert!(caps.land.policy.state_rents_land);
+        assert!(caps.land.policy.state_sharecrops);
+        assert!(!caps.land.policy.state_sells_land);
+        // Non-staples flipped to mixed; Wood/Stone/edibles stay
+        // communal (omitted from the map).
+        let wood = crate::economy::core_ids::wood();
+        let stone = crate::economy::core_ids::stone();
+        assert!(!caps.economic_policy.contains_key(&wood));
+        assert!(!caps.economic_policy.contains_key(&stone));
+    }
+}

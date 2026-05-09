@@ -10,6 +10,7 @@ pub mod market;
 pub mod mode;
 pub mod policy;
 pub mod resource_catalog;
+pub mod storage_backend;
 pub mod transactions;
 
 pub use command::CommandPools;
@@ -28,6 +29,7 @@ impl Plugin for EconomyPlugin {
                 (
                     market::price_update_system,
                     market::settlement_price_update_system,
+                    market::camp_price_update_system,
                 )
                     .in_set(SimulationSet::Economy),
             );

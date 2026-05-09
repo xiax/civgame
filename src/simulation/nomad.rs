@@ -80,7 +80,8 @@ pub fn nomad_migration_system(
     let now = clock.tick as u32;
 
     for (&fid, faction) in registry.factions.iter_mut() {
-        if !faction.lifestyle.is_nomadic() {
+        // Capability check: only mobile-home archetypes migrate.
+        if !faction.caps.home.is_mobile() {
             continue;
         }
         if faction.member_count == 0 {
@@ -526,23 +527,17 @@ pub const NOMAD_SEDENTARIZE_MIN_MEMBERS: u32 = 12;
 ///
 /// Reverse direction (settled → nomadic on collapse) is deferred.
 pub fn nomad_sedentarize_system(
-    mut registry: ResMut<FactionRegistry>,
+    registry: Res<FactionRegistry>,
     clock: Res<SimClock>,
-    members: Query<(Entity, &crate::simulation::faction::FactionMember)>,
-    mut log_events: EventWriter<crate::ui::activity_log::ActivityLogEvent>,
+    mut lifecycle_queue: ResMut<crate::simulation::lifecycle::LifecycleEventQueue>,
 ) {
     if clock.tick % TICKS_PER_DAY as u64 != 0 {
         return;
     }
     let now = clock.tick as u32;
-    // Pre-bucket one actor per faction so we can fire the ActivityLogEvent
-    // without a second query pass.
-    let mut actor_per_faction: ahash::AHashMap<u32, Entity> = ahash::AHashMap::new();
-    for (entity, m) in members.iter() {
-        actor_per_faction.entry(m.faction_id).or_insert(entity);
-    }
-    for (&fid, faction) in registry.factions.iter_mut() {
-        if !faction.lifestyle.is_nomadic() {
+    for (&fid, faction) in registry.factions.iter() {
+        // Capability check: only mobile-home archetypes can sedentarize.
+        if !faction.caps.home.is_mobile() {
             continue;
         }
         if faction.member_count < NOMAD_SEDENTARIZE_MIN_MEMBERS {
@@ -562,18 +557,22 @@ pub fn nomad_sedentarize_system(
             "Faction {fid} sedentarized (stable for {stay_duration} ticks at {:?}) tick {now}",
             faction.home_tile,
         );
-        let camp = faction.home_tile;
-        faction.lifestyle = crate::simulation::faction::Lifestyle::Settled;
-        if let Some(&actor) = actor_per_faction.get(&fid) {
-            log_events.send(crate::ui::activity_log::ActivityLogEvent {
-                tick: now as u64,
-                actor,
-                faction_id: fid,
-                kind: crate::ui::activity_log::ActivityEntryKind::Sedentarized {
-                    camp,
-                },
-            });
-        }
+        // P3: emit SwitchArchetype event. The lifecycle processor
+        // (exclusive World, runs later in this tick) executes the
+        // 7-step re-derivation: caps + land_policy + economic_policy
+        // re-applied, old camp structures despawned, culture_hash
+        // bumped, FactionStorageTile spawned synchronously, and the
+        // `Sedentarized` activity log event emitted.
+        let new_key = crate::simulation::lifecycle::settled_variant_of(
+            &faction.caps.archetype_key,
+        );
+        lifecycle_queue.push(
+            crate::simulation::lifecycle::SettlementLifecycleEvent::SwitchArchetype {
+                faction: fid,
+                new_archetype_key: new_key,
+                at_tile: faction.home_tile,
+            },
+        );
     }
 }
 

@@ -447,6 +447,14 @@ pub fn spawn_population(
             if group_idx == 0 {
                 faction_data.lifestyle = options.lifestyle;
             }
+            // P1a: derive the capability bundle that mirrors today's
+            // `(lifestyle, preset)` behaviour. Stays in lock-step with
+            // the legacy fields above.
+            faction_data.caps = crate::simulation::archetype::derive_from_legacy(
+                faction_data.lifestyle,
+                options.economy,
+                &catalog,
+            );
         }
 
         let home_world = tile_to_world(home_tx, home_ty);
@@ -456,12 +464,17 @@ pub fn spawn_population(
         // pack-animal / PackBundle inventories (Phase 4 backend split). The
         // tile would be misleading: it'd accept deposits but not travel with
         // the band on migration.
-        let lifestyle_for_storage = registry
+        // Capability check: only `FactionTile` storage backends spawn a tile.
+        let storage_kind = registry
             .factions
             .get(&faction_id)
-            .map(|d| d.lifestyle)
-            .unwrap_or_default();
-        if !lifestyle_for_storage.is_nomadic() {
+            .map(|d| d.caps.storage)
+            .unwrap_or(crate::simulation::archetype::StorageBackendKind::FactionTile);
+        if matches!(
+            storage_kind,
+            crate::simulation::archetype::StorageBackendKind::FactionTile
+                | crate::simulation::archetype::StorageBackendKind::Hybrid
+        ) {
             commands.spawn((
                 FactionStorageTile { faction_id },
                 Transform::from_xyz(home_world.x, home_world.y, 0.5),
@@ -605,7 +618,16 @@ pub fn spawn_population(
         // bond households continue to form later via
         // `household_formation_system`. Subsistence/Mixed presets skip this
         // — those villages keep household formation gated on bonding.
-        if matches!(options.economy, crate::game_state::EconomyPreset::Market) {
+        // Capability check: archetypes whose `inheritance.seed_storage_tile`
+        // is true seed one-person households at spawn (today: Market only).
+        // Subsistence/Mixed villages keep household formation gated on
+        // bonding (`household_formation_system`).
+        let seed_households_for_archetype = registry
+            .factions
+            .get(&faction_id)
+            .map(|d| d.caps.inheritance.seed_storage_tile)
+            .unwrap_or(false);
+        if seed_households_for_archetype {
             seed_market_households(
                 &mut commands,
                 &mut registry,

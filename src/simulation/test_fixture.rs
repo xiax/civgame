@@ -9148,4 +9148,225 @@ mod baseline_behaviour {
             ),
         }
     }
+
+    // ─── P3 Lifecycle: SwitchArchetype 7-step re-derivation ────────
+
+    /// Set up a fresh nomadic-Subsistence faction in the test fixture
+    /// and return its id. Caller pushes the SwitchArchetype event and
+    /// invokes the lifecycle processor.
+    fn setup_nomadic_faction(sim: &mut TestSim) -> u32 {
+        use crate::simulation::archetype::derive_from_legacy;
+        use crate::simulation::faction::{FactionRegistry, Lifestyle};
+        let catalog = sim
+            .app
+            .world()
+            .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+            .clone();
+        let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+        let fid = registry.create_faction((50, 50));
+        let faction = registry.factions.get_mut(&fid).unwrap();
+        faction.lifestyle = Lifestyle::Nomadic;
+        faction.caps = derive_from_legacy(
+            Lifestyle::Nomadic,
+            crate::game_state::EconomyPreset::Subsistence,
+            &catalog,
+        );
+        // Mirror the legacy fields too so spawn-time invariants hold.
+        crate::economy::policy::apply_preset(
+            &mut faction.economic_policy,
+            crate::game_state::EconomyPreset::Subsistence,
+            &catalog,
+        );
+        faction.land_policy =
+            crate::economy::policy::land_policy_for(crate::game_state::EconomyPreset::Subsistence);
+        fid
+    }
+
+    fn push_switch_to_settled_market(sim: &mut TestSim, fid: u32, tile: (i32, i32)) {
+        use crate::simulation::lifecycle::{LifecycleEventQueue, SettlementLifecycleEvent};
+        let mut queue = sim.app.world_mut().resource_mut::<LifecycleEventQueue>();
+        queue.push(SettlementLifecycleEvent::SwitchArchetype {
+            faction: fid,
+            new_archetype_key: "settled_market".to_string(),
+            at_tile: tile,
+        });
+    }
+
+    fn run_lifecycle_processor(sim: &mut TestSim) {
+        use bevy::ecs::system::RunSystemOnce;
+        use crate::simulation::lifecycle::process_settlement_lifecycle_system;
+        sim.app
+            .world_mut()
+            .run_system_once(process_settlement_lifecycle_system)
+            .expect("lifecycle processor should run");
+    }
+
+    /// Sedentarize trace finding #3: `land_policy` is set once at
+    /// spawn and never re-derived elsewhere, so flipping a
+    /// Subsistence-like nomadic faction to `settled_market` requires
+    /// the SwitchArchetype handler to re-derive `land_policy`
+    /// explicitly. After the event, `state_sells_land` must be true.
+    #[test]
+    fn sedentarize_re_derives_land_policy() {
+        use crate::simulation::faction::FactionRegistry;
+        let mut sim = TestSim::new(0xC0FFEE);
+        let fid = setup_nomadic_faction(&mut sim);
+        // Pre-condition: land_policy is Subsistence default
+        // (state_sells_land = false).
+        let pre = sim
+            .app
+            .world()
+            .resource::<FactionRegistry>()
+            .factions
+            .get(&fid)
+            .unwrap()
+            .land_policy;
+        assert!(!pre.state_sells_land, "subsistence default must be all-false");
+
+        push_switch_to_settled_market(&mut sim, fid, (50, 50));
+        run_lifecycle_processor(&mut sim);
+
+        let post = sim
+            .app
+            .world()
+            .resource::<FactionRegistry>()
+            .factions
+            .get(&fid)
+            .unwrap()
+            .land_policy;
+        assert!(
+            post.state_sells_land,
+            "settled_market must re-derive land_policy with state_sells_land=true",
+        );
+        assert!(post.private_freehold_allowed, "freehold must be enabled");
+    }
+
+    /// Per-resource `economic_policy` map must be re-applied for the
+    /// new archetype. Subsistence (empty) → Market (capitalist on
+    /// every catalog resource).
+    #[test]
+    fn sedentarize_re_derives_economic_policy() {
+        use crate::simulation::faction::FactionRegistry;
+        let mut sim = TestSim::new(0xC0FFEE);
+        let fid = setup_nomadic_faction(&mut sim);
+        // Pre: empty policy map (Subsistence default).
+        let pre_len = sim
+            .app
+            .world()
+            .resource::<FactionRegistry>()
+            .factions
+            .get(&fid)
+            .unwrap()
+            .economic_policy
+            .len();
+        assert_eq!(pre_len, 0);
+
+        push_switch_to_settled_market(&mut sim, fid, (50, 50));
+        run_lifecycle_processor(&mut sim);
+
+        let world = sim.app.world();
+        let registry = world.resource::<FactionRegistry>();
+        let faction = registry.factions.get(&fid).unwrap();
+        let catalog_len = world
+            .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+            .iter()
+            .count();
+        assert_eq!(
+            faction.economic_policy.len(),
+            catalog_len,
+            "settled_market should populate every catalog resource as capitalist",
+        );
+        // Spot-check Wood is capitalist now.
+        let wood_policy = faction.policy_for(crate::economy::core_ids::wood());
+        assert!(wood_policy.private_actors_allowed);
+        assert!(!wood_policy.chief_allocates_labor);
+    }
+
+    /// `caps` must mirror the new archetype after SwitchArchetype.
+    /// Capability-bearing systems (P1a migration) read `caps` for
+    /// every gating decision.
+    #[test]
+    fn sedentarize_updates_caps_to_match_archetype() {
+        use crate::simulation::archetype::StorageBackendKind;
+        use crate::simulation::faction::FactionRegistry;
+        let mut sim = TestSim::new(0xC0FFEE);
+        let fid = setup_nomadic_faction(&mut sim);
+
+        push_switch_to_settled_market(&mut sim, fid, (50, 50));
+        run_lifecycle_processor(&mut sim);
+
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let caps = &registry.factions.get(&fid).unwrap().caps;
+        assert_eq!(caps.archetype_key, "settled_market");
+        assert!(caps.home.is_anchored());
+        assert_eq!(caps.storage, StorageBackendKind::FactionTile);
+        assert!(caps.settlement.is_full_settlement());
+        assert!(caps.posting.enabled());
+    }
+
+    /// Synchronous storage tile bootstrap: `StorageTileMap` must
+    /// register a tile owned by the faction at `at_tile`
+    /// immediately after the event drains, no bootstrap window.
+    #[test]
+    fn sedentarize_storage_tile_synchronous() {
+        use crate::simulation::faction::StorageTileMap;
+        let mut sim = TestSim::new(0xC0FFEE);
+        let fid = setup_nomadic_faction(&mut sim);
+
+        let pre = sim
+            .app
+            .world()
+            .resource::<StorageTileMap>()
+            .by_faction
+            .get(&fid)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        assert_eq!(pre, 0, "nomadic faction must start with 0 storage tiles");
+
+        push_switch_to_settled_market(&mut sim, fid, (60, 60));
+        run_lifecycle_processor(&mut sim);
+
+        let map = sim.app.world().resource::<StorageTileMap>();
+        let tiles = map
+            .by_faction
+            .get(&fid)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            tiles.contains(&(60, 60)),
+            "synchronous bootstrap must place a FactionStorageTile at at_tile",
+        );
+        assert_eq!(map.tiles.get(&(60, 60)).copied(), Some(fid));
+    }
+
+    /// Lifestyle field must flip alongside caps so legacy readers
+    /// (UI labels, log strings) report the new archetype.
+    #[test]
+    fn sedentarize_flips_lifestyle_field() {
+        use crate::simulation::faction::{FactionRegistry, Lifestyle};
+        let mut sim = TestSim::new(0xC0FFEE);
+        let fid = setup_nomadic_faction(&mut sim);
+        assert_eq!(
+            sim.app
+                .world()
+                .resource::<FactionRegistry>()
+                .factions
+                .get(&fid)
+                .unwrap()
+                .lifestyle,
+            Lifestyle::Nomadic
+        );
+        push_switch_to_settled_market(&mut sim, fid, (50, 50));
+        run_lifecycle_processor(&mut sim);
+        assert_eq!(
+            sim.app
+                .world()
+                .resource::<FactionRegistry>()
+                .factions
+                .get(&fid)
+                .unwrap()
+                .lifestyle,
+            Lifestyle::Settled
+        );
+    }
 }

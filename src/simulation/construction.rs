@@ -1916,7 +1916,9 @@ pub fn chief_directive_system(
         // `seed_nomadic_camp` carries them until Phase 8's migration commit
         // re-seeds at the new camp; Phase 7's `nomad_chief_directives` will
         // own replenishment of lost Tents/Bedrolls/Yurts.
-        if faction.lifestyle.is_nomadic() {
+        // Capability check: archetypes with no posting layer have no
+        // chief allocating construction (today's nomadic behaviour).
+        if faction.caps.posting.is_disabled() {
             continue;
         }
         let count = faction_bp_count.get(&faction_id).copied().unwrap_or(0);
@@ -4778,7 +4780,8 @@ pub fn seed_starting_buildings_system(
         // a Bedroll per founder, a couple of Tents (sticks-and-leaves
         // shelter), and — at Neolithic+ — one or two Yurts (packable felt
         // shelters) near the central hearth.
-        if faction.lifestyle.is_nomadic() {
+        // Capability check: Camp settlement mode = nomadic-style camp seeding.
+        if faction.caps.settlement.is_camp() {
             seed_nomadic_camp(
                 &mut commands,
                 &mut maps,

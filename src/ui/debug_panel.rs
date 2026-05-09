@@ -348,7 +348,7 @@ pub fn debug_panel_system(
                     }
                     if let Some(faction) = registry.factions.get(&fid) {
                         ui.label(format!("Members: {}", faction.member_count));
-                        let home_label = if faction.lifestyle.is_nomadic() {
+                        let home_label = if faction.caps.home.is_mobile() {
                             "Camp tile"
                         } else {
                             "Home tile"
@@ -358,7 +358,7 @@ pub fn debug_panel_system(
                             home_label, faction.home_tile.0, faction.home_tile.1
                         ));
                         ui.label(format!("Lifestyle: {}", faction.lifestyle.name()));
-                        if faction.lifestyle.is_nomadic() {
+                        if faction.caps.home.is_mobile() {
                             if faction.last_migration_tick > 0 {
                                 ui.label(format!(
                                     "Last migration: tick {}",

@@ -2,8 +2,10 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::command::CommandPools;
-use crate::economy::market::Market;
+use crate::economy::market::{Market, SettlementMarket};
 use crate::economy::mode::EconomicMode;
+use crate::simulation::camp::{faction_market_node, Camp, CampMap, MarketNodeRef};
+use crate::simulation::settlement::{Settlement, SettlementMap};
 
 pub fn economy_panel_system(
     mut contexts: EguiContexts,
@@ -11,17 +13,21 @@ pub fn economy_panel_system(
     pools: Res<CommandPools>,
     mode: Res<EconomicMode>,
     player_faction: Res<crate::simulation::faction::PlayerFaction>,
-    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
-    settlements: Query<&crate::simulation::settlement::Settlement>,
+    settlement_map: Res<SettlementMap>,
+    camp_map: Res<CampMap>,
+    settlements: Query<&Settlement, Without<Camp>>,
+    camps: Query<&Camp, Without<Settlement>>,
 ) {
-    // Pluralist Economy R7: prefer the player faction's first
-    // settlement market over the global one. Falls back to global
-    // when the player has no settlements yet (start-up edge case).
-    let player_settlement = settlement_map
-        .first_for_faction(player_faction.faction_id)
-        .and_then(|sid| settlement_map.by_id.get(&sid).copied())
-        .and_then(|e| settlements.get(e).ok());
-    let title = if player_settlement.is_some() {
+    // P1b: prefer the player faction's economic node — Settlement for
+    // settled archetypes, Camp for nomadic. Falls back to the global
+    // Market when no node exists yet (start-up edge case).
+    let player_market: Option<&SettlementMarket> =
+        match faction_market_node(&settlement_map, &camp_map, player_faction.faction_id) {
+            Some(MarketNodeRef::Settlement(e)) => settlements.get(e).ok().map(|s| &s.market),
+            Some(MarketNodeRef::Camp(e)) => camps.get(e).ok().map(|c| &c.market),
+            None => None,
+        };
+    let title = if player_market.is_some() {
         "Economy (Local Market)"
     } else {
         "Economy"
@@ -38,8 +44,8 @@ pub fn economy_panel_system(
                 EconomicMode::Market | EconomicMode::Mixed => {
                     ui.label("Market Prices (Commodities):");
                     for (id, _def) in catalog.iter() {
-                        let price = match player_settlement {
-                            Some(s) => s.market.price_of(id),
+                        let price = match player_market {
+                            Some(m) => m.price_of(id),
                             None => market.price_of(id),
                         };
                         ui.label(format!(
@@ -48,9 +54,8 @@ pub fn economy_panel_system(
                             price
                         ));
                     }
-                    let listings: &[(crate::economy::item::Item, u32)] = match player_settlement
-                    {
-                        Some(s) => &s.market.listings,
+                    let listings: &[(crate::economy::item::Item, u32)] = match player_market {
+                        Some(m) => &m.listings,
                         None => &market.listings,
                     };
                     if !listings.is_empty() {
@@ -59,8 +64,8 @@ pub fn economy_panel_system(
                         for (item, stock) in listings {
                             if *stock > 0 {
                                 let name = item.label();
-                                let price = match player_settlement {
-                                    Some(s) => s.market.calculate_price(item),
+                                let price = match player_market {
+                                    Some(m) => m.calculate_price(item),
                                     None => market.calculate_price(item),
                                 };
                                 ui.label(format!("  {} x{}: ${:.1}", name, stock, price));

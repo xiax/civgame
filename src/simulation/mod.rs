@@ -1,7 +1,10 @@
 use bevy::prelude::*;
 
 pub mod animals;
+pub mod archetype;
 pub mod building_template;
+pub mod camp;
+pub mod lifecycle;
 pub mod carry;
 pub mod carve;
 pub mod civic_milestones;
@@ -117,6 +120,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(terraform::PendingFootprints::default())
             .insert_resource(settlement::SettlementPlans::default())
             .insert_resource(settlement::SettlementMap::default())
+            .insert_resource(camp::CampMap::default())
+            .insert_resource(lifecycle::LifecycleEventQueue::default())
             .insert_resource(settlement::ZoneOverlayToggle::default())
             .insert_resource(land::PlotIndex::default())
             .insert_resource(land::LandListings::default())
@@ -524,6 +529,12 @@ impl Plugin for SimulationPlugin {
                 (
                     settlement::settlement_peak_population_system
                         .after(settlement::auto_found_default_settlements_system),
+                    // P1b: spawn one Camp per Camp-mode (nomadic) faction.
+                    // Sibling to `auto_found_default_settlements_system`;
+                    // ordered before the planner so any subsequent camp-aware
+                    // logic on the same tick sees the live entity.
+                    camp::auto_found_default_camps_system
+                        .before(settlement::settlement_planner_system),
                     land::carve_plots_system
                         .after(settlement::settlement_planner_system)
                         .before(construction::chief_directive_system),
@@ -588,6 +599,11 @@ impl Plugin for SimulationPlugin {
                     shared_knowledge::cluster_decay_system,
                     knowledge::cluster_tier_promotion_system
                         .after(knowledge::awareness_gossip_system),
+                    // P3: drain SettlementLifecycleEvent queue (today
+                    // only `nomad_sedentarize_system` emits — must run
+                    // after it). Exclusive World; consumes the queue.
+                    lifecycle::process_settlement_lifecycle_system
+                        .after(nomad::nomad_sedentarize_system),
                 )
                     .in_set(SimulationSet::Economy),
             );

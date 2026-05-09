@@ -497,6 +497,27 @@ pub fn settlement_price_update_system(
     }
 }
 
+/// P1b: per-camp price update. Mirrors `settlement_price_update_system`
+/// for nomadic factions whose market lives on a `Camp` instead of a
+/// `Settlement`. Same `PRICE_UPDATE_INTERVAL` cadence + `Command` mode
+/// short-circuit so behaviour is uniform across archetypes.
+pub fn camp_price_update_system(
+    clock: Res<crate::simulation::schedule::SimClock>,
+    mode: Res<EconomicMode>,
+    mut camps: Query<&mut crate::simulation::camp::Camp>,
+) {
+    if matches!(*mode, EconomicMode::Command) {
+        return;
+    }
+    if clock.tick % PRICE_UPDATE_INTERVAL != 0 {
+        return;
+    }
+    for mut camp in camps.iter_mut() {
+        camp.market.update_prices();
+        camp.market.clear_flow();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

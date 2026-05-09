@@ -123,7 +123,8 @@ pub fn auto_found_default_settlements_system(
         // permanent market_tile, no plots, no treasury — `home_tile` is a
         // mutable camp anchor, and storage pools across member/pack-animal
         // inventories (Phase 4 backend split). See nomadic-mode plan.
-        if data.lifestyle.is_nomadic() {
+        // Capability check: only FullSettlement archetypes auto-found a Settlement.
+        if !data.caps.settlement.is_full_settlement() {
             continue;
         }
         let home = data.home_tile;
