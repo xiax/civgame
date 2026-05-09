@@ -152,4 +152,6 @@ core_ids! {
     BerrySeed => "berry_seed" => berry_seed,
     ClayTablet => "clay_tablet" => clay_tablet,
     Book => "book" => book,
+    Bedroll => "bedroll" => bedroll,
+    PackedYurt => "packed_yurt" => packed_yurt,
 }

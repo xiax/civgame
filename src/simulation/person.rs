@@ -287,6 +287,9 @@ impl PlayerOrderKind {
                 BuildSiteKind::Wall(WallMaterial::CutStone) => "Build Cut Stone Wall",
                 BuildSiteKind::Door => "Build Door",
                 BuildSiteKind::Bed => "Build Bed",
+                BuildSiteKind::Bedroll => "Build Bedroll",
+                BuildSiteKind::Tent => "Build Tent",
+                BuildSiteKind::Yurt => "Build Yurt",
                 BuildSiteKind::Campfire => "Build Campfire",
                 BuildSiteKind::Workbench => "Build Workbench",
                 BuildSiteKind::Loom => "Build Loom",
@@ -437,18 +440,36 @@ pub fn spawn_population(
                 &catalog,
             );
             faction_data.land_policy = crate::economy::policy::land_policy_for(options.economy);
+            // Apply lifestyle: only the player faction reads the user-picked
+            // option. AI factions stay Settled by default. Households inherit
+            // via `spawn_household` so a nomadic player faction's bonded pairs
+            // form nomadic households automatically.
+            if group_idx == 0 {
+                faction_data.lifestyle = options.lifestyle;
+            }
         }
 
         let home_world = tile_to_world(home_tx, home_ty);
 
-        // Spawn a storage tile marker for every faction at its home tile
-        commands.spawn((
-            FactionStorageTile { faction_id },
-            Transform::from_xyz(home_world.x, home_world.y, 0.5),
-            GlobalTransform::default(),
-            Visibility::Hidden,
-            InheritedVisibility::default(),
-        ));
+        // Settled factions get a fixed storage tile at home. Nomadic factions
+        // skip this — their `FactionStorage.totals` are pooled across member /
+        // pack-animal / PackBundle inventories (Phase 4 backend split). The
+        // tile would be misleading: it'd accept deposits but not travel with
+        // the band on migration.
+        let lifestyle_for_storage = registry
+            .factions
+            .get(&faction_id)
+            .map(|d| d.lifestyle)
+            .unwrap_or_default();
+        if !lifestyle_for_storage.is_nomadic() {
+            commands.spawn((
+                FactionStorageTile { faction_id },
+                Transform::from_xyz(home_world.x, home_world.y, 0.5),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ));
+        }
 
         if group_idx == 0 {
             player_faction.faction_id = faction_id;

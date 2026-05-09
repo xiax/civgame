@@ -901,6 +901,13 @@ pub fn chief_job_posting_system(
         if faction_id == SOLO {
             continue;
         }
+        // Nomadic factions don't post Stockpile/Farm/Build/Craft/Haul jobs:
+        // they have no FactionStorageTile to deposit into, no plots to farm,
+        // and Phase 7's `nomad_chief_directives` will own their slim build
+        // menu. Members work via autonomous need-driven goals until then.
+        if faction.lifestyle.is_nomadic() {
+            continue;
+        }
         let live_bps: Vec<Entity> = bps_by_faction
             .get(&faction_id)
             .cloned()

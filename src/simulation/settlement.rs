@@ -119,6 +119,13 @@ pub fn auto_found_default_settlements_system(
         if map.by_faction.contains_key(faction_id) {
             continue;
         }
+        // Nomadic factions skip Settlement creation entirely. They have no
+        // permanent market_tile, no plots, no treasury — `home_tile` is a
+        // mutable camp anchor, and storage pools across member/pack-animal
+        // inventories (Phase 4 backend split). See nomadic-mode plan.
+        if data.lifestyle.is_nomadic() {
+            continue;
+        }
         let home = data.home_tile;
         let mc = crate::simulation::region::MegaChunkCoord::from_tile(home.0, home.1);
         let id = map.alloc_id();

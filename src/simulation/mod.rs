@@ -26,6 +26,8 @@ pub mod military;
 pub mod mood;
 pub mod movement;
 pub mod needs;
+pub mod nomad;
+pub mod pack_deploy;
 pub mod person;
 pub mod plants;
 pub mod production;

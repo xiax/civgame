@@ -1233,6 +1233,30 @@ impl LayoutStyle {
     }
 }
 
+/// Faction-wide lifestyle archetype. Settled factions found Settlements,
+/// carve plots, and build permanent structures. Nomadic factions skip
+/// `Settlement` creation, store goods in pooled member/pack-animal/PackBundle
+/// inventories instead of `FactionStorageTile`, and migrate when local
+/// resources thin out. See `~/.claude/plans/i-want-to-add-snappy-manatee.md`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum Lifestyle {
+    #[default]
+    Settled,
+    Nomadic,
+}
+
+impl Lifestyle {
+    pub fn is_nomadic(self) -> bool {
+        matches!(self, Lifestyle::Nomadic)
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Lifestyle::Settled => "Settled",
+            Lifestyle::Nomadic => "Nomadic",
+        }
+    }
+}
+
 /// Per-faction architectural and behavioural personality. Rolled once at
 /// faction creation from a deterministic seed. Drives the settlement planner,
 /// build-candidate scoring, raid frequency, and ritual cadence.
@@ -1469,6 +1493,13 @@ pub struct FactionData {
     /// dominant→subordinates, but each subordinate has exactly one
     /// overlord.
     pub subordinate_to: Option<u32>,
+    /// Faction archetype — Settled (default) or Nomadic. Set at faction
+    /// creation; for nomads `home_tile` is mutable (current camp anchor),
+    /// no `Settlement` is auto-founded, no plots are carved, and storage
+    /// pools across member/pack-animal/PackBundle inventories instead of
+    /// using a `FactionStorageTile`. Households inherit from their parent
+    /// village via `spawn_household`.
+    pub lifestyle: Lifestyle,
 }
 
 impl FactionData {
@@ -1543,6 +1574,7 @@ impl FactionRegistry {
                 bureaucrat_treasury_empty_streak: 0,
                 dominance_over: Vec::new(),
                 subordinate_to: None,
+                lifestyle: Lifestyle::default(),
             },
         );
         id
@@ -1611,6 +1643,11 @@ impl FactionRegistry {
             .get(&parent_faction_id)
             .map(|p| p.land_policy)
             .unwrap_or_default();
+        let parent_lifestyle = self
+            .factions
+            .get(&parent_faction_id)
+            .map(|p| p.lifestyle)
+            .unwrap_or_default();
         let new_id = self.create_faction(home_tile);
         if let Some(data) = self.factions.get_mut(&new_id) {
             data.parent_faction = Some(parent_faction_id);
@@ -1619,6 +1656,10 @@ impl FactionRegistry {
             // demand systems (Phase 4+) can read "the state rents
             // land" consistently from either tier.
             data.land_policy = parent_land_policy;
+            // Inherit the parent village's lifestyle — a nomadic village's
+            // households are also nomadic (no plots, no FactionStorageTile,
+            // travel with the band on migration).
+            data.lifestyle = parent_lifestyle;
             if parent_is_capitalist {
                 let cap_policy =
                     crate::economy::policy::ResourceControlPolicy::capitalist();
@@ -2160,15 +2201,33 @@ pub fn sync_faction_center_hotspots_system(
 
 // ── Faction storage totals computation ───────────────────────────────────────
 
+/// Build `FactionStorage.totals` for every faction. Two backends:
+/// - **Settled** factions (default): sum `GroundItem`s sitting on tiles
+///   marked by a `FactionStorageTile` belonging to that faction.
+/// - **Nomadic** factions: sum `EconomicAgent.inventory` for every member
+///   of the faction. Pack-animal inventories and `PackBundle`-marked
+///   ground tiles will fold in here once Phase 5 / Phase 7 land.
+///
+/// Both backends populate the same `faction.storage.totals` map, so chief
+/// posting math (`faction.storage.stock_of(rid)`) and HTN food gates work
+/// unchanged in either mode.
 pub fn compute_faction_storage_system(
     storage_tile_map: Res<StorageTileMap>,
     ground_items: Query<(&GroundItem, &Transform)>,
+    members: Query<
+        (&FactionMember, &crate::economy::agent::EconomicAgent),
+        With<crate::simulation::person::Person>,
+    >,
     mut registry: ResMut<FactionRegistry>,
 ) {
     for faction in registry.factions.values_mut() {
         faction.storage.totals.clear();
     }
 
+    // Settled-backend pass: ground items on FactionStorageTile tiles.
+    // Nomadic factions never spawn storage tiles, so they fall through
+    // this loop with zero contributions and pick up their pool from the
+    // member-inventory pass below.
     for (gi, transform) in ground_items.iter() {
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
@@ -2183,6 +2242,29 @@ pub fn compute_faction_storage_system(
             .totals
             .entry(gi.item.resource_id)
             .or_insert(0) += gi.qty;
+    }
+
+    // Nomadic-backend pass: pool each band-member's `EconomicAgent.inventory`
+    // into the parent faction's `storage.totals`. Skipped entirely for
+    // settled factions to keep their stock numbers identical to pre-refactor
+    // behavior (regression invariant for the existing 411 tests).
+    for (member, agent) in members.iter() {
+        let Some(faction) = registry.factions.get_mut(&member.faction_id) else {
+            continue;
+        };
+        if !faction.lifestyle.is_nomadic() {
+            continue;
+        }
+        for (item, qty) in agent.inventory.iter() {
+            if *qty == 0 {
+                continue;
+            }
+            *faction
+                .storage
+                .totals
+                .entry(item.resource_id)
+                .or_insert(0) += qty;
+        }
     }
 }
 

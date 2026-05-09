@@ -44,6 +44,10 @@ pub struct GameStartOptions {
     /// Whether to pre-build era-appropriate structures around each faction's
     /// home tile. Set to false in sandbox mode.
     pub seed_buildings: bool,
+    /// Faction archetype for the player faction. Nomadic skips Settlement
+    /// founding, plot carving, and FactionStorageTile spawn; structures use
+    /// the pack/deploy cycle and the band migrates seasonally.
+    pub lifestyle: crate::simulation::faction::Lifestyle,
 }
 
 impl Default for GameStartOptions {
@@ -53,6 +57,7 @@ impl Default for GameStartOptions {
             player_population: 20,
             economy: EconomyPreset::Subsistence,
             seed_buildings: true,
+            lifestyle: crate::simulation::faction::Lifestyle::Settled,
         }
     }
 }

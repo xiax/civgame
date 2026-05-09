@@ -291,5 +291,37 @@ ResourceFile(
             tags: ["knowledge"],
             sprite_key: Some("item_cloth"),
         ),
+
+        // ── Nomadic kit ───────────────────────────────────────────────
+        // Packable inventory forms of nomadic structures. A Bedroll lives
+        // in inventory between camps; deploying it spawns a 1-tile Bed
+        // entity carrying the `Deployable` marker. PackedTent / PackedYurt
+        // are the inventory forms of full-shelter Tents / Yurts.
+        ResourceDef(
+            key: "bedroll",
+            display_name: "Bedroll",
+            class: material,
+            bulk: small,
+            weight_g: 1500,
+            entertainment_value: 0,
+            storage_class: pile,
+            trade_base_value: 8,
+            tags: ["nomadic", "packed_shelter"],
+            sprite_key: Some("item_cloth"),
+        ),
+        ResourceDef(
+            key: "packed_yurt",
+            display_name: "Packed Yurt",
+            class: material,
+            bulk: two_hand,
+            // Heavy bundle of felt + wooden lattice + roof poles. Two pack
+            // animals saturate on one packed yurt at standard horse capacity.
+            weight_g: 80000,
+            entertainment_value: 0,
+            storage_class: pile,
+            trade_base_value: 60,
+            tags: ["nomadic", "packed_shelter"],
+            sprite_key: Some("item_cloth"),
+        ),
     ],
 )

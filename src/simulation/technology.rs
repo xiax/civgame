@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 pub type TechId = u16;
-pub const TECH_COUNT: usize = 43;
+pub const TECH_COUNT: usize = 44;
 pub const ACTIVITY_COUNT: usize = 13;
 
 // ── Tech ID constants ─────────────────────────────────────────────────────────
@@ -54,6 +54,9 @@ pub const CITY_STATE_ORG: TechId = 39;
 pub const PROFESSIONAL_ARMY: TechId = 40;
 pub const MONUMENTAL_BUILDING: TechId = 41;
 pub const LUNAR_CALENDAR: TechId = 42;
+// Nomadic-mode addition. Sits in Neolithic so Neolithic+ factions
+// (settled or nomadic) get it Aware+Learned via `seeded_through_era`.
+pub const PORTABLE_DWELLINGS: TechId = 43;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -1112,6 +1115,22 @@ pub static TECH_TREE: [TechDef; TECH_COUNT] = [
             food_storage_bonus: 0.10,
             ..TechBonus::ZERO
         },
+    },
+    TechDef {
+        id: PORTABLE_DWELLINGS,
+        era: Era::Neolithic,
+        name: "Portable Dwellings",
+        description:
+            "Felt-and-lattice yurts and packable hide tents — bands can carry an \
+             entire shelter on a few pack animals and re-pitch at the next camp.",
+        prerequisites: &[LOOM_WEAVING],
+        triggers: &[
+            TechTrigger {
+                activity: ActivityKind::Foraging,
+                per_unit_chance: 0.001,
+            },
+        ],
+        bonus: TechBonus::ZERO,
     },
 ];
 

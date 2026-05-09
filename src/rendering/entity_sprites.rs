@@ -1719,6 +1719,11 @@ pub fn spawn_blueprint_sprites(
             BuildSiteKind::Wall(WallMaterial::CutStone) => textures.wall_cutstone_ascii.clone(),
             BuildSiteKind::Door => textures.door_ascii.clone(),
             BuildSiteKind::Bed => textures.bed_ascii.clone(),
+            // Bedroll reuses the bed sprite for now — Phase 9 ships proper
+            // procedural pixel art for nomadic kit.
+            BuildSiteKind::Bedroll => textures.bed_ascii.clone(),
+            // Stub: Tent + Yurt reuse a wall sprite until proper art ships.
+            BuildSiteKind::Tent | BuildSiteKind::Yurt => textures.wall_palisade_ascii.clone(),
             BuildSiteKind::Campfire => textures.campfire_ascii.clone(),
             BuildSiteKind::Workbench => textures.workbench_ascii.clone(),
             BuildSiteKind::Loom => textures.loom_ascii.clone(),

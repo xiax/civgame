@@ -19,7 +19,8 @@ use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::{
     current_era, Era, TechId, BRONZE_CASTING, BRONZE_TOOLS, CITY_STATE_ORG, COPPER_TOOLS,
     COPPER_WORKING, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING, GRANARY, LONG_DIST_TRADE,
-    LOOM_WEAVING, MONUMENTAL_BUILDING, PERM_SETTLEMENT, PROFESSIONAL_ARMY, SACRED_RITUAL,
+    LOOM_WEAVING, MONUMENTAL_BUILDING, PERM_SETTLEMENT, PORTABLE_DWELLINGS, PROFESSIONAL_ARMY,
+    SACRED_RITUAL,
 };
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::{Calendar, Season};
@@ -413,6 +414,11 @@ pub enum BuildSiteKind {
     Wall(WallMaterial),
     Door,
     Bed,
+    /// Nomadic per-person Bed equivalent. Deploys as a 1-tile `Bed { tier:
+    /// Crude }` carrying a `Deployable` marker; on migration it packs back
+    /// into a `bedroll` good in the owner's inventory. Tech-gate-free
+    /// (Paleolithic-available). See `pack_deploy.rs`.
+    Bedroll,
     Campfire,
     Workbench,
     Loom,
@@ -423,6 +429,37 @@ pub enum BuildSiteKind {
     Market,
     Barracks,
     Monument,
+    /// Sticks-and-leaves shelter. Deployed-only; on migration teardown
+    /// `pack_deployable` (Phase 8) drops 50% of the input wood as
+    /// `GroundItem`s. No tech gate.
+    Tent,
+    /// Felt-and-lattice packable shelter. Packs to `Good::PackedYurt` on
+    /// migration; re-pitches at the new camp at zero material cost.
+    /// Tech-gated on `PORTABLE_DWELLINGS` (Neolithic).
+    Yurt,
+}
+
+/// Marker component on tile entities representing portable shelter.
+/// Auras / sleep-comfort buffs land in a follow-on; for now this just
+/// tags the entity for inspector hover and pack/deploy filtering.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct TentShelter {
+    pub tier: ShelterTier,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ShelterTier {
+    Tent,
+    Yurt,
+}
+
+impl ShelterTier {
+    pub fn label(self) -> &'static str {
+        match self {
+            ShelterTier::Tent => "Tent",
+            ShelterTier::Yurt => "Yurt",
+        }
+    }
 }
 
 impl BuildSiteKind {
@@ -431,6 +468,7 @@ impl BuildSiteKind {
             BuildSiteKind::Wall(mat) => mat.label(),
             BuildSiteKind::Door => "Door",
             BuildSiteKind::Bed => "Bed",
+            BuildSiteKind::Bedroll => "Bedroll",
             BuildSiteKind::Campfire => "Campfire",
             BuildSiteKind::Workbench => "Workbench",
             BuildSiteKind::Loom => "Loom",
@@ -441,6 +479,8 @@ impl BuildSiteKind {
             BuildSiteKind::Market => "Market",
             BuildSiteKind::Barracks => "Barracks",
             BuildSiteKind::Monument => "Monument",
+            BuildSiteKind::Tent => "Tent",
+            BuildSiteKind::Yurt => "Yurt",
         }
     }
 }
@@ -571,6 +611,9 @@ enum BuildRecipeIdx {
     Market,
     Barracks,
     Monument,
+    Bedroll,
+    Tent,
+    Yurt,
 }
 
 fn build_recipes_table() -> Vec<BuildRecipe> {
@@ -579,6 +622,9 @@ fn build_recipes_table() -> Vec<BuildRecipe> {
     let wood = core_ids::wood();
     let stone = core_ids::stone();
     let grain = core_ids::grain();
+    let skin = core_ids::skin();
+    let bedroll = core_ids::bedroll();
+    let packed_yurt = core_ids::packed_yurt();
 
     vec![
         BuildRecipe {
@@ -700,6 +746,35 @@ fn build_recipes_table() -> Vec<BuildRecipe> {
             tech_gate: Some(MONUMENTAL_BUILDING),
             deconstruct_refund: vec![(stone, 3), (wood, 1)],
         },
+        // Nomadic kit. Bedroll is a per-person packable Bed: cheap, no tech
+        // gate, deploys as `Bed { tier: Crude }` carrying `Deployable`.
+        // Settled factions can also build them (rare, but harmless).
+        BuildRecipe {
+            name: "Bedroll",
+            inputs: vec![(skin, 1), (wood, 2)],
+            work_ticks: 30,
+            tech_gate: None,
+            deconstruct_refund: vec![(bedroll, 1)],
+        },
+        BuildRecipe {
+            name: "Tent",
+            inputs: vec![(wood, 6), (skin, 3)],
+            work_ticks: 50,
+            tech_gate: None,
+            // Sticks-and-leaves teardown: half the wood comes back as
+            // GroundItems on migration; the rest stays at the old camp.
+            // (Phase 8 reads `Deployable.refund_pct = 0.5` directly so this
+            // refund vec serves only the player-deconstruct path.)
+            deconstruct_refund: vec![(wood, 3)],
+        },
+        BuildRecipe {
+            name: "Yurt",
+            inputs: vec![(wood, 8), (skin, 6)],
+            work_ticks: 90,
+            tech_gate: Some(PORTABLE_DWELLINGS),
+            // Player-deconstruct returns the packed-yurt good directly.
+            deconstruct_refund: vec![(packed_yurt, 1)],
+        },
     ]
 }
 
@@ -791,6 +866,9 @@ pub fn recipe_for(kind: BuildSiteKind) -> &'static BuildRecipe {
         BuildSiteKind::Wall(WallMaterial::CutStone) => BuildRecipeIdx::CutStone,
         BuildSiteKind::Door => BuildRecipeIdx::Door,
         BuildSiteKind::Bed => BuildRecipeIdx::Bed,
+        BuildSiteKind::Bedroll => BuildRecipeIdx::Bedroll,
+        BuildSiteKind::Tent => BuildRecipeIdx::Tent,
+        BuildSiteKind::Yurt => BuildRecipeIdx::Yurt,
         BuildSiteKind::Campfire => BuildRecipeIdx::Campfire,
         BuildSiteKind::Workbench => BuildRecipeIdx::Workbench,
         BuildSiteKind::Loom => BuildRecipeIdx::Loom,
@@ -1831,6 +1909,14 @@ pub fn chief_directive_system(
     let empty_pending: AHashMap<BuildSiteKind, u32> = AHashMap::new();
     for (&faction_id, faction) in faction_registry.factions.iter() {
         if faction_id == SOLO || faction.member_count == 0 {
+            continue;
+        }
+        // Nomadic factions skip the settled chief's build menu entirely:
+        // no Hut/Longhouse/Granary/Wall queueing. Their seeded camp from
+        // `seed_nomadic_camp` carries them until Phase 8's migration commit
+        // re-seeds at the new camp; Phase 7's `nomad_chief_directives` will
+        // own replenishment of lost Tents/Bedrolls/Yurts.
+        if faction.lifestyle.is_nomadic() {
             continue;
         }
         let count = faction_bp_count.get(&faction_id).copied().unwrap_or(0);
@@ -3236,6 +3322,70 @@ pub fn construction_system(
                     maps.bed_map.0.insert(tile, bed_entity);
                     bed_entity
                 }
+                BuildSiteKind::Bedroll => {
+                    // Nomadic Bed: same `Bed { tier: Crude }` semantics so
+                    // sleep dispatch (`SleepMethod` / `BedMap`) finds it
+                    // unchanged; the `Deployable` marker lets Phase 8's
+                    // `pack_deployable` convert it back into a `bedroll`
+                    // good when the camp moves.
+                    let bed = Bed::default();
+                    let bed_entity = commands
+                        .spawn((
+                            bed,
+                            crate::simulation::pack_deploy::Deployable::fully_packable(
+                                crate::economy::core_ids::bedroll(),
+                            ),
+                            StructureLabel("Bedroll"),
+                            Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                            crate::world::spatial::Indexed::new(
+                                crate::world::spatial::IndexedKind::Bed,
+                            ),
+                        ))
+                        .id();
+                    maps.bed_map.0.insert(tile, bed_entity);
+                    bed_entity
+                }
+                BuildSiteKind::Tent => {
+                    // Sticks-and-leaves shelter. Deployed-only — the
+                    // `Deployable::refund_only(0.5)` marker tells the
+                    // migration teardown to drop half the input wood as
+                    // GroundItems. Tent does NOT carry a Bed; nomads sleep
+                    // in Bedrolls underneath.
+                    let e = commands
+                        .spawn((
+                            TentShelter { tier: ShelterTier::Tent },
+                            crate::simulation::pack_deploy::Deployable::refund_only(0.5),
+                            StructureLabel("Tent"),
+                            Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        ))
+                        .id();
+                    e
+                }
+                BuildSiteKind::Yurt => {
+                    // Felt-and-lattice packable shelter. On migration,
+                    // packs into a `packed_yurt` good (handled by Phase 8
+                    // via `Deployable::fully_packable`).
+                    let e = commands
+                        .spawn((
+                            TentShelter { tier: ShelterTier::Yurt },
+                            crate::simulation::pack_deploy::Deployable::fully_packable(
+                                crate::economy::core_ids::packed_yurt(),
+                            ),
+                            StructureLabel("Yurt"),
+                            Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        ))
+                        .id();
+                    e
+                }
                 BuildSiteKind::Campfire => {
                     let campfire = Campfire::default();
                     let label = campfire.tier.label();
@@ -4218,7 +4368,7 @@ pub(crate) fn next_clear_tile(
 fn seed_zone_for(kind: BuildSiteKind) -> Option<crate::simulation::settlement::ZoneKind> {
     use crate::simulation::settlement::ZoneKind;
     match kind {
-        BuildSiteKind::Bed => Some(ZoneKind::Residential),
+        BuildSiteKind::Bed | BuildSiteKind::Bedroll => Some(ZoneKind::Residential),
         BuildSiteKind::Campfire => Some(ZoneKind::Civic),
         BuildSiteKind::Workbench | BuildSiteKind::Loom => Some(ZoneKind::Crafting),
         BuildSiteKind::Granary => Some(ZoneKind::Storage),
@@ -4313,6 +4463,48 @@ fn spawn_seeded_structure(
                 ))
                 .id();
             maps.bed_map.0.insert(tile, e);
+        }
+        BuildSiteKind::Bedroll => {
+            let bed = Bed::default();
+            let e = commands
+                .spawn((
+                    bed,
+                    crate::simulation::pack_deploy::Deployable::fully_packable(
+                        crate::economy::core_ids::bedroll(),
+                    ),
+                    StructureLabel("Bedroll"),
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Bed),
+                ))
+                .id();
+            maps.bed_map.0.insert(tile, e);
+        }
+        BuildSiteKind::Tent => {
+            commands.spawn((
+                TentShelter { tier: ShelterTier::Tent },
+                crate::simulation::pack_deploy::Deployable::refund_only(0.5),
+                StructureLabel("Tent"),
+                Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ));
+        }
+        BuildSiteKind::Yurt => {
+            commands.spawn((
+                TentShelter { tier: ShelterTier::Yurt },
+                crate::simulation::pack_deploy::Deployable::fully_packable(
+                    crate::economy::core_ids::packed_yurt(),
+                ),
+                StructureLabel("Yurt"),
+                Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ));
         }
         BuildSiteKind::Campfire => {
             let campfire = Campfire::default();
@@ -4576,8 +4768,31 @@ pub fn seed_starting_buildings_system(
         let home = faction.home_tile;
         let members = faction.member_count;
         let mut used: AHashSet<(i32, i32)> = AHashSet::new();
-        // Reserve the home tile itself — it carries the FactionStorageTile.
+        // Reserve the home tile itself — settled factions place their
+        // FactionStorageTile here; nomadic factions still want it free of
+        // structure overlaps so the camp anchor stays clear.
         used.insert(home);
+
+        // ── Nomadic camps short-circuit the era ladder ─────────────────
+        // No walls, plots, granaries, or pre-built houses. Just hearths,
+        // a Bedroll per founder, a couple of Tents (sticks-and-leaves
+        // shelter), and — at Neolithic+ — one or two Yurts (packable felt
+        // shelters) near the central hearth.
+        if faction.lifestyle.is_nomadic() {
+            seed_nomadic_camp(
+                &mut commands,
+                &mut maps,
+                &chunk_map,
+                &mut tile_changed,
+                &mut used,
+                faction_id,
+                home,
+                members,
+                era,
+                hearth_tier,
+            );
+            continue;
+        }
 
         // Build the settlement plan inline so seeded structures land in
         // their intended zones (Granary in Storage, Shrine in Sacred, etc.).
@@ -5240,6 +5455,286 @@ fn seed_farmstead_yard(
 /// Place beds in a ring of radius 2..=4 around `hearth`, up to `count`.
 /// Used by the Paleolithic/Mesolithic seeding path so each campfire gets
 /// its own bed cluster.
+/// Seed a nomadic band camp at `home`. No walls, no plots, no granaries:
+/// hearths via the same `paleolithic_hearth_positions` ring layout the band
+/// camp uses, then one Bedroll per founder around each hearth, plus 1 Tent
+/// per 4 founders for shelter; Neolithic+ adds 1 Yurt per ~5 founders.
+///
+/// Mirrors `seed_paleo_beds_around_hearth`'s direct-spawn pattern (no
+/// Blueprint pipeline) so the camp is fully built at game-start.
+fn seed_nomadic_camp(
+    commands: &mut Commands,
+    maps: &mut FurnitureMaps,
+    chunk_map: &ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    faction_id: u32,
+    home: (i32, i32),
+    members: u32,
+    era: Era,
+    hearth_tier: HearthTier,
+) {
+    let hearth_positions =
+        crate::simulation::settlement::paleolithic_hearth_positions(faction_id, home, members);
+    let n_hearths = hearth_positions.len().max(1) as u32;
+    // Bedroll per founder, evenly split across hearths (round up).
+    let bedrolls_per_hearth = (members.max(1) + n_hearths - 1) / n_hearths;
+    // 1 tent per 4 founders, minimum 1 per camp.
+    let tents_total = (members.max(1) + 3) / 4;
+    let tents_per_hearth = tents_total.max(1).div_ceil(n_hearths).max(1);
+    // Yurts: Neolithic+ only, 1 per ~5 members, capped at 2 per camp.
+    let yurts_total = if (era as u8) >= (Era::Neolithic as u8) {
+        (members.max(1) / 5).clamp(1, 2)
+    } else {
+        0
+    };
+
+    let mut yurts_remaining = yurts_total;
+
+    for &offset_pos in hearth_positions.iter() {
+        // Snap the hearth to a passable tile.
+        let hearth_tile = if !used.contains(&offset_pos)
+            && chunk_map.is_passable(offset_pos.0, offset_pos.1)
+        {
+            offset_pos
+        } else if let Some(t) = next_clear_tile(offset_pos, used, chunk_map, 4) {
+            t
+        } else {
+            continue;
+        };
+        used.insert(hearth_tile);
+        let world_pos = tile_to_world(hearth_tile.0, hearth_tile.1);
+        let e = commands
+            .spawn((
+                Campfire { tier: hearth_tier },
+                StructureLabel(hearth_tier.label()),
+                Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        maps.campfire_map.0.insert(hearth_tile, e);
+        tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+            tx: hearth_tile.0,
+            ty: hearth_tile.1,
+        });
+
+        // Bedrolls — same crescent placement as paleo beds, but each entity
+        // carries the `Deployable::fully_packable(bedroll)` marker so Phase 8
+        // can pack them when the camp moves.
+        seed_bedrolls_around_hearth(
+            commands,
+            maps,
+            chunk_map,
+            tile_changed,
+            used,
+            hearth_tile,
+            bedrolls_per_hearth,
+        );
+
+        // Tents — outer ring shelter (sticks-and-leaves; 50% wood refund on
+        // teardown via `Deployable::refund_only(0.5)`).
+        seed_tents_around_hearth(
+            commands,
+            chunk_map,
+            tile_changed,
+            used,
+            hearth_tile,
+            tents_per_hearth,
+        );
+
+        // Yurts — packable felt shelter, only at Neolithic+. Distribute as
+        // many as `yurts_remaining` allows; nomadic Bronze Age camps still
+        // top out at 2 yurts per band.
+        if yurts_remaining > 0 {
+            let yurts_here = yurts_remaining.min(1);
+            seed_yurts_around_hearth(
+                commands,
+                chunk_map,
+                tile_changed,
+                used,
+                hearth_tile,
+                yurts_here,
+            );
+            yurts_remaining = yurts_remaining.saturating_sub(yurts_here);
+        }
+    }
+}
+
+fn seed_bedrolls_around_hearth(
+    commands: &mut Commands,
+    maps: &mut FurnitureMaps,
+    chunk_map: &ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    hearth: (i32, i32),
+    count: u32,
+) {
+    let bedroll_id = crate::economy::core_ids::bedroll();
+    let mut placed = 0u32;
+    'outer: for radius in 2i32..=5 {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx.abs().max(dy.abs()) != radius {
+                    continue;
+                }
+                if placed >= count {
+                    break 'outer;
+                }
+                let tile = (hearth.0 + dx, hearth.1 + dy);
+                if used.contains(&tile) {
+                    continue;
+                }
+                if !chunk_map.is_passable(tile.0, tile.1) {
+                    continue;
+                }
+                let Some(k) = chunk_map.tile_kind_at(tile.0, tile.1) else {
+                    continue;
+                };
+                if k == TileKind::Wall || k == TileKind::Stone {
+                    continue;
+                }
+                let world_pos = tile_to_world(tile.0, tile.1);
+                let bed = Bed::default();
+                let e = commands
+                    .spawn((
+                        bed,
+                        crate::simulation::pack_deploy::Deployable::fully_packable(bedroll_id),
+                        StructureLabel("Bedroll"),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                        crate::world::spatial::Indexed::new(
+                            crate::world::spatial::IndexedKind::Bed,
+                        ),
+                    ))
+                    .id();
+                maps.bed_map.0.insert(tile, e);
+                used.insert(tile);
+                tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+                    tx: tile.0,
+                    ty: tile.1,
+                });
+                placed += 1;
+            }
+        }
+    }
+}
+
+fn seed_tents_around_hearth(
+    commands: &mut Commands,
+    chunk_map: &ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    hearth: (i32, i32),
+    count: u32,
+) {
+    let mut placed = 0u32;
+    // Outer ring (radius 5..=7) so tents shelter the bedrolls in 2..=5.
+    'outer: for radius in 5i32..=7 {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx.abs().max(dy.abs()) != radius {
+                    continue;
+                }
+                if placed >= count {
+                    break 'outer;
+                }
+                let tile = (hearth.0 + dx, hearth.1 + dy);
+                if used.contains(&tile) {
+                    continue;
+                }
+                if !chunk_map.is_passable(tile.0, tile.1) {
+                    continue;
+                }
+                let Some(k) = chunk_map.tile_kind_at(tile.0, tile.1) else {
+                    continue;
+                };
+                if k == TileKind::Wall || k == TileKind::Stone {
+                    continue;
+                }
+                let world_pos = tile_to_world(tile.0, tile.1);
+                commands.spawn((
+                    TentShelter {
+                        tier: ShelterTier::Tent,
+                    },
+                    crate::simulation::pack_deploy::Deployable::refund_only(0.5),
+                    StructureLabel("Tent"),
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ));
+                used.insert(tile);
+                tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+                    tx: tile.0,
+                    ty: tile.1,
+                });
+                placed += 1;
+            }
+        }
+    }
+}
+
+fn seed_yurts_around_hearth(
+    commands: &mut Commands,
+    chunk_map: &ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    hearth: (i32, i32),
+    count: u32,
+) {
+    let packed_yurt_id = crate::economy::core_ids::packed_yurt();
+    let mut placed = 0u32;
+    // Yurts go on the inner ring next to the hearth — they're the chief's
+    // big shelter and the social anchor of the camp.
+    'outer: for radius in 3i32..=5 {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx.abs().max(dy.abs()) != radius {
+                    continue;
+                }
+                if placed >= count {
+                    break 'outer;
+                }
+                let tile = (hearth.0 + dx, hearth.1 + dy);
+                if used.contains(&tile) {
+                    continue;
+                }
+                if !chunk_map.is_passable(tile.0, tile.1) {
+                    continue;
+                }
+                let Some(k) = chunk_map.tile_kind_at(tile.0, tile.1) else {
+                    continue;
+                };
+                if k == TileKind::Wall || k == TileKind::Stone {
+                    continue;
+                }
+                let world_pos = tile_to_world(tile.0, tile.1);
+                commands.spawn((
+                    TentShelter {
+                        tier: ShelterTier::Yurt,
+                    },
+                    crate::simulation::pack_deploy::Deployable::fully_packable(packed_yurt_id),
+                    StructureLabel("Yurt"),
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ));
+                used.insert(tile);
+                tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+                    tx: tile.0,
+                    ty: tile.1,
+                });
+                placed += 1;
+            }
+        }
+    }
+}
+
 fn seed_paleo_beds_around_hearth(
     commands: &mut Commands,
     maps: &mut FurnitureMaps,

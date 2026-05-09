@@ -6,6 +6,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::game_state::{EconomyPreset, GameStartOptions, GameState, PendingSpawn};
+use crate::simulation::faction::Lifestyle;
 use crate::simulation::region::MegaChunkCoord;
 use crate::simulation::technology::Era;
 use crate::ui::world_map::build_globe_image;
@@ -80,6 +81,25 @@ pub fn spawn_select_system(
             ui.label(
                 egui::RichText::new(
                     "Every resource fully privatised; agents bid on chief postings.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add_space(12.0);
+
+            ui.label(egui::RichText::new("Lifestyle").strong());
+            ui.radio_value(&mut options.lifestyle, Lifestyle::Settled, "Settled");
+            ui.label(
+                egui::RichText::new(
+                    "Found a permanent settlement; build huts, walls, plots.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.radio_value(&mut options.lifestyle, Lifestyle::Nomadic, "Nomadic");
+            ui.label(
+                egui::RichText::new(
+                    "No permanent home: tents, bedrolls, pack animals, seasonal migration.",
                 )
                 .small()
                 .weak(),
