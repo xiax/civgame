@@ -189,6 +189,22 @@ pub const MIN_MONTHLY_RENT: f32 = 0.5;
 /// plot.
 pub const EVICTION_MISS_THRESHOLD: u8 = 2;
 
+/// P7b: emitted by `rent_collection_system` on every eviction. The
+/// landlord's `caps.land.eviction_policy` rides on the event so a
+/// downstream cleanup system can act on it without re-reading the
+/// `FactionRegistry`. `LeaveStructures` events are still emitted (for
+/// observability / activity-log hooks); the cleanup system simply
+/// no-ops on them.
+#[derive(Event, Clone, Copy, Debug)]
+pub struct PlotEvictedEvent {
+    pub plot_entity: Entity,
+    pub plot_id: PlotId,
+    pub plot_rect: TileRect,
+    pub plot_z: i8,
+    pub landlord_faction: u32,
+    pub policy: crate::simulation::archetype::EvictionPolicy,
+}
+
 /// Phase 6: bundled inputs to the gather harvest hook. `gather_system`
 /// already sits at Bevy's 16-param ceiling (it bundles routing
 /// resources too), so the sharecrop look-up + landlord-share drop ride
@@ -1107,6 +1123,7 @@ pub fn rent_collection_system(
     mut registry: ResMut<FactionRegistry>,
     plot_index: Res<PlotIndex>,
     mut plot_q: Query<&mut Plot>,
+    mut evicted: EventWriter<PlotEvictedEvent>,
 ) {
     let cadence = (TICKS_PER_DAY as u64).saturating_mul(30).max(1);
     if clock.tick % cadence != 0 {
@@ -1210,15 +1227,35 @@ pub fn rent_collection_system(
         } else {
             let next_misses = row.missed_payments.saturating_add(1);
             if next_misses >= EVICTION_MISS_THRESHOLD {
-                // Evict: revert tenure + holder. Phase 5 keeps
-                // structures in place; downstream component cleanup
-                // (Bed.owner, HomeBed, planted-crop ownership) lands
-                // alongside the harvest-time hooks in Phase 6.
+                // Evict: revert tenure + holder, then emit
+                // `PlotEvictedEvent`. The landlord's
+                // `caps.land.eviction_policy` rides on the event so
+                // `evicted_plot_cleanup_system` can decide between
+                // LeaveStructures (no-op) / RevertToState (mark
+                // state-owned — same behaviour today, no
+                // personal_owner fields to clear yet) / Demolish
+                // (despawn structures + drop refunds).
+                let policy = registry
+                    .factions
+                    .get(&row.landlord)
+                    .map(|f| f.caps.land.eviction_policy)
+                    .unwrap_or(crate::simulation::archetype::EvictionPolicy::LeaveStructures);
+                let plot_rect = plot.rect;
+                let plot_z = plot.z;
+                let plot_id = plot.id;
                 plot.tenure = Tenure::StateOwned;
                 plot.holder = TenureHolder::State {
                     faction_id: row.landlord,
                 };
                 plot.missed_payments = 0;
+                evicted.send(PlotEvictedEvent {
+                    plot_entity: row.entity,
+                    plot_id,
+                    plot_rect,
+                    plot_z,
+                    landlord_faction: row.landlord,
+                    policy,
+                });
             } else {
                 // Bump miss counter; advance paid_through_tick so the
                 // next cycle re-checks (rather than re-billing the
@@ -1230,6 +1267,71 @@ pub fn rent_collection_system(
                 };
                 plot.missed_payments = next_misses;
             }
+        }
+    }
+}
+
+/// P7b: drains `PlotEvictedEvent`s and acts on each according to the
+/// landlord's `EvictionPolicy`.
+///
+/// - `LeaveStructures` — today's behaviour (Phase 5 minimal). No
+///   structure cleanup; the plot reverts to state-owned and the
+///   listing system republishes it on its next cycle.
+/// - `RevertToState` — same as `LeaveStructures` for now; reserved for
+///   per-structure `personal_owner` clearing once those fields exist.
+/// - `Demolish` — walks `StructureIndex` over every tile in
+///   `plot_rect`. For each entity it finds, drops the
+///   `Deployable::compute_refund_drop` payload (if any) as a
+///   `GroundItem` at the entity's tile, then despawns the structure.
+///   Bedroll/Tent/Yurt all carry `Deployable`; mudbrick walls do not
+///   and stay despawned without drops (mirrors today's nomadic
+///   teardown behaviour). Skips entities whose `Transform` we can't
+///   read (defensive — shouldn't happen in steady state).
+pub fn evicted_plot_cleanup_system(
+    mut commands: Commands,
+    mut events: EventReader<PlotEvictedEvent>,
+    structure_index: Res<crate::simulation::construction::StructureIndex>,
+    transform_q: Query<&Transform>,
+    deployable_q: Query<&crate::simulation::pack_deploy::Deployable>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    mut item_q: Query<&'static mut crate::simulation::items::GroundItem>,
+) {
+    use crate::simulation::archetype::EvictionPolicy;
+    for ev in events.read() {
+        match ev.policy {
+            EvictionPolicy::LeaveStructures | EvictionPolicy::RevertToState => continue,
+            EvictionPolicy::Demolish => {}
+        }
+        let r = ev.plot_rect;
+        let mut victims: Vec<Entity> = Vec::new();
+        for tx in r.x0..r.x0.saturating_add(r.w as i32) {
+            for ty in r.y0..r.y0.saturating_add(r.h as i32) {
+                if let Some(&e) = structure_index.0.get(&(tx, ty)) {
+                    victims.push(e);
+                }
+            }
+        }
+        for entity in victims {
+            // Refund first (while the entity still exists).
+            if let Ok(deployable) = deployable_q.get(entity) {
+                if let Some((rid, qty)) = deployable.compute_refund_drop() {
+                    if let Ok(transform) = transform_q.get(entity) {
+                        let (tx, ty) = crate::world::terrain::world_to_tile(
+                            transform.translation.truncate(),
+                        );
+                        crate::simulation::items::spawn_or_merge_ground_item(
+                            &mut commands,
+                            &spatial,
+                            &mut item_q,
+                            tx,
+                            ty,
+                            rid,
+                            qty,
+                        );
+                    }
+                }
+            }
+            commands.entity(entity).despawn_recursive();
         }
     }
 }

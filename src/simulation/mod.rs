@@ -87,6 +87,7 @@ impl Plugin for SimulationPlugin {
             .add_event::<combat::DistressCallEvent>()
             .add_event::<combat::HandDropEvent>()
             .add_event::<knowledge::DiscoveryActionEvent>()
+            .add_event::<land::PlotEvictedEvent>()
             .insert_resource(SimClock::default())
             .insert_resource(faction::FactionRegistry::default())
             .insert_resource(faction::PlayerFaction::default())
@@ -544,6 +545,8 @@ impl Plugin for SimulationPlugin {
                         .after(land::land_listing_system),
                     land::rent_collection_system
                         .after(land::household_land_acquisition_system),
+                    land::evicted_plot_cleanup_system
+                        .after(land::rent_collection_system),
                     // Nomadic mode (Phase 8). Runs after storage rollup so
                     // the migration trigger reads fresh `faction.storage`
                     // numbers, and after household systems so a

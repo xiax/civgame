@@ -3674,6 +3674,116 @@ mod smoke {
         assert_eq!(plot.missed_payments, 0, "missed_payments should reset on eviction");
     }
 
+    /// P7b: `EvictionPolicy::Demolish` despawns a structure inside the
+    /// evicted plot's rect and drops its refund stack as a `GroundItem`.
+    /// `LeaveStructures` (the default) leaves the structure in place
+    /// and does not produce any drop. Drives `evicted_plot_cleanup_system`
+    /// directly with a synthesized event so we can pin both branches
+    /// without wiring a full lease cycle.
+    #[test]
+    fn demolish_eviction_despawns_structure_and_drops_refund() {
+        use crate::economy::core_ids;
+        use crate::simulation::archetype::EvictionPolicy;
+        use crate::simulation::construction::{StructureIndex, StructureLabel};
+        use crate::simulation::items::GroundItem;
+        use crate::simulation::land::{evicted_plot_cleanup_system, PlotEvictedEvent};
+        use crate::simulation::pack_deploy::Deployable;
+        use crate::simulation::settlement::TileRect;
+        use crate::world::spatial::{Indexed, IndexedKind, SpatialIndex};
+        use bevy::ecs::system::RunSystemOnce;
+
+        for policy in [EvictionPolicy::LeaveStructures, EvictionPolicy::Demolish] {
+            let mut sim = TestSim::new(0xE71C71_00 + policy as u64);
+            sim.flat_world(3, 0, TileKind::Grass);
+
+            let wood_id = core_ids::wood();
+
+            // Spawn a Tent-style Deployable structure at (1, 1).
+            let tile = (1, 1);
+            let world = tile_to_world(tile.0, tile.1);
+            let structure = sim
+                .app
+                .world_mut()
+                .spawn((
+                    Transform::from_xyz(world.x, world.y, 0.4),
+                    GlobalTransform::default(),
+                    Visibility::Hidden,
+                    InheritedVisibility::default(),
+                    StructureLabel("Tent"),
+                    Deployable::refund_only(0.5, wood_id, 6), // drops 3 wood
+                ))
+                .id();
+
+            // Sanity: StructureIndex picks up the new entity via the
+            // on_add hook.
+            let indexed = sim
+                .app
+                .world()
+                .resource::<StructureIndex>()
+                .0
+                .get(&tile)
+                .copied();
+            assert_eq!(indexed, Some(structure));
+
+            // Synthesize an eviction event over a 3x3 rect that covers (1,1).
+            sim.app.world_mut().send_event(PlotEvictedEvent {
+                plot_entity: structure, // unused by cleanup
+                plot_id: 0,
+                plot_rect: TileRect::new(0, 0, 3, 3),
+                plot_z: 0,
+                landlord_faction: sim.player_faction_id,
+                policy,
+            });
+
+            sim.app
+                .world_mut()
+                .run_system_once(evicted_plot_cleanup_system)
+                .expect("evicted_plot_cleanup_system should run");
+
+            let alive = sim.app.world().get_entity(structure).is_ok();
+            let mut wood_drop_qty = 0u32;
+            for (_e, gi) in sim
+                .app
+                .world_mut()
+                .query::<(Entity, &GroundItem)>()
+                .iter(sim.app.world())
+            {
+                if gi.item.resource_id == wood_id {
+                    wood_drop_qty += gi.qty;
+                }
+            }
+            // Suppress dead_code on Indexed/SpatialIndex/IndexedKind imports
+            // for crates that don't reference them in this scope.
+            let _ = (Indexed::new(IndexedKind::GroundItem), SpatialIndex::default);
+            match policy {
+                EvictionPolicy::Demolish => {
+                    assert!(
+                        !alive,
+                        "Demolish: the structure inside the evicted plot \
+                         should have been despawned"
+                    );
+                    assert_eq!(
+                        wood_drop_qty, 3,
+                        "Demolish: a Tent (refund_pct=0.5, qty=6) should drop \
+                         floor(6 * 0.5) = 3 wood"
+                    );
+                }
+                EvictionPolicy::LeaveStructures => {
+                    assert!(
+                        alive,
+                        "LeaveStructures: the structure should still exist \
+                         after eviction"
+                    );
+                    assert_eq!(
+                        wood_drop_qty, 0,
+                        "LeaveStructures: no refund drops should be produced"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
     // ─── Pluralist Economy R10 — Trader / market arbitrage (Phase 8a) ───
 
     #[test]
