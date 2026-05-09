@@ -1500,6 +1500,16 @@ pub struct FactionData {
     /// using a `FactionStorageTile`. Households inherit from their parent
     /// village via `spawn_household`.
     pub lifestyle: Lifestyle,
+    /// Tick of the most recent migration commit (Phase 8). Zero on a band
+    /// that has never moved. `nomad_migration_system` reads this against
+    /// `TICKS_PER_SEASON` to enforce a minimum stay per camp.
+    pub last_migration_tick: u32,
+    /// Phase 8: target tile for an in-flight migration. `nomad_migration_system`
+    /// (trigger) writes this when the band decides to move. The trailing
+    /// `nomad_migration_commit_system` reads it, tears down the old camp's
+    /// deployable structures, then mutates `home_tile = target` and clears
+    /// this field. `None` outside of an active migration.
+    pub pending_migration: Option<(i32, i32)>,
 }
 
 impl FactionData {
@@ -1575,6 +1585,8 @@ impl FactionRegistry {
                 dominance_over: Vec::new(),
                 subordinate_to: None,
                 lifestyle: Lifestyle::default(),
+                last_migration_tick: 0,
+                pending_migration: None,
             },
         );
         id

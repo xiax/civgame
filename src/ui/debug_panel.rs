@@ -348,7 +348,33 @@ pub fn debug_panel_system(
                     }
                     if let Some(faction) = registry.factions.get(&fid) {
                         ui.label(format!("Members: {}", faction.member_count));
-                        ui.label(format!("Home tile: ({}, {})", faction.home_tile.0, faction.home_tile.1));
+                        let home_label = if faction.lifestyle.is_nomadic() {
+                            "Camp tile"
+                        } else {
+                            "Home tile"
+                        };
+                        ui.label(format!(
+                            "{}: ({}, {})",
+                            home_label, faction.home_tile.0, faction.home_tile.1
+                        ));
+                        ui.label(format!("Lifestyle: {}", faction.lifestyle.name()));
+                        if faction.lifestyle.is_nomadic() {
+                            if faction.last_migration_tick > 0 {
+                                ui.label(format!(
+                                    "Last migration: tick {}",
+                                    faction.last_migration_tick
+                                ));
+                            }
+                            if let Some(target) = faction.pending_migration {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "⇒ Migrating to ({}, {})",
+                                        target.0, target.1
+                                    ))
+                                    .color(egui::Color32::from_rgb(255, 200, 80)),
+                                );
+                            }
+                        }
                         if faction.under_raid {
                             ui.label(
                                 egui::RichText::new("⚠ Under Raid!").color(egui::Color32::RED),

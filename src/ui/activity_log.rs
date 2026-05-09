@@ -45,6 +45,17 @@ pub enum ActivityEntryKind {
     Read {
         tech_name: &'static str,
     },
+    /// Nomadic faction relocated camp (Phase 8 commit). `actor` is the
+    /// faction's chief or an arbitrary band member.
+    CampMoved {
+        from: (i32, i32),
+        to: (i32, i32),
+    },
+    /// Nomadic faction sedentarized (Phase 11). Lifestyle flipped from
+    /// Nomadic to Settled at the current camp tile.
+    Sedentarized {
+        camp: (i32, i32),
+    },
 }
 
 #[derive(Clone)]
@@ -141,6 +152,16 @@ pub fn activity_log_ingest_system(
                 "read of",
                 tech_name.to_string(),
                 ResultLink::HeldByActor,
+            ),
+            &ActivityEntryKind::CampMoved { from, to } => (
+                "moved camp",
+                format!("{:?} → {:?}", from, to),
+                ResultLink::NoTarget,
+            ),
+            &ActivityEntryKind::Sedentarized { camp } => (
+                "settled down at",
+                format!("{:?}", camp),
+                ResultLink::NoTarget,
             ),
         };
 

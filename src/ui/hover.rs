@@ -21,6 +21,7 @@ pub struct SitesHoverParams<'w, 's> {
     pub co_query: Query<'w, 's, &'static CraftOrder>,
     pub structure_index: Res<'w, StructureIndex>,
     pub structure_label_q: Query<'w, 's, &'static StructureLabel>,
+    pub deployable_q: Query<'w, 's, &'static crate::simulation::pack_deploy::Deployable>,
 }
 use crate::simulation::faction::FactionMember;
 use crate::simulation::items::GroundItem;
@@ -217,6 +218,39 @@ pub fn hover_info_system(
                 if let Ok(label) = sites.structure_label_q.get(structure_entity) {
                     ui.separator();
                     ui.label(egui::RichText::new(label.0).strong());
+                    // Surface nomadic-shelter pack/refund semantics on
+                    // hover so the player knows what migrating will cost
+                    // them. Bedrolls + Yurts pack into inventory; Tents
+                    // refund half their wood as ground items.
+                    if let Ok(deployable) = sites.deployable_q.get(structure_entity) {
+                        if let Some(packed) = deployable.packed_form {
+                            let name =
+                                crate::economy::core_ids::display_name(packed);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Packs as: {} on migration",
+                                    name
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        } else if let Some((rid, qty)) =
+                            deployable.compute_refund_drop()
+                        {
+                            let name =
+                                crate::economy::core_ids::display_name(rid);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Teardown: drops {} {} on migration ({}% refund)",
+                                    qty,
+                                    name,
+                                    (deployable.refund_pct * 100.0) as i32,
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        }
+                    }
                 }
             }
 

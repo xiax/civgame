@@ -29,6 +29,7 @@ pub mod needs;
 pub mod nomad;
 pub mod pack_deploy;
 pub mod person;
+pub mod wild_herd;
 pub mod plants;
 pub mod production;
 pub mod projects;
@@ -93,6 +94,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(plants::PlantSpriteIndex::default())
             .insert_resource(method_registry)
             .insert_resource(construction::AutonomousBuildingToggle(true))
+            .insert_resource(wild_herd::WildHerdRegistry::default())
             .insert_resource(construction::BedMap::default())
             .insert_resource(construction::WallMap::default())
             .insert_resource(construction::CampfireMap::default())
@@ -142,6 +144,9 @@ impl Plugin for SimulationPlugin {
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     animals::spawn_animals
                         .after(person::spawn_population)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    wild_herd::seed_wild_herds_system
+                        .after(animals::spawn_animals)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     faction::center_camera_on_player_faction
                         .after(person::spawn_population)
@@ -391,6 +396,16 @@ impl Plugin for SimulationPlugin {
                         .after(production::eat_task_system),
                     faction::bonding_system.after(movement::sync_indexed_after_move_system),
                     production::tile_regen_system,
+                    // Phase 8 follow-on: drain `pending_migration` orders
+                    // queued by `nomad_migration_system` (Economy, daily).
+                    // Sits in Sequential so the despawn happens cleanly
+                    // before the next tick's pathing / sleep dispatch.
+                    nomad::nomad_migration_commit_system,
+                    // Phase 10: per-tick bloom/collapse based on camera
+                    // proximity. Runs in Sequential so the entity spawns/
+                    // despawns are visible to next tick's render + AI
+                    // systems without an extra frame of lag.
+                    wild_herd::wild_herd_bloom_system,
                     schedule::advance_sim_clock,
                     crate::world::seasons::advance_calendar_system,
                 )
@@ -518,6 +533,24 @@ impl Plugin for SimulationPlugin {
                         .after(land::land_listing_system),
                     land::rent_collection_system
                         .after(land::household_land_acquisition_system),
+                    // Nomadic mode (Phase 8). Runs after storage rollup so
+                    // the migration trigger reads fresh `faction.storage`
+                    // numbers, and after household systems so a
+                    // sedentarized-then-relocated band's children-factions
+                    // see the new home_tile next tick.
+                    nomad::nomad_migration_system
+                        .after(faction::compute_faction_storage_system),
+                    // Phase 11. Sedentarization candidate check — runs
+                    // after migration trigger so a band that JUST set
+                    // `pending_migration` this tick is ineligible (won't
+                    // flip lifestyle and lose its move).
+                    nomad::nomad_sedentarize_system
+                        .after(nomad::nomad_migration_system),
+                    // Phase 10: wild herd seasonal drift. Daily, after the
+                    // calendar tick — sits next to the nomad migration so
+                    // nomads' food-cluster knowledge can pick up the herd's
+                    // new leader_tile via vision_system on subsequent ticks.
+                    wild_herd::wild_herd_migration_system,
                 )
                     .in_set(SimulationSet::Economy),
             )

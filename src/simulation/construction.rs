@@ -3350,14 +3350,14 @@ pub fn construction_system(
                 }
                 BuildSiteKind::Tent => {
                     // Sticks-and-leaves shelter. Deployed-only — the
-                    // `Deployable::refund_only(0.5)` marker tells the
+                    // `Deployable::refund_only(0.5, crate::economy::core_ids::wood(), 6)` marker tells the
                     // migration teardown to drop half the input wood as
                     // GroundItems. Tent does NOT carry a Bed; nomads sleep
                     // in Bedrolls underneath.
                     let e = commands
                         .spawn((
                             TentShelter { tier: ShelterTier::Tent },
-                            crate::simulation::pack_deploy::Deployable::refund_only(0.5),
+                            crate::simulation::pack_deploy::Deployable::refund_only(0.5, crate::economy::core_ids::wood(), 6),
                             StructureLabel("Tent"),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
@@ -4485,7 +4485,7 @@ fn spawn_seeded_structure(
         BuildSiteKind::Tent => {
             commands.spawn((
                 TentShelter { tier: ShelterTier::Tent },
-                crate::simulation::pack_deploy::Deployable::refund_only(0.5),
+                crate::simulation::pack_deploy::Deployable::refund_only(0.5, crate::economy::core_ids::wood(), 6),
                 StructureLabel("Tent"),
                 Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                 GlobalTransform::default(),
@@ -5461,8 +5461,10 @@ fn seed_farmstead_yard(
 /// per 4 founders for shelter; Neolithic+ adds 1 Yurt per ~5 founders.
 ///
 /// Mirrors `seed_paleo_beds_around_hearth`'s direct-spawn pattern (no
-/// Blueprint pipeline) so the camp is fully built at game-start.
-fn seed_nomadic_camp(
+/// Blueprint pipeline) so the camp is fully built at game-start AND can be
+/// re-invoked by `nomad_migration_commit_system` (Phase 8 follow-on) to
+/// stand up a fresh camp at the new `home_tile`.
+pub(crate) fn seed_nomadic_camp(
     commands: &mut Commands,
     maps: &mut FurnitureMaps,
     chunk_map: &ChunkMap,
@@ -5534,7 +5536,7 @@ fn seed_nomadic_camp(
         );
 
         // Tents — outer ring shelter (sticks-and-leaves; 50% wood refund on
-        // teardown via `Deployable::refund_only(0.5)`).
+        // teardown via `Deployable::refund_only(0.5, crate::economy::core_ids::wood(), 6)`).
         seed_tents_around_hearth(
             commands,
             chunk_map,
@@ -5660,7 +5662,7 @@ fn seed_tents_around_hearth(
                     TentShelter {
                         tier: ShelterTier::Tent,
                     },
-                    crate::simulation::pack_deploy::Deployable::refund_only(0.5),
+                    crate::simulation::pack_deploy::Deployable::refund_only(0.5, crate::economy::core_ids::wood(), 6),
                     StructureLabel("Tent"),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                     GlobalTransform::default(),
