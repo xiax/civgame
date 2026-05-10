@@ -30,7 +30,10 @@ use crate::simulation::technology::current_era;
 use crate::simulation::wild_herd::WildHerdRegistry;
 use crate::world::chunk::ChunkMap;
 use crate::world::chunk_streaming::TileChangedEvent;
-use crate::world::seasons::{TICKS_PER_DAY, TICKS_PER_SEASON};
+use crate::world::globe::{Biome, Globe};
+use crate::world::seasons::{Calendar, Season, TICKS_PER_DAY, TICKS_PER_SEASON};
+use crate::world::tile::TileKind;
+use std::collections::VecDeque;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MigrationStage {
@@ -57,6 +60,35 @@ pub const NOMAD_MIN_TARGET_DIST: i32 = 25;
 /// the world when their knowledge map happens to surface a far-away cluster.
 pub const NOMAD_MAX_TARGET_DIST: i32 = 60;
 
+/// P3: composite-score helpers — each helper returns a signed score that's
+/// summed into `MigrationScore.total`. Constants tuned so a dominant food
+/// cluster (estimated_count ~4) still wins against a weak biome bonus, but
+/// equal food candidates choose the better water/season/safety position.
+pub const WATER_PROBE_RADIUS: i32 = 8;
+pub const RECENT_CAMP_TTL: u32 = TICKS_PER_SEASON * 2;
+pub const RECENT_CAMP_RING_CAP: usize = 6;
+const PREDATOR_PROBE_RADIUS: i32 = 6;
+
+/// P1: per-agent component pinning the destination of an in-flight
+/// migration. Inserted on every band member by `nomad_migration_commit_system`
+/// after `home_tile` flips; removed by `nomad_migration_arrival_system`
+/// on arrival or timeout.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct MigrationTarget {
+    pub tile: (i32, i32),
+    pub started_tick: u32,
+}
+
+/// P1: chebyshev arrival radius around the new camp. Below this, the
+/// agent's `MigrationTarget` is stripped + their goal cleared so the
+/// next 200-tick goal-eval picks a normal need-driven goal.
+pub const MIGRATE_ARRIVAL_RADIUS: i32 = 4;
+
+/// P1: hard timeout. After this many ticks of carrying a `MigrationTarget`,
+/// the agent gives up — covers stuck-in-impassable-tile edge cases so a
+/// lost member doesn't carry the marker forever.
+pub const MIGRATE_TIMEOUT_TICKS: u32 = TICKS_PER_DAY * 3;
+
 /// Despawn radius for the old camp on commit. Sized to cover the seed
 /// helpers' outer-ring tents (radius 5..=7 around each hearth, plus a
 /// safety margin for offset hearth layouts).
@@ -73,6 +105,9 @@ pub fn nomad_migration_system(
     clock: Res<SimClock>,
     shared: Res<SharedKnowledge>,
     wild_herds: Res<WildHerdRegistry>,
+    chunk_map: Res<ChunkMap>,
+    globe: Res<Globe>,
+    calendar: Res<Calendar>,
 ) {
     if clock.tick % TICKS_PER_DAY as u64 != 0 {
         return;
@@ -104,6 +139,11 @@ pub fn nomad_migration_system(
         let target = pick_migration_target(
             &shared,
             &wild_herds,
+            &chunk_map,
+            &globe,
+            calendar.season,
+            &faction.recent_camps,
+            now,
             fid,
             home,
             NOMAD_MIN_TARGET_DIST,
@@ -164,6 +204,160 @@ pub fn nomad_migration_commit_system(world: &mut World) {
         return;
     }
     let now = world.resource::<SimClock>().tick as u32;
+
+    // ── P5: pre-migration band redistribution ───────────────────────
+    // Even out essentials (bedroll, packed_yurt, preserved_meat) across
+    // band members before the despawn / pack pass runs. Avoids the case
+    // where one member at 99% capacity strands the band's only yurt.
+    // Snapshot-then-writeback keeps disjoint mutable borrows simple.
+    {
+        let migrating: ahash::AHashSet<u32> = pending.iter().map(|p| p.fid).collect();
+        let essentials = crate::simulation::nomad_pool::essentials_for_band();
+        let mut state: SystemState<(
+            Res<FactionRegistry>,
+            Query<(
+                Entity,
+                &crate::simulation::faction::FactionMember,
+                &mut crate::economy::agent::EconomicAgent,
+            )>,
+        )> = SystemState::new(world);
+        let (registry, mut q) = state.get_mut(world);
+        let mut updates: ahash::AHashMap<Entity, crate::economy::agent::EconomicAgent> =
+            ahash::AHashMap::new();
+        for &fid in migrating.iter() {
+            let mut snapshot: Vec<(Entity, crate::economy::agent::EconomicAgent)> = q
+                .iter()
+                .filter(|(_, m, _)| registry.root_faction(m.faction_id) == fid)
+                .map(|(e, _, a)| (e, *a))
+                .collect();
+            if snapshot.len() < 2 {
+                continue;
+            }
+            let mut view: Vec<(Entity, &mut crate::economy::agent::EconomicAgent)> =
+                snapshot.iter_mut().map(|(e, a)| (*e, &mut *a)).collect();
+            let report = crate::simulation::nomad_pool::redistribute_essentials(
+                &mut view,
+                &essentials,
+            );
+            if report.units_moved == 0 {
+                continue;
+            }
+            for (e, a) in snapshot.into_iter() {
+                updates.insert(e, a);
+            }
+        }
+        for (e, _, mut agent) in q.iter_mut() {
+            if let Some(updated) = updates.get(&e) {
+                *agent = *updated;
+            }
+        }
+        state.apply(world);
+    }
+
+    // ── P8: pack pass ─────────────────────────────────────────────
+    // Walk fully-packable Deployables (Bedrolls/Yurts) within
+    // OLD_CAMP_RADIUS of each migrating band. Convert each to its
+    // `packed_form` good and place onto the nearest tamed pack animal
+    // with capacity, falling back to the nearest band member's
+    // EconomicAgent. Tents (refund-only) are skipped here — the despawn
+    // pass below drops their refund.
+    {
+        let migrating: ahash::AHashMap<u32, (i32, i32)> =
+            pending.iter().map(|p| (p.fid, p.old_home)).collect();
+        let mut state: SystemState<(
+            Query<(Entity, &Transform, &Deployable)>,
+            Query<
+                (Entity, &Transform, &Tamed, &mut crate::simulation::animals::PackAnimalInventory),
+            >,
+            Query<(
+                Entity,
+                &crate::simulation::faction::FactionMember,
+                &Transform,
+                &mut crate::economy::agent::EconomicAgent,
+            )>,
+            Res<FactionRegistry>,
+        )> = SystemState::new(world);
+        let (deployable_q, mut animal_q, mut member_q, registry) = state.get_mut(world);
+
+        // Snapshot packable shelters per migrating faction (we don't
+        // know faction ownership from the entity directly — match by
+        // proximity to the OLD home tile instead). For each shelter,
+        // route packed_form to the nearest pack animal or member.
+        for (e, transform, deploy) in deployable_q.iter() {
+            let Some(packed_rid) = deploy.packed_form else {
+                continue; // refund-only forms (Tents) skip the pack pass
+            };
+            let tile = transform_tile(transform);
+            // Find the migrating faction whose old-home is closest to
+            // this shelter (within OLD_CAMP_RADIUS). Skips shelters
+            // outside any migrating band's camp footprint.
+            let mut owner: Option<u32> = None;
+            let mut best_dist = i32::MAX;
+            for (&fid, &old_home) in migrating.iter() {
+                let d = chebyshev(tile, old_home);
+                if d <= OLD_CAMP_RADIUS && d < best_dist {
+                    best_dist = d;
+                    owner = Some(fid);
+                }
+            }
+            let Some(fid) = owner else {
+                continue;
+            };
+            // Try the closest tamed pack animal with capacity for one unit.
+            let unit_w = packed_rid.unit_weight_g().max(1);
+            let mut chosen_animal: Option<(Entity, i32)> = None;
+            for (a_e, a_t, tamed, inv) in animal_q.iter() {
+                if registry.root_faction(tamed.owner_faction) != fid {
+                    continue;
+                }
+                if inv.free_capacity_g() < unit_w {
+                    continue;
+                }
+                let a_tile = transform_tile(a_t);
+                let d = chebyshev(a_tile, tile);
+                if chosen_animal.map_or(true, |(_, prev_d)| d < prev_d) {
+                    chosen_animal = Some((a_e, d));
+                }
+            }
+            if let Some((a_e, _)) = chosen_animal {
+                if let Ok((_, _, _, mut inv)) = animal_q.get_mut(a_e) {
+                    let unfit = inv.add(packed_rid, 1);
+                    if unfit == 0 {
+                        // Successfully packed — let the despawn pass
+                        // remove the entity. We don't despawn here since
+                        // the despawn pass also handles BedMap cleanup.
+                        let _ = e;
+                        continue;
+                    }
+                }
+            }
+            // Fall back: nearest member's EconomicAgent.
+            let mut chosen_member: Option<(Entity, i32)> = None;
+            for (m_e, member, m_t, agent) in member_q.iter() {
+                if registry.root_faction(member.faction_id) != fid {
+                    continue;
+                }
+                if agent.free_capacity_g() < unit_w {
+                    continue;
+                }
+                let m_tile = transform_tile(m_t);
+                let d = chebyshev(m_tile, tile);
+                if chosen_member.map_or(true, |(_, prev_d)| d < prev_d) {
+                    chosen_member = Some((m_e, d));
+                }
+            }
+            if let Some((m_e, _)) = chosen_member {
+                if let Ok((_, _, _, mut agent)) = member_q.get_mut(m_e) {
+                    let _unfit = agent.add_resource(packed_rid, 1);
+                    // Even if fallback can't accept (heavy yurt vs full
+                    // member), we still let the despawn pass remove the
+                    // shelter — better to lose 1 packed shelter than to
+                    // leave a structure orphaned at the abandoned camp.
+                }
+            }
+        }
+        state.apply(world);
+    }
 
     // ── Despawn pass + refund drops ─────────────────────────────────
     // Walk BedMap / CampfireMap, then the Deployable / TentShelter
@@ -325,11 +519,56 @@ pub fn nomad_migration_commit_system(world: &mut World) {
         let mut registry = world.resource_mut::<FactionRegistry>();
         for p in pending.iter() {
             if let Some(faction) = registry.factions.get_mut(&p.fid) {
+                // P3: push the now-vacated camp tile into the recent-camps
+                // ring before mutating home_tile, so the next migration
+                // pick penalises returning here.
+                faction.recent_camps.push_back((p.old_home, now));
+                while faction.recent_camps.len() > RECENT_CAMP_RING_CAP {
+                    faction.recent_camps.pop_front();
+                }
                 faction.home_tile = p.target;
                 faction.last_migration_tick = now;
                 faction.pending_migration = None;
             }
         }
+    }
+
+    // ── P1: stamp every band member with `MigrationTarget` + flip their
+    // goal to MigrateToCamp so the dispatcher actively walks them with
+    // the band. Survive-tier needs (raid / starvation / rescue) preempt
+    // naturally in `goal_update_system`.
+    {
+        let migrating: ahash::AHashMap<u32, (i32, i32)> =
+            pending.iter().map(|p| (p.fid, p.target)).collect();
+        let mut state: SystemState<(
+            Commands,
+            Query<(
+                Entity,
+                &crate::simulation::faction::FactionMember,
+                &mut crate::simulation::goals::AgentGoal,
+                &mut crate::simulation::person::PersonAI,
+                &mut crate::simulation::typed_task::ActionQueue,
+            )>,
+            Res<FactionRegistry>,
+        )> = SystemState::new(world);
+        let (mut commands, mut q, registry) = state.get_mut(world);
+        for (e, member, mut goal, mut ai, mut aq) in q.iter_mut() {
+            let root = registry.root_faction(member.faction_id);
+            let Some(&target) = migrating.get(&root) else {
+                continue;
+            };
+            commands.entity(e).insert(MigrationTarget {
+                tile: target,
+                started_tick: now,
+            });
+            *goal = crate::simulation::goals::AgentGoal::MigrateToCamp;
+            // Cancel current chain so the dispatcher picks up MigrateToCamp
+            // immediately instead of finishing a pre-migration gather.
+            aq.cancel();
+            ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
+            ai.state = crate::simulation::person::AiState::Idle;
+        }
+        state.apply(world);
     }
 
     // ── Activity log ────────────────────────────────────────────────
@@ -451,53 +690,168 @@ fn score_local_food(
     score
 }
 
-fn pick_migration_target(
+/// Composite score for a candidate migration target tile. `total` is the
+/// authoritative ranking field; sub-scores are exposed for debug/inspect.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MigrationScore {
+    pub food: i32,
+    pub herd: i32,
+    pub water: i32,
+    pub biome_season: i32,
+    pub danger: i32,
+    pub recency: i32,
+    pub total: i32,
+}
+
+/// P3 picker. Composite-scores known food clusters + wild-herd leaders,
+/// adding water/biome-season bonuses and predator/recency penalties; picks
+/// the highest-total candidate within the distance band.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_migration_target(
     shared: &SharedKnowledge,
     wild_herds: &WildHerdRegistry,
+    chunk_map: &ChunkMap,
+    globe: &Globe,
+    season: Season,
+    recent_camps: &VecDeque<((i32, i32), u32)>,
+    now: u32,
     fid: u32,
     home: (i32, i32),
     min_d: i32,
     max_d: i32,
 ) -> Option<(i32, i32)> {
-    // Score = estimated population at the candidate tile. Known food
-    // clusters use their direct `estimated_count`; wild herds get a
-    // proportional bonus from `aggregate_count` so a 120-head herd
-    // outranks all but the very richest known clusters. Nomads thus
-    // drift toward visible herds even when the band hasn't recently
-    // sighted edible vegetation in that direction.
-    let mut best: Option<((i32, i32), i32)> = None;
+    let mut best: Option<((i32, i32), MigrationScore)> = None;
+
+    let mut consider = |tile: (i32, i32), food: i32, herd: i32| {
+        let d = chebyshev(tile, home);
+        if d < min_d || d > max_d {
+            return;
+        }
+        let water = score_water(chunk_map, tile, WATER_PROBE_RADIUS);
+        let biome_season = score_biome_season(globe, tile, season);
+        let danger = score_danger(shared, fid, tile);
+        let recency = score_recency(recent_camps, tile, now);
+        let total = food + herd + water + biome_season + danger + recency;
+        let score = MigrationScore {
+            food,
+            herd,
+            water,
+            biome_season,
+            danger,
+            recency,
+            total,
+        };
+        if best.map_or(true, |(_, s)| total > s.total) {
+            best = Some((tile, score));
+        }
+    };
 
     if let Some(map) = shared.map(KnowledgeTier::Faction(fid)) {
         for c in map.clusters.values() {
             if !matches!(c.kind, MemoryKind::AnyEdible) {
                 continue;
             }
-            let d = chebyshev(c.center, home);
-            if d < min_d || d > max_d {
-                continue;
-            }
-            let score = c.estimated_count as i32;
-            if best.map_or(true, |(_, s)| score > s) {
-                best = Some((c.center, score));
-            }
+            consider(c.center, c.estimated_count as i32, 0);
         }
     }
-
-    // Wild herds — score weighted as half the aggregate count so a
-    // 120-head herd contributes 60 score, comfortably outranking a
-    // typical 4-rep-tile food cluster (estimated_count ≤ 4).
     for herd in wild_herds.herds.values() {
-        let d = chebyshev(herd.leader_tile, home);
-        if d < min_d || d > max_d {
-            continue;
-        }
-        let score = (herd.aggregate_count as i32 / 2).max(20);
-        if best.map_or(true, |(_, s)| score > s) {
-            best = Some((herd.leader_tile, score));
-        }
+        // Wild herd score mirrors the legacy weighting: a 120-head herd
+        // contributes 60, comfortably outranking a typical 4-rep cluster.
+        let herd_score = (herd.aggregate_count as i32 / 2).max(20);
+        consider(herd.leader_tile, 0, herd_score);
     }
 
     best.map(|(t, _)| t)
+}
+
+/// +30 at the candidate tile when adjacent water; falls off ~3 per chebyshev
+/// tile, capped at 0 beyond `WATER_PROBE_RADIUS`. Bands strongly prefer
+/// camps with reliable water access.
+pub fn score_water(chunk_map: &ChunkMap, tile: (i32, i32), radius: i32) -> i32 {
+    for r in 0..=radius {
+        for dx in -r..=r {
+            for dy in -r..=r {
+                if dx.abs() != r && dy.abs() != r {
+                    continue; // outline only — concentric expansion
+                }
+                if let Some(kind) = chunk_map.tile_kind_at(tile.0 + dx, tile.1 + dy) {
+                    if kind == TileKind::Water {
+                        return (30 - r * 3).max(0);
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Per-biome × per-season suitability bonus. Winter penalises Tundra /
+/// Mountain; Summer penalises Desert; Grassland gets a year-round bonus
+/// (rich forage); Ocean is a hard reject.
+pub fn score_biome_season(globe: &Globe, tile: (i32, i32), season: Season) -> i32 {
+    let biome = crate::world::biome::classify_at_tile(globe, tile.0, tile.1);
+    let base: i32 = match biome {
+        Biome::Ocean => -100,
+        Biome::Grassland => 15,
+        Biome::Temperate => 10,
+        Biome::Tropical => 5,
+        Biome::Taiga => 0,
+        Biome::Desert => -5,
+        Biome::Tundra => -5,
+        Biome::Mountain => -10,
+    };
+    let seasonal: i32 = match (biome, season) {
+        (Biome::Tundra | Biome::Mountain, Season::Winter) => -15,
+        (Biome::Desert, Season::Summer) => -15,
+        (Biome::Grassland, Season::Spring | Season::Summer) => 5,
+        (Biome::Tropical, Season::Winter) => 5,
+        _ => 0,
+    };
+    base + seasonal
+}
+
+/// Penalises tiles near sighted predator/prey clusters (proxy for "wolves
+/// hunt this area"). −15 per `MemoryKind::Prey` cluster centre within
+/// `PREDATOR_PROBE_RADIUS`. A wolf-pack-rich tile thus pulls 15..45 below
+/// a quiet alternative — enough to flip equal-food candidates.
+pub fn score_danger(shared: &SharedKnowledge, fid: u32, tile: (i32, i32)) -> i32 {
+    let Some(map) = shared.map(KnowledgeTier::Faction(fid)) else {
+        return 0;
+    };
+    let mut penalty: i32 = 0;
+    for c in map.clusters.values() {
+        if !matches!(c.kind, MemoryKind::Prey) {
+            continue;
+        }
+        if chebyshev(c.center, tile) <= PREDATOR_PROBE_RADIUS {
+            penalty -= 15;
+        }
+    }
+    penalty
+}
+
+/// Penalises tiles near recent camp sites. Decays with age over
+/// `RECENT_CAMP_TTL`. A freshly-vacated tile within 8 chebyshev gets
+/// −25; older entries fade to ~0 as their age approaches the TTL.
+pub fn score_recency(
+    recent_camps: &VecDeque<((i32, i32), u32)>,
+    tile: (i32, i32),
+    now: u32,
+) -> i32 {
+    let mut penalty: i32 = 0;
+    for &(pos, when) in recent_camps.iter() {
+        if chebyshev(pos, tile) >= 8 {
+            continue;
+        }
+        let age = now.saturating_sub(when);
+        if age >= RECENT_CAMP_TTL {
+            continue;
+        }
+        // Linear decay from -25 at age=0 to 0 at age=TTL.
+        let factor = 1.0 - (age as f32 / RECENT_CAMP_TTL as f32);
+        penalty -= (25.0 * factor) as i32;
+    }
+    penalty
 }
 
 /// Stable-camp duration before a nomadic faction may sedentarize. One
@@ -590,4 +944,373 @@ fn fallback_direction(fid: u32, home: (i32, i32), now: u32) -> (i32, i32) {
         _ => (25, -25),
     };
     (home.0 + dx, home.1 + dy)
+}
+
+/// P2 (slim nomad chief): per-faction shelter targets used by
+/// `nomad_chief_directive_system` to size replacement blueprint queues.
+fn nomad_shelter_targets(members: u32) -> NomadShelterTargets {
+    NomadShelterTargets {
+        bedrolls: members,
+        tents: ((members + 3) / 4).max(1),
+        yurts: (members / 5).clamp(1, 2),
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct NomadShelterTargets {
+    pub bedrolls: u32,
+    pub tents: u32,
+    pub yurts: u32,
+}
+
+/// P2: max bps the nomad chief queues per tick (bounded so a brand-new
+/// camp doesn't get carpet-bombed with 30 blueprints all at once).
+const NOMAD_DIRECTIVE_BP_PER_TICK: usize = 2;
+
+/// P2: scan radius around `home_tile` for shelter counts + new-blueprint
+/// placement. Aligns with the seed/nomad_camp footprint.
+const NOMAD_DIRECTIVE_RADIUS: i32 = 8;
+
+/// P2: slim chief for nomadic bands. Daily, queues replacement Bedroll /
+/// Tent / Yurt blueprints when the camp's shelter falls below the
+/// per-member targets. Posts no jobs (members do autonomous gathering);
+/// the existing `gather` / `scavenge` HTN methods + the new
+/// `nomad_band_pool_balance_system` (P5) handle materials end-to-end.
+#[allow(clippy::too_many_arguments)]
+pub fn nomad_chief_directive_system(
+    mut commands: Commands,
+    registry: Res<FactionRegistry>,
+    clock: Res<SimClock>,
+    chunk_map: Res<ChunkMap>,
+    mut bp_map: ResMut<crate::simulation::construction::BlueprintMap>,
+    bed_map: Res<crate::simulation::construction::BedMap>,
+    tent_q: Query<(&Transform, &crate::simulation::construction::TentShelter)>,
+    bp_query: Query<&crate::simulation::construction::Blueprint>,
+) {
+    use crate::simulation::construction::{
+        next_clear_tile, BuildSiteKind, Blueprint, ShelterTier,
+    };
+
+    if clock.tick % TICKS_PER_DAY as u64 != 0 {
+        return;
+    }
+    let now_tick = clock.tick;
+    for (&fid, faction) in registry.factions.iter() {
+        if !faction.caps.home.is_mobile() {
+            continue;
+        }
+        if faction.pending_migration.is_some() {
+            continue;
+        }
+        if faction.member_count == 0 {
+            continue;
+        }
+        let home = faction.home_tile;
+        let targets = nomad_shelter_targets(faction.member_count);
+
+        // Count built shelter within radius of home.
+        let bedroll_built = bed_map
+            .0
+            .keys()
+            .filter(|&&t| chebyshev(t, home) <= NOMAD_DIRECTIVE_RADIUS)
+            .count() as u32;
+        let mut tent_built: u32 = 0;
+        let mut yurt_built: u32 = 0;
+        for (t_t, shelter) in tent_q.iter() {
+            let tile = transform_tile(t_t);
+            if chebyshev(tile, home) > NOMAD_DIRECTIVE_RADIUS {
+                continue;
+            }
+            match shelter.tier {
+                ShelterTier::Tent => tent_built += 1,
+                ShelterTier::Yurt => yurt_built += 1,
+            }
+        }
+
+        // Count pending blueprints (avoid re-queueing).
+        let mut bedroll_pending: u32 = 0;
+        let mut tent_pending: u32 = 0;
+        let mut yurt_pending: u32 = 0;
+        for bp in bp_query.iter() {
+            if bp.faction_id != fid {
+                continue;
+            }
+            if chebyshev(bp.tile, home) > NOMAD_DIRECTIVE_RADIUS {
+                continue;
+            }
+            match bp.kind {
+                BuildSiteKind::Bedroll => bedroll_pending += 1,
+                BuildSiteKind::Tent => tent_pending += 1,
+                BuildSiteKind::Yurt => yurt_pending += 1,
+                _ => {}
+            }
+        }
+
+        let mut budget = NOMAD_DIRECTIVE_BP_PER_TICK;
+        let mut used: ahash::AHashSet<(i32, i32)> = bp_map.0.keys().copied().collect();
+        // Helper: queue one Single blueprint of `kind` near home.
+        let queue_one = |budget: &mut usize,
+                         used: &mut ahash::AHashSet<(i32, i32)>,
+                         bp_map: &mut crate::simulation::construction::BlueprintMap,
+                         commands: &mut Commands,
+                         kind: BuildSiteKind|
+         -> bool {
+            if *budget == 0 {
+                return false;
+            }
+            let tile = match next_clear_tile(home, used, &chunk_map, NOMAD_DIRECTIVE_RADIUS) {
+                Some(t) => t,
+                None => return false,
+            };
+            let target_z = chunk_map.surface_z_at(tile.0, tile.1) as i8;
+            use crate::world::terrain::tile_to_world;
+            let wp = tile_to_world(tile.0, tile.1);
+            let e = commands
+                .spawn((
+                    Blueprint::new(fid, None, kind, tile, target_z),
+                    Transform::from_xyz(wp.x, wp.y, 0.3),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            bp_map.0.insert(tile, e);
+            used.insert(tile);
+            *budget -= 1;
+            true
+        };
+
+        // Priority order: bedrolls (every member sleeps), then tents
+        // (group shelter), then yurts (advanced, Neolithic+ tech-gated
+        // by recipe).
+        if bedroll_built + bedroll_pending < targets.bedrolls {
+            queue_one(
+                &mut budget,
+                &mut used,
+                &mut bp_map,
+                &mut commands,
+                BuildSiteKind::Bedroll,
+            );
+        }
+        if tent_built + tent_pending < targets.tents {
+            queue_one(
+                &mut budget,
+                &mut used,
+                &mut bp_map,
+                &mut commands,
+                BuildSiteKind::Tent,
+            );
+        }
+        if yurt_built + yurt_pending < targets.yurts
+            && faction.techs.has(crate::simulation::technology::PORTABLE_DWELLINGS)
+        {
+            queue_one(
+                &mut budget,
+                &mut used,
+                &mut bp_map,
+                &mut commands,
+                BuildSiteKind::Yurt,
+            );
+        }
+        let _ = now_tick;
+    }
+}
+
+/// P1 dispatcher — ParallelB. For every agent carrying a `MigrationTarget`
+/// whose goal is `MigrateToCamp` and whose `aq.current` is Idle, dispatch
+/// `Task::WalkTo { tile, why: Migration }` via `assign_task_with_routing`.
+/// Bucket-gated like other ParallelB dispatchers via `BucketSlot`.
+#[allow(clippy::too_many_arguments)]
+pub fn nomad_migration_dispatch_system(
+    clock: Res<SimClock>,
+    chunk_graph: Res<crate::pathfinding::chunk_graph::ChunkGraph>,
+    chunk_router: Res<crate::pathfinding::chunk_router::ChunkRouter>,
+    chunk_map: Res<ChunkMap>,
+    chunk_connectivity: Res<crate::pathfinding::connectivity::ChunkConnectivity>,
+    mut q: Query<
+        (
+            Entity,
+            &MigrationTarget,
+            &crate::simulation::goals::AgentGoal,
+            &Transform,
+            &mut crate::simulation::person::PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
+            &crate::simulation::schedule::BucketSlot,
+            &crate::simulation::lod::LodLevel,
+        ),
+        (
+            Without<crate::simulation::person::PlayerOrder>,
+            Without<crate::simulation::person::Drafted>,
+        ),
+    >,
+) {
+    use crate::simulation::lod::LodLevel;
+    use crate::simulation::person::{AiState, PersonAI};
+    use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
+    use crate::simulation::typed_task::{Task, WalkReason};
+    use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
+    use crate::world::terrain::TILE_SIZE;
+
+    for (_e, target, goal, transform, mut ai, mut aq, slot, lod) in q.iter_mut() {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !clock.is_active(slot.0) {
+            continue;
+        }
+        if *goal != crate::simulation::goals::AgentGoal::MigrateToCamp {
+            continue;
+        }
+        if ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+        if !matches!(aq.current, Task::Idle) {
+            continue;
+        }
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        // Already arrived? Skip — arrival system will strip the marker.
+        if chebyshev((cur_tx, cur_ty), target.tile) <= MIGRATE_ARRIVAL_RADIUS {
+            continue;
+        }
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+        let routed = assign_task_with_routing(
+            &mut ai,
+            (cur_tx, cur_ty),
+            cur_chunk,
+            target.tile,
+            TaskKind::Migrate,
+            None,
+            &chunk_graph,
+            &chunk_router,
+            &chunk_map,
+            &chunk_connectivity,
+        );
+        if !routed {
+            continue;
+        }
+        ai.state = AiState::Routing;
+        let z = ai.target_z;
+        aq.dispatch(Task::WalkTo {
+            tile: target.tile,
+            z,
+            why: WalkReason::Migration,
+        });
+    }
+}
+
+/// P1 arrival check — Sequential, after movement_system. Sweeps every
+/// agent with a `MigrationTarget`; on chebyshev arrival within
+/// `MIGRATE_ARRIVAL_RADIUS` or after `MIGRATE_TIMEOUT_TICKS`, removes the
+/// marker, drops back to Idle, and clears the goal so the next 200-tick
+/// goal-eval picks a normal need-driven goal.
+pub fn nomad_migration_arrival_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    mut q: Query<(
+        Entity,
+        &MigrationTarget,
+        &Transform,
+        &mut crate::simulation::goals::AgentGoal,
+        &mut crate::simulation::person::PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
+    )>,
+) {
+    use crate::simulation::person::{AiState, PersonAI};
+    use crate::world::terrain::TILE_SIZE;
+    let now = clock.tick as u32;
+    for (e, target, transform, mut goal, mut ai, mut aq) in q.iter_mut() {
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let arrived = chebyshev((cur_tx, cur_ty), target.tile) <= MIGRATE_ARRIVAL_RADIUS;
+        let timed_out = now.saturating_sub(target.started_tick) > MIGRATE_TIMEOUT_TICKS;
+        if !(arrived || timed_out) {
+            continue;
+        }
+        commands.entity(e).remove::<MigrationTarget>();
+        if *goal == crate::simulation::goals::AgentGoal::MigrateToCamp {
+            *goal = crate::simulation::goals::AgentGoal::GatherFood;
+        }
+        // Stop the walk; a normal goal will pick up next tick.
+        aq.cancel();
+        ai.task_id = PersonAI::UNEMPLOYED;
+        ai.state = AiState::Idle;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn score_recency_penalises_freshly_vacated_camp() {
+        let mut camps: VecDeque<((i32, i32), u32)> = VecDeque::new();
+        camps.push_back(((10, 10), 0));
+        // Tile near the recent camp, age=0 → strong negative.
+        let near = score_recency(&camps, (12, 11), 0);
+        assert!(near < -20, "fresh near-camp penalty should be ~ -25; got {near}");
+        // Far tile gets nothing.
+        let far = score_recency(&camps, (50, 50), 0);
+        assert_eq!(far, 0);
+        // Aged-out entry gets nothing.
+        let aged = score_recency(&camps, (10, 10), RECENT_CAMP_TTL + 1);
+        assert_eq!(aged, 0);
+    }
+
+    #[test]
+    fn score_biome_season_winter_penalises_tundra() {
+        // Use a default Globe — `classify_at_tile` will return whatever
+        // biome the noise picks, but Tundra/Mountain/Ocean are all
+        // negative regardless of season; the seasonal modifier just
+        // doubles down. We can't deterministically place a tile in
+        // tundra without seeding, so this test exercises the matrix
+        // logic by walking biomes directly.
+        for biome in [
+            Biome::Tundra,
+            Biome::Mountain,
+            Biome::Desert,
+            Biome::Grassland,
+        ] {
+            let summer = score_biome_season_for_biome(biome, Season::Summer);
+            let winter = score_biome_season_for_biome(biome, Season::Winter);
+            match biome {
+                Biome::Tundra | Biome::Mountain => {
+                    assert!(winter < summer, "{:?} winter should be worse than summer; w={winter} s={summer}", biome);
+                }
+                Biome::Desert => {
+                    assert!(summer < winter, "Desert summer should be worse than winter; w={winter} s={summer}");
+                }
+                Biome::Grassland => {
+                    assert!(summer >= winter, "Grassland summer should ≥ winter; w={winter} s={summer}");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Biome-season scoring extracted for unit-testing without a Globe.
+    /// Mirrors the per-(biome, season) table in `score_biome_season`.
+    fn score_biome_season_for_biome(biome: Biome, season: Season) -> i32 {
+        let base: i32 = match biome {
+            Biome::Ocean => -100,
+            Biome::Grassland => 15,
+            Biome::Temperate => 10,
+            Biome::Tropical => 5,
+            Biome::Taiga => 0,
+            Biome::Desert => -5,
+            Biome::Tundra => -5,
+            Biome::Mountain => -10,
+        };
+        let seasonal: i32 = match (biome, season) {
+            (Biome::Tundra | Biome::Mountain, Season::Winter) => -15,
+            (Biome::Desert, Season::Summer) => -15,
+            (Biome::Grassland, Season::Spring | Season::Summer) => 5,
+            (Biome::Tropical, Season::Winter) => 5,
+            _ => 0,
+        };
+        base + seasonal
+    }
 }

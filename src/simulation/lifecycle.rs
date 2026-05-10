@@ -85,6 +85,17 @@ pub fn settled_variant_of(archetype_key: &str) -> String {
     }
 }
 
+/// P4: inverse of `settled_variant_of`. `settled_subsistence` →
+/// `nomadic_subsistence`. Used by `sedentary_collapse_system` to flip a
+/// failing settled village back to nomadic life.
+pub fn nomadic_variant_of(archetype_key: &str) -> String {
+    if let Some(rest) = archetype_key.strip_prefix("settled_") {
+        format!("nomadic_{}", rest)
+    } else {
+        archetype_key.to_string()
+    }
+}
+
 /// Recover the `EconomyPreset` from an archetype key suffix. Returns
 /// `Subsistence` as a safe default for unknown keys (non-fatal: the
 /// re-derived caps will still produce a coherent settled archetype).
@@ -222,11 +233,82 @@ fn handle_switch_archetype(
     // ── Step 5: SettlementPlan.culture_hash bump ───────────────────
     bump_settlement_plan_culture_hash(world, faction_id);
 
-    // ── Step 6: Synchronous storage tile bootstrap ─────────────────
-    spawn_storage_tile_for(world, faction_id, at_tile);
+    // ── Step 6: Synchronous storage tile bootstrap (settled-only) ──
+    // Only spawn a `FactionStorageTile` when the destination archetype
+    // actually uses one. Reverse direction (settled → nomadic) skips
+    // this — nomads pool through member inventory + pack animals.
+    let storage_kind = world
+        .resource::<FactionRegistry>()
+        .factions
+        .get(&faction_id)
+        .map(|f| f.caps.storage);
+    let needs_storage_tile = matches!(
+        storage_kind,
+        Some(crate::simulation::archetype::StorageBackendKind::FactionTile)
+            | Some(crate::simulation::archetype::StorageBackendKind::Hybrid)
+    );
+    if needs_storage_tile {
+        spawn_storage_tile_for(world, faction_id, at_tile);
+    }
+
+    // ── P4: nomadic-direction re-seed ──────────────────────────────
+    // For settled→nomadic transitions, lay down a fresh hearth-ring
+    // camp at `at_tile` so the band has somewhere to sleep tonight.
+    if new_archetype_key.starts_with("nomadic_") {
+        reseed_nomadic_camp_for(world, faction_id, at_tile);
+    }
 
     // ── Step 7: Activity log ───────────────────────────────────────
     emit_sedentarized_event(world, faction_id, at_tile);
+}
+
+/// P4: re-seed a nomadic camp footprint at `tile` for the freshly
+/// collapsed faction. Mirrors `nomad_migration_commit_system`'s
+/// re-seed pass — same hearth ring + bedrolls + tents + Neolithic+
+/// yurts via `seed_nomadic_camp`.
+fn reseed_nomadic_camp_for(
+    world: &mut World,
+    faction_id: u32,
+    tile: (i32, i32),
+) {
+    use crate::simulation::construction::{
+        best_hearth_for, seed_nomadic_camp, FurnitureMaps,
+    };
+    use crate::simulation::technology::current_era;
+    use crate::world::chunk::ChunkMap;
+    use crate::world::chunk_streaming::TileChangedEvent;
+
+    let Some((members, era, hearth_tier)) = world
+        .resource::<FactionRegistry>()
+        .factions
+        .get(&faction_id)
+        .map(|f| (f.member_count, current_era(&f.techs), best_hearth_for(&f.techs)))
+    else {
+        return;
+    };
+
+    let mut state: SystemState<(
+        Commands,
+        FurnitureMaps,
+        Res<ChunkMap>,
+        EventWriter<TileChangedEvent>,
+    )> = SystemState::new(world);
+    let (mut commands, mut maps, chunk_map, mut tile_changed) = state.get_mut(world);
+    let mut used: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+    used.insert(tile);
+    seed_nomadic_camp(
+        &mut commands,
+        &mut maps,
+        &chunk_map,
+        &mut tile_changed,
+        &mut used,
+        faction_id,
+        tile,
+        members,
+        era,
+        hearth_tier,
+    );
+    state.apply(world);
 }
 
 /// Despawn `Camp` (if any), Beds/Bedrolls/Campfires/TentShelters and

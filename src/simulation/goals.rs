@@ -133,6 +133,14 @@ pub enum AgentGoal {
     /// `ClaimTarget.resource_id` companion. Set exclusively by `JobClaim` of
     /// `JobKind::Stockpile` for resources outside the Wood/Stone fallback.
     Stockpile = 18,
+    /// P1 (active migration): nomadic band member walking with the band
+    /// to the new camp tile after a migration commit. Stamped by
+    /// `nomad_migration_commit_system` alongside a `MigrationTarget`
+    /// component; cleared by `nomad_migration_arrival_system` on
+    /// arrival or timeout. Survive-tier needs (severe hunger / under
+    /// raid / rescue) preempt naturally via the existing branch order
+    /// in `goal_update_system`.
+    MigrateToCamp = 19,
 }
 
 impl AgentGoal {
@@ -156,6 +164,7 @@ impl AgentGoal {
             AgentGoal::Farm => "Farm",
             AgentGoal::Haul => "Haul",
             AgentGoal::Stockpile => "Stockpile",
+            AgentGoal::MigrateToCamp => "MigrateToCamp",
         }
     }
 }
@@ -282,6 +291,7 @@ pub fn goal_update_system(
             Option<&mut GoalReason>,
             Option<&FactionChief>,
             Option<&JobClaim>,
+            Option<&crate::simulation::nomad::MigrationTarget>,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -301,6 +311,7 @@ pub fn goal_update_system(
         reason_opt,
         chief_opt,
         claim_opt,
+        migration_target,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -403,6 +414,27 @@ pub fn goal_update_system(
                 // agent re-evaluates a normal goal next tick.
                 commands.entity(entity).remove::<RescueTarget>();
             }
+        }
+
+        // P1: active migration. While the band is moving, hold the
+        // MigrateToCamp goal so the dispatcher keeps walking the agent
+        // toward the new camp tile. Survive-tier hunger / under-raid /
+        // rescue branches above already preempt; everything else (Sleep,
+        // Socialize, Play, etc.) defers until arrival or timeout.
+        if migration_target.is_some() {
+            if *goal != AgentGoal::MigrateToCamp {
+                *goal = AgentGoal::MigrateToCamp;
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+            }
+            if let Some(mut r) = reason_opt {
+                r.0 = "Migrating to Camp";
+            } else {
+                commands
+                    .entity(entity)
+                    .insert(GoalReason("Migrating to Camp"));
+            }
+            continue;
         }
 
         // Don't interrupt combat or sleep

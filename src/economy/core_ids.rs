@@ -154,4 +154,5 @@ core_ids! {
     Book => "book" => book,
     Bedroll => "bedroll" => bedroll,
     PackedYurt => "packed_yurt" => packed_yurt,
+    PreservedMeat => "preserved_meat" => preserved_meat,
 }

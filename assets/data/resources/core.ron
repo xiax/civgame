@@ -323,5 +323,25 @@ ResourceFile(
             tags: ["nomadic", "packed_shelter"],
             sprite_key: Some("item_cloth"),
         ),
+
+        // ── Migration ration ──────────────────────────────────────────
+        // Smoke-cured meat. Half the calories of fresh, but a quarter of
+        // the weight per food-unit and doesn't perish, so nomadic bands
+        // pack it for migration journeys. `pick_food_to_eat` prefers
+        // fresh / berry / grain over preserved at decision time so the
+        // ration stays banked until the band actually leaves camp.
+        ResourceDef(
+            key: "preserved_meat",
+            display_name: "Preserved Meat",
+            class: food,
+            bulk: small,
+            weight_g: 200,
+            edible_calories: Some(120),
+            entertainment_value: 2,
+            storage_class: granary,
+            trade_base_value: 8,
+            tags: ["food", "edible", "preserved", "ration"],
+            sprite_key: Some("resource_meat"),
+        ),
     ],
 )

@@ -30,7 +30,9 @@ pub mod mood;
 pub mod movement;
 pub mod needs;
 pub mod nomad;
+pub mod nomad_pool;
 pub mod pack_deploy;
+pub mod sedentary_collapse;
 pub mod person;
 pub mod wild_herd;
 pub mod plants;
@@ -271,8 +273,22 @@ impl Plugin for SimulationPlugin {
                     // professions).
                     trader::trader_route_dispatch_system
                         .after(htn::bureaucrat_admin_dispatch_system),
+                    // P1: nomad-band migration dispatcher. Walks members
+                    // with a `MigrationTarget` toward the new camp tile.
+                    // Ordered after bureaucrat (idle agents only) and
+                    // gated on goal == MigrateToCamp inside the system.
+                    nomad::nomad_migration_dispatch_system
+                        .after(trader::trader_route_dispatch_system),
                 )
                     .in_set(SimulationSet::ParallelB),
+            )
+            // P8: attach `PackAnimalInventory` to freshly tamed pack
+            // animals (Horse / Cow / Pig). Own add_systems call to dodge
+            // the 20-element ceiling on the Sequential tuple.
+            .add_systems(
+                FixedUpdate,
+                animals::attach_pack_inventory_system
+                    .in_set(SimulationSet::Sequential),
             )
             .add_systems(
                 // Phase 5e-xi-a/b: split-off because the main ParallelB tuple
@@ -408,6 +424,11 @@ impl Plugin for SimulationPlugin {
                     // Sits in Sequential so the despawn happens cleanly
                     // before the next tick's pathing / sleep dispatch.
                     nomad::nomad_migration_commit_system,
+                    // P1: per-tick arrival check for in-flight migrations.
+                    // Sequential after movement so position reads are
+                    // already up-to-date this tick.
+                    nomad::nomad_migration_arrival_system
+                        .after(movement::movement_system),
                     // Phase 10: per-tick bloom/collapse based on camera
                     // proximity. Runs in Sequential so the entity spawns/
                     // despawns are visible to next tick's render + AI
@@ -463,6 +484,8 @@ impl Plugin for SimulationPlugin {
                         .after(faction::compute_faction_storage_system)
                         .after(faction::chief_selection_system)
                         .after(projects::project_lifecycle_system),
+                    jobs::worker_self_post_stockpile_system
+                        .after(jobs::chief_job_posting_system),
                     crafting::faction_craft_order_system
                         .after(jobs::chief_job_posting_system),
                     jobs::chief_tablet_posting_system
@@ -555,11 +578,24 @@ impl Plugin for SimulationPlugin {
                     // see the new home_tile next tick.
                     nomad::nomad_migration_system
                         .after(faction::compute_faction_storage_system),
+                    // P5: band-level inventory equalization. Runs every
+                    // quarter-day so a daily migration trigger has at
+                    // least one prior balance pass to draw on. Gated by
+                    // `caps.storage` ∈ {MemberPool, Hybrid} inside the
+                    // system itself; settled factions are no-ops.
+                    nomad_pool::nomad_band_pool_balance_system
+                        .after(faction::compute_faction_storage_system),
                     // Phase 11. Sedentarization candidate check — runs
                     // after migration trigger so a band that JUST set
                     // `pending_migration` this tick is ineligible (won't
                     // flip lifestyle and lose its move).
                     nomad::nomad_sedentarize_system
+                        .after(nomad::nomad_migration_system),
+                    // P2: slim nomad chief — queues replacement Bedroll/
+                    // Tent/Yurt blueprints when shelter falls below
+                    // per-member targets. Daily, after migration trigger
+                    // so a band about to move skips the work.
+                    nomad::nomad_chief_directive_system
                         .after(nomad::nomad_migration_system),
                     // Phase 10: wild herd seasonal drift. Daily, after the
                     // calendar tick — sits next to the nomad migration so
@@ -603,11 +639,17 @@ impl Plugin for SimulationPlugin {
                     shared_knowledge::cluster_decay_system,
                     knowledge::cluster_tier_promotion_system
                         .after(knowledge::awareness_gossip_system),
+                    // P4: settled→nomadic collapse. Daily, before the
+                    // lifecycle drain so a same-tick failing sample can
+                    // queue + execute its SwitchArchetype event in one
+                    // pass.
+                    sedentary_collapse::sedentary_collapse_system
+                        .after(nomad::nomad_sedentarize_system),
                     // P3: drain SettlementLifecycleEvent queue (today
                     // only `nomad_sedentarize_system` emits — must run
                     // after it). Exclusive World; consumes the queue.
                     lifecycle::process_settlement_lifecycle_system
-                        .after(nomad::nomad_sedentarize_system),
+                        .after(sedentary_collapse::sedentary_collapse_system),
                 )
                     .in_set(SimulationSet::Economy),
             );

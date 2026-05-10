@@ -48,7 +48,7 @@ pub struct CraftRecipe {
 
 use crate::simulation::technology::{
     BOW_AND_ARROW, BRONZE_WEAPONS, COPPER_TOOLS, CUNEIFORM_WRITING, FIRED_POTTERY, FIRE_MAKING,
-    FLINT_KNAPPING, HUNTING_SPEAR, LOOM_WEAVING,
+    FLINT_KNAPPING, FOOD_SMOKING, HUNTING_SPEAR, LOOM_WEAVING,
 };
 
 /// Lazily-built recipe table. Phase 2d migrated `CraftRecipe` from a
@@ -79,6 +79,8 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
     let luxury = core_ids::luxury();
     let clay_tablet = core_ids::clay_tablet();
     let book = core_ids::book();
+    let meat = core_ids::meat();
+    let preserved_meat = core_ids::preserved_meat();
 
     vec![
         // 0
@@ -223,6 +225,20 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             work_ticks: 180,
             crafting_xp: 12,
             tech_gate: Some(CUNEIFORM_WRITING),
+            requires_station: Some(StationKind::Workbench),
+        },
+        // 12 — P7: Smoke 2 fresh meat into 3 preserved (lighter, banked
+        // for migration). Workbench gating keeps this off the wild trail
+        // until the band has set up a hearth + work station.
+        CraftRecipe {
+            name: "Preserved Meat",
+            inputs: vec![(meat, 2), (wood, 1)],
+            output_resource: preserved_meat,
+            output_qty: 3,
+            output_material: None,
+            work_ticks: 60,
+            crafting_xp: 4,
+            tech_gate: Some(FOOD_SMOKING),
             requires_station: Some(StationKind::Workbench),
         },
     ]
@@ -941,8 +957,8 @@ mod tests {
         let recipes = craft_recipes();
         assert_eq!(
             recipes.len(),
-            12,
-            "expected 12 recipes; counts feed CraftOrder.recipe_id wire format"
+            13,
+            "expected 13 recipes; counts feed CraftOrder.recipe_id wire format"
         );
 
         // Stone Tools (recipe 0): Stone×2 + Wood×1 → Tools×1

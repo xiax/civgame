@@ -1146,11 +1146,16 @@ pub fn eat_task_system(
                 u32,
                 crate::economy::resource_catalog::ResourceId,
             )> = None;
+            // P7: two-pass food selection. First pass excludes preserved
+            // foods (smoked meat, future jerky etc.) so the band's
+            // migration ration stays banked when fresh food is available;
+            // only fall through to preserved if nothing else is on hand.
             let mut consider =
                 |src: EdibleSlot,
                  rid: crate::economy::resource_catalog::ResourceId,
                  qty: u32,
                  hunger: f32,
+                 skip_preserved: bool,
                  min_nut: &mut u32,
                  max_nut: &mut u32,
                  best_cover: &mut Option<(
@@ -1164,6 +1169,9 @@ pub fn eat_task_system(
                     crate::economy::resource_catalog::ResourceId,
                 )>| {
                     if qty == 0 || !rid.is_edible() {
+                        return;
+                    }
+                    if skip_preserved && rid.is_preserved_ration() {
                         return;
                     }
                     let nut = rid.nutrition() as u32;
@@ -1182,41 +1190,53 @@ pub fn eat_task_system(
                     }
                 };
 
-            for (idx, (it, q)) in agent.inventory.iter().enumerate() {
-                consider(
-                    EdibleSlot::Inventory(idx),
-                    it.resource_id,
-                    *q,
-                    needs.hunger,
-                    &mut min_nut,
-                    &mut max_nut,
-                    &mut best_cover,
-                    &mut best_largest,
-                );
-            }
-            if let Some(s) = carrier.left {
-                consider(
-                    EdibleSlot::HandLeft,
-                    s.item.resource_id,
-                    s.qty,
-                    needs.hunger,
-                    &mut min_nut,
-                    &mut max_nut,
-                    &mut best_cover,
-                    &mut best_largest,
-                );
-            }
-            if let Some(s) = carrier.right {
-                consider(
-                    EdibleSlot::HandRight,
-                    s.item.resource_id,
-                    s.qty,
-                    needs.hunger,
-                    &mut min_nut,
-                    &mut max_nut,
-                    &mut best_cover,
-                    &mut best_largest,
-                );
+            // Run pass 1 (skip preserved); if it found nothing, fall back
+            // to pass 2 (include preserved).
+            for skip_preserved in [true, false] {
+                if best_cover.is_some() || best_largest.is_some() {
+                    break;
+                }
+                min_nut = u32::MAX;
+                max_nut = 0;
+                for (idx, (it, q)) in agent.inventory.iter().enumerate() {
+                    consider(
+                        EdibleSlot::Inventory(idx),
+                        it.resource_id,
+                        *q,
+                        needs.hunger,
+                        skip_preserved,
+                        &mut min_nut,
+                        &mut max_nut,
+                        &mut best_cover,
+                        &mut best_largest,
+                    );
+                }
+                if let Some(s) = carrier.left {
+                    consider(
+                        EdibleSlot::HandLeft,
+                        s.item.resource_id,
+                        s.qty,
+                        needs.hunger,
+                        skip_preserved,
+                        &mut min_nut,
+                        &mut max_nut,
+                        &mut best_cover,
+                        &mut best_largest,
+                    );
+                }
+                if let Some(s) = carrier.right {
+                    consider(
+                        EdibleSlot::HandRight,
+                        s.item.resource_id,
+                        s.qty,
+                        needs.hunger,
+                        skip_preserved,
+                        &mut min_nut,
+                        &mut max_nut,
+                        &mut best_cover,
+                        &mut best_largest,
+                    );
+                }
             }
 
             if min_nut == u32::MAX {

@@ -1658,6 +1658,154 @@ mod smoke {
         );
     }
 
+    // ─── P4 full — worker self-posts staples in Market mode ───
+
+    /// Market-mode faction: chief skips Stockpile{Wood} (policy gate),
+    /// the worker_self_post system picks up a wealthy member and self-
+    /// posts on their behalf so the gather chain still runs.
+    #[test]
+    fn worker_self_posts_wood_in_market_mode() {
+        use crate::economy::core_ids;
+        use crate::economy::policy::ResourceControlPolicy;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{
+            JobBoard, JobProgress, JobSource, PosterClass, WORKER_SELF_POST_CADENCE,
+        };
+        use crate::simulation::memory::MemoryKind;
+        use crate::simulation::schedule::SimClock;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        for i in 1..4 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+        // Fund the wealthiest member; floor is WORKER_SELF_POST_MIN_CURRENCY (20).
+        set_currency(&mut sim.app, person, 50.0);
+
+        // Flip Wood to capitalist on the player faction so the chief
+        // branch skips the Stockpile{Wood} posting.
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                registry.add_member(sim.player_faction_id);
+            }
+            let f = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            f.economic_policy
+                .insert(core_ids::wood(), ResourceControlPolicy::capitalist());
+            // Set a non-trivial material target so the deficit gate
+            // passes; storage is empty by default.
+            f.material_targets.insert(core_ids::wood(), 50);
+        }
+
+        // Inject a faction-tier wood cluster so faction_knows_cluster
+        // returns true. Tile must be outside vision radius from (0,0).
+        sim.inject_faction_sighting(
+            sim.player_faction_id,
+            (40, 40),
+            MemoryKind::Resource(core_ids::wood()),
+        );
+
+        // Fast-forward the clock to one tick before the cadence so a
+        // single tick fires the system. Cheaper than ticking 3600
+        // frames; the system reads only `clock.tick % cadence`.
+        {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = WORKER_SELF_POST_CADENCE - 1;
+        }
+        sim.tick_n(2);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let self_posted: Vec<_> = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| {
+                matches!(
+                    &p.progress,
+                    JobProgress::Stockpile { resource_id, .. } if *resource_id == core_ids::wood()
+                ) && p.source == JobSource::Player
+                    && p.poster_class == PosterClass::Individual
+            })
+            .collect();
+        assert_eq!(
+            self_posted.len(),
+            1,
+            "exactly one worker-self-posted Stockpile{{Wood}} expected, got {}",
+            self_posted.len()
+        );
+        assert!(
+            self_posted[0].reward > 0.0,
+            "self-posted contract must carry a positive wage; got {}",
+            self_posted[0].reward
+        );
+    }
+
+    /// Subsistence-mode faction: chief still allocates wood, so the
+    /// worker self-post system must not fire on top of the chief's
+    /// posting. Pins the gating predicate.
+    #[test]
+    fn worker_does_not_self_post_in_subsistence_mode() {
+        use crate::economy::core_ids;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{JobBoard, JobProgress, JobSource, WORKER_SELF_POST_CADENCE};
+        use crate::simulation::memory::MemoryKind;
+        use crate::simulation::schedule::SimClock;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        for i in 1..4 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+        // Wealth is irrelevant; the gate trips on the chief policy.
+        set_currency(&mut sim.app, person, 200.0);
+
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                registry.add_member(sim.player_faction_id);
+            }
+            let f = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            f.material_targets.insert(core_ids::wood(), 50);
+            // Default Subsistence: chief_allocates_labor stays true
+            // (empty economic_policy → default policy → all-true).
+        }
+
+        sim.inject_faction_sighting(
+            sim.player_faction_id,
+            (40, 40),
+            MemoryKind::Resource(core_ids::wood()),
+        );
+
+        {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = WORKER_SELF_POST_CADENCE - 1;
+        }
+        sim.tick_n(2);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let player_self_posted = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| {
+                matches!(
+                    &p.progress,
+                    JobProgress::Stockpile { resource_id, .. } if *resource_id == core_ids::wood()
+                ) && p.source == JobSource::Player
+            })
+            .count();
+        assert_eq!(
+            player_self_posted, 0,
+            "Subsistence factions must not self-post — chief still allocates",
+        );
+    }
+
     // ─── R6-c — chief Build gated on state_funds_public_works ───
 
     #[test]

@@ -738,6 +738,184 @@ pub fn post_stockpile_self(
     Some(escrow)
 }
 
+// ─── P4 full: worker self-post for staple Stockpile contracts ─────────
+//
+// In Market-mode factions the chief stops posting Stockpile{wood/stone}
+// (chief_allocates_labor=false), but workers still need raw materials
+// flowing into faction storage. Without this system, Market workers
+// fall through to the autonomous gather goal in goal_update_system —
+// they gather "for free", earning nothing despite being in a market
+// economy. With this system, once per game-day a wealthy worker self-
+// posts a small Stockpile contract; another worker (often themselves)
+// claims and earns the wage. Subsistence factions are untouched
+// (their staples are chief-allocated, so the gate skips them).
+
+/// Cadence for `worker_self_post_stockpile_system`. Once per game-day
+/// matches the lifetime of a typical contract — long enough for
+/// claim-and-deliver round-trips, short enough to feel responsive.
+pub const WORKER_SELF_POST_CADENCE: u64 = crate::world::seasons::TICKS_PER_DAY as u64;
+/// Default target quantity for a self-posted Stockpile contract. Small
+/// enough that the wage stays affordable for early-game agents (wage =
+/// `trade_base_value(rid) * qty * SELF_POST_MARGIN` ≈ 5–8 currency at
+/// qty=10), large enough to make the posting worth claiming.
+pub const WORKER_SELF_POST_TARGET_QTY: u32 = 10;
+/// Floor on the author's currency. Below this we don't drain a near-
+/// destitute worker to fund a contract — they need the runway for
+/// market food purchases more than they need raw materials posted.
+pub const WORKER_SELF_POST_MIN_CURRENCY: f32 = 20.0;
+
+/// Worker-funded Stockpile poster. Runs daily, exclusive to allow
+/// `post_stockpile_self`'s atomic debit + JobBoard push + JobEscrow
+/// spawn. For each non-household, non-nomadic faction whose staple
+/// policy disables chief allocation, picks the wealthiest claim-free
+/// member and self-posts a Stockpile contract for any staple resource
+/// the faction has a deficit on AND knows a cluster for AND has no
+/// live Stockpile posting on already.
+pub fn worker_self_post_stockpile_system(world: &mut World) {
+    let tick = world.resource::<SimClock>().tick;
+    if tick % WORKER_SELF_POST_CADENCE != 0 {
+        return;
+    }
+
+    let wood_id = crate::economy::core_ids::wood();
+    let stone_id = crate::economy::core_ids::stone();
+    let catalog = world
+        .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+        .clone();
+
+    // Phase 1: per-faction decisions (which staple resources need a
+    // self-post). Snapshot the read-only state so we can mutate the
+    // world freely in Phase 3 without conflicting borrows.
+    #[derive(Clone, Copy)]
+    struct Decision {
+        faction_id: u32,
+        rid: crate::economy::resource_catalog::ResourceId,
+        qty: u32,
+    }
+    let decisions: Vec<Decision> = {
+        let registry = world.resource::<FactionRegistry>();
+        let board = world.resource::<JobBoard>();
+        let shared = world.resource::<crate::simulation::shared_knowledge::SharedKnowledge>();
+        let settlement_map = world.resource::<crate::simulation::settlement::SettlementMap>();
+
+        let mut out = Vec::new();
+        for (&fid, faction) in registry.factions.iter() {
+            if faction.member_count == 0 {
+                continue;
+            }
+            // Households post their own contracts via
+            // household_contract_posting_system. Skip them here so
+            // we don't double-post on the village's behalf.
+            if faction.parent_faction.is_some() {
+                continue;
+            }
+            // Nomadic / posting-disabled archetypes: capability gate
+            // already mirrors the legacy is_nomadic() short-circuit.
+            if faction.caps.posting.is_disabled() {
+                continue;
+            }
+
+            for &target_rid in &[wood_id, stone_id] {
+                // Chief still handles this resource? leave it alone.
+                if faction.policy_for(target_rid).chief_allocates_labor {
+                    continue;
+                }
+                // Already a Stockpile posting for this rid? skip —
+                // duplicate posting just dilutes claim attention.
+                let already = board.faction_postings(fid).iter().any(|p| matches!(
+                    p.progress,
+                    JobProgress::Stockpile { resource_id, .. } if resource_id == target_rid
+                ));
+                if already {
+                    continue;
+                }
+
+                // Real deficit on this staple? Mirrors the chief
+                // branch's deficit gate so a fully-stocked faction
+                // doesn't post for the sake of posting.
+                let target = faction
+                    .material_target_of(target_rid)
+                    .max(faction.demand_of(target_rid));
+                let stored = faction.storage.stock_of(target_rid);
+                if target <= stored {
+                    continue;
+                }
+
+                // Faction-tier cluster knowledge — same gate as the
+                // chief branch. No known cluster ⇒ futile posting.
+                if !crate::simulation::shared_knowledge::faction_knows_cluster(
+                    &shared,
+                    &settlement_map,
+                    fid,
+                    crate::simulation::memory::MemoryKind::Resource(target_rid),
+                    (faction.home_tile.0 as i32, faction.home_tile.1 as i32),
+                    16,
+                ) {
+                    continue;
+                }
+
+                out.push(Decision {
+                    faction_id: fid,
+                    rid: target_rid,
+                    qty: WORKER_SELF_POST_TARGET_QTY,
+                });
+            }
+        }
+        out
+    };
+
+    if decisions.is_empty() {
+        return;
+    }
+
+    // Phase 2: build per-faction wealth-ranked candidate lists. Skip
+    // claim-holders (they're working) and Drafted (combat / lecture).
+    let mut members_by_faction: ahash::AHashMap<u32, Vec<(Entity, f32)>> = ahash::AHashMap::new();
+    {
+        let mut q = world.query_filtered::<(
+            Entity,
+            &crate::simulation::faction::FactionMember,
+            &crate::economy::agent::EconomicAgent,
+        ), (
+            Without<JobClaim>,
+            Without<crate::simulation::person::Drafted>,
+        )>();
+        for (entity, member, econ) in q.iter(world) {
+            members_by_faction
+                .entry(member.faction_id)
+                .or_default()
+                .push((entity, econ.currency));
+        }
+    }
+    for list in members_by_faction.values_mut() {
+        list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    // Phase 3: enact decisions. One contract per (faction, rid) per
+    // cadence — the wealthiest member who can afford the wage authors.
+    for d in decisions {
+        let Some(members) = members_by_faction.get(&d.faction_id) else {
+            continue;
+        };
+        let wage = self_post_wage(&catalog, d.rid, d.qty);
+        let Some(&(author, _currency)) = members
+            .iter()
+            .find(|&&(_, c)| c >= wage && c >= WORKER_SELF_POST_MIN_CURRENCY)
+        else {
+            continue;
+        };
+        post_stockpile_self(
+            world,
+            author,
+            d.faction_id,
+            d.rid,
+            d.qty,
+            PosterClass::Individual,
+            None,
+        );
+    }
+}
+
 // ─── Pluralist Economy R8 follow-on: Esteem-driven posting ─────────
 
 /// Per-individual reward when an Esteem-seeking agent commissions a

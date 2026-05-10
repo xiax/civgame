@@ -1,0 +1,35 @@
+// Core faction archetypes (P5).
+//
+// Each entry maps an archetype key to a (lifestyle, preset) pair. The
+// loader builds the FactionCapabilities bundle by calling
+// `derive_from_legacy(lifestyle, preset, catalog)` — the cross-product
+// of Lifestyle x EconomyPreset is the single source of truth for
+// capability fields today. Adding a new archetype = one entry here.
+//
+// Inert combinations (e.g. nomadic_mixed, nomadic_market) are
+// deliberately omitted. Authoring a new entry below is the path to
+// enabling them; today they have no production usage.
+ArchetypeFile(
+    archetypes: [
+        ArchetypeEntry(
+            key: "settled_subsistence",
+            lifestyle: settled,
+            preset: subsistence,
+        ),
+        ArchetypeEntry(
+            key: "settled_mixed",
+            lifestyle: settled,
+            preset: mixed,
+        ),
+        ArchetypeEntry(
+            key: "settled_market",
+            lifestyle: settled,
+            preset: market,
+        ),
+        ArchetypeEntry(
+            key: "nomadic_subsistence",
+            lifestyle: nomadic,
+            preset: subsistence,
+        ),
+    ],
+)

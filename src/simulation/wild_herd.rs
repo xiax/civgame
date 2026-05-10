@@ -34,7 +34,7 @@ use crate::simulation::region::SimulationFocus;
 use crate::simulation::reproduction::BiologicalSex;
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
-use crate::world::seasons::{Calendar, Season, TICKS_PER_DAY};
+use crate::world::seasons::{Calendar, Season, TICKS_PER_DAY, TICKS_PER_SEASON};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 
 /// Number of distinct wild herds the world spawns at game start. Two horse +
@@ -62,6 +62,21 @@ pub const COLLAPSE_RADIUS_TILES: i32 = 48;
 /// stays in `aggregate_count` invisible until predation drops it.
 pub const BLOOM_VISIBLE_CAP: u16 = 60;
 
+/// P6: chebyshev radius around the leader within which a Wolf or armed
+/// hunter triggers a `flee_until_tick = now + TICKS_PER_DAY` reaction.
+pub const HERD_FLEE_RADIUS: i32 = 8;
+/// P6: chebyshev radius from any nomadic camp tile that the herd will
+/// drift away from (encouraging predators-vs-camps spatial pressure).
+pub const HERD_CAMP_AVOID_RADIUS: i32 = 10;
+/// P6: per-season replenishment, capped by `WILD_HERD_AGGREGATE_CAP`.
+/// Births skip Winter (food scarce) — Spring/Summer/Autumn all add.
+pub const WILD_HERD_BIRTH_PER_SEASON: u16 = 12;
+pub const WILD_HERD_AGGREGATE_CAP: u16 = 200;
+/// P6: water probe radius used during the daily water-seek bias. Beyond
+/// this distance the herd doesn't sense water and falls back to the
+/// season-biased random drift.
+pub const HERD_WATER_PROBE_RADIUS: i32 = 12;
+
 /// Fixed offset used for the herd's range-bounding box. The leader_tile
 /// drifts by ±2 daily within `home_range`; in Winter the range biases
 /// south by `WINTER_SHIFT_TILES`, in Spring north by `SPRING_SHIFT_TILES`.
@@ -83,6 +98,14 @@ pub struct WildHerd {
     pub bloomed: bool,
     /// Live entities currently spawned. Empty when collapsed.
     pub members: Vec<Entity>,
+    /// P6: tick when the herd last fled from a predator/hunter sighting.
+    /// While `now < flee_until_tick`, water-seek + camp-avoid biases are
+    /// suppressed in favour of the flee direction.
+    pub flee_until_tick: u32,
+    /// P6: tick of the last seasonal birth bump. Throttles
+    /// `aggregate_count` growth to once per `TICKS_PER_SEASON` so a
+    /// summer-long camera focus doesn't rapidly overflow `WILD_HERD_AGGREGATE_CAP`.
+    pub last_birthed_tick: u32,
 }
 
 #[derive(Resource, Default, Debug)]
@@ -151,6 +174,8 @@ pub fn seed_wild_herds_system(
                 range_center: centre,
                 bloomed: false,
                 members: Vec::new(),
+                flee_until_tick: 0,
+                last_birthed_tick: 0,
             },
         );
         info!(
@@ -182,21 +207,25 @@ fn collect_grassland(chunk_map: &ChunkMap) -> Vec<(i32, i32)> {
 
 /// Daily leader drift within the herd's seasonal range. Seasonal bias
 /// shifts the range centre on Spring / Winter transitions so herds
-/// migrate longitudinally over a game-year (4 seasons).
+/// migrate longitudinally over a game-year (4 seasons). P6 layered:
+/// (a) flee from nearby Wolves / armed hunters; (b) bias toward the
+/// nearest water tile when none is adjacent; (c) avoid nomadic camp
+/// tiles within `HERD_CAMP_AVOID_RADIUS`; (d) per-season birth bumps to
+/// `aggregate_count` (capped at `WILD_HERD_AGGREGATE_CAP`).
 pub fn wild_herd_migration_system(
     clock: Res<SimClock>,
     calendar: Res<Calendar>,
     chunk_map: Res<ChunkMap>,
+    registry_factions: Res<crate::simulation::faction::FactionRegistry>,
+    wolf_q: Query<&Transform, With<crate::simulation::animals::Wolf>>,
     mut registry: ResMut<WildHerdRegistry>,
 ) {
     if clock.tick % TICKS_PER_DAY as u64 != 0 {
         return;
     }
     let now = clock.tick as u32;
+    let day = now / TICKS_PER_DAY;
     for herd in registry.herds.values_mut() {
-        // Seasonal bias on the range centre. Computed each tick rather than
-        // stored — cheap, idempotent, and makes a season change immediately
-        // visible.
         let (cx, cy) = herd.range_center;
         let biased_centre = match calendar.season {
             Season::Winter => (cx, cy - WINTER_SHIFT_TILES),
@@ -204,15 +233,88 @@ pub fn wild_herd_migration_system(
             Season::Summer | Season::Autumn => (cx, cy),
         };
 
-        // Random-ish drift from current leader_tile keyed on (id, day).
-        let day = now / TICKS_PER_DAY;
-        let seed = herd.id.wrapping_mul(0x85EB_CA6B).wrapping_add(day);
-        let dx = ((seed & 0b11) as i32) - 1; // -1..=2
-        let dy = (((seed >> 2) & 0b11) as i32) - 1;
+        // P6 (a): predator flee. Scan nearby Wolves; if any within
+        // `HERD_FLEE_RADIUS` of leader, set flee_until and bias drift
+        // away from the average wolf direction.
+        let mut fleeing_dir: Option<(i32, i32)> = None;
+        if now >= herd.flee_until_tick {
+            let mut sum_dx = 0i32;
+            let mut sum_dy = 0i32;
+            let mut count = 0i32;
+            for w_t in wolf_q.iter() {
+                let wx = (w_t.translation.x / TILE_SIZE).floor() as i32;
+                let wy = (w_t.translation.y / TILE_SIZE).floor() as i32;
+                if chebyshev((wx, wy), herd.leader_tile) <= HERD_FLEE_RADIUS {
+                    sum_dx += herd.leader_tile.0 - wx;
+                    sum_dy += herd.leader_tile.1 - wy;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                let avg_dx = sum_dx.signum().max(-1).min(1);
+                let avg_dy = sum_dy.signum().max(-1).min(1);
+                fleeing_dir = Some((avg_dx * 3, avg_dy * 3));
+                herd.flee_until_tick = now + TICKS_PER_DAY;
+            }
+        } else {
+            // Already in flee state — keep walking the same way.
+            fleeing_dir = Some((0, 0));
+        }
+
+        let (mut dx, mut dy);
+        if let Some((fx, fy)) = fleeing_dir {
+            // Flee dominates other biases. If the flee direction is zero
+            // (lingering flee state), fall through to the random drift
+            // inside the seasonal box.
+            if fx != 0 || fy != 0 {
+                dx = fx;
+                dy = fy;
+            } else {
+                let seed = herd.id.wrapping_mul(0x85EB_CA6B).wrapping_add(day);
+                dx = ((seed & 0b11) as i32) - 1;
+                dy = (((seed >> 2) & 0b11) as i32) - 1;
+            }
+        } else {
+            // P6 (b): water-seek when no water nearby. If no water tile
+            // within chebyshev 4 of leader, override drift to step toward
+            // the nearest water tile within HERD_WATER_PROBE_RADIUS.
+            let immediate_water_present = water_within(&chunk_map, herd.leader_tile, 4);
+            if !immediate_water_present {
+                if let Some(target) = nearest_water(
+                    &chunk_map,
+                    herd.leader_tile,
+                    HERD_WATER_PROBE_RADIUS,
+                ) {
+                    dx = (target.0 - herd.leader_tile.0).signum();
+                    dy = (target.1 - herd.leader_tile.1).signum();
+                } else {
+                    let seed = herd.id.wrapping_mul(0x85EB_CA6B).wrapping_add(day);
+                    dx = ((seed & 0b11) as i32) - 1;
+                    dy = (((seed >> 2) & 0b11) as i32) - 1;
+                }
+            } else {
+                let seed = herd.id.wrapping_mul(0x85EB_CA6B).wrapping_add(day);
+                dx = ((seed & 0b11) as i32) - 1;
+                dy = (((seed >> 2) & 0b11) as i32) - 1;
+            }
+
+            // P6 (c): camp avoidance — push away from any nomadic faction
+            // home tile within HERD_CAMP_AVOID_RADIUS. Layered on top of
+            // the water/random drift; flee already short-circuited.
+            for faction in registry_factions.factions.values() {
+                if !faction.caps.home.is_mobile() {
+                    continue;
+                }
+                let d = chebyshev(faction.home_tile, herd.leader_tile);
+                if d <= HERD_CAMP_AVOID_RADIUS {
+                    dx += (herd.leader_tile.0 - faction.home_tile.0).signum() * 4;
+                    dy += (herd.leader_tile.1 - faction.home_tile.1).signum() * 4;
+                }
+            }
+        }
+
         let mut nx = herd.leader_tile.0 + dx;
         let mut ny = herd.leader_tile.1 + dy;
-
-        // Clamp to the seasonal bounding box around `biased_centre`.
         nx = nx.clamp(
             biased_centre.0 - HERD_RANGE_HALF,
             biased_centre.0 + HERD_RANGE_HALF,
@@ -221,12 +323,61 @@ pub fn wild_herd_migration_system(
             biased_centre.1 - HERD_RANGE_HALF,
             biased_centre.1 + HERD_RANGE_HALF,
         );
-
-        // Don't walk into impassable terrain — fall back to current tile.
         if chunk_map.is_passable(nx, ny) {
             herd.leader_tile = (nx, ny);
         }
+
+        // P6 (d): seasonal birth. Throttled to once per `TICKS_PER_SEASON`
+        // (skips Winter — predators dominate, food scarce).
+        if !matches!(calendar.season, Season::Winter)
+            && now.saturating_sub(herd.last_birthed_tick) >= TICKS_PER_SEASON
+            && herd.aggregate_count < WILD_HERD_AGGREGATE_CAP
+        {
+            herd.aggregate_count = herd
+                .aggregate_count
+                .saturating_add(WILD_HERD_BIRTH_PER_SEASON)
+                .min(WILD_HERD_AGGREGATE_CAP);
+            herd.last_birthed_tick = now;
+        }
     }
+}
+
+fn water_within(chunk_map: &ChunkMap, tile: (i32, i32), radius: i32) -> bool {
+    use crate::world::tile::TileKind;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if let Some(kind) = chunk_map.tile_kind_at(tile.0 + dx, tile.1 + dy) {
+                if kind == TileKind::Water {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn nearest_water(
+    chunk_map: &ChunkMap,
+    from: (i32, i32),
+    max_radius: i32,
+) -> Option<(i32, i32)> {
+    use crate::world::tile::TileKind;
+    for r in 1..=max_radius {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs() != r && dy.abs() != r {
+                    continue;
+                }
+                let tile = (from.0 + dx, from.1 + dy);
+                if let Some(kind) = chunk_map.tile_kind_at(tile.0, tile.1) {
+                    if kind == TileKind::Water {
+                        return Some(tile);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Bloom + collapse based on camera-focus proximity. Sequential pass — runs

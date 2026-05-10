@@ -72,6 +72,12 @@ pub enum TaskKind {
     /// Mirrors `WithdrawMaterial` for the FactionTile path; reaches
     /// the executor by `take_from_member_task_system`.
     TakeFromMember = 42,
+    /// P1 (active migration): walking with the band toward the new
+    /// camp tile after `nomad_migration_commit_system` flipped the
+    /// faction's `home_tile`. Driven by `MigrationTarget` component
+    /// + `nomad_migration_dispatch_system` (ParallelB) +
+    /// `nomad_migration_arrival_system` (Sequential, after movement).
+    Migrate = 43,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -120,6 +126,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::Teach as u16 => "Teaching",
         x if x == TaskKind::HoldLecture as u16 => "Lecturing",
         x if x == TaskKind::AttendLecture as u16 => "Attending Lecture",
+        x if x == TaskKind::Migrate as u16 => "Migrating to Camp",
         _ => "Unemployed",
     }
 }
@@ -923,6 +930,15 @@ pub fn goal_dispatch_system(
                     // task field) so the same arm shape covers it.
                     AgentGoal::Rescue if ai.task_id == TaskKind::Defend as u16 => {
                         Some(TaskKind::Defend as u16)
+                    }
+                    // P1: MigrateToCamp dispatcher emits a single
+                    // Task::WalkTo + TaskKind::Migrate that survives
+                    // across goal-dispatch ticks until
+                    // `nomad_migration_arrival_system` strips the
+                    // `MigrationTarget` component on chebyshev arrival
+                    // or timeout. Mirrors the Lead/Defend long-walk shape.
+                    AgentGoal::MigrateToCamp if ai.task_id == TaskKind::Migrate as u16 => {
+                        Some(TaskKind::Migrate as u16)
                     }
                     _ => None,
                 };

@@ -19,6 +19,7 @@ use crate::game_state::EconomyPreset;
 use crate::simulation::faction::Lifestyle;
 use ahash::AHashMap;
 use bevy::prelude::Resource;
+use serde::Deserialize;
 
 /// How a faction's home location is anchored. Settled factions stay put
 /// at a fixed `home_tile`; nomadic factions migrate seasonally.
@@ -349,24 +350,132 @@ impl FactionArchetypeRegistry {
     }
 }
 
-/// Build a registry populated with the four supported legacy archetypes
-/// (`settled_subsistence`, `settled_mixed`, `settled_market`,
-/// `nomadic_subsistence`). The three inert combinations
-/// (`nomadic_mixed`, `nomadic_market`, ...) are deliberately omitted —
-/// authoring them in RON is the path to enabling new archetypes;
-/// today they don't ship.
-pub fn default_registry(catalog: &ResourceCatalog) -> FactionArchetypeRegistry {
+// ── P5: RON archetype loader ──────────────────────────────────────
+//
+// Each `assets/data/factions/archetypes/*.ron` declares one or more
+// `ArchetypeEntry { key, lifestyle, preset }` rows. The loader builds
+// the capability bundle for each entry via `derive_from_legacy` —
+// the (Lifestyle x EconomyPreset) cross is still the source of truth
+// for capability fields today. Adding a new archetype that maps to an
+// existing cross is a one-RON-entry change with no Rust edits.
+
+#[derive(Copy, Clone, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LifestyleSpec {
+    Settled,
+    Nomadic,
+}
+
+impl From<LifestyleSpec> for Lifestyle {
+    fn from(s: LifestyleSpec) -> Self {
+        match s {
+            LifestyleSpec::Settled => Lifestyle::Settled,
+            LifestyleSpec::Nomadic => Lifestyle::Nomadic,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PresetSpec {
+    Subsistence,
+    Mixed,
+    Market,
+}
+
+impl From<PresetSpec> for EconomyPreset {
+    fn from(s: PresetSpec) -> Self {
+        match s {
+            PresetSpec::Subsistence => EconomyPreset::Subsistence,
+            PresetSpec::Mixed => EconomyPreset::Mixed,
+            PresetSpec::Market => EconomyPreset::Market,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ArchetypeEntry {
+    key: String,
+    lifestyle: LifestyleSpec,
+    preset: PresetSpec,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchetypeFile {
+    archetypes: Vec<ArchetypeEntry>,
+}
+
+/// Load every `*.ron` file under `assets/data/factions/archetypes/`,
+/// parse it, and merge entries into one registry. Each entry produces
+/// a `FactionCapabilities` via `derive_from_legacy(lifestyle, preset,
+/// catalog)`. Panics on missing dir / parse errors / duplicate keys —
+/// startup-time failure is the right default for config-driven data.
+pub fn load_archetype_registry(catalog: &ResourceCatalog) -> FactionArchetypeRegistry {
+    let dir = std::path::Path::new("assets/data/factions/archetypes");
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+        panic!(
+            "FactionArchetypeRegistry: cannot read {:?}: {}. \
+             Archetype definitions must live in \
+             assets/data/factions/archetypes/*.ron.",
+            dir, e
+        )
+    });
+
     let mut reg = FactionArchetypeRegistry::default();
-    for (lifestyle, preset) in [
-        (Lifestyle::Settled, EconomyPreset::Subsistence),
-        (Lifestyle::Settled, EconomyPreset::Mixed),
-        (Lifestyle::Settled, EconomyPreset::Market),
-        (Lifestyle::Nomadic, EconomyPreset::Subsistence),
-    ] {
-        let caps = derive_from_legacy(lifestyle, preset, catalog);
-        reg.insert(caps.archetype_key.clone(), caps);
+    let mut seen: AHashMap<String, std::path::PathBuf> = AHashMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("ron") {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("FactionArchetypeRegistry: cannot read {:?}: {}", path, e)
+        });
+        let file: ArchetypeFile = ron::from_str(&body).unwrap_or_else(|e| {
+            panic!(
+                "FactionArchetypeRegistry: parse error in {:?}: {}",
+                path, e
+            )
+        });
+        for row in file.archetypes {
+            if let Some(prev) = seen.get(&row.key) {
+                panic!(
+                    "FactionArchetypeRegistry: duplicate key {:?} in {:?} (also defined in {:?})",
+                    row.key, path, prev
+                );
+            }
+            seen.insert(row.key.clone(), path.clone());
+            let caps = derive_from_legacy(row.lifestyle.into(), row.preset.into(), catalog);
+            // Belt-and-suspenders: the bundle's archetype_key (assigned
+            // by `legacy_archetype_key`) must match the RON-declared
+            // key, otherwise the file mislabels its own row.
+            assert_eq!(
+                caps.archetype_key, row.key,
+                "archetype key {:?} in {:?} doesn't match legacy_archetype_key for ({:?}, {:?})",
+                row.key, path, row.lifestyle, row.preset
+            );
+            reg.insert(row.key, caps);
+        }
+    }
+
+    if reg.len() == 0 {
+        panic!(
+            "FactionArchetypeRegistry: no archetypes found in {:?}. \
+             At least one archetype definition is required.",
+            dir
+        );
     }
     reg
+}
+
+/// Build a registry populated with the four supported legacy archetypes
+/// (`settled_subsistence`, `settled_mixed`, `settled_market`,
+/// `nomadic_subsistence`). Routes through `load_archetype_registry`,
+/// which reads `assets/data/factions/archetypes/*.ron` and derives
+/// each entry's capabilities via `derive_from_legacy`. Adding a new
+/// archetype is a one-RON-entry change with no Rust edits.
+pub fn default_registry(catalog: &ResourceCatalog) -> FactionArchetypeRegistry {
+    load_archetype_registry(catalog)
 }
 
 /// P5 forward-facing entry point: look up a capability bundle by key.
@@ -520,6 +629,71 @@ mod tests {
         );
         assert!(fallback.is_some());
         assert_eq!(fallback.unwrap().archetype_key, "settled_market");
+    }
+
+    /// P5: `load_archetype_registry` reads the on-disk RON files and
+    /// produces capability bundles bit-for-bit identical to the
+    /// pre-RON `default_registry` builder. Pins the regression
+    /// invariant: switching the source from a hardcoded list to RON
+    /// must not perturb any flag.
+    #[test]
+    fn ron_loaded_registry_matches_legacy_derivation() {
+        let cat = test_catalog();
+        let ron = load_archetype_registry(&cat);
+
+        for (lifestyle, preset) in [
+            (Lifestyle::Settled, EconomyPreset::Subsistence),
+            (Lifestyle::Settled, EconomyPreset::Mixed),
+            (Lifestyle::Settled, EconomyPreset::Market),
+            (Lifestyle::Nomadic, EconomyPreset::Subsistence),
+        ] {
+            let key = legacy_archetype_key(lifestyle, preset);
+            let from_ron = ron
+                .get(key)
+                .unwrap_or_else(|| panic!("RON registry missing {key}"));
+            let from_legacy = derive_from_legacy(lifestyle, preset, &cat);
+
+            assert_eq!(from_ron.archetype_key, from_legacy.archetype_key);
+            assert_eq!(from_ron.home, from_legacy.home);
+            assert_eq!(from_ron.storage, from_legacy.storage);
+            assert_eq!(from_ron.shelter, from_legacy.shelter);
+            assert_eq!(from_ron.settlement, from_legacy.settlement);
+            assert_eq!(from_ron.posting, from_legacy.posting);
+            assert_eq!(from_ron.land.carves_plots, from_legacy.land.carves_plots);
+            assert_eq!(
+                from_ron.land.eviction_policy,
+                from_legacy.land.eviction_policy
+            );
+            assert_eq!(
+                from_ron.land.policy.state_sells_land,
+                from_legacy.land.policy.state_sells_land
+            );
+            assert_eq!(
+                from_ron.land.policy.state_rents_land,
+                from_legacy.land.policy.state_rents_land
+            );
+            assert_eq!(
+                from_ron.land.policy.state_sharecrops,
+                from_legacy.land.policy.state_sharecrops
+            );
+            assert_eq!(
+                from_ron.income.household_skim_pct,
+                from_legacy.income.household_skim_pct
+            );
+            assert_eq!(
+                from_ron.economic_policy.len(),
+                from_legacy.economic_policy.len(),
+                "policy map size differs for {key}"
+            );
+            for (rid, p) in from_legacy.economic_policy.iter() {
+                let q = from_ron
+                    .economic_policy
+                    .get(rid)
+                    .unwrap_or_else(|| panic!("RON {key} missing policy for {:?}", rid));
+                assert_eq!(p.chief_allocates_labor, q.chief_allocates_labor);
+                assert_eq!(p.private_actors_allowed, q.private_actors_allowed);
+            }
+        }
     }
 
     #[test]

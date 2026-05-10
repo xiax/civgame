@@ -104,6 +104,17 @@ impl ResourceId {
     pub fn class(self) -> Option<ResourceClass> {
         super::core_ids::catalog().get(self).map(|d| d.class)
     }
+
+    /// True if catalog tags include `"preserved"` — used by the eat
+    /// dispatcher to bias ration-class foods to be consumed last (so a
+    /// nomadic band's smoked stockpile stays banked for the next
+    /// migration). Defaults to false for unknown ids.
+    pub fn is_preserved_ration(self) -> bool {
+        super::core_ids::catalog()
+            .get(self)
+            .map(|d| d.tags.iter().any(|t| t == "preserved"))
+            .unwrap_or(false)
+    }
 }
 
 /// High-level functional category. Used by HTN methods to enumerate "all
@@ -424,5 +435,27 @@ mod tests {
                 key
             );
         }
+    }
+
+    /// P7: preserved_meat is a tagged ration that the eat dispatcher
+    /// should de-prioritise. Verify the catalog entry carries the
+    /// `"preserved"` tag and that `is_preserved_ration()` honours it.
+    #[test]
+    fn preserved_meat_is_flagged_as_ration() {
+        super::super::core_ids::catalog(); // lazy-init core_ids
+        let preserved_meat = super::super::core_ids::preserved_meat();
+        let fresh_meat = super::super::core_ids::meat();
+        assert!(
+            preserved_meat.is_preserved_ration(),
+            "preserved_meat should carry the `preserved` tag"
+        );
+        assert!(
+            !fresh_meat.is_preserved_ration(),
+            "fresh meat should not be flagged as a preserved ration"
+        );
+        assert!(
+            preserved_meat.is_edible(),
+            "preserved_meat must remain edible despite the ration tag"
+        );
     }
 }

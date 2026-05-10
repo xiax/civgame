@@ -1510,6 +1510,19 @@ pub struct FactionData {
     /// deployable structures, then mutates `home_tile = target` and clears
     /// this field. `None` outside of an active migration.
     pub pending_migration: Option<(i32, i32)>,
+    /// P3 (smarter targeting): ring buffer of the band's last
+    /// `RECENT_CAMP_RING_CAP` camp tiles + the tick they were vacated.
+    /// `pick_migration_target` reads this for the recency penalty so a
+    /// band doesn't oscillate between two known-good clusters when both
+    /// dry up. Pushed by `nomad_migration_commit_system` on every commit.
+    pub recent_camps: std::collections::VecDeque<((i32, i32), u32)>,
+    /// P4 (reverse sedentarization): per-day streak counter of "this
+    /// settlement is failing" samples. `sedentary_collapse_system`
+    /// increments daily when a trigger fires (food deficit / shelter
+    /// loss / population crash) and zeros it when the band recovers.
+    /// At `COLLAPSE_TRIGGER_TICKS` worth of consecutive samples the
+    /// faction emits `SwitchArchetype { nomadic_X }` and reverts.
+    pub collapse_streak: u32,
     /// Per-faction capability bundle (P1a). Computed at faction
     /// creation by `derive_from_legacy(...)` once a `(lifestyle,
     /// preset)` pair is known; mirrors the legacy fields above
@@ -1593,6 +1606,8 @@ impl FactionRegistry {
                 lifestyle: Lifestyle::default(),
                 last_migration_tick: 0,
                 pending_migration: None,
+                recent_camps: std::collections::VecDeque::new(),
+                collapse_streak: 0,
                 // P1a: default = settled-Subsistence capabilities.
                 // `spawn_population` overwrites this with the
                 // archetype derived from the faction's
@@ -2285,6 +2300,10 @@ pub fn compute_faction_storage_system(
         (&FactionMember, &crate::economy::agent::EconomicAgent),
         With<crate::simulation::person::Person>,
     >,
+    pack_animals: Query<(
+        &crate::simulation::animals::Tamed,
+        &crate::simulation::animals::PackAnimalInventory,
+    )>,
     mut registry: ResMut<FactionRegistry>,
 ) {
     use crate::simulation::archetype::StorageBackendKind;
@@ -2342,6 +2361,28 @@ pub fn compute_faction_storage_system(
                 .totals
                 .entry(item.resource_id)
                 .or_insert(0) += qty;
+        }
+    }
+
+    // P8: pack-animal pass — only mobile-home factions whose storage is
+    // member-pool-flavoured contribute. Folds carrying pack animals into
+    // the band's storage rollup so chief postings + UI panels see the
+    // band's full inventory regardless of who's holding it.
+    for (tamed, inv) in pack_animals.iter() {
+        let Some(faction) = registry.factions.get_mut(&tamed.owner_faction) else {
+            continue;
+        };
+        if !matches!(
+            faction.caps.storage,
+            StorageBackendKind::MemberPool | StorageBackendKind::Hybrid
+        ) {
+            continue;
+        }
+        if !faction.caps.home.is_mobile() {
+            continue;
+        }
+        for (rid, qty) in inv.iter() {
+            *faction.storage.totals.entry(rid).or_insert(0) += qty;
         }
     }
 }

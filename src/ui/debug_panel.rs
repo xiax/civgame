@@ -374,6 +374,24 @@ pub fn debug_panel_system(
                                     .color(egui::Color32::from_rgb(255, 200, 80)),
                                 );
                             }
+                            if !faction.recent_camps.is_empty() {
+                                ui.label(format!(
+                                    "Recent camps: {}",
+                                    faction.recent_camps.len()
+                                ));
+                            }
+                        } else if faction.collapse_streak > 0 {
+                            // P4: surfacing the failing-streak meter so a
+                            // settled faction's slide toward collapse is
+                            // visible to the player before SwitchArchetype
+                            // fires.
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "⚠ Collapse streak: {} ticks",
+                                    faction.collapse_streak
+                                ))
+                                .color(egui::Color32::from_rgb(255, 150, 50)),
+                            );
                         }
                         if faction.under_raid {
                             ui.label(

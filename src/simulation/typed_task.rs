@@ -61,6 +61,11 @@ pub enum WalkReason {
     /// `GatherFromKnownMethod` (Phase 5c-ii-c) — scaffolding only at
     /// 5c-ii-c-i; no dispatcher emits this reason yet.
     Gather,
+    /// P1: nomadic-band member walking with the band to the new camp
+    /// tile after a migration commit. Arrival is detected by
+    /// `nomad_migration_arrival_system`, which removes the
+    /// `MigrationTarget` component and drops the agent back to Idle.
+    Migration,
 }
 
 /// Selector for `Task::WithdrawGood`: which item on the storage tile satisfies

@@ -58,7 +58,14 @@ pub fn hover_info_system(
         ),
         With<Person>,
     >,
-    animal_query: Query<(&AnimalAI, &Health, Option<&Wolf>, Option<&Deer>)>,
+    animal_query: Query<(
+        &AnimalAI,
+        &Health,
+        Option<&Wolf>,
+        Option<&Deer>,
+        Option<&crate::simulation::animals::Tamed>,
+        Option<&crate::simulation::animals::PackAnimalInventory>,
+    )>,
     plant_query: Query<&Plant>,
     item_query: Query<&GroundItem>,
     name_query: Query<&Name>,
@@ -189,7 +196,9 @@ pub fn hover_info_system(
                                 }
                             }
                         });
-                    } else if let Ok((ai, health, wolf, deer)) = animal_query.get(entity) {
+                    } else if let Ok((ai, health, wolf, deer, tamed, pack)) =
+                        animal_query.get(entity)
+                    {
                         let kind = if wolf.is_some() {
                             "Wolf"
                         } else if deer.is_some() {
@@ -199,6 +208,26 @@ pub fn hover_info_system(
                         };
                         ui.label(format!("{}: {:?}", kind, ai.state));
                         ui.label(format!("Health: {}/{}", health.current, health.max));
+                        if let Some(t) = tamed {
+                            ui.label(format!("Tamed by: faction {}", t.owner_faction));
+                        }
+                        // P8: pack animal cargo. Surface what each animal
+                        // is hauling so the player can audit migration
+                        // packing and see why a horse is "loaded".
+                        if let Some(inv) = pack {
+                            ui.label(format!(
+                                "Carrying: {} / {} kg",
+                                inv.current_weight_g() / 1000,
+                                inv.capacity_g / 1000,
+                            ));
+                            for (rid, qty) in inv.iter() {
+                                ui.label(format!(
+                                    "  - {} x{}",
+                                    crate::economy::core_ids::display_name(rid),
+                                    qty,
+                                ));
+                            }
+                        }
                     } else if let Ok(plant) = plant_query.get(entity) {
                         ui.label(format!("Plant: {:?} ({:?})", plant.kind, plant.stage));
                     } else if let Ok(item) = item_query.get(entity) {

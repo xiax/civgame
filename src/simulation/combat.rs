@@ -569,6 +569,7 @@ pub fn death_system(
         Option<&crate::economy::agent::EconomicAgent>,
         Option<&crate::simulation::carry::Carrier>,
         Option<&Equipment>,
+        Option<&crate::simulation::animals::PackAnimalInventory>,
     )>,
 ) {
     for (
@@ -584,6 +585,7 @@ pub fn death_system(
         agent,
         carrier,
         equipment,
+        pack_inv,
     ) in &query
     {
         let is_dead = health.map_or(false, |h| h.is_dead()) || body.map_or(false, |b| b.is_dead());
@@ -637,8 +639,37 @@ pub fn death_system(
                 species,
                 fresh_until_tick: clock.tick + CORPSE_FRESHNESS_TICKS,
             });
-            // Animals carry no inventory/equipment, so nothing to spill.
+            // P8: tamed pack animals (Horse/Cow/Pig that became Wolf/Deer
+            // corpses don't apply here, but stash for the non-huntable
+            // tamed branch below). Wolves/Deer never carry packs.
             continue;
+        }
+
+        // P8: tamed pack animals (Horse/Cow/Pig) drop their pack inventory
+        // as `GroundItem`s on death. These don't go through the Wolf/Deer
+        // huntable branch above — they fall through and get cleanly
+        // despawned alongside their cargo here.
+        if let Some(inv) = pack_inv {
+            for (rid, qty) in inv.iter() {
+                if qty == 0 {
+                    continue;
+                }
+                let mut loot_transform = *transform;
+                loot_transform.translation.z = 0.3;
+                commands.spawn((
+                    GroundItem {
+                        item: Item::new_commodity(rid),
+                        qty,
+                    },
+                    loot_transform,
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                    crate::world::spatial::Indexed::new(
+                        crate::world::spatial::IndexedKind::GroundItem,
+                    ),
+                ));
+            }
         }
 
         // Person death — spill inventory, hand-held loads, AND equipped items
