@@ -236,10 +236,11 @@ pub fn generate_globe(seed: u64) -> Globe {
     let uplift = plates::uplift_field(&plate_field);
 
     // ── 2. Heightmap composition: noise + plate uplift ────────────────────
-    // Elevation in roughly [-1, +1] where 0 ≈ sea level. We mix multi-octave
-    // Perlin noise (continental shape + texture) with plate uplift (mountain
-    // ranges). Noise dominates at 70% so existing biome distribution is
-    // recognisable; plates add the geographically-coherent ridges/rifts.
+    // Elevation in roughly [-1, +1] where 0 ≈ sea level (after the percentile
+    // shift below). We mix multi-octave Perlin noise (continental shape +
+    // texture) with plate uplift (mountain ranges). The macro term carries
+    // the dominant weight so continents read as cohesive landmasses, with
+    // finer octaves adding coastal detail rather than fragmenting them.
     //
     // Frequencies are tuned against a reference 256-cell-wide grid; scale
     // inversely with current `GLOBE_WIDTH` so doubling the climate-cell
@@ -252,14 +253,23 @@ pub fn generate_globe(seed: u64) -> Globe {
         for gx in 0..w {
             let nx = gx as f64 * 0.03 * nscale;
             let ny = gy as f64 * 0.03 * nscale;
-            let macro_e = elev_noise.get([
-                gx as f64 * 0.012 * nscale,
-                gy as f64 * 0.012 * nscale,
+            // Two macro octaves at very low freq → super-continent skeleton;
+            // base + high octaves add coast/island detail. Macro-dominated
+            // weighting (52%) produces recognisable, contiguous continents
+            // instead of speckled archipelagos.
+            let macro_a = elev_noise.get([
+                gx as f64 * 0.008 * nscale,
+                gy as f64 * 0.008 * nscale,
             ]);
-            let ev = macro_e * 0.30
-                + elev_noise.get([nx, ny]) * 0.42
-                + elev_noise.get([nx * 2.0, ny * 2.0]) * 0.20
-                + elev_noise.get([nx * 4.0, ny * 4.0]) * 0.08;
+            let macro_b = elev_noise.get([
+                gx as f64 * 0.016 * nscale,
+                gy as f64 * 0.016 * nscale,
+            ]);
+            let ev = macro_a * 0.32
+                + macro_b * 0.20
+                + elev_noise.get([nx, ny]) * 0.30
+                + elev_noise.get([nx * 2.0, ny * 2.0]) * 0.13
+                + elev_noise.get([nx * 4.0, ny * 4.0]) * 0.05;
             // Map noise from [-1, 1] roughly into [-1, 1] where 0 ≈ shoreline.
             let noise_h = ev as f32 * 0.7;
             let plate_h = uplift[gy * w + gx] * 1.4; // amplify so mountains poke out
@@ -271,6 +281,26 @@ pub fn generate_globe(seed: u64) -> Globe {
     erosion::thermal(&mut height, 0.05, 20);
     erosion::hydraulic(&mut height, 40);
 
+    // ── 3.5. Sea-level alignment ──────────────────────────────────────────
+    // Hydrology and lake detection treat `h <= 0` as ocean (drainage sinks).
+    // Without an anchor, the 0-contour falls wherever the noise+plate sum
+    // happens to land — typically near the median, leaving 50% of cells
+    // "ocean" to hydrology but only ~3% classified as Ocean by biome
+    // (the elev_f normalisation concentrates near the mean). The mismatch
+    // means rivers walk past the visible coastline before terminating at
+    // the absolute h=0 contour, so they appear stranded inland of the
+    // ocean. Shifting the field so the 30th-percentile = 0 unifies the two:
+    // 30% of cells are h<=0 (ocean to both hydrology and biome), and rivers
+    // emit their last edge into a cell that *renders* as ocean.
+    {
+        let mut sorted: Vec<f32> = height.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let h_shift = sorted[(sorted.len() * 30 / 100).min(sorted.len() - 1)];
+        for h in height.iter_mut() {
+            *h -= h_shift;
+        }
+    }
+
     // ── 4. Hydrology ──────────────────────────────────────────────────────
     // Save pre-fill heights so lakes can be detected by comparing.
     let pre_fill_height = height.clone();
@@ -279,33 +309,24 @@ pub fn generate_globe(seed: u64) -> Globe {
     let accum = hydrology::flow_accum(&dirs);
     let rivers = hydrology::extract_rivers(&height, &dirs, &accum, 80);
 
-    // Anchor the elevation distribution against percentile pivots so the
-    // fraction of ocean / mountain cells stays consistent regardless of
-    // noise+plate distribution shape. Pure min/max normalization concentrates
-    // most of the world near the median, leaving the 0.22 ocean threshold
-    // starved of cells (≈3% ocean instead of the intended ~30%). Anchoring:
-    //   - 30th percentile → 0.22 (ocean line)
-    //   - 90th percentile → 0.82 (mountain line)
+    // After the sea-level shift, h<=0 is the ocean line for both hydrology
+    // and biome classification. Compute the 90th-percentile peak for the
+    // mountain anchor so the elev_f remap below targets ~10% mountain.
     let mut sorted_h: Vec<f32> = height.clone();
     sorted_h.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let pick = |p: f32| -> f32 {
-        let i = ((sorted_h.len() as f32 * p) as usize).min(sorted_h.len() - 1);
-        sorted_h[i]
-    };
     let h_min = sorted_h[0];
-    let h_sea = pick(0.30);
-    let h_peak = pick(0.90);
+    let h_peak = sorted_h[(sorted_h.len() * 90 / 100).min(sorted_h.len() - 1)];
     let h_max = sorted_h[sorted_h.len() - 1];
 
     // Lake detection: cells whose pit-fill raise was > a threshold AND that
-    // sit above the sea-level percentile — these are sub-spillpoint basins
-    // on land. (Sub-sea basins are ocean, not lakes.)
+    // sit above sea level — these are sub-spillpoint basins on land.
+    // (Sub-sea basins are ocean, not lakes.)
     let mut lakes = LakeMap::default();
     let tiles_per_cell = (GLOBE_CELL_CHUNKS * super::chunk::CHUNK_SIZE as i32) as i32;
     let mut is_lake_cell = vec![false; n];
     for i in 0..n {
         let raise = height[i] - pre_fill_height[i];
-        if raise > 0.02 && height[i] > h_sea {
+        if raise > 0.02 && height[i] > 0.0 {
             is_lake_cell[i] = true;
         }
     }
@@ -364,20 +385,21 @@ pub fn generate_globe(seed: u64) -> Globe {
     }
 
     // ── 5. Climate ────────────────────────────────────────────────────────
-    // Normalise elevation to [0, 1] for the temperature/rainfall formulas
-    // using the percentile pivots computed above:
-    //   h_min → 0.0, h_sea → 0.22, h_peak → 0.82, h_max → 1.0
-    // Three linear segments. Guarantees ~30% ocean and ~10% mountain.
-    let span_low = (h_sea - h_min).max(1e-6);
-    let span_mid = (h_peak - h_sea).max(1e-6);
+    // Normalise elevation to [0, 1] anchoring against sea level (h=0) and
+    // the 90th-percentile peak. Three linear segments:
+    //   h_min → 0.0, h=0 → 0.22 (ocean line), h_peak → 0.82 (mountain line),
+    //   h_max → 1.0. Guarantees ~30% ocean and ~10% mountain regardless of
+    //   distribution shape.
+    let span_low = (-h_min).max(1e-6);
+    let span_mid = h_peak.max(1e-6);
     let span_high = (h_max - h_peak).max(1e-6);
     let elev_norm: Vec<f32> = height
         .iter()
         .map(|&v| {
-            let f = if v <= h_sea {
+            let f = if v <= 0.0 {
                 0.22 * (v - h_min) / span_low
             } else if v <= h_peak {
-                0.22 + 0.60 * (v - h_sea) / span_mid
+                0.22 + 0.60 * v / span_mid
             } else {
                 0.82 + 0.18 * (v - h_peak) / span_high
             };
@@ -550,6 +572,51 @@ pub fn save_globe(globe: &Globe) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rivers_reach_oceans() {
+        // After the sea-level shift, hydrology and biome classification
+        // share the same coast: every river polyline should terminate in
+        // an Ocean cell (or at a pole, where Y clamps act as drainage
+        // edges). Verify the *terminal* cell of each river (the last
+        // edge's `to`) classifies as Ocean for >95% of polylines.
+        for seed in [42u64, 123] {
+            let g = generate_globe(seed);
+            // Group edges by (downstream end of polyline). A polyline
+            // terminus is an edge whose `to` cell never appears as a
+            // `from` (i.e. nothing flows out of it through a tracked edge).
+            use std::collections::HashSet;
+            let froms: HashSet<(u32, u32)> = g.rivers.edges.iter().map(|e| e.from).collect();
+            let mut termini: Vec<(u32, u32)> = g.rivers
+                .edges
+                .iter()
+                .map(|e| e.to)
+                .filter(|to| !froms.contains(to))
+                .collect();
+            termini.sort();
+            termini.dedup();
+            assert!(!termini.is_empty(), "seed {seed}: no river termini");
+
+            let mut at_ocean = 0;
+            let mut at_pole = 0;
+            for (gx, gy) in &termini {
+                let cell = g.cell(*gx as i32, *gy as i32).unwrap();
+                if cell.biome == Biome::Ocean {
+                    at_ocean += 1;
+                } else if *gy == 0 || *gy as i32 == GLOBE_HEIGHT - 1 {
+                    at_pole += 1;
+                }
+            }
+            let reached = (at_ocean + at_pole) as f32 / termini.len() as f32;
+            assert!(
+                reached >= 0.95,
+                "seed {seed}: only {:.0}% of {} river termini reach ocean/pole \
+                 (ocean={at_ocean}, pole={at_pole})",
+                reached * 100.0,
+                termini.len()
+            );
+        }
+    }
 
     #[test]
     fn ocean_fraction_within_band() {

@@ -4,6 +4,26 @@ pub const TICKS_PER_DAY: u32 = 3600;
 pub const DAYS_PER_SEASON: u32 = 5; // ← change this to adjust timescale
 pub const TICKS_PER_SEASON: u32 = TICKS_PER_DAY * DAYS_PER_SEASON;
 
+// Day-cycle phase cuts as a fraction of the day (`ticks_this_day / ticks_per_day`).
+// 0.0 is sunrise (start-of-day). The day rolls Dawn → Day → Dusk → Night and
+// loops back. Tuned so Day occupies the largest band, Dusk gets a meaningful
+// "light is fading" window, and short-lived sims (which start at tick 0) sit
+// firmly in Dawn/Day rather than Night — preserving daytime ranking for the
+// tens of behavioural tests that didn't previously care about time of day.
+pub const PHASE_DAWN_START: f32 = 0.00;
+pub const PHASE_DAY_START: f32 = 0.05;
+pub const PHASE_DUSK_START: f32 = 0.65;
+pub const PHASE_NIGHT_START: f32 = 0.85;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TimePhase {
+    #[default]
+    Day,
+    Dawn,
+    Dusk,
+    Night,
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Season {
@@ -68,6 +88,42 @@ impl Calendar {
     pub fn total_days(&self) -> u32 {
         let season_idx = self.season as u32;
         season_idx * self.days_per_season + self.day
+    }
+
+    /// Fraction of the day elapsed, in `[0.0, 1.0)`.
+    pub fn day_fraction(&self) -> f32 {
+        (self.ticks_this_day as f32 / self.ticks_per_day.max(1) as f32).clamp(0.0, 1.0)
+    }
+
+    /// Bucketed time-of-day phase. See `PHASE_*_START` constants for the cuts.
+    pub fn time_phase(&self) -> TimePhase {
+        let f = self.day_fraction();
+        if f < PHASE_DAWN_START {
+            TimePhase::Night
+        } else if f < PHASE_DAY_START {
+            TimePhase::Dawn
+        } else if f < PHASE_DUSK_START {
+            TimePhase::Day
+        } else if f < PHASE_NIGHT_START {
+            TimePhase::Dusk
+        } else {
+            TimePhase::Night
+        }
+    }
+
+    /// Within the dusk band, fraction of dusk daylight remaining (`1.0` at the
+    /// start of dusk, `0.0` at the dusk → night flip). Returns `1.0` outside
+    /// dusk so callers can pass it unconditionally.
+    pub fn dusk_fraction_remaining(&self) -> f32 {
+        let f = self.day_fraction();
+        if f < PHASE_DUSK_START || f >= PHASE_NIGHT_START {
+            return 1.0;
+        }
+        let span = PHASE_NIGHT_START - PHASE_DUSK_START;
+        if span <= 0.0 {
+            return 1.0;
+        }
+        ((PHASE_NIGHT_START - f) / span).clamp(0.0, 1.0)
     }
 }
 

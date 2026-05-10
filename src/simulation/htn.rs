@@ -60,6 +60,7 @@ use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::TechId;
 use crate::simulation::typed_task::{ActionQueue, Task};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
+use crate::world::seasons::{Calendar, TimePhase};
 use crate::world::terrain::TILE_SIZE;
 
 /// Abstract goals the planner can decompose. Each variant carries any
@@ -662,11 +663,17 @@ fn chebyshev_dist(a: (i32, i32), b: (i32, i32)) -> i32 {
 const DIST_DISCOUNT_PER_TILE: f32 = 0.02;
 const MAX_DIST_PENALTY: f32 = 0.30;
 
-/// Compute the distance-weighted discount for a method whose target tile is
-/// `target`. Returns 0 when `target.is_none()` so methods that haven't been
-/// populated by the dispatcher (or unit tests with `ctx_empty()`) score at
-/// their flat base utility.
-fn dist_penalty(agent: (i32, i32), target: Option<(i32, i32)>) -> f32 {
+/// Hard penalty cap when scoring under `ScoringScope::ContextAware` at night.
+/// Distinct from `MAX_DIST_PENALTY` so a hard-night penalty can drop a
+/// gather method below the explore-fallback floor — terminal Explore picks
+/// up, the agent quickly returns home, and Maslow-driven Sleep wins the next
+/// goal flip naturally.
+const MAX_DIST_PENALTY_NIGHT: f32 = 1.50;
+
+/// Geometric distance penalty: `chebyshev × 0.02`, capped at
+/// `MAX_DIST_PENALTY`. Used internally by `dist_penalty` /
+/// `full_trip_penalty` and directly by tests.
+fn dist_penalty_raw(agent: (i32, i32), target: Option<(i32, i32)>) -> f32 {
     match target {
         Some(t) => {
             let d = chebyshev_dist(agent, t) as f32;
@@ -676,13 +683,7 @@ fn dist_penalty(agent: (i32, i32), target: Option<(i32, i32)>) -> f32 {
     }
 }
 
-/// Two-leg distance discount for chains shaped agent → target → deposit
-/// (gather/scavenge methods whose expansion ends in `DepositToFactionStorage`,
-/// or the haul method's storage→blueprint pair). Total penalty caps at
-/// `MAX_DIST_PENALTY` so the cap-preserves-ranking invariant survives — a
-/// far full-trip never undercuts a method that outranked it on base utility.
-/// Falls back to the agent→target single-leg signal when `deposit` is `None`.
-fn full_trip_penalty(
+fn full_trip_penalty_raw(
     agent: (i32, i32),
     target: Option<(i32, i32)>,
     deposit: Option<(i32, i32)>,
@@ -692,8 +693,118 @@ fn full_trip_penalty(
             let total = (chebyshev_dist(agent, t) + chebyshev_dist(t, d)) as f32;
             (total * DIST_DISCOUNT_PER_TILE).min(MAX_DIST_PENALTY)
         }
-        _ => dist_penalty(agent, target),
+        _ => dist_penalty_raw(agent, target),
     }
+}
+
+/// Build a `ScoringScope::ContextAware` from a calendar snapshot and the
+/// agent's `Needs`. Fatigue blends sleep need (0..255, weight 0.6) and
+/// drained willpower (0..255 inverted, weight 0.4) so a sleep-deprived
+/// worker treats every tile as more expensive even before willpower
+/// crashes. Sleep weighted heavier because it's the harder cap — a
+/// sleeping agent is uncontrollable.
+pub fn context_aware_scope(calendar: &Calendar, needs: &Needs) -> ScoringScope {
+    let sleep_norm = (needs.sleep / 255.0).clamp(0.0, 1.0);
+    let willpower_drain_norm = ((255.0 - needs.willpower) / 255.0).clamp(0.0, 1.0);
+    let fatigue = (sleep_norm * 0.6 + willpower_drain_norm * 0.4).clamp(0.0, 1.0);
+    ScoringScope::ContextAware {
+        time_phase: calendar.time_phase(),
+        dusk_remaining: calendar.dusk_fraction_remaining(),
+        fatigue,
+    }
+}
+
+/// Multiplier on the geometric penalty driven by time-of-day and worker
+/// fatigue. Returns `(time_mul, fatigue_mul, cap)`.
+///
+/// - Day:   `time_mul = 1.0`. Cap = `MAX_DIST_PENALTY`.
+/// - Dawn:  `time_mul = 1.10` (slight cold-start bias to closer work).
+/// - Dusk:  `time_mul = 1.0..2.0` ramp on `dusk_remaining` (1 → 0).
+/// - Night: `time_mul = 4.0`, cap raised to `MAX_DIST_PENALTY_NIGHT` so
+///          gather methods can drop below the 0.3 explore fallback at any
+///          non-trivial distance.
+/// - Fatigue scales linearly: `fatigue_mul = 1.0 + fatigue` (up to 2× at
+///   `fatigue == 1.0`, doubling the effective penalty).
+fn ctx_penalty_factors(scope: ScoringScope) -> (f32, f32, f32) {
+    match scope {
+        ScoringScope::Geometric => (1.0, 1.0, MAX_DIST_PENALTY),
+        ScoringScope::ContextAware {
+            time_phase,
+            dusk_remaining,
+            fatigue,
+        } => {
+            let fatigue_mul = 1.0 + fatigue.clamp(0.0, 1.0);
+            let (time_mul, cap) = match time_phase {
+                TimePhase::Day => (1.0, MAX_DIST_PENALTY),
+                TimePhase::Dawn => (1.10, MAX_DIST_PENALTY),
+                TimePhase::Dusk => {
+                    let remaining = dusk_remaining.clamp(0.0, 1.0);
+                    (1.0 + (1.0 - remaining), MAX_DIST_PENALTY)
+                }
+                TimePhase::Night => (4.0, MAX_DIST_PENALTY_NIGHT),
+            };
+            (time_mul, fatigue_mul, cap)
+        }
+    }
+}
+
+/// Compute the distance-weighted discount for a method whose target tile is
+/// `target`. Returns 0 when `target.is_none()` so methods that haven't been
+/// populated by the dispatcher (or unit tests with `ctx_empty()`) score at
+/// their flat base utility.
+///
+/// When `ctx.scope == Geometric` (the default) this is the legacy
+/// `chebyshev × 0.02` penalty capped at `MAX_DIST_PENALTY`. When
+/// `ctx.scope == ContextAware` the penalty is multiplied by a time-of-day
+/// factor and a fatigue factor, with the cap raised at night so distant
+/// methods can lose to the explore fallback.
+fn dist_penalty(ctx: &PlannerCtx, target: Option<(i32, i32)>) -> f32 {
+    let Some(t) = target else { return 0.0 };
+    let d = chebyshev_dist(ctx.tile, t) as f32;
+    let (time_mul, fatigue_mul, cap) = ctx_penalty_factors(ctx.scope);
+    (d * DIST_DISCOUNT_PER_TILE * time_mul * fatigue_mul).min(cap)
+}
+
+/// Two-leg distance discount for chains shaped agent → target → deposit
+/// (gather/scavenge methods whose expansion ends in `DepositToFactionStorage`,
+/// or the haul method's storage→blueprint pair). Total penalty caps at
+/// `MAX_DIST_PENALTY` (or `MAX_DIST_PENALTY_NIGHT` under hard-night context).
+/// Falls back to the agent→target single-leg signal when `deposit` is `None`.
+fn full_trip_penalty(
+    ctx: &PlannerCtx,
+    target: Option<(i32, i32)>,
+    deposit: Option<(i32, i32)>,
+) -> f32 {
+    match (target, deposit) {
+        (Some(t), Some(d)) => {
+            let total = (chebyshev_dist(ctx.tile, t) + chebyshev_dist(t, d)) as f32;
+            let (time_mul, fatigue_mul, cap) = ctx_penalty_factors(ctx.scope);
+            (total * DIST_DISCOUNT_PER_TILE * time_mul * fatigue_mul).min(cap)
+        }
+        _ => dist_penalty(ctx, target),
+    }
+}
+
+/// Whether method `utility()` bodies should fold time-of-day and worker
+/// fatigue into their distance penalty (`ContextAware`) or stick to the
+/// simple geometric chebyshev penalty (`Geometric`).
+///
+/// Defaults to `Geometric` so dispatchers that haven't been migrated keep
+/// their existing behaviour. The `htn_acquire_food_dispatch_system` and
+/// the wood/stone branches of `htn_acquire_good_dispatch_system` set
+/// `ContextAware` after sampling `Calendar` + the agent's `Needs`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ScoringScope {
+    #[default]
+    Geometric,
+    ContextAware {
+        time_phase: TimePhase,
+        /// Within dusk, fraction of dusk daylight remaining (1.0 → 0.0).
+        /// 1.0 outside dusk; consumed only when `time_phase == Dusk`.
+        dusk_remaining: f32,
+        /// Composite tiredness in `[0.0, 1.0]`. Higher = more tired.
+        fatigue: f32,
+    },
 }
 
 /// Snapshot of the agent + world state a `Method` needs to make a decision.
@@ -704,6 +815,8 @@ fn full_trip_penalty(
 /// New fields land on demand as methods are added — no speculative coverage.
 #[derive(Clone, Copy, Debug)]
 pub struct PlannerCtx {
+    /// Distance-penalty scoring scope. See `ScoringScope`.
+    pub scope: ScoringScope,
     /// The agent's current tile (x, y).
     pub tile: (i32, i32),
     /// The agent's faction id. `SOLO=0` if ungrouped.
@@ -1301,7 +1414,7 @@ impl Method for WithdrawFromStorageMethod {
         // `ScavengeFoodFromGroundMethod` (`UTIL_VISIBLE_GROUND`) keeps a
         // ≥0.20 margin even at the worst-case dist-spread because both
         // methods clamp at the same cap.
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.nearest_storage_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.nearest_storage_tile)
     }
 
     fn expand(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -1400,7 +1513,7 @@ impl Method for ScavengeFoodFromGroundMethod {
         // (`UTIL_BASELINE`). Distance discount picks the closer of two
         // visible piles; cap (`MAX_DIST_PENALTY`) preserves the
         // inter-tier ranking against the baseline-tier sibling.
-        UTIL_VISIBLE_GROUND - dist_penalty(ctx.tile, ctx.scavenge_target_tile)
+        UTIL_VISIBLE_GROUND - dist_penalty(ctx, ctx.scavenge_target_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -1472,7 +1585,7 @@ impl Method for WithdrawMaterialFromStorageMethod {
         // tile (capped at `MAX_DIST_PENALTY`). Mirrors
         // `WithdrawFromStorageMethod`'s shape — same tier, same penalty
         // schedule, different ctx field.
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.material_storage_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.material_storage_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -1539,7 +1652,7 @@ impl Method for WithdrawAndHaulToBlueprintMethod {
         // UTIL_BASELINE`). Falls back to the storage-only signal when the
         // blueprint tile is missing.
         UTIL_CLAIMED_HAUL
-            - full_trip_penalty(ctx.tile, ctx.material_storage_tile, ctx.claimed_blueprint_tile)
+            - full_trip_penalty(ctx, ctx.material_storage_tile, ctx.claimed_blueprint_tile)
     }
 
     fn flags(&self) -> MethodFlags {
@@ -1630,7 +1743,7 @@ impl Method for GatherFromKnownMethod {
         // both legs are populated, capped at `MAX_DIST_PENALTY`. Falls
         // back to the gather-only signal when no deposit anchor is set
         // (SOLO / no storage / faction without storage tiles).
-        UTIL_BASELINE - full_trip_penalty(ctx.tile, ctx.gather_target_tile, ctx.gather_deposit_tile)
+        UTIL_BASELINE - full_trip_penalty(ctx, ctx.gather_target_tile, ctx.gather_deposit_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -1723,7 +1836,7 @@ impl Method for ScavengeFromGroundMethod {
         // Falls back to the scavenge-only signal when no deposit anchor
         // is set.
         UTIL_VISIBLE_GROUND
-            - full_trip_penalty(ctx.tile, ctx.scavenge_target_tile, ctx.scavenge_deposit_tile)
+            - full_trip_penalty(ctx, ctx.scavenge_target_tile, ctx.scavenge_deposit_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -1958,7 +2071,7 @@ impl Method for ScavengeFoodForStorageMethod {
         // (the AcquireGood sibling); chief-driven storage-fill rather
         // than personal-hunger drive.
         UTIL_VISIBLE_GROUND
-            - full_trip_penalty(ctx.tile, ctx.scavenge_target_tile, ctx.scavenge_deposit_tile)
+            - full_trip_penalty(ctx, ctx.scavenge_target_tile, ctx.scavenge_deposit_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -2057,7 +2170,7 @@ impl Method for ForageFromKnownMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.gather_target_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.gather_target_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -2110,7 +2223,7 @@ impl Method for ForageFromKnownForStorageMethod {
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
         UTIL_BASELINE
-            - full_trip_penalty(ctx.tile, ctx.gather_target_tile, ctx.gather_deposit_tile)
+            - full_trip_penalty(ctx, ctx.gather_target_tile, ctx.gather_deposit_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -2214,7 +2327,7 @@ impl Method for WithdrawAndEquipHuntingSpearMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.material_storage_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.material_storage_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, _ctx: &PlannerCtx) -> Vec<Task> {
@@ -2281,7 +2394,7 @@ impl Method for DepositSurplusAtStorageMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.nearest_storage_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.nearest_storage_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -2322,7 +2435,7 @@ impl Method for TameWildHorseMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.scavenge_target_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.scavenge_target_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -2377,7 +2490,7 @@ impl Method for WithdrawAndPlantSeedMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.material_storage_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.material_storage_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -2442,7 +2555,7 @@ impl Method for BuildClaimedBlueprintMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.claimed_blueprint_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.claimed_blueprint_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -2509,7 +2622,7 @@ impl Method for WithdrawAndHaulToPersonalBlueprintMethod {
         // Claimed-haul tier minus the full agent→storage→blueprint trip,
         // capped at `MAX_DIST_PENALTY`. Mirrors `WithdrawAndHaulToBlueprintMethod`.
         UTIL_CLAIMED_HAUL
-            - full_trip_penalty(ctx.tile, ctx.material_storage_tile, ctx.claimed_blueprint_tile)
+            - full_trip_penalty(ctx, ctx.material_storage_tile, ctx.claimed_blueprint_tile)
     }
 
     fn flags(&self) -> MethodFlags {
@@ -2583,7 +2696,7 @@ impl Method for GatherAndHaulToPersonalBlueprintMethod {
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
         UTIL_BASELINE
-            - full_trip_penalty(ctx.tile, ctx.gather_target_tile, ctx.claimed_blueprint_tile)
+            - full_trip_penalty(ctx, ctx.gather_target_tile, ctx.claimed_blueprint_tile)
     }
 
     fn flags(&self) -> MethodFlags {
@@ -2644,7 +2757,7 @@ impl Method for DeliverHuntKillMethod {
         // next step is to deliver it; baseline (1.0) suffices because the
         // dispatcher gates on `Carrying` and there are no sibling methods
         // competing for the slot. Distance discount on the haul leg.
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.butcher_site_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.butcher_site_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -2691,7 +2804,7 @@ impl Method for HuntPreyMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.prey_target_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.prey_target_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -2752,7 +2865,7 @@ impl Method for PickUpFreshCorpseMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_VISIBLE_GROUND - dist_penalty(ctx.tile, ctx.fresh_corpse_tile)
+        UTIL_VISIBLE_GROUND - dist_penalty(ctx, ctx.fresh_corpse_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -2805,7 +2918,7 @@ impl Method for MusterAtHearthMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.hunt_hearth_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.hunt_hearth_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -2862,7 +2975,7 @@ impl Method for TravelToHuntAreaMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.hunt_area_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.hunt_area_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, _ctx: &PlannerCtx) -> Vec<Task> {
@@ -2921,7 +3034,7 @@ impl Method for SocializeWithPartnerMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.scavenge_target_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.scavenge_target_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -3066,7 +3179,7 @@ impl Method for EngageRescueAttackerMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE - dist_penalty(ctx.tile, ctx.scavenge_target_tile)
+        UTIL_BASELINE - dist_penalty(ctx, ctx.scavenge_target_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -3222,6 +3335,7 @@ pub fn htn_dispatch_system(
             };
 
             let ctx = PlannerCtx {
+                scope: ScoringScope::Geometric,
                 tile: (cur_tx, cur_ty),
                 faction_id: member.faction_id,
                 faction_home,
@@ -3449,6 +3563,7 @@ pub fn htn_eat_dispatch_system(
             }
 
             let ctx = PlannerCtx {
+                scope: ScoringScope::Geometric,
                 tile: (cur_tx, cur_ty),
                 faction_id: member.faction_id,
                 faction_home: None,
@@ -3598,6 +3713,7 @@ pub fn htn_acquire_food_dispatch_system(
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
     clock: Res<SimClock>,
+    calendar: Res<Calendar>,
     plant_map: Res<PlantMap>,
     gather_claims: Res<GatherClaims>,
     gk: crate::simulation::shared_knowledge::GatherKnowledge,
@@ -3762,6 +3878,7 @@ pub fn htn_acquire_food_dispatch_system(
             });
 
             let ctx = PlannerCtx {
+                scope: context_aware_scope(&calendar, needs),
                 tile: (cur_tx, cur_ty),
                 faction_id: member.faction_id,
                 faction_home: faction_registry.home_tile(member.faction_id),
@@ -4111,6 +4228,7 @@ pub fn htn_acquire_good_dispatch_system(
     method_registry: Res<MethodRegistry>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<SimClock>,
+    calendar: Res<Calendar>,
     gather_claims: Res<GatherClaims>,
     gk: crate::simulation::shared_knowledge::GatherKnowledge,
     item_query: Query<&crate::simulation::items::GroundItem>,
@@ -4131,6 +4249,7 @@ pub fn htn_acquire_good_dispatch_system(
             &crate::simulation::memory::CurrentVision,
             &crate::simulation::carry::Carrier,
             &crate::economy::agent::EconomicAgent,
+            &Needs,
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
@@ -4153,6 +4272,7 @@ pub fn htn_acquire_good_dispatch_system(
         current_vision,
         carrier,
         agent_econ,
+        needs,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -4293,7 +4413,20 @@ pub fn htn_acquire_good_dispatch_system(
                         &chunk_connectivity,
                     )
                 });
+                // Time-of-day + fatigue scoring is enabled for wood and
+                // stone gathering (the user-requested resources). Other
+                // Stockpile resources (Cloth, Skin, Tools, …) keep the
+                // legacy geometric penalty so this PR doesn't shift their
+                // ranking.
+                let scope_for_branch = if target_rid == crate::economy::core_ids::wood()
+                    || target_rid == crate::economy::core_ids::stone()
+                {
+                    context_aware_scope(&calendar, needs)
+                } else {
+                    ScoringScope::Geometric
+                };
                 let ctx = PlannerCtx {
+                    scope: scope_for_branch,
                     tile: (cur_tx, cur_ty),
                     faction_id: member.faction_id,
                     faction_home: faction_registry.home_tile(member.faction_id),
@@ -4602,6 +4735,7 @@ pub fn htn_acquire_good_dispatch_system(
         };
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -4973,6 +5107,7 @@ pub fn htn_stockpile_food_dispatch_system(
             });
 
             let ctx = PlannerCtx {
+                scope: ScoringScope::Geometric,
                 tile: (cur_tx, cur_ty),
                 faction_id: member.faction_id,
                 faction_home: faction_registry.home_tile(member.faction_id),
@@ -5345,6 +5480,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
         };
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -5545,6 +5681,7 @@ pub fn htn_scout_dispatch_system(
             );
 
             let ctx = PlannerCtx {
+                scope: ScoringScope::Geometric,
                 tile: (cur_tx, cur_ty),
                 faction_id: member.faction_id,
                 faction_home: faction_registry.home_tile(member.faction_id),
@@ -5779,6 +5916,7 @@ pub fn htn_return_surplus_dispatch_system(
             };
 
             let ctx = PlannerCtx {
+                scope: ScoringScope::Geometric,
                 tile: (cur_tx, cur_ty),
                 faction_id: member.faction_id,
                 faction_home: faction_registry.home_tile(member.faction_id),
@@ -5996,6 +6134,7 @@ pub fn htn_tame_horse_dispatch_system(
         };
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -6262,6 +6401,7 @@ pub fn htn_plant_from_storage_dispatch_system(
         };
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -6677,6 +6817,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
         let personal_bp_resource = personal_bp_resource.or(gather_resource);
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -6908,6 +7049,7 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
         };
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -7209,6 +7351,7 @@ pub fn htn_engage_prey_dispatch_system(
         }
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -7449,6 +7592,7 @@ pub fn htn_join_hunt_party_dispatch_system(
         );
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -7668,6 +7812,7 @@ pub fn htn_socialize_dispatch_system(
         }
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -7894,6 +8039,7 @@ pub fn htn_combat_faction_dispatch_system(
         );
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -8390,6 +8536,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
         };
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -8648,6 +8795,7 @@ pub fn htn_work_on_craft_order_dispatch_system(
         let output_resource = recipe.output_resource;
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -8969,6 +9117,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
         };
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -9094,7 +9243,7 @@ impl Method for HarvestMaturePlantForStorageMethod {
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
         UTIL_BASELINE
-            - full_trip_penalty(ctx.tile, ctx.gather_target_tile, ctx.gather_deposit_tile)
+            - full_trip_penalty(ctx, ctx.gather_target_tile, ctx.gather_deposit_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -9235,6 +9384,7 @@ pub fn htn_harvest_plant_dispatch_system(
             storage_tile_map.nearest_for_faction(member.faction_id, plant_tile);
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member.faction_id,
             faction_home: faction_registry.home_tile(member.faction_id),
@@ -9910,6 +10060,7 @@ pub fn htn_play_dispatch_system(
         }
 
         let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (cur_tx, cur_ty),
             faction_id: member_opt.map(|m| m.faction_id).unwrap_or(SOLO),
             faction_home: member_opt.and_then(|m| faction_registry.home_tile(m.faction_id)),
@@ -10356,6 +10507,7 @@ mod tests {
 
     fn ctx_solo_in_place() -> PlannerCtx {
         PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (0, 0),
             faction_id: 0,
             faction_home: None,
@@ -10401,6 +10553,7 @@ mod tests {
 
     fn ctx_with_bed(bed: Entity, bed_tile: (i32, i32)) -> PlannerCtx {
         PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (10, 10),
             faction_id: 1,
             faction_home: Some((0, 0)),
@@ -10446,6 +10599,7 @@ mod tests {
 
     fn ctx_with_food(edible_count: u32, hunger: f32) -> PlannerCtx {
         PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (0, 0),
             faction_id: 0,
             faction_home: None,
@@ -10495,6 +10649,7 @@ mod tests {
         hunger: f32,
     ) -> PlannerCtx {
         PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (0, 0),
             faction_id: 1,
             faction_home: Some((0, 0)),
@@ -10543,6 +10698,7 @@ mod tests {
         material_stock: u32,
     ) -> PlannerCtx {
         PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (0, 0),
             faction_id: 1,
             faction_home: Some((0, 0)),
@@ -10601,6 +10757,7 @@ mod tests {
         blueprint_tile: Option<(i32, i32)>,
     ) -> PlannerCtx {
         PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (0, 0),
             faction_id: 1,
             faction_home: Some((0, 0)),
@@ -10918,6 +11075,7 @@ mod tests {
 
     fn ctx_with_gather_target(tile: Option<(i32, i32)>) -> PlannerCtx {
         PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (0, 0),
             faction_id: 1,
             faction_home: Some((0, 0)),
@@ -11055,6 +11213,7 @@ mod tests {
         tile: Option<(i32, i32)>,
     ) -> PlannerCtx {
         PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (0, 0),
             faction_id: 1,
             faction_home: Some((0, 0)),
@@ -11215,6 +11374,7 @@ mod tests {
         hunger: f32,
     ) -> PlannerCtx {
         PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (0, 0),
             faction_id: 1,
             faction_home: Some((0, 0)),
@@ -11431,6 +11591,7 @@ mod tests {
 
     fn ctx_empty() -> PlannerCtx {
         PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (0, 0),
             faction_id: 1,
             faction_home: Some((0, 0)),
@@ -11600,7 +11761,7 @@ mod tests {
     #[test]
     fn dist_penalty_caps_at_max() {
         // 30 tiles * 0.02/tile = 0.60 raw, but capped at MAX_DIST_PENALTY.
-        let p = dist_penalty((0, 0), Some((30, 0)));
+        let p = dist_penalty_raw((0, 0), Some((30, 0)));
         assert!((p - MAX_DIST_PENALTY).abs() < 1e-6);
     }
 
@@ -11608,7 +11769,127 @@ mod tests {
     fn dist_penalty_zero_for_no_target() {
         // ctx fields default to None when the dispatcher hasn't populated
         // them — methods read at base utility in that case.
-        assert_eq!(dist_penalty((0, 0), None), 0.0);
+        assert_eq!(dist_penalty_raw((0, 0), None), 0.0);
+    }
+
+    // ── Time-of-day + fatigue weighted distance penalty ─────────────────
+    //
+    // When `ctx.scope == ContextAware`, `dist_penalty(ctx, target)` scales
+    // the geometric penalty by a time-of-day multiplier and a fatigue
+    // multiplier. Day + fatigue=0 must match the geometric baseline so
+    // existing daytime ranking is unchanged. Dusk ramps with daylight
+    // remaining. Night raises the cap to `MAX_DIST_PENALTY_NIGHT (1.50)`
+    // so a 1.5-utility scavenge method drops below the 0.3 explore floor.
+    // Fatigue=1 doubles the effective penalty.
+
+    fn ctx_with_scope(scope: ScoringScope) -> PlannerCtx {
+        let mut c = ctx_solo_in_place();
+        c.scope = scope;
+        c
+    }
+
+    #[test]
+    fn weighted_dist_penalty_baseline_matches_geometric() {
+        // Day phase + zero fatigue must equal the legacy geometric value
+        // for any distance — this is the no-regression guarantee for
+        // existing daytime ranking.
+        let target = Some((10, 0));
+        let raw = dist_penalty_raw((0, 0), target);
+        let ctx = ctx_with_scope(ScoringScope::ContextAware {
+            time_phase: TimePhase::Day,
+            dusk_remaining: 1.0,
+            fatigue: 0.0,
+        });
+        let weighted = dist_penalty(&ctx, target);
+        assert!((raw - weighted).abs() < 1e-6);
+    }
+
+    #[test]
+    fn weighted_dist_penalty_dusk_ramps_with_remaining_light() {
+        // Same distance, lower daylight remaining → larger penalty (more
+        // hesitation about long walks as evening sets in).
+        let target = Some((8, 0));
+        let early_dusk = ctx_with_scope(ScoringScope::ContextAware {
+            time_phase: TimePhase::Dusk,
+            dusk_remaining: 0.9,
+            fatigue: 0.0,
+        });
+        let late_dusk = ctx_with_scope(ScoringScope::ContextAware {
+            time_phase: TimePhase::Dusk,
+            dusk_remaining: 0.1,
+            fatigue: 0.0,
+        });
+        let p_early = dist_penalty(&early_dusk, target);
+        let p_late = dist_penalty(&late_dusk, target);
+        assert!(
+            p_late > p_early,
+            "late dusk penalty {} should exceed early dusk {}",
+            p_late,
+            p_early
+        );
+    }
+
+    #[test]
+    fn weighted_dist_penalty_night_drops_method_below_explore() {
+        // At night, a 16-tile scavenge target's penalty must exceed
+        // (UTIL_VISIBLE_GROUND - UTIL_EXPLORE_FALLBACK) = 1.2 so the
+        // weighted score drops below the 0.3 explore fallback.
+        // 16 * 0.02 * 4.0 = 1.28 > 1.20.
+        let target = Some((16, 0));
+        let night = ctx_with_scope(ScoringScope::ContextAware {
+            time_phase: TimePhase::Night,
+            dusk_remaining: 1.0,
+            fatigue: 0.0,
+        });
+        let p = dist_penalty(&night, target);
+        let needed_drop = UTIL_VISIBLE_GROUND - UTIL_EXPLORE_FALLBACK;
+        assert!(
+            p > needed_drop,
+            "night penalty {} should exceed scavenge→explore margin {}",
+            p,
+            needed_drop
+        );
+        // Capped at MAX_DIST_PENALTY_NIGHT, not the daytime cap.
+        assert!(p <= MAX_DIST_PENALTY_NIGHT + 1e-6);
+        assert!(p > MAX_DIST_PENALTY);
+    }
+
+    #[test]
+    fn weighted_dist_penalty_fatigue_doubles_at_full_drain() {
+        // fatigue=1.0 → fatigue_mul = 2.0 → penalty doubles for the same
+        // distance + phase, as long as we stay under the cap.
+        let target = Some((4, 0)); // 4 tiles → 0.08 baseline, room under cap
+        let rested = ctx_with_scope(ScoringScope::ContextAware {
+            time_phase: TimePhase::Day,
+            dusk_remaining: 1.0,
+            fatigue: 0.0,
+        });
+        let exhausted = ctx_with_scope(ScoringScope::ContextAware {
+            time_phase: TimePhase::Day,
+            dusk_remaining: 1.0,
+            fatigue: 1.0,
+        });
+        let p_rested = dist_penalty(&rested, target);
+        let p_exhausted = dist_penalty(&exhausted, target);
+        assert!((p_exhausted - 2.0 * p_rested).abs() < 1e-6);
+    }
+
+    #[test]
+    fn calendar_time_phase_buckets_match_constants() {
+        // Spot-check the day-cycle phase cuts. Calendar at default
+        // ticks_per_day=3600 — phases per PHASE_*_START constants
+        // (Dawn 0.0–0.05, Day 0.05–0.65, Dusk 0.65–0.85, Night 0.85–1.0).
+        let mut cal = crate::world::seasons::Calendar::default();
+        cal.ticks_this_day = 100; // ~0.028 → Dawn
+        assert_eq!(cal.time_phase(), TimePhase::Dawn);
+        cal.ticks_this_day = 800; // ~0.222 → Day
+        assert_eq!(cal.time_phase(), TimePhase::Day);
+        cal.ticks_this_day = 1800; // 0.5 → Day
+        assert_eq!(cal.time_phase(), TimePhase::Day);
+        cal.ticks_this_day = 2500; // ~0.694 → Dusk
+        assert_eq!(cal.time_phase(), TimePhase::Dusk);
+        cal.ticks_this_day = 3300; // ~0.917 → Night
+        assert_eq!(cal.time_phase(), TimePhase::Night);
     }
 
     #[test]
@@ -11821,6 +12102,7 @@ mod tests {
         good: Option<crate::economy::resource_catalog::ResourceId>,
     ) -> PlannerCtx {
         PlannerCtx {
+            scope: ScoringScope::Geometric,
             tile: (0, 0),
             faction_id: 1,
             faction_home: Some((0, 0)),
@@ -12307,14 +12589,14 @@ mod tests {
 
     #[test]
     fn full_trip_penalty_helper_caps_and_falls_back() {
-        assert!((full_trip_penalty((0, 0), Some((5, 0)), Some((5, 0))) - 0.10).abs() < 1e-6);
+        assert!((full_trip_penalty_raw((0, 0), Some((5, 0)), Some((5, 0))) - 0.10).abs() < 1e-6);
         assert!(
-            (full_trip_penalty((0, 0), Some((20, 0)), Some((40, 0))) - MAX_DIST_PENALTY).abs()
+            (full_trip_penalty_raw((0, 0), Some((20, 0)), Some((40, 0))) - MAX_DIST_PENALTY).abs()
                 < 1e-6
         );
         // Fallback: no deposit → single-leg agent→target.
-        assert!((full_trip_penalty((0, 0), Some((10, 0)), None) - 0.20).abs() < 1e-6);
+        assert!((full_trip_penalty_raw((0, 0), Some((10, 0)), None) - 0.20).abs() < 1e-6);
         // No target → 0.
-        assert_eq!(full_trip_penalty((0, 0), None, Some((5, 0))), 0.0);
+        assert_eq!(full_trip_penalty_raw((0, 0), None, Some((5, 0))), 0.0);
     }
 }
