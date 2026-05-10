@@ -326,23 +326,29 @@ pub fn spawn_select_system(
 
         ui.vertical_centered(|ui| {
             ui.add_space(8.0);
-            ui.label("🟦 Ocean   ⬜ Tundra   🟫 Taiga   🟩 Temperate   🌿 Grassland   💚 Tropical   🟨 Desert   ⬛ Mountain   💧 River   💦 Lake");
+            ui.label("🟦 Ocean   ⬜ Tundra   🟫 Taiga   🟩 Temperate   🌿 Grassland   💚 Tropical   🟨 Desert   ⬛ Mountain   🟢 Wetland   🟡 Steppe   🟧 Badlands   💧 River   💦 Lake");
         });
     });
 }
 
 /// Find the most common biome among the climate cells covered by a mega-chunk.
 fn sample_dominant_biome(globe: &Globe, mx: i32, my: i32) -> Biome {
+    // Sized to cover every Biome discriminant (currently 0..=10). Resize if
+    // new variants are appended.
+    const N_BIOMES: usize = 11;
     let cell_w = MEGACHUNK_SIZE_CHUNKS / GLOBE_CELL_CHUNKS;
     let gx0 = mx * cell_w;
     let gy0 = my * cell_w;
-    let mut counts = [0u32; 8];
+    let mut counts = [0u32; N_BIOMES];
     for dy in 0..cell_w {
         for dx in 0..cell_w {
             let gx = (gx0 + dx).rem_euclid(GLOBE_WIDTH);
             let gy = (gy0 + dy).clamp(0, GLOBE_HEIGHT - 1);
             if let Some(c) = globe.cell(gx, gy) {
-                counts[c.biome as usize] += 1;
+                let idx = c.biome as usize;
+                if idx < counts.len() {
+                    counts[idx] += 1;
+                }
             }
         }
     }
@@ -362,6 +368,10 @@ fn sample_dominant_biome(globe: &Globe, mx: i32, my: i32) -> Biome {
         4 => Biome::Grassland,
         5 => Biome::Tropical,
         6 => Biome::Desert,
-        _ => Biome::Mountain,
+        7 => Biome::Mountain,
+        8 => Biome::Wetland,
+        9 => Biome::Steppe,
+        10 => Biome::Badlands,
+        _ => Biome::Ocean,
     }
 }
