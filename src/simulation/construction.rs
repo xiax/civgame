@@ -2796,10 +2796,12 @@ pub fn road_carve_system(
                 if !bp_map.0.contains_key(&tile) && !bed_map.0.contains_key(&tile) {
                     let surf_z = chunk_map.surface_z_at(x0, y0);
                     let cur = chunk_map.tile_kind_at(x0, y0);
-                    let writable = matches!(
-                        cur,
-                        Some(TileKind::Grass) | Some(TileKind::Dirt) | Some(TileKind::Farmland)
-                    );
+                    let writable = match cur {
+                        Some(TileKind::Grass) => true,
+                        Some(TileKind::Scrub) | Some(TileKind::Sand) => true,
+                        Some(k) if k.is_soil_like() => true,
+                        _ => false,
+                    };
                     if writable {
                         chunk_map.set_tile(
                             x0,
@@ -5434,7 +5436,7 @@ fn seed_farmstead_yard(
                 let Some(k) = cm.tile_kind_at(tx, ty) else {
                     return false;
                 };
-                if k == TileKind::Wall || k == TileKind::Stone || k == TileKind::Water {
+                if k == TileKind::Wall || k == TileKind::Stone || k.is_water_like() {
                     return false;
                 }
             }
@@ -5449,20 +5451,34 @@ fn seed_farmstead_yard(
         return 0;
     };
 
+    // Yard tiles preserve their natural surface kind (Grass / Loam / Silt /
+    // SandySoil / etc.) — we just tilled them, so bump fertility to 200 to
+    // mark a high-yield plot. Wheat planting is now soil-aware (see
+    // `find_nearest_unplanted_farmland`), so no synthetic Farmland tile is
+    // needed.
     let mut placed = 0u32;
     for ty in y0..y0 + yard_h {
         for tx in x0..x0 + yard_w {
             let z = chunk_map.surface_z_at(tx, ty);
+            let cur = chunk_map.tile_at(tx, ty, z as i32);
+            // Preserve the existing kind (or fall back to Loam if somehow
+            // the tile is bare rock and we still want to till it). Bump
+            // fertility to 200 so the planting heuristics pick this plot.
+            let kind = if cur.kind == TileKind::Grass || cur.kind.is_soil_like() {
+                cur.kind
+            } else {
+                TileKind::Loam
+            };
             chunk_map.set_tile(
                 tx,
                 ty,
-                z,
+                z as i32,
                 TileData {
-                    kind: TileKind::Farmland,
-                    elevation: 0,
+                    kind,
+                    elevation: cur.elevation,
                     fertility: 200,
-                    flags: 0,
-                    ore: 0,
+                    flags: cur.flags,
+                    ore: cur.ore,
                 },
             );
             used.insert((tx, ty));

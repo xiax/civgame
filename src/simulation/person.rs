@@ -391,33 +391,50 @@ pub fn spawn_population(
         None
     };
 
+    // Score a candidate home tile: positive = better. Combines river-proximity
+    // (riverside camps preferred over arid interior) with the existing
+    // 300-tile inter-faction spacing. Inside the channel itself is penalised
+    // (we don't want spawns on water tiles even though that's already
+    // rejected by the passability check — guards against future passable
+    // shallow-water variants).
+    let score_home_candidate = |tx: i32, ty: i32, others: &[(i32, i32)]| -> i32 {
+        let too_close = others.iter().any(|(hx, hy)| {
+            let dx = (tx - hx) as f32;
+            let dy = (ty - hy) as f32;
+            (dx * dx + dy * dy).sqrt() < 300.0
+        });
+        let spacing = if too_close { -100 } else { 50 };
+        let river_score = match chunk_map.river_distance_at(tx, ty) {
+            0..=1 => -50,
+            2..=4 => 60,
+            5..=8 => 30,
+            _ => 0,
+        };
+        spacing + river_score
+    };
+
     for group_idx in 0..num_groups {
-        // Find a home tile for this group anywhere in the spawn region,
-        // ensuring it's at least 300 tiles away from other factions.
+        // Find a home tile for this group anywhere in the spawn region.
+        // Best-of-N over 200 candidates so river proximity nudges the pick
+        // without hard-rejecting otherwise-fine inland tiles.
         let home = {
-            let mut result = None;
-            for _ in 0..1000 {
+            let mut best: Option<((i32, i32), i32)> = None;
+            for _ in 0..200 {
                 let tx = start_tx + rng.gen_range(0..total_tiles_x);
                 let ty = start_ty + rng.gen_range(0..total_tiles_y);
-
-                if chunk_map.is_passable(tx, ty)
-                    && !matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
+                if !chunk_map.is_passable(tx, ty)
+                    || matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
                 {
-                    // Distance check
-                    let too_close = spawned_homes.iter().any(|(hx, hy)| {
-                        let dx = (tx - hx) as f32;
-                        let dy = (ty - hy) as f32;
-                        (dx * dx + dy * dy).sqrt() < 300.0
-                    });
-
-                    if !too_close || spawned_homes.is_empty() {
-                        result = Some((tx, ty));
-                        break;
-                    }
+                    continue;
+                }
+                let score = score_home_candidate(tx, ty, &spawned_homes);
+                if best.as_ref().map_or(true, |(_, s)| score > *s) {
+                    best = Some(((tx, ty), score));
                 }
             }
-            // Fallback: if we couldn't find a spot 300 tiles away, just take any passable tile.
-            if result.is_none() {
+            // Fallback: if no candidate scored well, take any passable tile.
+            best.map(|(t, _)| t).or_else(|| {
+                let mut result = None;
                 for _ in 0..500 {
                     let tx = start_tx + rng.gen_range(0..total_tiles_x);
                     let ty = start_ty + rng.gen_range(0..total_tiles_y);
@@ -428,8 +445,8 @@ pub fn spawn_population(
                         break;
                     }
                 }
-            }
-            result
+                result
+            })
         };
 
         let Some((home_tx, home_ty)) = home else {

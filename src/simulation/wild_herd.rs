@@ -343,11 +343,10 @@ pub fn wild_herd_migration_system(
 }
 
 fn water_within(chunk_map: &ChunkMap, tile: (i32, i32), radius: i32) -> bool {
-    use crate::world::tile::TileKind;
     for dy in -radius..=radius {
         for dx in -radius..=radius {
             if let Some(kind) = chunk_map.tile_kind_at(tile.0 + dx, tile.1 + dy) {
-                if kind == TileKind::Water {
+                if kind.is_water_like() {
                     return true;
                 }
             }
@@ -356,28 +355,41 @@ fn water_within(chunk_map: &ChunkMap, tile: (i32, i32), radius: i32) -> bool {
     false
 }
 
+/// Walks chebyshev rings from `from`, preferring fresh water (rivers) over
+/// salt (ocean/lake). At each radius: if any ring tile is `River`, return it
+/// immediately; otherwise remember the first salt-water tile in this ring and
+/// keep looking for fresh in larger rings. Falls back to the closest salt if
+/// no fresh appears within `max_radius`.
 fn nearest_water(
     chunk_map: &ChunkMap,
     from: (i32, i32),
     max_radius: i32,
 ) -> Option<(i32, i32)> {
-    use crate::world::tile::TileKind;
+    let mut closest_salt: Option<(i32, i32)> = None;
     for r in 1..=max_radius {
+        let mut ring_salt: Option<(i32, i32)> = None;
         for dy in -r..=r {
             for dx in -r..=r {
                 if dx.abs() != r && dy.abs() != r {
                     continue;
                 }
                 let tile = (from.0 + dx, from.1 + dy);
-                if let Some(kind) = chunk_map.tile_kind_at(tile.0, tile.1) {
-                    if kind == TileKind::Water {
-                        return Some(tile);
-                    }
+                let Some(kind) = chunk_map.tile_kind_at(tile.0, tile.1) else {
+                    continue;
+                };
+                if kind.is_freshwater() {
+                    return Some(tile);
+                }
+                if ring_salt.is_none() && kind.is_water_like() {
+                    ring_salt = Some(tile);
                 }
             }
         }
+        if closest_salt.is_none() {
+            closest_salt = ring_salt;
+        }
     }
-    None
+    closest_salt
 }
 
 /// Bloom + collapse based on camera-focus proximity. Sequential pass — runs

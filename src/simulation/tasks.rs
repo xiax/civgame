@@ -458,6 +458,10 @@ pub fn find_nearest_item(
     best
 }
 
+/// Find the nearest plant-able tile within `radius` of `from`. A tile is
+/// plant-able when it's `Grass` or any of the four soil variants (Loam, Silt,
+/// Clay, SandySoil) and has no plant on it yet. Replaces the legacy
+/// Farmland-only check now that crops grow on natural soil.
 pub fn find_nearest_unplanted_farmland(
     chunk_map: &ChunkMap,
     plant_map: &PlantMap,
@@ -474,7 +478,12 @@ pub fn find_nearest_unplanted_farmland(
             if plant_map.0.contains_key(&(tx, ty)) {
                 continue;
             }
-            if chunk_map.tile_kind_at(tx, ty) == Some(TileKind::Farmland) {
+            let plantable = match chunk_map.tile_kind_at(tx, ty) {
+                Some(TileKind::Grass) => true,
+                Some(k) if k.is_soil_like() => true,
+                _ => false,
+            };
+            if plantable {
                 let dist = dx.abs() + dy.abs();
                 if dist < best_dist {
                     best_dist = dist;
@@ -565,6 +574,11 @@ pub fn assign_task_with_routing(
                         // Truly unreachable from this connectivity component.
                         // Clear target so the inspector reflects reality and
                         // the caller can mark the goal failed.
+                        info!(
+                            "[assign_task_with_routing] unreachable cur=({},{}) target=({},{}) \
+                             task={:?}",
+                            cur_tile.0, cur_tile.1, target.0, target.1, task
+                        );
                         ai.target_tile = cur_tile;
                         ai.dest_tile = cur_tile;
                         ai.target_entity = None;
@@ -1024,9 +1038,17 @@ pub fn apply_move_order_system(
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
     chunk_connectivity: Res<ChunkConnectivity>,
-    mut query: Query<(&PlayerOrder, &mut PersonAI, &Transform), Changed<PlayerOrder>>,
+    mut query: Query<
+        (
+            &PlayerOrder,
+            &mut PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
+            &Transform,
+        ),
+        Changed<PlayerOrder>,
+    >,
 ) {
-    for (order, mut ai, transform) in query.iter_mut() {
+    for (order, mut ai, mut aq, transform) in query.iter_mut() {
         if !matches!(order.order, PlayerOrderKind::Move) {
             continue;
         }
@@ -1036,7 +1058,10 @@ pub fn apply_move_order_system(
             cur_tx.div_euclid(CHUNK_SIZE as i32),
             cur_ty.div_euclid(CHUNK_SIZE as i32),
         );
-        assign_task_with_routing(
+        // Move is an external preempt — drop any prior typed task so the
+        // executor doesn't keep dragging the agent toward the old goal.
+        aq.cancel();
+        let routed = assign_task_with_routing(
             &mut ai,
             (cur_tx, cur_ty),
             cur_chunk,
@@ -1049,6 +1074,12 @@ pub fn apply_move_order_system(
             &chunk_connectivity,
         );
         ai.target_z = order.target_z;
+        info!(
+            "[apply_move_order] order target=({},{},{}) routed={} state={:?} \
+             dest={:?} target_tile={:?}",
+            order.target_tile.0, order.target_tile.1, order.target_z, routed,
+            ai.state, ai.dest_tile, ai.target_tile
+        );
     }
 }
 

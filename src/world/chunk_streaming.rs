@@ -260,14 +260,29 @@ pub struct TileChangedEvent {
 pub const RENDERABLE_KINDS: &[TileKind] = &[
     TileKind::Grass,
     TileKind::Water,
+    TileKind::River,
     TileKind::Stone,
     TileKind::Forest,
-    TileKind::Farmland,
+    TileKind::Sand,
     TileKind::Road,
     TileKind::Wall,
     TileKind::Ramp,
     TileKind::Dirt,
     TileKind::Ore,
+    // New surfaces
+    TileKind::Snow,
+    TileKind::Marsh,
+    TileKind::Scrub,
+    // Stone variants
+    TileKind::Granite,
+    TileKind::Limestone,
+    TileKind::Sandstone,
+    TileKind::Basalt,
+    // Soil variants
+    TileKind::Loam,
+    TileKind::Silt,
+    TileKind::Clay,
+    TileKind::SandySoil,
 ];
 
 /// Ore variants rendered as `TileKind::Ore` tiles. Excludes `OreKind::None`,
@@ -482,11 +497,14 @@ pub fn spawn_chunk_plants(
                 ^ PLANT_HASH_SEED as i32) as u32;
 
             match tile.kind {
-                TileKind::Farmland => {
+                // High-fertility grassland — replaces the old Farmland branch.
+                // Wild Grain (wheat) and BerryBush spawn on the most fertile
+                // patches of grass. Effectively the natural prairie / meadow.
+                TileKind::Grass if tile.fertility > 180 => {
                     let pct = h % 100;
-                    let (kind, stage) = if pct < 5 {
+                    let (kind, stage) = if pct < 4 {
                         (PlantKind::BerryBush, initial_stage(h))
-                    } else if pct < 15 {
+                    } else if pct < 12 {
                         (PlantKind::Grain, initial_stage(h))
                     } else {
                         continue;
@@ -500,6 +518,20 @@ pub fn spawn_chunk_plants(
                         kind,
                         stage,
                     );
+                }
+                // Wetland-edge berries (no grain — too wet for cereal).
+                TileKind::Marsh => {
+                    if h % 100 < 5 {
+                        spawn_plant_at(
+                            commands,
+                            plant_map,
+                            plant_sprite_index,
+                            global_tx,
+                            global_ty,
+                            PlantKind::BerryBush,
+                            initial_stage(h),
+                        );
+                    }
                 }
                 TileKind::Grass if tile.fertility > 100 => {
                     let pct = h % 100;

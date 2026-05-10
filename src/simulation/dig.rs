@@ -58,7 +58,7 @@ pub fn dig_system(
         let surf_z = chunk_map.surface_z_at(tx, ty);
         let kind = chunk_map.tile_kind_at(tx, ty).unwrap_or(TileKind::Air);
 
-        if kind == TileKind::Air || kind == TileKind::Water || surf_z <= Z_MIN {
+        if kind == TileKind::Air || kind.is_water_like() || surf_z <= Z_MIN {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             aq.advance();

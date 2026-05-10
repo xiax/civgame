@@ -47,26 +47,57 @@ pub struct Chunk {
     pub surface_kind: Box<[[TileKind; CHUNK_SIZE]; CHUNK_SIZE]>,
     /// Procedurally computed surface fertility at each (lx, ly).
     pub surface_fertility: Box<[[u8; CHUNK_SIZE]; CHUNK_SIZE]>,
+    /// Chebyshev distance (in tiles) from each surface (lx, ly) to the
+    /// nearest river tile. `u8::MAX` means "no river within feather radius";
+    /// otherwise the value is `0..=RIVER_FEATHER_DIST` (where 0 is on the
+    /// channel itself). Populated by `generate_chunk_from_globe` while it
+    /// stamps river polylines, so no extra spatial walks at query time.
+    pub surface_river_distance: Box<[[u8; CHUNK_SIZE]; CHUNK_SIZE]>,
     pub entities: Vec<Entity>,
     pub aggregate: ChunkAggregate,
     pub is_active: bool,
 }
 
 impl Chunk {
+    /// Construct a chunk that has no river-proximity data — equivalent to
+    /// "no river anywhere in this chunk." Used by tests, pathfinding fixtures,
+    /// and any caller that doesn't materialise river edges.
     pub fn new(
         surface_z: Box<[[i8; CHUNK_SIZE]; CHUNK_SIZE]>,
         surface_kind: Box<[[TileKind; CHUNK_SIZE]; CHUNK_SIZE]>,
         surface_fertility: Box<[[u8; CHUNK_SIZE]; CHUNK_SIZE]>,
+    ) -> Self {
+        let surface_river_distance = Box::new([[u8::MAX; CHUNK_SIZE]; CHUNK_SIZE]);
+        Self::new_with_rivers(
+            surface_z,
+            surface_kind,
+            surface_fertility,
+            surface_river_distance,
+        )
+    }
+
+    pub fn new_with_rivers(
+        surface_z: Box<[[i8; CHUNK_SIZE]; CHUNK_SIZE]>,
+        surface_kind: Box<[[TileKind; CHUNK_SIZE]; CHUNK_SIZE]>,
+        surface_fertility: Box<[[u8; CHUNK_SIZE]; CHUNK_SIZE]>,
+        surface_river_distance: Box<[[u8; CHUNK_SIZE]; CHUNK_SIZE]>,
     ) -> Self {
         Self {
             deltas: AHashMap::new(),
             surface_z,
             surface_kind,
             surface_fertility,
+            surface_river_distance,
             entities: Vec::new(),
             aggregate: ChunkAggregate::default(),
             is_active: true,
         }
+    }
+
+    /// Chebyshev distance (in tiles) from (lx, ly) to the nearest river.
+    /// `u8::MAX` if no river is within the feather radius.
+    pub fn river_distance_at(&self, lx: usize, ly: usize) -> u8 {
+        self.surface_river_distance[ly][lx]
     }
 
     /// Read the tile delta override, if any.
@@ -284,6 +315,17 @@ impl ChunkMap {
     pub fn tile_fertility_at(&self, tile_x: i32, tile_y: i32) -> Option<u8> {
         let (coord, lx, ly) = Self::coord_and_local(tile_x, tile_y);
         self.0.get(&coord).map(|c| c.surface_fertility_at(lx, ly))
+    }
+
+    /// Chebyshev distance (in tiles) from (tx, ty) to the nearest river,
+    /// capped at `RIVER_FEATHER_DIST`. Returns `u8::MAX` when the chunk is
+    /// unloaded or no river lies within the feather. Cheap O(1).
+    pub fn river_distance_at(&self, tile_x: i32, tile_y: i32) -> u8 {
+        let (coord, lx, ly) = Self::coord_and_local(tile_x, tile_y);
+        self.0
+            .get(&coord)
+            .map(|c| c.river_distance_at(lx, ly))
+            .unwrap_or(u8::MAX)
     }
 
     /// Passability at (tx, ty) using cached surface data.

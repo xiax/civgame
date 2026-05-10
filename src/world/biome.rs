@@ -16,6 +16,20 @@ pub fn classify(elevation_f: f32, temp_f: f32, rainfall_f: f32) -> Biome {
     if elevation_f < 0.22 {
         return Biome::Ocean;
     }
+    // Warm + waterlogged lowlands → Wetland. Distinct from Tropical: same
+    // warmth, but persistently saturated and below the upland transition.
+    if elevation_f < 0.30 && rainfall_f > 0.75 && temp_f > 0.30 {
+        return Biome::Wetland;
+    }
+    // Eroded arid uplands → Badlands. Sits between Desert (low elev, hot)
+    // and Mountain (high elev). Rocky, sparse vegetation.
+    if rainfall_f < 0.25 && elevation_f >= 0.45 && elevation_f <= 0.80 {
+        return Biome::Badlands;
+    }
+    // Dry temperate grassland strip between Grassland and Desert.
+    if rainfall_f >= 0.30 && rainfall_f < 0.50 && temp_f >= 0.40 && temp_f < 0.70 {
+        return Biome::Steppe;
+    }
     match (temp_f > 0.55, rainfall_f > 0.55, temp_f > 0.3) {
         _ if temp_f < 0.2 => Biome::Tundra,
         _ if temp_f < 0.35 && rainfall_f > 0.45 => Biome::Taiga,

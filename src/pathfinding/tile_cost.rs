@@ -8,9 +8,18 @@ pub fn tile_speed_multiplier(kind: TileKind) -> f32 {
         TileKind::Grass | TileKind::Stone | TileKind::Ramp => 1.0,
         TileKind::Road => 1.4,
         TileKind::Forest => 0.7,
-        TileKind::Farmland => 0.85,
         TileKind::Dirt => 0.9,
-        TileKind::Water | TileKind::Air | TileKind::Wall | TileKind::Ore => 0.0,
+        // New climate surfaces
+        TileKind::Sand => 0.75,
+        TileKind::Snow => 0.6,
+        TileKind::Marsh => 0.4,
+        TileKind::Scrub => 0.9,
+        // Stone lithologies — match generic Stone
+        TileKind::Granite | TileKind::Limestone | TileKind::Sandstone | TileKind::Basalt => 1.0,
+        // Soil variants — match generic Dirt; SandySoil is a touch slower
+        TileKind::Loam | TileKind::Silt | TileKind::Clay => 0.9,
+        TileKind::SandySoil => 0.85,
+        TileKind::Water | TileKind::River | TileKind::Air | TileKind::Wall | TileKind::Ore => 0.0,
     }
 }
 

@@ -552,12 +552,25 @@ pub fn movement_system(
                         }
                     }
                     if !bumped {
-                        ai.state = AiState::Working;
+                        // No real task to do here — Move-order arrivals carry
+                        // `task_id == UNEMPLOYED` and would otherwise sit in
+                        // Working with no executor, blocking PlayerOrder
+                        // teardown. Drop to Idle so the completion system
+                        // releases the marker and autonomy resumes.
+                        ai.state = if ai.task_id == PersonAI::UNEMPLOYED {
+                            AiState::Idle
+                        } else {
+                            AiState::Working
+                        };
                     }
                     // else: stays Seeking toward the adjacent tile
                 } else {
                     claimed_this_tick.insert((tx, ty, cz));
-                    ai.state = AiState::Working;
+                    ai.state = if ai.task_id == PersonAI::UNEMPLOYED {
+                        AiState::Idle
+                    } else {
+                        AiState::Working
+                    };
                 }
             }
             AiState::Working => {

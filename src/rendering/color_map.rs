@@ -6,9 +6,10 @@ pub fn tile_color(kind: TileKind) -> Color {
     match kind {
         TileKind::Grass => Color::srgb(0.35, 0.65, 0.25),
         TileKind::Water => Color::srgb(0.15, 0.40, 0.75),
+        TileKind::River => Color::srgb(0.30, 0.55, 0.85),
         TileKind::Stone => Color::srgb(0.50, 0.50, 0.50),
         TileKind::Forest => Color::srgb(0.10, 0.40, 0.15),
-        TileKind::Farmland => Color::srgb(0.70, 0.55, 0.25),
+        TileKind::Sand => Color::srgb(0.86, 0.77, 0.55),
         TileKind::Road => Color::srgb(0.55, 0.45, 0.35),
         TileKind::Air => Color::srgb(0.00, 0.00, 0.00), // never directly rendered
         TileKind::Wall => Color::srgb(0.28, 0.24, 0.22),
@@ -17,6 +18,20 @@ pub fn tile_color(kind: TileKind) -> Color {
         // Fallback for Ore without an OreKind (shouldn't happen in practice).
         // Use ore_tile_color() to render specific ores.
         TileKind::Ore => Color::srgb(0.32, 0.28, 0.26),
+        // Climate surfaces
+        TileKind::Snow => Color::srgb(0.93, 0.94, 0.97),
+        TileKind::Marsh => Color::srgb(0.30, 0.45, 0.30),
+        TileKind::Scrub => Color::srgb(0.55, 0.62, 0.35),
+        // Stone lithologies
+        TileKind::Granite => Color::srgb(0.55, 0.52, 0.50),
+        TileKind::Limestone => Color::srgb(0.78, 0.74, 0.62),
+        TileKind::Sandstone => Color::srgb(0.80, 0.62, 0.40),
+        TileKind::Basalt => Color::srgb(0.25, 0.22, 0.22),
+        // Soil variants
+        TileKind::Loam => Color::srgb(0.42, 0.30, 0.18),
+        TileKind::Silt => Color::srgb(0.55, 0.45, 0.30),
+        TileKind::Clay => Color::srgb(0.60, 0.40, 0.30),
+        TileKind::SandySoil => Color::srgb(0.72, 0.60, 0.40),
     }
 }
 

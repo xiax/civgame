@@ -65,14 +65,16 @@ impl WorldGen {
     }
 }
 
-/// Topsoil layer depth (number of `Dirt` tiles below the surface) by biome.
+/// Topsoil layer depth (number of soil tiles below the surface) by biome.
 /// Mountains have thin soil; taiga/tropical/temperate have deep soil.
+/// Wetlands sit on a deep clay band; Steppe ≈ Grassland; Badlands ≈ Desert.
 pub fn topsoil_depth(biome: Biome) -> i32 {
     match biome {
         Biome::Mountain => 1,
-        Biome::Desert | Biome::Tundra => 2,
-        Biome::Grassland => 3,
+        Biome::Desert | Biome::Tundra | Biome::Badlands => 2,
+        Biome::Grassland | Biome::Steppe => 3,
         Biome::Taiga | Biome::Tropical | Biome::Temperate => 4,
+        Biome::Wetland => 4,
         Biome::Ocean => 0,
     }
 }
@@ -104,17 +106,117 @@ impl Default for WorldGen {
     }
 }
 
-/// Return biome tile thresholds: (water_t, grass_t, farm_t, forest_t).
-pub fn biome_thresholds(biome: Biome) -> (f32, f32, f32, f32) {
+/// Per-biome surface palette: 4 noise thresholds split the surface into 5
+/// bands; `kinds[i]` is the `TileKind` chosen when `v ∈ [v_{i-1}, v_i)`
+/// (with `v_{-1} = 0` and `v_4 = 1`).
+///
+/// The pre-existing four-tuple of thresholds (water_t, grass_t, farm_t,
+/// forest_t) is preserved as the `thresholds` field for callers that still
+/// shift those values (riparian moisture boost). The new `kinds` array picks
+/// per-biome surface flavour: Desert lays Sand/Scrub/Sandstone, Tundra lays
+/// Snow/Scrub/Granite, Wetland lays Marsh/Grass/Forest, etc.
+#[derive(Clone, Copy, Debug)]
+pub struct BiomeBands {
+    pub thresholds: [f32; 4],
+    pub kinds: [TileKind; 5],
+}
+
+impl BiomeBands {
+    /// Pick the surface kind for a noise value `v ∈ [0, 1]`.
+    pub fn pick(&self, v: f32) -> TileKind {
+        if v < self.thresholds[0] {
+            self.kinds[0]
+        } else if v < self.thresholds[1] {
+            self.kinds[1]
+        } else if v < self.thresholds[2] {
+            self.kinds[2]
+        } else if v < self.thresholds[3] {
+            self.kinds[3]
+        } else {
+            self.kinds[4]
+        }
+    }
+}
+
+/// Per-biome surface bands. Threshold tuples preserve the original
+/// (water_t, grass_t, farm_t, forest_t) shape so the riparian moisture-boost
+/// math still composes; the `kinds` slot determines which TileKind each
+/// band paints.
+pub fn biome_bands(biome: Biome) -> BiomeBands {
+    use TileKind::*;
     match biome {
-        Biome::Ocean => (0.90, 0.95, 0.97, 0.99),
-        Biome::Tundra => (0.18, 0.80, 0.85, 0.95),
-        Biome::Taiga => (0.18, 0.35, 0.40, 0.85),
-        Biome::Temperate => (0.26, 0.45, 0.60, 0.85),
-        Biome::Grassland => (0.18, 0.60, 0.75, 0.88),
-        Biome::Tropical => (0.25, 0.30, 0.35, 0.88),
-        Biome::Desert => (0.10, 0.65, 0.68, 0.75),
-        Biome::Mountain => (0.12, 0.25, 0.28, 0.50),
+        Biome::Ocean => BiomeBands {
+            thresholds: [0.90, 0.95, 0.97, 0.99],
+            // Below sea level: water; thin beach band; high crests: granite.
+            kinds: [Water, Sand, Sand, Granite, Granite],
+        },
+        Biome::Tundra => BiomeBands {
+            thresholds: [0.18, 0.55, 0.80, 0.95],
+            kinds: [Water, Snow, Scrub, Granite, Granite],
+        },
+        Biome::Taiga => BiomeBands {
+            thresholds: [0.18, 0.35, 0.55, 0.85],
+            kinds: [Water, Grass, Forest, Forest, Granite],
+        },
+        Biome::Temperate => BiomeBands {
+            thresholds: [0.26, 0.45, 0.60, 0.85],
+            kinds: [Water, Grass, Grass, Forest, Limestone],
+        },
+        Biome::Grassland => BiomeBands {
+            thresholds: [0.18, 0.60, 0.75, 0.88],
+            kinds: [Water, Grass, Grass, Forest, Limestone],
+        },
+        Biome::Tropical => BiomeBands {
+            thresholds: [0.25, 0.30, 0.40, 0.88],
+            kinds: [Water, Marsh, Grass, Forest, Basalt],
+        },
+        Biome::Desert => BiomeBands {
+            thresholds: [0.10, 0.55, 0.70, 0.85],
+            kinds: [Water, Sand, Scrub, Sandstone, Sandstone],
+        },
+        Biome::Mountain => BiomeBands {
+            thresholds: [0.12, 0.25, 0.50, 0.80],
+            kinds: [Granite, Granite, Granite, Granite, Basalt],
+        },
+        Biome::Wetland => BiomeBands {
+            thresholds: [0.20, 0.45, 0.65, 0.90],
+            kinds: [Water, Marsh, Grass, Forest, Forest],
+        },
+        Biome::Steppe => BiomeBands {
+            thresholds: [0.15, 0.45, 0.70, 0.90],
+            kinds: [Water, Scrub, Grass, Scrub, Sandstone],
+        },
+        Biome::Badlands => BiomeBands {
+            thresholds: [0.10, 0.40, 0.65, 0.90],
+            kinds: [Sand, Sand, Scrub, Sandstone, Granite],
+        },
+    }
+}
+
+/// Backwards-compatible four-tuple shape used by the riparian-band moisture
+/// shift math. Returns the band thresholds only; the kinds palette must be
+/// consulted via `biome_bands(biome).kinds`.
+pub fn biome_thresholds(biome: Biome) -> (f32, f32, f32, f32) {
+    let b = biome_bands(biome);
+    (
+        b.thresholds[0],
+        b.thresholds[1],
+        b.thresholds[2],
+        b.thresholds[3],
+    )
+}
+
+/// Soil variant for the topsoil layer at this tile. `river_d ≤ 5` is the
+/// riparian band; those tiles override to `Silt` regardless of biome.
+pub fn topsoil_kind(biome: Biome, river_d: u8) -> TileKind {
+    if river_d != u8::MAX && river_d <= 5 {
+        return TileKind::Silt;
+    }
+    match biome {
+        Biome::Wetland | Biome::Tropical => TileKind::Clay,
+        Biome::Temperate | Biome::Grassland | Biome::Steppe => TileKind::Loam,
+        Biome::Desert | Biome::Badlands => TileKind::SandySoil,
+        Biome::Tundra | Biome::Taiga | Biome::Mountain | Biome::Ocean => TileKind::Dirt,
     }
 }
 
@@ -158,24 +260,21 @@ pub fn surface_height(tx: i32, ty: i32, gen: &WorldGen, globe: &Globe) -> i32 {
     (z.round() as i32).clamp(Z_MIN, Z_MAX)
 }
 
-fn surface_kind_fn(v: f32, water_t: f32, grass_t: f32, farm_t: f32, forest_t: f32) -> TileKind {
-    if v < water_t {
-        TileKind::Water
-    } else if v < grass_t {
-        TileKind::Grass
-    } else if v < farm_t {
-        TileKind::Farmland
-    } else if v < forest_t {
-        TileKind::Forest
-    } else {
-        TileKind::Stone
-    }
+/// Pick the surface kind for `v ∈ [0,1]` given the four thresholds. Used by
+/// the riparian moisture-boost re-classification path which still operates on
+/// raw tuples; pass the biome's native `kinds` palette so the shifted
+/// thresholds re-pick a wetter slot from the same per-biome flavour.
+fn surface_kind_fn_bands(bands: &BiomeBands, v: f32) -> TileKind {
+    bands.pick(v)
 }
 
 /// Deterministically compute the tile at world tile coords (tx, ty, tz).
 /// Pure — no side effects, no allocations. Safe to call from any thread.
 ///
-/// `biome` controls topsoil depth (Dirt layer thickness) for subsurface tiles.
+/// `biome` controls topsoil depth (soil layer thickness) and the
+/// surface/topsoil palette via `biome_bands` / `topsoil_kind`. `river_d` is
+/// the chebyshev distance to the nearest river (`u8::MAX` if none); used to
+/// upgrade the topsoil to `Silt` and to feed the bedrock palette near rivers.
 pub fn proc_tile(
     tx: i32,
     ty: i32,
@@ -183,10 +282,7 @@ pub fn proc_tile(
     gen: &WorldGen,
     globe: &Globe,
     biome: Biome,
-    water_t: f32,
-    grass_t: f32,
-    farm_t: f32,
-    forest_t: f32,
+    river_d: u8,
 ) -> TileData {
     let v = surface_v(tx, ty, gen, globe);
     let surf_z = (Z_MIN as f32 + v * CHUNK_HEIGHT as f32).round() as i32;
@@ -200,8 +296,8 @@ pub fn proc_tile(
     }
 
     if tz == surf_z {
-        let kind = surface_kind_fn(v, water_t, grass_t, farm_t, forest_t);
-        let fertility = if matches!(kind, TileKind::Farmland | TileKind::Grass) {
+        let kind = biome_bands(biome).pick(v);
+        let fertility = if matches!(kind, TileKind::Grass) {
             ((1.0 - (v - 0.45).abs() * 5.0).max(0.0) * 255.0) as u8
         } else {
             0
@@ -226,7 +322,7 @@ pub fn proc_tile(
         // Carved cavity. The first Air tile above solid rock is the Dirt floor.
         let below_v = gen.cave.get([nx, ny, (tz as f64 - 1.0) * 0.12]);
         let kind = if below_v <= 0.55 {
-            TileKind::Dirt
+            topsoil_kind(biome, river_d)
         } else {
             TileKind::Air
         };
@@ -236,11 +332,12 @@ pub fn proc_tile(
         };
     }
 
-    // Topsoil layer: a few Dirt tiles directly below the surface, biome-thick.
+    // Topsoil layer: a few soil tiles directly below the surface, biome-thick.
+    // Soil variant follows biome (and the riparian Silt override).
     let depth = surf_z - tz; // > 0 below surface
     if depth <= topsoil_depth(biome) {
         return TileData {
-            kind: TileKind::Dirt,
+            kind: topsoil_kind(biome, river_d),
             ..Default::default()
         };
     }
@@ -303,82 +400,159 @@ pub fn tile_at_3d(
         return d;
     }
     let biome = biome_mod::classify_at_tile(globe, tx, ty);
-    let (water_t, grass_t, farm_t, forest_t) = biome_thresholds(biome);
-    proc_tile(tx, ty, tz, gen, globe, biome, water_t, grass_t, farm_t, forest_t)
+    let river_d = chunk_map.river_distance_at(tx, ty);
+    proc_tile(tx, ty, tz, gen, globe, biome, river_d)
 }
 
-/// Build a new Chunk: empty delta map + surface_z and surface_kind caches
-/// pre-filled. Per-tile biome via `biome::classify_at_tile` (continuous
-/// across mega-chunk seams). Rivers and lakes from the globe-level network
-/// are stamped over the noise-derived surface.
+/// Riparian feather radius (tiles outside the channel that still get the
+/// river-distance flag and a moisture/fertility boost).
+pub const RIVER_FEATHER_DIST: u8 = 5;
+
+/// Build a new Chunk: empty delta map + surface_z, surface_kind, fertility,
+/// and river-distance caches pre-filled. Per-tile biome via
+/// `biome::classify_at_tile` (continuous across mega-chunk seams). Rivers
+/// (curved polylines from the globe network) and lakes are stamped over the
+/// noise-derived surface; tiles within `RIVER_FEATHER_DIST` of a river get a
+/// moisture boost on biome thresholds and a fertility multiplier.
 pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGen) -> Chunk {
     let mut surface_z = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
     let mut surface_kind = Box::new([[TileKind::default(); CHUNK_SIZE]; CHUNK_SIZE]);
-    let mut surface_fertility = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
+    let mut surface_river_distance = Box::new([[u8::MAX; CHUNK_SIZE]; CHUNK_SIZE]);
 
     let chunk_tx0 = coord.0 * CHUNK_SIZE as i32;
     let chunk_ty0 = coord.1 * CHUNK_SIZE as i32;
+    let chunk_tx1 = chunk_tx0 + CHUNK_SIZE as i32;
+    let chunk_ty1 = chunk_ty0 + CHUNK_SIZE as i32;
 
+    // ── Pass 1: noise-derived surface (z + provisional kind) ──
+    // Cache `v` and biome so pass 3 can re-classify river-adjacent tiles
+    // using moisture-boosted thresholds without recomputing the noise.
+    let mut v_cache = Box::new([[0.0f32; CHUNK_SIZE]; CHUNK_SIZE]);
+    let mut biome_cache = Box::new([[Biome::default(); CHUNK_SIZE]; CHUNK_SIZE]);
     for ly in 0..CHUNK_SIZE {
         for lx in 0..CHUNK_SIZE {
             let global_tx = chunk_tx0 + lx as i32;
             let global_ty = chunk_ty0 + ly as i32;
             let biome = biome_mod::classify_at_tile(globe, global_tx, global_ty);
-            let (water_t, grass_t, farm_t, forest_t) = biome_thresholds(biome);
+            let bands = biome_bands(biome);
             let v = surface_v(global_tx, global_ty, gen, globe);
             let z = (Z_MIN as f32 + v * CHUNK_HEIGHT as f32).round() as i32;
             let z = z.clamp(Z_MIN, Z_MAX);
-            let kind = surface_kind_fn(v, water_t, grass_t, farm_t, forest_t);
-            let fertility = if matches!(kind, TileKind::Farmland | TileKind::Grass) {
-                ((1.0 - (v - 0.45).abs() * 5.0).max(0.0) * 255.0) as u8
-            } else {
-                0
-            };
+            let kind = bands.pick(v);
             surface_z[ly][lx] = z as i8;
             surface_kind[ly][lx] = kind;
-            surface_fertility[ly][lx] = fertility;
+            v_cache[ly][lx] = v;
+            biome_cache[ly][lx] = biome;
         }
     }
 
-    // Stamp rivers (Bresenham along each edge that touches this chunk).
-    let chunk_tx1 = chunk_tx0 + CHUNK_SIZE as i32;
-    let chunk_ty1 = chunk_ty0 + CHUNK_SIZE as i32;
-    let tiles_per_climate_cell = (GLOBE_CELL_CHUNKS * CHUNK_SIZE as i32) as f32;
-    let cell_to_tile = |gx: u32, gy: u32| {
-        let tx = (gx as f32 + 0.5) * tiles_per_climate_cell;
-        let ty = (gy as f32 + 0.5) * tiles_per_climate_cell;
-        (tx as i32, ty as i32)
-    };
-    for edge in &globe.rivers.edges {
-        let (ax, ay) = cell_to_tile(edge.from.0, edge.from.1);
-        let (bx, by) = cell_to_tile(edge.to.0, edge.to.1);
-        // Quick AABB reject — the edge's bbox vs this chunk's bbox.
-        let lo_x = ax.min(bx);
-        let hi_x = ax.max(bx);
-        let lo_y = ay.min(by);
-        let hi_y = ay.max(by);
-        let half_w = edge.width as i32;
-        if hi_x + half_w < chunk_tx0
-            || lo_x - half_w >= chunk_tx1
-            || hi_y + half_w < chunk_ty0
-            || lo_y - half_w >= chunk_ty1
+    // ── Pass 2: stamp curving river polylines + populate river-distance ──
+    for (edge_idx, edge) in globe.rivers.edges.iter().enumerate() {
+        let Some(polyline) = globe.rivers.edge_polylines.get(edge_idx) else {
+            continue;
+        };
+        if polyline.len() < 2 {
+            continue;
+        }
+        let max_w = edge.from_width.max(edge.to_width) as i32;
+        let feather = max_w + RIVER_FEATHER_DIST as i32;
+        // Polyline bbox vs chunk bbox + feather.
+        let (mut lo_x, mut lo_y) = polyline[0];
+        let (mut hi_x, mut hi_y) = polyline[0];
+        for &(x, y) in polyline {
+            lo_x = lo_x.min(x);
+            hi_x = hi_x.max(x);
+            lo_y = lo_y.min(y);
+            hi_y = hi_y.max(y);
+        }
+        if hi_x + feather < chunk_tx0
+            || lo_x - feather >= chunk_tx1
+            || hi_y + feather < chunk_ty0
+            || lo_y - feather >= chunk_ty1
         {
             continue;
         }
-        bresenham_stamp(
-            ax,
-            ay,
-            bx,
-            by,
-            edge.width as i32,
-            chunk_tx0,
-            chunk_ty0,
-            &mut surface_kind,
-            &mut surface_z,
-        );
+        // Cumulative arc length for taper t along the polyline.
+        let mut lengths = Vec::with_capacity(polyline.len());
+        lengths.push(0.0f32);
+        for w in polyline.windows(2) {
+            let dx = (w[1].0 - w[0].0) as f32;
+            let dy = (w[1].1 - w[0].1) as f32;
+            let prev = *lengths.last().unwrap();
+            lengths.push(prev + (dx * dx + dy * dy).sqrt());
+        }
+        let total = lengths.last().copied().unwrap_or(1.0).max(1.0);
+        for i in 0..polyline.len() - 1 {
+            let (ax, ay) = polyline[i];
+            let (bx, by) = polyline[i + 1];
+            let t0 = lengths[i] / total;
+            let t1 = lengths[i + 1] / total;
+            let w0 = lerp(edge.from_width as f32, edge.to_width as f32, t0);
+            let w1 = lerp(edge.from_width as f32, edge.to_width as f32, t1);
+            diamond_stamp(
+                ax,
+                ay,
+                bx,
+                by,
+                w0,
+                w1,
+                chunk_tx0,
+                chunk_ty0,
+                &mut surface_kind,
+                &mut surface_z,
+                &mut surface_river_distance,
+            );
+        }
     }
 
-    // Stamp lakes (disc fill).
+    // ── Pass 3: riparian re-classification + fertility ──
+    // For tiles in the feather ring (not already River) we shift biome
+    // thresholds toward "wetter" — Desert/Tundra strips along a river end up
+    // as Grass/Farmland, not bare stone. Then fertility gets a multiplier on
+    // top so wild plant patches cluster along the banks.
+    let mut surface_fertility = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
+    for ly in 0..CHUNK_SIZE {
+        for lx in 0..CHUNK_SIZE {
+            let river_d = surface_river_distance[ly][lx];
+            // River tiles themselves: skip; their kind is already River and
+            // fertility 0 (channel water).
+            if surface_kind[ly][lx] == TileKind::River {
+                continue;
+            }
+            // Re-classify with moisture-boosted thresholds when in the band.
+            if river_d != u8::MAX && river_d <= RIVER_FEATHER_DIST {
+                let biome = biome_cache[ly][lx];
+                let mut bands = biome_bands(biome);
+                let boost = riparian_moisture_boost(river_d);
+                let (water_t, grass_t, farm_t, forest_t) = apply_moisture_boost(
+                    bands.thresholds[0],
+                    bands.thresholds[1],
+                    bands.thresholds[2],
+                    bands.thresholds[3],
+                    boost,
+                );
+                bands.thresholds = [water_t, grass_t, farm_t, forest_t];
+                let v = v_cache[ly][lx];
+                let new_kind = surface_kind_fn_bands(&bands, v);
+                // Only upgrade toward greener kinds — riverside should add
+                // vegetation, never carve away forest into bare grass.
+                if greenness_rank(new_kind) > greenness_rank(surface_kind[ly][lx]) {
+                    surface_kind[ly][lx] = new_kind;
+                }
+            }
+            let kind = surface_kind[ly][lx];
+            if !matches!(kind, TileKind::Grass) {
+                continue;
+            }
+            let v = v_cache[ly][lx];
+            let base = (1.0 - (v - 0.45).abs() * 5.0).max(0.0) * 255.0;
+            let mult = river_fertility_mult(river_d);
+            let fert = (base * mult).min(255.0) as u8;
+            surface_fertility[ly][lx] = fert;
+        }
+    }
+
+    // ── Pass 4: lakes stamp on top (overrides river-claimed tiles too) ──
     for lake in &globe.lakes.lakes {
         let (cx, cy) = lake.center_tile;
         let r = lake.radius_tiles as i32;
@@ -401,54 +575,161 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
         }
     }
 
-    Chunk::new(surface_z, surface_kind, surface_fertility)
+    Chunk::new_with_rivers(
+        surface_z,
+        surface_kind,
+        surface_fertility,
+        surface_river_distance,
+    )
 }
 
-/// Bresenham line from (ax,ay) to (bx,by), widened by `half_w` tiles each
-/// side, stamping `Water` into the chunk-local arrays for any covered tile
-/// inside [chunk_tx0, chunk_tx0+CHUNK_SIZE) × [chunk_ty0, chunk_ty0+CHUNK_SIZE).
-fn bresenham_stamp(
+#[inline]
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Multiplier on base fertility from proximity to a river. `u8::MAX` means
+/// "far from river" → 1.0×; the riparian band 2..=5 tiles out gets
+/// 1.6× / 1.3× depending on distance. Tiles inside the channel never use
+/// this (their kind is `River`, not Grass/Farmland, so fertility is 0).
+fn river_fertility_mult(river_d: u8) -> f32 {
+    match river_d {
+        2 | 3 => 1.6,
+        4 | 5 => 1.3,
+        _ => 1.0,
+    }
+}
+
+/// Vegetation-density rank used to gate the riparian re-classification.
+/// Higher = more plant-supporting. Tiles only upgrade if the moisture-boosted
+/// thresholds produce a strictly greener kind than the current one — keeps
+/// mountain stone bare and never demotes existing forest.
+fn greenness_rank(kind: TileKind) -> u8 {
+    match kind {
+        TileKind::Forest => 4,
+        TileKind::Marsh => 3,
+        TileKind::Grass => 2,
+        TileKind::Scrub => 1,
+        // All barren / rocky / arid surfaces collapse to 0.
+        _ => 0,
+    }
+}
+
+/// Threshold-shift amount applied to `biome_thresholds` for tiles in the
+/// riparian band. Bigger boost = more aggressive shift toward grass/farmland.
+fn riparian_moisture_boost(river_d: u8) -> f32 {
+    match river_d {
+        // 0/1 are inside the channel; reclassify shouldn't fire there.
+        2 | 3 => 0.30,
+        4 | 5 => 0.15,
+        _ => 0.0,
+    }
+}
+
+/// Shift biome thresholds to mimic a wetter local microclimate. Lowering
+/// `grass_t` widens the grass band against rocky upland; lowering `farm_t`
+/// admits farmland in places that were too marginal. `water_t` and
+/// `forest_t` move proportionally so the ordering is preserved.
+fn apply_moisture_boost(
+    water_t: f32,
+    grass_t: f32,
+    farm_t: f32,
+    forest_t: f32,
+    boost: f32,
+) -> (f32, f32, f32, f32) {
+    let water_t = (water_t + boost * 0.05).min(grass_t - 1e-3);
+    let grass_t = (grass_t - boost * 0.30).max(water_t + 1e-3);
+    let farm_t = (farm_t - boost * 0.20).max(grass_t + 1e-3);
+    let forest_t = (forest_t - boost * 0.10).max(farm_t + 1e-3);
+    (water_t, grass_t, farm_t, forest_t)
+}
+
+/// Manhattan-clamped diamond stamp along the segment (ax,ay)→(bx,by). Width
+/// lerps from `w0` at the start to `w1` at the end. Channel tiles become
+/// `TileKind::River` with `surface_z` depressed by 1; tiles in the feather
+/// ring (`half_w + 1 .. half_w + RIVER_FEATHER_DIST`) only update
+/// `surface_river_distance` so downstream riparian effects fire without
+/// changing terrain.
+#[allow(clippy::too_many_arguments)]
+fn diamond_stamp(
     ax: i32,
     ay: i32,
     bx: i32,
     by: i32,
-    half_w: i32,
+    w0: f32,
+    w1: f32,
     chunk_tx0: i32,
     chunk_ty0: i32,
     surface_kind: &mut [[TileKind; CHUNK_SIZE]; CHUNK_SIZE],
     surface_z: &mut [[i8; CHUNK_SIZE]; CHUNK_SIZE],
+    surface_river_distance: &mut [[u8; CHUNK_SIZE]; CHUNK_SIZE],
 ) {
-    let dx = (bx - ax).abs();
+    let dx_abs = (bx - ax).abs();
+    let dy_abs_neg = -(by - ay).abs();
     let sx = if ax < bx { 1 } else { -1 };
-    let dy = -(by - ay).abs();
     let sy = if ay < by { 1 } else { -1 };
-    let mut err = dx + dy;
+    let mut err = dx_abs + dy_abs_neg;
     let mut x = ax;
     let mut y = ay;
+
+    let seg_len = ((dx_abs as f32).powi(2) + (dy_abs_neg as f32).powi(2))
+        .sqrt()
+        .max(1.0);
+    let max_half = w0.max(w1).round() as i32;
+    let feather_radius = max_half + RIVER_FEATHER_DIST as i32;
+
     loop {
-        // Stamp a half_w×half_w square centered on (x, y).
-        for oy in -half_w..=half_w {
-            for ox in -half_w..=half_w {
+        // Step progress along the segment for taper interpolation.
+        let dxf = (x - ax) as f32;
+        let dyf = (y - ay) as f32;
+        let prog = ((dxf * dxf + dyf * dyf).sqrt() / seg_len).clamp(0.0, 1.0);
+        let half_w = lerp(w0, w1, prog).round() as i32;
+        let half_w = half_w.max(0);
+
+        // Channel + feather: scan the bounding chebyshev square once and
+        // gate by Manhattan distance. The Manhattan check produces a soft
+        // diamond (rounded corners) instead of the old square stamp.
+        for oy in -feather_radius..=feather_radius {
+            for ox in -feather_radius..=feather_radius {
                 let lx = x + ox - chunk_tx0;
                 let ly = y + oy - chunk_ty0;
-                if lx >= 0 && lx < CHUNK_SIZE as i32 && ly >= 0 && ly < CHUNK_SIZE as i32 {
-                    surface_kind[ly as usize][lx as usize] = TileKind::Water;
-                    // Lower river by 1 below current surface for a gentle channel.
+                if lx < 0 || lx >= CHUNK_SIZE as i32 || ly < 0 || ly >= CHUNK_SIZE as i32 {
+                    continue;
+                }
+                let manhattan = ox.abs() + oy.abs();
+                let cheb = ox.abs().max(oy.abs());
+
+                // Channel: Manhattan <= half_w + 1 paints River. The +1 keeps
+                // a half_w=0 stamp at least one tile wide.
+                if manhattan <= half_w + 1 {
+                    surface_kind[ly as usize][lx as usize] = TileKind::River;
                     let cur = surface_z[ly as usize][lx as usize];
                     surface_z[ly as usize][lx as usize] = (cur as i32 - 1).max(Z_MIN) as i8;
+                    surface_river_distance[ly as usize][lx as usize] = 0;
+                    continue;
+                }
+
+                // Feather: chebyshev distance from channel center, capped
+                // at u8::MAX. Take the min so multiple edges crossing the
+                // same chunk produce the closest distance.
+                let outside = (cheb - half_w).max(0) as u8;
+                let cur = surface_river_distance[ly as usize][lx as usize];
+                if outside < cur {
+                    surface_river_distance[ly as usize][lx as usize] = outside;
                 }
             }
         }
+
         if x == bx && y == by {
             break;
         }
         let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
+        if e2 >= dy_abs_neg {
+            err += dy_abs_neg;
             x += sx;
         }
-        if e2 <= dx {
-            err += dx;
+        if e2 <= dx_abs {
+            err += dx_abs;
             y += sy;
         }
     }
@@ -543,7 +824,7 @@ mod tests {
         let gen = WorldGen::new();
         let g = test_globe();
         let surf = surface_height(5, 5, &gen, &g);
-        let t = proc_tile(5, 5, surf + 1, &gen, &g, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
+        let t = proc_tile(5, 5, surf + 1, &gen, &g, Biome::Temperate, u8::MAX);
         assert_eq!(t.kind, TileKind::Air);
     }
 
@@ -552,7 +833,7 @@ mod tests {
         let gen = WorldGen::new();
         let g = test_globe();
         let surf = surface_height(5, 5, &gen, &g);
-        let t = proc_tile(5, 5, surf, &gen, &g, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
+        let t = proc_tile(5, 5, surf, &gen, &g, Biome::Temperate, u8::MAX);
         assert!(!matches!(t.kind, TileKind::Air | TileKind::Wall));
     }
 
@@ -561,11 +842,11 @@ mod tests {
         let gen = WorldGen::new();
         let g = test_globe();
         let surf = surface_height(5, 5, &gen, &g);
-        let t = proc_tile(5, 5, surf - 10, &gen, &g, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
-        assert!(matches!(
-            t.kind,
-            TileKind::Wall | TileKind::Air | TileKind::Dirt | TileKind::Ore
-        ));
+        let t = proc_tile(5, 5, surf - 10, &gen, &g, Biome::Temperate, u8::MAX);
+        assert!(
+            matches!(t.kind, TileKind::Wall | TileKind::Air | TileKind::Ore)
+                || t.kind.is_soil_like()
+        );
     }
 
     #[test]
@@ -573,18 +854,18 @@ mod tests {
         let gen = WorldGen::new();
         let g = test_globe();
         let surf = surface_height(5, 5, &gen, &g);
-        // One tile below the surface should be Dirt (topsoil) for any non-Mountain biome,
-        // unless cave noise carves through. Check Temperate which has 4 Dirt tiles.
-        let t = proc_tile(5, 5, surf - 1, &gen, &g, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
-        assert!(matches!(t.kind, TileKind::Dirt | TileKind::Air));
+        // One tile below the surface should be soil (topsoil) for any non-Mountain
+        // biome, unless cave noise carves through. Temperate biome lays Loam.
+        let t = proc_tile(5, 5, surf - 1, &gen, &g, Biome::Temperate, u8::MAX);
+        assert!(t.kind.is_soil_like() || t.kind == TileKind::Air);
     }
 
     #[test]
     fn proc_tile_deterministic() {
         let gen = WorldGen::new();
         let g = test_globe();
-        let a = proc_tile(10, 20, 0, &gen, &g, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
-        let b = proc_tile(10, 20, 0, &gen, &g, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
+        let a = proc_tile(10, 20, 0, &gen, &g, Biome::Temperate, u8::MAX);
+        let b = proc_tile(10, 20, 0, &gen, &g, Biome::Temperate, u8::MAX);
         assert_eq!(a.kind, b.kind);
         assert_eq!(a.ore, b.ore);
     }

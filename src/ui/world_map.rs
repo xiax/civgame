@@ -239,22 +239,17 @@ pub fn build_globe_image(
                 // Hillshade: brightness scales with elevation so altitude is
                 // visible alongside biome. Deep ocean reads dark, mountain
                 // peaks read bright; mid-elev grassland sits near 1.0.
-                // Skip on water-flagged cells (rivers/lakes paint over).
-                if !cell.is_river && !cell.is_lake {
+                // Skip on lake cells (overpainted blue below). Rivers no
+                // longer use cell-level tinting — they get a polyline
+                // overlay after the main pass that follows the actual
+                // curving channel rather than the blocky climate cell.
+                if !cell.is_lake {
                     let shade = 0.55 + 0.95 * elev_f; // [0.55, 1.50]
                     c[0] = ((c[0] as f32 * shade).clamp(0.0, 255.0)) as u8;
                     c[1] = ((c[1] as f32 * shade).clamp(0.0, 255.0)) as u8;
                     c[2] = ((c[2] as f32 * shade).clamp(0.0, 255.0)) as u8;
                 }
 
-                // Rivers / lakes / faction tints stay cell-discrete: their
-                // semantics are placement-based, so bilinear smoothing makes
-                // no sense.
-                if cell.is_river {
-                    c[0] = (c[0] as u16 / 2 + 40) as u8;
-                    c[1] = (c[1] as u16 / 2 + 80) as u8;
-                    c[2] = c[2].saturating_add(80);
-                }
                 if cell.is_lake {
                     c[0] = 30;
                     c[1] = 80;
@@ -271,6 +266,95 @@ pub fn build_globe_image(
             pixels[idx + 1] = rgba[1];
             pixels[idx + 2] = rgba[2];
             pixels[idx + 3] = rgba[3];
+        }
+    }
+
+    // ── River polyline overlay ────────────────────────────────────────────
+    // Walk every river edge's tile polyline, project to image-pixel coords,
+    // and Bresenham-draw it. Width tapers from `edge.from_width` to
+    // `edge.to_width` along arc length so trunks read fatter than tributary
+    // headwaters. Drawing happens pre-flip so the orientation matches the
+    // biome buffer; respect_fog hides rivers in unexplored cells.
+    let tiles_per_cell = (GLOBE_CELL_CHUNKS * crate::world::chunk::CHUNK_SIZE as i32) as f32;
+    let world_to_px = |tile_x: i32, tile_y: i32| -> (i32, i32) {
+        let px = ((tile_x as f32 / tiles_per_cell) * oversample as f32) as i32;
+        let py = ((tile_y as f32 / tiles_per_cell) * oversample as f32) as i32;
+        (px, py)
+    };
+    for (edge_idx, edge) in globe.rivers.edges.iter().enumerate() {
+        let Some(polyline) = globe.rivers.edge_polylines.get(edge_idx) else {
+            continue;
+        };
+        if polyline.len() < 2 {
+            continue;
+        }
+        // Cumulative arc length for taper.
+        let mut lens = Vec::with_capacity(polyline.len());
+        lens.push(0.0f32);
+        for w in polyline.windows(2) {
+            let dx = (w[1].0 - w[0].0) as f32;
+            let dy = (w[1].1 - w[0].1) as f32;
+            let prev = *lens.last().unwrap();
+            lens.push(prev + (dx * dx + dy * dy).sqrt());
+        }
+        let total = lens.last().copied().unwrap_or(1.0).max(1.0);
+        for i in 0..polyline.len() - 1 {
+            let (ax, ay) = polyline[i];
+            let (bx, by) = polyline[i + 1];
+            let t_mid = (lens[i] + lens[i + 1]) * 0.5 / total;
+            let mid_w = edge.from_width as f32
+                + (edge.to_width as f32 - edge.from_width as f32) * t_mid;
+            // Per-pixel half-width: minor streams 1px, major rivers up to 3px.
+            let half_px = (mid_w * 0.5).round() as i32;
+            let half_px = half_px.clamp(0, 3);
+            let (px0, py0) = world_to_px(ax, ay);
+            let (px1, py1) = world_to_px(bx, by);
+            // Bresenham; stamp a small chebyshev square at each pixel.
+            let dx = (px1 - px0).abs();
+            let sx = if px0 < px1 { 1 } else { -1 };
+            let dy = -(py1 - py0).abs();
+            let sy = if py0 < py1 { 1 } else { -1 };
+            let mut err = dx + dy;
+            let mut x = px0;
+            let mut y = py0;
+            loop {
+                for oy in -half_px..=half_px {
+                    for ox in -half_px..=half_px {
+                        let qx = x + ox;
+                        let qy = y + oy;
+                        if qx < 0 || qy < 0 || qx >= img_w as i32 || qy >= img_h as i32 {
+                            continue;
+                        }
+                        if respect_fog {
+                            // Project pixel back to climate cell to gate on explored.
+                            let cgx = ((qx as f32 + 0.5) / oversample as f32) as i32;
+                            let cgy = ((qy as f32 + 0.5) / oversample as f32) as i32;
+                            if let Some(cell) = globe.cell(cgx, cgy) {
+                                if !cell.explored {
+                                    continue;
+                                }
+                            }
+                        }
+                        let idx = ((qy * img_w as i32 + qx) * 4) as usize;
+                        pixels[idx] = 60;
+                        pixels[idx + 1] = 130;
+                        pixels[idx + 2] = 200;
+                        pixels[idx + 3] = 255;
+                    }
+                }
+                if x == px1 && y == py1 {
+                    break;
+                }
+                let e2 = 2 * err;
+                if e2 >= dy {
+                    err += dy;
+                    x += sx;
+                }
+                if e2 <= dx {
+                    err += dx;
+                    y += sy;
+                }
+            }
         }
     }
 

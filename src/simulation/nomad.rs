@@ -780,8 +780,9 @@ pub fn pick_migration_target(
 }
 
 /// +30 at the candidate tile when adjacent water; falls off ~3 per chebyshev
-/// tile, capped at 0 beyond `WATER_PROBE_RADIUS`. Bands strongly prefer
-/// camps with reliable water access.
+/// tile, capped at 0 beyond `WATER_PROBE_RADIUS`. Fresh water (rivers) adds a
+/// flat `+10` so a band picks a riverside camp over an equidistant salt
+/// coast. Bands strongly prefer camps with reliable water access.
 pub fn score_water(chunk_map: &ChunkMap, tile: (i32, i32), radius: i32) -> i32 {
     for r in 0..=radius {
         for dx in -r..=r {
@@ -790,8 +791,10 @@ pub fn score_water(chunk_map: &ChunkMap, tile: (i32, i32), radius: i32) -> i32 {
                     continue; // outline only — concentric expansion
                 }
                 if let Some(kind) = chunk_map.tile_kind_at(tile.0 + dx, tile.1 + dy) {
-                    if kind == TileKind::Water {
-                        return (30 - r * 3).max(0);
+                    if kind.is_water_like() {
+                        let base = (30 - r * 3).max(0);
+                        let fresh = if kind.is_freshwater() { 10 } else { 0 };
+                        return base + fresh;
                     }
                 }
             }
@@ -808,17 +811,21 @@ pub fn score_biome_season(globe: &Globe, tile: (i32, i32), season: Season) -> i3
     let base: i32 = match biome {
         Biome::Ocean => -100,
         Biome::Grassland => 15,
+        Biome::Steppe => 12,
         Biome::Temperate => 10,
+        Biome::Wetland => 8,
         Biome::Tropical => 5,
         Biome::Taiga => 0,
         Biome::Desert => -5,
         Biome::Tundra => -5,
+        Biome::Badlands => -8,
         Biome::Mountain => -10,
     };
     let seasonal: i32 = match (biome, season) {
         (Biome::Tundra | Biome::Mountain, Season::Winter) => -15,
-        (Biome::Desert, Season::Summer) => -15,
-        (Biome::Grassland, Season::Spring | Season::Summer) => 5,
+        (Biome::Desert | Biome::Badlands, Season::Summer) => -15,
+        (Biome::Wetland, Season::Summer) => -8, // mosquito / disease load
+        (Biome::Grassland | Biome::Steppe, Season::Spring | Season::Summer) => 5,
         (Biome::Tropical, Season::Winter) => 5,
         _ => 0,
     };
@@ -1373,17 +1380,21 @@ mod tests {
         let base: i32 = match biome {
             Biome::Ocean => -100,
             Biome::Grassland => 15,
+            Biome::Steppe => 12,
             Biome::Temperate => 10,
+            Biome::Wetland => 8,
             Biome::Tropical => 5,
             Biome::Taiga => 0,
             Biome::Desert => -5,
             Biome::Tundra => -5,
+            Biome::Badlands => -8,
             Biome::Mountain => -10,
         };
         let seasonal: i32 = match (biome, season) {
             (Biome::Tundra | Biome::Mountain, Season::Winter) => -15,
-            (Biome::Desert, Season::Summer) => -15,
-            (Biome::Grassland, Season::Spring | Season::Summer) => 5,
+            (Biome::Desert | Biome::Badlands, Season::Summer) => -15,
+            (Biome::Wetland, Season::Summer) => -8,
+            (Biome::Grassland | Biome::Steppe, Season::Spring | Season::Summer) => 5,
             (Biome::Tropical, Season::Winter) => 5,
             _ => 0,
         };

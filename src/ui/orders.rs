@@ -179,12 +179,25 @@ pub fn right_click_context_menu_system(
         .get(sel_entity)
         .map(|m| m.faction_id == player_faction.faction_id)
         .unwrap_or(false);
+    let is_drafted = member_q.drafted_q.get(sel_entity).is_ok();
+    if mouse_buttons.just_pressed(MouseButton::Right) {
+        let sel_faction = member_q
+            .faction_q
+            .get(sel_entity)
+            .map(|m| m.faction_id)
+            .ok();
+        info!(
+            "[orders.menu] right-click sel={:?} sel_faction={:?} player_faction={} \
+             is_player_member={} is_drafted={}",
+            sel_entity, sel_faction, player_faction.faction_id, is_player_member, is_drafted
+        );
+    }
     if !is_player_member {
         menu_state.open = false;
         return;
     }
     // Drafted units are commanded by `military_right_click_system` instead.
-    if member_q.drafted_q.get(sel_entity).is_ok() {
+    if is_drafted {
         menu_state.open = false;
         return;
     }
@@ -447,6 +460,10 @@ pub fn right_click_context_menu_system(
         });
 
     if let Some(action) = chosen {
+        info!(
+            "[orders.menu] chosen={:?} sel={:?} target=({},{},{})",
+            action, sel_entity, target_tile.0, target_tile.1, target_z
+        );
         if let Ok((mut ai, mut aq, transform, mut combat_target, mut target_item)) =
             ai_q.get_mut(sel_entity)
         {
@@ -456,6 +473,11 @@ pub fn right_click_context_menu_system(
                 cur_tx.div_euclid(CHUNK_SIZE as i32),
                 cur_ty.div_euclid(CHUNK_SIZE as i32),
             );
+            // Player orders are external preempts (see simulation/CLAUDE.md
+            // "External preempts"). Drop the prior chain so the dispatched
+            // task promotes into `aq.current` instead of queueing behind a
+            // still-running `Explore` / etc.
+            aq.cancel();
 
             // For Build orders: spawn a personal Blueprint at the target tile.
             let build_bp: Option<Entity> = if let PlayerOrderKind::Build(kind) = action {
@@ -494,15 +516,35 @@ pub fn right_click_context_menu_system(
 
             match action {
                 PlayerOrderKind::Move => {
-                    // Routing is dispatched by `apply_move_order_system`
-                    // (`simulation/tasks.rs`) one tick after the `PlayerOrder`
-                    // marker lands, so the same code path serves both UI
-                    // right-clicks and programmatic insertions (tests,
-                    // scripting). One-tick latency is negligible for player
-                    // input.
+                    // Route immediately so an Idle worker enters Seeking this
+                    // tick. Without this, a player_order_completion_system
+                    // pass in the next Update can strip `PlayerOrder` (the
+                    // agent is still Idle/UNEMPLOYED) before FixedUpdate
+                    // accumulates enough time to run apply_move_order_system,
+                    // and the order is silently dropped.
+                    // `apply_move_order_system` still handles programmatic
+                    // / re-targeted inserts via `Changed<PlayerOrder>`;
+                    // re-routing the same target is idempotent.
+                    let routed = assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx as i32, cur_ty as i32),
+                        cur_chunk,
+                        target_tile,
+                        TaskKind::Idle,
+                        None,
+                        &routing.chunk_graph,
+                        &routing.chunk_router,
+                        &chunk_map,
+                        &routing.chunk_connectivity,
+                    );
+                    ai.target_z = target_z;
+                    info!(
+                        "[orders.menu] Move routed={} state={:?} dest={:?} target_tile={:?}",
+                        routed, ai.state, ai.dest_tile, ai.target_tile
+                    );
                 }
                 PlayerOrderKind::Mine | PlayerOrderKind::Gather => {
-                    assign_task_with_routing(
+                    let routed = assign_task_with_routing(
                         &mut ai,
                         (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
@@ -513,6 +555,11 @@ pub fn right_click_context_menu_system(
                         &routing.chunk_router,
                         &chunk_map,
                         &routing.chunk_connectivity,
+                    );
+                    info!(
+                        "[orders.menu] Mine/Gather routed={} task_id={} state={:?} \
+                         dest={:?} target_tile={:?}",
+                        routed, ai.task_id, ai.state, ai.dest_tile, ai.target_tile
                     );
                     aq.dispatch(crate::simulation::typed_task::Task::Gather {
                         tile: target_tile,

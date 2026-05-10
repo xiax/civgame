@@ -695,10 +695,11 @@ pub fn spawn_plant_at(
 /// Tile predicate for where a scattered seed may land.
 fn seed_target_tile_ok(chunk_map: &ChunkMap, x: i32, y: i32) -> bool {
     use crate::world::tile::TileKind as TK;
-    matches!(
-        chunk_map.tile_kind_at(x, y),
-        Some(TK::Grass | TK::Farmland)
-    )
+    match chunk_map.tile_kind_at(x, y) {
+        Some(TK::Grass) => true,
+        Some(k) if k.is_soil_like() => true,
+        _ => false,
+    }
 }
 
 /// Roll once: with probability `chance`, drop one fresh `Seed` plant of

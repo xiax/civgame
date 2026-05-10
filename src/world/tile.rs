@@ -7,18 +7,37 @@ pub enum TileKind {
     Water = 1,
     Stone = 2,
     Forest = 3,
-    Farmland = 4,
+    /// Hot/dry sandy surface. Reuses the slot freed by removing Farmland.
+    Sand = 4,
     Road = 5,
     Air = 6,  // open space — above ground or underground cavity
     Wall = 7, // solid rock/earth — blocks movement and LOS
     Ramp = 8, // slope — passable, allows ±1 Z movement
     Dirt = 9, // underground floor (carved cave ceiling/floor)
     Ore = 10, // ore-bearing rock; specific ore is in TileData.ore (OreKind)
+    River = 11, // freshwater channel (sibling of Water; impassable, but distinguishable)
+    // ── New surface variants ──
+    Snow = 12,   // tundra/cold surface
+    Marsh = 13,  // wetland surface (passable, slow)
+    Scrub = 14,  // dry sparse-vegetation (steppe / badlands / arid grassland)
+    // ── Stone lithologies (`is_stone_like`) ──
+    Granite = 15,   // hard, slow to mine; cold/mountain biomes
+    Limestone = 16, // soft sedimentary; warm lowlands; higher mining yield
+    Sandstone = 17, // arid sedimentary; deserts/badlands
+    Basalt = 18,    // volcanic; tropical/coastal/Mountain core
+    // ── Soil variants (`is_soil_like`) ──
+    Loam = 19,      // fertile temperate / grassland topsoil
+    Silt = 20,      // riverbank topsoil; very fertile
+    Clay = 21,      // wet topsoil; tropical/wetland
+    SandySoil = 22, // dry desert/badlands topsoil
 }
 
 impl TileKind {
     pub fn is_passable(self) -> bool {
-        !matches!(self, TileKind::Water | TileKind::Wall | TileKind::Air | TileKind::Ore)
+        !matches!(
+            self,
+            TileKind::Water | TileKind::River | TileKind::Wall | TileKind::Air | TileKind::Ore
+        )
     }
 
     /// Solid tiles cannot be entered from any direction.
@@ -32,10 +51,83 @@ impl TileKind {
     }
 
     /// Whether this tile can support an agent standing on top of it.
-    /// Anything but Air and Water; Wall counts because it's the ceiling/floor
-    /// of a tunnel below it.
+    /// Anything but Air, Water, and River; Wall counts because it's the
+    /// ceiling/floor of a tunnel below it.
     pub fn is_floor(self) -> bool {
-        !matches!(self, TileKind::Air | TileKind::Water)
+        !matches!(self, TileKind::Air | TileKind::Water | TileKind::River)
+    }
+
+    /// Water-shaped: ocean/lake (`Water`) or river channel (`River`).
+    /// Use this when behaviour ("don't walk into it", "looks blue") doesn't
+    /// care whether the water is fresh or salt.
+    pub fn is_water_like(self) -> bool {
+        matches!(self, TileKind::Water | TileKind::River)
+    }
+
+    /// Drinkable freshwater. Currently only `River`; lakes stay `Water` until
+    /// `LakeBasin` learns a fresh/salt flag.
+    pub fn is_freshwater(self) -> bool {
+        matches!(self, TileKind::River)
+    }
+
+    /// Generic "this tile is rock" — covers the legacy `Stone` plus all four
+    /// lithology variants, plus underground bedrock walls and ore tiles. Used
+    /// by `carve_tile` for mining-yield routing and by writability checks.
+    pub fn is_stone_like(self) -> bool {
+        matches!(
+            self,
+            TileKind::Stone
+                | TileKind::Granite
+                | TileKind::Limestone
+                | TileKind::Sandstone
+                | TileKind::Basalt
+                | TileKind::Wall
+                | TileKind::Ore
+        )
+    }
+
+    /// Generic "this tile is topsoil" — legacy `Dirt` plus the four soil
+    /// variants. Used by plant-fertility plumbing and farmland-yard
+    /// writability checks.
+    pub fn is_soil_like(self) -> bool {
+        matches!(
+            self,
+            TileKind::Dirt
+                | TileKind::Loam
+                | TileKind::Silt
+                | TileKind::Clay
+                | TileKind::SandySoil
+        )
+    }
+
+    /// Mining yield count when this stone-like tile is carved. Soft sedimentary
+    /// rock (Limestone) yields more per swing than hard igneous/metamorphic
+    /// (Granite/Basalt). Sandstone matches Granite for now. Wall and Ore are
+    /// not routed through this path — see `carve_tile`.
+    pub fn stone_yield_count(self) -> u32 {
+        match self {
+            TileKind::Limestone => 3,
+            TileKind::Stone
+            | TileKind::Granite
+            | TileKind::Sandstone
+            | TileKind::Basalt
+            | TileKind::Wall => 2,
+            _ => 0,
+        }
+    }
+
+    /// Multiplier applied to a plant's per-tick growth/fertility when growing
+    /// on this soil. `Grass` is 1.0 baseline; soils diverge from there.
+    pub fn soil_fertility_mult(self) -> f32 {
+        match self {
+            TileKind::Loam => 1.5,
+            TileKind::Silt => 1.4,
+            TileKind::Clay => 1.0,
+            TileKind::Dirt => 1.0,
+            TileKind::SandySoil => 0.6,
+            TileKind::Grass => 1.0,
+            _ => 1.0,
+        }
     }
 }
 
@@ -167,5 +259,56 @@ mod tests {
             ..Default::default()
         };
         assert!(t.is_passable());
+    }
+
+    #[test]
+    fn new_surfaces_passable() {
+        for k in [
+            TileKind::Sand,
+            TileKind::Snow,
+            TileKind::Marsh,
+            TileKind::Scrub,
+        ] {
+            assert!(k.is_passable(), "{:?} should be passable", k);
+            assert!(k.is_floor(), "{:?} should be floor", k);
+        }
+    }
+
+    #[test]
+    fn stone_variants_classified() {
+        for k in [
+            TileKind::Granite,
+            TileKind::Limestone,
+            TileKind::Sandstone,
+            TileKind::Basalt,
+            TileKind::Stone,
+        ] {
+            assert!(k.is_stone_like());
+            assert!(k.is_passable());
+        }
+    }
+
+    #[test]
+    fn soil_variants_classified() {
+        for k in [
+            TileKind::Loam,
+            TileKind::Silt,
+            TileKind::Clay,
+            TileKind::SandySoil,
+            TileKind::Dirt,
+        ] {
+            assert!(k.is_soil_like());
+            assert!(k.is_passable());
+        }
+    }
+
+    #[test]
+    fn limestone_softer_than_granite() {
+        assert!(TileKind::Limestone.stone_yield_count() > TileKind::Granite.stone_yield_count());
+    }
+
+    #[test]
+    fn loam_more_fertile_than_sandy() {
+        assert!(TileKind::Loam.soil_fertility_mult() > TileKind::SandySoil.soil_fertility_mult());
     }
 }

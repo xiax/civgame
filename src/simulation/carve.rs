@@ -28,16 +28,18 @@ pub fn ore_yield_resource_id(ore: OreKind) -> ResourceId {
 pub type CarveYield = Vec<(ResourceId, u32)>;
 
 fn yield_for_tile(data: TileData) -> Option<(ResourceId, u32)> {
-    match data.kind {
-        TileKind::Wall | TileKind::Stone => {
-            let id = *core_ids::Stone
-                .get()
-                .expect("core_ids: yield_for_tile called before init_core_ids()");
-            Some((id, STONE_PER_BLOCK))
-        }
-        TileKind::Ore => Some((ore_yield_resource_id(data.ore_kind()), STONE_PER_BLOCK)),
-        _ => None,
+    if data.kind == TileKind::Ore {
+        return Some((ore_yield_resource_id(data.ore_kind()), STONE_PER_BLOCK));
     }
+    if data.kind.is_stone_like() {
+        let id = *core_ids::Stone
+            .get()
+            .expect("core_ids: yield_for_tile called before init_core_ids()");
+        // Limestone yields more per swing; Granite/Sandstone/Basalt match Stone.
+        let qty = data.kind.stone_yield_count().max(STONE_PER_BLOCK);
+        return Some((id, qty));
+    }
+    None
 }
 
 /// Open up (tx, ty) so an agent can stand at foot-Z = `target_floor_z`.
@@ -64,7 +66,7 @@ pub fn carve_tile(
     let head_z = target_floor_z + 1;
     let head = tile_at_3d(chunk_map, gen, globe, tx, ty, head_z);
     match head.kind {
-        TileKind::Wall | TileKind::Stone | TileKind::Ore => {
+        k if k.is_stone_like() => {
             if let Some(y) = yield_for_tile(head) {
                 yields.push(y);
             }
@@ -98,7 +100,7 @@ pub fn carve_tile(
 
     let floor = tile_at_3d(chunk_map, gen, globe, tx, ty, target_floor_z);
     match floor.kind {
-        TileKind::Wall | TileKind::Stone | TileKind::Ore => {
+        k if k.is_stone_like() => {
             if let Some(y) = yield_for_tile(floor) {
                 yields.push(y);
             }
@@ -150,7 +152,7 @@ pub fn fill_tile(
 
     let floor = chunk_map.tile_at(tx, ty, target_floor_z);
     match floor.kind {
-        TileKind::Air | TileKind::Water => {
+        TileKind::Air | TileKind::Water | TileKind::River => {
             chunk_map.set_tile(
                 tx,
                 ty,
