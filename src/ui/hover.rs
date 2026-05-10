@@ -229,7 +229,17 @@ pub fn hover_info_system(
                             }
                         }
                     } else if let Ok(plant) = plant_query.get(entity) {
-                        ui.label(format!("Plant: {:?} ({:?})", plant.kind, plant.stage));
+                        let threshold = crate::simulation::plants::stage_threshold(
+                            plant.kind, plant.stage,
+                        );
+                        if threshold == 0 {
+                            ui.label(format!("Plant: {:?} ({:?})", plant.kind, plant.stage));
+                        } else {
+                            ui.label(format!(
+                                "Plant: {:?} ({:?}) — growth {}/{}",
+                                plant.kind, plant.stage, plant.growth, threshold
+                            ));
+                        }
                     } else if let Ok(item) = item_query.get(entity) {
                         ui.label(format!(
                             "Item: {} x{}",

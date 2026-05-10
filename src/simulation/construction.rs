@@ -517,6 +517,11 @@ pub struct Blueprint {
     pub deposits: [GoodNeed; MAX_BUILD_INPUTS],
     pub deposit_count: u8,
     pub build_progress: u8,
+    /// Obstacle entities (plants, etc.) that workers must clear before
+    /// construction can accumulate `build_progress`. Maintained by the
+    /// `ClearObstacle` task executor; populated at blueprint creation
+    /// via `obstacle::scan_footprint`.
+    pub pending_clear: Vec<Entity>,
 }
 
 impl Blueprint {
@@ -547,7 +552,14 @@ impl Blueprint {
             deposits,
             deposit_count: count as u8,
             build_progress: 0,
+            pending_clear: Vec::new(),
         }
+    }
+
+    /// `true` when every plant/obstacle in the footprint has been cleared
+    /// and `construction_system` is allowed to accumulate work_progress.
+    pub fn obstacles_cleared(&self) -> bool {
+        self.pending_clear.is_empty()
     }
 
     pub fn is_satisfied(&self) -> bool {
@@ -3238,12 +3250,15 @@ pub fn construction_system(
         }
 
         // Advance work by one tick per on-site worker — but only once all
-        // materials have been deposited. Gating on `is_satisfied()` here
-        // (a) prevents `build_progress` from saturating past `work_ticks`
-        // while haulers are still en route, and (b) keeps Building XP
-        // honest by only awarding it for real labour.
+        // materials have been deposited AND every obstacle in the footprint
+        // has been cleared. Gating on `is_satisfied()` + `obstacles_cleared()`
+        // here (a) prevents `build_progress` from saturating past `work_ticks`
+        // while haulers are still en route, and (b) keeps Building XP honest
+        // by only awarding it for real labour. The obstacle gate makes
+        // workers idle next to the blueprint until a `ClearObstacle` worker
+        // (potentially themselves) cuts/relocates the last entry.
         let recipe = recipe_for(bp.kind);
-        if bp.is_satisfied() {
+        if bp.is_satisfied() && bp.obstacles_cleared() {
             if let Some(workers) = bp_workers.get(&bp_entity) {
                 bp.build_progress = bp
                     .build_progress
@@ -3260,7 +3275,10 @@ pub fn construction_system(
             work_progress_resets.extend(workers.iter().copied());
         }
 
-        if bp.build_progress >= recipe.work_ticks && bp.is_satisfied() {
+        if bp.build_progress >= recipe.work_ticks
+            && bp.is_satisfied()
+            && bp.obstacles_cleared()
+        {
             let tile = bp.tile;
             let (tx, ty) = (tile.0 as i32, tile.1 as i32);
 

@@ -460,6 +460,17 @@ pub enum Task {
     Explore {
         kind: MemoryKind,
     },
+    /// Worker walks adjacent to a `ConstructionObstacle`-tagged entity in
+    /// `blueprint`'s footprint, accumulates work_progress against its
+    /// `WorkerClear { work_ticks, .. }` resolution, then despawns it
+    /// (dropping any yields on the ground) and pops it from
+    /// `Blueprint.pending_clear`. Distinct from `Gather` because the
+    /// activity is a structure-prerequisite, not resource acquisition;
+    /// loot drops on ground for haulers.
+    ClearObstacle {
+        entity: bevy::prelude::Entity,
+        blueprint: bevy::prelude::Entity,
+    },
 }
 
 impl Default for Task {
@@ -658,6 +669,17 @@ impl Task {
     pub fn as_construct(&self) -> Option<bevy::prelude::Entity> {
         match *self {
             Task::Construct { blueprint } => Some(blueprint),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the ClearObstacle variant. Returns
+    /// `(obstacle_entity, blueprint_entity)`.
+    pub fn as_clear_obstacle(
+        &self,
+    ) -> Option<(bevy::prelude::Entity, bevy::prelude::Entity)> {
+        match *self {
+            Task::ClearObstacle { entity, blueprint } => Some((entity, blueprint)),
             _ => None,
         }
     }

@@ -77,6 +77,13 @@ const PREDATOR_PROBE_RADIUS: i32 = 6;
 pub struct MigrationTarget {
     pub tile: (i32, i32),
     pub started_tick: u32,
+    /// Tick of the last successful `assign_task_with_routing` in
+    /// `nomad_migration_dispatch_system`. Used by the arrival system's
+    /// stall-release path: if dispatch never advances this for an Idle /
+    /// UNEMPLOYED agent (Drafted, PlayerOrder, or otherwise filtered by
+    /// the dispatcher), they release after `MIGRATE_STALL_TICKS` instead
+    /// of waiting out the 3-day hard timeout.
+    pub last_dispatched_tick: u32,
 }
 
 /// P1: chebyshev arrival radius around the new camp. Below this, the
@@ -88,6 +95,13 @@ pub const MIGRATE_ARRIVAL_RADIUS: i32 = 4;
 /// the agent gives up — covers stuck-in-impassable-tile edge cases so a
 /// lost member doesn't carry the marker forever.
 pub const MIGRATE_TIMEOUT_TICKS: u32 = TICKS_PER_DAY * 3;
+
+/// Stall-release window. If `last_dispatched_tick` hasn't advanced in
+/// this many ticks and the agent is sitting Idle / UNEMPLOYED, the
+/// arrival system releases the marker. Catches `Drafted` / `PlayerOrder`
+/// members the dispatcher's filter never serves, plus genuinely stranded
+/// agents whose path-worker keeps rejecting routes.
+pub const MIGRATE_STALL_TICKS: u32 = TICKS_PER_DAY / 2;
 
 /// Despawn radius for the old camp on commit. Sized to cover the seed
 /// helpers' outer-ring tents (radius 5..=7 around each hearth, plus a
@@ -560,6 +574,7 @@ pub fn nomad_migration_commit_system(world: &mut World) {
             commands.entity(e).insert(MigrationTarget {
                 tile: target,
                 started_tick: now,
+                last_dispatched_tick: now,
             });
             *goal = crate::simulation::goals::AgentGoal::MigrateToCamp;
             // Cancel current chain so the dispatcher picks up MigrateToCamp
@@ -1117,11 +1132,23 @@ pub fn nomad_chief_directive_system(
 }
 
 /// P1 dispatcher — ParallelB. For every agent carrying a `MigrationTarget`
-/// whose goal is `MigrateToCamp` and whose `aq.current` is Idle, dispatch
+/// whose goal is `MigrateToCamp` and who is otherwise idle, dispatch
 /// `Task::WalkTo { tile, why: Migration }` via `assign_task_with_routing`.
 /// Bucket-gated like other ParallelB dispatchers via `BucketSlot`.
+///
+/// Self-heals two failure modes the plain "queue is Idle" gate would
+/// otherwise leave permanently parked:
+/// - A stale `Task::WalkTo { why: Migration }` left on `aq.current` by
+///   `movement::release_to_idle` (which clears `task_id` but not `aq`).
+///   `goal_dispatch_system`'s stale-reset is gated on
+///   `task_id != UNEMPLOYED` and so misses this case.
+/// - A target whose chunk is in a different connectivity component than
+///   the agent's: routing always "succeeds" at this layer for non-adjacent
+///   tasks, then the path worker rejects it forever. We fail fast here
+///   and release the marker so the agent re-evaluates next tick.
 #[allow(clippy::too_many_arguments)]
 pub fn nomad_migration_dispatch_system(
+    mut commands: Commands,
     clock: Res<SimClock>,
     chunk_graph: Res<crate::pathfinding::chunk_graph::ChunkGraph>,
     chunk_router: Res<crate::pathfinding::chunk_router::ChunkRouter>,
@@ -1130,8 +1157,8 @@ pub fn nomad_migration_dispatch_system(
     mut q: Query<
         (
             Entity,
-            &MigrationTarget,
-            &crate::simulation::goals::AgentGoal,
+            &mut MigrationTarget,
+            &mut crate::simulation::goals::AgentGoal,
             &Transform,
             &mut crate::simulation::person::PersonAI,
             &mut crate::simulation::typed_task::ActionQueue,
@@ -1151,7 +1178,8 @@ pub fn nomad_migration_dispatch_system(
     use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
     use crate::world::terrain::TILE_SIZE;
 
-    for (_e, target, goal, transform, mut ai, mut aq, slot, lod) in q.iter_mut() {
+    let now = clock.tick as u32;
+    for (e, mut target, mut goal, transform, mut ai, mut aq, slot, lod) in q.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -1164,8 +1192,21 @@ pub fn nomad_migration_dispatch_system(
         if ai.task_id != PersonAI::UNEMPLOYED {
             continue;
         }
+        // Self-heal: `release_to_idle` (movement.rs) wipes `task_id` and
+        // `state` after a path-worker failure but does not touch
+        // `aq.current` — leaving a stale `Task::WalkTo { Migration }` that
+        // would otherwise block re-dispatch forever. Drop it here so the
+        // route below can run.
         if !matches!(aq.current, Task::Idle) {
-            continue;
+            let stale_migration_walk = matches!(
+                aq.current,
+                Task::WalkTo { why: WalkReason::Migration, .. },
+            );
+            if stale_migration_walk && ai.state == AiState::Idle {
+                aq.cancel();
+            } else {
+                continue;
+            }
         }
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
@@ -1177,6 +1218,30 @@ pub fn nomad_migration_dispatch_system(
             cur_tx.div_euclid(CHUNK_SIZE as i32),
             cur_ty.div_euclid(CHUNK_SIZE as i32),
         );
+        // Connectivity fast-fail. `assign_task_with_routing` only
+        // connectivity-checks for adjacent-task targets; for `Migrate` it
+        // always returns true and the path worker would just keep
+        // rejecting the request. Release the marker so the agent picks a
+        // normal goal next tick instead of cycling dispatch ↔ path-fail.
+        let target_chunk = ChunkCoord(
+            target.tile.0.div_euclid(CHUNK_SIZE as i32),
+            target.tile.1.div_euclid(CHUNK_SIZE as i32),
+        );
+        let target_z = chunk_map.nearest_standable_z(
+            target.tile.0,
+            target.tile.1,
+            ai.current_z as i32,
+        ) as i8;
+        if !chunk_connectivity
+            .is_reachable((cur_chunk, ai.current_z), (target_chunk, target_z))
+        {
+            commands.entity(e).remove::<MigrationTarget>();
+            *goal = crate::simulation::goals::AgentGoal::GatherFood;
+            aq.cancel();
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.state = AiState::Idle;
+            continue;
+        }
         let routed = assign_task_with_routing(
             &mut ai,
             (cur_tx, cur_ty),
@@ -1199,14 +1264,17 @@ pub fn nomad_migration_dispatch_system(
             z,
             why: WalkReason::Migration,
         });
+        target.last_dispatched_tick = now;
     }
 }
 
 /// P1 arrival check — Sequential, after movement_system. Sweeps every
 /// agent with a `MigrationTarget`; on chebyshev arrival within
-/// `MIGRATE_ARRIVAL_RADIUS` or after `MIGRATE_TIMEOUT_TICKS`, removes the
-/// marker, drops back to Idle, and clears the goal so the next 200-tick
-/// goal-eval picks a normal need-driven goal.
+/// `MIGRATE_ARRIVAL_RADIUS`, after `MIGRATE_TIMEOUT_TICKS`, or after
+/// `MIGRATE_STALL_TICKS` of dispatch inactivity (Drafted / PlayerOrder /
+/// stranded agents), removes the marker, drops back to Idle, and clears
+/// the goal so the next 200-tick goal-eval picks a normal need-driven
+/// goal.
 pub fn nomad_migration_arrival_system(
     mut commands: Commands,
     clock: Res<SimClock>,
@@ -1227,7 +1295,15 @@ pub fn nomad_migration_arrival_system(
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         let arrived = chebyshev((cur_tx, cur_ty), target.tile) <= MIGRATE_ARRIVAL_RADIUS;
         let timed_out = now.saturating_sub(target.started_tick) > MIGRATE_TIMEOUT_TICKS;
-        if !(arrived || timed_out) {
+        // Stall release: dispatch hasn't advanced `last_dispatched_tick`
+        // for a while and the agent is sitting Idle / UNEMPLOYED — either
+        // they're filtered out of the dispatcher (Drafted, PlayerOrder)
+        // or stranded by repeated path-worker failures. Either way, no
+        // further forward progress will happen on its own.
+        let stalled = ai.task_id == PersonAI::UNEMPLOYED
+            && ai.state == AiState::Idle
+            && now.saturating_sub(target.last_dispatched_tick) > MIGRATE_STALL_TICKS;
+        if !(arrived || timed_out || stalled) {
             continue;
         }
         commands.entity(e).remove::<MigrationTarget>();
@@ -1312,5 +1388,91 @@ mod tests {
             _ => 0,
         };
         base + seasonal
+    }
+
+    /// Stall release: an agent the dispatcher never serves (here simulated
+    /// via `Drafted`, which excludes the agent from the dispatcher and
+    /// from `goal_update_system`'s normal selection — the same code path
+    /// hunters / lecture attendees take during migration) must still get
+    /// out of `Goal::MigrateToCamp` once `MIGRATE_STALL_TICKS` elapses.
+    /// Without this we'd be paying the 3-day `MIGRATE_TIMEOUT_TICKS`
+    /// fallback for every drafted member of a migrating band.
+    #[test]
+    fn arrival_stall_releases_drafted_agent() {
+        use crate::simulation::test_fixture::TestSim;
+        use crate::world::tile::TileKind;
+        use bevy::prelude::*;
+
+        let mut sim = TestSim::new(0xBA11D);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let agent = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Tick once so all the Startup / first-frame systems settle and
+        // the agent acquires its components.
+        sim.tick();
+
+        let started_tick = sim.tick_count() as u32;
+        // Stamp MigrationTarget at a far tile and lock the agent into
+        // MigrateToCamp. `Drafted` keeps both the dispatcher and
+        // `goal_update_system`'s normal selection from touching them.
+        sim.app.world_mut().entity_mut(agent).insert((
+            MigrationTarget {
+                tile: (50, 50),
+                started_tick,
+                last_dispatched_tick: started_tick,
+            },
+            crate::simulation::goals::AgentGoal::MigrateToCamp,
+            crate::simulation::person::Drafted,
+        ));
+
+        // Walk past the stall threshold. arrival_system runs every
+        // tick, so the stall path should fire once the gap exceeds
+        // MIGRATE_STALL_TICKS.
+        sim.tick_n(MIGRATE_STALL_TICKS + 5);
+
+        assert!(
+            sim.app.world().get::<MigrationTarget>(agent).is_none(),
+            "MigrationTarget should be removed by stall arrival path",
+        );
+        let goal = sim
+            .app
+            .world()
+            .get::<crate::simulation::goals::AgentGoal>(agent)
+            .copied();
+        assert_eq!(
+            goal,
+            Some(crate::simulation::goals::AgentGoal::GatherFood),
+            "stall arrival should flip MigrateToCamp → GatherFood",
+        );
+    }
+
+    /// Within `MIGRATE_ARRIVAL_RADIUS` of the target, the regular arrival
+    /// path still releases the marker — this is the "happy path" that
+    /// the existing migration pipeline already exercises end-to-end, but
+    /// pin it explicitly so a regression in the stall-path edits doesn't
+    /// break it.
+    #[test]
+    fn arrival_radius_releases_when_at_target_tile() {
+        use crate::simulation::test_fixture::TestSim;
+        use crate::world::tile::TileKind;
+
+        let mut sim = TestSim::new(0xBA12D);
+        sim.flat_world(1, 0, TileKind::Grass);
+        // Spawn directly on the target tile — chebyshev = 0, well inside
+        // `MIGRATE_ARRIVAL_RADIUS`.
+        let agent = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        sim.tick();
+        let now = sim.tick_count() as u32;
+        sim.app.world_mut().entity_mut(agent).insert((
+            MigrationTarget {
+                tile: (0, 0),
+                started_tick: now,
+                last_dispatched_tick: now,
+            },
+            crate::simulation::goals::AgentGoal::MigrateToCamp,
+        ));
+        // One tick is enough — arrival runs in Sequential after movement.
+        sim.tick_n(2);
+        assert!(sim.app.world().get::<MigrationTarget>(agent).is_none());
     }
 }

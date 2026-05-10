@@ -86,3 +86,13 @@ Overhaul settlement and nomadic system to make them work better together and wor
 Need UI overhaul to add commands for all actions players can take
 
 Overhaul technology system to be entirely knowledge based, settlement creation gates the leader knowing about farming and deciding to farm, technological adoption is on a per agent level baed on their knowledge, technological adoption by governments depends on the knowledge of government officials and bureaucrats.
+
+
+Market-mode coherence track (M4-M5 deferred per memory)
+
+Free-agent gathering. In Market mode, when should_craft declines (cooldown or no materials), the household's natural alternative is to
+  gather raw materials themselves and sell to market. Today there's no AgentGoal::SelfStockpile — autonomous gathering routes through
+  Stockpile JobClaims (chief-driven) or Survive (food only).
+
+
+I need logging to track performance metrics and identify bottlenecks in the code that is slowing down each tick, give me a plan to do this comprehensively please.

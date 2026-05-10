@@ -276,12 +276,27 @@ pub fn terraform_system(
 }
 
 /// Drains `PendingFootprints` whose terraform tiles have all cleared,
-/// spawning the wall blueprints with the shared `target_z`.
+/// clearing any remaining obstacles (interior plants, loose rocks) in
+/// the footprint synchronously, then spawning the wall blueprints with
+/// the shared `target_z`. Per-blueprint obstacle clearing for the
+/// perimeter walls is handled by `populate_pending_clear_system` once
+/// the new blueprints are spawned; this pass catches interior tiles
+/// that have no individual blueprint of their own.
 pub fn footprint_completion_system(
     mut commands: Commands,
     mut bp_map: ResMut<BlueprintMap>,
     terraform_map: Res<TerraformMap>,
     mut pending: ResMut<PendingFootprints>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    chunk_map: Res<ChunkMap>,
+    obstacles: Query<(
+        &crate::world::spatial::Indexed,
+        &crate::simulation::obstacle::ConstructionObstacle,
+    )>,
+    plants: Query<&crate::simulation::plants::Plant>,
+    mut plant_map: ResMut<crate::simulation::plants::PlantMap>,
+    mut plant_sprite_index: ResMut<crate::simulation::plants::PlantSpriteIndex>,
+    mut transforms: Query<&mut Transform>,
 ) {
     let mut i = 0;
     while i < pending.queue.len() {
@@ -294,6 +309,24 @@ pub fn footprint_completion_system(
             continue;
         }
         let p = pending.queue.swap_remove(i);
+        let footprint_tiles: Vec<(i32, i32)> = p.terraform_tiles.clone();
+        let bp_map_ref = &bp_map;
+        crate::simulation::obstacle::resolve_footprint_sync(
+            &footprint_tiles,
+            p.target_z,
+            &mut commands,
+            &spatial,
+            &chunk_map,
+            &obstacles,
+            &plants,
+            &mut plant_map,
+            &mut plant_sprite_index,
+            &mut transforms,
+            &|tile| bp_map_ref.0.contains_key(&tile),
+            &mut |c, tx, ty, rid, qty| {
+                crate::simulation::gather::spawn_ground_drop(c, tx, ty, rid, qty);
+            },
+        );
         for (kind, tile) in &p.wall_plan {
             if bp_map.0.contains_key(tile) {
                 continue;

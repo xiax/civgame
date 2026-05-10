@@ -793,7 +793,7 @@ pub fn inspector_panel_system(
                                     outcome,
                                     now.saturating_sub(tick)
                                 ),
-                                None => "last attempt: none — preconditions failing".to_string(),
+                                None => "last attempt: none (no method dispatched in last 30s)".to_string(),
                             };
                             ui.label(
                                 egui::RichText::new(format!(
@@ -830,6 +830,9 @@ pub fn inspector_panel_system(
                                                 }
                                                 MethodOutcome::Interrupted => {
                                                     egui::Color32::from_gray(160)
+                                                }
+                                                MethodOutcome::Abandoned => {
+                                                    egui::Color32::from_rgb(200, 150, 90)
                                                 }
                                             };
                                             ui.label(

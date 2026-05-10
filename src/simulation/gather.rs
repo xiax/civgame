@@ -12,7 +12,9 @@ use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::MemoryKind;
 use crate::simulation::person::{AiState, PersonAI};
-use crate::simulation::plants::{GrowthStage, PlantKind, PlantMap, PlantSpriteIndex};
+use crate::simulation::plants::{
+    despawn_plant_internals, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
+};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::faction::StorageTileMap;
@@ -23,7 +25,9 @@ use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use bevy::ecs::system::SystemParam;
 use crate::simulation::knowledge::DiscoveryActionEvent;
-use crate::simulation::htn::{MethodHistory, MethodOutcome};
+use crate::simulation::htn::{
+    record_routing_failure, record_target_failure, MethodHistory, MethodOutcome,
+};
 use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::chunk_streaming::TileChangedEvent;
@@ -210,6 +214,8 @@ fn finish_gather(
     faction_id: Option<u32>,
     chunk_map: &ChunkMap,
     routing: &GatherRoutingResources,
+    method_history: &mut MethodHistory,
+    now: u64,
 ) {
     // Drop any active gather claim before resetting AI state. Mirrors
     // `release_reservation` for storage: the claim was staked at dispatch
@@ -230,6 +236,7 @@ fn finish_gather(
             let Some(fid) = faction_id else {
                 // SOLO agent — no faction storage. The dispatcher already
                 // filters SOLO out, so this is defensive.
+                record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 return;
             };
@@ -241,6 +248,7 @@ fn finish_gather(
                 // (the legacy gather plan registry never had a "where do I
                 // dump this" answer either; the agent just held the haul
                 // cap until something else happened).
+                record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 return;
             };
@@ -257,6 +265,7 @@ fn finish_gather(
                 &routing.chunk_connectivity,
             );
             if !dispatched {
+                record_routing_failure(method_history, ai, now);
                 aq.cancel();
             }
         }
@@ -278,6 +287,7 @@ fn finish_gather(
             // `production::finish_withdraw_material`'s HaulToBlueprint arm).
             // Despawned/satisfied bps silently degrade to Idle.
             let Ok(bp) = routing.bp_query.get(blueprint) else {
+                record_target_failure(method_history, ai, now);
                 aq.cancel();
                 return;
             };
@@ -295,6 +305,7 @@ fn finish_gather(
                 &routing.chunk_connectivity,
             );
             if !dispatched {
+                record_routing_failure(method_history, ai, now);
                 aq.cancel();
             }
         }
@@ -305,6 +316,7 @@ fn finish_gather(
             // is in hand, route to the order's anchor tile. Despawned/satisfied
             // orders silently degrade to Idle.
             let Ok(order_data) = routing.co_query.get(order) else {
+                record_target_failure(method_history, ai, now);
                 aq.cancel();
                 return;
             };
@@ -322,6 +334,7 @@ fn finish_gather(
                 &routing.chunk_connectivity,
             );
             if !dispatched {
+                record_routing_failure(method_history, ai, now);
                 aq.cancel();
             }
         }
@@ -519,6 +532,8 @@ pub fn gather_system(
                     faction_id,
                     &chunk_map,
                     &routing,
+                    &mut method_history,
+                    clock.tick,
                 );
                 continue;
             }
@@ -621,13 +636,13 @@ pub fn gather_system(
             }
 
             if kind.harvest_despawns(has_tool) {
-                plant_map.0.remove(&(tx, ty));
-                let cx = tx.div_euclid(CHUNK_SIZE as i32);
-                let cy = ty.div_euclid(CHUNK_SIZE as i32);
-                if let Some(vec) = plant_sprite_index.by_chunk.get_mut(&ChunkCoord(cx, cy)) {
-                    vec.retain(|(e, _)| *e != entity);
-                }
-                commands.entity(entity).despawn_recursive();
+                despawn_plant_internals(
+                    &mut commands,
+                    entity,
+                    (tx, ty),
+                    &mut plant_map,
+                    &mut plant_sprite_index,
+                );
                 // Depletion: a despawning harvest removes the resource from
                 // the cluster's accounting so other agents stop routing here.
                 let depleted_kind = match kind {
@@ -637,7 +652,7 @@ pub fn gather_system(
                 shared.report_depleted(agent_tier, (tx, ty), depleted_kind);
             } else {
                 plant.stage = GrowthStage::Harvested;
-                plant.growth_ticks = 0;
+                plant.growth = 0;
                 let depleted_kind = match plant.kind {
                     PlantKind::BerryBush | PlantKind::Grain => MemoryKind::AnyEdible,
                     PlantKind::Tree => MemoryKind::wood(),
@@ -728,6 +743,8 @@ pub fn gather_system(
                     faction_id,
                     &chunk_map,
                     &routing,
+                    &mut method_history,
+                    clock.tick,
                 );
             } else {
                 // Not a stone/wall tile and not a plant -> target is invalid or already harvested
@@ -746,6 +763,8 @@ pub fn gather_system(
                     faction_id,
                     &chunk_map,
                     &routing,
+                    &mut method_history,
+                    clock.tick,
                 );
             }
         }
@@ -762,6 +781,8 @@ pub fn gather_system(
                 faction_id,
                 &chunk_map,
                 &routing,
+                &mut method_history,
+                clock.tick,
             );
         }
     }
@@ -821,7 +842,13 @@ fn faction_muls(
     (1.0, 1.0, 1.0)
 }
 
-fn spawn_ground_drop(commands: &mut Commands, tx: i32, ty: i32, resource_id: ResourceId, qty: u32) {
+pub(crate) fn spawn_ground_drop(
+    commands: &mut Commands,
+    tx: i32,
+    ty: i32,
+    resource_id: ResourceId,
+    qty: u32,
+) {
     let (dx, dy) = adjacent_offset();
     let pos = tile_to_world(tx + dx, ty + dy);
     commands.spawn((
@@ -834,6 +861,9 @@ fn spawn_ground_drop(commands: &mut Commands, tx: i32, ty: i32, resource_id: Res
         Visibility::Visible,
         InheritedVisibility::default(),
         crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::GroundItem),
+        crate::simulation::obstacle::ConstructionObstacle {
+            resolution: crate::simulation::obstacle::ObstacleResolution::Relocate,
+        },
     ));
 }
 

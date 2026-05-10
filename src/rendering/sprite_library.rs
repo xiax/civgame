@@ -1206,6 +1206,26 @@ const RESOURCE_APPLE: &[&str] = &[
     ".....XrRrRX.....",
     "......XXX.......",
 ];
+// Generic seed: single teardrop/almond grain, used for all seed-class
+// resources (grain_seed, berry_seed, ...).
+const RESOURCE_SEED: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    ".......XX.......",
+    "......XbBX......",
+    ".....XdBBdX.....",
+    "....XdbBBbdX....",
+    "....XdDbBDdX....",
+    "....XdDDDDdX....",
+    ".....XdDDdX.....",
+    "......XddX......",
+    ".......XX.......",
+    "................",
+    "................",
+];
 
 // ============================================================
 // PLANT SPRITES  (from civgame Spritesheet design export)
@@ -5248,7 +5268,7 @@ pub fn setup_sprite_library(mut commands: Commands, mut images: ResMut<Assets<Im
     add!("creature_skeleton", CREATURE_SKELETON);
     add!("creature_bandit", CREATURE_BANDIT);
 
-    // --- Resources (13) ---
+    // --- Resources (15) ---
     add!("resource_wheat", RESOURCE_WHEAT);
     add!("resource_berries", RESOURCE_BERRIES);
     add!("resource_meat", RESOURCE_MEAT);
@@ -5263,6 +5283,7 @@ pub fn setup_sprite_library(mut commands: Commands, mut images: ResMut<Assets<Im
     add!("resource_gem", RESOURCE_GEM);
     add!("resource_water_jug", RESOURCE_WATER_JUG);
     add!("resource_apple", RESOURCE_APPLE);
+    add!("resource_seed", RESOURCE_SEED);
 
     // --- Plants (20) ---
     add!("plant_tree_oak", PLANT_TREE_OAK);

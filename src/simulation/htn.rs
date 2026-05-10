@@ -376,6 +376,15 @@ impl MethodId {
     pub const WITHDRAW_AND_HAUL_TO_PERSONAL_BLUEPRINT: MethodId = MethodId(39);
     pub const GATHER_AND_HAUL_TO_PERSONAL_BLUEPRINT: MethodId = MethodId(40);
     pub const HARVEST_MATURE_PLANT_FOR_STORAGE: MethodId = MethodId(41);
+    /// Synthetic id for terminal `Task::Explore` fallback (Phase 3) when no
+    /// registered method routes. Pushed onto `MethodHistory` so repeated
+    /// terminal-explore failures escalate to Phase 6B force-reevaluate.
+    pub const TERMINAL_EXPLORE: MethodId = MethodId(42);
+    /// Sentinel used when an executor cancels but `ai.active_method` was
+    /// `None` (e.g. a chain leg that never stamped a method). `recently_failed_count`
+    /// only matches concrete method ids, so UNKNOWN entries are harmless
+    /// padding but they keep the cancel paths panic-free.
+    pub const UNKNOWN: MethodId = MethodId(u16::MAX);
 
     pub fn raw(self) -> u16 {
         self.0
@@ -425,6 +434,8 @@ impl MethodId {
             Self::WITHDRAW_AND_HAUL_TO_PERSONAL_BLUEPRINT => "WithdrawAndHaulToPersonalBlueprint",
             Self::GATHER_AND_HAUL_TO_PERSONAL_BLUEPRINT => "GatherAndHaulToPersonalBlueprint",
             Self::HARVEST_MATURE_PLANT_FOR_STORAGE => "HarvestMaturePlantForStorage",
+            Self::TERMINAL_EXPLORE => "TerminalExplore",
+            Self::UNKNOWN => "Unknown",
             _ => "Unknown",
         }
     }
@@ -445,6 +456,14 @@ pub enum MethodOutcome {
     /// External preempt: chain dropped via `aq.cancel()` from a goal flip,
     /// muster, or distress response.
     Interrupted,
+    /// Goal flipped before the method's chain completed and the method was
+    /// *not* shielded by `MF_UNINTERRUPTIBLE`. Treated like `FailedTarget`
+    /// for scoring (penalises the abandoned method) but tagged separately
+    /// so the inspector can show why a method's bias accumulated. Without
+    /// this, an agent who keeps switching goals leaves phantom Success-
+    /// eligible state behind that fires on the next idle and never biases
+    /// away from anything.
+    Abandoned,
 }
 
 impl MethodOutcome {
@@ -454,19 +473,16 @@ impl MethodOutcome {
 }
 
 /// Soft utility penalty applied per recent failure in `MethodHistory` when
-/// the dispatcher scores a method. `0.5` keeps a once-failed method
-/// candidate (1.5 base scavenge → 1.0 effective) but pushes a twice-failed
-/// method below most siblings (1.5 → 0.5). Lower than `MAX_DIST_PENALTY`
-/// (0.30) so distance still discriminates between two siblings on the same
-/// failure count.
+/// the dispatcher scores a method.
 ///
-/// Tuned 0.5 → 0.2 per `feedback_plan_history_design.md` ("PlanHistory
-/// should bias, not exclude"): the prior 0.5 + ring-of-2 was strong enough
-/// that a single failure could flip the argmax even when the failed method
-/// remained the right choice (e.g. transient routing failure on the only
-/// reachable storage tile). 0.2 still discriminates between repeat-failers
-/// and clean candidates without dominating the utility tiers.
-pub const METHOD_FAILURE_PENALTY: f32 = 0.2;
+/// Tuned 0.5 → 0.2 → 0.4: 0.2 + ring-of-2 was mathematically too weak to
+/// overcome a 0.5 utility-tier gap (4 stacked failures needed but only 2
+/// fit in the ring). 0.4 with a ring of 6 lets three failures comfortably
+/// shift winner→runner-up while still leaving a once-failed method as a
+/// candidate. Distance penalty cap (0.30) is preserved so a single failure
+/// (-0.4) plus distance (-0.30 max) still keeps inter-tier ranking unless
+/// the agent has bounced repeatedly.
+pub const METHOD_FAILURE_PENALTY: f32 = 0.4;
 
 // ── Method utility tiers (Phase 6c) ────────────────────────────────────
 //
@@ -548,11 +564,14 @@ pub fn method_passes_policy_gate(
         .all(|(rid, flag)| data.policy_for(*rid).satisfies(*flag))
 }
 
-/// Mirrors `PLAN_HISTORY_LEN` / `PLAN_HISTORY_TTL_TICKS` from `plan/mod.rs`
-/// (per `feedback_plan_history_design.md`: ring length stays short; failures
-/// expire by tick age, not buffer eviction).
-pub const METHOD_HISTORY_LEN: usize = 2;
-pub const METHOD_HISTORY_TTL_TICKS: u64 = 100;
+/// Per-agent failure ring. Tuned 2 → 6 entries / 100 → 600 ticks:
+/// the prior ring overflowed after two parallel failure modes (e.g. food
+/// pacing + wood pacing) and the 5-second TTL evaporated bias before the
+/// agent re-considered the method on its next dispatch tick. Six slots cover
+/// the typical concurrent-method count an agent juggles; 30 seconds keeps
+/// the bias alive across a typical walk-and-arrive cycle.
+pub const METHOD_HISTORY_LEN: usize = 6;
+pub const METHOD_HISTORY_TTL_TICKS: u64 = 600;
 
 /// Per-agent ring buffer of the last few method outcomes. Phase 6a writes the
 /// component on every Person spawn site and exposes `recently_failed_count`;
@@ -589,6 +608,40 @@ impl MethodHistory {
             })
             .count() as u32
     }
+}
+
+/// Record a target-loss failure on the agent's currently-active method and
+/// clear `active_method`. Use this at executor cancel paths when a *target*
+/// became invalid (despawned plant, snatched ground item, blueprint gone).
+/// Caller is also responsible for any cluster `report_depleted` (when the
+/// target was tied to a `SharedKnowledge` cluster) and for any
+/// `release_reservation` / `release_gather_claim` on the cancelled chain leg.
+///
+/// Safe to call when `active_method` is `None` — pushes a `MethodId::UNKNOWN`
+/// entry which `recently_failed_count` filters out (it only matches concrete
+/// method ids), so the entry is harmless padding rather than a panic.
+pub fn record_target_failure(
+    method_history: &mut MethodHistory,
+    ai: &mut crate::simulation::person::PersonAI,
+    now: u64,
+) {
+    let mid = ai.active_method.take().unwrap_or(MethodId::UNKNOWN);
+    method_history.push(mid, MethodOutcome::FailedTarget, now);
+}
+
+/// Same as `record_target_failure` but stamps `FailedRouting` instead — use
+/// at chain-handoff sites where the trailing leg of a multi-step expansion
+/// could not route (e.g. `finish_gather`'s DepositToFactionStorage handoff
+/// finds no reachable storage tile). The first leg succeeded; the chain
+/// dies because the second leg is unroutable, which is structurally a
+/// routing failure, not a target failure.
+pub fn record_routing_failure(
+    method_history: &mut MethodHistory,
+    ai: &mut crate::simulation::person::PersonAI,
+    now: u64,
+) {
+    let mid = ai.active_method.take().unwrap_or(MethodId::UNKNOWN);
+    method_history.push(mid, MethodOutcome::FailedRouting, now);
 }
 
 /// Tile-level chebyshev (king's-move) distance, the same metric `SpatialIndex`
@@ -962,6 +1015,22 @@ impl MethodRegistry {
 
     pub fn method_count(&self, kind: AbstractTaskKind) -> usize {
         self.methods_for(kind).len()
+    }
+
+    /// Look up a registered method's `flags()` by its stable `MethodId`.
+    /// O(N) over every registered method (~50 entries) — only called from
+    /// `goal_dispatch_system`'s goal-flip path which fires on a tiny subset
+    /// of agents per tick. Returns `None` for `MethodId::UNKNOWN` /
+    /// `TERMINAL_EXPLORE` and any synthetic id without a registered owner.
+    pub fn flags_by_id(&self, id: MethodId) -> Option<MethodFlags> {
+        for methods in self.by_kind.values() {
+            for m in methods {
+                if m.id() == id {
+                    return Some(m.flags());
+                }
+            }
+        }
+        None
     }
 }
 
@@ -3595,8 +3664,17 @@ pub fn htn_acquire_food_dispatch_system(
                 cur_ty.div_euclid(CHUNK_SIZE as i32),
             );
 
-            let nearest_storage_tile =
-                storage_tile_map.nearest_for_faction(member.faction_id, (cur_tx, cur_ty));
+            // Phase 2a: reachability-aware storage pick. Skips storage tiles
+            // whose chunk isn't reachable from the agent's chunk so the
+            // dispatcher doesn't burn a tick on an unroutable target before
+            // the failure path biases the method.
+            let nearest_storage_tile = storage_tile_map.nearest_for_faction_reachable(
+                member.faction_id,
+                (cur_tx, cur_ty),
+                cur_chunk,
+                ai.current_z,
+                &chunk_connectivity,
+            );
             // `food_stock` returns f32 because it sums Fruit/Meat/Grain at
             // floating-point granularity in some legacy code; for ctx purposes
             // we want a u32 tally. Floor the value — under-counting is the
@@ -3607,10 +3685,24 @@ pub fn htn_acquire_food_dispatch_system(
             // GroundItem within the agent's current vision (LOS-checked by
             // `vision_system`), excluding storage tiles so the agent doesn't
             // try to "scavenge" their own deposit.
+            // Phase 2a: build a tile-reachability closure once and pass it to
+            // every vision-picker so we don't pin a target in a disconnected
+            // chunk only to fail at routing time. Two-pass design inside the
+            // pickers falls back to the connectivity-blind result if every
+            // candidate is disconnected.
+            let reach_from_agent = |t: (i32, i32)| -> bool {
+                let target_chunk = ChunkCoord(
+                    t.0.div_euclid(CHUNK_SIZE as i32),
+                    t.1.div_euclid(CHUNK_SIZE as i32),
+                );
+                chunk_connectivity
+                    .is_reachable((cur_chunk, ai.current_z), (target_chunk, ai.current_z))
+            };
             let scavenge = current_vision.nearest_scavenge_target(
                 MemoryKind::AnyEdible,
                 (cur_tx, cur_ty),
                 |t| storage_tile_map.tiles.contains_key(&t),
+                reach_from_agent,
             );
             let scavenge_target_entity = scavenge.map(|(e, _)| e);
             let scavenge_target_tile = scavenge.map(|(_, t)| t);
@@ -3648,6 +3740,7 @@ pub fn htn_acquire_food_dispatch_system(
                 viewer_settlement,
                 member.faction_id,
                 |t| gather_claims.pressure(t, now, actor) * 4,
+                reach_from_agent,
             );
             let gather_target_tile = underfoot.or(visible_forage).or_else(|| {
                 gk.nearest_target_tile(
@@ -3730,6 +3823,49 @@ pub fn htn_acquire_food_dispatch_system(
                 });
 
             let Some(method) = chosen else {
+                // Phase 3 terminal Explore fallback: every AcquireFood
+                // method's precondition failed (no inventory, no storage,
+                // no scavenge target, no known forage tile). Rather than
+                // standing idle for another goal-update cycle, walk
+                // somewhere new in the hope of recording a fresh
+                // `AnyEdible` sighting. Stamps `MethodId::TERMINAL_EXPLORE`
+                // so chronic terminal-fallback failures are observable in
+                // `MethodHistory` and later phases can escalate.
+                let home = faction_registry
+                    .home_tile(member.faction_id)
+                    .unwrap_or((cur_tx, cur_ty));
+                if let Some(dest) = pick_explore_tile(
+                    home,
+                    cur_chunk,
+                    ai.current_z,
+                    &chunk_map,
+                    &chunk_connectivity,
+                ) {
+                    let dispatched = assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx, cur_ty),
+                        cur_chunk,
+                        dest,
+                        TaskKind::Explore,
+                        None,
+                        &chunk_graph,
+                        &chunk_router,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    );
+                    if dispatched {
+                        ai.active_method = Some(MethodId::TERMINAL_EXPLORE);
+                        aq.dispatch(Task::Explore {
+                            kind: MemoryKind::AnyEdible,
+                        });
+                    } else {
+                        history.push(
+                            MethodId::TERMINAL_EXPLORE,
+                            MethodOutcome::FailedRouting,
+                            now,
+                        );
+                    }
+                }
                 return;
             };
             let chosen_id = method.id();
@@ -4077,6 +4213,15 @@ pub fn htn_acquire_good_dispatch_system(
                 let viewer_settlement = gk
                     .settlement_map
                     .first_for_faction(member.faction_id);
+                // Phase 2a: tile-reachability closure for vision pickers.
+                let reach_from_agent = |t: (i32, i32)| -> bool {
+                    let target_chunk = ChunkCoord(
+                        t.0.div_euclid(CHUNK_SIZE as i32),
+                        t.1.div_euclid(CHUNK_SIZE as i32),
+                    );
+                    chunk_connectivity
+                        .is_reachable((cur_chunk, ai.current_z), (target_chunk, ai.current_z))
+                };
                 let visible_gather = current_vision.nearest_gather_target(
                     memory_kind,
                     (cur_tx, cur_ty),
@@ -4085,6 +4230,7 @@ pub fn htn_acquire_good_dispatch_system(
                     viewer_settlement,
                     member.faction_id,
                     |t| gather_claims.pressure(t, now, actor) * 4,
+                    reach_from_agent,
                 );
                 let gather_target_tile = visible_gather.or_else(|| {
                     gk.nearest_target_tile(
@@ -4105,6 +4251,7 @@ pub fn htn_acquire_good_dispatch_system(
                     memory_kind,
                     (cur_tx, cur_ty),
                     |t| storage_tile_map.tiles.contains_key(&t),
+                    reach_from_agent,
                 );
                 let scavenge_target_entity = scavenge.map(|(e, _)| e);
                 let scavenge_target_tile = scavenge.map(|(_, t)| t);
@@ -4116,10 +4263,36 @@ pub fn htn_acquire_good_dispatch_system(
                 // `ExploreForWood`/`ExploreForStone` plan path that this PR
                 // deletes from the registry.
 
-                let gather_deposit_tile = gather_target_tile
-                    .and_then(|t| storage_tile_map.nearest_for_faction(member.faction_id, t));
-                let scavenge_deposit_tile = scavenge_target_tile
-                    .and_then(|t| storage_tile_map.nearest_for_faction(member.faction_id, t));
+                // Phase 2a: reachability-aware deposit picks for AcquireGood —
+                // pick a storage tile reachable from the gather/scavenge tile
+                // so the dispatcher doesn't bake an unroutable trailing leg
+                // into the chain.
+                let gather_deposit_tile = gather_target_tile.and_then(|t| {
+                    let target_chunk = ChunkCoord(
+                        t.0.div_euclid(CHUNK_SIZE as i32),
+                        t.1.div_euclid(CHUNK_SIZE as i32),
+                    );
+                    storage_tile_map.nearest_for_faction_reachable(
+                        member.faction_id,
+                        t,
+                        target_chunk,
+                        ai.current_z,
+                        &chunk_connectivity,
+                    )
+                });
+                let scavenge_deposit_tile = scavenge_target_tile.and_then(|t| {
+                    let target_chunk = ChunkCoord(
+                        t.0.div_euclid(CHUNK_SIZE as i32),
+                        t.1.div_euclid(CHUNK_SIZE as i32),
+                    );
+                    storage_tile_map.nearest_for_faction_reachable(
+                        member.faction_id,
+                        t,
+                        target_chunk,
+                        ai.current_z,
+                        &chunk_connectivity,
+                    )
+                });
                 let ctx = PlannerCtx {
                     tile: (cur_tx, cur_ty),
                     faction_id: member.faction_id,
@@ -4679,10 +4852,20 @@ pub fn htn_stockpile_food_dispatch_system(
             // `vision_system`), excluding storage tiles. Resolve the good's
             // resource id from `item_query` so the trailing deposit carries
             // the right payload.
+            // Phase 2a: tile-reachability closure for vision pickers.
+            let reach_from_agent = |t: (i32, i32)| -> bool {
+                let target_chunk = ChunkCoord(
+                    t.0.div_euclid(CHUNK_SIZE as i32),
+                    t.1.div_euclid(CHUNK_SIZE as i32),
+                );
+                chunk_connectivity
+                    .is_reachable((cur_chunk, ai.current_z), (target_chunk, ai.current_z))
+            };
             let scavenge = current_vision.nearest_scavenge_target(
                 MemoryKind::AnyEdible,
                 (cur_tx, cur_ty),
                 |t| storage_tile_map.tiles.contains_key(&t),
+                reach_from_agent,
             );
             let (scavenge_target_entity, scavenge_target_tile, scavenge_food_good) =
                 if let Some((entity, tile)) = scavenge {
@@ -4692,8 +4875,22 @@ pub fn htn_stockpile_food_dispatch_system(
                     (None, None, None)
                 };
 
-            let scavenge_deposit_tile = scavenge_target_tile
-                .and_then(|t| storage_tile_map.nearest_for_faction(member.faction_id, t));
+            // Phase 2a: reachability-aware deposit pick — `t` is the scavenge
+            // tile the agent will be on after pickup; from there, find the
+            // nearest *reachable* storage tile.
+            let scavenge_deposit_tile = scavenge_target_tile.and_then(|t| {
+                let target_chunk = ChunkCoord(
+                    t.0.div_euclid(CHUNK_SIZE as i32),
+                    t.1.div_euclid(CHUNK_SIZE as i32),
+                );
+                storage_tile_map.nearest_for_faction_reachable(
+                    member.faction_id,
+                    t,
+                    target_chunk,
+                    ai.current_z,
+                    &chunk_connectivity,
+                )
+            });
 
             // P6a: live `PlantMap` fast path — see AcquireFood
             // dispatcher comment. Same rationale: catches plants the
@@ -4731,6 +4928,7 @@ pub fn htn_stockpile_food_dispatch_system(
                     viewer_settlement,
                     member.faction_id,
                     |t| gather_claims.pressure(t, now, actor) * 4,
+                    reach_from_agent,
                 )
                 .and_then(|tile| {
                     let entity = plant_map.0.get(&tile).copied()?;
@@ -4759,8 +4957,20 @@ pub fn htn_stockpile_food_dispatch_system(
             });
             let gather_target_tile = forage_candidate.map(|(tile, _)| tile);
             let forage_food_good = forage_candidate.map(|(_, id)| id);
-            let gather_deposit_tile = gather_target_tile
-                .and_then(|t| storage_tile_map.nearest_for_faction(member.faction_id, t));
+            // Phase 2a: reachability-aware deposit pick.
+            let gather_deposit_tile = gather_target_tile.and_then(|t| {
+                let target_chunk = ChunkCoord(
+                    t.0.div_euclid(CHUNK_SIZE as i32),
+                    t.1.div_euclid(CHUNK_SIZE as i32),
+                );
+                storage_tile_map.nearest_for_faction_reachable(
+                    member.faction_id,
+                    t,
+                    target_chunk,
+                    ai.current_z,
+                    &chunk_connectivity,
+                )
+            });
 
             let ctx = PlannerCtx {
                 tile: (cur_tx, cur_ty),
@@ -4817,6 +5027,46 @@ pub fn htn_stockpile_food_dispatch_system(
                 });
 
             let Some(method) = chosen else {
+                // Phase 3 terminal Explore fallback (StockpileFood): every
+                // method's precondition failed (no scavengeable, no known
+                // forage tile). Walk somewhere new; the next sighting fed
+                // by `vision_system` will give the next dispatch tick a
+                // concrete target.
+                let home = faction_registry
+                    .home_tile(member.faction_id)
+                    .unwrap_or((cur_tx, cur_ty));
+                if let Some(dest) = pick_explore_tile(
+                    home,
+                    cur_chunk,
+                    ai.current_z,
+                    &chunk_map,
+                    &chunk_connectivity,
+                ) {
+                    let dispatched = assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx, cur_ty),
+                        cur_chunk,
+                        dest,
+                        TaskKind::Explore,
+                        None,
+                        &chunk_graph,
+                        &chunk_router,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    );
+                    if dispatched {
+                        ai.active_method = Some(MethodId::TERMINAL_EXPLORE);
+                        aq.dispatch(Task::Explore {
+                            kind: MemoryKind::AnyEdible,
+                        });
+                    } else {
+                        history.push(
+                            MethodId::TERMINAL_EXPLORE,
+                            MethodOutcome::FailedRouting,
+                            now,
+                        );
+                    }
+                }
                 return;
             };
             let chosen_id = method.id();
@@ -8665,6 +8915,15 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
         let viewer_settlement = gk
             .settlement_map
             .first_for_faction(member.faction_id);
+        // Phase 2a: tile-reachability closure for the visible-grain pick.
+        let reach_from_agent = |t: (i32, i32)| -> bool {
+            let target_chunk = ChunkCoord(
+                t.0.div_euclid(CHUNK_SIZE as i32),
+                t.1.div_euclid(CHUNK_SIZE as i32),
+            );
+            chunk_connectivity
+                .is_reachable((cur_chunk, ai.current_z), (target_chunk, ai.current_z))
+        };
         let visible_grain = current_vision
             .nearest_gather_target(
                 MemoryKind::AnyEdible,
@@ -8674,6 +8933,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
                 viewer_settlement,
                 member.faction_id,
                 |t| gather_claims.pressure(t, now, actor) * 4,
+                reach_from_agent,
             )
             .filter(|tile| {
                 plant_map
@@ -9837,6 +10097,132 @@ pub fn htn_method_completion_system(
     }
 }
 
+/// Dispatcher for `Task::ClearObstacle`. An idle Build-goal agent whose
+/// claimed/owned blueprint has a non-empty `pending_clear` gets routed
+/// to the first listed obstacle. Runs in `ParallelB` after the build
+/// dispatcher so the build dispatcher is the primary path; this system
+/// catches builds whose footprint still has plants standing on it.
+///
+/// Two paths mirror `htn_build_claimed_blueprint_dispatch_system`:
+/// - **Path A**: the agent holds a `JobClaim::Build` whose target
+///   blueprint has obstacles.
+/// - **Path B**: the agent owns a personal blueprint with obstacles.
+///
+/// Without a claim, idle members of a faction with stale obstacle-only
+/// blueprints stay idle — the formal posting layer (`E2`, deferred) is
+/// the long-term fix.
+pub fn htn_clear_obstacle_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    bp_map: Res<crate::simulation::construction::BlueprintMap>,
+    bp_query: Query<&crate::simulation::construction::Blueprint>,
+    obstacle_query: Query<&crate::world::spatial::Indexed>,
+    mut query: Query<
+        (
+            Entity,
+            &mut PersonAI,
+            &mut ActionQueue,
+            &AgentGoal,
+            &Transform,
+            Option<&crate::simulation::jobs::JobClaim>,
+            Option<&crate::simulation::jobs::ClaimTarget>,
+            &LodLevel,
+        ),
+        (Without<PlayerOrder>, Without<Drafted>),
+    >,
+) {
+    use crate::simulation::jobs::JobKind;
+    for (
+        agent_entity,
+        mut ai,
+        mut aq,
+        goal,
+        transform,
+        job_claim_opt,
+        claim_target_opt,
+        lod,
+    ) in query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::Build) {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+
+        // Path A — JobClaim::Build target with non-empty pending_clear.
+        let path_a: Option<Entity> = match (job_claim_opt, claim_target_opt) {
+            (Some(claim), Some(target)) if claim.kind == JobKind::Build => {
+                target.blueprint.filter(|&bp_e| {
+                    bp_query.get(bp_e).map(|bp| !bp.pending_clear.is_empty()).unwrap_or(false)
+                })
+            }
+            _ => None,
+        };
+
+        // Path B — personal blueprint with non-empty pending_clear.
+        let path_b: Option<Entity> = if path_a.is_some() {
+            None
+        } else {
+            bp_map.0.values().copied().find(|&bp_e| {
+                bp_query
+                    .get(bp_e)
+                    .map(|bp| {
+                        bp.personal_owner == Some(agent_entity) && !bp.pending_clear.is_empty()
+                    })
+                    .unwrap_or(false)
+            })
+        };
+
+        let Some(bp_entity) = path_a.or(path_b) else {
+            continue;
+        };
+        let Ok(bp) = bp_query.get(bp_entity) else {
+            continue;
+        };
+        let Some(&obstacle_entity) = bp.pending_clear.first() else {
+            continue;
+        };
+        let Ok(obs_indexed) = obstacle_query.get(obstacle_entity) else {
+            continue;
+        };
+        let tile = obs_indexed.tile;
+
+        let agent_tile = (
+            (transform.translation.x / TILE_SIZE).floor() as i32,
+            (transform.translation.y / TILE_SIZE).floor() as i32,
+        );
+        let cur_chunk = ChunkCoord(
+            agent_tile.0.div_euclid(CHUNK_SIZE as i32),
+            agent_tile.1.div_euclid(CHUNK_SIZE as i32),
+        );
+        let dispatched = assign_task_with_routing(
+            &mut ai,
+            agent_tile,
+            cur_chunk,
+            tile,
+            TaskKind::ClearObstacle,
+            Some(obstacle_entity),
+            &chunk_graph,
+            &chunk_router,
+            &chunk_map,
+            &chunk_connectivity,
+        );
+        if dispatched {
+            aq.dispatch(Task::ClearObstacle {
+                entity: obstacle_entity,
+                blueprint: bp_entity,
+            });
+            ai.active_method = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9888,11 +10274,15 @@ mod tests {
     #[test]
     fn method_history_ring_overwrites_oldest() {
         let mut h = MethodHistory::default();
-        // METHOD_HISTORY_LEN=2, so a third push evicts the first.
-        h.push(MethodId::SLEEP, MethodOutcome::FailedTarget, 10);
-        h.push(MethodId::SLEEP, MethodOutcome::FailedTarget, 20);
-        h.push(MethodId::SLEEP, MethodOutcome::FailedTarget, 30);
-        assert_eq!(h.recently_failed_count(MethodId::SLEEP, 35), 2);
+        // Push METHOD_HISTORY_LEN+1 entries; the oldest gets evicted so the
+        // count saturates at the ring length.
+        for i in 0..(METHOD_HISTORY_LEN + 1) {
+            h.push(MethodId::SLEEP, MethodOutcome::FailedTarget, 10 + i as u64);
+        }
+        assert_eq!(
+            h.recently_failed_count(MethodId::SLEEP, 10 + METHOD_HISTORY_LEN as u64 + 5),
+            METHOD_HISTORY_LEN as u32
+        );
     }
 
     #[test]

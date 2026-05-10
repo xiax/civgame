@@ -374,19 +374,19 @@ pub fn setup_pixel_art(mut commands: Commands, mut images: ResMut<Assets<Image>>
         "................",
         "................",
         "................",
+        ".......XX.......",
+        "......XbBX......",
+        ".....XdBBdX.....",
+        "....XdbBBbdX....",
+        "....XdDbBDdX....",
+        "....XdDDDDdX....",
+        ".....XdDDdX.....",
+        "......XddX......",
+        ".......XX.......",
         "................",
         "................",
-        "................",
-        "................",
-        "................",
-        "................",
-        "................",
-        ".......dd.......",
-        "......dddd......",
-        "......dddd......",
-        ".......dd.......",
     ];
-    let plant_seed_img = ascii_to_image(plant_seed_ascii, &[('d', d_b), ('.', _t)]);
+    let plant_seed_img = ascii_to_image(plant_seed_ascii, WARM_PALETTE);
 
     // Plant Seedling (sapling): 16x16
     let plant_seedling_img = ascii_to_image(

@@ -2509,11 +2509,23 @@ pub fn job_goal_lock_system(
             release_claimant(&mut board, claim.job_id, worker);
             continue;
         }
+        // Phase 5 contract: the equality guards below avoid writing through
+        // `&mut AgentGoal` when the lock target matches the agent's current
+        // goal. Without them every tick triggers `Changed<AgentGoal>` for
+        // every JobClaim'd worker, which `record_abandoned_method_system`
+        // then misreads as a chain of goal flips and biases each working
+        // method into oblivion.
         let target = if let Some(p) = board.get(claim.job_id) {
-            *goal = posting_goal(p);
+            let new_goal = posting_goal(p);
+            if *goal != new_goal {
+                *goal = new_goal;
+            }
             posting_claim_target(p)
         } else {
-            *goal = claim.kind.to_goal();
+            let new_goal = claim.kind.to_goal();
+            if *goal != new_goal {
+                *goal = new_goal;
+            }
             ClaimTarget::default()
         };
         match target_opt.as_mut() {

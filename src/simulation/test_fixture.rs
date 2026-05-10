@@ -8089,7 +8089,7 @@ mod baseline_behaviour {
                 Plant {
                     kind: PlantKind::Grain,
                     stage: GrowthStage::Mature,
-                    growth_ticks: 0,
+                    growth: 0,
                     tile_pos: grain_tile,
                 },
                 Transform::from_xyz(grain_world.x, grain_world.y, 0.4),
@@ -8280,7 +8280,7 @@ mod baseline_behaviour {
                 Plant {
                     kind: PlantKind::Grain,
                     stage: GrowthStage::Mature,
-                    growth_ticks: 0,
+                    growth: 0,
                     tile_pos: grain_tile,
                 },
                 Transform::from_xyz(grain_world.x, grain_world.y, 0.4),
@@ -8437,7 +8437,7 @@ mod baseline_behaviour {
                 Plant {
                     kind: PlantKind::BerryBush,
                     stage: GrowthStage::Mature,
-                    growth_ticks: 0,
+                    growth: 0,
                     tile_pos: berry_tile,
                 },
                 Transform::from_xyz(berry_world.x, berry_world.y, 0.4),
@@ -8552,7 +8552,7 @@ mod baseline_behaviour {
                 Plant {
                     kind: PlantKind::Tree,
                     stage: GrowthStage::Mature,
-                    growth_ticks: 0,
+                    growth: 0,
                     tile_pos: tree_tile,
                 },
                 Transform::from_xyz(tree_world.x, tree_world.y, 0.4),
@@ -8751,7 +8751,7 @@ mod baseline_behaviour {
                 Plant {
                     kind: PlantKind::BerryBush,
                     stage: GrowthStage::Mature,
-                    growth_ticks: 0,
+                    growth: 0,
                     tile_pos: berry_tile,
                 },
                 Transform::from_xyz(berry_world.x, berry_world.y, 0.4),
@@ -8832,7 +8832,7 @@ mod baseline_behaviour {
                 Plant {
                     kind: PlantKind::Grain,
                     stage: GrowthStage::Mature,
-                    growth_ticks: 0,
+                    growth: 0,
                     tile_pos: grain_tile,
                 },
                 Transform::from_xyz(grain_world.x, grain_world.y, 0.4),
@@ -8925,7 +8925,7 @@ mod baseline_behaviour {
                     Plant {
                         kind: PlantKind::Grain,
                         stage: GrowthStage::Mature,
-                        growth_ticks: 0,
+                        growth: 0,
                         tile_pos: tile,
                     },
                     Transform::from_xyz(world.x, world.y, 0.4),
@@ -9327,7 +9327,7 @@ mod baseline_behaviour {
                 Plant {
                     kind: PlantKind::Tree,
                     stage: GrowthStage::Mature,
-                    growth_ticks: 0,
+                    growth: 0,
                     tile_pos: tree_tile,
                 },
                 Transform::from_xyz(tree_world.x, tree_world.y, 0.4),
@@ -9441,7 +9441,7 @@ mod baseline_behaviour {
                 Plant {
                     kind: PlantKind::BerryBush,
                     stage: GrowthStage::Mature,
-                    growth_ticks: 0,
+                    growth: 0,
                     tile_pos: berry_tile,
                 },
                 Transform::from_xyz(berry_world.x, berry_world.y, 0.4),

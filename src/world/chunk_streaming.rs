@@ -608,6 +608,9 @@ pub fn spawn_chunk_loose_rocks(commands: &mut Commands, chunk_map: &ChunkMap, co
                 Visibility::Visible,
                 InheritedVisibility::default(),
                 crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::GroundItem),
+                crate::simulation::obstacle::ConstructionObstacle {
+                    resolution: crate::simulation::obstacle::ObstacleResolution::Relocate,
+                },
             ));
         }
     }

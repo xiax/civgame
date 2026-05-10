@@ -1076,6 +1076,49 @@ impl StorageTileMap {
             .min_by_key(|&&(tx, ty)| (tx as i32 - from.0).abs() + (ty as i32 - from.1).abs())
             .copied()
     }
+
+    /// Phase 2a: like `nearest_for_faction` but skips storage tiles whose
+    /// chunk isn't reachable from `agent_chunk` at `agent_z` per
+    /// `ChunkConnectivity`. Closes the gap where the Manhattan-closest
+    /// storage tile sits in a disconnected component (across a wall, in a
+    /// separated cave, on a different megachunk surface) and the dispatcher
+    /// would happily pick it, then fail at `assign_task_with_routing` and
+    /// burn a tick before re-evaluating.
+    ///
+    /// Falls back to the connectivity-blind result when the reachability
+    /// filter rejects every tile — better to attempt a (likely-failing)
+    /// route than return `None` and have the dispatcher emit nothing at
+    /// all. The `Phase 1` cancel-path failure recording will still bias
+    /// the method on miss; this is purely a reachability *first-pass*.
+    pub fn nearest_for_faction_reachable(
+        &self,
+        faction_id: u32,
+        from: (i32, i32),
+        agent_chunk: crate::world::chunk::ChunkCoord,
+        agent_z: i8,
+        connectivity: &crate::pathfinding::connectivity::ChunkConnectivity,
+    ) -> Option<(i32, i32)> {
+        let tiles = self.by_faction.get(&faction_id)?;
+        let pick = |reachable_only: bool| {
+            tiles
+                .iter()
+                .filter(|&&(tx, ty)| {
+                    if !reachable_only {
+                        return true;
+                    }
+                    let target_chunk = crate::world::chunk::ChunkCoord(
+                        (tx as i32).div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+                        (ty as i32).div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+                    );
+                    connectivity.is_reachable((agent_chunk, agent_z), (target_chunk, agent_z))
+                })
+                .min_by_key(|&&(tx, ty)| {
+                    (tx as i32 - from.0).abs() + (ty as i32 - from.1).abs()
+                })
+                .copied()
+        };
+        pick(true).or_else(|| pick(false))
+    }
 }
 
 /// Tile-scoped reservations on storage stocks. Two agents committing to the

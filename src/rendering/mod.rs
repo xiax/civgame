@@ -1,4 +1,3 @@
-use crate::simulation::plants;
 use crate::world::chunk_streaming;
 use bevy::prelude::*;
 
@@ -119,8 +118,6 @@ impl Plugin for RenderingPlugin {
                     entity_sprites::animate_horses_system,
                     animations::handle_combat_events,
                     animations::update_animations,
-                    plants::plant_growth_system,
-                    plants::seed_scatter_system.after(plants::plant_growth_system),
                 ),
             )
             .add_systems(

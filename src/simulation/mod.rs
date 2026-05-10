@@ -8,6 +8,7 @@ pub mod lifecycle;
 pub mod carry;
 pub mod carve;
 pub mod civic_milestones;
+pub mod clear_obstacle;
 pub mod combat;
 pub mod construction;
 pub mod corpse;
@@ -31,6 +32,7 @@ pub mod movement;
 pub mod needs;
 pub mod nomad;
 pub mod nomad_pool;
+pub mod obstacle;
 pub mod pack_deploy;
 pub mod sedentary_collapse;
 pub mod person;
@@ -91,6 +93,7 @@ impl Plugin for SimulationPlugin {
             .add_event::<knowledge::DiscoveryActionEvent>()
             .add_event::<land::PlotEvictedEvent>()
             .insert_resource(SimClock::default())
+            .insert_resource(goals::ForceGoalReevaluate::default())
             .insert_resource(faction::FactionRegistry::default())
             .insert_resource(faction::PlayerFaction::default())
             .insert_resource(faction::StorageTileMap::default())
@@ -162,6 +165,15 @@ impl Plugin for SimulationPlugin {
                     construction::seed_starting_buildings_system
                         .after(person::spawn_population)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Seeded structures (walls, beds, hearths, nomadic shelters)
+                    // bypass the blueprint pipeline, so the per-blueprint
+                    // obstacle scan never runs on them. This one-shot pass
+                    // walks `StructureIndex` and clears obstacles on every
+                    // seeded tile — plants despawn (yields drop on ground),
+                    // loose rocks relocate aside.
+                    clear_obstacle::clear_obstacles_under_seeded_structures
+                        .after(construction::seed_starting_buildings_system)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                 ),
             )
             .add_systems(
@@ -181,6 +193,15 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 (
                     goals::goal_update_system.after(needs::tick_needs_system),
+                    // Phase 5: must observe `Changed<AgentGoal>` after
+                    // `goal_update_system` flips it but before the typed-task
+                    // tick so the abandoned method's bias is in `MethodHistory`
+                    // by the time the next dispatcher reads it. `Changed` only
+                    // fires on real flips because both `goal_update_system`
+                    // and `job_goal_lock_system` guard their `*goal = X` writes
+                    // on `*goal != new_goal`.
+                    goals::record_abandoned_method_system
+                        .after(goals::goal_update_system),
                     animals::animal_sense_system,
                 )
                     .in_set(SimulationSet::ParallelA),
@@ -289,6 +310,63 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 animals::attach_pack_inventory_system
                     .in_set(SimulationSet::Sequential),
+            )
+            // Calendar-driven plant lifecycle (replaces the old per-frame
+            // tick growth + scatter pair). Edge-triggers on season change;
+            // ordered after `advance_calendar_system` so the season the
+            // calendar just landed on is the one we react to.
+            .add_systems(
+                FixedUpdate,
+                plants::plant_lifecycle_system
+                    .after(crate::world::seasons::advance_calendar_system)
+                    .in_set(SimulationSet::Sequential),
+            )
+            // ClearObstacle executor — own add_systems call (Sequential
+            // tuples are at the 20-element ceiling). Ordered after
+            // movement (work_progress is incremented there) and before
+            // construction (build gate reads `pending_clear`).
+            .add_systems(
+                FixedUpdate,
+                clear_obstacle::clear_obstacle_task_system
+                    .after(movement::movement_system)
+                    .before(construction::construction_system)
+                    .in_set(SimulationSet::Sequential),
+            )
+            // Reactive: every newly-spawned `Blueprint` has its footprint
+            // scanned for `ConstructionObstacle` entities. WorkerClear
+            // hits land on `pending_clear`; Relocate hits move aside
+            // synchronously. Sequential, before construction so the
+            // gate sees populated pending_clear on the same tick.
+            .add_systems(
+                FixedUpdate,
+                obstacle::populate_pending_clear_system
+                    .before(construction::construction_system)
+                    .in_set(SimulationSet::Sequential),
+            )
+            // Reactive cleanup for obstacles that spawn under existing
+            // structures / blueprints — most importantly, loose rocks
+            // streamed in by `chunk_streaming_system` (FixedUpdate) onto
+            // tiles that the OnEnter(Playing) seeded-structure pass
+            // already left behind. Sequential after movement so the
+            // `relocate_entity_aside` Transform mutation rides the next
+            // `sync_indexed_after_move_system` pass.
+            .add_systems(
+                FixedUpdate,
+                clear_obstacle::react_obstacle_under_structure_system
+                    .after(movement::sync_indexed_after_move_system)
+                    .in_set(SimulationSet::Sequential),
+            )
+            // ClearObstacle dispatcher — own add_systems call (ParallelB
+            // tuples are at the 20-element ceiling). Routes idle Build-
+            // goal agents to the first pending_clear obstacle on a same-
+            // faction (or personal) blueprint. Ordered after the build
+            // dispatcher; both systems gate on (Idle + UNEMPLOYED), so
+            // one wins the agent each tick.
+            .add_systems(
+                FixedUpdate,
+                htn::htn_clear_obstacle_dispatch_system
+                    .after(htn::htn_build_claimed_blueprint_dispatch_system)
+                    .in_set(SimulationSet::ParallelB),
             )
             .add_systems(
                 // Phase 5e-xi-a/b: split-off because the main ParallelB tuple
@@ -494,6 +572,8 @@ impl Plugin for SimulationPlugin {
                         .after(jobs::chief_job_posting_system),
                     jobs::job_claim_release_system
                         .after(jobs::job_build_completion_system),
+                    goals::chronic_failure_release_system
+                        .after(jobs::job_claim_release_system),
                 )
                     .in_set(SimulationSet::Economy),
             )

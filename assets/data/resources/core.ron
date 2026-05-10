@@ -64,7 +64,7 @@ ResourceFile(
             storage_class: granary,
             trade_base_value: 3,
             tags: ["seed"],
-            sprite_key: Some("resource_wheat"),
+            sprite_key: Some("resource_seed"),
         ),
         ResourceDef(
             key: "berry_seed",
@@ -77,7 +77,7 @@ ResourceFile(
             storage_class: granary,
             trade_base_value: 3,
             tags: ["seed"],
-            sprite_key: Some("resource_berries"),
+            sprite_key: Some("resource_seed"),
         ),
 
         // ── Construction materials ────────────────────────────────────

@@ -182,22 +182,32 @@ impl CurrentVision {
         viewer_settlement: Option<crate::simulation::settlement::SettlementId>,
         viewer_faction: u32,
         claim_penalty: impl Fn((i32, i32)) -> i32,
+        is_reachable: impl Fn((i32, i32)) -> bool,
     ) -> Option<(i32, i32)> {
-        self.iter_kind(kind)
-            .filter(|v| v.entity.is_none())
-            .filter(|v| {
-                v.owner.is_accessible_to(
-                    viewer,
-                    viewer_household,
-                    viewer_settlement,
-                    viewer_faction,
-                )
-            })
-            .min_by_key(|v| {
-                let cheb = (v.tile.0 - from.0).abs().max((v.tile.1 - from.1).abs());
-                cheb + claim_penalty(v.tile)
-            })
-            .map(|v| v.tile)
+        // Phase 2a: prefer reachable targets; if every visible candidate is
+        // in a disconnected chunk, fall back to the unfiltered nearest so
+        // the dispatcher doesn't suddenly emit nothing for an agent who
+        // stepped into a momentarily-unbuilt-graph chunk. Matches the
+        // fallback behaviour of `StorageTileMap::nearest_for_faction_reachable`.
+        let pick = |require_reachable: bool| -> Option<(i32, i32)> {
+            self.iter_kind(kind)
+                .filter(|v| v.entity.is_none())
+                .filter(|v| {
+                    v.owner.is_accessible_to(
+                        viewer,
+                        viewer_household,
+                        viewer_settlement,
+                        viewer_faction,
+                    )
+                })
+                .filter(|v| !require_reachable || is_reachable(v.tile))
+                .min_by_key(|v| {
+                    let cheb = (v.tile.0 - from.0).abs().max((v.tile.1 - from.1).abs());
+                    cheb + claim_penalty(v.tile)
+                })
+                .map(|v| v.tile)
+        };
+        pick(true).or_else(|| pick(false))
     }
 
     /// Pick the nearest visible entity-anchored target (`entity == Some`) of
@@ -209,13 +219,21 @@ impl CurrentVision {
         kind: MemoryKind,
         from: (i32, i32),
         is_storage_tile: impl Fn((i32, i32)) -> bool,
+        is_reachable: impl Fn((i32, i32)) -> bool,
     ) -> Option<(Entity, (i32, i32))> {
-        self.iter_kind(kind)
-            .filter_map(|v| v.entity.map(|e| (e, v.tile)))
-            .filter(|(_, tile)| !is_storage_tile(*tile))
-            .min_by_key(|(_, tile)| {
-                (tile.0 - from.0).abs().max((tile.1 - from.1).abs())
-            })
+        // Phase 2a: prefer reachable scavenge targets; fall back to the
+        // unfiltered nearest if everything visible is in a disconnected
+        // chunk. Matches `nearest_gather_target`'s two-pass shape.
+        let pick = |require_reachable: bool| -> Option<(Entity, (i32, i32))> {
+            self.iter_kind(kind)
+                .filter_map(|v| v.entity.map(|e| (e, v.tile)))
+                .filter(|(_, tile)| !is_storage_tile(*tile))
+                .filter(|(_, tile)| !require_reachable || is_reachable(*tile))
+                .min_by_key(|(_, tile)| {
+                    (tile.0 - from.0).abs().max((tile.1 - from.1).abs())
+                })
+        };
+        pick(true).or_else(|| pick(false))
     }
 }
 

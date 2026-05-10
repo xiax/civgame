@@ -78,6 +78,13 @@ pub enum TaskKind {
     /// + `nomad_migration_dispatch_system` (ParallelB) +
     /// `nomad_migration_arrival_system` (Sequential, after movement).
     Migrate = 43,
+    /// Worker walks adjacent to a `ConstructionObstacle`-tagged entity
+    /// inside a blueprint's footprint, accumulates work_progress, then
+    /// despawns the entity (dropping any yields on the ground) and
+    /// pops it from the blueprint's `pending_clear`. Distinct from
+    /// `Gather` because the work is structure-prerequisite, not
+    /// resource-acquisition; yields go to ground for haulers.
+    ClearObstacle = 44,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -127,6 +134,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::HoldLecture as u16 => "Lecturing",
         x if x == TaskKind::AttendLecture as u16 => "Attending Lecture",
         x if x == TaskKind::Migrate as u16 => "Migrating to Camp",
+        x if x == TaskKind::ClearObstacle as u16 => "Clearing Obstacle",
         _ => "Unemployed",
     }
 }
@@ -150,7 +158,8 @@ pub fn task_requires_free_hands(task_id: u16) -> u8 {
             || x == TaskKind::Raid as u16
             || x == TaskKind::Defend as u16
             || x == TaskKind::MilitaryAttack as u16
-            || x == TaskKind::TameAnimal as u16 =>
+            || x == TaskKind::TameAnimal as u16
+            || x == TaskKind::ClearObstacle as u16 =>
         {
             1
         }
@@ -173,6 +182,7 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::Planter as u16
         || task_id == TaskKind::Construct as u16
         || task_id == TaskKind::ConstructBed as u16
+        || task_id == TaskKind::ClearObstacle as u16
         || task_id == TaskKind::HaulMaterials as u16
         || task_id == TaskKind::DepositResource as u16
         || task_id == TaskKind::TameAnimal as u16
@@ -725,6 +735,13 @@ pub fn goal_dispatch_system(
                     AgentGoal::Build if ai.task_id == TaskKind::ConstructBed as u16 => {
                         Some(TaskKind::ConstructBed as u16)
                     }
+                    // ClearObstacle is a Build-prerequisite chain — preserve
+                    // across goal-dispatch ticks the same way as Construct,
+                    // so the worker stays committed until the obstacle is
+                    // cleared (or the executor naturally advances).
+                    AgentGoal::Build if ai.task_id == TaskKind::ClearObstacle as u16 => {
+                        Some(TaskKind::ClearObstacle as u16)
+                    }
                     // Phase 5e-xiii-a: HTN-driven personal-blueprint chain
                     // (`WithdrawAndHaulToPersonalBlueprintMethod`) runs without
                     // an ActivePlan under Build. Both legs (WithdrawMaterial +
@@ -944,6 +961,18 @@ pub fn goal_dispatch_system(
                 };
 
                 if Some(ai.task_id) != expected_task {
+                    // Phase 5 contract note: this branch fires both for
+                    // genuine goal flips *and* for working chains whose
+                    // (goal, task) pair is missing a preserve arm above
+                    // (HTN re-dispatches the same chain next tick, so the
+                    // chain still progresses). Recording `Abandoned` here
+                    // would push every fire-and-redispatch cycle of a
+                    // long-running chain into `MethodHistory` — a 600-
+                    // tick walk would saturate the failure ring within a
+                    // handful of ticks and the agent would bias against
+                    // its own working method. The `Abandoned` outcome is
+                    // therefore recorded by `goal_update_system` (the
+                    // actual goal-flip site), not here.
                     // Goal changed or task is done; drop the current task.
                     // A pending gather claim must release here too: a goal
                     // flip preempts the chain before `finish_gather` runs.

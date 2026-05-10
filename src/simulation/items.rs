@@ -4,6 +4,7 @@ use crate::economy::item::Item;
 use crate::simulation::carry::Carrier;
 use crate::simulation::faction::{FactionMember, SOLO};
 use crate::simulation::gather::GatherRoutingResources;
+use crate::simulation::htn::{record_routing_failure, record_target_failure, MethodHistory};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, Person, PersonAI};
@@ -187,6 +188,8 @@ fn finish_scavenge(
     faction_id: Option<u32>,
     chunk_map: &ChunkMap,
     routing: &GatherRoutingResources,
+    method_history: &mut MethodHistory,
+    now: u64,
 ) {
     ai.state = AiState::Idle;
     ai.task_id = PersonAI::UNEMPLOYED;
@@ -198,12 +201,14 @@ fn finish_scavenge(
             // 5c-ii-d-ii-a: AcquireGood scavenge tail. Walk to nearest faction
             // storage and prime DepositResource.
             let Some(fid) = faction_id else {
+                record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 return;
             };
             let Some(storage_tile) =
                 routing.storage_tile_map.nearest_for_faction(fid, cur_tile)
             else {
+                record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 return;
             };
@@ -220,6 +225,7 @@ fn finish_scavenge(
                 &routing.chunk_connectivity,
             );
             if !dispatched {
+                record_routing_failure(method_history, ai, now);
                 aq.cancel();
             }
         }
@@ -262,6 +268,7 @@ pub fn item_pickup_system(
             &LodLevel,
             &Transform,
             Option<&FactionMember>,
+            &mut MethodHistory,
         ),
         With<Person>,
     >,
@@ -278,6 +285,7 @@ pub fn item_pickup_system(
         lod,
         transform,
         faction_member,
+        mut method_history,
     ) in pickers.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -301,8 +309,11 @@ pub fn item_pickup_system(
         // Phase 3b-vi: target comes from typed `Task::Scavenge`, falling back
         // to legacy `target_item.0` for any unmigrated dispatch path.
         let Some(target_ent) = aq.current.as_scavenge().or(target_item.0) else {
-            // No target, but in scavenge state? Cleanup.
+            // No target, but in scavenge state? Cleanup. The arrival-state
+            // machine got into Scavenge with no `target_ent` — treat as a
+            // target failure so the next argmax biases away from this method.
             target_item.0 = None;
+            record_target_failure(&mut method_history, &mut ai, clock.tick);
             finish_scavenge(
                 &mut ai,
                 &mut aq,
@@ -311,6 +322,8 @@ pub fn item_pickup_system(
                 faction_id,
                 &chunk_map,
                 &routing,
+                &mut method_history,
+                clock.tick,
             );
             continue;
         };
@@ -362,10 +375,14 @@ pub fn item_pickup_system(
                 faction_id,
                 &chunk_map,
                 &routing,
+                &mut method_history,
+                clock.tick,
             );
         } else {
-            // Targeted item is gone (stolen or rotted)
+            // Targeted item is gone (stolen or rotted) — record failure so
+            // the next argmax biases away from the same scavenge target.
             target_item.0 = None;
+            record_target_failure(&mut method_history, &mut ai, clock.tick);
             finish_scavenge(
                 &mut ai,
                 &mut aq,
@@ -374,6 +391,8 @@ pub fn item_pickup_system(
                 faction_id,
                 &chunk_map,
                 &routing,
+                &mut method_history,
+                clock.tick,
             );
         }
     }

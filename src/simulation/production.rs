@@ -393,6 +393,7 @@ pub fn withdraw_material_task_system(
         &FactionMember,
         &BucketSlot,
         &LodLevel,
+        &mut crate::simulation::htn::MethodHistory,
     )>,
 ) {
     use crate::simulation::typed_task::Task;
@@ -408,6 +409,7 @@ pub fn withdraw_material_task_system(
         member,
         slot,
         lod,
+        mut method_history,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -430,6 +432,8 @@ pub fn withdraw_material_task_system(
             finish_withdraw_material(
                 &mut ai,
                 &mut aq,
+                &mut method_history,
+                clock.tick,
                 &storage_reservations,
                 &chunk_map,
                 &chunk_graph,
@@ -447,6 +451,8 @@ pub fn withdraw_material_task_system(
             finish_withdraw_material(
                 &mut ai,
                 &mut aq,
+                &mut method_history,
+                clock.tick,
                 &storage_reservations,
                 &chunk_map,
                 &chunk_graph,
@@ -467,6 +473,8 @@ pub fn withdraw_material_task_system(
             finish_withdraw_material(
                 &mut ai,
                 &mut aq,
+                &mut method_history,
+                clock.tick,
                 &storage_reservations,
                 &chunk_map,
                 &chunk_graph,
@@ -566,6 +574,8 @@ pub fn withdraw_material_task_system(
         finish_withdraw_material(
             &mut ai,
             &mut aq,
+            &mut method_history,
+            clock.tick,
             &storage_reservations,
             &chunk_map,
             &chunk_graph,
@@ -596,6 +606,8 @@ pub fn withdraw_material_task_system(
 fn finish_withdraw_material(
     ai: &mut PersonAI,
     aq: &mut crate::simulation::typed_task::ActionQueue,
+    method_history: &mut crate::simulation::htn::MethodHistory,
+    now: u64,
     storage_reservations: &StorageReservations,
     chunk_map: &crate::world::chunk::ChunkMap,
     chunk_graph: &crate::pathfinding::chunk_graph::ChunkGraph,
@@ -619,6 +631,7 @@ fn finish_withdraw_material(
             // and arrival. Drop the chain to Idle so the goal-dispatch path
             // can re-evaluate next tick rather than strand the agent.
             let Ok(bp) = bp_query.get(blueprint) else {
+                crate::simulation::htn::record_target_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
@@ -639,6 +652,7 @@ fn finish_withdraw_material(
                 chunk_connectivity,
             );
             if !dispatched {
+                crate::simulation::htn::record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
@@ -652,6 +666,7 @@ fn finish_withdraw_material(
             // hand, route to the order's anchor tile. Despawned/satisfied
             // orders silently degrade to Idle so the agent re-evaluates.
             let Ok(order_data) = co_query.get(order) else {
+                crate::simulation::htn::record_target_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
@@ -672,6 +687,7 @@ fn finish_withdraw_material(
                 chunk_connectivity,
             );
             if !dispatched {
+                crate::simulation::htn::record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
@@ -710,6 +726,7 @@ fn finish_withdraw_material(
                 chunk_connectivity,
             );
             if !dispatched {
+                crate::simulation::htn::record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
@@ -768,6 +785,7 @@ fn finish_withdraw_material(
                 chunk_connectivity,
             );
             if !dispatched {
+                crate::simulation::htn::record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
@@ -782,6 +800,7 @@ fn finish_withdraw_material(
             // No other task family is expected as a chained follow-up to
             // WithdrawMaterial. Drop the entire chain to Idle so a
             // mis-built expansion can't strand the agent.
+            crate::simulation::htn::record_target_failure(method_history, ai, now);
             aq.cancel();
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;

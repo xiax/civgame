@@ -43,7 +43,11 @@ const HUNGER_EAT_HELD: f32 = 180.0;
 /// hunt/forage immediately).
 const HUNGER_FORAGE_REQUIRED: f32 = 150.0;
 /// Above this hunger the starvation flag fires (used for emergency reactions).
-const HUNGER_STARVING: f32 = 120.0;
+/// Held at `EAT_TRIGGER_HUNGER` so the goal label flips at exactly the same
+/// hunger level the AcquireFood dispatcher / methods are willing to act on —
+/// otherwise an agent in (HUNGER_STARVING, EAT_TRIGGER_HUNGER) is labelled
+/// "Starving (Faction has food)" while every dispatcher silently bails.
+const HUNGER_STARVING: f32 = 180.0;
 /// Above this sleep need an agent enters Sleep.
 const SLEEP_TIRED: f32 = 180.0;
 /// Above this sleep need an agent prefers not to start a long task.
@@ -185,6 +189,95 @@ pub struct RescueTarget {
 #[derive(Component, Default)]
 pub struct GoalReason(pub &'static str);
 
+/// Per-agent cooldown table that gates *opportunistic* goal eligibility.
+/// `(goal_disc, expires_tick)` ring with 4 slots; oldest evicted on
+/// overflow. Phase 6B writes here on chronic method-failure for any
+/// non-survival goal so the next `goal_update_system` evaluation
+/// declines re-entering the same goal until the cooldown expires.
+///
+/// **Survive / Sleep are never cooldown-gated.** The `is_active` check
+/// rejects those discriminants up front — a hungry agent who can't
+/// find food via methods AND can't make Explore-fallback work would
+/// otherwise starve, and a sleep-need-critical agent likewise.
+///
+/// `craft_until_tick` is preserved for `should_craft`'s legacy fast
+/// path; `chronic_craft_cooldown_system` writes both `craft_until_tick`
+/// *and* the ring entry so old + new readers stay in sync.
+#[derive(Component, Default, Debug)]
+pub struct GoalCooldown {
+    pub craft_until_tick: u64,
+    pub entries: [Option<(u8, u64)>; 4],
+}
+
+impl GoalCooldown {
+    /// Goal discriminants we *allow* in the cooldown ring. `Survive` /
+    /// `Sleep` are explicitly absent — see component-level doc.
+    fn cooldown_eligible(goal: AgentGoal) -> bool {
+        !matches!(goal, AgentGoal::Survive | AgentGoal::Sleep)
+    }
+
+    pub fn push(&mut self, goal: AgentGoal, expires_tick: u64) {
+        if !Self::cooldown_eligible(goal) {
+            return;
+        }
+        let disc = goal as u8;
+        // Refresh-in-place if the same discriminant already lives in the
+        // ring — keeps ring entries unique per goal.
+        for slot in self.entries.iter_mut() {
+            if let Some((d, t)) = slot {
+                if *d == disc {
+                    *t = (*t).max(expires_tick);
+                    return;
+                }
+            }
+        }
+        // First empty slot wins.
+        for slot in self.entries.iter_mut() {
+            if slot.is_none() {
+                *slot = Some((disc, expires_tick));
+                return;
+            }
+        }
+        // Ring full: evict the entry with the *earliest* expiry (the
+        // most-likely-already-expired one).
+        let mut evict_idx = 0usize;
+        let mut earliest = u64::MAX;
+        for (i, slot) in self.entries.iter().enumerate() {
+            if let Some((_, t)) = slot {
+                if *t < earliest {
+                    earliest = *t;
+                    evict_idx = i;
+                }
+            }
+        }
+        self.entries[evict_idx] = Some((disc, expires_tick));
+    }
+
+    pub fn is_active(&self, goal: AgentGoal, now: u64) -> bool {
+        if !Self::cooldown_eligible(goal) {
+            return false;
+        }
+        let disc = goal as u8;
+        self.entries
+            .iter()
+            .any(|s| matches!(s, Some((d, t)) if *d == disc && *t > now))
+    }
+}
+
+/// Phase 6B force-reevaluate set. `chronic_failure_release_system`
+/// inserts entities into this set when their current goal has failed
+/// chronically; `goal_update_system` then bypasses the 200-tick
+/// cadence for those entities (so the goal flips on the very next
+/// tick rather than waiting up to ~10 s) and drains the set after
+/// evaluating. Without this, an autonomous-goal agent whose only
+/// applicable methods are all bias-suppressed would idle for the
+/// full cadence cycle before re-evaluating.
+///
+/// `AHashSet` for fast contains/insert/remove; populated and drained
+/// each tick the system fires.
+#[derive(Resource, Default)]
+pub struct ForceGoalReevaluate(pub ahash::AHashSet<Entity>);
+
 /// Pluralist Economy R8 follow-on: Maslow's hierarchy of needs as a
 /// 5-tier comparator. Each agent's `next_unmet_tier` is the
 /// lowest-numbered tier whose representative need is below its
@@ -295,6 +388,8 @@ pub fn goal_update_system(
         ),
         (Without<PlayerOrder>, Without<Drafted>),
     >,
+    cooldown_query: Query<&GoalCooldown>,
+    mut force_reeval: ResMut<ForceGoalReevaluate>,
 ) {
     for (
         entity,
@@ -341,10 +436,24 @@ pub fn goal_update_system(
         // `pf.goal != goal3` and re-enqueues the path, parking the
         // agent in `FollowStatus::Pending` — the visible "move one
         // tile, pause" symptom.
-        if ai.task_id != PersonAI::UNEMPLOYED
+        // Phase 6B: agents in `ForceGoalReevaluate` bypass the 200-tick
+        // cadence so chronic-failure release fires *this* tick rather
+        // than up to ~10 s later. The set is drained per-entity below
+        // after the re-evaluation completes (or earlier on bypass).
+        let force_now = force_reeval.0.contains(&entity);
+        if !force_now
+            && ai.task_id != PersonAI::UNEMPLOYED
             && clock.tick.saturating_sub(ai.last_goal_eval_tick) < 200
         {
             continue;
+        }
+        if force_now {
+            // Drop any stale task so the dispatchers see clean state on
+            // the goal flip. Mirrors the goal-flip cleanup below.
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
+            target_item.0 = None;
+            force_reeval.0.remove(&entity);
         }
         ai.last_goal_eval_tick = clock.tick;
 
@@ -647,7 +756,13 @@ pub fn goal_update_system(
             (AgentGoal::Play, "Low Willpower")
         } else if has_personal_build_site {
             (AgentGoal::Build, "Building Personal Project")
-        } else if should_craft(&registry, member.faction_id, needs) {
+        } else if should_craft(
+            &registry,
+            member.faction_id,
+            needs,
+            cooldown_query.get(entity).ok(),
+            clock.tick,
+        ) {
             (AgentGoal::Craft, "Crafting for Faction")
         } else {
             (gather_goal, gather_reason)
@@ -671,13 +786,28 @@ pub fn goal_update_system(
 /// Returns true when a faction agent should switch to crafting.
 /// Triggers when the faction has at least one craft tech unlocked and is short on
 /// crafted goods (Tools + Weapon + Armor + Shield + Cloth < member_count / 3).
-fn should_craft(registry: &FactionRegistry, faction_id: u32, needs: &Needs) -> bool {
+fn should_craft(
+    registry: &FactionRegistry,
+    faction_id: u32,
+    needs: &Needs,
+    cooldown: Option<&GoalCooldown>,
+    now: u64,
+) -> bool {
     if faction_id == SOLO {
         return false;
     }
     // Only craft when not hungry or tired
     if needs.hunger > NEED_BUSY || needs.sleep > NEED_BUSY {
         return false;
+    }
+    // Phase 6C/6B: per-agent cooldown after chronic Craft failure. Stops
+    // Market-mode households from oscillating Craft → fail → Craft within
+    // the 200-tick goal-eval cadence. Reads both legacy `craft_until_tick`
+    // and the unified ring (`is_active`) so both code paths agree.
+    if let Some(cd) = cooldown {
+        if now < cd.craft_until_tick || cd.is_active(AgentGoal::Craft, now) {
+            return false;
+        }
     }
     let Some(faction) = registry.factions.get(&faction_id) else {
         return false;
@@ -722,4 +852,159 @@ fn should_craft(registry: &FactionRegistry, faction_id: u32, needs: &Needs) -> b
             faction.resource_supply.get(&id).copied().unwrap_or(0) >= qty
         })
     })
+}
+
+/// Phase 5: when `goal_update_system` flips an agent's `AgentGoal`, the
+/// in-flight method's chain is dropped on the next `goal_dispatch_system`
+/// tick (unless it's `MF_UNINTERRUPTIBLE`, in which case the preserve-arm
+/// matrix in `tasks.rs` keeps it running). Record `MethodOutcome::Abandoned`
+/// against the active method so its score gets the same recency penalty as
+/// any other failure — without this, an agent who keeps switching goals
+/// leaves phantom successes behind and never biases away from the methods
+/// it kept abandoning.
+///
+/// Filters by `Changed<AgentGoal>` so the system fires only on actual goal
+/// flips (not on every tick during a working chain). `goal_update_system`'s
+/// existing `*goal != new_goal` guard ensures `Changed<AgentGoal>` only
+/// triggers on real flips. Skips `MF_UNINTERRUPTIBLE` methods since their
+/// chains survive the flip via the preserve-arm matrix.
+pub fn record_abandoned_method_system(
+    clock: Res<SimClock>,
+    method_registry: Res<crate::simulation::htn::MethodRegistry>,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut crate::simulation::htn::MethodHistory,
+        ),
+        Changed<AgentGoal>,
+    >,
+) {
+    use crate::simulation::htn::{MethodOutcome, MF_UNINTERRUPTIBLE};
+    let now = clock.tick;
+    for (mut ai, mut history) in query.iter_mut() {
+        let Some(active_id) = ai.active_method else {
+            continue;
+        };
+        let interruptible = method_registry
+            .flags_by_id(active_id)
+            .map(|f| f & MF_UNINTERRUPTIBLE == 0)
+            .unwrap_or(true);
+        if interruptible {
+            history.push(active_id, MethodOutcome::Abandoned, now);
+            ai.active_method = None;
+        }
+    }
+}
+
+/// Phase 6B/6C combined: chronic-failure release.
+///
+/// For each agent whose current goal is *not* `Survive` / `Sleep` and
+/// whose `MethodHistory` shows ≥ `CHRONIC_FAIL_THRESHOLD` non-success
+/// entries within the TTL window:
+///
+/// - **Without `JobClaim` (autonomous goal)**: insert the entity into
+///   `ForceGoalReevaluate` so `goal_update_system` flips the goal *next*
+///   tick instead of waiting up to 200 ticks. Stamp the goal into the
+///   `GoalCooldown` ring so the same goal can't immediately re-fire via
+///   `should_craft` / equivalent eligibility checks.
+///
+/// - **With `JobClaim` (chief / household / individual posting)**:
+///   remove the `JobClaim` + `ClaimTarget` and release the claimant slot
+///   on the posting so the chief reposts to a better-positioned worker.
+///   Also stamp the goal cooldown so a subsequent `job_claim_system` run
+///   doesn't immediately re-grant the same kind of claim. Orthogonal to
+///   `job_claim_release_system`'s stuck-idle `fail_count` bump — that
+///   one fires on `task_id == UNEMPLOYED` for STUCK_FAIL_INTERVAL ticks;
+///   this one fires on the *quality* of recent attempts (whether they
+///   succeeded), so an agent that keeps starting tasks but losing them
+///   to target races / routing failures gets released too.
+///
+/// `Survive` / `Sleep` are exempt: a hungry agent who can't find food
+/// via methods AND can't make Explore-fallback work would otherwise
+/// be cooldown'd out of trying for food and starve. Same for sleep.
+/// The terminal Explore fallback (Phase 3) is the design's relief
+/// valve for chronic Survive/Sleep failure.
+///
+/// Cadence: every `TICKS_PER_DAY/4` (~3 min); threshold 3 failures;
+/// cooldown duration matches `MethodHistory` TTL so bias and cooldown
+/// expire together.
+pub fn chronic_failure_release_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    mut force_reeval: ResMut<ForceGoalReevaluate>,
+    mut board: ResMut<crate::simulation::jobs::JobBoard>,
+    mut query: Query<(
+        Entity,
+        &AgentGoal,
+        &crate::simulation::htn::MethodHistory,
+        Option<&JobClaim>,
+        Option<&mut GoalCooldown>,
+    )>,
+) {
+    use crate::simulation::htn::{MethodOutcome, METHOD_HISTORY_TTL_TICKS};
+
+    if clock.tick % (crate::world::seasons::TICKS_PER_DAY as u64 / 4) != 0 {
+        return;
+    }
+    let now = clock.tick;
+    const CHRONIC_FAIL_THRESHOLD: u32 = 3;
+    const COOLDOWN_DURATION_TICKS: u64 = METHOD_HISTORY_TTL_TICKS;
+
+    for (entity, goal, history, claim_opt, cooldown_opt) in query.iter_mut() {
+        // Survive / Sleep exempt — see system-level doc.
+        if matches!(*goal, AgentGoal::Survive | AgentGoal::Sleep) {
+            continue;
+        }
+        let failures: u32 = history
+            .entries
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    slot,
+                    Some((_, outcome, tick))
+                        if !matches!(outcome, MethodOutcome::Success)
+                            && now.saturating_sub(*tick) <= METHOD_HISTORY_TTL_TICKS
+                )
+            })
+            .count() as u32;
+        if failures < CHRONIC_FAIL_THRESHOLD {
+            continue;
+        }
+        let until = now + COOLDOWN_DURATION_TICKS;
+
+        // Stamp the cooldown ring (and legacy `craft_until_tick` for
+        // `should_craft`'s fast path).
+        match cooldown_opt {
+            Some(mut existing) => {
+                existing.push(*goal, until);
+                if matches!(*goal, AgentGoal::Craft) {
+                    existing.craft_until_tick = existing.craft_until_tick.max(until);
+                }
+            }
+            None => {
+                let mut cd = GoalCooldown::default();
+                cd.push(*goal, until);
+                if matches!(*goal, AgentGoal::Craft) {
+                    cd.craft_until_tick = until;
+                }
+                commands.entity(entity).insert(cd);
+            }
+        }
+
+        if let Some(claim) = claim_opt {
+            // 6B-A: JobClaim'd path — release the claim + claimant slot.
+            // The chief's next posting cycle picks a better-positioned
+            // worker; this agent is free to pursue something else next
+            // tick.
+            let job_id = claim.job_id;
+            commands.entity(entity).remove::<JobClaim>();
+            commands.entity(entity).remove::<crate::simulation::jobs::ClaimTarget>();
+            crate::simulation::jobs::release_claimant(&mut board, job_id, entity);
+        } else {
+            // 6B-B: autonomous path — bypass the 200-tick cadence on
+            // next `goal_update_system` so the new cooldown bites
+            // immediately.
+            force_reeval.0.insert(entity);
+        }
+    }
 }
