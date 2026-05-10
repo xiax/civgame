@@ -19,6 +19,23 @@ pub enum GameState {
 #[derive(Resource, Default, Debug, Clone, Copy)]
 pub struct PendingSpawn(pub Option<(i32, i32)>);
 
+/// User-facing seed driving globe + per-tile terrain generation. The
+/// spawn-select UI exposes this as an editable field with Apply / Reroll
+/// buttons; firing `RegenerateWorldRequest` rebuilds the `Globe` and
+/// `WorldGen` resources from this seed.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct WorldSeed(pub u64);
+
+impl Default for WorldSeed {
+    fn default() -> Self {
+        Self(42)
+    }
+}
+
+/// Fired by the spawn-select UI to rebuild the world from `WorldSeed`.
+#[derive(Event)]
+pub struct RegenerateWorldRequest;
+
 /// Economy preset selected at game start; applied to every faction's
 /// `economic_policy` map by `spawn_population`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -11,34 +11,44 @@ pub const WORLD_CHUNKS_X: i32 = 32;
 pub const WORLD_CHUNKS_Y: i32 = 32;
 pub const TILE_SIZE: f32 = 16.0;
 
-const WORLD_SEED: u32 = 42;
+/// Default surface/ore-noise seed, used when no `WorldSeed` resource has
+/// been set yet (tests, sandbox quick-boot). The spawn-select reroll path
+/// constructs `WorldGen::with_seed(world_seed.0 as u32)`.
+pub const DEFAULT_WORLD_SEED: u32 = 42;
 
 /// Perlin instances used for world generation, stored as a Bevy resource.
 /// One noise field per ore lets veins of different ores overlap and span
 /// independent depth bands (see `ORE_BANDS`).
 #[derive(Resource)]
 pub struct WorldGen {
-    pub surface: Perlin, // 2D surface height + tile kind (seed WORLD_SEED)
-    pub cave: Perlin,    // 3D cave cavities (seed WORLD_SEED + 1)
-    pub coal: Perlin,    // 3D coal vein noise (WORLD_SEED + 2)
-    pub copper: Perlin,  // 3D copper vein noise (WORLD_SEED + 3)
-    pub iron: Perlin,    // 3D iron vein noise (WORLD_SEED + 4)
-    pub tin: Perlin,     // 3D tin vein noise (WORLD_SEED + 5)
-    pub silver: Perlin,  // 3D silver vein noise (WORLD_SEED + 6)
-    pub gold: Perlin,    // 3D gold vein noise (WORLD_SEED + 7)
+    pub surface: Perlin, // 2D surface height + tile kind (seed N)
+    pub cave: Perlin,    // 3D cave cavities (seed N + 1)
+    pub coal: Perlin,    // 3D coal vein noise (N + 2)
+    pub copper: Perlin,  // 3D copper vein noise (N + 3)
+    pub iron: Perlin,    // 3D iron vein noise (N + 4)
+    pub tin: Perlin,     // 3D tin vein noise (N + 5)
+    pub silver: Perlin,  // 3D silver vein noise (N + 6)
+    pub gold: Perlin,    // 3D gold vein noise (N + 7)
 }
 
 impl WorldGen {
     pub fn new() -> Self {
+        Self::with_seed(DEFAULT_WORLD_SEED)
+    }
+
+    /// Build a `WorldGen` from a base seed. The spawn-select reroll path
+    /// passes `WorldSeed.0 as u32` so per-tile terrain (heightmap, caves,
+    /// ore veins) re-rolls in lockstep with the climate globe.
+    pub fn with_seed(seed: u32) -> Self {
         Self {
-            surface: Perlin::default().set_seed(WORLD_SEED),
-            cave: Perlin::default().set_seed(WORLD_SEED + 1),
-            coal: Perlin::default().set_seed(WORLD_SEED + 2),
-            copper: Perlin::default().set_seed(WORLD_SEED + 3),
-            iron: Perlin::default().set_seed(WORLD_SEED + 4),
-            tin: Perlin::default().set_seed(WORLD_SEED + 5),
-            silver: Perlin::default().set_seed(WORLD_SEED + 6),
-            gold: Perlin::default().set_seed(WORLD_SEED + 7),
+            surface: Perlin::default().set_seed(seed),
+            cave: Perlin::default().set_seed(seed.wrapping_add(1)),
+            coal: Perlin::default().set_seed(seed.wrapping_add(2)),
+            copper: Perlin::default().set_seed(seed.wrapping_add(3)),
+            iron: Perlin::default().set_seed(seed.wrapping_add(4)),
+            tin: Perlin::default().set_seed(seed.wrapping_add(5)),
+            silver: Perlin::default().set_seed(seed.wrapping_add(6)),
+            gold: Perlin::default().set_seed(seed.wrapping_add(7)),
         }
     }
 

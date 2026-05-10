@@ -7,17 +7,19 @@ const SAVE_PATH: &str = "world.bin";
 /// On-disk schema version for `world.bin`. Bump whenever `Globe`, `WorldCell`,
 /// or any serialized geo-data layout changes — `load_or_generate` will discard
 /// older caches and regenerate.
-pub const GLOBE_FILE_VERSION: u32 = 2;
+pub const GLOBE_FILE_VERSION: u32 = 3;
 
 /// Climate-sample grid resolution. Each cell holds elevation/climate/biome
 /// samples; per-tile values are bilinearly interpolated. Resolution is
 /// independent of mega-chunk size — biomes flow continuously across mega-chunk
 /// seams because the underlying climate field is continuous.
-pub const GLOBE_WIDTH: i32 = 256;
-pub const GLOBE_HEIGHT: i32 = 128;
+pub const GLOBE_WIDTH: i32 = 512;
+pub const GLOBE_HEIGHT: i32 = 256;
 
 /// Chunks per climate (globe) cell. Each cell covers GLOBE_CELL_CHUNKS² chunks.
-pub const GLOBE_CELL_CHUNKS: i32 = 4;
+/// Halved (was 4) when the climate grid was doubled, so the world tile total
+/// (`GLOBE_WIDTH * GLOBE_CELL_CHUNKS = 1024` chunks per axis) is unchanged.
+pub const GLOBE_CELL_CHUNKS: i32 = 2;
 
 /// Chunks per mega-chunk. Mega-chunks are the player's settlement / world-map
 /// switching unit. Independent of GLOBE_CELL_CHUNKS so a single mega-chunk can
@@ -135,7 +137,7 @@ pub struct LakeMap {
     pub lakes: Vec<LakeBasin>,
 }
 
-#[derive(Resource, Serialize, Deserialize)]
+#[derive(Resource, Clone, Serialize, Deserialize)]
 pub struct Globe {
     pub cells: Vec<WorldCell>, // GLOBE_WIDTH × GLOBE_HEIGHT, row-major (y-major)
     pub seed: u64,
@@ -238,13 +240,22 @@ pub fn generate_globe(seed: u64) -> Globe {
     // Perlin noise (continental shape + texture) with plate uplift (mountain
     // ranges). Noise dominates at 70% so existing biome distribution is
     // recognisable; plates add the geographically-coherent ridges/rifts.
+    //
+    // Frequencies are tuned against a reference 256-cell-wide grid; scale
+    // inversely with current `GLOBE_WIDTH` so doubling the climate-cell
+    // density doesn't shrink continents (and therefore the ocean fraction).
+    const REF_GRID_WIDTH: f64 = 256.0;
+    let nscale: f64 = REF_GRID_WIDTH / GLOBE_WIDTH as f64;
     let elev_noise = Perlin::default().set_seed(seed as u32);
     let mut height = vec![0.0f32; n];
     for gy in 0..h {
         for gx in 0..w {
-            let nx = gx as f64 * 0.03;
-            let ny = gy as f64 * 0.03;
-            let macro_e = elev_noise.get([gx as f64 * 0.012, gy as f64 * 0.012]);
+            let nx = gx as f64 * 0.03 * nscale;
+            let ny = gy as f64 * 0.03 * nscale;
+            let macro_e = elev_noise.get([
+                gx as f64 * 0.012 * nscale,
+                gy as f64 * 0.012 * nscale,
+            ]);
             let ev = macro_e * 0.30
                 + elev_noise.get([nx, ny]) * 0.42
                 + elev_noise.get([nx * 2.0, ny * 2.0]) * 0.20
@@ -268,14 +279,33 @@ pub fn generate_globe(seed: u64) -> Globe {
     let accum = hydrology::flow_accum(&dirs);
     let rivers = hydrology::extract_rivers(&height, &dirs, &accum, 80);
 
+    // Anchor the elevation distribution against percentile pivots so the
+    // fraction of ocean / mountain cells stays consistent regardless of
+    // noise+plate distribution shape. Pure min/max normalization concentrates
+    // most of the world near the median, leaving the 0.22 ocean threshold
+    // starved of cells (≈3% ocean instead of the intended ~30%). Anchoring:
+    //   - 30th percentile → 0.22 (ocean line)
+    //   - 90th percentile → 0.82 (mountain line)
+    let mut sorted_h: Vec<f32> = height.clone();
+    sorted_h.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pick = |p: f32| -> f32 {
+        let i = ((sorted_h.len() as f32 * p) as usize).min(sorted_h.len() - 1);
+        sorted_h[i]
+    };
+    let h_min = sorted_h[0];
+    let h_sea = pick(0.30);
+    let h_peak = pick(0.90);
+    let h_max = sorted_h[sorted_h.len() - 1];
+
     // Lake detection: cells whose pit-fill raise was > a threshold AND that
-    // sit above sea level — these are sub-spillpoint basins.
+    // sit above the sea-level percentile — these are sub-spillpoint basins
+    // on land. (Sub-sea basins are ocean, not lakes.)
     let mut lakes = LakeMap::default();
     let tiles_per_cell = (GLOBE_CELL_CHUNKS * super::chunk::CHUNK_SIZE as i32) as i32;
     let mut is_lake_cell = vec![false; n];
     for i in 0..n {
         let raise = height[i] - pre_fill_height[i];
-        if raise > 0.02 && height[i] > 0.0 {
+        if raise > 0.02 && height[i] > h_sea {
             is_lake_cell[i] = true;
         }
     }
@@ -334,22 +364,36 @@ pub fn generate_globe(seed: u64) -> Globe {
     }
 
     // ── 5. Climate ────────────────────────────────────────────────────────
-    // Normalise elevation to [0, 1] for the temperature/rainfall formulas.
-    let mut min_h = f32::INFINITY;
-    let mut max_h = f32::NEG_INFINITY;
-    for &v in &height {
-        min_h = min_h.min(v);
-        max_h = max_h.max(v);
-    }
-    let span = (max_h - min_h).max(1e-6);
-    let elev_norm: Vec<f32> = height.iter().map(|&v| ((v - min_h) / span).clamp(0.0, 1.0)).collect();
+    // Normalise elevation to [0, 1] for the temperature/rainfall formulas
+    // using the percentile pivots computed above:
+    //   h_min → 0.0, h_sea → 0.22, h_peak → 0.82, h_max → 1.0
+    // Three linear segments. Guarantees ~30% ocean and ~10% mountain.
+    let span_low = (h_sea - h_min).max(1e-6);
+    let span_mid = (h_peak - h_sea).max(1e-6);
+    let span_high = (h_max - h_peak).max(1e-6);
+    let elev_norm: Vec<f32> = height
+        .iter()
+        .map(|&v| {
+            let f = if v <= h_sea {
+                0.22 * (v - h_min) / span_low
+            } else if v <= h_peak {
+                0.22 + 0.60 * (v - h_sea) / span_mid
+            } else {
+                0.82 + 0.18 * (v - h_peak) / span_high
+            };
+            f.clamp(0.0, 1.0)
+        })
+        .collect();
 
     let rain_noise = Perlin::default().set_seed(seed as u32 ^ 0xDEAD_BEEF);
     let mut base_rain = vec![0.0f32; n];
     for gy in 0..h {
         for gx in 0..w {
-            let nx = gx as f64 * 0.03;
-            let ny = gy as f64 * 0.03;
+            // Same `nscale` rationale as the heightmap pass — keep rainfall
+            // features at their original world-space size after a resolution
+            // change.
+            let nx = gx as f64 * 0.03 * nscale;
+            let ny = gy as f64 * 0.03 * nscale;
             let rv = rain_noise.get([nx + 5.0, ny + 5.0]) * 0.70
                 + rain_noise.get([nx * 3.0, ny * 3.0]) * 0.30;
             base_rain[gy * w + gx] = ((rv + 1.0) * 0.5) as f32;
@@ -452,28 +496,44 @@ struct GlobeFile {
     globe: Globe,
 }
 
-/// Load globe from disk if available and version-compatible, otherwise
-/// generate and save it.
+/// Load globe from disk if the cache is version-compatible AND was produced
+/// from the same seed; otherwise generate fresh and rewrite the cache.
 pub fn load_or_generate(seed: u64) -> Globe {
     if let Ok(bytes) = std::fs::read(SAVE_PATH) {
         match bincode::deserialize::<GlobeFile>(&bytes) {
-            Ok(file) if file.version == GLOBE_FILE_VERSION => {
-                info!("Globe loaded from {SAVE_PATH} (v{})", file.version);
+            Ok(file)
+                if file.version == GLOBE_FILE_VERSION && file.globe.seed == seed =>
+            {
+                info!(
+                    "Globe loaded from {SAVE_PATH} (v{}, seed {})",
+                    file.version, file.globe.seed
+                );
                 return file.globe;
             }
-            Ok(file) => warn!(
+            Ok(file) if file.version != GLOBE_FILE_VERSION => warn!(
                 "Globe cache version mismatch ({} != {GLOBE_FILE_VERSION}) — regenerating",
                 file.version
+            ),
+            Ok(file) => info!(
+                "Globe cache seed mismatch ({} != {seed}) — regenerating",
+                file.globe.seed
             ),
             Err(_) => warn!("Failed to deserialize {SAVE_PATH} — regenerating"),
         }
     }
 
     let globe = generate_globe(seed);
+    save_globe(&globe);
+    globe
+}
 
+/// Persist the current `Globe` to `world.bin`. Used by `load_or_generate`
+/// after a fresh roll, and by the spawn-select commit transition so that
+/// only the *chosen* world is cached (rerolls skip disk IO).
+pub fn save_globe(globe: &Globe) {
     let file = GlobeFile {
         version: GLOBE_FILE_VERSION,
-        globe,
+        globe: globe.clone(),
     };
     match bincode::serialize(&file) {
         Ok(bytes) => {
@@ -485,13 +545,34 @@ pub fn load_or_generate(seed: u64) -> Globe {
         }
         Err(e) => warn!("Could not serialize globe: {e}"),
     }
-
-    file.globe
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocean_fraction_within_band() {
+        // Percentile-anchored elevation remap targets ~30% ocean and ~10%
+        // mountain regardless of distribution shape. Verify across two
+        // seeds; tolerate ±5% drift from the anchor.
+        for seed in [42u64, 123] {
+            let g = generate_globe(seed);
+            let total = g.cells.len() as f32;
+            let ocean = g.cells.iter().filter(|c| c.biome == Biome::Ocean).count() as f32;
+            let mountain = g.cells.iter().filter(|c| c.biome == Biome::Mountain).count() as f32;
+            let ocean_pct = ocean / total * 100.0;
+            let mountain_pct = mountain / total * 100.0;
+            assert!(
+                (25.0..=35.0).contains(&ocean_pct),
+                "seed {seed}: ocean fraction {ocean_pct:.1}% out of band [25,35]"
+            );
+            assert!(
+                (5.0..=15.0).contains(&mountain_pct),
+                "seed {seed}: mountain fraction {mountain_pct:.1}% out of band [5,15]"
+            );
+        }
+    }
 
     #[test]
     fn generate_globe_smoke() {

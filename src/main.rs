@@ -9,7 +9,9 @@ mod simulation;
 mod ui;
 mod world;
 
-pub use game_state::{EconomyPreset, GameStartOptions, GameState, PendingSpawn};
+pub use game_state::{
+    EconomyPreset, GameStartOptions, GameState, PendingSpawn, RegenerateWorldRequest, WorldSeed,
+};
 
 fn main() {
     let is_sandbox = std::env::args().any(|a| a == "--sandbox");

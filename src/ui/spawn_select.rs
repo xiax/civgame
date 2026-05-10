@@ -5,11 +5,13 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::game_state::{EconomyPreset, GameStartOptions, GameState, PendingSpawn};
+use crate::game_state::{
+    EconomyPreset, GameStartOptions, GameState, PendingSpawn, RegenerateWorldRequest, WorldSeed,
+};
 use crate::simulation::faction::Lifestyle;
 use crate::simulation::region::MegaChunkCoord;
 use crate::simulation::technology::Era;
-use crate::ui::world_map::build_globe_image;
+use crate::ui::world_map::{build_globe_image, WORLD_MAP_OVERSAMPLE};
 use crate::world::globe::{
     Biome, Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH, MEGACHUNK_SIZE_CHUNKS,
 };
@@ -17,6 +19,16 @@ use crate::world::globe::{
 #[derive(Resource, Default)]
 pub struct SpawnSelectTexture {
     handle: Option<egui::TextureHandle>,
+    /// Buffered seed text so partial typing doesn't fight the resource.
+    seed_text: String,
+}
+
+impl SpawnSelectTexture {
+    /// Drop the cached egui texture handle so the next render rebuilds it
+    /// from the current `Globe` (used after a reroll).
+    pub fn clear_handle(&mut self) {
+        self.handle = None;
+    }
 }
 
 pub fn spawn_select_system(
@@ -25,6 +37,8 @@ pub fn spawn_select_system(
     mut tex_cache: ResMut<SpawnSelectTexture>,
     mut pending: ResMut<PendingSpawn>,
     mut options: ResMut<GameStartOptions>,
+    mut world_seed: ResMut<WorldSeed>,
+    mut regen_w: EventWriter<RegenerateWorldRequest>,
     mut next_state: ResMut<NextState<GameState>>,
 ) {
     let ctx = contexts.ctx_mut();
@@ -104,14 +118,53 @@ pub fn spawn_select_system(
                 .small()
                 .weak(),
             );
+            ui.add_space(12.0);
+
+            ui.label(egui::RichText::new("World").strong());
+            // First-time init only — afterwards the buffer is owned by the
+            // text field (typing) or explicitly overwritten by the Reroll
+            // handler. Auto-mirroring would clobber mid-type input.
+            if tex_cache.seed_text.is_empty() {
+                tex_cache.seed_text = world_seed.0.to_string();
+            }
+            ui.horizontal(|ui| {
+                ui.label("Seed:");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut tex_cache.seed_text)
+                        .desired_width(120.0),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Ok(v) = tex_cache.seed_text.parse::<u64>() {
+                        world_seed.0 = v;
+                        regen_w.send(RegenerateWorldRequest);
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Apply seed").clicked() {
+                    if let Ok(v) = tex_cache.seed_text.parse::<u64>() {
+                        world_seed.0 = v;
+                    }
+                    regen_w.send(RegenerateWorldRequest);
+                }
+                if ui.button("Reroll").clicked() {
+                    world_seed.0 = fastrand::u64(..);
+                    tex_cache.seed_text = world_seed.0.to_string();
+                    regen_w.send(RegenerateWorldRequest);
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Apply re-rolls climate, rivers, lakes, and per-tile terrain noise from the seed.",
+                )
+                .small()
+                .weak(),
+            );
         });
 
     if tex_cache.handle.is_none() {
-        let pixels = build_globe_image(&globe, false);
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [GLOBE_WIDTH as usize, GLOBE_HEIGHT as usize],
-            &pixels,
-        );
+        let (pixels, [w, h]) = build_globe_image(&globe, false, WORLD_MAP_OVERSAMPLE);
+        let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
         tex_cache.handle = Some(ctx.load_texture(
             "spawn_select_globe",
             image,
@@ -155,6 +208,31 @@ pub fn spawn_select_system(
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
+
+            // Climate-cell sub-grid (drawn first so the bolder mega-chunk
+            // grid sits on top). Drawn every 4 cells so the user sees a
+            // finer subdivision without a wall-of-lines at full density.
+            let sub_step = 4i32;
+            let sub_nx = GLOBE_WIDTH / sub_step;
+            let sub_ny = GLOBE_HEIGHT / sub_step;
+            let sub_cw = img_w / sub_nx as f32;
+            let sub_ch = img_h / sub_ny as f32;
+            let sub_stroke =
+                egui::Stroke::new(0.25, egui::Color32::from_rgba_premultiplied(0, 0, 0, 25));
+            for i in 0..=sub_nx {
+                let x = rect.min.x + i as f32 * sub_cw;
+                ui.painter().line_segment(
+                    [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+                    sub_stroke,
+                );
+            }
+            for j in 0..=sub_ny {
+                let y = rect.min.y + j as f32 * sub_ch;
+                ui.painter().line_segment(
+                    [egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)],
+                    sub_stroke,
+                );
+            }
 
             // Mega-chunk grid overlay.
             let cell_w = img_w / mc_grid_w as f32;

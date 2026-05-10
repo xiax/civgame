@@ -96,3 +96,4 @@ Free-agent gathering. In Market mode, when should_craft declines (cooldown or no
 
 
 I need logging to track performance metrics and identify bottlenecks in the code that is slowing down each tick, give me a plan to do this comprehensively please.
+

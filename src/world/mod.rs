@@ -1,5 +1,7 @@
 use bevy::prelude::*;
 
+use crate::game_state::{RegenerateWorldRequest, WorldSeed};
+
 pub mod biome;
 pub mod chunk;
 pub mod chunk_streaming;
@@ -14,10 +16,6 @@ pub mod terrain;
 pub mod tile;
 
 pub use chunk::ChunkMap;
-
-fn insert_globe(app: &mut App) {
-    app.insert_resource(globe::load_or_generate(42));
-}
 
 pub struct WorldPlugin;
 
@@ -43,19 +41,64 @@ impl Plugin for WorldPlugin {
         app.insert_resource(catalog);
         app.insert_resource(archetype_registry);
 
-        insert_globe(app);
+        // World seed drives both the climate globe and the per-tile
+        // terrain Perlins. Insert before loading the globe so reroll
+        // paths can read it back.
+        let seed = WorldSeed::default();
+        app.insert_resource(seed);
+        app.insert_resource(globe::load_or_generate(seed.0));
+        app.insert_resource(terrain::WorldGen::with_seed(seed.0 as u32));
+
         app.world_mut()
             .register_component_hooks::<spatial::Indexed>()
             .on_remove(spatial::on_indexed_remove);
         app.insert_resource(ChunkMap::default())
             .insert_resource(spatial::SpatialIndex::default())
             .insert_resource(seasons::Calendar::default())
-            .insert_resource(terrain::WorldGen::new())
             .insert_resource(chunk_streaming::ChunkRetention::default())
             .add_event::<chunk_streaming::TileChangedEvent>()
             .add_event::<chunk_streaming::ChunkLoadedEvent>()
             .add_event::<chunk_streaming::ChunkUnloadedEvent>()
+            .add_event::<RegenerateWorldRequest>()
+            .add_systems(
+                Update,
+                regenerate_world_system
+                    .run_if(in_state(crate::GameState::SpawnSelect)),
+            )
+            .add_systems(
+                OnExit(crate::GameState::SpawnSelect),
+                persist_globe_on_commit_system,
+            )
             .add_systems(OnEnter(crate::GameState::Playing), terrain::spawn_world_system)
             .add_systems(PostUpdate, chunk_streaming::refresh_changed_tiles_system);
     }
+}
+
+/// Drains `RegenerateWorldRequest` events fired by spawn-select. Each event
+/// rebuilds the climate globe + per-tile noise from the current `WorldSeed`
+/// (no disk write — only the chosen world is cached on commit).
+fn regenerate_world_system(
+    mut events: EventReader<RegenerateWorldRequest>,
+    seed: Res<WorldSeed>,
+    mut commands: Commands,
+    mut spawn_tex: ResMut<crate::ui::spawn_select::SpawnSelectTexture>,
+    mut map_tex: ResMut<crate::ui::world_map::WorldMapTexture>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    events.clear();
+
+    info!("Regenerating world from seed {}", seed.0);
+    commands.insert_resource(globe::generate_globe(seed.0));
+    commands.insert_resource(terrain::WorldGen::with_seed(seed.0 as u32));
+    spawn_tex.clear_handle();
+    map_tex.clear_handle();
+}
+
+/// On transition out of spawn-select (player has chosen their region),
+/// persist the active globe to `world.bin` so the next launch boots into
+/// the same world.
+fn persist_globe_on_commit_system(globe: Res<globe::Globe>) {
+    globe::save_globe(&globe);
 }

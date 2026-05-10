@@ -4,6 +4,11 @@ use bevy_egui::{egui, EguiContexts};
 use crate::simulation::region::{MegaChunkCoord, SettledRegions};
 use crate::world::globe::{Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH, MEGACHUNK_SIZE_CHUNKS};
 
+/// Pixels per climate cell when rendering the world map. 2× = sub-cell
+/// bilinear biome detail that matches `biome::classify_at_tile`. Bumping
+/// further is purely cosmetic (cell density is the data resolution).
+pub const WORLD_MAP_OVERSAMPLE: u32 = 2;
+
 #[derive(Resource, Default)]
 pub struct WorldMapOpen(pub bool);
 
@@ -13,6 +18,14 @@ pub struct WorldMapTexture {
     handle: Option<egui::TextureHandle>,
     /// Last count of explored cells when we built the texture — rebuild when it changes.
     last_explored: u32,
+}
+
+impl WorldMapTexture {
+    /// Drop the cached egui texture handle so the next render rebuilds it
+    /// from the current `Globe`.
+    pub fn clear_handle(&mut self) {
+        self.handle = None;
+    }
 }
 
 pub fn world_map_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut open: ResMut<WorldMapOpen>) {
@@ -44,11 +57,8 @@ pub fn world_map_system(
     // Rebuild texture if explored cells changed
     let explored_count = globe.cells.iter().filter(|c| c.explored).count() as u32;
     if tex_cache.handle.is_none() || tex_cache.last_explored != explored_count {
-        let pixels = build_globe_image(&globe, true);
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [GLOBE_WIDTH as usize, GLOBE_HEIGHT as usize],
-            &pixels,
-        );
+        let (pixels, [w, h]) = build_globe_image(&globe, true, WORLD_MAP_OVERSAMPLE);
+        let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
         let handle = ctx.load_texture("world_map", image, egui::TextureOptions::NEAREST);
         tex_cache.handle = Some(handle);
         tex_cache.last_explored = explored_count;
@@ -174,23 +184,57 @@ pub fn world_map_system(
         });
 }
 
-/// Render the globe as an RGBA pixel buffer. When `respect_fog` is true,
-/// unexplored cells render as dark grey (player-facing in-game map). When
-/// false, every cell shows its true biome (used by spawn-select before any
-/// exploration has happened).
-pub fn build_globe_image(globe: &Globe, respect_fog: bool) -> Vec<u8> {
-    let mut pixels = vec![0u8; (GLOBE_WIDTH * GLOBE_HEIGHT * 4) as usize];
+/// Render the globe as an RGBA pixel buffer. `oversample` is pixels per
+/// climate cell (1 = legacy block-colour render, 2+ = bilinear sub-cell
+/// detail matching the in-game `biome::classify_at_tile` field). When
+/// `respect_fog` is true, unexplored cells render as dark grey
+/// (player-facing in-game map). Returns `(pixels, [width, height])`.
+pub fn build_globe_image(
+    globe: &Globe,
+    respect_fog: bool,
+    oversample: u32,
+) -> (Vec<u8>, [usize; 2]) {
+    let oversample = oversample.max(1);
+    let img_w = GLOBE_WIDTH as u32 * oversample;
+    let img_h = GLOBE_HEIGHT as u32 * oversample;
+    let mut pixels = vec![0u8; (img_w * img_h * 4) as usize];
 
-    for gy in 0..GLOBE_HEIGHT {
-        for gx in 0..GLOBE_WIDTH {
-            let idx = ((gy * GLOBE_WIDTH + gx) * 4) as usize;
+    let inv_os = 1.0 / oversample as f32;
+
+    for py in 0..img_h {
+        for px in 0..img_w {
+            let idx = ((py * img_w + px) * 4) as usize;
+
+            // Fractional climate-cell coords for bilinear sampling.
+            let fx = (px as f32 + 0.5) * inv_os;
+            let fy = (py as f32 + 0.5) * inv_os;
+            let gx = (fx as i32).clamp(0, GLOBE_WIDTH - 1);
+            let gy = (fy as i32).clamp(0, GLOBE_HEIGHT - 1);
             let cell = globe.cell(gx, gy).unwrap();
 
             let rgba = if respect_fog && !cell.explored {
-                [25, 25, 25, 255] // unexplored — dark gray
+                [25, 25, 25, 255]
             } else {
-                let mut c = cell.biome.color();
-                // Rivers tint blue, lakes deeper blue.
+                // Bilinear-classify at oversampled pixel position. The same
+                // climate field as `classify_at_tile`, evaluated at the
+                // pixel's fractional cell location → smooth biome boundaries
+                // that match the actual in-game terrain instead of blocky
+                // per-cell colours.
+                let mut c = if oversample > 1 {
+                    let tiles_per_cell = (GLOBE_CELL_CHUNKS
+                        * crate::world::chunk::CHUNK_SIZE as i32)
+                        as f32;
+                    let tile_x = (fx * tiles_per_cell) as i32;
+                    let tile_y = (fy * tiles_per_cell) as i32;
+                    crate::world::biome::classify_at_tile(globe, tile_x, tile_y)
+                        .color()
+                } else {
+                    cell.biome.color()
+                };
+
+                // Rivers / lakes / faction tints stay cell-discrete: their
+                // semantics are placement-based, so bilinear smoothing makes
+                // no sense.
                 if cell.is_river {
                     c[0] = (c[0] as u16 / 2 + 40) as u8;
                     c[1] = (c[1] as u16 / 2 + 80) as u8;
@@ -201,7 +245,6 @@ pub fn build_globe_image(globe: &Globe, respect_fog: bool) -> Vec<u8> {
                     c[1] = 80;
                     c[2] = 180;
                 }
-                // Tint faction cells slightly
                 if respect_fog && cell.faction_id != 0 {
                     c[0] = c[0].saturating_add(30);
                     c[2] = c[2].saturating_sub(20);
@@ -216,13 +259,13 @@ pub fn build_globe_image(globe: &Globe, respect_fog: bool) -> Vec<u8> {
         }
     }
 
-    // Flip Y so north is up (Bevy Y=0 is bottom)
-    let row_bytes = (GLOBE_WIDTH * 4) as usize;
+    // Flip Y so north is up (Bevy Y=0 is bottom).
+    let row_bytes = (img_w * 4) as usize;
     let mut flipped = vec![0u8; pixels.len()];
-    for row in 0..GLOBE_HEIGHT as usize {
+    for row in 0..img_h as usize {
         let src = row * row_bytes;
-        let dst = (GLOBE_HEIGHT as usize - 1 - row) * row_bytes;
+        let dst = (img_h as usize - 1 - row) * row_bytes;
         flipped[dst..dst + row_bytes].copy_from_slice(&pixels[src..src + row_bytes]);
     }
-    flipped
+    (flipped, [img_w as usize, img_h as usize])
 }
