@@ -7,7 +7,7 @@ const SAVE_PATH: &str = "world.bin";
 /// On-disk schema version for `world.bin`. Bump whenever `Globe`, `WorldCell`,
 /// or any serialized geo-data layout changes — `load_or_generate` will discard
 /// older caches and regenerate.
-pub const GLOBE_FILE_VERSION: u32 = 3;
+pub const GLOBE_FILE_VERSION: u32 = 4;
 
 /// Climate-sample grid resolution. Each cell holds elevation/climate/biome
 /// samples; per-tile values are bilinearly interpolated. Resolution is
@@ -233,7 +233,7 @@ pub fn generate_globe(seed: u64) -> Globe {
 
     // ── 1. Plate tectonics ────────────────────────────────────────────────
     let plate_field = plates::generate(seed);
-    let uplift = plates::uplift_field(&plate_field);
+    let uplift = plates::uplift_field(&plate_field, seed);
 
     // ── 2. Heightmap composition: noise + plate uplift ────────────────────
     // Elevation in roughly [-1, +1] where 0 ≈ sea level (after the percentile

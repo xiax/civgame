@@ -10,10 +10,18 @@
 //! X wraps (cylinder); Y clamps (poles).
 
 use super::globe::{GLOBE_HEIGHT, GLOBE_WIDTH};
+use noise::{NoiseFn, Perlin, Seedable};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 pub const NUM_PLATES: usize = 8;
 const LLOYD_ITERS: u32 = 4;
+
+/// Domain-warp tunables for plate-boundary perturbation. The warp offsets the
+/// lookup point fed into the nearest-plate search so Voronoi edges become
+/// wavy/fingered rather than chord-straight. Wavelength ~ 1/FREQ cells; AMP
+/// is the peak displacement in cells.
+const WARP_FREQ: f64 = 0.04;
+const WARP_AMP: f64 = 8.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Plate {
@@ -55,11 +63,20 @@ fn dist_sq(a: (f32, f32), b: (f32, f32)) -> f32 {
     dx * dx + dy * dy
 }
 
-fn assign_nearest(plates: &[Plate]) -> Vec<u8> {
+fn assign_nearest(plates: &[Plate], warp_x: &Perlin, warp_y: &Perlin) -> Vec<u8> {
     let mut out = vec![0u8; (GLOBE_WIDTH * GLOBE_HEIGHT) as usize];
     for gy in 0..GLOBE_HEIGHT {
         for gx in 0..GLOBE_WIDTH {
-            let p = (gx as f32 + 0.5, gy as f32 + 0.5);
+            // Domain-warp the lookup point. Two octaves: a coarse meander at
+            // WARP_FREQ + a finer crenellation at 2.5× freq, 0.4× amp, to
+            // produce peninsulas/inlets at sub-boundary scale.
+            let u = gx as f64 * WARP_FREQ;
+            let v = gy as f64 * WARP_FREQ;
+            let wx = warp_x.get([u, v]) * WARP_AMP
+                + warp_x.get([u * 2.5, v * 2.5]) * (WARP_AMP * 0.4);
+            let wy = warp_y.get([u, v]) * WARP_AMP
+                + warp_y.get([u * 2.5, v * 2.5]) * (WARP_AMP * 0.4);
+            let p = (gx as f32 + 0.5 + wx as f32, gy as f32 + 0.5 + wy as f32);
             let mut best = 0;
             let mut best_d = f32::INFINITY;
             for (i, plate) in plates.iter().enumerate() {
@@ -120,11 +137,17 @@ pub fn generate(seed: u64) -> PlateField {
         })
         .collect();
 
+    // Domain-warp Perlins, deterministic from world seed with distinct salts.
+    let warp_x = Perlin::default().set_seed(seed.wrapping_add(0xA17E_5D01) as u32);
+    let warp_y = Perlin::default().set_seed(seed.wrapping_add(0xB29F_6E02) as u32);
+
     // Lloyd-relax the plate centers so they're roughly equally-spaced.
-    let mut assignment = assign_nearest(&plates);
+    // Lloyd uses the same warped assignment so centroids settle against the
+    // warped owners — keeps plate sizes roughly even after warping.
+    let mut assignment = assign_nearest(&plates, &warp_x, &warp_y);
     for _ in 0..LLOYD_ITERS {
         lloyd_relax(&mut plates, &assignment);
-        assignment = assign_nearest(&plates);
+        assignment = assign_nearest(&plates, &warp_x, &warp_y);
     }
 
     PlateField {
@@ -138,7 +161,7 @@ pub fn generate(seed: u64) -> PlateField {
 /// per-cell delta to add into the elevation field.
 ///
 /// Output is in normalised units (~ -0.5 .. +0.5) before mixing with noise.
-pub fn uplift_field(field: &PlateField) -> Vec<f32> {
+pub fn uplift_field(field: &PlateField, seed: u64) -> Vec<f32> {
     let w = GLOBE_WIDTH as usize;
     let h = GLOBE_HEIGHT as usize;
     let mut raw = vec![0.0f32; w * h];
@@ -211,6 +234,21 @@ pub fn uplift_field(field: &PlateField) -> Vec<f32> {
             }
         }
         std::mem::swap(&mut raw, &mut buf);
+    }
+
+    // Jitter the post-smooth uplift along the boundary band by ±12% so the
+    // ridge height varies along its length (peaks → saddles → fade-outs)
+    // instead of reading as a uniform-amplitude wall. Sampled from a
+    // dedicated Perlin so it's independent of the warp field.
+    let jitter = Perlin::default().set_seed(seed.wrapping_add(0xC3DA_1F03) as u32);
+    const JITTER_FREQ: f64 = 0.05;
+    const JITTER_AMP: f32 = 0.12;
+    for gy in 0..h {
+        for gx in 0..w {
+            let n = jitter.get([gx as f64 * JITTER_FREQ, gy as f64 * JITTER_FREQ]) as f32;
+            let factor = 1.0 + n * JITTER_AMP;
+            raw[gy * w + gx] *= factor;
+        }
     }
 
     // Normalise to roughly [-0.5, 0.5].
