@@ -273,6 +273,7 @@ pub fn spawn_select_system(
                     );
                     let (tx, ty) = MegaChunkCoord::center_tile(mx, my);
                     let center_biome = sample_dominant_biome(&globe, mx, my);
+                    let (elev_u, temp_c, _rain_u) = globe.sample_climate(tx, ty);
                     let habitable = center_biome.is_habitable();
                     let stroke_color = if habitable {
                         egui::Color32::WHITE
@@ -282,11 +283,25 @@ pub fn spawn_select_system(
                     ui.painter()
                         .rect_stroke(highlight_rect, 0.0, egui::Stroke::new(2.0, stroke_color));
 
-                    // Tooltip with biome / coord info.
+                    // Tooltip with biome / coord / climate info.
                     egui::show_tooltip(ctx, ui.layer_id(), egui::Id::new("spawn_tooltip"), |ui| {
                         ui.label(format!("Mega-chunk ({}, {})", mx, my));
                         ui.label(format!("Centre tile: ({}, {})", tx, ty));
                         ui.label(format!("Dominant biome: {}", center_biome.name()));
+                        let elev_label = if elev_u < 56.0 {
+                            "below sea level"
+                        } else if elev_u < 140.0 {
+                            "lowland"
+                        } else if elev_u < 209.0 {
+                            "highland"
+                        } else {
+                            "mountain"
+                        };
+                        ui.label(format!(
+                            "Elevation: {} ({:.0}/255)",
+                            elev_label, elev_u
+                        ));
+                        ui.label(format!("Temperature: {:.0}°C", temp_c));
                         if !habitable {
                             ui.colored_label(
                                 egui::Color32::from_rgb(220, 100, 100),

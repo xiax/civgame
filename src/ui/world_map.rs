@@ -215,22 +215,37 @@ pub fn build_globe_image(
             let rgba = if respect_fog && !cell.explored {
                 [25, 25, 25, 255]
             } else {
-                // Bilinear-classify at oversampled pixel position. The same
+                // Bilinear-classify at oversampled pixel position + sample
+                // the bilinear elevation field for hillshading. The same
                 // climate field as `classify_at_tile`, evaluated at the
                 // pixel's fractional cell location → smooth biome boundaries
                 // that match the actual in-game terrain instead of blocky
                 // per-cell colours.
+                let tiles_per_cell = (GLOBE_CELL_CHUNKS
+                    * crate::world::chunk::CHUNK_SIZE as i32)
+                    as f32;
+                let tile_x = (fx * tiles_per_cell) as i32;
+                let tile_y = (fy * tiles_per_cell) as i32;
+                let (elev_u, _, _) = globe.sample_climate(tile_x, tile_y);
+                let elev_f = (elev_u / 255.0).clamp(0.0, 1.0);
+
                 let mut c = if oversample > 1 {
-                    let tiles_per_cell = (GLOBE_CELL_CHUNKS
-                        * crate::world::chunk::CHUNK_SIZE as i32)
-                        as f32;
-                    let tile_x = (fx * tiles_per_cell) as i32;
-                    let tile_y = (fy * tiles_per_cell) as i32;
                     crate::world::biome::classify_at_tile(globe, tile_x, tile_y)
                         .color()
                 } else {
                     cell.biome.color()
                 };
+
+                // Hillshade: brightness scales with elevation so altitude is
+                // visible alongside biome. Deep ocean reads dark, mountain
+                // peaks read bright; mid-elev grassland sits near 1.0.
+                // Skip on water-flagged cells (rivers/lakes paint over).
+                if !cell.is_river && !cell.is_lake {
+                    let shade = 0.55 + 0.95 * elev_f; // [0.55, 1.50]
+                    c[0] = ((c[0] as f32 * shade).clamp(0.0, 255.0)) as u8;
+                    c[1] = ((c[1] as f32 * shade).clamp(0.0, 255.0)) as u8;
+                    c[2] = ((c[2] as f32 * shade).clamp(0.0, 255.0)) as u8;
+                }
 
                 // Rivers / lakes / faction tints stay cell-discrete: their
                 // semantics are placement-based, so bilinear smoothing makes

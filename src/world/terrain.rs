@@ -118,29 +118,42 @@ pub fn biome_thresholds(biome: Biome) -> (f32, f32, f32, f32) {
     }
 }
 
+/// Local-detail amplitude for `surface_v`: the per-tile Perlin field can
+/// only push the macro value by ±this much. Lower = terrain hugs globe
+/// elevation more tightly; higher = more within-biome variation.
+const LOCAL_DETAIL_AMP: f32 = 0.20;
+
 /// Fractional surface noise value at (tx, ty). Range [0, 1].
 ///
-/// 4-octave FBM with a continental macro layer; the result is reshaped via a
-/// signed power curve so peaks and basins push toward the Z extremes instead
-/// of clustering near 0.5. Lower base frequency than the original (0.02 vs
-/// 0.04) doubles feature wavelength.
-fn surface_v(tx: i32, ty: i32, surface: &Perlin) -> f32 {
-    let nx = tx as f64 * 0.02;
-    let ny = ty as f64 * 0.02;
-    let macro_v = surface.get([tx as f64 * 0.005, ty as f64 * 0.005]);
-    let v = macro_v * 0.35
-        + surface.get([nx, ny]) * 0.40
-        + surface.get([nx * 2.0, ny * 2.0]) * 0.18
-        + surface.get([nx * 4.0, ny * 4.0]) * 0.07;
-    let n = (((v + 1.0) * 0.5) as f32).clamp(0.0, 1.0);
-    let centered = (n - 0.5) * 2.0;
-    let shaped = centered.signum() * centered.abs().powf(0.65);
-    (shaped * 0.5 + 0.5).clamp(0.0, 1.0)
+/// **Macro signal**: bilinearly-interpolated globe elevation (`elev_u` / 255).
+/// Anchors per-tile z to the climate-cell elevation field so a Grassland
+/// lowland on the world map produces near-sea-level terrain in 3D, and a
+/// Mountain biome produces tall peaks. Without this coupling per-tile noise
+/// was independent of globe elevation, so a "lowland" biome on the map
+/// could still show a tall plateau in-world — the cognitive dissonance read
+/// as "everything is tall."
+///
+/// **Local detail**: 3-octave Perlin perturbation, ±LOCAL_DETAIL_AMP,
+/// breaks up the macro into recognisable terrain (rolling grass, jagged
+/// mountain ridges, coastal shelves) without overpowering the anchor.
+pub fn surface_v(tx: i32, ty: i32, gen: &WorldGen, globe: &Globe) -> f32 {
+    let (elev_u, _, _) = globe.sample_climate(tx, ty);
+    let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
+
+    let nx = tx as f64 * 0.04;
+    let ny = ty as f64 * 0.04;
+    let d0 = gen.surface.get([nx, ny]);
+    let d1 = gen.surface.get([nx * 2.0, ny * 2.0]);
+    let d2 = gen.surface.get([nx * 4.0, ny * 4.0]);
+    // Weighted sum normalised so output stays roughly in [-1, 1].
+    let detail = (d0 * 0.60 + d1 * 0.28 + d2 * 0.12) as f32;
+
+    (macro_f + detail * LOCAL_DETAIL_AMP).clamp(0.0, 1.0)
 }
 
 /// Compute discrete surface Z level at world tile (tx, ty). O(1).
-pub fn surface_height(tx: i32, ty: i32, gen: &WorldGen) -> i32 {
-    let v = surface_v(tx, ty, &gen.surface);
+pub fn surface_height(tx: i32, ty: i32, gen: &WorldGen, globe: &Globe) -> i32 {
+    let v = surface_v(tx, ty, gen, globe);
     let z = Z_MIN as f32 + v * CHUNK_HEIGHT as f32;
     (z.round() as i32).clamp(Z_MIN, Z_MAX)
 }
@@ -168,13 +181,14 @@ pub fn proc_tile(
     ty: i32,
     tz: i32,
     gen: &WorldGen,
+    globe: &Globe,
     biome: Biome,
     water_t: f32,
     grass_t: f32,
     farm_t: f32,
     forest_t: f32,
 ) -> TileData {
-    let v = surface_v(tx, ty, &gen.surface);
+    let v = surface_v(tx, ty, gen, globe);
     let surf_z = (Z_MIN as f32 + v * CHUNK_HEIGHT as f32).round() as i32;
     let surf_z = surf_z.clamp(Z_MIN, Z_MAX);
 
@@ -290,7 +304,7 @@ pub fn tile_at_3d(
     }
     let biome = biome_mod::classify_at_tile(globe, tx, ty);
     let (water_t, grass_t, farm_t, forest_t) = biome_thresholds(biome);
-    proc_tile(tx, ty, tz, gen, biome, water_t, grass_t, farm_t, forest_t)
+    proc_tile(tx, ty, tz, gen, globe, biome, water_t, grass_t, farm_t, forest_t)
 }
 
 /// Build a new Chunk: empty delta map + surface_z and surface_kind caches
@@ -311,7 +325,7 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
             let global_ty = chunk_ty0 + ly as i32;
             let biome = biome_mod::classify_at_tile(globe, global_tx, global_ty);
             let (water_t, grass_t, farm_t, forest_t) = biome_thresholds(biome);
-            let v = surface_v(global_tx, global_ty, &gen.surface);
+            let v = surface_v(global_tx, global_ty, gen, globe);
             let z = (Z_MIN as f32 + v * CHUNK_HEIGHT as f32).round() as i32;
             let z = z.clamp(Z_MIN, Z_MAX);
             let kind = surface_kind_fn(v, water_t, grass_t, farm_t, forest_t);
@@ -510,35 +524,44 @@ pub fn world_to_tile(pos: Vec2) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::globe::generate_globe;
+
+    fn test_globe() -> Globe {
+        generate_globe(42)
+    }
 
     #[test]
     fn surface_height_in_range() {
         let gen = WorldGen::new();
-        let z = surface_height(0, 0, &gen);
+        let g = test_globe();
+        let z = surface_height(0, 0, &gen, &g);
         assert!((Z_MIN..=Z_MAX).contains(&z));
     }
 
     #[test]
     fn proc_tile_above_surface_is_air() {
         let gen = WorldGen::new();
-        let surf = surface_height(5, 5, &gen);
-        let t = proc_tile(5, 5, surf + 1, &gen, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
+        let g = test_globe();
+        let surf = surface_height(5, 5, &gen, &g);
+        let t = proc_tile(5, 5, surf + 1, &gen, &g, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
         assert_eq!(t.kind, TileKind::Air);
     }
 
     #[test]
     fn proc_tile_surface_not_wall_or_air() {
         let gen = WorldGen::new();
-        let surf = surface_height(5, 5, &gen);
-        let t = proc_tile(5, 5, surf, &gen, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
+        let g = test_globe();
+        let surf = surface_height(5, 5, &gen, &g);
+        let t = proc_tile(5, 5, surf, &gen, &g, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
         assert!(!matches!(t.kind, TileKind::Air | TileKind::Wall));
     }
 
     #[test]
     fn proc_tile_deep_is_wall_or_cave_or_ore() {
         let gen = WorldGen::new();
-        let surf = surface_height(5, 5, &gen);
-        let t = proc_tile(5, 5, surf - 10, &gen, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
+        let g = test_globe();
+        let surf = surface_height(5, 5, &gen, &g);
+        let t = proc_tile(5, 5, surf - 10, &gen, &g, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
         assert!(matches!(
             t.kind,
             TileKind::Wall | TileKind::Air | TileKind::Dirt | TileKind::Ore
@@ -548,18 +571,20 @@ mod tests {
     #[test]
     fn proc_tile_topsoil_is_dirt() {
         let gen = WorldGen::new();
-        let surf = surface_height(5, 5, &gen);
+        let g = test_globe();
+        let surf = surface_height(5, 5, &gen, &g);
         // One tile below the surface should be Dirt (topsoil) for any non-Mountain biome,
         // unless cave noise carves through. Check Temperate which has 4 Dirt tiles.
-        let t = proc_tile(5, 5, surf - 1, &gen, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
+        let t = proc_tile(5, 5, surf - 1, &gen, &g, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
         assert!(matches!(t.kind, TileKind::Dirt | TileKind::Air));
     }
 
     #[test]
     fn proc_tile_deterministic() {
         let gen = WorldGen::new();
-        let a = proc_tile(10, 20, 0, &gen, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
-        let b = proc_tile(10, 20, 0, &gen, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
+        let g = test_globe();
+        let a = proc_tile(10, 20, 0, &gen, &g, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
+        let b = proc_tile(10, 20, 0, &gen, &g, Biome::Temperate, 0.22, 0.45, 0.60, 0.75);
         assert_eq!(a.kind, b.kind);
         assert_eq!(a.ore, b.ore);
     }

@@ -227,7 +227,8 @@ pub fn hud_system(
                         };
                         ui.label(
                             egui::RichText::new(format!(
-                                "{} Day {}",
+                                "Year {} · {} Day {}",
+                                calendar.year,
                                 calendar.season.name(),
                                 calendar.day
                             ))

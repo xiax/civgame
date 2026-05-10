@@ -61,6 +61,9 @@ pub struct Calendar {
     pub ticks_this_day: u32,
     pub ticks_per_day: u32,
     pub days_per_season: u32,
+    /// Year counter, starting at 1. Increments when the season rolls
+    /// Winter → Spring. Year 1 is the founding year.
+    pub year: u32,
 }
 
 impl Default for Calendar {
@@ -71,6 +74,7 @@ impl Default for Calendar {
             ticks_this_day: 0,
             ticks_per_day: TICKS_PER_DAY,
             days_per_season: DAYS_PER_SEASON,
+            year: 1,
         }
     }
 }
@@ -85,9 +89,18 @@ impl Calendar {
         }
     }
 
+    /// Cumulative day count since founding (year 1, Spring, day 1 == 1).
+    /// Useful for elapsed-time math that spans years.
     pub fn total_days(&self) -> u32 {
         let season_idx = self.season as u32;
-        season_idx * self.days_per_season + self.day
+        let days_per_year = self.days_per_season * 4;
+        (self.year - 1) * days_per_year + season_idx * self.days_per_season + self.day
+    }
+
+    /// Game-years elapsed since founding. Year 1 is the founding year, so
+    /// a fresh `Calendar::default()` returns 0.
+    pub fn years_elapsed(&self) -> u32 {
+        self.year.saturating_sub(1)
     }
 
     /// Fraction of the day elapsed, in `[0.0, 1.0)`.
@@ -134,7 +147,68 @@ pub fn advance_calendar_system(mut calendar: ResMut<Calendar>) {
         calendar.day += 1;
         if calendar.day > calendar.days_per_season {
             calendar.day = 1;
-            calendar.season = calendar.season.next();
+            let next = calendar.season.next();
+            if matches!(calendar.season, Season::Winter) && matches!(next, Season::Spring) {
+                calendar.year += 1;
+            }
+            calendar.season = next;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn year_increments_on_winter_to_spring_rollover() {
+        let mut world = bevy::prelude::World::new();
+        world.insert_resource(Calendar {
+            season: Season::Winter,
+            day: DAYS_PER_SEASON,
+            ticks_this_day: TICKS_PER_DAY - 1,
+            year: 3,
+            ..Calendar::default()
+        });
+        let mut schedule = bevy::prelude::Schedule::default();
+        schedule.add_systems(advance_calendar_system);
+        schedule.run(&mut world);
+        let cal = world.resource::<Calendar>();
+        assert_eq!(cal.season, Season::Spring);
+        assert_eq!(cal.day, 1);
+        assert_eq!(cal.year, 4);
+    }
+
+    #[test]
+    fn year_does_not_increment_on_other_season_rollovers() {
+        let mut world = bevy::prelude::World::new();
+        world.insert_resource(Calendar {
+            season: Season::Summer,
+            day: DAYS_PER_SEASON,
+            ticks_this_day: TICKS_PER_DAY - 1,
+            year: 2,
+            ..Calendar::default()
+        });
+        let mut schedule = bevy::prelude::Schedule::default();
+        schedule.add_systems(advance_calendar_system);
+        schedule.run(&mut world);
+        let cal = world.resource::<Calendar>();
+        assert_eq!(cal.season, Season::Autumn);
+        assert_eq!(cal.year, 2);
+    }
+
+    #[test]
+    fn total_days_factors_year() {
+        let cal = Calendar {
+            season: Season::Summer,
+            day: 2,
+            year: 3,
+            ..Calendar::default()
+        };
+        // Year 3 → 2 full years elapsed = 2 * 4 * DAYS_PER_SEASON days
+        // + Summer (1 season elapsed) * DAYS_PER_SEASON
+        // + day 2.
+        let expected = 2 * 4 * DAYS_PER_SEASON + DAYS_PER_SEASON + 2;
+        assert_eq!(cal.total_days(), expected);
     }
 }
