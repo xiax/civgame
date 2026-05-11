@@ -3,7 +3,7 @@ use crate::economy::agent::EconomicAgent;
 use crate::economy::item::Item;
 use crate::simulation::carry::Carrier;
 use crate::simulation::faction::{FactionMember, SOLO};
-use crate::simulation::gather::GatherRoutingResources;
+use crate::simulation::gather::{FinishGatherOutcome, GatherRoutingResources};
 use crate::simulation::htn::{record_routing_failure, record_target_failure, MethodHistory};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
@@ -190,10 +190,21 @@ fn finish_scavenge(
     routing: &GatherRoutingResources,
     method_history: &mut MethodHistory,
     now: u64,
+    outcome: FinishGatherOutcome,
 ) {
     ai.state = AiState::Idle;
     ai.task_id = PersonAI::UNEMPLOYED;
     ai.target_entity = None;
+
+    if outcome == FinishGatherOutcome::TargetInvalid {
+        // GroundItem despawned mid-walk / no target on arrival. The queued
+        // tail (Deposit / Eat) was predicated on the pickup producing yield;
+        // drop the chain so the agent doesn't walk to storage empty-handed.
+        // `MethodHistory.FailedTarget` was recorded by the caller.
+        aq.cancel();
+        return;
+    }
+
     aq.advance();
 
     match aq.current {
@@ -324,6 +335,7 @@ pub fn item_pickup_system(
                 &routing,
                 &mut method_history,
                 clock.tick,
+                FinishGatherOutcome::TargetInvalid,
             );
             continue;
         };
@@ -377,6 +389,7 @@ pub fn item_pickup_system(
                 &routing,
                 &mut method_history,
                 clock.tick,
+                FinishGatherOutcome::Completed,
             );
         } else {
             // Targeted item is gone (stolen or rotted) — record failure so
@@ -393,6 +406,7 @@ pub fn item_pickup_system(
                 &routing,
                 &mut method_history,
                 clock.tick,
+                FinishGatherOutcome::TargetInvalid,
             );
         }
     }

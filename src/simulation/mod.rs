@@ -34,6 +34,7 @@ pub mod nomad;
 pub mod nomad_pool;
 pub mod obstacle;
 pub mod pack_deploy;
+pub mod player_command;
 pub mod sedentary_collapse;
 pub mod person;
 pub mod wild_herd;
@@ -92,6 +93,8 @@ impl Plugin for SimulationPlugin {
             .add_event::<combat::HandDropEvent>()
             .add_event::<knowledge::DiscoveryActionEvent>()
             .add_event::<land::PlotEvictedEvent>()
+            .add_event::<player_command::PlayerCommandEvent>()
+            .insert_resource(player_command::PlayerCommandIdGen::default())
             .insert_resource(SimClock::default())
             .insert_resource(goals::ForceGoalReevaluate::default())
             .insert_resource(faction::FactionRegistry::default())
@@ -141,7 +144,8 @@ impl Plugin for SimulationPlugin {
             .configure_sets(
                 FixedUpdate,
                 (
-                    SimulationSet::ParallelA,
+                    SimulationSet::Input,
+                    SimulationSet::ParallelA.after(SimulationSet::Input),
                     SimulationSet::ParallelB.after(SimulationSet::ParallelA),
                     SimulationSet::Sequential.after(SimulationSet::ParallelB),
                     SimulationSet::Economy.after(SimulationSet::Sequential),
@@ -175,6 +179,25 @@ impl Plugin for SimulationPlugin {
                         .after(construction::seed_starting_buildings_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                 ),
+            )
+            .add_systems(
+                FixedUpdate,
+                (player_command::drain_player_command_events_system,)
+                    .in_set(SimulationSet::Input),
+            )
+            .add_systems(
+                FixedUpdate,
+                (player_command::dispatch_player_command_system,)
+                    .in_set(SimulationSet::ParallelB),
+            )
+            .add_systems(
+                FixedUpdate,
+                (
+                    player_command::player_command_lifecycle_system,
+                    player_command::reap_terminal_commands_system
+                        .after(player_command::player_command_lifecycle_system),
+                )
+                    .in_set(SimulationSet::Sequential),
             )
             .add_systems(
                 FixedUpdate,

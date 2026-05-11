@@ -154,20 +154,13 @@ pub fn right_click_context_menu_system(
     member_q: OrderMemberQueries,
     player_faction: Res<PlayerFaction>,
     faction_registry: Res<FactionRegistry>,
-    mut ai_q: Query<(
-        &mut PersonAI,
-        &mut crate::simulation::typed_task::ActionQueue,
-        &Transform,
-        &mut CombatTarget,
-        &mut TargetItem,
-    )>,
     chunk_map: Res<ChunkMap>,
     plant_map: Res<PlantMap>,
     spatial: Res<SpatialIndex>,
     tile_display: TileDisplayQueries,
-    mut routing: RoutingResources,
+    routing: RoutingResources,
     mut menu_state: ResMut<ContextMenuState>,
-    mut commands: Commands,
+    mut cmd_events: EventWriter<crate::simulation::player_command::PlayerCommandEvent>,
 ) {
     // Require a selected player-faction member.
     let Some(sel_entity) = selected.0 else {
@@ -180,18 +173,6 @@ pub fn right_click_context_menu_system(
         .map(|m| m.faction_id == player_faction.faction_id)
         .unwrap_or(false);
     let is_drafted = member_q.drafted_q.get(sel_entity).is_ok();
-    if mouse_buttons.just_pressed(MouseButton::Right) {
-        let sel_faction = member_q
-            .faction_q
-            .get(sel_entity)
-            .map(|m| m.faction_id)
-            .ok();
-        info!(
-            "[orders.menu] right-click sel={:?} sel_faction={:?} player_faction={} \
-             is_player_member={} is_drafted={}",
-            sel_entity, sel_faction, player_faction.faction_id, is_player_member, is_drafted
-        );
-    }
     if !is_player_member {
         menu_state.open = false;
         return;
@@ -460,286 +441,83 @@ pub fn right_click_context_menu_system(
         });
 
     if let Some(action) = chosen {
-        info!(
-            "[orders.menu] chosen={:?} sel={:?} target=({},{},{})",
-            action, sel_entity, target_tile.0, target_tile.1, target_z
-        );
-        if let Ok((mut ai, mut aq, transform, mut combat_target, mut target_item)) =
-            ai_q.get_mut(sel_entity)
-        {
-            let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
-            let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-            let cur_chunk = ChunkCoord(
-                cur_tx.div_euclid(CHUNK_SIZE as i32),
-                cur_ty.div_euclid(CHUNK_SIZE as i32),
-            );
-            // Player orders are external preempts (see simulation/CLAUDE.md
-            // "External preempts"). Drop the prior chain so the dispatched
-            // task promotes into `aq.current` instead of queueing behind a
-            // still-running `Explore` / etc.
-            aq.cancel();
-
-            // For Build orders: spawn a personal Blueprint at the target tile.
-            let build_bp: Option<Entity> = if let PlayerOrderKind::Build(kind) = action {
-                if !routing.bp_map.0.contains_key(&target_tile) {
-                    let faction_id = member_q
-                        .faction_q
-                        .get(sel_entity)
-                        .map(|m| m.faction_id)
-                        .unwrap_or(SOLO);
-                    let wp = tile_to_world(target_tile.0 as i32, target_tile.1 as i32);
-                    let bz =
-                        chunk_map.surface_z_at(target_tile.0 as i32, target_tile.1 as i32) as i8;
-                    let bp_e = commands
-                        .spawn((
-                            Blueprint::new(
-                                faction_id,
-                                Some(sel_entity),
-                                kind,
-                                target_tile,
-                                bz,
-                            ),
-                            Transform::from_xyz(wp.x, wp.y, 0.3),
-                            GlobalTransform::default(),
-                            Visibility::Visible,
-                            InheritedVisibility::default(),
-                        ))
-                        .id();
-                    routing.bp_map.0.insert(target_tile, bp_e);
-                    Some(bp_e)
-                } else {
-                    routing.bp_map.0.get(&target_tile).copied()
-                }
-            } else {
-                None
-            };
-
-            match action {
-                PlayerOrderKind::Move => {
-                    // Route immediately so an Idle worker enters Seeking this
-                    // tick. Without this, a player_order_completion_system
-                    // pass in the next Update can strip `PlayerOrder` (the
-                    // agent is still Idle/UNEMPLOYED) before FixedUpdate
-                    // accumulates enough time to run apply_move_order_system,
-                    // and the order is silently dropped.
-                    // `apply_move_order_system` still handles programmatic
-                    // / re-targeted inserts via `Changed<PlayerOrder>`;
-                    // re-routing the same target is idempotent.
-                    let routed = assign_task_with_routing(
-                        &mut ai,
-                        (cur_tx as i32, cur_ty as i32),
-                        cur_chunk,
-                        target_tile,
-                        TaskKind::Idle,
-                        None,
-                        &routing.chunk_graph,
-                        &routing.chunk_router,
-                        &chunk_map,
-                        &routing.chunk_connectivity,
-                    );
-                    ai.target_z = target_z;
-                    info!(
-                        "[orders.menu] Move routed={} state={:?} dest={:?} target_tile={:?}",
-                        routed, ai.state, ai.dest_tile, ai.target_tile
-                    );
-                }
-                PlayerOrderKind::Mine | PlayerOrderKind::Gather => {
-                    let routed = assign_task_with_routing(
-                        &mut ai,
-                        (cur_tx as i32, cur_ty as i32),
-                        cur_chunk,
-                        target_tile,
-                        TaskKind::Gather,
-                        None,
-                        &routing.chunk_graph,
-                        &routing.chunk_router,
-                        &chunk_map,
-                        &routing.chunk_connectivity,
-                    );
-                    info!(
-                        "[orders.menu] Mine/Gather routed={} task_id={} state={:?} \
-                         dest={:?} target_tile={:?}",
-                        routed, ai.task_id, ai.state, ai.dest_tile, ai.target_tile
-                    );
-                    aq.dispatch(crate::simulation::typed_task::Task::Gather {
-                        tile: target_tile,
-                    });
-                }
-                PlayerOrderKind::PickUp => {
-                    assign_task_with_routing(
-                        &mut ai,
-                        (cur_tx as i32, cur_ty as i32),
-                        cur_chunk,
-                        target_tile,
-                        TaskKind::Scavenge,
-                        None,
-                        &routing.chunk_graph,
-                        &routing.chunk_router,
-                        &chunk_map,
-                        &routing.chunk_connectivity,
-                    );
-                }
-                PlayerOrderKind::PickUpItem(item_entity) => {
-                    assign_task_with_routing(
-                        &mut ai,
-                        (cur_tx as i32, cur_ty as i32),
-                        cur_chunk,
-                        target_tile,
-                        TaskKind::Scavenge,
-                        Some(item_entity),
-                        &routing.chunk_graph,
-                        &routing.chunk_router,
-                        &chunk_map,
-                        &routing.chunk_connectivity,
-                    );
-                    target_item.0 = Some(item_entity);
-                    aq.dispatch(crate::simulation::typed_task::Task::Scavenge {
-                        target: item_entity,
-                    });
-                }
-                PlayerOrderKind::AttackEntity(foe) => {
-                    assign_task_with_routing(
-                        &mut ai,
-                        (cur_tx as i32, cur_ty as i32),
-                        cur_chunk,
-                        target_tile,
-                        TaskKind::MilitaryAttack,
-                        Some(foe),
-                        &routing.chunk_graph,
-                        &routing.chunk_router,
-                        &chunk_map,
-                        &routing.chunk_connectivity,
-                    );
-                    combat_target.0 = None;
-                }
-                PlayerOrderKind::PickUpCorpse(corpse_entity) => {
-                    assign_task_with_routing(
-                        &mut ai,
-                        (cur_tx as i32, cur_ty as i32),
-                        cur_chunk,
-                        target_tile,
-                        TaskKind::PickUpCorpse,
-                        Some(corpse_entity),
-                        &routing.chunk_graph,
-                        &routing.chunk_router,
-                        &chunk_map,
-                        &routing.chunk_connectivity,
-                    );
-                    aq.dispatch(crate::simulation::typed_task::Task::PickUpCorpse {
-                        corpse: corpse_entity,
-                    });
-                }
-                PlayerOrderKind::Build(BuildSiteKind::Bed) => {
-                    assign_task_with_routing(
-                        &mut ai,
-                        (cur_tx as i32, cur_ty as i32),
-                        cur_chunk,
-                        target_tile,
-                        TaskKind::ConstructBed,
-                        build_bp,
-                        &routing.chunk_graph,
-                        &routing.chunk_router,
-                        &chunk_map,
-                        &routing.chunk_connectivity,
-                    );
-                    if let Some(bp) = build_bp {
-                        aq.dispatch(crate::simulation::typed_task::Task::Construct {
-                            blueprint: bp,
-                        });
-                    }
-                }
-                PlayerOrderKind::Build(_) => {
-                    assign_task_with_routing(
-                        &mut ai,
-                        (cur_tx as i32, cur_ty as i32),
-                        cur_chunk,
-                        target_tile,
-                        TaskKind::Construct,
-                        build_bp,
-                        &routing.chunk_graph,
-                        &routing.chunk_router,
-                        &chunk_map,
-                        &routing.chunk_connectivity,
-                    );
-                    if let Some(bp) = build_bp {
-                        aq.dispatch(crate::simulation::typed_task::Task::Construct {
-                            blueprint: bp,
-                        });
-                    }
-                }
-                PlayerOrderKind::DigDown => {
-                    assign_task_with_routing(
-                        &mut ai,
-                        (cur_tx as i32, cur_ty as i32),
-                        cur_chunk,
-                        target_tile,
-                        TaskKind::Dig,
-                        None,
-                        &routing.chunk_graph,
-                        &routing.chunk_router,
-                        &chunk_map,
-                        &routing.chunk_connectivity,
-                    );
-                    aq.dispatch(crate::simulation::typed_task::Task::Dig {
-                        tile: target_tile,
-                    });
-                }
-                PlayerOrderKind::Deconstruct => {
-                    assign_task_with_routing(
-                        &mut ai,
-                        (cur_tx as i32, cur_ty as i32),
-                        cur_chunk,
-                        target_tile,
-                        TaskKind::Deconstruct,
-                        None,
-                        &routing.chunk_graph,
-                        &routing.chunk_router,
-                        &chunk_map,
-                        &routing.chunk_connectivity,
-                    );
-                }
-                // Knowledge-system orders are routed by dedicated systems
-                // (`apply_teach_order_system`, `apply_lecture_request_system`,
-                // `apply_read_order_system`, `apply_player_craft_request_system`)
-                // that consume the inserted `PlayerOrder` component below.
-                PlayerOrderKind::Teach(student) => {
-                    // The right-click "Teach <name>" entry stores the
-                    // student's tile in `target_tile`; route the teacher there
-                    // and `apply_teach_order_system` (in `teaching.rs`) inserts
-                    // the TeachingPair/BeingTaught markers on adjacency.
-                    assign_task_with_routing(
-                        &mut ai,
-                        (cur_tx as i32, cur_ty as i32),
-                        cur_chunk,
-                        target_tile,
-                        TaskKind::Teach,
-                        Some(student),
-                        &routing.chunk_graph,
-                        &routing.chunk_router,
-                        &chunk_map,
-                        &routing.chunk_connectivity,
-                    );
-                }
-                PlayerOrderKind::HoldLecture(_)
-                | PlayerOrderKind::ReadItem(_)
-                | PlayerOrderKind::EncodeTablet(_) => {
-                    // Handled by dedicated systems that read PlayerOrder.
-                }
-            }
-
-            // For non-adjacent tasks (Move) honor the player's chosen Z layer.
-            let task = ai.task_id;
-            if !task_interacts_from_adjacent(task) {
-                ai.target_z = target_z;
-            }
+        if let Some(cmd) = player_order_to_command(action, target_tile, target_z) {
+            cmd_events.send(crate::simulation::player_command::PlayerCommandEvent {
+                actors: vec![sel_entity],
+                command: cmd,
+            });
         }
-        commands.entity(sel_entity).insert(PlayerOrder {
-            order: action,
-            target_tile,
-            target_z,
-        });
         menu_state.open = false;
     }
+}
+
+/// Translate a UI `PlayerOrderKind` selection (plus the right-clicked target
+/// tile / z) into the equivalent `PlayerCommand` event payload. Returning
+/// `None` means the UI still needs to take a legacy path (currently nothing —
+/// all UI paths now have a `PlayerCommand` equivalent).
+fn player_order_to_command(
+    action: PlayerOrderKind,
+    target_tile: (i32, i32),
+    target_z: i8,
+) -> Option<crate::simulation::player_command::PlayerCommand> {
+    use crate::simulation::player_command::PlayerCommand;
+    Some(match action {
+        PlayerOrderKind::Move => PlayerCommand::Move {
+            tile: target_tile,
+            z: target_z,
+        },
+        PlayerOrderKind::Gather => PlayerCommand::Gather {
+            tile: target_tile,
+            z: target_z,
+        },
+        PlayerOrderKind::Mine => PlayerCommand::Mine {
+            tile: target_tile,
+            z: target_z,
+        },
+        PlayerOrderKind::Build(kind) => PlayerCommand::Build {
+            kind,
+            tile: target_tile,
+            z: target_z,
+        },
+        PlayerOrderKind::Deconstruct => PlayerCommand::Deconstruct {
+            tile: target_tile,
+            z: target_z,
+        },
+        PlayerOrderKind::DigDown => PlayerCommand::DigDown {
+            tile: target_tile,
+            z: target_z,
+        },
+        PlayerOrderKind::PickUpItem(item) => PlayerCommand::PickUpItem {
+            item,
+            tile: target_tile,
+            z: target_z,
+        },
+        PlayerOrderKind::PickUpCorpse(corpse) => PlayerCommand::PickUpCorpse {
+            corpse,
+            tile: target_tile,
+            z: target_z,
+        },
+        PlayerOrderKind::AttackEntity(foe) => PlayerCommand::AttackEntity {
+            foe,
+            tile: target_tile,
+            z: target_z,
+        },
+        PlayerOrderKind::Teach(student) => PlayerCommand::Teach {
+            student,
+            tile: target_tile,
+            z: target_z,
+        },
+        PlayerOrderKind::HoldLecture(tech) => PlayerCommand::HoldLecture { tech },
+        PlayerOrderKind::ReadItem(tech) => PlayerCommand::ReadItem { tech },
+        PlayerOrderKind::EncodeTablet(tech) => PlayerCommand::EncodeTablet { tech },
+        // `PickUp` (generic pick-up) is the menu shortcut that doesn't pre-pick
+        // an item entity; UI converts it to Gather/Scavenge based on what's on
+        // the tile elsewhere. Treat as Gather here to keep the menu working.
+        PlayerOrderKind::PickUp => PlayerCommand::Gather {
+            tile: target_tile,
+            z: target_z,
+        },
+    })
 }
 
 /// Build a human-readable display name for an entity on the right-clicked tile.

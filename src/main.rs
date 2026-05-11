@@ -43,6 +43,7 @@ fn main() {
     .add_plugins(rendering::RenderingPlugin)
     .add_plugins(ui::UiPlugin)
     .insert_resource(Time::<Fixed>::from_hz(20.0))
+    .add_systems(Startup, configure_time)
     .add_systems(PreUpdate, log_first_pre_update)
     .add_systems(Update, log_first_update)
     .add_systems(Update, log_first_update_end.after(log_first_update))
@@ -57,6 +58,10 @@ fn main() {
     }
 
     app.run();
+}
+
+fn configure_time(mut time: ResMut<Time<Virtual>>) {
+    time.set_max_delta(std::time::Duration::from_millis(50));
 }
 
 fn log_first_pre_update(mut has_logged: Local<bool>, time: Res<Time>) {

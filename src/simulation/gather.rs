@@ -205,6 +205,21 @@ pub struct GatherRoutingResources<'w, 's> {
 /// via `aq.cancel()`. The agent stays Idle with full hands; the next dispatcher
 /// tick will either re-dispatch a fresh chain (if memory still has a target)
 /// or fall through to `Explore`.
+///
+/// `outcome` distinguishes the success path (yield is in hands; the prefetched
+/// tail is valid — advance and route it) from the target-invalid path (plant
+/// gone / wrong tile kind / no yield produced; the tail was predicated on yield
+/// and must be dropped via `aq.cancel()` so the agent doesn't walk to storage
+/// empty-handed).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FinishGatherOutcome {
+    /// Yield was produced and is in hands/inventory; advance the chain.
+    Completed,
+    /// Target was invalid (despawned plant, de-matured plant, tile no longer a
+    /// rock/plant). No yield was produced; abort the rest of the plan.
+    TargetInvalid,
+}
+
 fn finish_gather(
     ai: &mut PersonAI,
     aq: &mut ActionQueue,
@@ -216,6 +231,7 @@ fn finish_gather(
     routing: &GatherRoutingResources,
     method_history: &mut MethodHistory,
     now: u64,
+    outcome: FinishGatherOutcome,
 ) {
     // Drop any active gather claim before resetting AI state. Mirrors
     // `release_reservation` for storage: the claim was staked at dispatch
@@ -228,6 +244,17 @@ fn finish_gather(
     ai.task_id = PersonAI::UNEMPLOYED;
     ai.target_entity = None;
     ai.work_progress = 0;
+
+    if outcome == FinishGatherOutcome::TargetInvalid {
+        // The queued tail (Deposit / HaulToBlueprint / HaulToCraftOrder / Eat)
+        // was predicated on this gather producing yield. Walking to storage
+        // with empty hands is the visible bug — drop the chain wholesale.
+        // `MethodHistory.FailedTarget` was recorded by the caller; the next
+        // dispatcher tick will re-plan with that bias applied.
+        aq.cancel();
+        return;
+    }
+
     aq.advance();
 
     // Chain handoff: route based on what the prefetch ring promoted.
@@ -534,6 +561,7 @@ pub fn gather_system(
                     &routing,
                     &mut method_history,
                     clock.tick,
+                    FinishGatherOutcome::TargetInvalid,
                 );
                 continue;
             }
@@ -745,6 +773,7 @@ pub fn gather_system(
                     &routing,
                     &mut method_history,
                     clock.tick,
+                    FinishGatherOutcome::Completed,
                 );
             } else {
                 // Not a stone/wall tile and not a plant -> target is invalid or already harvested
@@ -765,6 +794,7 @@ pub fn gather_system(
                     &routing,
                     &mut method_history,
                     clock.tick,
+                    FinishGatherOutcome::TargetInvalid,
                 );
             }
         }
@@ -783,6 +813,7 @@ pub fn gather_system(
                 &routing,
                 &mut method_history,
                 clock.tick,
+                FinishGatherOutcome::Completed,
             );
         }
     }

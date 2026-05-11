@@ -13,7 +13,7 @@ use crate::simulation::faction::{FactionMember, SOLO};
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
-use crate::simulation::person::{AiState, PersonAI, PlayerOrder};
+use crate::simulation::person::{AiState, Drafted, PersonAI};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
@@ -96,7 +96,7 @@ pub fn terraform_dispatch_system(
             &Transform,
             &LodLevel,
         ),
-        Without<PlayerOrder>,
+        Without<Drafted>,
     >,
 ) {
     if terraform_map.0.is_empty() {

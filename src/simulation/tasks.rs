@@ -574,11 +574,6 @@ pub fn assign_task_with_routing(
                         // Truly unreachable from this connectivity component.
                         // Clear target so the inspector reflects reality and
                         // the caller can mark the goal failed.
-                        info!(
-                            "[assign_task_with_routing] unreachable cur=({},{}) target=({},{}) \
-                             task={:?}",
-                            cur_tile.0, cur_tile.1, target.0, target.1, task
-                        );
                         ai.target_tile = cur_tile;
                         ai.dest_tile = cur_tile;
                         ai.target_entity = None;
@@ -642,13 +637,21 @@ pub fn goal_dispatch_system(
             &AgentGoal,
             &LodLevel,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     query
         .par_iter_mut()
         .for_each(|(actor, mut ai, mut aq, goal, lod)| {
             if *lod == LodLevel::Dormant {
+                return;
+            }
+
+            // Player command authority: skip stale-task reset entirely.
+            // `dispatch_player_command_system` owns the task chain and
+            // `player_command_lifecycle_system` owns teardown. Resetting
+            // here would clobber the dispatch routed this tick.
+            if *goal == AgentGoal::FollowingPlayerCommand {
                 return;
             }
 
@@ -1074,12 +1077,7 @@ pub fn apply_move_order_system(
             &chunk_connectivity,
         );
         ai.target_z = order.target_z;
-        info!(
-            "[apply_move_order] order target=({},{},{}) routed={} state={:?} \
-             dest={:?} target_tile={:?}",
-            order.target_tile.0, order.target_tile.1, order.target_z, routed,
-            ai.state, ai.dest_tile, ai.target_tile
-        );
+        let _ = routed;
     }
 }
 

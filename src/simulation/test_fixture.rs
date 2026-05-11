@@ -5142,6 +5142,120 @@ mod baseline_behaviour {
         );
     }
 
+    /// Event-driven player command path: emitting `PlayerCommandEvent::Move`
+    /// attaches `Commanded` (status flips Pending → Active), routes the
+    /// agent, and inserts the legacy `PlayerOrder` marker so HTN
+    /// `Without<PlayerOrder>` filters still gate autonomy until Commit 3
+    /// drops them. Pins the new pipeline end-to-end.
+    #[test]
+    fn player_command_event_move_routes_agent() {
+        use crate::simulation::player_command::{
+            Commanded, CommandStatus, PlayerCommand, PlayerCommandEvent,
+        };
+
+        let mut sim = TestSim::new(2);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.hunger(0.0); // sated → no autonomous Survive goal
+        });
+
+        let start_pos = sim
+            .app
+            .world()
+            .get::<Transform>(person)
+            .unwrap()
+            .translation;
+
+        sim.app
+            .world_mut()
+            .send_event(PlayerCommandEvent {
+                actors: vec![person],
+                command: PlayerCommand::Move {
+                    tile: (8, 0),
+                    z: 0,
+                },
+            });
+
+        // Two ticks: tick 1 drains the event and stamps `Pending`; tick 2
+        // observes the dispatcher transitioning `Pending → Active`. The
+        // two-tick latency is the cost of running drain/dispatch in
+        // different sets with an `apply_deferred` between them — single
+        // event, single observed transition.
+        sim.tick();
+        sim.tick();
+        let status_after_dispatch = sim
+            .app
+            .world()
+            .get::<Commanded>(person)
+            .map(|c| c.status);
+        assert_eq!(
+            status_after_dispatch,
+            Some(CommandStatus::Active),
+            "Commanded should be Active after two ticks; got {:?}",
+            status_after_dispatch
+        );
+
+        sim.tick_n(120);
+
+        let end_pos = sim
+            .app
+            .world()
+            .get::<Transform>(person)
+            .unwrap()
+            .translation;
+        let moved = (end_pos - start_pos).length();
+        assert!(
+            moved > 1.0,
+            "expected PlayerCommand::Move event to move agent; moved {} units",
+            moved
+        );
+    }
+
+    /// Lifecycle: after an issued Move command, the agent walks to the target,
+    /// the lifecycle system flips `Commanded → Completed` on arrival, the reap
+    /// system strips both `Commanded` and the legacy `PlayerOrder` marker, and
+    /// `goal_update_system` releases the `FollowingPlayerCommand` lock so
+    /// autonomy resumes. This is the regression-prevention test for the
+    /// "worker doesn't resume after Move" bug.
+    #[test]
+    fn player_command_move_completes_and_releases_autonomy() {
+        use crate::simulation::player_command::{
+            Commanded, PlayerCommand, PlayerCommandEvent,
+        };
+        use crate::simulation::person::PlayerOrder;
+
+        let mut sim = TestSim::new(7);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.hunger(0.0);
+        });
+
+        sim.app
+            .world_mut()
+            .send_event(PlayerCommandEvent {
+                actors: vec![person],
+                command: PlayerCommand::Move {
+                    tile: (4, 0),
+                    z: 0,
+                },
+            });
+
+        // Generous tick budget: drain → dispatch → walk → arrival → lifecycle
+        // flip → reap. 4 tiles + per-tile movement time + a margin.
+        sim.tick_n(400);
+
+        let commanded_still_present = sim.app.world().get::<Commanded>(person).is_some();
+        let player_order_still_present = sim.app.world().get::<PlayerOrder>(person).is_some();
+        assert!(
+            !commanded_still_present,
+            "Commanded should have been reaped after Move completion"
+        );
+        assert!(
+            !player_order_still_present,
+            "legacy PlayerOrder marker should have been reaped too"
+        );
+    }
+
     /// `compute_faction_storage_system` (Economy) walks each faction
     /// storage tile and reports totals on `FactionData.storage`. This
     /// pins the resource → faction-storage rollup pipeline so changes to
@@ -8626,6 +8740,240 @@ mod baseline_behaviour {
             completed,
             "expected wood deposited to faction storage within 1200 ticks via \
              chief Stockpile{{wood}} posting → GatherWood → Forage chain"
+        );
+    }
+
+    /// Regression: a worker arriving at a stale Gather target must drop the
+    /// rest of the plan (the queued `DepositToFactionStorage`) instead of
+    /// walking to storage with empty hands. `finish_gather` returns an outcome
+    /// flag for this — `TargetInvalid` calls `aq.cancel()`; `Completed` calls
+    /// `aq.advance()`. Before the fix, both paths advanced and the agent
+    /// wasted a full haul cycle routing to storage with nothing in hand.
+    #[test]
+    fn stale_gather_target_clears_queued_deposit() {
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+        };
+        use crate::simulation::memory::MemoryKind;
+        use crate::simulation::person::PersonAI;
+        use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+        use crate::simulation::tasks::TaskKind;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(0xDEAD_BEEF);
+        sim.flat_world(4, 0, TileKind::Grass);
+
+        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |_| {});
+
+        let storage_tile = (4, 4);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+
+        // Mature Tree adjacent to the worker so the walk leg is trivial and
+        // the gather_system arrival fires quickly.
+        let tree_tile = (20, 0);
+        let tree_world = tile_to_world(tree_tile.0, tree_tile.1);
+        let tree_entity = sim
+            .app
+            .world_mut()
+            .spawn((
+                Plant {
+                    kind: PlantKind::Tree,
+                    stage: GrowthStage::Mature,
+                    growth: 0,
+                    tile_pos: tree_tile,
+                },
+                Transform::from_xyz(tree_world.x, tree_world.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<PlantMap>()
+            .0
+            .insert(tree_tile, tree_entity);
+
+        // Spawn worker outside VIEW_RADIUS=15 of the tree so vision doesn't
+        // immediately re-sighting the cluster and confuse memory accounting
+        // — matches the layout of the canonical dispatch test.
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Warmup: SpatialIndex / storage rollup, parallel to other dispatch tests.
+        sim.tick_n(10);
+
+        let wood_id = crate::economy::core_ids::wood();
+        sim.inject_faction_sighting(sim.player_faction_id, tree_tile, MemoryKind::wood());
+
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            let posting = JobPosting {
+                id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Stockpile {
+                    resource_id: wood_id,
+                    deposited: 0,
+                    target: 8,
+                },
+                claimants: vec![worker],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            };
+            board
+                .postings
+                .entry(sim.player_faction_id)
+                .or_default()
+                .push(posting);
+            id
+        };
+        sim.app.world_mut().entity_mut(worker).insert(JobClaim {
+            job_id,
+            faction_id: sim.player_faction_id,
+            kind: JobKind::Stockpile,
+            posted_tick: 0,
+            fail_count: 0,
+        });
+
+        // Also force-set the goal to GatherWood and clear any task so the
+        // dispatcher routes the chain on its next tick (mirrors the existing
+        // `gather_wood_goal_dispatches_gather_then_deposit_chain` setup).
+        {
+            let mut entity = sim.app.world_mut().entity_mut(worker);
+            entity.insert(crate::simulation::jobs::ClaimTarget::default());
+            let mut goal = entity
+                .get_mut::<crate::simulation::goals::AgentGoal>()
+                .unwrap();
+            *goal = crate::simulation::goals::AgentGoal::GatherWood;
+        }
+
+        // Tick until the chain is dispatched: aq.current = Gather { tree_tile },
+        // queued = [Deposit].
+        let mut dispatched = false;
+        for _ in 0..200 {
+            sim.tick();
+            let aq = sim.app.world().get::<ActionQueue>(worker).unwrap();
+            if let Task::Gather { tile } = aq.current {
+                if tile == tree_tile {
+                    dispatched = true;
+                    break;
+                }
+            }
+        }
+        if !dispatched {
+            let aq = sim.app.world().get::<ActionQueue>(worker).unwrap();
+            let ai = sim.app.world().get::<PersonAI>(worker).unwrap();
+            let goal = sim
+                .app
+                .world()
+                .get::<crate::simulation::goals::AgentGoal>(worker)
+                .unwrap();
+            panic!(
+                "expected Task::Gather chain to be dispatched within 200 ticks; \
+                 aq.current = {:?}, queued_len = {}, task_id = {}, goal = {:?}",
+                aq.current,
+                aq.queued_len(),
+                ai.task_id,
+                goal,
+            );
+        }
+
+        // Confirm the queue tail is the Deposit we want to see *not* run.
+        {
+            let aq = sim.app.world().get::<ActionQueue>(worker).unwrap();
+            assert_eq!(aq.queued_len(), 1, "tail should be the Deposit");
+            assert!(
+                matches!(aq.peek_next(), Some(Task::DepositToFactionStorage { .. })),
+                "tail should be DepositToFactionStorage, got {:?}",
+                aq.peek_next()
+            );
+        }
+
+        // Teleport the worker adjacent to the tree and force the arrival
+        // state (Working + task_id=Gather) directly. The 20-tile walk leg
+        // isn't load-bearing for this regression — `gather_system` fires
+        // its stale-check whenever it observes the agent in (Working,
+        // task_id=Gather) regardless of how they got there.
+        let adj_tile = (tree_tile.0 - 1, tree_tile.1);
+        let adj_world = tile_to_world(adj_tile.0, adj_tile.1);
+        {
+            let mut tf = sim.app.world_mut().get_mut::<Transform>(worker).unwrap();
+            tf.translation.x = adj_world.x;
+            tf.translation.y = adj_world.y;
+        }
+        {
+            let mut ai = sim.app.world_mut().get_mut::<PersonAI>(worker).unwrap();
+            ai.state = crate::simulation::person::AiState::Working;
+            ai.task_id = TaskKind::Gather as u16;
+            ai.dest_tile = (tree_tile.0, tree_tile.1);
+        }
+
+        // Simulate "another worker already chopped it" — yank the tree out
+        // from under the planned harvest.
+        sim.app
+            .world_mut()
+            .resource_mut::<PlantMap>()
+            .0
+            .remove(&tree_tile);
+        sim.app.world_mut().entity_mut(tree_entity).despawn_recursive();
+
+        // One tick: `gather_system` observes (Working, Gather), looks up
+        // the tile in `PlantMap`, hits the legacy `finish_gather` fall-through
+        // since neighbor-retarget finds nothing, and routes through
+        // `FinishGatherOutcome::TargetInvalid` → `aq.cancel()`.
+        sim.tick();
+
+        let aq = sim.app.world().get::<ActionQueue>(worker).unwrap();
+        assert_eq!(
+            aq.current,
+            Task::Idle,
+            "stale-arrival should leave aq.current Idle, got {:?}",
+            aq.current
+        );
+        assert_eq!(
+            aq.queued_len(),
+            0,
+            "the queued Deposit must have been dropped — \
+             this is the regression guard for the empty-handed-walk-to-storage bug"
+        );
+
+        // Storage tile is at (4,4); worker is at ~(20,0). If the bug were
+        // present, the agent would have been routed toward storage. Verify
+        // the worker isn't doing that across a few more ticks — `aq.current`
+        // should not become any `DepositToFactionStorage` / `WalkTo` aimed at
+        // the storage tile until a fresh re-dispatch sets up a new chain.
+        let worker_tile_before = {
+            let t = sim.app.world().get::<Transform>(worker).unwrap();
+            crate::world::terrain::world_to_tile(t.translation.truncate())
+        };
+        for _ in 0..3 {
+            sim.tick();
+            let aq = sim.app.world().get::<ActionQueue>(worker).unwrap();
+            if let Task::WalkTo { tile, .. } = aq.current {
+                assert!(
+                    tile != storage_tile,
+                    "worker walked to storage tile after stale gather — the empty-handed-deposit bug regressed"
+                );
+            }
+        }
+        // Sanity: worker isn't somehow at storage tile a few ticks later.
+        let worker_tile_after = {
+            let t = sim.app.world().get::<Transform>(worker).unwrap();
+            crate::world::terrain::world_to_tile(t.translation.truncate())
+        };
+        let drift = (worker_tile_after.0 - worker_tile_before.0).abs()
+            + (worker_tile_after.1 - worker_tile_before.1).abs();
+        assert!(
+            drift < 5,
+            "worker drifted {} tiles in 3 ticks after stale-arrival — \
+             unexpected motion suggests a follow-up dispatch routed them somewhere",
+            drift
         );
     }
 

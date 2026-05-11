@@ -3273,7 +3273,7 @@ pub fn htn_dispatch_system(
             &LodLevel,
             Option<&HomeBed>,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     query.par_iter_mut().for_each(
@@ -3529,7 +3529,7 @@ pub fn htn_eat_dispatch_system(
             &FactionMember,
             &LodLevel,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     query.par_iter_mut().for_each(
@@ -3712,11 +3712,13 @@ pub fn htn_acquire_food_dispatch_system(
     storage_tile_map: Res<StorageTileMap>,
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<SimClock>,
     calendar: Res<Calendar>,
     plant_map: Res<PlantMap>,
     gather_claims: Res<GatherClaims>,
     gk: crate::simulation::shared_knowledge::GatherKnowledge,
+    item_query: Query<&crate::simulation::items::GroundItem>,
     plant_query: Query<&Plant>,
     mut query: Query<
         (
@@ -3734,7 +3736,7 @@ pub fn htn_acquire_food_dispatch_system(
             Option<&crate::simulation::reproduction::HouseholdMember>,
             &crate::simulation::memory::CurrentVision,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     let now = clock.tick;
@@ -3784,13 +3786,40 @@ pub fn htn_acquire_food_dispatch_system(
             // whose chunk isn't reachable from the agent's chunk so the
             // dispatcher doesn't burn a tick on an unroutable target before
             // the failure path biases the method.
-            let nearest_storage_tile = storage_tile_map.nearest_for_faction_reachable(
-                member.faction_id,
-                (cur_tx, cur_ty),
-                cur_chunk,
-                ai.current_z,
-                &chunk_connectivity,
-            );
+            // **Correction:** Filter storage tiles to ensure they actually
+            // contain edible items, preventing a loop where agents walk to
+            // a seed-only tile under Survive.
+            let nearest_storage_tile = if let Some(tiles) = storage_tile_map.by_faction.get(&member.faction_id) {
+                let pick = |reachable_only: bool| {
+                    tiles
+                        .iter()
+                        .filter(|&&(tx, ty)| {
+                            if reachable_only {
+                                let target_chunk = ChunkCoord(
+                                    tx.div_euclid(CHUNK_SIZE as i32),
+                                    ty.div_euclid(CHUNK_SIZE as i32),
+                                );
+                                if !chunk_connectivity.is_reachable((cur_chunk, ai.current_z), (target_chunk, ai.current_z)) {
+                                    return false;
+                                }
+                            }
+
+                            // Ensure at least one edible item exists on this tile
+                            spatial.get(tx, ty).iter().any(|&e| {
+                                if let Ok(gi) = item_query.get(e) {
+                                    gi.item.resource_id.is_edible() && gi.qty > 0
+                                } else {
+                                    false
+                                }
+                            })
+                        })
+                        .min_by_key(|&&(tx, ty)| (tx - cur_tx).abs() + (ty - cur_ty).abs())
+                        .copied()
+                };
+                pick(true).or_else(|| pick(false))
+            } else {
+                None
+            };
             // `food_stock` returns f32 because it sums Fruit/Meat/Grain at
             // floating-point granularity in some legacy code; for ctx purposes
             // we want a u32 tally. Floor the value — under-counting is the
@@ -4251,7 +4280,7 @@ pub fn htn_acquire_good_dispatch_system(
             &crate::economy::agent::EconomicAgent,
             &Needs,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     use crate::simulation::jobs::JobKind;
@@ -4915,7 +4944,7 @@ pub fn htn_stockpile_food_dispatch_system(
             Option<&crate::simulation::reproduction::HouseholdMember>,
             &crate::simulation::memory::CurrentVision,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     use crate::simulation::jobs::JobKind;
@@ -5371,7 +5400,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
             &LodLevel,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     let weapon_id = crate::economy::core_ids::weapon();
@@ -5623,7 +5652,7 @@ pub fn htn_scout_dispatch_system(
             &LodLevel,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     use crate::simulation::faction::HuntOrder;
@@ -5842,7 +5871,7 @@ pub fn htn_return_surplus_dispatch_system(
             &FactionMember,
             &LodLevel,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     let now = clock.tick;
@@ -6066,7 +6095,7 @@ pub fn htn_tame_horse_dispatch_system(
             &FactionMember,
             &LodLevel,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     const VIEW_RADIUS: i32 = 15;
@@ -6285,7 +6314,7 @@ pub fn htn_plant_from_storage_dispatch_system(
             &LodLevel,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     use crate::simulation::plants::PlantKind;
@@ -6575,7 +6604,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             &crate::simulation::carry::Carrier,
             &crate::economy::agent::EconomicAgent,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     use crate::simulation::jobs::JobKind;
@@ -7010,7 +7039,7 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
             &LodLevel,
             &crate::simulation::corpse::Carrying,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     let now = clock.tick;
@@ -7195,7 +7224,7 @@ pub fn htn_engage_prey_dispatch_system(
             Option<&crate::simulation::reproduction::HouseholdMember>,
             Option<&crate::simulation::corpse::Carrying>,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     use crate::simulation::faction::HuntOrder;
@@ -7516,7 +7545,7 @@ pub fn htn_join_hunt_party_dispatch_system(
             &LodLevel,
             Option<&crate::simulation::corpse::Carrying>,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     use crate::simulation::faction::{HuntOrder, HUNT_PARTY_TIMEOUT};
@@ -7752,7 +7781,7 @@ pub fn htn_socialize_dispatch_system(
             &FactionMember,
             &LodLevel,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     const PARTNER_RADIUS: i32 = 12;
@@ -7945,7 +7974,7 @@ pub fn htn_combat_faction_dispatch_system(
             &FactionMember,
             &LodLevel,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     let now = clock.tick;
@@ -8185,7 +8214,7 @@ pub fn bureaucrat_admin_dispatch_system(
             &FactionMember,
             &LodLevel,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     for (prof, mut ai, mut aq, transform, member, lod) in query.iter_mut() {
@@ -8369,7 +8398,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
             &Transform,
             &LodLevel,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     let now = clock.tick;
@@ -8737,7 +8766,7 @@ pub fn htn_work_on_craft_order_dispatch_system(
             &Transform,
             &LodLevel,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     let now = clock.tick;
@@ -8984,7 +9013,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             Option<&crate::simulation::reproduction::HouseholdMember>,
             &crate::simulation::memory::CurrentVision,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     let now = clock.tick;
@@ -9314,7 +9343,7 @@ pub fn htn_harvest_plant_dispatch_system(
             Option<&crate::simulation::knowledge::PersonKnowledge>,
             Option<&crate::simulation::reproduction::HouseholdMember>,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     let now = clock.tick;
@@ -9810,7 +9839,7 @@ pub fn htn_play_dispatch_system(
             &LodLevel,
             Option<&FactionMember>,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     const PLAY_RADIUS: i32 = 12;
@@ -10281,7 +10310,7 @@ pub fn htn_clear_obstacle_dispatch_system(
             Option<&crate::simulation::jobs::ClaimTarget>,
             &LodLevel,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     use crate::simulation::jobs::JobKind;

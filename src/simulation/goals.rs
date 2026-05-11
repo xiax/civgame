@@ -145,6 +145,14 @@ pub enum AgentGoal {
     /// raid / rescue) preempt naturally via the existing branch order
     /// in `goal_update_system`.
     MigrateToCamp = 19,
+    /// Player-issued command is owning this agent. Forced by
+    /// `goal_update_system` when `Commanded { status: Pending | Active }`
+    /// is present. HTN dispatchers don't match this goal so they naturally
+    /// skip the agent — replaces the 28 scattered `Without<PlayerOrder>`
+    /// filters. The task chain is set up by
+    /// `dispatch_player_command_system` and preserved by
+    /// `goal_dispatch_system`'s short-circuit.
+    FollowingPlayerCommand = 20,
 }
 
 impl AgentGoal {
@@ -165,6 +173,7 @@ impl AgentGoal {
             AgentGoal::Lead => "Lead",
             AgentGoal::Rescue => "Rescue",
             AgentGoal::Play => "Play",
+            AgentGoal::FollowingPlayerCommand => "FollowingPlayerCommand",
             AgentGoal::Farm => "Farm",
             AgentGoal::Haul => "Haul",
             AgentGoal::Stockpile => "Stockpile",
@@ -348,6 +357,27 @@ impl MaslowTier {
     }
 }
 
+/// Read-only validation queries goal_update_system uses to detect despawned
+/// target entities. Bundled to keep the system under the 16-param ceiling.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct GoalValidationQueries<'w, 's> {
+    pub plant_query: Query<'w, 's, &'static Plant>,
+    pub item_query: Query<'w, 's, (), With<GroundItem>>,
+    pub bp_query: Query<'w, 's, &'static Blueprint>,
+    pub wild_horse_q: Query<'w, 's, (), (With<Horse>, Without<Tamed>)>,
+    pub rescue_q: Query<'w, 's, &'static RescueTarget>,
+    pub attacker_alive_q: Query<
+        'w,
+        's,
+        Entity,
+        Or<(
+            With<crate::simulation::combat::Health>,
+            With<crate::simulation::combat::Body>,
+        )>,
+    >,
+    pub commanded_q: Query<'w, 's, &'static crate::simulation::player_command::Commanded>,
+}
+
 pub fn goal_update_system(
     mut commands: Commands,
     clock: Res<SimClock>,
@@ -355,19 +385,8 @@ pub fn goal_update_system(
     calendar: Res<Calendar>,
     auto_build: Res<AutonomousBuildingToggle>,
     storage: StorageReachability,
-    plant_query: Query<&Plant>,
-    item_query: Query<(), With<GroundItem>>,
+    validation: GoalValidationQueries,
     bp_map: Res<BlueprintMap>,
-    bp_query: Query<&Blueprint>,
-    wild_horse_q: Query<(), (With<Horse>, Without<Tamed>)>,
-    rescue_q: Query<&RescueTarget>,
-    attacker_alive_q: Query<
-        Entity,
-        Or<(
-            With<crate::simulation::combat::Health>,
-            With<crate::simulation::combat::Body>,
-        )>,
-    >,
     mut query: Query<
         (
             Entity,
@@ -386,7 +405,7 @@ pub fn goal_update_system(
             Option<&JobClaim>,
             Option<&crate::simulation::nomad::MigrationTarget>,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
     cooldown_query: Query<&GoalCooldown>,
     mut force_reeval: ResMut<ForceGoalReevaluate>,
@@ -409,6 +428,28 @@ pub fn goal_update_system(
         migration_target,
     ) in query.iter_mut()
     {
+        // Player command authority: when `Commanded` is non-terminal, force
+        // the player-command goal and skip all autonomous evaluation. HTN
+        // dispatchers don't match `FollowingPlayerCommand`, so they'll
+        // naturally skip this agent without needing `Without<PlayerOrder>`
+        // filters. This replaces the 28 scattered filters from the legacy
+        // design. `dispatch_player_command_system` set up the task chain
+        // already; `goal_dispatch_system` preserves it via a top-level
+        // short-circuit on this goal.
+        if let Ok(cmd) = validation.commanded_q.get(entity) {
+            if !cmd.status.is_terminal() {
+                if *goal != AgentGoal::FollowingPlayerCommand {
+                    *goal = AgentGoal::FollowingPlayerCommand;
+                }
+                if let Some(mut r) = reason_opt {
+                    r.0 = "Player Order";
+                } else {
+                    commands.entity(entity).insert(GoalReason("Player Order"));
+                }
+                continue;
+            }
+        }
+
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -472,13 +513,13 @@ pub fn goal_update_system(
 
             if tid == TaskKind::Gather as u16 {
                 if let Some(ent) = ai.target_entity {
-                    if plant_query.get(ent).is_err() {
+                    if validation.plant_query.get(ent).is_err() {
                         invalid = true;
                     }
                 }
             } else if tid == TaskKind::Scavenge as u16 {
                 match ai.target_entity {
-                    Some(ent) if item_query.get(ent).is_err() => invalid = true,
+                    Some(ent) if validation.item_query.get(ent).is_err() => invalid = true,
                     None => invalid = true,
                     _ => {}
                 }
@@ -487,7 +528,7 @@ pub fn goal_update_system(
                 || tid == TaskKind::HaulMaterials as u16
             {
                 match ai.target_entity {
-                    Some(ent) if bp_query.get(ent).is_err() => invalid = true,
+                    Some(ent) if validation.bp_query.get(ent).is_err() => invalid = true,
                     None => invalid = true,
                     _ => {}
                 }
@@ -503,8 +544,8 @@ pub fn goal_update_system(
 
         // Rescue override: if a distress responder still has a live attacker target,
         // hold the Rescue goal until they engage / it dies / or it times out.
-        if let Ok(rt) = rescue_q.get(entity) {
-            let attacker_alive = attacker_alive_q.get(rt.attacker).is_ok();
+        if let Ok(rt) = validation.rescue_q.get(entity) {
+            let attacker_alive = validation.attacker_alive_q.get(rt.attacker).is_ok();
             let timed_out = clock.tick.saturating_sub(rt.set_tick) > 200;
             if attacker_alive && !timed_out {
                 if *goal != AgentGoal::Rescue {
@@ -626,7 +667,7 @@ pub fn goal_update_system(
                 .get(&member.faction_id)
                 .map(|f| f.techs.has(HORSE_TAMING))
                 .unwrap_or(false)
-            && !wild_horse_q.is_empty();
+            && !validation.wild_horse_q.is_empty();
 
         let (faction_food_ratio, can_return_camp) = if member.faction_id != SOLO {
             let per_member: f32 = match calendar.season {
@@ -686,7 +727,8 @@ pub fn goal_update_system(
         // the Stockpile/Haul/Build job pipeline (see jobs.rs).
         let has_personal_build_site = auto_build.0
             && bp_map.0.values().any(|&bp_e| {
-                bp_query
+                validation
+                    .bp_query
                     .get(bp_e)
                     .map(|bp| bp.personal_owner == Some(entity))
                     .unwrap_or(false)

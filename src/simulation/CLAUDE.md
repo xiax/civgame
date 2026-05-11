@@ -25,13 +25,24 @@ AI dispatch runs end-to-end through HTN.
 - **Faction storage refresh:** `FactionStorage.totals` rebuilt every Economy tick by `compute_faction_storage_system`. HTN dispatchers read these directly when scoring.
 - **`MF_UNINTERRUPTIBLE`:** methods set this when their multi-leg chain must survive across goal-dispatch ticks.
 
+## Player command authority (`player_command.rs`)
+
+UI inserts player input as `PlayerCommandEvent` (event bus). The sim drains in `SimulationSet::Input`, attaches a `Commanded { command, status, issued_tick, command_id }` component per actor, then `dispatch_player_command_system` (ParallelB) routes the command into the typed-task pipeline. **All routing happens sim-side** — UI never mutates `PersonAI` / `ActionQueue` / authority markers directly.
+
+- **Goal forcing replaces filter scatter.** `goal_update_system` checks `Commanded` (via `GoalValidationQueries.commanded_q`); when non-terminal, forces `AgentGoal::FollowingPlayerCommand` and `continue`s. HTN dispatchers gate on goal variants they recognize; `FollowingPlayerCommand` matches none, so they naturally skip. **No `Without<PlayerOrder>` filters anywhere.** Previously 28 of these were scattered across `htn.rs`, `goals.rs`, `tasks.rs`, `terraform.rs`, `trader.rs`.
+- **Lifecycle is explicit, per-kind.** `player_command_lifecycle_system` (Sequential, after executors) match-arms on `PlayerCommand` to detect terminal state: Move = chebyshev arrival; Gather = target plant despawned OR agent idle; Mine = tile no longer Wall/Stone; Build = blueprint despawned; PickUp* = target gone; Attack = foe dead. Knowledge orders complete on idle. Replaces the legacy heuristic `state==Idle && task_id==UNEMPLOYED` rule that broke Move (which sets `task_id=Idle` upfront).
+- **Reap one tick after terminal.** `reap_terminal_commands_system` strips both `Commanded` and the legacy `PlayerOrder` marker once status is `Completed | Failed(_) | Superseded`. UI consumers read `RemovedComponents<Commanded>` for HUD feedback.
+- **Schedule placement:** `Input → ParallelA → ParallelB → Sequential → Economy`. The `Input` set is exclusive to player-command drain; commands flush before goal/dispatch reads. The Move race fixed earlier (UI in Update racing FixedUpdate dispatch) is structurally impossible — events deliver before the next FixedUpdate tick.
+- **Adding a new order type** = four touches: `PlayerCommand` variant (`player_command.rs`), `dispatch_one` match arm (same file), `player_command_lifecycle_system` match arm (same file), UI button emits the event. No HTN edits, no schedule edits, no scattered filter changes.
+- **Legacy `PlayerOrder` marker** still exists and is inserted by `dispatch_player_command_system` alongside `Commanded` because `apply_player_knowledge_orders_system` (ReadItem/EncodeTablet) and `apply_teach_order_system` consume it. Migration to events for those handlers is a follow-on. `player_order_completion_system` and `apply_move_order_system` are vestigial fallbacks for tests / programmatic inserts.
+
 ## ActionQueue and typed Task variants (`typed_task.rs`)
 
 `aq.current: Task` is canonical "task running now"; `Task::Idle` default; every Person spawn site bundles `ActionQueue::idle()`. Behind `current` sits a fixed-capacity `queued: [Task; 4]` prefetch ring (private; access via `enqueue` / `pop_next` / `peek_next` / `queued_len` / `queued_is_empty` / `clear_queued`).
 
 - **Producers** (HTN dispatchers, `ui/orders.rs`, `teaching.rs::ReadItem`) route through `aq.dispatch(task)` — enqueues then promotes head into `current` if `current == Idle`.
 - **Consumers** (executor exit paths in `gather.rs`, `dig.rs`, `corpse.rs`, `construction.rs`, `items.rs`, `production.rs`, `teaching.rs`, plus `MilitaryMove` arrival in `military.rs`) call `aq.advance()` instead of writing `current = Idle`.
-- **External preempts** (`apply_muster_hunters_system`, hunter demote, `goal_dispatch_system` stale reset) call `aq.cancel()`, dropping both `current` and the queue.
+- **External preempts** (`dispatch_player_command_system`, `apply_muster_hunters_system`, hunter demote, `goal_dispatch_system` stale reset) call `aq.cancel()`, dropping both `current` and the queue.
 - Per-tick "pin" sites (lecture/teach pin writes in `teaching.rs`) stay as direct `aq.current = X` writes — idempotent re-assertions, not fresh dispatches.
 
 **Variants:** `Idle`, `WalkTo { tile, z, why }`, `WithdrawGood { filter }`, `WithdrawMaterial { resource_id, qty }`, `WithdrawFood { tile }`, `Equip { slot, resource_id }`, `Construct { blueprint }`, `Gather { tile }`, `Dig { tile }`, `Scavenge { target }`, `Read/Teach/HoldLecture/AttendLecture { tech }`, `PickUpCorpse { corpse }`, `HuntPartyMuster { hearth }`, `Hunt { prey }`, `HaulCorpse { dest }`, `Butcher`, `TameAnimal { target }`, `Sleep { bed }`, `Eat`, `HaulToBlueprint { blueprint }`, `HaulToCraftOrder { order }`, `WorkOnCraftOrder { order }`, `DepositToFactionStorage { resource_id }`, `WalkAndTakeFromMember { target, resource_id, qty }`, `PlayThrow`, `PlayPlant { tile }`, `Explore { kind }`, `Migrate`, plus `Lead/Defend/Raid/RescueAlly/Socialize/Play` (faction/social).
@@ -103,8 +114,8 @@ Trailing legs of multi-task chains live in exit helpers on the head executor:
 
 - **`production::finish_withdraw_food`** — primes `task_id = Eat`.
 - **`production::finish_withdraw_material`** — releases reservation; routes `HaulToBlueprint` / `HaulToCraftOrder` / `Planter`; primes `Equip` / `PlayThrow` / `Play` in-place.
-- **`gather::finish_gather`** (5 exit sites) — routes `DepositToFactionStorage` to nearest storage; routes `HaulToBlueprint` / `HaulToCraftOrder`; primes `Eat` for the Forage chain. Routing failure drops the chain (`aq.cancel()`).
-- **`items::finish_scavenge`** — mirror of `finish_gather`; primes `Eat` for the AcquireFood path.
+- **`gather::finish_gather`** (5 exit sites) — routes `DepositToFactionStorage` to nearest storage; routes `HaulToBlueprint` / `HaulToCraftOrder`; primes `Eat` for the Forage chain. Routing failure drops the chain (`aq.cancel()`). Takes a `FinishGatherOutcome::{Completed, TargetInvalid}` parameter: `TargetInvalid` (stale plant, wrong tile kind) calls `aq.cancel()` so the queued tail isn't run with empty hands; `Completed` calls `aq.advance()` and routes the tail as before.
+- **`items::finish_scavenge`** — mirror of `finish_gather`; primes `Eat` for the AcquireFood path. Same `FinishGatherOutcome` parameter — GroundItem despawned mid-walk fires `TargetInvalid` so the chain doesn't walk to storage empty-handed.
 - **`drop_items_at_destination_system`** — executor for `TaskKind::DepositResource`; dumps hands at `dest_tile`, credits any `JobClaim::Stockpile`, `aq.advance()`s.
 
 ### Stale-reset / catch-all (`goal_dispatch_system`)

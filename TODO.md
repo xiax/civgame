@@ -73,19 +73,21 @@ X implement willpower system. Work decreases willpower, fun stuff increases will
  Pre-existing; out of scope.
 
 
-Can you come up with a plan to overhaul the construction system please? The way it is currently implemented doesn't make sense  historically and doesn't look good and doesn't take into account farming plots and room for various buildings and the starting buildings infrastructure for various ages that matches the number of people in the faction and is able to expand organically.
+X - Can you come up with a plan to overhaul the construction system please? The way it is currently implemented doesn't make sense  historically and doesn't look good and doesn't take into account farming plots and room for various buildings and the starting buildings infrastructure for various ages that matches the number of people in the faction and is able to expand organically.
 
-I want to Add the concept of land ownership to the game. All land around a settlement belongs to the state by default but In mixed and capitalist economies the state can rent or sell land to households. Everything on a plot of land belongs to the household and the household can build or farm on the land. Land value should follow market dynamics, people desire housing next to where they work, land further away from settlement centre or other desirable resources are lower value and can be sold in larger quantities for private farmers or rented out for a tenant farmer model.
+X - I want to Add the concept of land ownership to the game. All land around a settlement belongs to the state by default but In mixed and capitalist economies the state can rent or sell land to households. Everything on a plot of land belongs to the household and the household can build or farm on the land. Land value should follow market dynamics, people desire housing next to where they work, land further away from settlement centre or other desirable resources are lower value and can be sold in larger quantities for private farmers or rented out for a tenant farmer model.
 
 Fix memory leaks in late game.
 
-I feel like there are a lot of places where the nomadic and settlement system are clashing as well as places where the different economic models are clashing, can you propose a design that allows us to seamlessly switch between the different models we want to capture in the game? In a way that minimizes bugs and allows us to expand to more systems easily in the future?
+X - I feel like there are a lot of places where the nomadic and settlement system are clashing as well as places where the different economic models are clashing, can you propose a design that allows us to seamlessly switch between the different models we want to capture in the game? In a way that minimizes bugs and allows us to expand to more systems easily in the future?
 
-Overhaul settlement and nomadic system to make them work better together and work better in the future, throw in overhaul for making the different economic models mesh together as well.
+X - Overhaul settlement and nomadic system to make them work better together and work better in the future, throw in overhaul for making the different economic models mesh together as well.
 
-Need UI overhaul to add commands for all actions players can take
+Need UI overhaul to add commands for all actions players can take, in a way that is robust and extensible in the future
 
-Overhaul technology system to be entirely knowledge based, settlement creation gates the leader knowing about farming and deciding to farm, technological adoption is on a per agent level baed on their knowledge, technological adoption by governments depends on the knowledge of government officials and bureaucrats.
+Overhaul technology system to be entirely knowledge based, please propose a system for technological adoption that is true to history that uses the knowledge based system.
+
+settlement creation gates the leader knowing about farming and deciding to farm, technological adoption is on a per agent level baed on their knowledge, technological adoption by governments depends on the knowledge of government officials and bureaucrats.
 
 
 Market-mode coherence track (M4-M5 deferred per memory)
@@ -96,4 +98,19 @@ Free-agent gathering. In Market mode, when should_craft declines (cooldown or no
 
 
 I need logging to track performance metrics and identify bottlenecks in the code that is slowing down each tick, give me a plan to do this comprehensively please.
+
+
+Settlements shouldn't be split by a river when placing initial settlements and camps
+
+Add initial stone tools to spawn
+
+Adjust work time and show progress bars. Cutting down trees should take way longer with initial stone tools
+
+Add a fishing system to the game that works well with existing systems and is robust and extensible and true to history.
+
+Nomadic tribes should migrate way farther and actually look for good spots where there is a lot of food. They should send scouts far further away to look for good locations. Migration is also extremely buggy. I see people left behind in migrations, people not migrating properly, people still gathered around the old faction base and people no gain to the new faction base properly. Factions also migrate too easily.
+
+
+
+
 

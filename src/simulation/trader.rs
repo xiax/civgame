@@ -76,6 +76,7 @@ fn goal_preempts_trade(goal: &AgentGoal) -> bool {
             | AgentGoal::Raid
             | AgentGoal::Lead
             | AgentGoal::Rescue
+            | AgentGoal::FollowingPlayerCommand
     )
 }
 
@@ -217,7 +218,6 @@ pub fn trader_market_step_system(world: &mut World) {
             &EconomicAgent,
             Option<&TraderPlan>,
             Option<&Drafted>,
-            Option<&PlayerOrder>,
         )>();
         let mut out = Vec::new();
         for (
@@ -232,7 +232,6 @@ pub fn trader_market_step_system(world: &mut World) {
             econ,
             plan,
             drafted,
-            player_order,
         ) in q.iter(world)
         {
             if *prof != Profession::Trader {
@@ -241,7 +240,7 @@ pub fn trader_market_step_system(world: &mut World) {
             if *lod == LodLevel::Dormant {
                 continue;
             }
-            if drafted.is_some() || player_order.is_some() {
+            if drafted.is_some() {
                 continue;
             }
             if goal_preempts_trade(goal) {
@@ -389,7 +388,7 @@ pub fn trader_route_dispatch_system(
             &LodLevel,
             &AgentGoal,
         ),
-        (Without<PlayerOrder>, Without<Drafted>),
+        Without<Drafted>,
     >,
 ) {
     for (prof, plan, mut ai, mut aq, transform, lod, goal) in query.iter_mut() {

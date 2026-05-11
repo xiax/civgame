@@ -201,16 +201,7 @@ pub fn apply_muster_hunters_system(
         return;
     }
     request.pending = false;
-    let mut drafted_count: u32 = 0;
-    let mut player_member_count: u32 = 0;
-    let mut player_hunter_count: u32 = 0;
     for (entity, prof, member, mut ai, mut aq) in hunters.iter_mut() {
-        if member.faction_id == player_faction.faction_id {
-            player_member_count += 1;
-            if *prof == Profession::Hunter {
-                player_hunter_count += 1;
-            }
-        }
         if *prof != Profession::Hunter || member.faction_id != player_faction.faction_id {
             continue;
         }
@@ -230,12 +221,7 @@ pub fn apply_muster_hunters_system(
             .entity(entity)
             .remove::<crate::simulation::corpse::Carrying>()
             .insert(Drafted);
-        drafted_count += 1;
     }
-    info!(
-        "[muster] player_faction={} members={} hunters={} drafted={}",
-        player_faction.faction_id, player_member_count, player_hunter_count, drafted_count
-    );
 }
 
 /// Garbage-collects rally-point flow fields after `RALLY_EXPIRE_TICKS` ticks
