@@ -247,10 +247,8 @@ impl Plugin for SimulationPlugin {
                         .after(htn::htn_eat_dispatch_system),
                     htn::htn_acquire_good_dispatch_system
                         .after(htn::htn_acquire_food_dispatch_system),
-                    htn::htn_stockpile_food_dispatch_system
-                        .after(htn::htn_acquire_good_dispatch_system),
                     htn::htn_scout_dispatch_system
-                        .after(htn::htn_stockpile_food_dispatch_system),
+                        .after(htn::htn_acquire_good_dispatch_system),
                     htn::htn_return_surplus_dispatch_system
                         .after(htn::htn_scout_dispatch_system),
                     htn::htn_tame_horse_dispatch_system
@@ -265,8 +263,15 @@ impl Plugin for SimulationPlugin {
                         .after(htn::htn_deliver_hunt_kill_dispatch_system),
                     htn::htn_join_hunt_party_dispatch_system
                         .after(htn::htn_engage_prey_dispatch_system),
-                    htn::htn_socialize_dispatch_system
+                    // Subsistence stockpile is the lowest-priority
+                    // autonomous work — runs after every specialised
+                    // dispatcher so corpse carriers / hunters /
+                    // builders / migrators / etc. claim the agent
+                    // first.
+                    htn::htn_stockpile_food_dispatch_system
                         .after(htn::htn_join_hunt_party_dispatch_system),
+                    htn::htn_socialize_dispatch_system
+                        .after(htn::htn_stockpile_food_dispatch_system),
                     htn::htn_combat_faction_dispatch_system
                         .after(htn::htn_socialize_dispatch_system),
                 )

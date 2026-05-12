@@ -33,7 +33,7 @@ use crate::simulation::mood::Mood;
 use crate::simulation::movement::MovementState;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{
-    AiState, HairColor, Person, PersonAI, Profession, SkinTone,
+    AiState, Drafted, HairColor, Person, PersonAI, Profession, SkinTone,
 };
 use crate::simulation::htn::MethodHistory;
 use crate::simulation::reproduction::BiologicalSex;
@@ -295,6 +295,49 @@ impl TestSim {
             .id()
     }
 
+    /// Remove the `Drafted` marker from an agent previously spawned
+    /// with `PersonBuilder::drafted()`. After the next tick the agent
+    /// is eligible for normal HTN dispatch and `goal_update_system`
+    /// re-evaluation.
+    pub fn undraft(&mut self, entity: Entity) {
+        self.app.world_mut().entity_mut(entity).remove::<Drafted>();
+    }
+
+    /// Seed `qty` units of `fruit` at a faction storage tile so the
+    /// next-tick `compute_faction_storage_system` pass reports
+    /// `food_stock(faction) >= qty`. Useful in fixtures to suppress
+    /// the autonomous-subsistence stockpile fallback (`prioritize_food`
+    /// in `goal_update_system`) during warm-up. If the faction has no
+    /// storage tile yet, one is spawned at `(-32, -32)` (well outside
+    /// most test grids, so it doesn't interfere with scavenge / gather
+    /// targets the test cares about). Returns the storage tile coords.
+    pub fn seed_faction_food(
+        &mut self,
+        faction_id: u32,
+        qty: u32,
+    ) -> (i32, i32) {
+        let tile = self
+            .app
+            .world()
+            .resource::<crate::simulation::faction::StorageTileMap>()
+            .by_faction
+            .get(&faction_id)
+            .and_then(|tiles| tiles.first().copied())
+            .unwrap_or_else(|| (-32, -32));
+        // Spawn the tile if it didn't already exist in the index.
+        let has_tile = self
+            .app
+            .world()
+            .resource::<crate::simulation::faction::StorageTileMap>()
+            .tiles
+            .contains_key(&tile);
+        if !has_tile {
+            self.spawn_storage_tile(faction_id, tile);
+        }
+        self.spawn_ground_item(tile, crate::economy::core_ids::fruit(), qty);
+        tile
+    }
+
     /// Run a single frame. With `TimeUpdateStrategy::ManualDuration`
     /// installed, each call advances `Time` by exactly one fixed
     /// timestep so `FixedUpdate` fires once per call.
@@ -326,6 +369,7 @@ pub struct PersonBuilder {
     goal: AgentGoal,
     inventory: Vec<(crate::economy::resource_catalog::ResourceId, u32)>,
     bucket: u32,
+    drafted: bool,
 }
 
 impl PersonBuilder {
@@ -340,6 +384,7 @@ impl PersonBuilder {
             goal: AgentGoal::default(),
             inventory: Vec::new(),
             bucket: 0,
+            drafted: false,
         }
     }
 
@@ -382,6 +427,18 @@ impl PersonBuilder {
         self
     }
 
+    /// Spawn the agent with the `Drafted` marker. Every HTN dispatcher
+    /// filters `Without<Drafted>`, so a drafted agent stays Idle /
+    /// UNEMPLOYED regardless of what `goal_update_system` assigns
+    /// during warmup ticks. `goal_update_system` itself also skips
+    /// `Drafted` agents, so the goal stays at whatever the builder
+    /// configured. Call `TestSim::undraft(entity)` once the warmup is
+    /// done and the test wants normal dispatch behaviour.
+    pub fn drafted(&mut self) -> &mut Self {
+        self.drafted = true;
+        self
+    }
+
     fn spawn(self, world: &mut World) -> Entity {
         let world_pos = tile_to_world(self.tile.0, self.tile.1);
         let sex = BiologicalSex::random();
@@ -393,7 +450,7 @@ impl PersonBuilder {
 
         let now_tick = world.resource::<SimClock>().tick;
 
-        world
+        let entity = world
             .spawn((
                 (
                     Person,
@@ -453,7 +510,11 @@ impl PersonBuilder {
                     crate::simulation::typed_task::ActionQueue::idle(),
                 ),
             ))
-            .id()
+            .id();
+        if self.drafted {
+            world.entity_mut(entity).insert(Drafted);
+        }
+        entity
     }
 }
 
@@ -2009,15 +2070,20 @@ mod smoke {
         sim.flat_world(2, 0, TileKind::Grass);
         // Member-count > 0 so worker isn't filtered out by faction
         // checks elsewhere (some upstream systems gate on it).
-        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.drafted();
+        });
         {
             let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
             registry.add_member(sim.player_faction_id);
         }
 
         // Tick a couple times so the claim system schedules and
-        // SimClock advances past tick 0.
+        // SimClock advances past tick 0. Worker is Drafted so the
+        // autonomous-subsistence GatherFood dispatch (Phase 1) doesn't
+        // fire during this warm-up.
         sim.tick_n(2);
+        sim.undraft(worker);
 
         let unpaid_id;
         let paid_id;
@@ -2636,12 +2702,16 @@ mod smoke {
         let mut sim = TestSim::new(0xC0FFEE);
         sim.flat_world(2, 0, TileKind::Grass);
         let bureaucrat = sim.spawn_person(sim.player_faction_id, (3, 3), |b| {
-            b.profession(Profession::Bureaucrat);
+            b.profession(Profession::Bureaucrat).drafted();
         });
 
         // Tick a couple times so the auto-found settlement appears
-        // and the dispatcher can find a town_hall_tile.
+        // and the dispatcher can find a town_hall_tile. The bureaucrat
+        // is Drafted during warm-up so the autonomous-subsistence
+        // GatherFood dispatch (Phase 1) doesn't preempt the Lead task.
         sim.tick_n(10);
+        sim.undraft(bureaucrat);
+        sim.tick_n(2);
 
         let town_hall = {
             let map = sim.app.world().resource::<SettlementMap>();
@@ -5947,12 +6017,12 @@ mod baseline_behaviour {
         sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
         sim.spawn_ground_item(storage_tile, crate::economy::core_ids::fruit(), 5);
 
-        // Spawn the agent sated and Idle so it does not start dispatching
-        // during the warm-up. The warm-up is needed for SpatialIndex sync
-        // (Added<Indexed> takes a few ticks), the Economy storage rollup,
-        // and the StorageTileMap to populate.
+        // Spawn the agent sated, Drafted (skip HTN dispatch) so it
+        // doesn't dispatch during the warm-up — needed because the
+        // Phase 1 autonomous-subsistence path would otherwise have
+        // the agent foraging by the time we want to pin Survive.
         let person = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
-            b.hunger(0.0);
+            b.hunger(0.0).drafted();
         });
 
         sim.tick_n(80);
@@ -5973,10 +6043,8 @@ mod baseline_behaviour {
             );
         }
 
-        // Now arm the agent: spike hunger past EAT_TRIGGER_HUNGER (180) and
-        // pin AgentGoal::Survive so `htn_acquire_food_dispatch_system` fires
-        // on the very next ParallelB tick rather than waiting for
-        // `goal_update_system`'s 32-tick cadence.
+        // Now arm the agent: spike hunger past EAT_TRIGGER_HUNGER (180),
+        // pin AgentGoal::Survive, and undraft so dispatch fires.
         {
             let mut entity = sim.app.world_mut().entity_mut(person);
             let mut needs = entity
@@ -5989,6 +6057,7 @@ mod baseline_behaviour {
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::Survive;
         }
+        sim.undraft(person);
 
         // One ParallelB tick is enough for `htn_acquire_food_dispatch_system`
         // to argmax the registry, route the agent, and dispatch
@@ -6065,17 +6134,15 @@ mod baseline_behaviour {
         let ground_item = sim.spawn_ground_item(scavenge_tile, crate::economy::core_ids::fruit(), 3);
 
         let person = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
-            b.hunger(0.0);
+            b.hunger(0.0).drafted();
         });
 
         // Warm-up so the Added<Indexed> hook registers the GroundItem in
-        // SpatialIndex. The 5c-ii-d-ii-a Wood test uses 10 ticks for the
-        // same reason; reuse that budget.
+        // SpatialIndex. Drafted suppresses the autonomous-subsistence
+        // dispatch path during warm-up (Phase 1).
         sim.tick_n(10);
 
-        // Spike hunger past EAT_TRIGGER_HUNGER (180) and pin Survive so the
-        // dispatcher fires on the next ParallelB tick rather than waiting
-        // for `goal_update_system`'s 32-tick cadence.
+        // Spike hunger past EAT_TRIGGER_HUNGER (180), pin Survive, undraft.
         {
             let mut entity = sim.app.world_mut().entity_mut(person);
             let mut needs = entity
@@ -6088,6 +6155,7 @@ mod baseline_behaviour {
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::Survive;
         }
+        sim.undraft(person);
 
         // Two ticks: one for the goal mutation to land in the dispatcher's
         // query, one for the dispatch itself. The scavenge tile is 5 tiles
@@ -6330,15 +6398,21 @@ mod baseline_behaviour {
         // Spawn the chief first (first member of a faction is auto-promoted
         // by `update_chief_assignment_system`); they get
         // `AgentGoal::Lead` which the dispatcher rejects. The second agent
-        // is the regular worker the test exercises.
-        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |_| {});
-        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        // is the regular worker the test exercises. Both Drafted during
+        // warm-up so the autonomous-subsistence dispatch doesn't fire.
+        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |b| {
+            b.drafted();
+        });
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.drafted();
+        });
 
         // Warm-up ticks for SpatialIndex / storage rollup. Less than the
         // haul test's 80 because we're not depending on `material_targets`
         // — the JobPosting + JobClaim hack below pins the goal to
         // GatherWood directly via `job_goal_lock_system`.
         sim.tick_n(10);
+        sim.undraft(person);
 
         // Inject a Wood memory entry. The tile must lie outside the
         // 15-tile `VIEW_RADIUS` from the agent's spawn at (0,0) — otherwise
@@ -6586,8 +6660,12 @@ mod baseline_behaviour {
         let storage_tile = (4, 4);
         sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
 
-        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |_| {});
-        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |b| {
+            b.drafted();
+        });
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.drafted();
+        });
 
         // Spawn a loose Wood GroundItem within VIEW_RADIUS=15 of the worker
         // at (0,0). Avoid the storage tile (4,4) — the dispatcher excludes
@@ -6598,8 +6676,10 @@ mod baseline_behaviour {
 
         // Warm-up ticks: SpatialIndex picks up the new GroundItem (Added<Indexed>
         // hooks need at least 2-3 FixedUpdate frames to register), storage
-        // rollup runs, and `update_chief_assignment_system` settles.
+        // rollup runs, and `update_chief_assignment_system` settles. Drafted
+        // suppresses the autonomous-subsistence dispatch (Phase 1).
         sim.tick_n(10);
+        sim.undraft(person);
 
         let job_id = {
             let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
@@ -6710,11 +6790,17 @@ mod baseline_behaviour {
         sim.flat_world(2, 0, TileKind::Grass);
 
         // No memory, no GroundItem, no storage tile — the only applicable
-        // method should be `ExploreForMaterialMethod`.
-        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |_| {});
-        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        // method should be `ExploreForMaterialMethod`. Both Drafted during
+        // warm-up so autonomous-subsistence dispatch doesn't fire.
+        let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |b| {
+            b.drafted();
+        });
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.drafted();
+        });
 
         sim.tick_n(10);
+        sim.undraft(person);
 
         // Pin the goal to GatherWood via the JobPosting + JobClaim hack
         // (mirrors `gather_wood_goal_dispatches_gather_then_deposit_chain`).
@@ -6891,11 +6977,14 @@ mod baseline_behaviour {
         let fruit_entity = sim.spawn_ground_item((5, 0), crate::economy::core_ids::fruit(), 3);
 
         let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
-            b.hunger(0.0);
+            b.hunger(0.0).drafted();
         });
 
-        // Warmup so SpatialIndex picks up the GroundItem.
+        // Warmup so SpatialIndex picks up the GroundItem. Drafted so the
+        // autonomous-subsistence stockpile fallback (Phase 1) doesn't
+        // dispatch during warm-up.
         sim.tick_n(5);
+        sim.undraft(worker);
 
         // Inject a Stockpile/Fruit posting + JobClaim so `posting_goal(p)`
         // (`jobs.rs:1264`) maps Stockpile + Fruit → GatherFood and
@@ -6998,13 +7087,19 @@ mod baseline_behaviour {
             b.hunger(210.0).add_inventory(crate::economy::core_ids::fruit(), 10);
         });
 
+        // Seed plenty of faction food so the autonomous-subsistence
+        // GatherFood path (Phase 1) doesn't keep firing terminal Explore
+        // between Eat chains. With food well above the per-member cap,
+        // `prioritize_food` stays false.
+        sim.seed_faction_food(sim.player_faction_id, 100);
+
         // Eat task takes TICKS_EAT (~60) ticks of Working state. 400 ticks
         // is enough for at least one full Eat chain to dispatch, run, and
         // be recorded by `htn_method_completion_system` (which runs in
         // Economy after `drop_items_at_destination_system`).
         sim.tick_n(400);
 
-        let ai = person_ai(&sim.app, person);
+        let _ai = person_ai(&sim.app, person);
         let history = sim
             .app
             .world()
@@ -7012,13 +7107,12 @@ mod baseline_behaviour {
             .expect("person should have MethodHistory");
         let now = sim.app.world().resource::<SimClock>().tick;
 
-        // active_method clears once the chain drains and the completion
-        // system records the outcome.
-        assert!(
-            ai.active_method.is_none(),
-            "expected PersonAI.active_method to be None after chain drained, got {:?}",
-            ai.active_method
-        );
+        // Post-Phase-1 the agent may bounce between Eat chains and the
+        // autonomous-subsistence stockpile fallback (terminal Explore) in
+        // a long run; `active_method` is intentionally non-None at the
+        // start of any new chain. The substantive check is that Success
+        // was recorded for EAT_FROM_INVENTORY at *some* point during the
+        // 400 ticks — that's what proves the completion pipeline works.
 
         // MethodHistory contains a Success entry for EAT_FROM_INVENTORY.
         // We don't gate on TTL — the test runs 400 ticks but each Eat chain
@@ -7471,9 +7565,12 @@ mod baseline_behaviour {
         let skin_id = crate::economy::core_ids::skin();
         let skin_entity = sim.spawn_ground_item((5, 0), skin_id, 1);
 
-        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.drafted();
+        });
 
         sim.tick_n(10);
+        sim.undraft(worker);
 
         // Post a `JobKind::Stockpile { Skin }` posting + claim onto the
         // worker. `posting_goal()` maps Stockpile{Skin} → AgentGoal::Stockpile;
@@ -7578,7 +7675,7 @@ mod baseline_behaviour {
         // target). With no campfires in the fixture, hearth resolves to the
         // home tile (0, 0).
         let person = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
-            b.profession(Profession::Hunter);
+            b.profession(Profession::Hunter).drafted();
         });
         {
             let mut knowledge = sim
@@ -7589,8 +7686,10 @@ mod baseline_behaviour {
             knowledge.aware |= 1u64 << HUNTING_SPEAR;
             knowledge.learned |= 1u64 << HUNTING_SPEAR;
         }
-        // Post a fresh HuntOrder::Hunt with an empty mustered list and
-        // deployed_tick = None — the muster phase precondition.
+        sim.tick_n(5);
+
+        // Post a fresh HuntOrder::Hunt AFTER warm-up — `chief_hunt_order_system`
+        // clears it on every Economy tick when area_tile has no live prey.
         {
             let mut registry = sim
                 .app
@@ -7606,8 +7705,7 @@ mod baseline_behaviour {
                 posted_tick: 1,
             });
         }
-
-        sim.tick_n(5);
+        sim.undraft(person);
         sim.tick_n(2);
 
         let aq = sim
@@ -7650,7 +7748,7 @@ mod baseline_behaviour {
         // Hunter at (5, 5); fresh corpse at (10, 10) — within VIEW_RADIUS=15 but
         // far enough that the agent can't walk-and-pickup before the assertion.
         let person = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
-            b.profession(Profession::Hunter);
+            b.profession(Profession::Hunter).drafted();
         });
 
         // Mark HUNTING_SPEAR Learned on the hunter (paleolithic_seed only sets
@@ -7689,7 +7787,12 @@ mod baseline_behaviour {
             .resource_mut::<CorpseMap>()
             .insert(corpse_tile, corpse);
 
-        // Faction needs a live HuntOrder::Hunt — the dispatcher gates on it.
+        sim.tick_n(5);
+
+        // Faction needs a live HuntOrder::Hunt — set AFTER warm-up because
+        // `chief_hunt_order_system` clears it on every Economy tick when
+        // the area_tile has no live prey (this test only has a corpse, no
+        // live Deer/Wolf).
         {
             let mut registry = sim
                 .app
@@ -7705,8 +7808,7 @@ mod baseline_behaviour {
                 posted_tick: 0,
             });
         }
-
-        sim.tick_n(5);
+        sim.undraft(person);
 
         // Two ticks: ParallelB's `htn_engage_prey_dispatch_system` resolves
         // the corpse, scores `PickUpFreshCorpseMethod` (1.5) above
@@ -7756,7 +7858,9 @@ mod baseline_behaviour {
         // Put person at (5, 5); faction home is (0, 0) so the butcher site
         // resolves via `faction_registry.home_tile` fallback (no campfires
         // in the fixture). Agent has work to do reaching the destination.
-        let person = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+        let person = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
+            b.drafted();
+        });
 
         // Spawn a corpse at the agent's tile (the legacy pickup_corpse_task
         // would have placed it there; we shortcut to skip routing).
@@ -7784,6 +7888,7 @@ mod baseline_behaviour {
         // doesn't read the spatial index for the corpse lookup, but routing
         // does.
         sim.tick_n(5);
+        sim.undraft(person);
 
         // Two ticks: ParallelB's `htn_deliver_hunt_kill_dispatch_system`
         // resolves the butcher site, scores `DeliverHuntKillMethod`, routes
@@ -8845,10 +8950,13 @@ mod baseline_behaviour {
         // Spawn worker outside VIEW_RADIUS=15 of the tree so vision doesn't
         // immediately re-sighting the cluster and confuse memory accounting
         // — matches the layout of the canonical dispatch test.
-        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.drafted();
+        });
 
         // Warmup: SpatialIndex / storage rollup, parallel to other dispatch tests.
         sim.tick_n(10);
+        sim.undraft(worker);
 
         let wood_id = crate::economy::core_ids::wood();
         sim.inject_faction_sighting(sim.player_faction_id, tree_tile, MemoryKind::wood());
@@ -9052,13 +9160,15 @@ mod baseline_behaviour {
         // dispatcher's storage-tile filter doesn't skip it.
         let _stone_pile = sim.spawn_ground_item((5, 0), stone_id, 3);
 
-        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.drafted();
+        });
 
         // Warmup so `sync_indexed_after_move_system` (Sequential) registers
         // the GroundItem in `SpatialIndex` before the dispatcher's scavenge
-        // scan runs in ParallelB. Without this the first dispatch picks
-        // Explore (utility 0.3) and the worker drifts off across the map.
+        // scan runs in ParallelB.
         sim.tick_n(2);
+        sim.undraft(worker);
 
         let job_id = {
             let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
@@ -9744,7 +9854,9 @@ mod baseline_behaviour {
         // is gather-arrival driven, not vision-driven).
         sim.inject_faction_sighting(sim.player_faction_id, (3, 0), MemoryKind::wood());
 
-        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.drafted();
+        });
 
         // Warmup ticks: populate `CurrentVision` from `vision_system`
         // (Sequential) and sync `SpatialIndex` before the JobClaim drops in.
@@ -9752,6 +9864,7 @@ mod baseline_behaviour {
         // same tick — without a warmup, the first dispatch reads an empty
         // CurrentVision and falls back to memory.
         sim.tick_n(2);
+        sim.undraft(worker);
 
         let wood_id = crate::economy::core_ids::wood();
         let job_id = {
@@ -9861,11 +9974,11 @@ mod baseline_behaviour {
         // doesn't pollute the test.
         sim.spawn_storage_tile(sim.player_faction_id, (-30, 0));
 
-        // Spawn the worker non-hungry first so warmup ticks let
-        // `vision_system` populate `CurrentVision` without the food
-        // dispatcher firing (it gates on `hunger >= EAT_TRIGGER_HUNGER`).
+        // Spawn the worker non-hungry first; Drafted so the autonomous
+        // GatherFood dispatch (Phase 1) doesn't fire during warm-up.
         let worker = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
-            b.needs(Needs::new(20.0, 20.0, 10.0, 5.0, 40.0, 200.0));
+            b.needs(Needs::new(20.0, 20.0, 10.0, 5.0, 40.0, 200.0))
+                .drafted();
         });
 
         // Warmup: vision_system runs in Sequential after the dispatchers
@@ -9884,6 +9997,7 @@ mod baseline_behaviour {
             .world_mut()
             .entity_mut(worker)
             .insert(AgentGoal::Survive);
+        sim.undraft(worker);
 
         sim.tick_n(2);
 

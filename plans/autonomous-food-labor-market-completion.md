@@ -1,101 +1,155 @@
-# Autonomous Food Labor Market — Completing Track B
+# Autonomous Subsistence + Scoring-Based Goal Selection
 
 ## Context
 
-Two prior workstreams set up the architecture this plan completes:
+Two interlocking issues showed up while investigating workers stuck Idle under `AgentGoal::GatherFood`:
 
-- **Pluralist Economy R0–R13** (shipped): `JobPosting.poster_class { Chief | Bureaucrat | HouseholdHead | Individual }`, `reward: f32`, `JobEscrow`, `U_bid` scoring, per-resource `ResourceControlPolicy { chief_allocates_labor, private_actors_allowed }`, `Subsistence` / `Mixed` / `Market` presets.
-- **HTN Robustness Track B** (`plans/htn_robustness_posting_market.md`, partially shipped): `worker_self_post_stockpile_system` self-funds `Stockpile{Wood|Stone}` postings in Mixed/Market when chief is policy-gated off; `htn_acquire_good_dispatch_system` dispatches autonomous `GatherWood`/`GatherStone` without requiring a claim.
+1. **The dispatcher gate is wrong.** `htn_stockpile_food_dispatch_system` requires a `JobClaim::Stockpile{food}`, but `goal_update_system` legitimately assigns `GatherFood` as the unclaimed-worker default whenever `prioritize_food = faction_food_ratio < 1.0`. Personal/household food stockpiling is *subsistence reflex*, not economic coordination — it doesn't need a posting any more than eating does. The self-posting workaround (`worker_self_post_stockpile_system`) is currency-laundering: wallet → escrow → wallet, models nothing, and falls apart for food because pricing per-calorie-aggregate isn't well-defined.
 
-The current bug — workers stuck Idle under autonomous `GatherFood` — exists because Calories was not folded into either of the above paths. The dispatch path for food (`htn_stockpile_food_dispatch_system`) hard-requires a `JobClaim::Stockpile{food}`; the self-posting system explicitly iterates only `[wood_id, stone_id]` (`jobs.rs:818`). In Market preset this strands every worker in a low-food faction: chief skips Calories postings (`policy_for(Fruit).chief_allocates_labor = false`), no worker posts one either, dispatcher returns silently, `goal_update_system`'s 200-tick cadence re-selects `GatherFood` next cycle, and `chronic_failure_release_system` can't bite because no `MethodHistory` failure ever stamps.
+2. **`goal_update_system` is a procedural if-else cascade that can't grow.** Lines 779–810 of `goals.rs` are ~10 hardcoded branches in fixed priority order. There's no room for: per-agent variation (some workers are more entrepreneurial), exploration vs. exploitation (ε-greedy across reasonable alternatives), or personal-enterprise goals (`EarnIncome`, `SaveForTool`, `LearnTech`). Every new motivation requires editing the ladder and re-ordering branches.
 
-The simplest patch (drop the claim gate) was tried and reverted: it fires terminal-`Explore { AnyEdible }` during *every* test fixture's warm-up `tick_n` (any faction below seasonal food cap triggers `prioritize_food` → autonomous `GatherFood`), breaking 17 baseline tests that pin a goal after warm-up and expect the agent Idle. The breakage is symptomatic of a deeper asymmetry: GatherWood/GatherStone also have this property in production, but Wood/Stone tests happen to be written around `JobClaim`-pinned setups while food tests rely on Idle warmup.
+This plan addresses both: ships the immediate bug fix in Phase 1 with the right semantics (subsistence, not market), and refactors goal selection into a scorer registry in Phases 3–5 so personal-enterprise and ε-greedy land cleanly.
 
-## Goal
+## Design principles
 
-Land symmetric autonomous-labor behavior for Wood / Stone / **Food** across all three economy presets, without breaking the test suite. After this plan:
+- **Subsistence reflexes bypass markets entirely.** Eat, sleep, stockpile-for-self/household, forage-for-self. No posting, no claim, no currency.
+- **Coordination uses postings.** Chief allocates communal labor; households post buy-orders for goods they don't produce; individuals post craft contracts. These add *wage* incentive on top of subsistence work; they don't replace it.
+- **Goals are scored, not branched.** Each goal-candidate produces a utility; the system argmaxes (with optional ε-greedy exploration). Crisis goals (Survive/Defend/Rescue) preempt above the argmax floor.
+- **Per-agent variation lives in `Disposition`.** A small `[u8; N]` component biases certain goal classes (industrious, social, entrepreneurial, risk-tolerant). Stable across an agent's life; inherited at birth with mutation.
 
-- **Subsistence:** chief posts Calories / Wood / Stone (no behavior change); autonomous fallback remains dormant because chief postings consume the workforce.
-- **Mixed:** chief posts staples; workers self-post non-staples (no behavior change).
-- **Market:** chief abstains; workers self-post Calories *and* Wood/Stone, claim their own contracts, dispatch via the claim path (no orphan autonomous path needed).
+## Phased plan
 
-The asymmetry between food and materials disappears.
+### Phase 1 — Drop the claim gate for autonomous food stockpile
 
-## Design
+`src/simulation/htn.rs:4981–5004` (`htn_stockpile_food_dispatch_system`): make the `JobClaim` check optional, identical to the haul branch in `htn_acquire_good_dispatch_system`. Comment block rewritten to credit subsistence behavior.
 
-### Recommended approach: route Market-mode food work through self-posting, not autonomous dispatch
+This is the fix from the prior attempt. The test fallout (Phase 2) is paid for separately.
 
-Rather than relax `htn_stockpile_food_dispatch_system`'s claim gate (which would re-introduce the 17 test failures), make the food work route entirely through claims by extending `worker_self_post_stockpile_system` to cover Calories. The autonomous `GatherFood` goal then becomes the *trigger* for self-posting, not a separate dispatch path.
+### Phase 2 — Route subsistence deposits to the right storage
 
-This is exactly the shape `worker_self_post_stockpile_system` already implements for Wood/Stone. Calories is the missing branch.
+The dispatch chain ends in `Task::DepositToFactionStorage`. Today it targets `member.faction_id` (the village). For Market-preset households, this puts food in the village granary that the worker doesn't own — wrong. Resolve the deposit target by walking the membership hierarchy:
 
-### Phase A — Calorie self-posting
+```rust
+fn subsistence_deposit_faction(
+    member: &FactionMember,
+    household: Option<&HouseholdMember>,
+    registry: &FactionRegistry,
+) -> u32 {
+    // Prefer household sub-faction if it owns a storage tile; else the village.
+    household
+        .and_then(|h| registry.factions.get(&h.household_id))
+        .filter(|f| f.caps.storage.is_tile_backed())
+        .map(|f| h.unwrap().household_id)
+        .unwrap_or(member.faction_id)
+}
+```
 
-`worker_self_post_stockpile_system` (`jobs.rs:774–917`) gains a third loop iteration for `Calories`.
+Call this in `htn_stockpile_food_dispatch_system` when computing `scavenge_deposit_tile`, `forage_deposit_tile`, etc. (`htn.rs:5042–5056` and sister blocks). Subsistence + Mixed villages keep village-storage routing because households don't have their own tiles there.
 
-Two design questions specific to Calories:
+### Phase 3 — Test fixture support: `seed_faction_food` + `idle_during_warmup`
 
-1. **Resource selection.** Wood/Stone are concrete `ResourceId`s; Calories is a category. The chief Calories branch uses `JobProgress::Calories { deposited, target }` (aggregate calorie counter) with `ClaimKind::AnyEdible`. **Use the same shape for the self-post**: post one `JobKind::Stockpile` with `JobProgress::Calories { target }` and a `ClaimTarget { kind: AnyEdible }`. Dispatch already handles `AnyEdible` correctly (`htn_stockpile_food_dispatch_system::scavenge` resolves the good per-pickup).
-2. **Wage formula.** `self_post_wage(catalog, rid, qty)` requires a concrete `rid`. For Calories: pick a representative staple (Fruit) — cheap, always available in the catalog — and price as `trade_base_value(Fruit) * (target_calories / Fruit.calories_per_unit) * SELF_POST_MARGIN`. Optionally hoist this into a `food_self_post_wage(catalog, target_calories)` helper.
+Two helpers on `TestSim` close the 17-test regression cleanly:
 
-Gates mirror Wood/Stone:
-- `policy_for(Fruit).chief_allocates_labor == false` (skip in Subsistence).
-- No live Calories posting in the faction.
-- Faction-tier `MemoryKind::AnyEdible` cluster within 16 tiles of `home_tile` (uses existing `faction_knows_cluster`).
-- Author's currency ≥ `WORKER_SELF_POST_MIN_CURRENCY (20.0)`.
-- Real deficit: `food_total < target_supply`.
+- `sim.seed_faction_food(faction_id, calories)` — directly bumps `faction.storage.totals` for the faction's edible category so `prioritize_food` is false during warmup. Already half-built; just needs to be public and documented.
+- `PersonBuilder::dormant()` — spawns the agent with `LodLevel::Dormant` so dispatchers skip it during warmup. Test calls `sim.wake(person)` before the act-phase assertions.
 
-Target qty: `WORKER_SELF_POST_FOOD_CALORIES = 240` (≈ 2 fruits per faction member × 4 members, scaled by `member_count` like the chief branch).
+Failing tests get a one-line edit each — `b.dormant()` in the spawn closure or `seed_faction_food` before `tick_n`. The mechanical churn is real but bounded and doesn't touch any production code.
 
-### Phase B — Bootstrap path for Market factions with no wealthy worker
+### Phase 4 — Scorer-registry refactor of `goal_update_system`
 
-Even after Phase A, Market factions in the very early game can deadlock: every worker has < 20 currency, so nobody self-posts, so nobody earns income. Two cheap escapes already exist; pick the lighter one:
+Replace the procedural ladder with a `GoalScorer` trait mirroring the existing `Method` trait:
 
-- **Option B1 (recommended):** seed each Market-preset adult with `MARKET_BOOTSTRAP_CURRENCY = 30.0` at spawn (one slot above `WORKER_SELF_POST_MIN_CURRENCY`). `seed_market_households` (`person.rs`) already runs only for Market preset and already inserts `HOUSEHOLD_SEED_TREASURY = 15.0` — extend it to set per-adult `EconomicAgent.currency` floor at spawn.
-- **Option B2:** add an "emergency" branch where, if no member can afford the wage *and* food_total has been below threshold for one game-day, the faction treasury covers the post. Heavier; defer unless B1 proves insufficient.
+```rust
+pub trait GoalScorer: Send + Sync {
+    fn goal(&self) -> AgentGoal;
+    fn class(&self) -> GoalClass; // Crisis | Subsistence | Coordination | Enterprise | Discretionary
+    fn score(&self, ctx: &GoalScoringCtx) -> Option<f32>; // None = inapplicable
+    fn name(&self) -> &'static str;
+}
 
-This preserves the currency invariant (the bootstrap currency comes from `MARKET_BOOTSTRAP_CURRENCY` being added to the system on spawn, recorded by extending `CurrencySnapshot::capture` and `total_system_currency`'s baseline; the helper `assert_total_currency_invariant` already takes a baseline parameter).
+pub struct GoalRegistry(pub Vec<Box<dyn GoalScorer>>);
+```
 
-### Phase C — Drop the autonomous-food dispatch path entirely
+`GoalScoringCtx` bundles what the current ladder reads: `&Needs`, `&EconomicAgent`, `Option<&HouseholdMember>`, `Option<&JobClaim>`, faction food/material ratios, calendar, `Disposition`, and a handful of resource queries. Built once per agent per tick, passed read-only to every scorer.
 
-Once Phase A guarantees a Calories posting exists in any Market faction with food deficit + cluster knowledge + minimum currency, `htn_stockpile_food_dispatch_system`'s claim gate becomes load-bearing in the right way: claimless `GatherFood` is genuinely a transient state, and returning early is correct.
+`goal_update_system` becomes:
 
-**Do not relax the claim gate.** Keep the comment at `htn.rs:4981–4990` accurate.
+```rust
+let mut best = (AgentGoal::Idle, f32::MIN, "default");
+for scorer in &registry.0 {
+    let Some(score) = scorer.score(&ctx) else { continue; };
+    // Crisis class hard-preempts: any positive Crisis score wins over any non-Crisis.
+    let tiered = score + tier_bias(scorer.class());
+    if tiered > best.1 { best = (scorer.goal(), tiered, scorer.name()); }
+}
+*goal = best.0;
+```
 
-### Phase D — Validation tests
+Registered scorers replicate the current ladder one-to-one in Phase 4 — same triggers, same precedence via `tier_bias`. No behaviour change. The refactor is the win: every future motivation is one new scorer + one registration.
 
-Three new behavioural tests covering the regimes:
+`GoalClass::Crisis` (Survive/Defend/Rescue/MigrateToCamp) gets `tier_bias = 1000.0`. `Subsistence` gets `100.0`. `Coordination` (claim-driven) gets `50.0` and only scores positive when a `JobClaim` is held. `Discretionary` (Socialize/Play) gets `0.0`. Within a tier, scores decide.
 
-1. `worker_self_post_stockpile_system::tests::market_faction_self_posts_calories_when_chief_abstains` — spawn a Market faction with food deficit + visible berry cluster + adult with 30 currency, tick a day, assert a `JobPosting { kind: Stockpile, progress: Calories { .. }, poster_class: Individual }` materialised and was claimed.
-2. `worker_self_post_stockpile_system::tests::subsistence_faction_does_not_self_post_calories` — Subsistence preset, no worker self-posts even with deficit (chief handles it).
-3. `htn::tests::autonomous_gather_food_without_claim_returns_early` — explicit assertion of the *unchanged* dispatcher behavior (regression guard against accidental future relaxation).
+### Phase 5 — `Disposition` + ε-greedy
 
-### Phase E (deferred — M4/M5) — Buy-orders + `EarnIncome` goal + `market_sell_system` gating
+Add `Disposition([u8; 4])` Component: `industrious`, `social`, `entrepreneurial`, `risk_tolerant`. Default `[128; 4]`. Inherited at birth: `child = lerp(mom, dad) + jitter([-16, 16])`. Surfaced in the inspector.
 
-Out of scope for this plan; the Phase A path lands Calories self-posting using the same chief-style posting (work-order, not buy-order). The fuller M4/M5 vision (chief posts buy-orders; workers self-post their labor and sell at stalls) lives in `plans/need-a-good-plan-noble-cascade.md` and can build on top.
+Each scorer reads `ctx.disposition` and applies a bias. Examples:
+- `GatherFoodScorer.score` adds `+0.5 * industrious_norm` (some agents work harder at stockpiling).
+- `SocializeScorer.score` adds `+1.0 * social_norm`.
+- A future `EarnIncomeScorer.score` adds `+1.0 * entrepreneurial_norm`.
+
+ε-greedy lives in `goal_update_system`'s selection step:
+
+```rust
+let epsilon = match best.tier {
+    GoalClass::Crisis => 0.0,         // never explore in a crisis
+    GoalClass::Subsistence => 0.05,   // small jitter
+    GoalClass::Coordination => 0.10,  // try other postings sometimes
+    GoalClass::Enterprise => 0.20,    // entrepreneurs try new ventures
+    GoalClass::Discretionary => 0.30, // play vs socialize is mostly whim
+};
+if fastrand::f32() < epsilon {
+    // pick weighted-random over candidates within tier whose score
+    // is within EPSILON_WINDOW (0.5) of the best
+    let alts = candidates.filter(|c| c.tier == best.tier && best.score - c.score < 0.5);
+    *goal = weighted_random_choice(alts).0;
+}
+```
+
+Per-agent stochastic streams seed from `Entity::index()` + `clock.tick / 200` so the choice is stable for the 200-tick `goal_update_system` cycle but varies across cycles.
+
+### Phase 6 (deferred — future plans) — Personal-enterprise goals
+
+The scorer registry enables a clean follow-up:
+
+- **`AgentGoal::EarnIncome`** — agent has high `entrepreneurial` *and* unmet currency-gated need (Esteem-tier contracts, planned tool purchase). Scorer looks at posting board for paid postings with high `U_bid`; high entrepreneurial bias makes the agent prefer wage labor over subsistence stockpiling. Wires to existing paid-posting U_bid scoring (`jobs.rs:2121–2140`).
+- **`AgentGoal::SaveForPurchase { target_resource, target_qty }`** — agent commits to accumulating currency for a specific buy; biases all economic scores upward until met.
+- **`AgentGoal::Trader`** — entrepreneurial-disposition + Trader profession; layers on top of existing `TraderPlan` system.
+- **`AgentGoal::PersonalBuild`** — agent posts their own house blueprint and gathers/builds it themselves.
+
+Each of these is one new scorer file + the goal-enum variant + an HTN dispatch system (or reuse of an existing one). The scorer registry is the contract; no edits to `goal_update_system` per addition.
 
 ## Why this design
 
-- **Symmetric with Wood/Stone end state.** After Phase A, every autonomous-gathering branch in `goal_update_system` has a matching self-posting branch in `worker_self_post_stockpile_system`. The "autonomous dispatch without claim" path becomes vestigial — kept for crisis-mode `Survive` (which has its own dispatcher and shouldn't go through the market) but no longer load-bearing for productive labor.
-- **No test fallout.** `htn_stockpile_food_dispatch_system` keeps the claim gate; warm-up `tick_n` calls in fixtures continue to leave agents Idle. The new Calories self-posting only fires for factions with `chief_allocates_labor=false` for Fruit (i.e., Market preset) and minimum currency — most test fixtures use default `FactionData` (Subsistence), which is unaffected.
-- **Bootstrap-safe.** Phase B's spawn-time currency seed costs zero scheduling complexity and is naturally scoped to the Market preset.
-- **Incremental on shipped infrastructure.** `JobProgress::Calories`, `ClaimKind::AnyEdible`, `self_post_wage`, `JobEscrow`, `htn_stockpile_food_dispatch_system` already understand the Calories case — we only wire the missing branch.
-- **Respects "Support diverse economic models" memory** — Subsistence is bit-for-bit identical; Mixed gains Calories self-posting only for non-staple food types; Market gets the full pluralist behavior.
+- **Honest semantics.** Phase 1+2 acknowledges subsistence stockpiling for what it is — autonomous personal reflex, no market involved. The "worker pays themselves" hack disappears.
+- **Test fallout addressed at source.** Phase 3 helpers fix the broken test pattern (warmup with low food) rather than constraining production behavior to satisfy fixtures.
+- **Refactor pays for itself immediately.** The scorer registry replaces a procedural ladder that everyone editing `goals.rs` has feared. The diff in Phase 4 is mostly mechanical translation; behavior is preserved.
+- **Extensibility built-in, not retrofit.** ε-greedy and `Disposition` slot into the registry without further architecture. Personal-enterprise goals (Phase 6) become content additions.
+- **All three economy modes work coherently throughout.** Subsistence: chief postings dominate, autonomous fallback rarely fires. Mixed: chief + household postings; autonomous fills gaps. Market: no chief postings, no household coordination, agents autonomously stockpile for their own household *and* claim paid postings from household buy-orders (M4/M5 future) for currency. The same dispatcher serves all three.
 
 ## Critical files
 
-- `src/simulation/jobs.rs:774–917` — `worker_self_post_stockpile_system`, add Calories branch.
-- `src/simulation/jobs.rs:2113–2128` — `self_post_wage`; consider `food_self_post_wage` helper.
-- `src/simulation/jobs.rs:1346–1411` — `chief_job_posting_system` Calories branch (reference for posting shape).
-- `src/simulation/person.rs::seed_market_households` — Phase B currency floor.
-- `src/simulation/test_fixture.rs::CurrencySnapshot` — extend baseline accounting for bootstrap currency.
-- `src/simulation/htn.rs:4981–5004` — leave alone; preserve claim gate + add a doc-comment line crediting Phase A for closing the upstream gap.
-- `src/simulation/CLAUDE.md` `Worker self-post system` paragraph — extend to mention Calories branch.
-- Top-level `CLAUDE.md` is unaffected (the change is sub-system local).
+- `src/simulation/htn.rs:4981–5004` — drop claim gate (Phase 1).
+- `src/simulation/htn.rs:5042–5056` + sisters — household-aware deposit target (Phase 2).
+- `src/simulation/test_fixture.rs` — `seed_faction_food`, `PersonBuilder::dormant`, `sim.wake` (Phase 3).
+- `src/simulation/goals.rs:585–825` — scorer registry refactor (Phase 4).
+- `src/simulation/goals.rs` (new file `goal_scorers.rs`) — individual scorer impls.
+- `src/simulation/person.rs::PersonBundle` — `Disposition` component, inheritance hook in `pregnancy_system` (Phase 5).
+- `src/simulation/CLAUDE.md` — replace the goal-cadence paragraph with a "Goals → Scorer Registry → HTN" description.
 
 ## Verification
 
-- `cargo check && cargo test --bin civgame` — 480-test suite must remain green.
-- `cargo run` with default (Subsistence) preset for 5 in-game days — agents work, inspector shows chief-authored postings, no `Individual` Calories postings appear. Behaviour unchanged.
-- `cargo run` with Market preset (when wired into the spawn-select UI; otherwise force via test or temporary `GameStartOptions` default) for 5 in-game days — agents work, inspector shows `Individual`-authored Calories postings claimed by self-author. Food stock stays above zero, no idle workers under autonomous `GatherFood`.
-- Visual: inspector hover on a Market-preset adult should show a `JobClaim::Stockpile` with `JobEscrow` debited from their wallet.
+- `cargo check && cargo test --bin civgame` — Phase 1+2 expect 17 failures; Phase 3 fixes them. End state of Phases 1–3: ≥497 tests passing (current 497 + the three regression-guard tests).
+- Phase 4 ships with a behaviour-equivalence test: spawn an agent in each canonical state (hungry, tired, low-food-faction, hauling, idle-rich, etc.) and assert the new system picks the same goal as the old ladder. Lock this in before deleting the old code.
+- Phase 5 ships with a determinism test: same seed, same Disposition, same world → same goal selection (modulo the ε-greedy stochastic stream, which is itself deterministic per `(entity, tick/200)`).
+- `cargo run` post-Phase-5: inspector shows Disposition values and selected goal's tier. Spawn 6 founders, observe behavioural variety (some idle workers self-select into Socialize where the old system would have all-picked GatherFood).

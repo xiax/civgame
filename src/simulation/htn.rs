@@ -4943,8 +4943,22 @@ pub fn htn_stockpile_food_dispatch_system(
             Option<&crate::simulation::jobs::ClaimTarget>,
             Option<&crate::simulation::reproduction::HouseholdMember>,
             &crate::simulation::memory::CurrentVision,
+            &Profession,
         ),
-        Without<Drafted>,
+        (
+            Without<Drafted>,
+            // Subsistence stockpile is the lowest-priority autonomous
+            // work an agent can have — never preempt specialised mid-
+            // task state. Corpse carriers, in-flight nomad migrators,
+            // and active traders all have their own dispatchers that
+            // should fire instead. Hunters mid-hunt are gated by goal
+            // and the specialised dispatchers; bureaucrats are filtered
+            // by profession inside the closure (no `Without<value>` in
+            // Bevy queries).
+            Without<crate::simulation::corpse::Carrying>,
+            Without<crate::simulation::nomad::MigrationTarget>,
+            Without<crate::simulation::person::TraderPlan>,
+        ),
     >,
 ) {
     use crate::simulation::jobs::JobKind;
@@ -4964,6 +4978,7 @@ pub fn htn_stockpile_food_dispatch_system(
             claim_target_opt,
             household_member,
             current_vision,
+            profession,
         )| {
             if *lod == LodLevel::Dormant {
                 return;
@@ -4977,30 +4992,36 @@ pub fn htn_stockpile_food_dispatch_system(
             if member.faction_id == SOLO {
                 return;
             }
-
-            // Gate on an explicit `JobClaim::Stockpile` for a food good. The
-            // chief-driven storage-fill flow always pairs `AgentGoal::GatherFood`
-            // with a `Stockpile{food}` claim (`job_goal_lock_system` maps
-            // `Stockpile{food}` → `GatherFood` via `posting_goal`). Without
-            // the claim, an agent that happens to land on `GatherFood` during
-            // warmup or transient need-state shouldn't trigger a dispatch —
-            // the legacy plan registry's analogous gating was implicit (no
-            // posting → `chief_job_posting_system` doesn't post → plan
-            // candidate filter rejects). Same shape as the haul branch's
-            // `JobClaim::Haul` gate in `htn_acquire_good_dispatch_system`.
-            let Some(claim) = job_claim_opt else {
-                return;
-            };
-            if claim.kind != JobKind::Stockpile {
+            // Specialised professions have their own dispatchers
+            // (bureaucrat_admin, trader_route, hunter pipeline) that
+            // route them to non-subsistence work. Don't divert them
+            // into autonomous food gathering.
+            if matches!(*profession, Profession::Bureaucrat | Profession::Trader) {
                 return;
             }
-            // Confirm the claim is food-bearing — either chief `Calories`
-            // postings (`ClaimKind::AnyEdible`) or any `Specific(rid)` where
-            // `rid.is_edible()`. `Stockpile{Wood}` routes through the
-            // AcquireGood gather branch, not here.
-            let claim_is_food = claim_target_opt.map(|t| t.is_food()).unwrap_or(false);
-            if !claim_is_food {
-                return;
+
+            // `AgentGoal::GatherFood` covers two regimes:
+            //   1. **Subsistence reflex** — `goal_update_system`'s autonomous
+            //      fallback assigns this when `prioritize_food` (faction food
+            //      ratio < 1.0). The worker is stockpiling for their own
+            //      household / village, not fulfilling an economic contract.
+            //      No `JobClaim` involved; the trailing
+            //      `DepositToFactionStorage` lands the haul in their own
+            //      storage (household first via Phase 2 routing, else village).
+            //   2. **Chief / household / self-post coordination** — agent
+            //      holds a `JobClaim::Stockpile{food}` (mapped to
+            //      `GatherFood` by `job_goal_lock_system` via `posting_goal`).
+            // When a claim *is* present, validate its shape — wrong-kind /
+            // non-food claims belong on the AcquireGood path. When absent,
+            // proceed: this is subsistence work, not a category error.
+            if let Some(claim) = job_claim_opt {
+                if claim.kind != JobKind::Stockpile {
+                    return;
+                }
+                let claim_is_food = claim_target_opt.map(|t| t.is_food()).unwrap_or(false);
+                if !claim_is_food {
+                    return;
+                }
             }
 
             let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
@@ -5038,6 +5059,26 @@ pub fn htn_stockpile_food_dispatch_system(
                     (None, None, None)
                 };
 
+            // Subsistence deposit routing: when this dispatch is autonomous
+            // (no claim) and the agent belongs to a household sub-faction
+            // that owns its own storage tile (Market preset's
+            // `seed_market_households`), prefer that storage — the worker is
+            // filling their own larder, not the village granary. Chief- /
+            // household-claimed work falls through to `member.faction_id`,
+            // matching the existing posting semantics (the posting's faction
+            // is whoever owns the granary the contract is filling).
+            let deposit_faction_id = {
+                let hid_opt = household_member.map(|h| h.household_id);
+                if job_claim_opt.is_none() {
+                    match hid_opt {
+                        Some(hid) if storage_tile_map.by_faction.contains_key(&hid) => hid,
+                        _ => member.faction_id,
+                    }
+                } else {
+                    member.faction_id
+                }
+            };
+
             // Phase 2a: reachability-aware deposit pick — `t` is the scavenge
             // tile the agent will be on after pickup; from there, find the
             // nearest *reachable* storage tile.
@@ -5047,7 +5088,7 @@ pub fn htn_stockpile_food_dispatch_system(
                     t.1.div_euclid(CHUNK_SIZE as i32),
                 );
                 storage_tile_map.nearest_for_faction_reachable(
-                    member.faction_id,
+                    deposit_faction_id,
                     t,
                     target_chunk,
                     ai.current_z,
@@ -5120,14 +5161,16 @@ pub fn htn_stockpile_food_dispatch_system(
             });
             let gather_target_tile = forage_candidate.map(|(tile, _)| tile);
             let forage_food_good = forage_candidate.map(|(_, id)| id);
-            // Phase 2a: reachability-aware deposit pick.
+            // Phase 2a: reachability-aware deposit pick. Uses the
+            // household-aware `deposit_faction_id` computed above so
+            // subsistence-mode harvests land in the worker's own larder.
             let gather_deposit_tile = gather_target_tile.and_then(|t| {
                 let target_chunk = ChunkCoord(
                     t.0.div_euclid(CHUNK_SIZE as i32),
                     t.1.div_euclid(CHUNK_SIZE as i32),
                 );
                 storage_tile_map.nearest_for_faction_reachable(
-                    member.faction_id,
+                    deposit_faction_id,
                     t,
                     target_chunk,
                     ai.current_z,

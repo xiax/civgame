@@ -103,7 +103,7 @@ Adjust work time and show progress bars. Cutting down trees should take way long
 
 Add a fishing system to the game that works well with existing systems and is robust and extensible and true to history. Add swimming knowledge.
 
-Nomadic tribes should migrate way farther, they shouldn't be migrating to just within the gathering distance of their current settlement and actually look for good spots where there is a lot of food. They should send scouts far further away to look for good locations. Migration is also extremely buggy. I see people left behind in migrations, people not migrating properly, people still gathered around the old faction base and people no gain to the new faction base properly. Can you plan a comprehensive robust, and extensible migration system? I would also like it if it is possible to play a faction on the move rather than migration just being an atomic task.
+X - Nomadic tribes should migrate way farther, they shouldn't be migrating to just within the gathering distance of their current settlement and actually look for good spots where there is a lot of food. They should send scouts far further away to look for good locations. Migration is also extremely buggy. I see people left behind in migrations, people not migrating properly, people still gathered around the old faction base and people no gain to the new faction base properly. Can you plan a comprehensive robust, and extensible migration system? I would also like it if it is possible to play a faction on the move rather than migration just being an atomic task.
 
 
 Need UI overhaul to add commands for all actions players can take, in a way that is robust and extensible in the future
@@ -118,4 +118,6 @@ Chief should have a daily quota. He can only post so many jobs a day. Immediate 
 
 Implement the ε-greedy system.
 
+Overhaul faction construction planning and fix doors being blocked by walls or other buildings, all doors should have an adjacent road on the opening side, not diagonal. The construction system should generate layouts randomly but with rules to make it logical and looks good and organic, rather than have a fixed plan.
 
+Hunting system is currently buggy. Hunters lose target and just stand there doing nothing. They don't appear to chase. And they seem to hunt without weapons when they really shouldn't.

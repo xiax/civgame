@@ -110,6 +110,8 @@ Each dispatcher: gates on goal + Idle + non-Dormant + `task_id == UNEMPLOYED`, b
 
 **`ClaimTarget.kind: ClaimKind`** (`jobs.rs`) — `None | Specific(ResourceId) | AnyEdible`. Mirrors `MemoryKind`. Stockpile/Haul postings yield `Specific(rid)`; chief `Calories` postings yield `AnyEdible`; Build yields `None`. Food dispatchers gate on `ClaimTarget::is_food()` (true for `AnyEdible` or `Specific(rid)` where `rid.is_edible()`), so adding a new edible to `assets/data/resources/*.ron` automatically participates without code changes.
 
+**Subsistence vs. coordinated stockpile (`htn_stockpile_food_dispatch_system`).** `AgentGoal::GatherFood` is set in two regimes: (1) **subsistence reflex** — `goal_update_system`'s autonomous fallback when `prioritize_food` (food ratio < 1.0); no `JobClaim`. (2) **chief / household / self-post coordination** — agent holds `JobClaim::Stockpile{food}` mapped from a posting via `posting_goal`. The dispatcher serves both — claim is *optional*, not required. The dispatcher's deposit target is household-first: if the agent has `HouseholdMember` and the household sub-faction owns a `FactionStorageTile` (Market preset's `seed_market_households`), the chain ends in the household's larder; else it falls back to the village's. The dispatcher also runs *after* every specialised dispatcher in ParallelB (corpse delivery / hunt engage / hunt join / construction / etc.) and filters out `Carrying` / `MigrationTarget` / `TraderPlan` carriers plus `Profession::{Bureaucrat, Trader}` — subsistence is the lowest-priority autonomous work.
+
 ### Chain handoffs
 
 Trailing legs of multi-task chains live in exit helpers on the head executor:
