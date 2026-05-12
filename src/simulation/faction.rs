@@ -1426,6 +1426,49 @@ impl ActivityLog {
     }
 }
 
+/// Whether the band's shelters are currently pitched at `home_tile`
+/// or fully packed for travel. AI factions atomically pack-and-pitch
+/// in a single Sequential tick (`nomad_migration_commit_system`); a
+/// player-driven band stays in `Packed` between explicit `PackCamp`
+/// and `PitchCamp` commands and is free to forage / sleep / fight
+/// while mobile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CampState {
+    Pitched,
+    Packed { since_tick: u32 },
+}
+
+impl Default for CampState {
+    fn default() -> Self {
+        CampState::Pitched
+    }
+}
+
+/// AI migration coarse phase. The player-flow only ever uses
+/// `CampState`; `MigrationPhase` is the AI-only state machine layered
+/// on top of the legacy `pending_migration` field. `Surveying` runs
+/// a few-day scout window before `pick_migration_target` is allowed
+/// to write `pending_migration`. `Walking` is set after commit and
+/// cleared by `nomad_migration_arrival_system` once every member's
+/// `MigrationTarget` marker has been consumed.
+#[derive(Clone, Debug, Default)]
+pub enum MigrationPhase {
+    #[default]
+    Idle,
+    Surveying {
+        started_tick: u32,
+        scouts: Vec<Entity>,
+        quadrants: [bool; 4],
+    },
+    PendingCommit {
+        target: (i32, i32),
+        chosen_tick: u32,
+    },
+    Walking {
+        target: (i32, i32),
+    },
+}
+
 pub struct FactionData {
     pub storage: FactionStorage,
     pub home_tile: (i32, i32),
@@ -1559,6 +1602,18 @@ pub struct FactionData {
     /// band doesn't oscillate between two known-good clusters when both
     /// dry up. Pushed by `nomad_migration_commit_system` on every commit.
     pub recent_camps: std::collections::VecDeque<((i32, i32), u32)>,
+    /// Camp lifecycle state: shelters Pitched at `home_tile`, or fully
+    /// Packed (mobile band). Settled factions remain `Pitched`. AI
+    /// nomadic factions pack+pitch atomically inside
+    /// `nomad_migration_commit_system`; player-flow nomadic factions
+    /// transition via `PlayerCommand::PackCamp` / `PitchCamp`.
+    pub camp_state: CampState,
+    /// AI-only migration state machine (Surveying → PendingCommit →
+    /// Walking → Idle). The player flow uses only `camp_state`.
+    pub migration_phase: MigrationPhase,
+    /// Tick of the most recent `camp_state` or `migration_phase`
+    /// transition. Used by HUD age display + telemetry.
+    pub last_phase_change_tick: u32,
     /// P4 (reverse sedentarization): per-day streak counter of "this
     /// settlement is failing" samples. `sedentary_collapse_system`
     /// increments daily when a trigger fires (food deficit / shelter
@@ -1650,6 +1705,9 @@ impl FactionRegistry {
                 last_migration_tick: 0,
                 pending_migration: None,
                 recent_camps: std::collections::VecDeque::new(),
+                camp_state: CampState::default(),
+                migration_phase: MigrationPhase::default(),
+                last_phase_change_tick: 0,
                 collapse_streak: 0,
                 // P1a: default = settled-Subsistence capabilities.
                 // `spawn_population` overwrites this with the

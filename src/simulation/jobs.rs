@@ -814,6 +814,13 @@ pub fn worker_self_post_stockpile_system(world: &mut World) {
             if faction.caps.posting.is_disabled() {
                 continue;
             }
+            // Phase C: a Packed (mobile) band is settled-life-paused.
+            if matches!(
+                faction.camp_state,
+                crate::simulation::faction::CampState::Packed { .. }
+            ) {
+                continue;
+            }
 
             for &target_rid in &[wood_id, stone_id] {
                 // Chief still handles this resource? leave it alone.
@@ -1195,6 +1202,13 @@ pub fn chief_job_posting_system(
         // menu. Members work via autonomous need-driven goals until then.
         // Capability check: archetypes with no posting layer skip chief postings.
         if faction.caps.posting.is_disabled() {
+            continue;
+        }
+        // Phase C: Packed (mobile) bands skip all chief postings.
+        if matches!(
+            faction.camp_state,
+            crate::simulation::faction::CampState::Packed { .. }
+        ) {
             continue;
         }
         let live_bps: Vec<Entity> = bps_by_faction
@@ -2024,6 +2038,13 @@ pub fn chief_tablet_posting_system(
 
     for (&faction_id, faction) in registry.factions.iter() {
         if faction_id == SOLO {
+            continue;
+        }
+        // Phase C: Packed bands skip tablet posting.
+        if matches!(
+            faction.camp_state,
+            crate::simulation::faction::CampState::Packed { .. }
+        ) {
             continue;
         }
         // Workbench in zone.

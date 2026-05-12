@@ -107,6 +107,18 @@ pub struct Tamed {
     pub owner_faction: u32,
 }
 
+/// Bug-fix #2 (pack animals stranded): marks a tamed animal as
+/// herd-following its owner faction's `home_tile`. Inserted by the
+/// nomad commit + player pitch paths so the animal redirect survives
+/// `LodLevel::Dormant` cycles. `following_band_animal_redirect_system`
+/// re-snaps `AnimalAI.target_tile` to a small offset of the live
+/// `home_tile` every `TICKS_PER_DAY/4`.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct FollowingBand {
+    pub faction: u32,
+    pub last_redirect_tick: u32,
+}
+
 /// P8: per-species pack capacity in grams. Tuned so a horse comfortably
 /// carries a packed yurt (80kg, but two horses split the load), while
 /// dogs carry only light supplies (skins, tools).
@@ -256,6 +268,36 @@ pub fn attach_pack_inventory_system(
         commands
             .entity(e)
             .insert(PackAnimalInventory::for_capacity(PACK_CAP_PIG));
+    }
+}
+
+/// Bug-fix #2: re-snap `AnimalAI.target_tile` to a small offset of
+/// each `FollowingBand` animal's faction `home_tile` every
+/// `TICKS_PER_DAY/4`. Live read of the registry — survives migration
+/// commits, player Pitch commands, and Dormant↔Active LOD cycles.
+pub fn following_band_animal_redirect_system(
+    clock: Res<crate::simulation::schedule::SimClock>,
+    registry: Res<crate::simulation::faction::FactionRegistry>,
+    mut q: Query<(&mut FollowingBand, &mut AnimalAI)>,
+) {
+    let tick = clock.tick;
+    if tick % (crate::world::seasons::TICKS_PER_DAY as u64 / 4) != 0 {
+        return;
+    }
+    let now = tick as u32;
+    for (mut follow, mut ai) in q.iter_mut() {
+        let Some(faction) = registry.factions.get(&follow.faction) else {
+            continue;
+        };
+        let home = faction.home_tile;
+        let seed = follow
+            .faction
+            .wrapping_mul(0x85EB_CA6B)
+            .wrapping_add(now);
+        let dx = ((seed & 0b11) as i32) - 2;
+        let dy = (((seed >> 2) & 0b11) as i32) - 2;
+        ai.target_tile = (home.0 + dx, home.1 + dy);
+        follow.last_redirect_tick = now;
     }
 }
 

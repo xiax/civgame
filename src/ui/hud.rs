@@ -206,6 +206,43 @@ pub fn hud_system(
                             });
                         }
 
+                        // Pack Camp / Pitch Camp button — shown only for
+                        // mobile (nomadic) player factions. Pack Camp
+                        // emits the command on the chief; Pitch Camp is
+                        // issued via right-click "Pitch Camp Here" on a
+                        // target tile.
+                        if let Some(player_fac) =
+                            registry.factions.get(&player_faction.faction_id)
+                        {
+                            if player_fac.caps.home.is_mobile() {
+                                ui.separator();
+                                let chief = player_fac.chief_entity;
+                                use crate::simulation::faction::CampState;
+                                let (label, fill, enabled) = match player_fac.camp_state {
+                                    CampState::Pitched => (
+                                        "Pack Camp",
+                                        egui::Color32::from_rgb(160, 120, 60),
+                                        chief.is_some(),
+                                    ),
+                                    CampState::Packed { .. } => (
+                                        "Mobile (right-click → Pitch)",
+                                        egui::Color32::from_rgb(120, 80, 200),
+                                        false,
+                                    ),
+                                };
+                                let camp_btn = egui::Button::new(label).fill(fill);
+                                let resp = ui.add_enabled(enabled, camp_btn);
+                                if resp.clicked() {
+                                    if let Some(c) = chief {
+                                        cmd_events.send(PlayerCommandEvent {
+                                            actors: vec![c],
+                                            command: PlayerCommand::PackCamp,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
                         ui.separator();
                         let dbg_btn = egui::Button::new("Debug").fill(if debug_state.open {
                             egui::Color32::from_rgb(200, 100, 60)

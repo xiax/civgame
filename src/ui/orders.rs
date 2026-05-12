@@ -54,6 +54,11 @@ pub enum MenuAction {
     ReadItem(crate::simulation::technology::TechId),
     /// Faction-level: craft a tablet encoding the given tech.
     EncodeTablet(crate::simulation::technology::TechId),
+    /// Pitch the player faction's mobile camp at this tile (only
+    /// available when `caps.home.is_mobile()` and `camp_state ==
+    /// Packed`). The chief is the dispatched actor; the apply system
+    /// re-seeds the camp here and flips state to Pitched.
+    PitchCampHere,
 }
 
 impl MenuAction {
@@ -95,6 +100,7 @@ impl MenuAction {
             MenuAction::HoldLecture(_) => "Hold Lecture",
             MenuAction::ReadItem(_) => "Read",
             MenuAction::EncodeTablet(_) => "Encode Tablet",
+            MenuAction::PitchCampHere => "Pitch Camp Here",
         }
     }
 }
@@ -311,6 +317,25 @@ pub fn right_click_context_menu_system(
                                 for bk in all_build_options() {
                                     let unlocked = faction_can_build(bk, &player_techs);
                                     build_options.push((MenuAction::Build(bk), unlocked));
+                                }
+                            }
+                            // Pitch Camp Here — visible when the player
+                            // faction is Packed (mobile, shelters down)
+                            // and the tile is reachable + far enough
+                            // from the band centroid.
+                            if let Some(player_fac) =
+                                faction_registry.factions.get(&player_faction.faction_id)
+                            {
+                                use crate::simulation::faction::CampState;
+                                if player_fac.caps.home.is_mobile()
+                                    && matches!(player_fac.camp_state, CampState::Packed { .. })
+                                {
+                                    let cheb = (pos_tile.0 - player_fac.home_tile.0)
+                                        .abs()
+                                        .max((pos_tile.1 - player_fac.home_tile.1).abs());
+                                    if cheb >= crate::simulation::nomad::MIN_PITCH_DISTANCE {
+                                        actions.push(MenuAction::PitchCampHere);
+                                    }
                                 }
                             }
                         }
@@ -579,6 +604,10 @@ fn menu_action_to_command(
         MenuAction::HoldLecture(tech) => PlayerCommand::HoldLecture { tech },
         MenuAction::ReadItem(tech) => PlayerCommand::ReadItem { tech },
         MenuAction::EncodeTablet(tech) => PlayerCommand::EncodeTablet { tech },
+        MenuAction::PitchCampHere => PlayerCommand::PitchCamp {
+            tile: target_tile,
+            z: target_z,
+        },
         // `PickUp` (generic pick-up) is the menu shortcut that doesn't pre-pick
         // an item entity; UI converts it to Gather/Scavenge based on what's on
         // the tile elsewhere. Treat as Gather here to keep the menu working.

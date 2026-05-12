@@ -120,6 +120,22 @@ pub enum PlayerCommand {
         tile: (i32, i32),
         z: i8,
     },
+    /// Tear down the actor's faction's camp shelters at the current
+    /// `home_tile`, drop refunds, pack `Deployable` shelters into pack
+    /// animals / member inventories, and flip the faction to
+    /// `CampState::Packed`. `home_tile` is **not** changed — the band
+    /// becomes mobile at its current location. The chief is the
+    /// canonical actor.
+    PackCamp,
+    /// Validate `tile` (passable, reachable from band centroid),
+    /// re-seed nomadic camp at the new tile, flip faction to
+    /// `CampState::Pitched`, update `home_tile = tile`, and stamp
+    /// `ForceGoalReevaluate` on every faction member so they re-pick
+    /// goals against the fresh home next tick.
+    PitchCamp {
+        tile: (i32, i32),
+        z: i8,
+    },
 }
 
 /// Per-actor authority marker. Replaces `PlayerOrder` once Commit 3 lands.
@@ -271,9 +287,16 @@ pub fn player_command_lifecycle_system(
     corpse_query: Query<&crate::simulation::corpse::Corpse>,
     health_query: Query<&crate::simulation::combat::Health>,
     bp_map: Res<crate::simulation::construction::BlueprintMap>,
-    mut q: Query<(Entity, &mut Commanded, &PersonAI, &Transform)>,
+    registry: Res<crate::simulation::faction::FactionRegistry>,
+    mut q: Query<(
+        Entity,
+        &mut Commanded,
+        &PersonAI,
+        &Transform,
+        Option<&FactionMember>,
+    )>,
 ) {
-    for (entity, mut cmd, ai, transform) in q.iter_mut() {
+    for (entity, mut cmd, ai, transform, member) in q.iter_mut() {
         if cmd.status != CommandStatus::Active {
             continue;
         }
@@ -385,6 +408,37 @@ pub fn player_command_lifecycle_system(
                     None
                 }
             }
+            PlayerCommand::PackCamp => {
+                let fid = member
+                    .map(|m| registry.root_faction(m.faction_id))
+                    .unwrap_or(SOLO);
+                match registry.factions.get(&fid) {
+                    Some(f) if matches!(
+                        f.camp_state,
+                        crate::simulation::faction::CampState::Packed { .. }
+                    ) =>
+                    {
+                        Some(CommandStatus::Completed)
+                    }
+                    _ => None,
+                }
+            }
+            PlayerCommand::PitchCamp { tile, .. } => {
+                let fid = member
+                    .map(|m| registry.root_faction(m.faction_id))
+                    .unwrap_or(SOLO);
+                match registry.factions.get(&fid) {
+                    Some(f)
+                        if matches!(
+                            f.camp_state,
+                            crate::simulation::faction::CampState::Pitched
+                        ) && f.home_tile == tile =>
+                    {
+                        Some(CommandStatus::Completed)
+                    }
+                    _ => None,
+                }
+            }
         };
         if let Some(new_status) = outcome {
             cmd.status = new_status;
@@ -463,6 +517,8 @@ pub fn dispatch_player_command_system(
     mut combat_target_q: Query<&mut CombatTarget>,
     mut player_craft: ResMut<crate::simulation::jobs::PlayerCraftRequest>,
     mut lecture_req: ResMut<crate::simulation::teaching::LectureRequest>,
+    registry: Res<crate::simulation::faction::FactionRegistry>,
+    mut camp_ops: ResMut<crate::simulation::nomad::PendingCampOps>,
 ) {
     for (actor, mut cmd, mut ai, mut aq, transform, member) in actors.iter_mut() {
         if cmd.status != CommandStatus::Pending {
@@ -477,8 +533,16 @@ pub fn dispatch_player_command_system(
         let faction_id = member.map(|m| m.faction_id).unwrap_or(SOLO);
 
         // Player commands are external preempts. Drop any prior typed-task
-        // chain so the new task promotes immediately.
-        aq.cancel();
+        // chain so the new task promotes immediately. Camp commands are an
+        // exception — they leave the actor's existing chain alone (the
+        // chief keeps doing whatever they were doing while the apply system
+        // mutates the world next Sequential tick).
+        if !matches!(
+            cmd.command,
+            PlayerCommand::PackCamp | PlayerCommand::PitchCamp { .. }
+        ) {
+            aq.cancel();
+        }
 
         let outcome = dispatch_one(
             actor,
@@ -494,6 +558,8 @@ pub fn dispatch_player_command_system(
             &mut player_craft,
             &mut lecture_req,
             &mut commands,
+            &registry,
+            &mut camp_ops,
         );
 
         match outcome {
@@ -527,6 +593,8 @@ fn dispatch_one(
     player_craft: &mut crate::simulation::jobs::PlayerCraftRequest,
     lecture_req: &mut crate::simulation::teaching::LectureRequest,
     commands: &mut Commands,
+    registry: &crate::simulation::faction::FactionRegistry,
+    camp_ops: &mut crate::simulation::nomad::PendingCampOps,
 ) -> DispatchOutcome {
     use PlayerCommand::*;
     match *command {
@@ -856,6 +924,73 @@ fn dispatch_one(
             }
             if let Ok(mut ct) = combat_target_q.get_mut(actor) {
                 ct.0 = None;
+            }
+            DispatchOutcome::Active
+        }
+        PackCamp => {
+            let _ = (target_item_q, lecture_req, player_craft);
+            // Resolve actor's faction; nomadic + Pitched required.
+            let fid = registry.root_faction(faction_id);
+            let Some(faction) = registry.factions.get(&fid) else {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            };
+            if !faction.caps.home.is_mobile() {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            }
+            if matches!(
+                faction.camp_state,
+                crate::simulation::faction::CampState::Packed { .. }
+            ) {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            }
+            // Idempotent enqueue (same faction queued twice in one tick
+            // is fine — apply system uses the first entry).
+            if !camp_ops.packs.iter().any(|(f, _)| *f == fid) {
+                camp_ops.packs.push((fid, faction.home_tile));
+            }
+            DispatchOutcome::Active
+        }
+        PitchCamp { tile, z } => {
+            let fid = registry.root_faction(faction_id);
+            let Some(faction) = registry.factions.get(&fid) else {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            };
+            if !faction.caps.home.is_mobile() {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            }
+            if !matches!(
+                faction.camp_state,
+                crate::simulation::faction::CampState::Packed { .. }
+            ) {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            }
+            // Passability check.
+            if !routing.chunk_map.is_passable(tile.0, tile.1) {
+                return DispatchOutcome::Failed(CommandFailure::Unreachable);
+            }
+            // Connectivity check from the actor's chunk to target chunk.
+            let target_chunk = ChunkCoord(
+                tile.0.div_euclid(CHUNK_SIZE as i32),
+                tile.1.div_euclid(CHUNK_SIZE as i32),
+            );
+            if !routing
+                .chunk_connectivity
+                .is_reachable((cur_chunk, ai.current_z), (target_chunk, z))
+            {
+                return DispatchOutcome::Failed(CommandFailure::Unreachable);
+            }
+            // Prevent same-spot pitch.
+            let cheb = (tile.0 - cur_tile.0).abs().max((tile.1 - cur_tile.1).abs());
+            if cheb < crate::simulation::nomad::MIN_PITCH_DISTANCE {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            }
+            if !camp_ops.pitches.iter().any(|p| p.fid == fid) {
+                camp_ops.pitches.push(crate::simulation::nomad::PendingPitch {
+                    fid,
+                    tile,
+                    z,
+                    command_actor: actor,
+                });
             }
             DispatchOutcome::Active
         }

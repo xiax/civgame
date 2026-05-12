@@ -95,6 +95,7 @@ impl Plugin for SimulationPlugin {
             .add_event::<land::PlotEvictedEvent>()
             .add_event::<player_command::PlayerCommandEvent>()
             .insert_resource(player_command::PlayerCommandIdGen::default())
+            .insert_resource(nomad::PendingCampOps::default())
             .insert_resource(SimClock::default())
             .insert_resource(goals::ForceGoalReevaluate::default())
             .insert_resource(faction::FactionRegistry::default())
@@ -224,7 +225,19 @@ impl Plugin for SimulationPlugin {
                     // on `*goal != new_goal`.
                     goals::record_abandoned_method_system
                         .after(goals::goal_update_system),
+                    // Phase C (mobile gating): demote settled-life
+                    // goals on members of CampState::Packed factions
+                    // to GatherFood + drop any held JobClaim. Runs
+                    // after goal_update so the per-tick selection is
+                    // honoured first; before the dispatchers in
+                    // ParallelB so blocked goals never run.
+                    goals::mobile_state_goal_gate_system
+                        .after(goals::goal_update_system),
                     animals::animal_sense_system,
+                    // Bug-fix #2: re-snap tamed animals' target_tile
+                    // toward their faction's `home_tile` every
+                    // quarter-day, surviving Dormant LOD cycles.
+                    animals::following_band_animal_redirect_system,
                 )
                     .in_set(SimulationSet::ParallelA),
             )
@@ -327,6 +340,11 @@ impl Plugin for SimulationPlugin {
                     // gated on goal == MigrateToCamp inside the system.
                     nomad::nomad_migration_dispatch_system
                         .after(trader::trader_route_dispatch_system),
+                    // Phase D: route Scout-goal members toward their
+                    // ScoutAssignment tile to seed faction-tier
+                    // SharedKnowledge before commit.
+                    nomad::nomad_survey_dispatch_system
+                        .after(nomad::nomad_migration_dispatch_system),
                 )
                     .in_set(SimulationSet::ParallelB),
             )
@@ -540,6 +558,22 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
+                    // Player Pack/Pitch Camp commands. Drain
+                    // `PendingCampOps` written by the player-command
+                    // dispatcher in ParallelB. Pack runs before Pitch
+                    // so a same-tick player Pack→Pitch is well-ordered.
+                    // After AI commit so they share shelter cleanup
+                    // ordering rather than fighting it.
+                    nomad::apply_pack_camp_command_system
+                        .after(nomad::nomad_migration_commit_system),
+                    nomad::apply_pitch_camp_command_system
+                        .after(nomad::apply_pack_camp_command_system),
+                )
+                    .in_set(SimulationSet::Sequential),
+            )
+            .add_systems(
+                FixedUpdate,
+                (
                     memory::relationship_decay_system,
                     faction::social_fill_system,
                     memory::conversation_memory_system.after(faction::social_fill_system),
@@ -676,6 +710,11 @@ impl Plugin for SimulationPlugin {
                     // see the new home_tile next tick.
                     nomad::nomad_migration_system
                         .after(faction::compute_faction_storage_system),
+                    // Phase D: roll Surveying → PendingCommit once the
+                    // scout window has elapsed. After the trigger so a
+                    // freshly-entered Surveying state doesn't race-promote.
+                    nomad::nomad_survey_completion_system
+                        .after(nomad::nomad_migration_system),
                     // P5: band-level inventory equalization. Runs every
                     // quarter-day so a daily migration trigger has at
                     // least one prior balance pass to draw on. Gated by

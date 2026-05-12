@@ -1933,6 +1933,13 @@ pub fn chief_directive_system(
         if faction.caps.posting.is_disabled() {
             continue;
         }
+        // Phase C: Packed (mobile) bands skip the chief directive.
+        if matches!(
+            faction.camp_state,
+            crate::simulation::faction::CampState::Packed { .. }
+        ) {
+            continue;
+        }
         let count = faction_bp_count.get(&faction_id).copied().unwrap_or(0);
         if count >= MAX_BLUEPRINTS_SAFETY_CAP {
             continue;
@@ -5501,6 +5508,20 @@ fn seed_farmstead_yard(
 /// Blueprint pipeline) so the camp is fully built at game-start AND can be
 /// re-invoked by `nomad_migration_commit_system` (Phase 8 follow-on) to
 /// stand up a fresh camp at the new `home_tile`.
+/// Bug-fix #6: returns the chebyshev radius around a seed home that
+/// covers every entity `seed_nomadic_camp` will spawn. Outer-ring
+/// tents fall at 5..=7 from each hearth, plus a few-tile safety
+/// margin for offset hearth layouts and large-band hearth rings. For
+/// 12-member bands → 12; for 24-member bands → 14; for 40+ → 18.
+/// Callers (`pack_camp_assets`, `process_settlement_lifecycle_system`)
+/// use this in place of the legacy `OLD_CAMP_RADIUS = 12` constant
+/// when they have a member count.
+pub fn seed_nomadic_camp_extent(members: u32, _era: Era) -> i32 {
+    let base = 8_i32;
+    let scale = (members as i32) / 6;
+    (base + scale + 4).clamp(12, 22)
+}
+
 pub(crate) fn seed_nomadic_camp(
     commands: &mut Commands,
     maps: &mut FurnitureMaps,

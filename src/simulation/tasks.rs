@@ -973,6 +973,13 @@ pub fn goal_dispatch_system(
                     AgentGoal::MigrateToCamp if ai.task_id == TaskKind::Migrate as u16 => {
                         Some(TaskKind::Migrate as u16)
                     }
+                    // Phase D scout: preserve the Explore chain so the
+                    // agent walks the full survey leg without
+                    // goal_dispatch tearing it down between goal-update
+                    // ticks (200 ticks = 10 s, scout walks may be 30-60s).
+                    AgentGoal::Scout if ai.task_id == TaskKind::Explore as u16 => {
+                        Some(TaskKind::Explore as u16)
+                    }
                     _ => None,
                 };
 

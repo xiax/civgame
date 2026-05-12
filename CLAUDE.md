@@ -52,7 +52,7 @@ Settlement layout flows through `SettlementPlan` → plot carving → blueprint 
 
 ## Nomadic mode
 
-`Lifestyle::{Settled, Nomadic}` on `FactionData`; nomadic factions skip Settlement spawning, run a camp pipeline, and migrate seasonally. Detailed system list in `src/simulation/CLAUDE.md` (search `nomad`, `wild_herd`, `pack_deploy`, `sedentary_collapse`).
+`Lifestyle::{Settled, Nomadic}` on `FactionData`; nomadic factions skip Settlement spawning, run a camp pipeline, and migrate seasonally. Two coexisting flows: AI commits atomically (Surveying → PendingCommit → Walking phases) while player-controlled nomadic factions transition between `CampState::Pitched` and `CampState::Packed` via `PlayerCommand::PackCamp` / `PitchCamp`. Detailed system list in `src/simulation/CLAUDE.md` (search `Camp lifecycle`, `nomad`, `wild_herd`, `pack_deploy`, `sedentary_collapse`).
 
 - **Shelters** (`pack_deploy.rs`): `Deployable { packed_form, refund_pct, refund_resource, refund_qty }` on every nomadic structure. Bedroll (1 skin + 2 wood) and Yurt (8 wood + 6 skin, gated on `PORTABLE_DWELLINGS`) are `fully_packable`; Tent (6 wood + 3 skin) is `refund_only(0.5, wood, 6)` — half drops as `GroundItem`s on teardown.
 - **Camp seeding** (`seed_nomadic_camp`): hearth ring, bedrolls (radial 2..=5, one per founder), tents (outer 5..=7, ~1 per 4 founders), yurts (Neolithic+, inner 3..=5, capped 2).

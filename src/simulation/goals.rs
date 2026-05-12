@@ -153,6 +153,36 @@ pub enum AgentGoal {
     /// `dispatch_player_command_system` and preserved by
     /// `goal_dispatch_system`'s short-circuit.
     FollowingPlayerCommand = 20,
+    /// Phase D (migration scout): nomadic-band member dispatched by
+    /// `nomad_survey_trigger_system` to walk to a quadrant tile and
+    /// seed faction-tier `SharedKnowledge` for the chief's
+    /// `pick_migration_target` re-score after the survey window.
+    /// Stamped alongside a `ScoutAssignment` companion (in
+    /// `nomad.rs`); cleared by `nomad_survey_completion_system` once
+    /// the survey window closes.
+    Scout = 21,
+}
+
+/// True if `goal` is permitted for a member of a faction whose
+/// `CampState` is `Packed`. Settled-life work (Build / Craft / Farm /
+/// Haul / Stockpile / TameHorse / GatherWood / GatherStone /
+/// ReturnCamp / Lead) is gated off; survival, food, social, defence,
+/// migration, and player-command goals stay live so the band can
+/// keep itself alive on the move.
+#[inline]
+pub fn allowed_while_packed(goal: AgentGoal) -> bool {
+    matches!(
+        goal,
+        AgentGoal::Survive
+            | AgentGoal::Sleep
+            | AgentGoal::GatherFood
+            | AgentGoal::Socialize
+            | AgentGoal::Defend
+            | AgentGoal::Rescue
+            | AgentGoal::Play
+            | AgentGoal::FollowingPlayerCommand
+            | AgentGoal::MigrateToCamp
+    )
 }
 
 impl AgentGoal {
@@ -178,6 +208,7 @@ impl AgentGoal {
             AgentGoal::Haul => "Haul",
             AgentGoal::Stockpile => "Stockpile",
             AgentGoal::MigrateToCamp => "MigrateToCamp",
+            AgentGoal::Scout => "Scout",
         }
     }
 }
@@ -403,7 +434,10 @@ pub fn goal_update_system(
             Option<&mut GoalReason>,
             Option<&FactionChief>,
             Option<&JobClaim>,
-            Option<&crate::simulation::nomad::MigrationTarget>,
+            (
+                Option<&crate::simulation::nomad::MigrationTarget>,
+                Option<&crate::simulation::nomad::ScoutAssignment>,
+            ),
         ),
         Without<Drafted>,
     >,
@@ -425,7 +459,7 @@ pub fn goal_update_system(
         reason_opt,
         chief_opt,
         claim_opt,
-        migration_target,
+        (migration_target, scout_assignment),
     ) in query.iter_mut()
     {
         // Player command authority: when `Commanded` is non-terminal, force
@@ -564,6 +598,26 @@ pub fn goal_update_system(
                 // agent re-evaluates a normal goal next tick.
                 commands.entity(entity).remove::<RescueTarget>();
             }
+        }
+
+        // Phase D: active scout assignment. Hold AgentGoal::Scout so
+        // the dispatcher keeps routing the agent toward their quadrant
+        // tile. Survive-tier needs / under-raid / rescue above already
+        // preempt; everything else defers until the survey window
+        // closes and `nomad_survey_completion_system` strips the
+        // marker.
+        if scout_assignment.is_some() {
+            if *goal != AgentGoal::Scout {
+                *goal = AgentGoal::Scout;
+                ai.state = AiState::Idle;
+                ai.task_id = PersonAI::UNEMPLOYED;
+            }
+            if let Some(mut r) = reason_opt {
+                r.0 = "Scouting";
+            } else {
+                commands.entity(entity).insert(GoalReason("Scouting"));
+            }
+            continue;
         }
 
         // P1: active migration. While the band is moving, hold the
@@ -910,6 +964,58 @@ fn should_craft(
 /// existing `*goal != new_goal` guard ensures `Changed<AgentGoal>` only
 /// triggers on real flips. Skips `MF_UNINTERRUPTIBLE` methods since their
 /// chains survive the flip via the preserve-arm matrix.
+/// Safety-net gate that demotes any settled-life goal to `GatherFood`
+/// for members of a faction whose `CampState::Packed`. Catches goals
+/// stamped outside `goal_update_system` (chief postings via
+/// `JobClaim`, household systems, etc.). Runs in `ParallelA` after
+/// `goal_update_system` so the per-tick selection is honoured first
+/// and only blocked outcomes are corrected.
+///
+/// The block list is the inverse of `allowed_while_packed`: Build,
+/// Craft, Farm, Haul, Stockpile, ReturnCamp, TameHorse, GatherWood,
+/// GatherStone, Lead. Any of those flips to `GatherFood`, the agent's
+/// task chain is cancelled, and any held `JobClaim` is dropped so the
+/// chief can re-post when the band re-pitches.
+pub fn mobile_state_goal_gate_system(
+    mut commands: Commands,
+    registry: Res<crate::simulation::faction::FactionRegistry>,
+    mut q: Query<(
+        Entity,
+        &crate::simulation::faction::FactionMember,
+        &mut AgentGoal,
+        &mut crate::simulation::person::PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
+        Option<&crate::simulation::jobs::JobClaim>,
+    )>,
+) {
+    for (e, member, mut goal, mut ai, mut aq, claim) in q.iter_mut() {
+        let root = registry.root_faction(member.faction_id);
+        let Some(faction) = registry.factions.get(&root) else {
+            continue;
+        };
+        if !matches!(
+            faction.camp_state,
+            crate::simulation::faction::CampState::Packed { .. }
+        ) {
+            continue;
+        }
+        if allowed_while_packed(*goal) {
+            continue;
+        }
+        // Settled-life goal on a Packed band — demote.
+        *goal = AgentGoal::GatherFood;
+        aq.cancel();
+        ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
+        ai.state = crate::simulation::person::AiState::Idle;
+        if claim.is_some() {
+            commands
+                .entity(e)
+                .remove::<crate::simulation::jobs::JobClaim>()
+                .remove::<crate::simulation::jobs::ClaimTarget>();
+        }
+    }
+}
+
 pub fn record_abandoned_method_system(
     clock: Res<SimClock>,
     method_registry: Res<crate::simulation::htn::MethodRegistry>,
