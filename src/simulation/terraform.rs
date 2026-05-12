@@ -51,7 +51,7 @@ pub struct PendingFootprint {
     pub faction_id: u32,
     pub target_z: i8,
     pub terraform_tiles: Vec<(i32, i32)>,
-    pub wall_plan: Vec<(BuildSiteKind, (i32, i32))>,
+    pub wall_plan: Vec<(BuildSiteKind, (i32, i32), Option<crate::simulation::land::TileEdge>)>,
 }
 
 #[derive(Resource, Default)]
@@ -327,14 +327,18 @@ pub fn footprint_completion_system(
                 crate::simulation::gather::spawn_ground_drop(c, tx, ty, rid, qty);
             },
         );
-        for (kind, tile) in &p.wall_plan {
+        for (kind, tile, edge) in &p.wall_plan {
             if bp_map.0.contains_key(tile) {
                 continue;
             }
             let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
+            let mut bp = Blueprint::new(p.faction_id, None, *kind, *tile, p.target_z);
+            if let Some(e) = edge {
+                bp = bp.with_door_dir(*e);
+            }
             let e = commands
                 .spawn((
-                    Blueprint::new(p.faction_id, None, *kind, *tile, p.target_z),
+                    bp,
                     Transform::from_xyz(wp.x, wp.y, 0.3),
                     GlobalTransform::default(),
                     Visibility::Visible,

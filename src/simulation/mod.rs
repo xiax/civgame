@@ -14,6 +14,7 @@ pub mod construction;
 pub mod corpse;
 pub mod crafting;
 pub mod dig;
+pub mod doormat;
 pub mod faction;
 pub mod gather;
 pub mod gather_claims;
@@ -86,6 +87,13 @@ impl Plugin for SimulationPlugin {
             .on_add(construction::on_structure_label_add)
             .on_remove(construction::on_structure_label_remove);
 
+        // Door doormat-release hook: dropping a Door frees its reserved
+        // outside tile so future construction can land there. Matches the
+        // `JobEscrow` refund-on-despawn pattern.
+        app.world_mut()
+            .register_component_hooks::<construction::Door>()
+            .on_remove(doormat::release_doormat_on_door_remove);
+
         app.add_plugins(jobs::JobsPlugin)
             .add_plugins(projects::ProjectsPlugin)
             .add_event::<combat::CombatEvent>()
@@ -125,6 +133,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::BlueprintMap::default())
             .insert_resource(crafting::CraftOrderMap::default())
             .insert_resource(construction::RoadCarveQueue::default())
+            .insert_resource(doormat::DoormatReservations::default())
             .insert_resource(construction::RitualState::default())
             .insert_resource(terraform::TerraformMap::default())
             .insert_resource(terraform::PendingFootprints::default())

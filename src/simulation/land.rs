@@ -27,13 +27,44 @@ pub type PlotId = u32;
 
 /// Which side of a `Plot.rect` faces a carved street. Phase 2 of the
 /// Construction Overhaul: lot-driven placement (Phase 3) anchors footprints
-/// at the frontage edge so structures face their road.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// at the frontage edge so structures face their road. Doubles as the cardinal
+/// for a door's opening side: `pick_door_direction` derives a `TileEdge` from
+/// the plot's frontage (or a road halo / home cardinal fallback), and the door
+/// is placed on that side of the building. The doormat tile sits one step in
+/// the same direction outside the building.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TileEdge {
     North,
     East,
     South,
     West,
+}
+
+impl TileEdge {
+    /// Unit offset for "one step outward in this cardinal direction".
+    pub fn delta(self) -> (i32, i32) {
+        match self {
+            TileEdge::North => (0, 1),
+            TileEdge::South => (0, -1),
+            TileEdge::East => (1, 0),
+            TileEdge::West => (-1, 0),
+        }
+    }
+
+    /// Cardinal direction from `from` toward `to` (Chebyshev). Ties prefer
+    /// the axis with the larger absolute delta; pure-diagonal inputs prefer
+    /// East/West for x-positive, North/South otherwise.
+    pub fn toward(from: (i32, i32), to: (i32, i32)) -> TileEdge {
+        let dx = to.0 - from.0;
+        let dy = to.1 - from.1;
+        if dx.abs() >= dy.abs() {
+            if dx >= 0 { TileEdge::East } else { TileEdge::West }
+        } else if dy >= 0 {
+            TileEdge::North
+        } else {
+            TileEdge::South
+        }
+    }
 }
 
 /// A bounded rectangular parcel of land within a settlement. Tenure
@@ -1339,6 +1370,26 @@ pub fn evicted_plot_cleanup_system(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tile_edge_delta_cardinal_directions() {
+        assert_eq!(TileEdge::North.delta(), (0, 1));
+        assert_eq!(TileEdge::South.delta(), (0, -1));
+        assert_eq!(TileEdge::East.delta(), (1, 0));
+        assert_eq!(TileEdge::West.delta(), (-1, 0));
+    }
+
+    #[test]
+    fn tile_edge_toward_picks_dominant_axis() {
+        // Larger |dx| → East/West
+        assert_eq!(TileEdge::toward((0, 0), (5, 1)), TileEdge::East);
+        assert_eq!(TileEdge::toward((0, 0), (-5, 1)), TileEdge::West);
+        // Larger |dy| → North/South
+        assert_eq!(TileEdge::toward((0, 0), (1, 5)), TileEdge::North);
+        assert_eq!(TileEdge::toward((0, 0), (1, -5)), TileEdge::South);
+        // Tie prefers x-axis (East for dx >= 0).
+        assert_eq!(TileEdge::toward((0, 0), (3, 3)), TileEdge::East);
+    }
 
     #[test]
     fn subdivide_clean_grid() {

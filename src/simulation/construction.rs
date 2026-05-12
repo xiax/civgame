@@ -317,12 +317,20 @@ impl DoorTier {
 
 /// A door — passable to all agents (faction-gating is TODO), and blocks line of
 /// sight when `open == false`. The `faction_id` is recorded for future use
-/// when pathfinding gains faction context.
+/// when pathfinding gains faction context. `dir` is the cardinal the door
+/// opens onto; `doormat_tile` is the protected outside tile (one step in
+/// `dir`) reserved in `DoormatReservations` and carved as `Road`. Both
+/// `dir` and `doormat_tile` are read by inspector hover / future faction-aware
+/// pathfinding; the doormat reservation is freed in `Door::on_remove` by
+/// matching on the entity id, not by reading these fields.
 #[derive(Component)]
+#[allow(dead_code)]
 pub struct Door {
     pub faction_id: u32,
     pub open: bool,
     pub tier: DoorTier,
+    pub dir: crate::simulation::land::TileEdge,
+    pub doormat_tile: (i32, i32),
 }
 
 /// Workbench tier. Stone tools → Copper smithing → Bronze casting.
@@ -522,6 +530,10 @@ pub struct Blueprint {
     /// `ClearObstacle` task executor; populated at blueprint creation
     /// via `obstacle::scan_footprint`.
     pub pending_clear: Vec<Entity>,
+    /// Cardinal the door will open onto when `kind == BuildSiteKind::Door`.
+    /// `None` for non-door blueprints (and for legacy door blueprints whose
+    /// direction wasn't sourced from a frontage / road halo).
+    pub door_dir: Option<crate::simulation::land::TileEdge>,
 }
 
 impl Blueprint {
@@ -553,7 +565,15 @@ impl Blueprint {
             deposit_count: count as u8,
             build_progress: 0,
             pending_clear: Vec::new(),
+            door_dir: None,
         }
+    }
+
+    /// Builder: stamp the door's opening cardinal. Caller must only set this
+    /// for `BuildSiteKind::Door` blueprints; ignored for other kinds.
+    pub fn with_door_dir(mut self, dir: crate::simulation::land::TileEdge) -> Self {
+        self.door_dir = Some(dir);
+        self
     }
 
     /// `true` when every plant/obstacle in the footprint has been cleared
@@ -1009,6 +1029,7 @@ fn find_footprint_at_frontage_lot(
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
     bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
     plot_index: &crate::simulation::land::PlotIndex,
     plot_q: &Query<&crate::simulation::land::Plot>,
     faction_id: u32,
@@ -1016,7 +1037,7 @@ fn find_footprint_at_frontage_lot(
     home: (i32, i32),
     half_w: i32,
     half_h: i32,
-) -> Option<(i32, i32)> {
+) -> Option<((i32, i32), crate::simulation::land::TileEdge)> {
     use crate::simulation::land::TileEdge;
 
     // Gather candidate plots: matching faction + zone kind + has frontage +
@@ -1035,7 +1056,7 @@ fn find_footprint_at_frontage_lot(
         let (Some(edge), Some(at)) = (plot.frontage_edge, plot.access_tile) else {
             continue;
         };
-        if !plot_rect_vacant(bed_map, bp_map, plot.rect) {
+        if !plot_rect_vacant(bed_map, bp_map, doormat, plot.rect) {
             continue;
         }
         let d = (at.0 - home.0).abs().max((at.1 - home.1).abs());
@@ -1066,7 +1087,7 @@ fn find_footprint_at_frontage_lot(
         let mut best: Option<(u8, i32, (i32, i32))> = None;
         for cy in ay_min..=ay_max {
             for cx in ax_min..=ax_max {
-                if !is_clear_footprint(chunk_map, bed_map, bp_map, cx, cy, half_w, half_h) {
+                if !is_clear_footprint(chunk_map, bed_map, bp_map, doormat, cx, cy, half_w, half_h) {
                     continue;
                 }
                 let (_, spread) = footprint_z_stats(chunk_map, cx, cy, half_w, half_h);
@@ -1081,7 +1102,7 @@ fn find_footprint_at_frontage_lot(
             }
         }
         if let Some((_, _, p)) = best {
-            return Some(p);
+            return Some((p, edge));
         }
     }
     None
@@ -1092,11 +1113,15 @@ fn find_footprint_at_frontage_lot(
 fn plot_rect_vacant(
     bed_map: &BedMap,
     bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
     rect: crate::simulation::settlement::TileRect,
 ) -> bool {
     for ty in rect.y0..rect.y0 + rect.h as i32 {
         for tx in rect.x0..rect.x0 + rect.w as i32 {
             if bed_map.0.contains_key(&(tx, ty)) || bp_map.0.contains_key(&(tx, ty)) {
+                return false;
+            }
+            if doormat.is_reserved((tx, ty)) {
                 return false;
             }
         }
@@ -1111,6 +1136,7 @@ fn find_footprint_in_zone(
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
     bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
     plan: Option<&crate::simulation::settlement::SettlementPlan>,
     kind: crate::simulation::settlement::ZoneKind,
     home: (i32, i32),
@@ -1132,7 +1158,7 @@ fn find_footprint_in_zone(
             let cy_max = rect.y0 as i32 + rect.h as i32 - half_h - 1;
             for cy in cy_min..=cy_max {
                 for cx in cx_min..=cx_max {
-                    if !is_clear_footprint(chunk_map, bed_map, bp_map, cx, cy, half_w, half_h) {
+                    if !is_clear_footprint(chunk_map, bed_map, bp_map, doormat, cx, cy, half_w, half_h) {
                         continue;
                     }
                     if blocks_cardinal_corridor(cx, cy, half_w, half_h, home) {
@@ -1160,6 +1186,7 @@ fn find_footprint_in_zone(
         chunk_map,
         bed_map,
         bp_map,
+        doormat,
         home,
         half_w,
         half_h,
@@ -1175,6 +1202,7 @@ fn find_clear_tile_in_zone(
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
     bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
     plan: Option<&crate::simulation::settlement::SettlementPlan>,
     kind: crate::simulation::settlement::ZoneKind,
     home: (i32, i32),
@@ -1191,6 +1219,9 @@ fn find_clear_tile_in_zone(
                     let ty = rect.y0 as i32 + dy;
                     let pos = (tx as i32, ty as i32);
                     if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
+                        continue;
+                    }
+                    if doormat.is_reserved(pos) {
                         continue;
                     }
                     let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
@@ -1222,6 +1253,9 @@ fn find_clear_tile_in_zone(
                 if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
                     continue;
                 }
+                if doormat.is_reserved(pos) {
+                    continue;
+                }
                 let Some(k) = chunk_map.tile_kind_at(hx + dx, hy + dy) else {
                     continue;
                 };
@@ -1243,6 +1277,7 @@ fn find_unfilled_civic_zone_tile(
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
     bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
     campfire_map: &CampfireMap,
     plan: Option<&crate::simulation::settlement::SettlementPlan>,
     home: (i32, i32),
@@ -1264,6 +1299,9 @@ fn find_unfilled_civic_zone_tile(
                     let ty = rect.y0 as i32 + dy;
                     let pos = (tx as i32, ty as i32);
                     if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
+                        continue;
+                    }
+                    if doormat.is_reserved(pos) {
                         continue;
                     }
                     let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
@@ -1297,6 +1335,9 @@ fn find_unfilled_civic_zone_tile(
                     || bed_map.0.contains_key(&pos)
                     || campfire_map.0.contains_key(&pos)
                 {
+                    continue;
+                }
+                if doormat.is_reserved(pos) {
                     continue;
                 }
                 let Some(k) = chunk_map.tile_kind_at(hx + dx, hy + dy) else {
@@ -1343,6 +1384,7 @@ fn find_bed_tile_around_hearth(
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
     bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
     hearths: &[(i32, i32)],
     home: (i32, i32),
     inner_r: i32,
@@ -1410,6 +1452,9 @@ fn find_bed_tile_around_hearth(
                 if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
                     continue;
                 }
+                if doormat.is_reserved(pos) {
+                    continue;
+                }
                 let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
                     continue;
                 };
@@ -1470,6 +1515,7 @@ fn is_clear_footprint(
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
     bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
     cx: i32,
     cy: i32,
     half_w: i32,
@@ -1484,12 +1530,51 @@ fn is_clear_footprint(
             if bed_map.0.contains_key(&pos) {
                 return false;
             }
+            if doormat.is_reserved(pos) {
+                return false;
+            }
             let Some(kind) = chunk_map.tile_kind_at(cx + dx, cy + dy) else {
                 return false;
             };
-            if !kind.is_passable() || kind == TileKind::Wall {
+            // Buildings never land on existing Roads — main thoroughfares
+            // must stay open. Without this gate a hut can plant its wall
+            // straight across a carved street, severing the network.
+            if !kind.is_passable() || kind == TileKind::Wall || kind == TileKind::Road {
                 return false;
             }
+        }
+    }
+    true
+}
+
+/// Shape-aware variant of `is_clear_footprint`: walks every tile in the
+/// `shape` mask under `rotation` at `anchor` and rejects when any cell is
+/// non-passable, walled, beded, blueprinted, or reserved as another door's
+/// doormat. Used by `BuildIntent::CompositeHouse` placement so non-rectangular
+/// masks don't drift onto impassable interior tiles that a bounding-box
+/// `is_clear_footprint` wouldn't catch.
+fn is_clear_shape(
+    chunk_map: &ChunkMap,
+    bed_map: &BedMap,
+    bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
+    shape: crate::simulation::building_template::FootprintShape,
+    rotation: crate::simulation::building_template::Rotation,
+    anchor: (i32, i32),
+) -> bool {
+    for (tx, ty) in crate::simulation::building_template::shape_tiles(shape, anchor, rotation) {
+        let pos = (tx, ty);
+        if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
+            return false;
+        }
+        if doormat.is_reserved(pos) {
+            return false;
+        }
+        let Some(kind) = chunk_map.tile_kind_at(tx, ty) else {
+            return false;
+        };
+        if !kind.is_passable() || kind == TileKind::Wall || kind == TileKind::Road {
+            return false;
         }
     }
     true
@@ -1544,6 +1629,7 @@ fn find_building_origin(
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
     bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
     camp_home: (i32, i32),
     half_w: i32,
     half_h: i32,
@@ -1564,7 +1650,7 @@ fn find_building_origin(
                 if blocks_cardinal_corridor(cx, cy, half_w, half_h, camp_home) {
                     continue;
                 }
-                if !is_clear_footprint(chunk_map, bed_map, bp_map, cx, cy, half_w, half_h) {
+                if !is_clear_footprint(chunk_map, bed_map, bp_map, doormat, cx, cy, half_w, half_h) {
                     continue;
                 }
                 if ring <= early_ring {
@@ -1583,12 +1669,38 @@ fn find_building_origin(
 /// Phase 1/2: plan all wall and bed blueprints for a single rectangular building.
 /// The perimeter wall tile closest to camp_home becomes the entrance (left open).
 /// `wall_material` controls which wall recipe is used for every perimeter tile.
+/// Pick the perimeter cell on the given cardinal side of a rectangular
+/// footprint. Returned as `(dx, dy)` offsets from the centre — guaranteed to
+/// be a flat side (not a corner). For even-length sides the cell closest to
+/// `camp_home` along the perpendicular axis is chosen so multi-building rows
+/// flow naturally toward the village core.
+fn entrance_cell_for_edge(
+    half_w: i32,
+    half_h: i32,
+    edge: crate::simulation::land::TileEdge,
+    camp_home: (i32, i32),
+    centre: (i32, i32),
+) -> (i32, i32) {
+    use crate::simulation::land::TileEdge;
+    // For odd-length sides (half_w == 1 → length 3), the only non-corner
+    // cell is dx == 0 (N/S edge) or dy == 0 (E/W edge). For larger sides
+    // we clamp the projection of camp_home onto the edge.
+    match edge {
+        TileEdge::East => (half_w, ((camp_home.1 - centre.1).clamp(-(half_h - 1).max(0), (half_h - 1).max(0)))),
+        TileEdge::West => (-half_w, ((camp_home.1 - centre.1).clamp(-(half_h - 1).max(0), (half_h - 1).max(0)))),
+        TileEdge::North => (((camp_home.0 - centre.0).clamp(-(half_w - 1).max(0), (half_w - 1).max(0))), half_h),
+        TileEdge::South => (((camp_home.0 - centre.0).clamp(-(half_w - 1).max(0), (half_w - 1).max(0))), -half_h),
+    }
+}
+
 fn plan_building(
     commands: &mut Commands,
     bp_map: &mut BlueprintMap,
     terraform_map: &mut crate::simulation::terraform::TerraformMap,
     pending_footprints: &mut crate::simulation::terraform::PendingFootprints,
     chunk_map: &ChunkMap,
+    bed_map: &BedMap,
+    doormat_res: &crate::simulation::doormat::DoormatReservations,
     cx: i32,
     cy: i32,
     half_w: i32,
@@ -1597,29 +1709,27 @@ fn plan_building(
     camp_home: (i32, i32),
     interior_beds: &[(i32, i32)],
     wall_material: WallMaterial,
+    door_dir: Option<crate::simulation::land::TileEdge>,
 ) {
-    let (hx, hy) = (camp_home.0 as i32, camp_home.1 as i32);
-
-    // The perimeter tile whose world-position is closest to the camp center becomes entrance.
-    let entrance: (i32, i32) = {
-        let mut best = (0i32, half_h);
-        let mut best_dist = i64::MAX;
-        for dy in -half_h..=half_h {
-            for dx in -half_w..=half_w {
-                if dx.abs() < half_w && dy.abs() < half_h {
-                    continue;
-                } // interior
-                if dx.abs() == half_w && dy.abs() == half_h {
-                    continue;
-                } // corner — entrance must be on a flat side
-                let d = ((cx + dx - hx) as i64).pow(2) + ((cy + dy - hy) as i64).pow(2);
-                if d < best_dist {
-                    best_dist = d;
-                    best = (dx, dy);
-                }
-            }
-        }
-        best
+    // Door direction: prefer the sourced cardinal (plot frontage); fall back
+    // to cardinal-toward-home. If that cardinal's doormat is blocked, try
+    // other cardinals. Abort the build if none work — placing an unreachable
+    // door is strictly worse than placing nothing.
+    let preferred_edge = door_dir.unwrap_or_else(|| {
+        crate::simulation::land::TileEdge::toward((cx, cy), camp_home)
+    });
+    let Some((door_edge, entrance, _planned_doormat)) = pick_clear_door_cardinal(
+        chunk_map,
+        bed_map,
+        bp_map,
+        doormat_res,
+        (cx, cy),
+        half_w,
+        half_h,
+        preferred_edge,
+        camp_home,
+    ) else {
+        return;
     };
 
     let (target_z, _spread) = footprint_z_stats(chunk_map, cx, cy, half_w, half_h);
@@ -1627,7 +1737,7 @@ fn plan_building(
     // Build the wall+bed plan. We always compute it first so the deferred
     // path (footprint_completion_system) can spawn the same blueprints once
     // terraform completes.
-    let mut wall_plan: Vec<(BuildSiteKind, (i32, i32))> = Vec::new();
+    let mut wall_plan: Vec<(BuildSiteKind, (i32, i32), Option<crate::simulation::land::TileEdge>)> = Vec::new();
     for dy in -half_h..=half_h {
         for dx in -half_w..=half_w {
             if dx.abs() < half_w && dy.abs() < half_h {
@@ -1639,12 +1749,13 @@ fn plan_building(
             } else {
                 BuildSiteKind::Wall(wall_material)
             };
-            wall_plan.push((kind, tile));
+            let edge = if (dx, dy) == entrance { Some(door_edge) } else { None };
+            wall_plan.push((kind, tile, edge));
         }
     }
     for &(bdx, bdy) in interior_beds {
         let tile = ((cx + bdx) as i32, (cy + bdy) as i32);
-        wall_plan.push((BuildSiteKind::Bed, tile));
+        wall_plan.push((BuildSiteKind::Bed, tile, None));
     }
 
     // Collect the tiles that need terraforming (footprint covers walls AND
@@ -1664,14 +1775,18 @@ fn plan_building(
 
     if terraform_tiles.is_empty() {
         // Flat ground: spawn wall blueprints immediately.
-        for (kind, tile) in &wall_plan {
+        for (kind, tile, edge) in &wall_plan {
             if bp_map.0.contains_key(tile) {
                 continue;
             }
             let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
+            let mut bp = Blueprint::new(faction_id, None, *kind, *tile, target_z);
+            if let Some(e) = edge {
+                bp = bp.with_door_dir(*e);
+            }
             let e = commands
                 .spawn((
-                    Blueprint::new(faction_id, None, *kind, *tile, target_z),
+                    bp,
                     Transform::from_xyz(wp.x, wp.y, 0.3),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -1719,6 +1834,7 @@ fn find_palisade_site(
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
     bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
     camp_home: (i32, i32),
     buffer: i32,
 ) -> Option<(i32, i32)> {
@@ -1748,39 +1864,50 @@ fn find_palisade_site(
     min_y -= buffer;
     max_y += buffer;
 
-    // Top and bottom rows — leave one-tile gateway at x=hx on each row.
+    // Top and bottom rows — leave a 3-tile gateway centred on x=hx for each
+    // cardinal axis so the spine has real flow capacity instead of a single-
+    // tile choke. Same width applied below for E/W columns.
+    let gateway_half = 1i32; // half-width: gateway spans [hx-1, hx+1] (3 tiles)
     for x in min_x..=max_x {
         for &y in &[min_y, max_y] {
-            if x == hx {
+            if (x - hx).abs() <= gateway_half {
                 continue; // N or S gateway: keep open for cardinal access
             }
             let tile = (x as i32, y as i32);
             if bp_map.0.contains_key(&tile) {
                 continue;
             }
+            if doormat.is_reserved(tile) {
+                continue; // never wall over a door's doormat
+            }
             let Some(kind) = chunk_map.tile_kind_at(x, y) else {
                 continue;
             };
-            if !kind.is_passable() || kind == TileKind::Wall {
+            // Skip Road too — the spine carves Road through the perimeter
+            // band; we don't want a palisade segment paving over a street.
+            if !kind.is_passable() || kind == TileKind::Wall || kind == TileKind::Road {
                 continue;
             }
             return Some(tile);
         }
     }
-    // Left and right columns (excluding corners) — leave one-tile gateway at y=hy.
+    // Left and right columns (excluding corners) — 3-tile gateway centred on y=hy.
     for y in (min_y + 1)..max_y {
         for &x in &[min_x, max_x] {
-            if y == hy {
+            if (y - hy).abs() <= gateway_half {
                 continue; // W or E gateway: keep open for cardinal access
             }
             let tile = (x as i32, y as i32);
             if bp_map.0.contains_key(&tile) {
                 continue;
             }
+            if doormat.is_reserved(tile) {
+                continue;
+            }
             let Some(kind) = chunk_map.tile_kind_at(x, y) else {
                 continue;
             };
-            if !kind.is_passable() || kind == TileKind::Wall {
+            if !kind.is_passable() || kind == TileKind::Wall || kind == TileKind::Road {
                 continue;
             }
             return Some(tile);
@@ -1805,6 +1932,7 @@ pub struct BuildingMapsRO<'w> {
     pub market_map: Res<'w, MarketMap>,
     pub barracks_map: Res<'w, BarracksMap>,
     pub monument_map: Res<'w, MonumentMap>,
+    pub doormat: Res<'w, crate::simulation::doormat::DoormatReservations>,
 }
 
 /// One thing the chief is considering building this tick. The selector
@@ -1814,6 +1942,10 @@ struct BuildCandidate {
     /// Centre tile for the placement (single-tile target or footprint centre).
     tile: (i32, i32),
     score: f32,
+    /// Door opening cardinal sourced from the plot's `frontage_edge`. `None`
+    /// for civic/zone-area placements that don't have a frontage; the door
+    /// then falls back to the cardinal-toward-home rule inside `plan_building`.
+    door_dir: Option<crate::simulation::land::TileEdge>,
 }
 
 #[derive(Clone, Copy)]
@@ -1826,6 +1958,15 @@ enum BuildIntent {
     Longhouse(WallMaterial),
     /// One palisade segment along the settlement perimeter.
     PalisadeSegment(WallMaterial, i32 /*buffer*/),
+    /// Composite house with an irregular footprint (L-shape, courtyard, …).
+    /// Walls span the perimeter of `shape` under `rotation`; one door on
+    /// the frontage cardinal; interior tiles take beds (1 bed per cell up
+    /// to the shape's interior count). Used by Chalcolithic+ residential.
+    CompositeHouse {
+        shape: crate::simulation::building_template::FootprintShape,
+        rotation: crate::simulation::building_template::Rotation,
+        wall_material: WallMaterial,
+    },
 }
 
 impl BuildIntent {
@@ -1856,6 +1997,27 @@ impl BuildIntent {
                 add(BuildSiteKind::Bed, 2);
             }
             BuildIntent::PalisadeSegment(mat, _) => add(BuildSiteKind::Wall(mat), 1),
+            BuildIntent::CompositeHouse { shape, rotation, wall_material } => {
+                use crate::simulation::building_template::shape_tiles;
+                // Walk canonical tiles, classify perimeter vs interior. We
+                // don't know exact wall/bed counts without inspecting the
+                // shape mask — close enough is fine for the deficit-EMA
+                // feedback loop. Perimeter ≈ outside-facing tiles; interior
+                // ≈ everything else, which we map to beds.
+                let tiles = shape_tiles(shape, (0, 0), rotation);
+                let tile_set: ahash::AHashSet<(i32, i32)> = tiles.iter().copied().collect();
+                let mut perim = 0u32;
+                let mut interior = 0u32;
+                for &(tx, ty) in &tiles {
+                    let is_perim = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                        .iter()
+                        .any(|&(ox, oy)| !tile_set.contains(&(tx + ox, ty + oy)));
+                    if is_perim { perim += 1; } else { interior += 1; }
+                }
+                add(BuildSiteKind::Wall(wall_material), perim.saturating_sub(1));
+                add(BuildSiteKind::Door, 1);
+                add(BuildSiteKind::Bed, interior.max(1));
+            }
         }
         totals
     }
@@ -1973,6 +2135,7 @@ pub fn chief_directive_system(
             &chunk_map,
             &maps,
             &bp_map,
+            &*maps.doormat,
             pending_kinds,
             &plot_index,
             &plot_q,
@@ -2028,10 +2191,13 @@ pub fn chief_directive_system(
             &mut terraform_map,
             &mut pending_footprints,
             &chunk_map,
+            &*maps.bed_map,
+            &*maps.doormat,
             faction_id,
             faction.home_tile,
             best.intent,
             best.tile,
+            best.door_dir,
         );
     }
 }
@@ -2045,6 +2211,7 @@ fn generate_candidates(
     chunk_map: &ChunkMap,
     maps: &BuildingMapsRO,
     bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
     pending_kinds: &AHashMap<BuildSiteKind, u32>,
     plot_index: &crate::simulation::land::PlotIndex,
     plot_q: &Query<&crate::simulation::land::Plot>,
@@ -2091,6 +2258,7 @@ fn generate_candidates(
                     intent: BuildIntent::PalisadeSegment(wall_mat, 2),
                     tile: up_tile,
                     score: 5000.0,
+                door_dir: None,
                 });
                 return out; // skip everything else this tick
             }
@@ -2144,6 +2312,7 @@ fn generate_candidates(
                 chunk_map,
                 &maps.bed_map,
                 bp_map,
+                doormat,
                 &hearths,
                 home,
                 2,
@@ -2181,6 +2350,7 @@ fn generate_candidates(
             chunk_map,
             &maps.bed_map,
             bp_map,
+            doormat,
             &maps.campfire_map,
             plan,
             home,
@@ -2221,7 +2391,8 @@ fn generate_candidates(
                 intent: BuildIntent::Single(BuildSiteKind::Campfire),
                 tile,
                 score: 1000.0,
-            });
+            door_dir: None,
+                });
         }
     }
 
@@ -2251,6 +2422,7 @@ fn generate_candidates(
                     chunk_map,
                     &maps.bed_map,
                     bp_map,
+                    doormat,
                     &hearths,
                     home,
                     2,
@@ -2260,48 +2432,164 @@ fn generate_candidates(
                         intent: BuildIntent::Single(BuildSiteKind::Bed),
                         tile,
                         score: 200.0 + bed_deficit * 30.0,
-                    });
+                    door_dir: None,
+                });
                 }
             }
         } else if techs.has(CITY_STATE_ORG) && bed_deficit >= 2.0 {
             // Frontage-first: prefer vacant residential lots whose access tile
             // sits on the carved spine; fall back to zone-area scoring.
-            let lh_origin = find_footprint_at_frontage_lot(
-                chunk_map,
-                &maps.bed_map,
-                bp_map,
-                plot_index,
-                plot_q,
-                faction_id,
-                ZoneKind::Residential,
-                home,
-                2,
-                1,
-            )
-            .or_else(|| {
-                find_footprint_in_zone(
+            // Layout-seed roll: Longhouse is the default when bed deficit is
+            // large (≥4), but for smaller deficits we roll for visual variety.
+            // Seed mixes plan.culture_hash with current bed_count so successive
+            // builds in the same faction don't all pick the same footprint.
+            let layout_seed = plan
+                .map(|p| p.culture_hash)
+                .unwrap_or(faction_id as u64)
+                ^ (bed_count as u64);
+            let mut roll_rng = fastrand::Rng::with_seed(layout_seed);
+            let try_longhouse = if bed_deficit >= 4.0 {
+                true
+            } else {
+                roll_rng.f32() < 0.6
+            };
+            // Small chance (10%) of an LShape farmstead alongside the
+            // Hut/Longhouse — only when bed_deficit is modest so we don't
+            // blow the budget on a fancy footprint while people sleep on
+            // the floor. The LShape candidate is added below if a 4×2 slot
+            // accepts it.
+            let try_lshape = bed_deficit >= 2.0 && bed_deficit < 4.0 && roll_rng.f32() < 0.10;
+            if try_lshape {
+                // L-shape main block (2×2) + east extension (2×1) — 4×2
+                // bounding box. Use the bounding-box search to find a
+                // candidate anchor, then verify the actual mask via
+                // `is_clear_shape` so non-rectangular interior cells aren't
+                // dropped onto impassable terrain.
+                let lshape = crate::simulation::building_template::FootprintShape::LShape {
+                    w1: 2, h1: 2, w2: 2, h2: 1,
+                };
+                if let Some(origin) = find_footprint_in_zone(
                     chunk_map,
                     &maps.bed_map,
                     bp_map,
+                    doormat,
                     plan,
                     ZoneKind::Residential,
                     home,
                     2,
                     1,
-                    20,
+                    18,
+                ) {
+                    let rotation = crate::simulation::building_template::Rotation::R0;
+                    if is_clear_shape(
+                        chunk_map,
+                        &maps.bed_map,
+                        bp_map,
+                        doormat,
+                        lshape,
+                        rotation,
+                        origin,
+                    ) {
+                        out.push(BuildCandidate {
+                            intent: BuildIntent::CompositeHouse {
+                                shape: lshape,
+                                rotation,
+                                wall_material: wall_mat,
+                            },
+                            tile: origin,
+                            score: 245.0 + bed_deficit * 25.0,
+                            door_dir: None,
+                        });
+                    }
+                }
+            }
+            let lh_origin: Option<((i32, i32), Option<crate::simulation::land::TileEdge>)> = if try_longhouse {
+                find_footprint_at_frontage_lot(
+                    chunk_map,
+                    &maps.bed_map,
+                    bp_map,
+                    doormat,
+                    plot_index,
+                    plot_q,
+                    faction_id,
+                    ZoneKind::Residential,
+                    home,
+                    2,
+                    1,
                 )
-            });
-            if let Some(origin) = lh_origin {
+                .map(|(t, e)| (t, Some(e)))
+                .or_else(|| {
+                    find_footprint_in_zone(
+                        chunk_map,
+                        &maps.bed_map,
+                        bp_map,
+                        doormat,
+                        plan,
+                        ZoneKind::Residential,
+                        home,
+                        2,
+                        1,
+                        20,
+                    )
+                    .map(|t| (t, None))
+                })
+            } else {
+                None
+            };
+            if let Some((origin, edge)) = lh_origin {
                 out.push(BuildCandidate {
                     intent: BuildIntent::Longhouse(wall_mat),
                     tile: origin,
                     score: 260.0 + bed_deficit * 25.0,
+                    door_dir: edge,
                 });
             } else {
-                let hut_origin = find_footprint_at_frontage_lot(
+                let hut_origin: Option<((i32, i32), Option<crate::simulation::land::TileEdge>)> =
+                    find_footprint_at_frontage_lot(
+                        chunk_map,
+                        &maps.bed_map,
+                        bp_map,
+                        doormat,
+                        plot_index,
+                        plot_q,
+                        faction_id,
+                        ZoneKind::Residential,
+                        home,
+                        1,
+                        1,
+                    )
+                    .map(|(t, e)| (t, Some(e)))
+                    .or_else(|| {
+                        find_footprint_in_zone(
+                            chunk_map,
+                            &maps.bed_map,
+                            bp_map,
+                            doormat,
+                            plan,
+                            ZoneKind::Residential,
+                            home,
+                            1,
+                            1,
+                            18,
+                        )
+                        .map(|t| (t, None))
+                    });
+                if let Some((origin, edge)) = hut_origin {
+                    out.push(BuildCandidate {
+                        intent: BuildIntent::Hut(wall_mat),
+                        tile: origin,
+                        score: 230.0 + bed_deficit * 25.0,
+                        door_dir: edge,
+                    });
+                }
+            }
+        } else {
+            let hut_origin: Option<((i32, i32), Option<crate::simulation::land::TileEdge>)> =
+                find_footprint_at_frontage_lot(
                     chunk_map,
                     &maps.bed_map,
                     bp_map,
+                    doormat,
                     plot_index,
                     plot_q,
                     faction_id,
@@ -2310,11 +2598,13 @@ fn generate_candidates(
                     1,
                     1,
                 )
+                .map(|(t, e)| (t, Some(e)))
                 .or_else(|| {
                     find_footprint_in_zone(
                         chunk_map,
                         &maps.bed_map,
                         bp_map,
+                        doormat,
                         plan,
                         ZoneKind::Residential,
                         home,
@@ -2322,46 +2612,14 @@ fn generate_candidates(
                         1,
                         18,
                     )
+                    .map(|t| (t, None))
                 });
-                if let Some(origin) = hut_origin {
-                    out.push(BuildCandidate {
-                        intent: BuildIntent::Hut(wall_mat),
-                        tile: origin,
-                        score: 230.0 + bed_deficit * 25.0,
-                    });
-                }
-            }
-        } else {
-            let hut_origin = find_footprint_at_frontage_lot(
-                chunk_map,
-                &maps.bed_map,
-                bp_map,
-                plot_index,
-                plot_q,
-                faction_id,
-                ZoneKind::Residential,
-                home,
-                1,
-                1,
-            )
-            .or_else(|| {
-                find_footprint_in_zone(
-                    chunk_map,
-                    &maps.bed_map,
-                    bp_map,
-                    plan,
-                    ZoneKind::Residential,
-                    home,
-                    1,
-                    1,
-                    18,
-                )
-            });
-            if let Some(origin) = hut_origin {
+            if let Some((origin, edge)) = hut_origin {
                 out.push(BuildCandidate {
                     intent: BuildIntent::Hut(wall_mat),
                     tile: origin,
                     score: 230.0 + bed_deficit * 25.0,
+                    door_dir: edge,
                 });
             }
         }
@@ -2377,12 +2635,13 @@ fn generate_candidates(
         let target_walls = (members as i32 * 2 + 8).min(48);
         let defense_deficit = (target_walls - walls_count).max(0) as f32;
         if defense_deficit > 0.0 && bed_count > 0 {
-            if let Some(tile) = find_palisade_site(chunk_map, &maps.bed_map, bp_map, home, 2) {
+            if let Some(tile) = find_palisade_site(chunk_map, &maps.bed_map, bp_map, doormat, home, 2) {
                 let def_mult = 0.4 + (culture.defensive as f32 / 255.0) * 1.6;
                 out.push(BuildCandidate {
                     intent: BuildIntent::PalisadeSegment(wall_mat, 2),
                     tile,
                     score: 70.0 * def_mult + defense_deficit * 1.5,
+                door_dir: None,
                 });
             }
         }
@@ -2399,6 +2658,7 @@ fn generate_candidates(
             chunk_map,
             &maps.bed_map,
             bp_map,
+            doormat,
             plan,
             ZoneKind::Crafting,
             home,
@@ -2408,7 +2668,8 @@ fn generate_candidates(
                 intent: BuildIntent::Single(BuildSiteKind::Workbench),
                 tile,
                 score: 150.0,
-            });
+            door_dir: None,
+                });
         }
     }
 
@@ -2427,6 +2688,7 @@ fn generate_candidates(
             chunk_map,
             &maps.bed_map,
             bp_map,
+            doormat,
             plan,
             ZoneKind::Storage,
             home,
@@ -2437,7 +2699,8 @@ fn generate_candidates(
                 intent: BuildIntent::Single(BuildSiteKind::Granary),
                 tile,
                 score: 180.0 * mer_mult,
-            });
+            door_dir: None,
+                });
         }
     }
 
@@ -2456,6 +2719,7 @@ fn generate_candidates(
             chunk_map,
             &maps.bed_map,
             bp_map,
+            doormat,
             plan,
             ZoneKind::Sacred,
             home,
@@ -2466,7 +2730,8 @@ fn generate_candidates(
                 intent: BuildIntent::Single(BuildSiteKind::Shrine),
                 tile,
                 score: 110.0 * cer_mult,
-            });
+            door_dir: None,
+                });
         }
     }
 
@@ -2486,6 +2751,7 @@ fn generate_candidates(
                 chunk_map,
                 &maps.bed_map,
                 bp_map,
+                doormat,
                 plan,
                 ZoneKind::Market,
                 home,
@@ -2496,6 +2762,7 @@ fn generate_candidates(
                     intent: BuildIntent::Single(BuildSiteKind::Market),
                     tile,
                     score: 130.0 * mer_mult,
+                door_dir: None,
                 });
             }
         }
@@ -2516,6 +2783,7 @@ fn generate_candidates(
             chunk_map,
             &maps.bed_map,
             bp_map,
+            doormat,
             plan,
             ZoneKind::Defense,
             home,
@@ -2526,7 +2794,8 @@ fn generate_candidates(
                 intent: BuildIntent::Single(BuildSiteKind::Barracks),
                 tile,
                 score: 140.0 * mar_mult,
-            });
+            door_dir: None,
+                });
         }
     }
 
@@ -2545,6 +2814,7 @@ fn generate_candidates(
             chunk_map,
             &maps.bed_map,
             bp_map,
+            doormat,
             plan,
             ZoneKind::Sacred,
             home,
@@ -2555,7 +2825,8 @@ fn generate_candidates(
                 intent: BuildIntent::Single(BuildSiteKind::Monument),
                 tile,
                 score: 95.0 * cer_mult,
-            });
+            door_dir: None,
+                });
         }
     }
 
@@ -2569,10 +2840,13 @@ fn spawn_intent(
     terraform_map: &mut crate::simulation::terraform::TerraformMap,
     pending_footprints: &mut crate::simulation::terraform::PendingFootprints,
     chunk_map: &ChunkMap,
+    bed_map: &BedMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
     faction_id: u32,
     home: (i32, i32),
     intent: BuildIntent,
     tile: (i32, i32),
+    door_dir: Option<crate::simulation::land::TileEdge>,
 ) {
     match intent {
         BuildIntent::Single(kind) => {
@@ -2596,6 +2870,8 @@ fn spawn_intent(
                 terraform_map,
                 pending_footprints,
                 chunk_map,
+                bed_map,
+                doormat,
                 tile.0 as i32,
                 tile.1 as i32,
                 1,
@@ -2604,6 +2880,7 @@ fn spawn_intent(
                 home,
                 &[(0, 0)],
                 wall_mat,
+                door_dir,
             );
         }
         BuildIntent::Longhouse(wall_mat) => {
@@ -2613,6 +2890,8 @@ fn spawn_intent(
                 terraform_map,
                 pending_footprints,
                 chunk_map,
+                bed_map,
+                doormat,
                 tile.0 as i32,
                 tile.1 as i32,
                 2,
@@ -2621,6 +2900,7 @@ fn spawn_intent(
                 home,
                 &[(-1, 0), (1, 0)],
                 wall_mat,
+                door_dir,
             );
         }
         BuildIntent::PalisadeSegment(wall_mat, _) => {
@@ -2643,6 +2923,146 @@ fn spawn_intent(
                 .id();
             bp_map.0.insert(tile, e);
         }
+        BuildIntent::CompositeHouse { shape, rotation, wall_material } => {
+            plan_composite_building(
+                commands,
+                bp_map,
+                chunk_map,
+                bed_map,
+                doormat,
+                tile,
+                shape,
+                rotation,
+                wall_material,
+                faction_id,
+                home,
+                door_dir,
+            );
+        }
+    }
+}
+
+/// Place wall / door / bed blueprints over an arbitrary shape mask. Perimeter
+/// tiles (any cardinal neighbour outside the mask) become Wall; the one
+/// perimeter tile closest to the door cardinal becomes Door; interior tiles
+/// become Bed. No terraforming is performed (composite houses anchor to the
+/// most-level cell during selection); uneven ground is left to a future
+/// shape-aware terraform extension.
+fn plan_composite_building(
+    commands: &mut Commands,
+    bp_map: &mut BlueprintMap,
+    chunk_map: &ChunkMap,
+    bed_map: &BedMap,
+    doormat_res: &crate::simulation::doormat::DoormatReservations,
+    anchor: (i32, i32),
+    shape: crate::simulation::building_template::FootprintShape,
+    rotation: crate::simulation::building_template::Rotation,
+    wall_material: WallMaterial,
+    faction_id: u32,
+    camp_home: (i32, i32),
+    door_dir: Option<crate::simulation::land::TileEdge>,
+) {
+    use crate::simulation::building_template::shape_tiles;
+    let tiles = shape_tiles(shape, anchor, rotation);
+    if tiles.is_empty() {
+        return;
+    }
+    let tile_set: ahash::AHashSet<(i32, i32)> = tiles.iter().copied().collect();
+
+    // Door direction: prefer the sourced cardinal (plot frontage); else fall
+    // back to the cardinal-toward-home rule used by `plan_building`.
+    let preferred_edge = door_dir.unwrap_or_else(|| {
+        crate::simulation::land::TileEdge::toward(anchor, camp_home)
+    });
+
+    // Among the four cardinals, find one whose chosen perimeter cell's
+    // cardinal-out tile is genuinely outside the mask AND a clear doormat
+    // target. Without this gate, an L-shape can place a door on a perimeter
+    // cell whose "outside" cardinal hits another wall blueprint, leaving the
+    // door unreachable.
+    use crate::simulation::land::TileEdge;
+    let cardinals = [TileEdge::North, TileEdge::East, TileEdge::South, TileEdge::West];
+    let pick_perim_for_edge = |edge: TileEdge| -> Option<((i32, i32), (i32, i32), i64)> {
+        let (ddx, ddy) = edge.delta();
+        let mut best: Option<((i32, i32), (i32, i32), i64)> = None;
+        for &(tx, ty) in &tiles {
+            let outside = (tx + ddx, ty + ddy);
+            if tile_set.contains(&outside) {
+                continue;
+            }
+            let is_perim = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                .iter()
+                .any(|&(ox, oy)| !tile_set.contains(&(tx + ox, ty + oy)));
+            if !is_perim {
+                continue;
+            }
+            if !doormat_tile_clear(chunk_map, bed_map, bp_map, doormat_res, outside) {
+                continue;
+            }
+            let d = ((outside.0 - camp_home.0) as i64).pow(2)
+                + ((outside.1 - camp_home.1) as i64).pow(2);
+            if best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
+                best = Some(((tx, ty), outside, d));
+            }
+        }
+        best
+    };
+    let mut chosen: Option<((i32, i32), TileEdge)> = pick_perim_for_edge(preferred_edge)
+        .map(|(door, _outside, _)| (door, preferred_edge));
+    if chosen.is_none() {
+        chosen = cardinals
+            .iter()
+            .copied()
+            .filter(|&e| e != preferred_edge)
+            .filter_map(|e| pick_perim_for_edge(e).map(|(door, _, d)| (door, e, d)))
+            .min_by_key(|&(_, _, d)| d)
+            .map(|(door, e, _)| (door, e));
+    }
+    let Some((picked_door_tile, door_edge)) = chosen else {
+        return; // every cardinal blocked — abort the build
+    };
+    let door_tile: Option<(i32, i32)> = Some(picked_door_tile);
+
+    // Same target_z as the rectangular path: use the anchor's surface_z so
+    // composite walls form a consistent floor. (Spread checks happen in the
+    // caller via `shape_z_stats`.)
+    let target_z = chunk_map.surface_z_at(anchor.0, anchor.1) as i8;
+
+    for &(tx, ty) in &tiles {
+        let pos = (tx, ty);
+        if bp_map.0.contains_key(&pos) {
+            continue;
+        }
+        let is_perim = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+            .iter()
+            .any(|&(ox, oy)| !tile_set.contains(&(tx + ox, ty + oy)));
+        let kind = if Some(pos) == door_tile {
+            BuildSiteKind::Door
+        } else if is_perim {
+            BuildSiteKind::Wall(wall_material)
+        } else {
+            BuildSiteKind::Bed
+        };
+        let edge = if Some(pos) == door_tile {
+            Some(door_edge)
+        } else {
+            None
+        };
+        let wp = tile_to_world(tx, ty);
+        let mut bp = Blueprint::new(faction_id, None, kind, pos, target_z);
+        if let Some(e) = edge {
+            bp = bp.with_door_dir(e);
+        }
+        let e = commands
+            .spawn((
+                bp,
+                Transform::from_xyz(wp.x, wp.y, 0.3),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        bp_map.0.insert(pos, e);
     }
 }
 
@@ -2764,6 +3184,185 @@ pub fn ritual_system(
 }
 
 // ── Road carving ──────────────────────────────────────────────────────────────
+
+/// Convert a single tile to `Road` and emit a `TileChangedEvent`. Used by
+/// the door-finalization paths for the doormat tile (which sits at the
+/// Bresenham `from` endpoint and is therefore skipped by `road_carve_system`).
+/// Only writes when the current tile kind is a writable surface
+/// (Grass / Scrub / Sand / soil-like); leaves Wall / Water / Stone alone.
+/// Is the tile a valid doormat target — passable, not a wall/stone, not
+/// blueprinted, not already-bed, not reserved as another door's doormat?
+/// Used to gate door placement so a door's cardinal-out neighbour isn't a
+/// neighbour's wall (which `write_road_tile` would refuse to overwrite,
+/// leaving the door permanently blocked).
+fn doormat_tile_clear(
+    chunk_map: &ChunkMap,
+    bed_map: &BedMap,
+    bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
+    tile: (i32, i32),
+) -> bool {
+    if bp_map.0.contains_key(&tile) || bed_map.0.contains_key(&tile) {
+        return false;
+    }
+    if doormat.is_reserved(tile) {
+        return false;
+    }
+    match chunk_map.tile_kind_at(tile.0, tile.1) {
+        Some(k) if k == TileKind::Wall || k == TileKind::Stone => false,
+        Some(k) if !k.is_passable() => false,
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Bounded BFS from `start` checking whether `home` is reachable via passable
+/// terrain (Wall / Stone block; everything else is walkable). Treats existing
+/// blueprints and beds as walkable so a freshly-staged hut doesn't trip itself
+/// — only finalized walls block. Caps at `MAX_DOORMAT_BFS_STEPS` expansions
+/// per call so the placement path stays cheap even on Bronze-Age starts.
+///
+/// Used by `pick_clear_door_cardinal`: a cardinal whose doormat is locally
+/// clear but enclosed in a sealed courtyard fails this check, forcing the
+/// caller to try another cardinal or abort. The cap is generous enough to
+/// cover even Bronze-Age city footprints (≤ 80 tile chebyshev) but small
+/// enough that placement stays cheap.
+const MAX_DOORMAT_BFS_STEPS: usize = 1500;
+fn doormat_reaches_home(chunk_map: &ChunkMap, start: (i32, i32), home: (i32, i32)) -> bool {
+    use std::collections::VecDeque;
+    if start == home {
+        return true;
+    }
+    let mut visited: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+    visited.insert(start);
+    let mut q: VecDeque<(i32, i32)> = VecDeque::new();
+    q.push_back(start);
+    let mut steps = 0usize;
+    while let Some((x, y)) = q.pop_front() {
+        steps += 1;
+        if steps > MAX_DOORMAT_BFS_STEPS {
+            // Couldn't prove reachability within the budget — fail closed so
+            // we don't ship a sealed courtyard. False negatives are rare since
+            // 200 chebyshev hops covers any reasonable settlement extent.
+            return false;
+        }
+        for &(dx, dy) in &[(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let n = (x + dx, y + dy);
+            if n == home {
+                return true;
+            }
+            if !visited.insert(n) {
+                continue;
+            }
+            match chunk_map.tile_kind_at(n.0, n.1) {
+                Some(k) if k == TileKind::Wall || k == TileKind::Stone => continue,
+                Some(k) if !k.is_passable() => continue,
+                None => continue,
+                _ => {}
+            }
+            q.push_back(n);
+        }
+    }
+    false
+}
+
+/// Pick a door cardinal whose entrance cell's cardinal-out neighbour is a
+/// clear doormat target. Tries `preferred` first; if its doormat is blocked
+/// (neighbour wall, blueprint, bed, palisade, reserved doormat, impassable),
+/// scans the other three cardinals in order of resulting doormat → home
+/// chebyshev distance. Returns `(edge, entrance_offset, doormat_tile)` or
+/// `None` when *every* cardinal yields a blocked doormat — caller should
+/// abort the build rather than place an unreachable door.
+fn pick_clear_door_cardinal(
+    chunk_map: &ChunkMap,
+    bed_map: &BedMap,
+    bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
+    centre: (i32, i32),
+    half_w: i32,
+    half_h: i32,
+    preferred: crate::simulation::land::TileEdge,
+    home: (i32, i32),
+) -> Option<(crate::simulation::land::TileEdge, (i32, i32), (i32, i32))> {
+    use crate::simulation::land::TileEdge;
+    let cardinals = [TileEdge::North, TileEdge::East, TileEdge::South, TileEdge::West];
+    let try_edge = |e: TileEdge| -> Option<(TileEdge, (i32, i32), (i32, i32), i64)> {
+        let entrance_offset = entrance_cell_for_edge(half_w, half_h, e, home, centre);
+        let door_tile = (centre.0 + entrance_offset.0, centre.1 + entrance_offset.1);
+        let (dx, dy) = e.delta();
+        let dm = (door_tile.0 + dx, door_tile.1 + dy);
+        if !doormat_tile_clear(chunk_map, bed_map, bp_map, doormat, dm) {
+            return None;
+        }
+        // Reachability gate: the doormat must connect to the faction's home
+        // tile through passable terrain. Sealed courtyards / pockets fail
+        // here so the caller tries another cardinal.
+        if !doormat_reaches_home(chunk_map, dm, home) {
+            return None;
+        }
+        let d = ((dm.0 - home.0) as i64).pow(2) + ((dm.1 - home.1) as i64).pow(2);
+        Some((e, entrance_offset, dm, d))
+    };
+    if let Some((e, off, dm, _)) = try_edge(preferred) {
+        return Some((e, off, dm));
+    }
+    cardinals
+        .iter()
+        .copied()
+        .filter(|&e| e != preferred)
+        .filter_map(try_edge)
+        .min_by_key(|&(_, _, _, d)| d)
+        .map(|(e, off, dm, _)| (e, off, dm))
+}
+
+/// Is there any `TileKind::Road` tile within `radius` chebyshev of `from`?
+/// Used to gate per-door road-carving so we don't pave the entire settlement
+/// when many doors all push a fresh Bresenham line to home. The doormat tile
+/// itself is always written; only the connection-to-home extension is gated.
+fn road_within(chunk_map: &ChunkMap, from: (i32, i32), radius: i32) -> bool {
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            if chunk_map.tile_kind_at(from.0 + dx, from.1 + dy) == Some(TileKind::Road) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn write_road_tile(
+    chunk_map: &mut ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    tile: (i32, i32),
+) {
+    let cur = chunk_map.tile_kind_at(tile.0, tile.1);
+    let writable = match cur {
+        Some(TileKind::Grass) => true,
+        Some(TileKind::Scrub) | Some(TileKind::Sand) => true,
+        Some(k) if k.is_soil_like() => true,
+        _ => false,
+    };
+    if !writable {
+        return;
+    }
+    let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
+    chunk_map.set_tile(
+        tile.0,
+        tile.1,
+        surf_z as i32,
+        TileData {
+            kind: TileKind::Road,
+            ..Default::default()
+        },
+    );
+    tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+        tx: tile.0,
+        ty: tile.1,
+    });
+}
 
 /// Drains `RoadCarveQueue`. For each pending (faction_id, building_tile, home)
 /// triple, walks a Bresenham line from the building back to the home tile and
@@ -3001,6 +3600,7 @@ pub fn construction_system(
     clock: Res<SimClock>,
     mut registry: ResMut<FactionRegistry>,
     mut road_carve_queue: ResMut<RoadCarveQueue>,
+    mut doormat_reservations: ResMut<crate::simulation::doormat::DoormatReservations>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
     mut job_board: ResMut<JobBoard>,
@@ -3434,11 +4034,24 @@ pub fn construction_system(
                 BuildSiteKind::Door => {
                     // A door does NOT write a Wall tile — the underlying
                     // terrain stays passable. The Door entity carries the
-                    // open/closed state consulted by line_of_sight.
+                    // open/closed state consulted by line_of_sight. Door
+                    // direction is sourced from `bp.door_dir` (frontage edge
+                    // when plot-driven). `plan_building` always stamps a
+                    // direction; an absent `door_dir` here means a Single-tile
+                    // Door blueprint was placed without one — log + default to
+                    // East so we don't silently break the doormat invariant.
+                    let door_edge = bp.door_dir.unwrap_or_else(|| {
+                        warn!("Door blueprint at {:?} had no door_dir; defaulting to East", tile);
+                        crate::simulation::land::TileEdge::East
+                    });
+                    let (ddx, ddy) = door_edge.delta();
+                    let doormat_tile = (tile.0 + ddx, tile.1 + ddy);
                     let door = Door {
                         faction_id: bp.faction_id,
                         open: false,
                         tier: DoorTier::default(),
+                        dir: door_edge,
+                        doormat_tile,
                     };
                     let label = door.tier.label();
                     let door_entity = commands
@@ -3458,6 +4071,30 @@ pub fn construction_system(
                             open: false,
                         },
                     );
+                    doormat_reservations.0.insert(
+                        doormat_tile,
+                        crate::simulation::doormat::DoormatEntry {
+                            owner_door: door_entity,
+                            door_tile: tile,
+                            dir: door_edge,
+                        },
+                    );
+                    // Carve doormat to Road directly; road_carve_system
+                    // skips both endpoints. Extend toward the faction's home
+                    // tile *only* when no existing road sits within 4 chebyshev
+                    // of the doormat — otherwise the new door already connects
+                    // naturally to the road network and a fresh Bresenham would
+                    // just pave duplicate spokes.
+                    write_road_tile(&mut *chunk_map, &mut tile_changed, doormat_tile);
+                    if !road_within(&chunk_map, doormat_tile, 4) {
+                        if let Some(faction) = registry.factions.get(&bp.faction_id) {
+                            road_carve_queue.0.push((
+                                bp.faction_id,
+                                doormat_tile,
+                                faction.home_tile,
+                            ));
+                        }
+                    }
                     door_entity
                 }
                 BuildSiteKind::Workbench => {
@@ -4669,10 +5306,16 @@ fn seed_perimeter(
     half: i32,
     material: WallMaterial,
     faction_id: u32,
+    doormat: &mut crate::simulation::doormat::DoormatReservations,
+    road_carve: &mut RoadCarveQueue,
 ) {
     let (hx, hy) = home;
-    // Door tile: east side, mid-height. Other perimeter tiles get walls.
+    // Door tile: east side, mid-height. The palisade gets a 3-tile gateway
+    // on each cardinal so traffic flow isn't choked through a single tile,
+    // matching `find_palisade_site`'s chief-built ring.
     let door_tile = (hx + half, hy);
+    let door_edge = crate::simulation::land::TileEdge::East;
+    let gateway_half = 1i32;
 
     for dy in -half..=half {
         for dx in -half..=half {
@@ -4681,6 +5324,16 @@ fn seed_perimeter(
                 continue;
             }
             let tile = (hx + dx, hy + dy);
+            // 3-tile cardinal gateways: leave Grass (no wall, no door) on
+            // gateway tiles except for the canonical east `door_tile` which
+            // gets the Door entity itself.
+            let on_top_or_bottom = dy.abs() == half && dx.abs() != half;
+            let on_left_or_right = dx.abs() == half && dy.abs() != half;
+            let in_horizontal_gateway = on_top_or_bottom && dx.abs() <= gateway_half;
+            let in_vertical_gateway = on_left_or_right && dy.abs() <= gateway_half;
+            if (in_horizontal_gateway || in_vertical_gateway) && tile != door_tile {
+                continue;
+            }
             if used.contains(&tile) {
                 continue;
             }
@@ -4690,17 +5343,21 @@ fn seed_perimeter(
             let Some(k) = chunk_map.tile_kind_at(tile.0, tile.1) else {
                 continue;
             };
-            if k == TileKind::Wall {
+            if k == TileKind::Wall || k == TileKind::Road {
                 continue;
             }
 
             let world_pos = tile_to_world(tile.0, tile.1);
 
             if tile == door_tile {
+                let (ddx, ddy) = door_edge.delta();
+                let doormat_tile = (tile.0 + ddx, tile.1 + ddy);
                 let door = Door {
                     faction_id,
                     open: false,
                     tier: DoorTier::default(),
+                    dir: door_edge,
+                    doormat_tile,
                 };
                 let label = door.tier.label();
                 let e = commands
@@ -4720,6 +5377,19 @@ fn seed_perimeter(
                         open: false,
                     },
                 );
+                doormat.0.insert(
+                    doormat_tile,
+                    crate::simulation::doormat::DoormatEntry {
+                        owner_door: e,
+                        door_tile: tile,
+                        dir: door_edge,
+                    },
+                );
+                let needs_extension = !road_within(chunk_map, doormat_tile, 4);
+                write_road_tile(chunk_map, tile_changed, doormat_tile);
+                if needs_extension {
+                    road_carve.0.push((faction_id, doormat_tile, home));
+                }
             } else {
                 let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
                 chunk_map.set_tile(
@@ -4773,6 +5443,8 @@ pub fn seed_starting_buildings_system(
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
     registry: Res<FactionRegistry>,
     options: Res<crate::GameStartOptions>,
+    mut doormat_reservations: ResMut<crate::simulation::doormat::DoormatReservations>,
+    mut road_carve_queue: ResMut<RoadCarveQueue>,
 ) {
     if !options.seed_buildings {
         return;
@@ -4948,8 +5620,16 @@ pub fn seed_starting_buildings_system(
                     house_wall_mat,
                     faction_id,
                     home,
+                    None,
+                    &mut doormat_reservations,
+                    &mut road_carve_queue,
                 ) {
-                    break;
+                    // Failed anchor (footprint blocked OR all door cardinals
+                    // blocked). Mark the centre tile as used so the next
+                    // `pick_seed_house_anchor` call doesn't return the same
+                    // spot and stall the loop. Try another anchor.
+                    used.insert((cx, cy));
+                    continue;
                 }
                 // Farmstead yard: 2×2 (Neo/Chalc) or 3×3 (Bronze).
                 let yard_side: i32 = if (era as u8) >= (Era::BronzeAge as u8) { 3 } else { 2 };
@@ -4957,6 +5637,7 @@ pub fn seed_starting_buildings_system(
                     &mut chunk_map,
                     &mut tile_changed,
                     &mut used,
+                    &doormat_reservations,
                     cx,
                     cy,
                     half_w,
@@ -5090,6 +5771,9 @@ pub fn seed_starting_buildings_system(
                     rect,
                     material,
                     faction_id,
+                    home,
+                    &mut doormat_reservations,
+                    &mut road_carve_queue,
                 );
             } else {
                 seed_perimeter(
@@ -5102,6 +5786,8 @@ pub fn seed_starting_buildings_system(
                     5,
                     material,
                     faction_id,
+                    &mut doormat_reservations,
+                    &mut road_carve_queue,
                 );
             }
         }
@@ -5146,12 +5832,21 @@ fn seed_walled_house_at(
     wall_material: WallMaterial,
     faction_id: u32,
     home: (i32, i32),
+    door_dir: Option<crate::simulation::land::TileEdge>,
+    doormat: &mut crate::simulation::doormat::DoormatReservations,
+    road_carve: &mut RoadCarveQueue,
 ) -> bool {
-    // Pre-flight: every tile in the footprint must be clear.
+    // Pre-flight: every tile in the footprint must be clear (passable, not a
+    // wall/stone/road, not already used, not reserved as another building's
+    // doormat). Roads are protected so a seeded hut can't pave over an existing
+    // street carved by the spine or a neighbour's doormat extension.
     for dy in -half_h..=half_h {
         for dx in -half_w..=half_w {
             let tile = (cx + dx, cy + dy);
             if used.contains(&tile) {
+                return false;
+            }
+            if doormat.is_reserved(tile) {
                 return false;
             }
             if !chunk_map.is_passable(tile.0, tile.1) {
@@ -5160,34 +5855,36 @@ fn seed_walled_house_at(
             let Some(k) = chunk_map.tile_kind_at(tile.0, tile.1) else {
                 return false;
             };
-            if k == TileKind::Wall || k == TileKind::Stone {
+            if k == TileKind::Wall || k == TileKind::Stone || k == TileKind::Road {
                 return false;
             }
         }
     }
 
-    // Entrance: perimeter tile (not corner) closest to home — same rule as
-    // `plan_building` so doors face inward toward camp.
-    let (hx, hy) = home;
-    let entrance: (i32, i32) = {
-        let mut best = (0i32, half_h);
-        let mut best_dist = i64::MAX;
-        for dy in -half_h..=half_h {
-            for dx in -half_w..=half_w {
-                if dx.abs() < half_w && dy.abs() < half_h {
-                    continue; // interior
-                }
-                if dx.abs() == half_w && dy.abs() == half_h {
-                    continue; // corner
-                }
-                let d = ((cx + dx - hx) as i64).pow(2) + ((cy + dy - hy) as i64).pow(2);
-                if d < best_dist {
-                    best_dist = d;
-                    best = (dx, dy);
-                }
-            }
-        }
-        best
+    // Entrance: centre cell of the chosen frontage cardinal (or fall back to
+    // cardinal-toward-home). If that cardinal's doormat is blocked by a
+    // neighbour wall / blueprint / reserved doormat / impassable terrain, pick
+    // the next-best cardinal whose doormat IS clear. Abort the build entirely
+    // if no cardinal works — placing an unreachable door is strictly worse
+    // than placing nothing.
+    let preferred_edge = door_dir.unwrap_or_else(|| {
+        crate::simulation::land::TileEdge::toward((cx, cy), home)
+    });
+    let Some((door_edge, entrance, _planned_doormat)) = pick_clear_door_cardinal(
+        chunk_map,
+        &maps.bed_map,
+        // seeded path has no blueprint map at hand — pass an empty one. The
+        // game-start seeder operates on a fresh world, so blueprints don't
+        // exist yet; only `used` and the chunk's tile_kind matter.
+        &BlueprintMap::default(),
+        doormat,
+        (cx, cy),
+        half_w,
+        half_h,
+        preferred_edge,
+        home,
+    ) else {
+        return false;
     };
 
     // Place perimeter tiles: walls everywhere except the entrance (door).
@@ -5199,10 +5896,14 @@ fn seed_walled_house_at(
             let tile = (cx + dx, cy + dy);
             let world_pos = tile_to_world(tile.0, tile.1);
             if (dx, dy) == entrance {
+                let (ddx, ddy) = door_edge.delta();
+                let doormat_tile = (tile.0 + ddx, tile.1 + ddy);
                 let door = Door {
                     faction_id,
                     open: false,
                     tier: DoorTier::default(),
+                    dir: door_edge,
+                    doormat_tile,
                 };
                 let label = door.tier.label();
                 let e = commands
@@ -5222,6 +5923,19 @@ fn seed_walled_house_at(
                         open: false,
                     },
                 );
+                doormat.0.insert(
+                    doormat_tile,
+                    crate::simulation::doormat::DoormatEntry {
+                        owner_door: e,
+                        door_tile: tile,
+                        dir: door_edge,
+                    },
+                );
+                // Carve doormat tile directly to Road; the Bresenham
+                // road_carve_system skips both endpoints. Push an extension
+                // from doormat → home so the door connects back to the spine.
+                write_road_tile(&mut *chunk_map, tile_changed, doormat_tile);
+                road_carve.0.push((faction_id, doormat_tile, home));
             } else {
                 let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
                 chunk_map.set_tile(
@@ -5313,7 +6027,7 @@ fn pick_seed_house_anchor(
                 let Some(k) = chunk_map.tile_kind_at(t.0, t.1) else {
                     return false;
                 };
-                if k == TileKind::Wall || k == TileKind::Stone {
+                if k == TileKind::Wall || k == TileKind::Stone || k == TileKind::Road {
                     return false;
                 }
                 let z = chunk_map.surface_z_at(t.0, t.1);
@@ -5413,6 +6127,7 @@ fn seed_farmstead_yard(
     chunk_map: &mut ChunkMap,
     tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
     used: &mut AHashSet<(i32, i32)>,
+    doormat: &crate::simulation::doormat::DoormatReservations,
     cx: i32,
     cy: i32,
     half_w: i32,
@@ -5431,10 +6146,13 @@ fn seed_farmstead_yard(
         (cx - yard_w / 2, cy - half_h - yard_h, 1, 1), // North
     ];
 
-    let yard_clear = |x0: i32, y0: i32, used: &AHashSet<(i32, i32)>, cm: &ChunkMap| -> bool {
+    let yard_clear = |x0: i32, y0: i32, used: &AHashSet<(i32, i32)>, cm: &ChunkMap, dm: &crate::simulation::doormat::DoormatReservations| -> bool {
         for ty in y0..y0 + yard_h {
             for tx in x0..x0 + yard_w {
                 if used.contains(&(tx, ty)) {
+                    return false;
+                }
+                if dm.is_reserved((tx, ty)) {
                     return false;
                 }
                 if !cm.is_passable(tx, ty) {
@@ -5453,7 +6171,7 @@ fn seed_farmstead_yard(
 
     let chosen = candidates
         .iter()
-        .find(|(x0, y0, _, _)| yard_clear(*x0, *y0, used, chunk_map));
+        .find(|(x0, y0, _, _)| yard_clear(*x0, *y0, used, chunk_map, doormat));
     let Some(&(x0, y0, _, _)) = chosen else {
         return 0;
     };
@@ -5868,12 +6586,23 @@ fn seed_perimeter_rect(
     rect: crate::simulation::settlement::TileRect,
     material: WallMaterial,
     faction_id: u32,
+    home: (i32, i32),
+    doormat: &mut crate::simulation::doormat::DoormatReservations,
+    road_carve: &mut RoadCarveQueue,
 ) {
     let x0 = rect.x0;
     let y0 = rect.y0;
     let x1 = rect.x0 + rect.w as i32 - 1;
     let y1 = rect.y0 + rect.h as i32 - 1;
     let door_tile = (x1, y0 + (rect.h as i32) / 2);
+    let door_edge = crate::simulation::land::TileEdge::East;
+    // 3-tile gateways centred on each cardinal axis through `home`. Use home
+    // coords (clamped to the rect span) as the gateway centre so traffic
+    // funnels through the home-facing axis even when the defense rect isn't
+    // centred on home.
+    let gateway_half = 1i32;
+    let gate_cx = home.0.clamp(x0, x1);
+    let gate_cy = home.1.clamp(y0, y1);
 
     for ty in y0..=y1 {
         for tx in x0..=x1 {
@@ -5883,6 +6612,14 @@ fn seed_perimeter_rect(
                 continue;
             }
             let tile = (tx, ty);
+            // Skip gateway tiles (except the canonical east `door_tile`).
+            let in_top_bottom_gateway =
+                (ty == y0 || ty == y1) && (tx - gate_cx).abs() <= gateway_half;
+            let in_left_right_gateway =
+                (tx == x0 || tx == x1) && (ty - gate_cy).abs() <= gateway_half;
+            if (in_top_bottom_gateway || in_left_right_gateway) && tile != door_tile {
+                continue;
+            }
             if used.contains(&tile) {
                 continue;
             }
@@ -5892,15 +6629,19 @@ fn seed_perimeter_rect(
             let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
                 continue;
             };
-            if k == TileKind::Wall {
+            if k == TileKind::Wall || k == TileKind::Road {
                 continue;
             }
             let world_pos = tile_to_world(tx, ty);
             if tile == door_tile {
+                let (ddx, ddy) = door_edge.delta();
+                let doormat_tile = (tile.0 + ddx, tile.1 + ddy);
                 let door = Door {
                     faction_id,
                     open: false,
                     tier: DoorTier::default(),
+                    dir: door_edge,
+                    doormat_tile,
                 };
                 let label = door.tier.label();
                 let e = commands
@@ -5920,6 +6661,19 @@ fn seed_perimeter_rect(
                         open: false,
                     },
                 );
+                doormat.0.insert(
+                    doormat_tile,
+                    crate::simulation::doormat::DoormatEntry {
+                        owner_door: e,
+                        door_tile: tile,
+                        dir: door_edge,
+                    },
+                );
+                let needs_extension = !road_within(chunk_map, doormat_tile, 4);
+                write_road_tile(chunk_map, tile_changed, doormat_tile);
+                if needs_extension {
+                    road_carve.0.push((faction_id, doormat_tile, home));
+                }
             } else {
                 let surf_z = chunk_map.surface_z_at(tx, ty);
                 chunk_map.set_tile(
@@ -5952,5 +6706,50 @@ fn seed_perimeter_rect(
                 ty: tile.1,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulation::land::TileEdge;
+
+    #[test]
+    fn entrance_cell_picks_centre_of_chosen_side() {
+        // Hut footprint: half_w=1, half_h=1 (3×3). Centre at (10, 10), home
+        // toward east at (20, 10). East frontage → entrance at (+1, 0).
+        let e = entrance_cell_for_edge(1, 1, TileEdge::East, (20, 10), (10, 10));
+        assert_eq!(e, (1, 0));
+        // West frontage → entrance at (-1, 0).
+        let e = entrance_cell_for_edge(1, 1, TileEdge::West, (-5, 10), (10, 10));
+        assert_eq!(e, (-1, 0));
+        // North frontage → entrance at (0, +1).
+        let e = entrance_cell_for_edge(1, 1, TileEdge::North, (10, 20), (10, 10));
+        assert_eq!(e, (0, 1));
+    }
+
+    #[test]
+    fn entrance_cell_never_corner_for_3x3() {
+        for edge in [TileEdge::North, TileEdge::South, TileEdge::East, TileEdge::West] {
+            let (dx, dy) = entrance_cell_for_edge(1, 1, edge, (10, 10), (10, 10));
+            // For half_w=half_h=1 every entrance is on a flat side (one
+            // coordinate ±1, the other 0).
+            assert!(
+                (dx.abs() == 1 && dy == 0) || (dx == 0 && dy.abs() == 1),
+                "edge={:?} produced corner-cell offset ({dx}, {dy})", edge
+            );
+        }
+    }
+
+    #[test]
+    fn entrance_cell_longhouse_centres_along_long_side() {
+        // Longhouse: half_w=2, half_h=1 (5×3). East frontage clamps dy=0 so
+        // the entrance lands on the centre cell of the east edge.
+        let e = entrance_cell_for_edge(2, 1, TileEdge::East, (20, 10), (10, 10));
+        assert_eq!(e, (2, 0));
+        // North frontage on a longhouse: clamp camp_home.0=10 → centre cell
+        // gets dx=0.
+        let e = entrance_cell_for_edge(2, 1, TileEdge::North, (10, 20), (10, 10));
+        assert_eq!(e, (0, 1));
     }
 }

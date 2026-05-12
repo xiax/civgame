@@ -810,11 +810,37 @@ pub fn build_settlement_plan(faction_id: u32, faction: &FactionData, tick: u64) 
 
     let spine = generate_streetspine(faction.home_tile, style, current_era(techs), base_r);
 
+    // Layout-seed organic jitter: ±1 tile offset per non-civic / non-defense
+    // zone rect, deterministic from culture_hash so re-derivation produces
+    // identical layouts. Two factions with different ids produce visibly
+    // different residential / crafting / storage arrangements at the same
+    // (era, members, style).
+    let seed = culture_hash(faction);
+    jitter_zones(&mut zones, seed);
+
     SettlementPlan {
         zones,
         spine,
         planned_at_tick: tick,
-        culture_hash: culture_hash(faction),
+        culture_hash: seed,
+    }
+}
+
+/// Apply ±1 tile deterministic jitter to non-structural zone rects so two
+/// factions with the same `(era, members, style)` produce different layouts.
+/// Civic / Defense / Sacred zones stay fixed — they anchor the rest of the
+/// plan and breaking their relative positions causes visual chaos.
+fn jitter_zones(zones: &mut [Zone], seed: u64) {
+    let mut rng = fastrand::Rng::with_seed(seed);
+    for zone in zones.iter_mut() {
+        match zone.kind {
+            ZoneKind::Civic | ZoneKind::Defense | ZoneKind::Sacred => continue,
+            _ => {}
+        }
+        let jx = (rng.i32(-1..=1)) as i32;
+        let jy = (rng.i32(-1..=1)) as i32;
+        zone.rect.x0 += jx;
+        zone.rect.y0 += jy;
     }
 }
 
