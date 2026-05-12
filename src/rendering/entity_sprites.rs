@@ -1,3 +1,4 @@
+use crate::economy::resource_catalog::ResourceCatalog;
 use crate::rendering::pixel_art::{AnimalTextures, ArtMode, EntityTextures};
 use crate::rendering::sprite_library::SpriteLibrary;
 use crate::simulation::animals::{Cat, Cow, Deer, Fox, Horse, Pig, Rabbit, Wolf};
@@ -8,7 +9,6 @@ use crate::simulation::construction::{
 use crate::simulation::faction::{
     FactionCenter, FactionMember, PlayerFaction, PlayerFactionMarker,
 };
-use crate::economy::resource_catalog::ResourceCatalog;
 use crate::simulation::items::{Equipment, EquipmentSlot, GroundItem};
 use crate::simulation::person::{HairColor, Person, PersonAI, SkinTone};
 use crate::simulation::plants::{GrowthStage, Plant, PlantKind};
@@ -423,16 +423,20 @@ pub fn spawn_ground_item_sprites(
     for (entity, gi) in query.iter() {
         let id = gi.item.resource_id;
         let Some(def) = catalog.get(id) else { continue };
-        let Some(key) = def.sprite_key.as_deref() else { continue };
+        let Some(key) = def.sprite_key.as_deref() else {
+            continue;
+        };
         let Some(img) = sprite_lib.get(key).cloned() else {
             continue;
         };
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
-        commands
-            .entity(entity)
-            .insert((GroundItemVisual, EntityFogState::default(), FogPersistent));
+        commands.entity(entity).insert((
+            GroundItemVisual,
+            EntityFogState::default(),
+            FogPersistent,
+        ));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -875,7 +879,12 @@ pub fn animate_wolves_system(
     mut wolves: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Wolf>>,
     mut child_sprites: Query<
         (&mut Sprite, &mut Transform),
-        (With<VisualChild>, Without<Wolf>, Without<Deer>, Without<Horse>),
+        (
+            With<VisualChild>,
+            Without<Wolf>,
+            Without<Deer>,
+            Without<Horse>,
+        ),
     >,
 ) {
     if *art_mode == ArtMode::Ascii {
@@ -889,7 +898,13 @@ pub fn animate_wolves_system(
         last_pos.0 = pos;
 
         let img = animal_tex.wolf[*facing as usize].clone();
-        update_animal_visual(&mut child_sprites, children, img, is_moving, time.elapsed_secs());
+        update_animal_visual(
+            &mut child_sprites,
+            children,
+            img,
+            is_moving,
+            time.elapsed_secs(),
+        );
     }
 }
 
@@ -900,7 +915,12 @@ pub fn animate_deer_system(
     mut deer: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Deer>>,
     mut child_sprites: Query<
         (&mut Sprite, &mut Transform),
-        (With<VisualChild>, Without<Wolf>, Without<Deer>, Without<Horse>),
+        (
+            With<VisualChild>,
+            Without<Wolf>,
+            Without<Deer>,
+            Without<Horse>,
+        ),
     >,
 ) {
     if *art_mode == ArtMode::Ascii {
@@ -914,7 +934,13 @@ pub fn animate_deer_system(
         last_pos.0 = pos;
 
         let img = animal_tex.deer[*facing as usize].clone();
-        update_animal_visual(&mut child_sprites, children, img, is_moving, time.elapsed_secs());
+        update_animal_visual(
+            &mut child_sprites,
+            children,
+            img,
+            is_moving,
+            time.elapsed_secs(),
+        );
     }
 }
 
@@ -975,7 +1001,12 @@ pub fn animate_horses_system(
     mut horses: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Horse>>,
     mut child_sprites: Query<
         (&mut Sprite, &mut Transform),
-        (With<VisualChild>, Without<Wolf>, Without<Deer>, Without<Horse>),
+        (
+            With<VisualChild>,
+            Without<Wolf>,
+            Without<Deer>,
+            Without<Horse>,
+        ),
     >,
 ) {
     if *art_mode == ArtMode::Ascii {
@@ -989,14 +1020,28 @@ pub fn animate_horses_system(
         last_pos.0 = pos;
 
         let img = animal_tex.horse[*facing as usize].clone();
-        update_animal_visual(&mut child_sprites, children, img, is_moving, time.elapsed_secs());
+        update_animal_visual(
+            &mut child_sprites,
+            children,
+            img,
+            is_moving,
+            time.elapsed_secs(),
+        );
     }
 }
 
 /// Shared sprite swap + procedural bob/sway helper for PNG-textured animals.
 /// Uses sin-wave Y bob (always positive — feet stay grounded) and small Z sway.
 fn update_animal_visual(
-    child_sprites: &mut Query<(&mut Sprite, &mut Transform), (With<VisualChild>, Without<Wolf>, Without<Deer>, Without<Horse>)>,
+    child_sprites: &mut Query<
+        (&mut Sprite, &mut Transform),
+        (
+            With<VisualChild>,
+            Without<Wolf>,
+            Without<Deer>,
+            Without<Horse>,
+        ),
+    >,
     children: &Children,
     img: Handle<Image>,
     is_moving: bool,

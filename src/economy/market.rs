@@ -58,7 +58,10 @@ impl SettlementMarket {
     }
 
     fn floor_id(&self, id: ResourceId) -> f32 {
-        self.price_floor.get(&id).copied().unwrap_or(DEFAULT_PRICE_FLOOR)
+        self.price_floor
+            .get(&id)
+            .copied()
+            .unwrap_or(DEFAULT_PRICE_FLOOR)
     }
 
     pub fn price_of(&self, id: ResourceId) -> f32 {
@@ -247,7 +250,10 @@ impl Market {
     }
 
     fn floor_id(&self, id: ResourceId) -> f32 {
-        self.price_floor.get(&id).copied().unwrap_or(DEFAULT_PRICE_FLOOR)
+        self.price_floor
+            .get(&id)
+            .copied()
+            .unwrap_or(DEFAULT_PRICE_FLOOR)
     }
 
     /// Current price for the resource identified by `id`. Returns 1.0 if

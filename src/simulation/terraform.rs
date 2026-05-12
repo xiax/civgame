@@ -51,7 +51,11 @@ pub struct PendingFootprint {
     pub faction_id: u32,
     pub target_z: i8,
     pub terraform_tiles: Vec<(i32, i32)>,
-    pub wall_plan: Vec<(BuildSiteKind, (i32, i32), Option<crate::simulation::land::TileEdge>)>,
+    pub wall_plan: Vec<(
+        BuildSiteKind,
+        (i32, i32),
+        Option<crate::simulation::land::TileEdge>,
+    )>,
 }
 
 #[derive(Resource, Default)]

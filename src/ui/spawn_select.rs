@@ -165,11 +165,8 @@ pub fn spawn_select_system(
     if tex_cache.handle.is_none() {
         let (pixels, [w, h]) = build_globe_image(&globe, false, WORLD_MAP_OVERSAMPLE);
         let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
-        tex_cache.handle = Some(ctx.load_texture(
-            "spawn_select_globe",
-            image,
-            egui::TextureOptions::NEAREST,
-        ));
+        tex_cache.handle =
+            Some(ctx.load_texture("spawn_select_globe", image, egui::TextureOptions::NEAREST));
     }
     let Some(ref tex) = tex_cache.handle else {
         return;

@@ -309,10 +309,7 @@ pub fn awareness_gossip_system(
     // teaching (Learned) is the bottleneck via tech_teaching_system.
     let snapshots: ahash::AHashMap<
         Entity,
-        (
-            u64,
-            Vec<crate::simulation::settlement::SettlementId>,
-        ),
+        (u64, Vec<crate::simulation::settlement::SettlementId>),
     > = q
         .iter()
         .filter(|(_, _, goal, lod, _, _)| {
@@ -339,9 +336,8 @@ pub fn awareness_gossip_system(
         let tx = (transform.translation.x / TILE_SIZE_LOCAL).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE_LOCAL).floor() as i32;
         let mut aware_received: u64 = 0;
-        let mut settlements_received: ahash::AHashSet<
-            crate::simulation::settlement::SettlementId,
-        > = ahash::AHashSet::default();
+        let mut settlements_received: ahash::AHashSet<crate::simulation::settlement::SettlementId> =
+            ahash::AHashSet::default();
         for dy in -3i32..=3 {
             for dx in -3i32..=3 {
                 for &other in spatial.get(tx + dx, ty + dy) {
@@ -454,10 +450,14 @@ pub fn cluster_tier_promotion_system(
     // (mirrors `SettlementMap::first_for_faction` semantics elsewhere in
     // the codebase). A household's root faction (walking parent chain) is
     // what we match against the bureaucrat's faction.
-    let mut household_to_settlement: ahash::AHashSet<(u32, crate::simulation::settlement::SettlementId)> =
-        ahash::AHashSet::default();
-    let mut settlement_to_faction: ahash::AHashSet<(crate::simulation::settlement::SettlementId, u32)> =
-        ahash::AHashSet::default();
+    let mut household_to_settlement: ahash::AHashSet<(
+        u32,
+        crate::simulation::settlement::SettlementId,
+    )> = ahash::AHashSet::default();
+    let mut settlement_to_faction: ahash::AHashSet<(
+        crate::simulation::settlement::SettlementId,
+        u32,
+    )> = ahash::AHashSet::default();
     for s in &snaps {
         if !(s.is_bureaucrat || s.is_chief) {
             continue;
@@ -510,11 +510,19 @@ pub fn cluster_tier_promotion_system(
         let dst = KnowledgeTier::Settlement(sid);
         if let Some(map) = shared.tiers.get(&src) {
             // Snapshot to avoid borrow conflict during the copy loop.
-            let entries: Vec<((i32, i32), crate::simulation::memory::MemoryKind, crate::simulation::shared_knowledge::ResourceOwner)> = map
+            let entries: Vec<(
+                (i32, i32),
+                crate::simulation::memory::MemoryKind,
+                crate::simulation::shared_knowledge::ResourceOwner,
+            )> = map
                 .clusters
                 .values()
                 .filter_map(|c| {
-                    let rep = c.representative_tiles.iter().find_map(|s| *s).unwrap_or(c.center);
+                    let rep = c
+                        .representative_tiles
+                        .iter()
+                        .find_map(|s| *s)
+                        .unwrap_or(c.center);
                     Some((rep, c.kind, c.owner))
                 })
                 .collect();
@@ -527,11 +535,19 @@ pub fn cluster_tier_promotion_system(
         let src = KnowledgeTier::Settlement(sid);
         let dst = KnowledgeTier::Faction(fid);
         if let Some(map) = shared.tiers.get(&src) {
-            let entries: Vec<((i32, i32), crate::simulation::memory::MemoryKind, crate::simulation::shared_knowledge::ResourceOwner)> = map
+            let entries: Vec<(
+                (i32, i32),
+                crate::simulation::memory::MemoryKind,
+                crate::simulation::shared_knowledge::ResourceOwner,
+            )> = map
                 .clusters
                 .values()
                 .filter_map(|c| {
-                    let rep = c.representative_tiles.iter().find_map(|s| *s).unwrap_or(c.center);
+                    let rep = c
+                        .representative_tiles
+                        .iter()
+                        .find_map(|s| *s)
+                        .unwrap_or(c.center);
                     Some((rep, c.kind, c.owner))
                 })
                 .collect();

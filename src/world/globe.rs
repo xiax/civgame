@@ -257,7 +257,9 @@ pub fn generate_globe(seed: u64) -> Globe {
 
     info!(
         "Generating globe: {}×{} cells, {} plates...",
-        GLOBE_WIDTH, GLOBE_HEIGHT, plates::NUM_PLATES
+        GLOBE_WIDTH,
+        GLOBE_HEIGHT,
+        plates::NUM_PLATES
     );
 
     // ── 1. Plate tectonics ────────────────────────────────────────────────
@@ -286,14 +288,8 @@ pub fn generate_globe(seed: u64) -> Globe {
             // base + high octaves add coast/island detail. Macro-dominated
             // weighting (52%) produces recognisable, contiguous continents
             // instead of speckled archipelagos.
-            let macro_a = elev_noise.get([
-                gx as f64 * 0.008 * nscale,
-                gy as f64 * 0.008 * nscale,
-            ]);
-            let macro_b = elev_noise.get([
-                gx as f64 * 0.016 * nscale,
-                gy as f64 * 0.016 * nscale,
-            ]);
+            let macro_a = elev_noise.get([gx as f64 * 0.008 * nscale, gy as f64 * 0.008 * nscale]);
+            let macro_b = elev_noise.get([gx as f64 * 0.016 * nscale, gy as f64 * 0.016 * nscale]);
             let ev = macro_a * 0.32
                 + macro_b * 0.20
                 + elev_noise.get([nx, ny]) * 0.30
@@ -572,9 +568,7 @@ struct GlobeFile {
 pub fn load_or_generate(seed: u64) -> Globe {
     if let Ok(bytes) = std::fs::read(SAVE_PATH) {
         match bincode::deserialize::<GlobeFile>(&bytes) {
-            Ok(file)
-                if file.version == GLOBE_FILE_VERSION && file.globe.seed == seed =>
-            {
+            Ok(file) if file.version == GLOBE_FILE_VERSION && file.globe.seed == seed => {
                 info!(
                     "Globe loaded from {SAVE_PATH} (v{}, seed {})",
                     file.version, file.globe.seed
@@ -636,7 +630,8 @@ mod tests {
             // `from` (i.e. nothing flows out of it through a tracked edge).
             use std::collections::HashSet;
             let froms: HashSet<(u32, u32)> = g.rivers.edges.iter().map(|e| e.from).collect();
-            let mut termini: Vec<(u32, u32)> = g.rivers
+            let mut termini: Vec<(u32, u32)> = g
+                .rivers
                 .edges
                 .iter()
                 .map(|e| e.to)
@@ -689,7 +684,11 @@ mod tests {
             let g = generate_globe(seed);
             let total = g.cells.len() as f32;
             let ocean = g.cells.iter().filter(|c| c.biome == Biome::Ocean).count() as f32;
-            let mountain = g.cells.iter().filter(|c| c.biome == Biome::Mountain).count() as f32;
+            let mountain = g
+                .cells
+                .iter()
+                .filter(|c| c.biome == Biome::Mountain)
+                .count() as f32;
             let ocean_pct = ocean / total * 100.0;
             let mountain_pct = mountain / total * 100.0;
             assert!(
@@ -713,13 +712,20 @@ mod tests {
         assert!(ocean_count > 0, "no ocean cells");
         assert!(land_count > 0, "no land cells");
         // At least one mountain (plates should have produced ranges).
-        let mountains = g.cells.iter().filter(|c| c.biome == Biome::Mountain).count();
+        let mountains = g
+            .cells
+            .iter()
+            .filter(|c| c.biome == Biome::Mountain)
+            .count();
         assert!(mountains > 0, "no mountain cells (plate uplift broken)");
         // Some rivers (hydrology should have extracted at least one polyline).
         assert!(!g.rivers.edges.is_empty(), "no rivers extracted");
         // All cells get a plate id.
         let max_pid = g.cells.iter().map(|c| c.plate_id).max().unwrap_or(0);
-        assert!(max_pid > 0, "all cells assigned to plate 0 (plate gen broken)");
+        assert!(
+            max_pid > 0,
+            "all cells assigned to plate 0 (plate gen broken)"
+        );
     }
 
     #[test]

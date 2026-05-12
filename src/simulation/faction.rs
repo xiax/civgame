@@ -371,7 +371,9 @@ pub fn chief_bureaucrat_appointment_system(
             continue;
         }
         let mut target = if faction.member_count > 0 {
-            (faction.member_count as f32 * BUREAUCRAT_MIN_RATIO).round().max(1.0) as usize
+            (faction.member_count as f32 * BUREAUCRAT_MIN_RATIO)
+                .round()
+                .max(1.0) as usize
         } else {
             0
         };
@@ -611,10 +613,7 @@ pub fn bureaucrat_salary_tick_system(
 /// Treasury-to-treasury transfer; agent currency untouched. The
 /// amount is capped at the subordinate's available treasury (no
 /// debt). Total system currency is conserved.
-pub fn tribute_payment_system(
-    clock: Res<SimClock>,
-    mut registry: ResMut<FactionRegistry>,
-) {
+pub fn tribute_payment_system(clock: Res<SimClock>, mut registry: ResMut<FactionRegistry>) {
     if clock.tick % TRIBUTE_CADENCE != 0 {
         return;
     }
@@ -835,8 +834,7 @@ pub fn chief_hunt_order_system(
         let phase_invalidate =
             ((fid as u64).wrapping_add(HUNT_INVALIDATE_CADENCE / 2)) % HUNT_INVALIDATE_CADENCE;
         let do_decide = clock.tick % HUNT_DECISION_CADENCE == phase_decide;
-        let do_invalidate = !do_decide
-            && clock.tick % HUNT_INVALIDATE_CADENCE == phase_invalidate;
+        let do_invalidate = !do_decide && clock.tick % HUNT_INVALIDATE_CADENCE == phase_invalidate;
         if do_decide {
             decide_for_faction(
                 fid,
@@ -848,7 +846,15 @@ pub fn chief_hunt_order_system(
                 clock.tick,
             );
         } else if do_invalidate {
-            invalidate_for_faction(fid, &mut registry, &spatial, &prey_query, &wolf_q, &deer_q, clock.tick);
+            invalidate_for_faction(
+                fid,
+                &mut registry,
+                &spatial,
+                &prey_query,
+                &wolf_q,
+                &deer_q,
+                clock.tick,
+            );
         }
     }
 }
@@ -874,15 +880,17 @@ fn invalidate_for_faction(
     // Stale-muster timeout: the order has been live longer than agents
     // should patiently wait for stragglers, and the party never deployed.
     if let HuntOrder::Hunt { deployed_tick, .. } = order {
-        if deployed_tick.is_none()
-            && tick.saturating_sub(order.posted_tick()) > HUNT_PARTY_TIMEOUT
+        if deployed_tick.is_none() && tick.saturating_sub(order.posted_tick()) > HUNT_PARTY_TIMEOUT
         {
             faction.hunt_order = None;
             return;
         }
     }
     // Target-area-empty: prey has moved on or been butchered.
-    if let HuntOrder::Hunt { area_tile, species, .. } = order {
+    if let HuntOrder::Hunt {
+        area_tile, species, ..
+    } = order
+    {
         let mut count = 0u32;
         let cx = area_tile.0 as i32;
         let cy = area_tile.1 as i32;
@@ -968,9 +976,17 @@ fn decide_for_faction(
         return;
     }
     let (species, count, centroid) = if wolf_count >= deer_count {
-        (super::corpse::CorpseSpecies::Wolf, wolf_count, wolf_centroid)
+        (
+            super::corpse::CorpseSpecies::Wolf,
+            wolf_count,
+            wolf_centroid,
+        )
     } else {
-        (super::corpse::CorpseSpecies::Deer, deer_count, deer_centroid)
+        (
+            super::corpse::CorpseSpecies::Deer,
+            deer_count,
+            deer_centroid,
+        )
     };
     let area_tile = (
         (centroid.0 / count as i64) as i32,
@@ -1171,9 +1187,7 @@ impl StorageTileMap {
                     );
                     connectivity.is_reachable((agent_chunk, agent_z), (target_chunk, agent_z))
                 })
-                .min_by_key(|&&(tx, ty)| {
-                    (tx as i32 - from.0).abs() + (ty as i32 - from.1).abs()
-                })
+                .min_by_key(|&&(tx, ty)| (tx as i32 - from.0).abs() + (ty as i32 - from.1).abs())
                 .copied()
         };
         pick(true).or_else(|| pick(false))
@@ -1561,8 +1575,7 @@ pub struct FactionData {
     /// picking blueprints that need a chronically-deficient input. Range
     /// 0..=255. Phase 2-residual: keyed on `ResourceId`; legacy callers go
     /// through `material_deficit_ema_of(good)`.
-    pub material_deficit_ema:
-        ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u8>,
+    pub material_deficit_ema: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u8>,
     /// Anticipatory stockpile reserves: target storage levels per resource
     /// that the chief asks workers to maintain even before any blueprint
     /// demands them. Computed each chief tick from member count, culture
@@ -1571,8 +1584,7 @@ pub struct FactionData {
     /// fallback gather goal for unclaimed workers. Range 0..=u32::MAX.
     /// Phase 2-residual: keyed on `ResourceId`; legacy callers go through
     /// `material_target_of(good)`.
-    pub material_targets:
-        ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
+    pub material_targets: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
     /// Active hunting directive (`Hunt` or `Scout`) issued by the chief.
     /// Refreshed by `chief_hunt_order_system` once per game-day, with a
     /// mid-day invalidation sweep that clears spent / empty targets.
@@ -1881,8 +1893,7 @@ impl FactionRegistry {
             // travel with the band on migration).
             data.lifestyle = parent_lifestyle;
             if parent_is_capitalist {
-                let cap_policy =
-                    crate::economy::policy::ResourceControlPolicy::capitalist();
+                let cap_policy = crate::economy::policy::ResourceControlPolicy::capitalist();
                 for (rid, _def) in catalog.iter() {
                     data.economic_policy.insert(rid, cap_policy);
                 }
@@ -2038,9 +2049,7 @@ pub fn bonding_system(
                         key,
                         Some((fd.lifestyle, options.economy, &catalog)),
                     )
-                    .expect(
-                        "derive_from_archetype_key with legacy fallback always returns Some",
-                    );
+                    .expect("derive_from_archetype_key with legacy fallback always returns Some");
                 }
                 nb_fm.faction_id = new_id;
                 nb_fm.bond_timer = 0;
@@ -2219,8 +2228,7 @@ pub fn drop_items_at_destination_system(
         let food_qty = agent.total_food();
         if food_qty > CAMP_KEEP {
             let mut deposit = food_qty - CAMP_KEEP;
-            let mut drops: Vec<(crate::economy::resource_catalog::ResourceId, u32)> =
-                Vec::new();
+            let mut drops: Vec<(crate::economy::resource_catalog::ResourceId, u32)> = Vec::new();
             for (it, q) in agent.inventory.iter_mut() {
                 if it.resource_id.is_edible() && *q > 0 {
                     let to_remove = (*q).min(deposit);
@@ -2530,11 +2538,7 @@ pub fn compute_faction_storage_system(
             if *qty == 0 {
                 continue;
             }
-            *faction
-                .storage
-                .totals
-                .entry(item.resource_id)
-                .or_insert(0) += qty;
+            *faction.storage.totals.entry(item.resource_id).or_insert(0) += qty;
         }
     }
 
@@ -2605,7 +2609,10 @@ impl FactionData {
         &self,
         resource_id: crate::economy::resource_catalog::ResourceId,
     ) -> u32 {
-        self.material_targets.get(&resource_id).copied().unwrap_or(0)
+        self.material_targets
+            .get(&resource_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Read `material_deficit_ema` by `ResourceId`.
@@ -2689,10 +2696,7 @@ pub fn resource_demand_system(
         if let Some(faction) = registry.factions.get_mut(&member.faction_id) {
             for (item, qty) in &agent.inventory {
                 if *qty > 0 {
-                    *faction
-                        .resource_supply
-                        .entry(item.resource_id)
-                        .or_insert(0) += *qty;
+                    *faction.resource_supply.entry(item.resource_id).or_insert(0) += *qty;
                 }
             }
         }
@@ -2740,12 +2744,24 @@ pub fn resource_demand_system(
         // Crafted-good demand: scales with member count. Drives
         // `chief_job_posting_system`'s recipe selection (highest output
         // deficit wins).
-        faction.resource_demand.insert(tools, faction.member_count.div_ceil(2));
-        faction.resource_demand.insert(weapon, faction.member_count.div_ceil(2));
-        faction.resource_demand.insert(cloth, faction.member_count.div_ceil(2));
-        faction.resource_demand.insert(luxury, faction.member_count.div_ceil(3));
-        faction.resource_demand.insert(shield, faction.member_count.div_ceil(4));
-        faction.resource_demand.insert(armor, faction.member_count.div_ceil(4));
+        faction
+            .resource_demand
+            .insert(tools, faction.member_count.div_ceil(2));
+        faction
+            .resource_demand
+            .insert(weapon, faction.member_count.div_ceil(2));
+        faction
+            .resource_demand
+            .insert(cloth, faction.member_count.div_ceil(2));
+        faction
+            .resource_demand
+            .insert(luxury, faction.member_count.div_ceil(3));
+        faction
+            .resource_demand
+            .insert(shield, faction.member_count.div_ceil(4));
+        faction
+            .resource_demand
+            .insert(armor, faction.member_count.div_ceil(4));
     }
 }
 
@@ -2755,10 +2771,7 @@ pub fn resource_demand_system(
 /// anticipatory reserves the chief asks workers to keep in storage even when
 /// no blueprint currently demands them. Driven by member count, culture
 /// traits, and tech foresight; runs every 60 ticks in Economy.
-pub fn update_material_targets_system(
-    clock: Res<SimClock>,
-    mut registry: ResMut<FactionRegistry>,
-) {
+pub fn update_material_targets_system(clock: Res<SimClock>, mut registry: ResMut<FactionRegistry>) {
     if clock.tick % 60 != 0 {
         return;
     }
@@ -2791,10 +2804,16 @@ pub fn update_material_targets_system(
 
         // Tech foresight: once flint knapping or settlement is unlocked,
         // construction tier-ups will start consuming stone in volume.
-        if faction.techs.has(crate::simulation::technology::FLINT_KNAPPING) {
+        if faction
+            .techs
+            .has(crate::simulation::technology::FLINT_KNAPPING)
+        {
             stone_target = stone_target.saturating_add(4);
         }
-        if faction.techs.has(crate::simulation::technology::PERM_SETTLEMENT) {
+        if faction
+            .techs
+            .has(crate::simulation::technology::PERM_SETTLEMENT)
+        {
             wood_target = wood_target.saturating_add(4);
         }
 

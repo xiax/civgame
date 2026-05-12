@@ -45,12 +45,7 @@ pub enum FootprintShape {
     /// L-shape: a `w1 × h1` block (canonical: south-west corner) joined to
     /// a `w2 × h2` block at the south-east corner. Used by Farmstead
     /// (residence + attached yard strip).
-    LShape {
-        w1: i32,
-        h1: i32,
-        w2: i32,
-        h2: i32,
-    },
+    LShape { w1: i32, h1: i32, w2: i32, h2: i32 },
     /// U-shape: outer `w_outer × h_outer` rect with a `w_yard × h_yard`
     /// notch removed on `opening`. Used by CourtyardHouse.
     UShape {
@@ -75,11 +70,7 @@ pub fn rotate_offset(rot: Rotation, dx: i32, dy: i32) -> (i32, i32) {
 
 /// Every tile covered by `shape` at `anchor` under `rot`. Tiles are
 /// emitted in row-major canonical order before rotation.
-pub fn shape_tiles(
-    shape: FootprintShape,
-    anchor: (i32, i32),
-    rot: Rotation,
-) -> Vec<(i32, i32)> {
+pub fn shape_tiles(shape: FootprintShape, anchor: (i32, i32), rot: Rotation) -> Vec<(i32, i32)> {
     let mut out = Vec::new();
     let (ax, ay) = anchor;
     match shape {
@@ -127,10 +118,7 @@ pub fn shape_tiles(
             };
             for dy in 0..h_outer {
                 for dx in 0..w_outer {
-                    let in_yard = dx >= yx0
-                        && dx < yx0 + yard_w
-                        && dy >= yy0
-                        && dy < yy0 + yard_h;
+                    let in_yard = dx >= yx0 && dx < yx0 + yard_w && dy >= yy0 && dy < yy0 + yard_h;
                     if in_yard {
                         continue;
                     }
@@ -177,7 +165,10 @@ mod tests {
     #[test]
     fn rect_shape_tiles_match_canonical_size() {
         let tiles = shape_tiles(
-            FootprintShape::Rect { half_w: 1, half_h: 1 },
+            FootprintShape::Rect {
+                half_w: 1,
+                half_h: 1,
+            },
             (10, 10),
             Rotation::R0,
         );
@@ -189,7 +180,12 @@ mod tests {
     #[test]
     fn lshape_tiles_count_correct() {
         let tiles = shape_tiles(
-            FootprintShape::LShape { w1: 2, h1: 2, w2: 4, h2: 6 },
+            FootprintShape::LShape {
+                w1: 2,
+                h1: 2,
+                w2: 4,
+                h2: 6,
+            },
             (0, 0),
             Rotation::R0,
         );

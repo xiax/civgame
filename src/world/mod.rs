@@ -36,8 +36,7 @@ impl Plugin for WorldPlugin {
         // builder without touching consumers — the registry is the new
         // forward-facing entry point exposed via
         // `derive_from_archetype_key`.
-        let archetype_registry =
-            crate::simulation::archetype::default_registry(&catalog);
+        let archetype_registry = crate::simulation::archetype::default_registry(&catalog);
         app.insert_resource(catalog);
         app.insert_resource(archetype_registry);
 
@@ -62,14 +61,16 @@ impl Plugin for WorldPlugin {
             .add_event::<RegenerateWorldRequest>()
             .add_systems(
                 Update,
-                regenerate_world_system
-                    .run_if(in_state(crate::GameState::SpawnSelect)),
+                regenerate_world_system.run_if(in_state(crate::GameState::SpawnSelect)),
             )
             .add_systems(
                 OnExit(crate::GameState::SpawnSelect),
                 persist_globe_on_commit_system,
             )
-            .add_systems(OnEnter(crate::GameState::Playing), terrain::spawn_world_system)
+            .add_systems(
+                OnEnter(crate::GameState::Playing),
+                terrain::spawn_world_system,
+            )
             .add_systems(PostUpdate, chunk_streaming::refresh_changed_tiles_system);
     }
 }

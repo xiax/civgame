@@ -169,9 +169,13 @@ pub fn production_system(
                         // (plants.rs:overripe path) leaves no LandClaim → Public.
                         if let Some(plant_entity) = spawned {
                             let owner = if let Some(hm) = household_member {
-                                crate::simulation::shared_knowledge::ResourceOwner::Household(hm.household_id)
+                                crate::simulation::shared_knowledge::ResourceOwner::Household(
+                                    hm.household_id,
+                                )
                             } else if let (Some(_), Some(fm)) = (claim_opt, faction_member) {
-                                crate::simulation::shared_knowledge::ResourceOwner::Faction(fm.faction_id)
+                                crate::simulation::shared_knowledge::ResourceOwner::Faction(
+                                    fm.faction_id,
+                                )
                             } else {
                                 crate::simulation::shared_knowledge::ResourceOwner::Person(actor)
                             };
@@ -421,8 +425,12 @@ pub fn withdraw_material_task_system(
 
         let cur_tile = world_to_tile(transform.translation.truncate());
         let cur_chunk = crate::world::chunk::ChunkCoord(
-            cur_tile.0.div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
-            cur_tile.1.div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+            cur_tile
+                .0
+                .div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+            cur_tile
+                .1
+                .div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
         );
 
         // Phase 3b-ii: target good + qty come from the typed variant. If the
@@ -497,8 +505,7 @@ pub fn withdraw_material_task_system(
             let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
             // Check left / right; collect mismatched stacks first to avoid
             // borrowing issues across the spawn call.
-            let mut to_drop: Vec<(crate::economy::resource_catalog::ResourceId, u32)> =
-                Vec::new();
+            let mut to_drop: Vec<(crate::economy::resource_catalog::ResourceId, u32)> = Vec::new();
             if let Some(s) = carrier.left {
                 if s.item.resource_id != target_resource {
                     to_drop.push((s.item.resource_id, s.qty));
@@ -846,8 +853,12 @@ pub fn take_from_member_task_system(
     // Two-pass: collect (actor, target, rid, qty) tuples first, then
     // perform the disjoint mutable borrows via `get_many_mut`. Avoids
     // the long alias-windowing dance inside the iter loop.
-    let mut transfers: Vec<(Entity, Entity, crate::economy::resource_catalog::ResourceId, u32)> =
-        Vec::new();
+    let mut transfers: Vec<(
+        Entity,
+        Entity,
+        crate::economy::resource_catalog::ResourceId,
+        u32,
+    )> = Vec::new();
     let mut to_finalize: Vec<Entity> = Vec::new();
     for (actor, ai, aq, _agent, _carrier, member, slot, lod) in query.iter() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -878,10 +889,9 @@ pub fn take_from_member_task_system(
             continue;
         }
         // Disjoint borrows: actor + target both Persons.
-        let Ok([
-            (_, mut a_ai, mut a_aq, mut a_agent, mut a_carrier, _, _, _),
-            (_, _, _, mut t_agent, mut t_carrier, _, _, _),
-        ]) = query.get_many_mut([actor, target])
+        let Ok(
+            [(_, mut a_ai, mut a_aq, mut a_agent, mut a_carrier, _, _, _), (_, _, _, mut t_agent, mut t_carrier, _, _, _)],
+        ) = query.get_many_mut([actor, target])
         else {
             to_finalize.push(actor);
             continue;
@@ -1042,10 +1052,7 @@ pub fn withdraw_food_task_system(
 /// without re-entering dispatch. Other (non-Eat / Idle) follow-ups fall back to
 /// a clean `(Idle, UNEMPLOYED)` slot — defensive against future methods that
 /// chain something other than Eat behind WithdrawFood.
-fn finish_withdraw_food(
-    ai: &mut PersonAI,
-    aq: &mut crate::simulation::typed_task::ActionQueue,
-) {
+fn finish_withdraw_food(ai: &mut PersonAI, aq: &mut crate::simulation::typed_task::ActionQueue) {
     use crate::simulation::typed_task::Task;
     aq.advance();
     ai.work_progress = 0;
@@ -1169,45 +1176,44 @@ pub fn eat_task_system(
             // foods (smoked meat, future jerky etc.) so the band's
             // migration ration stays banked when fresh food is available;
             // only fall through to preserved if nothing else is on hand.
-            let mut consider =
-                |src: EdibleSlot,
-                 rid: crate::economy::resource_catalog::ResourceId,
-                 qty: u32,
-                 hunger: f32,
-                 skip_preserved: bool,
-                 min_nut: &mut u32,
-                 max_nut: &mut u32,
-                 best_cover: &mut Option<(
-                    EdibleSlot,
-                    u32,
-                    crate::economy::resource_catalog::ResourceId,
-                )>,
-                 best_largest: &mut Option<(
-                    EdibleSlot,
-                    u32,
-                    crate::economy::resource_catalog::ResourceId,
-                )>| {
-                    if qty == 0 || !rid.is_edible() {
-                        return;
+            let mut consider = |src: EdibleSlot,
+                                rid: crate::economy::resource_catalog::ResourceId,
+                                qty: u32,
+                                hunger: f32,
+                                skip_preserved: bool,
+                                min_nut: &mut u32,
+                                max_nut: &mut u32,
+                                best_cover: &mut Option<(
+                EdibleSlot,
+                u32,
+                crate::economy::resource_catalog::ResourceId,
+            )>,
+                                best_largest: &mut Option<(
+                EdibleSlot,
+                u32,
+                crate::economy::resource_catalog::ResourceId,
+            )>| {
+                if qty == 0 || !rid.is_edible() {
+                    return;
+                }
+                if skip_preserved && rid.is_preserved_ration() {
+                    return;
+                }
+                let nut = rid.nutrition() as u32;
+                if nut < *min_nut {
+                    *min_nut = nut;
+                }
+                if nut >= *max_nut {
+                    *max_nut = nut;
+                    *best_largest = Some((src, nut, rid));
+                }
+                if (nut as f32) >= hunger {
+                    match *best_cover {
+                        Some((_, prev, _)) if nut >= prev => {}
+                        _ => *best_cover = Some((src, nut, rid)),
                     }
-                    if skip_preserved && rid.is_preserved_ration() {
-                        return;
-                    }
-                    let nut = rid.nutrition() as u32;
-                    if nut < *min_nut {
-                        *min_nut = nut;
-                    }
-                    if nut >= *max_nut {
-                        *max_nut = nut;
-                        *best_largest = Some((src, nut, rid));
-                    }
-                    if (nut as f32) >= hunger {
-                        match *best_cover {
-                            Some((_, prev, _)) if nut >= prev => {}
-                            _ => *best_cover = Some((src, nut, rid)),
-                        }
-                    }
-                };
+                }
+            };
 
             // Run pass 1 (skip preserved); if it found nothing, fall back
             // to pass 2 (include preserved).

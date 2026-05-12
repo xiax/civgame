@@ -25,6 +25,7 @@ use crate::simulation::carry::Carrier;
 use crate::simulation::combat::{Body, CombatCooldown, CombatTarget};
 use crate::simulation::faction::{FactionMember, FactionStorageTile, PlayerFaction};
 use crate::simulation::goals::{AgentGoal, Personality};
+use crate::simulation::htn::MethodHistory;
 use crate::simulation::items::{Equipment, TargetItem};
 use crate::simulation::knowledge::PersonKnowledge;
 use crate::simulation::lod::LodLevel;
@@ -35,10 +36,9 @@ use crate::simulation::needs::Needs;
 use crate::simulation::person::{
     AiState, Drafted, HairColor, Person, PersonAI, Profession, SkinTone,
 };
-use crate::simulation::htn::MethodHistory;
 use crate::simulation::reproduction::BiologicalSex;
 use crate::simulation::schedule::{BucketSlot, SimClock};
-use crate::simulation::skills::{Skills, SkillPeaks, SkillUseTicks, SkillsLastSeen};
+use crate::simulation::skills::{SkillPeaks, SkillUseTicks, Skills, SkillsLastSeen};
 use crate::simulation::stats::Stats;
 use crate::world::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::spatial::{Indexed, IndexedKind};
@@ -107,8 +107,7 @@ impl TestSim {
         // populated cell silently no-ops.
         let catalog = crate::economy::resource_catalog::load_resource_catalog();
         crate::economy::core_ids::install_catalog(catalog.clone());
-        let archetype_registry =
-            crate::simulation::archetype::default_registry(&catalog);
+        let archetype_registry = crate::simulation::archetype::default_registry(&catalog);
         app.insert_resource(catalog);
         app.insert_resource(archetype_registry);
 
@@ -168,9 +167,7 @@ impl TestSim {
                 .resource_mut::<crate::simulation::faction::FactionRegistry>();
             registry.create_faction((0, 0))
         };
-        app.world_mut()
-            .resource_mut::<PlayerFaction>()
-            .faction_id = player_faction_id;
+        app.world_mut().resource_mut::<PlayerFaction>().faction_id = player_faction_id;
 
         Self {
             app,
@@ -225,12 +222,7 @@ impl TestSim {
     /// Spawn a `Person` at world tile `(tx, ty)` belonging to `faction_id`.
     /// `customise` runs after the bundle is built so callers can tweak
     /// needs / skills / inventory before it lands in the world.
-    pub fn spawn_person<F>(
-        &mut self,
-        faction_id: u32,
-        tile: (i32, i32),
-        customise: F,
-    ) -> Entity
+    pub fn spawn_person<F>(&mut self, faction_id: u32, tile: (i32, i32), customise: F) -> Entity
     where
         F: FnOnce(&mut PersonBuilder),
     {
@@ -311,11 +303,7 @@ impl TestSim {
     /// storage tile yet, one is spawned at `(-32, -32)` (well outside
     /// most test grids, so it doesn't interfere with scavenge / gather
     /// targets the test cares about). Returns the storage tile coords.
-    pub fn seed_faction_food(
-        &mut self,
-        faction_id: u32,
-        qty: u32,
-    ) -> (i32, i32) {
+    pub fn seed_faction_food(&mut self, faction_id: u32, qty: u32) -> (i32, i32) {
         let tile = self
             .app
             .world()
@@ -533,7 +521,9 @@ fn flat_chunk(surface_z: i8, kind: TileKind) -> Chunk {
 /// Quick accessor for inspecting an agent's PersonAI without verbose
 /// world-query boilerplate at the call site.
 pub fn person_ai(app: &App, entity: Entity) -> PersonAI {
-    *app.world().get::<PersonAI>(entity).expect("PersonAI missing")
+    *app.world()
+        .get::<PersonAI>(entity)
+        .expect("PersonAI missing")
 }
 
 /// Quick accessor for an agent's typed `ActionQueue.current` task. Phase 4a
@@ -687,10 +677,7 @@ impl CurrencySnapshot {
 
     /// Total system currency (sum of every accounted-for slot).
     pub fn total(&self) -> f32 {
-        self.agents_total
-            + self.faction_treasuries
-            + self.settlement_treasuries
-            + self.escrowed
+        self.agents_total + self.faction_treasuries + self.settlement_treasuries + self.escrowed
     }
 }
 
@@ -698,11 +685,7 @@ impl CurrencySnapshot {
 /// `baseline` by more than `epsilon`. Use after any operation that
 /// purports to be currency-conservative (pay, escrow post + cancel,
 /// market trade).
-pub fn assert_total_currency_invariant(
-    app: &mut App,
-    baseline: CurrencySnapshot,
-    epsilon: f32,
-) {
+pub fn assert_total_currency_invariant(app: &mut App, baseline: CurrencySnapshot, epsilon: f32) {
     let now = CurrencySnapshot::capture(app);
     let diff = (now.total() - baseline.total()).abs();
     assert!(
@@ -846,7 +829,12 @@ mod smoke {
         assert_eq!(settlement.owner_faction, sim.player_faction_id);
         assert_eq!(settlement.market_tile, (0, 0)); // home_tile from TestSim::new
         assert_eq!(settlement.treasury, 0.0);
-        assert_eq!(settlement.market.price_of(crate::economy::core_ids::cloth()), 1.0);
+        assert_eq!(
+            settlement
+                .market
+                .price_of(crate::economy::core_ids::cloth()),
+            1.0
+        );
     }
 
     #[test]
@@ -1064,9 +1052,7 @@ mod smoke {
         use crate::economy::core_ids;
         use crate::economy::policy::{RequiredFlag, ResourceControlPolicy};
         use crate::simulation::faction::FactionRegistry;
-        use crate::simulation::htn::{
-            method_passes_policy_gate, AbstractTaskKind, MethodRegistry,
-        };
+        use crate::simulation::htn::{method_passes_policy_gate, AbstractTaskKind, MethodRegistry};
 
         let mut sim = TestSim::new(0xC0FFEE);
         let registry = sim.app.world().resource::<FactionRegistry>();
@@ -1124,9 +1110,7 @@ mod smoke {
             fn id(&self) -> crate::simulation::htn::MethodId {
                 crate::simulation::htn::MethodId(0xFFFF)
             }
-            fn policy_gate(
-                &self,
-            ) -> &'static [crate::economy::policy::PolicyGateEntry] {
+            fn policy_gate(&self) -> &'static [crate::economy::policy::PolicyGateEntry] {
                 static GATE: [crate::economy::policy::PolicyGateEntry; 1] = [(
                     crate::economy::resource_catalog::ResourceId(0),
                     RequiredFlag::PrivateActorsAllowed,
@@ -1165,10 +1149,7 @@ mod smoke {
         let mut sim = TestSim::new(0xC0FFEE);
         {
             let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
-            let data = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let data = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             data.economic_policy
                 .insert(core_ids::cloth(), ResourceControlPolicy::capitalist());
         }
@@ -1319,11 +1300,8 @@ mod smoke {
         let map = sim.app.world().resource::<StorageTileMap>();
 
         // Per-faction lookup must not bleed across.
-        let village_tiles: Vec<(i32, i32)> = map
-            .by_faction
-            .get(&village_id)
-            .cloned()
-            .unwrap_or_default();
+        let village_tiles: Vec<(i32, i32)> =
+            map.by_faction.get(&village_id).cloned().unwrap_or_default();
         let household_tiles: Vec<(i32, i32)> = map
             .by_faction
             .get(&household_id)
@@ -1383,10 +1361,7 @@ mod smoke {
             for _ in 0..4 {
                 registry.add_member(sim.player_faction_id);
             }
-            let f = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.state_funds_public_works = true;
         }
 
@@ -1473,10 +1448,7 @@ mod smoke {
             for _ in 0..4 {
                 registry.add_member(sim.player_faction_id);
             }
-            let f = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.economic_policy
                 .insert(core_ids::fruit(), ResourceControlPolicy::capitalist());
         }
@@ -1594,10 +1566,7 @@ mod smoke {
             }
             // Force a wood material target so the chief wants to post
             // (otherwise anticipatory target may be 0).
-            let f = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.storage = FactionStorage::default();
         }
 
@@ -1608,10 +1577,12 @@ mod smoke {
         let wood_postings: usize = board
             .faction_postings(sim.player_faction_id)
             .iter()
-            .filter(|p| matches!(
-                &p.progress,
-                JobProgress::Stockpile { resource_id, .. } if *resource_id == wood_id
-            ))
+            .filter(|p| {
+                matches!(
+                    &p.progress,
+                    JobProgress::Stockpile { resource_id, .. } if *resource_id == wood_id
+                )
+            })
             .count();
         assert_eq!(
             wood_postings, 0,
@@ -1638,19 +1609,12 @@ mod smoke {
             for _ in 0..4 {
                 registry.add_member(sim.player_faction_id);
             }
-            let f = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.storage = FactionStorage::default();
         }
         // Inject outside vision range (VIEW_RADIUS=15) so the next
         // vision sweep doesn't deplete it as "tile has no wood plant."
-        sim.inject_faction_sighting(
-            sim.player_faction_id,
-            (40, 40),
-            MemoryKind::wood(),
-        );
+        sim.inject_faction_sighting(sim.player_faction_id, (40, 40), MemoryKind::wood());
 
         sim.tick_n(120);
 
@@ -1659,10 +1623,12 @@ mod smoke {
         let wood_postings: usize = board
             .faction_postings(sim.player_faction_id)
             .iter()
-            .filter(|p| matches!(
-                &p.progress,
-                JobProgress::Stockpile { resource_id, .. } if *resource_id == wood_id
-            ))
+            .filter(|p| {
+                matches!(
+                    &p.progress,
+                    JobProgress::Stockpile { resource_id, .. } if *resource_id == wood_id
+                )
+            })
             .count();
         assert!(
             wood_postings >= 1,
@@ -1695,10 +1661,7 @@ mod smoke {
             for _ in 0..4 {
                 registry.add_member(sim.player_faction_id);
             }
-            let f = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.storage = FactionStorage::default();
             f.storage.totals.insert(core_ids::wood(), 50);
             f.economic_policy
@@ -1711,10 +1674,12 @@ mod smoke {
         let wood_haul_postings: usize = board
             .faction_postings(sim.player_faction_id)
             .iter()
-            .filter(|p| matches!(
-                &p.progress,
-                JobProgress::Haul { resource_id, .. } if *resource_id == core_ids::wood()
-            ))
+            .filter(|p| {
+                matches!(
+                    &p.progress,
+                    JobProgress::Haul { resource_id, .. } if *resource_id == core_ids::wood()
+                )
+            })
             .count();
         assert_eq!(
             wood_haul_postings, 0,
@@ -1754,10 +1719,7 @@ mod smoke {
             for _ in 0..4 {
                 registry.add_member(sim.player_faction_id);
             }
-            let f = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.economic_policy
                 .insert(core_ids::wood(), ResourceControlPolicy::capitalist());
             // Set a non-trivial material target so the deficit gate
@@ -1832,10 +1794,7 @@ mod smoke {
             for _ in 0..4 {
                 registry.add_member(sim.player_faction_id);
             }
-            let f = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.material_targets.insert(core_ids::wood(), 50);
             // Default Subsistence: chief_allocates_labor stays true
             // (empty economic_policy → default policy → all-true).
@@ -1891,10 +1850,7 @@ mod smoke {
             for _ in 0..4 {
                 registry.add_member(sim.player_faction_id);
             }
-            let f = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.state_funds_public_works = true;
         }
 
@@ -1934,10 +1890,7 @@ mod smoke {
             for _ in 0..4 {
                 registry.add_member(sim.player_faction_id);
             }
-            let f = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             // Flip the common craft-output resources to capitalist.
             for rid in [
                 core_ids::tools(),
@@ -2093,43 +2046,47 @@ mod smoke {
         {
             let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
             unpaid_id = board.alloc_id();
-            board.faction_postings_mut(sim.player_faction_id).push(JobPosting {
-                id: unpaid_id,
-                faction_id: sim.player_faction_id,
-                kind: JobKind::Stockpile,
-                progress: JobProgress::Stockpile {
-                    resource_id: core_ids::wood(),
-                    deposited: 0,
-                    target: 5,
-                },
-                claimants: Vec::new(),
-                priority: 100,
-                source: JobSource::Chief,
-                posted_tick: 0,
-                expiry_tick: None,
-                poster_class: PosterClass::Chief,
-                reward: 0.0,
-                settlement_id: None,
-            });
+            board
+                .faction_postings_mut(sim.player_faction_id)
+                .push(JobPosting {
+                    id: unpaid_id,
+                    faction_id: sim.player_faction_id,
+                    kind: JobKind::Stockpile,
+                    progress: JobProgress::Stockpile {
+                        resource_id: core_ids::wood(),
+                        deposited: 0,
+                        target: 5,
+                    },
+                    claimants: Vec::new(),
+                    priority: 100,
+                    source: JobSource::Chief,
+                    posted_tick: 0,
+                    expiry_tick: None,
+                    poster_class: PosterClass::Chief,
+                    reward: 0.0,
+                    settlement_id: None,
+                });
             paid_id = board.alloc_id();
-            board.faction_postings_mut(sim.player_faction_id).push(JobPosting {
-                id: paid_id,
-                faction_id: sim.player_faction_id,
-                kind: JobKind::Stockpile,
-                progress: JobProgress::Stockpile {
-                    resource_id: core_ids::stone(),
-                    deposited: 0,
-                    target: 5,
-                },
-                claimants: Vec::new(),
-                priority: 100,
-                source: JobSource::Player,
-                posted_tick: 0,
-                expiry_tick: None,
-                poster_class: PosterClass::HouseholdHead,
-                reward: 10.0,
-                settlement_id: None,
-            });
+            board
+                .faction_postings_mut(sim.player_faction_id)
+                .push(JobPosting {
+                    id: paid_id,
+                    faction_id: sim.player_faction_id,
+                    kind: JobKind::Stockpile,
+                    progress: JobProgress::Stockpile {
+                        resource_id: core_ids::stone(),
+                        deposited: 0,
+                        target: 5,
+                    },
+                    claimants: Vec::new(),
+                    priority: 100,
+                    source: JobSource::Player,
+                    posted_tick: 0,
+                    expiry_tick: None,
+                    poster_class: PosterClass::HouseholdHead,
+                    reward: 10.0,
+                    settlement_id: None,
+                });
         }
 
         // Tick the claim system. job_claim_system runs each tick;
@@ -2464,16 +2421,13 @@ mod smoke {
         // still a village member; the newborn likewise lands in
         // the village's faction by `pregnancy_system` while
         // additionally getting a HouseholdMember marker).
-        sim.app
-            .world_mut()
-            .entity_mut(mother)
-            .insert(Pregnancy {
-                ticks_remaining: 5,
-                father: None,
-                father_stats: None,
-                father_known: 0,
-                faction_id: village,
-            });
+        sim.app.world_mut().entity_mut(mother).insert(Pregnancy {
+            ticks_remaining: 5,
+            father: None,
+            father_stats: None,
+            father_known: 0,
+            faction_id: village,
+        });
 
         // Tick enough for the pregnancy timer + birth + Commands
         // flush. pregnancy_system runs in Economy schedule. The
@@ -2482,19 +2436,18 @@ mod smoke {
 
         // Find the child: the newest Person whose entity isn't the mother.
         let child_with_household: Option<HouseholdMember> = {
-            let mut q = sim.app.world_mut().query_filtered::<
-                (Entity, &HouseholdMember),
-                With<Person>,
-            >();
+            let mut q = sim
+                .app
+                .world_mut()
+                .query_filtered::<(Entity, &HouseholdMember), With<Person>>();
             q.iter(sim.app.world())
                 .filter(|(e, _)| *e != mother)
                 .map(|(_, hh)| *hh)
                 .next()
         };
 
-        let child_hh = child_with_household.expect(
-            "newborn should have inherited HouseholdMember from mother",
-        );
+        let child_hh = child_with_household
+            .expect("newborn should have inherited HouseholdMember from mother");
         assert_eq!(
             child_hh.household_id, household_id,
             "newborn should be in same household as mother",
@@ -2513,9 +2466,7 @@ mod smoke {
         // self_actualization need.
         use crate::simulation::knowledge::PersonKnowledge;
         use crate::simulation::needs::Needs;
-        use crate::simulation::teaching::{
-            LectureRequest, SELF_ACTUALIZATION_LECTURE_GAIN,
-        };
+        use crate::simulation::teaching::{LectureRequest, SELF_ACTUALIZATION_LECTURE_GAIN};
         use crate::world::seasons::TICKS_PER_DAY;
 
         let mut sim = TestSim::new(0xC0FFEE);
@@ -2539,21 +2490,30 @@ mod smoke {
         });
 
         // Confirm they have at least one Learned tech.
-        let knowledge = sim
+        let knowledge = sim.app.world().get::<PersonKnowledge>(elder).unwrap();
+        assert!(
+            knowledge.learned != 0,
+            "elder should have Paleolithic Learned techs"
+        );
+
+        let starting_sa = sim
             .app
             .world()
-            .get::<PersonKnowledge>(elder)
-            .unwrap();
-        assert!(knowledge.learned != 0, "elder should have Paleolithic Learned techs");
-
-        let starting_sa = sim.app.world().get::<Needs>(elder).unwrap().self_actualization;
+            .get::<Needs>(elder)
+            .unwrap()
+            .self_actualization;
 
         // Tick one game-day so the cadence fires.
         sim.tick_n(TICKS_PER_DAY as u32 + 5);
 
         // The elder's self_actualization should have bumped (the
         // act of triggering the lecture grants the satisfaction).
-        let new_sa = sim.app.world().get::<Needs>(elder).unwrap().self_actualization;
+        let new_sa = sim
+            .app
+            .world()
+            .get::<Needs>(elder)
+            .unwrap()
+            .self_actualization;
         assert!(
             new_sa > starting_sa,
             "self_actualization should increase: {starting_sa} → {new_sa}",
@@ -2601,22 +2561,31 @@ mod smoke {
             });
         });
         let _ = sim.app.world().get::<PersonKnowledge>(agent).unwrap();
-        let starting_sa = sim.app.world().get::<Needs>(agent).unwrap().self_actualization;
+        let starting_sa = sim
+            .app
+            .world()
+            .get::<Needs>(agent)
+            .unwrap()
+            .self_actualization;
 
         sim.tick_n(TICKS_PER_DAY as u32 + 5);
 
-        let new_sa = sim.app.world().get::<Needs>(agent).unwrap().self_actualization;
+        let new_sa = sim
+            .app
+            .world()
+            .get::<Needs>(agent)
+            .unwrap()
+            .self_actualization;
         assert_eq!(
             new_sa, starting_sa,
             "self_actualization must not bump while Esteem unmet",
         );
         // No Lecturing component either.
-        assert!(
-            sim.app
-                .world()
-                .get::<crate::simulation::teaching::Lecturing>(agent)
-                .is_none(),
-        );
+        assert!(sim
+            .app
+            .world()
+            .get::<crate::simulation::teaching::Lecturing>(agent)
+            .is_none(),);
         // (LectureRequest may have been triggered by some other agent
         // — we don't assert on the resource itself in the negative
         // case.)
@@ -2675,15 +2644,8 @@ mod smoke {
         sim.tick_n(5);
 
         // Listener should now know about the exotic settlement.
-        let listener_mem = sim
-            .app
-            .world()
-            .get::<AgentMemory>(listener)
-            .unwrap();
-        let known: Vec<_> = listener_mem
-            .known_settlements()
-            .map(|(id, _)| id)
-            .collect();
+        let listener_mem = sim.app.world().get::<AgentMemory>(listener).unwrap();
+        let known: Vec<_> = listener_mem.known_settlements().map(|(id, _)| id).collect();
         assert!(
             known.contains(&exotic_id),
             "listener should have learned exotic settlement {exotic_id:?} via gossip; known={known:?}",
@@ -2752,9 +2714,9 @@ mod smoke {
                     Some(Task::Lead { dest }) => {
                         assert_eq!(dest, town_hall);
                     }
-                    _ => panic!(
-                        "expected Task::Lead in current or queued slot; current={other:?}",
-                    ),
+                    _ => {
+                        panic!("expected Task::Lead in current or queued slot; current={other:?}",)
+                    }
                 }
             }
         }
@@ -2801,19 +2763,40 @@ mod smoke {
         };
         assert_eq!(MaslowTier::next_unmet(&satiated), None);
 
-        let hungry = Needs { hunger: 200.0, ..satiated };
-        assert_eq!(MaslowTier::next_unmet(&hungry), Some(MaslowTier::Physiological));
+        let hungry = Needs {
+            hunger: 200.0,
+            ..satiated
+        };
+        assert_eq!(
+            MaslowTier::next_unmet(&hungry),
+            Some(MaslowTier::Physiological)
+        );
 
-        let unsafe_ = Needs { safety: 200.0, ..satiated };
+        let unsafe_ = Needs {
+            safety: 200.0,
+            ..satiated
+        };
         assert_eq!(MaslowTier::next_unmet(&unsafe_), Some(MaslowTier::Safety));
 
-        let lonely = Needs { social: 200.0, ..satiated };
+        let lonely = Needs {
+            social: 200.0,
+            ..satiated
+        };
         assert_eq!(MaslowTier::next_unmet(&lonely), Some(MaslowTier::Belonging));
 
-        let unfulfilled = Needs { esteem: 100.0, ..satiated };
-        assert_eq!(MaslowTier::next_unmet(&unfulfilled), Some(MaslowTier::Esteem));
+        let unfulfilled = Needs {
+            esteem: 100.0,
+            ..satiated
+        };
+        assert_eq!(
+            MaslowTier::next_unmet(&unfulfilled),
+            Some(MaslowTier::Esteem)
+        );
 
-        let mastering = Needs { self_actualization: 100.0, ..satiated };
+        let mastering = Needs {
+            self_actualization: 100.0,
+            ..satiated
+        };
         assert_eq!(
             MaslowTier::next_unmet(&mastering),
             Some(MaslowTier::SelfActualization),
@@ -2826,9 +2809,7 @@ mod smoke {
         // Maslow tiers satiated AND esteem unfulfilled posts a
         // Torch (recipe 2 = Luxury) contract per game-day. Esteem
         // bumps on each post; system-wide currency invariant holds.
-        use crate::simulation::jobs::{
-            JobBoard, JobKind, PosterClass, ESTEEM_CONTRACT_REWARD,
-        };
+        use crate::simulation::jobs::{JobBoard, JobKind, PosterClass, ESTEEM_CONTRACT_REWARD};
         use crate::simulation::needs::Needs;
         use crate::world::seasons::TICKS_PER_DAY;
 
@@ -2912,10 +2893,7 @@ mod smoke {
         let count = board
             .faction_postings(sim.player_faction_id)
             .iter()
-            .filter(|p| {
-                p.kind == JobKind::Craft
-                    && p.poster_class == PosterClass::Individual
-            })
+            .filter(|p| p.kind == JobKind::Craft && p.poster_class == PosterClass::Individual)
             .count();
         assert_eq!(
             count, 0,
@@ -2940,9 +2918,7 @@ mod smoke {
         //   faction), not a separate per-household board.
         // - System-wide currency invariant holds (debit + escrow ==
         //   const).
-        use crate::simulation::faction::{
-            FactionRegistry, HOUSEHOLD_CONTRACT_REWARD,
-        };
+        use crate::simulation::faction::{FactionRegistry, HOUSEHOLD_CONTRACT_REWARD};
         use crate::simulation::jobs::{JobBoard, JobKind, PosterClass};
         use crate::world::seasons::TICKS_PER_DAY;
 
@@ -3006,9 +2982,7 @@ mod smoke {
     fn underfunded_household_posts_nothing() {
         // Edge case: a household with treasury below
         // HOUSEHOLD_MIN_TREASURY_FOR_POSTING posts nothing.
-        use crate::simulation::faction::{
-            FactionRegistry, HOUSEHOLD_MIN_TREASURY_FOR_POSTING,
-        };
+        use crate::simulation::faction::{FactionRegistry, HOUSEHOLD_MIN_TREASURY_FOR_POSTING};
         use crate::simulation::jobs::{JobBoard, JobKind, PosterClass};
         use crate::world::seasons::TICKS_PER_DAY;
 
@@ -3036,10 +3010,7 @@ mod smoke {
         let house_postings = board
             .faction_postings(village_id)
             .iter()
-            .filter(|p| {
-                p.kind == JobKind::Craft
-                    && p.poster_class == PosterClass::HouseholdHead
-            })
+            .filter(|p| p.kind == JobKind::Craft && p.poster_class == PosterClass::HouseholdHead)
             .count();
         assert_eq!(house_postings, 0);
         assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
@@ -3124,13 +3095,14 @@ mod smoke {
         // member could be the head. The other is then a member by
         // virtue of also having `HouseholdMember` inserted.
         assert!(
-            household.household_head == Some(head)
-                || household.household_head == Some(partner),
+            household.household_head == Some(head) || household.household_head == Some(partner),
             "household head should be one of the pair: got {:?}",
             household.household_head,
         );
         let village = registry.factions.get(&sim.player_faction_id).unwrap();
-        assert!(village.children_factions.contains(&head_marker.household_id));
+        assert!(village
+            .children_factions
+            .contains(&head_marker.household_id));
 
         // Default-communist parent → household inherits communist
         // defaults (empty economic_policy map). Both Wood policies
@@ -3197,7 +3169,11 @@ mod smoke {
             t.bond_strength = HOUSEHOLD_BOND_THRESHOLD + 5;
         }
         {
-            let mut t = sim.app.world_mut().get_mut::<CoSleepTracker>(partner).unwrap();
+            let mut t = sim
+                .app
+                .world_mut()
+                .get_mut::<CoSleepTracker>(partner)
+                .unwrap();
             t.partner = Some(head);
             t.bond_strength = HOUSEHOLD_BOND_THRESHOLD + 5;
         }
@@ -3217,8 +3193,18 @@ mod smoke {
             "pair must form exactly one household even after many ticks",
         );
 
-        let head_id = sim.app.world().get::<HouseholdMember>(head).unwrap().household_id;
-        let partner_id = sim.app.world().get::<HouseholdMember>(partner).unwrap().household_id;
+        let head_id = sim
+            .app
+            .world()
+            .get::<HouseholdMember>(head)
+            .unwrap()
+            .household_id;
+        let partner_id = sim
+            .app
+            .world()
+            .get::<HouseholdMember>(partner)
+            .unwrap()
+            .household_id;
         assert_eq!(head_id, partner_id);
     }
 
@@ -3287,7 +3273,10 @@ mod smoke {
             .find(|p| p.kind == JobKind::Craft && p.poster_class == PosterClass::Individual)
             .expect("contract posting not found on board");
         assert_eq!(posting.reward, reward);
-        assert!(posting.claimants.is_empty(), "fresh contract has no claimants");
+        assert!(
+            posting.claimants.is_empty(),
+            "fresh contract has no claimants"
+        );
 
         // Mid-flight invariant: 25 currency in escrow + 75 on poster
         // = 100 baseline. Total system currency unchanged.
@@ -3346,9 +3335,7 @@ mod smoke {
         // FactionData.dominance_over / subordinate_to (relationship
         // primitive) + FactionRegistry::set_dominance + the
         // periodic tribute_payment_system.
-        use crate::simulation::faction::{
-            FactionRegistry, TRIBUTE_PER_DAY,
-        };
+        use crate::simulation::faction::{FactionRegistry, TRIBUTE_PER_DAY};
         use crate::world::seasons::TICKS_PER_DAY;
 
         let mut sim = TestSim::new(0xC0FFEE);
@@ -3368,14 +3355,12 @@ mod smoke {
         // Verify reciprocal relationship recorded.
         {
             let registry = sim.app.world().resource::<FactionRegistry>();
-            assert!(
-                registry
-                    .factions
-                    .get(&dominant)
-                    .unwrap()
-                    .dominance_over
-                    .contains(&subordinate)
-            );
+            assert!(registry
+                .factions
+                .get(&dominant)
+                .unwrap()
+                .dominance_over
+                .contains(&subordinate));
             assert_eq!(
                 registry.factions.get(&subordinate).unwrap().subordinate_to,
                 Some(dominant),
@@ -3602,8 +3587,12 @@ mod smoke {
         // Inspect: at least one Sharecropping plot held by this household,
         // and the agricultural zone is the only one acquired.
         let world = sim.app.world_mut();
-        let plot_entities: Vec<Entity> =
-            world.resource::<PlotIndex>().by_id.values().copied().collect();
+        let plot_entities: Vec<Entity> = world
+            .resource::<PlotIndex>()
+            .by_id
+            .values()
+            .copied()
+            .collect();
         let mut sharecropping_count = 0usize;
         let mut other_household_held = 0usize;
         for e in plot_entities {
@@ -3640,7 +3629,6 @@ mod smoke {
         // household → landlord (currency-conservative); the lease's
         // `paid_through_tick` advances by one period; missed_payments
         // resets to 0.
-        use bevy::ecs::system::RunSystemOnce;
         use crate::economy::policy::land_policy_for;
         use crate::game_state::EconomyPreset;
         use crate::simulation::faction::FactionRegistry;
@@ -3649,6 +3637,7 @@ mod smoke {
         };
         use crate::simulation::schedule::SimClock;
         use crate::world::seasons::TICKS_PER_DAY;
+        use bevy::ecs::system::RunSystemOnce;
 
         let mut sim = TestSim::new(0xCAFE_F005);
         sim.flat_world(4, 0, TileKind::Grass);
@@ -3781,7 +3770,10 @@ mod smoke {
             let expected = target_tick - 1 + one_period;
             assert_eq!(paid_through_tick, expected);
         } else {
-            panic!("plot should still be Leased after successful payment, got {:?}", plot.tenure);
+            panic!(
+                "plot should still be Leased after successful payment, got {:?}",
+                plot.tenure
+            );
         }
         assert_eq!(plot.missed_payments, 0);
 
@@ -3794,7 +3786,6 @@ mod smoke {
         // time rent comes due accumulates `missed_payments`. Once
         // `EVICTION_MISS_THRESHOLD` is reached the plot reverts to
         // `StateOwned` of the original landlord.
-        use bevy::ecs::system::RunSystemOnce;
         use crate::economy::policy::land_policy_for;
         use crate::game_state::EconomyPreset;
         use crate::simulation::faction::FactionRegistry;
@@ -3803,6 +3794,7 @@ mod smoke {
         };
         use crate::simulation::schedule::SimClock;
         use crate::world::seasons::TICKS_PER_DAY;
+        use bevy::ecs::system::RunSystemOnce;
 
         let mut sim = TestSim::new(0xDEAD_B00B);
         sim.flat_world(4, 0, TileKind::Grass);
@@ -3895,7 +3887,10 @@ mod smoke {
             ),
             other => panic!("evicted plot should be held by State, got {:?}", other),
         }
-        assert_eq!(plot.missed_payments, 0, "missed_payments should reset on eviction");
+        assert_eq!(
+            plot.missed_payments, 0,
+            "missed_payments should reset on eviction"
+        );
     }
 
     /// P2b: `take_from_member_task_system` transfers `qty` units of a
@@ -3970,8 +3965,7 @@ mod smoke {
             .get::<EconomicAgent>(actor)
             .unwrap()
             .quantity_of_resource(grain);
-        let a_carry_qty = a_carrier
-            .quantity_of_resource(grain);
+        let a_carry_qty = a_carrier.quantity_of_resource(grain);
         assert_eq!(t_after, 1, "target should have 1 wood left after the take");
         assert_eq!(
             a_carry_qty + a_inv,
@@ -4119,9 +4113,7 @@ mod smoke {
         // trader_buy_at_settlement / trader_sell_at_settlement (two
         // helpers in transactions.rs).
         use crate::economy::core_ids;
-        use crate::economy::transactions::{
-            trader_buy_at_settlement, trader_sell_at_settlement,
-        };
+        use crate::economy::transactions::{trader_buy_at_settlement, trader_sell_at_settlement};
         use crate::simulation::faction::FactionRegistry;
         use crate::simulation::person::Profession;
         use crate::simulation::settlement::{Settlement, SettlementMap};
@@ -4207,22 +4199,15 @@ mod smoke {
         // A's price up under the bid-driven model. That stockout-driven
         // rise is the convergence mechanism.
         for _ in 0..4 {
-            let bought = trader_buy_at_settlement(
-                sim.app.world_mut(),
-                trader,
-                settlement_a,
-                cloth,
-                5,
+            let bought =
+                trader_buy_at_settlement(sim.app.world_mut(), trader, settlement_a, cloth, 5);
+            assert!(
+                bought.is_some(),
+                "buy must succeed when stock + funds available"
             );
-            assert!(bought.is_some(), "buy must succeed when stock + funds available");
 
-            let sold = trader_sell_at_settlement(
-                sim.app.world_mut(),
-                trader,
-                settlement_b,
-                cloth,
-                5,
-            );
+            let sold =
+                trader_sell_at_settlement(sim.app.world_mut(), trader, settlement_b, cloth, 5);
             assert!(sold.is_some(), "sell must succeed when treasury funds it");
 
             // Tick the per-settlement price update so prices
@@ -4231,13 +4216,8 @@ mod smoke {
         }
         // Cycle 5: A is empty. The failed buy registers a stockout bid
         // signal at A; the next price tick rises A's price.
-        let bought_after_depletion = trader_buy_at_settlement(
-            sim.app.world_mut(),
-            trader,
-            settlement_a,
-            cloth,
-            5,
-        );
+        let bought_after_depletion =
+            trader_buy_at_settlement(sim.app.world_mut(), trader, settlement_a, cloth, 5);
         assert!(
             bought_after_depletion.is_none(),
             "5th buy must fail — A's stock has been exhausted by prior cycles"
@@ -4313,7 +4293,12 @@ mod smoke {
             let map = sim.app.world().resource::<SettlementMap>();
             let a = map.first_for_faction(faction_a).unwrap();
             let b = map.first_for_faction(faction_b).unwrap();
-            (a, b, *map.by_id.get(&a).unwrap(), *map.by_id.get(&b).unwrap())
+            (
+                a,
+                b,
+                *map.by_id.get(&a).unwrap(),
+                *map.by_id.get(&b).unwrap(),
+            )
         };
 
         let cloth = core_ids::cloth();
@@ -4343,11 +4328,7 @@ mod smoke {
 
         // Teach the trader about both settlements.
         {
-            let mut mem = sim
-                .app
-                .world_mut()
-                .get_mut::<AgentMemory>(trader)
-                .unwrap();
+            let mut mem = sim.app.world_mut().get_mut::<AgentMemory>(trader).unwrap();
             mem.record_settlement(sid_a);
             mem.record_settlement(sid_b);
         }
@@ -4405,11 +4386,7 @@ mod smoke {
         // Teleport trader to the buy market and step the dispatcher
         // directly — the buy leg should fire.
         {
-            let mut t = sim
-                .app
-                .world_mut()
-                .get_mut::<Transform>(trader)
-                .unwrap();
+            let mut t = sim.app.world_mut().get_mut::<Transform>(trader).unwrap();
             t.translation.x = buy_tile.0 as f32 * crate::world::terrain::TILE_SIZE
                 + crate::world::terrain::TILE_SIZE * 0.5;
             t.translation.y = buy_tile.1 as f32 * crate::world::terrain::TILE_SIZE
@@ -4442,11 +4419,7 @@ mod smoke {
         // Teleport to the sell market — the sell leg should fire and
         // remove the plan.
         {
-            let mut t = sim
-                .app
-                .world_mut()
-                .get_mut::<Transform>(trader)
-                .unwrap();
+            let mut t = sim.app.world_mut().get_mut::<Transform>(trader).unwrap();
             t.translation.x = sell_tile.0 as f32 * crate::world::terrain::TILE_SIZE
                 + crate::world::terrain::TILE_SIZE * 0.5;
             t.translation.y = sell_tile.1 as f32 * crate::world::terrain::TILE_SIZE
@@ -4507,7 +4480,12 @@ mod smoke {
             let map = sim.app.world().resource::<SettlementMap>();
             let a = map.first_for_faction(faction_a).unwrap();
             let b = map.first_for_faction(faction_b).unwrap();
-            (a, b, *map.by_id.get(&a).unwrap(), *map.by_id.get(&b).unwrap())
+            (
+                a,
+                b,
+                *map.by_id.get(&a).unwrap(),
+                *map.by_id.get(&b).unwrap(),
+            )
         };
         let cloth = core_ids::cloth();
         {
@@ -4529,11 +4507,7 @@ mod smoke {
             b.treasury = 1000.0;
         }
         {
-            let mut mem = sim
-                .app
-                .world_mut()
-                .get_mut::<AgentMemory>(trader)
-                .unwrap();
+            let mut mem = sim.app.world_mut().get_mut::<AgentMemory>(trader).unwrap();
             mem.record_settlement(sid_a);
             mem.record_settlement(sid_b);
         }
@@ -4585,9 +4559,11 @@ mod smoke {
         assert_eq!(known2.len(), 8, "re-record must not add duplicate");
 
         // Manually drop the freshness of slot 0 to force eviction.
-        if let Some(slot) = mem.visited_settlements.iter_mut().find(|s| {
-            matches!(s, Some((id, _)) if *id == SettlementId(0))
-        }) {
+        if let Some(slot) = mem
+            .visited_settlements
+            .iter_mut()
+            .find(|s| matches!(s, Some((id, _)) if *id == SettlementId(0)))
+        {
             if let Some((_, f)) = slot {
                 *f = 1;
             }
@@ -4615,11 +4591,7 @@ mod smoke {
         let person = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
         sim.tick_n(2);
 
-        let needs = sim
-            .app
-            .world()
-            .get::<Needs>(person)
-            .expect("Needs missing");
+        let needs = sim.app.world().get::<Needs>(person).expect("Needs missing");
         assert_eq!(needs.esteem, 0.0);
         assert_eq!(needs.self_actualization, 0.0);
     }
@@ -4642,10 +4614,7 @@ mod smoke {
             for _ in 0..4 {
                 registry.add_member(sim.player_faction_id);
             }
-            let f = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             // Pretend the faction has CROP_CULTIVATION + grain seeds
             // so the only thing blocking the post would be the policy
             // gate. (Default test factions don't have either, so this
@@ -4706,19 +4675,12 @@ mod smoke {
         // Apply Market preset to the player faction the same way
         // `spawn_population` does it.
         {
-            let catalog = sim
-                .app
-                .world()
-                .resource::<ResourceCatalog>()
-                .clone();
+            let catalog = sim.app.world().resource::<ResourceCatalog>().clone();
             let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
             for _ in 0..6 {
                 registry.add_member(sim.player_faction_id);
             }
-            let f = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             apply_preset(&mut f.economic_policy, EconomyPreset::Market, &catalog);
             assert!(
                 !f.economic_policy.is_empty(),
@@ -4808,16 +4770,9 @@ mod smoke {
 
         // Apply Market preset: every catalog resource flips to capitalist.
         {
-            let catalog = sim
-                .app
-                .world()
-                .resource::<ResourceCatalog>()
-                .clone();
+            let catalog = sim.app.world().resource::<ResourceCatalog>().clone();
             let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
-            let f = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             apply_preset(&mut f.economic_policy, EconomyPreset::Market, &catalog);
         }
 
@@ -4832,12 +4787,7 @@ mod smoke {
             let registry = world.resource::<FactionRegistry>();
             let projects = world.resource::<Projects>();
             let faction = registry.factions.get(&sim.player_faction_id).unwrap();
-            budget = compute_workforce_budget(
-                faction,
-                projects,
-                sim.player_faction_id,
-                budget,
-            );
+            budget = compute_workforce_budget(faction, projects, sim.player_faction_id, budget);
         }
 
         assert!(
@@ -4922,13 +4872,13 @@ mod smoke {
         // a one-person household with `HouseholdMember`, a dedicated
         // `FactionStorageTile` registered in `StorageTileMap`, and
         // treasury == HOUSEHOLD_SEED_TREASURY at tick 0.
-        use bevy::ecs::system::RunSystemOnce;
         use crate::simulation::faction::{
             FactionRegistry, FactionStorageTile, HOUSEHOLD_SEED_TREASURY,
         };
         use crate::simulation::person::seed_market_households;
         use crate::simulation::reproduction::HouseholdMember;
         use crate::world::chunk::ChunkMap;
+        use bevy::ecs::system::RunSystemOnce;
 
         let mut sim = TestSim::new(0xDEFACE);
         sim.flat_world(2, 0, TileKind::Grass);
@@ -5146,7 +5096,8 @@ mod baseline_behaviour {
         let mut sim = TestSim::new(1);
         sim.flat_world(1, 0, TileKind::Grass);
         let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
-            b.hunger(210.0).add_inventory(crate::economy::core_ids::fruit(), 10);
+            b.hunger(210.0)
+                .add_inventory(crate::economy::core_ids::fruit(), 10);
         });
 
         let initial_food = person_inventory(&sim.app, person)
@@ -5195,10 +5146,7 @@ mod baseline_behaviour {
 
         sim.app.world_mut().send_event(PlayerCommandEvent {
             actors: vec![person],
-            command: PlayerCommand::Move {
-                tile: (8, 0),
-                z: 0,
-            },
+            command: PlayerCommand::Move { tile: (8, 0), z: 0 },
         });
 
         sim.tick_n(120);
@@ -5225,7 +5173,7 @@ mod baseline_behaviour {
     #[test]
     fn player_command_event_move_routes_agent() {
         use crate::simulation::player_command::{
-            Commanded, CommandStatus, PlayerCommand, PlayerCommandEvent,
+            CommandStatus, Commanded, PlayerCommand, PlayerCommandEvent,
         };
 
         let mut sim = TestSim::new(2);
@@ -5241,15 +5189,10 @@ mod baseline_behaviour {
             .unwrap()
             .translation;
 
-        sim.app
-            .world_mut()
-            .send_event(PlayerCommandEvent {
-                actors: vec![person],
-                command: PlayerCommand::Move {
-                    tile: (8, 0),
-                    z: 0,
-                },
-            });
+        sim.app.world_mut().send_event(PlayerCommandEvent {
+            actors: vec![person],
+            command: PlayerCommand::Move { tile: (8, 0), z: 0 },
+        });
 
         // Two ticks: tick 1 drains the event and stamps `Pending`; tick 2
         // observes the dispatcher transitioning `Pending → Active`. The
@@ -5258,11 +5201,7 @@ mod baseline_behaviour {
         // event, single observed transition.
         sim.tick();
         sim.tick();
-        let status_after_dispatch = sim
-            .app
-            .world()
-            .get::<Commanded>(person)
-            .map(|c| c.status);
+        let status_after_dispatch = sim.app.world().get::<Commanded>(person).map(|c| c.status);
         assert_eq!(
             status_after_dispatch,
             Some(CommandStatus::Active),
@@ -5292,7 +5231,7 @@ mod baseline_behaviour {
     #[test]
     fn player_command_supersedes_prior() {
         use crate::simulation::player_command::{
-            Commanded, CommandStatus, PlayerCommand, PlayerCommandEvent,
+            CommandStatus, Commanded, PlayerCommand, PlayerCommandEvent,
         };
 
         let mut sim = TestSim::new(8);
@@ -5304,10 +5243,7 @@ mod baseline_behaviour {
         // First Move to (3, 0).
         sim.app.world_mut().send_event(PlayerCommandEvent {
             actors: vec![person],
-            command: PlayerCommand::Move {
-                tile: (3, 0),
-                z: 0,
-            },
+            command: PlayerCommand::Move { tile: (3, 0), z: 0 },
         });
         sim.tick_n(2);
 
@@ -5348,9 +5284,7 @@ mod baseline_behaviour {
     /// "worker doesn't resume after Move" bug.
     #[test]
     fn player_command_move_completes_and_releases_autonomy() {
-        use crate::simulation::player_command::{
-            Commanded, PlayerCommand, PlayerCommandEvent,
-        };
+        use crate::simulation::player_command::{Commanded, PlayerCommand, PlayerCommandEvent};
 
         let mut sim = TestSim::new(7);
         sim.flat_world(1, 0, TileKind::Grass);
@@ -5360,10 +5294,7 @@ mod baseline_behaviour {
 
         sim.app.world_mut().send_event(PlayerCommandEvent {
             actors: vec![person],
-            command: PlayerCommand::Move {
-                tile: (4, 0),
-                z: 0,
-            },
+            command: PlayerCommand::Move { tile: (4, 0), z: 0 },
         });
 
         // Generous tick budget: drain → dispatch → walk → arrival → lifecycle
@@ -5489,7 +5420,10 @@ mod baseline_behaviour {
         let ai = person_ai(&sim.app, person);
         let task = person_task(&sim.app, person);
         let inv = person_inventory(&sim.app, person);
-        let wood_in_hand = inv.get(&crate::economy::core_ids::wood()).copied().unwrap_or(0);
+        let wood_in_hand = inv
+            .get(&crate::economy::core_ids::wood())
+            .copied()
+            .unwrap_or(0);
 
         assert!(
             wood_in_hand >= 1,
@@ -5624,7 +5558,8 @@ mod baseline_behaviour {
         let mut sim = TestSim::new(8);
         sim.flat_world(1, 0, TileKind::Grass);
         let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
-            b.hunger(0.0).add_inventory(crate::economy::core_ids::weapon(), 1);
+            b.hunger(0.0)
+                .add_inventory(crate::economy::core_ids::weapon(), 1);
         });
 
         sim.app.world_mut().entity_mut(person).insert(Drafted);
@@ -5713,15 +5648,24 @@ mod baseline_behaviour {
         let task = person_task(&sim.app, person);
         let inv = person_inventory(&sim.app, person);
         // Wood is Bulk::TwoHand 5kg — fits in either hands or inventory.
-        let wood_total = inv.get(&crate::economy::core_ids::wood()).copied().unwrap_or(0);
+        let wood_total = inv
+            .get(&crate::economy::core_ids::wood())
+            .copied()
+            .unwrap_or(0);
         let in_hand = sim
             .app
             .world()
             .get::<crate::simulation::carry::Carrier>(person)
             .map(|c| {
                 let wood = crate::economy::core_ids::wood();
-                let l = c.left.map(|s| if s.item.resource_id == wood { s.qty } else { 0 }).unwrap_or(0);
-                let r = c.right.map(|s| if s.item.resource_id == wood { s.qty } else { 0 }).unwrap_or(0);
+                let l = c
+                    .left
+                    .map(|s| if s.item.resource_id == wood { s.qty } else { 0 })
+                    .unwrap_or(0);
+                let r = c
+                    .right
+                    .map(|s| if s.item.resource_id == wood { s.qty } else { 0 })
+                    .unwrap_or(0);
                 l + r
             })
             .unwrap_or(0);
@@ -5867,8 +5811,7 @@ mod baseline_behaviour {
 
         let task = person_task(&sim.app, person);
         assert_eq!(
-            task,
-            queued_follow_up,
+            task, queued_follow_up,
             "expected advance() to promote the queued Dig into current, got {:?}",
             task
         );
@@ -6007,11 +5950,11 @@ mod baseline_behaviour {
     /// `advance` + Eat-priming) regresses, this test fails.
     #[test]
     fn acquire_food_goal_dispatches_withdraw_then_eat_chain() {
-        use crate::simulation::goals::AgentGoal;
-        use crate::simulation::typed_task::{ActionQueue, Task};
         use crate::simulation::faction::FactionRegistry;
         use crate::simulation::faction::StorageTileMap;
+        use crate::simulation::goals::AgentGoal;
         use crate::simulation::needs::EAT_TRIGGER_HUNGER;
+        use crate::simulation::typed_task::{ActionQueue, Task};
         let _ = EAT_TRIGGER_HUNGER;
 
         let mut sim = TestSim::new(42);
@@ -6041,7 +5984,8 @@ mod baseline_behaviour {
                 "storage rollup should report food stock > 0 after warm-up"
             );
             assert!(
-                stm.nearest_for_faction(sim.player_faction_id, (0, 0)).is_some(),
+                stm.nearest_for_faction(sim.player_faction_id, (0, 0))
+                    .is_some(),
                 "StorageTileMap should know about the spawned storage tile"
             );
         }
@@ -6050,9 +5994,7 @@ mod baseline_behaviour {
         // pin AgentGoal::Survive, and undraft so dispatch fires.
         {
             let mut entity = sim.app.world_mut().entity_mut(person);
-            let mut needs = entity
-                .get_mut::<crate::simulation::needs::Needs>()
-                .unwrap();
+            let mut needs = entity.get_mut::<crate::simulation::needs::Needs>().unwrap();
             needs.hunger = 220.0;
         }
         {
@@ -6134,7 +6076,8 @@ mod baseline_behaviour {
         // argmax is unambiguous (1.5 from ScavengeFood vs 0 applicable
         // others). Ground item is within VIEW_RADIUS=15 of (0,0).
         let scavenge_tile = (5, 0);
-        let ground_item = sim.spawn_ground_item(scavenge_tile, crate::economy::core_ids::fruit(), 3);
+        let ground_item =
+            sim.spawn_ground_item(scavenge_tile, crate::economy::core_ids::fruit(), 3);
 
         let person = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
             b.hunger(0.0).drafted();
@@ -6148,9 +6091,7 @@ mod baseline_behaviour {
         // Spike hunger past EAT_TRIGGER_HUNGER (180), pin Survive, undraft.
         {
             let mut entity = sim.app.world_mut().entity_mut(person);
-            let mut needs = entity
-                .get_mut::<crate::simulation::needs::Needs>()
-                .unwrap();
+            let mut needs = entity.get_mut::<crate::simulation::needs::Needs>().unwrap();
             needs.hunger = 220.0;
         }
         {
@@ -7061,7 +7002,9 @@ mod baseline_behaviour {
         );
         assert_eq!(
             aq.peek_next(),
-            Some(Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::fruit() }),
+            Some(Task::DepositToFactionStorage {
+                resource_id: crate::economy::core_ids::fruit()
+            }),
             "the trailing DepositToFactionStorage{{Fruit}} should be queued \
              behind the Scavenge head"
         );
@@ -7087,7 +7030,8 @@ mod baseline_behaviour {
         // chain-completion system can't observe the drain).
         let _chief = sim.spawn_person(sim.player_faction_id, (1, 1), |_| {});
         let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
-            b.hunger(210.0).add_inventory(crate::economy::core_ids::fruit(), 10);
+            b.hunger(210.0)
+                .add_inventory(crate::economy::core_ids::fruit(), 10);
         });
 
         // Seed plenty of faction food so the autonomous-subsistence
@@ -7483,8 +7427,7 @@ mod baseline_behaviour {
         {
             let mut entity = sim.app.world_mut().entity_mut(person);
             entity.remove::<Drafted>();
-            entity
-                .remove::<crate::simulation::faction::FactionChief>();
+            entity.remove::<crate::simulation::faction::FactionChief>();
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::Build;
         }
@@ -7530,10 +7473,7 @@ mod baseline_behaviour {
                     "queued HaulToBlueprint should target the personal bp"
                 );
             }
-            other => panic!(
-                "expected queued Task::HaulToBlueprint, got {:?}",
-                other
-            ),
+            other => panic!("expected queued Task::HaulToBlueprint, got {:?}", other),
         }
     }
 
@@ -7678,7 +7618,9 @@ mod baseline_behaviour {
         // target). With no campfires in the fixture, hearth resolves to the
         // home tile (0, 0).
         let person = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
-            b.profession(Profession::Hunter).drafted();
+            b.profession(Profession::Hunter)
+                .add_inventory(crate::economy::core_ids::weapon(), 1)
+                .drafted();
         });
         {
             let mut knowledge = sim
@@ -7930,6 +7872,464 @@ mod baseline_behaviour {
         );
     }
 
+    /// Hunting fix: an unarmed Hunter (no weapon in inventory / hands /
+    /// MainHand) under a live `HuntOrder::Hunt` with deer in vision must
+    /// NOT dispatch `Task::Hunt`. The new weapon precondition on
+    /// `HuntPreyMethod` causes the engage dispatcher to fall through;
+    /// the goal-agnostic `htn_equip_hunting_spear_dispatch_system` then
+    /// fires when faction storage has a weapon (which this test sets up).
+    #[test]
+    fn unarmed_hunter_refuses_hunt_dispatches_equip_chain_instead() {
+        use crate::simulation::animals::{AnimalAI, AnimalNeeds, Deer};
+        use crate::simulation::combat::{CombatCooldown, CombatTarget, Health};
+        use crate::simulation::corpse::CorpseSpecies;
+        use crate::simulation::faction::{
+            FactionRegistry, FactionStorage, HuntOrder, StorageTileMap,
+        };
+        use crate::simulation::items::GroundItem;
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::person::Profession;
+        use crate::simulation::schedule::BucketSlot;
+        use crate::simulation::technology::HUNTING_SPEAR;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(13);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Hunter at (5,5); faction home (0,0). No weapon anywhere on them.
+        let person = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
+            b.profession(Profession::Hunter).drafted();
+        });
+        {
+            let mut k = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonKnowledge>(person)
+                .unwrap();
+            k.aware |= 1u64 << HUNTING_SPEAR;
+            k.learned |= 1u64 << HUNTING_SPEAR;
+        }
+
+        // Live deer at (7,5) — within VIEW_RADIUS=15. Triggers `HuntPreyMethod`'s
+        // first precondition (prey present); the second (`agent_has_weapon`)
+        // is what we're asserting blocks the dispatch.
+        let deer_world = tile_to_world(7, 5);
+        sim.app.world_mut().spawn((
+            Deer,
+            Transform::from_xyz(deer_world.x, deer_world.y, 1.0),
+            GlobalTransform::default(),
+            Visibility::Hidden,
+            InheritedVisibility::default(),
+            AnimalAI {
+                target_tile: (7, 5),
+                ..Default::default()
+            },
+            AnimalNeeds::default(),
+            Health::new(20),
+            CombatTarget::default(),
+            CombatCooldown::default(),
+            LodLevel::Full,
+            BucketSlot(0),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Deer),
+        ));
+
+        // Seed faction storage with a weapon ground-item so the
+        // EquipHuntingSpear dispatcher's stock check passes. Storage tile
+        // sits at the home (0,0) by the fixture's default.
+        let storage_tile = (0, 0);
+        let weapon_id = crate::economy::core_ids::weapon();
+        let weapon_world = tile_to_world(storage_tile.0, storage_tile.1);
+        sim.app.world_mut().spawn((
+            GroundItem {
+                item: Item::new_commodity(weapon_id),
+                qty: 1,
+            },
+            Transform::from_xyz(weapon_world.x, weapon_world.y, 0.4),
+            GlobalTransform::default(),
+            Visibility::Hidden,
+            InheritedVisibility::default(),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::GroundItem),
+        ));
+        {
+            let mut map = sim
+                .app
+                .world_mut()
+                .resource_mut::<StorageTileMap>();
+            map.by_faction
+                .entry(sim.player_faction_id)
+                .or_default()
+                .push(storage_tile);
+        }
+        // Refresh faction.storage.totals so the dispatcher sees the stock.
+        {
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<FactionRegistry>();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            f.storage = FactionStorage::default();
+            f.storage.totals.insert(weapon_id, 1);
+        }
+
+        sim.tick_n(5);
+
+        // Hunt order AFTER warm-up so chief_hunt_order_system doesn't clear it.
+        {
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<FactionRegistry>();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            f.hunt_order = Some(HuntOrder::Hunt {
+                species: CorpseSpecies::Deer,
+                area_tile: (7, 5),
+                target_party_size: 1,
+                mustered: vec![person],
+                deployed_tick: Some(0),
+                posted_tick: 0,
+            });
+        }
+        sim.undraft(person);
+        sim.tick_n(3);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+        assert!(
+            !matches!(aq.current, Task::Hunt { .. }),
+            "unarmed hunter must NOT dispatch Task::Hunt; got {:?}",
+            aq.current
+        );
+    }
+
+    /// Hunting fix: when prey moves while the hunter is en route, the
+    /// `hunt_chase_system` updates `dest_tile` / `target_tile` to the prey's
+    /// new tile so movement_system's `Following` arm re-plans the path.
+    #[test]
+    fn hunt_chase_re_routes_when_prey_moves() {
+        use crate::simulation::animals::{AnimalAI, AnimalNeeds, Deer};
+        use crate::simulation::combat::{CombatCooldown, CombatTarget, Health};
+        use crate::simulation::corpse::CorpseSpecies;
+        use crate::simulation::faction::{FactionRegistry, HuntOrder};
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::person::Profession;
+        use crate::simulation::schedule::BucketSlot;
+        use crate::simulation::technology::HUNTING_SPEAR;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(73);
+        sim.flat_world(3, 0, TileKind::Grass);
+
+        let person = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
+            b.profession(Profession::Hunter)
+                .add_inventory(crate::economy::core_ids::weapon(), 1)
+                .drafted();
+        });
+        {
+            let mut k = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonKnowledge>(person)
+                .unwrap();
+            k.aware |= 1u64 << HUNTING_SPEAR;
+            k.learned |= 1u64 << HUNTING_SPEAR;
+        }
+
+        let initial_prey_tile = (10, 5);
+        let deer_world = tile_to_world(initial_prey_tile.0, initial_prey_tile.1);
+        let deer = sim
+            .app
+            .world_mut()
+            .spawn((
+                Deer,
+                Transform::from_xyz(deer_world.x, deer_world.y, 1.0),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+                AnimalAI {
+                    target_tile: initial_prey_tile,
+                    ..Default::default()
+                },
+                AnimalNeeds::default(),
+                Health::new(20),
+                CombatTarget::default(),
+                CombatCooldown::default(),
+                LodLevel::Full,
+                BucketSlot(0),
+                crate::world::spatial::Indexed::new(
+                    crate::world::spatial::IndexedKind::Deer,
+                ),
+            ))
+            .id();
+
+        sim.tick_n(5);
+        {
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<FactionRegistry>();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            f.hunt_order = Some(HuntOrder::Hunt {
+                species: CorpseSpecies::Deer,
+                area_tile: initial_prey_tile,
+                target_party_size: 1,
+                mustered: vec![person],
+                deployed_tick: Some(0),
+                posted_tick: 0,
+            });
+        }
+        sim.undraft(person);
+        sim.tick_n(2);
+
+        // Hunter should have dispatched Task::Hunt; dest_tile snapshot taken
+        // here (the deer may wander a step during warmup/post-order ticks,
+        // so we record whatever the chase system locked onto rather than
+        // pinning to the spawn coord).
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+        assert!(
+            matches!(aq.current, Task::Hunt { .. }),
+            "armed hunter with deer in vision must dispatch Task::Hunt; got {:?}",
+            aq.current
+        );
+
+        // Teleport the deer to a new tile inside the leash radius.
+        let new_prey_tile = (10, 12);
+        let new_world = tile_to_world(new_prey_tile.0, new_prey_tile.1);
+        {
+            let mut t = sim.app.world_mut().get_mut::<Transform>(deer).unwrap();
+            t.translation.x = new_world.x;
+            t.translation.y = new_world.y;
+        }
+        sim.tick_n(1);
+
+        let ai = sim
+            .app
+            .world()
+            .get::<PersonAI>(person)
+            .expect("PersonAI missing");
+        assert_eq!(
+            (ai.dest_tile.0 as i32, ai.dest_tile.1 as i32),
+            new_prey_tile,
+            "hunt_chase_system should re-target dest_tile onto the prey's new tile"
+        );
+    }
+
+    /// Hunting fix: prey despawning mid-chase cancels the chain cleanly
+    /// (no frozen hunter holding a dangling entity reference).
+    #[test]
+    fn hunt_chase_abandons_when_prey_despawns() {
+        use crate::simulation::animals::{AnimalAI, AnimalNeeds, Deer};
+        use crate::simulation::combat::{CombatCooldown, CombatTarget, Health};
+        use crate::simulation::corpse::CorpseSpecies;
+        use crate::simulation::faction::{FactionRegistry, HuntOrder};
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::person::Profession;
+        use crate::simulation::schedule::BucketSlot;
+        use crate::simulation::technology::HUNTING_SPEAR;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(97);
+        sim.flat_world(3, 0, TileKind::Grass);
+
+        let person = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
+            b.profession(Profession::Hunter)
+                .add_inventory(crate::economy::core_ids::weapon(), 1)
+                .drafted();
+        });
+        {
+            let mut k = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonKnowledge>(person)
+                .unwrap();
+            k.aware |= 1u64 << HUNTING_SPEAR;
+            k.learned |= 1u64 << HUNTING_SPEAR;
+        }
+
+        let deer_world = tile_to_world(10, 5);
+        let deer = sim
+            .app
+            .world_mut()
+            .spawn((
+                Deer,
+                Transform::from_xyz(deer_world.x, deer_world.y, 1.0),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+                AnimalAI::default(),
+                AnimalNeeds::default(),
+                Health::new(20),
+                CombatTarget::default(),
+                CombatCooldown::default(),
+                LodLevel::Full,
+                BucketSlot(0),
+                crate::world::spatial::Indexed::new(
+                    crate::world::spatial::IndexedKind::Deer,
+                ),
+            ))
+            .id();
+
+        sim.tick_n(5);
+        {
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<FactionRegistry>();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            f.hunt_order = Some(HuntOrder::Hunt {
+                species: CorpseSpecies::Deer,
+                area_tile: (10, 5),
+                target_party_size: 1,
+                mustered: vec![person],
+                deployed_tick: Some(0),
+                posted_tick: 0,
+            });
+        }
+        sim.undraft(person);
+        sim.tick_n(2);
+
+        // Confirm hunter is hunting.
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+        assert!(
+            matches!(aq.current, Task::Hunt { .. }),
+            "expected Task::Hunt before despawn"
+        );
+
+        // Despawn the deer — `hunt_chase_system` must cancel cleanly.
+        sim.app.world_mut().despawn(deer);
+        sim.tick_n(1);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+        assert!(
+            matches!(aq.current, Task::Idle),
+            "hunter must drop back to Idle after prey despawn; got {:?}",
+            aq.current
+        );
+    }
+
+    /// Hunting fix: prey that flees beyond `HUNT_LEASH_RADIUS` causes the
+    /// hunter to abandon the chase (so the dispatcher's next-tick re-eval
+    /// can pick a closer prey or fall through to Scout).
+    #[test]
+    fn hunt_chase_abandons_beyond_leash_radius() {
+        use crate::simulation::animals::{AnimalAI, AnimalNeeds, Deer};
+        use crate::simulation::combat::{CombatCooldown, CombatTarget, Health, HUNT_LEASH_RADIUS};
+        use crate::simulation::corpse::CorpseSpecies;
+        use crate::simulation::faction::{FactionRegistry, HuntOrder};
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::person::Profession;
+        use crate::simulation::schedule::BucketSlot;
+        use crate::simulation::technology::HUNTING_SPEAR;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(131);
+        // Flat world big enough to teleport prey 40 tiles out.
+        sim.flat_world(4, 0, TileKind::Grass);
+
+        let person = sim.spawn_person(sim.player_faction_id, (5, 5), |b| {
+            b.profession(Profession::Hunter)
+                .add_inventory(crate::economy::core_ids::weapon(), 1)
+                .drafted();
+        });
+        {
+            let mut k = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonKnowledge>(person)
+                .unwrap();
+            k.aware |= 1u64 << HUNTING_SPEAR;
+            k.learned |= 1u64 << HUNTING_SPEAR;
+        }
+
+        let deer_world = tile_to_world(10, 5);
+        let deer = sim
+            .app
+            .world_mut()
+            .spawn((
+                Deer,
+                Transform::from_xyz(deer_world.x, deer_world.y, 1.0),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+                AnimalAI::default(),
+                AnimalNeeds::default(),
+                Health::new(20),
+                CombatTarget::default(),
+                CombatCooldown::default(),
+                LodLevel::Full,
+                BucketSlot(0),
+                crate::world::spatial::Indexed::new(
+                    crate::world::spatial::IndexedKind::Deer,
+                ),
+            ))
+            .id();
+
+        sim.tick_n(5);
+        {
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<FactionRegistry>();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            f.hunt_order = Some(HuntOrder::Hunt {
+                species: CorpseSpecies::Deer,
+                area_tile: (10, 5),
+                target_party_size: 1,
+                mustered: vec![person],
+                deployed_tick: Some(0),
+                posted_tick: 0,
+            });
+        }
+        sim.undraft(person);
+        sim.tick_n(2);
+
+        // Confirm dispatched.
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+        assert!(
+            matches!(aq.current, Task::Hunt { .. }),
+            "expected Task::Hunt before teleport"
+        );
+
+        // Teleport deer beyond leash radius from hunter at (5,5).
+        let beyond_leash = 5 + HUNT_LEASH_RADIUS + 5; // = 40
+        let far_world = tile_to_world(beyond_leash, 5);
+        {
+            let mut t = sim.app.world_mut().get_mut::<Transform>(deer).unwrap();
+            t.translation.x = far_world.x;
+            t.translation.y = far_world.y;
+        }
+        sim.tick_n(1);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .expect("ActionQueue missing");
+        assert!(
+            matches!(aq.current, Task::Idle),
+            "hunter must abandon when prey flees past leash; got {:?}",
+            aq.current
+        );
+    }
+
     /// Phase 5e-x: a chief with `AgentGoal::Lead` dispatches
     /// `Task::Lead { dest }` via `htn_combat_faction_dispatch_system` +
     /// `LeadCampMethod`, walking to faction `home_tile`. Lead is the
@@ -7976,10 +8376,7 @@ mod baseline_behaviour {
                     "head Task::Lead should target the faction home tile"
                 );
             }
-            other => panic!(
-                "expected Task::Lead as head of Lead chain, got {:?}",
-                other
-            ),
+            other => panic!("expected Task::Lead as head of Lead chain, got {:?}", other),
         }
         assert_eq!(
             aq.queued_len(),
@@ -8519,8 +8916,7 @@ mod baseline_behaviour {
     fn farm_goal_dispatches_harvest_then_deposit_chain_when_memory_has_grain() {
         use crate::simulation::goals::AgentGoal;
         use crate::simulation::jobs::{
-            ClaimTarget, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
-            TileAabb,
+            ClaimTarget, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, TileAabb,
         };
         use crate::simulation::knowledge::PersonKnowledge;
         use crate::simulation::memory::{AgentMemory, MemoryKind};
@@ -9080,7 +9476,10 @@ mod baseline_behaviour {
             .resource_mut::<PlantMap>()
             .0
             .remove(&tree_tile);
-        sim.app.world_mut().entity_mut(tree_entity).despawn_recursive();
+        sim.app
+            .world_mut()
+            .entity_mut(tree_entity)
+            .despawn_recursive();
 
         // One tick: `gather_system` observes (Working, Gather), looks up
         // the tile in `PlantMap`, hits the legacy `finish_gather` fall-through
@@ -9388,9 +9787,9 @@ mod baseline_behaviour {
                 .map(|n| n.hunger)
                 .unwrap_or(0.0);
             // Eating one Grain drops hunger by `grain.nutrition()`
-                // (~150 cal). A drop > 50 means the chain completed —
-                // could not have happened without the under-foot probe
-                // hitting because we never injected a sighting.
+            // (~150 cal). A drop > 50 means the chain completed —
+            // could not have happened without the under-foot probe
+            // hitting because we never injected a sighting.
             if hunger < initial_hunger - 50.0 {
                 hunger_dropped = true;
                 break;
@@ -9454,11 +9853,7 @@ mod baseline_behaviour {
         let _neighbor_entity = spawn_grain(&mut sim, neighbor_tile);
 
         // Inject a sighting on the primary tile so the dispatcher targets it.
-        sim.inject_faction_sighting(
-            sim.player_faction_id,
-            primary_tile,
-            MemoryKind::AnyEdible,
-        );
+        sim.inject_faction_sighting(sim.player_faction_id, primary_tile, MemoryKind::AnyEdible);
 
         // Hungry worker far enough to need a walk so we can despawn the
         // plant in flight.
@@ -9571,7 +9966,11 @@ mod baseline_behaviour {
             "Play is single-leg — nothing should be queued"
         );
         // Verify the goal actually settled on Play during the dispatch tick.
-        let goal = sim.app.world().get::<AgentGoal>(actor).expect("goal missing");
+        let goal = sim
+            .app
+            .world()
+            .get::<AgentGoal>(actor)
+            .expect("goal missing");
         assert_eq!(*goal, AgentGoal::Play, "expected goal to be Play");
     }
 
@@ -9651,7 +10050,11 @@ mod baseline_behaviour {
                 other
             ),
         }
-        let goal = sim.app.world().get::<AgentGoal>(actor).expect("goal missing");
+        let goal = sim
+            .app
+            .world()
+            .get::<AgentGoal>(actor)
+            .expect("goal missing");
         assert_eq!(*goal, AgentGoal::Play, "expected goal to be Play");
     }
 
@@ -9728,7 +10131,11 @@ mod baseline_behaviour {
                 other
             ),
         }
-        let goal = sim.app.world().get::<AgentGoal>(actor).expect("goal missing");
+        let goal = sim
+            .app
+            .world()
+            .get::<AgentGoal>(actor)
+            .expect("goal missing");
         assert_eq!(*goal, AgentGoal::Play, "expected goal to be Play");
     }
 
@@ -9803,7 +10210,11 @@ mod baseline_behaviour {
                 other
             ),
         }
-        let goal = sim.app.world().get::<AgentGoal>(actor).expect("goal missing");
+        let goal = sim
+            .app
+            .world()
+            .get::<AgentGoal>(actor)
+            .expect("goal missing");
         assert_eq!(*goal, AgentGoal::Play, "expected goal to be Play");
     }
 
@@ -10059,13 +10470,8 @@ mod baseline_behaviour {
             .world_mut()
             .spawn((
                 {
-                    let mut bp = Blueprint::new(
-                        sim.player_faction_id,
-                        None,
-                        BuildSiteKind::Bed,
-                        bp_tile,
-                        0,
-                    );
+                    let mut bp =
+                        Blueprint::new(sim.player_faction_id, None, BuildSiteKind::Bed, bp_tile, 0);
                     for i in 0..bp.deposit_count as usize {
                         bp.deposits[i].deposited = bp.deposits[i].needed;
                     }
@@ -10125,9 +10531,7 @@ mod baseline_behaviour {
         });
         sim.app.world_mut().entity_mut(hauler).insert(ClaimTarget {
             blueprint: Some(blueprint),
-            kind: crate::simulation::jobs::ClaimKind::Specific(
-                crate::economy::core_ids::wood(),
-            ),
+            kind: crate::simulation::jobs::ClaimKind::Specific(crate::economy::core_ids::wood()),
         });
 
         // Tick past CHIEF_POSTING_INTERVAL (60). Fix 1b's two-pass cleanup in
@@ -10204,13 +10608,7 @@ mod baseline_behaviour {
             .app
             .world_mut()
             .spawn((
-                Blueprint::new(
-                    sim.player_faction_id,
-                    None,
-                    BuildSiteKind::Bed,
-                    bp_tile,
-                    0,
-                ),
+                Blueprint::new(sim.player_faction_id, None, BuildSiteKind::Bed, bp_tile, 0),
                 Transform::from_xyz(bp_world.x, bp_world.y, 0.5),
                 GlobalTransform::default(),
                 Visibility::Hidden,
@@ -10238,9 +10636,7 @@ mod baseline_behaviour {
                 .app
                 .world_mut()
                 .resource_mut::<crate::simulation::faction::FactionRegistry>();
-            if let Some(faction) =
-                registry.factions.get_mut(&sim.player_faction_id)
-            {
+            if let Some(faction) = registry.factions.get_mut(&sim.player_faction_id) {
                 faction.chief_entity = Some(chief);
             }
         }
@@ -10314,10 +10710,7 @@ mod baseline_behaviour {
                 "in-hand fast-path should skip WithdrawMaterial when the agent \
                  already carries the needed resource; got WithdrawMaterial"
             ),
-            other => panic!(
-                "expected Task::HaulToBlueprint as head, got {:?}",
-                other
-            ),
+            other => panic!("expected Task::HaulToBlueprint as head, got {:?}", other),
         }
     }
 
@@ -10365,8 +10758,8 @@ mod baseline_behaviour {
     }
 
     fn run_lifecycle_processor(sim: &mut TestSim) {
-        use bevy::ecs::system::RunSystemOnce;
         use crate::simulation::lifecycle::process_settlement_lifecycle_system;
+        use bevy::ecs::system::RunSystemOnce;
         sim.app
             .world_mut()
             .run_system_once(process_settlement_lifecycle_system)
@@ -10393,7 +10786,10 @@ mod baseline_behaviour {
             .get(&fid)
             .unwrap()
             .land_policy;
-        assert!(!pre.state_sells_land, "subsistence default must be all-false");
+        assert!(
+            !pre.state_sells_land,
+            "subsistence default must be all-false"
+        );
 
         push_switch_to_settled_market(&mut sim, fid, (50, 50));
         run_lifecycle_processor(&mut sim);
@@ -10499,11 +10895,7 @@ mod baseline_behaviour {
         run_lifecycle_processor(&mut sim);
 
         let map = sim.app.world().resource::<StorageTileMap>();
-        let tiles = map
-            .by_faction
-            .get(&fid)
-            .cloned()
-            .unwrap_or_default();
+        let tiles = map.by_faction.get(&fid).cloned().unwrap_or_default();
         assert!(
             tiles.contains(&(60, 60)),
             "synchronous bootstrap must place a FactionStorageTile at at_tile",
@@ -10555,13 +10947,12 @@ mod wage_aware_phase0_phase1 {
     //!   skills (peak ≥ 80) stop decaying at 30 instead of 5.
     use super::*;
     use crate::simulation::jobs::{
-        Earnings, JobBoard, JobClaim, JobCompletedEvent, JobEscrow, JobEscrowIndex,
-        JobKind, JobPosting, JobProgress, JobSource, PosterClass,
+        Earnings, JobBoard, JobClaim, JobCompletedEvent, JobEscrow, JobEscrowIndex, JobKind,
+        JobPosting, JobProgress, JobSource, PosterClass,
     };
     use crate::simulation::skills::{
-        skill_decay_system, skill_peaks_tracker_system, SkillKind, SkillPeaks,
-        SkillUseTicks, Skills, SkillsLastSeen, SKILL_FLOOR_BASE, SKILL_MASTERED_FLOOR,
-        SKILL_MASTERY_LINE,
+        skill_decay_system, skill_peaks_tracker_system, SkillKind, SkillPeaks, SkillUseTicks,
+        Skills, SkillsLastSeen, SKILL_FLOOR_BASE, SKILL_MASTERED_FLOOR, SKILL_MASTERY_LINE,
     };
     use crate::world::seasons::TICKS_PER_DAY;
 
@@ -10638,8 +11029,7 @@ mod wage_aware_phase0_phase1 {
 
         let reward = 10.0;
         let fid = sim.player_faction_id;
-        let job_id =
-            post_paid_stockpile_contract(&mut sim, poster, fid, worker, reward);
+        let job_id = post_paid_stockpile_contract(&mut sim, poster, fid, worker, reward);
 
         // Emit a completion event directly (skip the full deposit
         // pipeline — Phase 0 owns payout, not credit accumulation).
@@ -10663,7 +11053,11 @@ mod wage_aware_phase0_phase1 {
         // Escrow despawned → escrowed amount = 0.
         assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
         // Worker earned a row.
-        let earnings = sim.app.world().get::<Earnings>(worker).expect("Earnings inserted");
+        let earnings = sim
+            .app
+            .world()
+            .get::<Earnings>(worker)
+            .expect("Earnings inserted");
         assert_eq!(earnings.recent.len(), 1);
         assert!((earnings.recent[0].amount - 10.0).abs() < 1e-3);
     }
@@ -10680,8 +11074,7 @@ mod wage_aware_phase0_phase1 {
 
         let reward = 15.0;
         let fid = sim.player_faction_id;
-        let job_id =
-            post_paid_stockpile_contract(&mut sim, poster, fid, worker, reward);
+        let job_id = post_paid_stockpile_contract(&mut sim, poster, fid, worker, reward);
 
         sim.app
             .world_mut()
@@ -10909,14 +11302,8 @@ mod wage_aware_phase0_phase1 {
         let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
         // Wire the chief.
         {
-            let mut registry = sim
-                .app
-                .world_mut()
-                .resource_mut::<FactionRegistry>();
-            let faction = registry
-                .factions
-                .get_mut(&sim.player_faction_id)
-                .unwrap();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let faction = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             faction.chief_entity = Some(chief);
             faction.treasury = 100.0;
             // Leave economic_policy empty (Subsistence).
@@ -10971,10 +11358,7 @@ mod wage_aware_phase0_phase1 {
         let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
         let fid = sim.player_faction_id;
         {
-            let mut registry = sim
-                .app
-                .world_mut()
-                .resource_mut::<FactionRegistry>();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
             let faction = registry.factions.get_mut(&fid).unwrap();
             faction.chief_entity = Some(chief);
             faction.treasury = 100.0;
@@ -11035,10 +11419,7 @@ mod wage_aware_phase0_phase1 {
         let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
         let fid = sim.player_faction_id;
         {
-            let mut registry = sim
-                .app
-                .world_mut()
-                .resource_mut::<FactionRegistry>();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
             let faction = registry.factions.get_mut(&fid).unwrap();
             faction.chief_entity = Some(chief);
             faction.treasury = 5.0; // less than wage (25)
@@ -11093,9 +11474,6 @@ mod wage_aware_phase0_phase1 {
         }
         assert_eq!(p.by_key.len(), PerceivedFactionWages::CAP);
         // Earliest entries (low tick) must have been evicted.
-        assert!(p
-            .by_key
-            .iter()
-            .all(|(_, (_, t))| *t >= 5));
+        assert!(p.by_key.iter().all(|(_, (_, t))| *t >= 5));
     }
 }

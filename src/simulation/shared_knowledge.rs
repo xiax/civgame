@@ -28,7 +28,7 @@ pub const CLUSTER_MERGE_RADIUS: i32 = 8;
 pub const MAX_CLUSTER_RADIUS: u8 = 12;
 pub const REPRESENTATIVE_TILES: usize = 4;
 pub const CLUSTER_DECAY_TTL_TICKS: u64 = 3600 * 7; // 7 game-days
-pub const CLUSTER_DECAY_CADENCE: u64 = 3600;       // 1 game-day
+pub const CLUSTER_DECAY_CADENCE: u64 = 3600; // 1 game-day
 
 /// Stable identifier for a `ResourceCluster`. Allocated by `SharedKnowledge`
 /// and never reused — depleted clusters are removed from every index but
@@ -123,7 +123,13 @@ pub struct ResourceCluster {
 }
 
 impl ResourceCluster {
-    fn new(id: ClusterId, kind: MemoryKind, owner: ResourceOwner, tile: (i32, i32), now: u64) -> Self {
+    fn new(
+        id: ClusterId,
+        kind: MemoryKind,
+        owner: ResourceOwner,
+        tile: (i32, i32),
+        now: u64,
+    ) -> Self {
         let mut rep = [None; REPRESENTATIVE_TILES];
         rep[0] = Some(tile);
         Self {
@@ -263,7 +269,12 @@ impl KnowledgeMap {
 
     /// Find an existing cluster of `(kind, owner)` whose center is within
     /// `CLUSTER_MERGE_RADIUS` of `tile`. O(candidates near `tile`'s chunk).
-    fn find_mergeable(&self, tile: (i32, i32), kind: MemoryKind, owner: ResourceOwner) -> Option<ClusterId> {
+    fn find_mergeable(
+        &self,
+        tile: (i32, i32),
+        kind: MemoryKind,
+        owner: ResourceOwner,
+    ) -> Option<ClusterId> {
         let chunk = ResourceCluster::chunk_of(tile);
         // Scan the 3×3 chunk neighbourhood (CLUSTER_MERGE_RADIUS=8 ≤ CHUNK_SIZE=32,
         // so candidate centers always fall within ±1 chunk).
@@ -271,9 +282,13 @@ impl KnowledgeMap {
         for dx in -1..=1 {
             for dy in -1..=1 {
                 let ch = ChunkCoord(chunk.0 + dx, chunk.1 + dy);
-                let Some(set) = self.by_chunk.get(&ch) else { continue };
+                let Some(set) = self.by_chunk.get(&ch) else {
+                    continue;
+                };
                 for &cid in set {
-                    let Some(c) = self.clusters.get(&cid) else { continue };
+                    let Some(c) = self.clusters.get(&cid) else {
+                        continue;
+                    };
                     if c.kind != kind || c.owner != owner {
                         continue;
                     }
@@ -295,9 +310,13 @@ impl KnowledgeMap {
         for dx in -1..=1 {
             for dy in -1..=1 {
                 let ch = ChunkCoord(chunk.0 + dx, chunk.1 + dy);
-                let Some(set) = self.by_chunk.get(&ch) else { continue };
+                let Some(set) = self.by_chunk.get(&ch) else {
+                    continue;
+                };
                 for &cid in set {
-                    let Some(c) = self.clusters.get(&cid) else { continue };
+                    let Some(c) = self.clusters.get(&cid) else {
+                        continue;
+                    };
                     if c.kind != kind {
                         continue;
                     }
@@ -365,9 +384,13 @@ impl KnowledgeMap {
                         continue;
                     }
                     let ch = ChunkCoord(origin.0 + dx, origin.1 + dy);
-                    let Some(set) = self.by_chunk.get(&ch) else { continue };
+                    let Some(set) = self.by_chunk.get(&ch) else {
+                        continue;
+                    };
                     for &cid in set {
-                        let Some(c) = self.clusters.get(&cid) else { continue };
+                        let Some(c) = self.clusters.get(&cid) else {
+                            continue;
+                        };
                         if c.kind != kind || !owner_filter(c.owner) {
                             continue;
                         }
@@ -379,8 +402,7 @@ impl KnowledgeMap {
                         // pressured-but-closest rep wins over a free-but-far
                         // rep on the same cluster, defeating the cluster
                         // mutex.
-                        let Some(target) = c.pick_least_pressured_rep(from, &claim_penalty)
-                        else {
+                        let Some(target) = c.pick_least_pressured_rep(from, &claim_penalty) else {
                             continue;
                         };
                         let raw = (target.0 - from.0).abs().max((target.1 - from.1).abs());
@@ -458,7 +480,11 @@ impl SharedKnowledge {
         if let Some(cid) = existing {
             // Borrow the cluster, decide how its footprint changes, then re-index.
             let m = self.tiers.get_mut(&tier).expect("tier entry just inserted");
-            let old_footprint = m.clusters.get(&cid).map(|c| c.chunk_footprint()).unwrap_or_default();
+            let old_footprint = m
+                .clusters
+                .get(&cid)
+                .map(|c| c.chunk_footprint())
+                .unwrap_or_default();
             if let Some(c) = m.clusters.get_mut(&cid) {
                 let already = c.representative_tiles.iter().any(|s| *s == Some(tile));
                 c.push_rep(tile);
@@ -469,8 +495,11 @@ impl SharedKnowledge {
                 // let `estimated_count` outlive every concrete rep tile,
                 // leaving the cluster un-despawnable after the LRU drained
                 // and routing every gatherer to `c.center` forever.
-                c.estimated_count =
-                    c.representative_tiles.iter().filter(|s| s.is_some()).count() as u16;
+                c.estimated_count = c
+                    .representative_tiles
+                    .iter()
+                    .filter(|s| s.is_some())
+                    .count() as u16;
                 if !already {
                     // Grow radius to fit the new tile.
                     let dx = (c.center.0 - tile.0).abs();
@@ -482,7 +511,11 @@ impl SharedKnowledge {
                 }
             }
             // Re-index if footprint changed.
-            let new_footprint = m.clusters.get(&cid).map(|c| c.chunk_footprint()).unwrap_or_default();
+            let new_footprint = m
+                .clusters
+                .get(&cid)
+                .map(|c| c.chunk_footprint())
+                .unwrap_or_default();
             if old_footprint != new_footprint {
                 for ch in &old_footprint {
                     if let Some(s) = m.by_chunk.get_mut(ch) {
@@ -511,12 +544,18 @@ impl SharedKnowledge {
     /// Decrements the containing cluster's `estimated_count`; when the count
     /// hits zero, despawns the cluster from every index.
     pub fn report_depleted(&mut self, tier: KnowledgeTier, tile: (i32, i32), kind: MemoryKind) {
-        let Some(m) = self.tiers.get_mut(&tier) else { return };
-        let Some(cid) = m.cluster_at(tile, kind) else { return };
+        let Some(m) = self.tiers.get_mut(&tier) else {
+            return;
+        };
+        let Some(cid) = m.cluster_at(tile, kind) else {
+            return;
+        };
         let despawn;
         let removed_cluster: Option<ResourceCluster>;
         {
-            let Some(c) = m.clusters.get_mut(&cid) else { return };
+            let Some(c) = m.clusters.get_mut(&cid) else {
+                return;
+            };
             if !c.drop_rep(tile) {
                 return;
             }
@@ -592,7 +631,9 @@ impl SharedKnowledge {
         G: Fn(&ResourceCluster) -> bool,
     {
         for tier in tier_set.tiers() {
-            let Some(m) = self.tiers.get(&tier) else { continue };
+            let Some(m) = self.tiers.get(&tier) else {
+                continue;
+            };
             if let Some(cid) = m.nearest_with_cluster_filter(
                 kind,
                 from,
@@ -724,13 +765,17 @@ pub fn faction_knows_cluster(
     let no_pen = |_t: (i32, i32)| 0;
 
     if let Some(m) = shared.tiers.get(&KnowledgeTier::Faction(faction_id)) {
-        if m.nearest(kind, from, &owner_filter, &no_pen, max_chunk_radius).is_some() {
+        if m.nearest(kind, from, &owner_filter, &no_pen, max_chunk_radius)
+            .is_some()
+        {
             return true;
         }
     }
     for &sid in &owned_settlements {
         if let Some(m) = shared.tiers.get(&KnowledgeTier::Settlement(sid)) {
-            if m.nearest(kind, from, &owner_filter, &no_pen, max_chunk_radius).is_some() {
+            if m.nearest(kind, from, &owner_filter, &no_pen, max_chunk_radius)
+                .is_some()
+            {
                 return true;
             }
         }
@@ -768,7 +813,13 @@ mod tests {
     #[test]
     fn singleton_sighting_creates_cluster() {
         let mut sk = SharedKnowledge::default();
-        let cid = sk.report_sighting(faction_tier(1), (10, 10), fake_kind(), ResourceOwner::Public, 0);
+        let cid = sk.report_sighting(
+            faction_tier(1),
+            (10, 10),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
         let m = sk.map(faction_tier(1)).unwrap();
         assert_eq!(m.clusters.len(), 1);
         let c = &m.clusters[&cid];
@@ -781,8 +832,20 @@ mod tests {
     #[test]
     fn nearby_sightings_merge_into_one_cluster() {
         let mut sk = SharedKnowledge::default();
-        let a = sk.report_sighting(faction_tier(1), (10, 10), fake_kind(), ResourceOwner::Public, 0);
-        let b = sk.report_sighting(faction_tier(1), (12, 11), fake_kind(), ResourceOwner::Public, 0);
+        let a = sk.report_sighting(
+            faction_tier(1),
+            (10, 10),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        let b = sk.report_sighting(
+            faction_tier(1),
+            (12, 11),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
         assert_eq!(a, b, "tiles within CLUSTER_MERGE_RADIUS should merge");
         let m = sk.map(faction_tier(1)).unwrap();
         assert_eq!(m.clusters.len(), 1);
@@ -794,8 +857,20 @@ mod tests {
     #[test]
     fn distant_sightings_create_separate_clusters() {
         let mut sk = SharedKnowledge::default();
-        let a = sk.report_sighting(faction_tier(1), (0, 0), fake_kind(), ResourceOwner::Public, 0);
-        let b = sk.report_sighting(faction_tier(1), (50, 50), fake_kind(), ResourceOwner::Public, 0);
+        let a = sk.report_sighting(
+            faction_tier(1),
+            (0, 0),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        let b = sk.report_sighting(
+            faction_tier(1),
+            (50, 50),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
         assert_ne!(a, b);
         assert_eq!(sk.map(faction_tier(1)).unwrap().clusters.len(), 2);
     }
@@ -803,16 +878,40 @@ mod tests {
     #[test]
     fn different_owners_do_not_merge() {
         let mut sk = SharedKnowledge::default();
-        let a = sk.report_sighting(faction_tier(1), (10, 10), fake_kind(), ResourceOwner::Public, 0);
-        let b = sk.report_sighting(faction_tier(1), (11, 10), fake_kind(), ResourceOwner::Faction(7), 0);
+        let a = sk.report_sighting(
+            faction_tier(1),
+            (10, 10),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        let b = sk.report_sighting(
+            faction_tier(1),
+            (11, 10),
+            fake_kind(),
+            ResourceOwner::Faction(7),
+            0,
+        );
         assert_ne!(a, b, "different owners must be tracked separately");
     }
 
     #[test]
     fn depletion_decrements_then_despawns_cluster() {
         let mut sk = SharedKnowledge::default();
-        sk.report_sighting(faction_tier(1), (10, 10), fake_kind(), ResourceOwner::Public, 0);
-        sk.report_sighting(faction_tier(1), (12, 11), fake_kind(), ResourceOwner::Public, 0);
+        sk.report_sighting(
+            faction_tier(1),
+            (10, 10),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        sk.report_sighting(
+            faction_tier(1),
+            (12, 11),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
         let m = sk.map(faction_tier(1)).unwrap();
         let cid = *m.clusters.keys().next().unwrap();
         assert_eq!(m.clusters[&cid].estimated_count, 2);
@@ -866,7 +965,8 @@ mod tests {
         // `nearest_target_tile` used to fall back to `c.center` when every
         // rep slot was None, which routed every querier to the same stale
         // tile. The new contract: empty LRU ⇒ None.
-        let mut c = ResourceCluster::new(ClusterId(0), fake_kind(), ResourceOwner::Public, (5, 5), 0);
+        let mut c =
+            ResourceCluster::new(ClusterId(0), fake_kind(), ResourceOwner::Public, (5, 5), 0);
         c.drop_rep((5, 5));
         assert!(c.representative_tiles.iter().all(|s| s.is_none()));
         assert_eq!(c.nearest_target_tile((0, 0)), None);
@@ -879,8 +979,20 @@ mod tests {
         // against vision sweeps over empty grass tiles inside a forest's
         // bounding box from collapsing the cluster.
         let mut sk = SharedKnowledge::default();
-        sk.report_sighting(faction_tier(1), (10, 10), fake_kind(), ResourceOwner::Public, 0);
-        sk.report_sighting(faction_tier(1), (15, 13), fake_kind(), ResourceOwner::Public, 0);
+        sk.report_sighting(
+            faction_tier(1),
+            (10, 10),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        sk.report_sighting(
+            faction_tier(1),
+            (15, 13),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
         let m = sk.map(faction_tier(1)).unwrap();
         let cid = *m.clusters.keys().next().unwrap();
         let count_before = m.clusters[&cid].estimated_count;
@@ -938,14 +1050,7 @@ mod tests {
 
         // No filter: the close cluster wins.
         let got = m
-            .nearest_with_cluster_filter(
-                fake_kind(),
-                (0, 0),
-                |_| true,
-                |_| 0,
-                |_| true,
-                32,
-            )
+            .nearest_with_cluster_filter(fake_kind(), (0, 0), |_| true, |_| 0, |_| true, 32)
             .unwrap();
         assert_eq!(got, near_close);
 
@@ -969,9 +1074,25 @@ mod tests {
         // P6c: end-to-end on `nearest_in_tier_set`. Single cluster with
         // two reps; pressure on the closer rep flips the chosen target.
         let mut sk = SharedKnowledge::default();
-        sk.report_sighting(faction_tier(1), (5, 5), fake_kind(), ResourceOwner::Public, 0);
-        sk.report_sighting(faction_tier(1), (12, 11), fake_kind(), ResourceOwner::Public, 0);
-        let ts = TierSet { household: None, settlement: None, faction: 1 };
+        sk.report_sighting(
+            faction_tier(1),
+            (5, 5),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        sk.report_sighting(
+            faction_tier(1),
+            (12, 11),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        let ts = TierSet {
+            household: None,
+            settlement: None,
+            faction: 1,
+        };
 
         // Without pressure: closest rep wins.
         let (_, _, t0) = sk
@@ -990,8 +1111,20 @@ mod tests {
     #[test]
     fn nearest_picks_closest_cluster() {
         let mut sk = SharedKnowledge::default();
-        let near = sk.report_sighting(faction_tier(1), (5, 5), fake_kind(), ResourceOwner::Public, 0);
-        let _far = sk.report_sighting(faction_tier(1), (200, 200), fake_kind(), ResourceOwner::Public, 0);
+        let near = sk.report_sighting(
+            faction_tier(1),
+            (5, 5),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        let _far = sk.report_sighting(
+            faction_tier(1),
+            (200, 200),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
         let m = sk.map(faction_tier(1)).unwrap();
         let got = m.nearest(fake_kind(), (0, 0), |_| true, |_| 0, 32).unwrap();
         assert_eq!(got, near);
@@ -1000,10 +1133,30 @@ mod tests {
     #[test]
     fn nearest_respects_owner_filter() {
         let mut sk = SharedKnowledge::default();
-        let _public_far = sk.report_sighting(faction_tier(1), (50, 50), fake_kind(), ResourceOwner::Public, 0);
-        let private_near = sk.report_sighting(faction_tier(1), (5, 5), fake_kind(), ResourceOwner::Faction(7), 0);
+        let _public_far = sk.report_sighting(
+            faction_tier(1),
+            (50, 50),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        let private_near = sk.report_sighting(
+            faction_tier(1),
+            (5, 5),
+            fake_kind(),
+            ResourceOwner::Faction(7),
+            0,
+        );
         let m = sk.map(faction_tier(1)).unwrap();
-        let got = m.nearest(fake_kind(), (0, 0), |o| matches!(o, ResourceOwner::Public), |_| 0, 32).unwrap();
+        let got = m
+            .nearest(
+                fake_kind(),
+                (0, 0),
+                |o| matches!(o, ResourceOwner::Public),
+                |_| 0,
+                32,
+            )
+            .unwrap();
         let cluster = &m.clusters[&got];
         assert!(matches!(cluster.owner, ResourceOwner::Public));
         assert_ne!(got, private_near);
@@ -1013,10 +1166,28 @@ mod tests {
     fn nearest_in_tier_set_walks_finest_first() {
         let mut sk = SharedKnowledge::default();
         // Faction-tier knows a far one; household-tier knows a near one.
-        sk.report_sighting(KnowledgeTier::Faction(1), (100, 100), fake_kind(), ResourceOwner::Public, 0);
-        sk.report_sighting(KnowledgeTier::Household(42), (3, 3), fake_kind(), ResourceOwner::Public, 0);
-        let ts = TierSet { household: Some(42), settlement: None, faction: 1 };
-        let (tier, _cid, target) = sk.nearest_in_tier_set(ts, fake_kind(), (0, 0), |_| true, |_| 0, 32).unwrap();
+        sk.report_sighting(
+            KnowledgeTier::Faction(1),
+            (100, 100),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        sk.report_sighting(
+            KnowledgeTier::Household(42),
+            (3, 3),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        let ts = TierSet {
+            household: Some(42),
+            settlement: None,
+            faction: 1,
+        };
+        let (tier, _cid, target) = sk
+            .nearest_in_tier_set(ts, fake_kind(), (0, 0), |_| true, |_| 0, 32)
+            .unwrap();
         assert_eq!(tier, KnowledgeTier::Household(42));
         assert_eq!(target, (3, 3));
     }
@@ -1024,8 +1195,20 @@ mod tests {
     #[test]
     fn decay_removes_stale_clusters() {
         let mut sk = SharedKnowledge::default();
-        sk.report_sighting(faction_tier(1), (10, 10), fake_kind(), ResourceOwner::Public, 0);
-        sk.report_sighting(faction_tier(1), (1000, 1000), fake_kind(), ResourceOwner::Public, CLUSTER_DECAY_TTL_TICKS + 100);
+        sk.report_sighting(
+            faction_tier(1),
+            (10, 10),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        sk.report_sighting(
+            faction_tier(1),
+            (1000, 1000),
+            fake_kind(),
+            ResourceOwner::Public,
+            CLUSTER_DECAY_TTL_TICKS + 100,
+        );
         sk.decay(CLUSTER_DECAY_TTL_TICKS + 100);
         let m = sk.map(faction_tier(1)).unwrap();
         assert_eq!(m.clusters.len(), 1);
@@ -1035,8 +1218,20 @@ mod tests {
     #[test]
     fn sighting_grows_cluster_radius() {
         let mut sk = SharedKnowledge::default();
-        let a = sk.report_sighting(faction_tier(1), (10, 10), fake_kind(), ResourceOwner::Public, 0);
-        sk.report_sighting(faction_tier(1), (15, 14), fake_kind(), ResourceOwner::Public, 0);
+        let a = sk.report_sighting(
+            faction_tier(1),
+            (10, 10),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        sk.report_sighting(
+            faction_tier(1),
+            (15, 14),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
         let c = &sk.map(faction_tier(1)).unwrap().clusters[&a];
         assert!(c.radius >= 5);
     }
@@ -1047,12 +1242,30 @@ mod tests {
         // each one should merge with the previous (within MERGE_RADIUS), but
         // radius is capped.
         let mut sk = SharedKnowledge::default();
-        sk.report_sighting(faction_tier(1), (0, 0), fake_kind(), ResourceOwner::Public, 0);
+        sk.report_sighting(
+            faction_tier(1),
+            (0, 0),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
         // Each step must be ≤ CLUSTER_MERGE_RADIUS from the *current center*,
         // and the center is the original sighting (we don't recompute it),
         // so a few merges still cap the radius at MAX_CLUSTER_RADIUS.
-        sk.report_sighting(faction_tier(1), (8, 0), fake_kind(), ResourceOwner::Public, 0);
-        let c = sk.map(faction_tier(1)).unwrap().clusters.values().next().unwrap();
+        sk.report_sighting(
+            faction_tier(1),
+            (8, 0),
+            fake_kind(),
+            ResourceOwner::Public,
+            0,
+        );
+        let c = sk
+            .map(faction_tier(1))
+            .unwrap()
+            .clusters
+            .values()
+            .next()
+            .unwrap();
         assert!(c.radius <= MAX_CLUSTER_RADIUS);
     }
 

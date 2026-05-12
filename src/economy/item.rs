@@ -252,4 +252,3 @@ fn compute_combat_stats(
         (None, None)
     }
 }
-

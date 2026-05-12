@@ -613,12 +613,12 @@ mod tests {
         // across bulk classes and partial-hand states. This guards the resolver
         // from committing units the executor would refuse.
         let cases: [crate::economy::resource_catalog::ResourceId; 6] = [
-            crate::economy::core_ids::stone(),       // TwoHand, 5000g
-            crate::economy::core_ids::wood(),        // TwoHand, 3000g
-            crate::economy::core_ids::coal(),        // OneHand, 2000g
-            crate::economy::core_ids::fruit(),       // Small, 250g
-            crate::economy::core_ids::grain_seed(),  // Small, 20g
-            crate::economy::core_ids::berry_seed(),  // Small, 20g
+            crate::economy::core_ids::stone(),      // TwoHand, 5000g
+            crate::economy::core_ids::wood(),       // TwoHand, 3000g
+            crate::economy::core_ids::coal(),       // OneHand, 2000g
+            crate::economy::core_ids::fruit(),      // Small, 250g
+            crate::economy::core_ids::grain_seed(), // Small, 20g
+            crate::economy::core_ids::berry_seed(), // Small, 20g
         ];
         let fruit_id = crate::economy::core_ids::fruit();
         for rid in cases {

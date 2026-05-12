@@ -56,22 +56,58 @@ mod tests {
 
     #[test]
     fn neolithic_8_unlocks_granary() {
-        assert!(civic_milestone_allows(CivicKind::Granary, Era::Neolithic, 8));
-        assert!(!civic_milestone_allows(CivicKind::Granary, Era::Neolithic, 7));
-        assert!(!civic_milestone_allows(CivicKind::Shrine, Era::Neolithic, 8));
+        assert!(civic_milestone_allows(
+            CivicKind::Granary,
+            Era::Neolithic,
+            8
+        ));
+        assert!(!civic_milestone_allows(
+            CivicKind::Granary,
+            Era::Neolithic,
+            7
+        ));
+        assert!(!civic_milestone_allows(
+            CivicKind::Shrine,
+            Era::Neolithic,
+            8
+        ));
     }
 
     #[test]
     fn bronze_80_unlocks_monument() {
-        assert!(civic_milestone_allows(CivicKind::Monument, Era::BronzeAge, 80));
-        assert!(!civic_milestone_allows(CivicKind::Monument, Era::Chalcolithic, 80));
-        assert!(!civic_milestone_allows(CivicKind::Monument, Era::BronzeAge, 79));
+        assert!(civic_milestone_allows(
+            CivicKind::Monument,
+            Era::BronzeAge,
+            80
+        ));
+        assert!(!civic_milestone_allows(
+            CivicKind::Monument,
+            Era::Chalcolithic,
+            80
+        ));
+        assert!(!civic_milestone_allows(
+            CivicKind::Monument,
+            Era::BronzeAge,
+            79
+        ));
     }
 
     #[test]
     fn chalcolithic_40_unlocks_market() {
-        assert!(civic_milestone_allows(CivicKind::Market, Era::Chalcolithic, 40));
-        assert!(!civic_milestone_allows(CivicKind::Market, Era::Neolithic, 40));
-        assert!(!civic_milestone_allows(CivicKind::Market, Era::Chalcolithic, 39));
+        assert!(civic_milestone_allows(
+            CivicKind::Market,
+            Era::Chalcolithic,
+            40
+        ));
+        assert!(!civic_milestone_allows(
+            CivicKind::Market,
+            Era::Neolithic,
+            40
+        ));
+        assert!(!civic_milestone_allows(
+            CivicKind::Market,
+            Era::Chalcolithic,
+            39
+        ));
     }
 }

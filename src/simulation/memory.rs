@@ -82,18 +82,14 @@ pub struct AgentMemory {
     /// `(SettlementId, freshness)` for up to 8 settlements the
     /// agent has visited or heard about. R10's Trader dispatcher
     /// walks pairs in this slot for arbitrage.
-    pub visited_settlements:
-        [Option<(crate::simulation::settlement::SettlementId, u8)>; 8],
+    pub visited_settlements: [Option<(crate::simulation::settlement::SettlementId, u8)>; 8],
 }
 
 impl AgentMemory {
     /// Pluralist Economy R8: record a visited / heard-about settlement.
     /// Idempotent — re-recording the same id resets the freshness to 255.
     /// When the slot ring is full, evicts the lowest-freshness entry.
-    pub fn record_settlement(
-        &mut self,
-        id: crate::simulation::settlement::SettlementId,
-    ) {
+    pub fn record_settlement(&mut self, id: crate::simulation::settlement::SettlementId) {
         for slot in &mut self.visited_settlements {
             if let Some((existing, fresh)) = slot {
                 if *existing == id {
@@ -229,9 +225,7 @@ impl CurrentVision {
                 .filter_map(|v| v.entity.map(|e| (e, v.tile)))
                 .filter(|(_, tile)| !is_storage_tile(*tile))
                 .filter(|(_, tile)| !require_reachable || is_reachable(*tile))
-                .min_by_key(|(_, tile)| {
-                    (tile.0 - from.0).abs().max((tile.1 - from.1).abs())
-                })
+                .min_by_key(|(_, tile)| (tile.0 - from.0).abs().max((tile.1 - from.1).abs()))
         };
         pick(true).or_else(|| pick(false))
     }
@@ -323,10 +317,7 @@ impl RelationshipMemory {
 /// Daily decay tick for `RelationshipMemory`. The companion tile-memory
 /// decay was retired with the 32-slot ring in Phase 7 — `SharedKnowledge`
 /// owns cluster freshness via `cluster_decay_system` now.
-pub fn relationship_decay_system(
-    clock: Res<SimClock>,
-    mut query: Query<&mut RelationshipMemory>,
-) {
+pub fn relationship_decay_system(clock: Res<SimClock>, mut query: Query<&mut RelationshipMemory>) {
     if clock.tick % 3600 != 0 {
         return;
     }
@@ -371,7 +362,9 @@ pub fn vision_system(
     const VIEW_RADIUS: i32 = 15;
 
     let now = clock.tick;
-    for (transform, slot, lod, ai, faction_member, household_member, mut current_vision) in query.iter_mut() {
+    for (transform, slot, lod, ai, faction_member, household_member, mut current_vision) in
+        query.iter_mut()
+    {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -420,9 +413,7 @@ pub fn vision_system(
                     if let Ok((plant, land_claim)) = plant_query.get(entity) {
                         let kind = match plant.kind {
                             crate::simulation::plants::PlantKind::BerryBush
-                            | crate::simulation::plants::PlantKind::Grain => {
-                                MemoryKind::AnyEdible
-                            }
+                            | crate::simulation::plants::PlantKind::Grain => MemoryKind::AnyEdible,
                             crate::simulation::plants::PlantKind::Tree => MemoryKind::wood(),
                         };
                         if plant.stage == crate::simulation::plants::GrowthStage::Mature {
@@ -466,7 +457,13 @@ pub fn vision_system(
                             });
                         if let Some(k) = shared_kind {
                             // Loose ground items belong to no one — Public.
-                            shared.report_sighting(write_tier, (ntx, nty), k, ResourceOwner::Public, now);
+                            shared.report_sighting(
+                                write_tier,
+                                (ntx, nty),
+                                k,
+                                ResourceOwner::Public,
+                                now,
+                            );
                         }
                         // Vision-first: dispatchers look up entries by
                         // MemoryKind. Push Resource(rid) for every item, plus
@@ -489,7 +486,13 @@ pub fn vision_system(
                         }
                     } else if let Ok((_, health)) = prey_query.get(entity) {
                         if !health.is_dead() {
-                            shared.report_sighting(write_tier, (ntx, nty), MemoryKind::Prey, ResourceOwner::Public, now);
+                            shared.report_sighting(
+                                write_tier,
+                                (ntx, nty),
+                                MemoryKind::Prey,
+                                ResourceOwner::Public,
+                                now,
+                            );
                             current_vision.entries.push(VisionEntry {
                                 kind: MemoryKind::Prey,
                                 tile: (ntx, nty),
@@ -502,7 +505,13 @@ pub fn vision_system(
 
                 if let Some(tile_kind) = chunk_map.tile_kind_at(ntx, nty) {
                     if tile_kind == crate::world::tile::TileKind::Stone {
-                        shared.report_sighting(write_tier, (ntx, nty), MemoryKind::stone(), ResourceOwner::Public, now);
+                        shared.report_sighting(
+                            write_tier,
+                            (ntx, nty),
+                            MemoryKind::stone(),
+                            ResourceOwner::Public,
+                            now,
+                        );
                         current_vision.entries.push(VisionEntry {
                             kind: MemoryKind::stone(),
                             tile: (ntx, nty),

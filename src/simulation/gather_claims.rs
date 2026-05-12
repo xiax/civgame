@@ -133,8 +133,7 @@ impl GatherClaims {
         now: u64,
         viewer: Entity,
     ) -> bool {
-        self.pressure_across_tiles(rep_tiles, now, viewer)
-            >= MAX_PARALLEL_GATHERERS_PER_CLUSTER
+        self.pressure_across_tiles(rep_tiles, now, viewer) >= MAX_PARALLEL_GATHERERS_PER_CLUSTER
     }
 }
 

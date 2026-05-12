@@ -26,9 +26,7 @@ use serde::Deserialize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HomeMobility {
     Anchored,
-    Mobile {
-        migration_period_min_days: u32,
-    },
+    Mobile { migration_period_min_days: u32 },
 }
 
 impl HomeMobility {
@@ -81,12 +79,7 @@ impl SettlementMode {
         matches!(self, SettlementMode::Camp)
     }
     pub fn carves_plots(self) -> bool {
-        matches!(
-            self,
-            SettlementMode::FullSettlement {
-                carves_plots: true
-            }
-        )
+        matches!(self, SettlementMode::FullSettlement { carves_plots: true })
     }
 }
 
@@ -204,9 +197,7 @@ impl Default for FactionCapabilities {
             home: HomeMobility::Anchored,
             storage: StorageBackendKind::FactionTile,
             shelter: ShelterMode::Permanent,
-            settlement: SettlementMode::FullSettlement {
-                carves_plots: true,
-            },
+            settlement: SettlementMode::FullSettlement { carves_plots: true },
             posting: PostingMode::Enabled,
             land: LandModalities {
                 policy: LandPolicy::default(),
@@ -245,9 +236,7 @@ pub fn derive_from_legacy(
             HomeMobility::Anchored,
             StorageBackendKind::FactionTile,
             ShelterMode::Permanent,
-            SettlementMode::FullSettlement {
-                carves_plots: true,
-            },
+            SettlementMode::FullSettlement { carves_plots: true },
             PostingMode::Enabled,
         ),
         Lifestyle::Nomadic => (
@@ -428,14 +417,10 @@ pub fn load_archetype_registry(catalog: &ResourceCatalog) -> FactionArchetypeReg
         if path.extension().and_then(|s| s.to_str()) != Some("ron") {
             continue;
         }
-        let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!("FactionArchetypeRegistry: cannot read {:?}: {}", path, e)
-        });
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("FactionArchetypeRegistry: cannot read {:?}: {}", path, e));
         let file: ArchetypeFile = ron::from_str(&body).unwrap_or_else(|e| {
-            panic!(
-                "FactionArchetypeRegistry: parse error in {:?}: {}",
-                path, e
-            )
+            panic!("FactionArchetypeRegistry: parse error in {:?}: {}", path, e)
         });
         for row in file.archetypes {
             if let Some(prev) = seen.get(&row.key) {

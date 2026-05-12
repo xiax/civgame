@@ -99,9 +99,7 @@ pub enum Task {
     /// itself is still routed via the legacy `dest_tile` field; this variant
     /// only owns the *what to take* parameters. Once Phase 3 finishes, the
     /// storage tile entity will live here too.
-    WithdrawGood {
-        filter: WithdrawGoodFilter,
-    },
+    WithdrawGood { filter: WithdrawGoodFilter },
     /// Withdraw `qty` units of `resource_id` for a faction-blueprint /
     /// craft-order / haul-claim need. Replaces
     /// `PersonAI.{withdraw_good, withdraw_qty}`. The reservation against the
@@ -109,10 +107,7 @@ pub enum Task {
     /// every cleanup path goes through `release_reservation` — Phase 3
     /// collapses that into a `Drop` guard once the loose-target fields are
     /// fully retired.
-    WithdrawMaterial {
-        resource_id: ResourceId,
-        qty: u8,
-    },
+    WithdrawMaterial { resource_id: ResourceId, qty: u8 },
     /// P2b: nomadic / member-pool counterpart to `WithdrawMaterial`. Walks
     /// the actor adjacent to `target` (a fellow faction member), then pulls
     /// `qty` units of `resource_id` out of the target's `EconomicAgent.inventory`
@@ -141,49 +136,33 @@ pub enum Task {
     /// `PersonAI.target_entity` reads in `construction_system`'s worker
     /// branch; the field stays populated for now because Hunt / Attack /
     /// other families haven't migrated yet.
-    Construct {
-        blueprint: bevy::prelude::Entity,
-    },
+    Construct { blueprint: bevy::prelude::Entity },
     /// Harvest from a tile: plant fruits/wood, surface stone, or ore.
     /// `gather_system` inspects the tile contents to decide; the typed task
     /// just owns the *which tile*. Replaces `dest_tile` reads in the gather
     /// executor — the legacy field stays populated because `movement_system`
     /// still drives routing off of it.
-    Gather {
-        tile: (i32, i32),
-    },
+    Gather { tile: (i32, i32) },
     /// Dig down at a tile, lowering its floor by one Z and producing the
     /// carved material as drops. Same shape as `Gather` — `dig_system` reads
     /// the tile from this variant; legacy `dest_tile` is kept for routing.
-    Dig {
-        tile: (i32, i32),
-    },
+    Dig { tile: (i32, i32) },
     /// Pick up a specific `GroundItem` entity. Replaces the `TargetItem.0`
     /// read in `item_pickup_system` for the Scavenge branch — the typed
     /// channel is now the source of truth, falling back to `TargetItem.0`
     /// only for legacy player-dispatch sites.
-    Scavenge {
-        target: bevy::prelude::Entity,
-    },
+    Scavenge { target: bevy::prelude::Entity },
     /// Solo study of a tablet/book in inventory. Replaces `tech_focus`
     /// (the loose `Option<TechId>` field) for the Read executor.
-    Read {
-        tech: TechId,
-    },
+    Read { tech: TechId },
     /// 1-on-1 teaching: teacher stays adjacent to student and transfers
     /// progress on `tech`. The student-side state (`BeingTaught`) is a
     /// separate component; this variant only owns the teacher's params.
-    Teach {
-        tech: TechId,
-    },
+    Teach { tech: TechId },
     /// Stand at lecture anchor and broadcast progress to nearby attendees.
-    HoldLecture {
-        tech: TechId,
-    },
+    HoldLecture { tech: TechId },
     /// Stand near a lecturer and accumulate study progress on `tech`.
-    AttendLecture {
-        tech: TechId,
-    },
+    AttendLecture { tech: TechId },
     /// Walk adjacent to a `Corpse` entity and attach it to
     /// `PersonAI.carried_corpse`. Replaces `target_entity` reads in
     /// `pickup_corpse_task_system`. The downstream HaulCorpse + Butcher tasks
@@ -191,9 +170,7 @@ pub enum Task {
     /// the corpse from the `Carrying` component (which spans pickup → haul →
     /// butcher) rather than per-task params, so the typed variants only
     /// document the phase.
-    PickUpCorpse {
-        corpse: bevy::prelude::Entity,
-    },
+    PickUpCorpse { corpse: bevy::prelude::Entity },
     /// Walk adjacent to another Person and converse — `social_fill_system`
     /// reduces `needs.social` for any agent with neighbours within
     /// `SOCIAL_RADIUS`, and `needs.rs`'s table+chair bonus reads
@@ -204,9 +181,7 @@ pub enum Task {
     /// flips them off `AgentGoal::Socialize`. Produced by HTN
     /// `SocializeWithPartnerMethod` (replaces legacy `Socialize` plan
     /// PlanId 60 + StepId 48).
-    Socialize {
-        partner: bevy::prelude::Entity,
-    },
+    Socialize { partner: bevy::prelude::Entity },
     /// Walk to the home tile of the faction this agent is raiding (per
     /// `FactionRegistry::raid_target`). On arrival the legacy executor's
     /// task entry, `task_requires_free_hands`, and `task_interacts_from_adjacent`
@@ -214,27 +189,21 @@ pub enum Task {
     /// faction member encountered along the way. Produced by HTN
     /// `RaidEnemyHomeMethod` (replaces legacy `Raid` plan PlanId 61 +
     /// StepId 49).
-    Raid {
-        dest: (i32, i32),
-    },
+    Raid { dest: (i32, i32) },
     /// Walk to the agent's faction home tile and stand watch. No dedicated
     /// executor — the agent stays in `TaskKind::Defend` until
     /// `goal_update_system` flips them off `AgentGoal::Defend` (typically
     /// when the faction is no longer `is_under_raid`). Produced by HTN
     /// `DefendCampMethod` (replaces legacy `Defend` plan PlanId 62 +
     /// StepId 50).
-    Defend {
-        dest: (i32, i32),
-    },
+    Defend { dest: (i32, i32) },
     /// Tribal chief in peacetime walks to the faction home tile and runs
     /// `TaskKind::Lead` — used by `chief_*` systems as a "chief is on duty"
     /// signal. No dedicated executor; the chief stays here until
     /// `goal_update_system` peels them off `AgentGoal::Lead` (crisis,
     /// hunger, sleep). Produced by HTN `LeadCampMethod` (replaces legacy
     /// `Lead` plan PlanId 63 + StepId 51).
-    Lead {
-        dest: (i32, i32),
-    },
+    Lead { dest: (i32, i32) },
     /// Distress responder routes to the attacker carried on the agent's
     /// `RescueTarget` component. The dispatcher mirrors the legacy
     /// `StepTarget::RescueAttacker` resolver: writes `CombatTarget(Some(attacker))`
@@ -254,9 +223,7 @@ pub enum Task {
     /// `hearth` tile is also written to legacy `dest_tile` for routing.
     /// Produced by the future HTN `MusterAtHearthMethod` and by the legacy
     /// `HuntFood` plan's StepId(57).
-    HuntPartyMuster {
-        hearth: (i32, i32),
-    },
+    HuntPartyMuster { hearth: (i32, i32) },
     /// Hunt down the named prey entity. There is no dedicated executor — the
     /// dispatcher routes the agent to the prey via
     /// `assign_task_with_routing(... TaskKind::Hunter, Some(prey) ...)` and
@@ -264,17 +231,13 @@ pub enum Task {
     /// agent is adjacent. The variant carries the prey entity for chain
     /// inspection (the future HTN `EngagePreyMethod` will read it; the
     /// legacy `HuntFood` plan's StepId(5) writes it for parity).
-    Hunt {
-        prey: bevy::prelude::Entity,
-    },
+    Hunt { prey: bevy::prelude::Entity },
     /// Drag the carried corpse to the named butcher-site tile. The corpse
     /// itself follows via `corpse_follow_system` (no typed-task input). The
     /// `dest` tile is also written to legacy `dest_tile` for routing.
     /// Produced by the future HTN `HaulCorpseMethod` and by the legacy
     /// `HuntFood` plan's StepId(54).
-    HaulCorpse {
-        dest: (i32, i32),
-    },
+    HaulCorpse { dest: (i32, i32) },
     /// Butcher the carried corpse in place. The corpse comes from the
     /// `Carrying` component (set at PickUpCorpse arrival, cleared on butcher
     /// completion). Parameterless because every input is component-level
@@ -291,9 +254,7 @@ pub enum Task {
     /// is what the HTN dispatcher (`htn_tame_horse_dispatch_system`) emits
     /// for chain-integrity inspection. Replaces the legacy `TameHorse` plan
     /// (PlanId 10).
-    TameAnimal {
-        target: bevy::prelude::Entity,
-    },
+    TameAnimal { target: bevy::prelude::Entity },
     /// Plant one seed (Grain / Berry / …) from the agent's inventory or hands
     /// onto an unplanted Farmland tile. The executor (`production_system`'s
     /// Planter branch) walks `PlantKind::ALL` to pick the matching plant for
@@ -304,9 +265,7 @@ pub enum Task {
     /// what the HTN dispatcher (`htn_plant_from_storage_dispatch_system`)
     /// emits for chain-integrity inspection. Replaces the dead legacy
     /// `PlantFromStorage` / `PlantBerryFromStorage` plans (PlanIds 4, 66).
-    Planter {
-        tile: (i32, i32),
-    },
+    Planter { tile: (i32, i32) },
     /// Agent is tired and is either routing toward a bed / faction home or
     /// already asleep in place. The Sleep "executor" is a state transition
     /// (`AiState::Sleeping`) rather than a per-tick task system, so this
@@ -315,9 +274,7 @@ pub enum Task {
     /// for Phase 5a, where an HTN method will produce this variant directly.
     /// `bed = None` means "sleep in place" (solo agent, or at-home with no
     /// claimed bed yet).
-    Sleep {
-        bed: Option<bevy::prelude::Entity>,
-    },
+    Sleep { bed: Option<bevy::prelude::Entity> },
     /// Consume edibles from inventory or hands in place. The agent stays in
     /// `AiState::Working` accumulating `work_progress` until `TICKS_EAT`, then
     /// `eat_task_system` consumes one item per loop and reduces hunger. The
@@ -336,9 +293,7 @@ pub enum Task {
     /// withdraw — no per-tick work accumulation. Produced by
     /// `WithdrawFromStorageMethod` as the first leg of an
     /// `AcquireFood → WithdrawFood → Eat` chain.
-    WithdrawFood {
-        tile: (i32, i32),
-    },
+    WithdrawFood { tile: (i32, i32) },
     /// Carry the agent's hand contents to the named `Blueprint` and drop them
     /// into its deposit slots. Produced by `WithdrawAndHaulToBlueprintMethod`
     /// as the second leg of an `AcquireGood → WithdrawMaterial → HaulToBlueprint`
@@ -349,9 +304,7 @@ pub enum Task {
     /// blueprint so the chain handoff in `withdraw_material_task_system`
     /// (`finish_withdraw_material`) has everything it needs to look up the
     /// tile and route the agent without re-entering plan selection.
-    HaulToBlueprint {
-        blueprint: bevy::prelude::Entity,
-    },
+    HaulToBlueprint { blueprint: bevy::prelude::Entity },
     /// Carry the agent's hand contents to the named `CraftOrder` anchor and
     /// drop matching held goods into its deposit slots. Produced by
     /// `WithdrawAndHaulToCraftOrderMethod` (Phase 5e-xi-a — replaces the legacy
@@ -363,9 +316,7 @@ pub enum Task {
     /// the chain handoff in `production::finish_withdraw_material` has
     /// everything it needs to route the agent to the order's anchor tile
     /// without re-entering plan selection.
-    HaulToCraftOrder {
-        order: bevy::prelude::Entity,
-    },
+    HaulToCraftOrder { order: bevy::prelude::Entity },
     /// Recreational play. `partner = Some(e)` for social play (the agent walks
     /// adjacent to another `Person` and plays together — `play_system` reads
     /// the partner from `ai.target_entity` set up by routing); `partner = None`
@@ -403,9 +354,7 @@ pub enum Task {
     /// handoff in `production::finish_withdraw_material` routes via
     /// `TaskKind::PlayPlant` to the destination grass tile carried by the
     /// typed variant once the seed is in hand.
-    PlayPlant {
-        tile: (i32, i32),
-    },
+    PlayPlant { tile: (i32, i32) },
     /// Work adjacent to a satisfied `CraftOrder` until the recipe completes.
     /// Produced by `WorkOnSatisfiedCraftOrderMethod` (Phase 5e-xi-b — replaces
     /// the legacy `WorkOnCraft` plan, PlanId 16) as the head of a
@@ -415,9 +364,7 @@ pub enum Task {
     /// out the recipe output to the lead worker on completion. The typed
     /// variant carries the order so dispatch / chain handoff has the right
     /// target without re-querying.
-    WorkOnCraftOrder {
-        order: bevy::prelude::Entity,
-    },
+    WorkOnCraftOrder { order: bevy::prelude::Entity },
     /// Carry the agent's hand contents to the nearest faction storage tile and
     /// drop them. Produced by `GatherFromKnownMethod` (Phase 5c-ii-c) as the
     /// trailing leg of an `AcquireGood → Gather → DepositToFactionStorage`
@@ -434,9 +381,7 @@ pub enum Task {
     /// `GatherFromKnownMethod` produces the variant in unit tests, but no
     /// dispatcher consumes the typed channel yet — the legacy `GatherWood` /
     /// `GatherStone` plans (PlanId 2/3) remain authoritative.
-    DepositToFactionStorage {
-        resource_id: ResourceId,
-    },
+    DepositToFactionStorage { resource_id: ResourceId },
     /// Walk to a random reachable tile near the agent's faction home, hoping
     /// to record a `MemoryKind::{kind}` sighting along the way. Produced by
     /// `ExploreForFoodMethod` (under `AcquireFood`) and `ExploreForMaterialMethod`
@@ -457,9 +402,7 @@ pub enum Task {
     /// tests but no dispatcher consumes the typed channel yet; the legacy
     /// `ExploreForFood` / `ExploreForWood` / `ExploreForStone` plans remain
     /// authoritative.
-    Explore {
-        kind: MemoryKind,
-    },
+    Explore { kind: MemoryKind },
     /// Worker walks adjacent to a `ConstructionObstacle`-tagged entity in
     /// `blueprint`'s footprint, accumulates work_progress against its
     /// `WorkerClear { work_ticks, .. }` resolution, then despawns it
@@ -675,9 +618,7 @@ impl Task {
 
     /// Convenience accessor for the ClearObstacle variant. Returns
     /// `(obstacle_entity, blueprint_entity)`.
-    pub fn as_clear_obstacle(
-        &self,
-    ) -> Option<(bevy::prelude::Entity, bevy::prelude::Entity)> {
+    pub fn as_clear_obstacle(&self) -> Option<(bevy::prelude::Entity, bevy::prelude::Entity)> {
         match *self {
             Task::ClearObstacle { entity, blueprint } => Some((entity, blueprint)),
             _ => None,

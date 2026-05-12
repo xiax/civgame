@@ -638,10 +638,7 @@ fn entity_display_name(
         return format!("{:?} Corpse", corpse.species);
     }
     if person_q.get(entity).is_ok() {
-        let name = name_q
-            .get(entity)
-            .map(|n| n.as_str())
-            .unwrap_or("Person");
+        let name = name_q.get(entity).map(|n| n.as_str()).unwrap_or("Person");
         let profession = profession_q.get(entity).ok();
         return match profession {
             Some(Profession::Farmer) => format!("{name} (Farmer)"),
@@ -845,12 +842,7 @@ pub fn military_right_click_system(
         match target {
             None => {
                 // Empty tile → group move.
-                emit_military_move(
-                    &mut cmd_events,
-                    &drafted_units,
-                    target_tile_i32,
-                    target_z,
-                );
+                emit_military_move(&mut cmd_events, &drafted_units, target_tile_i32, target_z);
                 menu_state.open = false;
             }
             Some(foe) => {

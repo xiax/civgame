@@ -39,8 +39,7 @@ impl Plugin for UiPlugin {
             .add_event::<activity_log::ActivityLogEvent>()
             .add_systems(
                 Update,
-                spawn_select::spawn_select_system
-                    .run_if(in_state(crate::GameState::SpawnSelect)),
+                spawn_select::spawn_select_system.run_if(in_state(crate::GameState::SpawnSelect)),
             )
             .add_systems(
                 Update,

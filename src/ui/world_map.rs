@@ -2,7 +2,9 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::simulation::region::{MegaChunkCoord, SettledRegions};
-use crate::world::globe::{Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH, MEGACHUNK_SIZE_CHUNKS};
+use crate::world::globe::{
+    Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH, MEGACHUNK_SIZE_CHUNKS,
+};
 
 /// Pixels per climate cell when rendering the world map. 2× = sub-cell
 /// bilinear biome detail that matches `biome::classify_at_tile`. Bumping
@@ -78,13 +80,11 @@ pub fn world_map_system(
 
             // Scale image to fit within ~800×400 px
             let scale = 10.0f32;
-            let img_w = GLOBE_WIDTH  as f32 * scale;
+            let img_w = GLOBE_WIDTH as f32 * scale;
             let img_h = GLOBE_HEIGHT as f32 * scale;
 
-            let (rect, response) = ui.allocate_exact_size(
-                egui::vec2(img_w, img_h),
-                egui::Sense::click(),
-            );
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(img_w, img_h), egui::Sense::click());
 
             ui.painter().image(
                 tex.id(),
@@ -96,11 +96,11 @@ pub fn world_map_system(
             use crate::world::chunk::CHUNK_SIZE;
             use crate::world::terrain::TILE_SIZE;
 
-            let total_tiles_x = (GLOBE_WIDTH  * GLOBE_CELL_CHUNKS * CHUNK_SIZE as i32) as f32;
+            let total_tiles_x = (GLOBE_WIDTH * GLOBE_CELL_CHUNKS * CHUNK_SIZE as i32) as f32;
             let total_tiles_y = (GLOBE_HEIGHT * GLOBE_CELL_CHUNKS * CHUNK_SIZE as i32) as f32;
 
             // Mega-chunk overlay: outline every settled mega-chunk in faction colour.
-            let mc_grid_w = (GLOBE_WIDTH  * GLOBE_CELL_CHUNKS) / MEGACHUNK_SIZE_CHUNKS;
+            let mc_grid_w = (GLOBE_WIDTH * GLOBE_CELL_CHUNKS) / MEGACHUNK_SIZE_CHUNKS;
             let mc_grid_h = (GLOBE_HEIGHT * GLOBE_CELL_CHUNKS) / MEGACHUNK_SIZE_CHUNKS;
             let cell_w = img_w / mc_grid_w as f32;
             let cell_h = img_h / mc_grid_h as f32;
@@ -124,7 +124,8 @@ pub fn world_map_system(
                 } else {
                     egui::Color32::from_rgba_premultiplied(200, 100, 100, 180)
                 };
-                ui.painter().rect_stroke(r, 0.0, egui::Stroke::new(2.0, color));
+                ui.painter()
+                    .rect_stroke(r, 0.0, egui::Stroke::new(2.0, color));
             }
 
             // Draw current camera position as a white rectangle.
@@ -136,7 +137,7 @@ pub fn world_map_system(
                 let ny = 1.0 - tile_y / total_tiles_y;
 
                 use crate::world::chunk_streaming::LOAD_RADIUS;
-                let view_w = (LOAD_RADIUS * 2) as f32 / (GLOBE_WIDTH  * GLOBE_CELL_CHUNKS) as f32;
+                let view_w = (LOAD_RADIUS * 2) as f32 / (GLOBE_WIDTH * GLOBE_CELL_CHUNKS) as f32;
                 let view_h = (LOAD_RADIUS * 2) as f32 / (GLOBE_HEIGHT * GLOBE_CELL_CHUNKS) as f32;
 
                 let cx = rect.min.x + nx * img_w;
@@ -221,17 +222,15 @@ pub fn build_globe_image(
                 // pixel's fractional cell location → smooth biome boundaries
                 // that match the actual in-game terrain instead of blocky
                 // per-cell colours.
-                let tiles_per_cell = (GLOBE_CELL_CHUNKS
-                    * crate::world::chunk::CHUNK_SIZE as i32)
-                    as f32;
+                let tiles_per_cell =
+                    (GLOBE_CELL_CHUNKS * crate::world::chunk::CHUNK_SIZE as i32) as f32;
                 let tile_x = (fx * tiles_per_cell) as i32;
                 let tile_y = (fy * tiles_per_cell) as i32;
                 let (elev_u, _, _) = globe.sample_climate(tile_x, tile_y);
                 let elev_f = (elev_u / 255.0).clamp(0.0, 1.0);
 
                 let mut c = if oversample > 1 {
-                    crate::world::biome::classify_at_tile(globe, tile_x, tile_y)
-                        .color()
+                    crate::world::biome::classify_at_tile(globe, tile_x, tile_y).color()
                 } else {
                     cell.biome.color()
                 };
@@ -302,8 +301,8 @@ pub fn build_globe_image(
             let (ax, ay) = polyline[i];
             let (bx, by) = polyline[i + 1];
             let t_mid = (lens[i] + lens[i + 1]) * 0.5 / total;
-            let mid_w = edge.from_width as f32
-                + (edge.to_width as f32 - edge.from_width as f32) * t_mid;
+            let mid_w =
+                edge.from_width as f32 + (edge.to_width as f32 - edge.from_width as f32) * t_mid;
             // Per-pixel half-width: minor streams 1px, major rivers up to 3px.
             let half_px = (mid_w * 0.5).round() as i32;
             let half_px = half_px.clamp(0, 3);

@@ -149,10 +149,7 @@ impl PlantKind {
         match self {
             PlantKind::Grain => (core_ids::grain(), 5),
             PlantKind::BerryBush => (core_ids::fruit(), 3),
-            PlantKind::Tree => (
-                core_ids::wood(),
-                if has_tool { 3 } else { 1 },
-            ),
+            PlantKind::Tree => (core_ids::wood(), if has_tool { 3 } else { 1 }),
         }
     }
 
@@ -409,10 +406,7 @@ mod tests {
                 tile_pos: tile,
             })
             .id();
-        app.world_mut()
-            .resource_mut::<PlantMap>()
-            .0
-            .insert(tile, e);
+        app.world_mut().resource_mut::<PlantMap>().0.insert(tile, e);
         e
     }
 
@@ -421,9 +415,7 @@ mod tests {
     }
 
     fn plant_get(app: &App, e: Entity) -> Option<(GrowthStage, u16)> {
-        app.world()
-            .get::<Plant>(e)
-            .map(|p| (p.stage, p.growth))
+        app.world().get::<Plant>(e).map(|p| (p.stage, p.growth))
     }
 
     /// Tree growth is purely threshold-driven (no season gate). Accumulating
@@ -473,15 +465,18 @@ mod tests {
         let mut app = build_lifecycle_app();
         // Seed last_season=Winter so the next tick reads "prev=Winter".
         set_season(&mut app, Season::Winter);
-        let tree = spawn_lifecycle_plant(
-            &mut app, (0, 0), PlantKind::Tree, GrowthStage::Seedling, 5,
-        );
+        let tree =
+            spawn_lifecycle_plant(&mut app, (0, 0), PlantKind::Tree, GrowthStage::Seedling, 5);
         let bush = spawn_lifecycle_plant(
-            &mut app, (1, 0), PlantKind::BerryBush, GrowthStage::Seedling, 5,
+            &mut app,
+            (1, 0),
+            PlantKind::BerryBush,
+            GrowthStage::Seedling,
+            5,
         );
 
         app.update(); // prime: last_season := Winter
-        // Now transition to Spring; prev=Winter contributes 0.
+                      // Now transition to Spring; prev=Winter contributes 0.
         set_season(&mut app, Season::Spring);
         app.update();
 
@@ -493,9 +488,7 @@ mod tests {
     #[test]
     fn season_idempotent_within_same_season() {
         let mut app = build_lifecycle_app();
-        let e = spawn_lifecycle_plant(
-            &mut app, (0, 0), PlantKind::Tree, GrowthStage::Seedling, 0,
-        );
+        let e = spawn_lifecycle_plant(&mut app, (0, 0), PlantKind::Tree, GrowthStage::Seedling, 0);
 
         app.update(); // prime: last_season = Spring
         app.update(); // still Spring → no-op
@@ -515,7 +508,10 @@ mod tests {
         set_season(&mut app, Season::Winter);
         app.update();
 
-        assert!(plant_get(&app, seedling).is_none(), "seedling grain should despawn");
+        assert!(
+            plant_get(&app, seedling).is_none(),
+            "seedling grain should despawn"
+        );
         assert!(plant_get(&app, seed).is_none(), "seed grain should despawn");
         // PlantMap entries should also be cleaned up.
         let map = app.world().resource::<PlantMap>();
@@ -528,9 +524,7 @@ mod tests {
     #[test]
     fn grain_seedling_matures_by_autumn() {
         let mut app = build_lifecycle_app();
-        let e = spawn_lifecycle_plant(
-            &mut app, (0, 0), PlantKind::Grain, GrowthStage::Seedling, 0,
-        );
+        let e = spawn_lifecycle_plant(&mut app, (0, 0), PlantKind::Grain, GrowthStage::Seedling, 0);
         app.update(); // prime in Spring
 
         set_season(&mut app, Season::Summer);
@@ -555,9 +549,7 @@ mod tests {
         let mut sprouts = 0u32;
         for _ in 0..TRIALS {
             let mut app = build_lifecycle_app();
-            let e = spawn_lifecycle_plant(
-                &mut app, (0, 0), PlantKind::Tree, GrowthStage::Seed, 12,
-            );
+            let e = spawn_lifecycle_plant(&mut app, (0, 0), PlantKind::Tree, GrowthStage::Seed, 12);
             app.update(); // prime
             set_season(&mut app, Season::Summer);
             app.update();
@@ -577,16 +569,18 @@ mod tests {
     #[test]
     fn mature_tree_reverts_after_fruiting() {
         let mut app = build_lifecycle_app();
-        let e = spawn_lifecycle_plant(
-            &mut app, (0, 0), PlantKind::Tree, GrowthStage::Mature, 18,
-        );
+        let e = spawn_lifecycle_plant(&mut app, (0, 0), PlantKind::Tree, GrowthStage::Mature, 18);
 
         app.update(); // prime
         set_season(&mut app, Season::Summer);
         app.update();
 
         let (stage, growth) = plant_get(&app, e).expect("tree should still exist");
-        assert_eq!(stage, GrowthStage::Mature, "tree reverts to Mature post-fruiting");
+        assert_eq!(
+            stage,
+            GrowthStage::Mature,
+            "tree reverts to Mature post-fruiting"
+        );
         // Each transition resets growth to 0 (no carry-over).
         assert_eq!(growth, 0);
     }
@@ -595,12 +589,12 @@ mod tests {
     /// at avg growth of 12/year).
     #[test]
     fn tree_seedling_threshold_constant() {
-        assert_eq!(
-            stage_threshold(PlantKind::Tree, GrowthStage::Seedling),
-            48
-        );
+        assert_eq!(stage_threshold(PlantKind::Tree, GrowthStage::Seedling), 48);
         assert_eq!(stage_threshold(PlantKind::Grain, GrowthStage::Harvested), 0);
-        assert_eq!(stage_threshold(PlantKind::BerryBush, GrowthStage::Mature), 4);
+        assert_eq!(
+            stage_threshold(PlantKind::BerryBush, GrowthStage::Mature),
+            4
+        );
     }
 }
 
@@ -933,9 +927,7 @@ pub fn deer_graze_system(
                 let pos = tile_to_world(sx, sy);
                 commands.spawn((
                     GroundItem {
-                        item: Item::new_commodity(
-                            crate::economy::core_ids::berry_seed(),
-                        ),
+                        item: Item::new_commodity(crate::economy::core_ids::berry_seed()),
                         qty: 1,
                     },
                     Transform::from_xyz(pos.x, pos.y, 0.3),

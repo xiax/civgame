@@ -16,7 +16,9 @@ use bevy::prelude::*;
 
 use crate::simulation::construction::BedMap;
 use crate::simulation::faction::FactionRegistry;
-use crate::simulation::lifecycle::{nomadic_variant_of, LifecycleEventQueue, SettlementLifecycleEvent};
+use crate::simulation::lifecycle::{
+    nomadic_variant_of, LifecycleEventQueue, SettlementLifecycleEvent,
+};
 use crate::simulation::nomad::OLD_CAMP_RADIUS;
 use crate::simulation::schedule::SimClock;
 use crate::world::seasons::{TICKS_PER_DAY, TICKS_PER_SEASON};
@@ -73,16 +75,13 @@ pub fn sedentary_collapse_system(
         let pop_crash = members < SEDENTARY_COLLAPSE_MIN_MEMBERS;
 
         // Trigger 2: sustained food deficit — per-head food < 10.
-        let food_deficit =
-            faction.storage.food_total() < (members as f32 * 10.0).max(10.0);
+        let food_deficit = faction.storage.food_total() < (members as f32 * 10.0).max(10.0);
 
         // Trigger 3: shelter loss — fewer beds than members/3.
         let bed_count = bed_map
             .0
             .keys()
-            .filter(|&&t| {
-                (t.0 - home.0).abs().max((t.1 - home.1).abs()) <= OLD_CAMP_RADIUS
-            })
+            .filter(|&&t| (t.0 - home.0).abs().max((t.1 - home.1).abs()) <= OLD_CAMP_RADIUS)
             .count() as u32;
         let shelter_loss = bed_count < (members / 3).max(1);
 
@@ -159,11 +158,7 @@ mod tests {
         // Belt-and-braces: every settled key maps cleanly to its nomadic
         // counterpart, and the inverse sedentarize path returns the
         // original key.
-        for key in [
-            "settled_subsistence",
-            "settled_mixed",
-            "settled_market",
-        ] {
+        for key in ["settled_subsistence", "settled_mixed", "settled_market"] {
             let nomadic = nomadic_variant_of(key);
             assert!(
                 nomadic.starts_with("nomadic_"),

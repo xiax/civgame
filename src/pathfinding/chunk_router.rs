@@ -194,12 +194,7 @@ impl ChunkRouter {
 
     /// Reachability test in the component graph: are `start` and `goal`
     /// in the same connected component? O(degree) using a cached tree.
-    pub fn is_reachable(
-        &self,
-        graph: &ChunkGraph,
-        start: RouterNode,
-        goal: RouterNode,
-    ) -> bool {
+    pub fn is_reachable(&self, graph: &ChunkGraph, start: RouterNode, goal: RouterNode) -> bool {
         if start == goal {
             return true;
         }
@@ -315,7 +310,12 @@ fn build_tree(graph: &ChunkGraph, goal: RouterNode) -> Option<ShortestPathTree> 
                         entry_z: e.exit_z,
                     },
                 );
-                heap.push(Reverse((new_d, e.neighbor.0, e.neighbor.1, e.to_component.0)));
+                heap.push(Reverse((
+                    new_d,
+                    e.neighbor.0,
+                    e.neighbor.1,
+                    e.to_component.0,
+                )));
             }
         }
     }
@@ -361,12 +361,19 @@ mod tests {
     #[test]
     fn compute_route_through_one_intermediate() {
         let mut graph = ChunkGraph::default();
-        graph.components.insert(ChunkCoord(0, 0), comp_one(ChunkCoord(0, 0), 1));
-        graph.components.insert(ChunkCoord(1, 0), comp_one(ChunkCoord(1, 0), 1));
-        graph.components.insert(ChunkCoord(2, 0), comp_one(ChunkCoord(2, 0), 1));
         graph
-            .edges
-            .insert(ChunkCoord(0, 0), vec![edge(ChunkCoord(1, 0), 0, 0, (31, 5), 0, 0)]);
+            .components
+            .insert(ChunkCoord(0, 0), comp_one(ChunkCoord(0, 0), 1));
+        graph
+            .components
+            .insert(ChunkCoord(1, 0), comp_one(ChunkCoord(1, 0), 1));
+        graph
+            .components
+            .insert(ChunkCoord(2, 0), comp_one(ChunkCoord(2, 0), 1));
+        graph.edges.insert(
+            ChunkCoord(0, 0),
+            vec![edge(ChunkCoord(1, 0), 0, 0, (31, 5), 0, 0)],
+        );
         graph.edges.insert(
             ChunkCoord(1, 0),
             vec![
@@ -374,9 +381,10 @@ mod tests {
                 edge(ChunkCoord(2, 0), 0, 0, (31, 5), 0, 0),
             ],
         );
-        graph
-            .edges
-            .insert(ChunkCoord(2, 0), vec![edge(ChunkCoord(1, 0), 0, 0, (0, 5), 0, 0)]);
+        graph.edges.insert(
+            ChunkCoord(2, 0),
+            vec![edge(ChunkCoord(1, 0), 0, 0, (0, 5), 0, 0)],
+        );
         graph.generation = 1;
 
         let router = ChunkRouter::default();
@@ -400,8 +408,12 @@ mod tests {
         // to B cave (1). Trying to route from A surface to B cave must
         // return None (not bounce A→B→A).
         let mut graph = ChunkGraph::default();
-        graph.components.insert(ChunkCoord(0, 0), comp_one(ChunkCoord(0, 0), 2));
-        graph.components.insert(ChunkCoord(1, 0), comp_one(ChunkCoord(1, 0), 2));
+        graph
+            .components
+            .insert(ChunkCoord(0, 0), comp_one(ChunkCoord(0, 0), 2));
+        graph
+            .components
+            .insert(ChunkCoord(1, 0), comp_one(ChunkCoord(1, 0), 2));
         graph.edges.insert(
             ChunkCoord(0, 0),
             vec![
@@ -433,14 +445,20 @@ mod tests {
     #[test]
     fn router_caches_then_invalidates_on_generation_bump() {
         let mut graph = ChunkGraph::default();
-        graph.components.insert(ChunkCoord(0, 0), comp_one(ChunkCoord(0, 0), 1));
-        graph.components.insert(ChunkCoord(1, 0), comp_one(ChunkCoord(1, 0), 1));
         graph
-            .edges
-            .insert(ChunkCoord(0, 0), vec![edge(ChunkCoord(1, 0), 0, 0, (31, 5), 0, 0)]);
+            .components
+            .insert(ChunkCoord(0, 0), comp_one(ChunkCoord(0, 0), 1));
         graph
-            .edges
-            .insert(ChunkCoord(1, 0), vec![edge(ChunkCoord(0, 0), 0, 0, (0, 5), 0, 0)]);
+            .components
+            .insert(ChunkCoord(1, 0), comp_one(ChunkCoord(1, 0), 1));
+        graph.edges.insert(
+            ChunkCoord(0, 0),
+            vec![edge(ChunkCoord(1, 0), 0, 0, (31, 5), 0, 0)],
+        );
+        graph.edges.insert(
+            ChunkCoord(1, 0),
+            vec![edge(ChunkCoord(0, 0), 0, 0, (0, 5), 0, 0)],
+        );
         graph.generation = 1;
 
         let router = ChunkRouter::default();

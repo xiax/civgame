@@ -58,7 +58,11 @@ impl TileEdge {
         let dx = to.0 - from.0;
         let dy = to.1 - from.1;
         if dx.abs() >= dy.abs() {
-            if dx >= 0 { TileEdge::East } else { TileEdge::West }
+            if dx >= 0 {
+                TileEdge::East
+            } else {
+                TileEdge::West
+            }
         } else if dy >= 0 {
             TileEdge::North
         } else {
@@ -479,9 +483,7 @@ pub fn holder_permits_build(
 ) -> bool {
     match holder {
         TenureHolder::State { faction_id: fid } => fid == faction_id,
-        TenureHolder::Household { faction_id: hh_id } => {
-            requesting_household == Some(hh_id)
-        }
+        TenureHolder::Household { faction_id: hh_id } => requesting_household == Some(hh_id),
     }
 }
 
@@ -973,7 +975,11 @@ pub fn household_land_acquisition_system(
                     // Sharecrop has no upfront cost — household just
                     // needs to be eligible. `asking` carries the share
                     // fraction; lower share = better deal for tenant.
-                    if best_sharecrop.as_ref().map(|b| l.asking < b.1).unwrap_or(true) {
+                    if best_sharecrop
+                        .as_ref()
+                        .map(|b| l.asking < b.1)
+                        .unwrap_or(true)
+                    {
                         best_sharecrop = Some((l.plot_id, l.asking, plot.faction_id));
                     }
                 }
@@ -1097,8 +1103,7 @@ pub fn household_land_acquisition_system(
                         if let Ok(mut child_plot) = plot_q.get_mut(cent) {
                             // Mirror parent tenure (already set above).
                             let period_days = lp.default_lease_period_days.max(1);
-                            let period_ticks =
-                                (period_days as u64) * (TICKS_PER_DAY as u64);
+                            let period_ticks = (period_days as u64) * (TICKS_PER_DAY as u64);
                             child_plot.holder = TenureHolder::Household {
                                 faction_id: cand.household_id,
                             };
@@ -1126,7 +1131,9 @@ pub fn household_land_acquisition_system(
 
     if !consumed.is_empty() {
         listings.for_sale.retain(|l| !consumed.contains(&l.plot_id));
-        listings.for_lease.retain(|l| !consumed.contains(&l.plot_id));
+        listings
+            .for_lease
+            .retain(|l| !consumed.contains(&l.plot_id));
     }
 }
 
@@ -1213,8 +1220,7 @@ pub fn rent_collection_system(
         });
     }
 
-    let period_ticks =
-        |period_days: u32| (period_days.max(1) as u64) * (TICKS_PER_DAY as u64);
+    let period_ticks = |period_days: u32| (period_days.max(1) as u64) * (TICKS_PER_DAY as u64);
 
     for row in rows {
         // Attempt the rent transfer. Treasury floor at 0 — destitute
@@ -1347,9 +1353,8 @@ pub fn evicted_plot_cleanup_system(
             if let Ok(deployable) = deployable_q.get(entity) {
                 if let Some((rid, qty)) = deployable.compute_refund_drop() {
                     if let Ok(transform) = transform_q.get(entity) {
-                        let (tx, ty) = crate::world::terrain::world_to_tile(
-                            transform.translation.truncate(),
-                        );
+                        let (tx, ty) =
+                            crate::world::terrain::world_to_tile(transform.translation.truncate());
                         crate::simulation::items::spawn_or_merge_ground_item(
                             &mut commands,
                             &spatial,

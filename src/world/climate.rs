@@ -66,8 +66,8 @@ pub fn orographic(base_rain: &[f32], elev: &[f32], lookahead: i32) -> Vec<f32> {
                 let ux = ((gx as i32 - dx * k).rem_euclid(W as i32)) as usize;
                 let h = elev[idx(ux, gy)];
                 let dh = prev - h; // positive if upwind is lower → wind climbing toward us
-                // dh > 0: air rising as it approaches us → orographic boost
-                // dh < 0: air descending → rain shadow
+                                   // dh > 0: air rising as it approaches us → orographic boost
+                                   // dh < 0: air descending → rain shadow
                 bonus += dh * 0.45 / k as f32;
                 prev = h;
             }

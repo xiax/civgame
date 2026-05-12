@@ -241,10 +241,8 @@ mod tests {
     fn fresh_agent() -> EconomicAgent {
         EconomicAgent {
             currency: 0.0,
-            inventory: [(
-                Item::new_commodity(crate::economy::core_ids::fruit()),
-                0,
-            ); INVENTORY_SLOTS],
+            inventory: [(Item::new_commodity(crate::economy::core_ids::fruit()), 0);
+                INVENTORY_SLOTS],
             base_cap_g: BASE_INVENTORY_CAP_G,
             bonus_cap_g: 0,
         }
@@ -286,7 +284,10 @@ mod tests {
             .map(|a| a.quantity_of_resource(bedroll))
             .max()
             .unwrap();
-        assert!(max_held <= 2, "donor should not retain 3 bedrolls; max={max_held}");
+        assert!(
+            max_held <= 2,
+            "donor should not retain 3 bedrolls; max={max_held}"
+        );
     }
 
     #[test]

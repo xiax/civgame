@@ -162,8 +162,7 @@ pub fn tick_needs_system(
                 } else {
                     WILLPOWER_SLEEP_RECOVER
                 };
-                needs.willpower =
-                    (needs.willpower + willpower_gain * dt).clamp(0.0, 255.0);
+                needs.willpower = (needs.willpower + willpower_gain * dt).clamp(0.0, 255.0);
                 if needs.sleep < 10.0 {
                     ai.state = AiState::Idle;
                 }

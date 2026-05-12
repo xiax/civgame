@@ -8,8 +8,8 @@ use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::pathfinding::flow_field::walk_to_goal;
 use crate::pathfinding::hotspots::HotspotFlowFields;
 use crate::pathfinding::path_request::{
-    FailSubReason, FailureLog, FailureRecord, FollowStatus, PathDebugFlags, PathFailed,
-    PathFollow, PathKind, PathReady, PathReadyKind, PathRequest, PathRequestQueue,
+    FailSubReason, FailureLog, FailureRecord, FollowStatus, PathDebugFlags, PathFailed, PathFollow,
+    PathKind, PathReady, PathReadyKind, PathRequest, PathRequestQueue,
 };
 use crate::pathfinding::pool::{AStarPool, AStarScratch};
 use crate::pathfinding::step::passable_diagonal_step;
@@ -364,44 +364,44 @@ fn compute_outcome(
     // The agent's exact (x, y, z) classifies into a single component;
     // an A→B→A oscillation is impossible because the cache is keyed by
     // the agent's specific component, not just by chunk + z.
-    let start_component =
-        match graph.component_for_tile(req.start.0, req.start.1, req.start.2) {
-            Some(c) => c,
-            None => {
-                if flags.verbose_logs {
-                    info!(
-                        "[path] start tile not classified agent={:?} start={:?}",
-                        req.agent, req.start
-                    );
-                }
-                let goal = req.goal;
-                let mut body =
-                    FailureBody::connectivity(FailSubReason::UnreachableConnectivity, goal);
-                body.component_lookup_failed_start = true;
-                return fail_outcome(req, body);
+    let start_component = match graph.component_for_tile(req.start.0, req.start.1, req.start.2) {
+        Some(c) => c,
+        None => {
+            if flags.verbose_logs {
+                info!(
+                    "[path] start tile not classified agent={:?} start={:?}",
+                    req.agent, req.start
+                );
             }
-        };
-    let goal_component =
-        match graph.component_for_tile(req.goal.0, req.goal.1, req.goal.2) {
-            Some(c) => c,
-            None => {
-                if flags.verbose_logs {
-                    info!(
-                        "[path] goal tile not classified agent={:?} goal={:?}",
-                        req.agent, req.goal
-                    );
-                }
-                let goal = req.goal;
-                let mut body =
-                    FailureBody::connectivity(FailSubReason::UnreachableConnectivity, goal);
-                body.component_lookup_failed_goal = true;
-                return fail_outcome(req, body);
+            let goal = req.goal;
+            let mut body = FailureBody::connectivity(FailSubReason::UnreachableConnectivity, goal);
+            body.component_lookup_failed_start = true;
+            return fail_outcome(req, body);
+        }
+    };
+    let goal_component = match graph.component_for_tile(req.goal.0, req.goal.1, req.goal.2) {
+        Some(c) => c,
+        None => {
+            if flags.verbose_logs {
+                info!(
+                    "[path] goal tile not classified agent={:?} goal={:?}",
+                    req.agent, req.goal
+                );
             }
-        };
+            let goal = req.goal;
+            let mut body = FailureBody::connectivity(FailSubReason::UnreachableConnectivity, goal);
+            body.component_lookup_failed_goal = true;
+            return fail_outcome(req, body);
+        }
+    };
     // Reachability check uses the same router cache the route does, so
     // the component-graph CC and the route are guaranteed in sync.
     let _ = conn; // legacy resource retained for backwards-compatible APIs
-    if !router.is_reachable(graph, (start_chunk, start_component), (goal_chunk, goal_component)) {
+    if !router.is_reachable(
+        graph,
+        (start_chunk, start_component),
+        (goal_chunk, goal_component),
+    ) {
         if flags.verbose_logs {
             info!(
                 "[path] component reject agent={:?} start={:?} goal={:?}",
@@ -429,10 +429,7 @@ fn compute_outcome(
                 );
             }
             let goal = req.goal;
-            return fail_outcome(
-                req,
-                FailureBody::basic(FailSubReason::NoRouteRouter, goal),
-            );
+            return fail_outcome(req, FailureBody::basic(FailSubReason::NoRouteRouter, goal));
         }
     };
 

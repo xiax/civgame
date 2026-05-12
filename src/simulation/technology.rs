@@ -1120,16 +1120,13 @@ pub static TECH_TREE: [TechDef; TECH_COUNT] = [
         id: PORTABLE_DWELLINGS,
         era: Era::Neolithic,
         name: "Portable Dwellings",
-        description:
-            "Felt-and-lattice yurts and packable hide tents — bands can carry an \
+        description: "Felt-and-lattice yurts and packable hide tents — bands can carry an \
              entire shelter on a few pack animals and re-pitch at the next camp.",
         prerequisites: &[LOOM_WEAVING],
-        triggers: &[
-            TechTrigger {
-                activity: ActivityKind::Foraging,
-                per_unit_chance: 0.001,
-            },
-        ],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::Foraging,
+            per_unit_chance: 0.001,
+        }],
         bonus: TechBonus::ZERO,
     },
 ];

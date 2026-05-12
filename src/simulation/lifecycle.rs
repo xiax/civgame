@@ -193,11 +193,7 @@ fn handle_switch_archetype(
 
         // Step 3 (rebuild map first; step 1's caps will mirror it).
         faction.economic_policy.clear();
-        crate::economy::policy::apply_preset(
-            &mut faction.economic_policy,
-            preset,
-            &catalog,
-        );
+        crate::economy::policy::apply_preset(&mut faction.economic_policy, preset, &catalog);
 
         // Step 2: explicit re-derivation (set once at spawn, never
         // re-derived elsewhere — sedentarize trace finding).
@@ -266,14 +262,8 @@ fn handle_switch_archetype(
 /// collapsed faction. Mirrors `nomad_migration_commit_system`'s
 /// re-seed pass — same hearth ring + bedrolls + tents + Neolithic+
 /// yurts via `seed_nomadic_camp`.
-fn reseed_nomadic_camp_for(
-    world: &mut World,
-    faction_id: u32,
-    tile: (i32, i32),
-) {
-    use crate::simulation::construction::{
-        best_hearth_for, seed_nomadic_camp, FurnitureMaps,
-    };
+fn reseed_nomadic_camp_for(world: &mut World, faction_id: u32, tile: (i32, i32)) {
+    use crate::simulation::construction::{best_hearth_for, seed_nomadic_camp, FurnitureMaps};
     use crate::simulation::technology::current_era;
     use crate::world::chunk::ChunkMap;
     use crate::world::chunk_streaming::TileChangedEvent;
@@ -282,7 +272,13 @@ fn reseed_nomadic_camp_for(
         .resource::<FactionRegistry>()
         .factions
         .get(&faction_id)
-        .map(|f| (f.member_count, current_era(&f.techs), best_hearth_for(&f.techs)))
+        .map(|f| {
+            (
+                f.member_count,
+                current_era(&f.techs),
+                best_hearth_for(&f.techs),
+            )
+        })
     else {
         return;
     };
@@ -338,15 +334,8 @@ fn despawn_camp_structures_at(world: &mut World, tile: (i32, i32)) {
         ResMut<crate::simulation::camp::CampMap>,
         Query<&crate::simulation::camp::Camp>,
     )> = SystemState::new(world);
-    let (
-        mut commands,
-        mut bed_map,
-        mut campfire_map,
-        deployable_q,
-        tent_q,
-        mut camp_map,
-        camp_q,
-    ) = state.get_mut(world);
+    let (mut commands, mut bed_map, mut campfire_map, deployable_q, tent_q, mut camp_map, camp_q) =
+        state.get_mut(world);
 
     let mut despawned: ahash::AHashSet<Entity> = ahash::AHashSet::new();
 
@@ -473,7 +462,9 @@ fn emit_sedentarized_event(world: &mut World, faction_id: u32, camp: (i32, i32))
     };
     let Some(actor) = actor else { return };
 
-    let tick = world.resource::<crate::simulation::schedule::SimClock>().tick;
+    let tick = world
+        .resource::<crate::simulation::schedule::SimClock>()
+        .tick;
     let mut events = world.resource_mut::<bevy::ecs::event::Events<ActivityLogEvent>>();
     events.send(ActivityLogEvent {
         tick,
@@ -489,7 +480,10 @@ mod tests {
 
     #[test]
     fn settled_variant_swaps_prefix() {
-        assert_eq!(settled_variant_of("nomadic_subsistence"), "settled_subsistence");
+        assert_eq!(
+            settled_variant_of("nomadic_subsistence"),
+            "settled_subsistence"
+        );
         assert_eq!(settled_variant_of("nomadic_market"), "settled_market");
         // Non-nomadic input passes through unchanged.
         assert_eq!(settled_variant_of("settled_mixed"), "settled_mixed");

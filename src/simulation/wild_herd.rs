@@ -135,10 +135,7 @@ pub struct WildHerdMember {
 /// tile `spawn_animals` pass. Picks random grassland tiles to anchor each
 /// herd's `range_center` and `leader_tile`; collapsed by default until a
 /// camera comes near.
-pub fn seed_wild_herds_system(
-    chunk_map: Res<ChunkMap>,
-    mut registry: ResMut<WildHerdRegistry>,
-) {
+pub fn seed_wild_herds_system(chunk_map: Res<ChunkMap>, mut registry: ResMut<WildHerdRegistry>) {
     if !registry.herds.is_empty() {
         return; // idempotent
     }
@@ -280,11 +277,9 @@ pub fn wild_herd_migration_system(
             // the nearest water tile within HERD_WATER_PROBE_RADIUS.
             let immediate_water_present = water_within(&chunk_map, herd.leader_tile, 4);
             if !immediate_water_present {
-                if let Some(target) = nearest_water(
-                    &chunk_map,
-                    herd.leader_tile,
-                    HERD_WATER_PROBE_RADIUS,
-                ) {
+                if let Some(target) =
+                    nearest_water(&chunk_map, herd.leader_tile, HERD_WATER_PROBE_RADIUS)
+                {
                     dx = (target.0 - herd.leader_tile.0).signum();
                     dy = (target.1 - herd.leader_tile.1).signum();
                 } else {
@@ -360,11 +355,7 @@ fn water_within(chunk_map: &ChunkMap, tile: (i32, i32), radius: i32) -> bool {
 /// immediately; otherwise remember the first salt-water tile in this ring and
 /// keep looking for fresh in larger rings. Falls back to the closest salt if
 /// no fresh appears within `max_radius`.
-fn nearest_water(
-    chunk_map: &ChunkMap,
-    from: (i32, i32),
-    max_radius: i32,
-) -> Option<(i32, i32)> {
+fn nearest_water(chunk_map: &ChunkMap, from: (i32, i32), max_radius: i32) -> Option<(i32, i32)> {
     let mut closest_salt: Option<(i32, i32)> = None;
     for r in 1..=max_radius {
         let mut ring_salt: Option<(i32, i32)> = None;
@@ -405,16 +396,12 @@ pub fn wild_herd_bloom_system(
     // Pull the camera focus tile (unique). Other focus points are settled-
     // region centres; we only bloom against the player camera so off-screen
     // herds stay quiet.
-    let camera_tile = focus
-        .points
-        .iter()
-        .find(|p| p.is_camera)
-        .map(|p| {
-            (
-                (p.world_pos.x / TILE_SIZE).floor() as i32,
-                (p.world_pos.y / TILE_SIZE).floor() as i32,
-            )
-        });
+    let camera_tile = focus.points.iter().find(|p| p.is_camera).map(|p| {
+        (
+            (p.world_pos.x / TILE_SIZE).floor() as i32,
+            (p.world_pos.y / TILE_SIZE).floor() as i32,
+        )
+    });
 
     for herd in registry.herds.values_mut() {
         let near = camera_tile

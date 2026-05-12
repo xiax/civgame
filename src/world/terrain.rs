@@ -92,12 +92,54 @@ struct OreBand {
 }
 
 const ORE_BANDS: &[OreBand] = &[
-    OreBand { kind: OreKind::Coal,   top_offset: 1,  bot_offset: 6,  threshold: 0.45, freq_xy: 0.10, freq_z: 0.18 },
-    OreBand { kind: OreKind::Copper, top_offset: 2,  bot_offset: 8,  threshold: 0.50, freq_xy: 0.10, freq_z: 0.18 },
-    OreBand { kind: OreKind::Tin,    top_offset: 5,  bot_offset: 12, threshold: 0.55, freq_xy: 0.10, freq_z: 0.18 },
-    OreBand { kind: OreKind::Iron,   top_offset: 6,  bot_offset: 14, threshold: 0.52, freq_xy: 0.10, freq_z: 0.18 },
-    OreBand { kind: OreKind::Silver, top_offset: 10, bot_offset: 18, threshold: 0.60, freq_xy: 0.12, freq_z: 0.20 },
-    OreBand { kind: OreKind::Gold,   top_offset: 14, bot_offset: 32, threshold: 0.65, freq_xy: 0.12, freq_z: 0.20 },
+    OreBand {
+        kind: OreKind::Coal,
+        top_offset: 1,
+        bot_offset: 6,
+        threshold: 0.45,
+        freq_xy: 0.10,
+        freq_z: 0.18,
+    },
+    OreBand {
+        kind: OreKind::Copper,
+        top_offset: 2,
+        bot_offset: 8,
+        threshold: 0.50,
+        freq_xy: 0.10,
+        freq_z: 0.18,
+    },
+    OreBand {
+        kind: OreKind::Tin,
+        top_offset: 5,
+        bot_offset: 12,
+        threshold: 0.55,
+        freq_xy: 0.10,
+        freq_z: 0.18,
+    },
+    OreBand {
+        kind: OreKind::Iron,
+        top_offset: 6,
+        bot_offset: 14,
+        threshold: 0.52,
+        freq_xy: 0.10,
+        freq_z: 0.18,
+    },
+    OreBand {
+        kind: OreKind::Silver,
+        top_offset: 10,
+        bot_offset: 18,
+        threshold: 0.60,
+        freq_xy: 0.12,
+        freq_z: 0.20,
+    },
+    OreBand {
+        kind: OreKind::Gold,
+        top_offset: 14,
+        bot_offset: 32,
+        threshold: 0.65,
+        freq_xy: 0.12,
+        freq_z: 0.20,
+    },
 ];
 
 impl Default for WorldGen {

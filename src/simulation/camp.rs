@@ -230,8 +230,14 @@ mod tests {
 
         let s1_view = w.get::<Settlement>(s1).unwrap();
         let s2_view = w.get::<Settlement>(s2).unwrap();
-        assert_eq!(s1_view.market.stock_of(crate::economy::core_ids::wood()), 0.0);
-        assert_eq!(s2_view.market.stock_of(crate::economy::core_ids::wood()), 42.0);
+        assert_eq!(
+            s1_view.market.stock_of(crate::economy::core_ids::wood()),
+            0.0
+        );
+        assert_eq!(
+            s2_view.market.stock_of(crate::economy::core_ids::wood()),
+            42.0
+        );
 
         // Helper picks the first one registered.
         let resolved =

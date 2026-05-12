@@ -12,17 +12,34 @@ use crate::world::chunk_streaming::{ChunkLoadedEvent, ChunkUnloadedEvent, TileCh
 /// component flood-fill — same set the old `connectivity` module used.
 pub const NEIGHBOR_DIRS_3D: [(i32, i32, i32); 26] = [
     // Same Z: 8 horizontal neighbours
-    (-1, -1, 0), (-1, 0, 0), (-1, 1, 0),
-    (0, -1, 0),              (0, 1, 0),
-    (1, -1, 0),  (1, 0, 0),  (1, 1, 0),
+    (-1, -1, 0),
+    (-1, 0, 0),
+    (-1, 1, 0),
+    (0, -1, 0),
+    (0, 1, 0),
+    (1, -1, 0),
+    (1, 0, 0),
+    (1, 1, 0),
     // Z+1
-    (-1, -1, 1), (-1, 0, 1), (-1, 1, 1),
-    (0, -1, 1),  (0, 0, 1),  (0, 1, 1),
-    (1, -1, 1),  (1, 0, 1),  (1, 1, 1),
+    (-1, -1, 1),
+    (-1, 0, 1),
+    (-1, 1, 1),
+    (0, -1, 1),
+    (0, 0, 1),
+    (0, 1, 1),
+    (1, -1, 1),
+    (1, 0, 1),
+    (1, 1, 1),
     // Z-1
-    (-1, -1, -1), (-1, 0, -1), (-1, 1, -1),
-    (0, -1, -1),  (0, 0, -1),  (0, 1, -1),
-    (1, -1, -1),  (1, 0, -1),  (1, 1, -1),
+    (-1, -1, -1),
+    (-1, 0, -1),
+    (-1, 1, -1),
+    (0, -1, -1),
+    (0, 0, -1),
+    (0, 1, -1),
+    (1, -1, -1),
+    (1, 0, -1),
+    (1, 1, -1),
 ];
 
 /// Chunk-local connected-component id. Components rarely exceed a
@@ -185,10 +202,7 @@ fn classify_components(
         }
     }
 
-    ChunkComponents {
-        at,
-        count: next_id,
-    }
+    ChunkComponents { at, count: next_id }
 }
 
 /// Cardinal-only border directions for cross-chunk edge scanning.
@@ -362,10 +376,7 @@ pub fn spawn_rebuild_task_system(
 
 /// Polls the in-flight task; when ready, merges the result into `ChunkGraph`
 /// and clears the task slot so the next tick can spawn a new one.
-pub fn poll_rebuild_task_system(
-    mut task: ResMut<GraphRebuildTask>,
-    mut graph: ResMut<ChunkGraph>,
-) {
+pub fn poll_rebuild_task_system(mut task: ResMut<GraphRebuildTask>, mut graph: ResMut<ChunkGraph>) {
     let Some(t) = task.0.as_mut() else {
         return;
     };
@@ -614,7 +625,6 @@ pub fn startup_initial_build_system(chunk_map: Res<ChunkMap>, mut graph: ResMut<
     rebuild_chunk_graph_sync(&chunk_map, &mut graph);
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,7 +727,9 @@ mod tests {
         let chunk = map.0.get(&ChunkCoord(0, 0)).unwrap().clone();
         let cc = classify_components(&map, ChunkCoord(0, 0), &chunk);
         let top = cc.component_at(0, 0, 0).expect("surface classified");
-        let bottom = cc.component_at(9, 5, -4).expect("staircase bottom classified");
+        let bottom = cc
+            .component_at(9, 5, -4)
+            .expect("staircase bottom classified");
         assert_eq!(
             top, bottom,
             "diagonal staircase must unify surface and underground into one component"

@@ -130,7 +130,10 @@ pub fn hover_info_system(
                     if let Ok(plot) = plot_query.get(entity) {
                         ui.separator();
                         ui.label(egui::RichText::new("Plot").strong());
-                        ui.label(format!("ID: {}  ·  Settlement: {}", plot.id, plot.settlement_id));
+                        ui.label(format!(
+                            "ID: {}  ·  Settlement: {}",
+                            plot.id, plot.settlement_id
+                        ));
                         ui.label(format!("Zone: {}", plot.zone_kind.label()));
                         ui.label(format!(
                             "Rect: ({}, {})  {}×{}",
@@ -141,14 +144,23 @@ pub fn hover_info_system(
                             Tenure::Leased { rent_per_month, .. } => {
                                 format!("Leased ({:.1}/mo)", rent_per_month)
                             }
-                            Tenure::Sharecropping { share_to_landlord, .. } => {
-                                format!("Sharecropping ({:.0}% to landlord)", share_to_landlord * 100.0)
+                            Tenure::Sharecropping {
+                                share_to_landlord, ..
+                            } => {
+                                format!(
+                                    "Sharecropping ({:.0}% to landlord)",
+                                    share_to_landlord * 100.0
+                                )
                             }
                             Tenure::Freehold => "Freehold".to_string(),
                         };
                         let holder = match plot.holder {
-                            TenureHolder::State { faction_id } => format!("State (faction {})", faction_id),
-                            TenureHolder::Household { faction_id } => format!("Household {}", faction_id),
+                            TenureHolder::State { faction_id } => {
+                                format!("State (faction {})", faction_id)
+                            }
+                            TenureHolder::Household { faction_id } => {
+                                format!("Household {}", faction_id)
+                            }
                         };
                         ui.label(format!("Tenure: {}", tenure));
                         ui.label(format!("Holder: {}", holder));
@@ -229,9 +241,8 @@ pub fn hover_info_system(
                             }
                         }
                     } else if let Ok(plant) = plant_query.get(entity) {
-                        let threshold = crate::simulation::plants::stage_threshold(
-                            plant.kind, plant.stage,
-                        );
+                        let threshold =
+                            crate::simulation::plants::stage_threshold(plant.kind, plant.stage);
                         if threshold == 0 {
                             ui.label(format!("Plant: {:?} ({:?})", plant.kind, plant.stage));
                         } else {
@@ -263,21 +274,14 @@ pub fn hover_info_system(
                     // refund half their wood as ground items.
                     if let Ok(deployable) = sites.deployable_q.get(structure_entity) {
                         if let Some(packed) = deployable.packed_form {
-                            let name =
-                                crate::economy::core_ids::display_name(packed);
+                            let name = crate::economy::core_ids::display_name(packed);
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "Packs as: {} on migration",
-                                    name
-                                ))
-                                .small()
-                                .weak(),
+                                egui::RichText::new(format!("Packs as: {} on migration", name))
+                                    .small()
+                                    .weak(),
                             );
-                        } else if let Some((rid, qty)) =
-                            deployable.compute_refund_drop()
-                        {
-                            let name =
-                                crate::economy::core_ids::display_name(rid);
+                        } else if let Some((rid, qty)) = deployable.compute_refund_drop() {
+                            let name = crate::economy::core_ids::display_name(rid);
                             ui.label(
                                 egui::RichText::new(format!(
                                     "Teardown: drops {} {} on migration ({}% refund)",
@@ -447,19 +451,14 @@ pub fn hover_info_system(
                         .get(order.recipe_id as usize)
                         .map(|r| r.work_ticks)
                         .unwrap_or(0);
-                    ui.label(
-                        egui::RichText::new(format!("Craft Order: {}", recipe_name)).strong(),
-                    );
+                    ui.label(egui::RichText::new(format!("Craft Order: {}", recipe_name)).strong());
                     ui.label(format!("Faction: {}", order.faction_id));
                     if let Some((wbx, wby)) = order.workbench_tile {
                         ui.label(format!("Workbench: ({}, {})", wbx, wby));
                     } else {
                         ui.label("Stationless (anchored at camp)");
                     }
-                    ui.label(format!(
-                        "Work: {} / {}",
-                        order.work_progress, work_ticks
-                    ));
+                    ui.label(format!("Work: {} / {}", order.work_progress, work_ticks));
                     ui.label(format!(
                         "Satisfied: {}",
                         if order.is_satisfied() { "yes" } else { "no" }

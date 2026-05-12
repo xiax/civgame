@@ -13,9 +13,7 @@ use bevy::prelude::*;
 
 use crate::economy::resource_catalog::ResourceId;
 use crate::simulation::construction::{Blueprint, BlueprintMap};
-use crate::simulation::plants::{
-    despawn_plant_internals, Plant, PlantMap, PlantSpriteIndex,
-};
+use crate::simulation::plants::{despawn_plant_internals, Plant, PlantMap, PlantSpriteIndex};
 use crate::simulation::skills::SkillKind;
 use crate::world::chunk::ChunkMap;
 use crate::world::spatial::{Indexed, SpatialIndex};
@@ -131,10 +129,7 @@ pub fn relocate_entity_aside(
 /// Yields produced when a `WorkerClear` obstacle is cleared. Plants drop
 /// their normal harvest yield (no-tool variant); future obstacle kinds
 /// add arms here. Empty Vec means "no loot".
-pub fn resolve_clear_yields(
-    entity: Entity,
-    plants: &Query<&Plant>,
-) -> Vec<(ResourceId, u32)> {
+pub fn resolve_clear_yields(entity: Entity, plants: &Query<&Plant>) -> Vec<(ResourceId, u32)> {
     let mut out = Vec::new();
     if let Ok(plant) = plants.get(entity) {
         let (id, qty) = plant.kind.harvest_yield(false);

@@ -15,17 +15,17 @@ use super::faction::{
     PlayerFactionMarker,
 };
 use super::goals::{AgentGoal, Personality};
+use super::htn::{MethodHistory, MethodId};
 use super::items::{Equipment, TargetItem};
+use super::knowledge::PersonKnowledge;
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, RelationshipMemory};
 use super::mood::Mood;
 use super::movement::MovementState;
 use super::needs::Needs;
-use super::htn::{MethodHistory, MethodId};
 use super::reproduction::BiologicalSex;
 use super::schedule::{BucketSlot, SimClock};
-use super::knowledge::PersonKnowledge;
-use super::skills::{Skills, SkillPeaks, SkillUseTicks, SkillsLastSeen};
+use super::skills::{SkillPeaks, SkillUseTicks, Skills, SkillsLastSeen};
 use super::stats::Stats;
 use crate::pathfinding::path_request::PathFollow;
 
@@ -265,7 +265,9 @@ pub fn spawn_population(
 ) {
     let now = Instant::now();
     use crate::simulation::region::MegaChunkCoord;
-    use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH, MEGACHUNK_SIZE_CHUNKS};
+    use crate::world::globe::{
+        GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH, MEGACHUNK_SIZE_CHUNKS,
+    };
 
     // Centre the spawn region on the player-picked mega-chunk; fall back to
     // globe centre if nothing was picked.
@@ -449,13 +451,7 @@ pub fn spawn_population(
 
             // Seed the player's first settled region.
             let megachunk = MegaChunkCoord::from_tile(home_tx, home_ty);
-            settled.settle(
-                megachunk,
-                clock.tick,
-                "Home".to_string(),
-                home_world,
-                true,
-            );
+            settled.settle(megachunk, clock.tick, "Home".to_string(), home_world, true);
         }
 
         // Player faction respects the user-chosen population; AI factions
@@ -481,69 +477,71 @@ pub fn spawn_population(
             let world_pos = tile_to_world(tx, ty);
             let sex = BiologicalSex::random();
 
-            let person_entity = commands.spawn((
-                (
-                    Person,
-                    Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
-                    GlobalTransform::default(),
-                    Visibility::Visible,
-                    InheritedVisibility::default(),
-                    Needs::new(30.0, 20.0, 10.0, 5.0, 40.0, 200.0),
-                    Mood::default(),
-                    Skills::default(),
-                    SkillPeaks::default(),
-                    SkillUseTicks::default(),
-                    SkillsLastSeen::default(),
-                    Stats::roll_3d6(),
-                    PersonAI {
-                        task_id: PersonAI::UNEMPLOYED,
-                        state: AiState::Idle,
-                        target_tile: (tx as i32, ty as i32),
-                        dest_tile: (tx as i32, ty as i32),
-                        current_z: chunk_map.surface_z_at(tx, ty) as i8,
-                        target_z: chunk_map.surface_z_at(tx, ty) as i8,
-                        ..PersonAI::default()
-                    },
-                    EconomicAgent::default(),
-                ),
-                (
-                    LodLevel::Full,
-                    BucketSlot(spawned),
-                    MovementState {
-                        wander_timer: (spawned % 100) as f32 * 0.025,
-                        ..Default::default()
-                    },
-                    sex,
-                    SkinTone::random(),
-                    HairColor::random(),
-                    Personality::random(),
-                    AgentGoal::default(),
-                    Profession::None,
-                    FactionMember {
-                        faction_id,
-                        ..Default::default()
-                    },
-                    Body::new_humanoid(),
-                    Equipment::default(),
-                    TargetItem::default(),
-                    CombatTarget::default(),
-                    CombatCooldown::default(),
-                ),
-                (
-                    AgentMemory::default(),
-                    RelationshipMemory::default(),
-                    MethodHistory::default(),
-                    crate::simulation::memory::CurrentVision::default(),
-                    Name::new(generate_person_name(sex)),
-                    PathFollow::default(),
-                    Carrier::default(),
-                    crate::simulation::reproduction::CoSleepTracker::default(),
-                    crate::simulation::reproduction::MaleConceptionCooldown::default(),
-                    Indexed::new(IndexedKind::Person),
-                    PersonKnowledge::seeded_through_era(options.era, clock.tick as u32),
-                    crate::simulation::typed_task::ActionQueue::idle(),
-                ),
-            )).id();
+            let person_entity = commands
+                .spawn((
+                    (
+                        Person,
+                        Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                        Needs::new(30.0, 20.0, 10.0, 5.0, 40.0, 200.0),
+                        Mood::default(),
+                        Skills::default(),
+                        SkillPeaks::default(),
+                        SkillUseTicks::default(),
+                        SkillsLastSeen::default(),
+                        Stats::roll_3d6(),
+                        PersonAI {
+                            task_id: PersonAI::UNEMPLOYED,
+                            state: AiState::Idle,
+                            target_tile: (tx as i32, ty as i32),
+                            dest_tile: (tx as i32, ty as i32),
+                            current_z: chunk_map.surface_z_at(tx, ty) as i8,
+                            target_z: chunk_map.surface_z_at(tx, ty) as i8,
+                            ..PersonAI::default()
+                        },
+                        EconomicAgent::default(),
+                    ),
+                    (
+                        LodLevel::Full,
+                        BucketSlot(spawned),
+                        MovementState {
+                            wander_timer: (spawned % 100) as f32 * 0.025,
+                            ..Default::default()
+                        },
+                        sex,
+                        SkinTone::random(),
+                        HairColor::random(),
+                        Personality::random(),
+                        AgentGoal::default(),
+                        Profession::None,
+                        FactionMember {
+                            faction_id,
+                            ..Default::default()
+                        },
+                        Body::new_humanoid(),
+                        Equipment::default(),
+                        TargetItem::default(),
+                        CombatTarget::default(),
+                        CombatCooldown::default(),
+                    ),
+                    (
+                        AgentMemory::default(),
+                        RelationshipMemory::default(),
+                        MethodHistory::default(),
+                        crate::simulation::memory::CurrentVision::default(),
+                        Name::new(generate_person_name(sex)),
+                        PathFollow::default(),
+                        Carrier::default(),
+                        crate::simulation::reproduction::CoSleepTracker::default(),
+                        crate::simulation::reproduction::MaleConceptionCooldown::default(),
+                        Indexed::new(IndexedKind::Person),
+                        PersonKnowledge::seeded_through_era(options.era, clock.tick as u32),
+                        crate::simulation::typed_task::ActionQueue::idle(),
+                    ),
+                ))
+                .id();
 
             if first_member.is_none() {
                 first_member = Some(person_entity);
@@ -636,8 +634,7 @@ pub(crate) fn seed_market_households(
             None => continue,
         };
         used.insert(plot);
-        let household_id =
-            registry.spawn_household(village_faction_id, plot, member, catalog);
+        let household_id = registry.spawn_household(village_faction_id, plot, member, catalog);
         if let Some(hh) = registry.factions.get_mut(&household_id) {
             hh.treasury = crate::simulation::faction::HOUSEHOLD_SEED_TREASURY;
             hh.member_count = 1;
@@ -654,8 +651,6 @@ pub(crate) fn seed_market_households(
         ));
         commands
             .entity(member)
-            .insert(crate::simulation::reproduction::HouseholdMember {
-                household_id,
-            });
+            .insert(crate::simulation::reproduction::HouseholdMember { household_id });
     }
 }

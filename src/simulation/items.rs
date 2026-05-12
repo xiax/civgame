@@ -216,8 +216,7 @@ fn finish_scavenge(
                 aq.cancel();
                 return;
             };
-            let Some(storage_tile) =
-                routing.storage_tile_map.nearest_for_faction(fid, cur_tile)
+            let Some(storage_tile) = routing.storage_tile_map.nearest_for_faction(fid, cur_tile)
             else {
                 record_routing_failure(method_history, ai, now);
                 aq.cancel();
@@ -481,7 +480,9 @@ pub fn equip_task_system(
         With<Person>,
     >,
 ) {
-    for (mut ai, mut aq, mut agent, mut carrier, mut equipment, transform, slot, lod) in q.iter_mut() {
+    for (mut ai, mut aq, mut agent, mut carrier, mut equipment, transform, slot, lod) in
+        q.iter_mut()
+    {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }

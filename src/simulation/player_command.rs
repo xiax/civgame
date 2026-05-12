@@ -223,10 +223,8 @@ pub fn drain_player_command_events_system(
             match ev.command {
                 PlayerCommand::EncodeTablet { tech } => {
                     if player_craft.0.is_none() {
-                        player_craft.0 = Some((
-                            crate::simulation::crafting::RECIPE_CLAY_TABLET,
-                            Some(tech),
-                        ));
+                        player_craft.0 =
+                            Some((crate::simulation::crafting::RECIPE_CLAY_TABLET, Some(tech)));
                     }
                 }
                 _ => {
@@ -261,10 +259,7 @@ pub fn drain_player_command_events_system(
 ///
 /// Runs in `SimulationSet::Sequential`, late, so executors have a full tick
 /// at terminal status.
-pub fn reap_terminal_commands_system(
-    mut commands: Commands,
-    query: Query<(Entity, &Commanded)>,
-) {
+pub fn reap_terminal_commands_system(mut commands: Commands, query: Query<(Entity, &Commanded)>) {
     for (entity, c) in query.iter() {
         if c.status.is_terminal() {
             commands.entity(entity).remove::<Commanded>();
@@ -314,12 +309,9 @@ pub fn player_command_lifecycle_system(
                     None
                 }
             }
-            PlayerCommand::Gather { tile, .. } => completion_when_gather_target_gone(
-                tile,
-                ai,
-                &plant_query,
-                &chunk_map,
-            ),
+            PlayerCommand::Gather { tile, .. } => {
+                completion_when_gather_target_gone(tile, ai, &plant_query, &chunk_map)
+            }
             PlayerCommand::Mine { tile, .. } => {
                 // Walls turn into floor / loose rock when mined. The mine
                 // target is done when the tile is no longer a Wall/Stone.
@@ -413,10 +405,11 @@ pub fn player_command_lifecycle_system(
                     .map(|m| registry.root_faction(m.faction_id))
                     .unwrap_or(SOLO);
                 match registry.factions.get(&fid) {
-                    Some(f) if matches!(
-                        f.camp_state,
-                        crate::simulation::faction::CampState::Packed { .. }
-                    ) =>
+                    Some(f)
+                        if matches!(
+                            f.camp_state,
+                            crate::simulation::faction::CampState::Packed { .. }
+                        ) =>
                     {
                         Some(CommandStatus::Completed)
                     }
@@ -447,9 +440,7 @@ pub fn player_command_lifecycle_system(
 }
 
 fn completion_when_agent_idle(ai: &PersonAI) -> Option<CommandStatus> {
-    if ai.state == crate::simulation::person::AiState::Idle
-        && ai.task_id == PersonAI::UNEMPLOYED
-    {
+    if ai.state == crate::simulation::person::AiState::Idle && ai.task_id == PersonAI::UNEMPLOYED {
         Some(CommandStatus::Completed)
     } else {
         None
@@ -828,10 +819,8 @@ fn dispatch_one(
             // Faction-level request: post a craft contract for a tablet
             // encoding this tech. `chief_tablet_posting_system` drains.
             if player_craft.0.is_none() {
-                player_craft.0 = Some((
-                    crate::simulation::crafting::RECIPE_CLAY_TABLET,
-                    Some(tech),
-                ));
+                player_craft.0 =
+                    Some((crate::simulation::crafting::RECIPE_CLAY_TABLET, Some(tech)));
             }
             DispatchOutcome::Active
         }
@@ -852,10 +841,7 @@ fn dispatch_one(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.work_progress = 0;
-            commands
-                .entity(actor)
-                .remove::<Carrying>()
-                .insert(Drafted);
+            commands.entity(actor).remove::<Carrying>().insert(Drafted);
             DispatchOutcome::Active
         }
         Disband => {
@@ -985,12 +971,14 @@ fn dispatch_one(
                 return DispatchOutcome::Failed(CommandFailure::Ineligible);
             }
             if !camp_ops.pitches.iter().any(|p| p.fid == fid) {
-                camp_ops.pitches.push(crate::simulation::nomad::PendingPitch {
-                    fid,
-                    tile,
-                    z,
-                    command_actor: actor,
-                });
+                camp_ops
+                    .pitches
+                    .push(crate::simulation::nomad::PendingPitch {
+                        fid,
+                        tile,
+                        z,
+                        command_actor: actor,
+                    });
             }
             DispatchOutcome::Active
         }

@@ -3,9 +3,7 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
 use crate::simulation::knowledge::PersonKnowledge;
-use crate::simulation::technology::{
-    complexity, ActivityKind, Era, TechId, TECH_COUNT, TECH_TREE,
-};
+use crate::simulation::technology::{complexity, ActivityKind, Era, TechId, TECH_COUNT, TECH_TREE};
 
 #[derive(Resource, Default)]
 pub struct TechPanelOpen(pub bool);
@@ -139,10 +137,7 @@ pub fn tech_panel_system(
                                 let status = if chief_learned {
                                     ("Chief Learned", egui::Color32::from_rgb(80, 210, 100))
                                 } else if unlocked {
-                                    (
-                                        "Chief Aware",
-                                        egui::Color32::from_rgb(120, 200, 200),
-                                    )
+                                    ("Chief Aware", egui::Color32::from_rgb(120, 200, 200))
                                 } else if prereqs_met {
                                     ("Discoverable", egui::Color32::from_rgb(240, 200, 60))
                                 } else {

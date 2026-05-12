@@ -2,6 +2,7 @@ use super::carry::Carrier;
 use super::combat::{Body, CombatCooldown, CombatTarget};
 use super::faction::{FactionMember, FactionRegistry, SOLO};
 use super::goals::{AgentGoal, Personality};
+use super::htn::MethodHistory;
 use super::items::{Equipment, TargetItem};
 use super::lod::LodLevel;
 use super::memory::{AgentMemory, RelationshipMemory};
@@ -11,9 +12,8 @@ use super::needs::Needs;
 use super::person::{
     generate_person_name, AiState, HairColor, Person, PersonAI, Profession, SkinTone,
 };
-use super::htn::MethodHistory;
 use super::schedule::{BucketSlot, SimClock};
-use super::skills::{Skills, SkillPeaks, SkillUseTicks, SkillsLastSeen};
+use super::skills::{SkillPeaks, SkillUseTicks, Skills, SkillsLastSeen};
 use super::stats::Stats;
 use crate::economy::agent::EconomicAgent;
 use crate::pathfinding::path_request::PathFollow;
@@ -437,8 +437,7 @@ pub fn pregnancy_system(
         Option<&HouseholdMember>,
     )>,
 ) {
-    let mut births: Vec<(Entity, Transform, u32, Stats, u64, Option<HouseholdMember>)> =
-        Vec::new();
+    let mut births: Vec<(Entity, Transform, u32, Stats, u64, Option<HouseholdMember>)> = Vec::new();
 
     for (
         mother,
@@ -475,14 +474,8 @@ pub fn pregnancy_system(
         ));
     }
 
-    for (
-        mother,
-        parent_transform,
-        faction_id,
-        child_stats,
-        inherited_aware,
-        mother_household,
-    ) in births
+    for (mother, parent_transform, faction_id, child_stats, inherited_aware, mother_household) in
+        births
     {
         commands.entity(mother).remove::<Pregnancy>();
 
@@ -506,73 +499,75 @@ pub fn pregnancy_system(
             mother_name, child_name, faction_id
         );
 
-        let child_entity = commands.spawn((
-            (
-                Person,
-                Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
-                GlobalTransform::default(),
-                Visibility::Visible,
-                InheritedVisibility::default(),
-                Needs::new(0.0, 0.0, 0.0, 0.0, 0.0, 255.0),
-                Mood::default(),
-                Skills::default(),
-                SkillPeaks::default(),
-                SkillUseTicks::default(),
-                SkillsLastSeen::default(),
-                child_stats,
-                PersonAI {
-                    task_id: PersonAI::UNEMPLOYED,
-                    state: AiState::Idle,
-                    target_tile: (tx as i32, ty as i32),
-                    dest_tile: (tx as i32, ty as i32),
-                    current_z: chunk_map.surface_z_at(tx, ty) as i8,
-                    target_z: chunk_map.surface_z_at(tx, ty) as i8,
-                    ..PersonAI::default()
-                },
-                EconomicAgent::default(),
-            ),
-            (
-                LodLevel::Full,
-                BucketSlot(new_slot),
-                MovementState::default(),
-                sex,
-                SkinTone::random(),
-                HairColor::random(),
-                Personality::random(),
-                AgentGoal::default(),
-                Profession::None,
-                FactionMember {
-                    faction_id,
-                    ..Default::default()
-                },
-                Body::new_humanoid(),
-                Equipment::default(),
-            ),
-            (
-                TargetItem::default(),
-                CombatTarget::default(),
-                CombatCooldown::default(),
-                AgentMemory::default(),
-                RelationshipMemory::default(),
-                MethodHistory::default(),
-                crate::simulation::memory::CurrentVision::default(),
-                Name::new(child_name),
-                PathFollow::default(),
-                Carrier::default(),
-            ),
-            (
-                CoSleepTracker::default(),
-                MaleConceptionCooldown::default(),
-                crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Person),
-                crate::simulation::knowledge::PersonKnowledge {
-                    aware: inherited_aware,
-                    learned: 0,
-                    learned_at: [0u32; crate::simulation::knowledge::KNOWLEDGE_SLOTS],
-                    study_progress: ahash::AHashMap::new(),
-                },
-                crate::simulation::typed_task::ActionQueue::idle(),
-            ),
-        )).id();
+        let child_entity = commands
+            .spawn((
+                (
+                    Person,
+                    Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                    Needs::new(0.0, 0.0, 0.0, 0.0, 0.0, 255.0),
+                    Mood::default(),
+                    Skills::default(),
+                    SkillPeaks::default(),
+                    SkillUseTicks::default(),
+                    SkillsLastSeen::default(),
+                    child_stats,
+                    PersonAI {
+                        task_id: PersonAI::UNEMPLOYED,
+                        state: AiState::Idle,
+                        target_tile: (tx as i32, ty as i32),
+                        dest_tile: (tx as i32, ty as i32),
+                        current_z: chunk_map.surface_z_at(tx, ty) as i8,
+                        target_z: chunk_map.surface_z_at(tx, ty) as i8,
+                        ..PersonAI::default()
+                    },
+                    EconomicAgent::default(),
+                ),
+                (
+                    LodLevel::Full,
+                    BucketSlot(new_slot),
+                    MovementState::default(),
+                    sex,
+                    SkinTone::random(),
+                    HairColor::random(),
+                    Personality::random(),
+                    AgentGoal::default(),
+                    Profession::None,
+                    FactionMember {
+                        faction_id,
+                        ..Default::default()
+                    },
+                    Body::new_humanoid(),
+                    Equipment::default(),
+                ),
+                (
+                    TargetItem::default(),
+                    CombatTarget::default(),
+                    CombatCooldown::default(),
+                    AgentMemory::default(),
+                    RelationshipMemory::default(),
+                    MethodHistory::default(),
+                    crate::simulation::memory::CurrentVision::default(),
+                    Name::new(child_name),
+                    PathFollow::default(),
+                    Carrier::default(),
+                ),
+                (
+                    CoSleepTracker::default(),
+                    MaleConceptionCooldown::default(),
+                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Person),
+                    crate::simulation::knowledge::PersonKnowledge {
+                        aware: inherited_aware,
+                        learned: 0,
+                        learned_at: [0u32; crate::simulation::knowledge::KNOWLEDGE_SLOTS],
+                        study_progress: ahash::AHashMap::new(),
+                    },
+                    crate::simulation::typed_task::ActionQueue::idle(),
+                ),
+            ))
+            .id();
 
         // Pluralist Economy R3 follow-on b: inherit
         // `HouseholdMember` from the mother. The child of two

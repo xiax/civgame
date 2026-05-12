@@ -6,7 +6,9 @@ use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::pathfinding::hotspots::{HotspotFlowFields, HotspotKind};
 use crate::simulation::combat::{CombatTarget, Health};
-use crate::simulation::faction::{release_reservation, FactionMember, PlayerFaction, StorageReservations};
+use crate::simulation::faction::{
+    release_reservation, FactionMember, PlayerFaction, StorageReservations,
+};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, Drafted, PersonAI, Profession};
 use crate::simulation::schedule::SimClock;

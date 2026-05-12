@@ -9,7 +9,6 @@ const MAX_ENTRIES: usize = 16;
 const TICKS_PER_DAY: u64 = 3600;
 const DAYS_PER_SEASON: u64 = 5;
 
-
 #[derive(Event, Clone)]
 pub struct ActivityLogEvent {
     pub tick: u64,
@@ -66,10 +65,7 @@ pub enum ActivityEntryKind {
 
 #[derive(Clone)]
 pub enum ResultLink {
-    Built {
-        entity: Entity,
-        snapshot: Vec2,
-    },
+    Built { entity: Entity, snapshot: Vec2 },
     HeldByActor,
     NoTarget,
 }
@@ -109,13 +105,14 @@ pub fn activity_log_ingest_system(
             .map(|t| t.translation.truncate());
 
         let (verb, thing_label, result) = match &ev.kind {
-            ActivityEntryKind::RegionSettled { megachunk, region_name } => {
-                (
-                    "settled",
-                    format!("{} (mega-chunk {:?})", region_name, megachunk),
-                    ResultLink::NoTarget,
-                )
-            }
+            ActivityEntryKind::RegionSettled {
+                megachunk,
+                region_name,
+            } => (
+                "settled",
+                format!("{} (mega-chunk {:?})", region_name, megachunk),
+                ResultLink::NoTarget,
+            ),
             &ActivityEntryKind::Constructed {
                 site,
                 tile,
@@ -136,12 +133,13 @@ pub fn activity_log_ingest_system(
                     },
                 )
             }
-            &ActivityEntryKind::Crafted { name } => (
-                "crafted",
-                name.to_string(),
-                ResultLink::HeldByActor,
-            ),
-            &ActivityEntryKind::TechDiscovered { tech_name, era_name } => (
+            &ActivityEntryKind::Crafted { name } => {
+                ("crafted", name.to_string(), ResultLink::HeldByActor)
+            }
+            &ActivityEntryKind::TechDiscovered {
+                tech_name,
+                era_name,
+            } => (
                 "discovered",
                 format!("{} ({})", tech_name, era_name),
                 ResultLink::NoTarget,
@@ -154,11 +152,9 @@ pub fn activity_log_ingest_system(
                 format!("{} ({})", student_name, tech_name),
                 ResultLink::NoTarget,
             ),
-            &ActivityEntryKind::Read { tech_name } => (
-                "read of",
-                tech_name.to_string(),
-                ResultLink::HeldByActor,
-            ),
+            &ActivityEntryKind::Read { tech_name } => {
+                ("read of", tech_name.to_string(), ResultLink::HeldByActor)
+            }
             &ActivityEntryKind::CampMoved { from, to } => (
                 "moved camp",
                 format!("{:?} → {:?}", from, to),
@@ -275,11 +271,8 @@ pub fn activity_log_panel_system(
                                     match &entry.result {
                                         ResultLink::Built { entity, snapshot } => {
                                             let result_alive = transforms.get(*entity).is_ok();
-                                            let thing_btn = link_button(
-                                                ui,
-                                                &entry.thing_label,
-                                                result_alive,
-                                            );
+                                            let thing_btn =
+                                                link_button(ui, &entry.thing_label, result_alive);
                                             if thing_btn.clicked() && result_alive {
                                                 click_result_entity = Some(*entity);
                                                 click_focus = transforms
@@ -290,13 +283,9 @@ pub fn activity_log_panel_system(
                                             }
                                         }
                                         ResultLink::HeldByActor => {
-                                            let actor_alive =
-                                                name_query.get(entry.actor).is_ok();
-                                            let thing_btn = link_button(
-                                                ui,
-                                                &entry.thing_label,
-                                                actor_alive,
-                                            );
+                                            let actor_alive = name_query.get(entry.actor).is_ok();
+                                            let thing_btn =
+                                                link_button(ui, &entry.thing_label, actor_alive);
                                             if thing_btn.clicked() && actor_alive {
                                                 click_actor = Some(entry.actor);
                                                 click_focus = transforms
@@ -309,9 +298,7 @@ pub fn activity_log_panel_system(
                                         ResultLink::NoTarget => {
                                             ui.label(
                                                 egui::RichText::new(&entry.thing_label)
-                                                    .color(egui::Color32::from_rgb(
-                                                        200, 230, 200,
-                                                    )),
+                                                    .color(egui::Color32::from_rgb(200, 230, 200)),
                                             );
                                         }
                                     }
@@ -343,7 +330,6 @@ pub fn activity_log_panel_system(
                     }
                 });
         });
-
 }
 
 pub fn camera_focus_system(

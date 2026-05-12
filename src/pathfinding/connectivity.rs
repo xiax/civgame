@@ -128,20 +128,19 @@ pub fn build_connectivity_components(
     let mut nodes: Vec<(ChunkCoord, ComponentId)> = Vec::new();
     let mut idx: AHashMap<(ChunkCoord, ComponentId), usize> = AHashMap::new();
 
-    let intern =
-        |key: (ChunkCoord, ComponentId),
-         nodes: &mut Vec<(ChunkCoord, ComponentId)>,
-         idx: &mut AHashMap<(ChunkCoord, ComponentId), usize>|
-         -> usize {
-            if let Some(&i) = idx.get(&key) {
-                i
-            } else {
-                let i = nodes.len();
-                nodes.push(key);
-                idx.insert(key, i);
-                i
-            }
-        };
+    let intern = |key: (ChunkCoord, ComponentId),
+                  nodes: &mut Vec<(ChunkCoord, ComponentId)>,
+                  idx: &mut AHashMap<(ChunkCoord, ComponentId), usize>|
+     -> usize {
+        if let Some(&i) = idx.get(&key) {
+            i
+        } else {
+            let i = nodes.len();
+            nodes.push(key);
+            idx.insert(key, i);
+            i
+        }
+    };
 
     // Intern every (chunk, component) — even ones with no inter-chunk
     // edges (an isolated cave system in a single chunk is a valid CC).
@@ -269,10 +268,18 @@ mod tests {
     #[test]
     fn two_connected_chunks_reach_at_their_shared_z() {
         let mut graph = ChunkGraph::default();
-        graph.components.insert(ChunkCoord(0, 0), comp_at_z(ChunkCoord(0, 0), 0, 1));
-        graph.components.insert(ChunkCoord(1, 0), comp_at_z(ChunkCoord(1, 0), 0, 1));
-        graph.edges.insert(ChunkCoord(0, 0), vec![edge(ChunkCoord(1, 0), 0, 0)]);
-        graph.edges.insert(ChunkCoord(1, 0), vec![edge(ChunkCoord(0, 0), 0, 0)]);
+        graph
+            .components
+            .insert(ChunkCoord(0, 0), comp_at_z(ChunkCoord(0, 0), 0, 1));
+        graph
+            .components
+            .insert(ChunkCoord(1, 0), comp_at_z(ChunkCoord(1, 0), 0, 1));
+        graph
+            .edges
+            .insert(ChunkCoord(0, 0), vec![edge(ChunkCoord(1, 0), 0, 0)]);
+        graph
+            .edges
+            .insert(ChunkCoord(1, 0), vec![edge(ChunkCoord(0, 0), 0, 0)]);
         let conn = rebuild(&graph);
         assert!(conn.is_reachable((ChunkCoord(0, 0), 0), (ChunkCoord(1, 0), 0)));
     }
@@ -280,8 +287,12 @@ mod tests {
     #[test]
     fn isolated_chunks_unreachable() {
         let mut graph = ChunkGraph::default();
-        graph.components.insert(ChunkCoord(0, 0), comp_at_z(ChunkCoord(0, 0), 0, 1));
-        graph.components.insert(ChunkCoord(5, 5), comp_at_z(ChunkCoord(5, 5), 0, 1));
+        graph
+            .components
+            .insert(ChunkCoord(0, 0), comp_at_z(ChunkCoord(0, 0), 0, 1));
+        graph
+            .components
+            .insert(ChunkCoord(5, 5), comp_at_z(ChunkCoord(5, 5), 0, 1));
         let conn = rebuild(&graph);
         assert!(!conn.is_reachable((ChunkCoord(0, 0), 0), (ChunkCoord(5, 5), 0)));
     }
@@ -298,10 +309,18 @@ mod tests {
         b.insert((0u8, 0u8, 0i8), ComponentId(0));
         b.insert((1u8, 0u8, -5i8), ComponentId(1));
         let mut graph = ChunkGraph::default();
-        graph.components.insert(ChunkCoord(0, 0), ChunkComponents { at: a, count: 2 });
-        graph.components.insert(ChunkCoord(1, 0), ChunkComponents { at: b, count: 2 });
-        graph.edges.insert(ChunkCoord(0, 0), vec![edge(ChunkCoord(1, 0), 0, 0)]);
-        graph.edges.insert(ChunkCoord(1, 0), vec![edge(ChunkCoord(0, 0), 0, 0)]);
+        graph
+            .components
+            .insert(ChunkCoord(0, 0), ChunkComponents { at: a, count: 2 });
+        graph
+            .components
+            .insert(ChunkCoord(1, 0), ChunkComponents { at: b, count: 2 });
+        graph
+            .edges
+            .insert(ChunkCoord(0, 0), vec![edge(ChunkCoord(1, 0), 0, 0)]);
+        graph
+            .edges
+            .insert(ChunkCoord(1, 0), vec![edge(ChunkCoord(0, 0), 0, 0)]);
         let conn = rebuild(&graph);
         assert!(conn.is_reachable((ChunkCoord(0, 0), 0), (ChunkCoord(1, 0), 0)));
         assert!(!conn.is_reachable((ChunkCoord(0, 0), 0), (ChunkCoord(1, 0), -5)));

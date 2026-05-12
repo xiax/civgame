@@ -9,18 +9,16 @@ use bevy::prelude::*;
 use crate::simulation::construction::{Blueprint, BlueprintMap, StructureIndex};
 use crate::simulation::gather::spawn_ground_drop;
 use crate::simulation::lod::LodLevel;
+use crate::simulation::obstacle::relocate_entity_aside;
 use crate::simulation::obstacle::{
     resolve_clear_yields, resolve_footprint_sync, ConstructionObstacle, ObstacleResolution,
 };
 use crate::simulation::person::{AiState, Person, PersonAI};
-use crate::simulation::plants::{
-    despawn_plant_internals, Plant, PlantMap, PlantSpriteIndex,
-};
+use crate::simulation::plants::{despawn_plant_internals, Plant, PlantMap, PlantSpriteIndex};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::Skills;
 use crate::simulation::tasks::TaskKind;
 use crate::simulation::typed_task::ActionQueue;
-use crate::simulation::obstacle::relocate_entity_aside;
 use crate::world::chunk::ChunkMap;
 use crate::world::spatial::{Indexed, SpatialIndex};
 use crate::world::terrain::TILE_SIZE;
@@ -203,9 +201,7 @@ pub fn react_obstacle_under_structure_system(
             (transform.translation.x / TILE_SIZE).floor() as i32,
             (transform.translation.y / TILE_SIZE).floor() as i32,
         );
-        if !structure_index.0.contains_key(&tile)
-            && !blueprint_map.0.contains_key(&tile)
-        {
+        if !structure_index.0.contains_key(&tile) && !blueprint_map.0.contains_key(&tile) {
             continue;
         }
         hits.push((entity, tile, obstacle.resolution));

@@ -51,17 +51,17 @@ pub enum TaskKind {
     Play = 26,        // recreation: refills willpower, optionally builds bonds with a partner
     WithdrawMaterial = 27, // pull one good currently needed by a faction blueprint from a storage tile
     WithdrawGood = 28, // pull one of a specific good (encoded in craft_recipe_id) from a faction storage tile; sentinel 255 = any entertainment-value good
-    PlayPlant = 29,   // recreational planting: consumes a Seed from inventory, spawns a Grain plant, awards Farming XP + activity, bursts willpower
-    PlayThrow = 30,   // recreational rock-throwing: consumes a Stone from inventory, awards Combat XP + activity, bursts willpower
+    PlayPlant = 29, // recreational planting: consumes a Seed from inventory, spawns a Grain plant, awards Farming XP + activity, bursts willpower
+    PlayThrow = 30, // recreational rock-throwing: consumes a Stone from inventory, awards Combat XP + activity, bursts willpower
     HaulToCraftOrder = 31, // carry inventory goods to a faction CraftOrder anchor and drop them into deposit slots
     WorkOnCraftOrder = 32, // adjacent to a satisfied CraftOrder anchor; advances work_progress until the recipe completes
     PickUpCorpse = 33, // walk to a fresh `Corpse` entity and attach it via PersonAI.carried_corpse
-    HaulCorpse = 34,  // walk a carried corpse to a butcher site (hearth / faction camp) and stand there
-    Butcher = 35,     // adjacent to own carried corpse; work_ticks then yield Meat+Skin and despawn
-    Equip = 36,       // instant: move a matching Item from inventory/Carrier into Equipment[slot]
+    HaulCorpse = 34, // walk a carried corpse to a butcher site (hearth / faction camp) and stand there
+    Butcher = 35,    // adjacent to own carried corpse; work_ticks then yield Meat+Skin and despawn
+    Equip = 36,      // instant: move a matching Item from inventory/Carrier into Equipment[slot]
     HuntPartyMuster = 37, // hunter waiting at hearth for the chief's hunting party to fill
-    Read = 38,        // study a tablet/book held in inventory; accumulates StudyProgress on its tech_payload
-    Teach = 39,       // adjacent to a target student, both stand still while teacher transfers progress
+    Read = 38, // study a tablet/book held in inventory; accumulates StudyProgress on its tech_payload
+    Teach = 39, // adjacent to a target student, both stand still while teacher transfers progress
     HoldLecture = 40, // stand at lecture anchor and broadcast progress to nearby Attending students
     AttendLecture = 41, // student rooted near a Lecturing teacher, accumulating progress per tick
     /// P2b: nomadic / member-pool withdraw. Walks the actor adjacent
@@ -169,8 +169,7 @@ pub fn task_requires_free_hands(task_id: u16) -> u8 {
 /// Tasks that should drop hand-held loads at entry (the activity is incompatible
 /// with carrying things). Stacks become GroundItems at the agent's tile.
 pub fn task_drops_hand_load(task_id: u16) -> bool {
-    task_id == TaskKind::Sleep as u16
-        || task_id == TaskKind::Socialize as u16
+    task_id == TaskKind::Sleep as u16 || task_id == TaskKind::Socialize as u16
 }
 
 /// Returns true for tasks where the agent works from an adjacent tile rather than
@@ -686,17 +685,25 @@ pub fn goal_dispatch_system(
                         Some(TaskKind::HaulMaterials as u16)
                     }
                     // Phase 5e-ii: hunter-arm chain (`htn_equip_hunting_spear_dispatch_system`)
-                    // runs without an ActivePlan under Survive / GatherFood.
-                    // Both legs (WithdrawMaterial + Equip) survive goal-dispatch
-                    // ticks until completion or external preempt — mirrors the
-                    // legacy plan's `PF_UNINTERRUPTIBLE`.
-                    AgentGoal::Survive | AgentGoal::GatherFood
-                        if ai.task_id == TaskKind::WithdrawMaterial as u16 =>
+                    // runs without an ActivePlan; the dispatcher is now
+                    // goal-agnostic (a Hunter under HuntOrder::Hunt may have
+                    // any goal — Lead / Defend / Socialize / Survive / etc.).
+                    // Preserve both legs of the chain across goal flips by
+                    // keying on the reserved-resource (WithdrawMaterial leg)
+                    // and the `Task::Equip { resource_id }` payload (Equip
+                    // leg, by which point the reservation has been released
+                    // in `finish_withdraw_material`). Weapon-specific so
+                    // non-hunter WithdrawMaterial/Equip chains still
+                    // respect their own goal preserve-arms below.
+                    _ if ai.task_id == TaskKind::WithdrawMaterial as u16
+                        && ai.reserved_resource
+                            == Some(crate::economy::core_ids::weapon()) =>
                     {
                         Some(TaskKind::WithdrawMaterial as u16)
                     }
-                    AgentGoal::Survive | AgentGoal::GatherFood
-                        if ai.task_id == TaskKind::Equip as u16 =>
+                    _ if ai.task_id == TaskKind::Equip as u16
+                        && aq.current.as_equip().map(|(_slot, rid)| rid)
+                            == Some(crate::economy::core_ids::weapon()) =>
                     {
                         Some(TaskKind::Equip as u16)
                     }
@@ -704,9 +711,7 @@ pub fn goal_dispatch_system(
                     // an ActivePlan under ReturnCamp. The DepositResource walk
                     // needs to survive across goal-dispatch ticks until
                     // `drop_items_at_destination_system` fires.
-                    AgentGoal::ReturnCamp
-                        if ai.task_id == TaskKind::DepositResource as u16 =>
-                    {
+                    AgentGoal::ReturnCamp if ai.task_id == TaskKind::DepositResource as u16 => {
                         Some(TaskKind::DepositResource as u16)
                     }
                     // Phase 5e-iv: HTN-driven TameWildHorse chain runs without
@@ -830,9 +835,7 @@ pub fn goal_dispatch_system(
                     AgentGoal::GatherFood if ai.task_id == TaskKind::Scavenge as u16 => {
                         Some(TaskKind::Scavenge as u16)
                     }
-                    AgentGoal::GatherFood
-                        if ai.task_id == TaskKind::DepositResource as u16 =>
-                    {
+                    AgentGoal::GatherFood if ai.task_id == TaskKind::DepositResource as u16 => {
                         Some(TaskKind::DepositResource as u16)
                     }
                     AgentGoal::GatherFood if ai.task_id == TaskKind::Explore as u16 => {
@@ -848,9 +851,7 @@ pub fn goal_dispatch_system(
                     _ if ai.task_id == TaskKind::HaulCorpse as u16 => {
                         Some(TaskKind::HaulCorpse as u16)
                     }
-                    _ if ai.task_id == TaskKind::Butcher as u16 => {
-                        Some(TaskKind::Butcher as u16)
-                    }
+                    _ if ai.task_id == TaskKind::Butcher as u16 => Some(TaskKind::Butcher as u16),
                     // Phase 5e-viii-b: HTN-driven EngagePrey runs without an
                     // ActivePlan after the truncated `HuntFood` plan completes
                     // at Travel. Hunt walks to prey + engages combat;
@@ -859,9 +860,7 @@ pub fn goal_dispatch_system(
                     // `HuntOrder::Hunt` is the standing obligation that
                     // overrides need-driven goal flips. Mirrors the methods'
                     // `MF_UNINTERRUPTIBLE` flag.
-                    _ if ai.task_id == TaskKind::Hunter as u16 => {
-                        Some(TaskKind::Hunter as u16)
-                    }
+                    _ if ai.task_id == TaskKind::Hunter as u16 => Some(TaskKind::Hunter as u16),
                     _ if ai.task_id == TaskKind::PickUpCorpse as u16 => {
                         Some(TaskKind::PickUpCorpse as u16)
                     }

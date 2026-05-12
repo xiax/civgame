@@ -72,10 +72,10 @@ fn assign_nearest(plates: &[Plate], warp_x: &Perlin, warp_y: &Perlin) -> Vec<u8>
             // produce peninsulas/inlets at sub-boundary scale.
             let u = gx as f64 * WARP_FREQ;
             let v = gy as f64 * WARP_FREQ;
-            let wx = warp_x.get([u, v]) * WARP_AMP
-                + warp_x.get([u * 2.5, v * 2.5]) * (WARP_AMP * 0.4);
-            let wy = warp_y.get([u, v]) * WARP_AMP
-                + warp_y.get([u * 2.5, v * 2.5]) * (WARP_AMP * 0.4);
+            let wx =
+                warp_x.get([u, v]) * WARP_AMP + warp_x.get([u * 2.5, v * 2.5]) * (WARP_AMP * 0.4);
+            let wy =
+                warp_y.get([u, v]) * WARP_AMP + warp_y.get([u * 2.5, v * 2.5]) * (WARP_AMP * 0.4);
             let p = (gx as f32 + 0.5 + wx as f32, gy as f32 + 0.5 + wy as f32);
             let mut best = 0;
             let mut best_d = f32::INFINITY;
@@ -174,12 +174,7 @@ pub fn uplift_field(field: &PlateField, seed: u64) -> Vec<f32> {
             // cell straddling a triple-junction averages cleanly.
             let mut total = 0.0f32;
             let mut count = 0u32;
-            let neighbours = [
-                (gx - 1, gy),
-                (gx + 1, gy),
-                (gx, gy - 1),
-                (gx, gy + 1),
-            ];
+            let neighbours = [(gx - 1, gy), (gx + 1, gy), (gx, gy - 1), (gx, gy + 1)];
             for (nx, ny) in neighbours {
                 if ny < 0 || ny >= GLOBE_HEIGHT {
                     continue;
@@ -220,8 +215,7 @@ pub fn uplift_field(field: &PlateField, seed: u64) -> Vec<f32> {
             for gx in 0..w {
                 let xm = (gx + w - 1) % w;
                 let xp = (gx + 1) % w;
-                buf[gy * w + gx] =
-                    (raw[gy * w + xm] + raw[gy * w + gx] + raw[gy * w + xp]) / 3.0;
+                buf[gy * w + gx] = (raw[gy * w + xm] + raw[gy * w + gx] + raw[gy * w + xp]) / 3.0;
             }
         }
         std::mem::swap(&mut raw, &mut buf);

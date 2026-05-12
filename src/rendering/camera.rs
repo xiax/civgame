@@ -70,8 +70,10 @@ pub fn position_camera_for_spawn(
     let (mx, my) = pending.0.unwrap_or_else(|| {
         let half_w = GLOBE_WIDTH / 2;
         let half_h = GLOBE_HEIGHT / 2;
-        (half_w * GLOBE_CELL_CHUNKS / crate::world::globe::MEGACHUNK_SIZE_CHUNKS,
-         half_h * GLOBE_CELL_CHUNKS / crate::world::globe::MEGACHUNK_SIZE_CHUNKS)
+        (
+            half_w * GLOBE_CELL_CHUNKS / crate::world::globe::MEGACHUNK_SIZE_CHUNKS,
+            half_h * GLOBE_CELL_CHUNKS / crate::world::globe::MEGACHUNK_SIZE_CHUNKS,
+        )
     });
     let (tx, ty) = crate::simulation::region::MegaChunkCoord::center_tile(mx, my);
     transform.translation.x = tx as f32 * TILE_SIZE + TILE_SIZE * 0.5;

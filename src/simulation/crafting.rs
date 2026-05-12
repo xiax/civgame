@@ -3,7 +3,6 @@ use crate::economy::core_ids;
 
 use crate::economy::item::{Item, ItemMaterial, ItemQuality};
 use crate::economy::resource_catalog::ResourceId;
-use std::sync::OnceLock;
 use crate::simulation::construction::{GoodNeed, LoomMap, WorkbenchMap, MAX_BUILD_INPUTS};
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::jobs::{
@@ -18,6 +17,7 @@ use crate::simulation::technology::TechId;
 use crate::world::terrain::tile_to_world;
 use ahash::AHashMap;
 use bevy::prelude::*;
+use std::sync::OnceLock;
 
 /// A crafting station required for certain recipes. Some recipes (e.g. Bow,
 /// Pottery) work in the open and have `requires_station: None`.
@@ -525,9 +525,14 @@ pub fn faction_craft_order_system(
                 JobProgress::Crafting { tech_payload, .. } => tech_payload,
                 _ => None,
             };
-            let Some(order) =
-                CraftOrder::new(faction_id, recipe, workbench, anchor, clock.tick, tech_payload)
-            else {
+            let Some(order) = CraftOrder::new(
+                faction_id,
+                recipe,
+                workbench,
+                anchor,
+                clock.tick,
+                tech_payload,
+            ) else {
                 continue;
             };
             let wp = tile_to_world(anchor.0 as i32, anchor.1 as i32);
@@ -546,7 +551,6 @@ pub fn faction_craft_order_system(
             if live_total >= cap {
                 break;
             }
-
         }
     }
 }
@@ -589,19 +593,8 @@ pub fn craft_order_system(
         AHashMap::new();
     let mut order_workers: AHashMap<Entity, Vec<Entity>> = AHashMap::new();
 
-    for (
-        entity,
-        mut ai,
-        mut aq,
-        agent,
-        carrier,
-        _skills,
-        _member,
-        slot,
-        lod,
-        _transform,
-        _claim,
-    ) in agent_query.iter_mut()
+    for (entity, mut ai, mut aq, agent, carrier, _skills, _member, slot, lod, _transform, _claim) in
+        agent_query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
@@ -675,7 +668,8 @@ pub fn craft_order_system(
     let mut orphaned_agents: Vec<Entity> = Vec::new();
     let mut xp_grants: Vec<Entity> = Vec::new();
     // (agent_entity, resource_id, qty_to_remove)
-    let mut good_removals: Vec<(Entity, crate::economy::resource_catalog::ResourceId, u32)> = Vec::new();
+    let mut good_removals: Vec<(Entity, crate::economy::resource_catalog::ResourceId, u32)> =
+        Vec::new();
     // (agent_entity, recipe_id, tech_payload) — paid out as inventory at end of pass.
     let mut output_grants: Vec<(Entity, u8, Option<TechId>)> = Vec::new();
     // Job board credits to apply (recipe, qty) per worker entity.
@@ -753,15 +747,12 @@ pub fn craft_order_system(
             if let Some(lead_e) = lead {
                 output_grants.push((lead_e, order.recipe_id, order.tech_payload));
                 order_completion_credits.push((lead_e, order.recipe_id, recipe.output_qty));
-                let faction_id =
-                    member_query.get(lead_e).map(|m| m.faction_id).unwrap_or(0);
+                let faction_id = member_query.get(lead_e).map(|m| m.faction_id).unwrap_or(0);
                 activity_log.send(crate::ui::activity_log::ActivityLogEvent {
                     tick: clock.tick,
                     actor: lead_e,
                     faction_id,
-                    kind: crate::ui::activity_log::ActivityEntryKind::Crafted {
-                        name: recipe.name,
-                    },
+                    kind: crate::ui::activity_log::ActivityEntryKind::Crafted { name: recipe.name },
                 });
             }
 
@@ -848,10 +839,12 @@ pub fn craft_order_system(
                 }
                 let matches_recipe = board
                     .get(claim.job_id)
-                    .map(|p| matches!(
-                        p.progress,
-                        JobProgress::Crafting { recipe, .. } if recipe == recipe_id
-                    ))
+                    .map(|p| {
+                        matches!(
+                            p.progress,
+                            JobProgress::Crafting { recipe, .. } if recipe == recipe_id
+                        )
+                    })
                     .unwrap_or(false);
                 if matches_recipe {
                     record_progress(
@@ -889,7 +882,10 @@ pub fn craft_order_system(
             // crafted output goods from inventory on arrival. Hauler chains
             // (5e-xi-a) end at HaulToCraftOrder with no trailing deposit, so
             // this branch only fires for completed workers.
-            if matches!(aq.current, crate::simulation::typed_task::Task::DepositToFactionStorage { .. }) {
+            if matches!(
+                aq.current,
+                crate::simulation::typed_task::Task::DepositToFactionStorage { .. }
+            ) {
                 use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
                 use crate::world::terrain::TILE_SIZE;
                 let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
@@ -926,7 +922,6 @@ pub fn craft_order_system(
             }
         }
     }
-
 }
 
 fn quality_for_skill(crafting_xp: u32) -> ItemQuality {
@@ -966,10 +961,7 @@ mod tests {
         assert_eq!(stone_tools.name, "Stone Tools");
         assert_eq!(
             stone_tools.inputs,
-            vec![
-                (core_ids::stone(), 2),
-                (core_ids::wood(), 1),
-            ]
+            vec![(core_ids::stone(), 2), (core_ids::wood(), 1),]
         );
         assert_eq!(stone_tools.output_resource, core_ids::tools());
         assert_eq!(stone_tools.output_qty, 1);
@@ -979,12 +971,8 @@ mod tests {
         assert_eq!(book.name, "Book");
         assert_eq!(
             book.inputs,
-            vec![
-                (core_ids::cloth(), 2),
-                (core_ids::skin(), 1),
-            ]
+            vec![(core_ids::cloth(), 2), (core_ids::skin(), 1),]
         );
         assert_eq!(book.output_resource, core_ids::book());
     }
-
 }

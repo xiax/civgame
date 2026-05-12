@@ -342,12 +342,10 @@ pub fn load_resource_catalog() -> ResourceCatalog {
         if path.extension().and_then(|s| s.to_str()) != Some("ron") {
             continue;
         }
-        let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!("ResourceCatalog: cannot read {:?}: {}", path, e)
-        });
-        let file: ResourceFile = ron::from_str(&body).unwrap_or_else(|e| {
-            panic!("ResourceCatalog: parse error in {:?}: {}", path, e)
-        });
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("ResourceCatalog: cannot read {:?}: {}", path, e));
+        let file: ResourceFile = ron::from_str(&body)
+            .unwrap_or_else(|e| panic!("ResourceCatalog: parse error in {:?}: {}", path, e));
         defs.extend(file.resources);
     }
 

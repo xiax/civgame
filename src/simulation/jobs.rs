@@ -92,10 +92,7 @@ pub struct TileAabb {
 
 impl TileAabb {
     pub fn contains(&self, tile: (i32, i32)) -> bool {
-        tile.0 >= self.min.0
-            && tile.0 <= self.max.0
-            && tile.1 >= self.min.1
-            && tile.1 <= self.max.1
+        tile.0 >= self.min.0 && tile.0 <= self.max.0 && tile.1 >= self.min.1 && tile.1 <= self.max.1
     }
 }
 
@@ -156,11 +153,9 @@ impl JobProgress {
             JobProgress::Stockpile { resource_id, .. } => Some(*resource_id),
             JobProgress::Haul { resource_id, .. } => Some(*resource_id),
             JobProgress::Planting { .. } => Some(core_ids::grain_seed()),
-            JobProgress::Crafting { recipe, .. } => {
-                crate::simulation::crafting::craft_recipes()
-                    .get(*recipe as usize)
-                    .map(|r| r.output_resource)
-            }
+            JobProgress::Crafting { recipe, .. } => crate::simulation::crafting::craft_recipes()
+                .get(*recipe as usize)
+                .map(|r| r.output_resource),
             JobProgress::Building { .. } => None,
         }
     }
@@ -321,7 +316,10 @@ impl JobPosting {
             // `chief_defaults()` doesn't depend on the resource
             // catalog being installed at call time. Any caller using
             // this stub should override `progress` explicitly.
-            progress: JobProgress::Calories { deposited: 0, target: 1 },
+            progress: JobProgress::Calories {
+                deposited: 0,
+                target: 1,
+            },
             claimants: Vec::new(),
             priority: 0,
             source: JobSource::Chief,
@@ -439,8 +437,8 @@ pub fn on_job_escrow_remove(
         // Cleared on successful payout; nothing to refund.
         return;
     }
-    if let Some(mut econ) = world
-        .get_mut::<crate::economy::agent::EconomicAgent>(escrow.beneficiary)
+    if let Some(mut econ) =
+        world.get_mut::<crate::economy::agent::EconomicAgent>(escrow.beneficiary)
     {
         econ.currency += escrow.amount;
     }
@@ -552,8 +550,8 @@ pub fn job_payout_system(world: &mut World) {
                 // re-debit the beneficiary. Invariant: agents_total
                 // gains `share`, escrowed loses `share`, net zero.
                 let credited = {
-                    if let Some(mut to_agent) = world
-                        .get_mut::<crate::economy::agent::EconomicAgent>(worker)
+                    if let Some(mut to_agent) =
+                        world.get_mut::<crate::economy::agent::EconomicAgent>(worker)
                     {
                         to_agent.currency += share;
                         true
@@ -682,8 +680,7 @@ pub fn chief_wage_for(progress: &JobProgress) -> f32 {
             (wage + (*target as f32) * 0.2).min(40.0)
         }
         JobProgress::Building { .. } => {
-            (CHIEF_BUILD_WAGE_PER_DAY * CHIEF_BUILD_EXPECTED_DAYS)
-                .min(CHIEF_BUILD_WAGE_CAP)
+            (CHIEF_BUILD_WAGE_PER_DAY * CHIEF_BUILD_EXPECTED_DAYS).min(CHIEF_BUILD_WAGE_CAP)
         }
     }
 }
@@ -744,8 +741,7 @@ pub fn chief_post_funding_system(world: &mut World) {
     //    reward, index it.
     for (job_id, faction_id, wage, chief) in candidates {
         let funded = {
-            let mut registry =
-                world.resource_mut::<crate::simulation::faction::FactionRegistry>();
+            let mut registry = world.resource_mut::<crate::simulation::faction::FactionRegistry>();
             let Some(faction) = registry.factions.get_mut(&faction_id) else {
                 continue;
             };
@@ -820,13 +816,14 @@ pub fn faction_wage_signal_system(world: &mut World) {
 
     // 1. Snapshot per-(faction, key) sums from member earnings.
     let mut sums: ahash::AHashMap<
-        (u32, JobKind, Option<crate::economy::resource_catalog::ResourceId>),
+        (
+            u32,
+            JobKind,
+            Option<crate::economy::resource_catalog::ResourceId>,
+        ),
         (f32, u32),
     > = ahash::AHashMap::default();
-    let mut q = world.query::<(
-        &Earnings,
-        &crate::simulation::faction::FactionMember,
-    )>();
+    let mut q = world.query::<(&Earnings, &crate::simulation::faction::FactionMember)>();
     for (earnings, fm) in q.iter(world) {
         let village_id = {
             let registry = world.resource::<crate::simulation::faction::FactionRegistry>();
@@ -854,8 +851,10 @@ pub fn faction_wage_signal_system(world: &mut World) {
         };
         // Collect this faction's existing keys; needed because we may
         // also touch keys that don't appear in `sums` (zero-decay).
-        let existing_keys: Vec<(JobKind, Option<crate::economy::resource_catalog::ResourceId>)> =
-            faction.wage_signal.keys().copied().collect();
+        let existing_keys: Vec<(
+            JobKind,
+            Option<crate::economy::resource_catalog::ResourceId>,
+        )> = faction.wage_signal.keys().copied().collect();
         for key in existing_keys {
             let sample = sums
                 .get(&(fid, key.0, key.1))
@@ -1028,12 +1027,8 @@ pub fn wage_gossip_system(
         if *lod == LodLevel::Dormant || !matches!(goal, AgentGoal::Socialize) {
             continue;
         }
-        let tx = (transform.translation.x
-            / crate::world::terrain::TILE_SIZE)
-            .floor() as i32;
-        let ty = (transform.translation.y
-            / crate::world::terrain::TILE_SIZE)
-            .floor() as i32;
+        let tx = (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;
+        let ty = (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32;
         let village_id = registry.root_faction(fm.faction_id);
         let mut to_merge: Vec<GossipEntry> = Vec::new();
         for dy in -WAGE_GOSSIP_RADIUS..=WAGE_GOSSIP_RADIUS {
@@ -1123,8 +1118,7 @@ pub fn post_craft_contract(
         return None;
     }
     {
-        let mut econ = world
-            .get_mut::<crate::economy::agent::EconomicAgent>(poster)?;
+        let mut econ = world.get_mut::<crate::economy::agent::EconomicAgent>(poster)?;
         econ.currency -= reward;
     }
 
@@ -1243,20 +1237,22 @@ pub fn post_craft_contract_from_treasury(
             bench: None,
             tech_payload: None,
         };
-        board.faction_postings_mut(posting_faction_id).push(JobPosting {
-            id,
-            faction_id: posting_faction_id,
-            kind: JobKind::Craft,
-            progress,
-            claimants: Vec::new(),
-            priority: PLAYER_PRIORITY,
-            source: JobSource::Player,
-            posted_tick,
-            expiry_tick: deadline_tick,
-            poster_class: PosterClass::HouseholdHead,
-            reward,
-            settlement_id: None,
-        });
+        board
+            .faction_postings_mut(posting_faction_id)
+            .push(JobPosting {
+                id,
+                faction_id: posting_faction_id,
+                kind: JobKind::Craft,
+                progress,
+                claimants: Vec::new(),
+                priority: PLAYER_PRIORITY,
+                source: JobSource::Player,
+                posted_tick,
+                expiry_tick: deadline_tick,
+                poster_class: PosterClass::HouseholdHead,
+                reward,
+                settlement_id: None,
+            });
         id
     };
 
@@ -1347,8 +1343,7 @@ pub fn post_stockpile_self(
         return None;
     }
     {
-        let mut econ = world
-            .get_mut::<crate::economy::agent::EconomicAgent>(author)?;
+        let mut econ = world.get_mut::<crate::economy::agent::EconomicAgent>(author)?;
         econ.currency -= reward;
     }
 
@@ -1485,10 +1480,12 @@ pub fn worker_self_post_stockpile_system(world: &mut World) {
                 }
                 // Already a Stockpile posting for this rid? skip —
                 // duplicate posting just dilutes claim attention.
-                let already = board.faction_postings(fid).iter().any(|p| matches!(
-                    p.progress,
-                    JobProgress::Stockpile { resource_id, .. } if resource_id == target_rid
-                ));
+                let already = board.faction_postings(fid).iter().any(|p| {
+                    matches!(
+                        p.progress,
+                        JobProgress::Stockpile { resource_id, .. } if resource_id == target_rid
+                    )
+                });
                 if already {
                     continue;
                 }
@@ -1597,8 +1594,7 @@ pub const ESTEEM_POSTING_MIN_CURRENCY: f32 = 50.0;
 /// Cadence at which `esteem_driven_posting_system` runs. Once per
 /// game-day; each qualifying agent posts at most one contract per
 /// firing.
-pub const ESTEEM_POSTING_CADENCE: u64 =
-    crate::world::seasons::TICKS_PER_DAY as u64;
+pub const ESTEEM_POSTING_CADENCE: u64 = crate::world::seasons::TICKS_PER_DAY as u64;
 
 /// Per-tick `Needs.esteem` increment when an agent posts a
 /// prestigious contract. The act of commissioning is what grants
@@ -1892,10 +1888,7 @@ pub fn chief_job_posting_system(
         ) {
             continue;
         }
-        let live_bps: Vec<Entity> = bps_by_faction
-            .get(&faction_id)
-            .cloned()
-            .unwrap_or_default();
+        let live_bps: Vec<Entity> = bps_by_faction.get(&faction_id).cloned().unwrap_or_default();
 
         // 1. Drop stale unclaimed Chief postings whose target no longer needs work.
         //    Build postings whose project is not in the Build phase are also
@@ -2020,10 +2013,12 @@ pub fn chief_job_posting_system(
                     if !in_build_phase {
                         return false;
                     }
-                    !postings.iter().any(|p| matches!(
-                        p.progress,
-                        JobProgress::Building { blueprint } if blueprint == *bp_entity
-                    ))
+                    !postings.iter().any(|p| {
+                        matches!(
+                            p.progress,
+                            JobProgress::Building { blueprint } if blueprint == *bp_entity
+                        )
+                    })
                 })
                 .collect()
         };
@@ -2032,7 +2027,8 @@ pub fn chief_job_posting_system(
             let progress = JobProgress::Building {
                 blueprint: bp_entity,
             };
-            let priority = compute_priority(faction, faction_id, JobKind::Build, &progress, &projects);
+            let priority =
+                compute_priority(faction, faction_id, JobKind::Build, &progress, &projects);
             board.faction_postings_mut(faction_id).push(JobPosting {
                 id,
                 faction_id,
@@ -2087,8 +2083,7 @@ pub fn chief_job_posting_system(
                     // adding richer foods (e.g. Fish, Cheese) doesn't change the
                     // target — deposits credit their actual nutrition, just
                     // finishing the posting faster.
-                    let calories =
-                        deficit_units * crate::economy::core_ids::min_edible_calories();
+                    let calories = deficit_units * crate::economy::core_ids::min_edible_calories();
                     let scaled = (calories as f32 * food_seasonal_multiplier) as u32;
                     let target = scaled.clamp(GATHER_TARGET_MIN, GATHER_TARGET_CAP);
                     let id = board.alloc_id();
@@ -2096,8 +2091,13 @@ pub fn chief_job_posting_system(
                         deposited: 0,
                         target,
                     };
-                    let priority =
-                        compute_priority(faction, faction_id, JobKind::Stockpile, &progress, &projects);
+                    let priority = compute_priority(
+                        faction,
+                        faction_id,
+                        JobKind::Stockpile,
+                        &progress,
+                        &projects,
+                    );
                     board.faction_postings_mut(faction_id).push(JobPosting {
                         id,
                         faction_id,
@@ -2152,8 +2152,9 @@ pub fn chief_job_posting_system(
                     };
                     for slot in &bp.deposits[..bp.deposit_count as usize] {
                         if slot.resource_id == target_rid {
-                            bp_demand = bp_demand
-                                .saturating_add((slot.needed.saturating_sub(slot.deposited)) as u32);
+                            bp_demand = bp_demand.saturating_add(
+                                (slot.needed.saturating_sub(slot.deposited)) as u32,
+                            );
                         }
                     }
                 }
@@ -2183,8 +2184,13 @@ pub fn chief_job_posting_system(
                     deposited: 0,
                     target,
                 };
-                let priority =
-                    compute_priority(faction, faction_id, JobKind::Stockpile, &progress, &projects);
+                let priority = compute_priority(
+                    faction,
+                    faction_id,
+                    JobKind::Stockpile,
+                    &progress,
+                    &projects,
+                );
                 board.faction_postings_mut(faction_id).push(JobPosting {
                     id,
                     faction_id,
@@ -2216,10 +2222,8 @@ pub fn chief_job_posting_system(
             // CraftOrders. Only process resources NOT already handled by 3b.
             let wood_id = crate::economy::core_ids::wood();
             let stone_id = crate::economy::core_ids::stone();
-            let mut co_demand: AHashMap<
-                crate::economy::resource_catalog::ResourceId,
-                u32,
-            > = AHashMap::new();
+            let mut co_demand: AHashMap<crate::economy::resource_catalog::ResourceId, u32> =
+                AHashMap::new();
             for (_, &order_entity) in &co_map.0 {
                 let Ok(order) = co_query.get(order_entity) else {
                     continue;
@@ -2235,12 +2239,11 @@ pub fn chief_job_posting_system(
                     if still == 0 {
                         continue;
                     }
-                    *co_demand.entry(slot.resource_id).or_insert(0) =
-                        co_demand
-                            .get(&slot.resource_id)
-                            .copied()
-                            .unwrap_or(0)
-                            .saturating_add(still);
+                    *co_demand.entry(slot.resource_id).or_insert(0) = co_demand
+                        .get(&slot.resource_id)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(still);
                 }
             }
             for (target_rid, demand) in co_demand {
@@ -2272,8 +2275,13 @@ pub fn chief_job_posting_system(
                     deposited: 0,
                     target,
                 };
-                let priority =
-                    compute_priority(faction, faction_id, JobKind::Stockpile, &progress, &projects);
+                let priority = compute_priority(
+                    faction,
+                    faction_id,
+                    JobKind::Stockpile,
+                    &progress,
+                    &projects,
+                );
                 board.faction_postings_mut(faction_id).push(JobPosting {
                     id,
                     faction_id,
@@ -2300,10 +2308,8 @@ pub fn chief_job_posting_system(
             // Phase 2d: storage_remaining, deposit slots, and the Haul
             // JobProgress payload are all ResourceId-keyed end-to-end —
             // no Good roundtrip on this hot path.
-            let mut storage_remaining: AHashMap<
-                crate::economy::resource_catalog::ResourceId,
-                u32,
-            > = faction.storage.totals.clone();
+            let mut storage_remaining: AHashMap<crate::economy::resource_catalog::ResourceId, u32> =
+                faction.storage.totals.clone();
             // Subtract qty already committed to existing alive Haul postings
             // (not yet delivered) so we don't double-allocate the same stock.
             for p in board.faction_postings(faction_id).iter() {
@@ -2400,9 +2406,7 @@ pub fn chief_job_posting_system(
                 .faction_postings(faction_id)
                 .iter()
                 .any(|p| matches!(p.kind, JobKind::Farm));
-            let grain = faction
-                .storage
-                .stock_of(crate::economy::core_ids::grain());
+            let grain = faction.storage.stock_of(crate::economy::core_ids::grain());
             let seed = faction.storage.seed_total();
             // Post farm if grain is low and seeds are available.
             if !already_farm && grain < faction.member_count * 4 && seed > 0 {
@@ -2476,7 +2480,10 @@ pub fn chief_job_posting_system(
                     u32,
                 > = AHashMap::new();
                 let mut best_blocked_deficit: u32 = 0;
-                for (idx, recipe) in crate::simulation::crafting::craft_recipes().iter().enumerate() {
+                for (idx, recipe) in crate::simulation::crafting::craft_recipes()
+                    .iter()
+                    .enumerate()
+                {
                     if let Some(tech) = recipe.tech_gate {
                         if !faction.techs.has(tech) {
                             continue;
@@ -2493,12 +2500,10 @@ pub fn chief_job_posting_system(
                         continue;
                     }
                     let bench_ref = match recipe.requires_station {
-                        Some(crate::simulation::crafting::StationKind::Workbench) => {
-                            match bench {
-                                Some(e) => Some(e),
-                                None => continue,
-                            }
-                        }
+                        Some(crate::simulation::crafting::StationKind::Workbench) => match bench {
+                            Some(e) => Some(e),
+                            None => continue,
+                        },
                         Some(crate::simulation::crafting::StationKind::Loom) => {
                             if loom.is_none() {
                                 continue;
@@ -2673,7 +2678,9 @@ pub fn chief_tablet_posting_system(
         &LodLevel,
     )>,
 ) {
-    use crate::simulation::crafting::{craft_recipes, recipe_encodes_knowledge, RECIPE_CLAY_TABLET};
+    use crate::simulation::crafting::{
+        craft_recipes, recipe_encodes_knowledge, RECIPE_CLAY_TABLET,
+    };
     use crate::simulation::technology::{complexity, TechId, TECH_COUNT};
 
     let posted_tick = clock.tick as u32;
@@ -2926,7 +2933,12 @@ fn profession_bias(p: Profession, kind: JobKind) -> f32 {
 /// Distinguishing key for claim-cap accounting. Stockpile postings split by
 /// the targeted resource so wood/stone caps are independent of food's. All
 /// other kinds (Haul, Build, Farm, Craft) cap as a single bucket per JobKind.
-fn cap_bucket(p: &JobPosting) -> (JobKind, Option<crate::economy::resource_catalog::ResourceId>) {
+fn cap_bucket(
+    p: &JobPosting,
+) -> (
+    JobKind,
+    Option<crate::economy::resource_catalog::ResourceId>,
+) {
     match (&p.kind, &p.progress) {
         (JobKind::Stockpile, JobProgress::Stockpile { resource_id, .. }) => {
             (JobKind::Stockpile, Some(*resource_id))
@@ -3014,8 +3026,7 @@ pub fn job_claim_system(
     for (faction_id, postings) in board.postings.iter() {
         for p in postings.iter() {
             let (kind, rid) = cap_bucket(p);
-            *claim_counts.entry((*faction_id, kind, rid)).or_insert(0) +=
-                p.claimants.len() as u32;
+            *claim_counts.entry((*faction_id, kind, rid)).or_insert(0) += p.claimants.len() as u32;
         }
     }
 
@@ -3559,20 +3570,21 @@ pub fn job_board_command_system(
 /// are matched by kind alone.
 fn same_target(a: &JobProgress, b: &JobProgress) -> bool {
     match (a, b) {
-        (JobProgress::Building { blueprint: x }, JobProgress::Building { blueprint: y }) => {
-            x == y
+        (JobProgress::Building { blueprint: x }, JobProgress::Building { blueprint: y }) => x == y,
+        (JobProgress::Crafting { recipe: rx, .. }, JobProgress::Crafting { recipe: ry, .. }) => {
+            rx == ry
         }
-        (
-            JobProgress::Crafting { recipe: rx, .. },
-            JobProgress::Crafting { recipe: ry, .. },
-        ) => rx == ry,
         (JobProgress::Planting { area: ax, .. }, JobProgress::Planting { area: ay, .. }) => {
             ax == ay
         }
         (JobProgress::Calories { .. }, JobProgress::Calories { .. }) => true,
         (
-            JobProgress::Stockpile { resource_id: rx, .. },
-            JobProgress::Stockpile { resource_id: ry, .. },
+            JobProgress::Stockpile {
+                resource_id: rx, ..
+            },
+            JobProgress::Stockpile {
+                resource_id: ry, ..
+            },
         ) => rx == ry,
         (
             JobProgress::Haul {
@@ -3622,10 +3634,7 @@ pub fn job_claim_release_system(
                 }
             }
             // Workbench / bench-target invalid.
-            if let JobProgress::Crafting {
-                bench: Some(b), ..
-            } = p.progress
-            {
+            if let JobProgress::Crafting { bench: Some(b), .. } = p.progress {
                 if bench_query.get(b).is_err() {
                     to_remove.push(p.id);
                 }
@@ -3744,11 +3753,17 @@ mod posting_target_workers_tests {
         // target=80 → (80/80).max(2).min(8) = 2; target=800 → 8 (clamp).
         let small = stub_posting(
             JobKind::Stockpile,
-            JobProgress::Calories { deposited: 0, target: 80 },
+            JobProgress::Calories {
+                deposited: 0,
+                target: 80,
+            },
         );
         let large = stub_posting(
             JobKind::Stockpile,
-            JobProgress::Calories { deposited: 0, target: 800 },
+            JobProgress::Calories {
+                deposited: 0,
+                target: 800,
+            },
         );
         assert_eq!(posting_target_workers(&small), 2);
         assert_eq!(posting_target_workers(&large), 8);

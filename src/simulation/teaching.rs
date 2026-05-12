@@ -581,8 +581,8 @@ pub fn apply_teach_order_system(
             continue;
         }
         let mut chosen: Option<(TechId, u8)> = None;
-        for id in 0..crate::simulation::technology::TECH_COUNT
-            as crate::simulation::technology::TechId
+        for id in
+            0..crate::simulation::technology::TECH_COUNT as crate::simulation::technology::TechId
         {
             if (teachable >> id) & 1 == 0 {
                 continue;
@@ -626,8 +626,7 @@ pub const SELF_ACTUALIZATION_LECTURE_GAIN: f32 = 30.0;
 /// Cadence at which `self_actualization_teaching_system` runs.
 /// Once per game-day; at most one lecture is scheduled per firing
 /// because `LectureRequest` is a single-slot resource.
-pub const SELF_ACTUALIZATION_CADENCE: u64 =
-    crate::world::seasons::TICKS_PER_DAY as u64;
+pub const SELF_ACTUALIZATION_CADENCE: u64 = crate::world::seasons::TICKS_PER_DAY as u64;
 
 /// Pluralist Economy R8 follow-on: SelfActualization tier triggers
 /// teaching. When an agent's Maslow tier is `SelfActualization`

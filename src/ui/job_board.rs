@@ -7,9 +7,7 @@ use crate::simulation::jobs::{
     JobBoard, JobBoardCommand, JobKind, JobPosting, JobProgress, JobSource, TileAabb,
     PLAYER_PRIORITY,
 };
-use crate::simulation::projects::{
-    ProjectCancelReason, ProjectEventKind, ProjectPhase, Projects,
-};
+use crate::simulation::projects::{ProjectCancelReason, ProjectEventKind, ProjectPhase, Projects};
 use crate::simulation::schedule::SimClock;
 use crate::ui::activity_log::CameraFocusRequest;
 use crate::ui::selection::SelectedEntity;
@@ -100,13 +98,13 @@ pub fn job_board_panel_system(
 
                 ui.collapsing("Workforce Budget", |ui| {
                     let rows: [(&str, f32, usize); 7] = [
-                        ("Stockpile Food",  budget.stockpile_food,  0),
-                        ("Stockpile Wood",  budget.stockpile_wood,  1),
+                        ("Stockpile Food", budget.stockpile_food, 0),
+                        ("Stockpile Wood", budget.stockpile_wood, 1),
                         ("Stockpile Stone", budget.stockpile_stone, 2),
-                        ("Haul",            budget.haul,            3),
-                        ("Farm",            budget.farm,            4),
-                        ("Build",           budget.build,           5),
-                        ("Craft",           budget.craft,           6),
+                        ("Haul", budget.haul, 3),
+                        ("Farm", budget.farm, 4),
+                        ("Build", budget.build, 5),
+                        ("Craft", budget.craft, 6),
                     ];
 
                     for (label, share, bucket_idx) in rows {
@@ -125,9 +123,7 @@ pub fn job_board_panel_system(
                             egui::CollapsingHeader::new(header)
                                 .id_salt(format!("wfb_{}", bucket_idx))
                                 .show(ui, |ui| {
-                                    ui.add(
-                                        egui::ProgressBar::new(share).desired_width(160.0),
-                                    );
+                                    ui.add(egui::ProgressBar::new(share).desired_width(160.0));
                                     for &entity in worker_entities {
                                         let name = name_query
                                             .get(entity)
@@ -233,11 +229,7 @@ pub fn job_board_panel_system(
                         .selected_text(selected_name)
                         .show_ui(ui, |ui| {
                             for (i, recipe) in craft_recipes().iter().enumerate() {
-                                ui.selectable_value(
-                                    &mut state.draft_recipe,
-                                    i as u8,
-                                    recipe.name,
-                                );
+                                ui.selectable_value(&mut state.draft_recipe, i as u8, recipe.name);
                             }
                         });
                 }
@@ -268,79 +260,83 @@ pub fn job_board_panel_system(
                 ui.label("No active postings.");
             } else {
                 let mut to_cancel: Option<u32> = None;
-                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                    for p in postings {
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.strong(p.kind.name());
-                                ui.label(format!("[{}]", source_label(p.source)));
-                                ui.label(format!("p{}", p.priority));
-                            });
-                            ui.label(progress_label(&p.progress));
-                            let frac = p.progress.fraction();
-                            ui.add(egui::ProgressBar::new(frac).desired_width(220.0));
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for p in postings {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.strong(p.kind.name());
+                                    ui.label(format!("[{}]", source_label(p.source)));
+                                    ui.label(format!("p{}", p.priority));
+                                });
+                                ui.label(progress_label(&p.progress));
+                                let frac = p.progress.fraction();
+                                ui.add(egui::ProgressBar::new(frac).desired_width(220.0));
 
-                            ui.horizontal(|ui| {
-                                if ui.button("Cancel").clicked() {
-                                    to_cancel = Some(p.id);
-                                }
-                            });
+                                ui.horizontal(|ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        to_cancel = Some(p.id);
+                                    }
+                                });
 
-                            // Worker links.
-                            match p.claimants.len() {
-                                0 => {
-                                    ui.label("No workers.");
-                                }
-                                1 => {
-                                    let entity = p.claimants[0];
-                                    let name = name_query
-                                        .get(entity)
-                                        .map(|n| n.as_str().to_string())
-                                        .unwrap_or_else(|_| "(unknown)".to_string());
-                                    let alive = transforms.get(entity).is_ok();
-                                    let rich = egui::RichText::new(format!("Worker: {}", name))
-                                        .color(if alive {
-                                            egui::Color32::from_rgb(120, 200, 255)
-                                        } else {
-                                            egui::Color32::from_rgb(120, 120, 120)
-                                        })
-                                        .underline();
-                                    if ui.add(egui::Button::new(rich).frame(false)).clicked()
-                                        && alive
-                                    {
-                                        click_entity = Some(entity);
-                                        click_pos = transforms
+                                // Worker links.
+                                match p.claimants.len() {
+                                    0 => {
+                                        ui.label("No workers.");
+                                    }
+                                    1 => {
+                                        let entity = p.claimants[0];
+                                        let name = name_query
                                             .get(entity)
-                                            .ok()
-                                            .map(|t| t.translation.truncate());
+                                            .map(|n| n.as_str().to_string())
+                                            .unwrap_or_else(|_| "(unknown)".to_string());
+                                        let alive = transforms.get(entity).is_ok();
+                                        let rich = egui::RichText::new(format!("Worker: {}", name))
+                                            .color(if alive {
+                                                egui::Color32::from_rgb(120, 200, 255)
+                                            } else {
+                                                egui::Color32::from_rgb(120, 120, 120)
+                                            })
+                                            .underline();
+                                        if ui.add(egui::Button::new(rich).frame(false)).clicked()
+                                            && alive
+                                        {
+                                            click_entity = Some(entity);
+                                            click_pos = transforms
+                                                .get(entity)
+                                                .ok()
+                                                .map(|t| t.translation.truncate());
+                                        }
+                                    }
+                                    n => {
+                                        egui::CollapsingHeader::new(format!("Workers ({})", n))
+                                            .id_salt(format!("posting_workers_{}", p.id))
+                                            .show(ui, |ui| {
+                                                for &entity in &p.claimants {
+                                                    let name = name_query
+                                                        .get(entity)
+                                                        .map(|n| n.as_str().to_string())
+                                                        .unwrap_or_else(|_| {
+                                                            "(unknown)".to_string()
+                                                        });
+                                                    let alive = transforms.get(entity).is_ok();
+                                                    if link_button(ui, &name, alive).clicked()
+                                                        && alive
+                                                    {
+                                                        click_entity = Some(entity);
+                                                        click_pos = transforms
+                                                            .get(entity)
+                                                            .ok()
+                                                            .map(|t| t.translation.truncate());
+                                                    }
+                                                }
+                                            });
                                     }
                                 }
-                                n => {
-                                    egui::CollapsingHeader::new(format!("Workers ({})", n))
-                                        .id_salt(format!("posting_workers_{}", p.id))
-                                        .show(ui, |ui| {
-                                            for &entity in &p.claimants {
-                                                let name = name_query
-                                                    .get(entity)
-                                                    .map(|n| n.as_str().to_string())
-                                                    .unwrap_or_else(|_| "(unknown)".to_string());
-                                                let alive = transforms.get(entity).is_ok();
-                                                if link_button(ui, &name, alive).clicked()
-                                                    && alive
-                                                {
-                                                    click_entity = Some(entity);
-                                                    click_pos = transforms
-                                                        .get(entity)
-                                                        .ok()
-                                                        .map(|t| t.translation.truncate());
-                                                }
-                                            }
-                                        });
-                                }
-                            }
-                        });
-                    }
-                });
+                            });
+                        }
+                    });
                 if let Some(id) = to_cancel {
                     commands.send(JobBoardCommand::Cancel(id));
                 }

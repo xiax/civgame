@@ -118,6 +118,6 @@ Chief should have a daily quota. He can only post so many jobs a day. Immediate 
 
 Implement the ε-greedy system.
 
-Overhaul faction construction planning and fix doors being blocked by walls or other buildings, all doors should have an adjacent road on the opening side, not diagonal. The construction system should generate layouts randomly but with rules to make it logical and looks good and organic, rather than have a fixed plan.
+X - Overhaul faction construction planning and fix doors being blocked by walls or other buildings, all doors should have an adjacent road on the opening side, not diagonal. The construction system should generate layouts randomly but with rules to make it logical and looks good and organic, rather than have a fixed plan.
 
 Hunting system is currently buggy. Hunters lose target and just stand there doing nothing. They don't appear to chase. And they seem to hunt without weapons when they really shouldn't.

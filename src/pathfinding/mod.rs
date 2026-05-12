@@ -40,8 +40,7 @@ impl Plugin for PathfindingPlugin {
             .add_systems(
                 OnEnter(crate::GameState::Playing),
                 (
-                    chunk_graph::startup_initial_build_system
-                        .after(terrain::spawn_world_system),
+                    chunk_graph::startup_initial_build_system.after(terrain::spawn_world_system),
                     connectivity::rebuild_connectivity_system
                         .after(chunk_graph::startup_initial_build_system),
                 ),
@@ -50,8 +49,7 @@ impl Plugin for PathfindingPlugin {
                 PreUpdate,
                 (
                     chunk_graph::poll_rebuild_task_system,
-                    worker::drain_path_requests_system
-                        .after(chunk_graph::poll_rebuild_task_system),
+                    worker::drain_path_requests_system.after(chunk_graph::poll_rebuild_task_system),
                 ),
             )
             .add_systems(

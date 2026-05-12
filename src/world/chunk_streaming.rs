@@ -3,20 +3,22 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use std::time::Instant;
 
+use crate::economy::item::Item;
 use crate::pathfinding::path_request::PathFollow;
 use crate::rendering::camera::CameraViewZ;
 use crate::rendering::color_map::{shaded_ore_tile_color, shaded_tile_color, z_bucket};
 use crate::rendering::fog::{apply_fog_to_material, FogMap, FogTileMaterials};
 use crate::simulation::construction::{Wall, WallMap, WallMaterial};
 use crate::simulation::faction::{FactionCenter, StorageTileMap};
+use crate::simulation::items::GroundItem;
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
-use crate::economy::item::Item;
-use crate::simulation::items::GroundItem;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE, Z_MIN};
 use crate::world::globe::{Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
-use crate::world::terrain::{generate_chunk_from_globe, tile_at_3d, tile_to_world, WorldGen, TILE_SIZE};
+use crate::world::terrain::{
+    generate_chunk_from_globe, tile_at_3d, tile_to_world, WorldGen, TILE_SIZE,
+};
 use crate::world::tile::{OreKind, TileKind};
 
 pub const LOAD_RADIUS: i32 = 12;
@@ -460,7 +462,12 @@ pub fn resolve_render_tile(
     // Surface tile is above the view level — show what's at camera_view_z instead
     let underground_tile = tile_at_3d(chunk_map, gen, globe, tx, ty, camera_view_z);
     if underground_tile.kind == TileKind::Air {
-        (TileKind::Grass, OreKind::None, camera_view_z, Visibility::Hidden)
+        (
+            TileKind::Grass,
+            OreKind::None,
+            camera_view_z,
+            Visibility::Hidden,
+        )
     } else {
         (
             underground_tile.kind,
@@ -535,20 +542,12 @@ pub fn spawn_chunk_plants(
                 }
                 TileKind::Grass if tile.fertility > 100 => {
                     let pct = h % 100;
-                    let berry_patch = patch_hash(
-                        global_tx,
-                        global_ty,
-                        PATCH_CELL_SIZE,
-                        BERRY_PATCH_SEED,
-                    ) % 100
-                        < 6;
-                    let tree_patch = patch_hash(
-                        global_tx,
-                        global_ty,
-                        PATCH_CELL_SIZE,
-                        TREE_PATCH_SEED,
-                    ) % 100
-                        < 12;
+                    let berry_patch =
+                        patch_hash(global_tx, global_ty, PATCH_CELL_SIZE, BERRY_PATCH_SEED) % 100
+                            < 6;
+                    let tree_patch =
+                        patch_hash(global_tx, global_ty, PATCH_CELL_SIZE, TREE_PATCH_SEED) % 100
+                            < 12;
                     if berry_patch && pct < 40 {
                         spawn_plant_at(
                             commands,
@@ -613,8 +612,7 @@ pub fn spawn_chunk_loose_rocks(commands: &mut Commands, chunk_map: &ChunkMap, co
             let global_tx = coord.0 * CHUNK_SIZE as i32 + tx as i32;
             let global_ty = coord.1 * CHUNK_SIZE as i32 + ty as i32;
 
-            if patch_hash(global_tx, global_ty, PATCH_CELL_SIZE, ROCK_PATCH_SEED) % 100 >= 30
-            {
+            if patch_hash(global_tx, global_ty, PATCH_CELL_SIZE, ROCK_PATCH_SEED) % 100 >= 30 {
                 continue;
             }
 
@@ -630,9 +628,7 @@ pub fn spawn_chunk_loose_rocks(commands: &mut Commands, chunk_map: &ChunkMap, co
             let world_pos = tile_to_world(global_tx, global_ty);
             commands.spawn((
                 GroundItem {
-                    item: Item::new_commodity(
-                        crate::economy::core_ids::stone(),
-                    ),
+                    item: Item::new_commodity(crate::economy::core_ids::stone()),
                     qty,
                 },
                 Transform::from_xyz(world_pos.x, world_pos.y, 0.3),

@@ -161,7 +161,9 @@ pub fn flow_accum(dirs: &[u32]) -> Vec<u32> {
     }
     // Topological order: start with leaves (indeg = 0) and propagate downstream.
     let mut accum = vec![1u32; W * H];
-    let mut stack: Vec<u32> = (0..(W * H) as u32).filter(|&i| indeg[i as usize] == 0).collect();
+    let mut stack: Vec<u32> = (0..(W * H) as u32)
+        .filter(|&i| indeg[i as usize] == 0)
+        .collect();
     while let Some(i) = stack.pop() {
         let d = dirs[i as usize] as usize;
         if d == i as usize {
@@ -182,12 +184,7 @@ pub fn flow_accum(dirs: &[u32]) -> Vec<u32> {
 /// of flow accumulation at its endpoints, so the rasteriser can taper.
 /// Polylines (curved tile paths) are populated separately at globe-gen time
 /// — see `chaikin_river_path` below.
-pub fn extract_rivers(
-    height: &[f32],
-    dirs: &[u32],
-    accum: &[u32],
-    min_accum: u32,
-) -> RiverNetwork {
+pub fn extract_rivers(height: &[f32], dirs: &[u32], accum: &[u32], min_accum: u32) -> RiverNetwork {
     let mut edges = Vec::new();
     let mut visited_edge = vec![false; W * H];
     for start in 0..(W * H) {

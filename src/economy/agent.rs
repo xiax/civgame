@@ -27,10 +27,8 @@ impl Default for EconomicAgent {
             // Empty placeholder slots use Fruit's id; qty=0 means the slot
             // is unused (the underlying resource doesn't matter until a
             // real Item is stamped in).
-            inventory: [(
-                Item::new_commodity(crate::economy::core_ids::fruit()),
-                0,
-            ); INVENTORY_SLOTS],
+            inventory: [(Item::new_commodity(crate::economy::core_ids::fruit()), 0);
+                INVENTORY_SLOTS],
             base_cap_g: BASE_INVENTORY_CAP_G,
             bonus_cap_g: 0,
         }

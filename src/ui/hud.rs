@@ -6,8 +6,8 @@ use crate::economy::mode::EconomicMode;
 use crate::rendering::camera::CameraViewZ;
 use crate::simulation::combat::CombatTarget;
 use crate::simulation::construction::AutonomousBuildingToggle;
-use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
 use crate::simulation::faction::HuntOrder;
+use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
 use crate::simulation::person::{Drafted, Person, Profession};
 use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
 use crate::simulation::schedule::SimClock;
@@ -66,9 +66,7 @@ pub fn hud_system(
     let has_selection = !selected_many.ids.is_empty();
     let player_hunters: Vec<Entity> = professions
         .iter()
-        .filter(|(_, p, m)| {
-            **p == Profession::Hunter && m.faction_id == player_faction.faction_id
-        })
+        .filter(|(_, p, m)| **p == Profession::Hunter && m.faction_id == player_faction.faction_id)
         .map(|(e, _, _)| e)
         .collect();
     let current_hunters = player_hunters.len();
@@ -187,16 +185,13 @@ pub fn hud_system(
                             })
                             .unwrap_or_else(|| "Idle".to_string());
                         let display = format!("{} · {}", current_hunters, order_label);
-                        ui.label(
-                            egui::RichText::new(display)
-                                .color(if hunting_unlocked {
-                                    egui::Color32::WHITE
-                                } else {
-                                    egui::Color32::GRAY
-                                }),
-                        );
-                        let muster_btn = egui::Button::new("Muster")
-                            .fill(egui::Color32::from_rgb(180, 100, 60));
+                        ui.label(egui::RichText::new(display).color(if hunting_unlocked {
+                            egui::Color32::WHITE
+                        } else {
+                            egui::Color32::GRAY
+                        }));
+                        let muster_btn =
+                            egui::Button::new("Muster").fill(egui::Color32::from_rgb(180, 100, 60));
                         let muster_resp =
                             ui.add_enabled(hunting_unlocked && current_hunters > 0, muster_btn);
                         if muster_resp.clicked() {
@@ -211,8 +206,7 @@ pub fn hud_system(
                         // emits the command on the chief; Pitch Camp is
                         // issued via right-click "Pitch Camp Here" on a
                         // target tile.
-                        if let Some(player_fac) =
-                            registry.factions.get(&player_faction.faction_id)
+                        if let Some(player_fac) = registry.factions.get(&player_faction.faction_id)
                         {
                             if player_fac.caps.home.is_mobile() {
                                 ui.separator();
@@ -315,16 +309,17 @@ pub fn hud_system(
                                     .iter()
                                     .filter(|(_, &qty)| qty > 0)
                                     .collect();
-                                
+
                                 if !other_entries.is_empty() {
                                     // Storage is now ResourceId-keyed; pull
                                     // display names from the catalog.
-                                    let name_of = |id: &crate::economy::resource_catalog::ResourceId| {
-                                        catalog
-                                            .get(*id)
-                                            .map(|d| d.display_name.as_str())
-                                            .unwrap_or("?")
-                                    };
+                                    let name_of =
+                                        |id: &crate::economy::resource_catalog::ResourceId| {
+                                            catalog
+                                                .get(*id)
+                                                .map(|d| d.display_name.as_str())
+                                                .unwrap_or("?")
+                                        };
                                     other_entries.sort_by(|a, b| name_of(a.0).cmp(name_of(b.0)));
                                     for (id, qty) in other_entries {
                                         storage_text.push_str(&format!(

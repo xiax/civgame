@@ -39,9 +39,7 @@ use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::AgentMemory;
-use crate::simulation::person::{
-    AiState, Drafted, PersonAI, Profession, TraderPhase, TraderPlan,
-};
+use crate::simulation::person::{AiState, Drafted, PersonAI, Profession, TraderPhase, TraderPlan};
 use crate::simulation::settlement::{Settlement, SettlementId, SettlementMap};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::typed_task::{ActionQueue, Task};
@@ -220,19 +218,8 @@ pub fn trader_market_step_system(world: &mut World) {
             Option<&Drafted>,
         )>();
         let mut out = Vec::new();
-        for (
-            entity,
-            prof,
-            ai,
-            aq,
-            transform,
-            lod,
-            goal,
-            memory,
-            econ,
-            plan,
-            drafted,
-        ) in q.iter(world)
+        for (entity, prof, ai, aq, transform, lod, goal, memory, econ, plan, drafted) in
+            q.iter(world)
         {
             if *prof != Profession::Trader {
                 continue;
@@ -408,7 +395,9 @@ pub fn trader_route_dispatch_system(
             continue;
         }
 
-        let Some((buy_tile, sell_tile, _, _)) = resolve_plan_tiles_q(plan, &settlement_map, &settlements) else {
+        let Some((buy_tile, sell_tile, _, _)) =
+            resolve_plan_tiles_q(plan, &settlement_map, &settlements)
+        else {
             continue;
         };
         let dest = match plan.phase {

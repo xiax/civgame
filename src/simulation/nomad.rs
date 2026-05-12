@@ -227,7 +227,10 @@ pub fn nomad_migration_system(world: &mut World) {
                 if food_score >= threshold {
                     return None;
                 }
-                Some(Trigger { fid, home: faction.home_tile })
+                Some(Trigger {
+                    fid,
+                    home: faction.home_tile,
+                })
             })
             .collect()
     };
@@ -264,8 +267,7 @@ pub fn nomad_migration_system(world: &mut World) {
                 if Some(e) == chief {
                     continue;
                 }
-                let need_score =
-                    needs.shelter as u32 + needs.sleep as u32 + needs.hunger as u32;
+                let need_score = needs.shelter as u32 + needs.sleep as u32 + needs.hunger as u32;
                 candidates.push((e, need_score));
             }
             candidates.sort_by_key(|(_, n)| *n);
@@ -328,12 +330,11 @@ pub fn nomad_migration_system(world: &mut World) {
                         quadrants[q as usize] = true;
                     }
                 }
-                faction.migration_phase =
-                    crate::simulation::faction::MigrationPhase::Surveying {
-                        started_tick: now,
-                        scouts,
-                        quadrants,
-                    };
+                faction.migration_phase = crate::simulation::faction::MigrationPhase::Surveying {
+                    started_tick: now,
+                    scouts,
+                    quadrants,
+                };
                 faction.last_phase_change_tick = now;
                 info!(
                     "Faction {} entering Surveying tick {now}; scouts={}",
@@ -591,9 +592,8 @@ pub fn nomad_migration_commit_system(world: &mut World) {
     let packs: Vec<(u32, (i32, i32), i32)> = pending
         .iter()
         .map(|p| {
-            let radius = crate::simulation::construction::seed_nomadic_camp_extent(
-                p.members, p.era,
-            );
+            let radius =
+                crate::simulation::construction::seed_nomadic_camp_extent(p.members, p.era);
             (p.fid, p.old_home, radius)
         })
         .collect();
@@ -634,9 +634,8 @@ pub fn nomad_migration_commit_system(world: &mut World) {
     // ActivityLogEvent's `actor`, then mutate registry state.
     let mut actor_per_faction: ahash::AHashMap<u32, Entity> = ahash::AHashMap::new();
     {
-        let mut state: SystemState<
-            Query<(Entity, &crate::simulation::faction::FactionMember)>,
-        > = SystemState::new(world);
+        let mut state: SystemState<Query<(Entity, &crate::simulation::faction::FactionMember)>> =
+            SystemState::new(world);
         let q = state.get(world);
         for (entity, member) in q.iter() {
             actor_per_faction.entry(member.faction_id).or_insert(entity);
@@ -714,9 +713,8 @@ pub fn nomad_migration_commit_system(world: &mut World) {
     // "moved camp (x,y) → (x',y')". Chief or first-found member is the
     // notional actor.
     {
-        let mut state: SystemState<
-            EventWriter<crate::ui::activity_log::ActivityLogEvent>,
-        > = SystemState::new(world);
+        let mut state: SystemState<EventWriter<crate::ui::activity_log::ActivityLogEvent>> =
+            SystemState::new(world);
         let mut writer = state.get_mut(world);
         for p in pending.iter() {
             let Some(&actor) = actor_per_faction.get(&p.fid) else {
@@ -742,10 +740,8 @@ pub fn nomad_migration_commit_system(world: &mut World) {
     // bands' herds (tamed horses, etc.) thus drift with the camp instead
     // of being abandoned at the old site.
     {
-        let mut tamed_state: SystemState<(
-            Commands,
-            Query<(Entity, &Tamed, &mut AnimalAI)>,
-        )> = SystemState::new(world);
+        let mut tamed_state: SystemState<(Commands, Query<(Entity, &Tamed, &mut AnimalAI)>)> =
+            SystemState::new(world);
         let (mut commands, mut tamed_q) = tamed_state.get_mut(world);
         let new_homes: ahash::AHashMap<u32, (i32, i32)> =
             pending.iter().map(|p| (p.fid, p.target)).collect();
@@ -756,10 +752,12 @@ pub fn nomad_migration_commit_system(world: &mut World) {
             // Bug-fix #2: stamp `FollowingBand` so the redirect
             // survives Dormant LOD; the standalone redirect system
             // re-snaps target_tile every quarter-day.
-            commands.entity(e).insert(crate::simulation::animals::FollowingBand {
-                faction: tamed.owner_faction,
-                last_redirect_tick: now,
-            });
+            commands
+                .entity(e)
+                .insert(crate::simulation::animals::FollowingBand {
+                    faction: tamed.owner_faction,
+                    last_redirect_tick: now,
+                });
             let seed = tamed.owner_faction.wrapping_mul(0x85EB_CA6B);
             let dx = ((seed & 0b11) as i32) - 2;
             let dy = (((seed >> 2) & 0b11) as i32) - 2;
@@ -828,10 +826,8 @@ pub(crate) fn pack_camp_assets(world: &mut World, packs: &[(u32, (i32, i32), i32
             }
             let mut view: Vec<(Entity, &mut crate::economy::agent::EconomicAgent)> =
                 snapshot.iter_mut().map(|(e, a)| (*e, &mut *a)).collect();
-            let report = crate::simulation::nomad_pool::redistribute_essentials(
-                &mut view,
-                &essentials,
-            );
+            let report =
+                crate::simulation::nomad_pool::redistribute_essentials(&mut view, &essentials);
             if report.units_moved == 0 {
                 continue;
             }
@@ -861,9 +857,12 @@ pub(crate) fn pack_camp_assets(world: &mut World, packs: &[(u32, (i32, i32), i32
             .collect();
         let mut state: SystemState<(
             Query<(Entity, &Transform, &Deployable)>,
-            Query<
-                (Entity, &Transform, &Tamed, &mut crate::simulation::animals::PackAnimalInventory),
-            >,
+            Query<(
+                Entity,
+                &Transform,
+                &Tamed,
+                &mut crate::simulation::animals::PackAnimalInventory,
+            )>,
             Query<(
                 Entity,
                 &crate::simulation::faction::FactionMember,
@@ -1071,8 +1070,7 @@ pub fn apply_pack_camp_command_system(world: &mut World) {
     let mut registry = world.resource_mut::<FactionRegistry>();
     for (fid, _anchor, _radius) in packs.iter() {
         if let Some(faction) = registry.factions.get_mut(fid) {
-            faction.camp_state =
-                crate::simulation::faction::CampState::Packed { since_tick: now };
+            faction.camp_state = crate::simulation::faction::CampState::Packed { since_tick: now };
             faction.migration_phase = crate::simulation::faction::MigrationPhase::Idle;
             faction.last_phase_change_tick = now;
         }
@@ -1135,8 +1133,7 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
             Res<ChunkMap>,
             EventWriter<TileChangedEvent>,
         )> = SystemState::new(world);
-        let (mut commands, mut maps, chunk_map, mut tile_changed) =
-            seed_state.get_mut(world);
+        let (mut commands, mut maps, chunk_map, mut tile_changed) = seed_state.get_mut(world);
         let mut used: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::default();
         used.insert(r.target);
         seed_nomadic_camp(
@@ -1177,17 +1174,16 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
     // `following_band_animal_redirect_system` (survives Dormant LOD).
     {
         let pitched_fids: ahash::AHashSet<u32> = resolved.iter().map(|r| r.fid).collect();
-        let mut state: SystemState<(
-            Commands,
-            Query<(Entity, &Tamed)>,
-        )> = SystemState::new(world);
+        let mut state: SystemState<(Commands, Query<(Entity, &Tamed)>)> = SystemState::new(world);
         let (mut commands, q) = state.get_mut(world);
         for (e, tamed) in q.iter() {
             if pitched_fids.contains(&tamed.owner_faction) {
-                commands.entity(e).insert(crate::simulation::animals::FollowingBand {
-                    faction: tamed.owner_faction,
-                    last_redirect_tick: now,
-                });
+                commands
+                    .entity(e)
+                    .insert(crate::simulation::animals::FollowingBand {
+                        faction: tamed.owner_faction,
+                        last_redirect_tick: now,
+                    });
             }
         }
         state.apply(world);
@@ -1272,12 +1268,7 @@ fn transform_tile(transform: &Transform) -> (i32, i32) {
     (tx, ty)
 }
 
-fn score_local_food(
-    shared: &SharedKnowledge,
-    fid: u32,
-    home: (i32, i32),
-    radius: i32,
-) -> u16 {
+fn score_local_food(shared: &SharedKnowledge, fid: u32, home: (i32, i32), radius: i32) -> u16 {
     let Some(map) = shared.map(KnowledgeTier::Faction(fid)) else {
         return 0;
     };
@@ -1533,9 +1524,7 @@ pub fn nomad_sedentarize_system(
         // re-applied, old camp structures despawned, culture_hash
         // bumped, FactionStorageTile spawned synchronously, and the
         // `Sedentarized` activity log event emitted.
-        let new_key = crate::simulation::lifecycle::settled_variant_of(
-            &faction.caps.archetype_key,
-        );
+        let new_key = crate::simulation::lifecycle::settled_variant_of(&faction.caps.archetype_key);
         lifecycle_queue.push(
             crate::simulation::lifecycle::SettlementLifecycleEvent::SwitchArchetype {
                 faction: fid,
@@ -1603,9 +1592,7 @@ pub fn nomad_chief_directive_system(
     tent_q: Query<(&Transform, &crate::simulation::construction::TentShelter)>,
     bp_query: Query<&crate::simulation::construction::Blueprint>,
 ) {
-    use crate::simulation::construction::{
-        next_clear_tile, BuildSiteKind, Blueprint, ShelterTier,
-    };
+    use crate::simulation::construction::{next_clear_tile, Blueprint, BuildSiteKind, ShelterTier};
 
     if clock.tick % TICKS_PER_DAY as u64 != 0 {
         return;
@@ -1726,7 +1713,9 @@ pub fn nomad_chief_directive_system(
             );
         }
         if yurt_built + yurt_pending < targets.yurts
-            && faction.techs.has(crate::simulation::technology::PORTABLE_DWELLINGS)
+            && faction
+                .techs
+                .has(crate::simulation::technology::PORTABLE_DWELLINGS)
         {
             queue_one(
                 &mut budget,
@@ -1766,7 +1755,11 @@ pub fn nomad_migration_dispatch_system(
     registry: Res<FactionRegistry>,
     mut qs: ParamSet<(
         // Pass 1: snapshot per-faction migrating-member tiles for centroid reroute.
-        Query<(&MigrationTarget, &Transform, &crate::simulation::faction::FactionMember)>,
+        Query<(
+            &MigrationTarget,
+            &Transform,
+            &crate::simulation::faction::FactionMember,
+        )>,
         // Pass 2: actual dispatcher mutation pass.
         Query<(
             Entity,
@@ -1801,9 +1794,7 @@ pub fn nomad_migration_dispatch_system(
         }
     }
     let mut q = qs.p1();
-    for (e, mut target, mut goal, transform, mut ai, mut aq, slot, lod, member) in
-        q.iter_mut()
-    {
+    for (e, mut target, mut goal, transform, mut ai, mut aq, slot, lod, member) in q.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -1824,7 +1815,10 @@ pub fn nomad_migration_dispatch_system(
         if !matches!(aq.current, Task::Idle) {
             let stale_migration_walk = matches!(
                 aq.current,
-                Task::WalkTo { why: WalkReason::Migration, .. },
+                Task::WalkTo {
+                    why: WalkReason::Migration,
+                    ..
+                },
             );
             if stale_migration_walk && ai.state == AiState::Idle {
                 aq.cancel();
@@ -1851,14 +1845,9 @@ pub fn nomad_migration_dispatch_system(
             target.tile.0.div_euclid(CHUNK_SIZE as i32),
             target.tile.1.div_euclid(CHUNK_SIZE as i32),
         );
-        let target_z = chunk_map.nearest_standable_z(
-            target.tile.0,
-            target.tile.1,
-            ai.current_z as i32,
-        ) as i8;
-        if !chunk_connectivity
-            .is_reachable((cur_chunk, ai.current_z), (target_chunk, target_z))
-        {
+        let target_z =
+            chunk_map.nearest_standable_z(target.tile.0, target.tile.1, ai.current_z as i32) as i8;
+        if !chunk_connectivity.is_reachable((cur_chunk, ai.current_z), (target_chunk, target_z)) {
             // Bug-fix #4: rather than dropping the marker outright,
             // reroute toward the band centroid (median tile of other
             // migrating members in reachable chunks). Cap retries via
@@ -1873,10 +1862,8 @@ pub fn nomad_migration_dispatch_system(
                             px.div_euclid(CHUNK_SIZE as i32),
                             py.div_euclid(CHUNK_SIZE as i32),
                         );
-                        let pz =
-                            chunk_map.nearest_standable_z(px, py, ai.current_z as i32) as i8;
-                        if chunk_connectivity
-                            .is_reachable((cur_chunk, ai.current_z), (pchunk, pz))
+                        let pz = chunk_map.nearest_standable_z(px, py, ai.current_z as i32) as i8;
+                        if chunk_connectivity.is_reachable((cur_chunk, ai.current_z), (pchunk, pz))
                         {
                             peers.push((px, py));
                         }
@@ -2012,7 +1999,10 @@ mod tests {
         camps.push_back(((10, 10), 0));
         // Tile near the recent camp, age=0 → strong negative.
         let near = score_recency(&camps, (12, 11), 0);
-        assert!(near < -20, "fresh near-camp penalty should be ~ -25; got {near}");
+        assert!(
+            near < -20,
+            "fresh near-camp penalty should be ~ -25; got {near}"
+        );
         // Far tile gets nothing.
         let far = score_recency(&camps, (50, 50), 0);
         assert_eq!(far, 0);
@@ -2039,13 +2029,23 @@ mod tests {
             let winter = score_biome_season_for_biome(biome, Season::Winter);
             match biome {
                 Biome::Tundra | Biome::Mountain => {
-                    assert!(winter < summer, "{:?} winter should be worse than summer; w={winter} s={summer}", biome);
+                    assert!(
+                        winter < summer,
+                        "{:?} winter should be worse than summer; w={winter} s={summer}",
+                        biome
+                    );
                 }
                 Biome::Desert => {
-                    assert!(summer < winter, "Desert summer should be worse than winter; w={winter} s={summer}");
+                    assert!(
+                        summer < winter,
+                        "Desert summer should be worse than winter; w={winter} s={summer}"
+                    );
                 }
                 Biome::Grassland => {
-                    assert!(summer >= winter, "Grassland summer should ≥ winter; w={winter} s={summer}");
+                    assert!(
+                        summer >= winter,
+                        "Grassland summer should ≥ winter; w={winter} s={summer}"
+                    );
                 }
                 _ => {}
             }

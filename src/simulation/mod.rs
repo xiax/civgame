@@ -5,7 +5,6 @@ pub mod archetype;
 pub mod building_template;
 pub mod camp;
 pub mod capital;
-pub mod lifecycle;
 pub mod carry;
 pub mod carve;
 pub mod civic_milestones;
@@ -25,6 +24,7 @@ pub mod items;
 pub mod jobs;
 pub mod knowledge;
 pub mod land;
+pub mod lifecycle;
 pub mod line_of_sight;
 pub mod lod;
 pub mod memory;
@@ -35,19 +35,19 @@ pub mod needs;
 pub mod nomad;
 pub mod nomad_pool;
 pub mod obstacle;
+pub mod organic_settlement;
 pub mod pack_deploy;
-pub mod player_command;
-pub mod sedentary_collapse;
 pub mod person;
-pub mod profession_choice;
-pub mod wild_herd;
 pub mod plants;
+pub mod player_command;
 pub mod production;
+pub mod profession_choice;
 pub mod projects;
 pub mod raid;
 pub mod region;
 pub mod reproduction;
 pub mod schedule;
+pub mod sedentary_collapse;
 pub mod settlement;
 pub mod shared_knowledge;
 pub mod skills;
@@ -55,12 +55,13 @@ pub mod sound;
 pub mod stats;
 pub mod tasks;
 pub mod teaching;
-pub mod trader;
-pub mod typed_task;
-#[cfg(test)]
-pub mod test_fixture;
 pub mod technology;
 pub mod terraform;
+#[cfg(test)]
+pub mod test_fixture;
+pub mod trader;
+pub mod typed_task;
+pub mod wild_herd;
 pub mod world_sim;
 
 pub use schedule::SimClock;
@@ -151,6 +152,12 @@ impl Plugin for SimulationPlugin {
             .insert_resource(terraform::PendingFootprints::default())
             .insert_resource(settlement::SettlementPlans::default())
             .insert_resource(settlement::SettlementMap::default())
+            .insert_resource(organic_settlement::SettlementBrains::default())
+            .insert_resource(organic_settlement::SettlementParcelIndex::default())
+            .insert_resource(organic_settlement::SettlementPressureMap::default())
+            .insert_resource(organic_settlement::SettlementIntentMap::default())
+            .insert_resource(organic_settlement::SelectedSettlementIntents::default())
+            .insert_resource(organic_settlement::load_building_archetype_catalog())
             .insert_resource(camp::CampMap::default())
             .insert_resource(lifecycle::LifecycleEventQueue::default())
             .insert_resource(settlement::ZoneOverlayToggle::default())
@@ -203,13 +210,11 @@ impl Plugin for SimulationPlugin {
             )
             .add_systems(
                 FixedUpdate,
-                (player_command::drain_player_command_events_system,)
-                    .in_set(SimulationSet::Input),
+                (player_command::drain_player_command_events_system,).in_set(SimulationSet::Input),
             )
             .add_systems(
                 FixedUpdate,
-                (player_command::dispatch_player_command_system,)
-                    .in_set(SimulationSet::ParallelB),
+                (player_command::dispatch_player_command_system,).in_set(SimulationSet::ParallelB),
             )
             .add_systems(
                 FixedUpdate,
@@ -244,16 +249,14 @@ impl Plugin for SimulationPlugin {
                     // fires on real flips because both `goal_update_system`
                     // and `job_goal_lock_system` guard their `*goal = X` writes
                     // on `*goal != new_goal`.
-                    goals::record_abandoned_method_system
-                        .after(goals::goal_update_system),
+                    goals::record_abandoned_method_system.after(goals::goal_update_system),
                     // Phase C (mobile gating): demote settled-life
                     // goals on members of CampState::Packed factions
                     // to GatherFood + drop any held JobClaim. Runs
                     // after goal_update so the per-tick selection is
                     // honoured first; before the dispatchers in
                     // ParallelB so blocked goals never run.
-                    goals::mobile_state_goal_gate_system
-                        .after(goals::goal_update_system),
+                    goals::mobile_state_goal_gate_system.after(goals::goal_update_system),
                     animals::animal_sense_system,
                     // Bug-fix #2: re-snap tamed animals' target_tile
                     // toward their faction's `home_tile` every
@@ -273,18 +276,14 @@ impl Plugin for SimulationPlugin {
                     // Equip-hunting-spear runs ahead of the food dispatchers
                     // so an unarmed hunter prefers fetching their spear over
                     // eating (mirrors legacy plan bias 5.0 + PF_UNINTERRUPTIBLE).
-                    htn::htn_equip_hunting_spear_dispatch_system
-                        .after(htn::htn_dispatch_system),
+                    htn::htn_equip_hunting_spear_dispatch_system.after(htn::htn_dispatch_system),
                     htn::htn_eat_dispatch_system
                         .after(htn::htn_equip_hunting_spear_dispatch_system),
-                    htn::htn_acquire_food_dispatch_system
-                        .after(htn::htn_eat_dispatch_system),
+                    htn::htn_acquire_food_dispatch_system.after(htn::htn_eat_dispatch_system),
                     htn::htn_acquire_good_dispatch_system
                         .after(htn::htn_acquire_food_dispatch_system),
-                    htn::htn_scout_dispatch_system
-                        .after(htn::htn_acquire_good_dispatch_system),
-                    htn::htn_return_surplus_dispatch_system
-                        .after(htn::htn_scout_dispatch_system),
+                    htn::htn_scout_dispatch_system.after(htn::htn_acquire_good_dispatch_system),
+                    htn::htn_return_surplus_dispatch_system.after(htn::htn_scout_dispatch_system),
                     htn::htn_tame_horse_dispatch_system
                         .after(htn::htn_return_surplus_dispatch_system),
                     htn::htn_plant_from_storage_dispatch_system
@@ -374,8 +373,7 @@ impl Plugin for SimulationPlugin {
             // the 20-element ceiling on the Sequential tuple.
             .add_systems(
                 FixedUpdate,
-                animals::attach_pack_inventory_system
-                    .in_set(SimulationSet::Sequential),
+                animals::attach_pack_inventory_system.in_set(SimulationSet::Sequential),
             )
             // Calendar-driven plant lifecycle (replaces the old per-frame
             // tick growth + scatter pair). Edge-triggers on season change;
@@ -449,8 +447,7 @@ impl Plugin for SimulationPlugin {
                         .after(htn::htn_work_on_craft_order_dispatch_system),
                     htn::htn_harvest_plant_dispatch_system
                         .after(htn::htn_harvest_grain_for_craft_order_dispatch_system),
-                    htn::htn_play_dispatch_system
-                        .after(htn::htn_harvest_plant_dispatch_system),
+                    htn::htn_play_dispatch_system.after(htn::htn_harvest_plant_dispatch_system),
                 )
                     .in_set(SimulationSet::ParallelB),
             )
@@ -494,8 +491,7 @@ impl Plugin for SimulationPlugin {
                     combat::hand_drop_event_handler.after(combat::combat_system),
                     reproduction::cosleep_observation_system
                         .after(movement::sync_indexed_after_move_system),
-                    tasks::play_system
-                        .after(movement::sync_indexed_after_move_system),
+                    tasks::play_system.after(movement::sync_indexed_after_move_system),
                 )
                     .in_set(SimulationSet::Sequential),
             )
@@ -503,6 +499,13 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 (military::military_task_system
                     .after(movement::movement_system)
+                    .before(combat::combat_system),)
+                    .in_set(SimulationSet::Sequential),
+            )
+            .add_systems(
+                FixedUpdate,
+                (combat::hunt_chase_system
+                    .after(movement::sync_indexed_after_move_system)
                     .before(combat::combat_system),)
                     .in_set(SimulationSet::Sequential),
             )
@@ -564,8 +567,7 @@ impl Plugin for SimulationPlugin {
                     // P1: per-tick arrival check for in-flight migrations.
                     // Sequential after movement so position reads are
                     // already up-to-date this tick.
-                    nomad::nomad_migration_arrival_system
-                        .after(movement::movement_system),
+                    nomad::nomad_migration_arrival_system.after(movement::movement_system),
                     // Phase 10: per-tick bloom/collapse based on camera
                     // proximity. Runs in Sequential so the entity spawns/
                     // despawns are visible to next tick's render + AI
@@ -629,51 +631,57 @@ impl Plugin for SimulationPlugin {
                     projects::project_lifecycle_system
                         .after(faction::compute_faction_storage_system)
                         .after(construction::chief_directive_system),
-                    projects::workforce_budget_system
-                        .after(projects::project_lifecycle_system),
-                    projects::project_stagnation_system
-                        .after(projects::project_lifecycle_system),
+                    projects::workforce_budget_system.after(projects::project_lifecycle_system),
+                    projects::project_stagnation_system.after(projects::project_lifecycle_system),
                     jobs::chief_job_posting_system
                         .after(faction::compute_faction_storage_system)
                         .after(faction::chief_selection_system)
                         .after(projects::project_lifecycle_system),
-                    jobs::worker_self_post_stockpile_system
-                        .after(jobs::chief_job_posting_system),
-                    crafting::faction_craft_order_system
-                        .after(jobs::chief_job_posting_system),
-                    jobs::chief_tablet_posting_system
-                        .after(jobs::chief_job_posting_system),
-                    jobs::job_build_completion_system
-                        .after(jobs::chief_job_posting_system),
-                    jobs::job_claim_release_system
-                        .after(jobs::job_build_completion_system),
-                    jobs::chief_post_funding_system
-                        .after(jobs::chief_job_posting_system),
-                    jobs::job_payout_system
-                        .after(jobs::job_claim_release_system),
-                    jobs::faction_wage_signal_system
-                        .after(jobs::job_payout_system),
-                    skills::skill_peaks_tracker_system
-                        .after(jobs::faction_wage_signal_system),
-                    skills::skill_decay_system
-                        .after(skills::skill_peaks_tracker_system),
-                    goals::chronic_failure_release_system
-                        .after(jobs::job_claim_release_system),
+                    jobs::worker_self_post_stockpile_system.after(jobs::chief_job_posting_system),
+                    crafting::faction_craft_order_system.after(jobs::chief_job_posting_system),
+                    jobs::chief_tablet_posting_system.after(jobs::chief_job_posting_system),
+                    jobs::job_build_completion_system.after(jobs::chief_job_posting_system),
+                    jobs::job_claim_release_system.after(jobs::job_build_completion_system),
+                    jobs::chief_post_funding_system.after(jobs::chief_job_posting_system),
+                    jobs::job_payout_system.after(jobs::job_claim_release_system),
+                    jobs::faction_wage_signal_system.after(jobs::job_payout_system),
+                    skills::skill_peaks_tracker_system.after(jobs::faction_wage_signal_system),
+                    skills::skill_decay_system.after(skills::skill_peaks_tracker_system),
+                    goals::chronic_failure_release_system.after(jobs::job_claim_release_system),
                 )
                     .in_set(SimulationSet::Economy),
             )
             .add_systems(
                 FixedUpdate,
-                (jobs::wage_gossip_system
-                    .after(knowledge::awareness_gossip_system),)
+                (jobs::wage_gossip_system.after(knowledge::awareness_gossip_system),)
+                    .in_set(SimulationSet::Economy),
+            )
+            .add_systems(
+                FixedUpdate,
+                (
+                    organic_settlement::settlement_survey_system
+                        .after(settlement::auto_found_default_settlements_system)
+                        .before(settlement::settlement_planner_system),
+                    organic_settlement::settlement_pressure_system
+                        .after(organic_settlement::settlement_survey_system)
+                        .before(organic_settlement::settlement_morphology_system),
+                    organic_settlement::settlement_morphology_system
+                        .after(organic_settlement::settlement_pressure_system)
+                        .before(organic_settlement::settlement_project_selection_system),
+                    organic_settlement::settlement_project_selection_system
+                        .after(organic_settlement::settlement_morphology_system)
+                        .before(construction::chief_directive_system),
+                )
                     .in_set(SimulationSet::Economy),
             )
             .add_systems(
                 FixedUpdate,
                 (
                     settlement::settlement_planner_system
+                        .after(organic_settlement::settlement_survey_system)
                         .before(construction::chief_directive_system),
                     settlement::auto_found_default_settlements_system
+                        .before(organic_settlement::settlement_survey_system)
                         .before(settlement::settlement_planner_system),
                     construction::building_upgrade_system
                         .after(settlement::settlement_planner_system)
@@ -685,26 +693,22 @@ impl Plugin for SimulationPlugin {
                         .after(faction::compute_faction_storage_system),
                     faction::update_material_targets_system
                         .after(faction::compute_faction_storage_system),
-                    knowledge::discovery_system
-                        .after(faction::compute_faction_storage_system),
-                    knowledge::tech_teaching_system
-                        .after(knowledge::awareness_gossip_system),
+                    knowledge::discovery_system.after(faction::compute_faction_storage_system),
+                    knowledge::tech_teaching_system.after(knowledge::awareness_gossip_system),
                     faction::sync_faction_techs_from_chief_system
                         .after(faction::chief_selection_system)
                         .after(knowledge::discovery_system)
                         .after(knowledge::tech_teaching_system),
                     military::expire_rally_points_system,
                     teaching::apply_lecture_request_system,
-                    faction::chief_hunt_order_system
-                        .after(faction::compute_faction_storage_system),
+                    faction::chief_hunt_order_system.after(faction::compute_faction_storage_system),
                     faction::faction_hunter_assignment_system
                         .after(faction::chief_hunt_order_system),
                     faction::chief_bureaucrat_appointment_system
                         .after(faction::compute_faction_storage_system),
                     faction::bureaucrat_salary_tick_system
                         .after(faction::chief_bureaucrat_appointment_system),
-                    faction::tribute_payment_system
-                        .after(faction::bureaucrat_salary_tick_system),
+                    faction::tribute_payment_system.after(faction::bureaucrat_salary_tick_system),
                     faction::household_contract_posting_system
                         .after(faction::tribute_payment_system),
                     corpse::corpse_decay_system,
@@ -732,26 +736,20 @@ impl Plugin for SimulationPlugin {
                     land::carve_plots_system
                         .after(settlement::settlement_planner_system)
                         .before(construction::chief_directive_system),
-                    land::land_listing_system
-                        .after(land::carve_plots_system),
-                    land::household_land_acquisition_system
-                        .after(land::land_listing_system),
-                    land::rent_collection_system
-                        .after(land::household_land_acquisition_system),
-                    land::evicted_plot_cleanup_system
-                        .after(land::rent_collection_system),
+                    land::land_listing_system.after(land::carve_plots_system),
+                    land::household_land_acquisition_system.after(land::land_listing_system),
+                    land::rent_collection_system.after(land::household_land_acquisition_system),
+                    land::evicted_plot_cleanup_system.after(land::rent_collection_system),
                     // Nomadic mode (Phase 8). Runs after storage rollup so
                     // the migration trigger reads fresh `faction.storage`
                     // numbers, and after household systems so a
                     // sedentarized-then-relocated band's children-factions
                     // see the new home_tile next tick.
-                    nomad::nomad_migration_system
-                        .after(faction::compute_faction_storage_system),
+                    nomad::nomad_migration_system.after(faction::compute_faction_storage_system),
                     // Phase D: roll Surveying → PendingCommit once the
                     // scout window has elapsed. After the trigger so a
                     // freshly-entered Surveying state doesn't race-promote.
-                    nomad::nomad_survey_completion_system
-                        .after(nomad::nomad_migration_system),
+                    nomad::nomad_survey_completion_system.after(nomad::nomad_migration_system),
                     // P5: band-level inventory equalization. Runs every
                     // quarter-day so a daily migration trigger has at
                     // least one prior balance pass to draw on. Gated by
@@ -763,14 +761,12 @@ impl Plugin for SimulationPlugin {
                     // after migration trigger so a band that JUST set
                     // `pending_migration` this tick is ineligible (won't
                     // flip lifestyle and lose its move).
-                    nomad::nomad_sedentarize_system
-                        .after(nomad::nomad_migration_system),
+                    nomad::nomad_sedentarize_system.after(nomad::nomad_migration_system),
                     // P2: slim nomad chief — queues replacement Bedroll/
                     // Tent/Yurt blueprints when shelter falls below
                     // per-member targets. Daily, after migration trigger
                     // so a band about to move skips the work.
-                    nomad::nomad_chief_directive_system
-                        .after(nomad::nomad_migration_system),
+                    nomad::nomad_chief_directive_system.after(nomad::nomad_migration_system),
                     // Phase 10: wild herd seasonal drift. Daily, after the
                     // calendar tick — sits next to the nomad migration so
                     // nomads' food-cluster knowledge can pick up the herd's

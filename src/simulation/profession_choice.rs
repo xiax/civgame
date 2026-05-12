@@ -152,8 +152,14 @@ mod tests {
 
     #[test]
     fn primary_skill_per_profession() {
-        assert_eq!(primary_skill_for(Profession::Farmer), Some(SkillKind::Farming));
-        assert_eq!(primary_skill_for(Profession::Hunter), Some(SkillKind::Combat));
+        assert_eq!(
+            primary_skill_for(Profession::Farmer),
+            Some(SkillKind::Farming)
+        );
+        assert_eq!(
+            primary_skill_for(Profession::Hunter),
+            Some(SkillKind::Combat)
+        );
         assert_eq!(primary_skill_for(Profession::None), None);
     }
 }

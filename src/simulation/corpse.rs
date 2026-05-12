@@ -274,7 +274,9 @@ pub fn butcher_task_system(
             tick: clock.tick,
             actor: entity,
             faction_id: member.map(|m| m.faction_id).unwrap_or(0),
-            kind: crate::ui::activity_log::ActivityEntryKind::Crafted { name: activity_name },
+            kind: crate::ui::activity_log::ActivityEntryKind::Crafted {
+                name: activity_name,
+            },
         });
 
         commands.entity(corpse_e).despawn_recursive();

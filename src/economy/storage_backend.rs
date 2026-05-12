@@ -94,9 +94,7 @@ where
         members
             .into_iter()
             .filter(|(_e, fm, _tile, qty)| fm.faction_id == faction_id && *qty > 0)
-            .min_by_key(|(_e, _fm, tile, _qty)| {
-                (tile.0 - from.0).abs() + (tile.1 - from.1).abs()
-            })
+            .min_by_key(|(_e, _fm, tile, _qty)| (tile.0 - from.0).abs() + (tile.1 - from.1).abs())
             .map(|(e, _, _, _)| WithdrawSource::MemberHands { entity: e })
     };
     match kind {
@@ -133,9 +131,7 @@ where
         members
             .into_iter()
             .filter(|(_e, fm, _tile, has_room)| fm.faction_id == faction_id && *has_room)
-            .min_by_key(|(_e, _fm, tile, _)| {
-                (tile.0 - from.0).abs() + (tile.1 - from.1).abs()
-            })
+            .min_by_key(|(_e, _fm, tile, _)| (tile.0 - from.0).abs() + (tile.1 - from.1).abs())
             .map(|(e, _, _, _)| DepositTarget::MemberHands { entity: e })
     };
     match kind {
@@ -244,7 +240,10 @@ mod tests {
             std::iter::once((&fm, &agent)),
         );
         assert_eq!(tile_only.get(&wood).copied(), Some(5));
-        assert!(!tile_only.contains_key(&stone), "FactionTile must not pool members");
+        assert!(
+            !tile_only.contains_key(&stone),
+            "FactionTile must not pool members"
+        );
 
         let member_only = rollup_for_kind(
             StorageBackendKind::MemberPool,
@@ -306,10 +305,8 @@ mod tests {
             ..FactionMember::default()
         };
         // alice at (0,0) with 5 wood; bob at (10,10) with 5 wood. Agent at (8,8) → bob is closer.
-        let members: Vec<(Entity, &FactionMember, (i32, i32), u32)> = vec![
-            (alice, &fm, (0, 0), 5),
-            (bob, &fm, (10, 10), 5),
-        ];
+        let members: Vec<(Entity, &FactionMember, (i32, i32), u32)> =
+            vec![(alice, &fm, (0, 0), 5), (bob, &fm, (10, 10), 5)];
         let pick = nearest_withdraw(
             StorageBackendKind::MemberPool,
             9,
@@ -334,8 +331,7 @@ mod tests {
             faction_id: 11,
             ..FactionMember::default()
         };
-        let members: Vec<(Entity, &FactionMember, (i32, i32), u32)> =
-            vec![(alice, &fm, (5, 5), 3)];
+        let members: Vec<(Entity, &FactionMember, (i32, i32), u32)> = vec![(alice, &fm, (5, 5), 3)];
 
         // Tile has stock → tile wins.
         let pick = nearest_withdraw(

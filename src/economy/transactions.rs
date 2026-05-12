@@ -1,11 +1,11 @@
 use super::agent::EconomicAgent;
 use super::market::Market;
+use crate::simulation::camp::{faction_market_node, Camp, CampMap, MarketNodeRef};
 use crate::simulation::faction::FactionMember;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{AiState, PersonAI};
 use crate::simulation::schedule::{BucketSlot, SimClock};
-use crate::simulation::camp::{faction_market_node, Camp, CampMap, MarketNodeRef};
 use crate::simulation::settlement::{Settlement, SettlementMap};
 use bevy::prelude::*;
 
@@ -32,17 +32,18 @@ pub fn trader_buy_at_settlement(
     }
     // Read settlement state for the price + stock check.
     let (price_per_unit, stock_available) = {
-        let s = world
-            .get::<crate::simulation::settlement::Settlement>(settlement)?;
-        (s.market.price_of(resource_id), s.market.stock_of(resource_id))
+        let s = world.get::<crate::simulation::settlement::Settlement>(settlement)?;
+        (
+            s.market.price_of(resource_id),
+            s.market.stock_of(resource_id),
+        )
     };
     let total = price_per_unit * qty as f32;
     if stock_available < qty as f32 {
         // Trader's would-buy attempt was blocked by insufficient stock.
         // Record stockout so the market's bid-driven price update sees
         // the buyer pressure.
-        if let Some(mut s) = world
-            .get_mut::<crate::simulation::settlement::Settlement>(settlement)
+        if let Some(mut s) = world.get_mut::<crate::simulation::settlement::Settlement>(settlement)
         {
             s.market.add_bid_stockout(resource_id, qty as f32);
         }
@@ -51,8 +52,7 @@ pub fn trader_buy_at_settlement(
     // Currency check.
     let agent_currency = world.get::<EconomicAgent>(trader)?.currency;
     if agent_currency < total {
-        if let Some(mut s) = world
-            .get_mut::<crate::simulation::settlement::Settlement>(settlement)
+        if let Some(mut s) = world.get_mut::<crate::simulation::settlement::Settlement>(settlement)
         {
             s.market.add_bid_unaffordable(resource_id, qty as f32);
         }
@@ -61,9 +61,7 @@ pub fn trader_buy_at_settlement(
     // Capacity check via add_item dry-run is awkward; we just attempt
     // the add and roll back the debit if the agent can't carry it.
     let item = crate::economy::item::Item::new_commodity(resource_id);
-    let leftover = world
-        .get_mut::<EconomicAgent>(trader)?
-        .add_item(item, qty);
+    let leftover = world.get_mut::<EconomicAgent>(trader)?.add_item(item, qty);
     let acquired = qty - leftover;
     if acquired == 0 {
         return None;
@@ -77,8 +75,7 @@ pub fn trader_buy_at_settlement(
     // Update settlement: stock down, treasury up, record cleared bid
     // so the price tick reflects the trade.
     {
-        let mut s = world
-            .get_mut::<crate::simulation::settlement::Settlement>(settlement)?;
+        let mut s = world.get_mut::<crate::simulation::settlement::Settlement>(settlement)?;
         s.market.add_bid_cleared(resource_id, acquired as f32);
         let new_stock = (stock_available - acquired as f32).max(0.0);
         s.market.set_stock(resource_id, new_stock);
@@ -103,13 +100,14 @@ pub fn trader_sell_at_settlement(
     if qty == 0 {
         return None;
     }
-    let agent_qty = world.get::<EconomicAgent>(trader)?.quantity_of_resource(resource_id);
+    let agent_qty = world
+        .get::<EconomicAgent>(trader)?
+        .quantity_of_resource(resource_id);
     if agent_qty < qty {
         return None;
     }
     let price_per_unit = {
-        let s = world
-            .get::<crate::simulation::settlement::Settlement>(settlement)?;
+        let s = world.get::<crate::simulation::settlement::Settlement>(settlement)?;
         s.market.price_of(resource_id)
     };
     let asking = price_per_unit * qty as f32;
@@ -141,14 +139,14 @@ pub fn trader_sell_at_settlement(
     // record a bid signal — sellers don't move price; only buyer
     // outcomes do.
     {
-        let mut s = world
-            .get_mut::<crate::simulation::settlement::Settlement>(settlement)?;
+        let mut s = world.get_mut::<crate::simulation::settlement::Settlement>(settlement)?;
         s.treasury -= actual_total;
         if s.treasury < 0.0 {
             s.treasury = 0.0;
         }
         let cur_stock = s.market.stock_of(resource_id);
-        s.market.set_stock(resource_id, cur_stock + actual_qty as f32);
+        s.market
+            .set_stock(resource_id, cur_stock + actual_qty as f32);
     }
     Some(price_per_unit)
 }
@@ -208,11 +206,7 @@ pub const HOUSEHOLD_INCOME_SKIM: f32 = 0.10;
 /// Currency invariant: the function debits nothing (the caller
 /// hasn't credited anything yet); it only redirects part of the
 /// would-be agent credit to the household.
-pub fn split_market_earnings_with_household(
-    world: &mut World,
-    agent: Entity,
-    earned: f32,
-) -> f32 {
+pub fn split_market_earnings_with_household(world: &mut World, agent: Entity, earned: f32) -> f32 {
     if earned <= 0.0 {
         return 0.0;
     }

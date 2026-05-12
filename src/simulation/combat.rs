@@ -1,8 +1,7 @@
-
 use crate::economy::item::{armor_coverage, Item};
 use crate::simulation::animals::{AnimalAI, AnimalNeeds, AnimalState, Deer, Wolf};
-use crate::simulation::corpse::{Corpse, CorpseMap, CorpseSpecies, CORPSE_FRESHNESS_TICKS};
 use crate::simulation::construction::{Bed, HomeBed};
+use crate::simulation::corpse::{Corpse, CorpseMap, CorpseSpecies, CORPSE_FRESHNESS_TICKS};
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::items::{Equipment, EquipmentSlot, GroundItem};
 use crate::simulation::line_of_sight::has_los;
@@ -475,6 +474,150 @@ pub fn combat_system(
     }
 }
 
+/// Hunters whose prey is farther than this Chebyshev distance abandon the
+/// chase. Keeps the dispatcher's next tick free to pick a closer target via
+/// vision or fall through to `ScoutForPreyMethod` rather than chasing the
+/// herd halfway across the map.
+pub const HUNT_LEASH_RADIUS: i32 = 30;
+
+/// Live re-targeting tick for `Task::Hunt { prey }`. Runs in
+/// `SimulationSet::Sequential` between `movement_system` and `combat_system`.
+///
+/// Fixes two related bugs left over from the legacy `HuntFood` plan
+/// migration:
+///
+/// 1. `assign_task_with_routing` caches `ai.dest_tile = prey_tile` at
+///    dispatch time. When the prey flees (Deer/Horse/Cow flee on Person
+///    sight) the hunter arrives at the now-stale tile, `movement_system`
+///    flips state to `Working`, and `combat_system` can't find anything
+///    adjacent — leaving the hunter frozen on the empty tile forever with
+///    `aq.current == Task::Hunt { prey }` and `combat_target` still set.
+///
+/// 2. `combat_system`'s `Attacking → !found` branch aborts to Idle on the
+///    first missed swing, so even a one-tile bump from the prey ends the
+///    chase prematurely.
+///
+/// Strategy each tick:
+/// - Look up the prey's live transform + Health.
+/// - **Despawned / dead:** cancel the chain via `record_target_failure` so
+///   `MethodHistory` biases the next dispatch (and the dispatcher's
+///   next-tick re-eval picks a fresh prey or falls through to Scout).
+/// - **Beyond `HUNT_LEASH_RADIUS`:** same — abandon, push `FailedTarget`.
+/// - **Within Chebyshev 1:** no-op. `combat_system` handles the swing.
+/// - **Moved ≥ 1 tile away:** point `dest_tile` / `target_tile` at the
+///   prey's current tile, drop `Working → Seeking`, and reset
+///   `PathFollow.segment_path` so `movement_system`'s `Following`-arm
+///   replan re-routes through the path worker next tick.
+pub fn hunt_chase_system(
+    clock: Res<SimClock>,
+    chunk_map: Res<ChunkMap>,
+    prey_query: Query<(&Transform, &Health), Or<(With<Wolf>, With<Deer>)>>,
+    mut query: Query<(
+        Entity,
+        &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
+        &mut crate::simulation::htn::MethodHistory,
+        &mut CombatTarget,
+        &mut crate::pathfinding::path_request::PathFollow,
+        &Transform,
+        &LodLevel,
+        &BucketSlot,
+    )>,
+) {
+    let now = clock.tick;
+    for (
+        _entity,
+        mut ai,
+        mut aq,
+        mut history,
+        mut combat_target,
+        mut pf,
+        transform,
+        lod,
+        slot,
+    ) in query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        let prey = match aq.current {
+            crate::simulation::typed_task::Task::Hunt { prey } => prey,
+            _ => continue,
+        };
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+
+        // Despawned, or dead, or no longer huntable: abandon. Defer cleanup
+        // of `combat_target` + `aq.current` to the death-aware branch in
+        // `combat_system` for the death case; the despawn case has to do it
+        // here because combat_system early-returns when the entity is gone.
+        let Ok((prey_t, prey_health)) = prey_query.get(prey) else {
+            // Despawned. Cancel cleanly so dispatcher re-evaluates next tick.
+            crate::simulation::htn::record_target_failure(&mut history, &mut ai, now);
+            combat_target.0 = None;
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            aq.cancel();
+            continue;
+        };
+        if prey_health.is_dead() {
+            // combat_system's `target_is_dead` branch will handle the kill
+            // bookkeeping in the same tick (it also calls aq.advance()).
+            // Skip — don't double-cancel.
+            continue;
+        }
+
+        let prey_tx = (prey_t.translation.x / TILE_SIZE).floor() as i32;
+        let prey_ty = (prey_t.translation.y / TILE_SIZE).floor() as i32;
+
+        let cheb = (cur_tx - prey_tx).abs().max((cur_ty - prey_ty).abs());
+
+        // Already adjacent — combat_system will swing this tick.
+        if cheb <= 1 {
+            continue;
+        }
+
+        // Out of leash range. Abandon so the dispatcher can pick a closer
+        // prey or transition the chief from Hunt → Scout. Stamping
+        // FailedTarget on MethodHistory keeps the same prey from being
+        // re-picked the next few ticks via the recency penalty.
+        if cheb > HUNT_LEASH_RADIUS {
+            crate::simulation::htn::record_target_failure(&mut history, &mut ai, now);
+            combat_target.0 = None;
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            aq.cancel();
+            continue;
+        }
+
+        // Re-target if the prey is no longer at the cached destination.
+        // movement_system's `Following`-arm replan picks this up next tick
+        // when it sees `pf.goal != goal3` derived from the updated target.
+        if (ai.dest_tile.0 as i32, ai.dest_tile.1 as i32) != (prey_tx, prey_ty) {
+            ai.dest_tile = (prey_tx, prey_ty);
+            ai.target_tile = (prey_tx, prey_ty);
+            ai.target_z = chunk_map.surface_z_at(prey_tx, prey_ty) as i8;
+            // If we were already at the (now stale) dest tile, movement_system
+            // had flipped us into Working. Drop back to Seeking so the
+            // movement loop actually re-routes instead of accumulating
+            // work_progress while the prey runs free.
+            if ai.state == AiState::Working {
+                ai.state = AiState::Seeking;
+                ai.work_progress = 0;
+            }
+            // Force a fresh path plan next tick. Mirror movement_system's
+            // stuck-tick clear (lines 280-287) so the path worker rebuilds
+            // against the live prey location.
+            pf.segment_path.clear();
+            pf.chunk_route.clear();
+            pf.segment_cursor = 0;
+            pf.route_cursor = 0;
+            pf.status = crate::pathfinding::path_request::FollowStatus::Idle;
+        }
+    }
+}
+
 /// Sent when an agent drops a stack from their hands (combat reflex, etc).
 /// `hand_drop_event_handler` consumes it.
 #[derive(Event, Clone, Copy, Debug)]
@@ -704,9 +847,7 @@ pub fn death_system(
                 GlobalTransform::default(),
                 Visibility::Visible,
                 InheritedVisibility::default(),
-                crate::world::spatial::Indexed::new(
-                    crate::world::spatial::IndexedKind::GroundItem,
-                ),
+                crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::GroundItem),
             ));
         }
 

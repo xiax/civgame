@@ -49,11 +49,11 @@ use crate::simulation::gather_claims::{suggested_expiry, GatherClaims};
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::MemoryKind;
+use crate::simulation::needs::{Needs, EAT_TRIGGER_HUNGER};
+use crate::simulation::person::{AiState, Drafted, PersonAI, Profession};
 use crate::simulation::plants::{
     nearest_mature_plant_under_agent, GrowthStage, Plant, PlantKind, PlantMap,
 };
-use crate::simulation::needs::{Needs, EAT_TRIGGER_HUNGER};
-use crate::simulation::person::{AiState, Drafted, PersonAI, Profession};
 use crate::simulation::production::total_edible;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
@@ -93,7 +93,9 @@ pub enum AbstractTask {
     /// Scaffolding only at 5c-i: `WithdrawMaterialFromStorageMethod` is
     /// registered, but no dispatcher consumes `AbstractTaskKind::AcquireGood`
     /// yet. 5c-ii adds the dispatcher and starts deleting per-good plans.
-    AcquireGood { resource_id: ResourceId },
+    AcquireGood {
+        resource_id: ResourceId,
+    },
     /// Fill faction food storage. The chief-driven counterpart to
     /// `AcquireFood`: instead of "agent is hungry, get food into mouth," this
     /// expresses "faction wants more food in storage, regardless of who is
@@ -136,7 +138,9 @@ pub enum AbstractTask {
     /// ground. Replaces the legacy (and dead — never seeded into KnownPlans)
     /// `PlantFromStorage` (PlanId 4) and `PlantBerryFromStorage` (PlanId 66)
     /// plans, restoring chief-driven planting under the Farm goal.
-    PlantFromStorage { resource_id: ResourceId },
+    PlantFromStorage {
+        resource_id: ResourceId,
+    },
     /// Agent holding a `JobClaim::Build` walks to the claimed blueprint and
     /// labors at it. Single expansion `[Task::Construct { blueprint }]`.
     /// `MF_UNINTERRUPTIBLE` so a goal flip mid-walk doesn't drop the claim.
@@ -217,7 +221,9 @@ pub enum AbstractTask {
     /// the legacy `DeliverFromStorageToCraftOrder` plan (PlanId 15) +
     /// `[StepId(40) FetchCraftOrderMaterialFromStorage, StepId(38)
     /// HaulToCraftOrder]`.
-    DeliverMaterialToCraftOrder { resource_id: ResourceId },
+    DeliverMaterialToCraftOrder {
+        resource_id: ResourceId,
+    },
     /// Worker under `AgentGoal::Craft` walks adjacent to a satisfied faction
     /// `CraftOrder` and labors at it until `craft_order_system` produces the
     /// output and despawns the order. Single expansion
@@ -1050,6 +1056,14 @@ pub struct PlannerCtx {
     /// JobClaim::Build path (which only fires once `bp.is_satisfied()`) so
     /// the existing `BuildClaimedBlueprintMethod` wins as before.
     pub personal_bp_resource: Option<ResourceId>,
+    /// True when the agent has a Weapon resource in any of: `Equipment`
+    /// MainHand, `Carrier` hands, `EconomicAgent.inventory`. Gates
+    /// `HuntPreyMethod` / `MusterAtHearthMethod` / `TravelToHuntAreaMethod`
+    /// so an unarmed hunter falls through to `EquipHuntingSpear` instead
+    /// of marching into combat with bare hands. Only populated by the
+    /// engage-prey and join-hunt-party dispatchers; everywhere else
+    /// defaults to `false` (the hunting methods are the only readers).
+    pub agent_has_weapon: bool,
 }
 
 /// A single decomposition rule for an `AbstractTask`. Scoring (`utility`) and
@@ -1120,10 +1134,7 @@ impl MethodRegistry {
     }
 
     pub fn methods_for(&self, kind: AbstractTaskKind) -> &[Box<dyn Method>] {
-        self.by_kind
-            .get(&kind)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        self.by_kind.get(&kind).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     pub fn method_count(&self, kind: AbstractTaskKind) -> usize {
@@ -1597,7 +1608,10 @@ impl Method for WithdrawMaterialFromStorageMethod {
         if ctx.material_storage_tile.is_none() {
             return Vec::new();
         }
-        vec![Task::WithdrawMaterial { resource_id, qty: 1 }]
+        vec![Task::WithdrawMaterial {
+            resource_id,
+            qty: 1,
+        }]
     }
 
     fn name(&self) -> &'static str {
@@ -1674,7 +1688,10 @@ impl Method for WithdrawAndHaulToBlueprintMethod {
             return Vec::new();
         }
         vec![
-            Task::WithdrawMaterial { resource_id, qty: 1 },
+            Task::WithdrawMaterial {
+                resource_id,
+                qty: 1,
+            },
             Task::HaulToBlueprint { blueprint },
         ]
     }
@@ -2222,8 +2239,7 @@ impl Method for ForageFromKnownForStorageMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE
-            - full_trip_penalty(ctx, ctx.gather_target_tile, ctx.gather_deposit_tile)
+        UTIL_BASELINE - full_trip_penalty(ctx, ctx.gather_target_tile, ctx.gather_deposit_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -2643,7 +2659,10 @@ impl Method for WithdrawAndHaulToPersonalBlueprintMethod {
             return Vec::new();
         }
         vec![
-            Task::WithdrawMaterial { resource_id, qty: 1 },
+            Task::WithdrawMaterial {
+                resource_id,
+                qty: 1,
+            },
             Task::HaulToBlueprint { blueprint },
         ]
     }
@@ -2695,8 +2714,7 @@ impl Method for GatherAndHaulToPersonalBlueprintMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE
-            - full_trip_penalty(ctx, ctx.gather_target_tile, ctx.claimed_blueprint_tile)
+        UTIL_BASELINE - full_trip_penalty(ctx, ctx.gather_target_tile, ctx.claimed_blueprint_tile)
     }
 
     fn flags(&self) -> MethodFlags {
@@ -2716,10 +2734,7 @@ impl Method for GatherAndHaulToPersonalBlueprintMethod {
         if ctx.personal_bp_resource.is_none() {
             return Vec::new();
         }
-        vec![
-            Task::Gather { tile },
-            Task::HaulToBlueprint { blueprint },
-        ]
+        vec![Task::Gather { tile }, Task::HaulToBlueprint { blueprint }]
     }
 
     fn name(&self) -> &'static str {
@@ -2800,7 +2815,7 @@ impl Method for HuntPreyMethod {
         if !matches!(abstract_task, AbstractTask::EngagePrey) {
             return false;
         }
-        ctx.prey_target_entity.is_some()
+        ctx.prey_target_entity.is_some() && ctx.agent_has_weapon
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
@@ -2914,7 +2929,10 @@ impl Method for MusterAtHearthMethod {
         if !matches!(abstract_task, AbstractTask::JoinHuntParty) {
             return false;
         }
-        ctx.hunt_hearth_tile.is_some() && !ctx.hunt_party_deployed && !ctx.hunt_party_stale
+        ctx.hunt_hearth_tile.is_some()
+            && !ctx.hunt_party_deployed
+            && !ctx.hunt_party_stale
+            && ctx.agent_has_weapon
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
@@ -2971,7 +2989,9 @@ impl Method for TravelToHuntAreaMethod {
         if !matches!(abstract_task, AbstractTask::JoinHuntParty) {
             return false;
         }
-        ctx.hunt_area_tile.is_some() && (ctx.hunt_party_deployed || ctx.hunt_party_stale)
+        ctx.hunt_area_tile.is_some()
+            && (ctx.hunt_party_deployed || ctx.hunt_party_stale)
+            && ctx.agent_has_weapon
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
@@ -3377,13 +3397,14 @@ pub fn htn_dispatch_system(
                 craft_output_resource: None,
                 play_partner_entity: None,
                 play_solo_eligible: false,
-            play_stone_storage_tile: None,
-            play_toy_storage_tile: None,
-            play_toy_resource: None,
-            play_grain_seed_storage_tile: None,
-            play_berry_seed_storage_tile: None,
-            play_plant_destination_tile: None,
-            personal_bp_resource: None,
+                play_stone_storage_tile: None,
+                play_toy_storage_tile: None,
+                play_toy_resource: None,
+                play_grain_seed_storage_tile: None,
+                play_berry_seed_storage_tile: None,
+                play_plant_destination_tile: None,
+                personal_bp_resource: None,
+                agent_has_weapon: false,
             };
 
             // Argmax over applicable methods. f32 has no total order; ties
@@ -3412,7 +3433,9 @@ pub fn htn_dispatch_system(
             // methods that return non-Sleep heads (e.g. a `WalkTo` chain
             // ahead of a Sleep) will land as new arms here.
             match head {
-                Task::Sleep { bed: Some(bed_entity) } => {
+                Task::Sleep {
+                    bed: Some(bed_entity),
+                } => {
                     if let Some(bed_tile) = home_bed_tile {
                         assign_task_with_routing(
                             &mut ai,
@@ -3603,13 +3626,14 @@ pub fn htn_eat_dispatch_system(
                 craft_output_resource: None,
                 play_partner_entity: None,
                 play_solo_eligible: false,
-            play_stone_storage_tile: None,
-            play_toy_storage_tile: None,
-            play_toy_resource: None,
-            play_grain_seed_storage_tile: None,
-            play_berry_seed_storage_tile: None,
-            play_plant_destination_tile: None,
-            personal_bp_resource: None,
+                play_stone_storage_tile: None,
+                play_toy_storage_tile: None,
+                play_toy_resource: None,
+                play_grain_seed_storage_tile: None,
+                play_berry_seed_storage_tile: None,
+                play_plant_destination_tile: None,
+                personal_bp_resource: None,
+                agent_has_weapon: false,
             };
 
             let abstract_task = AbstractTask::Eat;
@@ -3741,7 +3765,21 @@ pub fn htn_acquire_food_dispatch_system(
 ) {
     let now = clock.tick;
     query.par_iter_mut().for_each(
-        |(actor, mut ai, mut aq, mut history, goal, needs, agent, carrier, transform, member, lod, household_member, current_vision)| {
+        |(
+            actor,
+            mut ai,
+            mut aq,
+            mut history,
+            goal,
+            needs,
+            agent,
+            carrier,
+            transform,
+            member,
+            lod,
+            household_member,
+            current_vision,
+        )| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -3789,37 +3827,41 @@ pub fn htn_acquire_food_dispatch_system(
             // **Correction:** Filter storage tiles to ensure they actually
             // contain edible items, preventing a loop where agents walk to
             // a seed-only tile under Survive.
-            let nearest_storage_tile = if let Some(tiles) = storage_tile_map.by_faction.get(&member.faction_id) {
-                let pick = |reachable_only: bool| {
-                    tiles
-                        .iter()
-                        .filter(|&&(tx, ty)| {
-                            if reachable_only {
-                                let target_chunk = ChunkCoord(
-                                    tx.div_euclid(CHUNK_SIZE as i32),
-                                    ty.div_euclid(CHUNK_SIZE as i32),
-                                );
-                                if !chunk_connectivity.is_reachable((cur_chunk, ai.current_z), (target_chunk, ai.current_z)) {
-                                    return false;
+            let nearest_storage_tile =
+                if let Some(tiles) = storage_tile_map.by_faction.get(&member.faction_id) {
+                    let pick = |reachable_only: bool| {
+                        tiles
+                            .iter()
+                            .filter(|&&(tx, ty)| {
+                                if reachable_only {
+                                    let target_chunk = ChunkCoord(
+                                        tx.div_euclid(CHUNK_SIZE as i32),
+                                        ty.div_euclid(CHUNK_SIZE as i32),
+                                    );
+                                    if !chunk_connectivity.is_reachable(
+                                        (cur_chunk, ai.current_z),
+                                        (target_chunk, ai.current_z),
+                                    ) {
+                                        return false;
+                                    }
                                 }
-                            }
 
-                            // Ensure at least one edible item exists on this tile
-                            spatial.get(tx, ty).iter().any(|&e| {
-                                if let Ok(gi) = item_query.get(e) {
-                                    gi.item.resource_id.is_edible() && gi.qty > 0
-                                } else {
-                                    false
-                                }
+                                // Ensure at least one edible item exists on this tile
+                                spatial.get(tx, ty).iter().any(|&e| {
+                                    if let Ok(gi) = item_query.get(e) {
+                                        gi.item.resource_id.is_edible() && gi.qty > 0
+                                    } else {
+                                        false
+                                    }
+                                })
                             })
-                        })
-                        .min_by_key(|&&(tx, ty)| (tx - cur_tx).abs() + (ty - cur_ty).abs())
-                        .copied()
+                            .min_by_key(|&&(tx, ty)| (tx - cur_tx).abs() + (ty - cur_ty).abs())
+                            .copied()
+                    };
+                    pick(true).or_else(|| pick(false))
+                } else {
+                    None
                 };
-                pick(true).or_else(|| pick(false))
-            } else {
-                None
-            };
             // `food_stock` returns f32 because it sums Fruit/Meat/Grain at
             // floating-point granularity in some legacy code; for ctx purposes
             // we want a u32 tally. Floor the value — under-counting is the
@@ -3857,9 +3899,7 @@ pub fn htn_acquire_food_dispatch_system(
             // no extra stage filter needed. Falls back to SharedKnowledge
             // when vision shows nothing.
             let viewer_household = household_member.map(|h| h.household_id);
-            let viewer_settlement = gk
-                .settlement_map
-                .first_for_faction(member.faction_id);
+            let viewer_settlement = gk.settlement_map.first_for_faction(member.faction_id);
             // P6a: live `PlantMap` fast path. Probes for a mature
             // edible plant within chebyshev radius 2 *before* vision /
             // SharedKnowledge — vision runs once per ~20-tick bucket
@@ -3944,13 +3984,14 @@ pub fn htn_acquire_food_dispatch_system(
                 craft_output_resource: None,
                 play_partner_entity: None,
                 play_solo_eligible: false,
-            play_stone_storage_tile: None,
-            play_toy_storage_tile: None,
-            play_toy_resource: None,
-            play_grain_seed_storage_tile: None,
-            play_berry_seed_storage_tile: None,
-            play_plant_destination_tile: None,
-            personal_bp_resource: None,
+                play_stone_storage_tile: None,
+                play_toy_storage_tile: None,
+                play_toy_resource: None,
+                play_grain_seed_storage_tile: None,
+                play_berry_seed_storage_tile: None,
+                play_plant_destination_tile: None,
+                personal_bp_resource: None,
+                agent_has_weapon: false,
             };
 
             let abstract_task = AbstractTask::AcquireFood;
@@ -3963,8 +4004,10 @@ pub fn htn_acquire_food_dispatch_system(
                 .iter()
                 .filter(|m| m.precondition(abstract_task, &ctx))
                 .max_by(|a, b| {
-                    let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                    let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                    let ua =
+                        score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                    let ub =
+                        score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
                     ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
@@ -4336,7 +4379,9 @@ pub fn htn_acquire_good_dispatch_system(
                     MemoryKind,
                 ) = match *goal {
                     AgentGoal::GatherWood => (crate::economy::core_ids::wood(), MemoryKind::wood()),
-                    AgentGoal::GatherStone => (crate::economy::core_ids::stone(), MemoryKind::stone()),
+                    AgentGoal::GatherStone => {
+                        (crate::economy::core_ids::stone(), MemoryKind::stone())
+                    }
                     AgentGoal::Stockpile => {
                         let Some(rid) = claim_target_opt.and_then(|c| c.resource_id()) else {
                             continue;
@@ -4359,9 +4404,7 @@ pub fn htn_acquire_good_dispatch_system(
                 // Memory is only consulted when vision shows nothing of the
                 // requested kind.
                 let viewer_household = household_member.map(|h| h.household_id);
-                let viewer_settlement = gk
-                    .settlement_map
-                    .first_for_faction(member.faction_id);
+                let viewer_settlement = gk.settlement_map.first_for_faction(member.faction_id);
                 // Phase 2a: tile-reachability closure for vision pickers.
                 let reach_from_agent = |t: (i32, i32)| -> bool {
                     let target_chunk = ChunkCoord(
@@ -4489,13 +4532,14 @@ pub fn htn_acquire_good_dispatch_system(
                     craft_output_resource: None,
                     play_partner_entity: None,
                     play_solo_eligible: false,
-            play_stone_storage_tile: None,
-            play_toy_storage_tile: None,
-            play_toy_resource: None,
-            play_grain_seed_storage_tile: None,
-            play_berry_seed_storage_tile: None,
-            play_plant_destination_tile: None,
-            personal_bp_resource: None,
+                    play_stone_storage_tile: None,
+                    play_toy_storage_tile: None,
+                    play_toy_resource: None,
+                    play_grain_seed_storage_tile: None,
+                    play_berry_seed_storage_tile: None,
+                    play_plant_destination_tile: None,
+                    personal_bp_resource: None,
+                    agent_has_weapon: false,
                 };
 
                 let abstract_task = AbstractTask::AcquireGood {
@@ -4810,6 +4854,7 @@ pub fn htn_acquire_good_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
+            agent_has_weapon: false,
         };
 
         let abstract_task = AbstractTask::AcquireGood { resource_id };
@@ -4835,7 +4880,10 @@ pub fn htn_acquire_good_dispatch_system(
         let head = tasks.remove(0);
 
         match head {
-            Task::WithdrawMaterial { resource_id: head_resource, qty } => {
+            Task::WithdrawMaterial {
+                resource_id: head_resource,
+                qty,
+            } => {
                 let dispatched = assign_task_with_routing(
                     &mut ai,
                     (cur_tx, cur_ty),
@@ -4862,7 +4910,10 @@ pub fn htn_acquire_good_dispatch_system(
                 ai.reserved_tile = reserved_tile;
                 ai.reserved_resource = Some(head_resource);
                 ai.reserved_qty = qty;
-                aq.dispatch(Task::WithdrawMaterial { resource_id: head_resource, qty });
+                aq.dispatch(Task::WithdrawMaterial {
+                    resource_id: head_resource,
+                    qty,
+                });
             }
             _ => {
                 // No registered AcquireGood method returns a non-WithdrawMaterial
@@ -5101,9 +5152,7 @@ pub fn htn_stockpile_food_dispatch_system(
             // agent walked onto this tick that vision /
             // SharedKnowledge haven't yet reported.
             let viewer_household = household_member.map(|h| h.household_id);
-            let viewer_settlement = gk
-                .settlement_map
-                .first_for_faction(member.faction_id);
+            let viewer_settlement = gk.settlement_map.first_for_faction(member.faction_id);
             let underfoot = nearest_mature_plant_under_agent(
                 &plant_map,
                 &plant_query,
@@ -5213,13 +5262,14 @@ pub fn htn_stockpile_food_dispatch_system(
                 craft_output_resource: None,
                 play_partner_entity: None,
                 play_solo_eligible: false,
-            play_stone_storage_tile: None,
-            play_toy_storage_tile: None,
-            play_toy_resource: None,
-            play_grain_seed_storage_tile: None,
-            play_berry_seed_storage_tile: None,
-            play_plant_destination_tile: None,
-            personal_bp_resource: None,
+                play_stone_storage_tile: None,
+                play_toy_storage_tile: None,
+                play_toy_resource: None,
+                play_grain_seed_storage_tile: None,
+                play_berry_seed_storage_tile: None,
+                play_plant_destination_tile: None,
+                personal_bp_resource: None,
+                agent_has_weapon: false,
             };
 
             let abstract_task = AbstractTask::StockpileFood;
@@ -5228,8 +5278,10 @@ pub fn htn_stockpile_food_dispatch_system(
                 .iter()
                 .filter(|m| m.precondition(abstract_task, &ctx))
                 .max_by(|a, b| {
-                    let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                    let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                    let ua =
+                        score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                    let ub =
+                        score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
                     ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
@@ -5452,7 +5504,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
         mut ai,
         mut aq,
         mut history,
-        goal,
+        _goal,
         profession,
         agent,
         carrier,
@@ -5466,9 +5518,10 @@ pub fn htn_equip_hunting_spear_dispatch_system(
         if *lod == LodLevel::Dormant {
             continue;
         }
-        if !matches!(*goal, AgentGoal::Survive | AgentGoal::GatherFood) {
-            continue;
-        }
+        // Goal-agnostic: a Hunter under a faction `HuntOrder::Hunt` may have
+        // any goal (Lead / Defend / Socialize / Survive / etc.). All that
+        // matters is they're an unarmed Hunter with stock available.
+        // Profession + tech + idle + weapon-absence gates suffice.
         if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
             continue;
         }
@@ -5488,8 +5541,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
         // equipment slot self-deselects the chain. Mirrors the legacy
         // `StepPreconditions::forbids_resource(weapon)` gate plus the
         // plan-level forbids_good check.
-        if agent.quantity_of_resource(weapon_id) > 0
-            || carrier.quantity_of_resource(weapon_id) > 0
+        if agent.quantity_of_resource(weapon_id) > 0 || carrier.quantity_of_resource(weapon_id) > 0
         {
             continue;
         }
@@ -5593,6 +5645,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
+            agent_has_weapon: false,
         };
 
         let abstract_task = AbstractTask::EquipHuntingSpear;
@@ -5617,7 +5670,10 @@ pub fn htn_equip_hunting_spear_dispatch_system(
         }
         let head = tasks.remove(0);
         match head {
-            Task::WithdrawMaterial { resource_id: head_resource, qty } => {
+            Task::WithdrawMaterial {
+                resource_id: head_resource,
+                qty,
+            } => {
                 let dispatched = assign_task_with_routing(
                     &mut ai,
                     (cur_tx, cur_ty),
@@ -5640,7 +5696,10 @@ pub fn htn_equip_hunting_spear_dispatch_system(
                 ai.reserved_tile = reserved_tile;
                 ai.reserved_resource = Some(head_resource);
                 ai.reserved_qty = qty;
-                aq.dispatch(Task::WithdrawMaterial { resource_id: head_resource, qty });
+                aq.dispatch(Task::WithdrawMaterial {
+                    resource_id: head_resource,
+                    qty,
+                });
             }
             _ => {
                 ai.active_method = None;
@@ -5701,17 +5760,7 @@ pub fn htn_scout_dispatch_system(
     use crate::simulation::faction::HuntOrder;
     let now = clock.tick;
     query.par_iter_mut().for_each(
-        |(
-            mut ai,
-            mut aq,
-            mut history,
-            goal,
-            profession,
-            transform,
-            member,
-            lod,
-            knowledge_opt,
-        )| {
+        |(mut ai, mut aq, mut history, goal, profession, transform, member, lod, knowledge_opt)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -5787,13 +5836,14 @@ pub fn htn_scout_dispatch_system(
                 craft_output_resource: None,
                 play_partner_entity: None,
                 play_solo_eligible: false,
-            play_stone_storage_tile: None,
-            play_toy_storage_tile: None,
-            play_toy_resource: None,
-            play_grain_seed_storage_tile: None,
-            play_berry_seed_storage_tile: None,
-            play_plant_destination_tile: None,
-            personal_bp_resource: None,
+                play_stone_storage_tile: None,
+                play_toy_storage_tile: None,
+                play_toy_resource: None,
+                play_grain_seed_storage_tile: None,
+                play_berry_seed_storage_tile: None,
+                play_plant_destination_tile: None,
+                personal_bp_resource: None,
+                agent_has_weapon: false,
             };
 
             let abstract_task = AbstractTask::Scout;
@@ -5802,20 +5852,10 @@ pub fn htn_scout_dispatch_system(
                 .iter()
                 .filter(|m| m.precondition(abstract_task, &ctx))
                 .max_by(|a, b| {
-                    let ua = score_method_with_history(
-                        a.as_ref(),
-                        abstract_task,
-                        &ctx,
-                        &history,
-                        now,
-                    );
-                    let ub = score_method_with_history(
-                        b.as_ref(),
-                        abstract_task,
-                        &ctx,
-                        &history,
-                        now,
-                    );
+                    let ua =
+                        score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                    let ub =
+                        score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
                     ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
                 });
             let Some(method) = chosen else {
@@ -5919,17 +5959,7 @@ pub fn htn_return_surplus_dispatch_system(
 ) {
     let now = clock.tick;
     query.par_iter_mut().for_each(
-        |(
-            mut ai,
-            mut aq,
-            mut history,
-            goal,
-            agent,
-            carrier,
-            transform,
-            member,
-            lod,
-        )| {
+        |(mut ai, mut aq, mut history, goal, agent, carrier, transform, member, lod)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -6024,13 +6054,14 @@ pub fn htn_return_surplus_dispatch_system(
                 craft_output_resource: None,
                 play_partner_entity: None,
                 play_solo_eligible: false,
-            play_stone_storage_tile: None,
-            play_toy_storage_tile: None,
-            play_toy_resource: None,
-            play_grain_seed_storage_tile: None,
-            play_berry_seed_storage_tile: None,
-            play_plant_destination_tile: None,
-            personal_bp_resource: None,
+                play_stone_storage_tile: None,
+                play_toy_storage_tile: None,
+                play_toy_resource: None,
+                play_grain_seed_storage_tile: None,
+                play_berry_seed_storage_tile: None,
+                play_plant_destination_tile: None,
+                personal_bp_resource: None,
+                agent_has_weapon: false,
             };
 
             let abstract_task = AbstractTask::ReturnSurplus;
@@ -6039,20 +6070,10 @@ pub fn htn_return_surplus_dispatch_system(
                 .iter()
                 .filter(|m| m.precondition(abstract_task, &ctx))
                 .max_by(|a, b| {
-                    let ua = score_method_with_history(
-                        a.as_ref(),
-                        abstract_task,
-                        &ctx,
-                        &history,
-                        now,
-                    );
-                    let ub = score_method_with_history(
-                        b.as_ref(),
-                        abstract_task,
-                        &ctx,
-                        &history,
-                        now,
-                    );
+                    let ua =
+                        score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
+                    let ub =
+                        score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
                     ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
                 });
             let Some(method) = chosen else {
@@ -6143,16 +6164,7 @@ pub fn htn_tame_horse_dispatch_system(
 ) {
     const VIEW_RADIUS: i32 = 15;
     let now = clock.tick;
-    for (
-        mut ai,
-        mut aq,
-        mut history,
-        goal,
-        transform,
-        member,
-        lod,
-    ) in query.iter_mut()
-    {
+    for (mut ai, mut aq, mut history, goal, transform, member, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -6249,6 +6261,7 @@ pub fn htn_tame_horse_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
+            agent_has_weapon: false,
         };
 
         let abstract_task = AbstractTask::TameWildHorse;
@@ -6364,16 +6377,8 @@ pub fn htn_plant_from_storage_dispatch_system(
     use crate::simulation::tasks::find_nearest_unplanted_farmland;
     const VIEW_RADIUS: i32 = 15;
     let now = clock.tick;
-    for (
-        mut ai,
-        mut aq,
-        mut history,
-        goal,
-        transform,
-        member,
-        lod,
-        knowledge_opt,
-    ) in query.iter_mut()
+    for (mut ai, mut aq, mut history, goal, transform, member, lod, knowledge_opt) in
+        query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
             continue;
@@ -6463,12 +6468,9 @@ pub fn htn_plant_from_storage_dispatch_system(
         // Find nearest unplanted farmland tile near the agent. Reuses the
         // legacy resolver from `tasks.rs` so behaviour matches the dead plans'
         // `StepTarget::NearestTile(GRASS_TILES)` override.
-        let Some(plant_tile) = find_nearest_unplanted_farmland(
-            &chunk_map,
-            &plant_map,
-            (cur_tx, cur_ty),
-            VIEW_RADIUS,
-        ) else {
+        let Some(plant_tile) =
+            find_nearest_unplanted_farmland(&chunk_map, &plant_map, (cur_tx, cur_ty), VIEW_RADIUS)
+        else {
             continue;
         };
 
@@ -6517,6 +6519,7 @@ pub fn htn_plant_from_storage_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
+            agent_has_weapon: false,
         };
 
         let abstract_task = AbstractTask::PlantFromStorage {
@@ -6543,7 +6546,10 @@ pub fn htn_plant_from_storage_dispatch_system(
         }
         let head = tasks.remove(0);
         match head {
-            Task::WithdrawMaterial { resource_id: head_resource, qty } => {
+            Task::WithdrawMaterial {
+                resource_id: head_resource,
+                qty,
+            } => {
                 let dispatched = assign_task_with_routing(
                     &mut ai,
                     (cur_tx, cur_ty),
@@ -6684,7 +6690,10 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
         let path_a: Option<Entity> = match (job_claim_opt, claim_target_opt) {
             (Some(claim), Some(target)) if claim.kind == JobKind::Build => {
                 target.blueprint.filter(|&bp_e| {
-                    bp_query.get(bp_e).map(|bp| bp.is_satisfied()).unwrap_or(false)
+                    bp_query
+                        .get(bp_e)
+                        .map(|bp| bp.is_satisfied())
+                        .unwrap_or(false)
                 })
             }
             _ => None,
@@ -6733,8 +6742,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             for i in 0..bp.deposit_count as usize {
                 let still = bp.deposits[i]
                     .needed
-                    .saturating_sub(bp.deposits[i].deposited)
-                    as u32;
+                    .saturating_sub(bp.deposits[i].deposited) as u32;
                 if still == 0 {
                     continue;
                 }
@@ -6758,7 +6766,9 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                     &chunk_connectivity,
                 );
                 if dispatched {
-                    aq.dispatch(Task::HaulToBlueprint { blueprint: bp_entity });
+                    aq.dispatch(Task::HaulToBlueprint {
+                        blueprint: bp_entity,
+                    });
                     ai.active_method = None;
                     hauled = true;
                 }
@@ -6930,6 +6940,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource,
+            agent_has_weapon: false,
         };
 
         let abstract_task = AbstractTask::ConstructBlueprint;
@@ -6974,7 +6985,10 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                 }
                 aq.dispatch(Task::Construct { blueprint });
             }
-            Task::WithdrawMaterial { resource_id: head_resource, qty } => {
+            Task::WithdrawMaterial {
+                resource_id: head_resource,
+                qty,
+            } => {
                 // Path B haul leg. Route to the resolved storage tile, reserve
                 // the qty against `StorageReservations`, dispatch the head.
                 // Mirrors the AcquireGood haul branch's reservation
@@ -7086,9 +7100,7 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
     >,
 ) {
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, transform, member, lod, _carrying) in
-        query.iter_mut()
-    {
+    for (mut ai, mut aq, mut history, transform, member, lod, _carrying) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -7162,6 +7174,7 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
+            agent_has_weapon: false,
         };
 
         let abstract_task = AbstractTask::DeliverHuntKill;
@@ -7266,6 +7279,9 @@ pub fn htn_engage_prey_dispatch_system(
             &LodLevel,
             Option<&crate::simulation::reproduction::HouseholdMember>,
             Option<&crate::simulation::corpse::Carrying>,
+            &EconomicAgent,
+            &crate::simulation::carry::Carrier,
+            Option<&crate::simulation::items::Equipment>,
         ),
         Without<Drafted>,
     >,
@@ -7273,6 +7289,7 @@ pub fn htn_engage_prey_dispatch_system(
     use crate::simulation::faction::HuntOrder;
     use crate::simulation::technology::HUNTING_SPEAR;
     const VIEW_RADIUS: i32 = 15;
+    let weapon_id = crate::economy::core_ids::weapon();
     let now = clock.tick;
     for (
         agent,
@@ -7286,6 +7303,9 @@ pub fn htn_engage_prey_dispatch_system(
         lod,
         household_member,
         carrying_opt,
+        agent_econ,
+        carrier,
+        equipment_opt,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -7464,6 +7484,11 @@ pub fn htn_engage_prey_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
+            agent_has_weapon: agent_econ.quantity_of_resource(weapon_id) > 0
+                || carrier.quantity_of_resource(weapon_id) > 0
+                || equipment_opt
+                    .map(|eq| eq.has_resource(weapon_id))
+                    .unwrap_or(false),
         };
 
         let abstract_task = AbstractTask::EngagePrey;
@@ -7489,10 +7514,7 @@ pub fn htn_engage_prey_dispatch_system(
         let head = tasks.remove(0);
         match head {
             Task::Hunt { prey } => {
-                let Some((_, prey_tile)) = ctx
-                    .prey_target_entity
-                    .zip(ctx.prey_target_tile)
-                else {
+                let Some((_, prey_tile)) = ctx.prey_target_entity.zip(ctx.prey_target_tile) else {
                     ai.active_method = None;
                     continue;
                 };
@@ -7587,12 +7609,16 @@ pub fn htn_join_hunt_party_dispatch_system(
             &Profession,
             &LodLevel,
             Option<&crate::simulation::corpse::Carrying>,
+            &EconomicAgent,
+            &crate::simulation::carry::Carrier,
+            Option<&crate::simulation::items::Equipment>,
         ),
         Without<Drafted>,
     >,
 ) {
     use crate::simulation::faction::{HuntOrder, HUNT_PARTY_TIMEOUT};
     use crate::simulation::technology::HUNTING_SPEAR;
+    let weapon_id = crate::economy::core_ids::weapon();
     let now = clock.tick;
     for (
         agent,
@@ -7604,6 +7630,9 @@ pub fn htn_join_hunt_party_dispatch_system(
         profession,
         lod,
         carrying_opt,
+        agent_econ,
+        carrier,
+        equipment_opt,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -7705,6 +7734,11 @@ pub fn htn_join_hunt_party_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
+            agent_has_weapon: agent_econ.quantity_of_resource(weapon_id) > 0
+                || carrier.quantity_of_resource(weapon_id) > 0
+                || equipment_opt
+                    .map(|eq| eq.has_resource(weapon_id))
+                    .unwrap_or(false),
         };
 
         let abstract_task = AbstractTask::JoinHuntParty;
@@ -7829,17 +7863,7 @@ pub fn htn_socialize_dispatch_system(
 ) {
     const PARTNER_RADIUS: i32 = 12;
     let now = clock.tick;
-    for (
-        agent,
-        mut ai,
-        mut aq,
-        mut history,
-        goal,
-        transform,
-        member,
-        lod,
-    ) in query.iter_mut()
-    {
+    for (agent, mut ai, mut aq, mut history, goal, transform, member, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -7925,6 +7949,7 @@ pub fn htn_socialize_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
+            agent_has_weapon: false,
         };
 
         let abstract_task = AbstractTask::Socialize;
@@ -8021,17 +8046,8 @@ pub fn htn_combat_faction_dispatch_system(
     >,
 ) {
     let now = clock.tick;
-    for (
-        agent,
-        mut ai,
-        mut aq,
-        mut history,
-        mut combat_target,
-        goal,
-        transform,
-        member,
-        lod,
-    ) in query.iter_mut()
+    for (agent, mut ai, mut aq, mut history, mut combat_target, goal, transform, member, lod) in
+        query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
             continue;
@@ -8164,6 +8180,7 @@ pub fn htn_combat_faction_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
+            agent_has_weapon: false,
         };
 
         let methods = method_registry.methods_for(abstract_kind);
@@ -8342,7 +8359,10 @@ pub struct WithdrawAndHaulToCraftOrderMethod;
 
 impl Method for WithdrawAndHaulToCraftOrderMethod {
     fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
-        if !matches!(abstract_task, AbstractTask::DeliverMaterialToCraftOrder { .. }) {
+        if !matches!(
+            abstract_task,
+            AbstractTask::DeliverMaterialToCraftOrder { .. }
+        ) {
             return false;
         }
         ctx.material_stock_for_target > 0
@@ -8373,7 +8393,10 @@ impl Method for WithdrawAndHaulToCraftOrderMethod {
             return Vec::new();
         }
         vec![
-            Task::WithdrawMaterial { resource_id, qty: 1 },
+            Task::WithdrawMaterial {
+                resource_id,
+                qty: 1,
+            },
             Task::HaulToCraftOrder { order },
         ]
     }
@@ -8445,9 +8468,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
     >,
 ) {
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, goal, member, transform, lod) in
-        query.iter_mut()
-    {
+    for (mut ai, mut aq, mut history, goal, member, transform, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -8471,8 +8492,9 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
                 continue;
             }
             for i in 0..order.deposit_count as usize {
-                let still =
-                    order.deposits[i].needed.saturating_sub(order.deposits[i].deposited);
+                let still = order.deposits[i]
+                    .needed
+                    .saturating_sub(order.deposits[i].deposited);
                 if still > 0 {
                     let rid = order.deposits[i].resource_id;
                     let slot = still_need.entry(rid).or_insert(0);
@@ -8595,8 +8617,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
             if !needs_it {
                 continue;
             }
-            let dist =
-                (order.anchor_tile.0 - cur_tx).abs() + (order.anchor_tile.1 - cur_ty).abs();
+            let dist = (order.anchor_tile.0 - cur_tx).abs() + (order.anchor_tile.1 - cur_ty).abs();
             order_pick = Some(match order_pick {
                 None => (order_entity, dist),
                 Some((_, prev_dist)) if dist < prev_dist => (order_entity, dist),
@@ -8649,13 +8670,13 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
+            agent_has_weapon: false,
         };
 
         let abstract_task = AbstractTask::DeliverMaterialToCraftOrder {
             resource_id: target_rid,
         };
-        let methods =
-            method_registry.methods_for(AbstractTaskKind::DeliverMaterialToCraftOrder);
+        let methods = method_registry.methods_for(AbstractTaskKind::DeliverMaterialToCraftOrder);
         let chosen = methods
             .iter()
             .filter(|m| m.precondition(abstract_task, &ctx))
@@ -8676,7 +8697,10 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
         }
         let head = tasks.remove(0);
         match head {
-            Task::WithdrawMaterial { resource_id: head_resource, qty } => {
+            Task::WithdrawMaterial {
+                resource_id: head_resource,
+                qty,
+            } => {
                 let dispatched = assign_task_with_routing(
                     &mut ai,
                     (cur_tx, cur_ty),
@@ -8759,7 +8783,9 @@ impl Method for WorkOnSatisfiedCraftOrderMethod {
         };
         vec![
             Task::WorkOnCraftOrder { order },
-            Task::DepositToFactionStorage { resource_id: output },
+            Task::DepositToFactionStorage {
+                resource_id: output,
+            },
         ]
     }
 
@@ -8813,9 +8839,7 @@ pub fn htn_work_on_craft_order_dispatch_system(
     >,
 ) {
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, goal, member, transform, lod) in
-        query.iter_mut()
-    {
+    for (mut ai, mut aq, mut history, goal, member, transform, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -8908,6 +8932,7 @@ pub fn htn_work_on_craft_order_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
+            agent_has_weapon: false,
         };
 
         let abstract_task = AbstractTask::WorkOnCraftOrder;
@@ -9001,10 +9026,7 @@ impl Method for HarvestAndHaulGrainToCraftOrderMethod {
         let Some(order) = ctx.target_craft_order else {
             return Vec::new();
         };
-        vec![
-            Task::Gather { tile },
-            Task::HaulToCraftOrder { order },
-        ]
+        vec![Task::Gather { tile }, Task::HaulToCraftOrder { order }]
     }
 
     fn name(&self) -> &'static str {
@@ -9116,8 +9138,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             if !needs_grain {
                 continue;
             }
-            let dist =
-                (order.anchor_tile.0 - cur_tx).abs() + (order.anchor_tile.1 - cur_ty).abs();
+            let dist = (order.anchor_tile.0 - cur_tx).abs() + (order.anchor_tile.1 - cur_ty).abs();
             order_pick = Some(match order_pick {
                 None => (order_entity, dist),
                 Some((_, prev_dist)) if dist < prev_dist => (order_entity, dist),
@@ -9132,17 +9153,14 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
         // see right now over a remembered one. SharedKnowledge is consulted
         // only when vision shows none.
         let viewer_household = household_member.map(|h| h.household_id);
-        let viewer_settlement = gk
-            .settlement_map
-            .first_for_faction(member.faction_id);
+        let viewer_settlement = gk.settlement_map.first_for_faction(member.faction_id);
         // Phase 2a: tile-reachability closure for the visible-grain pick.
         let reach_from_agent = |t: (i32, i32)| -> bool {
             let target_chunk = ChunkCoord(
                 t.0.div_euclid(CHUNK_SIZE as i32),
                 t.1.div_euclid(CHUNK_SIZE as i32),
             );
-            chunk_connectivity
-                .is_reachable((cur_chunk, ai.current_z), (target_chunk, ai.current_z))
+            chunk_connectivity.is_reachable((cur_chunk, ai.current_z), (target_chunk, ai.current_z))
         };
         let visible_grain = current_vision
             .nearest_gather_target(
@@ -9230,6 +9248,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
+            agent_has_weapon: false,
         };
 
         let abstract_task = AbstractTask::HarvestGrainForCraftOrder;
@@ -9314,8 +9333,7 @@ impl Method for HarvestMaturePlantForStorageMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        UTIL_BASELINE
-            - full_trip_penalty(ctx, ctx.gather_target_tile, ctx.gather_deposit_tile)
+        UTIL_BASELINE - full_trip_penalty(ctx, ctx.gather_target_tile, ctx.gather_deposit_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -9452,8 +9470,7 @@ pub fn htn_harvest_plant_dispatch_system(
         let Some((plant_tile, harvest_id)) = harvest_candidate else {
             continue;
         };
-        let deposit_tile =
-            storage_tile_map.nearest_for_faction(member.faction_id, plant_tile);
+        let deposit_tile = storage_tile_map.nearest_for_faction(member.faction_id, plant_tile);
 
         let ctx = PlannerCtx {
             scope: ScoringScope::Geometric,
@@ -9497,6 +9514,7 @@ pub fn htn_harvest_plant_dispatch_system(
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
+            agent_has_weapon: false,
         };
 
         let abstract_task = AbstractTask::HarvestPlant;
@@ -9577,7 +9595,9 @@ impl Method for PlayWithPartnerMethod {
         let Some(partner) = ctx.play_partner_entity else {
             return Vec::new();
         };
-        vec![Task::Play { partner: Some(partner) }]
+        vec![Task::Play {
+            partner: Some(partner),
+        }]
     }
 
     fn name(&self) -> &'static str {
@@ -9889,17 +9909,8 @@ pub fn htn_play_dispatch_system(
     const ITEM_RADIUS: i32 = 8;
 
     let now = clock.tick;
-    for (
-        agent,
-        mut ai,
-        mut aq,
-        mut history,
-        goal,
-        transform,
-        carrier,
-        lod,
-        member_opt,
-    ) in query.iter_mut()
+    for (agent, mut ai, mut aq, mut history, goal, transform, carrier, lod, member_opt) in
+        query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
             continue;
@@ -10108,9 +10119,7 @@ pub fn htn_play_dispatch_system(
                     if plant_map.0.contains_key(&(tx, ty)) {
                         continue;
                     }
-                    if chunk_map.tile_kind_at(tx, ty)
-                        != Some(crate::world::tile::TileKind::Grass)
-                    {
+                    if chunk_map.tile_kind_at(tx, ty) != Some(crate::world::tile::TileKind::Grass) {
                         continue;
                     }
                     let dist = dx.abs() + dy.abs();
@@ -10173,6 +10182,7 @@ pub fn htn_play_dispatch_system(
             play_berry_seed_storage_tile,
             play_plant_destination_tile,
             personal_bp_resource: None,
+            agent_has_weapon: false,
         };
 
         let abstract_task = AbstractTask::Play;
@@ -10306,7 +10316,11 @@ pub fn htn_play_dispatch_system(
 /// `feedback_plan_history_design.md`), so the residual noise from cancel
 /// paths is acceptable until success-rate weighting actually consumes it.
 pub fn htn_method_completion_system(
-    mut q: Query<(&mut crate::simulation::person::PersonAI, &mut MethodHistory, &ActionQueue)>,
+    mut q: Query<(
+        &mut crate::simulation::person::PersonAI,
+        &mut MethodHistory,
+        &ActionQueue,
+    )>,
     clock: Res<crate::simulation::schedule::SimClock>,
 ) {
     let now = clock.tick;
@@ -10357,16 +10371,8 @@ pub fn htn_clear_obstacle_dispatch_system(
     >,
 ) {
     use crate::simulation::jobs::JobKind;
-    for (
-        agent_entity,
-        mut ai,
-        mut aq,
-        goal,
-        transform,
-        job_claim_opt,
-        claim_target_opt,
-        lod,
-    ) in query.iter_mut()
+    for (agent_entity, mut ai, mut aq, goal, transform, job_claim_opt, claim_target_opt, lod) in
+        query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
             continue;
@@ -10382,7 +10388,10 @@ pub fn htn_clear_obstacle_dispatch_system(
         let path_a: Option<Entity> = match (job_claim_opt, claim_target_opt) {
             (Some(claim), Some(target)) if claim.kind == JobKind::Build => {
                 target.blueprint.filter(|&bp_e| {
-                    bp_query.get(bp_e).map(|bp| !bp.pending_clear.is_empty()).unwrap_or(false)
+                    bp_query
+                        .get(bp_e)
+                        .map(|bp| !bp.pending_clear.is_empty())
+                        .unwrap_or(false)
                 })
             }
             _ => None,
@@ -10456,17 +10465,21 @@ mod tests {
     fn method_history_default_empty() {
         let h = MethodHistory::default();
         assert_eq!(h.recently_failed_count(MethodId::SLEEP, 0), 0);
-        assert_eq!(h.recently_failed_count(MethodId::GATHER_FROM_KNOWN, 1000), 0);
+        assert_eq!(
+            h.recently_failed_count(MethodId::GATHER_FROM_KNOWN, 1000),
+            0
+        );
     }
 
     #[test]
     fn method_history_counts_recent_failure() {
         let mut h = MethodHistory::default();
-        h.push(MethodId::GATHER_FROM_KNOWN, MethodOutcome::FailedRouting, 50);
-        assert_eq!(
-            h.recently_failed_count(MethodId::GATHER_FROM_KNOWN, 100),
-            1
+        h.push(
+            MethodId::GATHER_FROM_KNOWN,
+            MethodOutcome::FailedRouting,
+            50,
         );
+        assert_eq!(h.recently_failed_count(MethodId::GATHER_FROM_KNOWN, 100), 1);
         // Different method — no penalty.
         assert_eq!(h.recently_failed_count(MethodId::SLEEP, 100), 0);
     }
@@ -10620,7 +10633,8 @@ mod tests {
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
-        }
+            agent_has_weapon: false,
+                    }
     }
 
     fn ctx_with_bed(bed: Entity, bed_tile: (i32, i32)) -> PlannerCtx {
@@ -10666,7 +10680,8 @@ mod tests {
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
-        }
+            agent_has_weapon: false,
+                    }
     }
 
     fn ctx_with_food(edible_count: u32, hunger: f32) -> PlannerCtx {
@@ -10712,7 +10727,8 @@ mod tests {
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
-        }
+            agent_has_weapon: false,
+                    }
     }
 
     fn ctx_with_storage(
@@ -10762,7 +10778,8 @@ mod tests {
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
-        }
+            agent_has_weapon: false,
+                    }
     }
 
     fn ctx_with_material_storage(
@@ -10811,7 +10828,8 @@ mod tests {
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
-        }
+            agent_has_weapon: false,
+                    }
     }
 
     fn ctx_with_haul_claim(
@@ -10870,7 +10888,8 @@ mod tests {
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
-        }
+            agent_has_weapon: false,
+                    }
     }
 
     #[test]
@@ -11006,10 +11025,7 @@ mod tests {
         let m = WithdrawFromStorageMethod;
         let ctx = ctx_with_storage(Some((4, 7)), 3, 220.0);
         let tasks = m.expand(AbstractTask::AcquireFood, &ctx);
-        assert_eq!(
-            tasks,
-            vec![Task::WithdrawFood { tile: (4, 7) }, Task::Eat]
-        );
+        assert_eq!(tasks, vec![Task::WithdrawFood { tile: (4, 7) }, Task::Eat]);
     }
 
     #[test]
@@ -11035,7 +11051,10 @@ mod tests {
             AbstractTaskKind::AcquireFood
         );
         assert_eq!(
-            AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }.kind(),
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            }
+            .kind(),
             AbstractTaskKind::AcquireGood
         );
     }
@@ -11058,7 +11077,12 @@ mod tests {
     fn withdraw_material_precondition_true_when_stock_and_storage() {
         let m = WithdrawMaterialFromStorageMethod;
         let ctx = ctx_with_material_storage(Some((2, 3)), 4);
-        assert!(m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        assert!(m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
     }
 
     #[test]
@@ -11066,14 +11090,24 @@ mod tests {
         let m = WithdrawMaterialFromStorageMethod;
         // Stock recorded but no reachable tile.
         let ctx = ctx_with_material_storage(None, 5);
-        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        assert!(!m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
     }
 
     #[test]
     fn withdraw_material_precondition_false_without_stock() {
         let m = WithdrawMaterialFromStorageMethod;
         let ctx = ctx_with_material_storage(Some((1, 1)), 0);
-        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::stone() }, &ctx));
+        assert!(!m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::stone()
+            },
+            &ctx
+        ));
     }
 
     #[test]
@@ -11090,7 +11124,12 @@ mod tests {
     fn withdraw_material_expands_to_single_withdraw_task_carrying_good() {
         let m = WithdrawMaterialFromStorageMethod;
         let ctx = ctx_with_material_storage(Some((6, 9)), 3);
-        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::stone() }, &ctx);
+        let tasks = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::stone(),
+            },
+            &ctx,
+        );
         // qty: 1 — the single-unit acquisition contract; larger needs come
         // from chained calls or a future `FulfillClaim` abstract task.
         assert_eq!(
@@ -11109,8 +11148,18 @@ mod tests {
         // parameterised method is the whole point of 5c.
         let m = WithdrawMaterialFromStorageMethod;
         let ctx = ctx_with_material_storage(Some((0, 0)), 1);
-        let wood = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
-        let iron = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::iron() }, &ctx);
+        let wood = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
+        let iron = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::iron(),
+            },
+            &ctx,
+        );
         assert_eq!(
             wood,
             vec![Task::WithdrawMaterial {
@@ -11133,7 +11182,12 @@ mod tests {
         // empty-vec answer rather than a panic.
         let m = WithdrawMaterialFromStorageMethod;
         let ctx = ctx_with_material_storage(None, 5);
-        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
+        let tasks = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
         assert!(tasks.is_empty());
     }
 
@@ -11188,14 +11242,20 @@ mod tests {
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
-        }
+            agent_has_weapon: false,
+                    }
     }
 
     #[test]
     fn gather_from_known_precondition_true_when_target_tile_known() {
         let m = GatherFromKnownMethod;
         let ctx = ctx_with_gather_target(Some((4, 7)));
-        assert!(m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        assert!(m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
     }
 
     #[test]
@@ -11204,7 +11264,12 @@ mod tests {
         // No memory of trees / stone tiles for this agent — falls back to
         // the bare-withdraw method or `ExploreFor*`.
         let ctx = ctx_with_gather_target(None);
-        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        assert!(!m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
     }
 
     #[test]
@@ -11222,7 +11287,12 @@ mod tests {
     fn gather_from_known_expands_to_gather_then_deposit_chain() {
         let m = GatherFromKnownMethod;
         let ctx = ctx_with_gather_target(Some((6, 9)));
-        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
+        let tasks = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
         // Two-task chain: gather at the known tile, then deposit at faction
         // storage. The deposit's `good` mirrors the abstract-task payload so
         // chain integrity can be inspected at runtime.
@@ -11230,7 +11300,9 @@ mod tests {
             tasks,
             vec![
                 Task::Gather { tile: (6, 9) },
-                Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::wood() },
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::wood()
+                },
             ]
         );
     }
@@ -11244,20 +11316,34 @@ mod tests {
         // multi-task chain rather than the single-task expansion.
         let m = GatherFromKnownMethod;
         let ctx = ctx_with_gather_target(Some((0, 0)));
-        let wood = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
-        let stone = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::stone() }, &ctx);
+        let wood = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
+        let stone = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::stone(),
+            },
+            &ctx,
+        );
         assert_eq!(
             wood,
             vec![
                 Task::Gather { tile: (0, 0) },
-                Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::wood() },
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::wood()
+                },
             ]
         );
         assert_eq!(
             stone,
             vec![
                 Task::Gather { tile: (0, 0) },
-                Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::stone() },
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::stone()
+                },
             ]
         );
     }
@@ -11268,7 +11354,12 @@ mod tests {
         // empty-vec answer rather than a panic.
         let m = GatherFromKnownMethod;
         let ctx = ctx_with_gather_target(None);
-        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
+        let tasks = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
         assert!(tasks.is_empty());
     }
 
@@ -11280,10 +11371,7 @@ mod tests {
         assert!(tasks.is_empty());
     }
 
-    fn ctx_with_scavenge_target(
-        target: Option<Entity>,
-        tile: Option<(i32, i32)>,
-    ) -> PlannerCtx {
+    fn ctx_with_scavenge_target(target: Option<Entity>, tile: Option<(i32, i32)>) -> PlannerCtx {
         PlannerCtx {
             scope: ScoringScope::Geometric,
             tile: (0, 0),
@@ -11326,14 +11414,20 @@ mod tests {
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
-        }
+            agent_has_weapon: false,
+                    }
     }
 
     #[test]
     fn scavenge_from_ground_precondition_true_when_target_known() {
         let m = ScavengeFromGroundMethod;
         let ctx = ctx_with_scavenge_target(Some(Entity::from_raw(11)), Some((4, 7)));
-        assert!(m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        assert!(m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
     }
 
     #[test]
@@ -11342,7 +11436,12 @@ mod tests {
         // Tile populated but no live ground-item entity — falls back to the
         // gather / bare-withdraw / explore methods.
         let ctx = ctx_with_scavenge_target(None, Some((4, 7)));
-        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        assert!(!m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
     }
 
     #[test]
@@ -11351,7 +11450,12 @@ mod tests {
         // Entity recorded but no tile — the dispatcher couldn't route the
         // agent there, so the method must opt out cleanly.
         let ctx = ctx_with_scavenge_target(Some(Entity::from_raw(11)), None);
-        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        assert!(!m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
     }
 
     #[test]
@@ -11370,7 +11474,12 @@ mod tests {
         let m = ScavengeFromGroundMethod;
         let target = Entity::from_raw(13);
         let ctx = ctx_with_scavenge_target(Some(target), Some((6, 9)));
-        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
+        let tasks = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
         // Two-task chain: pick up the loose item, then deposit at faction
         // storage. The deposit's `good` mirrors the abstract-task payload so
         // chain integrity can be inspected at runtime.
@@ -11378,7 +11487,9 @@ mod tests {
             tasks,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::wood() },
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::wood()
+                },
             ]
         );
     }
@@ -11392,20 +11503,34 @@ mod tests {
         let m = ScavengeFromGroundMethod;
         let target = Entity::from_raw(21);
         let ctx = ctx_with_scavenge_target(Some(target), Some((0, 0)));
-        let wood = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
-        let stone = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::stone() }, &ctx);
+        let wood = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
+        let stone = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::stone(),
+            },
+            &ctx,
+        );
         assert_eq!(
             wood,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::wood() },
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::wood()
+                },
             ]
         );
         assert_eq!(
             stone,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::stone() },
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::stone()
+                },
             ]
         );
     }
@@ -11416,12 +11541,22 @@ mod tests {
         // empty-vec answer rather than a panic.
         let m = ScavengeFromGroundMethod;
         let ctx = ctx_with_scavenge_target(None, Some((1, 1)));
-        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
+        let tasks = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
         assert!(tasks.is_empty());
 
         // Also defensive: target entity present but tile missing.
         let ctx = ctx_with_scavenge_target(Some(Entity::from_raw(7)), None);
-        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
+        let tasks = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
         assert!(tasks.is_empty());
     }
 
@@ -11487,7 +11622,8 @@ mod tests {
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
-        }
+            agent_has_weapon: false,
+                    }
     }
 
     #[test]
@@ -11535,9 +11671,13 @@ mod tests {
         // Defensive: AcquireGood / Sleep / Eat all rejected even when both
         // scavenge fields are populated and hunger is high.
         let m = ScavengeFoodFromGroundMethod;
-        let ctx =
-            ctx_with_food_scavenge_target(Some(Entity::from_raw(11)), Some((1, 1)), 220.0);
-        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        let ctx = ctx_with_food_scavenge_target(Some(Entity::from_raw(11)), Some((1, 1)), 220.0);
+        assert!(!m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
         assert!(!m.precondition(AbstractTask::Sleep, &ctx));
         assert!(!m.precondition(AbstractTask::Eat, &ctx));
     }
@@ -11570,11 +11710,15 @@ mod tests {
     #[test]
     fn scavenge_food_from_ground_expand_returns_empty_for_wrong_abstract_task() {
         let m = ScavengeFoodFromGroundMethod;
-        let ctx =
-            ctx_with_food_scavenge_target(Some(Entity::from_raw(7)), Some((1, 1)), 220.0);
+        let ctx = ctx_with_food_scavenge_target(Some(Entity::from_raw(7)), Some((1, 1)), 220.0);
         let tasks = m.expand(AbstractTask::Eat, &ctx);
         assert!(tasks.is_empty());
-        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
+        let tasks = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
         assert!(tasks.is_empty());
     }
 
@@ -11609,7 +11753,12 @@ mod tests {
         // hunger is high.
         let m = ExploreForFoodMethod;
         let ctx = ctx_with_storage(None, 0, 220.0);
-        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        assert!(!m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
         assert!(!m.precondition(AbstractTask::Sleep, &ctx));
         assert!(!m.precondition(AbstractTask::Eat, &ctx));
     }
@@ -11624,9 +11773,21 @@ mod tests {
         let m = ExploreForFoodMethod;
         let ctx = ctx_with_storage(None, 0, 220.0);
         let u = m.utility(AbstractTask::AcquireFood, &ctx);
-        assert!(u < 1.0, "ExploreForFood utility {} should be below WithdrawFromStorage's 1.0", u);
-        assert!(u < 1.5, "ExploreForFood utility {} should be below ScavengeFoodFromGround's 1.5", u);
-        assert!(u > 0.0, "ExploreForFood utility {} should be positive (the fallback still beats no method)", u);
+        assert!(
+            u < 1.0,
+            "ExploreForFood utility {} should be below WithdrawFromStorage's 1.0",
+            u
+        );
+        assert!(
+            u < 1.5,
+            "ExploreForFood utility {} should be below ScavengeFoodFromGround's 1.5",
+            u
+        );
+        assert!(
+            u > 0.0,
+            "ExploreForFood utility {} should be positive (the fallback still beats no method)",
+            u
+        );
     }
 
     #[test]
@@ -11647,7 +11808,12 @@ mod tests {
         let m = ExploreForFoodMethod;
         let ctx = ctx_with_storage(None, 0, 220.0);
         assert!(m
-            .expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx)
+            .expand(
+                AbstractTask::AcquireGood {
+                    resource_id: crate::economy::core_ids::wood()
+                },
+                &ctx
+            )
             .is_empty());
         assert!(m.expand(AbstractTask::Sleep, &ctx).is_empty());
         assert!(m.expand(AbstractTask::Eat, &ctx).is_empty());
@@ -11704,21 +11870,32 @@ mod tests {
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
-        }
+            agent_has_weapon: false,
+                    }
     }
 
     #[test]
     fn explore_for_material_precondition_true_for_wood() {
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
-        assert!(m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        assert!(m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
     }
 
     #[test]
     fn explore_for_material_precondition_true_for_stone() {
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
-        assert!(m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::stone() }, &ctx));
+        assert!(m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::stone()
+            },
+            &ctx
+        ));
     }
 
     #[test]
@@ -11729,8 +11906,18 @@ mod tests {
         // with a default kind.
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
-        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::iron() }, &ctx));
-        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::fruit() }, &ctx));
+        assert!(!m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::iron()
+            },
+            &ctx
+        ));
+        assert!(!m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::fruit()
+            },
+            &ctx
+        ));
     }
 
     #[test]
@@ -11750,16 +11937,34 @@ mod tests {
         // (scavenge), and 2.0 (haul) — Explore must lose to all four.
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
-        let u = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
-        assert!(u < 1.0, "ExploreForMaterial utility {} should be below 1.0", u);
-        assert!(u > 0.0, "ExploreForMaterial utility {} should be positive", u);
+        let u = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
+        assert!(
+            u < 1.0,
+            "ExploreForMaterial utility {} should be below 1.0",
+            u
+        );
+        assert!(
+            u > 0.0,
+            "ExploreForMaterial utility {} should be positive",
+            u
+        );
     }
 
     #[test]
     fn explore_for_material_expands_to_single_explore_task_for_wood() {
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
-        let tasks = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
+        let tasks = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
         assert_eq!(
             tasks,
             vec![Task::Explore {
@@ -11776,8 +11981,18 @@ mod tests {
         // hardcoded MemoryKind.
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
-        let wood = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
-        let stone = m.expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::stone() }, &ctx);
+        let wood = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
+        let stone = m.expand(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::stone(),
+            },
+            &ctx,
+        );
         assert_eq!(
             wood,
             vec![Task::Explore {
@@ -11800,7 +12015,12 @@ mod tests {
         let m = ExploreForMaterialMethod;
         let ctx = ctx_empty();
         assert!(m
-            .expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::iron() }, &ctx)
+            .expand(
+                AbstractTask::AcquireGood {
+                    resource_id: crate::economy::core_ids::iron()
+                },
+                &ctx
+            )
             .is_empty());
     }
 
@@ -11971,7 +12191,12 @@ mod tests {
         let far = ctx_with_storage(Some((10, 0)), 5, 220.0);
         let u_near = m.utility(AbstractTask::AcquireFood, &near);
         let u_far = m.utility(AbstractTask::AcquireFood, &far);
-        assert!(u_near > u_far, "near {} should outscore far {}", u_near, u_far);
+        assert!(
+            u_near > u_far,
+            "near {} should outscore far {}",
+            u_near,
+            u_far
+        );
     }
 
     #[test]
@@ -11987,7 +12212,12 @@ mod tests {
         ctx.scavenge_target_tile = Some((30, 0)); // beyond MAX_DIST_PENALTY
         let u_scav = scav.utility(AbstractTask::AcquireFood, &ctx);
         let u_wd = wd.utility(AbstractTask::AcquireFood, &ctx);
-        assert!(u_scav > u_wd, "scavenge {} should still beat withdraw {}", u_scav, u_wd);
+        assert!(
+            u_scav > u_wd,
+            "scavenge {} should still beat withdraw {}",
+            u_scav,
+            u_wd
+        );
     }
 
     #[test]
@@ -12005,8 +12235,18 @@ mod tests {
         let m = WithdrawMaterialFromStorageMethod;
         let near = ctx_with_material_storage(Some((1, 1)), 5);
         let far = ctx_with_material_storage(Some((12, 12)), 5);
-        let u_near = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &near);
-        let u_far = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &far);
+        let u_near = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &near,
+        );
+        let u_far = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &far,
+        );
         assert!(u_near > u_far);
     }
 
@@ -12022,9 +12262,24 @@ mod tests {
         let bare = WithdrawMaterialFromStorageMethod;
         // Bare-withdraw on a degenerate ctx with storage at zero distance:
         let bare_ctx = ctx_with_material_storage(Some((0, 0)), 5);
-        let u_haul = haul.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
-        let u_bare = bare.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &bare_ctx);
-        assert!(u_haul > u_bare, "haul {} should beat bare-withdraw {}", u_haul, u_bare);
+        let u_haul = haul.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
+        let u_bare = bare.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &bare_ctx,
+        );
+        assert!(
+            u_haul > u_bare,
+            "haul {} should beat bare-withdraw {}",
+            u_haul,
+            u_bare
+        );
     }
 
     // ── Full-trip distance discount (Phase 5c-ii-d-vii) ──────────────────
@@ -12046,8 +12301,18 @@ mod tests {
         let bp = Entity::from_raw(99);
         let near = ctx_with_haul_claim_at(Some((5, 0)), 5, Some(bp), Some((10, 0)));
         let far = ctx_with_haul_claim_at(Some((5, 0)), 5, Some(bp), Some((20, 0)));
-        let u_near = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &near);
-        let u_far = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &far);
+        let u_near = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &near,
+        );
+        let u_far = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &far,
+        );
         assert!(
             u_near > u_far,
             "near-bp {} should outscore far-bp {} when storage is identical",
@@ -12066,7 +12331,12 @@ mod tests {
         let bp = Entity::from_raw(7);
         // storage at chebyshev=10 from agent. Storage-only path: 2.0 - 0.20.
         let ctx = ctx_with_haul_claim(Some((10, 0)), 5, Some(bp));
-        let u = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
+        let u = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
         assert!((u - (2.0 - 0.20)).abs() < 1e-6, "expected 1.80, got {}", u);
     }
 
@@ -12078,7 +12348,12 @@ mod tests {
         let m = WithdrawAndHaulToBlueprintMethod;
         let bp = Entity::from_raw(7);
         let ctx = ctx_with_haul_claim_at(Some((20, 0)), 5, Some(bp), Some((40, 0)));
-        let u = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
+        let u = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
         assert!(
             (u - (2.0 - MAX_DIST_PENALTY)).abs() < 1e-6,
             "expected {}, got {}",
@@ -12097,8 +12372,18 @@ mod tests {
         let ctx = ctx_with_haul_claim_at(Some((20, 0)), 5, Some(bp), Some((40, 0)));
         let bare = WithdrawMaterialFromStorageMethod;
         let bare_ctx = ctx_with_material_storage(Some((0, 0)), 5);
-        let u_haul = haul.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
-        let u_bare = bare.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &bare_ctx);
+        let u_haul = haul.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
+        let u_bare = bare.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &bare_ctx,
+        );
         assert!(
             u_haul > u_bare,
             "full-trip haul {} should still beat bare-withdraw {}",
@@ -12112,8 +12397,18 @@ mod tests {
         let m = GatherFromKnownMethod;
         let near = ctx_with_gather_target(Some((2, 0)));
         let far = ctx_with_gather_target(Some((12, 0)));
-        let u_near = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &near);
-        let u_far = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &far);
+        let u_near = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &near,
+        );
+        let u_far = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &far,
+        );
         assert!(u_near > u_far);
     }
 
@@ -12128,8 +12423,18 @@ mod tests {
         let mut ctx = ctx_with_gather_target(Some((0, 0)));
         ctx.scavenge_target_entity = Some(Entity::from_raw(5));
         ctx.scavenge_target_tile = Some((30, 0));
-        let u_scav = scav.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
-        let u_gath = gath.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx);
+        let u_scav = scav.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
+        let u_gath = gath.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &ctx,
+        );
         assert!(u_scav > u_gath);
     }
 
@@ -12138,8 +12443,18 @@ mod tests {
         let m = ScavengeFromGroundMethod;
         let near = ctx_with_scavenge_target(Some(Entity::from_raw(1)), Some((2, 0)));
         let far = ctx_with_scavenge_target(Some(Entity::from_raw(2)), Some((12, 0)));
-        let u_near = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &near);
-        let u_far = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &far);
+        let u_near = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &near,
+        );
+        let u_far = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &far,
+        );
         assert!(u_near > u_far);
     }
 
@@ -12215,7 +12530,8 @@ mod tests {
             play_berry_seed_storage_tile: None,
             play_plant_destination_tile: None,
             personal_bp_resource: None,
-        }
+            agent_has_weapon: false,
+                    }
     }
 
     #[test]
@@ -12242,8 +12558,11 @@ mod tests {
     #[test]
     fn scavenge_food_for_storage_precondition_false_without_entity() {
         let m = ScavengeFoodForStorageMethod;
-        let ctx =
-            ctx_with_food_scavenge_for_storage(None, Some((4, 7)), Some(crate::economy::core_ids::fruit()));
+        let ctx = ctx_with_food_scavenge_for_storage(
+            None,
+            Some((4, 7)),
+            Some(crate::economy::core_ids::fruit()),
+        );
         assert!(!m.precondition(AbstractTask::StockpileFood, &ctx));
     }
 
@@ -12280,7 +12599,12 @@ mod tests {
             Some(crate::economy::core_ids::fruit()),
         );
         assert!(!m.precondition(AbstractTask::AcquireFood, &ctx));
-        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        assert!(!m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
         assert!(!m.precondition(AbstractTask::Sleep, &ctx));
         assert!(!m.precondition(AbstractTask::Eat, &ctx));
     }
@@ -12314,7 +12638,9 @@ mod tests {
             tasks,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::fruit() },
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::fruit()
+                },
             ]
         );
     }
@@ -12327,24 +12653,34 @@ mod tests {
         // through rather than being short-circuited on a hardcoded value.
         let m = ScavengeFoodForStorageMethod;
         let target = Entity::from_raw(21);
-        let fruit_ctx =
-            ctx_with_food_scavenge_for_storage(Some(target), Some((0, 0)), Some(crate::economy::core_ids::fruit()));
-        let meat_ctx =
-            ctx_with_food_scavenge_for_storage(Some(target), Some((0, 0)), Some(crate::economy::core_ids::meat()));
+        let fruit_ctx = ctx_with_food_scavenge_for_storage(
+            Some(target),
+            Some((0, 0)),
+            Some(crate::economy::core_ids::fruit()),
+        );
+        let meat_ctx = ctx_with_food_scavenge_for_storage(
+            Some(target),
+            Some((0, 0)),
+            Some(crate::economy::core_ids::meat()),
+        );
         let fruit = m.expand(AbstractTask::StockpileFood, &fruit_ctx);
         let meat = m.expand(AbstractTask::StockpileFood, &meat_ctx);
         assert_eq!(
             fruit,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::fruit() },
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::fruit()
+                },
             ]
         );
         assert_eq!(
             meat,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::meat() },
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::meat()
+                },
             ]
         );
     }
@@ -12352,13 +12688,19 @@ mod tests {
     #[test]
     fn scavenge_food_for_storage_expand_returns_empty_without_target_or_good() {
         let m = ScavengeFoodForStorageMethod;
-        let ctx = ctx_with_food_scavenge_for_storage(None, Some((1, 1)), Some(crate::economy::core_ids::fruit()));
+        let ctx = ctx_with_food_scavenge_for_storage(
+            None,
+            Some((1, 1)),
+            Some(crate::economy::core_ids::fruit()),
+        );
         assert!(m.expand(AbstractTask::StockpileFood, &ctx).is_empty());
-        let ctx =
-            ctx_with_food_scavenge_for_storage(Some(Entity::from_raw(7)), None, Some(crate::economy::core_ids::fruit()));
+        let ctx = ctx_with_food_scavenge_for_storage(
+            Some(Entity::from_raw(7)),
+            None,
+            Some(crate::economy::core_ids::fruit()),
+        );
         assert!(m.expand(AbstractTask::StockpileFood, &ctx).is_empty());
-        let ctx =
-            ctx_with_food_scavenge_for_storage(Some(Entity::from_raw(7)), Some((1, 1)), None);
+        let ctx = ctx_with_food_scavenge_for_storage(Some(Entity::from_raw(7)), Some((1, 1)), None);
         assert!(m.expand(AbstractTask::StockpileFood, &ctx).is_empty());
     }
 
@@ -12372,7 +12714,12 @@ mod tests {
         );
         assert!(m.expand(AbstractTask::AcquireFood, &ctx).is_empty());
         assert!(m
-            .expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx)
+            .expand(
+                AbstractTask::AcquireGood {
+                    resource_id: crate::economy::core_ids::wood()
+                },
+                &ctx
+            )
             .is_empty());
     }
 
@@ -12393,7 +12740,12 @@ mod tests {
         let m = ExploreForFoodForStorageMethod;
         let ctx = ctx_empty();
         assert!(!m.precondition(AbstractTask::AcquireFood, &ctx));
-        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        assert!(!m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
         assert!(!m.precondition(AbstractTask::Sleep, &ctx));
         assert!(!m.precondition(AbstractTask::Eat, &ctx));
     }
@@ -12421,7 +12773,12 @@ mod tests {
         );
         let u_exp = exp.utility(AbstractTask::StockpileFood, &ctx);
         let u_scav = scav.utility(AbstractTask::StockpileFood, &ctx);
-        assert!(u_exp < u_scav, "explore {} should lose to scavenge {}", u_exp, u_scav);
+        assert!(
+            u_exp < u_scav,
+            "explore {} should lose to scavenge {}",
+            u_exp,
+            u_scav
+        );
     }
 
     #[test]
@@ -12443,7 +12800,12 @@ mod tests {
         let ctx = ctx_empty();
         assert!(m.expand(AbstractTask::AcquireFood, &ctx).is_empty());
         assert!(m
-            .expand(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx)
+            .expand(
+                AbstractTask::AcquireGood {
+                    resource_id: crate::economy::core_ids::wood()
+                },
+                &ctx
+            )
             .is_empty());
         assert!(m.expand(AbstractTask::Sleep, &ctx).is_empty());
         assert!(m.expand(AbstractTask::Eat, &ctx).is_empty());
@@ -12479,7 +12841,12 @@ mod tests {
         let ctx = ctx_with_gather_target(Some((1, 1)));
         // Defensive: only AcquireFood drives this method. AcquireGood would
         // double-fire alongside `GatherFromKnownMethod` if this gate slipped.
-        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        assert!(!m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
         assert!(!m.precondition(AbstractTask::Sleep, &ctx));
         assert!(!m.precondition(AbstractTask::Eat, &ctx));
         assert!(!m.precondition(AbstractTask::StockpileFood, &ctx));
@@ -12530,7 +12897,11 @@ mod tests {
     #[test]
     fn forage_from_known_for_storage_precondition_true_with_target_and_good() {
         let m = ForageFromKnownForStorageMethod;
-        let ctx = ctx_with_forage_for_storage(Some((4, 7)), None, Some(crate::economy::core_ids::fruit()));
+        let ctx = ctx_with_forage_for_storage(
+            Some((4, 7)),
+            None,
+            Some(crate::economy::core_ids::fruit()),
+        );
         assert!(m.precondition(AbstractTask::StockpileFood, &ctx));
     }
 
@@ -12547,9 +12918,18 @@ mod tests {
     #[test]
     fn forage_from_known_for_storage_precondition_false_for_wrong_abstract_task() {
         let m = ForageFromKnownForStorageMethod;
-        let ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(crate::economy::core_ids::grain()));
+        let ctx = ctx_with_forage_for_storage(
+            Some((1, 1)),
+            None,
+            Some(crate::economy::core_ids::grain()),
+        );
         assert!(!m.precondition(AbstractTask::AcquireFood, &ctx));
-        assert!(!m.precondition(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &ctx));
+        assert!(!m.precondition(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood()
+            },
+            &ctx
+        ));
         assert!(!m.precondition(AbstractTask::Sleep, &ctx));
         assert!(!m.precondition(AbstractTask::Eat, &ctx));
     }
@@ -12557,13 +12937,19 @@ mod tests {
     #[test]
     fn forage_from_known_for_storage_expands_to_gather_then_deposit_chain() {
         let m = ForageFromKnownForStorageMethod;
-        let ctx = ctx_with_forage_for_storage(Some((6, 9)), Some((0, 0)), Some(crate::economy::core_ids::fruit()));
+        let ctx = ctx_with_forage_for_storage(
+            Some((6, 9)),
+            Some((0, 0)),
+            Some(crate::economy::core_ids::fruit()),
+        );
         let tasks = m.expand(AbstractTask::StockpileFood, &ctx);
         assert_eq!(
             tasks,
             vec![
                 Task::Gather { tile: (6, 9) },
-                Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::fruit() },
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::fruit()
+                },
             ]
         );
     }
@@ -12575,15 +12961,27 @@ mod tests {
         // except the good comes from `ctx.forage_food_good` (resolved at
         // dispatch from the plant kind) instead of the abstract task.
         let m = ForageFromKnownForStorageMethod;
-        let grain_ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(crate::economy::core_ids::grain()));
-        let fruit_ctx = ctx_with_forage_for_storage(Some((1, 1)), None, Some(crate::economy::core_ids::fruit()));
+        let grain_ctx = ctx_with_forage_for_storage(
+            Some((1, 1)),
+            None,
+            Some(crate::economy::core_ids::grain()),
+        );
+        let fruit_ctx = ctx_with_forage_for_storage(
+            Some((1, 1)),
+            None,
+            Some(crate::economy::core_ids::fruit()),
+        );
         assert_eq!(
             m.expand(AbstractTask::StockpileFood, &grain_ctx).last(),
-            Some(&Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::grain() })
+            Some(&Task::DepositToFactionStorage {
+                resource_id: crate::economy::core_ids::grain()
+            })
         );
         assert_eq!(
             m.expand(AbstractTask::StockpileFood, &fruit_ctx).last(),
-            Some(&Task::DepositToFactionStorage { resource_id: crate::economy::core_ids::fruit() })
+            Some(&Task::DepositToFactionStorage {
+                resource_id: crate::economy::core_ids::fruit()
+            })
         );
     }
 
@@ -12593,7 +12991,11 @@ mod tests {
         // outranks `ExploreForFoodForStorageMethod` (0.3 flat) so the
         // tier-preserving invariant holds for forage→deposit chains too.
         let m = ForageFromKnownForStorageMethod;
-        let ctx = ctx_with_forage_for_storage(Some((20, 0)), Some((40, 0)), Some(crate::economy::core_ids::fruit()));
+        let ctx = ctx_with_forage_for_storage(
+            Some((20, 0)),
+            Some((40, 0)),
+            Some(crate::economy::core_ids::fruit()),
+        );
         let u = m.utility(AbstractTask::StockpileFood, &ctx);
         assert!(
             u >= UTIL_EXPLORE_FALLBACK,
@@ -12629,8 +13031,18 @@ mod tests {
         let m = GatherFromKnownMethod;
         let near = ctx_with_gather_full_trip(Some((5, 0)), Some((6, 0)));
         let far = ctx_with_gather_full_trip(Some((5, 0)), Some((20, 0)));
-        let u_near = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &near);
-        let u_far = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &far);
+        let u_near = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &near,
+        );
+        let u_far = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &far,
+        );
         assert!(u_near > u_far, "near {} should beat far {}", u_near, u_far);
     }
 
@@ -12639,8 +13051,18 @@ mod tests {
         let m = GatherFromKnownMethod;
         let with_dep = ctx_with_gather_full_trip(Some((5, 0)), Some((5, 0))); // 0-cost second leg
         let no_dep = ctx_with_gather_full_trip(Some((5, 0)), None);
-        let u_a = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &with_dep);
-        let u_b = m.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &no_dep);
+        let u_a = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &with_dep,
+        );
+        let u_b = m.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &no_dep,
+        );
         assert!((u_a - u_b).abs() < 1e-6, "{} vs {}", u_a, u_b);
     }
 
@@ -12653,10 +13075,24 @@ mod tests {
         let target = Entity::from_raw(1);
         let scav_ctx = ctx_with_scavenge_full_trip(Some(target), Some((20, 0)), Some((40, 0)));
         let gather_ctx = ctx_with_gather_target(Some((0, 0)));
-        let u_scav = scav.utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &scav_ctx);
-        let u_gat = GatherFromKnownMethod
-            .utility(AbstractTask::AcquireGood { resource_id: crate::economy::core_ids::wood() }, &gather_ctx);
-        assert!(u_scav > u_gat, "scav {} should beat gather {}", u_scav, u_gat);
+        let u_scav = scav.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &scav_ctx,
+        );
+        let u_gat = GatherFromKnownMethod.utility(
+            AbstractTask::AcquireGood {
+                resource_id: crate::economy::core_ids::wood(),
+            },
+            &gather_ctx,
+        );
+        assert!(
+            u_scav > u_gat,
+            "scav {} should beat gather {}",
+            u_scav,
+            u_gat
+        );
     }
 
     #[test]

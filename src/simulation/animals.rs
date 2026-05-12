@@ -175,11 +175,7 @@ impl PackAnimalInventory {
     }
 
     /// Add up to `qty` units of `rid`. Returns the number that did NOT fit.
-    pub fn add(
-        &mut self,
-        rid: crate::economy::resource_catalog::ResourceId,
-        qty: u32,
-    ) -> u32 {
+    pub fn add(&mut self, rid: crate::economy::resource_catalog::ResourceId, qty: u32) -> u32 {
         if qty == 0 {
             return 0;
         }
@@ -218,11 +214,7 @@ impl PackAnimalInventory {
         remaining
     }
 
-    pub fn remove(
-        &mut self,
-        rid: crate::economy::resource_catalog::ResourceId,
-        qty: u32,
-    ) -> u32 {
+    pub fn remove(&mut self, rid: crate::economy::resource_catalog::ResourceId, qty: u32) -> u32 {
         for (slot_rid, slot_qty) in self.items.iter_mut() {
             if *slot_rid == rid && *slot_qty > 0 {
                 let removed = (*slot_qty).min(qty);
@@ -240,7 +232,9 @@ impl PackAnimalInventory {
             .fold(0u32, |acc, (_, q)| acc.saturating_add(*q))
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (crate::economy::resource_catalog::ResourceId, u32)> + '_ {
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = (crate::economy::resource_catalog::ResourceId, u32)> + '_ {
         self.items.iter().filter(|(_, q)| *q > 0).copied()
     }
 }
@@ -290,10 +284,7 @@ pub fn following_band_animal_redirect_system(
             continue;
         };
         let home = faction.home_tile;
-        let seed = follow
-            .faction
-            .wrapping_mul(0x85EB_CA6B)
-            .wrapping_add(now);
+        let seed = follow.faction.wrapping_mul(0x85EB_CA6B).wrapping_add(now);
         let dx = ((seed & 0b11) as i32) - 2;
         let dy = (((seed >> 2) & 0b11) as i32) - 2;
         ai.target_tile = (home.0 + dx, home.1 + dy);
@@ -1868,9 +1859,7 @@ pub fn animal_reproduction_system(
                         AnimalReproductionCooldown(0),
                         sex,
                     ),
-                    crate::world::spatial::Indexed::new(
-                        crate::world::spatial::IndexedKind::Deer,
-                    ),
+                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Deer),
                 ));
             }
             2 => {
@@ -2001,7 +1990,10 @@ mod pack_tests {
         let mut inv = PackAnimalInventory::for_capacity(PACK_CAP_HORSE);
         let bedroll = core_ids::bedroll();
         let unfit = inv.add(bedroll, 5);
-        assert_eq!(unfit, 0, "horse should accept 5 bedrolls (5x1500g = 7.5kg << 60kg)");
+        assert_eq!(
+            unfit, 0,
+            "horse should accept 5 bedrolls (5x1500g = 7.5kg << 60kg)"
+        );
         assert_eq!(inv.quantity_of(bedroll), 5);
         let removed = inv.remove(bedroll, 3);
         assert_eq!(removed, 3);
@@ -2024,8 +2016,8 @@ mod pack_tests {
         let mut a = PackAnimalInventory::for_capacity(PACK_CAP_HORSE);
         let mut b = PackAnimalInventory::for_capacity(PACK_CAP_HORSE);
         let yurt = core_ids::packed_yurt(); // 80kg, > horse cap (60kg)
-        // One horse can't carry one yurt — but we sized capacity so the
-        // recipient overflows cleanly when the unit doesn't fit.
+                                            // One horse can't carry one yurt — but we sized capacity so the
+                                            // recipient overflows cleanly when the unit doesn't fit.
         let unfit_a = a.add(yurt, 1);
         assert_eq!(unfit_a, 1, "single horse rejects the yurt unit");
         // Combined band cap is 120kg; if we had a 'split' helper we could
@@ -2039,4 +2031,3 @@ mod pack_tests {
         assert_eq!(unfit2, 0);
     }
 }
-

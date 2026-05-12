@@ -936,18 +936,20 @@ fn should_craft(
     // Don't flood workers into Craft goal when no recipe's inputs are covered.
     // `resource_supply` includes agent inventories + faction storage totals,
     // refreshed each Economy tick — cheapest faction-wide material proxy.
-    crate::simulation::crafting::craft_recipes().iter().any(|recipe| {
-        if let Some(tech) = recipe.tech_gate {
-            if !faction.techs.has(tech) {
-                return false;
+    crate::simulation::crafting::craft_recipes()
+        .iter()
+        .any(|recipe| {
+            if let Some(tech) = recipe.tech_gate {
+                if !faction.techs.has(tech) {
+                    return false;
+                }
             }
-        }
-        recipe.inputs.iter().all(|&(id, qty)| {
-            // Phase 2d: resource_supply is now ResourceId-keyed, so the
-            // recipe's id can index it directly — no reverse-resolve.
-            faction.resource_supply.get(&id).copied().unwrap_or(0) >= qty
+            recipe.inputs.iter().all(|&(id, qty)| {
+                // Phase 2d: resource_supply is now ResourceId-keyed, so the
+                // recipe's id can index it directly — no reverse-resolve.
+                faction.resource_supply.get(&id).copied().unwrap_or(0) >= qty
+            })
         })
-    })
 }
 
 /// Phase 5: when `goal_update_system` flips an agent's `AgentGoal`, the
@@ -1020,10 +1022,7 @@ pub fn record_abandoned_method_system(
     clock: Res<SimClock>,
     method_registry: Res<crate::simulation::htn::MethodRegistry>,
     mut query: Query<
-        (
-            &mut PersonAI,
-            &mut crate::simulation::htn::MethodHistory,
-        ),
+        (&mut PersonAI, &mut crate::simulation::htn::MethodHistory),
         Changed<AgentGoal>,
     >,
 ) {
@@ -1146,7 +1145,9 @@ pub fn chronic_failure_release_system(
             // tick.
             let job_id = claim.job_id;
             commands.entity(entity).remove::<JobClaim>();
-            commands.entity(entity).remove::<crate::simulation::jobs::ClaimTarget>();
+            commands
+                .entity(entity)
+                .remove::<crate::simulation::jobs::ClaimTarget>();
             crate::simulation::jobs::release_claimant(&mut board, job_id, entity);
         } else {
             // 6B-B: autonomous path — bypass the 200-tick cadence on

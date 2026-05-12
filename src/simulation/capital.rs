@@ -101,11 +101,7 @@ impl WorkshopOwnership {
     }
 }
 
-pub fn on_owned_by_add(
-    mut world: DeferredWorld<'_>,
-    entity: Entity,
-    _: ComponentId,
-) {
+pub fn on_owned_by_add(mut world: DeferredWorld<'_>, entity: Entity, _: ComponentId) {
     let Some(owner) = world.get::<OwnedBy>(entity).copied() else {
         return;
     };
@@ -120,11 +116,7 @@ pub fn on_owned_by_add(
     }
 }
 
-pub fn on_owned_by_remove(
-    mut world: DeferredWorld<'_>,
-    entity: Entity,
-    _: ComponentId,
-) {
+pub fn on_owned_by_remove(mut world: DeferredWorld<'_>, entity: Entity, _: ComponentId) {
     let Some(owner) = world.get::<OwnedBy>(entity).copied() else {
         return;
     };
@@ -174,9 +166,7 @@ pub fn tool_capital_factor(
     // probe because we already know the target profession's canonical
     // resource(s). For now there's only one (weapon → Hunter); future
     // catalog split will probe a small fixed list.
-    if profession == Profession::Hunter
-        && carrier.quantity_of_resource(core_ids::weapon()) > 0
-    {
+    if profession == Profession::Hunter && carrier.quantity_of_resource(core_ids::weapon()) > 0 {
         return 1.5;
     }
     1.0
@@ -225,8 +215,7 @@ fn any_affine_within(
     profession: Profession,
 ) -> bool {
     workshops.iter().any(|w| {
-        w.kind.affine_to(profession)
-            && chebyshev(w.tile, from) <= WORKSHOP_AFFINITY_RADIUS
+        w.kind.affine_to(profession) && chebyshev(w.tile, from) <= WORKSHOP_AFFINITY_RADIUS
     })
 }
 

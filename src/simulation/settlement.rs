@@ -84,7 +84,9 @@ impl SettlementMap {
 
     /// First settlement registered under `faction_id`, or None.
     pub fn first_for_faction(&self, faction_id: u32) -> Option<SettlementId> {
-        self.by_faction.get(&faction_id).and_then(|v| v.first().copied())
+        self.by_faction
+            .get(&faction_id)
+            .and_then(|v| v.first().copied())
     }
 
     /// Every settlement registered under `faction_id`.
@@ -200,7 +202,7 @@ impl TileRect {
 }
 
 /// Functional category of a zone within a settlement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ZoneKind {
     /// Beds, longhouses, dwellings.
     Residential,
@@ -480,7 +482,9 @@ pub fn generate_streetspine(
             }];
             StreetSpine::Linear { plaza, segments }
         }
-        LayoutStyle::Sprawling | LayoutStyle::Citadel if (era as u8) >= (Era::Chalcolithic as u8) => {
+        LayoutStyle::Sprawling | LayoutStyle::Citadel
+            if (era as u8) >= (Era::Chalcolithic as u8) =>
+        {
             // Grid: NS + EW primaries + two diagonals as Secondary.
             let r2 = (r * 7) / 10; // diagonals shorter
             let segments = vec![
@@ -981,6 +985,8 @@ pub fn zone_overlay_gizmo_system(
 pub fn settlement_planner_system(
     clock: Res<SimClock>,
     registry: Res<FactionRegistry>,
+    settlement_map: Res<SettlementMap>,
+    brains: Res<crate::simulation::organic_settlement::SettlementBrains>,
     mut plans: ResMut<SettlementPlans>,
     mut road_queue: ResMut<crate::simulation::construction::RoadCarveQueue>,
 ) {
@@ -1000,7 +1006,12 @@ pub fn settlement_planner_system(
             continue;
         }
 
-        let new_hash = culture_hash(faction);
+        let organic_brain = settlement_map
+            .first_for_faction(fid)
+            .and_then(|sid| brains.0.get(&sid));
+        let new_hash = organic_brain
+            .map(|brain| brain.layout_hash ^ ((fid as u64) << 32))
+            .unwrap_or_else(|| culture_hash(faction));
         let prev_hash = plans.0.get(&fid).map(|p| p.culture_hash);
         let needs_plan = match plans.0.get(&fid) {
             Some(p) => {
@@ -1013,7 +1024,13 @@ pub fn settlement_planner_system(
         if !needs_plan {
             continue;
         }
-        let plan = build_settlement_plan(fid, faction, tick);
+        let plan = organic_brain
+            .map(|brain| {
+                crate::simulation::organic_settlement::compat_plan_from_brain(
+                    fid, faction, tick, brain,
+                )
+            })
+            .unwrap_or_else(|| build_settlement_plan(fid, faction, tick));
 
         // Enqueue spine carving once per culture_hash bump. Reuses
         // `RoadCarveQueue` (one Bresenham line per drained entry) — segments

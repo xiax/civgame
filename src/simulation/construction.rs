@@ -7,8 +7,8 @@ use crate::simulation::faction::{
 };
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::jobs::{
-    record_progress_filtered, release_claimant, ClaimTarget, JobBoard, JobClaim,
-    JobCompletedEvent, JobKind, JobProgress,
+    record_progress_filtered, release_claimant, ClaimTarget, JobBoard, JobClaim, JobCompletedEvent,
+    JobKind, JobProgress,
 };
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
@@ -1043,8 +1043,12 @@ fn find_footprint_at_frontage_lot(
     // Gather candidate plots: matching faction + zone kind + has frontage +
     // vacant rect. Sort by chebyshev distance to home so we fill near-home
     // lots first.
-    let mut plots: Vec<(i32, (i32, i32), TileEdge, crate::simulation::settlement::TileRect)> =
-        Vec::new();
+    let mut plots: Vec<(
+        i32,
+        (i32, i32),
+        TileEdge,
+        crate::simulation::settlement::TileRect,
+    )> = Vec::new();
     for (&pid, &entity) in plot_index.by_id.iter() {
         let _ = pid;
         let Ok(plot) = plot_q.get(entity) else {
@@ -1087,7 +1091,8 @@ fn find_footprint_at_frontage_lot(
         let mut best: Option<(u8, i32, (i32, i32))> = None;
         for cy in ay_min..=ay_max {
             for cx in ax_min..=ax_max {
-                if !is_clear_footprint(chunk_map, bed_map, bp_map, doormat, cx, cy, half_w, half_h) {
+                if !is_clear_footprint(chunk_map, bed_map, bp_map, doormat, cx, cy, half_w, half_h)
+                {
                     continue;
                 }
                 let (_, spread) = footprint_z_stats(chunk_map, cx, cy, half_w, half_h);
@@ -1158,7 +1163,9 @@ fn find_footprint_in_zone(
             let cy_max = rect.y0 as i32 + rect.h as i32 - half_h - 1;
             for cy in cy_min..=cy_max {
                 for cx in cx_min..=cx_max {
-                    if !is_clear_footprint(chunk_map, bed_map, bp_map, doormat, cx, cy, half_w, half_h) {
+                    if !is_clear_footprint(
+                        chunk_map, bed_map, bp_map, doormat, cx, cy, half_w, half_h,
+                    ) {
                         continue;
                     }
                     if blocks_cardinal_corridor(cx, cy, half_w, half_h, home) {
@@ -1360,12 +1367,7 @@ fn find_unfilled_civic_zone_tile(
 /// Count beds (placed, not blueprinted) sitting inside the annulus
 /// `inner_r..=outer_r` around `hearth`. Used by the Neolithic hearth gate to
 /// decide when a household cluster is "full" and a new hearth should open.
-fn count_beds_in_crescent(
-    bed_map: &BedMap,
-    hearth: (i32, i32),
-    inner_r: i32,
-    outer_r: i32,
-) -> u32 {
+fn count_beds_in_crescent(bed_map: &BedMap, hearth: (i32, i32), inner_r: i32, outer_r: i32) -> u32 {
     let inner_sq = inner_r * inner_r;
     let outer_sq = outer_r * outer_r;
     let mut n = 0u32;
@@ -1650,7 +1652,8 @@ fn find_building_origin(
                 if blocks_cardinal_corridor(cx, cy, half_w, half_h, camp_home) {
                     continue;
                 }
-                if !is_clear_footprint(chunk_map, bed_map, bp_map, doormat, cx, cy, half_w, half_h) {
+                if !is_clear_footprint(chunk_map, bed_map, bp_map, doormat, cx, cy, half_w, half_h)
+                {
                     continue;
                 }
                 if ring <= early_ring {
@@ -1686,10 +1689,22 @@ fn entrance_cell_for_edge(
     // cell is dx == 0 (N/S edge) or dy == 0 (E/W edge). For larger sides
     // we clamp the projection of camp_home onto the edge.
     match edge {
-        TileEdge::East => (half_w, ((camp_home.1 - centre.1).clamp(-(half_h - 1).max(0), (half_h - 1).max(0)))),
-        TileEdge::West => (-half_w, ((camp_home.1 - centre.1).clamp(-(half_h - 1).max(0), (half_h - 1).max(0)))),
-        TileEdge::North => (((camp_home.0 - centre.0).clamp(-(half_w - 1).max(0), (half_w - 1).max(0))), half_h),
-        TileEdge::South => (((camp_home.0 - centre.0).clamp(-(half_w - 1).max(0), (half_w - 1).max(0))), -half_h),
+        TileEdge::East => (
+            half_w,
+            ((camp_home.1 - centre.1).clamp(-(half_h - 1).max(0), (half_h - 1).max(0))),
+        ),
+        TileEdge::West => (
+            -half_w,
+            ((camp_home.1 - centre.1).clamp(-(half_h - 1).max(0), (half_h - 1).max(0))),
+        ),
+        TileEdge::North => (
+            ((camp_home.0 - centre.0).clamp(-(half_w - 1).max(0), (half_w - 1).max(0))),
+            half_h,
+        ),
+        TileEdge::South => (
+            ((camp_home.0 - centre.0).clamp(-(half_w - 1).max(0), (half_w - 1).max(0))),
+            -half_h,
+        ),
     }
 }
 
@@ -1715,9 +1730,8 @@ fn plan_building(
     // to cardinal-toward-home. If that cardinal's doormat is blocked, try
     // other cardinals. Abort the build if none work — placing an unreachable
     // door is strictly worse than placing nothing.
-    let preferred_edge = door_dir.unwrap_or_else(|| {
-        crate::simulation::land::TileEdge::toward((cx, cy), camp_home)
-    });
+    let preferred_edge =
+        door_dir.unwrap_or_else(|| crate::simulation::land::TileEdge::toward((cx, cy), camp_home));
     let Some((door_edge, entrance, _planned_doormat)) = pick_clear_door_cardinal(
         chunk_map,
         bed_map,
@@ -1737,7 +1751,11 @@ fn plan_building(
     // Build the wall+bed plan. We always compute it first so the deferred
     // path (footprint_completion_system) can spawn the same blueprints once
     // terraform completes.
-    let mut wall_plan: Vec<(BuildSiteKind, (i32, i32), Option<crate::simulation::land::TileEdge>)> = Vec::new();
+    let mut wall_plan: Vec<(
+        BuildSiteKind,
+        (i32, i32),
+        Option<crate::simulation::land::TileEdge>,
+    )> = Vec::new();
     for dy in -half_h..=half_h {
         for dx in -half_w..=half_w {
             if dx.abs() < half_w && dy.abs() < half_h {
@@ -1749,7 +1767,11 @@ fn plan_building(
             } else {
                 BuildSiteKind::Wall(wall_material)
             };
-            let edge = if (dx, dy) == entrance { Some(door_edge) } else { None };
+            let edge = if (dx, dy) == entrance {
+                Some(door_edge)
+            } else {
+                None
+            };
             wall_plan.push((kind, tile, edge));
         }
     }
@@ -1933,6 +1955,8 @@ pub struct BuildingMapsRO<'w> {
     pub barracks_map: Res<'w, BarracksMap>,
     pub monument_map: Res<'w, MonumentMap>,
     pub doormat: Res<'w, crate::simulation::doormat::DoormatReservations>,
+    pub organic_selected: Res<'w, crate::simulation::organic_settlement::SelectedSettlementIntents>,
+    pub organic_brains: Res<'w, crate::simulation::organic_settlement::SettlementBrains>,
 }
 
 /// One thing the chief is considering building this tick. The selector
@@ -1969,14 +1993,82 @@ enum BuildIntent {
     },
 }
 
+fn build_candidate_from_organic(
+    intent: &crate::simulation::organic_settlement::ConstructionIntent,
+) -> BuildCandidate {
+    let build_intent = match intent.build_kind {
+        crate::simulation::organic_settlement::OrganicBuildKind::Single(kind) => {
+            BuildIntent::Single(kind)
+        }
+        crate::simulation::organic_settlement::OrganicBuildKind::Hut(mat) => BuildIntent::Hut(mat),
+        crate::simulation::organic_settlement::OrganicBuildKind::Longhouse(mat) => {
+            BuildIntent::Longhouse(mat)
+        }
+        crate::simulation::organic_settlement::OrganicBuildKind::PalisadeSegment(mat) => {
+            BuildIntent::PalisadeSegment(mat, 2)
+        }
+        crate::simulation::organic_settlement::OrganicBuildKind::CompositeHouse {
+            shape,
+            rotation,
+            wall_material,
+        } => BuildIntent::CompositeHouse {
+            shape,
+            rotation,
+            wall_material,
+        },
+    };
+    BuildCandidate {
+        intent: build_intent,
+        tile: intent.tile,
+        score: intent.priority,
+        door_dir: intent.door_dir,
+    }
+}
+
+fn candidate_touches_planned_road(
+    candidate: &BuildCandidate,
+    faction_id: u32,
+    settlement_map: &crate::simulation::settlement::SettlementMap,
+    brains: &crate::simulation::organic_settlement::SettlementBrains,
+) -> bool {
+    let Some(sid) = settlement_map.first_for_faction(faction_id) else {
+        return false;
+    };
+    let Some(brain) = brains.0.get(&sid) else {
+        return false;
+    };
+    candidate_footprint_tiles(candidate)
+        .into_iter()
+        .any(|tile| brain.road_tiles.contains(&tile))
+}
+
+fn candidate_footprint_tiles(candidate: &BuildCandidate) -> Vec<(i32, i32)> {
+    match candidate.intent {
+        BuildIntent::Single(_) | BuildIntent::PalisadeSegment(_, _) => vec![candidate.tile],
+        BuildIntent::Hut(_) => rect_tiles(candidate.tile, 1, 1),
+        BuildIntent::Longhouse(_) => rect_tiles(candidate.tile, 2, 1),
+        BuildIntent::CompositeHouse {
+            shape, rotation, ..
+        } => crate::simulation::building_template::shape_tiles(shape, candidate.tile, rotation),
+    }
+}
+
+fn rect_tiles(centre: (i32, i32), half_w: i32, half_h: i32) -> Vec<(i32, i32)> {
+    let mut out = Vec::new();
+    for dy in -half_h..=half_h {
+        for dx in -half_w..=half_w {
+            out.push((centre.0 + dx, centre.1 + dy));
+        }
+    }
+    out
+}
+
 impl BuildIntent {
     /// The primary input goods this intent will require, summed across every
     /// blueprint it would spawn. Used by the deficit-EMA feedback loop in
     /// `generate_candidates` so candidates that need a chronically-scarce
     /// good get down-scored.
-    fn required_goods(
-        self,
-    ) -> ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32> {
+    fn required_goods(self) -> ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32> {
         let mut totals: ahash::AHashMap<_, u32> = ahash::AHashMap::new();
         let mut add = |kind: BuildSiteKind, multiplier: u32| {
             for &(rid, qty) in &recipe_for(kind).inputs {
@@ -1997,7 +2089,11 @@ impl BuildIntent {
                 add(BuildSiteKind::Bed, 2);
             }
             BuildIntent::PalisadeSegment(mat, _) => add(BuildSiteKind::Wall(mat), 1),
-            BuildIntent::CompositeHouse { shape, rotation, wall_material } => {
+            BuildIntent::CompositeHouse {
+                shape,
+                rotation,
+                wall_material,
+            } => {
                 use crate::simulation::building_template::shape_tiles;
                 // Walk canonical tiles, classify perimeter vs interior. We
                 // don't know exact wall/bed counts without inspecting the
@@ -2012,7 +2108,11 @@ impl BuildIntent {
                     let is_perim = [(1, 0), (-1, 0), (0, 1), (0, -1)]
                         .iter()
                         .any(|&(ox, oy)| !tile_set.contains(&(tx + ox, ty + oy)));
-                    if is_perim { perim += 1; } else { interior += 1; }
+                    if is_perim {
+                        perim += 1;
+                    } else {
+                        interior += 1;
+                    }
                 }
                 add(BuildSiteKind::Wall(wall_material), perim.saturating_sub(1));
                 add(BuildSiteKind::Door, 1);
@@ -2109,8 +2209,8 @@ pub fn chief_directive_system(
         // Population-scaled concurrency cap: ~1 concurrent project per 6 members,
         // floor 2, ceiling MAX_BLUEPRINTS_SAFETY_CAP - 1. Keeps small bands moving
         // without flooding workers; lets larger settlements parallelise civic work.
-        let concurrent_cap = ((faction.member_count as usize / 6).max(2))
-            .min(MAX_BLUEPRINTS_SAFETY_CAP - 1);
+        let concurrent_cap =
+            ((faction.member_count as usize / 6).max(2)).min(MAX_BLUEPRINTS_SAFETY_CAP - 1);
         if count >= concurrent_cap {
             continue;
         }
@@ -2128,44 +2228,52 @@ pub fn chief_directive_system(
             .and_then(|&e| settlement_q.get(e).ok())
             .map(|s| s.peak_population)
             .unwrap_or(faction.member_count);
-        let mut candidates = generate_candidates(
-            faction_id,
-            faction,
-            plan,
-            &chunk_map,
-            &maps,
-            &bp_map,
-            &*maps.doormat,
-            pending_kinds,
-            &plot_index,
-            &plot_q,
-            peak_pop,
-        );
-        // Stage 3 feedback: penalize candidates whose required inputs include
-        // a chronically-deficient good (per `material_deficit_ema`). Skips the
-        // upgrade-rebuild path which short-circuits with score 5000 from
-        // `generate_candidates`.
-        for candidate in candidates.iter_mut() {
-            let required = candidate.intent.required_goods();
-            let mut penalty = 0.0f32;
-            for (rid, qty) in required {
-                if qty == 0 {
-                    continue;
+        let best = maps
+            .organic_selected
+            .0
+            .get(&faction_id)
+            .map(build_candidate_from_organic)
+            .or_else(|| {
+                let mut candidates = generate_candidates(
+                    faction_id,
+                    faction,
+                    plan,
+                    &chunk_map,
+                    &maps,
+                    &bp_map,
+                    &*maps.doormat,
+                    pending_kinds,
+                    &plot_index,
+                    &plot_q,
+                    peak_pop,
+                );
+                // Stage 3 feedback: penalize candidates whose required inputs include
+                // a chronically-deficient good (per `material_deficit_ema`). Skips the
+                // upgrade-rebuild path which short-circuits with score 5000 from
+                // `generate_candidates`.
+                for candidate in candidates.iter_mut() {
+                    let required = candidate.intent.required_goods();
+                    let mut penalty = 0.0f32;
+                    for (rid, qty) in required {
+                        if qty == 0 {
+                            continue;
+                        }
+                        let ema = faction.material_deficit_ema_of(rid);
+                        if ema >= crate::simulation::projects::DEFICIT_EMA_RARE_THRESHOLD {
+                            penalty += 600.0;
+                        } else if ema >= 80 {
+                            penalty += 200.0;
+                        }
+                    }
+                    candidate.score -= penalty;
                 }
-                let ema = faction.material_deficit_ema_of(rid);
-                if ema >= crate::simulation::projects::DEFICIT_EMA_RARE_THRESHOLD {
-                    penalty += 600.0;
-                } else if ema >= 80 {
-                    penalty += 200.0;
-                }
-            }
-            candidate.score -= penalty;
-        }
-        let Some(best) = candidates.into_iter().max_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }) else {
+                candidates.into_iter().max_by(|a, b| {
+                    a.score
+                        .partial_cmp(&b.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            });
+        let Some(best) = best else {
             continue;
         };
 
@@ -2182,6 +2290,10 @@ pub fn chief_directive_system(
             faction_id,
             None,
         ) {
+            continue;
+        }
+        if candidate_touches_planned_road(&best, faction_id, &settlement_map, &maps.organic_brains)
+        {
             continue;
         }
 
@@ -2217,9 +2329,7 @@ fn generate_candidates(
     plot_q: &Query<&crate::simulation::land::Plot>,
     peak_pop: u32,
 ) -> Vec<BuildCandidate> {
-    let pending_of = |k: BuildSiteKind| -> u32 {
-        pending_kinds.get(&k).copied().unwrap_or(0)
-    };
+    let pending_of = |k: BuildSiteKind| -> u32 { pending_kinds.get(&k).copied().unwrap_or(0) };
     // Walls are tracked per-material (`Wall(Palisade)`, `Wall(Stone)`, …);
     // the wall-deficit gate cares only about total wall blueprints in flight.
     let pending_walls_total: u32 = pending_kinds
@@ -2258,7 +2368,7 @@ fn generate_candidates(
                     intent: BuildIntent::PalisadeSegment(wall_mat, 2),
                     tile: up_tile,
                     score: 5000.0,
-                door_dir: None,
+                    door_dir: None,
                 });
                 return out; // skip everything else this tick
             }
@@ -2280,9 +2390,9 @@ fn generate_candidates(
         Era::Paleolithic | Era::Mesolithic => {
             crate::simulation::settlement::paleolithic_hearth_count(members)
         }
-        Era::Neolithic => ((members + NEOLITHIC_BEDS_PER_HEARTH - 1)
-            / NEOLITHIC_BEDS_PER_HEARTH)
-            .max(1),
+        Era::Neolithic => {
+            ((members + NEOLITHIC_BEDS_PER_HEARTH - 1) / NEOLITHIC_BEDS_PER_HEARTH).max(1)
+        }
         _ => 1,
     };
     // Counts include both built structures *and* in-flight blueprints, so a
@@ -2303,8 +2413,7 @@ fn generate_candidates(
             .keys()
             .copied()
             .filter(|&(cx, cy)| {
-                (cx as i32 - home.0 as i32).abs() <= 25
-                    && (cy as i32 - home.1 as i32).abs() <= 25
+                (cx as i32 - home.0 as i32).abs() <= 25 && (cy as i32 - home.1 as i32).abs() <= 25
             })
             .collect();
         let crescents_saturated = !hearths.is_empty()
@@ -2334,8 +2443,7 @@ fn generate_candidates(
                         && (cy as i32 - home.1 as i32).abs() <= 25
                 })
                 .all(|h| {
-                    count_beds_in_crescent(&maps.bed_map, h, 2, 6)
-                        >= NEOLITHIC_BEDS_PER_HEARTH
+                    count_beds_in_crescent(&maps.bed_map, h, 2, 6) >= NEOLITHIC_BEDS_PER_HEARTH
                 })
     } else {
         false // Chalcolithic+: single civic hearth
@@ -2391,8 +2499,8 @@ fn generate_candidates(
                 intent: BuildIntent::Single(BuildSiteKind::Campfire),
                 tile,
                 score: 1000.0,
-            door_dir: None,
-                });
+                door_dir: None,
+            });
         }
     }
 
@@ -2432,8 +2540,8 @@ fn generate_candidates(
                         intent: BuildIntent::Single(BuildSiteKind::Bed),
                         tile,
                         score: 200.0 + bed_deficit * 30.0,
-                    door_dir: None,
-                });
+                        door_dir: None,
+                    });
                 }
             }
         } else if techs.has(CITY_STATE_ORG) && bed_deficit >= 2.0 {
@@ -2443,10 +2551,8 @@ fn generate_candidates(
             // large (≥4), but for smaller deficits we roll for visual variety.
             // Seed mixes plan.culture_hash with current bed_count so successive
             // builds in the same faction don't all pick the same footprint.
-            let layout_seed = plan
-                .map(|p| p.culture_hash)
-                .unwrap_or(faction_id as u64)
-                ^ (bed_count as u64);
+            let layout_seed =
+                plan.map(|p| p.culture_hash).unwrap_or(faction_id as u64) ^ (bed_count as u64);
             let mut roll_rng = fastrand::Rng::with_seed(layout_seed);
             let try_longhouse = if bed_deficit >= 4.0 {
                 true
@@ -2466,7 +2572,10 @@ fn generate_candidates(
                 // `is_clear_shape` so non-rectangular interior cells aren't
                 // dropped onto impassable terrain.
                 let lshape = crate::simulation::building_template::FootprintShape::LShape {
-                    w1: 2, h1: 2, w2: 2, h2: 1,
+                    w1: 2,
+                    h1: 2,
+                    w2: 2,
+                    h2: 1,
                 };
                 if let Some(origin) = find_footprint_in_zone(
                     chunk_map,
@@ -2503,39 +2612,40 @@ fn generate_candidates(
                     }
                 }
             }
-            let lh_origin: Option<((i32, i32), Option<crate::simulation::land::TileEdge>)> = if try_longhouse {
-                find_footprint_at_frontage_lot(
-                    chunk_map,
-                    &maps.bed_map,
-                    bp_map,
-                    doormat,
-                    plot_index,
-                    plot_q,
-                    faction_id,
-                    ZoneKind::Residential,
-                    home,
-                    2,
-                    1,
-                )
-                .map(|(t, e)| (t, Some(e)))
-                .or_else(|| {
-                    find_footprint_in_zone(
+            let lh_origin: Option<((i32, i32), Option<crate::simulation::land::TileEdge>)> =
+                if try_longhouse {
+                    find_footprint_at_frontage_lot(
                         chunk_map,
                         &maps.bed_map,
                         bp_map,
                         doormat,
-                        plan,
+                        plot_index,
+                        plot_q,
+                        faction_id,
                         ZoneKind::Residential,
                         home,
                         2,
                         1,
-                        20,
                     )
-                    .map(|t| (t, None))
-                })
-            } else {
-                None
-            };
+                    .map(|(t, e)| (t, Some(e)))
+                    .or_else(|| {
+                        find_footprint_in_zone(
+                            chunk_map,
+                            &maps.bed_map,
+                            bp_map,
+                            doormat,
+                            plan,
+                            ZoneKind::Residential,
+                            home,
+                            2,
+                            1,
+                            20,
+                        )
+                        .map(|t| (t, None))
+                    })
+                } else {
+                    None
+                };
             if let Some((origin, edge)) = lh_origin {
                 out.push(BuildCandidate {
                     intent: BuildIntent::Longhouse(wall_mat),
@@ -2635,13 +2745,15 @@ fn generate_candidates(
         let target_walls = (members as i32 * 2 + 8).min(48);
         let defense_deficit = (target_walls - walls_count).max(0) as f32;
         if defense_deficit > 0.0 && bed_count > 0 {
-            if let Some(tile) = find_palisade_site(chunk_map, &maps.bed_map, bp_map, doormat, home, 2) {
+            if let Some(tile) =
+                find_palisade_site(chunk_map, &maps.bed_map, bp_map, doormat, home, 2)
+            {
                 let def_mult = 0.4 + (culture.defensive as f32 / 255.0) * 1.6;
                 out.push(BuildCandidate {
                     intent: BuildIntent::PalisadeSegment(wall_mat, 2),
                     tile,
                     score: 70.0 * def_mult + defense_deficit * 1.5,
-                door_dir: None,
+                    door_dir: None,
                 });
             }
         }
@@ -2668,8 +2780,8 @@ fn generate_candidates(
                 intent: BuildIntent::Single(BuildSiteKind::Workbench),
                 tile,
                 score: 150.0,
-            door_dir: None,
-                });
+                door_dir: None,
+            });
         }
     }
 
@@ -2699,8 +2811,8 @@ fn generate_candidates(
                 intent: BuildIntent::Single(BuildSiteKind::Granary),
                 tile,
                 score: 180.0 * mer_mult,
-            door_dir: None,
-                });
+                door_dir: None,
+            });
         }
     }
 
@@ -2730,8 +2842,8 @@ fn generate_candidates(
                 intent: BuildIntent::Single(BuildSiteKind::Shrine),
                 tile,
                 score: 110.0 * cer_mult,
-            door_dir: None,
-                });
+                door_dir: None,
+            });
         }
     }
 
@@ -2762,7 +2874,7 @@ fn generate_candidates(
                     intent: BuildIntent::Single(BuildSiteKind::Market),
                     tile,
                     score: 130.0 * mer_mult,
-                door_dir: None,
+                    door_dir: None,
                 });
             }
         }
@@ -2794,8 +2906,8 @@ fn generate_candidates(
                 intent: BuildIntent::Single(BuildSiteKind::Barracks),
                 tile,
                 score: 140.0 * mar_mult,
-            door_dir: None,
-                });
+                door_dir: None,
+            });
         }
     }
 
@@ -2825,8 +2937,8 @@ fn generate_candidates(
                 intent: BuildIntent::Single(BuildSiteKind::Monument),
                 tile,
                 score: 95.0 * cer_mult,
-            door_dir: None,
-                });
+                door_dir: None,
+            });
         }
     }
 
@@ -2923,7 +3035,11 @@ fn spawn_intent(
                 .id();
             bp_map.0.insert(tile, e);
         }
-        BuildIntent::CompositeHouse { shape, rotation, wall_material } => {
+        BuildIntent::CompositeHouse {
+            shape,
+            rotation,
+            wall_material,
+        } => {
             plan_composite_building(
                 commands,
                 bp_map,
@@ -2971,9 +3087,8 @@ fn plan_composite_building(
 
     // Door direction: prefer the sourced cardinal (plot frontage); else fall
     // back to the cardinal-toward-home rule used by `plan_building`.
-    let preferred_edge = door_dir.unwrap_or_else(|| {
-        crate::simulation::land::TileEdge::toward(anchor, camp_home)
-    });
+    let preferred_edge =
+        door_dir.unwrap_or_else(|| crate::simulation::land::TileEdge::toward(anchor, camp_home));
 
     // Among the four cardinals, find one whose chosen perimeter cell's
     // cardinal-out tile is genuinely outside the mask AND a clear doormat
@@ -2981,7 +3096,12 @@ fn plan_composite_building(
     // cell whose "outside" cardinal hits another wall blueprint, leaving the
     // door unreachable.
     use crate::simulation::land::TileEdge;
-    let cardinals = [TileEdge::North, TileEdge::East, TileEdge::South, TileEdge::West];
+    let cardinals = [
+        TileEdge::North,
+        TileEdge::East,
+        TileEdge::South,
+        TileEdge::West,
+    ];
     let pick_perim_for_edge = |edge: TileEdge| -> Option<((i32, i32), (i32, i32), i64)> {
         let (ddx, ddy) = edge.delta();
         let mut best: Option<((i32, i32), (i32, i32), i64)> = None;
@@ -3007,8 +3127,8 @@ fn plan_composite_building(
         }
         best
     };
-    let mut chosen: Option<((i32, i32), TileEdge)> = pick_perim_for_edge(preferred_edge)
-        .map(|(door, _outside, _)| (door, preferred_edge));
+    let mut chosen: Option<((i32, i32), TileEdge)> =
+        pick_perim_for_edge(preferred_edge).map(|(door, _outside, _)| (door, preferred_edge));
     if chosen.is_none() {
         chosen = cardinals
             .iter()
@@ -3285,7 +3405,12 @@ fn pick_clear_door_cardinal(
     home: (i32, i32),
 ) -> Option<(crate::simulation::land::TileEdge, (i32, i32), (i32, i32))> {
     use crate::simulation::land::TileEdge;
-    let cardinals = [TileEdge::North, TileEdge::East, TileEdge::South, TileEdge::West];
+    let cardinals = [
+        TileEdge::North,
+        TileEdge::East,
+        TileEdge::South,
+        TileEdge::West,
+    ];
     let try_edge = |e: TileEdge| -> Option<(TileEdge, (i32, i32), (i32, i32), i64)> {
         let entrance_offset = entrance_cell_for_edge(half_w, half_h, e, home, centre);
         let door_tile = (centre.0 + entrance_offset.0, centre.1 + entrance_offset.1);
@@ -3525,9 +3650,7 @@ pub fn building_upgrade_system(
         let has_stock = recipe
             .inputs
             .iter()
-            .all(|&(rid, qty)| {
-                storage.get(&rid).copied().unwrap_or(0) >= (qty as u32) * 2
-            });
+            .all(|&(rid, qty)| storage.get(&rid).copied().unwrap_or(0) >= (qty as u32) * 2);
         if !has_stock {
             continue;
         }
@@ -3624,10 +3747,8 @@ pub fn construction_system(
     // role.
     //   bp_haulers: bp_entity → Vec<(agent, inventory snapshot per deposit slot, claim)>
     //   bp_workers: bp_entity → Vec<agent>
-    let mut bp_haulers: AHashMap<
-        Entity,
-        Vec<(Entity, [u32; MAX_BUILD_INPUTS], Option<JobClaim>)>,
-    > = AHashMap::new();
+    let mut bp_haulers: AHashMap<Entity, Vec<(Entity, [u32; MAX_BUILD_INPUTS], Option<JobClaim>)>> =
+        AHashMap::new();
     let mut bp_workers: AHashMap<Entity, Vec<Entity>> = AHashMap::new();
 
     for (entity, mut ai, mut aq, agent, carrier, _skills, slot, lod, claim_opt) in
@@ -3711,13 +3832,12 @@ pub fn construction_system(
                 // a Haul claim against a different bp is unrelated and stays.
                 if let Some(claim) = claim_opt {
                     if claim.kind == JobKind::Haul {
-                        let claim_bp_matches = job_board.get(claim.job_id).map_or(
-                            false,
-                            |p| matches!(
+                        let claim_bp_matches = job_board.get(claim.job_id).map_or(false, |p| {
+                            matches!(
                                 &p.progress,
                                 JobProgress::Haul { blueprint, .. } if *blueprint == bp_entity
-                            ),
-                        );
+                            )
+                        });
                         if claim_bp_matches {
                             commands.entity(entity).remove::<JobClaim>();
                             commands.entity(entity).remove::<ClaimTarget>();
@@ -3753,7 +3873,8 @@ pub fn construction_system(
     // counter (Fix 5). Pass 3 zeroes these.
     let mut work_progress_resets: Vec<Entity> = Vec::new();
     // (agent_entity, good, qty_to_remove)
-    let mut good_removals: Vec<(Entity, crate::economy::resource_catalog::ResourceId, u32)> = Vec::new();
+    let mut good_removals: Vec<(Entity, crate::economy::resource_catalog::ResourceId, u32)> =
+        Vec::new();
 
     // Pass 2: deposit hauler goods, advance worker progress, check completion.
     let mut bp_entities: Vec<Entity> = bp_haulers
@@ -3783,9 +3904,8 @@ pub fn construction_system(
         // claimants were dropped mid-trip and credits stopped) would linger
         // and trap fresh haulers in a withdraw-walk-noop loop.
         let bp_faction_id = bp.faction_id;
-        let mut newly_satisfied_resources: Vec<
-            crate::economy::resource_catalog::ResourceId,
-        > = Vec::with_capacity(MAX_BUILD_INPUTS);
+        let mut newly_satisfied_resources: Vec<crate::economy::resource_catalog::ResourceId> =
+            Vec::with_capacity(MAX_BUILD_INPUTS);
         if let Some(haulers) = bp_haulers.get(&bp_entity) {
             for (agent_e, snap, claim_opt) in haulers {
                 for i in 0..bp.deposit_count as usize {
@@ -3803,9 +3923,7 @@ pub fn construction_system(
                     bp.deposits[i].deposited = prev.saturating_add(take as u8);
                     let now_satisfied = prev < bp.deposits[i].needed
                         && bp.deposits[i].deposited >= bp.deposits[i].needed;
-                    if now_satisfied
-                        && !newly_satisfied_resources.contains(&need.resource_id)
-                    {
+                    if now_satisfied && !newly_satisfied_resources.contains(&need.resource_id) {
                         newly_satisfied_resources.push(need.resource_id);
                     }
                     if let Some(claim) = claim_opt {
@@ -3889,10 +4007,7 @@ pub fn construction_system(
             work_progress_resets.extend(workers.iter().copied());
         }
 
-        if bp.build_progress >= recipe.work_ticks
-            && bp.is_satisfied()
-            && bp.obstacles_cleared()
-        {
+        if bp.build_progress >= recipe.work_ticks && bp.is_satisfied() && bp.obstacles_cleared() {
             let tile = bp.tile;
             let (tx, ty) = (tile.0 as i32, tile.1 as i32);
 
@@ -3990,8 +4105,14 @@ pub fn construction_system(
                     // in Bedrolls underneath.
                     let e = commands
                         .spawn((
-                            TentShelter { tier: ShelterTier::Tent },
-                            crate::simulation::pack_deploy::Deployable::refund_only(0.5, crate::economy::core_ids::wood(), 6),
+                            TentShelter {
+                                tier: ShelterTier::Tent,
+                            },
+                            crate::simulation::pack_deploy::Deployable::refund_only(
+                                0.5,
+                                crate::economy::core_ids::wood(),
+                                6,
+                            ),
                             StructureLabel("Tent"),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
@@ -4007,7 +4128,9 @@ pub fn construction_system(
                     // via `Deployable::fully_packable`).
                     let e = commands
                         .spawn((
-                            TentShelter { tier: ShelterTier::Yurt },
+                            TentShelter {
+                                tier: ShelterTier::Yurt,
+                            },
                             crate::simulation::pack_deploy::Deployable::fully_packable(
                                 crate::economy::core_ids::packed_yurt(),
                             ),
@@ -4046,7 +4169,10 @@ pub fn construction_system(
                     // Door blueprint was placed without one — log + default to
                     // East so we don't silently break the doormat invariant.
                     let door_edge = bp.door_dir.unwrap_or_else(|| {
-                        warn!("Door blueprint at {:?} had no door_dir; defaulting to East", tile);
+                        warn!(
+                            "Door blueprint at {:?} had no door_dir; defaulting to East",
+                            tile
+                        );
                         crate::simulation::land::TileEdge::East
                     });
                     let (ddx, ddy) = door_edge.delta();
@@ -5190,8 +5316,14 @@ fn spawn_seeded_structure(
         }
         BuildSiteKind::Tent => {
             commands.spawn((
-                TentShelter { tier: ShelterTier::Tent },
-                crate::simulation::pack_deploy::Deployable::refund_only(0.5, crate::economy::core_ids::wood(), 6),
+                TentShelter {
+                    tier: ShelterTier::Tent,
+                },
+                crate::simulation::pack_deploy::Deployable::refund_only(
+                    0.5,
+                    crate::economy::core_ids::wood(),
+                    6,
+                ),
                 StructureLabel("Tent"),
                 Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                 GlobalTransform::default(),
@@ -5201,7 +5333,9 @@ fn spawn_seeded_structure(
         }
         BuildSiteKind::Yurt => {
             commands.spawn((
-                TentShelter { tier: ShelterTier::Yurt },
+                TentShelter {
+                    tier: ShelterTier::Yurt,
+                },
                 crate::simulation::pack_deploy::Deployable::fully_packable(
                     crate::economy::core_ids::packed_yurt(),
                 ),
@@ -5676,9 +5810,9 @@ pub fn seed_starting_buildings_system(
                 } else {
                     (1, 1, &[(0, 0)])
                 };
-                let Some((cx, cy)) = pick_seed_house_anchor(
-                    plan_ref, &chunk_map, &used, home, half_w, half_h,
-                ) else {
+                let Some((cx, cy)) =
+                    pick_seed_house_anchor(plan_ref, &chunk_map, &used, home, half_w, half_h)
+                else {
                     break; // Out of room — fall through to civic seeding.
                 };
                 if !seed_walled_house_at(
@@ -5707,7 +5841,11 @@ pub fn seed_starting_buildings_system(
                     continue;
                 }
                 // Farmstead yard: 2×2 (Neo/Chalc) or 3×3 (Bronze).
-                let yard_side: i32 = if (era as u8) >= (Era::BronzeAge as u8) { 3 } else { 2 };
+                let yard_side: i32 = if (era as u8) >= (Era::BronzeAge as u8) {
+                    3
+                } else {
+                    2
+                };
                 seed_farmstead_yard(
                     &mut chunk_map,
                     &mut tile_changed,
@@ -5942,9 +6080,8 @@ fn seed_walled_house_at(
     // the next-best cardinal whose doormat IS clear. Abort the build entirely
     // if no cardinal works — placing an unreachable door is strictly worse
     // than placing nothing.
-    let preferred_edge = door_dir.unwrap_or_else(|| {
-        crate::simulation::land::TileEdge::toward((cx, cy), home)
-    });
+    let preferred_edge =
+        door_dir.unwrap_or_else(|| crate::simulation::land::TileEdge::toward((cx, cy), home));
     let Some((door_edge, entrance, _planned_doormat)) = pick_clear_door_cardinal(
         chunk_map,
         &maps.bed_map,
@@ -6221,7 +6358,12 @@ fn seed_farmstead_yard(
         (cx - yard_w / 2, cy - half_h - yard_h, 1, 1), // North
     ];
 
-    let yard_clear = |x0: i32, y0: i32, used: &AHashSet<(i32, i32)>, cm: &ChunkMap, dm: &crate::simulation::doormat::DoormatReservations| -> bool {
+    let yard_clear = |x0: i32,
+                      y0: i32,
+                      used: &AHashSet<(i32, i32)>,
+                      cm: &ChunkMap,
+                      dm: &crate::simulation::doormat::DoormatReservations|
+     -> bool {
         for ty in y0..y0 + yard_h {
             for tx in x0..x0 + yard_w {
                 if used.contains(&(tx, ty)) {
@@ -6346,15 +6488,14 @@ pub(crate) fn seed_nomadic_camp(
 
     for &offset_pos in hearth_positions.iter() {
         // Snap the hearth to a passable tile.
-        let hearth_tile = if !used.contains(&offset_pos)
-            && chunk_map.is_passable(offset_pos.0, offset_pos.1)
-        {
-            offset_pos
-        } else if let Some(t) = next_clear_tile(offset_pos, used, chunk_map, 4) {
-            t
-        } else {
-            continue;
-        };
+        let hearth_tile =
+            if !used.contains(&offset_pos) && chunk_map.is_passable(offset_pos.0, offset_pos.1) {
+                offset_pos
+            } else if let Some(t) = next_clear_tile(offset_pos, used, chunk_map, 4) {
+                t
+            } else {
+                continue;
+            };
         used.insert(hearth_tile);
         let world_pos = tile_to_world(hearth_tile.0, hearth_tile.1);
         let e = commands
@@ -6513,7 +6654,11 @@ fn seed_tents_around_hearth(
                     TentShelter {
                         tier: ShelterTier::Tent,
                     },
-                    crate::simulation::pack_deploy::Deployable::refund_only(0.5, crate::economy::core_ids::wood(), 6),
+                    crate::simulation::pack_deploy::Deployable::refund_only(
+                        0.5,
+                        crate::economy::core_ids::wood(),
+                        6,
+                    ),
                     StructureLabel("Tent"),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                     GlobalTransform::default(),
@@ -6805,13 +6950,19 @@ mod tests {
 
     #[test]
     fn entrance_cell_never_corner_for_3x3() {
-        for edge in [TileEdge::North, TileEdge::South, TileEdge::East, TileEdge::West] {
+        for edge in [
+            TileEdge::North,
+            TileEdge::South,
+            TileEdge::East,
+            TileEdge::West,
+        ] {
             let (dx, dy) = entrance_cell_for_edge(1, 1, edge, (10, 10), (10, 10));
             // For half_w=half_h=1 every entrance is on a flat side (one
             // coordinate ±1, the other 0).
             assert!(
                 (dx.abs() == 1 && dy == 0) || (dx == 0 && dy.abs() == 1),
-                "edge={:?} produced corner-cell offset ({dx}, {dy})", edge
+                "edge={:?} produced corner-cell offset ({dx}, {dy})",
+                edge
             );
         }
     }

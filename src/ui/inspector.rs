@@ -9,22 +9,22 @@ use crate::pathfinding::path_request::{
 };
 use crate::simulation::carry::Carrier;
 use crate::simulation::combat::{Body, BodyPart, Health};
+use crate::simulation::corpse::Corpse;
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction, SOLO};
 use crate::simulation::goals::{AgentGoal, GoalReason, Personality};
+use crate::simulation::htn::{MethodHistory, MethodOutcome, METHOD_HISTORY_TTL_TICKS};
 use crate::simulation::items::{
     spawn_or_merge_ground_item_full, valid_equip_slots, Equipment, EquipmentSlot, GroundItem,
 };
 use crate::simulation::memory::{RelEntry, RelationshipMemory};
 use crate::simulation::mood::Mood;
 use crate::simulation::needs::Needs;
-use crate::simulation::htn::{MethodHistory, MethodOutcome, METHOD_HISTORY_TTL_TICKS};
 use crate::simulation::person::{AiState, PersonAI, Profession};
-use crate::simulation::schedule::SimClock;
-use crate::simulation::corpse::Corpse;
 use crate::simulation::plants::{Plant, PlantMap};
 use crate::simulation::reproduction::{
     BiologicalSex, CoSleepTracker, MaleConceptionCooldown, Pregnancy, PREGNANCY_TICKS,
 };
+use crate::simulation::schedule::SimClock;
 use crate::simulation::skills::{SkillKind, Skills, SKILL_COUNT};
 use crate::simulation::stats::{self, Stats};
 use crate::simulation::tasks::{task_kind_label, TaskKind};
@@ -43,21 +43,48 @@ use super::selection::SelectedEntity;
 pub struct PendingInspectorAction(pub Option<InspectorActionKind>);
 
 pub enum InspectorActionKind {
-    DropInventoryItem { target: Entity, item: Item, qty: u32 },
-    DropInvItemOne { target: Entity, item: Item },
-    DropLeftHand { target: Entity },
-    DropRightHand { target: Entity },
-    EquipItem { target: Entity, item: Item, from_hands: bool, slot: EquipmentSlot },
-    UnequipSlot { target: Entity, slot: EquipmentSlot },
+    DropInventoryItem {
+        target: Entity,
+        item: Item,
+        qty: u32,
+    },
+    DropInvItemOne {
+        target: Entity,
+        item: Item,
+    },
+    DropLeftHand {
+        target: Entity,
+    },
+    DropRightHand {
+        target: Entity,
+    },
+    EquipItem {
+        target: Entity,
+        item: Item,
+        from_hands: bool,
+        slot: EquipmentSlot,
+    },
+    UnequipSlot {
+        target: Entity,
+        slot: EquipmentSlot,
+    },
     /// Selected agent broadcasts a tech to nearby same-faction adults via
     /// `apply_lecture_request_system` (Economy).
-    HoldLecture { lecturer: Entity, tech: crate::simulation::technology::TechId },
+    HoldLecture {
+        lecturer: Entity,
+        tech: crate::simulation::technology::TechId,
+    },
     /// Selected agent reads an inventory tablet/book whose `tech_payload`
     /// matches `tech`. Routed by `apply_player_knowledge_orders_system`.
-    ReadItem { reader: Entity, tech: crate::simulation::technology::TechId },
+    ReadItem {
+        reader: Entity,
+        tech: crate::simulation::technology::TechId,
+    },
     /// Player asks the faction to craft a Clay Tablet encoding `tech`.
     /// Posted by `chief_tablet_posting_system` via `PlayerCraftRequest`.
-    EncodeTablet { tech: crate::simulation::technology::TechId },
+    EncodeTablet {
+        tech: crate::simulation::technology::TechId,
+    },
 }
 
 #[derive(SystemParam)]
@@ -183,11 +210,7 @@ pub fn inspector_panel_system(
                         });
                         if let Ok(claim) = job_params.claim_query.get(entity) {
                             ui.horizontal(|ui| {
-                                ui.label(format!(
-                                    "Job: {} (#{})",
-                                    claim.kind.name(),
-                                    claim.job_id
-                                ));
+                                ui.label(format!("Job: {} (#{})", claim.kind.name(), claim.job_id));
                                 if ui.button("Release").clicked() {
                                     job_params.commands.send(
                                         crate::simulation::jobs::JobBoardCommand::Cancel(
@@ -197,7 +220,8 @@ pub fn inspector_panel_system(
                                 }
                             });
                             // Extra job details: source, progress, fail count
-                            if let Some(postings) = job_params.board.postings.get(&claim.faction_id) {
+                            if let Some(postings) = job_params.board.postings.get(&claim.faction_id)
+                            {
                                 if let Some(post) = postings.iter().find(|p| p.id == claim.job_id) {
                                     ui.horizontal(|ui| {
                                         ui.label(format!("Source: {:?}", post.source))
@@ -216,7 +240,9 @@ pub fn inspector_panel_system(
                                                 ))
                                                 .color(egui::Color32::from_rgb(255, 100, 100)),
                                             )
-                                            .on_hover_text("Number of times worker got stuck or timed out");
+                                            .on_hover_text(
+                                                "Number of times worker got stuck or timed out",
+                                            );
                                         }
                                     });
                                 }
@@ -412,8 +438,7 @@ pub fn inspector_panel_system(
                                 .max_height(140.0)
                                 .show(ui, |ui| {
                                     for id in &learned {
-                                        let def =
-                                            crate::simulation::technology::tech_def(*id);
+                                        let def = crate::simulation::technology::tech_def(*id);
                                         let cx = crate::simulation::technology::complexity(*id);
                                         ui.horizontal(|ui| {
                                             ui.label(format!(
@@ -422,9 +447,13 @@ pub fn inspector_panel_system(
                                                 def.era.name(),
                                                 cx
                                             ));
-                                            if ui.small_button("Lecture").on_hover_text(
-                                                "Have this person hold a lecture on this tech"
-                                            ).clicked() {
+                                            if ui
+                                                .small_button("Lecture")
+                                                .on_hover_text(
+                                                    "Have this person hold a lecture on this tech",
+                                                )
+                                                .clicked()
+                                            {
                                                 path_params.pending_action.0 =
                                                     Some(InspectorActionKind::HoldLecture {
                                                         lecturer: entity,
@@ -453,14 +482,9 @@ pub fn inspector_panel_system(
                                     k.study_progress.iter().map(|(t, p)| (*t, *p)).collect();
                                 entries.sort_by_key(|e| e.0);
                                 for (tech, prog) in entries {
-                                    let def =
-                                        crate::simulation::technology::tech_def(tech);
-                                    let thr =
-                                        crate::simulation::knowledge::study_threshold(tech);
-                                    ui.label(format!(
-                                        "  · {}: {}/{} ticks",
-                                        def.name, prog, thr
-                                    ));
+                                    let def = crate::simulation::technology::tech_def(tech);
+                                    let thr = crate::simulation::knowledge::study_threshold(tech);
+                                    ui.label(format!("  · {}: {}/{} ticks", def.name, prog, thr));
                                 }
                             }
                             ui.label(format!("Aware of ({}):", aware_only.len()));
@@ -477,11 +501,9 @@ pub fn inspector_panel_system(
                                         if *qty == 0 {
                                             continue;
                                         }
-                                        let tablet_id = crate::economy::core_ids::ClayTablet
-                                            .get()
-                                            .copied();
-                                        let book_id =
-                                            crate::economy::core_ids::Book.get().copied();
+                                        let tablet_id =
+                                            crate::economy::core_ids::ClayTablet.get().copied();
+                                        let book_id = crate::economy::core_ids::Book.get().copied();
                                         let rid = item.resource_id;
                                         if Some(rid) != tablet_id && Some(rid) != book_id {
                                             continue;
@@ -491,8 +513,7 @@ pub fn inspector_panel_system(
                                         }
                                     }
                                     for id in &aware_only {
-                                        let def =
-                                            crate::simulation::technology::tech_def(*id);
+                                        let def = crate::simulation::technology::tech_def(*id);
                                         ui.horizontal(|ui| {
                                             ui.label(format!(
                                                 "  \u{25CE} {} ({})",
@@ -706,10 +727,7 @@ pub fn inspector_panel_system(
                                     for &slot in valid_equip_slots(item.resource_id) {
                                         let slot_name = slot_display_name(slot);
                                         if ui
-                                            .small_button(format!(
-                                                "{} → {slot_name}",
-                                                item.label()
-                                            ))
+                                            .small_button(format!("{} → {slot_name}", item.label()))
                                             .clicked()
                                         {
                                             path_params.pending_action.0 =
@@ -723,15 +741,17 @@ pub fn inspector_panel_system(
                                     }
                                 }
                                 if let Some(c) = carrier {
-                                    for (stack, from_left) in [
-                                        (c.left, true),
-                                        (c.right, false),
-                                    ] {
+                                    for (stack, from_left) in [(c.left, true), (c.right, false)] {
                                         let Some(stack) = stack else { continue };
                                         for &slot in valid_equip_slots(stack.item.resource_id) {
                                             let slot_name = slot_display_name(slot);
-                                            let hand_tag =
-                                                if stack.two_handed { "hands" } else if from_left { "L" } else { "R" };
+                                            let hand_tag = if stack.two_handed {
+                                                "hands"
+                                            } else if from_left {
+                                                "L"
+                                            } else {
+                                                "R"
+                                            };
                                             if ui
                                                 .small_button(format!(
                                                     "{} ({hand_tag}) → {slot_name}",
@@ -790,7 +810,10 @@ pub fn inspector_panel_system(
                         if ai.task_id == PersonAI::UNEMPLOYED && aq.current == Task::Idle {
                             let last_attempt = method_history
                                 .and_then(|h| {
-                                    h.entries.iter().filter_map(|e| *e).max_by_key(|(_, _, t)| *t)
+                                    h.entries
+                                        .iter()
+                                        .filter_map(|e| *e)
+                                        .max_by_key(|(_, _, t)| *t)
                                 })
                                 .filter(|(_, _, tick)| {
                                     now.saturating_sub(*tick) <= METHOD_HISTORY_TTL_TICKS
@@ -802,7 +825,8 @@ pub fn inspector_panel_system(
                                     outcome,
                                     now.saturating_sub(tick)
                                 ),
-                                None => "last attempt: none (no method dispatched in last 30s)".to_string(),
+                                None => "last attempt: none (no method dispatched in last 30s)"
+                                    .to_string(),
                             };
                             ui.label(
                                 egui::RichText::new(format!(
@@ -912,8 +936,7 @@ pub fn inspector_panel_system(
                                         (ai.work_progress as u32 * 100) / 60
                                     );
                                 } else if ai.task_id == TaskKind::WorkOnCraftOrder as u16 {
-                                    work_str =
-                                        format!("Crafting (step: {})", ai.work_progress);
+                                    work_str = format!("Crafting (step: {})", ai.work_progress);
                                 } else if ai.task_id == TaskKind::WithdrawGood as u16 {
                                     use crate::simulation::typed_task::WithdrawGoodFilter;
                                     let good_label = match aq.current.as_withdraw_good() {
@@ -1390,7 +1413,12 @@ pub fn inspector_action_system(
                 let _ = agent.bonus_cap_g;
             }
         }
-        InspectorActionKind::EquipItem { target, item, from_hands, slot } => {
+        InspectorActionKind::EquipItem {
+            target,
+            item,
+            from_hands,
+            slot,
+        } => {
             let Ok((transform, mut agent, mut carrier, mut equipment)) = worker_q.get_mut(target)
             else {
                 return;

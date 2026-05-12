@@ -330,9 +330,7 @@ pub fn farm_pressure(faction: &FactionData) -> u8 {
     if !faction_can_perform(faction, JobKind::Farm) {
         return 0;
     }
-    let grain = faction
-        .storage
-        .stock_of(crate::economy::core_ids::grain());
+    let grain = faction.storage.stock_of(crate::economy::core_ids::grain());
     let target = faction.member_count.saturating_mul(4);
     if grain >= target || target == 0 {
         return 0;
@@ -456,7 +454,10 @@ impl WorkforceBudget {
     /// Share of the workforce allocated to a Stockpile posting for
     /// `resource_id`. Resources other than Wood/Stone fall back to the food
     /// share since they share the calorie pipeline.
-    pub fn stockpile_share(&self, resource_id: crate::economy::resource_catalog::ResourceId) -> f32 {
+    pub fn stockpile_share(
+        &self,
+        resource_id: crate::economy::resource_catalog::ResourceId,
+    ) -> f32 {
         use crate::economy::core_ids;
         if Some(resource_id) == core_ids::Wood.get().copied() {
             self.stockpile_wood
@@ -548,10 +549,8 @@ pub fn compute_workforce_budget(
         deficit_ratio * 70.0 + project_term * 30.0
     };
     let stockpile_food_pressure = food;
-    let stockpile_wood_pressure =
-        material_urgency(crate::economy::core_ids::wood());
-    let stockpile_stone_pressure =
-        material_urgency(crate::economy::core_ids::stone());
+    let stockpile_wood_pressure = material_urgency(crate::economy::core_ids::wood());
+    let stockpile_stone_pressure = material_urgency(crate::economy::core_ids::stone());
 
     // Haul + Build urgency on the same 0..100 scale, saturating at modest
     // queue depths since beyond that the bottleneck is throughput not
@@ -785,18 +784,19 @@ pub fn project_stagnation_system(
         // blueprint — progress is in flight even though no deposit has landed yet.
         let bp_entity = project.blueprint;
         let faction_id = project.faction_id;
-        let has_active_workers = board
-            .faction_postings(faction_id)
-            .iter()
-            .any(|p| match &p.progress {
-                JobProgress::Haul { blueprint, .. } => {
-                    *blueprint == bp_entity && !p.claimants.is_empty()
-                }
-                JobProgress::Building { blueprint } => {
-                    *blueprint == bp_entity && !p.claimants.is_empty()
-                }
-                _ => false,
-            });
+        let has_active_workers =
+            board
+                .faction_postings(faction_id)
+                .iter()
+                .any(|p| match &p.progress {
+                    JobProgress::Haul { blueprint, .. } => {
+                        *blueprint == bp_entity && !p.claimants.is_empty()
+                    }
+                    JobProgress::Building { blueprint } => {
+                        *blueprint == bp_entity && !p.claimants.is_empty()
+                    }
+                    _ => false,
+                });
         if has_active_workers {
             continue;
         }
@@ -808,13 +808,23 @@ pub fn project_stagnation_system(
         let Some((&resource_id, _)) = remaining.iter().max_by_key(|(_, qty)| **qty) else {
             continue;
         };
-        to_cancel.push((project.id, project.blueprint, project.faction_id, resource_id, bp.tile));
+        to_cancel.push((
+            project.id,
+            project.blueprint,
+            project.faction_id,
+            resource_id,
+            bp.tile,
+        ));
     }
 
     for (project_id, blueprint, faction_id, resource_id, tile) in to_cancel {
         // Bump the faction's deficit EMA for the stalled resource.
         if let Some(faction) = registry.factions.get_mut(&faction_id) {
-            let prev = faction.material_deficit_ema.get(&resource_id).copied().unwrap_or(0) as f32;
+            let prev = faction
+                .material_deficit_ema
+                .get(&resource_id)
+                .copied()
+                .unwrap_or(0) as f32;
             let next = (prev + (255.0 - prev) * DEFICIT_EMA_ALPHA).round() as u8;
             faction.material_deficit_ema.insert(resource_id, next);
         }
@@ -865,7 +875,8 @@ pub fn workforce_budget_system(
         return;
     }
     for (&faction_id, faction) in registry.factions.iter_mut() {
-        let next = compute_workforce_budget(faction, &projects, faction_id, faction.workforce_budget);
+        let next =
+            compute_workforce_budget(faction, &projects, faction_id, faction.workforce_budget);
         faction.workforce_budget = next;
     }
 }

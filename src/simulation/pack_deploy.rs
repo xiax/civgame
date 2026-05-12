@@ -55,11 +55,7 @@ impl Deployable {
 
     /// Tent-style: deployed-only; teardown drops `refund_pct` of
     /// `refund_qty` units of `refund_resource` at the entity's tile.
-    pub fn refund_only(
-        refund_pct: f32,
-        refund_resource: ResourceId,
-        refund_qty: u8,
-    ) -> Self {
+    pub fn refund_only(refund_pct: f32, refund_resource: ResourceId, refund_qty: u8) -> Self {
         Self {
             packed_form: None,
             refund_pct: refund_pct.clamp(0.0, 1.0),

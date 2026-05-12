@@ -10,16 +10,16 @@ pub enum TileKind {
     /// Hot/dry sandy surface. Reuses the slot freed by removing Farmland.
     Sand = 4,
     Road = 5,
-    Air = 6,  // open space — above ground or underground cavity
-    Wall = 7, // solid rock/earth — blocks movement and LOS
-    Ramp = 8, // slope — passable, allows ±1 Z movement
-    Dirt = 9, // underground floor (carved cave ceiling/floor)
-    Ore = 10, // ore-bearing rock; specific ore is in TileData.ore (OreKind)
+    Air = 6,    // open space — above ground or underground cavity
+    Wall = 7,   // solid rock/earth — blocks movement and LOS
+    Ramp = 8,   // slope — passable, allows ±1 Z movement
+    Dirt = 9,   // underground floor (carved cave ceiling/floor)
+    Ore = 10,   // ore-bearing rock; specific ore is in TileData.ore (OreKind)
     River = 11, // freshwater channel (sibling of Water; impassable, but distinguishable)
     // ── New surface variants ──
-    Snow = 12,   // tundra/cold surface
-    Marsh = 13,  // wetland surface (passable, slow)
-    Scrub = 14,  // dry sparse-vegetation (steppe / badlands / arid grassland)
+    Snow = 12,  // tundra/cold surface
+    Marsh = 13, // wetland surface (passable, slow)
+    Scrub = 14, // dry sparse-vegetation (steppe / badlands / arid grassland)
     // ── Stone lithologies (`is_stone_like`) ──
     Granite = 15,   // hard, slow to mine; cold/mountain biomes
     Limestone = 16, // soft sedimentary; warm lowlands; higher mining yield
@@ -92,11 +92,7 @@ impl TileKind {
     pub fn is_soil_like(self) -> bool {
         matches!(
             self,
-            TileKind::Dirt
-                | TileKind::Loam
-                | TileKind::Silt
-                | TileKind::Clay
-                | TileKind::SandySoil
+            TileKind::Dirt | TileKind::Loam | TileKind::Silt | TileKind::Clay | TileKind::SandySoil
         )
     }
 

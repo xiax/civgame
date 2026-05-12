@@ -2,13 +2,21 @@ use crate::economy::agent::EconomicAgent;
 use crate::economy::core_ids;
 use crate::economy::item::Item;
 use crate::economy::resource_catalog::ResourceId;
+use crate::pathfinding::chunk_graph::ChunkGraph;
+use crate::pathfinding::chunk_router::ChunkRouter;
+use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::carry::Carrier;
 use crate::simulation::carve::carve_tile;
 use crate::simulation::construction::WallMap;
+use crate::simulation::faction::StorageTileMap;
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::gather_claims::{release_gather_claim, GatherClaims};
 use crate::simulation::goals::AgentGoal;
+use crate::simulation::htn::{
+    record_routing_failure, record_target_failure, MethodHistory, MethodOutcome,
+};
 use crate::simulation::items::GroundItem;
+use crate::simulation::knowledge::DiscoveryActionEvent;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::MemoryKind;
 use crate::simulation::person::{AiState, PersonAI};
@@ -17,23 +25,15 @@ use crate::simulation::plants::{
 };
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
-use crate::simulation::faction::StorageTileMap;
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
-use crate::simulation::typed_task::{ActionQueue, Task};
-use crate::pathfinding::chunk_graph::ChunkGraph;
-use crate::pathfinding::chunk_router::ChunkRouter;
-use crate::pathfinding::connectivity::ChunkConnectivity;
-use bevy::ecs::system::SystemParam;
-use crate::simulation::knowledge::DiscoveryActionEvent;
-use crate::simulation::htn::{
-    record_routing_failure, record_target_failure, MethodHistory, MethodOutcome,
-};
 use crate::simulation::technology::ActivityKind;
+use crate::simulation::typed_task::{ActionQueue, Task};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::chunk_streaming::TileChangedEvent;
 use crate::world::globe::Globe;
 use crate::world::terrain::{tile_to_world, world_to_tile, WorldGen};
 use crate::world::tile::TileKind;
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 // ── Stone / ore tile harvest profile ──────────────────────────────────────────
@@ -267,8 +267,7 @@ fn finish_gather(
                 aq.cancel();
                 return;
             };
-            let Some(storage_tile) =
-                routing.storage_tile_map.nearest_for_faction(fid, cur_tile)
+            let Some(storage_tile) = routing.storage_tile_map.nearest_for_faction(fid, cur_tile)
             else {
                 // No storage tiles for this faction — drop the chain, hands
                 // stay full. They'll be eligible to gather again next tick
@@ -506,15 +505,10 @@ pub fn gather_system(
                                 &routing.chunk_connectivity,
                             );
                             if dispatched {
-                                routing
-                                    .gather_claims
-                                    .release(claim_tile, claim_kind, actor);
-                                let expires =
-                                    crate::simulation::gather_claims::suggested_expiry(
-                                        clock.tick,
-                                        cur_tile,
-                                        new_tile,
-                                    );
+                                routing.gather_claims.release(claim_tile, claim_kind, actor);
+                                let expires = crate::simulation::gather_claims::suggested_expiry(
+                                    clock.tick, cur_tile, new_tile,
+                                );
                                 routing
                                     .gather_claims
                                     .add(new_tile, claim_kind, actor, expires);
