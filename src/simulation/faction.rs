@@ -950,10 +950,11 @@ pub fn household_contract_posting_system(world: &mut World) {
             let Some(head) = data.household_head else {
                 continue;
             };
-            // Read the village's tech awareness (tech_gate is keyed on
-            // chief-awareness — see `sync_faction_techs_from_chief_system`).
+            // Use community-adoption (not chief-Aware) so a village
+            // that only *heard* of weaving doesn't issue Cloth
+            // contracts the chief can't actually fulfil.
             let village_techs = match registry.factions.get(&parent) {
-                Some(v) => v.techs.clone(),
+                Some(v) => crate::simulation::technology_adoption::community_adoption_bitset(v),
                 None => continue,
             };
             // Pick the recipe driven by the head's Maslow tier. Read
@@ -1804,6 +1805,25 @@ pub struct FactionData {
     pub raid_target: Option<u32>,
     pub under_raid: bool,
     pub techs: FactionTechs,
+    /// Community adoption stage per tech, derived every
+    /// `ADOPTION_DERIVE_CADENCE` ticks by
+    /// `technology_adoption::derive_tech_adoption_system` from
+    /// member-knowledge aggregates + workshop ownership + recent use.
+    /// `community_has_adopted(faction, tech)` reads this directly; civic
+    /// gates that previously consulted `techs` should switch over.
+    pub tech_adoption: [crate::simulation::technology_adoption::AdoptionStage;
+        crate::simulation::technology::TECH_COUNT],
+    /// Tick at which each tech's `tech_adoption[i]` last *changed* (in
+    /// either direction). Drives the "Adopted ≥ 1 game-year" boost into
+    /// `Institutionalized` and the Phase 4 decay cooldown.
+    pub stage_changed_at_tick: [u32; crate::simulation::technology::TECH_COUNT],
+    /// Sparse ring buffer of recent successful uses per tech. Populated
+    /// by craft / hunt / build executors; consumed by `derive_stage` for
+    /// the "≥N successful uses in last K days" Adopted threshold.
+    pub recent_tech_use: ahash::AHashMap<
+        crate::simulation::technology::TechId,
+        crate::simulation::technology_adoption::RecentTechUse,
+    >,
     pub activity_log: ActivityLog,
     /// Phase 2d: keyed on `ResourceId` so consumers (recipe pipelines,
     /// HTN methods) can look up by catalog id without reverse-resolving
@@ -1969,6 +1989,20 @@ pub struct FactionData {
 }
 
 impl FactionData {
+    /// Has the community *adopted* `tech` — i.e. `tech_adoption[tech] >=
+    /// Adopted`? Use this for civic / tier / material gates. Chief-Aware
+    /// for planning lives on `self.techs.has(tech)`; per-person execution
+    /// lives on `PersonKnowledge::has_learned`.
+    #[inline]
+    pub fn community_has(&self, tech: crate::simulation::technology::TechId) -> bool {
+        let idx = tech as usize;
+        if idx >= crate::simulation::technology::TECH_COUNT {
+            return false;
+        }
+        (self.tech_adoption[idx] as u8)
+            >= (crate::simulation::technology_adoption::AdoptionStage::Adopted as u8)
+    }
+
     /// Look up the policy for `resource_id`, falling back to the
     /// all-communist default for unmapped resources. Hot-path call
     /// site; never allocates.
@@ -2018,6 +2052,10 @@ impl FactionRegistry {
                 raid_target: None,
                 under_raid: false,
                 techs,
+                tech_adoption: [crate::simulation::technology_adoption::AdoptionStage::Unknown;
+                    crate::simulation::technology::TECH_COUNT],
+                stage_changed_at_tick: [0; crate::simulation::technology::TECH_COUNT],
+                recent_tech_use: ahash::AHashMap::default(),
                 activity_log: ActivityLog::default(),
                 resource_supply: ahash::AHashMap::default(),
                 resource_demand: ahash::AHashMap::default(),

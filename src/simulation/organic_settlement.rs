@@ -750,7 +750,7 @@ fn organic_seed(settlement: &Settlement, faction: &FactionData) -> u64 {
 
 fn phase_for(faction: &FactionData, peak_population: u32) -> SettlementPhase {
     let era = current_era(&faction.techs);
-    if !faction.techs.has(PERM_SETTLEMENT) {
+    if !faction.community_has(PERM_SETTLEMENT) {
         SettlementPhase::Camp
     } else if peak_population < 12 {
         SettlementPhase::Hamlet
@@ -1037,7 +1037,7 @@ fn build_districts(
 }
 
 fn build_road_network(faction: &FactionData, brain: &SettlementBrain) -> Vec<StreetSegment> {
-    if !faction.techs.has(PERM_SETTLEMENT) {
+    if !faction.community_has(PERM_SETTLEMENT) {
         return Vec::new();
     }
 
@@ -1194,7 +1194,7 @@ fn build_frontier(
 ) -> Vec<(i32, i32)> {
     let home = faction.home_tile;
     let radius = survey_radius(brain.phase);
-    let road_centred = faction.techs.has(PERM_SETTLEMENT) && !brain.road_tiles.is_empty();
+    let road_centred = faction.community_has(PERM_SETTLEMENT) && !brain.road_tiles.is_empty();
     let mut scored: Vec<(f32, i32, i32)> = Vec::new();
     for y in home.1 - radius..=home.1 + radius {
         for x in home.0 - radius..=home.0 + radius {
@@ -1245,7 +1245,7 @@ fn build_parcels(
     let mut occupied: Vec<TileRect> = Vec::new();
     let mut counts: AHashMap<DistrictKind, usize> = AHashMap::default();
     let targets = parcel_targets(faction, settlement, brain.phase);
-    let road_centred = faction.techs.has(PERM_SETTLEMENT) && !brain.road_tiles.is_empty();
+    let road_centred = faction.community_has(PERM_SETTLEMENT) && !brain.road_tiles.is_empty();
     let mut next_id = 0u32;
     for &tile in &brain.frontier {
         if parcels.len() >= MAX_PARCELS {
@@ -1351,7 +1351,7 @@ fn append_pressures_for_faction(
         }
     }
 
-    if faction.techs.has(FLINT_KNAPPING)
+    if faction.community_has(FLINT_KNAPPING)
         && count_near(&maps.workbench_map.0, home, 28)
             + pending_of(BuildSiteKind::Workbench) as usize
             == 0
@@ -1367,7 +1367,7 @@ fn append_pressures_for_faction(
         });
     }
 
-    if faction.techs.has(GRANARY)
+    if faction.community_has(GRANARY)
         && civic_milestone_allows(CivicKind::Granary, era, settlement.peak_population)
         && count_near(&maps.granary_map.0, home, 30) + pending_of(BuildSiteKind::Granary) as usize
             == 0
@@ -1382,7 +1382,7 @@ fn append_pressures_for_faction(
         });
     }
 
-    if faction.techs.has(SACRED_RITUAL)
+    if faction.community_has(SACRED_RITUAL)
         && civic_milestone_allows(CivicKind::Shrine, era, settlement.peak_population)
         && count_near(&maps.shrine_map.0, home, 32) + pending_of(BuildSiteKind::Shrine) as usize
             == 0
@@ -1397,7 +1397,7 @@ fn append_pressures_for_faction(
         });
     }
 
-    if faction.techs.has(LONG_DIST_TRADE)
+    if faction.community_has(LONG_DIST_TRADE)
         && civic_milestone_allows(CivicKind::Market, era, settlement.peak_population)
     {
         let target = if faction.culture.mercantile > 180 {
@@ -1445,7 +1445,7 @@ fn append_pressures_for_faction(
         }
     }
 
-    if faction.techs.has(PROFESSIONAL_ARMY)
+    if faction.community_has(PROFESSIONAL_ARMY)
         && civic_milestone_allows(CivicKind::Barracks, era, settlement.peak_population)
         && count_near(&maps.barracks_map.0, home, 32) + pending_of(BuildSiteKind::Barracks) as usize
             == 0
@@ -1460,7 +1460,7 @@ fn append_pressures_for_faction(
         });
     }
 
-    if faction.techs.has(MONUMENTAL_BUILDING)
+    if faction.community_has(MONUMENTAL_BUILDING)
         && civic_milestone_allows(CivicKind::Monument, era, settlement.peak_population)
         && count_near(&maps.monument_map.0, home, 36) + pending_of(BuildSiteKind::Monument) as usize
             == 0
@@ -1475,7 +1475,7 @@ fn append_pressures_for_faction(
         });
     }
 
-    if faction.techs.has(CITY_STATE_ORG)
+    if faction.community_has(CITY_STATE_ORG)
         && count_near(&maps.table_map.0, home, 20) + pending_of(BuildSiteKind::Table) as usize == 0
         && settlement.peak_population >= 16
     {
@@ -1501,11 +1501,13 @@ fn pressure_to_intent(
     archetypes: &BuildingArchetypeCatalog,
     occupied: &mut AHashSet<(i32, i32)>,
 ) -> Option<ConstructionIntent> {
-    let era = current_era(&faction.techs);
-    let wall_mat = best_wall_material(&faction.techs);
+    let community_techs =
+        crate::simulation::technology_adoption::community_adoption_bitset(faction);
+    let era = current_era(&community_techs);
+    let wall_mat = best_wall_material(&community_techs);
     let build_kind = match pressure.kind {
         SettlementPressureKind::Hearth => OrganicBuildKind::Single(BuildSiteKind::Campfire),
-        SettlementPressureKind::Shelter if !faction.techs.has(PERM_SETTLEMENT) => {
+        SettlementPressureKind::Shelter if !community_techs.has(PERM_SETTLEMENT) => {
             OrganicBuildKind::Single(BuildSiteKind::Bed)
         }
         SettlementPressureKind::Shelter => {
@@ -1562,7 +1564,7 @@ fn shelter_kind(
             rotation: Rotation::R0,
             wall_material: wall_mat,
         }
-    } else if faction.techs.has(CITY_STATE_ORG)
+    } else if faction.community_has(CITY_STATE_ORG)
         || (matches!(era, Era::Chalcolithic | Era::BronzeAge) && bed_deficit >= 2)
     {
         OrganicBuildKind::Longhouse(wall_mat)
@@ -1584,7 +1586,7 @@ fn choose_site_for_intent(
 ) -> Option<(i32, i32)> {
     let mut candidates: Vec<(f32, (i32, i32))> = Vec::new();
     let road_frontage_required =
-        faction.techs.has(PERM_SETTLEMENT) && build_kind_requires_frontage(build_kind);
+        faction.community_has(PERM_SETTLEMENT) && build_kind_requires_frontage(build_kind);
     for parcel in &brain.parcels {
         let tile = parcel.centre();
         if occupied.contains(&tile) {
@@ -1902,20 +1904,21 @@ fn required_goods(
 }
 
 fn intent_tech_allowed(build_kind: OrganicBuildKind, faction: &FactionData) -> bool {
+    let techs = crate::simulation::technology_adoption::community_adoption_bitset(faction);
     match build_kind {
-        OrganicBuildKind::Single(kind) => faction_can_build(kind, &faction.techs),
+        OrganicBuildKind::Single(kind) => faction_can_build(kind, &techs),
         OrganicBuildKind::Hut(mat) | OrganicBuildKind::Longhouse(mat) => {
-            faction_can_build(BuildSiteKind::Wall(mat), &faction.techs)
-                && faction_can_build(BuildSiteKind::Door, &faction.techs)
-                && faction_can_build(BuildSiteKind::Bed, &faction.techs)
+            faction_can_build(BuildSiteKind::Wall(mat), &techs)
+                && faction_can_build(BuildSiteKind::Door, &techs)
+                && faction_can_build(BuildSiteKind::Bed, &techs)
         }
         OrganicBuildKind::PalisadeSegment(mat) => {
-            faction_can_build(BuildSiteKind::Wall(mat), &faction.techs)
+            faction_can_build(BuildSiteKind::Wall(mat), &techs)
         }
         OrganicBuildKind::CompositeHouse { wall_material, .. } => {
-            faction_can_build(BuildSiteKind::Wall(wall_material), &faction.techs)
-                && faction_can_build(BuildSiteKind::Door, &faction.techs)
-                && faction_can_build(BuildSiteKind::Bed, &faction.techs)
+            faction_can_build(BuildSiteKind::Wall(wall_material), &techs)
+                && faction_can_build(BuildSiteKind::Door, &techs)
+                && faction_can_build(BuildSiteKind::Bed, &techs)
         }
     }
 }
@@ -2071,19 +2074,19 @@ fn parcel_targets(
     targets.insert(DistrictKind::Civic, 1);
     targets.insert(DistrictKind::Residential, ((members + 3) / 4).clamp(2, 24));
 
-    if faction.techs.has(CROP_CULTIVATION) {
+    if faction.community_has(CROP_CULTIVATION) {
         targets.insert(DistrictKind::Agricultural, ((members + 2) / 3).clamp(2, 24));
     }
-    if faction.techs.has(FLINT_KNAPPING) {
+    if faction.community_has(FLINT_KNAPPING) {
         targets.insert(DistrictKind::Crafting, 2);
     }
-    if faction.techs.has(PERM_SETTLEMENT) || faction.techs.has(GRANARY) {
+    if faction.community_has(PERM_SETTLEMENT) || faction.community_has(GRANARY) {
         targets.insert(DistrictKind::Storage, 2);
     }
-    if faction.techs.has(SACRED_RITUAL) {
+    if faction.community_has(SACRED_RITUAL) {
         targets.insert(DistrictKind::Sacred, 2);
     }
-    if faction.techs.has(LONG_DIST_TRADE) {
+    if faction.community_has(LONG_DIST_TRADE) {
         let market_target = if faction.culture.mercantile > 180 {
             2
         } else {
@@ -2431,7 +2434,7 @@ fn zone_capacity(kind: ZoneKind, members: u32) -> u8 {
 }
 
 fn organic_street_spine(faction: &FactionData, brain: &SettlementBrain) -> StreetSpine {
-    if !faction.techs.has(PERM_SETTLEMENT) || brain.road_segments.is_empty() {
+    if !faction.community_has(PERM_SETTLEMENT) || brain.road_segments.is_empty() {
         return StreetSpine::None;
     }
     StreetSpine::Spokes {
@@ -2491,11 +2494,20 @@ mod tests {
         faction
     }
 
+    /// Force-adopt a tech on a test faction: flips chief-Aware *and*
+    /// community-Adopted so civic gates that now read the adoption layer
+    /// (not chief-Aware) fire as the test expects.
+    fn force_adopt(faction: &mut FactionData, tech: crate::simulation::technology::TechId) {
+        faction.techs.unlock(tech);
+        faction.tech_adoption[tech as usize] =
+            crate::simulation::technology_adoption::AdoptionStage::Adopted;
+    }
+
     #[test]
     fn phase_tracks_population_and_permanent_settlement() {
         let mut faction = dummy_faction((0, 0), 20);
         assert_eq!(phase_for(&faction, 20), SettlementPhase::Camp);
-        faction.techs.unlock(PERM_SETTLEMENT);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
         assert_eq!(phase_for(&faction, 8), SettlementPhase::Hamlet);
         assert_eq!(phase_for(&faction, 20), SettlementPhase::Village);
     }
@@ -2541,7 +2553,7 @@ mod tests {
     #[test]
     fn permanent_hamlet_gets_road_skeleton_before_lots() {
         let mut faction = dummy_faction((0, 0), 8);
-        faction.techs.unlock(PERM_SETTLEMENT);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
         let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
         brain.phase = SettlementPhase::Hamlet;
 

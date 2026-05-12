@@ -31,6 +31,27 @@ pub enum ActivityEntryKind {
         tech_name: &'static str,
         era_name: &'static str,
     },
+    /// Per-action discovery roll succeeded; the actor just became Aware of
+    /// `tech_name` and got a `study_progress` jump-start. Distinct from
+    /// `TechDiscovered`, which fires only when the tech is actually Learned
+    /// (via study/teaching).
+    TechInsight {
+        tech_name: &'static str,
+        era_name: &'static str,
+    },
+    /// Faction-level event: a tech crossed into community `Adopted` stage
+    /// (Phase 5 of the tech-adoption refactor). `actor` may be a chief or
+    /// other representative member.
+    TechAdopted {
+        tech_name: &'static str,
+        era_name: &'static str,
+    },
+    /// Faction-level event: a tech crossed into `Institutionalized` stage —
+    /// survives chief death because preservation conditions are met.
+    TechInstitutionalized {
+        tech_name: &'static str,
+        era_name: &'static str,
+    },
     RegionSettled {
         megachunk: (i32, i32),
         region_name: String,
@@ -140,7 +161,31 @@ pub fn activity_log_ingest_system(
                 tech_name,
                 era_name,
             } => (
-                "discovered",
+                "learned",
+                format!("{} ({})", tech_name, era_name),
+                ResultLink::NoTarget,
+            ),
+            &ActivityEntryKind::TechInsight {
+                tech_name,
+                era_name,
+            } => (
+                "had an insight about",
+                format!("{} ({})", tech_name, era_name),
+                ResultLink::NoTarget,
+            ),
+            &ActivityEntryKind::TechAdopted {
+                tech_name,
+                era_name,
+            } => (
+                "adopted",
+                format!("{} ({})", tech_name, era_name),
+                ResultLink::NoTarget,
+            ),
+            &ActivityEntryKind::TechInstitutionalized {
+                tech_name,
+                era_name,
+            } => (
+                "institutionalized",
                 format!("{} ({})", tech_name, era_name),
                 ResultLink::NoTarget,
             ),

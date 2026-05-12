@@ -4,6 +4,7 @@ use bevy_egui::{egui, EguiContexts};
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
 use crate::simulation::knowledge::PersonKnowledge;
 use crate::simulation::technology::{complexity, ActivityKind, Era, TechId, TECH_COUNT, TECH_TREE};
+use crate::simulation::technology_adoption::AdoptionStage;
 
 #[derive(Resource, Default)]
 pub struct TechPanelOpen(pub bool);
@@ -74,15 +75,14 @@ pub fn tech_panel_system(
                 return;
             }
             ui.label(
-                egui::RichText::new("State reflects the chief's awareness.")
+                egui::RichText::new("Icon shows community adoption · hover for details.")
                     .small()
                     .color(egui::Color32::from_gray(160)),
             );
             ui.separator();
-            // Use the cached faction-tech projection of chief awareness as the
-            // primary display state. Hover dives into chief Learned vs Aware
-            // and member distribution.
-            let techs = &faction_data.unwrap().techs;
+            let faction = faction_data.unwrap();
+            let techs = &faction.techs;
+            let adoption = &faction.tech_adoption;
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for era in [
@@ -106,17 +106,34 @@ pub fn tech_panel_system(
                             let chief_learned = chief_knowledge
                                 .map(|k| k.has_learned(tech.id))
                                 .unwrap_or(false);
+                            let stage = adoption[tech.id as usize];
 
-                            // ✓ green = chief Learned, ◉ teal = chief Aware
-                            // only, ◎ yellow = discoverable, ○ gray = locked.
-                            let (icon, name_color) = if chief_learned {
-                                ("✓", egui::Color32::from_rgb(80, 210, 100))
-                            } else if unlocked {
-                                ("◉", egui::Color32::from_rgb(120, 200, 200))
-                            } else if prereqs_met {
-                                ("◎", egui::Color32::from_rgb(240, 200, 60))
-                            } else {
-                                ("○", egui::Color32::from_gray(100))
+                            // Adoption-stage colours dominate. Within an
+                            // unadopted tech, chief-Aware/discoverable still
+                            // hints at progression.
+                            let (icon, name_color) = match stage {
+                                AdoptionStage::Institutionalized => {
+                                    ("◆", egui::Color32::from_rgb(80, 230, 130))
+                                }
+                                AdoptionStage::Adopted => {
+                                    ("✓", egui::Color32::from_rgb(120, 220, 120))
+                                }
+                                AdoptionStage::Practiced => {
+                                    ("●", egui::Color32::from_rgb(180, 220, 120))
+                                }
+                                AdoptionStage::Demonstrated => {
+                                    ("◐", egui::Color32::from_rgb(220, 200, 120))
+                                }
+                                AdoptionStage::Rumored => {
+                                    ("◉", egui::Color32::from_rgb(180, 200, 220))
+                                }
+                                AdoptionStage::Unknown => {
+                                    if prereqs_met {
+                                        ("◎", egui::Color32::from_rgb(240, 200, 60))
+                                    } else {
+                                        ("○", egui::Color32::from_gray(100))
+                                    }
+                                }
                             };
 
                             let row = ui.horizontal(|ui| {
@@ -134,14 +151,15 @@ pub fn tech_panel_system(
                             hover_response.on_hover_ui(|ui| {
                                 ui.set_max_width(280.0);
 
-                                let status = if chief_learned {
-                                    ("Chief Learned", egui::Color32::from_rgb(80, 210, 100))
+                                let status = (stage.name(), name_color);
+                                let chief_label = if chief_learned {
+                                    Some(("Chief Learned", egui::Color32::from_rgb(80, 210, 100)))
                                 } else if unlocked {
-                                    ("Chief Aware", egui::Color32::from_rgb(120, 200, 200))
+                                    Some(("Chief Aware", egui::Color32::from_rgb(120, 200, 200)))
                                 } else if prereqs_met {
-                                    ("Discoverable", egui::Color32::from_rgb(240, 200, 60))
+                                    Some(("Discoverable", egui::Color32::from_rgb(240, 200, 60)))
                                 } else {
-                                    ("Locked", egui::Color32::from_gray(150))
+                                    None
                                 };
                                 ui.horizontal(|ui| {
                                     ui.label(
@@ -154,6 +172,11 @@ pub fn tech_panel_system(
                                         egui::RichText::new(status.0).size(12.0).color(status.1),
                                     );
                                 });
+                                if let Some((label, colour)) = chief_label {
+                                    ui.label(
+                                        egui::RichText::new(label).size(11.0).color(colour),
+                                    );
+                                }
 
                                 ui.separator();
                                 ui.label(

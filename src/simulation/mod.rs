@@ -56,6 +56,7 @@ pub mod stats;
 pub mod tasks;
 pub mod teaching;
 pub mod technology;
+pub mod technology_adoption;
 pub mod terraform;
 #[cfg(test)]
 pub mod test_fixture;
@@ -774,6 +775,12 @@ impl Plugin for SimulationPlugin {
                     // nomads' food-cluster knowledge can pick up the herd's
                     // new leader_tile via vision_system on subsequent ticks.
                     wild_herd::wild_herd_migration_system,
+                    // Community-level tech adoption derivation. Runs every
+                    // `ADOPTION_DERIVE_CADENCE = 900` ticks (4× per game-day)
+                    // after the chief-aware sync so this tick's chief flips
+                    // propagate into adoption gates on the same pass.
+                    technology_adoption::derive_tech_adoption_system
+                        .after(faction::sync_faction_techs_from_chief_system),
                 )
                     .in_set(SimulationSet::Economy),
             )

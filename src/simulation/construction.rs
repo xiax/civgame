@@ -2344,7 +2344,15 @@ fn generate_candidates(
     let mut out: Vec<BuildCandidate> = Vec::with_capacity(8);
     let home = faction.home_tile;
     let members = faction.member_count;
-    let techs = &faction.techs;
+    // `faction.techs` is the chief-Aware projection. All civic / tier /
+    // material gates inside this function query the *community-adoption*
+    // bitset instead so a chief who's only *heard* of bronze can't unlock
+    // bronze beds for everyone. The local `techs` binding is the
+    // adoption snapshot — every `techs.has(X)` below means "X is at
+    // adoption stage ≥ Adopted across the village."
+    let community_techs =
+        crate::simulation::technology_adoption::community_adoption_bitset(faction);
+    let techs = &community_techs;
     let culture = &faction.culture;
     let wall_mat = best_wall_material(techs);
 
@@ -3608,10 +3616,13 @@ pub fn building_upgrade_system(
         .iter()
         .filter(|(&id, _)| id != SOLO)
         .map(|(&id, f)| {
+            // Target material is a *community-adoption* gate — mirrors
+            // `chief_directive_system`. A chief who only heard of bronze
+            // doesn't trigger village-wide wall upgrades.
             (
                 id,
                 f.home_tile,
-                f.techs.clone(),
+                crate::simulation::technology_adoption::community_adoption_bitset(f),
                 f.active_upgrade.is_some(),
                 f.under_raid,
                 f.storage.totals.clone(),

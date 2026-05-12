@@ -482,6 +482,22 @@ pub fn spawn_population(
             let Some((tx, ty)) = find_tile(&mut rng, home_tx, home_ty) else {
                 continue;
             };
+            // Founder role assignment for realistic seeding:
+            //   - the first spawned member becomes the chief.
+            //   - every ~8th member is a Specialist (one workshop hand
+            //     per "family"). Index 1 is included so even small bands
+            //     get at least one specialist beyond the chief.
+            //   - everyone else carries the band's common knowledge.
+            // `derive_tech_adoption_system` then promotes era-prior
+            // techs to Adopted on the next tick via the broad-learning
+            // / small-band shortcuts.
+            let role = if spawned_members.is_empty() {
+                crate::simulation::knowledge::FounderRole::Chief
+            } else if spawned_members.len() == 1 || spawned_members.len() % 8 == 0 {
+                crate::simulation::knowledge::FounderRole::Specialist
+            } else {
+                crate::simulation::knowledge::FounderRole::Common
+            };
 
             let world_pos = tile_to_world(tx, ty);
             let sex = BiologicalSex::random();
@@ -546,7 +562,11 @@ pub fn spawn_population(
                         crate::simulation::reproduction::CoSleepTracker::default(),
                         crate::simulation::reproduction::MaleConceptionCooldown::default(),
                         Indexed::new(IndexedKind::Person),
-                        PersonKnowledge::seeded_through_era(options.era, clock.tick as u32),
+                        PersonKnowledge::seeded_realistic_through_era(
+                            options.era,
+                            role,
+                            clock.tick as u32,
+                        ),
                         crate::simulation::typed_task::ActionQueue::idle(),
                     ),
                 ))

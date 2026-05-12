@@ -537,7 +537,13 @@ pub fn build_settlement_plan(faction_id: u32, faction: &FactionData, tick: u64) 
     let (hx, hy) = (faction.home_tile.0 as i32, faction.home_tile.1 as i32);
     let style = faction.culture.style;
     let members = faction.member_count.max(2);
-    let techs = &faction.techs;
+    // Civic / tier gates inside the planner answer "what does the
+    // community currently build?" — query the community-adoption layer,
+    // not chief-Aware. `faction.techs` (chief-Aware) is reserved for
+    // planning-authority checks (`can_direct_tech`) elsewhere.
+    let community_techs =
+        crate::simulation::technology_adoption::community_adoption_bitset(faction);
+    let techs = &community_techs;
 
     if !techs.has(PERM_SETTLEMENT) {
         return build_paleolithic_plan(faction_id, faction, tick);
@@ -854,7 +860,11 @@ fn jitter_zones(zones: &mut [Zone], seed: u64) {
 fn build_paleolithic_plan(faction_id: u32, faction: &FactionData, tick: u64) -> SettlementPlan {
     let (hx, hy) = (faction.home_tile.0 as i32, faction.home_tile.1 as i32);
     let members = faction.member_count.max(1);
-    let techs = &faction.techs;
+    // See `build_settlement_plan` — civic zone gates query community
+    // adoption, not chief-Aware.
+    let community_techs =
+        crate::simulation::technology_adoption::community_adoption_bitset(faction);
+    let techs = &community_techs;
 
     let hearths = paleolithic_hearth_positions(faction_id, faction.home_tile, members);
     let n_hearths = hearths.len() as u32;

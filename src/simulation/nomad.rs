@@ -573,13 +573,17 @@ pub fn nomad_migration_commit_system(world: &mut World) {
             .factions
             .iter()
             .filter_map(|(&fid, f)| {
-                f.pending_migration.map(|target| Pending {
-                    fid,
-                    old_home: f.home_tile,
-                    target,
-                    members: f.member_count,
-                    era: current_era(&f.techs),
-                    hearth_tier: best_hearth_for(&f.techs),
+                f.pending_migration.map(|target| {
+                    let adoption =
+                        crate::simulation::technology_adoption::community_adoption_bitset(f);
+                    Pending {
+                        fid,
+                        old_home: f.home_tile,
+                        target,
+                        members: f.member_count,
+                        era: current_era(&adoption),
+                        hearth_tier: best_hearth_for(&adoption),
+                    }
                 })
             })
             .collect()
@@ -1113,13 +1117,17 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
         pitches
             .iter()
             .filter_map(|p| {
-                registry.factions.get(&p.fid).map(|f| Resolved {
-                    fid: p.fid,
-                    old_home: f.home_tile,
-                    target: p.tile,
-                    members: f.member_count,
-                    era: current_era(&f.techs),
-                    hearth_tier: best_hearth_for(&f.techs),
+                registry.factions.get(&p.fid).map(|f| {
+                    let adoption =
+                        crate::simulation::technology_adoption::community_adoption_bitset(f);
+                    Resolved {
+                        fid: p.fid,
+                        old_home: f.home_tile,
+                        target: p.tile,
+                        members: f.member_count,
+                        era: current_era(&adoption),
+                        hearth_tier: best_hearth_for(&adoption),
+                    }
                 })
             })
             .collect()

@@ -32,6 +32,28 @@ pub const STUDY_TICKS_PER_COMPLEXITY: u32 = 3600;
 /// `aware`: bit set if the person has *heard of* a tech. Free, gossipable.
 /// `learned`: bit set if the person has mastered the tech. Costs complexity
 /// points (see `complexity()`); always a subset of `aware`.
+/// What role a founder fills at game-start. Drives
+/// [`PersonKnowledge::seeded_realistic_through_era`] — chiefs / scribes
+/// learn institutional techs, specialists learn the workshop techs, and
+/// the rest of the band has band-wide common knowledge only (everyone
+/// remains Aware of the full era, so awareness gossip + study can still
+/// spread mastery through normal play).
+#[derive(Clone, Copy, Debug)]
+pub enum FounderRole {
+    /// Default founder. Personal / Household / Subsistence techs Learned;
+    /// Specialist / Institutional techs Aware only.
+    Common,
+    /// One per `~members/8`. Adds Specialist + MilitaryTransport techs
+    /// to the Learned set.
+    Specialist,
+    /// The first member spawned per faction. Adds Specialist +
+    /// Institutional techs on top of the common pool.
+    Chief,
+    /// Reserved for future use (a literate scribe inside an Institutional
+    /// faction). Equivalent to `Chief` for Institutional gating today.
+    Scribe,
+}
+
 /// `learned_at`: last tick this tech was learned or refreshed (used or taught).
 #[derive(Component, Clone, Debug)]
 pub struct PersonKnowledge {
@@ -63,14 +85,65 @@ impl PersonKnowledge {
     }
 
     /// Seed a brand-new agent with every tech whose era is at or below
-    /// `target` set both Aware and Learned. Used by `spawn_population` to
-    /// honour the player's chosen starting era.
+    /// `target` set both Aware and Learned. Retained for tests and
+    /// fixtures that need an "everyone knows everything" baseline.
+    /// Production gameplay should use `seeded_realistic_through_era`,
+    /// which scopes Specialist + Institutional techs to a fraction of
+    /// founders so a band doesn't spawn with universal blacksmiths.
     pub fn seeded_through_era(target: super::technology::Era, now: u32) -> Self {
         let mut k = Self::default();
         let target_rank = target as u8;
         for def in TECH_TREE.iter() {
             if (def.era as u8) <= target_rank {
                 k.aware |= 1u64 << def.id;
+                k.learned |= 1u64 << def.id;
+                k.learned_at[def.id as usize] = now;
+            }
+        }
+        k
+    }
+
+    /// Realistic founder seeding scoped by `role`:
+    /// - `Personal` / `Household` / `Subsistence` techs land Aware+Learned
+    ///   on everyone (the band-wide common knowledge).
+    /// - `Specialist` techs land Aware on everyone, but Learned only on
+    ///   `FounderRole::Specialist` or `FounderRole::Chief`.
+    /// - `Institutional` techs land Aware on everyone, Learned only on
+    ///   `FounderRole::Chief` (or `FounderRole::Scribe`).
+    ///
+    /// Phase 1's `derive_tech_adoption_system` picks up the resulting
+    /// community state on the next tick: common techs hit `Adopted` via
+    /// broad-learning; specialist techs hit `Adopted` via the
+    /// small-band-with-practitioner shortcut; institutional techs hit
+    /// `Adopted` via the chief-learned + prereqs path.
+    pub fn seeded_realistic_through_era(
+        target: super::technology::Era,
+        role: FounderRole,
+        now: u32,
+    ) -> Self {
+        use super::technology_adoption::{tech_scale, AdoptionScale};
+        let mut k = Self::default();
+        let target_rank = target as u8;
+        for def in TECH_TREE.iter() {
+            if (def.era as u8) > target_rank {
+                continue;
+            }
+            k.aware |= 1u64 << def.id;
+            let should_learn = match (tech_scale(def.id), role) {
+                (
+                    AdoptionScale::Personal
+                    | AdoptionScale::Household
+                    | AdoptionScale::Subsistence,
+                    _,
+                ) => true,
+                (
+                    AdoptionScale::Specialist | AdoptionScale::MilitaryTransport,
+                    FounderRole::Chief | FounderRole::Specialist | FounderRole::Scribe,
+                ) => true,
+                (AdoptionScale::Institutional, FounderRole::Chief | FounderRole::Scribe) => true,
+                _ => false,
+            };
+            if should_learn {
                 k.learned |= 1u64 << def.id;
                 k.learned_at[def.id as usize] = now;
             }
@@ -220,8 +293,11 @@ pub fn activity_to_skill(activity: ActivityKind) -> SkillKind {
 
 /// Per-action discovery roll. For each tech whose triggers include `activity`
 /// and whose prerequisites the person has personally Learned, roll
-/// `base * (1 + int_mod) * (1 + skill_xp / 1000)`. On success, mark Learned.
-/// Returns the discovered tech id, if any.
+/// `base * (1 + int_mod) * (1 + skill_xp / 1000)`. On success, set Aware and
+/// jump-start `study_progress` by `complexity * INSIGHT_PROGRESS_PER_COMPLEXITY`
+/// (capped strictly below the learn threshold). Insight is one-shot per agent
+/// per tech — once Aware, further rolls on the same tech are skipped so
+/// repeated foraging doesn't re-fire the event.
 pub fn try_discover_from_action(
     knowledge: &mut PersonKnowledge,
     stats: &Stats,
@@ -229,6 +305,7 @@ pub fn try_discover_from_action(
     activity: ActivityKind,
     now: u32,
 ) -> Option<TechId> {
+    let _ = now;
     let int_mod = modifier(stats.intelligence) as f32;
     let int_scale = 1.0 + (int_mod * 0.1).max(-0.4);
     let skill = activity_to_skill(activity);
@@ -236,7 +313,7 @@ pub fn try_discover_from_action(
     let skill_scale = 1.0 + (skill_xp / 1000.0).min(2.0);
 
     for def in TECH_TREE.iter() {
-        if knowledge.has_learned(def.id) {
+        if knowledge.is_aware(def.id) {
             continue;
         }
         // Prerequisites: must have personally Learned every prereq (the
@@ -255,15 +332,24 @@ pub fn try_discover_from_action(
         }
         let chance = (trigger_chance * int_scale * skill_scale).min(0.5);
         if fastrand::f32() < chance {
-            // Discovery yields Learned directly; no cap.
-            match knowledge.try_learn(def.id, now) {
-                LearnOutcome::Learned => return Some(def.id),
-                _ => {}
-            }
+            knowledge.aware |= 1u64 << def.id;
+            let threshold = study_threshold(def.id);
+            let bump = complexity(def.id) as u32 * INSIGHT_PROGRESS_PER_COMPLEXITY;
+            let capped = bump.min(threshold.saturating_sub(1));
+            let entry = knowledge.study_progress.entry(def.id).or_insert(0);
+            *entry = (*entry).saturating_add(capped).min(threshold.saturating_sub(1));
+            return Some(def.id);
         }
     }
     None
 }
+
+/// Study-progress jump-start granted by a single discovery insight, per unit
+/// of tech complexity. `complexity × this` is capped strictly below
+/// `study_threshold(tech) = complexity × STUDY_TICKS_PER_COMPLEXITY (3600)`,
+/// so insight never auto-completes — the agent still needs Read/Lecture/Teach
+/// to push over the threshold.
+pub const INSIGHT_PROGRESS_PER_COMPLEXITY: u32 = 1200;
 
 /// Helper: capacity for a person from their stats.
 #[inline]
@@ -712,7 +798,6 @@ pub fn discovery_system(
             ev.activity,
             clock.tick as u32,
         ) {
-            // Emit a tech-discovery activity entry for the player faction.
             if let Some(fm) = fm {
                 if fm.faction_id == player.faction_id {
                     let def = tech_def(tech_id);
@@ -720,7 +805,7 @@ pub fn discovery_system(
                         tick: clock.tick,
                         actor: entity,
                         faction_id: fm.faction_id,
-                        kind: crate::ui::activity_log::ActivityEntryKind::TechDiscovered {
+                        kind: crate::ui::activity_log::ActivityEntryKind::TechInsight {
                             tech_name: def.name,
                             era_name: def.era.name(),
                         },

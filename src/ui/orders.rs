@@ -285,12 +285,19 @@ pub fn right_click_context_menu_system(
                     let mut actions = vec![MenuAction::Move];
                     let mut build_options: Vec<(MenuAction, bool)> = Vec::new();
 
+                    // Build-menu unlock check uses the *community-adoption*
+                    // bitset, mirroring `chief_directive_system`. A chief
+                    // who's merely Aware of bronze doesn't get bronze
+                    // walls in their build menu — the village must have
+                    // adopted the gating tech first.
                     let player_techs: FactionTechs = member_q
                         .faction_q
                         .get(sel_entity)
                         .ok()
                         .and_then(|m| faction_registry.factions.get(&m.faction_id))
-                        .map(|f| f.techs.clone())
+                        .map(|f| {
+                            crate::simulation::technology_adoption::community_adoption_bitset(f)
+                        })
                         .unwrap_or_default();
 
                     let pos_tile = (tx as i32, ty as i32);
