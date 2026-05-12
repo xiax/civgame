@@ -40,7 +40,7 @@ use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::AgentMemory;
 use crate::simulation::person::{
-    AiState, Drafted, PersonAI, PlayerOrder, Profession, TraderPhase, TraderPlan,
+    AiState, Drafted, PersonAI, Profession, TraderPhase, TraderPlan,
 };
 use crate::simulation::settlement::{Settlement, SettlementId, SettlementMap};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};

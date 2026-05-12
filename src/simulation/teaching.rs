@@ -29,7 +29,7 @@ use crate::economy::agent::EconomicAgent;
 use crate::simulation::faction::{FactionMember, PlayerFaction};
 use crate::simulation::knowledge::{study_threshold, PersonKnowledge, StudyOutcome};
 use crate::simulation::lod::LodLevel;
-use crate::simulation::person::{AiState, Drafted, PersonAI, PlayerOrder, PlayerOrderKind};
+use crate::simulation::person::{AiState, Drafted, PersonAI};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::stats::{modifier, Stats};
 use crate::simulation::tasks::TaskKind;
@@ -150,48 +150,6 @@ fn lecture_candidate_ok(
 }
 
 // ── Systems ─────────────────────────────────────────────────────────────────
-
-/// Consume `PlayerOrderKind::ReadItem` and `EncodeTablet` orders inserted by
-/// the inspector. Read orders enter `TaskKind::Read` with `tech_focus` set;
-/// EncodeTablet orders write `PlayerCraftRequest` for the tablet posting
-/// system to consume.
-pub fn apply_player_knowledge_orders_system(
-    mut commands: Commands,
-    mut player_craft: ResMut<crate::simulation::jobs::PlayerCraftRequest>,
-    mut q: Query<(
-        Entity,
-        &PlayerOrder,
-        &mut PersonAI,
-        &mut crate::simulation::typed_task::ActionQueue,
-    )>,
-) {
-    for (entity, order, mut ai, mut aq) in q.iter_mut() {
-        match order.order {
-            PlayerOrderKind::ReadItem(tech) => {
-                ai.task_id = TaskKind::Read as u16;
-                ai.state = AiState::Working;
-                ai.work_progress = 0;
-                aq.dispatch(crate::simulation::typed_task::Task::Read { tech });
-                if let Some(mut ec) = commands.get_entity(entity) {
-                    // Pin the agent in place so autonomous goal dispatch
-                    // doesn't re-assign them mid-read.
-                    ec.insert(Drafted);
-                    ec.remove::<PlayerOrder>();
-                }
-            }
-            PlayerOrderKind::EncodeTablet(tech) => {
-                if player_craft.0.is_none() {
-                    player_craft.0 = Some((
-                        crate::simulation::crafting::RECIPE_CLAY_TABLET,
-                        Some(tech),
-                    ));
-                }
-                commands.entity(entity).remove::<PlayerOrder>();
-            }
-            _ => {}
-        }
-    }
-}
 
 /// Solo reading: agent stands still, accumulating study progress against the
 /// tech encoded on a tablet/book in their inventory. Awareness is granted

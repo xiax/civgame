@@ -136,7 +136,6 @@ impl Plugin for SimulationPlugin {
             .insert_resource(land::LandListings::default())
             .insert_resource(military::ActiveRallyPoints::default())
             .insert_resource(corpse::CorpseMap::default())
-            .insert_resource(military::MusterHuntersRequest::default())
             .insert_resource(teaching::LectureRequest::default())
             .insert_resource(jobs::PlayerCraftRequest::default())
             .insert_resource(shared_knowledge::SharedKnowledge::default())
@@ -471,16 +470,9 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    teaching::apply_player_knowledge_orders_system
-                        .after(movement::movement_system),
-                    teaching::apply_teach_order_system
-                        .after(teaching::apply_player_knowledge_orders_system),
-                    tasks::apply_move_order_system
-                        .after(teaching::apply_teach_order_system),
-                    teaching::read_task_system
-                        .after(teaching::apply_player_knowledge_orders_system),
-                    teaching::teach_task_system
-                        .after(teaching::apply_teach_order_system),
+                    teaching::apply_teach_order_system.after(movement::movement_system),
+                    teaching::read_task_system.after(movement::movement_system),
+                    teaching::teach_task_system.after(teaching::apply_teach_order_system),
                     teaching::lecture_tick_system.after(movement::movement_system),
                 )
                     .in_set(SimulationSet::Sequential),
@@ -626,9 +618,7 @@ impl Plugin for SimulationPlugin {
                         .after(knowledge::discovery_system)
                         .after(knowledge::tech_teaching_system),
                     military::expire_rally_points_system,
-                    military::apply_muster_hunters_system,
-                    teaching::apply_lecture_request_system
-                        .after(military::apply_muster_hunters_system),
+                    teaching::apply_lecture_request_system,
                     faction::chief_hunt_order_system
                         .after(faction::compute_faction_storage_system),
                     faction::faction_hunter_assignment_system

@@ -16,9 +16,7 @@ use crate::simulation::corpse::Corpse;
 use crate::simulation::faction::SOLO;
 use crate::simulation::faction::{FactionMember, FactionRegistry, FactionTechs, PlayerFaction};
 use crate::simulation::items::{GroundItem, TargetItem};
-use crate::simulation::person::{
-    AiState, Drafted, Person, PersonAI, PlayerOrder, PlayerOrderKind, Profession,
-};
+use crate::simulation::person::{Drafted, Person, Profession};
 use crate::simulation::plants::PlantMap;
 use crate::simulation::tasks::{assign_task_with_routing, task_interacts_from_adjacent, TaskKind};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
@@ -29,6 +27,77 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts};
+
+/// UI-internal selection enum for the right-click menu. Captures which button
+/// the player clicked; the menu code attaches the right-click target tile/z
+/// from `ContextMenuState` and constructs the corresponding `PlayerCommand`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuAction {
+    Move,
+    Mine,
+    Gather,
+    PickUp,
+    Build(crate::simulation::construction::BuildSiteKind),
+    DigDown,
+    Deconstruct,
+    /// Pick up a specific `GroundItem` entity.
+    PickUpItem(Entity),
+    /// Attack a specific entity (usable by non-drafted workers).
+    AttackEntity(Entity),
+    /// Pick up a specific fresh `Corpse` entity.
+    PickUpCorpse(Entity),
+    /// 1-on-1 teaching: the selected agent walks to the target person.
+    Teach(Entity),
+    /// Player-directed lecture: the selected agent broadcasts to nearby adults.
+    HoldLecture(crate::simulation::technology::TechId),
+    /// Self-study from a tablet/book in the actor's inventory.
+    ReadItem(crate::simulation::technology::TechId),
+    /// Faction-level: craft a tablet encoding the given tech.
+    EncodeTablet(crate::simulation::technology::TechId),
+}
+
+impl MenuAction {
+    pub fn label(self) -> &'static str {
+        use crate::simulation::construction::{BuildSiteKind, WallMaterial};
+        match self {
+            MenuAction::Move => "Move here",
+            MenuAction::Mine => "Mine",
+            MenuAction::Gather => "Gather",
+            MenuAction::PickUp => "Pick up",
+            MenuAction::Build(kind) => match kind {
+                BuildSiteKind::Wall(WallMaterial::Palisade) => "Build Palisade",
+                BuildSiteKind::Wall(WallMaterial::WattleDaub) => "Build Wattle Wall",
+                BuildSiteKind::Wall(WallMaterial::Stone) => "Build Stone Wall",
+                BuildSiteKind::Wall(WallMaterial::Mudbrick) => "Build Mudbrick Wall",
+                BuildSiteKind::Wall(WallMaterial::CutStone) => "Build Cut Stone Wall",
+                BuildSiteKind::Door => "Build Door",
+                BuildSiteKind::Bed => "Build Bed",
+                BuildSiteKind::Bedroll => "Build Bedroll",
+                BuildSiteKind::Tent => "Build Tent",
+                BuildSiteKind::Yurt => "Build Yurt",
+                BuildSiteKind::Campfire => "Build Campfire",
+                BuildSiteKind::Workbench => "Build Workbench",
+                BuildSiteKind::Loom => "Build Loom",
+                BuildSiteKind::Table => "Build Table",
+                BuildSiteKind::Chair => "Build Chair",
+                BuildSiteKind::Granary => "Build Granary",
+                BuildSiteKind::Shrine => "Build Shrine",
+                BuildSiteKind::Market => "Build Market",
+                BuildSiteKind::Barracks => "Build Barracks",
+                BuildSiteKind::Monument => "Build Monument",
+            },
+            MenuAction::DigDown => "Dig Down",
+            MenuAction::Deconstruct => "Deconstruct",
+            MenuAction::PickUpItem(_) => "Pick up item",
+            MenuAction::AttackEntity(_) => "Attack",
+            MenuAction::PickUpCorpse(_) => "Pick up corpse",
+            MenuAction::Teach(_) => "Teach",
+            MenuAction::HoldLecture(_) => "Hold Lecture",
+            MenuAction::ReadItem(_) => "Read",
+            MenuAction::EncodeTablet(_) => "Encode Tablet",
+        }
+    }
+}
 
 /// An entity found on the right-clicked tile that is displayed in Section 2.
 struct TileEntityInfo {
@@ -54,10 +123,10 @@ pub struct ContextMenuState {
     /// Foot Z of the targeted tile at the moment of right-click.
     pub target_z: i8,
     /// Top-level tile actions shown directly (Move, Mine, Gather, …).
-    pub actions: Vec<PlayerOrderKind>,
+    pub actions: Vec<MenuAction>,
     /// Build options nested under the "Build ▸" submenu. `bool` is whether the
     /// player faction has the required tech — locked options render greyed-out.
-    pub build_options: Vec<(PlayerOrderKind, bool)>,
+    pub build_options: Vec<(MenuAction, bool)>,
     /// Non-item entities on the target tile (Section 2).
     pub tile_entities: Vec<TileEntityInfo>,
     /// Ground-item stacks on the target tile (Section 3).
@@ -207,8 +276,8 @@ pub fn right_click_context_menu_system(
                         chunk_map.tile_kind_at(tx, ty)
                     };
 
-                    let mut actions = vec![PlayerOrderKind::Move];
-                    let mut build_options: Vec<(PlayerOrderKind, bool)> = Vec::new();
+                    let mut actions = vec![MenuAction::Move];
+                    let mut build_options: Vec<(MenuAction, bool)> = Vec::new();
 
                     let player_techs: FactionTechs = member_q
                         .faction_q
@@ -234,23 +303,23 @@ pub fn right_click_context_menu_system(
 
                     if let Some(kind) = target_kind {
                         if matches!(kind, TileKind::Wall | TileKind::Stone) {
-                            actions.push(PlayerOrderKind::Mine);
+                            actions.push(MenuAction::Mine);
                         }
                         if kind.is_passable() && !underground {
-                            actions.push(PlayerOrderKind::DigDown);
+                            actions.push(MenuAction::DigDown);
                             if !already_built {
                                 for bk in all_build_options() {
                                     let unlocked = faction_can_build(bk, &player_techs);
-                                    build_options.push((PlayerOrderKind::Build(bk), unlocked));
+                                    build_options.push((MenuAction::Build(bk), unlocked));
                                 }
                             }
                         }
                     }
                     if !underground && already_built {
-                        actions.push(PlayerOrderKind::Deconstruct);
+                        actions.push(MenuAction::Deconstruct);
                     }
                     if !underground && plant_map.0.contains_key(&(tx, ty)) {
-                        actions.push(PlayerOrderKind::Gather);
+                        actions.push(MenuAction::Gather);
                     }
 
                     // Populate tile entities and items (Sections 2 & 3).
@@ -351,7 +420,7 @@ pub fn right_click_context_menu_system(
         .iter()
         .map(|i| (i.entity, i.item, i.qty))
         .collect();
-    let mut chosen: Option<PlayerOrderKind> = None;
+    let mut chosen: Option<MenuAction> = None;
 
     egui::Area::new("context_menu".into())
         .fixed_pos(menu_state.screen_pos)
@@ -367,7 +436,7 @@ pub fn right_click_context_menu_system(
                     ui.menu_button("Build \u{25B8}", |ui| {
                         for (opt, unlocked) in &build_options {
                             let label = match opt {
-                                PlayerOrderKind::Build(bk) => recipe_for(*bk).name,
+                                MenuAction::Build(bk) => recipe_for(*bk).name,
                                 _ => opt.label(),
                             };
                             let btn = egui::Button::new(label);
@@ -398,12 +467,12 @@ pub fn right_click_context_menu_system(
                             ui.label(&info_label);
                             if *hostility != Hostility::Friendly && health.is_some() {
                                 if ui.small_button("Attack").clicked() {
-                                    chosen = Some(PlayerOrderKind::AttackEntity(*entity));
+                                    chosen = Some(MenuAction::AttackEntity(*entity));
                                 }
                             }
                             if *is_corpse {
                                 if ui.small_button("Pick up corpse").clicked() {
-                                    chosen = Some(PlayerOrderKind::PickUpCorpse(*entity));
+                                    chosen = Some(MenuAction::PickUpCorpse(*entity));
                                 }
                             }
                             // Teach: friendly person target, distinct from
@@ -415,7 +484,7 @@ pub fn right_click_context_menu_system(
                                 && health.is_some()
                             {
                                 if ui.small_button("Teach").clicked() {
-                                    chosen = Some(PlayerOrderKind::Teach(*entity));
+                                    chosen = Some(MenuAction::Teach(*entity));
                                 }
                             }
                         });
@@ -433,7 +502,7 @@ pub fn right_click_context_menu_system(
                     for (entity, item, qty) in &tile_items {
                         let label = format!("Pick up: {qty}\u{00d7} {}", item.label());
                         if ui.button(&label).clicked() {
-                            chosen = Some(PlayerOrderKind::PickUpItem(*entity));
+                            chosen = Some(MenuAction::PickUpItem(*entity));
                         }
                     }
                 }
@@ -441,7 +510,7 @@ pub fn right_click_context_menu_system(
         });
 
     if let Some(action) = chosen {
-        if let Some(cmd) = player_order_to_command(action, target_tile, target_z) {
+        if let Some(cmd) = menu_action_to_command(action, target_tile, target_z) {
             cmd_events.send(crate::simulation::player_command::PlayerCommandEvent {
                 actors: vec![sel_entity],
                 command: cmd,
@@ -451,69 +520,69 @@ pub fn right_click_context_menu_system(
     }
 }
 
-/// Translate a UI `PlayerOrderKind` selection (plus the right-clicked target
+/// Translate a UI `MenuAction` selection (plus the right-clicked target
 /// tile / z) into the equivalent `PlayerCommand` event payload. Returning
 /// `None` means the UI still needs to take a legacy path (currently nothing —
 /// all UI paths now have a `PlayerCommand` equivalent).
-fn player_order_to_command(
-    action: PlayerOrderKind,
+fn menu_action_to_command(
+    action: MenuAction,
     target_tile: (i32, i32),
     target_z: i8,
 ) -> Option<crate::simulation::player_command::PlayerCommand> {
     use crate::simulation::player_command::PlayerCommand;
     Some(match action {
-        PlayerOrderKind::Move => PlayerCommand::Move {
+        MenuAction::Move => PlayerCommand::Move {
             tile: target_tile,
             z: target_z,
         },
-        PlayerOrderKind::Gather => PlayerCommand::Gather {
+        MenuAction::Gather => PlayerCommand::Gather {
             tile: target_tile,
             z: target_z,
         },
-        PlayerOrderKind::Mine => PlayerCommand::Mine {
+        MenuAction::Mine => PlayerCommand::Mine {
             tile: target_tile,
             z: target_z,
         },
-        PlayerOrderKind::Build(kind) => PlayerCommand::Build {
+        MenuAction::Build(kind) => PlayerCommand::Build {
             kind,
             tile: target_tile,
             z: target_z,
         },
-        PlayerOrderKind::Deconstruct => PlayerCommand::Deconstruct {
+        MenuAction::Deconstruct => PlayerCommand::Deconstruct {
             tile: target_tile,
             z: target_z,
         },
-        PlayerOrderKind::DigDown => PlayerCommand::DigDown {
+        MenuAction::DigDown => PlayerCommand::DigDown {
             tile: target_tile,
             z: target_z,
         },
-        PlayerOrderKind::PickUpItem(item) => PlayerCommand::PickUpItem {
+        MenuAction::PickUpItem(item) => PlayerCommand::PickUpItem {
             item,
             tile: target_tile,
             z: target_z,
         },
-        PlayerOrderKind::PickUpCorpse(corpse) => PlayerCommand::PickUpCorpse {
+        MenuAction::PickUpCorpse(corpse) => PlayerCommand::PickUpCorpse {
             corpse,
             tile: target_tile,
             z: target_z,
         },
-        PlayerOrderKind::AttackEntity(foe) => PlayerCommand::AttackEntity {
+        MenuAction::AttackEntity(foe) => PlayerCommand::AttackEntity {
             foe,
             tile: target_tile,
             z: target_z,
         },
-        PlayerOrderKind::Teach(student) => PlayerCommand::Teach {
+        MenuAction::Teach(student) => PlayerCommand::Teach {
             student,
             tile: target_tile,
             z: target_z,
         },
-        PlayerOrderKind::HoldLecture(tech) => PlayerCommand::HoldLecture { tech },
-        PlayerOrderKind::ReadItem(tech) => PlayerCommand::ReadItem { tech },
-        PlayerOrderKind::EncodeTablet(tech) => PlayerCommand::EncodeTablet { tech },
+        MenuAction::HoldLecture(tech) => PlayerCommand::HoldLecture { tech },
+        MenuAction::ReadItem(tech) => PlayerCommand::ReadItem { tech },
+        MenuAction::EncodeTablet(tech) => PlayerCommand::EncodeTablet { tech },
         // `PickUp` (generic pick-up) is the menu shortcut that doesn't pre-pick
         // an item entity; UI converts it to Gather/Scavenge based on what's on
         // the tile elsewhere. Treat as Gather here to keep the menu working.
-        PlayerOrderKind::PickUp => PlayerCommand::Gather {
+        MenuAction::PickUp => PlayerCommand::Gather {
             tile: target_tile,
             z: target_z,
         },
@@ -580,17 +649,6 @@ fn entity_display_name(
         .get(entity)
         .map(|n| n.as_str().to_owned())
         .unwrap_or_else(|_| "Unknown".to_owned())
-}
-
-pub fn player_order_completion_system(
-    mut commands: Commands,
-    query: Query<(Entity, &PersonAI), With<PlayerOrder>>,
-) {
-    for (entity, ai) in query.iter() {
-        if ai.state == AiState::Idle && ai.task_id == PersonAI::UNEMPLOYED {
-            commands.entity(entity).remove::<PlayerOrder>();
-        }
-    }
 }
 
 /// Persistent state for the small two-button popup shown when drafted units
@@ -672,111 +730,6 @@ pub struct ClassifyQueries<'w, 's> {
     pub drafted_q: Query<'w, 's, (), With<Drafted>>,
 }
 
-/// Issue a `MilitaryMove` to every drafted player-faction unit in
-/// `drafted_units`, registering the destination tile as a flow-field
-/// hotspot so units in the goal chunk skip per-agent A*.
-fn issue_group_move(
-    drafted_units: &[Entity],
-    target_tile: (i32, i32),
-    target_z: i8,
-    routing: &MilitaryRouting,
-    ai_q: &mut Query<
-        (
-            &mut PersonAI,
-            &mut crate::simulation::typed_task::ActionQueue,
-            &Transform,
-            &mut CombatTarget,
-        ),
-        With<Drafted>,
-    >,
-    hotspots: &mut HotspotFlowFields,
-) {
-    hotspots.register(
-        (target_tile.0, target_tile.1, target_z),
-        HotspotKind::RallyPoint,
-    );
-    for &e in drafted_units {
-        let Ok((mut ai, mut aq, transform, mut combat)) = ai_q.get_mut(e) else {
-            continue;
-        };
-        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
-        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-        let cur_chunk = ChunkCoord(
-            cur_tx.div_euclid(CHUNK_SIZE as i32),
-            cur_ty.div_euclid(CHUNK_SIZE as i32),
-        );
-        assign_task_with_routing(
-            &mut ai,
-            (cur_tx as i32, cur_ty as i32),
-            cur_chunk,
-            target_tile,
-            TaskKind::MilitaryMove,
-            None,
-            &routing.chunk_graph,
-            &routing.chunk_router,
-            &routing.chunk_map,
-            &routing.chunk_connectivity,
-        );
-        ai.target_z = target_z;
-        aq.dispatch(crate::simulation::typed_task::Task::WalkTo {
-            tile: target_tile,
-            z: target_z,
-            why: crate::simulation::typed_task::WalkReason::MilitaryMove,
-        });
-        combat.0 = None;
-    }
-}
-
-/// Issue a `MilitaryAttack` against `foe` to every drafted unit. Each unit
-/// routes toward the foe's current tile; the attack-task driver re-targets
-/// each tick as the foe moves.
-fn issue_group_attack(
-    drafted_units: &[Entity],
-    foe: Entity,
-    foe_tile: (i32, i32),
-    foe_z: i8,
-    routing: &MilitaryRouting,
-    ai_q: &mut Query<
-        (
-            &mut PersonAI,
-            &mut crate::simulation::typed_task::ActionQueue,
-            &Transform,
-            &mut CombatTarget,
-        ),
-        With<Drafted>,
-    >,
-    hotspots: &mut HotspotFlowFields,
-) {
-    hotspots.register((foe_tile.0, foe_tile.1, foe_z), HotspotKind::RallyPoint);
-    for &e in drafted_units {
-        if e == foe {
-            continue;
-        }
-        let Ok((mut ai, mut _aq, transform, mut combat)) = ai_q.get_mut(e) else {
-            continue;
-        };
-        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
-        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-        let cur_chunk = ChunkCoord(
-            cur_tx.div_euclid(CHUNK_SIZE as i32),
-            cur_ty.div_euclid(CHUNK_SIZE as i32),
-        );
-        assign_task_with_routing(
-            &mut ai,
-            (cur_tx as i32, cur_ty as i32),
-            cur_chunk,
-            foe_tile,
-            TaskKind::MilitaryAttack,
-            Some(foe),
-            &routing.chunk_graph,
-            &routing.chunk_router,
-            &routing.chunk_map,
-            &routing.chunk_connectivity,
-        );
-        combat.0 = None; // attack-task driver sets it on adjacency
-    }
-}
-
 pub fn military_right_click_system(
     mut contexts: EguiContexts,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
@@ -789,18 +742,8 @@ pub fn military_right_click_system(
     chunk_map: Res<ChunkMap>,
     camera_view_z: Res<CameraViewZ>,
     registry: Res<FactionRegistry>,
-    routing: MilitaryRouting,
-    mut ai_q: Query<
-        (
-            &mut PersonAI,
-            &mut crate::simulation::typed_task::ActionQueue,
-            &Transform,
-            &mut CombatTarget,
-        ),
-        With<Drafted>,
-    >,
-    mut hotspots: ResMut<HotspotFlowFields>,
     mut menu_state: ResMut<MilitaryMenuState>,
+    mut cmd_events: EventWriter<crate::simulation::player_command::PlayerCommandEvent>,
 ) {
     // Snapshot drafted player-faction members from the selection.
     let drafted_units: Vec<Entity> = selected_many
@@ -873,13 +816,11 @@ pub fn military_right_click_system(
         match target {
             None => {
                 // Empty tile → group move.
-                issue_group_move(
+                emit_military_move(
+                    &mut cmd_events,
                     &drafted_units,
                     target_tile_i32,
                     target_z,
-                    &routing,
-                    &mut ai_q,
-                    &mut hotspots,
                 );
                 menu_state.open = false;
             }
@@ -909,14 +850,12 @@ pub fn military_right_click_system(
                     }
                     Hostility::Hostile => {
                         if classify.health_q.get(foe).is_ok() {
-                            issue_group_attack(
+                            emit_military_attack(
+                                &mut cmd_events,
                                 &drafted_units,
                                 foe,
                                 foe_tile,
                                 target_z,
-                                &routing,
-                                &mut ai_q,
-                                &mut hotspots,
                             );
                         }
                         menu_state.open = false;
@@ -963,27 +902,52 @@ pub fn military_right_click_system(
     if chosen_attack {
         if let Some(foe) = menu_state.target_entity {
             if classify.health_q.get(foe).is_ok() {
-                issue_group_attack(
+                emit_military_attack(
+                    &mut cmd_events,
                     &drafted_units,
                     foe,
                     menu_state.target_tile,
                     menu_state.target_z,
-                    &routing,
-                    &mut ai_q,
-                    &mut hotspots,
                 );
             }
         }
         menu_state.open = false;
     } else if chosen_move {
-        issue_group_move(
+        emit_military_move(
+            &mut cmd_events,
             &drafted_units,
             menu_state.target_tile,
             menu_state.target_z,
-            &routing,
-            &mut ai_q,
-            &mut hotspots,
         );
         menu_state.open = false;
     }
+}
+
+fn emit_military_move(
+    cmd_events: &mut EventWriter<crate::simulation::player_command::PlayerCommandEvent>,
+    actors: &[Entity],
+    tile: (i32, i32),
+    z: i8,
+) {
+    use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
+    cmd_events.send(PlayerCommandEvent {
+        actors: actors.to_vec(),
+        command: PlayerCommand::MilitaryMove { tile, z },
+    });
+}
+
+fn emit_military_attack(
+    cmd_events: &mut EventWriter<crate::simulation::player_command::PlayerCommandEvent>,
+    actors: &[Entity],
+    foe: Entity,
+    tile: (i32, i32),
+    z: i8,
+) {
+    use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
+    // Drop the foe from the actor list so they don't try to attack themselves.
+    let filtered: Vec<Entity> = actors.iter().copied().filter(|&e| e != foe).collect();
+    cmd_events.send(PlayerCommandEvent {
+        actors: filtered,
+        command: PlayerCommand::MilitaryAttack { foe, tile, z },
+    });
 }

@@ -50,7 +50,6 @@ impl Plugin for UiPlugin {
                     selection::selection_gizmo_system,
                     orders::military_right_click_system,
                     orders::right_click_context_menu_system,
-                    orders::player_order_completion_system,
                     inspector::inspector_panel_system,
                     inspector::inspector_action_system,
                     economy_panel::economy_panel_system,

@@ -8,8 +8,8 @@ use crate::simulation::combat::CombatTarget;
 use crate::simulation::construction::AutonomousBuildingToggle;
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
 use crate::simulation::faction::HuntOrder;
-use crate::simulation::military::MusterHuntersRequest;
-use crate::simulation::person::{AiState, Drafted, Person, PersonAI, Profession};
+use crate::simulation::person::{Drafted, Person, Profession};
+use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::technology::HUNTING_SPEAR;
 use crate::ui::debug_panel::DebugPanelState;
@@ -33,7 +33,6 @@ pub struct HudResources<'w> {
     pub tech_panel_open: ResMut<'w, TechPanelOpen>,
     pub debug_state: ResMut<'w, DebugPanelState>,
     pub draft_req: ResMut<'w, DraftToggleRequest>,
-    pub muster_req: ResMut<'w, MusterHuntersRequest>,
     pub camera_view_z: Res<'w, CameraViewZ>,
     pub calendar: Res<'w, Calendar>,
     pub player_faction: Res<'w, PlayerFaction>,
@@ -47,7 +46,8 @@ pub fn hud_system(
     mut res: HudResources,
     drafted_q: Query<(), With<Drafted>>,
     persons: Query<(), With<Person>>,
-    professions: Query<(&Profession, &FactionMember), With<Person>>,
+    professions: Query<(Entity, &Profession, &FactionMember), With<Person>>,
+    mut cmd_events: EventWriter<PlayerCommandEvent>,
 ) {
     let clock = &mut *res.clock;
     let mode = &mut *res.mode;
@@ -55,7 +55,6 @@ pub fn hud_system(
     let tech_panel_open = &mut *res.tech_panel_open;
     let debug_state = &mut *res.debug_state;
     let draft_req = &mut *res.draft_req;
-    let muster_req = &mut *res.muster_req;
     let camera_view_z = &*res.camera_view_z;
     let calendar = &*res.calendar;
     let player_faction = &*res.player_faction;
@@ -65,10 +64,14 @@ pub fn hud_system(
     let pop = persons.iter().count();
     let any_drafted = selected_many.ids.iter().any(|&e| drafted_q.get(e).is_ok());
     let has_selection = !selected_many.ids.is_empty();
-    let current_hunters = professions
+    let player_hunters: Vec<Entity> = professions
         .iter()
-        .filter(|(p, m)| **p == Profession::Hunter && m.faction_id == player_faction.faction_id)
-        .count();
+        .filter(|(_, p, m)| {
+            **p == Profession::Hunter && m.faction_id == player_faction.faction_id
+        })
+        .map(|(e, _, _)| e)
+        .collect();
+    let current_hunters = player_hunters.len();
     let hunting_unlocked = registry
         .factions
         .get(&player_faction.faction_id)
@@ -197,7 +200,10 @@ pub fn hud_system(
                         let muster_resp =
                             ui.add_enabled(hunting_unlocked && current_hunters > 0, muster_btn);
                         if muster_resp.clicked() {
-                            muster_req.pending = true;
+                            cmd_events.send(PlayerCommandEvent {
+                                actors: player_hunters.clone(),
+                                command: PlayerCommand::Muster,
+                            });
                         }
 
                         ui.separator();
@@ -303,11 +309,12 @@ pub fn hud_system(
         });
 }
 
-/// Applies a Draft/Undraft toggle requested via the HUD button or `R` key.
-/// On undraft, also clears any pending military task so the unit goes idle
-/// instead of continuing a stale chase.
+/// Translates a Draft/Undraft toggle (HUD button or `R` key) into a
+/// `PlayerCommand::Muster` or `Disband` event. UI determines eligibility
+/// (player-faction subset of the selection) and which direction to flip
+/// (drafting if any are not yet drafted; undrafting only when all already
+/// drafted). The dispatcher does the state mutation.
 pub fn apply_draft_toggle_system(
-    mut commands: Commands,
     mut req: ResMut<DraftToggleRequest>,
     keys: Res<ButtonInput<KeyCode>>,
     mut contexts: EguiContexts,
@@ -315,8 +322,7 @@ pub fn apply_draft_toggle_system(
     player_faction: Res<PlayerFaction>,
     drafted_q: Query<(), With<Drafted>>,
     faction_q: Query<&FactionMember>,
-    mut ai_q: Query<&mut PersonAI>,
-    mut combat_q: Query<&mut CombatTarget>,
+    mut cmd_events: EventWriter<PlayerCommandEvent>,
 ) {
     let mut requested = req.0;
     req.0 = false;
@@ -344,23 +350,14 @@ pub fn apply_draft_toggle_system(
     if player_only.is_empty() {
         return;
     }
-    // Drafting if ANY are not yet drafted; undrafting only when all already drafted.
     let any_undrafted = player_only.iter().any(|e| drafted_q.get(*e).is_err());
-    if any_undrafted {
-        for e in player_only {
-            commands.entity(e).insert(Drafted);
-        }
+    let command = if any_undrafted {
+        PlayerCommand::Muster
     } else {
-        for e in player_only {
-            commands.entity(e).remove::<Drafted>();
-            if let Ok(mut ai) = ai_q.get_mut(e) {
-                ai.task_id = PersonAI::UNEMPLOYED;
-                ai.state = AiState::Idle;
-                ai.target_entity = None;
-            }
-            if let Ok(mut tgt) = combat_q.get_mut(e) {
-                tgt.0 = None;
-            }
-        }
-    }
+        PlayerCommand::Disband
+    };
+    cmd_events.send(PlayerCommandEvent {
+        actors: player_only,
+        command,
+    });
 }

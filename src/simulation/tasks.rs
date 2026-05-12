@@ -5,7 +5,6 @@ use super::items::GroundItem;
 use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::needs::Needs;
-use super::person::{PlayerOrder, PlayerOrderKind};
 use super::person::{AiState, Drafted, PersonAI};
 use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
 
@@ -1024,61 +1023,6 @@ pub fn goal_dispatch_system(
                 aq.advance();
             }
         });
-}
-
-/// Consume `PlayerOrder { Move }` and dispatch the routing once. The right-click
-/// UI handler in `ui/orders.rs` only inserts the marker for the Move arm; this
-/// system owns the actual `assign_task_with_routing` call so programmatic
-/// callers (tests, future scripting / network-issued orders) get the same
-/// behaviour without duplicating the dispatch in the UI layer.
-///
-/// Fires on `Changed<PlayerOrder>` so a fresh insert (or a re-targeted order)
-/// re-routes; once the agent reaches the target and `task_id` returns to
-/// `UNEMPLOYED`, `player_order_completion_system` (in `ui/orders.rs`) removes
-/// the marker.
-pub fn apply_move_order_system(
-    chunk_map: Res<ChunkMap>,
-    chunk_graph: Res<ChunkGraph>,
-    chunk_router: Res<ChunkRouter>,
-    chunk_connectivity: Res<ChunkConnectivity>,
-    mut query: Query<
-        (
-            &PlayerOrder,
-            &mut PersonAI,
-            &mut crate::simulation::typed_task::ActionQueue,
-            &Transform,
-        ),
-        Changed<PlayerOrder>,
-    >,
-) {
-    for (order, mut ai, mut aq, transform) in query.iter_mut() {
-        if !matches!(order.order, PlayerOrderKind::Move) {
-            continue;
-        }
-        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
-        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-        let cur_chunk = ChunkCoord(
-            cur_tx.div_euclid(CHUNK_SIZE as i32),
-            cur_ty.div_euclid(CHUNK_SIZE as i32),
-        );
-        // Move is an external preempt — drop any prior typed task so the
-        // executor doesn't keep dragging the agent toward the old goal.
-        aq.cancel();
-        let routed = assign_task_with_routing(
-            &mut ai,
-            (cur_tx, cur_ty),
-            cur_chunk,
-            order.target_tile,
-            TaskKind::Idle,
-            None,
-            &chunk_graph,
-            &chunk_router,
-            &chunk_map,
-            &chunk_connectivity,
-        );
-        ai.target_z = order.target_z;
-        let _ = routed;
-    }
 }
 
 // ── Play task system ──────────────────────────────────────────────────────────

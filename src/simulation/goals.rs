@@ -3,7 +3,7 @@ use super::faction::{FactionChief, FactionMember, FactionRegistry, StorageTileMa
 use super::jobs::JobClaim;
 use super::lod::LodLevel;
 use super::needs::Needs;
-use super::person::{AiState, Drafted, PersonAI, PlayerOrder};
+use super::person::{AiState, Drafted, PersonAI};
 use super::schedule::{BucketSlot, SimClock};
 use crate::economy::agent::EconomicAgent;
 use crate::pathfinding::chunk_graph::ChunkGraph;

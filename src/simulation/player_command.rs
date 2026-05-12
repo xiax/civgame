@@ -15,14 +15,16 @@ use bevy::prelude::*;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
+use crate::pathfinding::hotspots::{HotspotFlowFields, HotspotKind};
 use crate::simulation::combat::CombatTarget;
 use crate::simulation::construction::{Blueprint, BlueprintMap, BuildSiteKind};
+use crate::simulation::corpse::Carrying;
 use crate::simulation::faction::{FactionMember, SOLO};
 use crate::simulation::items::TargetItem;
-use crate::simulation::person::{PersonAI, PlayerOrder, PlayerOrderKind};
+use crate::simulation::person::{AiState, Drafted, PersonAI};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::TechId;
-use crate::simulation::typed_task::{ActionQueue, Task};
+use crate::simulation::typed_task::{ActionQueue, Task, WalkReason};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 
@@ -102,17 +104,21 @@ pub enum PlayerCommand {
     EncodeTablet {
         tech: TechId,
     },
-    /// Promote selection to military mode (`Drafted`). The dispatcher
-    /// filters `actors` by `Profession::Hunter` + player faction.
+    /// Promote `actors` to military mode (`Drafted`). UI enumerates which
+    /// agents to draft (e.g. all player-faction Hunters for the HUD button,
+    /// or the current selection for the R-key toggle).
     Muster,
-    /// Group route order for already-drafted units. Empty actors list means
-    /// "every drafted player-faction unit".
+    /// Remove the `Drafted` marker from `actors` and idle their tasks.
+    Disband,
+    /// Group route order for already-drafted units.
     MilitaryMove {
         tile: (i32, i32),
         z: i8,
     },
     MilitaryAttack {
         foe: Entity,
+        tile: (i32, i32),
+        z: i8,
     },
 }
 
@@ -181,6 +187,9 @@ impl PlayerCommandIdGen {
 /// every actor. Supersedes any prior `Commanded` on the same actor (status
 /// flips to `Superseded`; `reap_terminal_commands_system` strips it next tick).
 ///
+/// Faction-level commands with an empty `actors` list (currently only
+/// `EncodeTablet`) bypass the per-actor stamping and apply directly here.
+///
 /// Runs in `SimulationSet::Input` so the dispatcher (ParallelB) sees fresh
 /// `Pending` markers the same FixedUpdate tick the event was emitted in.
 pub fn drain_player_command_events_system(
@@ -189,9 +198,27 @@ pub fn drain_player_command_events_system(
     clock: Res<crate::simulation::schedule::SimClock>,
     mut id_gen: ResMut<PlayerCommandIdGen>,
     mut existing: Query<&mut Commanded>,
+    mut player_craft: ResMut<crate::simulation::jobs::PlayerCraftRequest>,
 ) {
     let now = clock.tick as u32;
     for ev in reader.read() {
+        // Faction-level applies (no actors needed).
+        if ev.actors.is_empty() {
+            match ev.command {
+                PlayerCommand::EncodeTablet { tech } => {
+                    if player_craft.0.is_none() {
+                        player_craft.0 = Some((
+                            crate::simulation::crafting::RECIPE_CLAY_TABLET,
+                            Some(tech),
+                        ));
+                    }
+                }
+                _ => {
+                    // Other commands need actors; skip a malformed event.
+                }
+            }
+            continue;
+        }
         for &actor in &ev.actors {
             // Mark any existing command on this actor as superseded so the
             // reap pass strips it next tick. The dispatcher won't act on a
@@ -212,10 +239,9 @@ pub fn drain_player_command_events_system(
     }
 }
 
-/// Removes `Commanded` (and the legacy `PlayerOrder` marker) one tick after
-/// `Commanded` reaches terminal status. UI consumers read
-/// `RemovedComponents<Commanded>` for HUD feedback ("Order complete" /
-/// "Couldn't reach target").
+/// Removes `Commanded` one tick after it reaches terminal status. UI
+/// consumers read `RemovedComponents<Commanded>` for HUD feedback ("Order
+/// complete" / "Couldn't reach target").
 ///
 /// Runs in `SimulationSet::Sequential`, late, so executors have a full tick
 /// at terminal status.
@@ -225,10 +251,7 @@ pub fn reap_terminal_commands_system(
 ) {
     for (entity, c) in query.iter() {
         if c.status.is_terminal() {
-            commands
-                .entity(entity)
-                .remove::<Commanded>()
-                .remove::<PlayerOrder>();
+            commands.entity(entity).remove::<Commanded>();
         }
     }
 }
@@ -343,13 +366,24 @@ pub fn player_command_lifecycle_system(
                 // agent is idle and unemployed (the legacy completion rule).
                 completion_when_agent_idle(ai)
             }
-            PlayerCommand::Muster
-            | PlayerCommand::MilitaryMove { .. }
-            | PlayerCommand::MilitaryAttack { .. } => {
-                // Military commands have indefinite lifetime — they last
-                // until the player unmusters or issues a fresh command.
-                // Don't auto-complete.
-                None
+            PlayerCommand::Muster | PlayerCommand::Disband => {
+                // Muster / Disband are stamp-and-done: after the dispatcher
+                // inserts/removes Drafted, the command's job is finished.
+                Some(CommandStatus::Completed)
+            }
+            PlayerCommand::MilitaryMove { tile, .. } => {
+                if chebyshev(cur, tile) <= 1 {
+                    Some(CommandStatus::Completed)
+                } else {
+                    None
+                }
+            }
+            PlayerCommand::MilitaryAttack { foe, .. } => {
+                if health_query.get(foe).is_err() {
+                    Some(CommandStatus::Completed)
+                } else {
+                    None
+                }
             }
         };
         if let Some(new_status) = outcome {
@@ -402,51 +436,14 @@ pub struct CommandRouting<'w, 's> {
     pub chunk_router: Res<'w, ChunkRouter>,
     pub chunk_connectivity: Res<'w, ChunkConnectivity>,
     pub bp_map: ResMut<'w, BlueprintMap>,
+    pub hotspots: ResMut<'w, HotspotFlowFields>,
     #[system_param(ignore)]
     pub _marker: std::marker::PhantomData<&'s ()>,
 }
 
-/// Translate a `PlayerCommand` to the equivalent legacy `PlayerOrder` so HTN
-/// dispatchers' `Without<PlayerOrder>` filters still gate the actor. Removed
-/// in Commit 3 along with the filters themselves.
-fn to_legacy_player_order(command: &PlayerCommand) -> Option<PlayerOrder> {
-    let (order, target_tile, target_z) = match *command {
-        PlayerCommand::Move { tile, z } => (PlayerOrderKind::Move, tile, z),
-        PlayerCommand::Gather { tile, z } => (PlayerOrderKind::Gather, tile, z),
-        PlayerCommand::Mine { tile, z } => (PlayerOrderKind::Mine, tile, z),
-        PlayerCommand::Build { kind, tile, z } => (PlayerOrderKind::Build(kind), tile, z),
-        PlayerCommand::Deconstruct { tile, z } => (PlayerOrderKind::Deconstruct, tile, z),
-        PlayerCommand::DigDown { tile, z } => (PlayerOrderKind::DigDown, tile, z),
-        PlayerCommand::PickUpItem { item, tile, z } => {
-            (PlayerOrderKind::PickUpItem(item), tile, z)
-        }
-        PlayerCommand::PickUpCorpse { corpse, tile, z } => {
-            (PlayerOrderKind::PickUpCorpse(corpse), tile, z)
-        }
-        PlayerCommand::AttackEntity { foe, tile, z } => {
-            (PlayerOrderKind::AttackEntity(foe), tile, z)
-        }
-        PlayerCommand::Teach { student, tile, z } => (PlayerOrderKind::Teach(student), tile, z),
-        PlayerCommand::HoldLecture { tech } => (PlayerOrderKind::HoldLecture(tech), (0, 0), 0),
-        PlayerCommand::ReadItem { tech } => (PlayerOrderKind::ReadItem(tech), (0, 0), 0),
-        PlayerCommand::EncodeTablet { tech } => (PlayerOrderKind::EncodeTablet(tech), (0, 0), 0),
-        // Muster / Military variants don't map to PlayerOrder — they live on
-        // their own marker (`Drafted`) and don't gate HTN via `Without<PlayerOrder>`.
-        PlayerCommand::Muster
-        | PlayerCommand::MilitaryMove { .. }
-        | PlayerCommand::MilitaryAttack { .. } => return None,
-    };
-    Some(PlayerOrder {
-        order,
-        target_tile,
-        target_z,
-    })
-}
-
 /// Dispatch every `Commanded { status: Pending }`. Translates the kind into
-/// the same task chain the legacy `right_click_context_menu_system` used to
-/// emit inline. Sets `status = Active` on success, `status = Failed(...)` on
-/// routing failure.
+/// the corresponding task chain in one match. Sets `status = Active` on
+/// success, `status = Failed(...)` on routing failure.
 ///
 /// Runs in `SimulationSet::ParallelB` after the drain system in `Input` so
 /// fresh `Pending` markers route the same tick. Single source of truth for
@@ -464,6 +461,8 @@ pub fn dispatch_player_command_system(
     )>,
     mut target_item_q: Query<&mut TargetItem>,
     mut combat_target_q: Query<&mut CombatTarget>,
+    mut player_craft: ResMut<crate::simulation::jobs::PlayerCraftRequest>,
+    mut lecture_req: ResMut<crate::simulation::teaching::LectureRequest>,
 ) {
     for (actor, mut cmd, mut ai, mut aq, transform, member) in actors.iter_mut() {
         if cmd.status != CommandStatus::Pending {
@@ -492,26 +491,17 @@ pub fn dispatch_player_command_system(
             &mut routing,
             &mut target_item_q,
             &mut combat_target_q,
+            &mut player_craft,
+            &mut lecture_req,
             &mut commands,
         );
 
         match outcome {
             DispatchOutcome::Active => {
                 cmd.status = CommandStatus::Active;
-                if let Some(po) = to_legacy_player_order(&cmd.command) {
-                    commands.entity(actor).insert(po);
-                }
             }
             DispatchOutcome::Failed(reason) => {
                 cmd.status = CommandStatus::Failed(reason);
-            }
-            DispatchOutcome::DeferredToLegacy => {
-                // Knowledge commands (ReadItem) route through their own
-                // existing systems via the inserted PlayerOrder marker.
-                cmd.status = CommandStatus::Active;
-                if let Some(po) = to_legacy_player_order(&cmd.command) {
-                    commands.entity(actor).insert(po);
-                }
             }
         }
     }
@@ -520,10 +510,6 @@ pub fn dispatch_player_command_system(
 enum DispatchOutcome {
     Active,
     Failed(CommandFailure),
-    /// Successfully attached the legacy marker, leaving the dispatch to the
-    /// pre-existing handler (used for knowledge orders whose systems already
-    /// own the lifecycle).
-    DeferredToLegacy,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -538,6 +524,8 @@ fn dispatch_one(
     routing: &mut CommandRouting,
     target_item_q: &mut Query<&mut TargetItem>,
     combat_target_q: &mut Query<&mut CombatTarget>,
+    player_craft: &mut crate::simulation::jobs::PlayerCraftRequest,
+    lecture_req: &mut crate::simulation::teaching::LectureRequest,
     commands: &mut Commands,
 ) -> DispatchOutcome {
     use PlayerCommand::*;
@@ -752,21 +740,124 @@ fn dispatch_one(
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
             // Adjacency markers (`TeachingPair` / `BeingTaught`) are inserted
-            // by `apply_teach_order_system` once the teacher arrives.
-            DispatchOutcome::DeferredToLegacy
+            // by `apply_teach_order_system` once the teacher arrives — keyed
+            // off `ai.task_id == TaskKind::Teach`, which `assign_task_with_routing`
+            // just set. No legacy marker required.
+            DispatchOutcome::Active
         }
-        HoldLecture { .. } | ReadItem { .. } | EncodeTablet { .. } => {
-            // Knowledge orders route through dedicated systems in `teaching.rs`
-            // and `jobs.rs` keyed off the legacy `PlayerOrder` marker. The
-            // dispatcher attaches that marker; the specialized systems handle
-            // the rest.
-            DispatchOutcome::DeferredToLegacy
+        ReadItem { tech } => {
+            // Pin the agent in place and stamp the Read task. `read_task_system`
+            // accumulates study progress against the matching tablet/book in
+            // the agent's inventory.
+            ai.task_id = TaskKind::Read as u16;
+            ai.state = AiState::Working;
+            ai.work_progress = 0;
+            aq.dispatch(Task::Read { tech });
+            commands.entity(actor).insert(Drafted);
+            DispatchOutcome::Active
         }
-        Muster | MilitaryMove { .. } | MilitaryAttack { .. } => {
-            // Military commands are handled by a sibling dispatcher (Commit 2
-            // follow-on); for now we leave the existing muster + military
-            // right-click paths in place and emit no work here.
-            DispatchOutcome::DeferredToLegacy
+        EncodeTablet { tech } => {
+            // Faction-level request: post a craft contract for a tablet
+            // encoding this tech. `chief_tablet_posting_system` drains.
+            if player_craft.0.is_none() {
+                player_craft.0 = Some((
+                    crate::simulation::crafting::RECIPE_CLAY_TABLET,
+                    Some(tech),
+                ));
+            }
+            DispatchOutcome::Active
+        }
+        HoldLecture { tech } => {
+            // Faction-level request: a `LectureRequest` directs
+            // `apply_lecture_request_system` to draft nearby adults and
+            // start the lecture session anchored on this actor.
+            lecture_req.0 = Some((actor, tech));
+            DispatchOutcome::Active
+        }
+        Muster => {
+            // Promote this actor to military mode. UI determined eligibility
+            // (player faction + Hunter profession for the HUD button; current
+            // selection for the R-key toggle). Sim resets task state and
+            // attaches `Drafted`. Carrying / reservations cleared so the
+            // unit goes military-clean.
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
+            ai.work_progress = 0;
+            commands
+                .entity(actor)
+                .remove::<Carrying>()
+                .insert(Drafted);
+            DispatchOutcome::Active
+        }
+        Disband => {
+            // Inverse of Muster. Removes `Drafted` and idles tasks.
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
+            commands.entity(actor).remove::<Drafted>();
+            if let Ok(mut ct) = combat_target_q.get_mut(actor) {
+                ct.0 = None;
+            }
+            DispatchOutcome::Active
+        }
+        MilitaryMove { tile, z } => {
+            // Register the rally-point hotspot once per dispatch (idempotent).
+            routing
+                .hotspots
+                .register((tile.0, tile.1, z), HotspotKind::RallyPoint);
+            let routed = assign_task_with_routing(
+                ai,
+                cur_tile,
+                cur_chunk,
+                tile,
+                TaskKind::MilitaryMove,
+                None,
+                &routing.chunk_graph,
+                &routing.chunk_router,
+                &routing.chunk_map,
+                &routing.chunk_connectivity,
+            );
+            if !routed {
+                return DispatchOutcome::Failed(CommandFailure::Unreachable);
+            }
+            ai.target_z = z;
+            aq.dispatch(Task::WalkTo {
+                tile,
+                z,
+                why: WalkReason::MilitaryMove,
+            });
+            if let Ok(mut ct) = combat_target_q.get_mut(actor) {
+                ct.0 = None;
+            }
+            DispatchOutcome::Active
+        }
+        MilitaryAttack { foe, tile, z } => {
+            if commands.get_entity(foe).is_none() {
+                return DispatchOutcome::Failed(CommandFailure::TargetGone);
+            }
+            routing
+                .hotspots
+                .register((tile.0, tile.1, z), HotspotKind::RallyPoint);
+            let routed = assign_task_with_routing(
+                ai,
+                cur_tile,
+                cur_chunk,
+                tile,
+                TaskKind::MilitaryAttack,
+                Some(foe),
+                &routing.chunk_graph,
+                &routing.chunk_router,
+                &routing.chunk_map,
+                &routing.chunk_connectivity,
+            );
+            if !routed {
+                return DispatchOutcome::Failed(CommandFailure::Unreachable);
+            }
+            if let Ok(mut ct) = combat_target_q.get_mut(actor) {
+                ct.0 = None;
+            }
+            DispatchOutcome::Active
         }
     }
 }

@@ -5099,13 +5099,13 @@ mod baseline_behaviour {
         );
     }
 
-    /// A `PlayerOrder::Move` short-circuits autonomous goal selection and
-    /// dispatches the agent to the ordered tile. We assert the agent
+    /// A `PlayerCommand::Move` event short-circuits autonomous goal
+    /// selection and dispatches the agent to the ordered tile. The agent
     /// leaves its starting tile within a handful of ticks even though it
     /// has no autonomous reason to move.
     #[test]
     fn player_order_move_short_circuits_autonomy() {
-        use crate::simulation::person::{PlayerOrder, PlayerOrderKind};
+        use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
 
         let mut sim = TestSim::new(2);
         sim.flat_world(1, 0, TileKind::Grass);
@@ -5120,10 +5120,12 @@ mod baseline_behaviour {
             .unwrap()
             .translation;
 
-        sim.app.world_mut().entity_mut(person).insert(PlayerOrder {
-            order: PlayerOrderKind::Move,
-            target_tile: (8, 0),
-            target_z: 0,
+        sim.app.world_mut().send_event(PlayerCommandEvent {
+            actors: vec![person],
+            command: PlayerCommand::Move {
+                tile: (8, 0),
+                z: 0,
+            },
         });
 
         sim.tick_n(120);
@@ -5137,7 +5139,7 @@ mod baseline_behaviour {
         let moved = (end_pos - start_pos).length();
         assert!(
             moved > 1.0,
-            "expected PlayerOrder::Move to move agent; moved {} units",
+            "expected PlayerCommand::Move event to move agent; moved {} units",
             moved
         );
     }
@@ -5211,6 +5213,60 @@ mod baseline_behaviour {
         );
     }
 
+    /// Supersession: a second Move event for the same actor overwrites the
+    /// first. The prior `Commanded` flips to `Superseded` and is reaped; the
+    /// new one is `Active` with the new target.
+    #[test]
+    fn player_command_supersedes_prior() {
+        use crate::simulation::player_command::{
+            Commanded, CommandStatus, PlayerCommand, PlayerCommandEvent,
+        };
+
+        let mut sim = TestSim::new(8);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.hunger(0.0);
+        });
+
+        // First Move to (3, 0).
+        sim.app.world_mut().send_event(PlayerCommandEvent {
+            actors: vec![person],
+            command: PlayerCommand::Move {
+                tile: (3, 0),
+                z: 0,
+            },
+        });
+        sim.tick_n(2);
+
+        // Second Move to (-3, 0). Should supersede.
+        sim.app.world_mut().send_event(PlayerCommandEvent {
+            actors: vec![person],
+            command: PlayerCommand::Move {
+                tile: (-3, 0),
+                z: 0,
+            },
+        });
+        // One tick for drain to mark prior as Superseded and stamp new
+        // Pending; one for dispatch to flip to Active.
+        sim.tick_n(2);
+
+        let cmd = sim
+            .app
+            .world()
+            .get::<Commanded>(person)
+            .expect("Commanded should be present after second event");
+        assert_eq!(
+            cmd.status,
+            CommandStatus::Active,
+            "second command should be Active"
+        );
+        if let PlayerCommand::Move { tile, .. } = cmd.command {
+            assert_eq!(tile, (-3, 0), "second target should win");
+        } else {
+            panic!("expected Move command");
+        }
+    }
+
     /// Lifecycle: after an issued Move command, the agent walks to the target,
     /// the lifecycle system flips `Commanded → Completed` on arrival, the reap
     /// system strips both `Commanded` and the legacy `PlayerOrder` marker, and
@@ -5222,7 +5278,6 @@ mod baseline_behaviour {
         use crate::simulation::player_command::{
             Commanded, PlayerCommand, PlayerCommandEvent,
         };
-        use crate::simulation::person::PlayerOrder;
 
         let mut sim = TestSim::new(7);
         sim.flat_world(1, 0, TileKind::Grass);
@@ -5230,29 +5285,22 @@ mod baseline_behaviour {
             b.hunger(0.0);
         });
 
-        sim.app
-            .world_mut()
-            .send_event(PlayerCommandEvent {
-                actors: vec![person],
-                command: PlayerCommand::Move {
-                    tile: (4, 0),
-                    z: 0,
-                },
-            });
+        sim.app.world_mut().send_event(PlayerCommandEvent {
+            actors: vec![person],
+            command: PlayerCommand::Move {
+                tile: (4, 0),
+                z: 0,
+            },
+        });
 
         // Generous tick budget: drain → dispatch → walk → arrival → lifecycle
         // flip → reap. 4 tiles + per-tile movement time + a margin.
         sim.tick_n(400);
 
         let commanded_still_present = sim.app.world().get::<Commanded>(person).is_some();
-        let player_order_still_present = sim.app.world().get::<PlayerOrder>(person).is_some();
         assert!(
             !commanded_still_present,
             "Commanded should have been reaped after Move completion"
-        );
-        assert!(
-            !player_order_still_present,
-            "legacy PlayerOrder marker should have been reaped too"
         );
     }
 

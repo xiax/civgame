@@ -15,14 +15,6 @@ use crate::simulation::typed_task::{Task, WalkReason};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::TILE_SIZE;
 
-/// Pulse resource set by the HUD Muster button. `apply_muster_hunters_system`
-/// consumes it the same tick. The `pending` flag stays high until the
-/// system handles it and resets to false, so the UI can fire-and-forget.
-#[derive(Resource, Default)]
-pub struct MusterHuntersRequest {
-    pub pending: bool,
-}
-
 /// Tracks `HotspotKind::RallyPoint` registrations so they can be unregistered
 /// when no drafted unit is still routing to them. Without this they'd
 /// accumulate forever — every right-click leaks a flow-field rebuild slot.
@@ -170,57 +162,6 @@ pub fn military_task_system(
                 combat.0 = None;
             }
         }
-    }
-}
-
-/// Consumes a `MusterHuntersRequest` pulse from the HUD. For every
-/// `Profession::Hunter` in the player faction:
-///   - inserts `Drafted` (idempotent — Bevy replaces the component)
-///   - tears down any in-flight plan + reservations + carried corpse
-///   - resets PersonAI to Idle / UNEMPLOYED so `military_right_click_system`
-///     can route them to the player's chosen rally point next click.
-///
-/// The player issues the rally point separately via right-click on a tile —
-/// that path already registers `HotspotKind::RallyPoint` and assigns
-/// `MilitaryMove` tasks. Muster is the "go to military mode" half;
-/// right-click is the "here's where to go" half.
-pub fn apply_muster_hunters_system(
-    mut commands: Commands,
-    mut request: ResMut<MusterHuntersRequest>,
-    player_faction: Res<PlayerFaction>,
-    reservations: Res<StorageReservations>,
-    mut hunters: Query<(
-        Entity,
-        &Profession,
-        &FactionMember,
-        &mut PersonAI,
-        &mut crate::simulation::typed_task::ActionQueue,
-    )>,
-) {
-    if !request.pending {
-        return;
-    }
-    request.pending = false;
-    for (entity, prof, member, mut ai, mut aq) in hunters.iter_mut() {
-        if *prof != Profession::Hunter || member.faction_id != player_faction.faction_id {
-            continue;
-        }
-        if ai.reserved_resource.is_some() {
-            release_reservation(&reservations, &mut ai);
-        }
-        ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
-        ai.target_entity = None;
-        ai.work_progress = 0;
-        // Phase 4b-ii: muster is an external preempt (player drops every
-        // in-flight hunter task to draft them). Use `cancel()` so any
-        // prefetched tasks queued behind `current` are dropped along with
-        // the cancellation, not promoted into `current` next tick.
-        aq.cancel();
-        commands
-            .entity(entity)
-            .remove::<crate::simulation::corpse::Carrying>()
-            .insert(Drafted);
     }
 }
 

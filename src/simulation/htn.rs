@@ -53,7 +53,7 @@ use crate::simulation::plants::{
     nearest_mature_plant_under_agent, GrowthStage, Plant, PlantKind, PlantMap,
 };
 use crate::simulation::needs::{Needs, EAT_TRIGGER_HUNGER};
-use crate::simulation::person::{AiState, Drafted, PersonAI, PlayerOrder, Profession};
+use crate::simulation::person::{AiState, Drafted, PersonAI, Profession};
 use crate::simulation::production::total_edible;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};

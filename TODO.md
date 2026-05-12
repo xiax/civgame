@@ -20,15 +20,14 @@ X- add parallelization
 - faction camp should have 20 tiles view range
 - rimworld-like bottom menu for mass orders for gathering wood or farming or gathering bushes or construction
 - Additional orders for mass crafting from a central control menu
-- world generation to be more expansive with wider plains, bigger valleys and mountains, larger bodies of water, etc.
+X- world generation to be more expansive with wider plains, bigger valleys and mountains, larger bodies of water, etc.
 X implement willpower system. Work decreases willpower, fun stuff increases willpower, add play task, low willpower workers can look for entertainment items or people to play with. Any item like wood or stone can be played with, though they have low entertainment value. Add entertainment values to every item. Playing with other people should have higher value for everyone except loners. Playing with people counts as socialization as well and builds relationships
 - allow workers to get more than one thing if their hands aren't full
--  I want to refactor the resouce collection system. Rather than      
-- I want to add a military system to the game. There should be a military button that opens a military menu where players can define their military, add people to the military, either individually recruiting from a list of all workers or just increase the number cap and the game will automatically pick the most suitable, making sure not to leave crucial industries like food production without workers.
+X- I want to add a military system to the game. There should be a military button that opens a military menu where players can define their military, add people to the military, either individually recruiting from a list of all workers or just increase the number cap and the game will automatically pick the most suitable, making sure not to leave crucial industries like food production without workers.
 
-- I want to overhaul the world generation system. I want to first generate a realistic earth-like planet with various biomes and geographical features, mountains, rivers, valleys, plains, lakes, and oceans. The globe is divided into grids, like mega-chunks that make up the world. Then the player should be allowed to choose where they want to settle, and then the game generates the game map from that location's information using a deterministic seed that stays the same for that game, and when the player explores past their mega-chunk, we generate the map for that mega-chunk and allow the player to switch between the two using the world map. Make sure the geographical features between adjacent mega-chunks connect properly and that the biomes transition from on to the next in a way that makes realistic sense.
+X - I want to overhaul the world generation system. I want to first generate a realistic earth-like planet with various biomes and geographical features, mountains, rivers, valleys, plains, lakes, and oceans. The globe is divided into grids, like mega-chunks that make up the world. Then the player should be allowed to choose where they want to settle, and then the game generates the game map from that location's information using a deterministic seed that stays the same for that game, and when the player explores past their mega-chunk, we generate the map for that mega-chunk and allow the player to switch between the two using the world map. Make sure the geographical features between adjacent mega-chunks connect properly and that the biomes transition from on to the next in a way that makes realistic sense.
 
--I want to overhaul the resource gathering system. Picking stuff off the ground should be prioritized over      
+X -I want to overhaul the resource gathering system. Picking stuff off the ground should be prioritized over      
   doing actual gathering work like cutting down trees or mining stone if the worker can see the resource just     
   lying on the groun  
 
@@ -77,17 +76,11 @@ X - Can you come up with a plan to overhaul the construction system please? The 
 
 X - I want to Add the concept of land ownership to the game. All land around a settlement belongs to the state by default but In mixed and capitalist economies the state can rent or sell land to households. Everything on a plot of land belongs to the household and the household can build or farm on the land. Land value should follow market dynamics, people desire housing next to where they work, land further away from settlement centre or other desirable resources are lower value and can be sold in larger quantities for private farmers or rented out for a tenant farmer model.
 
-Fix memory leaks in late game.
 
 X - I feel like there are a lot of places where the nomadic and settlement system are clashing as well as places where the different economic models are clashing, can you propose a design that allows us to seamlessly switch between the different models we want to capture in the game? In a way that minimizes bugs and allows us to expand to more systems easily in the future?
 
 X - Overhaul settlement and nomadic system to make them work better together and work better in the future, throw in overhaul for making the different economic models mesh together as well.
 
-Need UI overhaul to add commands for all actions players can take, in a way that is robust and extensible in the future
-
-Overhaul technology system to be entirely knowledge based, please propose a system for technological adoption that is true to history that uses the knowledge based system.
-
-settlement creation gates the leader knowing about farming and deciding to farm, technological adoption is on a per agent level baed on their knowledge, technological adoption by governments depends on the knowledge of government officials and bureaucrats.
 
 
 Market-mode coherence track (M4-M5 deferred per memory)
@@ -97,7 +90,9 @@ Free-agent gathering. In Market mode, when should_craft declines (cooldown or no
   Stockpile JobClaims (chief-driven) or Survive (food only).
 
 
+Fix memory leaks in late game.
 I need logging to track performance metrics and identify bottlenecks in the code that is slowing down each tick, give me a plan to do this comprehensively please.
+
 
 
 Settlements shouldn't be split by a river when placing initial settlements and camps
@@ -106,11 +101,21 @@ Add initial stone tools to spawn
 
 Adjust work time and show progress bars. Cutting down trees should take way longer with initial stone tools
 
-Add a fishing system to the game that works well with existing systems and is robust and extensible and true to history.
+Add a fishing system to the game that works well with existing systems and is robust and extensible and true to history. Add swimming knowledge.
 
-Nomadic tribes should migrate way farther and actually look for good spots where there is a lot of food. They should send scouts far further away to look for good locations. Migration is also extremely buggy. I see people left behind in migrations, people not migrating properly, people still gathered around the old faction base and people no gain to the new faction base properly. Factions also migrate too easily.
+Nomadic tribes should migrate way farther, they shouldn't be migrating to just within the gathering distance of their current settlement and actually look for good spots where there is a lot of food. They should send scouts far further away to look for good locations. Migration is also extremely buggy. I see people left behind in migrations, people not migrating properly, people still gathered around the old faction base and people no gain to the new faction base properly. Can you plan a comprehensive robust, and extensible migration system? I would also like it if it is possible to play a faction on the move rather than migration just being an atomic task.
 
 
+Need UI overhaul to add commands for all actions players can take, in a way that is robust and extensible in the future
 
+Overhaul technology system to be entirely knowledge based, please propose a system for technological adoption that is true to history that uses the knowledge based system.
+
+settlement creation gates the leader knowing about farming and deciding to farm, technological adoption is on a per agent level baed on their knowledge, technological adoption by governments depends on the knowledge of government officials and bureaucrats.
+
+Add lookout system where an agent standing on high ground can see up to 50 grind vision rather than the standard 15, broken when they move. Add this as a player command and as something agents can naturally do, might be useful when exploring. Can be extended further with telescopes in the future.
+
+Chief should have a daily quota. He can only post so many jobs a day. Immediate needs first, like getting enough food, then 
+
+Implement the ε-greedy system.
 
 

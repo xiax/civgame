@@ -1172,10 +1172,7 @@ pub fn nomad_migration_dispatch_system(
             &crate::simulation::schedule::BucketSlot,
             &crate::simulation::lod::LodLevel,
         ),
-        (
-            Without<crate::simulation::person::PlayerOrder>,
-            Without<crate::simulation::person::Drafted>,
-        ),
+        Without<crate::simulation::person::Drafted>,
     >,
 ) {
     use crate::simulation::lod::LodLevel;
