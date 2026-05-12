@@ -108,9 +108,9 @@ X - Nomadic tribes should migrate way farther, they shouldn't be migrating to ju
 
 Need UI overhaul to add commands for all actions players can take, in a way that is robust and extensible in the future
 
-Overhaul technology system to be entirely knowledge based, please propose a system for technological adoption that is true to history that uses the knowledge based system.
+X- Overhaul technology system to be entirely knowledge based, please propose a system for technological adoption that is true to history that uses the knowledge based system.
 
-settlement creation gates the leader knowing about farming and deciding to farm, technological adoption is on a per agent level baed on their knowledge, technological adoption by governments depends on the knowledge of government officials and bureaucrats.
+X- settlement creation gates the leader knowing about farming and deciding to farm, technological adoption is on a per agent level baed on their knowledge, technological adoption by governments depends on the knowledge of government officials and bureaucrats.
 
 Add lookout system where an agent standing on high ground can see up to 50 grind vision rather than the standard 15, broken when they move. Add this as a player command and as something agents can naturally do, might be useful when exploring. Can be extended further with telescopes in the future.
 

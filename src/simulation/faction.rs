@@ -103,6 +103,39 @@ pub const CRAFTER_MAX_DIVISOR: usize = 3;
 /// headcount. Mirrors `HUNTER_ASSIGNMENT_CADENCE`.
 pub const CRAFTER_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
 
+/// Phase 4b/5a hysteresis deadband: promote crafters only when the
+/// faction's Craft `wage_signal` has accumulated past this floor
+/// (~one day of sustained paid craft work). A single first-day payout
+/// folds in at `α ≈ 0.129 × reward`, so a ~5-currency contract
+/// produces `ema ≈ 0.65` after one day — below the promote floor.
+/// Two days of similar contracts push the EMA above 1.0 and trigger
+/// promotion. Demotion uses the lower ceiling — once the signal has
+/// genuinely decayed below 0.3, target → 0. Between the thresholds,
+/// target = current crafter count (no churn).
+pub const CRAFTER_WAGE_PROMOTE_FLOOR: f32 = 1.0;
+pub const CRAFTER_WAGE_DEMOTE_CEILING: f32 = 0.3;
+
+/// Pure helper for `chief_craft_assignment_system`'s target headcount.
+/// Returns the post-cap target given the faction's max Craft EMA, its
+/// current crafter count, and its member count. Exposed as a free
+/// function so the deadband logic stays unit-testable without a `World`.
+pub fn crafter_target_with_hysteresis(
+    craft_ema: f32,
+    current_crafters: usize,
+    member_count: u32,
+) -> usize {
+    let mut target = if craft_ema >= CRAFTER_WAGE_PROMOTE_FLOOR && member_count > 0 {
+        (member_count as f32 * CRAFTER_MIN_RATIO).round().max(1.0) as usize
+    } else if craft_ema <= CRAFTER_WAGE_DEMOTE_CEILING {
+        0
+    } else {
+        // Deadband: hold steady.
+        current_crafters
+    };
+    target = target.min((member_count as usize) / CRAFTER_MAX_DIVISOR);
+    target
+}
+
 // ── Pluralist Economy R11: Tribute constants ──────────────────────────
 
 /// Per-subordinate-per-day tribute amount transferred from the
@@ -569,31 +602,42 @@ pub fn chief_craft_assignment_system(
         return;
     }
 
-    // Per-faction target headcounts. Skipped factions: SOLO and any
-    // faction whose Craft wage signal is currently dormant (no paid
-    // craft work). The EMA decays toward zero on outage, so a stale
-    // burst doesn't permanently inflate target.
+    // Pre-pass: count current crafters per faction so the deadband
+    // can hold steady when ema sits between the promote / demote
+    // thresholds. Pre-passing also lets us short-circuit the candidate
+    // walk for factions that have neither crafters nor a live signal.
+    let mut current_crafters: AHashMap<u32, usize> = AHashMap::default();
+    for (_, prof, member, _, _, _, _, _, _, _) in query.iter() {
+        if member.faction_id == SOLO {
+            continue;
+        }
+        if matches!(*prof, Profession::Crafter) {
+            *current_crafters.entry(member.faction_id).or_insert(0) += 1;
+        }
+    }
+
+    // Per-faction target headcounts. Skipped factions: SOLO. Crafter
+    // assignment honors a hysteresis deadband on the Craft wage signal:
+    //   ema >  CRAFTER_WAGE_PROMOTE_FLOOR  → target = ratio-driven
+    //   ema <  CRAFTER_WAGE_DEMOTE_CEILING → target = 0
+    //   otherwise (deadband)               → target = current count
+    // The deadband prevents flapping when a single one-shot Craft
+    // payout's EMA fold ripples around zero between paid contracts.
     let mut targets: AHashMap<u32, usize> = AHashMap::default();
     for (&fid, faction) in registry.factions.iter() {
         if fid == SOLO {
             continue;
         }
-        let craft_signal_alive = faction
+        // Highest active Craft EMA across all resource variants.
+        let craft_ema = faction
             .wage_signal
             .iter()
-            .any(|((kind, _), ema)| {
-                *kind == crate::simulation::jobs::JobKind::Craft && ema.ema_per_day > 0.0
-            });
-        let mut target = if craft_signal_alive && faction.member_count > 0 {
-            (faction.member_count as f32 * CRAFTER_MIN_RATIO)
-                .round()
-                .max(1.0) as usize
-        } else {
-            0
-        };
-        // Cap at adults/CRAFTER_MAX_DIVISOR so crafters can't crowd
-        // out subsistence labor.
-        target = target.min((faction.member_count as usize) / CRAFTER_MAX_DIVISOR);
+            .filter_map(|((kind, _), ema)| {
+                (*kind == crate::simulation::jobs::JobKind::Craft).then_some(ema.ema_per_day)
+            })
+            .fold(0.0_f32, f32::max);
+        let current = current_crafters.get(&fid).copied().unwrap_or(0);
+        let target = crafter_target_with_hysteresis(craft_ema, current, faction.member_count);
         targets.insert(fid, target);
     }
 
@@ -3226,4 +3270,49 @@ fn drift_culture(culture: &mut FactionCulture, generation: u32) {
     culture.ceremonial = drift(culture.ceremonial, next());
     culture.mercantile = drift(culture.mercantile, next());
     culture.martial = drift(culture.martial, next());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crafter_target_promotes_above_floor() {
+        // Live signal + member room → ratio-driven target.
+        let t = crafter_target_with_hysteresis(2.0, 0, 12);
+        // 12 × 0.25 = 3, capped at 12/3 = 4.
+        assert_eq!(t, 3);
+    }
+
+    #[test]
+    fn crafter_target_demotes_below_ceiling() {
+        // Stale signal → target collapses to 0 regardless of incumbents.
+        let t = crafter_target_with_hysteresis(0.1, 4, 12);
+        assert_eq!(t, 0);
+    }
+
+    #[test]
+    fn crafter_target_holds_in_deadband() {
+        // ema between 0.3 and 1.0 → keep current count (no churn).
+        let t_with_two = crafter_target_with_hysteresis(0.5, 2, 12);
+        assert_eq!(t_with_two, 2);
+        let t_with_zero = crafter_target_with_hysteresis(0.5, 0, 12);
+        assert_eq!(t_with_zero, 0);
+    }
+
+    #[test]
+    fn crafter_target_capped_by_member_divisor() {
+        // 24 members → cap at 24/3 = 8. Ratio 0.25 × 24 = 6, so target = 6.
+        let t = crafter_target_with_hysteresis(5.0, 0, 24);
+        assert_eq!(t, 6);
+        // 3 members → cap at 1. Even with active signal, can't promote more.
+        let t_small = crafter_target_with_hysteresis(5.0, 0, 3);
+        assert_eq!(t_small, 1);
+    }
+
+    #[test]
+    fn crafter_target_zero_when_no_members() {
+        let t = crafter_target_with_hysteresis(5.0, 0, 0);
+        assert_eq!(t, 0);
+    }
 }
