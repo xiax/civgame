@@ -86,6 +86,23 @@ pub const BUREAUCRAT_QUIT_DAYS: u32 = 3;
 /// bureaucrat headcount. Mirrors `HUNTER_ASSIGNMENT_CADENCE`.
 pub const BUREAUCRAT_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
 
+// ── Phase 5a (wage-aware-labor-market-v2): Crafter constants ──────────
+
+/// Floor proportion of adults the chief tries to maintain as
+/// `Profession::Crafter` whenever the faction's `wage_signal` shows
+/// active paid craft work. Capped at adults/3 so crafters don't
+/// crowd out subsistence labor.
+pub const CRAFTER_MIN_RATIO: f32 = 0.25;
+
+/// Per-faction cap for crafters. Mirrors hunter `adults/2`; crafters
+/// are slightly tighter (adults/3) because their work depends on
+/// upstream material flow.
+pub const CRAFTER_MAX_DIVISOR: usize = 3;
+
+/// Cadence at which `chief_craft_assignment_system` reconciles crafter
+/// headcount. Mirrors `HUNTER_ASSIGNMENT_CADENCE`.
+pub const CRAFTER_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
+
 // ── Pluralist Economy R11: Tribute constants ──────────────────────────
 
 /// Per-subordinate-per-day tribute amount transferred from the
@@ -173,12 +190,19 @@ pub fn faction_hunter_assignment_system(
     clock: Res<SimClock>,
     registry: Res<FactionRegistry>,
     reservations: Res<StorageReservations>,
+    ownership: Res<crate::simulation::capital::WorkshopOwnership>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    plots: Query<&crate::simulation::land::Plot>,
     mut commands: Commands,
     mut query: Query<(
         Entity,
         &mut Profession,
         &FactionMember,
         &Skills,
+        &EconomicAgent,
+        &crate::simulation::carry::Carrier,
+        &Transform,
+        Option<&crate::simulation::reproduction::HouseholdMember>,
         Option<&mut PersonAI>,
         Option<&mut crate::simulation::typed_task::ActionQueue>,
         Option<&crate::simulation::knowledge::PersonKnowledge>,
@@ -232,19 +256,33 @@ pub fn faction_hunter_assignment_system(
     // promotable. Existing hunters are left alone; demotion will catch any
     // who lost the tech via LRU eviction.
     // Phase 4b: rank candidates by `(EV, skill)` — EV via
-    // `profession_choice::expected_wage(faction, Hunter, skills, 1.0)`
+    // `profession_choice::expected_wage(faction, Hunter, skills, capital)`
     // dominates when the faction's `wage_signal` has accumulated samples
     // for Hunter's job kinds; falls back to raw Combat skill when wages
-    // are zero. Capital factor pinned to 1.0 here; the full EV-driven
-    // unification (with tool / workshop / land factors) is the remaining
-    // Phase 4b deliverable.
+    // are zero. `capital_factor` averages tool / workshop / land affinity
+    // so a weapon-bearing agent ranks ahead of an unarmed equal-skill
+    // peer when wages are non-zero.
     let mut by_faction_hunters: AHashMap<u32, Vec<(Entity, f32, u32)>> = AHashMap::default();
     let mut by_faction_none: AHashMap<u32, Vec<(Entity, f32, u32)>> = AHashMap::default();
-    for (entity, prof, member, skills, _, _, knowledge_opt) in query.iter() {
+    for (entity, prof, member, skills, agent, carrier, xf, household_opt, _, _, knowledge_opt) in
+        query.iter()
+    {
         if member.faction_id == SOLO {
             continue;
         }
         let combat = skills.0[SkillKind::Combat as usize];
+        let tile = crate::world::terrain::world_to_tile(xf.translation.truncate());
+        let cap = crate::simulation::capital::capital_factor(
+            agent,
+            carrier,
+            tile,
+            member.faction_id,
+            household_opt,
+            Profession::Hunter,
+            &ownership,
+            &plots,
+            &plot_index,
+        );
         let ev = registry
             .factions
             .get(&member.faction_id)
@@ -253,7 +291,7 @@ pub fn faction_hunter_assignment_system(
                     f,
                     Profession::Hunter,
                     skills,
-                    1.0,
+                    cap,
                 )
             })
             .unwrap_or(0.0);
@@ -313,7 +351,9 @@ pub fn faction_hunter_assignment_system(
         return;
     }
 
-    for (entity, mut prof, _member, _skills, ai_opt, aq_opt, _knowledge) in query.iter_mut() {
+    for (entity, mut prof, _member, _skills, _agent, _carrier, _xf, _household, ai_opt, aq_opt, _knowledge) in
+        query.iter_mut()
+    {
         if promote.contains(&entity) {
             *prof = Profession::Hunter;
         } else if demote.contains(&entity) {
@@ -347,12 +387,19 @@ pub fn chief_bureaucrat_appointment_system(
     clock: Res<SimClock>,
     registry: Res<FactionRegistry>,
     reservations: Res<StorageReservations>,
+    ownership: Res<crate::simulation::capital::WorkshopOwnership>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    plots: Query<&crate::simulation::land::Plot>,
     mut commands: Commands,
     mut query: Query<(
         Entity,
         &mut Profession,
         &FactionMember,
         &Skills,
+        &EconomicAgent,
+        &crate::simulation::carry::Carrier,
+        &Transform,
+        Option<&crate::simulation::reproduction::HouseholdMember>,
         Option<&mut PersonAI>,
         Option<&mut crate::simulation::typed_task::ActionQueue>,
     )>,
@@ -388,14 +435,28 @@ pub fn chief_bureaucrat_appointment_system(
         return;
     }
 
-    // Phase 4b: EV-aware ranking. See hunter equivalent above.
+    // Phase 4b: EV-aware ranking. See hunter equivalent above. Capital
+    // factor here is dominated by Market workshop ownership (Bureaucrat
+    // affine) within `WORKSHOP_AFFINITY_RADIUS` of the agent's tile.
     let mut by_faction_bureaucrats: AHashMap<u32, Vec<(Entity, f32, u32)>> = AHashMap::default();
     let mut by_faction_none: AHashMap<u32, Vec<(Entity, f32, u32)>> = AHashMap::default();
-    for (entity, prof, member, skills, _, _) in query.iter() {
+    for (entity, prof, member, skills, agent, carrier, xf, household_opt, _, _) in query.iter() {
         if member.faction_id == SOLO || !targets.contains_key(&member.faction_id) {
             continue;
         }
         let social = skills.0[SkillKind::Social as usize];
+        let tile = crate::world::terrain::world_to_tile(xf.translation.truncate());
+        let cap = crate::simulation::capital::capital_factor(
+            agent,
+            carrier,
+            tile,
+            member.faction_id,
+            household_opt,
+            Profession::Bureaucrat,
+            &ownership,
+            &plots,
+            &plot_index,
+        );
         let ev = registry
             .factions
             .get(&member.faction_id)
@@ -404,7 +465,7 @@ pub fn chief_bureaucrat_appointment_system(
                     f,
                     Profession::Bureaucrat,
                     skills,
-                    1.0,
+                    cap,
                 )
             })
             .unwrap_or(0.0);
@@ -452,9 +513,177 @@ pub fn chief_bureaucrat_appointment_system(
         return;
     }
 
-    for (entity, mut prof, _member, _skills, ai_opt, aq_opt) in query.iter_mut() {
+    for (entity, mut prof, _member, _skills, _agent, _carrier, _xf, _household, ai_opt, aq_opt) in
+        query.iter_mut()
+    {
         if promote.contains(&entity) {
             *prof = Profession::Bureaucrat;
+        } else if demote.contains(&entity) {
+            *prof = Profession::None;
+            crate::simulation::profession_choice::demote_profession_state(
+                entity,
+                ai_opt.map(|x| x.into_inner()),
+                aq_opt.map(|x| x.into_inner()),
+                &reservations,
+                &mut commands,
+            );
+        }
+    }
+}
+
+/// Phase 5a (wage-aware-labor-market-v2): chief-driven crafter
+/// assignment. Mirrors `chief_bureaucrat_appointment_system` and
+/// `faction_hunter_assignment_system`.
+///
+/// Trigger: faction has a positive `wage_signal[(Craft, _)].ema_per_day`
+/// — there's actually paid craft work flowing. When the signal
+/// collapses (no Craft postings for ~5 days), target → 0 and
+/// existing crafters demote.
+///
+/// Target headcount: `max(1, member_count * CRAFTER_MIN_RATIO)`,
+/// capped at `member_count / CRAFTER_MAX_DIVISOR`. Skips Farmers /
+/// Hunters / Bureaucrats / Traders — crafter assignment doesn't
+/// poach established roles.
+pub fn chief_craft_assignment_system(
+    clock: Res<SimClock>,
+    registry: Res<FactionRegistry>,
+    reservations: Res<StorageReservations>,
+    ownership: Res<crate::simulation::capital::WorkshopOwnership>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    plots: Query<&crate::simulation::land::Plot>,
+    mut commands: Commands,
+    mut query: Query<(
+        Entity,
+        &mut Profession,
+        &FactionMember,
+        &Skills,
+        &EconomicAgent,
+        &crate::simulation::carry::Carrier,
+        &Transform,
+        Option<&crate::simulation::reproduction::HouseholdMember>,
+        Option<&mut PersonAI>,
+        Option<&mut crate::simulation::typed_task::ActionQueue>,
+    )>,
+) {
+    if clock.tick % CRAFTER_ASSIGNMENT_CADENCE != 0 {
+        return;
+    }
+
+    // Per-faction target headcounts. Skipped factions: SOLO and any
+    // faction whose Craft wage signal is currently dormant (no paid
+    // craft work). The EMA decays toward zero on outage, so a stale
+    // burst doesn't permanently inflate target.
+    let mut targets: AHashMap<u32, usize> = AHashMap::default();
+    for (&fid, faction) in registry.factions.iter() {
+        if fid == SOLO {
+            continue;
+        }
+        let craft_signal_alive = faction
+            .wage_signal
+            .iter()
+            .any(|((kind, _), ema)| {
+                *kind == crate::simulation::jobs::JobKind::Craft && ema.ema_per_day > 0.0
+            });
+        let mut target = if craft_signal_alive && faction.member_count > 0 {
+            (faction.member_count as f32 * CRAFTER_MIN_RATIO)
+                .round()
+                .max(1.0) as usize
+        } else {
+            0
+        };
+        // Cap at adults/CRAFTER_MAX_DIVISOR so crafters can't crowd
+        // out subsistence labor.
+        target = target.min((faction.member_count as usize) / CRAFTER_MAX_DIVISOR);
+        targets.insert(fid, target);
+    }
+
+    if targets.is_empty() {
+        return;
+    }
+
+    // EV-aware ranking. Capital factor here is dominated by
+    // Workbench / Loom ownership within `WORKSHOP_AFFINITY_RADIUS`
+    // and any `tools` resource in inventory or hands.
+    let mut by_faction_crafters: AHashMap<u32, Vec<(Entity, f32, u32)>> = AHashMap::default();
+    let mut by_faction_none: AHashMap<u32, Vec<(Entity, f32, u32)>> = AHashMap::default();
+    for (entity, prof, member, skills, agent, carrier, xf, household_opt, _, _) in query.iter() {
+        if member.faction_id == SOLO || !targets.contains_key(&member.faction_id) {
+            continue;
+        }
+        let crafting = skills.0[SkillKind::Crafting as usize];
+        let tile = crate::world::terrain::world_to_tile(xf.translation.truncate());
+        let cap = crate::simulation::capital::capital_factor(
+            agent,
+            carrier,
+            tile,
+            member.faction_id,
+            household_opt,
+            Profession::Crafter,
+            &ownership,
+            &plots,
+            &plot_index,
+        );
+        let ev = registry
+            .factions
+            .get(&member.faction_id)
+            .map(|f| {
+                crate::simulation::profession_choice::expected_wage(
+                    f,
+                    Profession::Crafter,
+                    skills,
+                    cap,
+                )
+            })
+            .unwrap_or(0.0);
+        match *prof {
+            Profession::Crafter => by_faction_crafters
+                .entry(member.faction_id)
+                .or_default()
+                .push((entity, ev, crafting)),
+            Profession::None => by_faction_none
+                .entry(member.faction_id)
+                .or_default()
+                .push((entity, ev, crafting)),
+            _ => {}
+        }
+    }
+
+    let mut promote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut demote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    for (&fid, &want) in &targets {
+        let mut crafters = by_faction_crafters.remove(&fid).unwrap_or_default();
+        let mut none = by_faction_none.remove(&fid).unwrap_or_default();
+        if crafters.len() < want {
+            none.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.2.cmp(&a.2))
+            });
+            for (e, _, _) in none.into_iter().take(want - crafters.len()) {
+                promote.insert(e);
+            }
+        } else if crafters.len() > want {
+            crafters.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.2.cmp(&b.2))
+            });
+            let extra = crafters.len() - want;
+            for (e, _, _) in crafters.into_iter().take(extra) {
+                demote.insert(e);
+            }
+        }
+    }
+
+    if promote.is_empty() && demote.is_empty() {
+        return;
+    }
+
+    for (entity, mut prof, _member, _skills, _agent, _carrier, _xf, _household, ai_opt, aq_opt) in
+        query.iter_mut()
+    {
+        if promote.contains(&entity) {
+            *prof = Profession::Crafter;
         } else if demote.contains(&entity) {
             *prof = Profession::None;
             crate::simulation::profession_choice::demote_profession_state(
@@ -1018,7 +1247,19 @@ pub const FARMER_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
 pub fn faction_profession_system(
     clock: Res<SimClock>,
     mut registry: ResMut<FactionRegistry>,
-    mut query: Query<(Entity, &mut Profession, &FactionMember, &Skills)>,
+    ownership: Res<crate::simulation::capital::WorkshopOwnership>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    plots: Query<&crate::simulation::land::Plot>,
+    mut query: Query<(
+        Entity,
+        &mut Profession,
+        &FactionMember,
+        &Skills,
+        &EconomicAgent,
+        &crate::simulation::carry::Carrier,
+        &Transform,
+        Option<&crate::simulation::reproduction::HouseholdMember>,
+    )>,
 ) {
     if clock.tick % FARMER_ASSIGNMENT_CADENCE != 0 {
         return;
@@ -1039,20 +1280,34 @@ pub fn faction_profession_system(
         let demote_threshold = FARMER_PROMOTE_PER_HEAD * FARMER_DEMOTE_RATIO;
         // Phase 4b: rank candidates by `(expected_wage(Farmer), Farming skill)`
         // so that wage-signal-driven promotion picks competent agents over
-        // arbitrary scan order. Capital factor pinned to 1.0 here — the full
-        // capital-threaded EV is the remaining Phase 4b deliverable.
+        // arbitrary scan order. `capital_factor` averages tool / workshop /
+        // land affinity — a household with an Agricultural plot under
+        // non-StateOwned tenure scores 1.5 on land, lifting EV over a
+        // landless peer with identical Farming skill.
         let mut current_farmer_set: Vec<(Entity, f32, u32)> = Vec::new();
         let mut none_set: Vec<(Entity, f32, u32)> = Vec::new();
-        for (entity, prof, member, skills) in query.iter() {
+        for (entity, prof, member, skills, agent, carrier, xf, household_opt) in query.iter() {
             if member.faction_id != faction_id {
                 continue;
             }
             let farming = skills.0[SkillKind::Farming as usize];
+            let tile = crate::world::terrain::world_to_tile(xf.translation.truncate());
+            let cap = crate::simulation::capital::capital_factor(
+                agent,
+                carrier,
+                tile,
+                faction_id,
+                household_opt,
+                Profession::Farmer,
+                &ownership,
+                &plots,
+                &plot_index,
+            );
             let ev = crate::simulation::profession_choice::expected_wage(
                 faction,
                 Profession::Farmer,
                 skills,
-                1.0,
+                cap,
             );
             match *prof {
                 Profession::Farmer => current_farmer_set.push((entity, ev, farming)),
@@ -1083,7 +1338,7 @@ pub fn faction_profession_system(
                 .take(to_assign)
                 .map(|(e, _, _)| e)
                 .collect();
-            for (entity, mut prof, _, _) in query.iter_mut() {
+            for (entity, mut prof, _, _, _, _, _, _) in query.iter_mut() {
                 if promote.contains(&entity) {
                     *prof = Profession::Farmer;
                 }
@@ -1101,7 +1356,7 @@ pub fn faction_profession_system(
                 .take(to_unassign)
                 .map(|(e, _, _)| e)
                 .collect();
-            for (entity, mut prof, _, _) in query.iter_mut() {
+            for (entity, mut prof, _, _, _, _, _, _) in query.iter_mut() {
                 if demote.contains(&entity) {
                     *prof = Profession::None;
                 }

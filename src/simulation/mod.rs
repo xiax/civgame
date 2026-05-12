@@ -706,8 +706,10 @@ impl Plugin for SimulationPlugin {
                         .after(faction::chief_hunt_order_system),
                     faction::chief_bureaucrat_appointment_system
                         .after(faction::compute_faction_storage_system),
-                    faction::bureaucrat_salary_tick_system
+                    faction::chief_craft_assignment_system
                         .after(faction::chief_bureaucrat_appointment_system),
+                    faction::bureaucrat_salary_tick_system
+                        .after(faction::chief_craft_assignment_system),
                     faction::tribute_payment_system.after(faction::bureaucrat_salary_tick_system),
                     faction::household_contract_posting_system
                         .after(faction::tribute_payment_system),

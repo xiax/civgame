@@ -2922,10 +2922,19 @@ fn personality_bias(p: Personality, kind: JobKind) -> f32 {
 /// Profession additive bias. Profession is the worker-directed baseline; this
 /// makes a Farmer the first to claim an open Farm job, while still letting
 /// the worker do farming via normal plan selection when no Farm job exists.
+/// Phase 5a (wage-aware-labor-market-v2): Crafter affinity bonus
+/// applied to `U_bid` for paid Craft postings. Sized so a Crafter
+/// outscores an equidistant generalist by ~3 currency units; large
+/// enough to dominate routing-cost tiebreaks but not so large that
+/// it crowds out skill-based ranking when wages are tight.
+pub const CRAFTER_AFFINITY_BONUS: f32 = 3.0;
+
 fn profession_bias(p: Profession, kind: JobKind) -> f32 {
     match (p, kind) {
         (Profession::Farmer, JobKind::Farm) => 0.5,
         (Profession::Farmer, JobKind::Stockpile) => 0.1,
+        (Profession::Crafter, JobKind::Craft) => 0.5,
+        (Profession::Crafter, JobKind::Stockpile) => 0.1,
         _ => 0.0,
     }
 }
@@ -3136,7 +3145,19 @@ pub fn job_claim_system(
                 let expected_reward = p.reward * wealth_mod;
                 let c_action = dist * BID_DIST_DISCOUNT;
                 let c_opportunity = 0.0_f32; // R9 stub; R10+ wires this
-                expected_reward - c_action - c_opportunity
+                // Phase 5a: Crafter claiming a Craft posting outscores
+                // an equidistant generalist via `CRAFTER_AFFINITY_BONUS`.
+                // Matches the unpaid-path `profession_bias` shape but
+                // sized for currency units (the unpaid path lives in
+                // skill-norm units).
+                let affinity_bonus = if matches!(profession, Profession::Crafter)
+                    && matches!(p.kind, JobKind::Craft)
+                {
+                    CRAFTER_AFFINITY_BONUS
+                } else {
+                    0.0
+                };
+                expected_reward + affinity_bonus - c_action - c_opportunity
             } else {
                 (p.priority as f32) * 0.01
                     + skill_norm

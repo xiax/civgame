@@ -46,6 +46,11 @@ pub fn job_kinds_for(prof: Profession) -> &'static [JobKind] {
         Profession::Hunter => &[JobKind::Stockpile],
         Profession::Bureaucrat => &[JobKind::Build],
         Profession::Trader => &[JobKind::Haul],
+        // Crafter earns from `Craft` postings primarily; `Stockpile`
+        // captures the upstream gather → deposit work crafters often
+        // do alongside (a fletcher gathers wood when craft demand is
+        // slack). `Haul` is omitted — that's Trader territory.
+        Profession::Crafter => &[JobKind::Craft, JobKind::Stockpile],
     }
 }
 
@@ -57,6 +62,7 @@ pub fn primary_skill_for(prof: Profession) -> Option<SkillKind> {
         Profession::Hunter => Some(SkillKind::Combat),
         Profession::Bureaucrat => Some(SkillKind::Social),
         Profession::Trader => Some(SkillKind::Trading),
+        Profession::Crafter => Some(SkillKind::Crafting),
     }
 }
 
@@ -148,6 +154,9 @@ mod tests {
         assert!(job_kinds_for(Profession::Farmer).contains(&JobKind::Farm));
         assert!(job_kinds_for(Profession::Hunter).contains(&JobKind::Stockpile));
         assert!(job_kinds_for(Profession::Bureaucrat).contains(&JobKind::Build));
+        // Phase 5a: Crafter draws wages from Craft postings primarily.
+        assert!(job_kinds_for(Profession::Crafter).contains(&JobKind::Craft));
+        assert!(job_kinds_for(Profession::Crafter).contains(&JobKind::Stockpile));
     }
 
     #[test]
@@ -161,5 +170,44 @@ mod tests {
             Some(SkillKind::Combat)
         );
         assert_eq!(primary_skill_for(Profession::None), None);
+        assert_eq!(
+            primary_skill_for(Profession::Crafter),
+            Some(SkillKind::Crafting)
+        );
+    }
+
+    #[test]
+    fn expected_wage_scales_linearly_with_capital() {
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{JobKind, WageEMA};
+        let mut registry = FactionRegistry::default();
+        let fid = registry.create_faction((0, 0));
+        let faction = registry.factions.get_mut(&fid).unwrap();
+        faction.wage_signal.insert(
+            (JobKind::Stockpile, None),
+            WageEMA {
+                ema_per_day: 10.0,
+                last_update_tick: 0,
+                samples: 1,
+            },
+        );
+        let mut skills = Skills::default();
+        skills.0[SkillKind::Combat as usize] = SKILL_MAX; // 1.0 competence
+        let base = expected_wage(faction, Profession::Hunter, &skills, 1.0);
+        let with_tool = expected_wage(faction, Profession::Hunter, &skills, 1.5);
+        assert!(base > 0.0);
+        assert!((with_tool / base - 1.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn expected_wage_zero_when_signal_empty() {
+        use crate::simulation::faction::FactionRegistry;
+        let mut registry = FactionRegistry::default();
+        let fid = registry.create_faction((0, 0));
+        let faction = registry.factions.get(&fid).unwrap();
+        let skills = Skills::default();
+        // No wage_signal entries → wage is zero regardless of capital.
+        let ev = expected_wage(faction, Profession::Hunter, &skills, 2.0);
+        assert_eq!(ev, 0.0);
     }
 }

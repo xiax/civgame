@@ -67,6 +67,15 @@ pub enum Profession {
     /// (R10 follow-on): a deterministic state machine driven by
     /// `TraderPlan` mirroring the Bureaucrat single-system pattern.
     Trader,
+    /// Phase 5a (wage-aware-labor-market-v2): dedicated craft worker.
+    /// Promoted by `chief_craft_assignment_system` when the faction's
+    /// `wage_signal[(Craft, _)].ema_per_day > 0` (i.e. paid craft work
+    /// is actively being posted). Workshop-affine via `WorkshopKind::
+    /// affine_to`: Workbench/Loom both lift Crafter EV. Tool affinity
+    /// via the catalog `tools` resource. Primary skill: Crafting.
+    /// Phase 5b apprenticeship layers on top — sub-`APPRENTICE_THRESHOLD`
+    /// candidates route through `Profession::Apprentice` instead.
+    Crafter,
 }
 
 /// Pluralist Economy R10 follow-on: per-trader arbitrage state. Tracks

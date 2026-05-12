@@ -60,9 +60,12 @@ impl WorkshopKind {
     pub fn affine_to(self, prof: Profession) -> bool {
         match prof {
             Profession::Bureaucrat => matches!(self, WorkshopKind::Market),
-            // Crafter / Healer ship in Phase 5 — once those land,
-            // Workbench / Loom / Shrine → true. Until then no current
-            // profession claims them, so they contribute nothing.
+            // Phase 5a: Crafter — Workbench is the primary station for
+            // tool/weapon recipes; Loom for cloth recipes. Both lift
+            // EV when within `WORKSHOP_AFFINITY_RADIUS` of the agent.
+            // Healer (Phase 5b) will claim `Shrine` once that variant
+            // lands.
+            Profession::Crafter => matches!(self, WorkshopKind::Workbench | WorkshopKind::Loom),
             _ => false,
         }
     }
@@ -136,11 +139,12 @@ pub fn on_owned_by_remove(mut world: DeferredWorld<'_>, entity: Entity, _: Compo
 /// stays stable.
 pub fn tool_profession(rid: ResourceId) -> Option<Profession> {
     // Cache the core ids — they never change after `init_core_ids`.
-    let weapon = core_ids::weapon();
-    if rid == weapon {
+    if rid == core_ids::weapon() {
         return Some(Profession::Hunter);
     }
-    // `tools` will map to Crafter once Phase 5 lands the variant.
+    if rid == core_ids::tools() {
+        return Some(Profession::Crafter);
+    }
     None
 }
 
@@ -162,12 +166,19 @@ pub fn tool_capital_factor(
     if has_in_inv {
         return 1.5;
     }
-    // `Carrier::quantity_of_resource` covers both hand slots; cheap to
-    // probe because we already know the target profession's canonical
-    // resource(s). For now there's only one (weapon → Hunter); future
-    // catalog split will probe a small fixed list.
-    if profession == Profession::Hunter && carrier.quantity_of_resource(core_ids::weapon()) > 0 {
-        return 1.5;
+    // `Carrier::quantity_of_resource` covers both hand slots. Probe
+    // each canonical tool resource that maps to `profession`; today
+    // that's a single ID per profession (weapon → Hunter, tools →
+    // Crafter), but the catalog-tag split will fold more here.
+    let hand_probe = match profession {
+        Profession::Hunter => Some(core_ids::weapon()),
+        Profession::Crafter => Some(core_ids::tools()),
+        _ => None,
+    };
+    if let Some(rid) = hand_probe {
+        if carrier.quantity_of_resource(rid) > 0 {
+            return 1.5;
+        }
     }
     1.0
 }
@@ -305,6 +316,18 @@ mod tests {
         assert!(!WorkshopKind::Workbench.affine_to(Profession::Bureaucrat));
         assert!(!WorkshopKind::Market.affine_to(Profession::None));
         assert!(!WorkshopKind::Market.affine_to(Profession::Farmer));
+    }
+
+    #[test]
+    fn workshop_kind_affine_to_crafter() {
+        // Phase 5a: Workbench and Loom both lift Crafter EV.
+        assert!(WorkshopKind::Workbench.affine_to(Profession::Crafter));
+        assert!(WorkshopKind::Loom.affine_to(Profession::Crafter));
+        // Market is Bureaucrat-affine, not Crafter.
+        assert!(!WorkshopKind::Market.affine_to(Profession::Crafter));
+        // Crafter doesn't pick up Granary / Shrine / Barracks / Monument.
+        assert!(!WorkshopKind::Granary.affine_to(Profession::Crafter));
+        assert!(!WorkshopKind::Shrine.affine_to(Profession::Crafter));
     }
 
     #[test]
