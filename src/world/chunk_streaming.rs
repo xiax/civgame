@@ -8,7 +8,7 @@ use crate::pathfinding::path_request::PathFollow;
 use crate::rendering::camera::CameraViewZ;
 use crate::rendering::color_map::{shaded_ore_tile_color, shaded_tile_color, z_bucket};
 use crate::rendering::fog::{apply_fog_to_material, FogMap, FogTileMaterials};
-use crate::simulation::construction::{Wall, WallMap, WallMaterial};
+use crate::simulation::construction::{StructureLabel, Wall, WallMap, WallMaterial};
 use crate::simulation::faction::{FactionCenter, StorageTileMap};
 use crate::simulation::items::GroundItem;
 use crate::simulation::plants::{
@@ -379,6 +379,7 @@ pub fn spawn_chunk_sprites(
                             Wall {
                                 material: WallMaterial::Stone,
                             },
+                            StructureLabel(WallMaterial::Stone.label()),
                             Transform::from_xyz(wx, wy, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -779,11 +780,13 @@ pub fn chunk_streaming_system(
         let y0 = (coord.1 * CHUNK_SIZE as i32) as i32;
 
         // Optimization: iterate locally over chunk tiles instead of scanning the whole map.
+        // Wall entities are durable structures — leave `wall_map` entries intact across
+        // unload/reload so the streaming reload path reuses them instead of spawning a
+        // generic Stone replacement that would lose the original material + StructureLabel.
         for ly in 0..CHUNK_SIZE as i32 {
             for lx in 0..CHUNK_SIZE as i32 {
                 let tx = x0 + lx;
                 let ty = y0 + ly;
-                wall_map.0.remove(&(tx, ty));
                 sprite_index.by_tile.remove(&(tx, ty));
             }
         }
@@ -840,14 +843,6 @@ pub fn refresh_changed_tiles_system(
             commands.entity(old_entity).despawn_recursive();
         }
 
-        // Also clean up any Wall entity at this position (e.g., mined wall)
-        if let Some(wall_entity) = wall_map.0.remove(&(tx, ty)) {
-            if let Some(chunk_entities) = sprite_index.by_chunk.get_mut(&coord) {
-                chunk_entities.retain(|&e| e != wall_entity);
-            }
-            commands.entity(wall_entity).despawn_recursive();
-        }
-
         // Get the new tile data
         let surf_z = chunk_map.surface_z_at(tx as i32, ty as i32);
         if surf_z < Z_MIN {
@@ -857,6 +852,21 @@ pub fn refresh_changed_tiles_system(
         let surface_kind = chunk_map
             .tile_kind_at(tx as i32, ty as i32)
             .unwrap_or(TileKind::Air);
+
+        // Wall entity lifecycle: only despawn when the tile is no longer a Wall
+        // (e.g. mined, demolished). When the tile is still a Wall and a wall
+        // entity already exists, leave it alone — the construction path already
+        // attached the correct material + StructureLabel, and respawning here
+        // would clobber both with a generic Stone placeholder.
+        if surface_kind != TileKind::Wall {
+            if let Some(wall_entity) = wall_map.0.remove(&(tx, ty)) {
+                if let Some(chunk_entities) = sprite_index.by_chunk.get_mut(&coord) {
+                    chunk_entities.retain(|&e| e != wall_entity);
+                }
+                commands.entity(wall_entity).despawn_recursive();
+            }
+        }
+
         if surface_kind == TileKind::Air {
             continue;
         }
@@ -865,21 +875,27 @@ pub fn refresh_changed_tiles_system(
         let wy = ty as f32 * TILE_SIZE + TILE_SIZE * 0.5;
 
         if surface_kind == TileKind::Wall {
-            // Spawn a new Wall entity (entity_sprites will attach the visual child)
-            let new_entity = commands
-                .spawn((
-                    Wall {
-                        material: WallMaterial::Stone,
-                    },
-                    Transform::from_xyz(wx, wy, 0.4),
-                    GlobalTransform::default(),
-                    Visibility::Visible,
-                    InheritedVisibility::default(),
-                ))
-                .id();
-            wall_map.0.insert((tx, ty), new_entity);
-            if let Some(chunk_entities) = sprite_index.by_chunk.get_mut(&coord) {
-                chunk_entities.push(new_entity);
+            // Only spawn a placeholder for natural bedrock newly exposed
+            // without an existing entity (e.g. mining adjacent rock surfaces
+            // a fresh Wall tile). Constructed walls already have their
+            // entity in wall_map with the correct material.
+            if !wall_map.0.contains_key(&(tx, ty)) {
+                let new_entity = commands
+                    .spawn((
+                        Wall {
+                            material: WallMaterial::Stone,
+                        },
+                        StructureLabel(WallMaterial::Stone.label()),
+                        Transform::from_xyz(wx, wy, 0.4),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id();
+                wall_map.0.insert((tx, ty), new_entity);
+                if let Some(chunk_entities) = sprite_index.by_chunk.get_mut(&coord) {
+                    chunk_entities.push(new_entity);
+                }
             }
         } else {
             let (render_kind, render_ore, render_z, base_vis) = resolve_render_tile(
