@@ -10652,6 +10652,7 @@ mod wage_aware_phase0_phase1 {
                 kind: JobKind::Stockpile,
                 claimants: vec![worker],
                 completed: true,
+                target_rid: None,
             });
 
         // Multiple ticks so FixedUpdate definitely fires.
@@ -10691,6 +10692,7 @@ mod wage_aware_phase0_phase1 {
                 kind: JobKind::Stockpile,
                 claimants: vec![worker],
                 completed: false,
+                target_rid: None,
             });
 
         sim.tick_n(2);
@@ -10819,5 +10821,281 @@ mod wage_aware_phase0_phase1 {
         let _ = skill_decay_system;
         let _ = skill_peaks_tracker_system;
         let _ = SkillsLastSeen::default();
+    }
+
+    #[test]
+    fn phase3_wage_signal_folds_payouts_into_ema() {
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::WageEMA;
+
+        let mut sim = TestSim::new(0xCAFEBABE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let poster = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let worker = sim.spawn_person(sim.player_faction_id, (1, 0), |_| {});
+        set_currency(&mut sim.app, poster, 1000.0);
+        set_currency(&mut sim.app, worker, 0.0);
+
+        let reward = 10.0;
+        let fid = sim.player_faction_id;
+        let job_id = post_paid_stockpile_contract(&mut sim, poster, fid, worker, reward);
+
+        // Fire completion with the wood target_rid so the EMA keys on it.
+        sim.app
+            .world_mut()
+            .resource_mut::<bevy::ecs::event::Events<JobCompletedEvent>>()
+            .send(JobCompletedEvent {
+                job_id,
+                faction_id: fid,
+                kind: JobKind::Stockpile,
+                claimants: vec![worker],
+                completed: true,
+                target_rid: Some(crate::economy::core_ids::wood()),
+            });
+
+        // Run payout, then advance to a TICKS_PER_DAY boundary so the
+        // wage signal aggregator fires. `advance_sim_clock` increments
+        // by one at the start of each tick, so to land *on* a multiple
+        // of TICKS_PER_DAY at the next tick we set clock to multiple-1.
+        sim.tick_n(3);
+        {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = (TICKS_PER_DAY as u64).saturating_sub(1);
+        }
+        sim.tick_n(1);
+
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let faction = registry.factions.get(&fid).expect("village faction exists");
+        let key = (JobKind::Stockpile, Some(crate::economy::core_ids::wood()));
+        let ema: WageEMA = *faction
+            .wage_signal
+            .get(&key)
+            .expect("wage_signal seeded by first-day payout");
+        // Fresh-key path seeds directly with the sample (10.0).
+        assert!(
+            (ema.ema_per_day - 10.0).abs() < 1e-3,
+            "fresh wage EMA should equal the sample: got {}",
+            ema.ema_per_day
+        );
+        assert!(ema.samples >= 1);
+    }
+
+    #[test]
+    fn phase4a_chief_wage_for_stockpile_uses_trade_base_value() {
+        use crate::simulation::jobs::{chief_wage_for, CHIEF_MARGIN};
+        // Wood trade_base_value = 5 (from core.ron); target = 10
+        // → wage = 5 * 10 * 0.5 = 25.0
+        let progress = JobProgress::Stockpile {
+            resource_id: crate::economy::core_ids::wood(),
+            deposited: 0,
+            target: 10,
+        };
+        let _ = CHIEF_MARGIN;
+        let wage = chief_wage_for(&progress);
+        assert!(
+            (wage - 25.0).abs() < 1e-3,
+            "expected wage 25.0, got {}",
+            wage
+        );
+    }
+
+    #[test]
+    fn phase4a_chief_funding_skipped_in_subsistence() {
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::chief_post_funding_system;
+
+        // Subsistence default: empty policy map → no funding.
+        let mut sim = TestSim::new(0xA11CE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        // Wire the chief.
+        {
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<FactionRegistry>();
+            let faction = registry
+                .factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap();
+            faction.chief_entity = Some(chief);
+            faction.treasury = 100.0;
+            // Leave economic_policy empty (Subsistence).
+        }
+        // Manually post a chief Stockpile job.
+        let fid = sim.player_faction_id;
+        {
+            let world = sim.app.world_mut();
+            let mut board = world.resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id,
+                faction_id: fid,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Stockpile {
+                    resource_id: crate::economy::core_ids::wood(),
+                    deposited: 0,
+                    target: 10,
+                },
+                claimants: Vec::new(),
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+        }
+        // Run the funding system directly.
+        chief_post_funding_system(sim.app.world_mut());
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let faction = registry.factions.get(&fid).unwrap();
+        assert!(
+            (faction.treasury - 100.0).abs() < 1e-3,
+            "Subsistence faction's treasury should be untouched, got {}",
+            faction.treasury
+        );
+        let board = sim.app.world().resource::<JobBoard>();
+        let p = board.postings.get(&fid).unwrap().first().unwrap();
+        assert_eq!(p.reward, 0.0, "Subsistence posting must stay unpaid");
+    }
+
+    #[test]
+    fn phase4a_chief_funding_in_market_debits_treasury() {
+        use crate::economy::policy::ResourceControlPolicy;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{chief_post_funding_system, JobEscrowIndex};
+
+        let mut sim = TestSim::new(0xB0B);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let fid = sim.player_faction_id;
+        {
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<FactionRegistry>();
+            let faction = registry.factions.get_mut(&fid).unwrap();
+            faction.chief_entity = Some(chief);
+            faction.treasury = 100.0;
+            // Non-empty policy map = Mixed/Market regime.
+            faction.economic_policy.insert(
+                crate::economy::core_ids::wood(),
+                ResourceControlPolicy::default(),
+            );
+        }
+        {
+            let world = sim.app.world_mut();
+            let mut board = world.resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id,
+                faction_id: fid,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Stockpile {
+                    resource_id: crate::economy::core_ids::wood(),
+                    deposited: 0,
+                    target: 10,
+                },
+                claimants: Vec::new(),
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+        }
+        chief_post_funding_system(sim.app.world_mut());
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let faction = registry.factions.get(&fid).unwrap();
+        // Wood 5 * 10 * 0.5 = 25.0 debited.
+        assert!(
+            (faction.treasury - 75.0).abs() < 1e-3,
+            "Mixed faction treasury should drain by 25; got {}",
+            faction.treasury
+        );
+        let board = sim.app.world().resource::<JobBoard>();
+        let p = board.postings.get(&fid).unwrap().first().unwrap();
+        assert!((p.reward - 25.0).abs() < 1e-3);
+        // Escrow indexed.
+        let idx = sim.app.world().resource::<JobEscrowIndex>();
+        assert_eq!(idx.0.len(), 1);
+    }
+
+    #[test]
+    fn phase4a_chief_funding_skips_unaffordable() {
+        use crate::economy::policy::ResourceControlPolicy;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::chief_post_funding_system;
+
+        let mut sim = TestSim::new(0xCAB);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let fid = sim.player_faction_id;
+        {
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<FactionRegistry>();
+            let faction = registry.factions.get_mut(&fid).unwrap();
+            faction.chief_entity = Some(chief);
+            faction.treasury = 5.0; // less than wage (25)
+            faction.economic_policy.insert(
+                crate::economy::core_ids::wood(),
+                ResourceControlPolicy::default(),
+            );
+        }
+        {
+            let world = sim.app.world_mut();
+            let mut board = world.resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id,
+                faction_id: fid,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Stockpile {
+                    resource_id: crate::economy::core_ids::wood(),
+                    deposited: 0,
+                    target: 10,
+                },
+                claimants: Vec::new(),
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+        }
+        chief_post_funding_system(sim.app.world_mut());
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let faction = registry.factions.get(&fid).unwrap();
+        assert!(
+            (faction.treasury - 5.0).abs() < 1e-3,
+            "Treasury should not be touched on unaffordable; got {}",
+            faction.treasury
+        );
+        let board = sim.app.world().resource::<JobBoard>();
+        let p = board.postings.get(&fid).unwrap().first().unwrap();
+        assert_eq!(p.reward, 0.0, "unfunded postings remain unpaid");
+    }
+
+    #[test]
+    fn phase3_perceived_wages_evicts_oldest_at_cap() {
+        use crate::simulation::jobs::PerceivedFactionWages;
+
+        let mut p = PerceivedFactionWages::default();
+        for i in 0..(PerceivedFactionWages::CAP as u32 + 5) {
+            p.merge_entry(i, JobKind::Stockpile, None, 5.0, i);
+        }
+        assert_eq!(p.by_key.len(), PerceivedFactionWages::CAP);
+        // Earliest entries (low tick) must have been evicted.
+        assert!(p
+            .by_key
+            .iter()
+            .all(|(_, (_, t))| *t >= 5));
     }
 }

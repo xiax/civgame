@@ -231,18 +231,37 @@ pub fn faction_hunter_assignment_system(
     // (faction-aware) but only members who actually know the technique are
     // promotable. Existing hunters are left alone; demotion will catch any
     // who lost the tech via LRU eviction.
-    let mut by_faction_hunters: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
-    let mut by_faction_none: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
+    // Phase 4b: rank candidates by `(EV, skill)` — EV via
+    // `profession_choice::expected_wage(faction, Hunter, skills, 1.0)`
+    // dominates when the faction's `wage_signal` has accumulated samples
+    // for Hunter's job kinds; falls back to raw Combat skill when wages
+    // are zero. Capital factor pinned to 1.0 here; the full EV-driven
+    // unification (with tool / workshop / land factors) is the remaining
+    // Phase 4b deliverable.
+    let mut by_faction_hunters: AHashMap<u32, Vec<(Entity, f32, u32)>> = AHashMap::default();
+    let mut by_faction_none: AHashMap<u32, Vec<(Entity, f32, u32)>> = AHashMap::default();
     for (entity, prof, member, skills, _, _, knowledge_opt) in query.iter() {
         if member.faction_id == SOLO {
             continue;
         }
         let combat = skills.0[SkillKind::Combat as usize];
+        let ev = registry
+            .factions
+            .get(&member.faction_id)
+            .map(|f| {
+                crate::simulation::profession_choice::expected_wage(
+                    f,
+                    Profession::Hunter,
+                    skills,
+                    1.0,
+                )
+            })
+            .unwrap_or(0.0);
         match *prof {
             Profession::Hunter => by_faction_hunters
                 .entry(member.faction_id)
                 .or_default()
-                .push((entity, combat)),
+                .push((entity, ev, combat)),
             Profession::None => {
                 let knows_hunting = knowledge_opt
                     .map(|k| k.has_learned(HUNTING_SPEAR))
@@ -251,7 +270,7 @@ pub fn faction_hunter_assignment_system(
                     by_faction_none
                         .entry(member.faction_id)
                         .or_default()
-                        .push((entity, combat));
+                        .push((entity, ev, combat));
                 }
             }
             _ => {}
@@ -266,15 +285,25 @@ pub fn faction_hunter_assignment_system(
         let want = target.hunter_target;
         let _ = target.adult_count; // populated for inspector/logging
         if hunters.len() < want {
-            none.sort_by(|a, b| b.1.cmp(&a.1));
+            // Highest (EV, skill) first.
+            none.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.2.cmp(&a.2))
+            });
             let need = want - hunters.len();
-            for (e, _) in none.into_iter().take(need) {
+            for (e, _, _) in none.into_iter().take(need) {
                 promote.insert(e);
             }
         } else if hunters.len() > want {
-            hunters.sort_by(|a, b| a.1.cmp(&b.1));
+            // Lowest (EV, skill) first.
+            hunters.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.2.cmp(&b.2))
+            });
             let extra = hunters.len() - want;
-            for (e, _) in hunters.into_iter().take(extra) {
+            for (e, _, _) in hunters.into_iter().take(extra) {
                 demote.insert(e);
             }
         }
@@ -289,25 +318,13 @@ pub fn faction_hunter_assignment_system(
             *prof = Profession::Hunter;
         } else if demote.contains(&entity) {
             *prof = Profession::None;
-            if let Some(mut ai) = ai_opt {
-                if ai.reserved_resource.is_some() {
-                    release_reservation(&reservations, &mut ai);
-                }
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
-                ai.target_entity = None;
-                ai.work_progress = 0;
-            }
-            if let Some(mut aq) = aq_opt {
-                // Phase 4b-ii: hunter demote tears down an in-flight hunt
-                // chain entirely. `cancel()` drops both `current` and the
-                // prefetched queue so a chained hunt method can't leak into
-                // the next dispatch.
-                aq.cancel();
-            }
-            commands
-                .entity(entity)
-                .remove::<crate::simulation::corpse::Carrying>();
+            crate::simulation::profession_choice::demote_profession_state(
+                entity,
+                ai_opt.map(|x| x.into_inner()),
+                aq_opt.map(|x| x.into_inner()),
+                &reservations,
+                &mut commands,
+            );
         }
     }
 }
@@ -369,22 +386,35 @@ pub fn chief_bureaucrat_appointment_system(
         return;
     }
 
-    let mut by_faction_bureaucrats: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
-    let mut by_faction_none: AHashMap<u32, Vec<(Entity, u32)>> = AHashMap::default();
+    // Phase 4b: EV-aware ranking. See hunter equivalent above.
+    let mut by_faction_bureaucrats: AHashMap<u32, Vec<(Entity, f32, u32)>> = AHashMap::default();
+    let mut by_faction_none: AHashMap<u32, Vec<(Entity, f32, u32)>> = AHashMap::default();
     for (entity, prof, member, skills, _, _) in query.iter() {
         if member.faction_id == SOLO || !targets.contains_key(&member.faction_id) {
             continue;
         }
         let social = skills.0[SkillKind::Social as usize];
+        let ev = registry
+            .factions
+            .get(&member.faction_id)
+            .map(|f| {
+                crate::simulation::profession_choice::expected_wage(
+                    f,
+                    Profession::Bureaucrat,
+                    skills,
+                    1.0,
+                )
+            })
+            .unwrap_or(0.0);
         match *prof {
             Profession::Bureaucrat => by_faction_bureaucrats
                 .entry(member.faction_id)
                 .or_default()
-                .push((entity, social)),
+                .push((entity, ev, social)),
             Profession::None => by_faction_none
                 .entry(member.faction_id)
                 .or_default()
-                .push((entity, social)),
+                .push((entity, ev, social)),
             _ => {}
         }
     }
@@ -395,14 +425,22 @@ pub fn chief_bureaucrat_appointment_system(
         let mut bureaucrats = by_faction_bureaucrats.remove(&fid).unwrap_or_default();
         let mut none = by_faction_none.remove(&fid).unwrap_or_default();
         if bureaucrats.len() < want {
-            none.sort_by(|a, b| b.1.cmp(&a.1));
-            for (e, _) in none.into_iter().take(want - bureaucrats.len()) {
+            none.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.2.cmp(&a.2))
+            });
+            for (e, _, _) in none.into_iter().take(want - bureaucrats.len()) {
                 promote.insert(e);
             }
         } else if bureaucrats.len() > want {
-            bureaucrats.sort_by(|a, b| a.1.cmp(&b.1));
+            bureaucrats.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.2.cmp(&b.2))
+            });
             let extra = bureaucrats.len() - want;
-            for (e, _) in bureaucrats.into_iter().take(extra) {
+            for (e, _, _) in bureaucrats.into_iter().take(extra) {
                 demote.insert(e);
             }
         }
@@ -417,21 +455,13 @@ pub fn chief_bureaucrat_appointment_system(
             *prof = Profession::Bureaucrat;
         } else if demote.contains(&entity) {
             *prof = Profession::None;
-            if let Some(mut ai) = ai_opt {
-                if ai.reserved_resource.is_some() {
-                    release_reservation(&reservations, &mut ai);
-                }
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
-                ai.target_entity = None;
-                ai.work_progress = 0;
-            }
-            if let Some(mut aq) = aq_opt {
-                aq.cancel();
-            }
-            commands
-                .entity(entity)
-                .remove::<crate::simulation::corpse::Carrying>();
+            crate::simulation::profession_choice::demote_profession_state(
+                entity,
+                ai_opt.map(|x| x.into_inner()),
+                aq_opt.map(|x| x.into_inner()),
+                &reservations,
+                &mut commands,
+            );
         }
     }
 }
@@ -972,7 +1002,7 @@ pub const FARMER_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
 pub fn faction_profession_system(
     clock: Res<SimClock>,
     mut registry: ResMut<FactionRegistry>,
-    mut query: Query<(&mut Profession, &FactionMember)>,
+    mut query: Query<(Entity, &mut Profession, &FactionMember, &Skills)>,
 ) {
     if clock.tick % FARMER_ASSIGNMENT_CADENCE != 0 {
         return;
@@ -991,12 +1021,30 @@ pub fn faction_profession_system(
         let per_head = faction.storage.food_total() / members as f32;
         let promote_threshold = FARMER_PROMOTE_PER_HEAD;
         let demote_threshold = FARMER_PROMOTE_PER_HEAD * FARMER_DEMOTE_RATIO;
-        let mut current_farmers_for_target = 0u32;
-        for (prof, member) in query.iter() {
-            if member.faction_id == faction_id && *prof == Profession::Farmer {
-                current_farmers_for_target += 1;
+        // Phase 4b: rank candidates by `(expected_wage(Farmer), Farming skill)`
+        // so that wage-signal-driven promotion picks competent agents over
+        // arbitrary scan order. Capital factor pinned to 1.0 here — the full
+        // capital-threaded EV is the remaining Phase 4b deliverable.
+        let mut current_farmer_set: Vec<(Entity, f32, u32)> = Vec::new();
+        let mut none_set: Vec<(Entity, f32, u32)> = Vec::new();
+        for (entity, prof, member, skills) in query.iter() {
+            if member.faction_id != faction_id {
+                continue;
+            }
+            let farming = skills.0[SkillKind::Farming as usize];
+            let ev = crate::simulation::profession_choice::expected_wage(
+                faction,
+                Profession::Farmer,
+                skills,
+                1.0,
+            );
+            match *prof {
+                Profession::Farmer => current_farmer_set.push((entity, ev, farming)),
+                Profession::None => none_set.push((entity, ev, farming)),
+                _ => {}
             }
         }
+        let current_farmers_for_target = current_farmer_set.len() as u32;
         let target_farmers = if per_head < promote_threshold {
             (faction.member_count / 5).max(1)
         } else if per_head > demote_threshold {
@@ -1004,31 +1052,42 @@ pub fn faction_profession_system(
         } else {
             current_farmers_for_target
         };
-
         let current_farmers = current_farmers_for_target;
 
         if current_farmers < target_farmers {
-            let to_assign = target_farmers - current_farmers;
-            let mut assigned = 0;
-            for (mut prof, member) in query.iter_mut() {
-                if member.faction_id == faction_id && *prof == Profession::None {
+            let to_assign = (target_farmers - current_farmers) as usize;
+            // Highest (EV, skill) first.
+            none_set.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.2.cmp(&a.2))
+            });
+            let promote: ahash::AHashSet<Entity> = none_set
+                .into_iter()
+                .take(to_assign)
+                .map(|(e, _, _)| e)
+                .collect();
+            for (entity, mut prof, _, _) in query.iter_mut() {
+                if promote.contains(&entity) {
                     *prof = Profession::Farmer;
-                    assigned += 1;
-                    if assigned >= to_assign {
-                        break;
-                    }
                 }
             }
         } else if current_farmers > target_farmers {
-            let to_unassign = current_farmers - target_farmers;
-            let mut unassigned = 0;
-            for (mut prof, member) in query.iter_mut() {
-                if member.faction_id == faction_id && *prof == Profession::Farmer {
+            let to_unassign = (current_farmers - target_farmers) as usize;
+            // Lowest (EV, skill) first.
+            current_farmer_set.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.2.cmp(&b.2))
+            });
+            let demote: ahash::AHashSet<Entity> = current_farmer_set
+                .into_iter()
+                .take(to_unassign)
+                .map(|(e, _, _)| e)
+                .collect();
+            for (entity, mut prof, _, _) in query.iter_mut() {
+                if demote.contains(&entity) {
                     *prof = Profession::None;
-                    unassigned += 1;
-                    if unassigned >= to_unassign {
-                        break;
-                    }
                 }
             }
         }
@@ -1627,6 +1686,19 @@ pub struct FactionData {
     /// observationally. Every site that previously branched on
     /// `is_nomadic()` or `match preset` should consult this instead.
     pub caps: crate::simulation::archetype::FactionCapabilities,
+    /// Phase 3 (wage-aware-labor-market-v2): per-`(JobKind, target_rid)`
+    /// exponential moving average of recent payouts on this faction's
+    /// postings. Folded daily by `faction_wage_signal_system` from
+    /// member-side `Earnings` rings. Phase 4's EV-driven profession
+    /// choice reads this to score `expected_wage(profession)`.
+    /// `target_rid = None` covers Build / Calories postings.
+    pub wage_signal: ahash::AHashMap<
+        (
+            crate::simulation::jobs::JobKind,
+            Option<crate::economy::resource_catalog::ResourceId>,
+        ),
+        crate::simulation::jobs::WageEMA,
+    >,
 }
 
 impl FactionData {
@@ -1717,6 +1789,7 @@ impl FactionRegistry {
                 // bonding-formed factions) keep the default until
                 // they apply their own preset/lifestyle.
                 caps: crate::simulation::archetype::FactionCapabilities::default(),
+                wage_signal: ahash::AHashMap::default(),
             },
         );
         id

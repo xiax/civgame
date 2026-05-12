@@ -4,6 +4,7 @@ pub mod animals;
 pub mod archetype;
 pub mod building_template;
 pub mod camp;
+pub mod capital;
 pub mod lifecycle;
 pub mod carry;
 pub mod carve;
@@ -38,6 +39,7 @@ pub mod pack_deploy;
 pub mod player_command;
 pub mod sedentary_collapse;
 pub mod person;
+pub mod profession_choice;
 pub mod wild_herd;
 pub mod plants;
 pub mod production;
@@ -94,6 +96,15 @@ impl Plugin for SimulationPlugin {
             .register_component_hooks::<construction::Door>()
             .on_remove(doormat::release_doormat_on_door_remove);
 
+        // Phase 2 (wage-aware-labor-market-v2): workshop ownership index
+        // tracks profession-affine capital per faction. Stamped at
+        // workshop finalize in `construction.rs`; maintained here so
+        // despawn paths (lifecycle abandon, etc.) stay untouched.
+        app.world_mut()
+            .register_component_hooks::<capital::OwnedBy>()
+            .on_add(capital::on_owned_by_add)
+            .on_remove(capital::on_owned_by_remove);
+
         app.add_plugins(jobs::JobsPlugin)
             .add_plugins(projects::ProjectsPlugin)
             .add_event::<combat::CombatEvent>()
@@ -120,6 +131,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::WallMap::default())
             .insert_resource(construction::CampfireMap::default())
             .insert_resource(construction::DoorMap::default())
+            .insert_resource(capital::WorkshopOwnership::default())
             .insert_resource(construction::WorkbenchMap::default())
             .insert_resource(construction::LoomMap::default())
             .insert_resource(construction::TableMap::default())
@@ -635,15 +647,25 @@ impl Plugin for SimulationPlugin {
                         .after(jobs::chief_job_posting_system),
                     jobs::job_claim_release_system
                         .after(jobs::job_build_completion_system),
+                    jobs::chief_post_funding_system
+                        .after(jobs::chief_job_posting_system),
                     jobs::job_payout_system
                         .after(jobs::job_claim_release_system),
-                    skills::skill_peaks_tracker_system
+                    jobs::faction_wage_signal_system
                         .after(jobs::job_payout_system),
+                    skills::skill_peaks_tracker_system
+                        .after(jobs::faction_wage_signal_system),
                     skills::skill_decay_system
                         .after(skills::skill_peaks_tracker_system),
                     goals::chronic_failure_release_system
                         .after(jobs::job_claim_release_system),
                 )
+                    .in_set(SimulationSet::Economy),
+            )
+            .add_systems(
+                FixedUpdate,
+                (jobs::wage_gossip_system
+                    .after(knowledge::awareness_gossip_system),)
                     .in_set(SimulationSet::Economy),
             )
             .add_systems(

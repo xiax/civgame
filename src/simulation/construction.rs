@@ -3855,6 +3855,7 @@ pub fn construction_system(
                         kind: dropped.kind,
                         claimants,
                         completed: true,
+                        target_rid: dropped.progress.target_rid(),
                     });
                 } else {
                     idx += 1;
@@ -4111,6 +4112,11 @@ pub fn construction_system(
                         .spawn((
                             wb,
                             StructureLabel(label),
+                            crate::simulation::capital::OwnedBy {
+                                faction_id: bp.faction_id,
+                                kind: crate::simulation::capital::WorkshopKind::Workbench,
+                                tile,
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -4127,6 +4133,11 @@ pub fn construction_system(
                                 faction_id: bp.faction_id,
                             },
                             StructureLabel(BuildSiteKind::Loom.label()),
+                            crate::simulation::capital::OwnedBy {
+                                faction_id: bp.faction_id,
+                                kind: crate::simulation::capital::WorkshopKind::Loom,
+                                tile,
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -4171,6 +4182,11 @@ pub fn construction_system(
                                 faction_id: bp.faction_id,
                             },
                             StructureLabel(BuildSiteKind::Granary.label()),
+                            crate::simulation::capital::OwnedBy {
+                                faction_id: bp.faction_id,
+                                kind: crate::simulation::capital::WorkshopKind::Granary,
+                                tile,
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -4187,6 +4203,11 @@ pub fn construction_system(
                                 faction_id: bp.faction_id,
                             },
                             StructureLabel(BuildSiteKind::Shrine.label()),
+                            crate::simulation::capital::OwnedBy {
+                                faction_id: bp.faction_id,
+                                kind: crate::simulation::capital::WorkshopKind::Shrine,
+                                tile,
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -4203,6 +4224,11 @@ pub fn construction_system(
                                 faction_id: bp.faction_id,
                             },
                             StructureLabel(BuildSiteKind::Market.label()),
+                            crate::simulation::capital::OwnedBy {
+                                faction_id: bp.faction_id,
+                                kind: crate::simulation::capital::WorkshopKind::Market,
+                                tile,
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -4219,6 +4245,11 @@ pub fn construction_system(
                                 faction_id: bp.faction_id,
                             },
                             StructureLabel(BuildSiteKind::Barracks.label()),
+                            crate::simulation::capital::OwnedBy {
+                                faction_id: bp.faction_id,
+                                kind: crate::simulation::capital::WorkshopKind::Barracks,
+                                tile,
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -4235,6 +4266,11 @@ pub fn construction_system(
                                 faction_id: bp.faction_id,
                             },
                             StructureLabel(BuildSiteKind::Monument.label()),
+                            crate::simulation::capital::OwnedBy {
+                                faction_id: bp.faction_id,
+                                kind: crate::simulation::capital::WorkshopKind::Monument,
+                                tile,
+                            },
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.45),
                             GlobalTransform::default(),
                             Visibility::Visible,
@@ -5201,6 +5237,11 @@ fn spawn_seeded_structure(
                 .spawn((
                     wb,
                     StructureLabel(label),
+                    crate::simulation::capital::OwnedBy {
+                        faction_id,
+                        kind: crate::simulation::capital::WorkshopKind::Workbench,
+                        tile,
+                    },
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -5214,6 +5255,11 @@ fn spawn_seeded_structure(
                 .spawn((
                     Loom { faction_id },
                     StructureLabel(BuildSiteKind::Loom.label()),
+                    crate::simulation::capital::OwnedBy {
+                        faction_id,
+                        kind: crate::simulation::capital::WorkshopKind::Loom,
+                        tile,
+                    },
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -5227,6 +5273,11 @@ fn spawn_seeded_structure(
                 .spawn((
                     Granary { faction_id },
                     StructureLabel(BuildSiteKind::Granary.label()),
+                    crate::simulation::capital::OwnedBy {
+                        faction_id,
+                        kind: crate::simulation::capital::WorkshopKind::Granary,
+                        tile,
+                    },
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -5240,6 +5291,11 @@ fn spawn_seeded_structure(
                 .spawn((
                     Shrine { faction_id },
                     StructureLabel(BuildSiteKind::Shrine.label()),
+                    crate::simulation::capital::OwnedBy {
+                        faction_id,
+                        kind: crate::simulation::capital::WorkshopKind::Shrine,
+                        tile,
+                    },
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -5253,6 +5309,11 @@ fn spawn_seeded_structure(
                 .spawn((
                     Market { faction_id },
                     StructureLabel(BuildSiteKind::Market.label()),
+                    crate::simulation::capital::OwnedBy {
+                        faction_id,
+                        kind: crate::simulation::capital::WorkshopKind::Market,
+                        tile,
+                    },
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -5266,6 +5327,11 @@ fn spawn_seeded_structure(
                 .spawn((
                     Barracks { faction_id },
                     StructureLabel(BuildSiteKind::Barracks.label()),
+                    crate::simulation::capital::OwnedBy {
+                        faction_id,
+                        kind: crate::simulation::capital::WorkshopKind::Barracks,
+                        tile,
+                    },
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -5279,6 +5345,11 @@ fn spawn_seeded_structure(
                 .spawn((
                     Monument { faction_id },
                     StructureLabel(BuildSiteKind::Monument.label()),
+                    crate::simulation::capital::OwnedBy {
+                        faction_id,
+                        kind: crate::simulation::capital::WorkshopKind::Monument,
+                        tile,
+                    },
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.45),
                     GlobalTransform::default(),
                     Visibility::Visible,

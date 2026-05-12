@@ -145,6 +145,26 @@ pub enum JobProgress {
 }
 
 impl JobProgress {
+    /// The specific resource this posting targets, if any. Drives Phase 3
+    /// wage-signal keying so `Stockpile{wheat}` and `Stockpile{wood}`
+    /// produce separate EMAs. `None` for postings without a single named
+    /// target (Calories / Building / Planting).
+    pub fn target_rid(&self) -> Option<crate::economy::resource_catalog::ResourceId> {
+        use crate::economy::core_ids;
+        match self {
+            JobProgress::Calories { .. } => None,
+            JobProgress::Stockpile { resource_id, .. } => Some(*resource_id),
+            JobProgress::Haul { resource_id, .. } => Some(*resource_id),
+            JobProgress::Planting { .. } => Some(core_ids::grain_seed()),
+            JobProgress::Crafting { recipe, .. } => {
+                crate::simulation::crafting::craft_recipes()
+                    .get(*recipe as usize)
+                    .map(|r| r.output_resource)
+            }
+            JobProgress::Building { .. } => None,
+        }
+    }
+
     pub fn is_complete(&self) -> bool {
         match self {
             JobProgress::Calories { deposited, target } => deposited >= target,
@@ -459,6 +479,11 @@ pub struct Earnings {
 #[derive(Clone, Copy, Debug)]
 pub struct EarningEntry {
     pub job_kind: JobKind,
+    /// Specific resource the posting targeted (e.g. `wheat` for
+    /// `Stockpile{wheat}`). Phase 3 wage-signal keys on `(job_kind,
+    /// target_rid)`. `None` when the posting wasn't resource-specific
+    /// (food calories, build, plant).
+    pub target_rid: Option<crate::economy::resource_catalog::ResourceId>,
     pub amount: f32,
     pub tick: u32,
 }
@@ -542,6 +567,7 @@ pub fn job_payout_system(world: &mut World) {
                     if let Some(mut earnings) = world.get_mut::<Earnings>(worker) {
                         earnings.push(EarningEntry {
                             job_kind: ev.kind,
+                            target_rid: ev.target_rid,
                             amount: share,
                             tick: now,
                         });
@@ -552,6 +578,7 @@ pub fn job_payout_system(world: &mut World) {
                         let mut e = Earnings::default();
                         e.push(EarningEntry {
                             job_kind: ev.kind,
+                            target_rid: ev.target_rid,
                             amount: share,
                             tick: now,
                         });
@@ -586,6 +613,468 @@ pub fn job_payout_system(world: &mut World) {
             // Cancellation / expiry / no claimants on completion:
             // despawn the escrow; the `on_remove` hook refunds.
             world.entity_mut(escrow_entity).despawn();
+        }
+    }
+}
+
+// ─── Phase 4a — Chief-funded postings (Mixed / Market only) ─────────────
+
+/// Chief pays half of catalog trade value for delivered material, by
+/// default; tunable per kind below. Half captures "chief beats catalog
+/// price by enough to draw labor, but is no worse than free agents
+/// could earn on the market".
+pub const CHIEF_MARGIN: f32 = 0.5;
+/// Daily wage paid to claimants of a chief `Build` posting. Bounded
+/// per-posting by [`CHIEF_BUILD_WAGE_CAP`] so a huge wall doesn't drain
+/// the treasury.
+pub const CHIEF_BUILD_WAGE_PER_DAY: f32 = 3.0;
+pub const CHIEF_BUILD_WAGE_CAP: f32 = 30.0;
+pub const CHIEF_BUILD_EXPECTED_DAYS: f32 = 5.0;
+/// Daily wage paid to claimants of a chief `Farm` (planting) posting.
+pub const CHIEF_FARM_WAGE_PER_DAY: f32 = 2.0;
+pub const CHIEF_FARM_EXPECTED_DAYS: f32 = 4.0;
+/// Daily wage for `Stockpile` Calories postings (food gather + deposit).
+/// Calories postings carry no `target_rid` so trade_base_value can't be
+/// keyed; use a flat per-day allowance instead.
+pub const CHIEF_FOOD_WAGE_PER_DAY: f32 = 2.5;
+pub const CHIEF_FOOD_EXPECTED_DAYS: f32 = 3.0;
+
+/// Compute the chief's offered wage for a posting in faction
+/// currency. Reads `JobProgress` to recover the (qty, target_rid)
+/// information; returns `0.0` for shapes the chief can't sensibly
+/// price (Building blueprints that already aren't scaled by qty —
+/// handled via expected_days).
+pub fn chief_wage_for(progress: &JobProgress) -> f32 {
+    match progress {
+        JobProgress::Stockpile {
+            resource_id,
+            target,
+            ..
+        } => {
+            let base = resource_id.trade_base_value() as f32;
+            base * (*target as f32) * CHIEF_MARGIN
+        }
+        JobProgress::Haul {
+            resource_id,
+            target,
+            ..
+        } => {
+            // Haul is pure transport — pay less than Stockpile to keep
+            // delivery cheaper than re-sourcing.
+            let base = resource_id.trade_base_value() as f32;
+            base * (*target as f32) * CHIEF_MARGIN * 0.5
+        }
+        JobProgress::Crafting { recipe, target, .. } => {
+            let recipes = crate::simulation::crafting::craft_recipes();
+            let out_value = recipes
+                .get(*recipe as usize)
+                .map(|r| r.output_resource.trade_base_value() as f32)
+                .unwrap_or(0.0);
+            out_value * (*target as f32) * CHIEF_MARGIN
+        }
+        JobProgress::Calories { .. } => {
+            (CHIEF_FOOD_WAGE_PER_DAY * CHIEF_FOOD_EXPECTED_DAYS).min(40.0)
+        }
+        JobProgress::Planting { target, .. } => {
+            let wage = CHIEF_FARM_WAGE_PER_DAY * CHIEF_FARM_EXPECTED_DAYS;
+            // Scale up with target tile count, bounded so a 50-tile
+            // farm doesn't crater treasury.
+            (wage + (*target as f32) * 0.2).min(40.0)
+        }
+        JobProgress::Building { .. } => {
+            (CHIEF_BUILD_WAGE_PER_DAY * CHIEF_BUILD_EXPECTED_DAYS)
+                .min(CHIEF_BUILD_WAGE_CAP)
+        }
+    }
+}
+
+/// Phase 4a: scan freshly-posted chief postings and attempt to fund
+/// them out of the faction treasury. Postings in Mixed/Market factions
+/// (those with a non-empty `economic_policy` map) become paid contracts
+/// at `chief_wage_for(progress)`; postings in Subsistence factions stay
+/// unpaid (matches the prior reward-0 behavior).
+///
+/// Insufficient treasury → posting stays at `reward = 0`. This couples
+/// chief coordination to fiscal health: bankrupt factions can't direct
+/// paid labor and fall back to communal work.
+///
+/// Runs in `SimulationSet::Economy`, exclusive `&mut World`, after
+/// `chief_job_posting_system`. Funds only chief-source postings with
+/// `reward == 0.0` (so it's idempotent — already-funded postings are
+/// skipped; player/individual postings carry their own escrow).
+pub fn chief_post_funding_system(world: &mut World) {
+    // 1. Snapshot candidate postings: (job_id, faction_id, wage, chief_entity).
+    //    Skip postings already funded, non-chief sources, or factions
+    //    without a chief / without a non-empty policy map.
+    let mut candidates: Vec<(JobId, u32, f32, Entity)> = Vec::new();
+    {
+        let registry = world.resource::<crate::simulation::faction::FactionRegistry>();
+        let board = world.resource::<JobBoard>();
+        for (&faction_id, postings) in board.postings.iter() {
+            let Some(faction) = registry.factions.get(&faction_id) else {
+                continue;
+            };
+            // Subsistence: empty policy map → unpaid communal labor.
+            if faction.economic_policy.is_empty() {
+                continue;
+            }
+            let Some(chief) = faction.chief_entity else {
+                continue;
+            };
+            for p in postings.iter() {
+                if !matches!(p.source, JobSource::Chief) {
+                    continue;
+                }
+                if p.reward > 0.0 {
+                    continue;
+                }
+                let wage = chief_wage_for(&p.progress);
+                if wage <= 0.0 {
+                    continue;
+                }
+                candidates.push((p.id, faction_id, wage, chief));
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+
+    // 2. For each candidate, check treasury, debit, spawn escrow, set
+    //    reward, index it.
+    for (job_id, faction_id, wage, chief) in candidates {
+        let funded = {
+            let mut registry =
+                world.resource_mut::<crate::simulation::faction::FactionRegistry>();
+            let Some(faction) = registry.factions.get_mut(&faction_id) else {
+                continue;
+            };
+            if faction.treasury < wage {
+                false
+            } else {
+                faction.treasury -= wage;
+                true
+            }
+        };
+        if !funded {
+            continue;
+        }
+        // Spawn escrow + index.
+        let escrow_entity = world
+            .spawn(JobEscrow {
+                amount: wage,
+                beneficiary: chief,
+            })
+            .id();
+        {
+            let mut idx = world.resource_mut::<JobEscrowIndex>();
+            idx.0.insert(job_id, escrow_entity);
+        }
+        // Set the posting's reward.
+        {
+            let mut board = world.resource_mut::<JobBoard>();
+            if let Some(p) = board.get_mut(job_id) {
+                p.reward = wage;
+            }
+        }
+    }
+}
+
+/// Phase 3 (wage-aware-labor-market-v2): per-`(JobKind, target_rid)`
+/// exponential moving average of payouts on this faction's postings.
+/// Stored on `FactionData.wage_signal`. The aggregator
+/// `faction_wage_signal_system` runs daily, sums each member's
+/// last-day earnings into one nominal-currency total per key, then
+/// folds via `ema_new = ALPHA * sample + (1 - ALPHA) * ema_old`.
+///
+/// `ALPHA = 1 − 0.5^(1/5) ≈ 0.129` matches a 5-day half-life: a wage
+/// shock decays to half-amplitude after 5 days, supporting agents
+/// reacting on a season-scale horizon. Zero-sample days decay the EMA
+/// toward zero so an outage shows up in the signal.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WageEMA {
+    /// Average wage earned per claimant on jobs of this key, in
+    /// currency units per game-day. Phase 4 reads this as the
+    /// expected payout when scoring `expected_wage(profession)`.
+    pub ema_per_day: f32,
+    pub last_update_tick: u32,
+    /// Cumulative count of payouts folded into this EMA; informational
+    /// for the inspector — not used in scoring.
+    pub samples: u32,
+}
+
+const WAGE_EMA_ALPHA: f32 = 0.129_449_43;
+const WAGE_EMA_WINDOW_TICKS: u32 = crate::world::seasons::TICKS_PER_DAY;
+
+/// Phase 3 aggregator. Walks every agent's `Earnings` ring, sums per-
+/// `(JobKind, target_rid)` payouts that landed in the last day, folds
+/// them into the agent's *village* faction's `wage_signal`, then folds
+/// zero into every other key on that faction's signal so the EMA decays
+/// when no postings of that kind paid out. Runs once per day.
+pub fn faction_wage_signal_system(world: &mut World) {
+    let clock_tick = world.resource::<SimClock>().tick as u32;
+    if clock_tick % WAGE_EMA_WINDOW_TICKS != 0 {
+        return;
+    }
+    let window_start = clock_tick.saturating_sub(WAGE_EMA_WINDOW_TICKS);
+
+    // 1. Snapshot per-(faction, key) sums from member earnings.
+    let mut sums: ahash::AHashMap<
+        (u32, JobKind, Option<crate::economy::resource_catalog::ResourceId>),
+        (f32, u32),
+    > = ahash::AHashMap::default();
+    let mut q = world.query::<(
+        &Earnings,
+        &crate::simulation::faction::FactionMember,
+    )>();
+    for (earnings, fm) in q.iter(world) {
+        let village_id = {
+            let registry = world.resource::<crate::simulation::faction::FactionRegistry>();
+            registry.root_faction(fm.faction_id)
+        };
+        for entry in earnings.recent.iter() {
+            if entry.tick < window_start {
+                continue;
+            }
+            let key = (village_id, entry.job_kind, entry.target_rid);
+            let slot = sums.entry(key).or_insert((0.0, 0));
+            slot.0 += entry.amount;
+            slot.1 = slot.1.saturating_add(1);
+        }
+    }
+
+    // 2. Fold into wage_signal for every village faction with a non-
+    //    empty key set (existing + freshly-paid).
+    let mut registry = world.resource_mut::<crate::simulation::faction::FactionRegistry>();
+    // Phase 1: process each faction's existing keys (decay path).
+    let faction_ids: Vec<u32> = registry.factions.keys().copied().collect();
+    for fid in faction_ids {
+        let Some(faction) = registry.factions.get_mut(&fid) else {
+            continue;
+        };
+        // Collect this faction's existing keys; needed because we may
+        // also touch keys that don't appear in `sums` (zero-decay).
+        let existing_keys: Vec<(JobKind, Option<crate::economy::resource_catalog::ResourceId>)> =
+            faction.wage_signal.keys().copied().collect();
+        for key in existing_keys {
+            let sample = sums
+                .get(&(fid, key.0, key.1))
+                .map(|(amt, n)| if *n > 0 { *amt / *n as f32 } else { 0.0 })
+                .unwrap_or(0.0);
+            let ema = faction.wage_signal.entry(key).or_default();
+            ema.ema_per_day = WAGE_EMA_ALPHA * sample + (1.0 - WAGE_EMA_ALPHA) * ema.ema_per_day;
+            ema.last_update_tick = clock_tick;
+            if sample > 0.0 {
+                ema.samples = ema.samples.saturating_add(1);
+            }
+        }
+    }
+    // Phase 2: fresh keys (paid for the first time on this faction).
+    for ((fid, kind, rid), (amt, n)) in sums.into_iter() {
+        let Some(faction) = registry.factions.get_mut(&fid) else {
+            continue;
+        };
+        let sample = if n > 0 { amt / n as f32 } else { 0.0 };
+        let key = (kind, rid);
+        if faction.wage_signal.contains_key(&key) {
+            continue; // already folded above
+        }
+        // Seed: jump straight to the sample so day-1 signals are
+        // immediately usable rather than 13% of true.
+        faction.wage_signal.insert(
+            key,
+            WageEMA {
+                ema_per_day: sample,
+                last_update_tick: clock_tick,
+                samples: 1,
+            },
+        );
+    }
+}
+
+/// Phase 3 cross-faction gossip surface: per-agent perception of
+/// *other* factions' wage signals, refreshed by socialize encounters.
+/// Same-faction work reads `FactionData.wage_signal` directly; this
+/// component captures the information friction for cross-faction
+/// migration / posting decisions that Phase 4+ will introduce.
+///
+/// Keys mirror `wage_signal` keys plus an outer `fid` so the agent
+/// remembers per-faction signals separately. Value is `(ema_per_day,
+/// observed_tick)` — the `observed_tick` lets stale gossip decay.
+#[derive(Component, Clone, Debug, Default)]
+pub struct PerceivedFactionWages {
+    pub by_key: ahash::AHashMap<
+        (
+            u32,
+            JobKind,
+            Option<crate::economy::resource_catalog::ResourceId>,
+        ),
+        (f32, u32),
+    >,
+}
+
+impl PerceivedFactionWages {
+    pub const CAP: usize = 32;
+
+    /// Merge `(fid, kind, rid, ema, observed_tick)` into this map,
+    /// keeping the higher `observed_tick` on conflict. Evicts oldest
+    /// entries past `CAP`.
+    pub fn merge_entry(
+        &mut self,
+        fid: u32,
+        kind: JobKind,
+        rid: Option<crate::economy::resource_catalog::ResourceId>,
+        ema: f32,
+        observed_tick: u32,
+    ) {
+        let key = (fid, kind, rid);
+        let take = match self.by_key.get(&key) {
+            Some((_, t)) => observed_tick > *t,
+            None => true,
+        };
+        if take {
+            self.by_key.insert(key, (ema, observed_tick));
+        }
+        if self.by_key.len() > Self::CAP {
+            // Evict oldest entry. Linear scan is fine at CAP=32.
+            if let Some((evict, _)) = self
+                .by_key
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, v)| (*k, *v))
+            {
+                self.by_key.remove(&evict);
+            }
+        }
+    }
+}
+
+/// Phase 3 gossip: when two agents are socializing within 3 tiles,
+/// each merges up to `WAGE_GOSSIP_TOP_K = 4` of the other's most-
+/// recent wage observations (their own faction's `wage_signal` plus
+/// any previously-gossiped `PerceivedFactionWages` entries) into their
+/// own `PerceivedFactionWages`. Same-faction entries are skipped —
+/// agents already see their own faction's signal directly.
+///
+/// Information friction is the point: wages spread across factions
+/// only as fast as agents physically socialize.
+pub const WAGE_GOSSIP_TOP_K: usize = 4;
+pub const WAGE_GOSSIP_RADIUS: i32 = 3;
+
+pub fn wage_gossip_system(
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    registry: Res<crate::simulation::faction::FactionRegistry>,
+    clock: Res<SimClock>,
+    mut q: Query<(
+        Entity,
+        &Transform,
+        &crate::simulation::goals::AgentGoal,
+        &crate::simulation::lod::LodLevel,
+        &crate::simulation::faction::FactionMember,
+        Option<&mut PerceivedFactionWages>,
+    )>,
+    mut commands: Commands,
+) {
+    use crate::simulation::goals::AgentGoal;
+    use crate::simulation::lod::LodLevel;
+    let now = clock.tick as u32;
+
+    // Each socializing agent contributes up to TOP_K (fid, kind, rid,
+    // ema, observed_tick) entries — drawn first from their own
+    // faction's wage_signal (most credible), then their existing
+    // perceived entries by recency.
+    type GossipEntry = (
+        u32,
+        JobKind,
+        Option<crate::economy::resource_catalog::ResourceId>,
+        f32,
+        u32,
+    );
+    let mut snapshots: ahash::AHashMap<Entity, Vec<GossipEntry>> = ahash::AHashMap::default();
+
+    for (entity, _t, goal, lod, fm, perceived) in q.iter() {
+        if *lod == LodLevel::Dormant || !matches!(goal, AgentGoal::Socialize) {
+            continue;
+        }
+        let village_id = registry.root_faction(fm.faction_id);
+        let mut entries: Vec<GossipEntry> = Vec::new();
+        if let Some(faction) = registry.factions.get(&village_id) {
+            for (&(kind, rid), ema) in faction.wage_signal.iter() {
+                if ema.ema_per_day <= 0.0 {
+                    continue;
+                }
+                entries.push((village_id, kind, rid, ema.ema_per_day, ema.last_update_tick));
+            }
+        }
+        if let Some(perc) = perceived.as_deref() {
+            for (&(fid, kind, rid), &(ema, tick)) in perc.by_key.iter() {
+                if ema <= 0.0 {
+                    continue;
+                }
+                entries.push((fid, kind, rid, ema, tick));
+            }
+        }
+        // Keep the top-K most recently observed entries.
+        entries.sort_unstable_by_key(|(_, _, _, _, t)| std::cmp::Reverse(*t));
+        entries.truncate(WAGE_GOSSIP_TOP_K);
+        snapshots.insert(entity, entries);
+    }
+
+    if snapshots.is_empty() {
+        return;
+    }
+
+    for (entity, transform, goal, lod, fm, perceived) in q.iter_mut() {
+        if *lod == LodLevel::Dormant || !matches!(goal, AgentGoal::Socialize) {
+            continue;
+        }
+        let tx = (transform.translation.x
+            / crate::world::terrain::TILE_SIZE)
+            .floor() as i32;
+        let ty = (transform.translation.y
+            / crate::world::terrain::TILE_SIZE)
+            .floor() as i32;
+        let village_id = registry.root_faction(fm.faction_id);
+        let mut to_merge: Vec<GossipEntry> = Vec::new();
+        for dy in -WAGE_GOSSIP_RADIUS..=WAGE_GOSSIP_RADIUS {
+            for dx in -WAGE_GOSSIP_RADIUS..=WAGE_GOSSIP_RADIUS {
+                for &other in spatial.get(tx + dx, ty + dy) {
+                    if other == entity {
+                        continue;
+                    }
+                    if let Some(snap) = snapshots.get(&other) {
+                        for e in snap.iter() {
+                            // Skip our own faction — we read it from
+                            // wage_signal directly, no need to cache.
+                            if e.0 == village_id {
+                                continue;
+                            }
+                            to_merge.push(*e);
+                        }
+                    }
+                }
+            }
+        }
+        if to_merge.is_empty() {
+            continue;
+        }
+        if let Some(mut perc) = perceived {
+            for (fid, kind, rid, ema, tick) in to_merge {
+                // Apply a small staleness penalty so older gossip
+                // doesn't overwrite fresher first-hand observations.
+                let age = now.saturating_sub(tick);
+                let penalty = (-(age as f32) / WAGE_EMA_WINDOW_TICKS as f32).exp();
+                let observed_ema = ema * penalty;
+                perc.merge_entry(fid, kind, rid, observed_ema, tick);
+            }
+        } else {
+            let mut perc = PerceivedFactionWages::default();
+            for (fid, kind, rid, ema, tick) in to_merge {
+                let age = now.saturating_sub(tick);
+                let penalty = (-(age as f32) / WAGE_EMA_WINDOW_TICKS as f32).exp();
+                perc.merge_entry(fid, kind, rid, ema * penalty, tick);
+            }
+            commands.entity(entity).insert(perc);
         }
     }
 }
@@ -1276,6 +1765,11 @@ pub struct JobCompletedEvent {
     /// paths — the payout system then just despawns the escrow so the
     /// `on_remove` hook refunds the poster.
     pub completed: bool,
+    /// Phase 3: specific resource the posting targeted (e.g. `wheat` for
+    /// `Stockpile{wheat}`); folded into `EarningEntry.target_rid` so the
+    /// wage-signal aggregator can key `(kind, rid)` separately.
+    /// `None` when the posting wasn't resource-specific.
+    pub target_rid: Option<crate::economy::resource_catalog::ResourceId>,
 }
 
 pub struct JobsPlugin;
@@ -1417,8 +1911,12 @@ pub fn chief_job_posting_system(
             // cleanup, then run the standard retain on the rest. Mirrors the
             // pattern in `job_claim_release_system`.
             let postings = board.faction_postings_mut(faction_id);
-            let mut to_drop_with_claimants: Vec<(JobId, JobKind, Vec<Entity>)> =
-                Vec::new();
+            let mut to_drop_with_claimants: Vec<(
+                JobId,
+                JobKind,
+                Vec<Entity>,
+                Option<crate::economy::resource_catalog::ResourceId>,
+            )> = Vec::new();
             for p in postings.iter() {
                 if !matches!(p.source, JobSource::Chief) {
                     continue;
@@ -1438,11 +1936,12 @@ pub fn chief_job_posting_system(
                             p.id,
                             p.kind,
                             p.claimants.clone(),
+                            p.progress.target_rid(),
                         ));
                     }
                 }
             }
-            for (job_id, kind, claimants) in to_drop_with_claimants {
+            for (job_id, kind, claimants, target_rid) in to_drop_with_claimants {
                 if let Some(idx) = postings.iter().position(|p| p.id == job_id) {
                     postings.swap_remove(idx);
                 }
@@ -1459,6 +1958,7 @@ pub fn chief_job_posting_system(
                     kind,
                     claimants,
                     completed: true,
+                    target_rid,
                 });
             }
 
@@ -2821,6 +3321,7 @@ pub fn job_build_completion_system(
             kind,
             claimants,
             completed: true,
+            target_rid: None,
         });
     }
 }
@@ -2943,6 +3444,7 @@ pub fn record_progress_filtered(
         let job_id = posting.id;
         let faction_id = posting.faction_id;
         let kind = posting.kind;
+        let target_rid = posting.progress.target_rid();
         let claimants: Vec<Entity> = std::mem::take(&mut posting.claimants);
         // Remove the posting now that it's done.
         if let Some((fid, idx)) = board.locate(job_id) {
@@ -2958,6 +3460,7 @@ pub fn record_progress_filtered(
             kind,
             claimants,
             completed: true,
+            target_rid,
         });
     }
 }
@@ -3038,6 +3541,7 @@ pub fn job_board_command_system(
                         kind: posting.kind,
                         claimants,
                         completed: false,
+                        target_rid: posting.progress.target_rid(),
                     });
                 }
             }
@@ -3144,6 +3648,7 @@ pub fn job_claim_release_system(
                 kind: posting.kind,
                 claimants,
                 completed: false,
+                target_rid: posting.progress.target_rid(),
             });
         }
     }

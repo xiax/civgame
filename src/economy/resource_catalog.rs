@@ -109,6 +109,16 @@ impl ResourceId {
     /// dispatcher to bias ration-class foods to be consumed last (so a
     /// nomadic band's smoked stockpile stays banked for the next
     /// migration). Defaults to false for unknown ids.
+    /// Per-unit catalog trade value (currency units). Returns `0` for
+    /// the `NONE` sentinel / unknown ids. Phase 4 chief-funded postings
+    /// key wages off this.
+    pub fn trade_base_value(self) -> u16 {
+        super::core_ids::catalog()
+            .get(self)
+            .map(|d| d.trade_base_value)
+            .unwrap_or(0)
+    }
+
     pub fn is_preserved_ration(self) -> bool {
         super::core_ids::catalog()
             .get(self)
