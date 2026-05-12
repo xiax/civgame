@@ -635,6 +635,12 @@ impl Plugin for SimulationPlugin {
                         .after(jobs::chief_job_posting_system),
                     jobs::job_claim_release_system
                         .after(jobs::job_build_completion_system),
+                    jobs::job_payout_system
+                        .after(jobs::job_claim_release_system),
+                    skills::skill_peaks_tracker_system
+                        .after(jobs::job_payout_system),
+                    skills::skill_decay_system
+                        .after(skills::skill_peaks_tracker_system),
                     goals::chronic_failure_release_system
                         .after(jobs::job_claim_release_system),
                 )

@@ -2,6 +2,12 @@
 
 Comprehensive replacement for `plans/wage-aware-labor-market.md`, after auditing every claim against the current tree.
 
+## Progress (2026-05-12)
+
+- **Phase 0 (wage payout) — shipped.** `JobEscrowIndex` resource links each paid `JobId` → escrow entity; `JobCompletedEvent` carries `claimants` + `completed`; `job_payout_system` (Economy, exclusive `&mut World`, after `job_claim_release_system`) splits the escrow `amount` across claimants by direct credit (no double-debit of beneficiary), despawns the sidecar, and writes an `Earnings` ring + `ActivityEntryKind::WagePaid` per worker. Currency invariant preserved end-to-end (5 new acceptance tests; 508 total pass).
+- **Phase 1 (skill peaks + decay) — shipped.** `Skills` is now clamped at `SKILL_MAX=255`. New components `SkillPeaks`, `SkillUseTicks`, `SkillsLastSeen` on every Person spawn site. `skill_peaks_tracker_system` (observer over `Changed<Skills>`) ratchets peaks + stamps `use_ticks`. `skill_decay_system` runs daily, decays unused skills exponentially (`half-life = 90 days`) toward `SKILL_MASTERED_FLOOR (30)` when `peak ≥ SKILL_MASTERY_LINE (80)`, else `max(SKILL_FLOOR_BASE (5), peak * 0.30)`. No existing `gain_xp` call site needed to change — the observer pattern handles every write path centrally.
+- **Phases 2–7 — deferred.** Capital recognition, earnings memory aggregation, wage signal, gossip, chief-funded postings, unified `profession_choice_system`, Crafter/Apprentice, HTN scorer/UI, docs — pending follow-up sessions.
+
 ## Context
 
 The existing plan diagnoses the right problem (profession assignment ignores wages/skills/capital/switching costs) and the right precondition bug (`JobCompletedEvent` has zero consumers, so workers are never paid). But several claims are stale or wrong, and one whole sub-system (`Profession::Crafter` + craft-profession dispatch) is assumed to exist when it doesn't. This v2 fixes those, adds an explicit chief-wage-source phase (chosen: faction treasury, Mixed/Market only), and broadens apprenticeship to crafts + medicine per user direction.

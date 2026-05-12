@@ -3843,14 +3843,18 @@ pub fn construction_system(
                 );
                 if drop {
                     let dropped = postings.swap_remove(idx);
-                    for c in dropped.claimants {
-                        commands.entity(c).remove::<JobClaim>();
-                        commands.entity(c).remove::<ClaimTarget>();
+                    let claimants = dropped.claimants.clone();
+                    for c in &claimants {
+                        commands.entity(*c).remove::<JobClaim>();
+                        commands.entity(*c).remove::<ClaimTarget>();
                     }
+                    // Phase 0: Haul-slot filled = genuine completion.
                     job_completed.send(JobCompletedEvent {
                         job_id: dropped.id,
                         faction_id: bp_faction_id,
                         kind: dropped.kind,
+                        claimants,
+                        completed: true,
                     });
                 } else {
                     idx += 1;

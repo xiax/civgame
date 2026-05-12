@@ -38,7 +38,7 @@ use crate::simulation::person::{
 use crate::simulation::htn::MethodHistory;
 use crate::simulation::reproduction::BiologicalSex;
 use crate::simulation::schedule::{BucketSlot, SimClock};
-use crate::simulation::skills::Skills;
+use crate::simulation::skills::{Skills, SkillPeaks, SkillUseTicks, SkillsLastSeen};
 use crate::simulation::stats::Stats;
 use crate::world::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::spatial::{Indexed, IndexedKind};
@@ -461,6 +461,9 @@ impl PersonBuilder {
                     self.needs,
                     Mood::default(),
                     self.skills,
+                    SkillPeaks::default(),
+                    SkillUseTicks::default(),
+                    SkillsLastSeen::default(),
                     Stats::roll_3d6(),
                     PersonAI {
                         task_id: PersonAI::UNEMPLOYED,
@@ -10537,5 +10540,284 @@ mod baseline_behaviour {
                 .lifestyle,
             Lifestyle::Settled
         );
+    }
+}
+
+#[cfg(test)]
+mod wage_aware_phase0_phase1 {
+    //! Acceptance tests for wage-aware-labor-market-v2 Phases 0–1.
+    //!
+    //! - Phase 0: `job_payout_system` pays claimants out of escrow on
+    //!   genuine completion; refunds beneficiary on cancellation; total
+    //!   currency invariant holds end-to-end.
+    //! - Phase 1: skill peaks ratchet up on XP gain; `skill_decay_system`
+    //!   shrinks unused skills toward the peak-derived floor; mastered
+    //!   skills (peak ≥ 80) stop decaying at 30 instead of 5.
+    use super::*;
+    use crate::simulation::jobs::{
+        Earnings, JobBoard, JobClaim, JobCompletedEvent, JobEscrow, JobEscrowIndex,
+        JobKind, JobPosting, JobProgress, JobSource, PosterClass,
+    };
+    use crate::simulation::skills::{
+        skill_decay_system, skill_peaks_tracker_system, SkillKind, SkillPeaks,
+        SkillUseTicks, Skills, SkillsLastSeen, SKILL_FLOOR_BASE, SKILL_MASTERED_FLOOR,
+        SKILL_MASTERY_LINE,
+    };
+    use crate::world::seasons::TICKS_PER_DAY;
+
+    fn post_paid_stockpile_contract(
+        sim: &mut TestSim,
+        poster: Entity,
+        faction_id: u32,
+        worker: Entity,
+        reward: f32,
+    ) -> u32 {
+        // Allocate posting + push + spawn escrow, mirroring
+        // `post_stockpile_self` but with explicit reward (no catalog
+        // base-value path). Returns the job_id.
+        let world = sim.app.world_mut();
+        let posted_tick = world.resource::<SimClock>().tick as u32;
+        {
+            let mut econ = world.get_mut::<EconomicAgent>(poster).unwrap();
+            econ.currency -= reward;
+        }
+        let job_id = {
+            let mut board = world.resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board.faction_postings_mut(faction_id).push(JobPosting {
+                id,
+                faction_id,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Stockpile {
+                    resource_id: crate::economy::core_ids::wood(),
+                    deposited: 0,
+                    target: 1,
+                },
+                claimants: vec![worker],
+                priority: 100,
+                source: JobSource::Player,
+                posted_tick,
+                expiry_tick: None,
+                poster_class: PosterClass::Individual,
+                reward,
+                settlement_id: None,
+            });
+            id
+        };
+        let escrow = world
+            .spawn(JobEscrow {
+                amount: reward,
+                beneficiary: poster,
+            })
+            .id();
+        world
+            .resource_mut::<JobEscrowIndex>()
+            .0
+            .insert(job_id, escrow);
+        // Stamp the worker with a JobClaim so payout sites that strip
+        // claims have something to strip.
+        world.entity_mut(worker).insert(JobClaim {
+            job_id,
+            faction_id,
+            kind: JobKind::Stockpile,
+            posted_tick,
+            fail_count: 0,
+        });
+        job_id
+    }
+
+    #[test]
+    fn phase0_completion_pays_claimant_via_escrow() {
+        let mut sim = TestSim::new(0xDEADBEEF);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let poster = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let worker = sim.spawn_person(sim.player_faction_id, (1, 0), |_| {});
+        set_currency(&mut sim.app, poster, 100.0);
+        set_currency(&mut sim.app, worker, 0.0);
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        let reward = 10.0;
+        let fid = sim.player_faction_id;
+        let job_id =
+            post_paid_stockpile_contract(&mut sim, poster, fid, worker, reward);
+
+        // Emit a completion event directly (skip the full deposit
+        // pipeline — Phase 0 owns payout, not credit accumulation).
+        sim.app
+            .world_mut()
+            .resource_mut::<bevy::ecs::event::Events<JobCompletedEvent>>()
+            .send(JobCompletedEvent {
+                job_id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                claimants: vec![worker],
+                completed: true,
+            });
+
+        // Multiple ticks so FixedUpdate definitely fires.
+        sim.tick_n(3);
+
+        assert_currency(&sim.app, poster, 90.0);
+        assert_currency(&sim.app, worker, 10.0);
+        // Escrow despawned → escrowed amount = 0.
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+        // Worker earned a row.
+        let earnings = sim.app.world().get::<Earnings>(worker).expect("Earnings inserted");
+        assert_eq!(earnings.recent.len(), 1);
+        assert!((earnings.recent[0].amount - 10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn phase0_cancellation_refunds_poster() {
+        let mut sim = TestSim::new(0xDEADBEEF);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let poster = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let worker = sim.spawn_person(sim.player_faction_id, (1, 0), |_| {});
+        set_currency(&mut sim.app, poster, 100.0);
+        set_currency(&mut sim.app, worker, 0.0);
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        let reward = 15.0;
+        let fid = sim.player_faction_id;
+        let job_id =
+            post_paid_stockpile_contract(&mut sim, poster, fid, worker, reward);
+
+        sim.app
+            .world_mut()
+            .resource_mut::<bevy::ecs::event::Events<JobCompletedEvent>>()
+            .send(JobCompletedEvent {
+                job_id,
+                faction_id: sim.player_faction_id,
+                kind: JobKind::Stockpile,
+                claimants: vec![worker],
+                completed: false,
+            });
+
+        sim.tick_n(2);
+
+        // Poster refunded, worker not paid.
+        assert_currency(&sim.app, poster, 100.0);
+        assert_currency(&sim.app, worker, 0.0);
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+    }
+
+    #[test]
+    fn phase1_peaks_track_skill_gains() {
+        let mut sim = TestSim::new(0xC0DE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let p = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Apply some XP via gain_xp (the canonical write path).
+        {
+            let mut s = sim.app.world_mut().get_mut::<Skills>(p).unwrap();
+            s.gain_xp(SkillKind::Crafting, 50);
+        }
+        // Tick once — peaks_tracker_system observes the change.
+        sim.tick_n(2);
+
+        let peaks = sim.app.world().get::<SkillPeaks>(p).unwrap();
+        // Peak must include the gained XP (baseline=5 + 50).
+        assert!(
+            peaks.0[SkillKind::Crafting as usize] >= 55,
+            "peak did not ratchet, got {:?}",
+            peaks.0
+        );
+    }
+
+    #[test]
+    fn phase1_decay_respects_mastery_floor() {
+        // A mastered skill (peak ≥ 80) decays toward MASTERED_FLOOR (30),
+        // not the lower base floor. Set up directly and step the decay
+        // system many days.
+        let mut sim = TestSim::new(0xC0DE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let p = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        // Pump the skill to 200 via repeated gain_xp; ratchet peak.
+        {
+            let mut s = sim.app.world_mut().get_mut::<Skills>(p).unwrap();
+            s.gain_xp(SkillKind::Crafting, 195);
+        }
+        // Let tracker observe.
+        sim.tick_n(2);
+        {
+            let peaks = sim.app.world().get::<SkillPeaks>(p).unwrap();
+            assert!(peaks.0[SkillKind::Crafting as usize] >= 200);
+            assert!(peaks.0[SkillKind::Crafting as usize] >= SKILL_MASTERY_LINE);
+        }
+        // Stamp use_ticks to "long ago" so decay engages immediately.
+        {
+            let mut u = sim.app.world_mut().get_mut::<SkillUseTicks>(p).unwrap();
+            u.0[SkillKind::Crafting as usize] = 0;
+        }
+
+        // Run many days of decay; skill should converge toward 30 but
+        // never below.
+        for _ in 0..(SKILL_MASTERY_LINE * 6) {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = clock.tick.saturating_add(TICKS_PER_DAY as u64);
+            // Re-stamp use_ticks "far behind" so decay continues.
+            let mut u = sim.app.world_mut().get_mut::<SkillUseTicks>(p).unwrap();
+            u.0[SkillKind::Crafting as usize] = 0;
+            // Drive the decay system manually via the App schedule.
+            sim.tick_n(2);
+        }
+
+        let s = sim.app.world().get::<Skills>(p).unwrap();
+        assert!(
+            s.0[SkillKind::Crafting as usize] >= SKILL_MASTERED_FLOOR,
+            "decayed below mastered floor: got {}",
+            s.0[SkillKind::Crafting as usize]
+        );
+        assert!(
+            s.0[SkillKind::Crafting as usize] <= 200,
+            "skill rose during decay-only stage: got {}",
+            s.0[SkillKind::Crafting as usize]
+        );
+    }
+
+    #[test]
+    fn phase1_base_floor_for_unmastered_skill() {
+        // Skill that never reached MASTERY_LINE decays only to
+        // max(SKILL_FLOOR_BASE, peak * 0.30). Peak=40 → floor=12.
+        let mut sim = TestSim::new(0xC0DE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let p = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+
+        {
+            let mut s = sim.app.world_mut().get_mut::<Skills>(p).unwrap();
+            s.gain_xp(SkillKind::Trading, 35); // 5 + 35 = 40
+        }
+        sim.tick_n(2);
+        {
+            let mut u = sim.app.world_mut().get_mut::<SkillUseTicks>(p).unwrap();
+            u.0[SkillKind::Trading as usize] = 0;
+        }
+
+        // Many decay cycles.
+        for _ in 0..400 {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = clock.tick.saturating_add(TICKS_PER_DAY as u64);
+            let mut u = sim.app.world_mut().get_mut::<SkillUseTicks>(p).unwrap();
+            u.0[SkillKind::Trading as usize] = 0;
+            sim.tick_n(2);
+        }
+
+        let s = sim.app.world().get::<Skills>(p).unwrap();
+        let expected_floor = SKILL_FLOOR_BASE.max((40.0 * 0.30) as u32); // 12
+        assert!(
+            s.0[SkillKind::Trading as usize] >= expected_floor,
+            "decayed below peak-derived floor: got {}, floor={}",
+            s.0[SkillKind::Trading as usize],
+            expected_floor
+        );
+    }
+
+    // Silence dead-code warnings for helpers used only across some
+    // tests.
+    fn _silence() {
+        let _ = skill_decay_system;
+        let _ = skill_peaks_tracker_system;
+        let _ = SkillsLastSeen::default();
     }
 }

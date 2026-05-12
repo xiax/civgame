@@ -20,7 +20,7 @@ use crate::simulation::plants::{
 };
 use crate::simulation::reproduction::BiologicalSex;
 use crate::simulation::schedule::{BucketSlot, SimClock};
-use crate::simulation::skills::Skills;
+use crate::simulation::skills::{Skills, SkillPeaks, SkillUseTicks, SkillsLastSeen};
 use crate::world::chunk::CHUNK_SIZE;
 use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 use crate::world::terrain::tile_to_world;
@@ -74,6 +74,9 @@ fn setup_sandbox(
             Needs::new(30.0, 20.0, 10.0, 5.0, 40.0, 200.0),
             Mood::default(),
             Skills::default(),
+            SkillPeaks::default(),
+            SkillUseTicks::default(),
+            SkillsLastSeen::default(),
             PersonAI {
                 task_id: PersonAI::UNEMPLOYED,
                 state: AiState::Idle,

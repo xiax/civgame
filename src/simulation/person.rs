@@ -25,7 +25,7 @@ use super::htn::{MethodHistory, MethodId};
 use super::reproduction::BiologicalSex;
 use super::schedule::{BucketSlot, SimClock};
 use super::knowledge::PersonKnowledge;
-use super::skills::Skills;
+use super::skills::{Skills, SkillPeaks, SkillUseTicks, SkillsLastSeen};
 use super::stats::Stats;
 use crate::pathfinding::path_request::PathFollow;
 
@@ -491,6 +491,9 @@ pub fn spawn_population(
                     Needs::new(30.0, 20.0, 10.0, 5.0, 40.0, 200.0),
                     Mood::default(),
                     Skills::default(),
+                    SkillPeaks::default(),
+                    SkillUseTicks::default(),
+                    SkillsLastSeen::default(),
                     Stats::roll_3d6(),
                     PersonAI {
                         task_id: PersonAI::UNEMPLOYED,

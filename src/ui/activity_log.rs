@@ -56,6 +56,12 @@ pub enum ActivityEntryKind {
     Sedentarized {
         camp: (i32, i32),
     },
+    /// Phase 0 (wage payout): a worker was paid `amount` for completing a
+    /// job. `actor` is the worker.
+    WagePaid {
+        amount: f32,
+        kind: crate::simulation::jobs::JobKind,
+    },
 }
 
 #[derive(Clone)]
@@ -162,6 +168,11 @@ pub fn activity_log_ingest_system(
                 "settled down at",
                 format!("{:?}", camp),
                 ResultLink::NoTarget,
+            ),
+            &ActivityEntryKind::WagePaid { amount, kind } => (
+                "earned",
+                format!("{:.2}c ({:?})", amount, kind),
+                ResultLink::HeldByActor,
             ),
         };
 

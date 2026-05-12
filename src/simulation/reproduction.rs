@@ -13,7 +13,7 @@ use super::person::{
 };
 use super::htn::MethodHistory;
 use super::schedule::{BucketSlot, SimClock};
-use super::skills::Skills;
+use super::skills::{Skills, SkillPeaks, SkillUseTicks, SkillsLastSeen};
 use super::stats::Stats;
 use crate::economy::agent::EconomicAgent;
 use crate::pathfinding::path_request::PathFollow;
@@ -516,6 +516,9 @@ pub fn pregnancy_system(
                 Needs::new(0.0, 0.0, 0.0, 0.0, 0.0, 255.0),
                 Mood::default(),
                 Skills::default(),
+                SkillPeaks::default(),
+                SkillUseTicks::default(),
+                SkillsLastSeen::default(),
                 child_stats,
                 PersonAI {
                     task_id: PersonAI::UNEMPLOYED,

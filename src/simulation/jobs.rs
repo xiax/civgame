@@ -438,6 +438,158 @@ pub fn total_escrowed_currency(world: &mut World) -> f32 {
     q.iter(world).map(|e| e.amount).sum()
 }
 
+/// Phase 0 (wage payout): map from `JobId → escrow sidecar entity` so
+/// `job_payout_system` can find the escrow at completion time without
+/// walking every entity in the world. Populated at posting-creation
+/// sites (post_craft_contract / post_craft_contract_from_treasury /
+/// post_stockpile_self) and drained at completion / cancellation by
+/// the payout system. Chief postings carry no escrow — their JobId
+/// is simply absent from this index.
+#[derive(Resource, Default)]
+pub struct JobEscrowIndex(pub AHashMap<JobId, Entity>);
+
+/// Per-agent earnings ring. Phase 0 stub — populated by
+/// `job_payout_system` on every paid completion. Phase 3 reads these
+/// to drive the per-faction wage-signal EMA.
+#[derive(Component, Clone, Debug, Default)]
+pub struct Earnings {
+    pub recent: std::collections::VecDeque<EarningEntry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EarningEntry {
+    pub job_kind: JobKind,
+    pub amount: f32,
+    pub tick: u32,
+}
+
+impl Earnings {
+    pub const CAP: usize = 16;
+    pub fn push(&mut self, e: EarningEntry) {
+        if self.recent.len() >= Self::CAP {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(e);
+    }
+}
+
+/// Phase 0 (wage payout): drain `JobCompletedEvent`s, find the matching
+/// escrow via `JobEscrowIndex`, and either pay claimants (completed
+/// successfully) or despawn-with-refund (cancelled / expired). The
+/// `JobEscrow.on_remove` hook handles the refund branch automatically —
+/// the system just despawns the sidecar with `amount > 0`.
+///
+/// Wage split: `amount / claimants.len()` per worker, paid via `pay()`.
+/// If `claimants` is empty on a `completed=true` event, the escrow is
+/// refunded to its beneficiary (no worker to pay). Beneficiary-paying-
+/// themselves is a no-op via `pay()`'s same-account guard? — `pay()`
+/// permits self-transfer, so we explicitly skip when `worker == benef`.
+pub fn job_payout_system(world: &mut World) {
+    use bevy::ecs::event::Events;
+    let events: Vec<JobCompletedEvent> = {
+        let mut ev_res = world.resource_mut::<Events<JobCompletedEvent>>();
+        ev_res.drain().collect()
+    };
+    if events.is_empty() {
+        return;
+    }
+    let now = world.resource::<SimClock>().tick as u32;
+    for ev in events {
+        let escrow_entity = {
+            let mut idx = world.resource_mut::<JobEscrowIndex>();
+            idx.0.remove(&ev.job_id)
+        };
+        let Some(escrow_entity) = escrow_entity else {
+            continue;
+        };
+        let Some(escrow) = world.get::<JobEscrow>(escrow_entity).copied() else {
+            continue;
+        };
+        let beneficiary = escrow.beneficiary;
+        let amount = escrow.amount;
+
+        if ev.completed && !ev.claimants.is_empty() && amount > 0.0 {
+            // Filter out the beneficiary themselves so a self-poster
+            // who also worked the job doesn't shuffle currency back
+            // into their own wallet.
+            let payable: Vec<Entity> = ev
+                .claimants
+                .iter()
+                .copied()
+                .filter(|&w| w != beneficiary)
+                .collect();
+            let n = payable.len().max(1);
+            let share = amount / n as f32;
+            let mut paid_total = 0.0_f32;
+            for worker in payable {
+                // Direct escrow → worker credit. The escrow already
+                // holds the funds (debited at posting time); we don't
+                // re-debit the beneficiary. Invariant: agents_total
+                // gains `share`, escrowed loses `share`, net zero.
+                let credited = {
+                    if let Some(mut to_agent) = world
+                        .get_mut::<crate::economy::agent::EconomicAgent>(worker)
+                    {
+                        to_agent.currency += share;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if credited {
+                    paid_total += share;
+                    // Log the earning on the worker.
+                    if let Some(mut earnings) = world.get_mut::<Earnings>(worker) {
+                        earnings.push(EarningEntry {
+                            job_kind: ev.kind,
+                            amount: share,
+                            tick: now,
+                        });
+                    } else {
+                        // Insert a fresh ring on first payout so we
+                        // don't require every Person spawn site to
+                        // bundle `Earnings`.
+                        let mut e = Earnings::default();
+                        e.push(EarningEntry {
+                            job_kind: ev.kind,
+                            amount: share,
+                            tick: now,
+                        });
+                        world.entity_mut(worker).insert(e);
+                    }
+                    // Activity-log surfacing.
+                    let faction_id = ev.faction_id;
+                    let kind = ev.kind;
+                    let mut events_log = world
+                        .resource_mut::<bevy::ecs::event::Events<
+                            crate::ui::activity_log::ActivityLogEvent,
+                        >>();
+                    events_log.send(crate::ui::activity_log::ActivityLogEvent {
+                        tick: now as u64,
+                        actor: worker,
+                        faction_id,
+                        kind: crate::ui::activity_log::ActivityEntryKind::WagePaid {
+                            amount: share,
+                            kind,
+                        },
+                    });
+                }
+            }
+            // Zero the escrow (so on_remove hook is a no-op for the
+            // paid portion) and despawn. Any residual rounds back to
+            // the beneficiary via the hook.
+            if let Some(mut e) = world.get_mut::<JobEscrow>(escrow_entity) {
+                e.amount = (amount - paid_total).max(0.0);
+            }
+            world.entity_mut(escrow_entity).despawn();
+        } else {
+            // Cancellation / expiry / no claimants on completion:
+            // despawn the escrow; the `on_remove` hook refunds.
+            world.entity_mut(escrow_entity).despawn();
+        }
+    }
+}
+
 /// Pluralist Economy R12: post a P2P craft contract. The `poster`
 /// (an individual agent with surplus currency, typically Esteem-
 /// driven) commissions a craft job paying `reward` on completion.
@@ -530,7 +682,12 @@ pub fn post_craft_contract(
             beneficiary: poster,
         })
         .id();
-    let _ = job_id; // job_id pairing tracked by the caller; not stored on escrow today
+    // Phase 0: register the escrow against the job_id so
+    // `job_payout_system` can pay claimants on completion.
+    world
+        .resource_mut::<JobEscrowIndex>()
+        .0
+        .insert(job_id, escrow);
     Some(escrow)
 }
 
@@ -587,7 +744,7 @@ pub fn post_craft_contract_from_treasury(
         .get_resource::<SimClock>()
         .map(|c| c.tick as u32)
         .unwrap_or(0);
-    {
+    let job_id = {
         let mut board = world.resource_mut::<JobBoard>();
         let id = board.alloc_id();
         let progress = JobProgress::Crafting {
@@ -611,7 +768,8 @@ pub fn post_craft_contract_from_treasury(
             reward,
             settlement_id: None,
         });
-    }
+        id
+    };
 
     // Escrow with the head as beneficiary. On cancellation, the
     // refund lands in the head's wallet — this is a small
@@ -625,6 +783,10 @@ pub fn post_craft_contract_from_treasury(
             beneficiary: head,
         })
         .id();
+    world
+        .resource_mut::<JobEscrowIndex>()
+        .0
+        .insert(job_id, escrow);
     Some(escrow)
 }
 
@@ -705,7 +867,7 @@ pub fn post_stockpile_self(
         .get_resource::<SimClock>()
         .map(|c| c.tick as u32)
         .unwrap_or(0);
-    {
+    let job_id = {
         let mut board = world.resource_mut::<JobBoard>();
         let id = board.alloc_id();
         let progress = JobProgress::Stockpile {
@@ -727,7 +889,8 @@ pub fn post_stockpile_self(
             reward,
             settlement_id: None,
         });
-    }
+        id
+    };
 
     let escrow = world
         .spawn(JobEscrow {
@@ -735,6 +898,10 @@ pub fn post_stockpile_self(
             beneficiary: author,
         })
         .id();
+    world
+        .resource_mut::<JobEscrowIndex>()
+        .0
+        .insert(job_id, escrow);
     Some(escrow)
 }
 
@@ -1085,11 +1252,30 @@ pub enum JobBoardCommand {
 
 /// Event fired when a posting completes (its progress hit the target, the
 /// build finished, etc.). A reactor system clears claimants from the board.
-#[derive(Event, Clone, Copy, Debug)]
+///
+/// Phase 0 (wage payout) extension: events that represent *genuine work
+/// completion* carry `completed = true` and the `claimants` who did the
+/// work. `job_payout_system` reads these to split the matching escrow's
+/// `amount` across the workers via `pay()` and despawn the escrow.
+/// Cancellation / expiry / target-invalid paths set `completed = false`
+/// and (usually) leave `claimants` empty; the payout system then despawns
+/// the escrow with `amount > 0` so the `on_remove` hook refunds the
+/// poster.
+#[derive(Event, Clone, Debug)]
 pub struct JobCompletedEvent {
     pub job_id: JobId,
     pub faction_id: u32,
     pub kind: JobKind,
+    /// Workers who held a claim at the moment the posting was removed.
+    /// Drained from the posting in the cleanup paths so the payout
+    /// system doesn't need to walk a stale `JobBoard`.
+    pub claimants: Vec<Entity>,
+    /// `true` if the posting was removed because its target was met
+    /// (record_progress completion, Haul-slot satisfied, Build blueprint
+    /// despawn). `false` for cancellation / expiry / bench-invalidation
+    /// paths — the payout system then just despawns the escrow so the
+    /// `on_remove` hook refunds the poster.
+    pub completed: bool,
 }
 
 pub struct JobsPlugin;
@@ -1105,6 +1291,7 @@ impl Plugin for JobsPlugin {
             .register_component_hooks::<JobEscrow>()
             .on_remove(on_job_escrow_remove);
         app.insert_resource(JobBoard::default())
+            .insert_resource(JobEscrowIndex::default())
             .add_event::<JobBoardCommand>()
             .add_event::<JobCompletedEvent>();
     }
@@ -1259,14 +1446,19 @@ pub fn chief_job_posting_system(
                 if let Some(idx) = postings.iter().position(|p| p.id == job_id) {
                     postings.swap_remove(idx);
                 }
-                for c in claimants {
-                    commands.entity(c).remove::<JobClaim>();
-                    commands.entity(c).remove::<ClaimTarget>();
+                for c in &claimants {
+                    commands.entity(*c).remove::<JobClaim>();
+                    commands.entity(*c).remove::<ClaimTarget>();
                 }
+                // Phase 0: Haul-slot satisfied = genuine work
+                // completion; the payout system pays claimants from
+                // the escrow if any.
                 completed_events.send(JobCompletedEvent {
                     job_id,
                     faction_id,
                     kind,
+                    claimants,
+                    completed: true,
                 });
             }
 
@@ -2617,14 +2809,18 @@ pub fn job_build_completion_system(
         });
     }
     for (job_id, faction_id, kind, claimants) in to_release {
-        for c in claimants {
-            commands.entity(c).remove::<JobClaim>();
-            commands.entity(c).remove::<ClaimTarget>();
+        for c in &claimants {
+            commands.entity(*c).remove::<JobClaim>();
+            commands.entity(*c).remove::<ClaimTarget>();
         }
+        // Phase 0: blueprint despawn = build finished. Pay the
+        // claimants who were on the build.
         completed_events.send(JobCompletedEvent {
             job_id,
             faction_id,
             kind,
+            claimants,
+            completed: true,
         });
     }
 }
@@ -2752,14 +2948,16 @@ pub fn record_progress_filtered(
         if let Some((fid, idx)) = board.locate(job_id) {
             board.postings.get_mut(&fid).unwrap().swap_remove(idx);
         }
-        for c in claimants {
-            commands.entity(c).remove::<JobClaim>();
-            commands.entity(c).remove::<ClaimTarget>();
+        for c in &claimants {
+            commands.entity(*c).remove::<JobClaim>();
+            commands.entity(*c).remove::<ClaimTarget>();
         }
         completed_events.send(JobCompletedEvent {
             job_id,
             faction_id,
             kind,
+            claimants,
+            completed: true,
         });
     }
 }
@@ -2825,14 +3023,21 @@ pub fn job_board_command_system(
             JobBoardCommand::Cancel(job_id) => {
                 if let Some((fid, idx)) = board.locate(job_id) {
                     let posting = board.postings.get_mut(&fid).unwrap().swap_remove(idx);
-                    for c in posting.claimants {
-                        commands.entity(c).remove::<JobClaim>();
-                        commands.entity(c).remove::<ClaimTarget>();
+                    let claimants = posting.claimants.clone();
+                    for c in &claimants {
+                        commands.entity(*c).remove::<JobClaim>();
+                        commands.entity(*c).remove::<ClaimTarget>();
                     }
+                    // Phase 0: cancellation is NOT a successful
+                    // completion — payout system despawns the escrow
+                    // with `amount > 0`, refunding the poster via the
+                    // on_remove hook.
                     completed_events.send(JobCompletedEvent {
                         job_id,
                         faction_id: fid,
                         kind: posting.kind,
+                        claimants,
+                        completed: false,
                     });
                 }
             }
@@ -2926,14 +3131,19 @@ pub fn job_claim_release_system(
     for job_id in to_remove {
         if let Some((fid, idx)) = board.locate(job_id) {
             let posting = board.postings.get_mut(&fid).unwrap().swap_remove(idx);
-            for c in posting.claimants {
-                commands.entity(c).remove::<JobClaim>();
-                commands.entity(c).remove::<ClaimTarget>();
+            let claimants = posting.claimants.clone();
+            for c in &claimants {
+                commands.entity(*c).remove::<JobClaim>();
+                commands.entity(*c).remove::<ClaimTarget>();
             }
+            // Phase 0: expiry / bench-invalid is NOT a successful
+            // completion — payout system refunds via escrow despawn.
             completed_events.send(JobCompletedEvent {
                 job_id,
                 faction_id: fid,
                 kind: posting.kind,
+                claimants,
+                completed: false,
             });
         }
     }
