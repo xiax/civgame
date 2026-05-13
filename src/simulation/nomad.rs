@@ -1507,18 +1507,9 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
         std::mem::take(&mut ops.pitches)
     };
 
-    struct Resolved {
-        fid: u32,
-        old_home: (i32, i32),
-        target: (i32, i32),
-        members: u32,
-        era: crate::simulation::technology::Era,
-        hearth_tier: crate::simulation::construction::HearthTier,
-    }
-
     let now = world.resource::<SimClock>().tick as u32;
 
-    let resolved: Vec<Resolved> = {
+    let resolved: Vec<PitchResolved> = {
         let registry = world.resource::<FactionRegistry>();
         pitches
             .iter()
@@ -1526,7 +1517,7 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
                 registry.factions.get(&p.fid).map(|f| {
                     let adoption =
                         crate::simulation::technology_adoption::community_adoption_bitset(f);
-                    Resolved {
+                    PitchResolved {
                         fid: p.fid,
                         old_home: f.home_tile,
                         target: p.tile,
@@ -1538,6 +1529,19 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
             })
             .collect()
     };
+
+    // Sweep any leftover `Deployable` structures within the OLD camp
+    // footprint. Pack labor normally despawns these one by one, but if
+    // the player pitches before workers finish (or before the band
+    // has moved enough for everyone to reach their assigned shelter),
+    // the leftovers would otherwise stay rooted at the old tile while
+    // a fresh camp spawns at the new tile — exactly the "more
+    // bedrolls than I started with" duplication. Refund-only Tents
+    // drop their refund (loose materials) so the band can scavenge;
+    // fully-packable shelters are silently discarded (their packed
+    // equivalents are already in inventories from earlier pack work,
+    // or the player is rage-pitching and forfeits them).
+    despawn_old_camp_leftovers(world, &resolved);
 
     // Re-seed each pitched camp.
     for r in resolved.iter() {
@@ -1564,6 +1568,18 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
         );
         seed_state.apply(world);
     }
+
+    // Shelter conservation: `seed_nomadic_camp` spawns N bedrolls
+    // (and Neolithic+ yurts) regardless of what the band already
+    // carries. Pack labor stashed each unpitched shelter as a
+    // `bedroll` / `packed_yurt` good in worker inventories / pack
+    // animals. Without this pass the player would Pack→Pitch and
+    // gain N free bedrolls every cycle. Debit the equivalent count
+    // from the band pool — covers member inventories first, pack
+    // animal inventories second. Missing supply is forgiven (the
+    // first cycle of a fresh game has no packed goods); subsequent
+    // cycles conserve exactly.
+    consume_band_packed_goods_after_pitch(world, &resolved);
 
     // Registry mutation: flip home_tile + camp_state.
     {
@@ -1594,6 +1610,41 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
             if let Some(e) = map.entity_for_faction(r.fid) {
                 if let Ok(mut camp) = q.get_mut(e) {
                     camp.home_tile = r.target;
+                }
+            }
+        }
+    }
+
+    // Sync the player faction's `FactionCenter` Transform. The marker
+    // is spawned once at the founder's home tile and renders a
+    // `camp_ascii` sprite on the world map; without this update the
+    // visual stays rooted at the original spawn even after the band
+    // pitches at a new location.
+    {
+        let player_fid = world
+            .resource::<crate::simulation::faction::PlayerFaction>()
+            .faction_id;
+        if resolved.iter().any(|r| r.fid == player_fid) {
+            let new_home = resolved
+                .iter()
+                .find(|r| r.fid == player_fid)
+                .map(|r| r.target);
+            if let Some(target) = new_home {
+                let world_pos =
+                    crate::world::terrain::tile_to_world(target.0, target.1);
+                let mut state: SystemState<
+                    Query<
+                        &mut Transform,
+                        (
+                            With<crate::simulation::faction::FactionCenter>,
+                            With<crate::simulation::faction::PlayerFactionMarker>,
+                        ),
+                    >,
+                > = SystemState::new(world);
+                let mut q = state.get_mut(world);
+                for mut t in q.iter_mut() {
+                    t.translation.x = world_pos.x;
+                    t.translation.y = world_pos.y;
                 }
             }
         }
@@ -1702,6 +1753,221 @@ fn transform_tile(transform: &Transform) -> (i32, i32) {
     let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
     let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
     (tx, ty)
+}
+
+/// Resolved per-pitch context shared between
+/// `apply_pitch_camp_command_system` and its helpers
+/// (`despawn_old_camp_leftovers`, `consume_band_packed_goods_after_pitch`).
+pub(crate) struct PitchResolved {
+    pub(crate) fid: u32,
+    pub(crate) old_home: (i32, i32),
+    pub(crate) target: (i32, i32),
+    pub(crate) members: u32,
+    pub(crate) era: crate::simulation::technology::Era,
+    pub(crate) hearth_tier: crate::simulation::construction::HearthTier,
+}
+
+/// Sweep `Deployable` structures within `seed_nomadic_camp_extent` of
+/// each pitched faction's *old* home tile and despawn them. Refund-only
+/// Tents drop their refund as `GroundItem`s; fully-packable shelters
+/// (Bedroll / Yurt) are silently discarded — the conservation pass in
+/// `consume_band_packed_goods_after_pitch` re-spawns the same count at
+/// the new camp.
+fn despawn_old_camp_leftovers(world: &mut World, resolved: &[PitchResolved]) {
+    if resolved.is_empty() {
+        return;
+    }
+    use crate::simulation::construction::seed_nomadic_camp_extent;
+
+    let footprints: ahash::AHashMap<u32, ((i32, i32), i32)> = resolved
+        .iter()
+        .map(|r| (r.fid, (r.old_home, seed_nomadic_camp_extent(r.members, r.era))))
+        .collect();
+
+    // Collect tear-down targets first so we don't hold queries while
+    // mutating via Commands.
+    struct TearDown {
+        entity: Entity,
+        tile: (i32, i32),
+        refund: Option<(crate::economy::resource_catalog::ResourceId, u32)>,
+        is_bed: bool,
+        is_campfire: bool,
+    }
+
+    let teardowns: Vec<TearDown> = {
+        let mut state: SystemState<(
+            Query<(Entity, &Transform, &Deployable)>,
+            Query<&Bed>,
+            Query<&Campfire>,
+        )> = SystemState::new(world);
+        let (deployable_q, bed_q, campfire_q) = state.get(world);
+        deployable_q
+            .iter()
+            .filter_map(|(e, transform, deploy)| {
+                let tile = transform_tile(transform);
+                // Must lie within at least one pitched faction's old
+                // camp footprint.
+                let mut hit = false;
+                for &(old_home, radius) in footprints.values() {
+                    if chebyshev(tile, old_home) <= radius {
+                        hit = true;
+                        break;
+                    }
+                }
+                if !hit {
+                    return None;
+                }
+                let refund = if deploy.packed_form.is_none() && deploy.packed_bundles.is_empty() {
+                    deploy.compute_refund_drop()
+                } else {
+                    None
+                };
+                Some(TearDown {
+                    entity: e,
+                    tile,
+                    refund,
+                    is_bed: bed_q.get(e).is_ok(),
+                    is_campfire: campfire_q.get(e).is_ok(),
+                })
+            })
+            .collect()
+    };
+
+    if teardowns.is_empty() {
+        return;
+    }
+
+    let mut state: SystemState<(
+        Commands,
+        ResMut<BedMap>,
+        ResMut<CampfireMap>,
+        EventWriter<TileChangedEvent>,
+        Res<crate::world::spatial::SpatialIndex>,
+        Query<&mut crate::simulation::items::GroundItem>,
+    )> = SystemState::new(world);
+    let (mut commands, mut bed_map, mut campfire_map, mut tile_changed, spatial, mut ground_q) =
+        state.get_mut(world);
+    for t in teardowns.iter() {
+        if let Some((rid, qty)) = t.refund {
+            crate::simulation::items::spawn_or_merge_ground_item(
+                &mut commands,
+                &spatial,
+                &mut ground_q,
+                t.tile.0,
+                t.tile.1,
+                rid,
+                qty,
+            );
+        }
+        if t.is_bed {
+            bed_map.0.remove(&t.tile);
+        }
+        if t.is_campfire {
+            campfire_map.0.remove(&t.tile);
+        }
+        commands.entity(t.entity).despawn_recursive();
+        tile_changed.send(TileChangedEvent {
+            tx: t.tile.0,
+            ty: t.tile.1,
+        });
+    }
+    state.apply(world);
+}
+
+/// Deduct `bedroll` / `packed_yurt` goods from the band pool
+/// proportional to the shelters `seed_nomadic_camp` just spawned —
+/// covers member inventories first, pack animal inventories second.
+/// Missing supply is forgiven (first pitch of a fresh game has no
+/// packed goods); a subsequent Pack→Pitch cycle conserves exactly.
+fn consume_band_packed_goods_after_pitch(world: &mut World, resolved: &[PitchResolved]) {
+    if resolved.is_empty() {
+        return;
+    }
+    use crate::simulation::technology::Era;
+
+    let bedroll_id = crate::economy::core_ids::bedroll();
+    let packed_yurt_id = crate::economy::core_ids::packed_yurt();
+
+    // Targets per faction match `seed_nomadic_camp`'s emission counts:
+    // one bedroll per founder; Neolithic+ yurts at `(members/5).clamp(1, 2)`.
+    let mut targets: ahash::AHashMap<u32, (u32, u32)> = ahash::AHashMap::default();
+    for r in resolved.iter() {
+        let bedrolls = r.members.max(1);
+        let yurts = if (r.era as u8) >= (Era::Neolithic as u8) {
+            (r.members.max(1) / 5).clamp(1, 2)
+        } else {
+            0
+        };
+        targets.insert(r.fid, (bedrolls, yurts));
+    }
+
+    // Pass 1: drain member inventories.
+    {
+        let mut state: SystemState<(
+            Res<FactionRegistry>,
+            Query<(
+                &crate::simulation::faction::FactionMember,
+                &mut crate::economy::agent::EconomicAgent,
+            )>,
+        )> = SystemState::new(world);
+        let (registry, mut q) = state.get_mut(world);
+        for (member, mut agent) in q.iter_mut() {
+            let root = registry.root_faction(member.faction_id);
+            let Some((bed_remaining, yurt_remaining)) = targets.get_mut(&root) else {
+                continue;
+            };
+            if *bed_remaining > 0 {
+                let have = agent.quantity_of_resource(bedroll_id);
+                let take = have.min(*bed_remaining);
+                if take > 0 {
+                    agent.remove_resource(bedroll_id, take);
+                    *bed_remaining -= take;
+                }
+            }
+            if *yurt_remaining > 0 {
+                let have = agent.quantity_of_resource(packed_yurt_id);
+                let take = have.min(*yurt_remaining);
+                if take > 0 {
+                    agent.remove_resource(packed_yurt_id, take);
+                    *yurt_remaining -= take;
+                }
+            }
+        }
+    }
+
+    // Pass 2: drain pack-animal inventories for any leftover need.
+    {
+        let mut state: SystemState<(
+            Res<FactionRegistry>,
+            Query<(
+                &Tamed,
+                &mut crate::simulation::animals::PackAnimalInventory,
+            )>,
+        )> = SystemState::new(world);
+        let (registry, mut q) = state.get_mut(world);
+        for (tamed, mut inv) in q.iter_mut() {
+            let root = registry.root_faction(tamed.owner_faction);
+            let Some((bed_remaining, yurt_remaining)) = targets.get_mut(&root) else {
+                continue;
+            };
+            if *bed_remaining > 0 {
+                let have = inv.quantity_of(bedroll_id);
+                let take = have.min(*bed_remaining);
+                if take > 0 {
+                    inv.remove(bedroll_id, take);
+                    *bed_remaining -= take;
+                }
+            }
+            if *yurt_remaining > 0 {
+                let have = inv.quantity_of(packed_yurt_id);
+                let take = have.min(*yurt_remaining);
+                if take > 0 {
+                    inv.remove(packed_yurt_id, take);
+                    *yurt_remaining -= take;
+                }
+            }
+        }
+    }
 }
 
 fn score_local_food(shared: &SharedKnowledge, fid: u32, home: (i32, i32), radius: i32) -> u16 {
