@@ -10955,6 +10955,93 @@ mod baseline_behaviour {
             Lifestyle::Settled
         );
     }
+
+    /// Heal-4 executor sanity check. Pins a Healer adjacent to an
+    /// injured Person with `Task::Heal { patient }` directly
+    /// dispatched, ticks once, and verifies `heal_task_system`
+    /// raised the patient's `Body.fraction` and granted the Healer
+    /// Medicine XP. Full-recovery end-to-end ships with Heal-4b
+    /// once the `SeekCare`-side dispatcher lands so the test
+    /// schedule's other systems don't unstick the Healer between
+    /// heal ticks (currently observed: heal lands once, then
+    /// upstream goal-state churn delays subsequent heals).
+    #[test]
+    fn heal_task_executor_decrements_patient_injury() {
+        use crate::simulation::combat::{Body, BodyPart};
+        use crate::simulation::medicine::Injury;
+        use crate::simulation::person::AiState;
+        use crate::simulation::tasks::TaskKind;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(3, 0, TileKind::Grass);
+
+        let fid = {
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<crate::simulation::faction::FactionRegistry>();
+            registry.create_faction((0, 0))
+        };
+        // Drafted on both agents so goal_update_system and every
+        // HTN dispatcher skip them; the test owns the task slot.
+        let healer = sim.spawn_person(fid, (1, 0), |b| {
+            b.profession(Profession::Healer).drafted();
+        });
+        let patient = sim.spawn_person(fid, (0, 0), |b| {
+            b.drafted();
+        });
+        // Damage every limb so Body.fraction() drops sharply.
+        {
+            let mut body = sim.app.world_mut().get_mut::<Body>(patient).unwrap();
+            for limb in body.parts.iter_mut() {
+                limb.current = limb.current.saturating_sub(15).max(5);
+            }
+            let torso = body.get_mut(BodyPart::Torso);
+            torso.current = 5;
+        }
+        // Let injury_tracking_system observe the body mutation and
+        // stamp Injury before we dispatch the heal task.
+        sim.tick_n(3);
+        assert!(
+            sim.app.world().get::<Injury>(patient).is_some(),
+            "Injury should be stamped after a few ticks of damaged Body"
+        );
+
+        // Directly arm the Healer to treat the patient.
+        {
+            let mut aq = sim
+                .app
+                .world_mut()
+                .get_mut::<ActionQueue>(healer)
+                .unwrap();
+            aq.dispatch(Task::Heal { patient });
+        }
+        {
+            let mut ai = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonAI>(healer)
+                .unwrap();
+            ai.state = AiState::Working;
+            ai.task_id = TaskKind::Heal as u16;
+        }
+
+        let fraction_before = sim.app.world().get::<Body>(patient).unwrap().fraction();
+        sim.tick_n(1);
+        let fraction_after = sim.app.world().get::<Body>(patient).unwrap().fraction();
+        assert!(
+            fraction_after > fraction_before,
+            "one tick of heal must raise Body.fraction (before {:.4} → after {:.4})",
+            fraction_before,
+            fraction_after,
+        );
+        let skills = sim.app.world().get::<Skills>(healer).unwrap();
+        assert!(
+            skills.get(crate::simulation::skills::SkillKind::Medicine) > 0,
+            "Healer should accumulate Medicine XP while treating"
+        );
+    }
 }
 
 #[cfg(test)]
