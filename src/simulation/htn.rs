@@ -3336,9 +3336,9 @@ impl Method for EngageRescueAttackerMethod {
 /// duplicating the helper).
 fn pick_explore_tile(
     home: (i32, i32),
-    cur_chunk: ChunkCoord,
-    cur_z: i8,
+    agent_tile: (i32, i32, i8),
     chunk_map: &ChunkMap,
+    chunk_graph: &ChunkGraph,
     chunk_connectivity: &ChunkConnectivity,
 ) -> Option<(i32, i32)> {
     for _ in 0..8 {
@@ -3346,12 +3346,8 @@ fn pick_explore_tile(
         let dy = fastrand::i32(-96..=96);
         let tx = (home.0 + dx).max(0);
         let ty = (home.1 + dy).max(0);
-        let to_chunk = ChunkCoord(
-            tx.div_euclid(CHUNK_SIZE as i32),
-            ty.div_euclid(CHUNK_SIZE as i32),
-        );
         let to_z = chunk_map.surface_z_at(tx, ty) as i8;
-        if chunk_connectivity.is_reachable((cur_chunk, cur_z), (to_chunk, to_z)) {
+        if chunk_connectivity.tile_reachable(chunk_graph, agent_tile, (tx, ty, to_z)) {
             return Some((tx, ty));
         }
     }
@@ -3931,18 +3927,19 @@ pub fn htn_acquire_food_dispatch_system(
             // a seed-only tile under Survive.
             let nearest_storage_tile =
                 if let Some(tiles) = storage_tile_map.by_faction.get(&member.faction_id) {
+                    let agent_tile_3d = (cur_tx, cur_ty, ai.current_z);
                     let pick = |reachable_only: bool| {
                         tiles
                             .iter()
                             .filter(|&&(tx, ty)| {
                                 if reachable_only {
-                                    let target_chunk = ChunkCoord(
-                                        tx.div_euclid(CHUNK_SIZE as i32),
-                                        ty.div_euclid(CHUNK_SIZE as i32),
-                                    );
-                                    if !chunk_connectivity.is_reachable(
-                                        (cur_chunk, ai.current_z),
-                                        (target_chunk, ai.current_z),
+                                    let tz = chunk_map
+                                        .nearest_standable_z(tx, ty, ai.current_z as i32)
+                                        as i8;
+                                    if !chunk_connectivity.tile_reachable(
+                                        &chunk_graph,
+                                        agent_tile_3d,
+                                        (tx, ty, tz),
                                     ) {
                                         return false;
                                     }
@@ -3980,12 +3977,12 @@ pub fn htn_acquire_food_dispatch_system(
             // pickers falls back to the connectivity-blind result if every
             // candidate is disconnected.
             let reach_from_agent = |t: (i32, i32)| -> bool {
-                let target_chunk = ChunkCoord(
-                    t.0.div_euclid(CHUNK_SIZE as i32),
-                    t.1.div_euclid(CHUNK_SIZE as i32),
-                );
-                chunk_connectivity
-                    .is_reachable((cur_chunk, ai.current_z), (target_chunk, ai.current_z))
+                let tz = chunk_map.nearest_standable_z(t.0, t.1, ai.current_z as i32) as i8;
+                chunk_connectivity.tile_reachable(
+                    &chunk_graph,
+                    (cur_tx, cur_ty, ai.current_z),
+                    (t.0, t.1, tz),
+                )
             };
             let scavenge = current_vision.nearest_scavenge_target(
                 MemoryKind::AnyEdible,
@@ -4127,9 +4124,9 @@ pub fn htn_acquire_food_dispatch_system(
                     .unwrap_or((cur_tx, cur_ty));
                 if let Some(dest) = pick_explore_tile(
                     home,
-                    cur_chunk,
-                    ai.current_z,
+                    (cur_tx, cur_ty, ai.current_z),
                     &chunk_map,
+                    &chunk_graph,
                     &chunk_connectivity,
                 ) {
                     let dispatched = assign_task_with_routing(
@@ -4259,9 +4256,9 @@ pub fn htn_acquire_food_dispatch_system(
                         .unwrap_or((cur_tx, cur_ty));
                     let Some(dest) = pick_explore_tile(
                         home,
-                        cur_chunk,
-                        ai.current_z,
+                        (cur_tx, cur_ty, ai.current_z),
                         &chunk_map,
+                        &chunk_graph,
                         &chunk_connectivity,
                     ) else {
                         ai.active_method = None;
@@ -4509,12 +4506,12 @@ pub fn htn_acquire_good_dispatch_system(
                 let viewer_settlement = gk.settlement_map.first_for_faction(member.faction_id);
                 // Phase 2a: tile-reachability closure for vision pickers.
                 let reach_from_agent = |t: (i32, i32)| -> bool {
-                    let target_chunk = ChunkCoord(
-                        t.0.div_euclid(CHUNK_SIZE as i32),
-                        t.1.div_euclid(CHUNK_SIZE as i32),
-                    );
-                    chunk_connectivity
-                        .is_reachable((cur_chunk, ai.current_z), (target_chunk, ai.current_z))
+                    let tz = chunk_map.nearest_standable_z(t.0, t.1, ai.current_z as i32) as i8;
+                    chunk_connectivity.tile_reachable(
+                        &chunk_graph,
+                        (cur_tx, cur_ty, ai.current_z),
+                        (t.0, t.1, tz),
+                    )
                 };
                 let visible_gather = current_vision.nearest_gather_target(
                     memory_kind,
@@ -4562,28 +4559,24 @@ pub fn htn_acquire_good_dispatch_system(
                 // so the dispatcher doesn't bake an unroutable trailing leg
                 // into the chain.
                 let gather_deposit_tile = gather_target_tile.and_then(|t| {
-                    let target_chunk = ChunkCoord(
-                        t.0.div_euclid(CHUNK_SIZE as i32),
-                        t.1.div_euclid(CHUNK_SIZE as i32),
-                    );
+                    let tz = chunk_map.nearest_standable_z(t.0, t.1, ai.current_z as i32) as i8;
                     storage_tile_map.nearest_for_faction_reachable(
                         member.faction_id,
                         t,
-                        target_chunk,
-                        ai.current_z,
+                        (t.0, t.1, tz),
+                        &chunk_map,
+                        &chunk_graph,
                         &chunk_connectivity,
                     )
                 });
                 let scavenge_deposit_tile = scavenge_target_tile.and_then(|t| {
-                    let target_chunk = ChunkCoord(
-                        t.0.div_euclid(CHUNK_SIZE as i32),
-                        t.1.div_euclid(CHUNK_SIZE as i32),
-                    );
+                    let tz = chunk_map.nearest_standable_z(t.0, t.1, ai.current_z as i32) as i8;
                     storage_tile_map.nearest_for_faction_reachable(
                         member.faction_id,
                         t,
-                        target_chunk,
-                        ai.current_z,
+                        (t.0, t.1, tz),
+                        &chunk_map,
+                        &chunk_graph,
                         &chunk_connectivity,
                     )
                 });
@@ -4749,9 +4742,9 @@ pub fn htn_acquire_good_dispatch_system(
                             .unwrap_or((cur_tx, cur_ty));
                         let Some(dest) = pick_explore_tile(
                             home,
-                            cur_chunk,
-                            ai.current_z,
+                            (cur_tx, cur_ty, ai.current_z),
                             &chunk_map,
+                            &chunk_graph,
                             &chunk_connectivity,
                         ) else {
                             ai.active_method = None;
@@ -5191,12 +5184,12 @@ pub fn htn_stockpile_food_dispatch_system(
             // the right payload.
             // Phase 2a: tile-reachability closure for vision pickers.
             let reach_from_agent = |t: (i32, i32)| -> bool {
-                let target_chunk = ChunkCoord(
-                    t.0.div_euclid(CHUNK_SIZE as i32),
-                    t.1.div_euclid(CHUNK_SIZE as i32),
-                );
-                chunk_connectivity
-                    .is_reachable((cur_chunk, ai.current_z), (target_chunk, ai.current_z))
+                let tz = chunk_map.nearest_standable_z(t.0, t.1, ai.current_z as i32) as i8;
+                chunk_connectivity.tile_reachable(
+                    &chunk_graph,
+                    (cur_tx, cur_ty, ai.current_z),
+                    (t.0, t.1, tz),
+                )
             };
             let scavenge = current_vision.nearest_scavenge_target(
                 MemoryKind::AnyEdible,
@@ -5236,15 +5229,13 @@ pub fn htn_stockpile_food_dispatch_system(
             // tile the agent will be on after pickup; from there, find the
             // nearest *reachable* storage tile.
             let scavenge_deposit_tile = scavenge_target_tile.and_then(|t| {
-                let target_chunk = ChunkCoord(
-                    t.0.div_euclid(CHUNK_SIZE as i32),
-                    t.1.div_euclid(CHUNK_SIZE as i32),
-                );
+                let tz = chunk_map.nearest_standable_z(t.0, t.1, ai.current_z as i32) as i8;
                 storage_tile_map.nearest_for_faction_reachable(
                     deposit_faction_id,
                     t,
-                    target_chunk,
-                    ai.current_z,
+                    (t.0, t.1, tz),
+                    &chunk_map,
+                    &chunk_graph,
                     &chunk_connectivity,
                 )
             });
@@ -5316,15 +5307,13 @@ pub fn htn_stockpile_food_dispatch_system(
             // household-aware `deposit_faction_id` computed above so
             // subsistence-mode harvests land in the worker's own larder.
             let gather_deposit_tile = gather_target_tile.and_then(|t| {
-                let target_chunk = ChunkCoord(
-                    t.0.div_euclid(CHUNK_SIZE as i32),
-                    t.1.div_euclid(CHUNK_SIZE as i32),
-                );
+                let tz = chunk_map.nearest_standable_z(t.0, t.1, ai.current_z as i32) as i8;
                 storage_tile_map.nearest_for_faction_reachable(
                     deposit_faction_id,
                     t,
-                    target_chunk,
-                    ai.current_z,
+                    (t.0, t.1, tz),
+                    &chunk_map,
+                    &chunk_graph,
                     &chunk_connectivity,
                 )
             });
@@ -5398,9 +5387,9 @@ pub fn htn_stockpile_food_dispatch_system(
                     .unwrap_or((cur_tx, cur_ty));
                 if let Some(dest) = pick_explore_tile(
                     home,
-                    cur_chunk,
-                    ai.current_z,
+                    (cur_tx, cur_ty, ai.current_z),
                     &chunk_map,
+                    &chunk_graph,
                     &chunk_connectivity,
                 ) {
                     let dispatched = assign_task_with_routing(
@@ -5480,9 +5469,9 @@ pub fn htn_stockpile_food_dispatch_system(
                         .unwrap_or((cur_tx, cur_ty));
                     let Some(dest) = pick_explore_tile(
                         home,
-                        cur_chunk,
-                        ai.current_z,
+                        (cur_tx, cur_ty, ai.current_z),
                         &chunk_map,
+                        &chunk_graph,
                         &chunk_connectivity,
                     ) else {
                         ai.active_method = None;
@@ -5975,9 +5964,9 @@ pub fn htn_scout_dispatch_system(
                         .unwrap_or((cur_tx, cur_ty));
                     let Some(dest) = pick_explore_tile(
                         home,
-                        cur_chunk,
-                        ai.current_z,
+                        (cur_tx, cur_ty, ai.current_z),
                         &chunk_map,
+                        &chunk_graph,
                         &chunk_connectivity,
                     ) else {
                         ai.active_method = None;
@@ -9271,11 +9260,12 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
         let viewer_settlement = gk.settlement_map.first_for_faction(member.faction_id);
         // Phase 2a: tile-reachability closure for the visible-grain pick.
         let reach_from_agent = |t: (i32, i32)| -> bool {
-            let target_chunk = ChunkCoord(
-                t.0.div_euclid(CHUNK_SIZE as i32),
-                t.1.div_euclid(CHUNK_SIZE as i32),
-            );
-            chunk_connectivity.is_reachable((cur_chunk, ai.current_z), (target_chunk, ai.current_z))
+            let tz = chunk_map.nearest_standable_z(t.0, t.1, ai.current_z as i32) as i8;
+            chunk_connectivity.tile_reachable(
+                &chunk_graph,
+                (cur_tx, cur_ty, ai.current_z),
+                (t.0, t.1, tz),
+            )
         };
         let visible_grain = current_vision
             .nearest_gather_target(

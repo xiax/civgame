@@ -1571,25 +1571,31 @@ impl StorageTileMap {
             .copied()
     }
 
-    /// Phase 2a: like `nearest_for_faction` but skips storage tiles whose
-    /// chunk isn't reachable from `agent_chunk` at `agent_z` per
-    /// `ChunkConnectivity`. Closes the gap where the Manhattan-closest
-    /// storage tile sits in a disconnected component (across a wall, in a
-    /// separated cave, on a different megachunk surface) and the dispatcher
-    /// would happily pick it, then fail at `assign_task_with_routing` and
-    /// burn a tick before re-evaluating.
+    /// Like `nearest_for_faction` but skips storage tiles that aren't
+    /// reachable from the source tile via component-exact `tile_reachable`.
+    /// Closes the gap where the Manhattan-closest storage tile sits in a
+    /// disconnected component (across a wall, in a separated cave, on a
+    /// different megachunk surface) and the dispatcher would happily pick
+    /// it, then fail at `assign_task_with_routing` and burn a tick before
+    /// re-evaluating.
+    ///
+    /// Each storage tile's z is resolved with `nearest_standable_z` so a
+    /// raised but-reachable platform beats a same-z tile in a sealed
+    /// chamber. The `source_tile` is typically the future pickup / gather
+    /// tile (not the agent's current tile) so deposit chains gate on the
+    /// post-pickup reachability rather than the worker's pre-walk state.
     ///
     /// Falls back to the connectivity-blind result when the reachability
     /// filter rejects every tile — better to attempt a (likely-failing)
     /// route than return `None` and have the dispatcher emit nothing at
-    /// all. The `Phase 1` cancel-path failure recording will still bias
-    /// the method on miss; this is purely a reachability *first-pass*.
+    /// all.
     pub fn nearest_for_faction_reachable(
         &self,
         faction_id: u32,
         from: (i32, i32),
-        agent_chunk: crate::world::chunk::ChunkCoord,
-        agent_z: i8,
+        source_tile: (i32, i32, i8),
+        chunk_map: &crate::world::chunk::ChunkMap,
+        chunk_graph: &crate::pathfinding::chunk_graph::ChunkGraph,
         connectivity: &crate::pathfinding::connectivity::ChunkConnectivity,
     ) -> Option<(i32, i32)> {
         let tiles = self.by_faction.get(&faction_id)?;
@@ -1600,11 +1606,8 @@ impl StorageTileMap {
                     if !reachable_only {
                         return true;
                     }
-                    let target_chunk = crate::world::chunk::ChunkCoord(
-                        (tx as i32).div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
-                        (ty as i32).div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
-                    );
-                    connectivity.is_reachable((agent_chunk, agent_z), (target_chunk, agent_z))
+                    let tz = chunk_map.nearest_standable_z(tx, ty, source_tile.2 as i32) as i8;
+                    connectivity.tile_reachable(chunk_graph, source_tile, (tx, ty, tz))
                 })
                 .min_by_key(|&&(tx, ty)| (tx as i32 - from.0).abs() + (ty as i32 - from.1).abs())
                 .copied()
@@ -3606,5 +3609,84 @@ mod tests {
     fn crafter_target_zero_when_no_members() {
         let t = crafter_target_with_hysteresis(5.0, 0, 0);
         assert_eq!(t, 0);
+    }
+
+    #[test]
+    fn nearest_for_faction_reachable_prefers_raised_reachable_over_farther_same_z() {
+        // Layout:
+        // - chunk (0,0) surface z=0 — agent stands at (5, 5, 0).
+        // - chunk (1,0) surface z=1 — reachable from chunk (0,0) via the
+        //   cross-chunk stair-step edge (|Δz| ≤ 1). Storage tile A at
+        //   (32, 5, z=1) — nearby but raised.
+        // - chunk (5,5) surface z=0 — isolated, not adjacent to anything
+        //   built. Storage tile B at (165, 165, z=0) — farther but at the
+        //   agent's Z.
+        //
+        // Old `(chunk, z)` reachability checked at the agent's z=0 and
+        // rejected the raised tile (chunk (1,0) has no component at z=0),
+        // then fell back to the blind result by Manhattan distance — which
+        // might pick *either* tile depending on chunk indexing. New
+        // `tile_reachable` resolves the storage tile's actual standable z
+        // and follows component identity, so it definitively picks A.
+        use crate::pathfinding::chunk_graph::{rebuild_chunk_graph_sync, ChunkGraph};
+        use crate::pathfinding::connectivity::{
+            populate_connectivity_from_graph, ChunkConnectivity,
+        };
+        use crate::world::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE};
+        use crate::world::tile::TileKind;
+
+        fn flat_chunk(surf_z: i8) -> Chunk {
+            let surface_z = Box::new([[surf_z; CHUNK_SIZE]; CHUNK_SIZE]);
+            let surface_kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
+            let surface_fertility = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
+            Chunk::new(surface_z, surface_kind, surface_fertility)
+        }
+
+        let mut chunk_map = ChunkMap::default();
+        chunk_map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
+        chunk_map.0.insert(ChunkCoord(1, 0), flat_chunk(1));
+        chunk_map.0.insert(ChunkCoord(5, 5), flat_chunk(0));
+
+        let mut graph = ChunkGraph::default();
+        rebuild_chunk_graph_sync(&chunk_map, &mut graph);
+
+        let mut conn = ChunkConnectivity::default();
+        populate_connectivity_from_graph(&graph, &mut conn);
+
+        let agent_tile = (5, 5, 0i8);
+        let raised_tile = (32, 5); // chunk (1,0) — reachable via stair-step
+        let isolated_tile = (165, 165); // chunk (5,5) — isolated
+
+        // Sanity: confirm the raised tile is reachable per the exact API.
+        assert!(
+            conn.tile_reachable(&graph, agent_tile, (raised_tile.0, raised_tile.1, 1)),
+            "raised tile must be reachable via the stair-step cross-chunk edge"
+        );
+        assert!(
+            !conn.tile_reachable(
+                &graph,
+                agent_tile,
+                (isolated_tile.0, isolated_tile.1, 0),
+            ),
+            "isolated chunk must be unreachable"
+        );
+
+        // Storage tile map carries both candidates for faction 7. Manhattan
+        // distance from agent (5, 5): raised (32, 5) = 27; isolated
+        // (165, 165) = 320. Both unreachable would tie-break to raised;
+        // we still want to confirm the reachability filter wins.
+        let mut stm = StorageTileMap::default();
+        stm.tiles.insert(raised_tile, 7);
+        stm.tiles.insert(isolated_tile, 7);
+        stm.by_faction
+            .insert(7, vec![raised_tile, isolated_tile]);
+
+        let picked =
+            stm.nearest_for_faction_reachable(7, (5, 5), agent_tile, &chunk_map, &graph, &conn);
+        assert_eq!(
+            picked,
+            Some(raised_tile),
+            "reachable raised tile must beat the isolated tile"
+        );
     }
 }

@@ -30,9 +30,13 @@ Z-mismatch penalty is gone — components are exact, no "wrong z" choice to pena
 
 ## Connectivity (`connectivity.rs`)
 
-`ChunkConnectivity` is a self-contained reachability snapshot built by `rebuild_connectivity_system`, gated on `connectivity_needs_rebuild` (graph settled + generation mismatch). `is_reachable((c1, z1), (c2, z2)) -> bool` so callers in `simulation/` don't need to thread a `&ChunkGraph`.
+`ChunkConnectivity` is a self-contained reachability snapshot built by `rebuild_connectivity_system`, gated on `connectivity_needs_rebuild` (graph settled + generation mismatch). Exposes three reachability APIs at different precision levels:
 
-Internally: per-(chunk, z) → list of inter-chunk CC ids; reachability = set intersection.
+- **`tile_reachable(graph, from_3d, to_3d) -> bool`** — *exact* tile-to-tile reachability. Resolves each endpoint's `ComponentId` via `ChunkGraph::component_for_tile` and tests equality of inter-chunk CC ids. **This is the authoritative gameplay-routing API.** Simulation target selection (storage picks, vision pickers, adjacency fallback, migration commit, player pitch-camp) all gate on `tile_reachable`. Costs one `ChunkGraph` borrow at the call site.
+- **`component_reachable(from_node, to_node) -> bool`** — same precision, but the caller has already resolved the `(ChunkCoord, ComponentId)` nodes. Used by the path worker.
+- **`is_reachable((chunk, z), (chunk, z)) -> bool`** — coarse `(chunk, z)` overload. OR-merges every component touching `z` in `chunk`, so it can return `true` when the agent's actual cell is in a disconnected component that only shares a `z` slice with the target. **Kept for the debug overlay and a few legacy callers** but not for gameplay routing — exact tile reachability is the rule.
+
+Internally: per-(chunk, ComponentId) → inter-chunk CC id (used by `tile_reachable` / `component_reachable`); per-(chunk, z) → list of CC ids (used by the legacy overload). Both are rebuilt together by `populate_connectivity_from_graph`.
 
 `z_band(z) = z.div_euclid(4)` survives only as a debug-overlay helper — nothing in reachability uses it.
 

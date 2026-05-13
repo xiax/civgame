@@ -2616,13 +2616,13 @@ pub fn nomad_migration_dispatch_system(
         // always returns true and the path worker would just keep
         // rejecting the request. Release the marker so the agent picks a
         // normal goal next tick instead of cycling dispatch ↔ path-fail.
-        let target_chunk = ChunkCoord(
-            target.tile.0.div_euclid(CHUNK_SIZE as i32),
-            target.tile.1.div_euclid(CHUNK_SIZE as i32),
-        );
         let target_z =
             chunk_map.nearest_standable_z(target.tile.0, target.tile.1, ai.current_z as i32) as i8;
-        if !chunk_connectivity.is_reachable((cur_chunk, ai.current_z), (target_chunk, target_z)) {
+        if !chunk_connectivity.tile_reachable(
+            &chunk_graph,
+            (cur_tx, cur_ty, ai.current_z),
+            (target.tile.0, target.tile.1, target_z),
+        ) {
             // Bug-fix #4: rather than dropping the marker outright,
             // reroute toward the band centroid (median tile of other
             // migrating members in reachable chunks). Cap retries via
@@ -2633,13 +2633,12 @@ pub fn nomad_migration_dispatch_system(
                 let mut peers: Vec<(i32, i32)> = Vec::new();
                 if let Some(tiles) = tiles_per_faction.get(&root) {
                     for &(px, py) in tiles.iter() {
-                        let pchunk = ChunkCoord(
-                            px.div_euclid(CHUNK_SIZE as i32),
-                            py.div_euclid(CHUNK_SIZE as i32),
-                        );
                         let pz = chunk_map.nearest_standable_z(px, py, ai.current_z as i32) as i8;
-                        if chunk_connectivity.is_reachable((cur_chunk, ai.current_z), (pchunk, pz))
-                        {
+                        if chunk_connectivity.tile_reachable(
+                            &chunk_graph,
+                            (cur_tx, cur_ty, ai.current_z),
+                            (px, py, pz),
+                        ) {
                             peers.push((px, py));
                         }
                     }

@@ -266,19 +266,19 @@ pub fn task_is_labor(task_id: u16) -> bool {
 }
 
 /// Spiral search outward from `target` for the closest tile that is passable
-/// at its surface Z and reachable (via `ChunkConnectivity`) from
-/// `agent_origin`. Used as a "wander toward target" fallback when the strict
-/// adjacency pick in `assign_task_with_routing` finds no usable tile — the
-/// agent walks toward the goal so the next dispatch tick can retry adjacency
-/// from a closer position.
+/// at its surface Z and reachable (via component-exact `tile_reachable`) from
+/// the agent's tile. Used as a "wander toward target" fallback when the
+/// strict adjacency pick in `assign_task_with_routing` finds no usable tile
+/// — the agent walks toward the goal so the next dispatch tick can retry
+/// adjacency from a closer position.
 pub fn nearest_reachable_tile_near(
     chunk_map: &ChunkMap,
+    chunk_graph: &ChunkGraph,
     chunk_connectivity: &ChunkConnectivity,
     target: (i32, i32),
-    agent_origin: (ChunkCoord, i8),
+    agent_tile: (i32, i32, i8),
     radius: i32,
 ) -> Option<(i32, i32)> {
-    let csz = CHUNK_SIZE as i32;
     let mut best: Option<(i32, i32)> = None;
     let mut best_dist = i32::MAX;
     for r in 1..=radius {
@@ -293,8 +293,7 @@ pub fn nearest_reachable_tile_near(
                 if !chunk_map.passable_at(tx, ty, tz) {
                     continue;
                 }
-                let n_chunk = ChunkCoord(tx.div_euclid(csz), ty.div_euclid(csz));
-                if !chunk_connectivity.is_reachable(agent_origin, (n_chunk, tz as i8)) {
+                if !chunk_connectivity.tile_reachable(chunk_graph, agent_tile, (tx, ty, tz as i8)) {
                     continue;
                 }
                 let dist = dx.abs() + dy.abs();
@@ -320,13 +319,13 @@ pub fn nearest_reachable_tile_near(
 /// tile is within `max_radius` — agent is genuinely sealed in.
 pub fn nearest_reachable_higher_tile(
     chunk_map: &ChunkMap,
+    chunk_graph: &ChunkGraph,
     chunk_connectivity: &ChunkConnectivity,
     origin_xy: (i32, i32),
-    agent_origin: (ChunkCoord, i8),
+    agent_tile: (i32, i32, i8),
     max_radius: i32,
 ) -> Option<(i32, i32)> {
-    let csz = CHUNK_SIZE as i32;
-    let agent_z = agent_origin.1;
+    let agent_z = agent_tile.2;
     for r in 1..=max_radius {
         for dy in -r..=r {
             for dx in -r..=r {
@@ -342,8 +341,11 @@ pub fn nearest_reachable_higher_tile(
                 if !chunk_map.passable_at(tx, ty, surf_z) {
                     continue;
                 }
-                let n_chunk = ChunkCoord(tx.div_euclid(csz), ty.div_euclid(csz));
-                if !chunk_connectivity.is_reachable(agent_origin, (n_chunk, surf_z as i8)) {
+                if !chunk_connectivity.tile_reachable(
+                    chunk_graph,
+                    agent_tile,
+                    (tx, ty, surf_z as i8),
+                ) {
                     continue;
                 }
                 return Some((tx as i32, ty as i32));
@@ -569,7 +571,7 @@ pub fn assign_task_with_routing(
             (1, 1),
         ];
         let agent_z = ai.current_z;
-        let csz = CHUNK_SIZE as i32;
+        let agent_tile_3d = (cur_tile.0, cur_tile.1, agent_z);
         let picked = ADJ
             .iter()
             .map(|&(dx, dy)| (tx + dx, ty + dy))
@@ -582,8 +584,11 @@ pub fn assign_task_with_routing(
                 if !(-1..=1).contains(&dz) {
                     return false;
                 }
-                let n_chunk = ChunkCoord(ntx.div_euclid(csz), nty.div_euclid(csz));
-                chunk_connectivity.is_reachable((cur_chunk, agent_z), (n_chunk, nz as i8))
+                chunk_connectivity.tile_reachable(
+                    chunk_graph,
+                    agent_tile_3d,
+                    (ntx, nty, nz as i8),
+                )
             })
             .min_by_key(|&(ntx, nty)| (ntx - ax).abs() + (nty - ay).abs())
             .map(|(ntx, nty)| (ntx as i32, nty as i32));
@@ -599,9 +604,10 @@ pub fn assign_task_with_routing(
                 // adjacency happens to be temporarily blocked.
                 match nearest_reachable_tile_near(
                     chunk_map,
+                    chunk_graph,
                     chunk_connectivity,
                     (tx, ty),
-                    (cur_chunk, agent_z),
+                    agent_tile_3d,
                     8,
                 ) {
                     Some(t) => t,

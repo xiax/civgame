@@ -1030,15 +1030,13 @@ fn dispatch_one(
             if !routing.chunk_map.is_passable(tile.0, tile.1) {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
-            // Connectivity check from the actor's chunk to target chunk.
-            let target_chunk = ChunkCoord(
-                tile.0.div_euclid(CHUNK_SIZE as i32),
-                tile.1.div_euclid(CHUNK_SIZE as i32),
-            );
-            if !routing
-                .chunk_connectivity
-                .is_reachable((cur_chunk, ai.current_z), (target_chunk, z))
-            {
+            // Component-exact reachability from the actor's tile to the
+            // exact target tile/z (not just the chunk pair).
+            if !routing.chunk_connectivity.tile_reachable(
+                &routing.chunk_graph,
+                (cur_tile.0, cur_tile.1, ai.current_z),
+                (tile.0, tile.1, z),
+            ) {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
             // Prevent same-spot pitch.

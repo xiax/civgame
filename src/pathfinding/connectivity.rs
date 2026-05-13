@@ -17,7 +17,7 @@ use ahash::AHashMap;
 use bevy::prelude::*;
 
 use crate::pathfinding::chunk_graph::{ChunkGraph, ComponentId};
-use crate::world::chunk::ChunkCoord;
+use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
 
 /// Coarse z-band used by debug visualisations to slice the world for
 /// per-band gizmo overlays. NOT used by reachability — components are
@@ -37,7 +37,15 @@ pub struct ChunkConnectivity {
     /// every component that has a cell at exactly that z. Multiple ids
     /// can appear when a chunk has two disconnected components touching
     /// the same z slice.
+    ///
+    /// Retained for backwards-compat `is_reachable((chunk, z), …)` and
+    /// the debug overlay. Gameplay paths should prefer `tile_reachable`,
+    /// which routes via the component-precise `cc_by_component` map.
     cc_at_z: AHashMap<(ChunkCoord, i8), Vec<u32>>,
+    /// Component-precise `(chunk, ComponentId) -> inter-chunk CC id`.
+    /// Built directly from `build_connectivity_components` and used by
+    /// `component_reachable` / `tile_reachable`.
+    cc_by_component: AHashMap<(ChunkCoord, ComponentId), u32>,
     /// Total node count for the debug panel.
     cc_total_nodes: usize,
     /// Distinct CC ids — exposed as `component_count`.
@@ -78,6 +86,63 @@ impl ChunkConnectivity {
     /// at that z.
     pub fn component_of(&self, chunk: ChunkCoord, z: i8) -> Option<u32> {
         self.cc_at_z.get(&(chunk, z))?.first().copied()
+    }
+
+    /// Exact inter-chunk CC id for a specific `(chunk, ComponentId)` node.
+    /// Returns `None` when the node isn't classified (chunk not built,
+    /// component id stale across a rebuild).
+    pub fn cc_of_component(&self, chunk: ChunkCoord, component: ComponentId) -> Option<u32> {
+        self.cc_by_component.get(&(chunk, component)).copied()
+    }
+
+    /// True iff the two `(chunk, component)` nodes share an inter-chunk
+    /// connected component. Component-precise — no false positives from
+    /// surface/cave coexisting at the same `(chunk, z)`.
+    pub fn component_reachable(
+        &self,
+        from: (ChunkCoord, ComponentId),
+        to: (ChunkCoord, ComponentId),
+    ) -> bool {
+        if from == to {
+            return true;
+        }
+        match (
+            self.cc_by_component.get(&from),
+            self.cc_by_component.get(&to),
+        ) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// Component-precise reachability between two exact 3D tiles. Looks
+    /// up each tile's chunk-graph component via
+    /// `ChunkGraph::component_for_tile` and tests CC equality.
+    ///
+    /// Use this for gameplay routing decisions instead of
+    /// `is_reachable((chunk, z), …)`: the `(chunk, z)` overload OR-merges
+    /// every component touching `z` in `chunk` and can return `true`
+    /// when the agent's actual cell is sealed in a disconnected
+    /// component that happens to share a `z` slice.
+    pub fn tile_reachable(
+        &self,
+        graph: &ChunkGraph,
+        from: (i32, i32, i8),
+        to: (i32, i32, i8),
+    ) -> bool {
+        if from == to {
+            return true;
+        }
+        let csz = CHUNK_SIZE as i32;
+        let from_chunk = ChunkCoord(from.0.div_euclid(csz), from.1.div_euclid(csz));
+        let to_chunk = ChunkCoord(to.0.div_euclid(csz), to.1.div_euclid(csz));
+        let Some(from_c) = graph.component_for_tile(from.0, from.1, from.2) else {
+            return false;
+        };
+        let Some(to_c) = graph.component_for_tile(to.0, to.1, to.2) else {
+            return false;
+        };
+        self.component_reachable((from_chunk, from_c), (to_chunk, to_c))
     }
 
     /// `(chunk, z_band, cc_id)` triples for the per-band debug overlay.
@@ -185,8 +250,11 @@ pub fn build_connectivity_components(
     out
 }
 
-pub fn rebuild_connectivity_system(graph: Res<ChunkGraph>, mut conn: ResMut<ChunkConnectivity>) {
-    let cc_map = build_connectivity_components(&graph);
+/// Repopulates `conn` from `graph`. Shared between the live
+/// `rebuild_connectivity_system` (which has Bevy resource accessors) and
+/// out-of-module tests that build their own `ChunkGraph` directly.
+pub fn populate_connectivity_from_graph(graph: &ChunkGraph, conn: &mut ChunkConnectivity) {
+    let cc_map = build_connectivity_components(graph);
     let mut cc_at_z: AHashMap<(ChunkCoord, i8), Vec<u32>> = AHashMap::new();
     let mut overlay_seen: ahash::AHashSet<(ChunkCoord, ZBand, u32)> = ahash::AHashSet::new();
     let mut overlay: Vec<(ChunkCoord, ZBand, u32)> = Vec::new();
@@ -209,10 +277,15 @@ pub fn rebuild_connectivity_system(graph: Res<ChunkGraph>, mut conn: ResMut<Chun
         }
     }
     conn.cc_at_z = cc_at_z;
+    conn.cc_by_component = cc_map;
     conn.overlay_entries = overlay;
-    conn.cc_total_nodes = cc_map.len();
+    conn.cc_total_nodes = conn.cc_by_component.len();
     conn.cc_distinct = distinct.len();
     conn.generation = conn.generation.wrapping_add(1);
+}
+
+pub fn rebuild_connectivity_system(graph: Res<ChunkGraph>, mut conn: ResMut<ChunkConnectivity>) {
+    populate_connectivity_from_graph(&graph, &mut conn);
 }
 
 #[cfg(test)]
@@ -256,9 +329,11 @@ mod tests {
                 }
             }
         }
+        let total_nodes = cc_map.len();
         ChunkConnectivity {
             cc_at_z,
-            cc_total_nodes: cc_map.len(),
+            cc_by_component: cc_map,
+            cc_total_nodes: total_nodes,
             cc_distinct: distinct.len(),
             overlay_entries: Vec::new(),
             generation: 0,
@@ -295,6 +370,48 @@ mod tests {
             .insert(ChunkCoord(5, 5), comp_at_z(ChunkCoord(5, 5), 0, 1));
         let conn = rebuild(&graph);
         assert!(!conn.is_reachable((ChunkCoord(0, 0), 0), (ChunkCoord(5, 5), 0)));
+    }
+
+    #[test]
+    fn tile_reachable_succeeds_across_z_offset() {
+        // Chunk A's only standable cell is at z=0, chunk B's at z=1, joined
+        // by a stair-step edge. The legacy `(chunk, z)` check between
+        // B@z=0 fails (no component there), but exact tile reachability
+        // between (A tile, z=0) and (B tile, z=1) succeeds.
+        let mut a = AHashMap::new();
+        a.insert((0u8, 0u8, 0i8), ComponentId(0));
+        let mut b = AHashMap::new();
+        b.insert((0u8, 0u8, 1i8), ComponentId(0));
+        let mut graph = ChunkGraph::default();
+        graph
+            .components
+            .insert(ChunkCoord(0, 0), ChunkComponents { at: a, count: 1 });
+        graph
+            .components
+            .insert(ChunkCoord(1, 0), ChunkComponents { at: b, count: 1 });
+        graph
+            .edges
+            .insert(ChunkCoord(0, 0), vec![edge(ChunkCoord(1, 0), 0, 0)]);
+        graph
+            .edges
+            .insert(ChunkCoord(1, 0), vec![edge(ChunkCoord(0, 0), 0, 0)]);
+        let conn = rebuild(&graph);
+
+        // Legacy chunk/z check rejects because chunk B has no component at z=0.
+        assert!(
+            !conn.is_reachable((ChunkCoord(0, 0), 0), (ChunkCoord(1, 0), 0)),
+            "legacy same-z chunk check must fail for B@z=0 — no component there"
+        );
+
+        // Exact tile reachability between (A's tile at z=0) and (B's tile
+        // at z=1) succeeds — the stair-step edge unifies their components.
+        let csz = CHUNK_SIZE as i32;
+        let a_tile = (0, 0, 0i8);
+        let b_tile = (csz, 0, 1i8);
+        assert!(
+            conn.tile_reachable(&graph, a_tile, b_tile),
+            "exact tile reachability must follow component identity, not (chunk, z)"
+        );
     }
 
     #[test]
