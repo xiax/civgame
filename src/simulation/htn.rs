@@ -543,6 +543,26 @@ pub fn score_method_with_history(
     raw - failures * METHOD_FAILURE_PENALTY
 }
 
+/// Phase E: disposition-aware variant of `score_method_with_history`.
+/// Multiplies the method's `utility()` by `disposition_lift(...)` (default
+/// 1.0 — no lift) before applying the failure penalty. Used by the
+/// 3 migrated dispatchers (Socialize / Hunt / Play); the other ~21
+/// stay on the legacy `score_method_with_history` until the
+/// dispatch_for_goal consolidation lands (see
+/// `civgame/plans/htn-dispatcher-consolidation.md`).
+pub fn score_method_with_history_and_disposition(
+    method: &dyn Method,
+    abstract_task: AbstractTask,
+    ctx: &PlannerCtx,
+    disposition: crate::simulation::goal_scorers::Disposition,
+    history: &MethodHistory,
+    now: u64,
+) -> f32 {
+    let raw = method.utility(abstract_task, ctx) * method.disposition_lift(disposition);
+    let failures = history.recently_failed_count(method.id(), now) as f32;
+    raw - failures * METHOD_FAILURE_PENALTY
+}
+
 /// Pluralist Economy R4: check whether a method's `policy_gate` is
 /// satisfied by the agent's effective faction. Returns `true` when:
 ///
@@ -1118,6 +1138,25 @@ pub trait Method: Send + Sync + 'static {
     /// consume the value, but the trait surface lets 6b's outcome-recording
     /// sites stamp the right id without re-deriving it from `name()`.
     fn id(&self) -> MethodId;
+
+    /// Phase E: personality-driven multiplier on the method's
+    /// `utility()`. Returns `1.0` by default (no lift). Methods that
+    /// want disposition-driven behaviour override and read the agent's
+    /// `Disposition` axes (e.g. `gregariousness` for socialize/play,
+    /// `martial` for combat, `curiosity` for explore/learn). Lift is
+    /// applied only by `score_method_with_history_and_disposition`;
+    /// the legacy `score_method_with_history` (used by ~21 unmigrated
+    /// dispatchers) ignores it for backwards compatibility.
+    ///
+    /// Lifts should stay sub-tier (recommended range ~`[1.0, 1.3]`)
+    /// so they don't cross `UTIL_BASELINE` → `UTIL_VISIBLE_GROUND`
+    /// breakpoints. Method-ranking tests pin those tier boundaries.
+    fn disposition_lift(
+        &self,
+        _disposition: crate::simulation::goal_scorers::Disposition,
+    ) -> f32 {
+        1.0
+    }
 }
 
 /// Registry of methods keyed by abstract-task kind. Populated once at startup
@@ -2851,6 +2890,17 @@ impl Method for HuntPreyMethod {
     fn id(&self) -> MethodId {
         MethodId::HUNT_PREY
     }
+
+    /// Martial agents press the hunt harder. Lift capped at 1.3
+    /// (martial=255) so HuntPrey's `UTIL_BASELINE` tier ranking
+    /// against `PickUpFreshCorpseMethod` (`UTIL_VISIBLE_GROUND`) is
+    /// preserved.
+    fn disposition_lift(
+        &self,
+        d: crate::simulation::goal_scorers::Disposition,
+    ) -> f32 {
+        crate::simulation::utility_curves::disposition_lift(d.martial, 0.3)
+    }
 }
 
 /// Second method for `AbstractTask::EngagePrey`. Fires when a fresh `Corpse`
@@ -3073,6 +3123,17 @@ impl Method for SocializeWithPartnerMethod {
 
     fn id(&self) -> MethodId {
         MethodId::SOCIALIZE_WITH_PARTNER
+    }
+
+    /// Gregarious agents lift the socialize utility — they pursue
+    /// conversation harder than equidistant loners. Lift capped at
+    /// 1.3 (gregariousness=255) so it stays under
+    /// `UTIL_VISIBLE_GROUND=1.5` and the method's tier ranking holds.
+    fn disposition_lift(
+        &self,
+        d: crate::simulation::goal_scorers::Disposition,
+    ) -> f32 {
+        crate::simulation::utility_curves::disposition_lift(d.gregariousness, 0.3)
     }
 }
 
@@ -7282,6 +7343,7 @@ pub fn htn_engage_prey_dispatch_system(
             &EconomicAgent,
             &crate::simulation::carry::Carrier,
             Option<&crate::simulation::items::Equipment>,
+            Option<&crate::simulation::goal_scorers::Disposition>,
         ),
         Without<Drafted>,
     >,
@@ -7306,8 +7368,10 @@ pub fn htn_engage_prey_dispatch_system(
         agent_econ,
         carrier,
         equipment_opt,
+        disposition_opt,
     ) in query.iter_mut()
     {
+        let disposition = disposition_opt.copied().unwrap_or_default();
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -7497,8 +7561,22 @@ pub fn htn_engage_prey_dispatch_system(
             .iter()
             .filter(|m| m.precondition(abstract_task, &ctx))
             .max_by(|a, b| {
-                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                let ua = score_method_with_history_and_disposition(
+                    a.as_ref(),
+                    abstract_task,
+                    &ctx,
+                    disposition,
+                    &history,
+                    now,
+                );
+                let ub = score_method_with_history_and_disposition(
+                    b.as_ref(),
+                    abstract_task,
+                    &ctx,
+                    disposition,
+                    &history,
+                    now,
+                );
                 ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
             });
         let Some(method) = chosen else {
@@ -7857,13 +7935,16 @@ pub fn htn_socialize_dispatch_system(
             &Transform,
             &FactionMember,
             &LodLevel,
+            Option<&crate::simulation::goal_scorers::Disposition>,
         ),
         Without<Drafted>,
     >,
 ) {
     const PARTNER_RADIUS: i32 = 12;
     let now = clock.tick;
-    for (agent, mut ai, mut aq, mut history, goal, transform, member, lod) in query.iter_mut() {
+    for (agent, mut ai, mut aq, mut history, goal, transform, member, lod, disposition_opt) in
+        query.iter_mut()
+    {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -7952,14 +8033,29 @@ pub fn htn_socialize_dispatch_system(
             agent_has_weapon: false,
         };
 
+        let disposition = disposition_opt.copied().unwrap_or_default();
         let abstract_task = AbstractTask::Socialize;
         let methods = method_registry.methods_for(AbstractTaskKind::Socialize);
         let chosen = methods
             .iter()
             .filter(|m| m.precondition(abstract_task, &ctx))
             .max_by(|a, b| {
-                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                let ua = score_method_with_history_and_disposition(
+                    a.as_ref(),
+                    abstract_task,
+                    &ctx,
+                    disposition,
+                    &history,
+                    now,
+                );
+                let ub = score_method_with_history_and_disposition(
+                    b.as_ref(),
+                    abstract_task,
+                    &ctx,
+                    disposition,
+                    &history,
+                    now,
+                );
                 ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
             });
         let Some(method) = chosen else {
@@ -9607,6 +9703,16 @@ impl Method for PlayWithPartnerMethod {
     fn id(&self) -> MethodId {
         MethodId::PLAY_WITH_PARTNER
     }
+
+    /// Gregarious agents pick partner play (vs solo play with toy /
+    /// stones / etc.) more eagerly. Lift capped at 1.3 (greg=255) so
+    /// `UTIL_VISIBLE_GROUND` stays under `UTIL_CLAIMED_HAUL=2.0`.
+    fn disposition_lift(
+        &self,
+        d: crate::simulation::goal_scorers::Disposition,
+    ) -> f32 {
+        crate::simulation::utility_curves::disposition_lift(d.gregariousness, 0.3)
+    }
 }
 
 /// Phase 5e-xii-a method: agent under `AgentGoal::Play` plays solo with a
@@ -9901,6 +10007,7 @@ pub fn htn_play_dispatch_system(
             &Carrier,
             &LodLevel,
             Option<&FactionMember>,
+            Option<&crate::simulation::goal_scorers::Disposition>,
         ),
         Without<Drafted>,
     >,
@@ -9909,9 +10016,20 @@ pub fn htn_play_dispatch_system(
     const ITEM_RADIUS: i32 = 8;
 
     let now = clock.tick;
-    for (agent, mut ai, mut aq, mut history, goal, transform, carrier, lod, member_opt) in
-        query.iter_mut()
+    for (
+        agent,
+        mut ai,
+        mut aq,
+        mut history,
+        goal,
+        transform,
+        carrier,
+        lod,
+        member_opt,
+        disposition_opt,
+    ) in query.iter_mut()
     {
+        let disposition = disposition_opt.copied().unwrap_or_default();
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -10191,8 +10309,22 @@ pub fn htn_play_dispatch_system(
             .iter()
             .filter(|m| m.precondition(abstract_task, &ctx))
             .max_by(|a, b| {
-                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
+                let ua = score_method_with_history_and_disposition(
+                    a.as_ref(),
+                    abstract_task,
+                    &ctx,
+                    disposition,
+                    &history,
+                    now,
+                );
+                let ub = score_method_with_history_and_disposition(
+                    b.as_ref(),
+                    abstract_task,
+                    &ctx,
+                    disposition,
+                    &history,
+                    now,
+                );
                 ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
             });
         let Some(method) = chosen else {
@@ -13106,5 +13238,195 @@ mod tests {
         assert!((full_trip_penalty_raw((0, 0), Some((10, 0)), None) - 0.20).abs() < 1e-6);
         // No target → 0.
         assert_eq!(full_trip_penalty_raw((0, 0), None, Some((5, 0))), 0.0);
+    }
+
+    // ─── Phase E: disposition-aware method scoring ────────────────
+
+    use crate::simulation::goal_scorers::Disposition;
+
+    fn neutral_ctx() -> PlannerCtx {
+        PlannerCtx {
+            scope: ScoringScope::Geometric,
+            tile: (0, 0),
+            faction_id: 0,
+            faction_home: None,
+            home_bed: None,
+            home_bed_tile: None,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: None,
+            scavenge_target_entity: Some(Entity::from_raw(1)),
+            scavenge_target_tile: Some((0, 0)),
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: Some(Entity::from_raw(2)),
+            prey_target_tile: Some((0, 0)),
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: Some(Entity::from_raw(3)),
+            play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
+            personal_bp_resource: None,
+            agent_has_weapon: true,
+        }
+    }
+
+    fn loner() -> Disposition {
+        Disposition {
+            gregariousness: 10,
+            martial: 10,
+            ..Disposition::default()
+        }
+    }
+
+    fn gregarious() -> Disposition {
+        Disposition {
+            gregariousness: 240,
+            martial: 10,
+            ..Disposition::default()
+        }
+    }
+
+    fn warrior() -> Disposition {
+        Disposition {
+            gregariousness: 10,
+            martial: 240,
+            ..Disposition::default()
+        }
+    }
+
+    #[test]
+    fn socialize_disposition_lift_diverges_by_gregariousness() {
+        let ctx = neutral_ctx();
+        let h = MethodHistory::default();
+        let loner_score = score_method_with_history_and_disposition(
+            &SocializeWithPartnerMethod,
+            AbstractTask::Socialize,
+            &ctx,
+            loner(),
+            &h,
+            0,
+        );
+        let greg_score = score_method_with_history_and_disposition(
+            &SocializeWithPartnerMethod,
+            AbstractTask::Socialize,
+            &ctx,
+            gregarious(),
+            &h,
+            0,
+        );
+        assert!(
+            greg_score > loner_score,
+            "gregarious socialize {greg_score} must outscore loner {loner_score}"
+        );
+        // Lift is capped sub-tier: a max-greg agent's score is at
+        // most 1.3× a neutral baseline, so it stays below
+        // `UTIL_VISIBLE_GROUND = 1.5` (the next tier up).
+        assert!(greg_score < UTIL_VISIBLE_GROUND);
+    }
+
+    #[test]
+    fn hunt_prey_disposition_lift_diverges_by_martial() {
+        let ctx = neutral_ctx();
+        let h = MethodHistory::default();
+        let docile_score = score_method_with_history_and_disposition(
+            &HuntPreyMethod,
+            AbstractTask::EngagePrey,
+            &ctx,
+            loner(), // martial=10
+            &h,
+            0,
+        );
+        let warrior_score = score_method_with_history_and_disposition(
+            &HuntPreyMethod,
+            AbstractTask::EngagePrey,
+            &ctx,
+            warrior(), // martial=240
+            &h,
+            0,
+        );
+        assert!(
+            warrior_score > docile_score,
+            "martial agent's HuntPrey {warrior_score} must outscore docile {docile_score}"
+        );
+        // Stays under `UTIL_VISIBLE_GROUND` so PickUpFreshCorpse's
+        // tier ranking against HuntPrey is preserved.
+        assert!(warrior_score < UTIL_VISIBLE_GROUND);
+    }
+
+    #[test]
+    fn play_with_partner_disposition_lift_diverges_by_gregariousness() {
+        let ctx = neutral_ctx();
+        let h = MethodHistory::default();
+        let loner_score = score_method_with_history_and_disposition(
+            &PlayWithPartnerMethod,
+            AbstractTask::Play,
+            &ctx,
+            loner(),
+            &h,
+            0,
+        );
+        let greg_score = score_method_with_history_and_disposition(
+            &PlayWithPartnerMethod,
+            AbstractTask::Play,
+            &ctx,
+            gregarious(),
+            &h,
+            0,
+        );
+        assert!(greg_score > loner_score);
+        // PlayWithPartner sits at UTIL_VISIBLE_GROUND (1.5); max
+        // greg lift (1.3×) → 1.95. Stays under UTIL_CLAIMED_HAUL (2.0).
+        assert!(greg_score < UTIL_CLAIMED_HAUL);
+    }
+
+    /// Other methods (no override) return 1.0× lift — `score_method_with_history`
+    /// and `score_method_with_history_and_disposition` agree for any
+    /// `disposition` value when the method uses the trait default.
+    #[test]
+    fn unoverridden_methods_ignore_disposition() {
+        let mut ctx = neutral_ctx();
+        ctx.home_bed_tile = Some((0, 0));
+        ctx.faction_home = Some((0, 0));
+        let h = MethodHistory::default();
+        let baseline = score_method_with_history(&SleepMethod, AbstractTask::Sleep, &ctx, &h, 0);
+        let with_warrior = score_method_with_history_and_disposition(
+            &SleepMethod,
+            AbstractTask::Sleep,
+            &ctx,
+            warrior(),
+            &h,
+            0,
+        );
+        let with_greg = score_method_with_history_and_disposition(
+            &SleepMethod,
+            AbstractTask::Sleep,
+            &ctx,
+            gregarious(),
+            &h,
+            0,
+        );
+        assert!((baseline - with_warrior).abs() < 1e-6);
+        assert!((baseline - with_greg).abs() < 1e-6);
     }
 }

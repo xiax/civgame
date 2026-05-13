@@ -12344,41 +12344,42 @@ mod wage_aware_phase0_phase1 {
         let faction = registry.factions.get(&fid).unwrap();
         let board = world.resource::<JobBoard>();
 
+        let make_ctx = |dispo: Disposition| GoalScoringContext {
+            agent: crafter,
+            agent_tile: (0, 0),
+            now: 0,
+            needs: &needs,
+            profession: Profession::Crafter,
+            skills: &skills,
+            disposition: dispo,
+            economic_agent: &agent,
+            faction_member: &member,
+            faction,
+            board,
+            personality: crate::simulation::goals::Personality::default(),
+            is_starving: false,
+            faction_has_food: false,
+            can_return_camp: false,
+            prioritize_food: false,
+            fallback_gather: AgentGoal::GatherFood,
+            fallback_gather_reason: "",
+            has_horse_taming: false,
+            has_personal_build_site: false,
+            should_craft: false,
+            time_of_day_bonus: 0.0,
+            age_ticks: 3600 * 365 * 5,
+        };
         let lo = scorer
-            .score(&GoalScoringContext {
-                agent: crafter,
-                agent_tile: (0, 0),
-                now: 0,
-                needs: &needs,
-                profession: Profession::Crafter,
-                skills: &skills,
-                disposition: Disposition {
-                    entrepreneurial: 0,
-                    ..Disposition::default()
-                },
-                economic_agent: &agent,
-                faction_member: &member,
-                faction,
-                board,
-            })
+            .score(&make_ctx(Disposition {
+                entrepreneurial: 0,
+                ..Disposition::default()
+            }))
             .expect("scorer must fire at min disposition (paid posting exists)");
         let hi = scorer
-            .score(&GoalScoringContext {
-                agent: crafter,
-                agent_tile: (0, 0),
-                now: 0,
-                needs: &needs,
-                profession: Profession::Crafter,
-                skills: &skills,
-                disposition: Disposition {
-                    entrepreneurial: 255,
-                    ..Disposition::default()
-                },
-                economic_agent: &agent,
-                faction_member: &member,
-                faction,
-                board,
-            })
+            .score(&make_ctx(Disposition {
+                entrepreneurial: 255,
+                ..Disposition::default()
+            }))
             .expect("scorer must fire at max disposition");
         assert_eq!(lo.class, GoalClass::Enterprise);
         assert_eq!(hi.class, GoalClass::Enterprise);

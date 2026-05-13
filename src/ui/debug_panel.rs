@@ -98,6 +98,7 @@ pub fn debug_panel_system(
     mut agents: Query<(&mut Needs, &mut Skills, &mut EconomicAgent), With<Person>>,
     terraform_map: Res<TerraformMap>,
     terraform_sites: Query<&TerraformSite>,
+    mut decision_mode: ResMut<crate::simulation::utility_curves::AgentDecisionMode>,
 ) {
     if !state.open {
         return;
@@ -119,6 +120,44 @@ pub fn debug_panel_system(
         .collapsible(false)
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
+                // ── AI Decision Mode ──────────────────────────────────────────
+                // Phase B/C toggle: Legacy = imperative cascade in
+                // `goal_update_system`; Scored = utility-curve scorers
+                // in `goal_scorers.rs` with Disposition-driven
+                // divergence. Defaults to Legacy so behaviour is
+                // unchanged at startup; flip here to A/B compare.
+                ui.horizontal(|ui| {
+                    use crate::simulation::utility_curves::AgentDecisionMode;
+                    let (label, fill) = match *decision_mode {
+                        AgentDecisionMode::Legacy => (
+                            "AI: Legacy",
+                            egui::Color32::from_gray(60),
+                        ),
+                        AgentDecisionMode::Scored => (
+                            "AI: Scored",
+                            egui::Color32::from_rgb(80, 150, 220),
+                        ),
+                    };
+                    let btn = egui::Button::new(label).fill(fill);
+                    if ui.add(btn).clicked() {
+                        *decision_mode = match *decision_mode {
+                            AgentDecisionMode::Legacy => AgentDecisionMode::Scored,
+                            AgentDecisionMode::Scored => AgentDecisionMode::Legacy,
+                        };
+                    }
+                    ui.label(
+                        egui::RichText::new(match *decision_mode {
+                            AgentDecisionMode::Legacy => "imperative cascade",
+                            AgentDecisionMode::Scored => "Disposition-driven scorers",
+                        })
+                        .color(egui::Color32::GRAY)
+                        .small(),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+
                 // ── Technology ────────────────────────────────────────────────
                 egui::CollapsingHeader::new(
                     egui::RichText::new("Technology")

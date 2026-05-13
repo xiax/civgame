@@ -38,6 +38,7 @@ pub mod nomad;
 pub mod nomad_pack_labor;
 pub mod nomad_pool;
 pub mod obstacle;
+pub mod opportunistic;
 pub mod organic_settlement;
 pub mod pack_deploy;
 pub mod person;
@@ -65,6 +66,7 @@ pub mod terraform;
 pub mod test_fixture;
 pub mod trader;
 pub mod typed_task;
+pub mod utility_curves;
 pub mod wild_herd;
 pub mod world_sim;
 
@@ -146,6 +148,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::CampfireMap::default())
             .insert_resource(construction::DoorMap::default())
             .insert_resource(capital::WorkshopOwnership::default())
+            .insert_resource(utility_curves::AgentDecisionMode::default())
+            .insert_resource(opportunistic::OpportunisticInterruptStats::default())
             .insert_resource(construction::WorkbenchMap::default())
             .insert_resource(construction::LoomMap::default())
             .insert_resource(construction::TableMap::default())
@@ -282,6 +286,16 @@ impl Plugin for SimulationPlugin {
                     goals::earnincome_goal_override_system
                         .after(goals::goal_update_system)
                         .after(goals::mobile_state_goal_gate_system),
+                    // Phase D (behavioural richness): opportunistic
+                    // mid-walk interrupts. Runs after the cascade has
+                    // set the agent's authoritative goal but before
+                    // record_abandoned_method_system so any opportunistic
+                    // flip's goal change feeds Abandoned outcomes into
+                    // MethodHistory in the same tick. Gated on
+                    // AgentDecisionMode::Scored; no-op in Legacy.
+                    opportunistic::opportunistic_interrupt_system
+                        .after(goals::goal_update_system)
+                        .before(goals::record_abandoned_method_system),
                     animals::animal_sense_system,
                     // Bug-fix #2: re-snap tamed animals' target_tile
                     // toward their faction's `home_tile` every

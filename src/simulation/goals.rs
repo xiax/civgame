@@ -64,6 +64,19 @@ pub struct StorageReachability<'w> {
     pub storage_tile_map: Res<'w, StorageTileMap>,
 }
 
+/// Phase B: bundles the scorer-pipeline inputs to keep
+/// `goal_update_system` under Bevy's 16-param ceiling. `mode` decides
+/// which path runs; the rest are read only when `Scored` is active.
+#[derive(SystemParam)]
+pub struct ScorerInputs<'w, 's> {
+    pub mode: Res<'w, crate::simulation::utility_curves::AgentDecisionMode>,
+    pub registry: Res<'w, crate::simulation::goal_scorers::GoalScorerRegistry>,
+    pub board: Res<'w, crate::simulation::jobs::JobBoard>,
+    pub disposition_q: Query<'w, 's, &'static crate::simulation::goal_scorers::Disposition>,
+    pub skills_q: Query<'w, 's, &'static crate::simulation::skills::Skills>,
+    pub profession_q: Query<'w, 's, &'static crate::simulation::person::Profession>,
+}
+
 #[repr(u8)]
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Personality {
@@ -425,6 +438,11 @@ pub fn goal_update_system(
     storage: StorageReachability,
     validation: GoalValidationQueries,
     bp_map: Res<BlueprintMap>,
+    // Phase B: scorer pipeline. `AgentDecisionMode::Scored` routes the
+    // need-driven cascade through `GoalScorerRegistry`; `Legacy` (the
+    // default) keeps the imperative if-else chain untouched. Bundled
+    // into one SystemParam to stay under Bevy's 16-param ceiling.
+    scorer_inputs: ScorerInputs,
     mut query: Query<
         (
             Entity,
@@ -862,38 +880,138 @@ pub fn goal_update_system(
             }
         }
 
-        let (new_goal, reason) = if is_starving && faction_has_food {
-            (AgentGoal::Survive, "Starving (Faction has food)")
-        } else if needs.hunger > HUNGER_SURVIVE_DESPERATE && agent.total_food() == 0 {
-            (AgentGoal::Survive, "Very Hungry")
-        } else if needs.hunger > HUNGER_EAT_HELD && agent.total_food() > 0 {
-            (AgentGoal::Survive, "Hungry (Eating)")
-        } else if agent.total_food() >= 3 && can_return_camp {
-            (AgentGoal::ReturnCamp, "Returning Surplus Food")
-        } else if needs.hunger > HUNGER_FORAGE_REQUIRED && agent.total_food() == 0 {
-            (AgentGoal::Survive, "Hungry")
-        } else if needs.sleep > SLEEP_TIRED {
-            (AgentGoal::Sleep, "Tired")
-        } else if prioritize_food {
-            (gather_goal, gather_reason)
-        } else if has_horse_taming {
-            (AgentGoal::TameHorse, "Taming Horse")
-        } else if needs.social > social_threshold {
-            (AgentGoal::Socialize, "Social Need")
-        } else if needs.willpower < play_threshold {
-            (AgentGoal::Play, "Low Willpower")
-        } else if has_personal_build_site {
-            (AgentGoal::Build, "Building Personal Project")
-        } else if should_craft(
+        let should_craft_now = should_craft(
             &registry,
             member.faction_id,
             needs,
             cooldown_query.get(entity).ok(),
             clock.tick,
-        ) {
-            (AgentGoal::Craft, "Crafting for Faction")
-        } else {
-            (gather_goal, gather_reason)
+        );
+
+        let legacy_pick = || -> (AgentGoal, &'static str) {
+            if is_starving && faction_has_food {
+                (AgentGoal::Survive, "Starving (Faction has food)")
+            } else if needs.hunger > HUNGER_SURVIVE_DESPERATE && agent.total_food() == 0 {
+                (AgentGoal::Survive, "Very Hungry")
+            } else if needs.hunger > HUNGER_EAT_HELD && agent.total_food() > 0 {
+                (AgentGoal::Survive, "Hungry (Eating)")
+            } else if agent.total_food() >= 3 && can_return_camp {
+                (AgentGoal::ReturnCamp, "Returning Surplus Food")
+            } else if needs.hunger > HUNGER_FORAGE_REQUIRED && agent.total_food() == 0 {
+                (AgentGoal::Survive, "Hungry")
+            } else if needs.sleep > SLEEP_TIRED {
+                (AgentGoal::Sleep, "Tired")
+            } else if prioritize_food {
+                (gather_goal, gather_reason)
+            } else if has_horse_taming {
+                (AgentGoal::TameHorse, "Taming Horse")
+            } else if needs.social > social_threshold {
+                (AgentGoal::Socialize, "Social Need")
+            } else if needs.willpower < play_threshold {
+                (AgentGoal::Play, "Low Willpower")
+            } else if has_personal_build_site {
+                (AgentGoal::Build, "Building Personal Project")
+            } else if should_craft_now {
+                (AgentGoal::Craft, "Crafting for Faction")
+            } else {
+                (gather_goal, gather_reason)
+            }
+        };
+
+        let (new_goal, reason) = match *scorer_inputs.mode {
+            crate::simulation::utility_curves::AgentDecisionMode::Legacy => legacy_pick(),
+            crate::simulation::utility_curves::AgentDecisionMode::Scored => {
+                // Build the scoring context from precomputed gates +
+                // per-agent reads. Faction lookup may fail (SOLO etc.)
+                // — fall back to legacy when it does.
+                if let Some(faction_data) = registry.factions.get(&member.faction_id) {
+                    let agent_tile = (
+                        (transform.translation.x / TILE_SIZE).floor() as i32,
+                        (transform.translation.y / TILE_SIZE).floor() as i32,
+                    );
+                    let disposition = scorer_inputs
+                        .disposition_q
+                        .get(entity)
+                        .copied()
+                        .unwrap_or_default();
+                    let skills_default = crate::simulation::skills::Skills::default();
+                    let skills_ref = scorer_inputs
+                        .skills_q
+                        .get(entity)
+                        .unwrap_or(&skills_default);
+                    let profession = scorer_inputs
+                        .profession_q
+                        .get(entity)
+                        .copied()
+                        .unwrap_or(crate::simulation::person::Profession::None);
+                    let time_of_day_bonus = match calendar.time_phase() {
+                        crate::world::seasons::TimePhase::Day => 0.0,
+                        crate::world::seasons::TimePhase::Dawn => 0.2,
+                        crate::world::seasons::TimePhase::Dusk => 0.6,
+                        crate::world::seasons::TimePhase::Night => 1.0,
+                    };
+                    let ctx = crate::simulation::goal_scorers::GoalScoringContext {
+                        agent: entity,
+                        agent_tile,
+                        now: clock.tick,
+                        needs,
+                        profession,
+                        skills: skills_ref,
+                        disposition,
+                        economic_agent: agent,
+                        faction_member: member,
+                        faction: faction_data,
+                        board: &scorer_inputs.board,
+                        personality: *personality,
+                        is_starving,
+                        faction_has_food,
+                        can_return_camp,
+                        prioritize_food,
+                        fallback_gather: gather_goal,
+                        fallback_gather_reason: gather_reason,
+                        has_horse_taming,
+                        has_personal_build_site,
+                        should_craft: should_craft_now,
+                        time_of_day_bonus,
+                        age_ticks: 3600 * 365 * 5,
+                    };
+                    // Hysteresis margin damps single-tick flips around
+                    // utility crossover; Survival/Subsistence still
+                    // preempt lower classes via the class ordering in
+                    // `GoalScorerRegistry::best`.
+                    const GOAL_CHALLENGER_MARGIN: f32 = 0.10;
+                    match scorer_inputs.registry.best(&ctx) {
+                        Some(best) => {
+                            if *goal == best.goal {
+                                (best.goal, best.reason)
+                            } else {
+                                let cur_score = scorer_inputs
+                                    .registry
+                                    .scorers
+                                    .iter()
+                                    .filter_map(|s| s.score(&ctx))
+                                    .filter(|s| s.goal == *goal && s.class >= best.class)
+                                    .map(|s| s.score)
+                                    .fold(f32::NEG_INFINITY, f32::max);
+                                if cur_score.is_finite()
+                                    && best.score - cur_score < GOAL_CHALLENGER_MARGIN
+                                {
+                                    let cur_reason = reason_opt
+                                        .as_deref()
+                                        .map(|r| r.0)
+                                        .unwrap_or("");
+                                    (*goal, cur_reason)
+                                } else {
+                                    (best.goal, best.reason)
+                                }
+                            }
+                        }
+                        None => (gather_goal, gather_reason),
+                    }
+                } else {
+                    legacy_pick()
+                }
+            }
         };
 
         if *goal != new_goal {
@@ -1084,6 +1202,12 @@ pub fn earnincome_goal_override_system(
             (transform.translation.x / TILE_SIZE).floor() as i32,
             (transform.translation.y / TILE_SIZE).floor() as i32,
         );
+        // `earnincome_goal_override_system` only filters on existing
+        // `Gather*` goals + `Enterprise+` tier results, so the
+        // precomputed-gate fields below are unused on this path. Stub
+        // them to neutral defaults so the type-checker is satisfied
+        // without re-deriving expensive context. `goal_update_system`
+        // fills these meaningfully in its `Scored` branch.
         let ctx = GoalScoringContext {
             agent: entity,
             agent_tile,
@@ -1096,6 +1220,18 @@ pub fn earnincome_goal_override_system(
             faction_member: member,
             faction,
             board: &board,
+            personality: Personality::default(),
+            is_starving: false,
+            faction_has_food: false,
+            can_return_camp: false,
+            prioritize_food: false,
+            fallback_gather: AgentGoal::GatherFood,
+            fallback_gather_reason: "",
+            has_horse_taming: false,
+            has_personal_build_site: false,
+            should_craft: false,
+            time_of_day_bonus: 0.0,
+            age_ticks: 3600 * 365 * 5,
         };
         let Some(best) = scorer_registry.best(&ctx) else {
             continue;

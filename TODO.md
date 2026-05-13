@@ -127,3 +127,6 @@ X - Update walls
 Add water usage and drinking for both humans and animals
 
 X - The way pack camp and pitch camp actually works isn't very realistic. The workers don't actually physically pack the camp. They don't carry the goods to the new camp, the camp itself just magically moves.
+
+
+Stockpile food job posting not tracking collected calories properly
