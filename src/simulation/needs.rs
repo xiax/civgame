@@ -92,21 +92,25 @@ impl Needs {
 }
 
 /// Rates in need-units per real second.
-const HUNGER_RATE: f32 = 0.07;
-const SLEEP_RATE: f32 = 0.5;
-const SLEEP_RECOVER_RATE: f32 = 2.0;
+/// Calibration: a game day is TICKS_PER_DAY=3600 ticks × 0.05s = 180 real sec.
+/// HUNGER_RATE 2.0 → 180 hunger accumulates in ~90 s → EAT_TRIGGER_HUNGER (180)
+/// hits twice per day. SLEEP_RATE 1.2 → ~216 sleep by end of day, peaks in
+/// Dusk/Night so SleepScorer × time_of_day_bonus fires once per day.
+const HUNGER_RATE: f32 = 2.0;
+const SLEEP_RATE: f32 = 1.2;
+const SLEEP_RECOVER_RATE: f32 = 6.0;
 const SHELTER_RATE: f32 = 0.1;
 const SHELTER_FILL_PER_SCORE: f32 = 0.15; // filled per enclosure-score point per second
 const SAFETY_RATE: f32 = 0.1;
 const SOCIAL_RATE: f32 = 0.2;
 const REPRODUCTION_RATE: f32 = 0.1;
 /// Willpower drain while in a labor task (per real second).
-const WILLPOWER_WORK_DRAIN: f32 = 0.6;
+const WILLPOWER_WORK_DRAIN: f32 = 1.8;
 /// Baseline willpower drift while idle / not working (per real second).
-const WILLPOWER_IDLE_DRAIN: f32 = 0.05;
+const WILLPOWER_IDLE_DRAIN: f32 = 0.15;
 /// Willpower regen while AiState::Sleeping (per real second). Doubled when
 /// the sleeper is on a bed, mirroring the bed bonus on SLEEP_RECOVER_RATE.
-const WILLPOWER_SLEEP_RECOVER: f32 = 1.0;
+const WILLPOWER_SLEEP_RECOVER: f32 = 3.0;
 
 pub fn tick_needs_system(
     time: Res<Time>,

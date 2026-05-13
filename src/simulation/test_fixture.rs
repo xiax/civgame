@@ -2517,8 +2517,24 @@ mod smoke {
             .unwrap()
             .self_actualization;
 
-        // Tick one game-day so the cadence fires.
-        sim.tick_n(TICKS_PER_DAY as u32 + 5);
+        // Tick one game-day so the cadence fires. Re-satiate lower-tier
+        // needs each step so MaslowTier::next_unmet stays at
+        // SelfActualization throughout — hunger/sleep decay would
+        // otherwise drag the agent back to Physiological tier well
+        // before the daily cadence fires.
+        for _ in 0..(TICKS_PER_DAY as u32 + 5) {
+            sim.tick();
+            if let Some(mut n) = sim.app.world_mut().get_mut::<Needs>(elder) {
+                n.hunger = 0.0;
+                n.sleep = 0.0;
+                n.shelter = 0.0;
+                n.safety = 0.0;
+                n.social = 0.0;
+                n.reproduction = 0.0;
+                n.willpower = 255.0;
+                n.esteem = 250.0;
+            }
+        }
 
         // The elder's self_actualization should have bumped (the
         // act of triggering the lecture grants the satisfaction).
@@ -2846,7 +2862,23 @@ mod smoke {
         let baseline = CurrencySnapshot::capture(&mut sim.app);
         let starting_esteem = sim.app.world().get::<Needs>(agent).unwrap().esteem;
 
-        sim.tick_n(TICKS_PER_DAY as u32 + 5);
+        // Tick one game-day so the daily Esteem cadence fires. Pin the
+        // agent's lower-tier needs at 0 each step so
+        // MaslowTier::next_unmet stays at Esteem — hunger/sleep decay
+        // would otherwise drag the agent back to Physiological tier
+        // before the cadence fires.
+        for _ in 0..(TICKS_PER_DAY as u32 + 5) {
+            sim.tick();
+            if let Some(mut n) = sim.app.world_mut().get_mut::<Needs>(agent) {
+                n.hunger = 0.0;
+                n.sleep = 0.0;
+                n.shelter = 0.0;
+                n.safety = 0.0;
+                n.social = 0.0;
+                n.reproduction = 0.0;
+                n.willpower = 255.0;
+            }
+        }
 
         let board = sim.app.world().resource::<JobBoard>();
         let postings: Vec<_> = board

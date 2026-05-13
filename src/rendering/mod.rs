@@ -4,6 +4,7 @@ use bevy::prelude::*;
 pub mod animations;
 pub mod camera;
 pub mod color_map;
+pub mod day_night;
 pub mod entity_sprites;
 pub mod fog;
 pub mod path_debug;
@@ -28,6 +29,7 @@ impl Plugin for RenderingPlugin {
                 Startup,
                 (
                     camera::setup_camera,
+                    day_night::spawn_day_night_overlay,
                     pixel_art::setup_pixel_art,
                     pixel_art::setup_animal_textures,
                     sprite_library::setup_sprite_library,
@@ -67,6 +69,7 @@ impl Plugin for RenderingPlugin {
                     path_debug::connectivity_component_gizmo_system,
                     path_debug::recent_failures_gizmo_system,
                     path_debug::selected_agent_failures_gizmo_system,
+                    day_night::update_day_night_overlay_system,
                 )
                     .run_if(in_state(crate::GameState::Playing)),
             )
