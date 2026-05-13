@@ -423,10 +423,17 @@ impl Plugin for SimulationPlugin {
             )
             // Part B: observable player Pack labor — worker walks to
             // a Deployable, accumulates UNPITCH_WORK_TICKS, then
-            // despawns + drops packed goods on the ground.
+            // despawns + transfers packed good into the worker's
+            // inventory. The continue system periodically re-dispatches
+            // idle PackingDuty members to the next remaining shelter,
+            // and strips PackingDuty when the camp is fully packed.
             .add_systems(
                 FixedUpdate,
-                nomad_pack_labor::unpitch_structure_task_system
+                (
+                    nomad_pack_labor::unpitch_structure_task_system,
+                    nomad_pack_labor::continue_pack_labor_system
+                        .after(nomad_pack_labor::unpitch_structure_task_system),
+                )
                     .after(movement::movement_system)
                     .in_set(SimulationSet::Sequential),
             )

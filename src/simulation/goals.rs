@@ -408,6 +408,12 @@ pub struct GoalValidationQueries<'w, 's> {
         )>,
     >,
     pub commanded_q: Query<'w, 's, &'static crate::simulation::player_command::Commanded>,
+    pub packing_duty_q: Query<
+        'w,
+        's,
+        (),
+        With<crate::simulation::nomad_pack_labor::PackingDuty>,
+    >,
 }
 
 pub fn goal_update_system(
@@ -495,6 +501,22 @@ pub fn goal_update_system(
         // hunger / sleep / mobile-gate would flip the goal and the
         // dispatcher would clear the chain.
         if ai.task_id == crate::simulation::tasks::TaskKind::UnpitchStructure as u16 {
+            continue;
+        }
+        // Pack duty: agents with PackingDuty stay on FollowingPlayerCommand
+        // across the gaps between Unpitch tasks. The continue-pack
+        // re-dispatcher assigns them their next structure on the next
+        // cadence tick. Without this short-circuit they'd run off to
+        // forage between dismantles.
+        if validation.packing_duty_q.get(entity).is_ok() {
+            if *goal != AgentGoal::FollowingPlayerCommand {
+                *goal = AgentGoal::FollowingPlayerCommand;
+            }
+            if let Some(mut r) = reason_opt {
+                r.0 = "Pack Duty";
+            } else {
+                commands.entity(entity).insert(GoalReason("Pack Duty"));
+            }
             continue;
         }
         // Workers with an active job claim are owned by job_goal_lock_system (Economy).

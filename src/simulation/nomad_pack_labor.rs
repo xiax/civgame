@@ -43,6 +43,29 @@ use crate::world::terrain::TILE_SIZE;
 /// without dragging the pack-up out unbearably for a 12-shelter camp.
 pub const UNPITCH_WORK_TICKS: u32 = 40;
 
+/// Cadence for `continue_pack_labor_system`. Fires often enough that
+/// idle workers pick up the next shelter before they wander, but not
+/// every tick (cheap polling).
+pub const PACK_LABOR_REDISPATCH_INTERVAL: u64 = 10;
+
+/// Marker inserted on every band member when a player issues
+/// `PackCamp`. Commits them to the pack pipeline:
+///
+/// - `goal_update_system` skips autonomous goal re-evaluation while
+///   this marker is present, so hunger / sleep / mobile-gate don't
+///   flip them off pack labor.
+/// - `continue_pack_labor_system` keeps assigning fresh
+///   `UnpitchStructure` tasks to idle members until every Deployable
+///   inside the camp's pack radius has been dismantled — at which
+///   point the marker is stripped and members resume normal AI
+///   (eat / sleep / scavenge / respond to player Move orders).
+/// - Player `Move` / other commands still override (the `Commanded`
+///   check in `goal_update_system` runs first, and player-command
+///   dispatch calls `aq.cancel()` to drop any in-flight Unpitch
+///   chain).
+#[derive(bevy::prelude::Component, Default)]
+pub struct PackingDuty;
+
 #[inline]
 fn chebyshev(a: (i32, i32), b: (i32, i32)) -> i32 {
     (a.0 - b.0).abs().max((a.1 - b.1).abs())
@@ -61,6 +84,138 @@ struct StructureToUnpitch {
     fid: u32,
     entity: Entity,
     tile: (i32, i32),
+}
+
+/// Insert a `PackingDuty` marker on every member of every faction in
+/// `fids`. Called by `apply_pack_camp_command_system` at the start
+/// of a player Pack episode.
+pub fn stamp_pack_duty(world: &mut World, fids: &[u32]) {
+    if fids.is_empty() {
+        return;
+    }
+    let mut state: SystemState<(
+        Commands,
+        Query<(Entity, &FactionMember), With<Person>>,
+        Res<FactionRegistry>,
+    )> = SystemState::new(world);
+    let (mut commands, q, registry) = state.get_mut(world);
+    for (entity, member) in q.iter() {
+        let root = registry.root_faction(member.faction_id);
+        if fids.contains(&root) {
+            commands.entity(entity).insert(PackingDuty);
+        }
+    }
+    state.apply(world);
+}
+
+/// Strip `PackingDuty` from every member of the given factions.
+/// Called when `continue_pack_labor_system` confirms the camp has no
+/// more Deployables in its pack radius (pack pipeline complete) or
+/// when `apply_pitch_camp_command_system` finalises the new camp.
+pub fn clear_pack_duty(world: &mut World, fids: &[u32]) {
+    if fids.is_empty() {
+        return;
+    }
+    let mut state: SystemState<(
+        Commands,
+        Query<(Entity, &FactionMember), With<PackingDuty>>,
+        Res<FactionRegistry>,
+        ResMut<crate::simulation::goals::ForceGoalReevaluate>,
+    )> = SystemState::new(world);
+    let (mut commands, q, registry, mut force_reeval) = state.get_mut(world);
+    for (entity, member) in q.iter() {
+        let root = registry.root_faction(member.faction_id);
+        if fids.contains(&root) {
+            commands.entity(entity).remove::<PackingDuty>();
+            force_reeval.0.insert(entity);
+        }
+    }
+    state.apply(world);
+}
+
+/// Periodic re-dispatcher: hands idle `PackingDuty` members the next
+/// Deployable structure in the camp radius. Runs every
+/// `PACK_LABOR_REDISPATCH_INTERVAL` ticks. When no Deployables remain
+/// for a faction, the marker is stripped so members resume normal AI.
+pub fn continue_pack_labor_system(world: &mut World) {
+    let tick = world.resource::<SimClock>().tick;
+    if tick % PACK_LABOR_REDISPATCH_INTERVAL != 0 {
+        return;
+    }
+
+    // Collect every faction that's currently Packed (player flow).
+    let packs: Vec<(u32, (i32, i32), i32)> = {
+        let registry = world.resource::<FactionRegistry>();
+        registry
+            .factions
+            .iter()
+            .filter_map(|(&fid, f)| {
+                if !matches!(
+                    f.camp_state,
+                    crate::simulation::faction::CampState::Packed { .. }
+                ) {
+                    return None;
+                }
+                // Skip AI autopilot factions; they use the atomic
+                // pack pass during commit and never sit in `Packed`
+                // for long enough to need re-dispatch.
+                if f.nomad_autopilot {
+                    return None;
+                }
+                let adoption =
+                    crate::simulation::technology_adoption::community_adoption_bitset(f);
+                let era = crate::simulation::technology::current_era(&adoption);
+                let radius =
+                    crate::simulation::construction::seed_nomadic_camp_extent(f.member_count, era);
+                Some((fid, f.home_tile, radius))
+            })
+            .collect()
+    };
+    if packs.is_empty() {
+        return;
+    }
+
+    // Which factions still have Deployables in their pack radius?
+    let factions_done: Vec<u32> = {
+        let mut state: SystemState<Query<&Transform, With<Deployable>>> = SystemState::new(world);
+        let q = state.get(world);
+        let mut tiles_per_fid: ahash::AHashMap<u32, usize> = ahash::AHashMap::default();
+        for transform in q.iter() {
+            let tile = transform_tile(transform);
+            for &(fid, home, radius) in packs.iter() {
+                if chebyshev(tile, home) <= radius {
+                    *tiles_per_fid.entry(fid).or_insert(0) += 1;
+                    break;
+                }
+            }
+        }
+        packs
+            .iter()
+            .filter_map(|(fid, _, _)| {
+                if tiles_per_fid.get(fid).copied().unwrap_or(0) == 0 {
+                    Some(*fid)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    if !factions_done.is_empty() {
+        clear_pack_duty(world, &factions_done);
+    }
+
+    // For factions with work remaining, re-dispatch UnpitchStructure
+    // to any PackingDuty member who is currently UNEMPLOYED. The
+    // dispatcher already filters by chebyshev distance to pick the
+    // nearest unused worker per structure.
+    let remaining: Vec<(u32, (i32, i32), i32)> = packs
+        .into_iter()
+        .filter(|(fid, _, _)| !factions_done.contains(fid))
+        .collect();
+    if remaining.is_empty() {
+        return;
+    }
+    dispatch_unpitch_tasks(world, &remaining);
 }
 
 /// Dispatch a `Task::UnpitchStructure` for every Deployable found
@@ -106,7 +261,7 @@ pub fn dispatch_unpitch_tasks(world: &mut World, packs: &[(u32, (i32, i32), i32)
         let mut state: SystemState<(
             Query<
                 (Entity, &FactionMember, &Transform, &PersonAI),
-                (With<Person>, Without<Drafted>),
+                (With<Person>, With<PackingDuty>, Without<Drafted>),
             >,
             Res<FactionRegistry>,
         )> = SystemState::new(world);
@@ -116,6 +271,11 @@ pub fn dispatch_unpitch_tasks(world: &mut World, packs: &[(u32, (i32, i32), i32)
         for (entity, member, transform, ai) in q.iter() {
             let root = registry.root_faction(member.faction_id);
             if !packs.iter().any(|(fid, _, _)| *fid == root) {
+                continue;
+            }
+            // Only re-dispatch to workers who are currently UNEMPLOYED.
+            // Members already on an UnpitchStructure task stay on it.
+            if ai.task_id != PersonAI::UNEMPLOYED {
                 continue;
             }
             let tile = transform_tile(transform);

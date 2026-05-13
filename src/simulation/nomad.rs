@@ -1434,6 +1434,15 @@ pub fn apply_pack_camp_command_system(world: &mut World) {
             .collect()
     };
 
+    // Stamp PackingDuty on every band member so they stay committed
+    // to pack labor across the gaps between Unpitch tasks. The
+    // continue-pack system below cycles them through remaining
+    // structures until the camp is fully dismantled.
+    crate::simulation::nomad_pack_labor::stamp_pack_duty(
+        world,
+        &packs.iter().map(|(fid, _, _)| *fid).collect::<Vec<_>>(),
+    );
+
     crate::simulation::nomad_pack_labor::dispatch_unpitch_tasks(world, &packs);
 
     let now = world.resource::<SimClock>().tick as u32;
@@ -1619,6 +1628,12 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
         }
         state.apply(world);
     }
+
+    // Clear any lingering PackingDuty (safety net if the player pitches
+    // before pack labor finished — members resume normal AI at the new
+    // camp).
+    let pitched_fids: Vec<u32> = resolved.iter().map(|r| r.fid).collect();
+    crate::simulation::nomad_pack_labor::clear_pack_duty(world, &pitched_fids);
 
     for r in resolved.iter() {
         info!(
