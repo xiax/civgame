@@ -154,6 +154,14 @@ pub struct GoalScoringContext<'a> {
     pub has_horse_taming: bool,
     pub has_personal_build_site: bool,
     pub should_craft: bool,
+    /// Heal-pipeline (Heal-2): the agent's own injury, if any. Read
+    /// by `HealNeedScorer` to gate `SeekCare` and drive
+    /// severity-weighted urgency.
+    pub injury: Option<crate::simulation::medicine::Injury>,
+    /// Heal-pipeline (Heal-2): true when any agent in the same
+    /// faction currently carries an `Injury` component. Read by
+    /// `ProvideCareScorer` (Healer-side) to gate `ProvideCare`.
+    pub faction_has_injured: bool,
     /// 0.0 daytime → 1.0 night; lifts `SleepScorer`'s curve so a
     /// moderately-tired agent picks sleep over work after dusk.
     pub time_of_day_bonus: f32,
@@ -618,6 +626,68 @@ impl GoalScorer for StockpileScorer {
     }
 }
 
+/// Heal-pipeline (Heal-2). Survival-class scorer for injured agents.
+/// Class is `Survival` (not `Safety` per the plan's first sketch)
+/// because the enum's numeric ordering puts `Subsistence > Safety`,
+/// so a Safety-tier injury would lose to routine gather/craft. Score
+/// scales with `Injury.severity / 255`: a 60/255 wound returns ~0.24,
+/// a 200/255 wound returns ~0.78. Combined with class precedence,
+/// light injuries naturally lose to acute hunger/sleep within the
+/// Survival tier; severe injuries beat them.
+pub struct HealNeedScorer;
+
+impl GoalScorer for HealNeedScorer {
+    fn score(&self, ctx: &GoalScoringContext) -> Option<GoalScore> {
+        let injury = ctx.injury?;
+        if injury.severity == 0 {
+            return None;
+        }
+        let urgency = injury.severity as f32 / 255.0;
+        Some(GoalScore {
+            goal: AgentGoal::SeekCare,
+            class: GoalClass::Survival,
+            score: urgency,
+            reason: "Injured",
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "HealNeedScorer"
+    }
+}
+
+/// Heal-pipeline (Heal-2). Subsistence-class scorer for Healers (and
+/// Healer apprentices) when the faction has at least one injured
+/// agent. Score = 0.65 baseline so it beats `CraftDemand` (0.50) and
+/// `StockpileScorer`-idle (0.20 Discretionary) — a Healer with
+/// patients waiting shouldn't be off gathering wood — but loses to
+/// `StockpileScorer`-prioritize-food (0.85) so a Healer in a starving
+/// faction still hunts food first. Faction-level gating only;
+/// per-patient triage lives in the HTN method (Heal-3) where it can
+/// read spatial position.
+pub struct ProvideCareScorer;
+
+impl GoalScorer for ProvideCareScorer {
+    fn score(&self, ctx: &GoalScoringContext) -> Option<GoalScore> {
+        if !matches!(ctx.profession, Profession::Healer | Profession::Apprentice) {
+            return None;
+        }
+        if !ctx.faction_has_injured {
+            return None;
+        }
+        Some(GoalScore {
+            goal: AgentGoal::ProvideCare,
+            class: GoalClass::Subsistence,
+            score: 0.65,
+            reason: "Tending Patient",
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "ProvideCareScorer"
+    }
+}
+
 /// Convenience: install the default scorer set on a `GoalScorerRegistry`.
 /// Phase 6's `EarnIncomeScorer` plus Phase B's behavioural-richness
 /// scorers. Consumed by `goal_update_system` when
@@ -634,6 +704,8 @@ pub fn register_default_scorers(registry: &mut GoalScorerRegistry) {
     registry.scorers.push(Box::new(PersonalBuildScorer));
     registry.scorers.push(Box::new(CraftDemandScorer));
     registry.scorers.push(Box::new(StockpileScorer));
+    registry.scorers.push(Box::new(HealNeedScorer));
+    registry.scorers.push(Box::new(ProvideCareScorer));
     registry.rebuild_opportunistic_indices();
 }
 
@@ -737,6 +809,8 @@ mod tests {
             has_horse_taming: false,
             has_personal_build_site: false,
             should_craft: false,
+            injury: None,
+            faction_has_injured: false,
             time_of_day_bonus: 0.0,
             age_ticks: 0,
         };
@@ -777,6 +851,8 @@ mod tests {
             has_horse_taming: false,
             has_personal_build_site: false,
             should_craft: false,
+            injury: None,
+            faction_has_injured: false,
             time_of_day_bonus: 0.0,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
         }
@@ -988,6 +1064,110 @@ mod tests {
         let s = PersonalBuildScorer.score(&ctx).expect("fires");
         assert_eq!(s.goal, AgentGoal::Build);
         assert_eq!(s.class, GoalClass::Esteem);
+    }
+
+    // ─── Heal-2: HealNeedScorer + ProvideCareScorer ──────────────
+
+    #[test]
+    fn heal_need_scorer_declines_when_uninjured() {
+        let (reg, fid) = make_faction();
+        let faction = reg.factions.get(&fid).unwrap();
+        let needs = Needs::default();
+        let agent = EconomicAgent::default();
+        let member = FactionMember {
+            faction_id: fid,
+            ..Default::default()
+        };
+        let board = JobBoard::default();
+        let skills = Skills::default();
+        let ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
+        assert!(HealNeedScorer.score(&ctx).is_none());
+    }
+
+    #[test]
+    fn heal_need_scorer_score_scales_with_severity() {
+        let (reg, fid) = make_faction();
+        let faction = reg.factions.get(&fid).unwrap();
+        let needs = Needs::default();
+        let agent = EconomicAgent::default();
+        let member = FactionMember {
+            faction_id: fid,
+            ..Default::default()
+        };
+        let board = JobBoard::default();
+        let skills = Skills::default();
+        let mut light_ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
+        light_ctx.injury = Some(crate::simulation::medicine::Injury {
+            severity: 30,
+            applied_tick: 0,
+            last_damage_tick: 0,
+        });
+        let mut severe_ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
+        severe_ctx.injury = Some(crate::simulation::medicine::Injury {
+            severity: 200,
+            applied_tick: 0,
+            last_damage_tick: 0,
+        });
+        let light = HealNeedScorer.score(&light_ctx).expect("light injury fires");
+        let severe = HealNeedScorer.score(&severe_ctx).expect("severe injury fires");
+        assert!(severe.score > light.score);
+        assert_eq!(severe.goal, AgentGoal::SeekCare);
+        assert_eq!(severe.class, GoalClass::Survival);
+    }
+
+    /// Severe injury (Survival class, high score) beats hunger at the
+    /// same class via end-to-end registry argmax.
+    #[test]
+    fn severe_injury_outscores_moderate_hunger() {
+        let (reg, fid) = make_faction();
+        let faction = reg.factions.get(&fid).unwrap();
+        let mut needs = Needs::default();
+        needs.hunger = 160.0; // forage-required tier; SurvivalHungerScorer fires moderately
+        let agent = EconomicAgent::default();
+        let member = FactionMember {
+            faction_id: fid,
+            ..Default::default()
+        };
+        let board = JobBoard::default();
+        let skills = Skills::default();
+        let mut ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
+        ctx.injury = Some(crate::simulation::medicine::Injury {
+            severity: 220,
+            applied_tick: 0,
+            last_damage_tick: 0,
+        });
+        let mut registry = GoalScorerRegistry::default();
+        register_default_scorers(&mut registry);
+        let best = registry.best(&ctx).expect("scorer fires");
+        assert_eq!(best.goal, AgentGoal::SeekCare);
+    }
+
+    #[test]
+    fn provide_care_only_fires_for_healers_with_patients() {
+        let (reg, fid) = make_faction();
+        let faction = reg.factions.get(&fid).unwrap();
+        let needs = Needs::default();
+        let agent = EconomicAgent::default();
+        let member = FactionMember {
+            faction_id: fid,
+            ..Default::default()
+        };
+        let board = JobBoard::default();
+        let skills = Skills::default();
+        let mut ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
+        // Non-Healer: declines regardless of patients.
+        ctx.faction_has_injured = true;
+        ctx.profession = Profession::Farmer;
+        assert!(ProvideCareScorer.score(&ctx).is_none());
+        // Healer without patients: declines.
+        ctx.profession = Profession::Healer;
+        ctx.faction_has_injured = false;
+        assert!(ProvideCareScorer.score(&ctx).is_none());
+        // Healer with patients: fires.
+        ctx.faction_has_injured = true;
+        let s = ProvideCareScorer.score(&ctx).expect("fires");
+        assert_eq!(s.goal, AgentGoal::ProvideCare);
+        assert_eq!(s.class, GoalClass::Subsistence);
     }
 
     // ─── Phase B-3: end-to-end registry calibration ───────────────

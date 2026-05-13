@@ -12374,6 +12374,8 @@ mod wage_aware_phase0_phase1 {
             has_horse_taming: false,
             has_personal_build_site: false,
             should_craft: false,
+            injury: None,
+            faction_has_injured: false,
             time_of_day_bonus: 0.0,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
         };

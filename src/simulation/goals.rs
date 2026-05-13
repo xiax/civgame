@@ -75,6 +75,17 @@ pub struct ScorerInputs<'w, 's> {
     pub disposition_q: Query<'w, 's, &'static crate::simulation::goal_scorers::Disposition>,
     pub skills_q: Query<'w, 's, &'static crate::simulation::skills::Skills>,
     pub profession_q: Query<'w, 's, &'static crate::simulation::person::Profession>,
+    pub injury_q: Query<'w, 's, &'static crate::simulation::medicine::Injury>,
+    /// All currently-injured agents' faction membership. Walked once
+    /// at the top of `goal_update_system` to build a per-faction
+    /// "any injured" set — cheap because `Injury` is rare and the
+    /// query iterates only injured entities.
+    pub injured_faction_q: Query<
+        'w,
+        's,
+        &'static FactionMember,
+        With<crate::simulation::medicine::Injury>,
+    >,
 }
 
 #[repr(u8)]
@@ -484,6 +495,13 @@ pub fn goal_update_system(
 ) {
     let time_of_day_bonus =
         crate::simulation::utility_curves::time_of_day_bonus(calendar.time_phase());
+    // Heal-2: precompute "any injured agent in faction" once per
+    // system invocation. Cheap — query iterates only entities that
+    // already carry an `Injury` component (rare in practice).
+    let mut faction_has_injured: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    for member in scorer_inputs.injured_faction_q.iter() {
+        faction_has_injured.insert(member.faction_id);
+    }
     for (
         entity,
         mut goal,
@@ -980,6 +998,9 @@ pub fn goal_update_system(
                         has_horse_taming,
                         has_personal_build_site,
                         should_craft: should_craft_now,
+                        injury: scorer_inputs.injury_q.get(entity).ok().copied(),
+                        faction_has_injured: faction_has_injured
+                            .contains(&member.faction_id),
                         time_of_day_bonus,
                         age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
                     };
@@ -1227,6 +1248,8 @@ pub fn earnincome_goal_override_system(
             has_horse_taming: false,
             has_personal_build_site: false,
             should_craft: false,
+            injury: None,
+            faction_has_injured: false,
             time_of_day_bonus: 0.0,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
         };
