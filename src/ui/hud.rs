@@ -236,6 +236,45 @@ pub fn hud_system(
                                         });
                                     }
                                 }
+                                // Player-locked migration: Hold/Forage
+                                // toggle while Packed. `Hold` is the
+                                // strict default; `Forage` releases the
+                                // packed-autonomy gate.
+                                if matches!(player_fac.camp_state, CampState::Packed { .. }) {
+                                    use crate::simulation::faction::PackedMigrationAutonomy;
+                                    let next = match player_fac.packed_autonomy {
+                                        PackedMigrationAutonomy::Hold => {
+                                            PackedMigrationAutonomy::Forage
+                                        }
+                                        PackedMigrationAutonomy::Forage => {
+                                            PackedMigrationAutonomy::Hold
+                                        }
+                                    };
+                                    let auto_label = format!(
+                                        "Autonomy: {}",
+                                        player_fac.packed_autonomy.label()
+                                    );
+                                    let auto_fill = match player_fac.packed_autonomy {
+                                        PackedMigrationAutonomy::Hold => {
+                                            egui::Color32::from_rgb(160, 120, 60)
+                                        }
+                                        PackedMigrationAutonomy::Forage => {
+                                            egui::Color32::from_rgb(60, 140, 80)
+                                        }
+                                    };
+                                    let auto_btn = egui::Button::new(auto_label).fill(auto_fill);
+                                    let auto_resp = ui.add_enabled(chief.is_some(), auto_btn);
+                                    if auto_resp.clicked() {
+                                        if let Some(c) = chief {
+                                            cmd_events.send(PlayerCommandEvent {
+                                                actors: vec![c],
+                                                command: PlayerCommand::SetPackedAutonomy {
+                                                    mode: next,
+                                                },
+                                            });
+                                        }
+                                    }
+                                }
                                 // Phase 6: Plan Migration toggle.
                                 let plan_btn = egui::Button::new("Plan Migration")
                                     .fill(if migration_panel.0 {

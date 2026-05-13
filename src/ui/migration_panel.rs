@@ -18,7 +18,8 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::simulation::faction::{
-    CampState, FactionRegistry, MigrationIntent, MigrationPhase, PlayerFaction,
+    CampState, FactionRegistry, MigrationIntent, MigrationPhase, PackedMigrationAutonomy,
+    PlayerFaction,
 };
 use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
 
@@ -78,10 +79,39 @@ pub fn migration_panel_system(
             ));
             ui.label(format!("Intent: {}", faction.migration_intent.label()));
             ui.label(
-                egui::RichText::new("Tip: Pack Camp on the HUD, then move members anywhere. Right-click any tile → Pitch Camp Here to settle.")
+                egui::RichText::new("Tip: Pack Camp on the HUD to enter mobile mode. While Packed, workers wait for explicit orders (Hold) unless you flip Autonomy to Forage. Right-click any tile → Pitch Camp Here to settle.")
                     .color(egui::Color32::from_gray(160))
                     .small(),
             );
+
+            // ── Packed autonomy (only meaningful while Packed) ──
+            if matches!(faction.camp_state, CampState::Packed { .. }) {
+                ui.separator();
+                ui.label(egui::RichText::new("Autonomy").strong());
+                ui.label(
+                    egui::RichText::new(
+                        "Hold: workers wait for direct orders. Forage: food/sleep/social/scout autonomy.",
+                    )
+                    .color(egui::Color32::from_gray(160))
+                    .small(),
+                );
+                ui.horizontal(|ui| {
+                    for mode in [PackedMigrationAutonomy::Hold, PackedMigrationAutonomy::Forage] {
+                        let mut btn = egui::Button::new(mode.label());
+                        if mode == faction.packed_autonomy {
+                            btn = btn.fill(egui::Color32::from_rgb(60, 120, 200));
+                        }
+                        if ui.add(btn).clicked() {
+                            if let Some(c) = chief {
+                                cmd_events.send(PlayerCommandEvent {
+                                    actors: vec![c],
+                                    command: PlayerCommand::SetPackedAutonomy { mode },
+                                });
+                            }
+                        }
+                    }
+                });
+            }
 
             ui.separator();
             // ── Intent picker ───────────────────────────────

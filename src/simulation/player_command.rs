@@ -151,6 +151,13 @@ pub enum PlayerCommand {
     SetMigrationIntent {
         intent: crate::simulation::faction::MigrationIntent,
     },
+    /// Player-locked migration: set the packed-autonomy mode for the
+    /// actor's faction. `Hold` keeps workers idle ("Awaiting Orders");
+    /// `Forage` releases them to the existing `allowed_while_packed`
+    /// autonomous behaviour. `PackCamp` resets the field to `Hold`.
+    SetPackedAutonomy {
+        mode: crate::simulation::faction::PackedMigrationAutonomy,
+    },
 }
 
 /// Per-actor authority marker. Replaces `PlayerOrder` once Commit 3 lands.
@@ -448,9 +455,9 @@ pub fn player_command_lifecycle_system(
                 }
             }
             // Phase 2/3: stamp-and-done faction commands.
-            PlayerCommand::SendScout { .. } | PlayerCommand::SetMigrationIntent { .. } => {
-                Some(CommandStatus::Completed)
-            }
+            PlayerCommand::SendScout { .. }
+            | PlayerCommand::SetMigrationIntent { .. }
+            | PlayerCommand::SetPackedAutonomy { .. } => Some(CommandStatus::Completed),
         };
         if let Some(new_status) = outcome {
             cmd.status = new_status;
@@ -553,6 +560,7 @@ pub fn dispatch_player_command_system(
                 | PlayerCommand::PitchCamp { .. }
                 | PlayerCommand::SendScout { .. }
                 | PlayerCommand::SetMigrationIntent { .. }
+                | PlayerCommand::SetPackedAutonomy { .. }
         ) {
             aq.cancel();
         }
@@ -991,6 +999,17 @@ fn dispatch_one(
                 return DispatchOutcome::Failed(CommandFailure::Ineligible);
             }
             camp_ops.intent_sets.push((fid, intent));
+            DispatchOutcome::Active
+        }
+        SetPackedAutonomy { mode } => {
+            let fid = registry.root_faction(faction_id);
+            let Some(faction) = registry.factions.get(&fid) else {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            };
+            if !faction.caps.home.is_mobile() {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            }
+            camp_ops.autonomy_sets.push((fid, mode));
             DispatchOutcome::Active
         }
         PitchCamp { tile, z } => {

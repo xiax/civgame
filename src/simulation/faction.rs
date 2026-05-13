@@ -1976,6 +1976,35 @@ pub enum MigrationIntent {
     AvoidDanger,
 }
 
+/// Player-locked autonomy gate for packed nomads. `Hold` (default)
+/// freezes autonomous workers and surfaces them as "Awaiting Orders" so
+/// the player can issue explicit moves between Pack Camp and Pitch
+/// Camp. `Forage` releases the gate so members may forage / sleep /
+/// socialize / etc. like the pre-existing behaviour. Every `PackCamp`
+/// resets this to `Hold`. Only consulted for player-driven nomadic
+/// factions (`nomad_autopilot == false`); AI nomads ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PackedMigrationAutonomy {
+    /// Strict: workers wait at their current tile and only execute
+    /// explicit `PlayerCommand` orders / `Pack Camp` labor / manual
+    /// `SendScout`.
+    #[default]
+    Hold,
+    /// Permissive: settled-life work is still blocked, but the
+    /// `allowed_while_packed` set (food / sleep / social / defence /
+    /// care / play / scout) may dispatch autonomously.
+    Forage,
+}
+
+impl PackedMigrationAutonomy {
+    pub fn label(self) -> &'static str {
+        match self {
+            PackedMigrationAutonomy::Hold => "Hold",
+            PackedMigrationAutonomy::Forage => "Forage",
+        }
+    }
+}
+
 impl MigrationIntent {
     /// Returns `[food, herd, water, biome, danger, distance_penalty]`
     /// multipliers applied per-component inside `pick_migration_target`.
@@ -2249,6 +2278,10 @@ pub struct FactionData {
     /// Phase 3: player-facing scoring bias for the next
     /// `pick_migration_target` evaluation. AI defaults to `FreeRoute`.
     pub migration_intent: MigrationIntent,
+    /// Player-locked autonomy mode for packed nomads. Reset to
+    /// `Hold` on every `PackCamp`. Only consulted when
+    /// `nomad_autopilot == false` (player nomads); AI nomads ignore.
+    pub packed_autonomy: PackedMigrationAutonomy,
     /// Phase 2: scouted / surveyed camp-site candidates the player or
     /// chief can pick from. Ring with cap `MAX_CANDIDATE_SITES`.
     pub candidate_sites: std::collections::VecDeque<CampSiteCandidate>,
@@ -2384,6 +2417,7 @@ impl FactionRegistry {
                 migration_phase: MigrationPhase::default(),
                 nomad_autopilot: true,
                 migration_intent: MigrationIntent::default(),
+                packed_autonomy: PackedMigrationAutonomy::default(),
                 candidate_sites: std::collections::VecDeque::new(),
                 cargo_manifest: CampCargoManifest::default(),
                 last_phase_change_tick: 0,

@@ -198,6 +198,10 @@ pub struct PendingCampOps {
     pub manual_scouts: Vec<PendingManualScout>,
     /// Phase 3: faction-scoped intent set requests.
     pub intent_sets: Vec<(u32, crate::simulation::faction::MigrationIntent)>,
+    /// Player-locked migration: faction-scoped autonomy mode for
+    /// packed nomads. Drained alongside intent_sets.
+    pub autonomy_sets:
+        Vec<(u32, crate::simulation::faction::PackedMigrationAutonomy)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1385,6 +1389,25 @@ pub fn apply_migration_intent_system(world: &mut World) {
     }
 }
 
+/// Player-locked migration: apply packed-autonomy set requests. Pure
+/// registry write — the gate in `mobile_state_goal_gate_system` reads
+/// the field next tick.
+pub fn apply_packed_autonomy_system(world: &mut World) {
+    let sets: Vec<(u32, crate::simulation::faction::PackedMigrationAutonomy)> = {
+        let mut ops = world.resource_mut::<PendingCampOps>();
+        if ops.autonomy_sets.is_empty() {
+            return;
+        }
+        std::mem::take(&mut ops.autonomy_sets)
+    };
+    let mut registry = world.resource_mut::<FactionRegistry>();
+    for (fid, mode) in sets.into_iter() {
+        if let Some(faction) = registry.factions.get_mut(&fid) {
+            faction.packed_autonomy = mode;
+        }
+    }
+}
+
 
 /// 8-cardinal direction unit vector for `SendScout`. 0=N, 1=NE, ...
 fn direction_offset(dir: u8) -> (i32, i32) {
@@ -1454,6 +1477,12 @@ pub fn apply_pack_camp_command_system(world: &mut World) {
             faction.last_phase_change_tick = now;
             // Reset the manifest for this Pack episode.
             faction.cargo_manifest = crate::simulation::faction::CampCargoManifest::default();
+            // Player-locked migration: every Pack resets autonomy to
+            // `Hold` so the band defaults to "Awaiting Orders" between
+            // Pack and Pitch. The player flips to `Forage` via the
+            // migration panel / HUD when they want the old behavior.
+            faction.packed_autonomy =
+                crate::simulation::faction::PackedMigrationAutonomy::Hold;
         }
     }
     for (fid, anchor, _radius) in packs.iter() {

@@ -671,6 +671,8 @@ impl Plugin for SimulationPlugin {
                         .after(nomad::apply_manual_scout_command_system),
                     nomad::apply_migration_intent_system
                         .after(nomad::manual_scout_completion_system),
+                    nomad::apply_packed_autonomy_system
+                        .after(nomad::apply_migration_intent_system),
                 )
                     .in_set(SimulationSet::Sequential),
             )

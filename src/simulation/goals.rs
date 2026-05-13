@@ -1315,9 +1315,11 @@ pub fn mobile_state_goal_gate_system(
         &mut crate::simulation::person::PersonAI,
         &mut crate::simulation::typed_task::ActionQueue,
         Option<&crate::simulation::jobs::JobClaim>,
+        Option<&mut GoalReason>,
+        Option<&crate::simulation::nomad::ScoutAssignment>,
     )>,
 ) {
-    for (e, member, mut goal, mut ai, mut aq, claim) in q.iter_mut() {
+    for (e, member, mut goal, mut ai, mut aq, claim, reason_opt, scout_opt) in q.iter_mut() {
         let root = registry.root_faction(member.faction_id);
         let Some(faction) = registry.factions.get(&root) else {
             continue;
@@ -1328,6 +1330,71 @@ pub fn mobile_state_goal_gate_system(
         ) {
             continue;
         }
+
+        // Player-locked migration: strict Hold mode for player-driven
+        // nomadic factions. Demote any goal that isn't a direct player
+        // command, manual scout, or migration walk down to the
+        // "Awaiting Orders" placeholder and cancel autonomous tasks.
+        // AI nomads (`nomad_autopilot == true`) keep the legacy
+        // `allowed_while_packed` semantics regardless of mode.
+        let strict_hold = !faction.nomad_autopilot
+            && matches!(
+                faction.packed_autonomy,
+                crate::simulation::faction::PackedMigrationAutonomy::Hold,
+            );
+        if strict_hold {
+            // `goal_update_system` already forced FollowingPlayerCommand
+            // for direct `Commanded` actors and `PackingDuty` workers
+            // mid-dismantle. Leave their goal and task chain intact —
+            // upstream owns the lifecycle.
+            if matches!(*goal, AgentGoal::FollowingPlayerCommand) {
+                if let Some(mut r) = reason_opt {
+                    if r.0.is_empty() {
+                        r.0 = "Awaiting Orders";
+                    }
+                } else {
+                    commands.entity(e).insert(GoalReason("Awaiting Orders"));
+                }
+                continue;
+            }
+            // Manual `SendScout` is treated as explicit player
+            // permission. AI-survey scouts can't exist on player
+            // nomads because they don't autopilot.
+            if matches!(*goal, AgentGoal::Scout) {
+                if let Some(sa) = scout_opt {
+                    if matches!(
+                        sa.kind,
+                        crate::simulation::nomad::ScoutKind::PlayerManual { .. }
+                    ) {
+                        continue;
+                    }
+                }
+            }
+            // MigrateToCamp marker is sim-owned by the AI commit
+            // pipeline; defence-in-depth — player nomads never reach
+            // this path today.
+            if matches!(*goal, AgentGoal::MigrateToCamp) {
+                continue;
+            }
+            // Drop the rest into "Awaiting Orders".
+            *goal = AgentGoal::FollowingPlayerCommand;
+            if let Some(mut r) = reason_opt {
+                r.0 = "Awaiting Orders";
+            } else {
+                commands.entity(e).insert(GoalReason("Awaiting Orders"));
+            }
+            aq.cancel();
+            ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
+            ai.state = crate::simulation::person::AiState::Idle;
+            if claim.is_some() {
+                commands
+                    .entity(e)
+                    .remove::<crate::simulation::jobs::JobClaim>()
+                    .remove::<crate::simulation::jobs::ClaimTarget>();
+            }
+            continue;
+        }
+
         if allowed_while_packed(*goal) {
             continue;
         }
