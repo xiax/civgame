@@ -113,6 +113,11 @@ pub enum TaskKind {
     /// them up. The dispatcher short-circuits when the patient is
     /// already within `SEEK_CARE_AT_SITE_RADIUS` of the chosen site.
     SeekCare = 49,
+    /// Thirst pipeline: agent drinks one unit from inventory `clean_water`
+    /// (in-place) or from an adjacent fresh `River`/`Marsh`/inland `Water`
+    /// tile. The variant carries the tile so the executor can verify
+    /// adjacency at arrival and roll sickness on raw sources.
+    Drink = 50,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -168,6 +173,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::PitchStructureAt as u16 => "Pitching Structure",
         x if x == TaskKind::Heal as u16 => "Healing",
         x if x == TaskKind::SeekCare as u16 => "Seeking Care",
+        x if x == TaskKind::Drink as u16 => "Drinking",
         _ => "Unemployed",
     }
 }
@@ -238,6 +244,7 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::UnpitchStructure as u16
         || task_id == TaskKind::PitchStructureAt as u16
         || task_id == TaskKind::Heal as u16
+        || task_id == TaskKind::Drink as u16
 }
 
 /// Tasks that count as productive labor — these drain willpower over time
@@ -1040,6 +1047,12 @@ pub fn goal_dispatch_system(
                     // clears their `Injury`.
                     AgentGoal::SeekCare if ai.task_id == TaskKind::SeekCare as u16 => {
                         Some(TaskKind::SeekCare as u16)
+                    }
+                    // Drink walk: agent routed to a fresh-water tile. The walk
+                    // leg outlives goal-eval ticks until adjacency / executor
+                    // completion or external preempt.
+                    AgentGoal::Drink if ai.task_id == TaskKind::Drink as u16 => {
+                        Some(TaskKind::Drink as u16)
                     }
                     _ => None,
                 };

@@ -95,6 +95,7 @@ pub fn movement_system(
         &BucketSlot,
         Option<&RelationshipMemory>,
         Option<&MountedOn>,
+        Option<&crate::simulation::medicine::Sickness>,
     )>,
 ) {
     let dt = time.delta_secs();
@@ -106,7 +107,7 @@ pub fn movement_system(
 
     // Movement can't be fully parallel because it writes Transform (position sync)
     // and can read ChunkMap for passability. Run sequentially.
-    for (entity, mut transform, mut ai, lod, mut mv, mut pf, slot, rel_opt, mounted_opt) in
+    for (entity, mut transform, mut ai, lod, mut mv, mut pf, slot, rel_opt, mounted_opt, sickness_opt) in
         query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -144,7 +145,11 @@ pub fn movement_system(
             // Working agent stopped adjacent to resource — stay put and accumulate progress.
             if ai.state == AiState::Working {
                 if clock.is_active(slot.0) {
-                    let progress = (sim_dt * 20.0).max(0.0) as u8;
+                    let base = (sim_dt * 20.0).max(0.0);
+                    let factor = sickness_opt
+                        .map(|s| crate::simulation::medicine::sickness_work_factor(s.severity))
+                        .unwrap_or(1.0);
+                    let progress = (base * factor) as u8;
                     ai.work_progress = ai.work_progress.saturating_add(progress);
                 }
                 continue;
@@ -576,7 +581,11 @@ pub fn movement_system(
             AiState::Working => {
                 // Production system handles output; only accumulate progress when bucket is active.
                 if clock.is_active(slot.0) {
-                    let progress = (sim_dt * 20.0).max(0.0) as u8;
+                    let base = (sim_dt * 20.0).max(0.0);
+                    let factor = sickness_opt
+                        .map(|s| crate::simulation::medicine::sickness_work_factor(s.severity))
+                        .unwrap_or(1.0);
+                    let progress = (base * factor) as u8;
                     ai.work_progress = ai.work_progress.saturating_add(progress);
                 }
             }

@@ -195,6 +195,11 @@ pub enum AgentGoal {
     /// or by chief `JobKind::Heal` posting claim; cleared when no
     /// injured agent remains in range or the patient recovers.
     ProvideCare = 23,
+    /// Thirst pipeline: agent's `needs.thirst >= THIRST_TRIGGER`. Set by
+    /// `ThirstScorer` (Survival class, parallel to `SurvivalHungerScorer`).
+    /// Decomposes via HTN into either an in-place sip from inventory
+    /// clean_water or a walk-and-drink at an adjacent fresh-water tile.
+    Drink = 24,
 }
 
 /// True if `goal` is permitted for a member of a faction whose
@@ -218,6 +223,7 @@ pub fn allowed_while_packed(goal: AgentGoal) -> bool {
             | AgentGoal::MigrateToCamp
             | AgentGoal::Scout
             | AgentGoal::SeekCare
+            | AgentGoal::Drink
     )
 }
 
@@ -247,6 +253,7 @@ impl AgentGoal {
             AgentGoal::Scout => "Scout",
             AgentGoal::SeekCare => "SeekCare",
             AgentGoal::ProvideCare => "ProvideCare",
+            AgentGoal::Drink => "Drink",
         }
     }
 }

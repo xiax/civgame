@@ -1780,6 +1780,8 @@ pub fn spawn_blueprint_sprites(
             BuildSiteKind::Market => textures.table_ascii.clone(),
             BuildSiteKind::Barracks => textures.wall_stone_ascii.clone(),
             BuildSiteKind::Monument => textures.wall_cutstone_ascii.clone(),
+            // Stub: reuse the wall_stone sprite until dedicated latrine art ships.
+            BuildSiteKind::Latrine => textures.wall_stone_ascii.clone(),
         };
 
         let mut ghost_sprite = Sprite::from_image(ghost_img);

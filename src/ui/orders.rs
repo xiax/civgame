@@ -90,6 +90,7 @@ impl MenuAction {
                 BuildSiteKind::Market => "Build Market",
                 BuildSiteKind::Barracks => "Build Barracks",
                 BuildSiteKind::Monument => "Build Monument",
+                BuildSiteKind::Latrine => "Build Latrine",
             },
             MenuAction::DigDown => "Dig Down",
             MenuAction::Deconstruct => "Deconstruct",
@@ -147,7 +148,7 @@ impl ContextMenuState {
 }
 
 /// All build options the player could potentially place on an open tile.
-fn all_build_options() -> [BuildSiteKind; 17] {
+fn all_build_options() -> [BuildSiteKind; 18] {
     [
         BuildSiteKind::Wall(WallMaterial::Palisade),
         BuildSiteKind::Wall(WallMaterial::WattleDaub),
@@ -166,6 +167,7 @@ fn all_build_options() -> [BuildSiteKind; 17] {
         BuildSiteKind::Market,
         BuildSiteKind::Barracks,
         BuildSiteKind::Monument,
+        BuildSiteKind::Latrine,
     ]
 }
 

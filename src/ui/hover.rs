@@ -195,6 +195,7 @@ pub fn hover_info_system(
                             ui.label(format!("Faction: {}", faction.faction_id));
                             ui.label(format!("Mood: {} ({})", mood.label(), mood.0));
                             ui.label(format!("Hunger: {}", needs.hunger));
+                            ui.label(format!("Thirst: {}", needs.thirst));
                             ui.label(format!("Sleep: {}", needs.sleep));
                             ui.label(format!("Currency: {:.1}", agent.currency));
                             ui.label("Inventory:");

@@ -396,6 +396,18 @@ pub fn corpse_decay_system(
             }
         }
         commands.entity(e).despawn_recursive();
+        // Rotting body → waste pile at the corpse's tile. Falls outside
+        // any Latrine, so contamination spreads at full intensity until
+        // `sanitation_decay_system` ages it out.
+        let world_pos = transform.translation;
+        commands.spawn((
+            Transform::from_xyz(world_pos.x, world_pos.y, 0.1),
+            GlobalTransform::default(),
+            crate::simulation::sanitation::WastePile {
+                intensity: 1.5,
+                created_tick: now,
+            },
+        ));
     }
 }
 

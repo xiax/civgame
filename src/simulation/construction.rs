@@ -445,6 +445,13 @@ pub enum BuildSiteKind {
     /// migration; re-pitches at the new camp at zero material cost.
     /// Tech-gated on `PORTABLE_DWELLINGS` (Neolithic).
     Yurt,
+    /// Open-trench latrine. Cheap (wood + stone surround). When a `Latrine`
+    /// entity sits within `LATRINE_ROUTING_RADIUS` of an agent's defecation
+    /// tile, the spawned `WastePile` is tagged `LatrineContained` and
+    /// contributes a fraction of its raw intensity to `SanitationMap` —
+    /// the village's contamination signature stays bounded around the
+    /// latrine rather than smearing across living space.
+    Latrine,
 }
 
 /// Marker component on tile entities representing portable shelter.
@@ -489,6 +496,7 @@ impl BuildSiteKind {
             BuildSiteKind::Monument => "Monument",
             BuildSiteKind::Tent => "Tent",
             BuildSiteKind::Yurt => "Yurt",
+            BuildSiteKind::Latrine => "Latrine",
         }
     }
 }
@@ -646,6 +654,7 @@ enum BuildRecipeIdx {
     Bedroll,
     Tent,
     Yurt,
+    Latrine,
 }
 
 fn build_recipes_table() -> Vec<BuildRecipe> {
@@ -807,6 +816,17 @@ fn build_recipes_table() -> Vec<BuildRecipe> {
             // Player-deconstruct returns the packed-yurt good directly.
             deconstruct_refund: vec![(packed_yurt, 1)],
         },
+        // Open-trench latrine. Wood for the surround, a stone slab as a
+        // step. No tech gate — pit latrines predate writing. Mirrors the
+        // Campfire shape (cheap + small) since it's a personal hygiene
+        // structure, not a workshop. Deconstruct returns one wood.
+        BuildRecipe {
+            name: "Latrine",
+            inputs: vec![(wood, 2), (stone, 1)],
+            work_ticks: 50,
+            tech_gate: None,
+            deconstruct_refund: vec![(wood, 1)],
+        },
     ]
 }
 
@@ -911,6 +931,7 @@ pub fn recipe_for(kind: BuildSiteKind) -> &'static BuildRecipe {
         BuildSiteKind::Market => BuildRecipeIdx::Market,
         BuildSiteKind::Barracks => BuildRecipeIdx::Barracks,
         BuildSiteKind::Monument => BuildRecipeIdx::Monument,
+        BuildSiteKind::Latrine => BuildRecipeIdx::Latrine,
     };
     &build_recipes()[idx as usize]
 }
@@ -4417,6 +4438,16 @@ pub fn construction_system(
                     maps.monument_map.0.insert(tile, e);
                     e
                 }
+                BuildSiteKind::Latrine => commands
+                    .spawn((
+                        crate::simulation::sanitation::Latrine,
+                        StructureLabel(BuildSiteKind::Latrine.label()),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id(),
             };
 
             // Emit a TileChangedEvent so pathfinding caches (flow fields,

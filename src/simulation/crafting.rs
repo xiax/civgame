@@ -81,6 +81,8 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
     let book = core_ids::book();
     let meat = core_ids::meat();
     let preserved_meat = core_ids::preserved_meat();
+    let raw_water = core_ids::raw_water();
+    let clean_water = core_ids::clean_water();
 
     vec![
         // 0
@@ -239,6 +241,23 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             work_ticks: 60,
             crafting_xp: 4,
             tech_gate: Some(FOOD_SMOKING),
+            requires_station: Some(StationKind::Workbench),
+        },
+        // 13 — Boiling raw water into clean drinking water at a hearth /
+        // workbench. Requires `FIRE_MAKING`; consumes 2 raw_water and a
+        // unit of wood for fuel. Output is 1 clean_water — the loss models
+        // evaporation. The recipe slots into the existing craft pipeline
+        // (no bespoke `BoilWater` task) so it inherits workshop, skill,
+        // and wage-aware labor wiring for free.
+        CraftRecipe {
+            name: "Boil Water",
+            inputs: vec![(raw_water, 2), (wood, 1)],
+            output_resource: clean_water,
+            output_qty: 1,
+            output_material: None,
+            work_ticks: 30,
+            crafting_xp: 2,
+            tech_gate: Some(FIRE_MAKING),
             requires_station: Some(StationKind::Workbench),
         },
     ]
@@ -974,8 +993,8 @@ mod tests {
         let recipes = craft_recipes();
         assert_eq!(
             recipes.len(),
-            13,
-            "expected 13 recipes; counts feed CraftOrder.recipe_id wire format"
+            14,
+            "expected 14 recipes; counts feed CraftOrder.recipe_id wire format"
         );
 
         // Stone Tools (recipe 0): Stone×2 + Wood×1 → Tools×1

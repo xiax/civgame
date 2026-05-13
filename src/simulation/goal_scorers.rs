@@ -130,6 +130,7 @@ impl Default for GoalCommitment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NeedAxis {
     Hunger,
+    Thirst,
     Sleep,
     Social,
     Willpower,
@@ -154,7 +155,10 @@ impl Default for InterruptPolicy {
 
 pub fn default_class_for_goal(goal: AgentGoal) -> GoalClass {
     match goal {
-        AgentGoal::Survive | AgentGoal::Sleep | AgentGoal::SeekCare => GoalClass::Survival,
+        AgentGoal::Survive
+        | AgentGoal::Sleep
+        | AgentGoal::SeekCare
+        | AgentGoal::Drink => GoalClass::Survival,
         AgentGoal::Raid
         | AgentGoal::Defend
         | AgentGoal::Rescue
@@ -185,7 +189,8 @@ pub fn default_interrupt_policy_for_goal(goal: AgentGoal) -> InterruptPolicy {
         | AgentGoal::Defend
         | AgentGoal::Rescue
         | AgentGoal::FollowingPlayerCommand
-        | AgentGoal::SeekCare => InterruptPolicy::UninterruptibleExceptSurvival,
+        | AgentGoal::SeekCare
+        | AgentGoal::Drink => InterruptPolicy::UninterruptibleExceptSurvival,
         _ => InterruptPolicy::AlwaysInterruptible,
     }
 }
@@ -673,6 +678,43 @@ impl GoalScorer for SurvivalHungerScorer {
     }
 }
 
+/// Survival-class thirst scorer. Mirrors `SurvivalHungerScorer` but reads
+/// `needs.thirst` against `THIRST_TRIGGER` / `THIRST_SEVERE`. Lower-class
+/// than hunger only via the score curve — both live in `Survival` class so
+/// a parched, hungry agent picks the more urgent need by raw urgency.
+pub struct ThirstScorer;
+
+impl GoalScorer for ThirstScorer {
+    fn score(&self, ctx: &GoalScoringContext) -> Option<GoalScore> {
+        let t = ctx.needs.thirst;
+        if t < crate::simulation::needs::THIRST_TRIGGER {
+            return None;
+        }
+        // Linear urgency from THIRST_TRIGGER → 255. Severe thirst lifts
+        // toward 1.0; at the trigger this starts at ~0.30 so a fresh
+        // dispatch slightly outranks moderate hunger when the agent has
+        // food on hand but not water.
+        let urgency = ((t - crate::simulation::needs::THIRST_TRIGGER) / 75.0).clamp(0.30, 1.0);
+        let reason: &'static str = if t >= crate::simulation::needs::THIRST_SEVERE {
+            "Parched"
+        } else {
+            "Thirsty"
+        };
+        Some(
+            GoalScore::new(AgentGoal::Drink, GoalClass::Survival, urgency, reason)
+                .with_commitment(GoalCommitment::UntilNeedBelow {
+                    need: NeedAxis::Thirst,
+                    threshold: 120.0,
+                })
+                .with_interrupt_policy(InterruptPolicy::UninterruptibleExceptSurvival),
+        )
+    }
+
+    fn name(&self) -> &'static str {
+        "ThirstScorer"
+    }
+}
+
 /// Survival-class sleep scorer. Reads `time_of_day_bonus` to lift
 /// urgency after dusk so a moderately tired agent picks sleep over
 /// work at night even when `sleep < SLEEP_TIRED`.
@@ -982,6 +1024,7 @@ impl GoalScorer for ProvideCareScorer {
 pub fn register_default_scorers(registry: &mut GoalScorerRegistry) {
     registry.scorers.push(Box::new(EarnIncomeScorer));
     registry.scorers.push(Box::new(SurvivalHungerScorer));
+    registry.scorers.push(Box::new(ThirstScorer));
     registry.scorers.push(Box::new(SleepScorer));
     registry.scorers.push(Box::new(ReturnSurplusScorer));
     registry.scorers.push(Box::new(SocialScorer));

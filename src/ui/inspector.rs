@@ -473,6 +473,7 @@ pub fn inspector_panel_system(
                     .default_open(true)
                     .show(ui, |ui| {
                         needs_bar(ui, "Hunger", needs.hunger);
+                        needs_bar(ui, "Thirst", needs.thirst);
                         needs_bar(ui, "Sleep", needs.sleep);
                         needs_bar(ui, "Shelter", needs.shelter);
                         needs_bar(ui, "Safety", needs.safety);

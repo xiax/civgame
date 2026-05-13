@@ -445,6 +445,26 @@ pub enum Task {
     /// when severity hits zero. Patient-side has no typed task —
     /// patients use `Task::WalkTo` to reach the Healer.
     Heal { patient: bevy::prelude::Entity },
+    /// Thirst pipeline: drink one unit of water.
+    ///
+    /// `source = DrinkSource::Inventory` — agent consumes one `clean_water`
+    /// from inventory/hands in-place.
+    ///
+    /// `source = DrinkSource::Tile { tile }` — agent stands adjacent to a
+    /// fresh-water tile (`River` / `Marsh` / inland `Water`) and sips
+    /// directly. Raw (non-River) sources roll a small sickness chance.
+    /// Salt-water tiles never produce this variant — the dispatcher rejects
+    /// them.
+    Drink { source: DrinkSource },
+}
+
+/// Source for a `Task::Drink`. Inventory drinks consume one `clean_water`
+/// unit; tile drinks read the adjacency tile and gate on freshness via
+/// `world::biome::water_kind_at`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrinkSource {
+    Inventory,
+    Tile { tile: (i32, i32) },
 }
 
 impl Default for Task {
@@ -834,6 +854,14 @@ impl Task {
     /// parameters so a discriminant check is sufficient.
     pub fn is_eat(&self) -> bool {
         matches!(*self, Task::Eat)
+    }
+
+    /// Convenience accessor for the Drink variant.
+    pub fn as_drink(&self) -> Option<DrinkSource> {
+        match *self {
+            Task::Drink { source } => Some(source),
+            _ => None,
+        }
     }
 
     /// Convenience accessor for the WithdrawFood variant. Returns the

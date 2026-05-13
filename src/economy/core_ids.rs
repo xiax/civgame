@@ -155,4 +155,6 @@ core_ids! {
     Bedroll => "bedroll" => bedroll,
     PackedYurt => "packed_yurt" => packed_yurt,
     PreservedMeat => "preserved_meat" => preserved_meat,
+    CleanWater => "clean_water" => clean_water,
+    RawWater => "raw_water" => raw_water,
 }

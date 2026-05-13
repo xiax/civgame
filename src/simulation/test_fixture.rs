@@ -600,6 +600,7 @@ pub fn clear_trader_for_dispatch(app: &mut App, entity: Entity) {
             willpower: 255.0,
             esteem: 0.0,
             self_actualization: 0.0,
+            thirst: 0.0,
         };
     }
     if let Some(mut goal) = app.world_mut().get_mut::<AgentGoal>(entity) {
@@ -2500,6 +2501,7 @@ mod smoke {
                 willpower: 255.0,
                 esteem: 250.0, // satiated → unlocks Tier 5
                 self_actualization: 0.0,
+                thirst: 0.0,
             });
         });
 
@@ -2588,6 +2590,7 @@ mod smoke {
                 willpower: 255.0,
                 esteem: 0.0, // UNMET → Tier 4 wins, Tier 5 doesn't fire
                 self_actualization: 0.0,
+                thirst: 0.0,
             });
         });
         let _ = sim.app.world().get::<PersonKnowledge>(agent).unwrap();
@@ -2651,6 +2654,7 @@ mod smoke {
             willpower: 200.0,
             esteem: 0.0,
             self_actualization: 0.0,
+            thirst: 0.0,
         };
         let traveler = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
             b.needs(high_social).goal(AgentGoal::Socialize);
@@ -2790,6 +2794,7 @@ mod smoke {
             willpower: 255.0,
             esteem: 250.0,
             self_actualization: 250.0,
+            thirst: 0.0,
         };
         assert_eq!(MaslowTier::next_unmet(&satiated), None);
 
@@ -2856,6 +2861,7 @@ mod smoke {
                 willpower: 255.0,
                 esteem: 0.0, // unfulfilled — Maslow tier 4
                 self_actualization: 0.0,
+                thirst: 0.0,
             });
         });
         set_currency(&mut sim.app, agent, 100.0);
@@ -2928,6 +2934,7 @@ mod smoke {
                 willpower: 255.0,
                 esteem: 0.0,
                 self_actualization: 0.0,
+                thirst: 0.0,
             });
         });
         set_currency(&mut sim.app, agent, 100.0);
@@ -5123,6 +5130,76 @@ mod smoke {
         // loudly if it gets renamed instead of compiling-around.
         let _ = bonding_system;
     }
+
+    #[test]
+    fn thirsty_agent_with_clean_water_drinks_and_drops_thirst() {
+        use crate::economy::core_ids;
+        use crate::simulation::medicine::Sickness;
+        use crate::simulation::needs::THIRST_TRIGGER;
+
+        let mut sim = TestSim::new(0xCAFE_F00D);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let agent = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.add_inventory(core_ids::clean_water(), 3);
+        });
+        // Force thirst above the trigger; baseline hunger/sleep low so
+        // ThirstScorer wins the registry argmax cleanly.
+        {
+            let mut needs = sim
+                .app
+                .world_mut()
+                .get_mut::<Needs>(agent)
+                .expect("Needs");
+            needs.hunger = 0.0;
+            needs.thirst = THIRST_TRIGGER + 20.0;
+            needs.sleep = 0.0;
+        }
+
+        // Snapshot starting Health so we can assert no damage.
+        let starting_hp = sim
+            .app
+            .world()
+            .get::<Body>(agent)
+            .map(|b| b.fraction())
+            .unwrap_or(1.0);
+
+        // Tick long enough for goal eval → dispatch → adjacency → executor.
+        // goal_update_system runs every 200 ticks; the drink executor
+        // consumes work_progress at TICKS_DRINK = 4. 300 ticks is a
+        // comfortable buffer.
+        sim.tick_n(300);
+
+        let thirst = sim.app.world().get::<Needs>(agent).unwrap().thirst;
+        assert!(
+            thirst < THIRST_TRIGGER,
+            "expected thirst < {THIRST_TRIGGER} after drink, got {thirst}",
+        );
+
+        // Inventory clean_water should have dropped by at least one.
+        let remaining = sim
+            .app
+            .world()
+            .get::<EconomicAgent>(agent)
+            .unwrap()
+            .quantity_of_resource(core_ids::clean_water());
+        assert!(remaining <= 2, "expected ≤ 2 clean_water left, got {remaining}");
+
+        // No Health damage from a clean inventory drink.
+        let ending_hp = sim
+            .app
+            .world()
+            .get::<Body>(agent)
+            .map(|b| b.fraction())
+            .unwrap_or(1.0);
+        assert!((ending_hp - starting_hp).abs() < 0.01, "no health change");
+
+        // No Sickness from a clean inventory drink.
+        assert!(
+            sim.app.world().get::<Sickness>(agent).is_none(),
+            "clean inventory drink should not roll sickness",
+        );
+    }
 }
 
 /// Behavioural baselines pinned by Phase 0. These fixtures lock in the
@@ -5911,6 +5988,7 @@ mod baseline_behaviour {
                 willpower: 200.0,
                 esteem: 0.0,
                 self_actualization: 0.0,
+                thirst: 0.0,
             });
         });
 
@@ -8468,6 +8546,7 @@ mod baseline_behaviour {
                 willpower: 220.0,
                 esteem: 0.0,
                 self_actualization: 0.0,
+                thirst: 0.0,
             });
         });
         let partner = sim.spawn_person(sim.player_faction_id, (3, 0), |_| {});
@@ -9985,6 +10064,7 @@ mod baseline_behaviour {
                 willpower: 30.0, // below PLAY_THRESHOLD so Play goal naturally fires
                 esteem: 0.0,
                 self_actualization: 0.0,
+                thirst: 0.0,
             });
         });
         let partner = sim.spawn_person(sim.player_faction_id, (3, 0), |_| {});
@@ -10059,6 +10139,7 @@ mod baseline_behaviour {
                 willpower: 30.0, // below PLAY_THRESHOLD so Play goal naturally fires
                 esteem: 0.0,
                 self_actualization: 0.0,
+                thirst: 0.0,
             });
         });
 
@@ -10146,6 +10227,7 @@ mod baseline_behaviour {
                 willpower: 30.0,
                 esteem: 0.0,
                 self_actualization: 0.0,
+                thirst: 0.0,
             });
         });
 
@@ -10225,6 +10307,7 @@ mod baseline_behaviour {
                 willpower: 30.0,
                 esteem: 0.0,
                 self_actualization: 0.0,
+                thirst: 0.0,
             });
         });
 

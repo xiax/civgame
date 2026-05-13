@@ -3,6 +3,34 @@
 //! continuity.
 
 use super::globe::{Biome, Globe};
+use super::tile::TileKind;
+
+/// Fresh vs salt classification for a water tile. Lakes inside continents
+/// classify as `Fresh`; ocean tiles (`Biome::Ocean`) classify as `Salt`.
+/// Rivers and freshwater Marsh tiles always read `Fresh` without sampling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaterKind {
+    Fresh,
+    Salt,
+}
+
+/// Returns the fresh/salt classification for any `Water | River | Marsh`
+/// tile by sampling the globe biome. Caller is expected to have already
+/// verified the tile is water-like; non-water tiles return `Fresh` as a
+/// neutral default. River channels skip the globe sample (always fresh).
+pub fn water_kind_at(globe: &Globe, kind: TileKind, tile_x: i32, tile_y: i32) -> WaterKind {
+    match kind {
+        TileKind::River | TileKind::Marsh => WaterKind::Fresh,
+        TileKind::Water => {
+            if matches!(classify_at_tile(globe, tile_x, tile_y), Biome::Ocean) {
+                WaterKind::Salt
+            } else {
+                WaterKind::Fresh
+            }
+        }
+        _ => WaterKind::Fresh,
+    }
+}
 
 /// Classify a biome from normalised climate inputs.
 ///

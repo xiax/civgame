@@ -324,6 +324,38 @@ ResourceFile(
             sprite_key: Some("item_cloth"),
         ),
 
+        // ── Water ─────────────────────────────────────────────────────
+        // Drinking water tracked as inventory/storage resource. One unit
+        // = one drink. Clean (potable, no sickness risk) vs raw (from
+        // turbid lake / marsh; rolls sickness when drunk without boiling).
+        // 500 g/unit so a 5-unit reserve weighs 2.5 kg, similar to a
+        // small waterskin. Ocean Water tiles classified as `WaterKind::Salt`
+        // by `water_kind_at` reject collection entirely.
+        ResourceDef(
+            key: "clean_water",
+            display_name: "Clean Water",
+            class: material,
+            bulk: small,
+            weight_g: 500,
+            entertainment_value: 0,
+            storage_class: granary,
+            trade_base_value: 1,
+            tags: ["water", "potable", "drinkable"],
+            sprite_key: Some("resource_seed"),
+        ),
+        ResourceDef(
+            key: "raw_water",
+            display_name: "Raw Water",
+            class: material,
+            bulk: small,
+            weight_g: 500,
+            entertainment_value: 0,
+            storage_class: granary,
+            trade_base_value: 0,
+            tags: ["water", "raw", "drinkable", "sickness_risk"],
+            sprite_key: Some("resource_seed"),
+        ),
+
         // ── Migration ration ──────────────────────────────────────────
         // Smoke-cured meat. Half the calories of fresh, but a quarter of
         // the weight per food-unit and doesn't perish, so nomadic bands

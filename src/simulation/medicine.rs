@@ -32,6 +32,90 @@ use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::TILE_SIZE;
 
+/// Per-agent illness record. Independent of `Injury` (which is *derived*
+/// from `Body` damage via `injury_tracking_system`, so making it carry
+/// a `cause` field would mean the body-derived path constantly clobbered
+/// the illness side). A parallel component keeps the lifecycles
+/// orthogonal: a sick agent can also be wounded, and the two recover
+/// on their own clocks.
+///
+/// Decays by `SICKNESS_DECAY_PER_DAY` per game-day until severity hits
+/// zero, at which point `sickness_decay_system` removes the component.
+/// Phase 5 grants this component via `apply_sickness` when an agent
+/// drinks raw / contaminated water; future industrial / contamination
+/// vectors land on the same helper.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Sickness {
+    /// 0..=255. Drives a mood penalty and a small work-progress
+    /// slowdown read at executor sites that consult `Sickness` (Phase 5
+    /// limits the slowdown to a single helper; future passes can fan
+    /// out to combat/movement).
+    pub severity: u8,
+    pub applied_tick: u64,
+}
+
+/// Severity decrement per game-day. With `apply_sickness` writing
+/// severity 80–160 typical, illnesses clear in 4–10 game-days.
+pub const SICKNESS_DECAY_PER_DAY: u8 = 16;
+
+/// Mild slowdown applied to work-progress increments while sick. Phase 5
+/// limits the wiring to a single helper; executor sites that consult
+/// `Sickness` can call `sickness_work_factor(severity)` to get a multiplier
+/// in `[0.5, 1.0]` for the per-tick `work_progress` advance.
+pub fn sickness_work_factor(severity: u8) -> f32 {
+    // 255 severity → 0.5×; 0 → 1.0×.
+    let s = severity as f32 / 255.0;
+    (1.0 - 0.5 * s).clamp(0.5, 1.0)
+}
+
+/// Apply or merge an illness severity onto an entity. Idempotent: if
+/// the entity already carries `Sickness`, severity is `max`'d with the
+/// incoming value so a more serious bout dominates. Caller is
+/// responsible for the world write — this helper is called from a
+/// system with `&mut World` access via the wrapper below.
+pub fn apply_sickness_severity(
+    existing: Option<&mut Sickness>,
+    severity: u8,
+    now: u64,
+) -> Option<Sickness> {
+    match existing {
+        Some(s) => {
+            s.severity = s.severity.max(severity);
+            None
+        }
+        None => Some(Sickness {
+            severity,
+            applied_tick: now,
+        }),
+    }
+}
+
+/// Severity assigned when an agent drinks raw (non-river) freshwater.
+pub const SICKNESS_RAW_DRINK_SEVERITY: u8 = 60;
+/// Severity assigned when the source water is `SanitationMap`-contaminated
+/// above the drink threshold. Heavier so the operator sees the difference
+/// in the inspector.
+pub const SICKNESS_CONTAMINATED_DRINK_SEVERITY: u8 = 140;
+
+/// Daily decay system. Iterates every entity carrying `Sickness`,
+/// subtracts `SICKNESS_DECAY_PER_DAY`, despawns the component on zero.
+/// Runs Economy / daily.
+pub fn sickness_decay_system(
+    clock: Res<SimClock>,
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut Sickness)>,
+) {
+    if clock.tick % crate::world::seasons::TICKS_PER_DAY as u64 != 0 {
+        return;
+    }
+    for (entity, mut sickness) in query.iter_mut() {
+        sickness.severity = sickness.severity.saturating_sub(SICKNESS_DECAY_PER_DAY);
+        if sickness.severity == 0 {
+            commands.entity(entity).remove::<Sickness>();
+        }
+    }
+}
+
 /// Per-agent injury record. Stamped by `injury_tracking_system` when
 /// `Health.current < Health.max`; removed when fully healed.
 ///

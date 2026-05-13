@@ -70,6 +70,13 @@ impl TileKind {
         matches!(self, TileKind::River)
     }
 
+    /// True when the tile carries some kind of water (fresh or salt); the
+    /// caller is responsible for using `water_kind_at` to disambiguate when
+    /// it matters (e.g. drinking / collecting). Rivers are always fresh.
+    pub fn is_drinkable_candidate(self) -> bool {
+        matches!(self, TileKind::Water | TileKind::River | TileKind::Marsh)
+    }
+
     /// Generic "this tile is rock" — covers the legacy `Stone` plus all four
     /// lithology variants, plus underground bedrock walls and ore tiles. Used
     /// by `carve_tile` for mining-yield routing and by writability checks.

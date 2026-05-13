@@ -17,6 +17,7 @@ pub mod corpse;
 pub mod crafting;
 pub mod dig;
 pub mod doormat;
+pub mod drink;
 pub mod faction;
 pub mod gather;
 pub mod gather_claims;
@@ -53,6 +54,7 @@ pub mod projects;
 pub mod raid;
 pub mod region;
 pub mod reproduction;
+pub mod sanitation;
 pub mod schedule;
 pub mod sedentary_collapse;
 pub mod settlement;
@@ -151,6 +153,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::CampfireMap::default())
             .insert_resource(construction::DoorMap::default())
             .insert_resource(capital::WorkshopOwnership::default())
+            .insert_resource(sanitation::SanitationMap::default())
             .insert_resource(opportunistic::OpportunisticInterruptStats::default())
             .insert_resource(goal_scorers::DecisionMetrics::default())
             .insert_resource(opportunity::OpportunityIndex::default())
@@ -499,6 +502,37 @@ impl Plugin for SimulationPlugin {
                     .after(htn::htn_build_claimed_blueprint_dispatch_system)
                     .in_set(SimulationSet::ParallelB),
             )
+            // Thirst pipeline (Phase 2): dispatcher routes `AgentGoal::Drink`
+            // agents to drinking sources. Drink-task executor runs Sequential
+            // after movement so adjacency arrival is settled.
+            .add_systems(
+                FixedUpdate,
+                drink::htn_drink_dispatch_system
+                    .after(htn::htn_eat_dispatch_system)
+                    .in_set(SimulationSet::ParallelB),
+            )
+            .add_systems(
+                FixedUpdate,
+                drink::drink_task_system
+                    .after(movement::movement_system)
+                    .in_set(SimulationSet::Sequential),
+            )
+            // Phase 3 (thirst): animal water seek + drink executors.
+            // Seek runs in ParallelA after `animal_needs_tick_system`
+            // (which has updated thirst this tick). Drink runs Sequential
+            // after `animal_movement_system` has settled the new position.
+            .add_systems(
+                FixedUpdate,
+                animals::animal_water_seek_system
+                    .after(animals::animal_needs_tick_system)
+                    .in_set(SimulationSet::ParallelA),
+            )
+            .add_systems(
+                FixedUpdate,
+                animals::animal_drink_system
+                    .after(animals::animal_movement_system)
+                    .in_set(SimulationSet::Sequential),
+            )
             .add_systems(
                 // Phase 5e-xi-a/b: split-off because the main ParallelB tuple
                 // is already at Bevy's 20-element IntoSystemConfigs ceiling.
@@ -736,6 +770,34 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (jobs::wage_gossip_system.after(knowledge::awareness_gossip_system),)
+                    .in_set(SimulationSet::Economy),
+            )
+            // Phase 4 (sanitation): emit pass writes `WastePile` intensity
+            // into `SanitationMap`; decay pass exponentially shrinks every
+            // cell back toward zero. Both gated to daily inside the systems
+            // via the SimClock.
+            .add_systems(
+                FixedUpdate,
+                (
+                    // Per-agent defecation runs every tick but the
+                    // system self-gates per-agent via
+                    // `DefecationCadence.last_emit_tick`.
+                    sanitation::agent_defecation_system,
+                    sanitation::sanitation_emit_system
+                        .after(sanitation::agent_defecation_system)
+                        .run_if(|clock: Res<schedule::SimClock>| {
+                            clock.tick % crate::world::seasons::TICKS_PER_DAY as u64 == 0
+                        }),
+                    sanitation::sanitation_decay_system
+                        .after(sanitation::sanitation_emit_system)
+                        .run_if(|clock: Res<schedule::SimClock>| {
+                            clock.tick % crate::world::seasons::TICKS_PER_DAY as u64 == 0
+                        }),
+                    // Phase 5: nonlethal sickness decay (daily). Self-gates
+                    // inside the system via `clock.tick %
+                    // TICKS_PER_DAY`, so no `run_if` needed here.
+                    medicine::sickness_decay_system,
+                )
                     .in_set(SimulationSet::Economy),
             )
             .add_systems(

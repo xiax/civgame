@@ -530,6 +530,8 @@ fn spawn_herd_members(
             hunger: fastrand::f32() * 60.0,
             sleep: fastrand::f32() * 40.0,
             reproduction: fastrand::f32() * 80.0,
+            thirst: fastrand::f32() * 50.0,
+            sickness: 0.0,
         };
 
         // Bevy bundles cap at 15 elements in a single tuple. Group the

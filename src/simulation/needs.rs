@@ -14,11 +14,31 @@ use bevy::prelude::*;
 /// foods at low hunger.
 pub const EAT_TRIGGER_HUNGER: u8 = 180;
 
+/// Thirst at or above this value triggers Survive-driven drinking. Mirrors
+/// `EAT_TRIGGER_HUNGER`. At `THIRST_DECAY_PER_SEC = 4.0` per real sec a fresh
+/// agent crosses this threshold in ~45 s of game-time — about three drinks
+/// per game-day.
+pub const THIRST_TRIGGER: f32 = 180.0;
+
+/// Severe-thirst tier. Below this an HTN agent's emergency raw-water method
+/// is gated off; above it the agent will drink from any non-salt source even
+/// if it risks sickness.
+pub const THIRST_SEVERE: f32 = 230.0;
+
+/// Thirst reduction per drink unit consumed. One unit refills ~30% of a
+/// fully-thirsty agent so the typical day is 3 drinks.
+pub const DRINK_THIRST_REDUCTION: f32 = 80.0;
+
 /// 7 u8 needs + 1 padding = 8 bytes.
 #[derive(Component, Clone, Copy, Default)]
 #[repr(C)]
 pub struct Needs {
     pub hunger: f32,
+    /// Drinking water need. 0 = sated, 255 = dying of thirst. Mirrors hunger
+    /// (decays continuously, gated by `THIRST_TRIGGER` for Survive). Refilled
+    /// by drinking from inventory clean_water, an adjacent fresh-water tile,
+    /// or boiled raw water — see `simulation/drink.rs`.
+    pub thirst: f32,
     pub sleep: f32,
     pub shelter: f32,
     pub safety: f32,
@@ -56,6 +76,7 @@ impl Needs {
     ) -> Self {
         Self {
             hunger,
+            thirst: 0.0,
             sleep,
             shelter,
             safety,
@@ -72,6 +93,7 @@ impl Needs {
 
     pub fn worst(&self) -> f32 {
         self.hunger
+            .max(self.thirst)
             .max(self.sleep)
             .max(self.shelter)
             .max(self.safety)
@@ -81,13 +103,14 @@ impl Needs {
 
     pub fn avg_distress(&self) -> f32 {
         (self.hunger
+            + self.thirst
             + self.sleep
             + self.shelter
             + self.safety
             + self.social
             + self.reproduction
             + (255.0 - self.willpower))
-            / 7.0
+            / 8.0
     }
 }
 
@@ -97,6 +120,10 @@ impl Needs {
 /// hits twice per day. SLEEP_RATE 1.2 → ~216 sleep by end of day, peaks in
 /// Dusk/Night so SleepScorer × time_of_day_bonus fires once per day.
 const HUNGER_RATE: f32 = 2.0;
+/// Thirst decay per real second. Roughly 2× hunger so a fresh agent crosses
+/// `THIRST_TRIGGER` in ~45 s and severe (~230) in ~60 s; `con_scale` reduces
+/// decay for high-Constitution agents (same floor `0.25×` as hunger).
+const THIRST_RATE: f32 = 4.0;
 const SLEEP_RATE: f32 = 1.2;
 const SLEEP_RECOVER_RATE: f32 = 6.0;
 const SHELTER_RATE: f32 = 0.1;
@@ -151,6 +178,7 @@ pub fn tick_needs_system(
                 .unwrap_or(1.0);
 
             needs.hunger = (needs.hunger + HUNGER_RATE * dt * con_scale).clamp(0.0, 255.0);
+            needs.thirst = (needs.thirst + THIRST_RATE * dt * con_scale).clamp(0.0, 255.0);
 
             if ai.state == AiState::Sleeping {
                 // Double sleep recovery when resting on a bed.
@@ -260,5 +288,14 @@ mod tests {
         // willpower=10 → contributes 245 to worst, larger than any other field.
         let n = Needs::new(50.0, 100.0, 30.0, 30.0, 50.0, 10.0);
         assert_eq!(n.worst(), 245.0);
+    }
+
+    #[test]
+    fn thirst_counts_toward_worst_and_distress() {
+        let mut n = Needs::new(10.0, 10.0, 10.0, 10.0, 10.0, 255.0);
+        n.thirst = 220.0;
+        assert_eq!(n.worst(), 220.0);
+        // 220 thirst dominates the distress average across 8 axes.
+        assert!(n.avg_distress() > 25.0);
     }
 }

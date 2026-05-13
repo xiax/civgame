@@ -45,6 +45,17 @@ const WANDER_INTERVAL: f32 = 3.0;
 
 // Need rates
 const ANIMAL_HUNGER_RATE: f32 = 0.03;
+/// Animal thirst rate per real second. Roughly 2× hunger so animals seek
+/// water multiple times per game-day.
+const ANIMAL_THIRST_RATE: f32 = 0.06;
+/// Animal thirst threshold to interrupt Wander / Grazing and route to
+/// water. Predator chase / flight still preempt.
+pub const ANIMAL_THIRST_TRIGGER: f32 = 160.0;
+/// Thirst reduction per adjacency-drink for an animal.
+pub const ANIMAL_DRINK_THIRST_REDUCTION: f32 = 90.0;
+/// Animal sickness decay per real second. Tuned so a fresh `255` sickness
+/// burn-off settles inside ~1 game-day of dt.
+const ANIMAL_SICKNESS_DECAY_RATE: f32 = 1.5;
 const ANIMAL_SLEEP_RATE: f32 = 0.25;
 const ANIMAL_SLEEP_RECOVER_RATE: f32 = 2.5;
 const ANIMAL_SLEEP_THRESHOLD: f32 = 180.0;
@@ -306,6 +317,11 @@ pub enum AnimalState {
     Flee = 2,
     Attack = 3,
     Sleeping = 4,
+    /// Walking toward / standing adjacent to a non-salt water tile to
+    /// drink. Set by `animal_water_seek_system` when `thirst >=
+    /// ANIMAL_THIRST_TRIGGER`; cleared on adjacency-drink or when the
+    /// animal is preempted by `Chase`/`Flee`/`Attack`.
+    Drinking = 5,
 }
 
 #[derive(Component, Clone, Copy, Default)]
@@ -323,6 +339,12 @@ pub struct AnimalNeeds {
     pub hunger: f32,       // 0=satiated, 255=starving
     pub sleep: f32,        // 0=rested, 255=exhausted
     pub reproduction: f32, // 0=not ready, 255=peak
+    /// 0=hydrated, 255=parched. Tick rate roughly 2× hunger so animals
+    /// drink ~3× per game-day. Crosses `ANIMAL_THIRST_TRIGGER` mid-day.
+    pub thirst: f32,
+    /// Light non-lethal sickness counter. Decays at the same per-second
+    /// rate as hunger. Slows movement and grazing recovery while > 0.
+    pub sickness: f32,
 }
 
 /// Countdown in ticks before a female can give birth again.
@@ -474,6 +496,8 @@ pub fn spawn_animals(
                 hunger: fastrand::f32() * 60.0,
                 sleep: fastrand::f32() * 40.0,
                 reproduction: fastrand::f32() * 80.0,
+                thirst: fastrand::f32() * 50.0,
+                sickness: 0.0,
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
@@ -510,6 +534,8 @@ pub fn spawn_animals(
                     hunger: fastrand::f32() * 60.0,
                     sleep: fastrand::f32() * 40.0,
                     reproduction: fastrand::f32() * 80.0,
+                    thirst: fastrand::f32() * 50.0,
+                    sickness: 0.0,
                 },
                 AnimalReproductionCooldown(0),
                 BiologicalSex::random(),
@@ -543,6 +569,8 @@ pub fn spawn_animals(
                 hunger: fastrand::f32() * 60.0,
                 sleep: fastrand::f32() * 40.0,
                 reproduction: fastrand::f32() * 80.0,
+                thirst: fastrand::f32() * 50.0,
+                sickness: 0.0,
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
@@ -575,6 +603,8 @@ pub fn spawn_animals(
                 hunger: fastrand::f32() * 60.0,
                 sleep: fastrand::f32() * 40.0,
                 reproduction: fastrand::f32() * 80.0,
+                thirst: fastrand::f32() * 50.0,
+                sickness: 0.0,
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
@@ -606,6 +636,8 @@ pub fn spawn_animals(
                 hunger: fastrand::f32() * 60.0,
                 sleep: fastrand::f32() * 40.0,
                 reproduction: fastrand::f32() * 80.0,
+                thirst: fastrand::f32() * 50.0,
+                sickness: 0.0,
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
@@ -637,6 +669,8 @@ pub fn spawn_animals(
                 hunger: fastrand::f32() * 60.0,
                 sleep: fastrand::f32() * 40.0,
                 reproduction: fastrand::f32() * 80.0,
+                thirst: fastrand::f32() * 50.0,
+                sickness: 0.0,
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
@@ -668,6 +702,8 @@ pub fn spawn_animals(
                 hunger: fastrand::f32() * 60.0,
                 sleep: fastrand::f32() * 40.0,
                 reproduction: fastrand::f32() * 80.0,
+                thirst: fastrand::f32() * 50.0,
+                sickness: 0.0,
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
@@ -699,6 +735,8 @@ pub fn spawn_animals(
                 hunger: fastrand::f32() * 60.0,
                 sleep: fastrand::f32() * 40.0,
                 reproduction: fastrand::f32() * 80.0,
+                thirst: fastrand::f32() * 50.0,
+                sickness: 0.0,
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
@@ -827,6 +865,7 @@ pub fn animal_needs_tick_system(
             }
 
             needs.reproduction = (needs.reproduction + ANIMAL_REPRO_RATE * dt).clamp(0.0, 255.0);
+            needs.sickness = (needs.sickness - ANIMAL_SICKNESS_DECAY_RATE * dt).max(0.0);
 
             if ai.state == AnimalState::Sleeping {
                 needs.sleep = (needs.sleep - ANIMAL_SLEEP_RECOVER_RATE * dt).clamp(0.0, 255.0);
@@ -835,8 +874,9 @@ pub fn animal_needs_tick_system(
                 }
             } else {
                 needs.hunger = (needs.hunger + ANIMAL_HUNGER_RATE * dt).clamp(0.0, 255.0);
+                needs.thirst = (needs.thirst + ANIMAL_THIRST_RATE * dt).clamp(0.0, 255.0);
                 needs.sleep = (needs.sleep + ANIMAL_SLEEP_RATE * dt).clamp(0.0, 255.0);
-                // Only sleep from Wander — never interrupt Chase/Flee/Attack
+                // Only sleep from Wander — never interrupt Chase/Flee/Attack/Drinking
                 if needs.sleep >= ANIMAL_SLEEP_THRESHOLD && ai.state == AnimalState::Wander {
                     ai.state = AnimalState::Sleeping;
                     ai.target_entity = None;
@@ -1972,6 +2012,195 @@ pub fn animal_reproduction_system(
                 ));
             }
         }
+    }
+}
+
+/// Per-tick (parallel) scan: thirsty animals in `Wander` flip to `Drinking`
+/// and set `target_tile` to a passable tile adjacent to the nearest
+/// non-salt water source. Sleeping / Chase / Flee / Attack states are
+/// never preempted — predator chase keeps urgency. Carried (ridden) and
+/// Dormant animals are skipped.
+pub fn animal_water_seek_system(
+    clock: Res<SimClock>,
+    chunk_map: Res<ChunkMap>,
+    globe: Res<crate::world::globe::Globe>,
+    mut query: Query<
+        (
+            &Transform,
+            &mut AnimalAI,
+            &AnimalNeeds,
+            &BucketSlot,
+            &LodLevel,
+            Option<&CarriedBy>,
+        ),
+        bevy::prelude::Or<(
+            With<Wolf>,
+            With<Deer>,
+            With<Horse>,
+            With<Cow>,
+            With<Rabbit>,
+            With<Pig>,
+            With<Fox>,
+            With<Cat>,
+        )>,
+    >,
+) {
+    const SCAN_RADIUS: i32 = 14;
+
+    for (transform, mut ai, needs, slot, lod, carried) in query.iter_mut() {
+        if *lod == LodLevel::Dormant || carried.is_some() || !clock.is_active(slot.0) {
+            continue;
+        }
+        // Stay in Drinking until the executor flips back to Wander on
+        // adjacency-drink. Don't preempt Chase/Flee/Attack/Sleeping.
+        if !matches!(ai.state, AnimalState::Wander) {
+            continue;
+        }
+        if needs.thirst < ANIMAL_THIRST_TRIGGER {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+
+        let Some(water_tile) =
+            crate::simulation::drink::nearest_fresh_drinkable_tile(
+                &chunk_map,
+                &globe,
+                (cur_tx, cur_ty),
+                SCAN_RADIUS,
+            )
+        else {
+            continue;
+        };
+
+        // Route to an adjacent passable tile rather than the water tile
+        // itself — water tiles are impassable for ground animals.
+        let dirs: [(i32, i32); 8] = [
+            (-1, 0),
+            (1, 0),
+            (0, -1),
+            (0, 1),
+            (-1, -1),
+            (1, -1),
+            (-1, 1),
+            (1, 1),
+        ];
+        let mut adj_target: Option<(i32, i32)> = None;
+        for (dx, dy) in dirs {
+            let t = (water_tile.0 + dx, water_tile.1 + dy);
+            if let Some(k) = chunk_map.tile_kind_at(t.0, t.1) {
+                if k.is_passable() {
+                    if adj_target.is_none() {
+                        adj_target = Some(t);
+                    } else {
+                        let cur = adj_target.unwrap();
+                        let cd = (cur.0 - cur_tx).abs() + (cur.1 - cur_ty).abs();
+                        let nd = (t.0 - cur_tx).abs() + (t.1 - cur_ty).abs();
+                        if nd < cd {
+                            adj_target = Some(t);
+                        }
+                    }
+                }
+            }
+        }
+        let Some(stand_tile) = adj_target else {
+            continue;
+        };
+
+        ai.state = AnimalState::Drinking;
+        ai.target_tile = stand_tile;
+        ai.target_entity = None;
+    }
+}
+
+/// Sequential pass after movement: any animal in `Drinking` state whose
+/// chebyshev distance to a fresh-water tile is ≤ 1 drinks one bout. Raw
+/// (non-River) sources roll a small sickness bump on `AnimalNeeds.sickness`.
+/// Salt water is rejected upstream by `animal_water_seek_system`.
+pub fn animal_drink_system(
+    clock: Res<SimClock>,
+    chunk_map: Res<ChunkMap>,
+    globe: Res<crate::world::globe::Globe>,
+    mut query: Query<
+        (
+            &Transform,
+            &mut AnimalAI,
+            &mut AnimalNeeds,
+            &BucketSlot,
+            &LodLevel,
+            Option<&CarriedBy>,
+        ),
+        bevy::prelude::Or<(
+            With<Wolf>,
+            With<Deer>,
+            With<Horse>,
+            With<Cow>,
+            With<Rabbit>,
+            With<Pig>,
+            With<Fox>,
+            With<Cat>,
+        )>,
+    >,
+) {
+    for (transform, mut ai, mut needs, slot, lod, carried) in query.iter_mut() {
+        if *lod == LodLevel::Dormant || carried.is_some() || !clock.is_active(slot.0) {
+            continue;
+        }
+        if ai.state != AnimalState::Drinking {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+
+        // Find any adjacent fresh water; if none in chebyshev 1 the animal
+        // hasn't arrived yet — keep walking.
+        let mut adj_fresh: Option<(i32, i32, TileKind)> = None;
+        for dy in -1..=1i32 {
+            for dx in -1..=1i32 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let t = (cur_tx + dx, cur_ty + dy);
+                let Some(k) = chunk_map.tile_kind_at(t.0, t.1) else {
+                    continue;
+                };
+                if !k.is_drinkable_candidate() {
+                    continue;
+                }
+                if matches!(
+                    crate::world::biome::water_kind_at(&globe, k, t.0, t.1),
+                    crate::world::biome::WaterKind::Salt
+                ) {
+                    continue;
+                }
+                adj_fresh = Some((t.0, t.1, k));
+                break;
+            }
+            if adj_fresh.is_some() {
+                break;
+            }
+        }
+        let Some((_, _, kind)) = adj_fresh else {
+            // Not adjacent yet — `animal_movement_system` is still walking
+            // us toward `target_tile`. Give up if thirst already eased
+            // (e.g. animal ate a wet fruit, sickness mods, etc.).
+            if needs.thirst < ANIMAL_THIRST_TRIGGER * 0.5 {
+                ai.state = AnimalState::Wander;
+            }
+            continue;
+        };
+
+        needs.thirst = (needs.thirst - ANIMAL_DRINK_THIRST_REDUCTION).max(0.0);
+        // Raw freshwater (lake / marsh) — bump sickness slightly. Rivers
+        // are flowing freshwater and don't add sickness. Phase 4 will
+        // factor in `SanitationMap` contamination.
+        if !matches!(kind, TileKind::River) {
+            needs.sickness = (needs.sickness + 20.0).clamp(0.0, 255.0);
+        }
+        ai.state = AnimalState::Wander;
+        ai.wander_timer = WANDER_INTERVAL;
     }
 }
 
