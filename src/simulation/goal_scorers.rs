@@ -325,7 +325,11 @@ impl GoalScorer for SurvivalHungerScorer {
         } else if ctx.needs.hunger > 150.0 && !has_food {
             "Hungry"
         } else {
-            "Peckish"
+            // Below every legacy cliff — no HTN food/eat method will
+            // match. Returning Survive here would pin the agent on a
+            // goal that can't decompose into a task. Fall through to
+            // lower-class scorers instead.
+            return None;
         };
         Some(GoalScore {
             goal: AgentGoal::Survive,
@@ -775,6 +779,34 @@ mod tests {
         let skills = Skills::default();
         let ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
         assert!(SurvivalHungerScorer.score(&ctx).is_none());
+    }
+
+    /// Regression: the scorer must NOT emit `Survive` in the dead-zone
+    /// between `hunger_utility >= 0.10` (~hunger 110) and the legacy
+    /// `HUNGER_FORAGE_REQUIRED = 150` cliff. Every HTN food/eat method
+    /// gates on `hunger >= EAT_TRIGGER_HUNGER (180)`; emitting Survive
+    /// at hunger 120 pins the agent on a goal that can't decompose into
+    /// a task.
+    #[test]
+    fn survival_scorer_silent_in_pre_cliff_dead_zone() {
+        let (reg, fid) = make_faction();
+        let faction = reg.factions.get(&fid).unwrap();
+        let agent = EconomicAgent::default();
+        let member = FactionMember {
+            faction_id: fid,
+            ..Default::default()
+        };
+        let board = JobBoard::default();
+        let skills = Skills::default();
+        for h in [110.0_f32, 120.0, 140.0, 149.0] {
+            let mut needs = Needs::default();
+            needs.hunger = h;
+            let ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
+            assert!(
+                SurvivalHungerScorer.score(&ctx).is_none(),
+                "hunger {h} must not emit Survive — no HTN food method matches below 180",
+            );
+        }
     }
 
     #[test]

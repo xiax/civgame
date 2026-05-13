@@ -12489,4 +12489,110 @@ mod wage_aware_phase0_phase1 {
             "Hunter must switch directly to Crafter when Craft EV beats Hunter EV by ≥ 20%",
         );
     }
+
+    #[test]
+    fn pack_camp_preempts_stale_worker_task_before_unpitch_dispatch() {
+        use crate::simulation::archetype::derive_from_legacy;
+        use crate::simulation::faction::{CampState, FactionChief, FactionRegistry, Lifestyle};
+        use crate::simulation::pack_deploy::Deployable;
+        use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
+        use crate::simulation::tasks::TaskKind;
+        use crate::simulation::typed_task::Task;
+
+        let mut sim = TestSim::new(0xA11CE);
+        sim.flat_world(1, 0, TileKind::Grass);
+
+        let fid = {
+            let catalog = sim
+                .app
+                .world()
+                .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+                .clone();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let fid = registry.create_faction((0, 0));
+            let faction = registry.factions.get_mut(&fid).unwrap();
+            faction.lifestyle = Lifestyle::Nomadic;
+            faction.caps = derive_from_legacy(
+                Lifestyle::Nomadic,
+                crate::game_state::EconomyPreset::Subsistence,
+                &catalog,
+            );
+            faction.camp_state = CampState::Pitched;
+            faction.nomad_autopilot = false;
+            faction.member_count = 2;
+            fid
+        };
+
+        let chief = sim.spawn_person(fid, (0, 0), |_| {});
+        let worker = sim.spawn_person(fid, (2, 0), |b| {
+            b.goal(AgentGoal::GatherFood);
+        });
+        sim.app.world_mut().entity_mut(chief).insert(FactionChief);
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.factions.get_mut(&fid).unwrap().chief_entity = Some(chief);
+        }
+
+        let stale_item = sim.spawn_ground_item((6, 0), crate::economy::core_ids::fruit(), 1);
+        {
+            let mut ai = sim.app.world_mut().get_mut::<PersonAI>(worker).unwrap();
+            ai.state = AiState::Seeking;
+            ai.task_id = TaskKind::Scavenge as u16;
+            ai.target_entity = Some(stale_item);
+            ai.target_tile = (6, 0);
+            ai.dest_tile = (6, 0);
+        }
+        {
+            let mut aq = sim
+                .app
+                .world_mut()
+                .get_mut::<crate::simulation::typed_task::ActionQueue>(worker)
+                .unwrap();
+            aq.dispatch(Task::Scavenge { target: stale_item });
+        }
+
+        let shelter_tile = (2, 1);
+        let shelter_pos = tile_to_world(shelter_tile.0, shelter_tile.1);
+        let shelter = sim
+            .app
+            .world_mut()
+            .spawn((
+                Deployable::refund_only(0.5, crate::economy::core_ids::wood(), 6),
+                Transform::from_xyz(shelter_pos.x, shelter_pos.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+
+        sim.app.world_mut().send_event(PlayerCommandEvent {
+            actors: vec![chief],
+            command: PlayerCommand::PackCamp,
+        });
+        sim.tick_n(2);
+
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        assert!(
+            matches!(
+                registry.factions.get(&fid).unwrap().camp_state,
+                CampState::Packed { .. }
+            ),
+            "PackCamp should flip the faction to Packed"
+        );
+
+        let ai = person_ai(&sim.app, worker);
+        assert_eq!(
+            ai.task_id,
+            TaskKind::UnpitchStructure as u16,
+            "PackCamp should clear the stale Scavenge task and dispatch pack labor"
+        );
+        assert_eq!(ai.target_entity, Some(shelter));
+        assert!(
+            matches!(
+                person_task(&sim.app, worker),
+                Task::UnpitchStructure { structure } if structure == shelter
+            ),
+            "worker should be on the typed UnpitchStructure task"
+        );
+    }
 }

@@ -22,9 +22,13 @@ use bevy::prelude::*;
 
 use crate::simulation::camp::CampMap;
 use crate::simulation::construction::{Bed, BedMap, Campfire, CampfireMap, TentShelter};
-use crate::simulation::faction::{FactionMember, FactionRegistry};
+use crate::simulation::faction::{
+    release_reservation, FactionMember, FactionRegistry, StorageReservations,
+};
 use crate::simulation::gather::spawn_ground_drop;
+use crate::simulation::gather_claims::{release_gather_claim, GatherClaims};
 use crate::simulation::goals::AgentGoal;
+use crate::simulation::jobs::{release_claimant, ClaimTarget, JobBoard, JobClaim};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::pack_deploy::Deployable;
 use crate::simulation::person::{AiState, Drafted, Person, PersonAI};
@@ -86,23 +90,60 @@ struct StructureToUnpitch {
     tile: (i32, i32),
 }
 
-/// Insert a `PackingDuty` marker on every member of every faction in
-/// `fids`. Called by `apply_pack_camp_command_system` at the start
-/// of a player Pack episode.
+/// Insert a `PackingDuty` marker on every non-drafted member of every
+/// faction in `fids` and clear any stale autonomous work. Called by
+/// `apply_pack_camp_command_system` at the start of a player Pack
+/// episode.
 pub fn stamp_pack_duty(world: &mut World, fids: &[u32]) {
     if fids.is_empty() {
         return;
     }
     let mut state: SystemState<(
         Commands,
-        Query<(Entity, &FactionMember), With<Person>>,
+        Query<
+            (
+                Entity,
+                &FactionMember,
+                &Transform,
+                &mut PersonAI,
+                &mut ActionQueue,
+                &mut AgentGoal,
+                Option<&JobClaim>,
+            ),
+            (With<Person>, Without<Drafted>),
+        >,
         Res<FactionRegistry>,
+        Res<StorageReservations>,
+        Res<GatherClaims>,
+        ResMut<JobBoard>,
     )> = SystemState::new(world);
-    let (mut commands, q, registry) = state.get_mut(world);
-    for (entity, member) in q.iter() {
+    let (mut commands, mut q, registry, reservations, gather_claims, mut board) =
+        state.get_mut(world);
+    for (entity, member, transform, mut ai, mut aq, mut goal, claim) in q.iter_mut() {
         let root = registry.root_faction(member.faction_id);
         if fids.contains(&root) {
-            commands.entity(entity).insert(PackingDuty);
+            let tile = transform_tile(transform);
+            release_reservation(&reservations, &mut ai);
+            release_gather_claim(&gather_claims, &mut ai, entity);
+            if let Some(claim) = claim {
+                release_claimant(&mut board, claim.job_id, entity);
+            }
+
+            aq.cancel();
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
+            ai.target_tile = tile;
+            ai.dest_tile = tile;
+            ai.target_z = ai.current_z;
+            ai.work_progress = 0;
+            *goal = AgentGoal::FollowingPlayerCommand;
+
+            commands
+                .entity(entity)
+                .insert(PackingDuty)
+                .remove::<JobClaim>()
+                .remove::<ClaimTarget>();
         }
     }
     state.apply(world);
