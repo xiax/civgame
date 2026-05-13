@@ -21,9 +21,9 @@ use bevy::prelude::*;
 
 use crate::simulation::faction::{FactionData, FactionMember};
 use crate::simulation::goal_scorers::{
-    Disposition, GoalClass, GoalScore, GoalScorerRegistry, GoalScoringContext,
+    Disposition, GoalScore, GoalScorerRegistry, GoalScoringContext,
 };
-use crate::simulation::goals::{AgentGoal, GoalCooldown, GoalReason, Personality};
+use crate::simulation::goals::{AgentGoal, GoalCooldown, GoalReason};
 use crate::simulation::htn::{MethodRegistry, MF_UNINTERRUPTIBLE};
 use crate::simulation::jobs::{JobBoard, JobClaim};
 use crate::simulation::lod::LodLevel;
@@ -64,32 +64,24 @@ pub struct OpportunisticInterruptStats {
     pub last_tick: u64,
 }
 
-/// Map an `AgentGoal` discriminant to its scoring class so the
-/// interrupt system can compare against the challenger's class
-/// without round-tripping through the registry. Mirrors the class
-/// assignments inside individual scorer impls; keep in sync.
-pub fn class_for_goal(goal: AgentGoal) -> GoalClass {
-    use AgentGoal::*;
-    match goal {
-        Survive | Sleep => GoalClass::Survival,
-        Raid | Defend | Rescue => GoalClass::Safety,
-        ReturnCamp
-        | GatherFood
-        | GatherWood
-        | GatherStone
-        | Stockpile
-        | Haul
-        | Craft
-        | Farm
-        | TameHorse
-        | MigrateToCamp
-        | Lead
-        | Scout => GoalClass::Subsistence,
-        Socialize => GoalClass::Belonging,
-        Build => GoalClass::Esteem,
-        Play => GoalClass::Discretionary,
-        FollowingPlayerCommand => GoalClass::Safety,
-    }
+/// Policy gate: goals the opportunistic interrupt system refuses to
+/// preempt regardless of challenger score. Captures the "mid-rescue /
+/// mid-defense / mid-survive" rule directly instead of round-tripping
+/// through a fragile `AgentGoal → GoalClass` mirror (one `AgentGoal`
+/// can map to two classes depending on which scorer picked it — e.g.
+/// `StockpileScorer` returns `GatherFood` at `Subsistence` when
+/// `prioritize_food` and `Discretionary` otherwise).
+pub fn is_policy_uninterruptible(goal: AgentGoal) -> bool {
+    matches!(
+        goal,
+        AgentGoal::Survive
+            | AgentGoal::Sleep
+            | AgentGoal::Raid
+            | AgentGoal::Defend
+            | AgentGoal::Rescue
+            | AgentGoal::FollowingPlayerCommand
+            | AgentGoal::SeekCare
+    )
 }
 
 /// Bundle of read-only resources / queries so the system fits Bevy's
@@ -123,7 +115,6 @@ pub fn opportunistic_interrupt_system(
             &EconomicAgent,
             &FactionMember,
             &LodLevel,
-            &Personality,
             Option<&mut GoalReason>,
             Option<&mut GoalCooldown>,
             Option<&JobClaim>,
@@ -138,6 +129,9 @@ pub fn opportunistic_interrupt_system(
         return;
     }
     let now = inputs.clock.tick;
+    let time_of_day_bonus = crate::simulation::utility_curves::time_of_day_bonus(
+        inputs.calendar.time_phase(),
+    );
     for (
         entity,
         mut goal,
@@ -147,7 +141,6 @@ pub fn opportunistic_interrupt_system(
         agent,
         member,
         lod,
-        personality,
         reason_opt,
         cooldown_opt,
         claim_opt,
@@ -176,15 +169,7 @@ pub fn opportunistic_interrupt_system(
                 }
             }
         }
-        let cur_class = class_for_goal(*goal);
-        // Survival / Safety goals are policy-uninterruptible. Don't
-        // peel off mid-rescue, mid-defense, mid-survive. Note: the
-        // class enum's numeric ordering puts `Subsistence (5) >
-        // Safety (4)` because Subsistence is semantically more
-        // important than Safety in the Maslow tower, so a naive `>=
-        // Safety` check would reject Subsistence agents (ReturnCamp,
-        // GatherFood). Explicit class membership is correct.
-        if matches!(cur_class, GoalClass::Survival | GoalClass::Safety) {
+        if is_policy_uninterruptible(*goal) {
             continue;
         }
         // Faction lookup may fail for SOLO etc.
@@ -206,12 +191,6 @@ pub fn opportunistic_interrupt_system(
             .get(entity)
             .copied()
             .unwrap_or(Profession::None);
-        let time_of_day_bonus = match inputs.calendar.time_phase() {
-            crate::world::seasons::TimePhase::Day => 0.0,
-            crate::world::seasons::TimePhase::Dawn => 0.2,
-            crate::world::seasons::TimePhase::Dusk => 0.6,
-            crate::world::seasons::TimePhase::Night => 1.0,
-        };
         let agent_tile = (ai.target_tile.0, ai.target_tile.1);
         let ctx = GoalScoringContext {
             agent: entity,
@@ -225,7 +204,6 @@ pub fn opportunistic_interrupt_system(
             faction_member: member,
             faction: faction_data,
             board: &inputs.board,
-            personality: *personality,
             // Phase D doesn't precompute the gates that Phase B's
             // scorers need for fallback decisions — they're
             // unused on the opportunistic path which only consults
@@ -240,25 +218,17 @@ pub fn opportunistic_interrupt_system(
             has_personal_build_site: false,
             should_craft: false,
             time_of_day_bonus,
-            age_ticks: 3600 * 365 * 5,
+            age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
         };
         let mut best: Option<GoalScore> = None;
-        for scorer in inputs.scorer_registry.scorers.iter() {
-            if !scorer.opportunistic() {
-                continue;
-            }
+        for &idx in &inputs.scorer_registry.opportunistic_indices {
+            let scorer = &inputs.scorer_registry.scorers[idx];
             let Some(s) = scorer.score(&ctx) else {
                 continue;
             };
             if s.goal == *goal {
                 continue;
             }
-            // No class comparison: opportunism is score-based.
-            // Survival / Safety preempt via the cur_class gate above;
-            // every other class is interruptible if the score is
-            // high enough. `cur_class` is still threaded so future
-            // policy tweaks can read it without re-derivation.
-            let _ = cur_class;
             if s.score < OPPORTUNISTIC_INTERRUPT_THRESHOLD {
                 continue;
             }
@@ -313,22 +283,6 @@ mod tests {
     use crate::simulation::goal_scorers::{register_default_scorers, GoalScorerRegistry};
     use crate::simulation::needs::Needs;
 
-    #[test]
-    fn class_for_goal_covers_every_variant() {
-        // Spot-check the matrix; if AgentGoal grows, this catches a
-        // missing arm by exhaustive-match warning at compile time.
-        assert_eq!(class_for_goal(AgentGoal::Survive), GoalClass::Survival);
-        assert_eq!(class_for_goal(AgentGoal::Sleep), GoalClass::Survival);
-        assert_eq!(class_for_goal(AgentGoal::Raid), GoalClass::Safety);
-        assert_eq!(class_for_goal(AgentGoal::Defend), GoalClass::Safety);
-        assert_eq!(class_for_goal(AgentGoal::Rescue), GoalClass::Safety);
-        assert_eq!(class_for_goal(AgentGoal::ReturnCamp), GoalClass::Subsistence);
-        assert_eq!(class_for_goal(AgentGoal::GatherFood), GoalClass::Subsistence);
-        assert_eq!(class_for_goal(AgentGoal::Socialize), GoalClass::Belonging);
-        assert_eq!(class_for_goal(AgentGoal::Play), GoalClass::Discretionary);
-        assert_eq!(class_for_goal(AgentGoal::Build), GoalClass::Esteem);
-    }
-
     /// Unit-test the eligibility logic by directly invoking the
     /// scorer-pick step (mirroring what `opportunistic_interrupt_system`
     /// does after gates). A gregarious agent on `ReturnCamp` with
@@ -368,7 +322,6 @@ mod tests {
             faction_member: &member,
             faction,
             board: &board,
-            personality: Personality::default(),
             is_starving: false,
             faction_has_food: false,
             can_return_camp: false,
@@ -379,7 +332,7 @@ mod tests {
             has_personal_build_site: false,
             should_craft: false,
             time_of_day_bonus: 0.0,
-            age_ticks: 3600 * 365 * 5,
+            age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
         };
 
         let pick = |ctx: &GoalScoringContext, current: AgentGoal| -> Option<GoalScore> {
@@ -435,31 +388,20 @@ mod tests {
         let _ = loner_pick; // Loner behaviour is policy-acceptable either way
     }
 
-    /// Survival/Safety-class goals are policy-uninterruptible.
-    /// Verify the class membership gate (the production system uses
-    /// `matches!(cur_class, Survival | Safety)` because the numeric
-    /// ordering puts Subsistence between them).
+    /// Survival/Safety goals are policy-uninterruptible.
     #[test]
     fn opportunistic_does_not_interrupt_survival_or_safety() {
-        fn uninterruptible(g: AgentGoal) -> bool {
-            matches!(
-                class_for_goal(g),
-                GoalClass::Survival | GoalClass::Safety
-            )
-        }
-        assert!(uninterruptible(AgentGoal::Survive));
-        assert!(uninterruptible(AgentGoal::Sleep));
-        assert!(uninterruptible(AgentGoal::Defend));
-        assert!(uninterruptible(AgentGoal::Raid));
-        assert!(uninterruptible(AgentGoal::Rescue));
-        assert!(uninterruptible(AgentGoal::FollowingPlayerCommand));
-        // Subsistence-tier goals are interruptible.
-        assert!(!uninterruptible(AgentGoal::ReturnCamp));
-        assert!(!uninterruptible(AgentGoal::GatherFood));
-        assert!(!uninterruptible(AgentGoal::Craft));
-        // Belonging / Esteem / Discretionary are interruptible.
-        assert!(!uninterruptible(AgentGoal::Socialize));
-        assert!(!uninterruptible(AgentGoal::Build));
-        assert!(!uninterruptible(AgentGoal::Play));
+        assert!(is_policy_uninterruptible(AgentGoal::Survive));
+        assert!(is_policy_uninterruptible(AgentGoal::Sleep));
+        assert!(is_policy_uninterruptible(AgentGoal::Defend));
+        assert!(is_policy_uninterruptible(AgentGoal::Raid));
+        assert!(is_policy_uninterruptible(AgentGoal::Rescue));
+        assert!(is_policy_uninterruptible(AgentGoal::FollowingPlayerCommand));
+        assert!(!is_policy_uninterruptible(AgentGoal::ReturnCamp));
+        assert!(!is_policy_uninterruptible(AgentGoal::GatherFood));
+        assert!(!is_policy_uninterruptible(AgentGoal::Craft));
+        assert!(!is_policy_uninterruptible(AgentGoal::Socialize));
+        assert!(!is_policy_uninterruptible(AgentGoal::Build));
+        assert!(!is_policy_uninterruptible(AgentGoal::Play));
     }
 }

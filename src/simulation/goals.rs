@@ -174,6 +174,16 @@ pub enum AgentGoal {
     /// `nomad.rs`); cleared by `nomad_survey_completion_system` once
     /// the survey window closes.
     Scout = 21,
+    /// Heal-pipeline patient side: an `Injury`-bearing agent walking
+    /// to the nearest available Healer / Shrine. Set by
+    /// `HealNeedScorer`; cleared when `Injury` despawns or the
+    /// patient arrives at a treatment site.
+    SeekCare = 22,
+    /// Heal-pipeline provider side: a `Profession::Healer` walking to
+    /// (or treating) the nearest patient. Set by `ProvideCareScorer`
+    /// or by chief `JobKind::Heal` posting claim; cleared when no
+    /// injured agent remains in range or the patient recovers.
+    ProvideCare = 23,
 }
 
 /// True if `goal` is permitted for a member of a faction whose
@@ -196,6 +206,7 @@ pub fn allowed_while_packed(goal: AgentGoal) -> bool {
             | AgentGoal::FollowingPlayerCommand
             | AgentGoal::MigrateToCamp
             | AgentGoal::Scout
+            | AgentGoal::SeekCare
     )
 }
 
@@ -223,6 +234,8 @@ impl AgentGoal {
             AgentGoal::Stockpile => "Stockpile",
             AgentGoal::MigrateToCamp => "MigrateToCamp",
             AgentGoal::Scout => "Scout",
+            AgentGoal::SeekCare => "SeekCare",
+            AgentGoal::ProvideCare => "ProvideCare",
         }
     }
 }
@@ -469,6 +482,8 @@ pub fn goal_update_system(
     cooldown_query: Query<&GoalCooldown>,
     mut force_reeval: ResMut<ForceGoalReevaluate>,
 ) {
+    let time_of_day_bonus =
+        crate::simulation::utility_curves::time_of_day_bonus(calendar.time_phase());
     for (
         entity,
         mut goal,
@@ -944,12 +959,6 @@ pub fn goal_update_system(
                         .get(entity)
                         .copied()
                         .unwrap_or(crate::simulation::person::Profession::None);
-                    let time_of_day_bonus = match calendar.time_phase() {
-                        crate::world::seasons::TimePhase::Day => 0.0,
-                        crate::world::seasons::TimePhase::Dawn => 0.2,
-                        crate::world::seasons::TimePhase::Dusk => 0.6,
-                        crate::world::seasons::TimePhase::Night => 1.0,
-                    };
                     let ctx = crate::simulation::goal_scorers::GoalScoringContext {
                         agent: entity,
                         agent_tile,
@@ -962,7 +971,6 @@ pub fn goal_update_system(
                         faction_member: member,
                         faction: faction_data,
                         board: &scorer_inputs.board,
-                        personality: *personality,
                         is_starving,
                         faction_has_food,
                         can_return_camp,
@@ -973,40 +981,30 @@ pub fn goal_update_system(
                         has_personal_build_site,
                         should_craft: should_craft_now,
                         time_of_day_bonus,
-                        age_ticks: 3600 * 365 * 5,
+                        age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
                     };
                     // Hysteresis margin damps single-tick flips around
                     // utility crossover; Survival/Subsistence still
                     // preempt lower classes via the class ordering in
                     // `GoalScorerRegistry::best`.
                     const GOAL_CHALLENGER_MARGIN: f32 = 0.10;
-                    match scorer_inputs.registry.best(&ctx) {
-                        Some(best) => {
-                            if *goal == best.goal {
-                                (best.goal, best.reason)
-                            } else {
-                                let cur_score = scorer_inputs
-                                    .registry
-                                    .scorers
-                                    .iter()
-                                    .filter_map(|s| s.score(&ctx))
-                                    .filter(|s| s.goal == *goal && s.class >= best.class)
-                                    .map(|s| s.score)
-                                    .fold(f32::NEG_INFINITY, f32::max);
-                                if cur_score.is_finite()
-                                    && best.score - cur_score < GOAL_CHALLENGER_MARGIN
-                                {
-                                    let cur_reason = reason_opt
-                                        .as_deref()
-                                        .map(|r| r.0)
-                                        .unwrap_or("");
-                                    (*goal, cur_reason)
-                                } else {
-                                    (best.goal, best.reason)
-                                }
-                            }
-                        }
+                    let (best_opt, incumbent_score) = scorer_inputs
+                        .registry
+                        .best_with_incumbent(&ctx, Some(*goal));
+                    match best_opt {
                         None => (gather_goal, gather_reason),
+                        Some(best) if best.goal == *goal => (best.goal, best.reason),
+                        Some(best)
+                            if incumbent_score
+                                .map_or(false, |s| best.score - s < GOAL_CHALLENGER_MARGIN) =>
+                        {
+                            let cur_reason = reason_opt
+                                .as_deref()
+                                .map(|r| r.0)
+                                .unwrap_or("");
+                            (*goal, cur_reason)
+                        }
+                        Some(best) => (best.goal, best.reason),
                     }
                 } else {
                     legacy_pick()
@@ -1220,7 +1218,6 @@ pub fn earnincome_goal_override_system(
             faction_member: member,
             faction,
             board: &board,
-            personality: Personality::default(),
             is_starving: false,
             faction_has_food: false,
             can_return_camp: false,
@@ -1231,7 +1228,7 @@ pub fn earnincome_goal_override_system(
             has_personal_build_site: false,
             should_craft: false,
             time_of_day_bonus: 0.0,
-            age_ticks: 3600 * 365 * 5,
+            age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
         };
         let Some(best) = scorer_registry.best(&ctx) else {
             continue;

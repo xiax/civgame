@@ -32,7 +32,7 @@ use bevy::prelude::*;
 
 use crate::economy::agent::EconomicAgent;
 use crate::simulation::faction::{FactionData, FactionMember};
-use crate::simulation::goals::{AgentGoal, Personality};
+use crate::simulation::goals::AgentGoal;
 use crate::simulation::jobs::{JobBoard, JobKind};
 use crate::simulation::needs::Needs;
 use crate::simulation::person::Profession;
@@ -145,7 +145,6 @@ pub struct GoalScoringContext<'a> {
     // ── Phase B (behavioural richness): precomputed gates ──────────
     // `goal_update_system` already derives these per agent each tick;
     // hoisting them into the context lets scorers stay pure-read.
-    pub personality: Personality,
     pub is_starving: bool,
     pub faction_has_food: bool,
     pub can_return_camp: bool,
@@ -188,9 +187,17 @@ pub trait GoalScorer: Send + Sync + 'static {
 
 /// Resource: the live list of scorers. Built once at
 /// `SimulationPlugin::build`; queried per-agent per-tick.
+///
+/// `opportunistic_indices` is a cached projection of
+/// `scorers.iter().enumerate().filter(|s| s.opportunistic())` —
+/// `opportunistic_interrupt_system` runs every 20 ticks across every
+/// walking agent and would otherwise burn ~80% of its scorer walk
+/// rejecting non-opportunistic candidates. Rebuild via
+/// `rebuild_opportunistic_indices()` after mutating `scorers`.
 #[derive(Resource, Default)]
 pub struct GoalScorerRegistry {
     pub scorers: Vec<Box<dyn GoalScorer>>,
+    pub opportunistic_indices: Vec<usize>,
 }
 
 impl GoalScorerRegistry {
@@ -198,24 +205,62 @@ impl GoalScorerRegistry {
     /// every scorer declines (e.g. all gates failed). Ties broken by
     /// `class` first (higher wins), then `score` within a class.
     pub fn best(&self, ctx: &GoalScoringContext) -> Option<GoalScore> {
+        self.best_with_incumbent(ctx, None).0
+    }
+
+    /// Single-pass `best` + incumbent-score lookup. When
+    /// `current_goal == Some(g)`, also returns the highest-class /
+    /// highest-score `GoalScore` whose `goal == g`, capped to
+    /// `class >= best.class` so the caller can run a hysteresis
+    /// comparison without a second scorer walk. Eliminates the
+    /// double-scoring `goal_update_system::Scored` did when the new
+    /// pick differed from the agent's current goal.
+    pub fn best_with_incumbent(
+        &self,
+        ctx: &GoalScoringContext,
+        current_goal: Option<AgentGoal>,
+    ) -> (Option<GoalScore>, Option<f32>) {
         let mut best: Option<GoalScore> = None;
+        let mut incumbent: Option<GoalScore> = None;
         for scorer in &self.scorers {
             let Some(candidate) = scorer.score(ctx) else {
                 continue;
             };
-            let take = match best {
-                None => true,
-                Some(cur) => match candidate.class.cmp(&cur.class) {
-                    std::cmp::Ordering::Greater => true,
-                    std::cmp::Ordering::Less => false,
-                    std::cmp::Ordering::Equal => candidate.score > cur.score,
-                },
-            };
-            if take {
+            if best.map_or(true, |b| Self::beats(candidate, b)) {
                 best = Some(candidate);
             }
+            if current_goal == Some(candidate.goal)
+                && incumbent.map_or(true, |i| Self::beats(candidate, i))
+            {
+                incumbent = Some(candidate);
+            }
         }
-        best
+        let incumbent_score = match (best, incumbent) {
+            (Some(b), Some(i)) if i.class >= b.class => Some(i.score),
+            _ => None,
+        };
+        (best, incumbent_score)
+    }
+
+    /// Strict greater-than under the (class, score) lex order used by
+    /// `best`. Pulled out so `best_with_incumbent`'s two argmax tracks
+    /// share one comparison.
+    #[inline]
+    fn beats(candidate: GoalScore, current: GoalScore) -> bool {
+        match candidate.class.cmp(&current.class) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => candidate.score > current.score,
+        }
+    }
+
+    pub fn rebuild_opportunistic_indices(&mut self) {
+        self.opportunistic_indices = self
+            .scorers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.opportunistic().then_some(i))
+            .collect();
     }
 }
 
@@ -589,6 +634,7 @@ pub fn register_default_scorers(registry: &mut GoalScorerRegistry) {
     registry.scorers.push(Box::new(PersonalBuildScorer));
     registry.scorers.push(Box::new(CraftDemandScorer));
     registry.scorers.push(Box::new(StockpileScorer));
+    registry.rebuild_opportunistic_indices();
 }
 
 #[cfg(test)]
@@ -682,7 +728,6 @@ mod tests {
             faction_member: &member,
             faction,
             board: &board,
-            personality: Personality::default(),
             is_starving: false,
             faction_has_food: false,
             can_return_camp: false,
@@ -723,7 +768,6 @@ mod tests {
             faction_member: member,
             faction,
             board,
-            personality: Personality::default(),
             is_starving: false,
             faction_has_food: false,
             can_return_camp: false,
@@ -734,7 +778,7 @@ mod tests {
             has_personal_build_site: false,
             should_craft: false,
             time_of_day_bonus: 0.0,
-            age_ticks: 3600 * 365 * 5, // adult
+            age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
         }
     }
 

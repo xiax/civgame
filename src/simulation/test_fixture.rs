@@ -12365,7 +12365,6 @@ mod wage_aware_phase0_phase1 {
             faction_member: &member,
             faction,
             board,
-            personality: crate::simulation::goals::Personality::default(),
             is_starving: false,
             faction_has_food: false,
             can_return_camp: false,
@@ -12376,7 +12375,7 @@ mod wage_aware_phase0_phase1 {
             has_personal_build_site: false,
             should_craft: false,
             time_of_day_bonus: 0.0,
-            age_ticks: 3600 * 365 * 5,
+            age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
         };
         let lo = scorer
             .score(&make_ctx(Disposition {

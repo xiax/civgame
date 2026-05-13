@@ -29,6 +29,7 @@ pub mod land;
 pub mod lifecycle;
 pub mod line_of_sight;
 pub mod lod;
+pub mod medicine;
 pub mod memory;
 pub mod military;
 pub mod mood;
@@ -547,6 +548,7 @@ impl Plugin for SimulationPlugin {
                     reproduction::cosleep_observation_system
                         .after(movement::sync_indexed_after_move_system),
                     tasks::play_system.after(movement::sync_indexed_after_move_system),
+                    medicine::injury_tracking_system.after(combat::combat_system),
                 )
                     .in_set(SimulationSet::Sequential),
             )

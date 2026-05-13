@@ -99,16 +99,35 @@ pub fn material_deficit_utility(faction_deficit: u32, prof_affinity: f32) -> f32
 /// Age-based youth falloff for play / curiosity. Young agents (≤ 1
 /// in-game year) get the full multiplier; falls off to 0.4 by adulthood
 /// (~5 years). Tuned to stay above zero so adults still play, just less.
-///
-/// `TICKS_PER_DAY = 3600`, `TICKS_PER_YEAR ≈ 3600 × 365`. We avoid
-/// pulling that constant in here to keep the module dependency-free —
-/// callers pass `age_ticks` and this curve handles the rest.
 #[inline]
 fn age_falloff(age_ticks: u64) -> f32 {
     const TICKS_PER_YEAR: u64 = 3600 * 365;
     let years = age_ticks as f32 / TICKS_PER_YEAR as f32;
     let t = smoothstep(years, 1.0, 5.0);
     1.0 - 0.6 * t
+}
+
+/// Adult-agent placeholder for `play_utility`'s `age_ticks` parameter
+/// until the simulation grows a real per-person age component. Five
+/// in-game years lands fully past the `age_falloff` knee at one year,
+/// so every Person registered with this constant sees the adult
+/// (`0.4×`) youth multiplier.
+pub const ADULT_AGE_TICKS_PLACEHOLDER: u64 = 3600 * 365 * 5;
+
+/// Map the world calendar's `TimePhase` to the `[0.0, 1.0]` bonus
+/// `sleep_utility` expects in its second argument — `Day` 0.0,
+/// `Dawn` 0.2, `Dusk` 0.6, `Night` 1.0. Used by `goal_update_system`
+/// + `opportunistic_interrupt_system`; defined here so the mapping
+/// has a single source of truth.
+#[inline]
+pub fn time_of_day_bonus(phase: crate::world::seasons::TimePhase) -> f32 {
+    use crate::world::seasons::TimePhase;
+    match phase {
+        TimePhase::Day => 0.0,
+        TimePhase::Dawn => 0.2,
+        TimePhase::Dusk => 0.6,
+        TimePhase::Night => 1.0,
+    }
 }
 
 /// Helper: convert a Disposition axis `u8` into a multiplier in
