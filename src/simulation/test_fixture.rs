@@ -146,6 +146,15 @@ impl TestSim {
         app.add_plugins(crate::economy::EconomyPlugin);
         app.add_plugins(crate::simulation::SimulationPlugin);
 
+        // Phase F-1: production default is `Scored`. Tests pre-date
+        // the scorer pipeline and pin Legacy semantics (specific
+        // goal flips at specific need thresholds, specific dispatcher
+        // outputs at known ticks). Override the resource back to
+        // Legacy so existing fixtures keep their behaviour contract;
+        // dedicated Scored-mode tests can flip per-test via
+        // `sim.app.world_mut().insert_resource(...)`.
+        app.insert_resource(crate::simulation::utility_curves::AgentDecisionMode::Legacy);
+
         // Spawn a camera at world origin. Without it,
         // `update_lod_levels_system` reports every agent as Dormant
         // (cam_dist = i32::MAX) and every task executor skips them.

@@ -125,15 +125,22 @@ pub fn disposition_lift(axis: u8, max_lift: f32) -> f32 {
 // touching `goal_update_system` yet.
 
 /// Runtime switch between the legacy imperative cascade and the
-/// scorer-first pipeline. Defaults to `Legacy` so Phase A is a no-op at
-/// runtime. Phase B's `goal_update_system` reads this to decide whether
-/// to call into `GoalScorerRegistry::best` for the need-driven branch.
+/// scorer-first pipeline. **Defaults to `Scored`** as of Phase F-1 —
+/// the behavioural-richness pipeline is the live path; `Legacy` is
+/// kept as a fallback for A/B comparison via the debug panel and as
+/// an escape hatch if a Scored regression is discovered. Full Legacy
+/// removal stays deferred (Phase F-2) until in-game testing confirms
+/// no regression.
 #[derive(bevy::prelude::Resource, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AgentDecisionMode {
-    /// Imperative cascade in `goal_update_system::run_legacy_cascade`.
-    #[default]
+    /// Imperative cascade in `goal_update_system`'s `legacy_pick`
+    /// closure. Kept as fallback for A/B comparison + regression
+    /// escape hatch; not the default since Phase F-1.
     Legacy,
-    /// Scorer-first pipeline driven by `GoalScorerRegistry`.
+    /// Scorer-first pipeline driven by `GoalScorerRegistry` with
+    /// `GOAL_CHALLENGER_MARGIN` hysteresis and Phase D's
+    /// opportunistic en-route interrupts. Default since Phase F-1.
+    #[default]
     Scored,
 }
 
@@ -262,7 +269,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_decision_mode_default_is_legacy() {
-        assert_eq!(AgentDecisionMode::default(), AgentDecisionMode::Legacy);
+    fn agent_decision_mode_default_is_scored() {
+        // Phase F-1: default flipped from Legacy to Scored once the
+        // scorer pipeline was proven against calibration tests. The
+        // test fixture (`TestSim::new`) overrides back to Legacy so
+        // tests pinned to legacy semantics keep their contract.
+        assert_eq!(AgentDecisionMode::default(), AgentDecisionMode::Scored);
     }
 }

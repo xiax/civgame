@@ -99,6 +99,8 @@ pub fn debug_panel_system(
     terraform_map: Res<TerraformMap>,
     terraform_sites: Query<&TerraformSite>,
     mut decision_mode: ResMut<crate::simulation::utility_curves::AgentDecisionMode>,
+    interrupt_stats: Res<crate::simulation::opportunistic::OpportunisticInterruptStats>,
+    sim_clock: Res<crate::simulation::SimClock>,
 ) {
     if !state.open {
         return;
@@ -121,11 +123,11 @@ pub fn debug_panel_system(
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // ── AI Decision Mode ──────────────────────────────────────────
-                // Phase B/C toggle: Legacy = imperative cascade in
-                // `goal_update_system`; Scored = utility-curve scorers
-                // in `goal_scorers.rs` with Disposition-driven
-                // divergence. Defaults to Legacy so behaviour is
-                // unchanged at startup; flip here to A/B compare.
+                // Phase B/C toggle, default-flipped in Phase F-1: Scored
+                // = utility-curve scorers in `goal_scorers.rs` with
+                // Disposition-driven divergence + Phase D opportunistic
+                // en-route interrupts; Legacy = imperative cascade in
+                // `goal_update_system` (kept as A/B-comparison fallback).
                 ui.horizontal(|ui| {
                     use crate::simulation::utility_curves::AgentDecisionMode;
                     let (label, fill) = match *decision_mode {
@@ -154,6 +156,26 @@ pub fn debug_panel_system(
                         .small(),
                     );
                 });
+                // Phase D readout: opportunistic-interrupt counter.
+                // `total_fired` accumulates over the session;
+                // `last_tick` shows the most recent flip's tick so
+                // operators can spot whether interrupts are firing at
+                // all under the active mode.
+                let stats = *interrupt_stats;
+                let last_ago = sim_clock.tick.saturating_sub(stats.last_tick);
+                let last_txt = if stats.total_fired == 0 {
+                    "never".to_string()
+                } else {
+                    format!("{} ticks ago (tick {})", last_ago, stats.last_tick)
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Opportunistic interrupts: {} total · last {}",
+                        stats.total_fired, last_txt
+                    ))
+                    .small()
+                    .color(egui::Color32::from_gray(150)),
+                );
                 ui.add_space(4.0);
                 ui.separator();
                 ui.add_space(4.0);
