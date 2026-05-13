@@ -12049,6 +12049,98 @@ mod wage_aware_phase0_phase1 {
         );
     }
 
+    /// Regression: chief postings are funded at `CHIEF_MARGIN = 0.5`
+    /// of market value, so a chief Stockpile{wood} posting at
+    /// `reward = 5.0` would lose to a household contract at
+    /// `reward = 10.0` on raw `expected_reward` alone, leaving chief
+    /// postings unclaimed in Mixed/Market mode. The `priority_bonus`
+    /// term on the paid U_bid path (chief priority 200 vs household
+    /// 180) restores competitive parity for equivalent-distance
+    /// candidates.
+    #[test]
+    fn chief_priority_bonus_keeps_chief_postings_competitive() {
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass,
+        };
+
+        let mut sim = TestSim::new(0xBEEF_CAFE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let worker = sim.spawn_person(fid, (0, 0), |b| {
+            b.profession(Profession::None);
+        });
+
+        let catalog = sim
+            .app
+            .world()
+            .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+            .clone();
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let faction = registry.factions.get_mut(&fid).unwrap();
+            crate::economy::policy::apply_preset(
+                &mut faction.economic_policy,
+                crate::game_state::EconomyPreset::Market,
+                &catalog,
+            );
+        }
+
+        // Both at the same tile so distance is 0; chief carries higher
+        // priority (200 vs 100). At equal `reward = 5.0`, the chief's
+        // `priority_bonus = 2.0` beats household's `priority_bonus = 1.0`.
+        {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let postings = board.faction_postings_mut(fid);
+            postings.push(JobPosting {
+                id: 8001,
+                faction_id: fid,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Calories {
+                    deposited: 0,
+                    target: 100,
+                },
+                claimants: Vec::new(),
+                priority: 200,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                settlement_id: None,
+                reward: 5.0,
+            });
+            postings.push(JobPosting {
+                id: 8002,
+                faction_id: fid,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Calories {
+                    deposited: 0,
+                    target: 100,
+                },
+                claimants: Vec::new(),
+                priority: 100,
+                source: JobSource::Chief, // poster_class differentiates
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::HouseholdHead,
+                settlement_id: None,
+                reward: 5.0,
+            });
+        }
+
+        sim.tick_n(3);
+
+        let claim = sim
+            .app
+            .world()
+            .get::<JobClaim>(worker)
+            .expect("worker must claim one of the two postings");
+        assert_eq!(
+            claim.job_id, 8001,
+            "chief posting (priority 200) must outscore household (priority 100) at equal reward",
+        );
+    }
+
     /// Regression guard: workers still claim chief postings after the
     /// Phase 6 EarnIncome override + GoalScorer infrastructure lands.
     /// Subsistence faction (empty `economic_policy`) — chief posts

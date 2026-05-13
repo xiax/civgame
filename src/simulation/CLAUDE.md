@@ -387,7 +387,7 @@ Two additive needs on `Needs`: `esteem: f32` (Tier 4) and `self_actualization: f
 
 `job_claim_system` (`jobs.rs`) branches on `posting.reward`:
 
-- **Paid (`reward > 0.0`):** `U_bid = E(R) - C_action - C_opportunity` where `E(R) = posting.reward * wealth_modifier(agent.currency)` (`wealth_modifier(c) = 1.0 + 0.5 / (c + 50)`, bounded at 1.0); `C_action = euclidean(agent_tile, work_tile) * BID_DIST_DISCOUNT`; `C_opportunity = 0.0` (stub).
+- **Paid (`reward > 0.0`):** `U_bid = E(R) + priority_bonus + affinity_bonus - C_action - C_opportunity` where `E(R) = posting.reward * wealth_modifier(agent.currency) * disposition.earn_income_multiplier()` (Phase 6: `disposition` multiplier `= 1.0 + entrepreneurial/255` from the `Disposition` Component — falls back to `1.5` (the median-128 baseline) when the component is missing); `wealth_modifier(c) = 1.0 + 0.5 / (c + 50)` bounded at 1.0; `priority_bonus = posting.priority * 0.01` (Phase 6 regression fix: chief postings post at `priority = 200`, household at `180`, individual at `100`, so chief gets a +2.0 cushion that prevents `CHIEF_MARGIN = 0.5`-half-value chief postings from being strictly outcompeted by full-value private contracts at equal reward); `C_action = euclidean(agent_tile, work_tile) * BID_DIST_DISCOUNT`; `C_opportunity = 0.0` (stub).
 - **Unpaid (`reward == 0.0`, chief / legacy):** legacy `priority + skill + bias - distance`.
 
 ### Trader profession (autonomous arbitrage)

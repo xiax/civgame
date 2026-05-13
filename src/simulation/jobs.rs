@@ -3091,6 +3091,12 @@ pub fn job_claim_system(
             Option<&crate::simulation::knowledge::PersonKnowledge>,
             // Pluralist Economy R9: needed by `U_bid`'s wealth_modifier.
             &crate::economy::agent::EconomicAgent,
+            // Phase 6 of wage-aware-labor-market-v2: per-agent
+            // entrepreneurial multiplier on `expected_reward`. Optional
+            // so agents spawned before Phase 6 don't crash the claim
+            // pass; missing component falls back to the neutral 1.5×
+            // median (matching `Disposition::default()`).
+            Option<&crate::simulation::goal_scorers::Disposition>,
         ),
         Without<JobClaim>,
     >,
@@ -3126,6 +3132,7 @@ pub fn job_claim_system(
         transform,
         knowledge_opt,
         agent_econ,
+        disposition_opt,
     ) in workers.iter()
     {
         if *lod == LodLevel::Dormant {
@@ -3218,7 +3225,16 @@ pub fn job_claim_system(
             // are scored purely on reward + walk cost.
             let score = if p.reward > 0.0 {
                 let wealth_mod = wealth_modifier(agent_econ.currency);
-                let expected_reward = p.reward * wealth_mod;
+                // Phase 6: entrepreneurial disposition acts as a
+                // per-agent multiplier on `expected_reward`. Default
+                // (median 128) → 1.5×; max-entrepreneurial → 2.0×;
+                // cautious agents → 1.0×. Pulls income-seeking agents
+                // toward paid postings without forcing every agent
+                // into the same scoring band.
+                let disp_mod = disposition_opt
+                    .map(|d| d.earn_income_multiplier())
+                    .unwrap_or(1.5);
+                let expected_reward = p.reward * wealth_mod * disp_mod;
                 let c_action = dist * BID_DIST_DISCOUNT;
                 let c_opportunity = 0.0_f32; // R9 stub; R10+ wires this
                 // Phase 5a: Crafter claiming a Craft posting outscores
@@ -3233,7 +3249,23 @@ pub fn job_claim_system(
                 } else {
                     0.0
                 };
-                expected_reward + affinity_bonus - c_action - c_opportunity
+                // Phase 4a/6 regression guard: paid chief postings
+                // (`reward = trade_base_value × qty × CHIEF_MARGIN
+                // (0.5)`) carry only half the market value of an
+                // equivalent household / individual contract — without
+                // a priority bias, private postings would consistently
+                // outscore them on `expected_reward` alone and chief
+                // postings sit unclaimed. Chief postings post at
+                // `priority = 200` vs. household `180` and individual
+                // `100-160`; mirroring the unpaid path's `priority
+                // × 0.01` term to the paid path lifts chief postings
+                // by ~1.0 currency unit over household contracts,
+                // which restores competitive parity when chief wage
+                // ≈ household reward.
+                let priority_bonus = (p.priority as f32) * 0.01;
+                expected_reward + affinity_bonus + priority_bonus
+                    - c_action
+                    - c_opportunity
             } else {
                 (p.priority as f32) * 0.01
                     + skill_norm
