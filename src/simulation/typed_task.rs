@@ -66,6 +66,9 @@ pub enum WalkReason {
     /// `nomad_migration_arrival_system`, which removes the
     /// `MigrationTarget` component and drops the agent back to Idle.
     Migration,
+    /// Heal-3: patient walking to the nearest same-faction Healer to
+    /// receive care, or Healer walking to a patient.
+    SeekCare,
 }
 
 /// Selector for `Task::WithdrawGood`: which item on the storage tile satisfies
@@ -436,6 +439,12 @@ pub enum Task {
         kind: crate::simulation::construction::BuildSiteKind,
         anchor: (i32, i32),
     },
+    /// Heal-3: Healer walks adjacent to `patient` and treats the
+    /// patient's `Injury` over time. Decrements `Injury.severity`
+    /// each tick while in range; despawns the `Injury` component
+    /// when severity hits zero. Patient-side has no typed task —
+    /// patients use `Task::WalkTo` to reach the Healer.
+    Heal { patient: bevy::prelude::Entity },
 }
 
 impl Default for Task {

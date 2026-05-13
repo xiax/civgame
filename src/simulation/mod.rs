@@ -383,6 +383,12 @@ impl Plugin for SimulationPlugin {
                 (
                     htn::bureaucrat_admin_dispatch_system
                         .after(htn::htn_combat_faction_dispatch_system),
+                    // Heal-3 (heal-pipeline): Healer-side dispatcher.
+                    // Ordered after combat so combat-driven Heal events
+                    // settle first; idle + UNEMPLOYED gate ensures only
+                    // newly-tasked Healers are reached.
+                    medicine::htn_provide_care_dispatch_system
+                        .after(htn::htn_combat_faction_dispatch_system),
                     // Pluralist Economy R10 follow-on: trader route
                     // dispatcher. Same ParallelB shape as bureaucrat
                     // admin (idle + UNEMPLOYED gate + Lead routing);
@@ -549,6 +555,11 @@ impl Plugin for SimulationPlugin {
                         .after(movement::sync_indexed_after_move_system),
                     tasks::play_system.after(movement::sync_indexed_after_move_system),
                     medicine::injury_tracking_system.after(combat::combat_system),
+                    // Heal-3 executor: Healer adjacent to patient
+                    // decrements `Injury.severity` per tick. Runs
+                    // after combat so freshly-applied damage is
+                    // already reflected on the patient.
+                    medicine::heal_task_system.after(combat::combat_system),
                 )
                     .in_set(SimulationSet::Sequential),
             )

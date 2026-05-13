@@ -98,6 +98,13 @@ pub enum TaskKind {
     /// good from a co-located `GroundItem` (or inventory), and spawns
     /// the structure of the named `BuildSiteKind`.
     PitchStructureAt = 47,
+    /// Heal-3: Healer walks adjacent to a target patient carrying an
+    /// `Injury` and ticks down the patient's `Injury.severity` while
+    /// in range. Grants Medicine XP to the Healer. Patient-side
+    /// `AgentGoal::SeekCare` carries no typed task — patients use
+    /// `Task::WalkTo` to reach the nearest same-faction Healer; the
+    /// transfer fires from the Healer's `Task::Heal`.
+    Heal = 48,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -151,6 +158,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::UnpitchStructure as u16 => "Packing Camp",
         x if x == TaskKind::UnloadCampCargo as u16 => "Unloading Cargo",
         x if x == TaskKind::PitchStructureAt as u16 => "Pitching Structure",
+        x if x == TaskKind::Heal as u16 => "Healing",
         _ => "Unemployed",
     }
 }
@@ -220,6 +228,7 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::Butcher as u16
         || task_id == TaskKind::UnpitchStructure as u16
         || task_id == TaskKind::PitchStructureAt as u16
+        || task_id == TaskKind::Heal as u16
 }
 
 /// Tasks that count as productive labor — these drain willpower over time
