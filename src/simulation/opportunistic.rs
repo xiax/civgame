@@ -8,9 +8,8 @@
 //! method is not `MF_UNINTERRUPTIBLE`, the current goal is not
 //! Survival/Safety, and no `JobClaim` owns the agent.
 //!
-//! Only fires in `AgentDecisionMode::Scored`. The post-interrupt
-//! `GoalCooldown` push on the *prior* goal prevents ping-pong back
-//! within `OPPORTUNISTIC_COOLDOWN_TICKS`.
+//! The post-interrupt `GoalCooldown` push on the *prior* goal
+//! prevents ping-pong back within `OPPORTUNISTIC_COOLDOWN_TICKS`.
 //!
 //! Today only `SocialScorer` and `PlayScorer` opt in via
 //! `GoalScorer::opportunistic()`. Future scorers (`HealSeekerScorer`
@@ -32,7 +31,6 @@ use crate::simulation::person::{Drafted, PersonAI, Profession};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::skills::Skills;
 use crate::simulation::typed_task::{ActionQueue, Task};
-use crate::simulation::utility_curves::AgentDecisionMode;
 use crate::world::seasons::Calendar;
 use crate::economy::agent::EconomicAgent;
 
@@ -89,7 +87,6 @@ pub fn is_policy_uninterruptible(goal: AgentGoal) -> bool {
 #[derive(bevy::ecs::system::SystemParam)]
 pub struct OpportunisticInputs<'w, 's> {
     pub clock: Res<'w, SimClock>,
-    pub decision_mode: Res<'w, AgentDecisionMode>,
     pub registry: Res<'w, crate::simulation::faction::FactionRegistry>,
     pub calendar: Res<'w, Calendar>,
     pub method_registry: Res<'w, MethodRegistry>,
@@ -122,9 +119,6 @@ pub fn opportunistic_interrupt_system(
         Without<Drafted>,
     >,
 ) {
-    if *inputs.decision_mode != AgentDecisionMode::Scored {
-        return;
-    }
     if inputs.clock.tick % OPPORTUNISTIC_CADENCE != 0 {
         return;
     }

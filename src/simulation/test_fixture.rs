@@ -146,15 +146,6 @@ impl TestSim {
         app.add_plugins(crate::economy::EconomyPlugin);
         app.add_plugins(crate::simulation::SimulationPlugin);
 
-        // Phase F-1: production default is `Scored`. Tests pre-date
-        // the scorer pipeline and pin Legacy semantics (specific
-        // goal flips at specific need thresholds, specific dispatcher
-        // outputs at known ticks). Override the resource back to
-        // Legacy so existing fixtures keep their behaviour contract;
-        // dedicated Scored-mode tests can flip per-test via
-        // `sim.app.world_mut().insert_resource(...)`.
-        app.insert_resource(crate::simulation::utility_curves::AgentDecisionMode::Legacy);
-
         // Spawn a camera at world origin. Without it,
         // `update_lod_levels_system` reports every agent as Dormant
         // (cam_dist = i32::MAX) and every task executor skips them.
@@ -7254,6 +7245,12 @@ mod baseline_behaviour {
         let storage_tile = (4, 4);
         sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
         sim.spawn_ground_item(storage_tile, crate::economy::core_ids::wood(), 5);
+        // Phase F-2: in Scored mode `CraftDemandScorer` (Subsistence)
+        // would outrank `PersonalBuildScorer` (Esteem) when
+        // `should_craft` fires. Seed enough Tools (1 ≥ member_count/3
+        // with 2 members) so `should_craft` returns false and the
+        // Esteem-class personal build wins the scorer pass.
+        sim.spawn_ground_item(storage_tile, crate::economy::core_ids::tools(), 4);
 
         // Spawn a chief at (-5, -5) and explicitly mark them as FactionChief
         // so `goal_update_system`'s chief override doesn't pin our test

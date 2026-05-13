@@ -347,9 +347,10 @@ impl GoalScorer for EarnIncomeScorer {
 // ─── Phase B scorers (behavioural richness) ────────────────────────
 //
 // These migrate the need-driven branches of `goal_update_system`'s
-// imperative cascade onto continuous utility curves. Only consulted
-// when `AgentDecisionMode::Scored` is active; in `Legacy` mode the
-// cascade runs unchanged.
+// imperative cascade onto continuous utility curves. As of Phase F-2
+// the scorer pipeline is the only path through `goal_update_system`;
+// the historical Legacy cascade survives only as a SOLO / faction-
+// lookup-miss fallback (`fallback_pick` inside the system).
 //
 // Per-scorer Disposition multipliers (max lifts):
 const SOCIAL_GREG_LIFT: f32 = 1.5;
@@ -690,9 +691,8 @@ impl GoalScorer for ProvideCareScorer {
 
 /// Convenience: install the default scorer set on a `GoalScorerRegistry`.
 /// Phase 6's `EarnIncomeScorer` plus Phase B's behavioural-richness
-/// scorers. Consumed by `goal_update_system` when
-/// `AgentDecisionMode::Scored` is active and by
-/// `earnincome_goal_override_system` regardless of mode.
+/// scorers. Consumed by `goal_update_system` (the only goal-selection
+/// path as of Phase F-2) and by `earnincome_goal_override_system`.
 pub fn register_default_scorers(registry: &mut GoalScorerRegistry) {
     registry.scorers.push(Box::new(EarnIncomeScorer));
     registry.scorers.push(Box::new(SurvivalHungerScorer));

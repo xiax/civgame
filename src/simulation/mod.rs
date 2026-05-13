@@ -149,7 +149,6 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::CampfireMap::default())
             .insert_resource(construction::DoorMap::default())
             .insert_resource(capital::WorkshopOwnership::default())
-            .insert_resource(utility_curves::AgentDecisionMode::default())
             .insert_resource(opportunistic::OpportunisticInterruptStats::default())
             .insert_resource(construction::WorkbenchMap::default())
             .insert_resource(construction::LoomMap::default())
@@ -292,8 +291,7 @@ impl Plugin for SimulationPlugin {
                     // set the agent's authoritative goal but before
                     // record_abandoned_method_system so any opportunistic
                     // flip's goal change feeds Abandoned outcomes into
-                    // MethodHistory in the same tick. Gated on
-                    // AgentDecisionMode::Scored; no-op in Legacy.
+                    // MethodHistory in the same tick.
                     opportunistic::opportunistic_interrupt_system
                         .after(goals::goal_update_system)
                         .before(goals::record_abandoned_method_system),

@@ -64,12 +64,13 @@ pub struct StorageReachability<'w> {
     pub storage_tile_map: Res<'w, StorageTileMap>,
 }
 
-/// Phase B: bundles the scorer-pipeline inputs to keep
-/// `goal_update_system` under Bevy's 16-param ceiling. `mode` decides
-/// which path runs; the rest are read only when `Scored` is active.
+/// Bundles the scorer-pipeline inputs to keep `goal_update_system`
+/// under Bevy's 16-param ceiling. The scorer pipeline is the only
+/// goal-selection path as of Phase F-2 (Legacy mode removed); the
+/// imperative cascade survives only as the SOLO / faction-miss
+/// fallback inside the system.
 #[derive(SystemParam)]
 pub struct ScorerInputs<'w, 's> {
-    pub mode: Res<'w, crate::simulation::utility_curves::AgentDecisionMode>,
     pub registry: Res<'w, crate::simulation::goal_scorers::GoalScorerRegistry>,
     pub board: Res<'w, crate::simulation::jobs::JobBoard>,
     pub disposition_q: Query<'w, 's, &'static crate::simulation::goal_scorers::Disposition>,
@@ -462,10 +463,10 @@ pub fn goal_update_system(
     storage: StorageReachability,
     validation: GoalValidationQueries,
     bp_map: Res<BlueprintMap>,
-    // Phase B: scorer pipeline. `AgentDecisionMode::Scored` routes the
-    // need-driven cascade through `GoalScorerRegistry`; `Legacy` (the
-    // default) keeps the imperative if-else chain untouched. Bundled
-    // into one SystemParam to stay under Bevy's 16-param ceiling.
+    // Scorer pipeline inputs bundled into one SystemParam to stay
+    // under Bevy's 16-param ceiling. Phase F-2 removed the Legacy
+    // imperative-cascade mode; the cascade body survives only as the
+    // SOLO / faction-lookup-miss fallback (`fallback_pick` below).
     scorer_inputs: ScorerInputs,
     mut query: Query<
         (
@@ -921,7 +922,11 @@ pub fn goal_update_system(
             clock.tick,
         );
 
-        let legacy_pick = || -> (AgentGoal, &'static str) {
+        // Fallback used when the scorer pipeline cannot run (SOLO
+        // faction lookup miss). Mirrors the historical imperative
+        // cascade so SOLO / synthetic agents retain sensible
+        // behaviour without a populated `FactionData`.
+        let fallback_pick = || -> (AgentGoal, &'static str) {
             if is_starving && faction_has_food {
                 (AgentGoal::Survive, "Starving (Faction has food)")
             } else if needs.hunger > HUNGER_SURVIVE_DESPERATE && agent.total_food() == 0 {
@@ -951,86 +956,76 @@ pub fn goal_update_system(
             }
         };
 
-        let (new_goal, reason) = match *scorer_inputs.mode {
-            crate::simulation::utility_curves::AgentDecisionMode::Legacy => legacy_pick(),
-            crate::simulation::utility_curves::AgentDecisionMode::Scored => {
-                // Build the scoring context from precomputed gates +
-                // per-agent reads. Faction lookup may fail (SOLO etc.)
-                // — fall back to legacy when it does.
-                if let Some(faction_data) = registry.factions.get(&member.faction_id) {
-                    let agent_tile = (
-                        (transform.translation.x / TILE_SIZE).floor() as i32,
-                        (transform.translation.y / TILE_SIZE).floor() as i32,
-                    );
-                    let disposition = scorer_inputs
-                        .disposition_q
-                        .get(entity)
-                        .copied()
-                        .unwrap_or_default();
-                    let skills_default = crate::simulation::skills::Skills::default();
-                    let skills_ref = scorer_inputs
-                        .skills_q
-                        .get(entity)
-                        .unwrap_or(&skills_default);
-                    let profession = scorer_inputs
-                        .profession_q
-                        .get(entity)
-                        .copied()
-                        .unwrap_or(crate::simulation::person::Profession::None);
-                    let ctx = crate::simulation::goal_scorers::GoalScoringContext {
-                        agent: entity,
-                        agent_tile,
-                        now: clock.tick,
-                        needs,
-                        profession,
-                        skills: skills_ref,
-                        disposition,
-                        economic_agent: agent,
-                        faction_member: member,
-                        faction: faction_data,
-                        board: &scorer_inputs.board,
-                        is_starving,
-                        faction_has_food,
-                        can_return_camp,
-                        prioritize_food,
-                        fallback_gather: gather_goal,
-                        fallback_gather_reason: gather_reason,
-                        has_horse_taming,
-                        has_personal_build_site,
-                        should_craft: should_craft_now,
-                        injury: scorer_inputs.injury_q.get(entity).ok().copied(),
-                        faction_has_injured: faction_has_injured
-                            .contains(&member.faction_id),
-                        time_of_day_bonus,
-                        age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
-                    };
-                    // Hysteresis margin damps single-tick flips around
-                    // utility crossover; Survival/Subsistence still
-                    // preempt lower classes via the class ordering in
-                    // `GoalScorerRegistry::best`.
-                    const GOAL_CHALLENGER_MARGIN: f32 = 0.10;
-                    let (best_opt, incumbent_score) = scorer_inputs
-                        .registry
-                        .best_with_incumbent(&ctx, Some(*goal));
-                    match best_opt {
-                        None => (gather_goal, gather_reason),
-                        Some(best) if best.goal == *goal => (best.goal, best.reason),
-                        Some(best)
-                            if incumbent_score
-                                .map_or(false, |s| best.score - s < GOAL_CHALLENGER_MARGIN) =>
-                        {
-                            let cur_reason = reason_opt
-                                .as_deref()
-                                .map(|r| r.0)
-                                .unwrap_or("");
-                            (*goal, cur_reason)
-                        }
-                        Some(best) => (best.goal, best.reason),
-                    }
-                } else {
-                    legacy_pick()
+        let (new_goal, reason) = if let Some(faction_data) =
+            registry.factions.get(&member.faction_id)
+        {
+            let agent_tile = (
+                (transform.translation.x / TILE_SIZE).floor() as i32,
+                (transform.translation.y / TILE_SIZE).floor() as i32,
+            );
+            let disposition = scorer_inputs
+                .disposition_q
+                .get(entity)
+                .copied()
+                .unwrap_or_default();
+            let skills_default = crate::simulation::skills::Skills::default();
+            let skills_ref = scorer_inputs
+                .skills_q
+                .get(entity)
+                .unwrap_or(&skills_default);
+            let profession = scorer_inputs
+                .profession_q
+                .get(entity)
+                .copied()
+                .unwrap_or(crate::simulation::person::Profession::None);
+            let ctx = crate::simulation::goal_scorers::GoalScoringContext {
+                agent: entity,
+                agent_tile,
+                now: clock.tick,
+                needs,
+                profession,
+                skills: skills_ref,
+                disposition,
+                economic_agent: agent,
+                faction_member: member,
+                faction: faction_data,
+                board: &scorer_inputs.board,
+                is_starving,
+                faction_has_food,
+                can_return_camp,
+                prioritize_food,
+                fallback_gather: gather_goal,
+                fallback_gather_reason: gather_reason,
+                has_horse_taming,
+                has_personal_build_site,
+                should_craft: should_craft_now,
+                injury: scorer_inputs.injury_q.get(entity).ok().copied(),
+                faction_has_injured: faction_has_injured.contains(&member.faction_id),
+                time_of_day_bonus,
+                age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
+            };
+            // Hysteresis margin damps single-tick flips around
+            // utility crossover; Survival/Subsistence still
+            // preempt lower classes via the class ordering in
+            // `GoalScorerRegistry::best`.
+            const GOAL_CHALLENGER_MARGIN: f32 = 0.10;
+            let (best_opt, incumbent_score) = scorer_inputs
+                .registry
+                .best_with_incumbent(&ctx, Some(*goal));
+            match best_opt {
+                None => (gather_goal, gather_reason),
+                Some(best) if best.goal == *goal => (best.goal, best.reason),
+                Some(best)
+                    if incumbent_score
+                        .map_or(false, |s| best.score - s < GOAL_CHALLENGER_MARGIN) =>
+                {
+                    let cur_reason = reason_opt.as_deref().map(|r| r.0).unwrap_or("");
+                    (*goal, cur_reason)
                 }
+                Some(best) => (best.goal, best.reason),
             }
+        } else {
+            fallback_pick()
         };
 
         if *goal != new_goal {
