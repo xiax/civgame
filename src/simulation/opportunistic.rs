@@ -18,9 +18,11 @@
 
 use bevy::prelude::*;
 
-use crate::simulation::faction::{FactionData, FactionMember};
+use crate::economy::agent::EconomicAgent;
+use crate::simulation::faction::FactionMember;
 use crate::simulation::goal_scorers::{
-    Disposition, GoalScore, GoalScorerRegistry, GoalScoringContext,
+    default_class_for_goal, default_interrupt_policy_for_goal, interrupt_policy_allows,
+    AgentDecisionState, Disposition, GoalScore, GoalScorerRegistry, GoalScoringContext,
 };
 use crate::simulation::goals::{AgentGoal, GoalCooldown, GoalReason};
 use crate::simulation::htn::{MethodRegistry, MF_UNINTERRUPTIBLE};
@@ -32,7 +34,6 @@ use crate::simulation::schedule::SimClock;
 use crate::simulation::skills::Skills;
 use crate::simulation::typed_task::{ActionQueue, Task};
 use crate::world::seasons::Calendar;
-use crate::economy::agent::EconomicAgent;
 
 /// 1-Hz cadence (every 20 ticks @ 20 Hz). Cheap enough that running
 /// across every walking agent each second doesn't dominate; coarse
@@ -70,16 +71,8 @@ pub struct OpportunisticInterruptStats {
 /// `StockpileScorer` returns `GatherFood` at `Subsistence` when
 /// `prioritize_food` and `Discretionary` otherwise).
 pub fn is_policy_uninterruptible(goal: AgentGoal) -> bool {
-    matches!(
-        goal,
-        AgentGoal::Survive
-            | AgentGoal::Sleep
-            | AgentGoal::Raid
-            | AgentGoal::Defend
-            | AgentGoal::Rescue
-            | AgentGoal::FollowingPlayerCommand
-            | AgentGoal::SeekCare
-    )
+    default_interrupt_policy_for_goal(goal)
+        == crate::simulation::goal_scorers::InterruptPolicy::UninterruptibleExceptSurvival
 }
 
 /// Bundle of read-only resources / queries so the system fits Bevy's
@@ -91,8 +84,10 @@ pub struct OpportunisticInputs<'w, 's> {
     pub calendar: Res<'w, Calendar>,
     pub method_registry: Res<'w, MethodRegistry>,
     pub scorer_registry: Res<'w, GoalScorerRegistry>,
+    pub opportunities: Res<'w, crate::simulation::opportunity::OpportunityIndex>,
     pub board: Res<'w, JobBoard>,
     pub stats: ResMut<'w, OpportunisticInterruptStats>,
+    pub metrics: ResMut<'w, crate::simulation::goal_scorers::DecisionMetrics>,
     pub disposition_q: Query<'w, 's, &'static Disposition>,
     pub skills_q: Query<'w, 's, &'static Skills>,
     pub profession_q: Query<'w, 's, &'static Profession>,
@@ -115,6 +110,7 @@ pub fn opportunistic_interrupt_system(
             Option<&mut GoalReason>,
             Option<&mut GoalCooldown>,
             Option<&JobClaim>,
+            Option<&mut AgentDecisionState>,
         ),
         Without<Drafted>,
     >,
@@ -123,9 +119,8 @@ pub fn opportunistic_interrupt_system(
         return;
     }
     let now = inputs.clock.tick;
-    let time_of_day_bonus = crate::simulation::utility_curves::time_of_day_bonus(
-        inputs.calendar.time_phase(),
-    );
+    let time_of_day_bonus =
+        crate::simulation::utility_curves::time_of_day_bonus(inputs.calendar.time_phase());
     for (
         entity,
         mut goal,
@@ -138,6 +133,7 @@ pub fn opportunistic_interrupt_system(
         reason_opt,
         cooldown_opt,
         claim_opt,
+        decision_opt,
     ) in query.iter_mut()
     {
         // ── Eligibility gates ──────────────────────────────────────
@@ -163,9 +159,22 @@ pub fn opportunistic_interrupt_system(
                 }
             }
         }
-        if is_policy_uninterruptible(*goal) {
-            continue;
-        }
+        let decision_snapshot = decision_opt.as_deref().map(|decision| {
+            (
+                decision.last_goal,
+                decision.last_class,
+                decision.interrupt_policy,
+            )
+        });
+        let (current_class, current_interrupt_policy) = decision_snapshot
+            .filter(|(last_goal, _, _)| *last_goal == *goal)
+            .map(|(_, class, policy)| (class, policy))
+            .unwrap_or_else(|| {
+                (
+                    default_class_for_goal(*goal),
+                    default_interrupt_policy_for_goal(*goal),
+                )
+            });
         // Faction lookup may fail for SOLO etc.
         let Some(faction_data) = inputs.registry.factions.get(&member.faction_id) else {
             continue;
@@ -198,6 +207,7 @@ pub fn opportunistic_interrupt_system(
             faction_member: member,
             faction: faction_data,
             board: &inputs.board,
+            opportunities: Some(&inputs.opportunities),
             // Phase D doesn't precompute the gates that Phase B's
             // scorers need for fallback decisions — they're
             // unused on the opportunistic path which only consults
@@ -216,7 +226,12 @@ pub fn opportunistic_interrupt_system(
             time_of_day_bonus,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
         };
-        let mut best: Option<GoalScore> = None;
+        let mut best: Option<(GoalScore, &'static str)> = None;
+        inputs.metrics.goal_evaluations = inputs.metrics.goal_evaluations.saturating_add(1);
+        inputs.metrics.scorer_evaluations = inputs
+            .metrics
+            .scorer_evaluations
+            .saturating_add(inputs.scorer_registry.opportunistic_indices.len() as u64);
         for &idx in &inputs.scorer_registry.opportunistic_indices {
             let scorer = &inputs.scorer_registry.scorers[idx];
             let Some(s) = scorer.score(&ctx) else {
@@ -226,6 +241,9 @@ pub fn opportunistic_interrupt_system(
                 continue;
             }
             if s.score < OPPORTUNISTIC_INTERRUPT_THRESHOLD {
+                continue;
+            }
+            if !interrupt_policy_allows(current_interrupt_policy, current_class, s.class) {
                 continue;
             }
             // Cooldown gate: skip if this scorer's goal is already
@@ -238,16 +256,17 @@ pub fn opportunistic_interrupt_system(
             }
             let take = match best {
                 None => true,
-                Some(b) => s.class > b.class || (s.class == b.class && s.score > b.score),
+                Some((b, _)) => s.class > b.class || (s.class == b.class && s.score > b.score),
             };
             if take {
-                best = Some(s);
+                best = Some((s, scorer.name()));
             }
         }
-        let Some(pick) = best else {
+        let Some((pick, scorer_name)) = best else {
             continue;
         };
         let prior_goal = *goal;
+        inputs.metrics.record_goal_pick(pick.goal);
         // Stamp prior goal onto cooldown to prevent ping-pong. If
         // the agent doesn't have a `GoalCooldown` yet, insert one.
         if let Some(mut cd) = cooldown_opt {
@@ -267,6 +286,13 @@ pub fn opportunistic_interrupt_system(
             r.0 = pick.reason;
         } else {
             commands.entity(entity).insert(GoalReason(pick.reason));
+        }
+        if let Some(mut decision) = decision_opt {
+            decision.record_score(pick, scorer_name, now);
+        } else {
+            let mut decision = AgentDecisionState::default();
+            decision.record_score(pick, scorer_name, now);
+            commands.entity(entity).insert(decision);
         }
         inputs.stats.total_fired += 1;
         inputs.stats.last_tick = now;
@@ -318,6 +344,7 @@ mod tests {
             faction_member: &member,
             faction,
             board: &board,
+            opportunities: None,
             is_starving: false,
             faction_has_food: false,
             can_return_camp: false,
@@ -352,9 +379,7 @@ mod tests {
                 }
                 let take = match best {
                     None => true,
-                    Some(b) => {
-                        s.class > b.class || (s.class == b.class && s.score > b.score)
-                    }
+                    Some(b) => s.class > b.class || (s.class == b.class && s.score > b.score),
                 };
                 if take {
                     best = Some(s);

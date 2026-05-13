@@ -73,20 +73,19 @@ pub struct StorageReachability<'w> {
 pub struct ScorerInputs<'w, 's> {
     pub registry: Res<'w, crate::simulation::goal_scorers::GoalScorerRegistry>,
     pub board: Res<'w, crate::simulation::jobs::JobBoard>,
+    pub opportunities: Res<'w, crate::simulation::opportunity::OpportunityIndex>,
+    pub metrics: ResMut<'w, crate::simulation::goal_scorers::DecisionMetrics>,
     pub disposition_q: Query<'w, 's, &'static crate::simulation::goal_scorers::Disposition>,
     pub skills_q: Query<'w, 's, &'static crate::simulation::skills::Skills>,
     pub profession_q: Query<'w, 's, &'static crate::simulation::person::Profession>,
+    pub decision_q: Query<'w, 's, &'static mut crate::simulation::goal_scorers::AgentDecisionState>,
     pub injury_q: Query<'w, 's, &'static crate::simulation::medicine::Injury>,
     /// All currently-injured agents' faction membership. Walked once
     /// at the top of `goal_update_system` to build a per-faction
     /// "any injured" set — cheap because `Injury` is rare and the
     /// query iterates only injured entities.
-    pub injured_faction_q: Query<
-        'w,
-        's,
-        &'static FactionMember,
-        With<crate::simulation::medicine::Injury>,
-    >,
+    pub injured_faction_q:
+        Query<'w, 's, &'static FactionMember, With<crate::simulation::medicine::Injury>>,
 }
 
 #[repr(u8)]
@@ -446,12 +445,7 @@ pub struct GoalValidationQueries<'w, 's> {
         )>,
     >,
     pub commanded_q: Query<'w, 's, &'static crate::simulation::player_command::Commanded>,
-    pub packing_duty_q: Query<
-        'w,
-        's,
-        (),
-        With<crate::simulation::nomad_pack_labor::PackingDuty>,
-    >,
+    pub packing_duty_q: Query<'w, 's, (), With<crate::simulation::nomad_pack_labor::PackingDuty>>,
 }
 
 pub fn goal_update_system(
@@ -467,7 +461,7 @@ pub fn goal_update_system(
     // under Bevy's 16-param ceiling. Phase F-2 removed the Legacy
     // imperative-cascade mode; the cascade body survives only as the
     // SOLO / faction-lookup-miss fallback (`fallback_pick` below).
-    scorer_inputs: ScorerInputs,
+    mut scorer_inputs: ScorerInputs,
     mut query: Query<
         (
             Entity,
@@ -990,6 +984,7 @@ pub fn goal_update_system(
                 faction_member: member,
                 faction: faction_data,
                 board: &scorer_inputs.board,
+                opportunities: Some(&scorer_inputs.opportunities),
                 is_starving,
                 faction_has_food,
                 can_return_camp,
@@ -1009,20 +1004,63 @@ pub fn goal_update_system(
             // preempt lower classes via the class ordering in
             // `GoalScorerRegistry::best`.
             const GOAL_CHALLENGER_MARGIN: f32 = 0.10;
+            scorer_inputs.metrics.goal_evaluations =
+                scorer_inputs.metrics.goal_evaluations.saturating_add(1);
+            scorer_inputs.metrics.scorer_evaluations = scorer_inputs
+                .metrics
+                .scorer_evaluations
+                .saturating_add(scorer_inputs.registry.scorers.len() as u64);
+            let decision_snapshot = scorer_inputs
+                .decision_q
+                .get_mut(entity)
+                .ok()
+                .map(|d| (d.last_goal, d.last_class, d.interrupt_policy));
+            let (current_class, current_interrupt_policy) = decision_snapshot
+                .filter(|(last_goal, _, _)| *last_goal == *goal)
+                .map(|(_, class, policy)| (class, policy))
+                .unwrap_or_else(|| {
+                    (
+                        crate::simulation::goal_scorers::default_class_for_goal(*goal),
+                        crate::simulation::goal_scorers::default_interrupt_policy_for_goal(*goal),
+                    )
+                });
             let (best_opt, incumbent_score) = scorer_inputs
                 .registry
                 .best_with_incumbent(&ctx, Some(*goal));
             match best_opt {
                 None => (gather_goal, gather_reason),
-                Some(best) if best.goal == *goal => (best.goal, best.reason),
-                Some(best)
-                    if incumbent_score
-                        .map_or(false, |s| best.score - s < GOAL_CHALLENGER_MARGIN) =>
+                Some(best_pick) if best_pick.score.goal == *goal => {
+                    if let Ok(mut decision) = scorer_inputs.decision_q.get_mut(entity) {
+                        decision.record_score(best_pick.score, best_pick.scorer_name, clock.tick);
+                    }
+                    scorer_inputs.metrics.record_goal_pick(best_pick.score.goal);
+                    (best_pick.score.goal, best_pick.score.reason)
+                }
+                Some(best_pick)
+                    if incumbent_score.map_or(false, |s| {
+                        best_pick.score.score - s < GOAL_CHALLENGER_MARGIN
+                    }) =>
                 {
                     let cur_reason = reason_opt.as_deref().map(|r| r.0).unwrap_or("");
                     (*goal, cur_reason)
                 }
-                Some(best) => (best.goal, best.reason),
+                Some(best_pick)
+                    if !crate::simulation::goal_scorers::interrupt_policy_allows(
+                        current_interrupt_policy,
+                        current_class,
+                        best_pick.score.class,
+                    ) =>
+                {
+                    let cur_reason = reason_opt.as_deref().map(|r| r.0).unwrap_or("");
+                    (*goal, cur_reason)
+                }
+                Some(best_pick) => {
+                    if let Ok(mut decision) = scorer_inputs.decision_q.get_mut(entity) {
+                        decision.record_score(best_pick.score, best_pick.scorer_name, clock.tick);
+                    }
+                    scorer_inputs.metrics.record_goal_pick(best_pick.score.goal);
+                    (best_pick.score.goal, best_pick.score.reason)
+                }
             }
         } else {
             fallback_pick()
@@ -1158,6 +1196,7 @@ pub fn earnincome_goal_override_system(
     clock: Res<SimClock>,
     registry: Res<FactionRegistry>,
     board: Res<crate::simulation::jobs::JobBoard>,
+    opportunities: Res<crate::simulation::opportunity::OpportunityIndex>,
     scorer_registry: Res<crate::simulation::goal_scorers::GoalScorerRegistry>,
     mut commands: Commands,
     mut query: Query<
@@ -1178,9 +1217,7 @@ pub fn earnincome_goal_override_system(
         (Without<Drafted>, Without<JobClaim>),
     >,
 ) {
-    use crate::simulation::goal_scorers::{
-        Disposition, GoalClass, GoalScoringContext,
-    };
+    use crate::simulation::goal_scorers::{Disposition, GoalClass, GoalScoringContext};
 
     for (
         entity,
@@ -1234,6 +1271,7 @@ pub fn earnincome_goal_override_system(
             faction_member: member,
             faction,
             board: &board,
+            opportunities: Some(&opportunities),
             is_starving: false,
             faction_has_food: false,
             can_return_camp: false,

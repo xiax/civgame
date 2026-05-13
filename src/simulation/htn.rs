@@ -563,6 +563,52 @@ pub fn score_method_with_history_and_disposition(
     raw - failures * METHOD_FAILURE_PENALTY
 }
 
+pub struct DispatchForGoalPick<'a> {
+    pub method: &'a dyn Method,
+    pub method_id: MethodId,
+    pub score: f32,
+}
+
+/// Shared method argmax for goal-specific HTN wrappers. The wrapper still
+/// owns context construction and task routing; this helper owns the common
+/// "methods for abstract task → precondition → history-aware utility" shape.
+pub fn dispatch_for_goal<'a>(
+    method_registry: &'a MethodRegistry,
+    abstract_task: AbstractTask,
+    ctx: &PlannerCtx,
+    history: &MethodHistory,
+    now: u64,
+    disposition: Option<crate::simulation::goal_scorers::Disposition>,
+) -> Option<DispatchForGoalPick<'a>> {
+    let mut best: Option<DispatchForGoalPick<'a>> = None;
+    for method in method_registry.methods_for(abstract_task.kind()) {
+        let method_ref = method.as_ref();
+        if !method_ref.precondition(abstract_task, ctx) {
+            continue;
+        }
+        let score = if let Some(disposition) = disposition {
+            score_method_with_history_and_disposition(
+                method_ref,
+                abstract_task,
+                ctx,
+                disposition,
+                history,
+                now,
+            )
+        } else {
+            score_method_with_history(method_ref, abstract_task, ctx, history, now)
+        };
+        if best.as_ref().map_or(true, |b| score > b.score) {
+            best = Some(DispatchForGoalPick {
+                method: method_ref,
+                method_id: method_ref.id(),
+                score,
+            });
+        }
+    }
+    best
+}
+
 /// Pluralist Economy R4: check whether a method's `policy_gate` is
 /// satisfied by the agent's effective faction. Returns `true` when:
 ///
@@ -1151,10 +1197,7 @@ pub trait Method: Send + Sync + 'static {
     /// Lifts should stay sub-tier (recommended range ~`[1.0, 1.3]`)
     /// so they don't cross `UTIL_BASELINE` → `UTIL_VISIBLE_GROUND`
     /// breakpoints. Method-ranking tests pin those tier boundaries.
-    fn disposition_lift(
-        &self,
-        _disposition: crate::simulation::goal_scorers::Disposition,
-    ) -> f32 {
+    fn disposition_lift(&self, _disposition: crate::simulation::goal_scorers::Disposition) -> f32 {
         1.0
     }
 }
@@ -2895,10 +2938,7 @@ impl Method for HuntPreyMethod {
     /// (martial=255) so HuntPrey's `UTIL_BASELINE` tier ranking
     /// against `PickUpFreshCorpseMethod` (`UTIL_VISIBLE_GROUND`) is
     /// preserved.
-    fn disposition_lift(
-        &self,
-        d: crate::simulation::goal_scorers::Disposition,
-    ) -> f32 {
+    fn disposition_lift(&self, d: crate::simulation::goal_scorers::Disposition) -> f32 {
         crate::simulation::utility_curves::disposition_lift(d.martial, 0.3)
     }
 }
@@ -3129,10 +3169,7 @@ impl Method for SocializeWithPartnerMethod {
     /// conversation harder than equidistant loners. Lift capped at
     /// 1.3 (gregariousness=255) so it stays under
     /// `UTIL_VISIBLE_GROUND=1.5` and the method's tier ranking holds.
-    fn disposition_lift(
-        &self,
-        d: crate::simulation::goal_scorers::Disposition,
-    ) -> f32 {
+    fn disposition_lift(&self, d: crate::simulation::goal_scorers::Disposition) -> f32 {
         crate::simulation::utility_curves::disposition_lift(d.gregariousness, 0.3)
     }
 }
@@ -8035,33 +8072,18 @@ pub fn htn_socialize_dispatch_system(
 
         let disposition = disposition_opt.copied().unwrap_or_default();
         let abstract_task = AbstractTask::Socialize;
-        let methods = method_registry.methods_for(AbstractTaskKind::Socialize);
-        let chosen = methods
-            .iter()
-            .filter(|m| m.precondition(abstract_task, &ctx))
-            .max_by(|a, b| {
-                let ua = score_method_with_history_and_disposition(
-                    a.as_ref(),
-                    abstract_task,
-                    &ctx,
-                    disposition,
-                    &history,
-                    now,
-                );
-                let ub = score_method_with_history_and_disposition(
-                    b.as_ref(),
-                    abstract_task,
-                    &ctx,
-                    disposition,
-                    &history,
-                    now,
-                );
-                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        let Some(method) = chosen else {
+        let Some(pick) = dispatch_for_goal(
+            &method_registry,
+            abstract_task,
+            &ctx,
+            &history,
+            now,
+            Some(disposition),
+        ) else {
             continue;
         };
-        let chosen_id = method.id();
+        let method = pick.method;
+        let chosen_id = pick.method_id;
         ai.active_method = Some(chosen_id);
         let mut tasks = method.expand(abstract_task, &ctx);
         if tasks.is_empty() {
@@ -9707,10 +9729,7 @@ impl Method for PlayWithPartnerMethod {
     /// Gregarious agents pick partner play (vs solo play with toy /
     /// stones / etc.) more eagerly. Lift capped at 1.3 (greg=255) so
     /// `UTIL_VISIBLE_GROUND` stays under `UTIL_CLAIMED_HAUL=2.0`.
-    fn disposition_lift(
-        &self,
-        d: crate::simulation::goal_scorers::Disposition,
-    ) -> f32 {
+    fn disposition_lift(&self, d: crate::simulation::goal_scorers::Disposition) -> f32 {
         crate::simulation::utility_curves::disposition_lift(d.gregariousness, 0.3)
     }
 }
@@ -10448,6 +10467,7 @@ pub fn htn_play_dispatch_system(
 /// `feedback_plan_history_design.md`), so the residual noise from cancel
 /// paths is acceptable until success-rate weighting actually consumes it.
 pub fn htn_method_completion_system(
+    mut metrics: ResMut<crate::simulation::goal_scorers::DecisionMetrics>,
     mut q: Query<(
         &mut crate::simulation::person::PersonAI,
         &mut MethodHistory,
@@ -10460,6 +10480,7 @@ pub fn htn_method_completion_system(
         if let Some(method_id) = ai.active_method {
             if aq.current == Task::Idle && aq.queued_is_empty() {
                 history.push(method_id, MethodOutcome::Success, now);
+                metrics.htn_method_successes = metrics.htn_method_successes.saturating_add(1);
                 ai.active_method = None;
             }
         }
@@ -10766,7 +10787,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
-                    }
+        }
     }
 
     fn ctx_with_bed(bed: Entity, bed_tile: (i32, i32)) -> PlannerCtx {
@@ -10813,7 +10834,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
-                    }
+        }
     }
 
     fn ctx_with_food(edible_count: u32, hunger: f32) -> PlannerCtx {
@@ -10860,7 +10881,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
-                    }
+        }
     }
 
     fn ctx_with_storage(
@@ -10911,7 +10932,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
-                    }
+        }
     }
 
     fn ctx_with_material_storage(
@@ -10961,7 +10982,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
-                    }
+        }
     }
 
     fn ctx_with_haul_claim(
@@ -11021,7 +11042,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
-                    }
+        }
     }
 
     #[test]
@@ -11375,7 +11396,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
-                    }
+        }
     }
 
     #[test]
@@ -11547,7 +11568,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
-                    }
+        }
     }
 
     #[test]
@@ -11755,7 +11776,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
-                    }
+        }
     }
 
     #[test]
@@ -12003,7 +12024,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
-                    }
+        }
     }
 
     #[test]
@@ -12663,7 +12684,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
-                    }
+        }
     }
 
     #[test]

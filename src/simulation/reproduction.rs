@@ -565,6 +565,8 @@ pub fn pregnancy_system(
                         study_progress: ahash::AHashMap::new(),
                     },
                     crate::simulation::typed_task::ActionQueue::idle(),
+                    crate::simulation::goal_scorers::AgentDecisionState::default(),
+                    crate::simulation::goal_scorers::Disposition::default(),
                 ),
             ))
             .id();

@@ -598,6 +598,7 @@ pub fn spawn_population(
                             clock.tick as u32,
                         ),
                         crate::simulation::typed_task::ActionQueue::idle(),
+                        crate::simulation::goal_scorers::AgentDecisionState::default(),
                         // Phase 6 of wage-aware-labor-market-v2:
                         // per-agent psychological profile. Scattered
                         // by fastrand at spawn so populations have

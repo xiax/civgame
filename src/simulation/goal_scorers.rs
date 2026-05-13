@@ -20,13 +20,9 @@
 //!   tier can compete (e.g. EarnIncome at `Enterprise` against a
 //!   future TradeArbitrage scorer that pursues market gaps).
 //!
-//! The registry is consumed by `goals::earnincome_goal_override_system`
-//! (renamed from the Phase 6 procedural fold-in once it switches to
-//! reading scorers) — at most one scorer wins per agent per tick, and
-//! the existing legacy cascade in `goal_update_system` still drives
-//! `Survival` / `Subsistence` / `Safety` branches that this module
-//! intentionally doesn't try to migrate (those are correct as-is and
-//! migrating them all at once is a much larger refactor).
+//! The registry is consumed directly by `goals::goal_update_system` —
+//! at most one scorer wins per agent per tick, and fallback imperative
+//! logic only remains for synthetic / SOLO agents without faction data.
 
 use bevy::prelude::*;
 
@@ -113,6 +109,99 @@ pub enum GoalClass {
     Survival = 6,
 }
 
+/// How long a selected autonomous goal should be sticky before normal
+/// hysteresis may replace it. Most scorers use `None`; long chains and
+/// future institutional commitments can opt into stronger stickiness.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GoalCommitment {
+    None,
+    UntilTaskComplete,
+    UntilTick(u64),
+    UntilNeedBelow { need: NeedAxis, threshold: f32 },
+}
+
+impl Default for GoalCommitment {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// Need axis used by `GoalCommitment::UntilNeedBelow`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NeedAxis {
+    Hunger,
+    Sleep,
+    Social,
+    Willpower,
+    Safety,
+    Esteem,
+}
+
+/// Shared interrupt contract for normal goal re-evaluation and
+/// opportunistic mid-walk interruptions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterruptPolicy {
+    AlwaysInterruptible,
+    InterruptibleByHigherClass,
+    UninterruptibleExceptSurvival,
+}
+
+impl Default for InterruptPolicy {
+    fn default() -> Self {
+        Self::AlwaysInterruptible
+    }
+}
+
+pub fn default_class_for_goal(goal: AgentGoal) -> GoalClass {
+    match goal {
+        AgentGoal::Survive | AgentGoal::Sleep | AgentGoal::SeekCare => GoalClass::Survival,
+        AgentGoal::Raid
+        | AgentGoal::Defend
+        | AgentGoal::Rescue
+        | AgentGoal::FollowingPlayerCommand => GoalClass::Safety,
+        AgentGoal::Socialize => GoalClass::Belonging,
+        AgentGoal::Build | AgentGoal::Lead => GoalClass::Esteem,
+        AgentGoal::Play => GoalClass::Discretionary,
+        AgentGoal::GatherFood
+        | AgentGoal::GatherWood
+        | AgentGoal::GatherStone
+        | AgentGoal::ReturnCamp
+        | AgentGoal::TameHorse
+        | AgentGoal::Craft
+        | AgentGoal::Farm
+        | AgentGoal::Haul
+        | AgentGoal::Stockpile
+        | AgentGoal::MigrateToCamp
+        | AgentGoal::Scout
+        | AgentGoal::ProvideCare => GoalClass::Subsistence,
+    }
+}
+
+pub fn default_interrupt_policy_for_goal(goal: AgentGoal) -> InterruptPolicy {
+    match goal {
+        AgentGoal::Survive
+        | AgentGoal::Sleep
+        | AgentGoal::Raid
+        | AgentGoal::Defend
+        | AgentGoal::Rescue
+        | AgentGoal::FollowingPlayerCommand
+        | AgentGoal::SeekCare => InterruptPolicy::UninterruptibleExceptSurvival,
+        _ => InterruptPolicy::AlwaysInterruptible,
+    }
+}
+
+pub fn interrupt_policy_allows(
+    policy: InterruptPolicy,
+    current_class: GoalClass,
+    challenger_class: GoalClass,
+) -> bool {
+    match policy {
+        InterruptPolicy::AlwaysInterruptible => true,
+        InterruptPolicy::InterruptibleByHigherClass => challenger_class > current_class,
+        InterruptPolicy::UninterruptibleExceptSurvival => challenger_class == GoalClass::Survival,
+    }
+}
+
 /// What a scorer returns when it has an opinion. `None` means the
 /// scorer declines to set a goal for this agent (e.g. an
 /// `EarnIncomeScorer` returns `None` when the agent has no
@@ -123,6 +212,156 @@ pub struct GoalScore {
     pub class: GoalClass,
     pub score: f32,
     pub reason: &'static str,
+    pub commitment: GoalCommitment,
+    pub interrupt_policy: InterruptPolicy,
+}
+
+impl GoalScore {
+    pub fn new(goal: AgentGoal, class: GoalClass, score: f32, reason: &'static str) -> Self {
+        Self {
+            goal,
+            class,
+            score,
+            reason,
+            commitment: GoalCommitment::None,
+            interrupt_policy: InterruptPolicy::default(),
+        }
+    }
+
+    pub fn with_commitment(mut self, commitment: GoalCommitment) -> Self {
+        self.commitment = commitment;
+        self
+    }
+
+    pub fn with_interrupt_policy(mut self, interrupt_policy: InterruptPolicy) -> Self {
+        self.interrupt_policy = interrupt_policy;
+        self
+    }
+}
+
+/// Per-agent decision trace. This is intentionally compact and copyable:
+/// the debug UI can read it without chasing scorer objects, and the goal
+/// systems can use it for commitment/interrupt policy without rebuilding
+/// the full scoring context.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct AgentDecisionState {
+    pub last_goal: AgentGoal,
+    pub last_class: GoalClass,
+    pub last_score: f32,
+    pub last_reason: &'static str,
+    pub last_scorer: &'static str,
+    pub last_evaluation_tick: u64,
+    pub commitment: GoalCommitment,
+    pub commitment_expires_tick: Option<u64>,
+    pub interrupt_policy: InterruptPolicy,
+}
+
+impl Default for AgentDecisionState {
+    fn default() -> Self {
+        Self {
+            last_goal: AgentGoal::GatherFood,
+            last_class: GoalClass::Discretionary,
+            last_score: 0.0,
+            last_reason: "",
+            last_scorer: "",
+            last_evaluation_tick: 0,
+            commitment: GoalCommitment::None,
+            commitment_expires_tick: None,
+            interrupt_policy: InterruptPolicy::default(),
+        }
+    }
+}
+
+impl AgentDecisionState {
+    pub fn record_score(&mut self, score: GoalScore, scorer_name: &'static str, now: u64) {
+        self.last_goal = score.goal;
+        self.last_class = score.class;
+        self.last_score = score.score;
+        self.last_reason = score.reason;
+        self.last_scorer = scorer_name;
+        self.last_evaluation_tick = now;
+        self.commitment = score.commitment;
+        self.commitment_expires_tick = match score.commitment {
+            GoalCommitment::UntilTick(tick) => Some(tick),
+            _ => None,
+        };
+        self.interrupt_policy = score.interrupt_policy;
+    }
+
+    pub fn record_forced(
+        &mut self,
+        goal: AgentGoal,
+        class: GoalClass,
+        reason: &'static str,
+        now: u64,
+        interrupt_policy: InterruptPolicy,
+    ) {
+        self.last_goal = goal;
+        self.last_class = class;
+        self.last_score = 1.0;
+        self.last_reason = reason;
+        self.last_scorer = "Forced";
+        self.last_evaluation_tick = now;
+        self.commitment = GoalCommitment::UntilTaskComplete;
+        self.commitment_expires_tick = None;
+        self.interrupt_policy = interrupt_policy;
+    }
+}
+
+pub const AGENT_GOAL_COUNT: usize = 24;
+
+/// Lightweight counters for profiling the decision pipeline without
+/// pulling in a benchmarking dependency.
+#[derive(Resource, Clone, Debug)]
+pub struct DecisionMetrics {
+    pub goal_evaluations: u64,
+    pub scorer_evaluations: u64,
+    pub chosen_goal_counts: [u64; AGENT_GOAL_COUNT],
+    pub htn_method_attempts: u64,
+    pub htn_method_successes: u64,
+    pub htn_method_failures: u64,
+    pub action_queue_samples: u64,
+    pub action_queue_total_len: u64,
+    pub lod_full: u32,
+    pub lod_aggregate: u32,
+    pub lod_dormant: u32,
+    pub last_sample_tick: u64,
+}
+
+impl Default for DecisionMetrics {
+    fn default() -> Self {
+        Self {
+            goal_evaluations: 0,
+            scorer_evaluations: 0,
+            chosen_goal_counts: [0; AGENT_GOAL_COUNT],
+            htn_method_attempts: 0,
+            htn_method_successes: 0,
+            htn_method_failures: 0,
+            action_queue_samples: 0,
+            action_queue_total_len: 0,
+            lod_full: 0,
+            lod_aggregate: 0,
+            lod_dormant: 0,
+            last_sample_tick: 0,
+        }
+    }
+}
+
+impl DecisionMetrics {
+    pub fn record_goal_pick(&mut self, goal: AgentGoal) {
+        let idx = goal as usize;
+        if idx < AGENT_GOAL_COUNT {
+            self.chosen_goal_counts[idx] = self.chosen_goal_counts[idx].saturating_add(1);
+        }
+    }
+
+    pub fn average_action_queue_len(&self) -> f32 {
+        if self.action_queue_samples == 0 {
+            0.0
+        } else {
+            self.action_queue_total_len as f32 / self.action_queue_samples as f32
+        }
+    }
 }
 
 /// Read-only per-agent context the registry passes to each scorer.
@@ -142,6 +381,7 @@ pub struct GoalScoringContext<'a> {
     pub faction_member: &'a FactionMember,
     pub faction: &'a FactionData,
     pub board: &'a JobBoard,
+    pub opportunities: Option<&'a crate::simulation::opportunity::OpportunityIndex>,
     // ── Phase B (behavioural richness): precomputed gates ──────────
     // `goal_update_system` already derives these per agent each tick;
     // hoisting them into the context lets scorers stay pure-read.
@@ -213,7 +453,7 @@ impl GoalScorerRegistry {
     /// every scorer declines (e.g. all gates failed). Ties broken by
     /// `class` first (higher wins), then `score` within a class.
     pub fn best(&self, ctx: &GoalScoringContext) -> Option<GoalScore> {
-        self.best_with_incumbent(ctx, None).0
+        self.best_with_incumbent(ctx, None).0.map(|pick| pick.score)
     }
 
     /// Single-pass `best` + incumbent-score lookup. When
@@ -227,15 +467,18 @@ impl GoalScorerRegistry {
         &self,
         ctx: &GoalScoringContext,
         current_goal: Option<AgentGoal>,
-    ) -> (Option<GoalScore>, Option<f32>) {
-        let mut best: Option<GoalScore> = None;
+    ) -> (Option<GoalScorerPick>, Option<f32>) {
+        let mut best: Option<GoalScorerPick> = None;
         let mut incumbent: Option<GoalScore> = None;
         for scorer in &self.scorers {
             let Some(candidate) = scorer.score(ctx) else {
                 continue;
             };
-            if best.map_or(true, |b| Self::beats(candidate, b)) {
-                best = Some(candidate);
+            if best.map_or(true, |b| Self::beats(candidate, b.score)) {
+                best = Some(GoalScorerPick {
+                    score: candidate,
+                    scorer_name: scorer.name(),
+                });
             }
             if current_goal == Some(candidate.goal)
                 && incumbent.map_or(true, |i| Self::beats(candidate, i))
@@ -244,7 +487,7 @@ impl GoalScorerRegistry {
             }
         }
         let incumbent_score = match (best, incumbent) {
-            (Some(b), Some(i)) if i.class >= b.class => Some(i.score),
+            (Some(b), Some(i)) if i.class >= b.score.class => Some(i.score),
             _ => None,
         };
         (best, incumbent_score)
@@ -270,6 +513,12 @@ impl GoalScorerRegistry {
             .filter_map(|(i, s)| s.opportunistic().then_some(i))
             .collect();
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GoalScorerPick {
+    pub score: GoalScore,
+    pub scorer_name: &'static str,
 }
 
 // ─── EarnIncomeScorer ──────────────────────────────────────────────
@@ -315,28 +564,52 @@ impl GoalScorer for EarnIncomeScorer {
             .unwrap_or(1.0);
         let mult = ctx.disposition.earn_income_multiplier();
         let mut best: Option<(JobKind, f32)> = None;
-        for posting in ctx.board.faction_postings(ctx.faction_member.faction_id) {
-            if posting.reward <= 0.0 {
-                continue;
+        if let Some(opportunities) = ctx.opportunities {
+            for opportunity in opportunities.iter_kind_for_faction(
+                ctx.faction_member.faction_id,
+                crate::simulation::opportunity::OpportunityKind::PaidJob,
+            ) {
+                let crate::simulation::opportunity::OpportunityPayload::PaidJob {
+                    kind,
+                    reward,
+                    ..
+                } = opportunity.payload
+                else {
+                    continue;
+                };
+                if !kinds.contains(&kind) {
+                    continue;
+                }
+                let score = reward * comp * mult;
+                if best.map(|(_, s)| score > s).unwrap_or(true) {
+                    best = Some((kind, score));
+                }
             }
-            if !kinds.contains(&posting.kind) {
-                continue;
-            }
-            if !posting.claimants.is_empty() {
-                continue;
-            }
-            let score = posting.reward * comp * mult;
-            if best.map(|(_, s)| score > s).unwrap_or(true) {
-                best = Some((posting.kind, score));
+        }
+        if best.is_none() {
+            for posting in ctx.board.faction_postings(ctx.faction_member.faction_id) {
+                if posting.reward <= 0.0 {
+                    continue;
+                }
+                if !kinds.contains(&posting.kind) {
+                    continue;
+                }
+                if !posting.claimants.is_empty() {
+                    continue;
+                }
+                let score = posting.reward * comp * mult;
+                if best.map(|(_, s)| score > s).unwrap_or(true) {
+                    best = Some((posting.kind, score));
+                }
             }
         }
         let (kind, score) = best?;
-        Some(GoalScore {
-            goal: kind.to_goal(),
-            class: GoalClass::Enterprise,
+        Some(GoalScore::new(
+            kind.to_goal(),
+            GoalClass::Enterprise,
             score,
-            reason: "Earning Income",
-        })
+            "Earning Income",
+        ))
     }
 
     fn name(&self) -> &'static str {
@@ -385,12 +658,14 @@ impl GoalScorer for SurvivalHungerScorer {
             // lower-class scorers instead.
             return None;
         };
-        Some(GoalScore {
-            goal: AgentGoal::Survive,
-            class: GoalClass::Survival,
-            score: urgency,
-            reason,
-        })
+        Some(
+            GoalScore::new(AgentGoal::Survive, GoalClass::Survival, urgency, reason)
+                .with_commitment(GoalCommitment::UntilNeedBelow {
+                    need: NeedAxis::Hunger,
+                    threshold: 120.0,
+                })
+                .with_interrupt_policy(InterruptPolicy::UninterruptibleExceptSurvival),
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -409,12 +684,14 @@ impl GoalScorer for SleepScorer {
         if urgency < 0.15 {
             return None;
         }
-        Some(GoalScore {
-            goal: AgentGoal::Sleep,
-            class: GoalClass::Survival,
-            score: urgency,
-            reason: "Tired",
-        })
+        Some(
+            GoalScore::new(AgentGoal::Sleep, GoalClass::Survival, urgency, "Tired")
+                .with_commitment(GoalCommitment::UntilNeedBelow {
+                    need: NeedAxis::Sleep,
+                    threshold: 80.0,
+                })
+                .with_interrupt_policy(InterruptPolicy::UninterruptibleExceptSurvival),
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -440,12 +717,12 @@ impl GoalScorer for ReturnSurplusScorer {
         // home (where the people are) a touch sooner.
         let base = ((food as f32 - 3.0) / 6.0).clamp(0.0, 1.0);
         let lift = disposition_lift(ctx.disposition.gregariousness, 0.1);
-        Some(GoalScore {
-            goal: AgentGoal::ReturnCamp,
-            class: GoalClass::Subsistence,
-            score: (base * lift).clamp(0.0, 1.0),
-            reason: "Returning Surplus Food",
-        })
+        Some(GoalScore::new(
+            AgentGoal::ReturnCamp,
+            GoalClass::Subsistence,
+            (base * lift).clamp(0.0, 1.0),
+            "Returning Surplus Food",
+        ))
     }
 
     fn name(&self) -> &'static str {
@@ -465,12 +742,12 @@ impl GoalScorer for SocialScorer {
             return None;
         }
         let lift = disposition_lift(ctx.disposition.gregariousness, SOCIAL_GREG_LIFT);
-        Some(GoalScore {
-            goal: AgentGoal::Socialize,
-            class: GoalClass::Belonging,
-            score: (urgency * lift).clamp(0.0, 1.0),
-            reason: "Social Need",
-        })
+        Some(GoalScore::new(
+            AgentGoal::Socialize,
+            GoalClass::Belonging,
+            (urgency * lift).clamp(0.0, 1.0),
+            "Social Need",
+        ))
     }
 
     fn name(&self) -> &'static str {
@@ -498,12 +775,12 @@ impl GoalScorer for PlayScorer {
             return None;
         }
         let lift = disposition_lift(ctx.disposition.gregariousness, PLAY_GREG_LIFT);
-        Some(GoalScore {
-            goal: AgentGoal::Play,
-            class: GoalClass::Discretionary,
-            score: (urgency * lift).clamp(0.0, 1.0),
-            reason: "Low Willpower",
-        })
+        Some(GoalScore::new(
+            AgentGoal::Play,
+            GoalClass::Discretionary,
+            (urgency * lift).clamp(0.0, 1.0),
+            "Low Willpower",
+        ))
     }
 
     fn name(&self) -> &'static str {
@@ -527,12 +804,12 @@ impl GoalScorer for TameHorseScorer {
             return None;
         }
         let lift = disposition_lift(ctx.disposition.curiosity, 0.5);
-        Some(GoalScore {
-            goal: AgentGoal::TameHorse,
-            class: GoalClass::Subsistence,
-            score: (0.45 * lift).clamp(0.0, 1.0),
-            reason: "Taming Horse",
-        })
+        Some(GoalScore::new(
+            AgentGoal::TameHorse,
+            GoalClass::Subsistence,
+            (0.45 * lift).clamp(0.0, 1.0),
+            "Taming Horse",
+        ))
     }
 
     fn name(&self) -> &'static str {
@@ -550,12 +827,12 @@ impl GoalScorer for PersonalBuildScorer {
         if !ctx.has_personal_build_site {
             return None;
         }
-        Some(GoalScore {
-            goal: AgentGoal::Build,
-            class: GoalClass::Esteem,
-            score: 0.80,
-            reason: "Building Personal Project",
-        })
+        Some(GoalScore::new(
+            AgentGoal::Build,
+            GoalClass::Esteem,
+            0.80,
+            "Building Personal Project",
+        ))
     }
 
     fn name(&self) -> &'static str {
@@ -579,12 +856,12 @@ impl GoalScorer for CraftDemandScorer {
         let prof_bonus = matches!(ctx.profession, Profession::Crafter | Profession::Apprentice);
         let lift = disposition_lift(ctx.disposition.entrepreneurial, 0.5)
             * if prof_bonus { 1.2 } else { 1.0 };
-        Some(GoalScore {
-            goal: AgentGoal::Craft,
-            class: GoalClass::Subsistence,
-            score: (0.50 * lift).clamp(0.0, 1.0),
-            reason: "Crafting for Faction",
-        })
+        Some(GoalScore::new(
+            AgentGoal::Craft,
+            GoalClass::Subsistence,
+            (0.50 * lift).clamp(0.0, 1.0),
+            "Crafting for Faction",
+        ))
     }
 
     fn name(&self) -> &'static str {
@@ -614,12 +891,12 @@ impl GoalScorer for StockpileScorer {
         } else {
             (GoalClass::Discretionary, 0.20)
         };
-        Some(GoalScore {
-            goal: ctx.fallback_gather,
+        Some(GoalScore::new(
+            ctx.fallback_gather,
             class,
             score,
-            reason: ctx.fallback_gather_reason,
-        })
+            ctx.fallback_gather_reason,
+        ))
     }
 
     fn name(&self) -> &'static str {
@@ -644,12 +921,10 @@ impl GoalScorer for HealNeedScorer {
             return None;
         }
         let urgency = injury.severity as f32 / 255.0;
-        Some(GoalScore {
-            goal: AgentGoal::SeekCare,
-            class: GoalClass::Survival,
-            score: urgency,
-            reason: "Injured",
-        })
+        Some(
+            GoalScore::new(AgentGoal::SeekCare, GoalClass::Survival, urgency, "Injured")
+                .with_interrupt_policy(InterruptPolicy::UninterruptibleExceptSurvival),
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -673,15 +948,26 @@ impl GoalScorer for ProvideCareScorer {
         if !matches!(ctx.profession, Profession::Healer | Profession::Apprentice) {
             return None;
         }
-        if !ctx.faction_has_injured {
+        let has_care_opportunity = ctx
+            .opportunities
+            .map(|idx| {
+                idx.iter_kind_for_faction(
+                    ctx.faction_member.faction_id,
+                    crate::simulation::opportunity::OpportunityKind::CareNeed,
+                )
+                .next()
+                .is_some()
+            })
+            .unwrap_or(ctx.faction_has_injured);
+        if !has_care_opportunity {
             return None;
         }
-        Some(GoalScore {
-            goal: AgentGoal::ProvideCare,
-            class: GoalClass::Subsistence,
-            score: 0.65,
-            reason: "Tending Patient",
-        })
+        Some(GoalScore::new(
+            AgentGoal::ProvideCare,
+            GoalClass::Subsistence,
+            0.65,
+            "Tending Patient",
+        ))
     }
 
     fn name(&self) -> &'static str {
@@ -707,6 +993,42 @@ pub fn register_default_scorers(registry: &mut GoalScorerRegistry) {
     registry.scorers.push(Box::new(HealNeedScorer));
     registry.scorers.push(Box::new(ProvideCareScorer));
     registry.rebuild_opportunistic_indices();
+}
+
+pub fn sample_decision_metrics_system(
+    clock: Res<crate::simulation::schedule::SimClock>,
+    mut metrics: ResMut<DecisionMetrics>,
+    q: Query<
+        (
+            &crate::simulation::lod::LodLevel,
+            &crate::simulation::typed_task::ActionQueue,
+        ),
+        With<crate::simulation::person::Person>,
+    >,
+) {
+    if clock.tick % 20 != 0 {
+        return;
+    }
+    metrics.lod_full = 0;
+    metrics.lod_aggregate = 0;
+    metrics.lod_dormant = 0;
+    metrics.action_queue_samples = 0;
+    metrics.action_queue_total_len = 0;
+    metrics.last_sample_tick = clock.tick;
+    for (lod, aq) in q.iter() {
+        match *lod {
+            crate::simulation::lod::LodLevel::Full => metrics.lod_full += 1,
+            crate::simulation::lod::LodLevel::Aggregate => metrics.lod_aggregate += 1,
+            crate::simulation::lod::LodLevel::Dormant => metrics.lod_dormant += 1,
+        }
+        let active: usize = if matches!(aq.current, crate::simulation::typed_task::Task::Idle) {
+            0
+        } else {
+            1
+        };
+        metrics.action_queue_samples += 1;
+        metrics.action_queue_total_len += (active + aq.queued_len()) as u64;
+    }
 }
 
 #[cfg(test)]
@@ -746,6 +1068,35 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_policy_contract_matches_classes() {
+        assert!(interrupt_policy_allows(
+            InterruptPolicy::AlwaysInterruptible,
+            GoalClass::Survival,
+            GoalClass::Discretionary
+        ));
+        assert!(interrupt_policy_allows(
+            InterruptPolicy::InterruptibleByHigherClass,
+            GoalClass::Discretionary,
+            GoalClass::Belonging
+        ));
+        assert!(!interrupt_policy_allows(
+            InterruptPolicy::InterruptibleByHigherClass,
+            GoalClass::Belonging,
+            GoalClass::Discretionary
+        ));
+        assert!(interrupt_policy_allows(
+            InterruptPolicy::UninterruptibleExceptSurvival,
+            GoalClass::Subsistence,
+            GoalClass::Survival
+        ));
+        assert!(!interrupt_policy_allows(
+            InterruptPolicy::UninterruptibleExceptSurvival,
+            GoalClass::Subsistence,
+            GoalClass::Belonging
+        ));
+    }
+
+    #[test]
     fn registry_argmax_breaks_ties_by_class_first() {
         let mut registry = GoalScorerRegistry::default();
         struct StubScorer {
@@ -755,12 +1106,7 @@ mod tests {
         }
         impl GoalScorer for StubScorer {
             fn score(&self, _ctx: &GoalScoringContext) -> Option<GoalScore> {
-                Some(GoalScore {
-                    goal: self.goal,
-                    class: self.class,
-                    score: self.score,
-                    reason: "stub",
-                })
+                Some(GoalScore::new(self.goal, self.class, self.score, "stub"))
             }
             fn name(&self) -> &'static str {
                 "Stub"
@@ -800,6 +1146,7 @@ mod tests {
             faction_member: &member,
             faction,
             board: &board,
+            opportunities: None,
             is_starving: false,
             faction_has_food: false,
             can_return_camp: false,
@@ -842,6 +1189,7 @@ mod tests {
             faction_member: member,
             faction,
             board,
+            opportunities: None,
             is_starving: false,
             faction_has_food: false,
             can_return_camp: false,
@@ -878,7 +1226,9 @@ mod tests {
         let board = JobBoard::default();
         let skills = Skills::default();
         let ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
-        let score = SurvivalHungerScorer.score(&ctx).expect("hunger above 150 fires");
+        let score = SurvivalHungerScorer
+            .score(&ctx)
+            .expect("hunger above 150 fires");
         assert_eq!(score.class, GoalClass::Survival);
         assert_eq!(score.goal, AgentGoal::Survive);
         assert!(score.score > 0.4);
@@ -947,7 +1297,9 @@ mod tests {
         let mut greg_ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
         greg_ctx.disposition.gregariousness = 230;
         let loner = SocialScorer.score(&loner_ctx);
-        let greg = SocialScorer.score(&greg_ctx).expect("gregarious agent fires");
+        let greg = SocialScorer
+            .score(&greg_ctx)
+            .expect("gregarious agent fires");
         // Loner may decline entirely at this social level; gregarious agent must fire.
         match loner {
             None => {} // declined — OK, gregarious agent already fires
@@ -1017,7 +1369,9 @@ mod tests {
         ctx.should_craft = false;
         assert!(CraftDemandScorer.score(&ctx).is_none());
         ctx.should_craft = true;
-        let s = CraftDemandScorer.score(&ctx).expect("fires when should_craft");
+        let s = CraftDemandScorer
+            .score(&ctx)
+            .expect("fires when should_craft");
         assert_eq!(s.goal, AgentGoal::Craft);
         assert_eq!(s.class, GoalClass::Subsistence);
     }
@@ -1108,8 +1462,12 @@ mod tests {
             applied_tick: 0,
             last_damage_tick: 0,
         });
-        let light = HealNeedScorer.score(&light_ctx).expect("light injury fires");
-        let severe = HealNeedScorer.score(&severe_ctx).expect("severe injury fires");
+        let light = HealNeedScorer
+            .score(&light_ctx)
+            .expect("light injury fires");
+        let severe = HealNeedScorer
+            .score(&severe_ctx)
+            .expect("severe injury fires");
         assert!(severe.score > light.score);
         assert_eq!(severe.goal, AgentGoal::SeekCare);
         assert_eq!(severe.class, GoalClass::Survival);
@@ -1250,7 +1608,9 @@ mod tests {
 
         let mut registry = GoalScorerRegistry::default();
         register_default_scorers(&mut registry);
-        let best = registry.best(&ctx).expect("at minimum StockpileScorer fires");
+        let best = registry
+            .best(&ctx)
+            .expect("at minimum StockpileScorer fires");
         assert_eq!(best.goal, AgentGoal::GatherFood);
         // Idle fallback sits at Discretionary, the lowest priority
         // tier, so any higher-need scorer naturally preempts it.
@@ -1336,13 +1696,9 @@ mod tests {
                     needs.hunger = hunger;
                     needs.social = social;
                     needs.willpower = willpower;
-                    let mut loner = test_ctx(
-                        &needs, &agent, &member, faction, &board, &skills,
-                    );
+                    let mut loner = test_ctx(&needs, &agent, &member, faction, &board, &skills);
                     loner.disposition.gregariousness = 20;
-                    let mut greg = test_ctx(
-                        &needs, &agent, &member, faction, &board, &skills,
-                    );
+                    let mut greg = test_ctx(&needs, &agent, &member, faction, &board, &skills);
                     greg.disposition.gregariousness = 220;
                     let loner_goal = registry
                         .best(&loner)
@@ -1390,9 +1746,7 @@ mod tests {
                     needs.hunger = hunger;
                     needs.social = social;
                     needs.willpower = 100.0;
-                    let mut ctx = test_ctx(
-                        &needs, &agent, &member, faction, &board, &skills,
-                    );
+                    let mut ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
                     ctx.disposition.gregariousness = greg;
                     let pick = registry.best(&ctx).expect("scorer fires");
                     assert_eq!(
@@ -1424,8 +1778,12 @@ mod tests {
         day_ctx.time_of_day_bonus = 0.0;
         let mut night_ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
         night_ctx.time_of_day_bonus = 1.0;
-        let day = SleepScorer.score(&day_ctx).expect("daytime sleep at 170 fires");
-        let night = SleepScorer.score(&night_ctx).expect("nighttime sleep at 170 fires");
+        let day = SleepScorer
+            .score(&day_ctx)
+            .expect("daytime sleep at 170 fires");
+        let night = SleepScorer
+            .score(&night_ctx)
+            .expect("nighttime sleep at 170 fires");
         assert!(night.score > day.score, "night must outscore day");
         assert_eq!(day.class, GoalClass::Survival);
     }

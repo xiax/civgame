@@ -85,6 +85,15 @@ pub struct PathPanelParams<'w> {
     pub connectivity: Res<'w, ChunkConnectivity>,
 }
 
+#[derive(SystemParam)]
+pub struct DecisionPanelParams<'w> {
+    pub interrupt_stats: Res<'w, crate::simulation::opportunistic::OpportunisticInterruptStats>,
+    pub decision_metrics: Res<'w, crate::simulation::goal_scorers::DecisionMetrics>,
+    pub cohort_registry: Res<'w, crate::simulation::cohort::CohortRegistry>,
+    pub opportunity_index: Res<'w, crate::simulation::opportunity::OpportunityIndex>,
+    pub sim_clock: Res<'w, crate::simulation::SimClock>,
+}
+
 pub fn debug_panel_system(
     mut contexts: EguiContexts,
     mut state: ResMut<DebugPanelState>,
@@ -98,8 +107,7 @@ pub fn debug_panel_system(
     mut agents: Query<(&mut Needs, &mut Skills, &mut EconomicAgent), With<Person>>,
     terraform_map: Res<TerraformMap>,
     terraform_sites: Query<&TerraformSite>,
-    interrupt_stats: Res<crate::simulation::opportunistic::OpportunisticInterruptStats>,
-    sim_clock: Res<crate::simulation::SimClock>,
+    decision_panel: DecisionPanelParams,
 ) {
     if !state.open {
         return;
@@ -125,8 +133,11 @@ pub fn debug_panel_system(
                 // `total_fired` accumulates over the session;
                 // `last_tick` shows the most recent flip's tick so
                 // operators can spot whether interrupts are firing.
-                let stats = *interrupt_stats;
-                let last_ago = sim_clock.tick.saturating_sub(stats.last_tick);
+                let stats = *decision_panel.interrupt_stats;
+                let last_ago = decision_panel
+                    .sim_clock
+                    .tick
+                    .saturating_sub(stats.last_tick);
                 let last_txt = if stats.total_fired == 0 {
                     "never".to_string()
                 } else {
@@ -136,6 +147,28 @@ pub fn debug_panel_system(
                     egui::RichText::new(format!(
                         "Opportunistic interrupts: {} total · last {}",
                         stats.total_fired, last_txt
+                    ))
+                    .small()
+                    .color(egui::Color32::from_gray(150)),
+                );
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Decisions: {} goal evals · {} scorer evals · avg queue {:.2}",
+                        decision_panel.decision_metrics.goal_evaluations,
+                        decision_panel.decision_metrics.scorer_evaluations,
+                        decision_panel.decision_metrics.average_action_queue_len()
+                    ))
+                    .small()
+                    .color(egui::Color32::from_gray(150)),
+                );
+                ui.label(
+                    egui::RichText::new(format!(
+                        "LOD: {} full · {} aggregate · {} dormant · {} cohorts · {} opportunities",
+                        decision_panel.decision_metrics.lod_full,
+                        decision_panel.decision_metrics.lod_aggregate,
+                        decision_panel.decision_metrics.lod_dormant,
+                        decision_panel.cohort_registry.cohorts.len(),
+                        decision_panel.opportunity_index.len()
                     ))
                     .small()
                     .color(egui::Color32::from_gray(150)),

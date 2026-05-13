@@ -111,6 +111,8 @@ fn setup_sandbox(
             crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Person),
             crate::simulation::knowledge::PersonKnowledge::paleolithic_seed(0),
             crate::simulation::typed_task::ActionQueue::idle(),
+            crate::simulation::goal_scorers::AgentDecisionState::default(),
+            crate::simulation::goal_scorers::Disposition::default(),
         ),
     ));
 

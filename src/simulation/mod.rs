@@ -10,6 +10,7 @@ pub mod carry;
 pub mod carve;
 pub mod civic_milestones;
 pub mod clear_obstacle;
+pub mod cohort;
 pub mod combat;
 pub mod construction;
 pub mod corpse;
@@ -40,6 +41,7 @@ pub mod nomad_pack_labor;
 pub mod nomad_pool;
 pub mod obstacle;
 pub mod opportunistic;
+pub mod opportunity;
 pub mod organic_settlement;
 pub mod pack_deploy;
 pub mod person;
@@ -150,6 +152,9 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::DoorMap::default())
             .insert_resource(capital::WorkshopOwnership::default())
             .insert_resource(opportunistic::OpportunisticInterruptStats::default())
+            .insert_resource(goal_scorers::DecisionMetrics::default())
+            .insert_resource(opportunity::OpportunityIndex::default())
+            .insert_resource(cohort::CohortRegistry::default())
             .insert_resource(construction::WorkbenchMap::default())
             .insert_resource(construction::LoomMap::default())
             .insert_resource(construction::TableMap::default())
@@ -252,6 +257,8 @@ impl Plugin for SimulationPlugin {
                     faction::update_storage_tile_map_system,
                     faction::sync_faction_center_hotspots_system,
                     animals::animal_needs_tick_system,
+                    goal_scorers::sample_decision_metrics_system,
+                    cohort::rebuild_cohort_registry_system,
                 )
                     .in_set(SimulationSet::ParallelA),
             )
@@ -274,18 +281,6 @@ impl Plugin for SimulationPlugin {
                     // honoured first; before the dispatchers in
                     // ParallelB so blocked goals never run.
                     goals::mobile_state_goal_gate_system.after(goals::goal_update_system),
-                    // Phase 6 (wage-aware-labor-market-v2):
-                    // procedural-form `EarnIncomeScorer` fold-in. Runs
-                    // after `goal_update_system` so the fallback
-                    // gather goal is already set, and before the
-                    // dispatchers (ParallelB) so they see the
-                    // overridden goal. Tier = Enterprise: rewrites
-                    // gather fallback to a paid-posting-matching
-                    // goal for professioned agents in Mixed / Market
-                    // factions.
-                    goals::earnincome_goal_override_system
-                        .after(goals::goal_update_system)
-                        .after(goals::mobile_state_goal_gate_system),
                     // Phase D (behavioural richness): opportunistic
                     // mid-walk interrupts. Runs after the cascade has
                     // set the agent's authoritative goal but before
@@ -737,6 +732,16 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 (jobs::wage_gossip_system.after(knowledge::awareness_gossip_system),)
                     .in_set(SimulationSet::Economy),
+            )
+            .add_systems(
+                FixedUpdate,
+                opportunity::rebuild_opportunity_index_system
+                    .after(faction::compute_faction_storage_system)
+                    .in_set(SimulationSet::Economy),
+            )
+            .add_systems(
+                FixedUpdate,
+                cohort::cohort_pin_full_sim_system.in_set(SimulationSet::Economy),
             )
             .add_systems(
                 FixedUpdate,

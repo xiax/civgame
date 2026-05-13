@@ -499,6 +499,7 @@ impl PersonBuilder {
                     Indexed::new(IndexedKind::Person),
                     PersonKnowledge::paleolithic_seed(now_tick as u32),
                     crate::simulation::typed_task::ActionQueue::idle(),
+                    crate::simulation::goal_scorers::AgentDecisionState::default(),
                     crate::simulation::goal_scorers::Disposition::default(),
                 ),
             ))
@@ -12780,6 +12781,7 @@ mod wage_aware_phase0_phase1 {
             faction_member: &member,
             faction,
             board,
+            opportunities: None,
             is_starving: false,
             faction_has_food: false,
             can_return_camp: false,
