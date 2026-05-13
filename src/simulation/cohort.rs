@@ -154,7 +154,7 @@ pub enum FullSimPinReason {
 pub fn cohort_pin_full_sim_system(
     mut commands: Commands,
     clock: Res<SimClock>,
-    q: Query<
+    mut q: Query<
         (
             Entity,
             &PersonAI,
@@ -163,11 +163,12 @@ pub fn cohort_pin_full_sim_system(
             Option<&crate::simulation::player_command::Commanded>,
             Option<&Drafted>,
             Option<&PinnedFullSim>,
+            &mut LodLevel,
         ),
         With<Person>,
     >,
 ) {
-    for (entity, ai, goal, chief, commanded, drafted, existing_pin) in q.iter() {
+    for (entity, ai, goal, chief, commanded, drafted, existing_pin, mut lod) in q.iter_mut() {
         let reason = if commanded.is_some() || matches!(*goal, AgentGoal::FollowingPlayerCommand) {
             Some(FullSimPinReason::Commanded)
         } else if drafted.is_some() {
@@ -180,6 +181,7 @@ pub fn cohort_pin_full_sim_system(
             None
         };
         if let Some(reason) = reason {
+            *lod = LodLevel::Full;
             if existing_pin.map(|pin| pin.reason) != Some(reason) {
                 commands.entity(entity).insert(PinnedFullSim {
                     reason,

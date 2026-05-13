@@ -254,6 +254,11 @@ impl Plugin for SimulationPlugin {
                     mood::derive_mood_system,
                     items::recompute_inventory_capacity_system,
                     lod::update_lod_levels_system,
+                    cohort::cohort_pin_full_sim_system
+                        .after(lod::update_lod_levels_system)
+                        .before(goals::goal_update_system)
+                        .before(goal_scorers::sample_decision_metrics_system)
+                        .before(cohort::rebuild_cohort_registry_system),
                     faction::update_storage_tile_map_system,
                     faction::sync_faction_center_hotspots_system,
                     animals::animal_needs_tick_system,
@@ -741,10 +746,6 @@ impl Plugin for SimulationPlugin {
             )
             .add_systems(
                 FixedUpdate,
-                cohort::cohort_pin_full_sim_system.in_set(SimulationSet::Economy),
-            )
-            .add_systems(
-                FixedUpdate,
                 (
                     organic_settlement::settlement_survey_system
                         .after(settlement::auto_found_default_settlements_system)
@@ -789,8 +790,12 @@ impl Plugin for SimulationPlugin {
                     military::expire_rally_points_system,
                     teaching::apply_lecture_request_system,
                     faction::chief_hunt_order_system.after(faction::compute_faction_storage_system),
+                    // Let higher-specificity profession passes claim scarce
+                    // None candidates before the general hunter floor fills
+                    // leftover labour slots.
                     faction::faction_hunter_assignment_system
-                        .after(faction::chief_hunt_order_system),
+                        .after(faction::chief_hunt_order_system)
+                        .after(medicine::chief_healer_assignment_system),
                     faction::chief_bureaucrat_appointment_system
                         .after(faction::compute_faction_storage_system),
                     faction::chief_craft_assignment_system

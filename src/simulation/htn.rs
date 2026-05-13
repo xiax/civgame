@@ -598,7 +598,11 @@ pub fn dispatch_for_goal<'a>(
         } else {
             score_method_with_history(method_ref, abstract_task, ctx, history, now)
         };
-        if best.as_ref().map_or(true, |b| score > b.score) {
+        // Match the legacy per-dispatcher `Iterator::max_by` behavior: when
+        // utilities tie, the later registered method wins. Several Play
+        // methods intentionally sit at UTIL_BASELINE and rely on registration
+        // order for parity with the old plan ranking.
+        if best.as_ref().map_or(true, |b| score >= b.score) {
             best = Some(DispatchForGoalPick {
                 method: method_ref,
                 method_id: method_ref.id(),
@@ -5945,21 +5949,18 @@ pub fn htn_scout_dispatch_system(
             };
 
             let abstract_task = AbstractTask::Scout;
-            let methods = method_registry.methods_for(AbstractTaskKind::Scout);
-            let chosen = methods
-                .iter()
-                .filter(|m| m.precondition(abstract_task, &ctx))
-                .max_by(|a, b| {
-                    let ua =
-                        score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                    let ub =
-                        score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
-                    ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-                });
-            let Some(method) = chosen else {
+            let Some(pick) = dispatch_for_goal(
+                &method_registry,
+                abstract_task,
+                &ctx,
+                &history,
+                now,
+                None,
+            ) else {
                 return;
             };
-            let chosen_id = method.id();
+            let method = pick.method;
+            let chosen_id = pick.method_id;
             ai.active_method = Some(chosen_id);
             let mut tasks = method.expand(abstract_task, &ctx);
             if tasks.is_empty() {
@@ -6163,21 +6164,18 @@ pub fn htn_return_surplus_dispatch_system(
             };
 
             let abstract_task = AbstractTask::ReturnSurplus;
-            let methods = method_registry.methods_for(AbstractTaskKind::ReturnSurplus);
-            let chosen = methods
-                .iter()
-                .filter(|m| m.precondition(abstract_task, &ctx))
-                .max_by(|a, b| {
-                    let ua =
-                        score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                    let ub =
-                        score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
-                    ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-                });
-            let Some(method) = chosen else {
+            let Some(pick) = dispatch_for_goal(
+                &method_registry,
+                abstract_task,
+                &ctx,
+                &history,
+                now,
+                None,
+            ) else {
                 return;
             };
-            let chosen_id = method.id();
+            let method = pick.method;
+            let chosen_id = pick.method_id;
             ai.active_method = Some(chosen_id);
             let mut tasks = method.expand(abstract_task, &ctx);
             if tasks.is_empty() {
@@ -6363,19 +6361,18 @@ pub fn htn_tame_horse_dispatch_system(
         };
 
         let abstract_task = AbstractTask::TameWildHorse;
-        let methods = method_registry.methods_for(AbstractTaskKind::TameWildHorse);
-        let chosen = methods
-            .iter()
-            .filter(|m| m.precondition(abstract_task, &ctx))
-            .max_by(|a, b| {
-                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
-                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        let Some(method) = chosen else {
+        let Some(pick) = dispatch_for_goal(
+            &method_registry,
+            abstract_task,
+            &ctx,
+            &history,
+            now,
+            None,
+        ) else {
             continue;
         };
-        let chosen_id = method.id();
+        let method = pick.method;
+        let chosen_id = pick.method_id;
         ai.active_method = Some(chosen_id);
         let mut tasks = method.expand(abstract_task, &ctx);
         if tasks.is_empty() {
@@ -9636,19 +9633,18 @@ pub fn htn_harvest_plant_dispatch_system(
         };
 
         let abstract_task = AbstractTask::HarvestPlant;
-        let methods = method_registry.methods_for(AbstractTaskKind::HarvestPlant);
-        let chosen = methods
-            .iter()
-            .filter(|m| m.precondition(abstract_task, &ctx))
-            .max_by(|a, b| {
-                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
-                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        let Some(method) = chosen else {
+        let Some(pick) = dispatch_for_goal(
+            &method_registry,
+            abstract_task,
+            &ctx,
+            &history,
+            now,
+            None,
+        ) else {
             continue;
         };
-        let chosen_id = method.id();
+        let method = pick.method;
+        let chosen_id = pick.method_id;
         ai.active_method = Some(chosen_id);
         let mut tasks = method.expand(abstract_task, &ctx);
         if tasks.is_empty() {
@@ -10323,33 +10319,18 @@ pub fn htn_play_dispatch_system(
         };
 
         let abstract_task = AbstractTask::Play;
-        let methods = method_registry.methods_for(AbstractTaskKind::Play);
-        let chosen = methods
-            .iter()
-            .filter(|m| m.precondition(abstract_task, &ctx))
-            .max_by(|a, b| {
-                let ua = score_method_with_history_and_disposition(
-                    a.as_ref(),
-                    abstract_task,
-                    &ctx,
-                    disposition,
-                    &history,
-                    now,
-                );
-                let ub = score_method_with_history_and_disposition(
-                    b.as_ref(),
-                    abstract_task,
-                    &ctx,
-                    disposition,
-                    &history,
-                    now,
-                );
-                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        let Some(method) = chosen else {
+        let Some(pick) = dispatch_for_goal(
+            &method_registry,
+            abstract_task,
+            &ctx,
+            &history,
+            now,
+            Some(disposition),
+        ) else {
             continue;
         };
-        let chosen_id = method.id();
+        let method = pick.method;
+        let chosen_id = pick.method_id;
         ai.active_method = Some(chosen_id);
         let mut tasks = method.expand(abstract_task, &ctx);
         if tasks.is_empty() {
