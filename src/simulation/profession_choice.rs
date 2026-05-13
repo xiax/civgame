@@ -295,6 +295,7 @@ pub fn profession_change_log_system(
             || matches!(
                 (from, *prof),
                 (Profession::Apprentice, Profession::Crafter)
+                    | (Profession::Apprentice, Profession::Healer)
                     | (Profession::Apprentice, Profession::None)
             );
         if !suppress_apprenticeship_dup {

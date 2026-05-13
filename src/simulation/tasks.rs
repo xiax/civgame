@@ -100,11 +100,19 @@ pub enum TaskKind {
     PitchStructureAt = 47,
     /// Heal-3: Healer walks adjacent to a target patient carrying an
     /// `Injury` and ticks down the patient's `Injury.severity` while
-    /// in range. Grants Medicine XP to the Healer. Patient-side
-    /// `AgentGoal::SeekCare` carries no typed task — patients use
-    /// `Task::WalkTo` to reach the nearest same-faction Healer; the
-    /// transfer fires from the Healer's `Task::Heal`.
+    /// in range. Grants Medicine XP to the Healer.
     Heal = 48,
+    /// Heal-3b: patient with `AgentGoal::SeekCare` walking toward a
+    /// recovery site (nearest faction-owned `Shrine` if any, else the
+    /// faction's `home_tile`). The walk is a long-running marker —
+    /// `goal_dispatch_system` preserves the `(SeekCare, SeekCare)`
+    /// pair so the chain survives goal-eval ticks. On chebyshev
+    /// arrival the movement system drops the task back to Idle; the
+    /// agent then waits for a Healer's `htn_provide_care_dispatch_system`
+    /// (which scans `HEAL_SCAN_RADIUS = 12` of each Healer) to pick
+    /// them up. The dispatcher short-circuits when the patient is
+    /// already within `SEEK_CARE_AT_SITE_RADIUS` of the chosen site.
+    SeekCare = 49,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -159,6 +167,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::UnloadCampCargo as u16 => "Unloading Cargo",
         x if x == TaskKind::PitchStructureAt as u16 => "Pitching Structure",
         x if x == TaskKind::Heal as u16 => "Healing",
+        x if x == TaskKind::SeekCare as u16 => "Seeking Care",
         _ => "Unemployed",
     }
 }
@@ -1018,6 +1027,13 @@ pub fn goal_dispatch_system(
                     // ticks (200 ticks = 10 s, scout walks may be 30-60s).
                     AgentGoal::Scout if ai.task_id == TaskKind::Explore as u16 => {
                         Some(TaskKind::Explore as u16)
+                    }
+                    // Heal-3b: SeekCare patient walking to the recovery
+                    // site. The walk leg outlives goal-eval ticks; the
+                    // patient stays SeekCare until injury_tracking_system
+                    // clears their `Injury`.
+                    AgentGoal::SeekCare if ai.task_id == TaskKind::SeekCare as u16 => {
+                        Some(TaskKind::SeekCare as u16)
                     }
                     _ => None,
                 };

@@ -11039,6 +11039,337 @@ mod baseline_behaviour {
             "Healer should accumulate Medicine XP while treating"
         );
     }
+
+    /// Heal-3b: SeekCare patient with an `Injury` must dispatch a
+    /// `Task::WalkTo` toward the nearest faction-owned Shrine. Without
+    /// this routing the patient would idle in place forever, since
+    /// `HealNeedScorer` keeps them pinned to `AgentGoal::SeekCare` as
+    /// long as the `Injury` component is present.
+    #[test]
+    fn seek_care_dispatcher_routes_patient_to_faction_shrine() {
+        use crate::simulation::capital::{OwnedBy, WorkshopKind};
+        use crate::simulation::combat::{Body, BodyPart};
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::medicine::Injury;
+        use crate::simulation::typed_task::{ActionQueue, Task, WalkReason};
+
+        let mut sim = TestSim::new(0x5EECCA12);
+        sim.flat_world(3, 0, TileKind::Grass);
+
+        let fid = sim.player_faction_id;
+
+        // Stamp a faction-owned Shrine far from the patient so the
+        // SEEK_CARE_AT_SITE_RADIUS short-circuit doesn't trip.
+        let shrine_tile = (20, 0);
+        sim.app.world_mut().spawn((
+            Transform::default(),
+            GlobalTransform::default(),
+            OwnedBy {
+                faction_id: fid,
+                kind: WorkshopKind::Shrine,
+                tile: shrine_tile,
+            },
+        ));
+
+        // Injured patient at the faction's spawn area. Damage the
+        // torso so `injury_tracking_system` stamps `Injury` after the
+        // warm-up tick.
+        let patient = sim.spawn_person(fid, (0, 0), |_| {});
+        {
+            let mut body = sim.app.world_mut().get_mut::<Body>(patient).unwrap();
+            let torso = body.get_mut(BodyPart::Torso);
+            torso.current = 4;
+        }
+        sim.tick_n(2);
+        assert!(
+            sim.app.world().get::<Injury>(patient).is_some(),
+            "Injury must be stamped before the dispatcher fires"
+        );
+
+        // Pin SeekCare directly so the test doesn't race the scorer
+        // pipeline. The dispatcher gates on `Injury` + `Idle`, both true.
+        // Clear any task the warm-up dispatchers may have queued (e.g.
+        // terminal `Explore { AnyEdible }`) so the SeekCare dispatcher
+        // sees a clean idle slot.
+        {
+            let mut goal = sim.app.world_mut().get_mut::<AgentGoal>(patient).unwrap();
+            *goal = AgentGoal::SeekCare;
+            let mut ai = sim.app.world_mut().get_mut::<PersonAI>(patient).unwrap();
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.state = crate::simulation::person::AiState::Idle;
+            let mut aq = sim
+                .app
+                .world_mut()
+                .get_mut::<ActionQueue>(patient)
+                .unwrap();
+            aq.cancel();
+        }
+        sim.tick_n(2);
+
+        let aq = sim
+            .app
+            .world()
+            .get::<ActionQueue>(patient)
+            .expect("ActionQueue missing");
+        match aq.current {
+            Task::WalkTo { tile, why, .. } => {
+                assert_eq!(
+                    tile, shrine_tile,
+                    "SeekCare must walk toward the faction Shrine"
+                );
+                assert_eq!(
+                    why,
+                    WalkReason::SeekCare,
+                    "WalkReason must mark the leg as SeekCare"
+                );
+            }
+            other => panic!(
+                "expected Task::WalkTo toward Shrine for SeekCare patient, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Heal-5: chief_healer_assignment_system promotes a `Profession::None`
+    /// candidate to `Healer` when injuries are present and demotes back
+    /// to `None` when the band fully recovers. Verifies the
+    /// injured-count-driven target, the survival override is *not*
+    /// tripped (food seeded), and the asymmetric demote buffer.
+    #[test]
+    fn chief_healer_assignment_promotes_when_injured_then_demotes_on_recovery() {
+        use crate::simulation::combat::{Body, BodyPart};
+        use crate::simulation::medicine::{Injury, HEALER_ASSIGNMENT_CADENCE};
+        use crate::simulation::skills::SkillKind;
+
+        let mut sim = TestSim::new(0xC0DE_4EA0);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        // Dedicated chief away from the candidates — without this the
+        // first-spawned agent gets `FactionChief` from chief selection
+        // and is forced into `AgentGoal::Lead`, which doesn't block
+        // promotion but does cause the demote-phase log to noise.
+        let chief = sim.spawn_person(fid, (-5, -5), |_| {});
+        sim.app
+            .world_mut()
+            .entity_mut(chief)
+            .insert(crate::simulation::faction::FactionChief);
+
+        // Healer-capable candidate (high Medicine skill, EV ranking
+        // puts them on top of the None pool).
+        let candidate = sim.spawn_person(fid, (0, 0), |b| {
+            let mut s = Skills::default();
+            s.0[SkillKind::Medicine as usize] = 90;
+            b.skills(s).profession(Profession::None);
+        });
+        // Inject one injured filler so the chief sees nonzero demand.
+        let injured_filler = sim.spawn_person(fid, (1, 0), |b| {
+            b.profession(Profession::Farmer);
+        });
+        for tx in 2..5 {
+            sim.spawn_person(fid, (tx, 0), |b| {
+                b.profession(Profession::Farmer);
+            });
+        }
+        {
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<crate::simulation::faction::FactionRegistry>();
+            let faction = registry.factions.get_mut(&fid).unwrap();
+            faction.member_count = 6;
+            faction.chief_entity = Some(chief);
+        }
+        // Keep per-head food above the survival floor so the override
+        // doesn't zero the healer target.
+        sim.seed_faction_food(fid, 6 * 32);
+
+        // Damage filler torso → injury_tracking_system inserts Injury.
+        {
+            let mut body = sim
+                .app
+                .world_mut()
+                .get_mut::<Body>(injured_filler)
+                .unwrap();
+            let torso = body.get_mut(BodyPart::Torso);
+            torso.current = 4;
+        }
+        // Land on a HEALER_ASSIGNMENT_CADENCE boundary so the chief
+        // pass fires on the next tick.
+        {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = HEALER_ASSIGNMENT_CADENCE - 1;
+        }
+        sim.tick_n(2);
+
+        assert!(
+            sim.app.world().get::<Injury>(injured_filler).is_some(),
+            "injured filler should carry Injury after Body damage"
+        );
+        let prof = *sim.app.world().get::<Profession>(candidate).unwrap();
+        assert_eq!(
+            prof,
+            Profession::Healer,
+            "candidate with Medicine 90 should auto-promote to Healer when faction has injured"
+        );
+
+        // Heal the filler by restoring the torso. injury_tracking_system
+        // clears Injury once Body.fraction() == 1.0.
+        {
+            let mut body = sim
+                .app
+                .world_mut()
+                .get_mut::<Body>(injured_filler)
+                .unwrap();
+            for limb in body.parts.iter_mut() {
+                limb.current = limb.max;
+            }
+        }
+        // Two more cadence cycles + the demote-buffer pass: cadence
+        // fires once with no injuries (target = 0), and the
+        // single-slot demote buffer means `current (1) > target (0) +
+        // buffer (1)` is false on the first pass — but the `want == 0`
+        // arm bypasses the buffer for full stand-down. So one cadence
+        // tick after the injury clears is enough.
+        {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = HEALER_ASSIGNMENT_CADENCE * 3 - 1;
+        }
+        sim.tick_n(2);
+
+        assert!(
+            sim.app.world().get::<Injury>(injured_filler).is_none(),
+            "Injury must clear after Body is restored"
+        );
+        let prof = *sim.app.world().get::<Profession>(candidate).unwrap();
+        assert_eq!(
+            prof,
+            Profession::None,
+            "Healer should demote to None when no injured members remain"
+        );
+    }
+
+    /// Heal-5 / 6 end-to-end: a faction with several injured members
+    /// auto-promotes a Healer, the Healer walks to a patient and runs
+    /// `heal_task_system`, and the patient's `Body` fraction climbs
+    /// toward 1.0 over the trial. Smoke-level (we don't assert full
+    /// recovery — limb HP × 8 limbs × 1 HP/tick × ~20 patients ticks =
+    /// many seconds — but we do verify the chain progresses past the
+    /// "promote then sit idle" failure mode that motivated this slice.
+    #[test]
+    fn injured_band_with_one_healer_makes_recovery_progress() {
+        use crate::simulation::combat::{Body, BodyPart};
+        use crate::simulation::medicine::{Injury, HEALER_ASSIGNMENT_CADENCE};
+        use crate::simulation::skills::SkillKind;
+
+        let mut sim = TestSim::new(0xC0DE_4EA1);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        // Spawn a dedicated chief away from the test agents so the
+        // chief override in `goal_update_system` doesn't pin our
+        // Healer candidate into `AgentGoal::Lead`. Without this the
+        // first-spawned agent picks up `FactionChief` from
+        // `chief_selection_system` and the candidate never gets to
+        // serve patients.
+        let chief = sim.spawn_person(fid, (-5, -5), |_| {});
+        sim.app
+            .world_mut()
+            .entity_mut(chief)
+            .insert(crate::simulation::faction::FactionChief);
+
+        // Healer-capable candidate sitting next to a wounded peer so
+        // the ProvideCare dispatcher can route + heal in the same
+        // window. Medicine 120 keeps EV high and gives the candidate
+        // a master-track competence floor.
+        let candidate = sim.spawn_person(fid, (1, 0), |b| {
+            let mut s = Skills::default();
+            s.0[SkillKind::Medicine as usize] = 120;
+            b.skills(s).profession(Profession::None);
+        });
+        let patient = sim.spawn_person(fid, (0, 0), |b| {
+            b.profession(Profession::Farmer);
+        });
+        for tx in 2..5 {
+            sim.spawn_person(fid, (tx, 0), |b| {
+                b.profession(Profession::Farmer);
+            });
+        }
+        {
+            let mut registry = sim
+                .app
+                .world_mut()
+                .resource_mut::<crate::simulation::faction::FactionRegistry>();
+            let faction = registry.factions.get_mut(&fid).unwrap();
+            faction.member_count = 6;
+            faction.chief_entity = Some(chief);
+        }
+        sim.seed_faction_food(fid, 6 * 32);
+
+        // Severely damage every limb on the patient so Body.fraction()
+        // is well under 1.0; even a couple of heal ticks will visibly
+        // raise it.
+        {
+            let mut body = sim.app.world_mut().get_mut::<Body>(patient).unwrap();
+            let torso = body.get_mut(BodyPart::Torso);
+            torso.current = 4;
+            let head = body.get_mut(BodyPart::Head);
+            head.current = head.current.saturating_sub(8).max(4);
+        }
+        // Cadence-boundary, two ticks for Injury stamp + chief promote.
+        {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = HEALER_ASSIGNMENT_CADENCE - 1;
+        }
+        sim.tick_n(2);
+
+        assert!(
+            sim.app.world().get::<Injury>(patient).is_some(),
+            "patient should carry Injury before recovery"
+        );
+        assert_eq!(
+            *sim.app.world().get::<Profession>(candidate).unwrap(),
+            Profession::Healer,
+            "candidate must auto-promote to Healer once injured exists"
+        );
+
+        // Force the new Healer onto `ProvideCare` immediately. Without
+        // this nudge the Healer waits for `goal_update_system`'s
+        // 200-tick re-evaluation cadence before noticing the
+        // profession flip — by which point the test trial is over.
+        // `ForceGoalReevaluate` is the canonical channel: drop the
+        // entity in and goal_update_system bypasses the cadence gate
+        // next tick.
+        {
+            let mut force = sim
+                .app
+                .world_mut()
+                .resource_mut::<crate::simulation::goals::ForceGoalReevaluate>();
+            force.0.insert(candidate);
+        }
+
+        let fraction_before = sim.app.world().get::<Body>(patient).unwrap().fraction();
+
+        // Run for a couple of seconds of game-time so the Healer can
+        // route, arrive (adjacent at start — chebyshev 1), and tick
+        // `heal_task_system` repeatedly. 200 ticks @ 20 Hz = 10 s.
+        sim.tick_n(200);
+
+        let fraction_after = sim.app.world().get::<Body>(patient).unwrap().fraction();
+        assert!(
+            fraction_after > fraction_before,
+            "Body.fraction must climb over the trial \
+             (before {:.3} → after {:.3})",
+            fraction_before,
+            fraction_after,
+        );
+        // Healer should have accumulated some Medicine XP.
+        let skills = sim.app.world().get::<Skills>(candidate).unwrap();
+        assert!(
+            skills.get(SkillKind::Medicine) >= 120,
+            "Healer should retain (and probably grow) their Medicine skill while treating"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -181,6 +181,7 @@ pub fn inspector_panel_system(
             &crate::simulation::typed_task::ActionQueue,
             Option<&MethodHistory>,
             Option<&crate::simulation::player_command::Commanded>,
+            Option<&crate::simulation::medicine::Injury>,
         ),
     )>,
 ) {
@@ -198,6 +199,7 @@ pub fn inspector_panel_system(
             aq,
             method_history,
             commanded,
+            injury,
         ),
     )) = query.get(entity)
     else {
@@ -280,6 +282,39 @@ pub fn inspector_panel_system(
                                     .color(egui::Color32::from_gray(160)),
                             );
                         });
+                        // Heal-6: injury readout. Severity = 0..=255
+                        // (255 = fully wrecked); colour goes from yellow
+                        // (light wound) to red (severe) so the operator
+                        // can scan a settlement and spot triage cases.
+                        // `last_damage_tick` lets the operator see how
+                        // recent the injury is — a stale `applied_tick`
+                        // with old `last_damage_tick` is recovering, a
+                        // fresh `last_damage_tick` is still combat-hot.
+                        if let Some(inj) = injury {
+                            let sev = inj.severity as f32 / 255.0;
+                            let red = (180.0 + 75.0 * sev).clamp(180.0, 255.0) as u8;
+                            let green = (180.0 - 150.0 * sev).clamp(30.0, 180.0) as u8;
+                            let age_ticks = sim_clock.tick.saturating_sub(inj.applied_tick);
+                            let age_days =
+                                age_ticks / crate::world::seasons::TICKS_PER_DAY as u64;
+                            let since_damage = sim_clock
+                                .tick
+                                .saturating_sub(inj.last_damage_tick);
+                            let recency = if since_damage
+                                < (crate::world::seasons::TICKS_PER_DAY / 2) as u64
+                            {
+                                "fresh"
+                            } else {
+                                "stable"
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Injured: severity {} ({}, {} d since onset)",
+                                    inj.severity, recency, age_days,
+                                ))
+                                .color(egui::Color32::from_rgb(red, green, 40)),
+                            );
+                        }
                         if let Ok(claim) = job_params.claim_query.get(entity) {
                             ui.horizontal(|ui| {
                                 ui.label(format!("Job: {} (#{})", claim.kind.name(), claim.job_id));

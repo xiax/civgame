@@ -110,6 +110,34 @@ pub const HEAL_ADJACENCY_RADIUS: i32 = 1;
 /// will scan for patients from the Healer's tile. Mirrors the
 /// `PARTNER_RADIUS = 12` used by socialize/play dispatchers.
 pub const HEAL_SCAN_RADIUS: i32 = 12;
+/// Heal-3b: chebyshev radius at which a SeekCare patient is considered
+/// "at the recovery site". When already within this distance of the
+/// chosen Shrine / home_tile, `htn_seek_care_dispatch_system` skips
+/// re-routing so the patient idles in place while Healers come to
+/// them. Set to half `HEAL_SCAN_RADIUS` so a patient who walks to the
+/// site lands comfortably inside the Healer's sweep ring even after
+/// drift.
+pub const SEEK_CARE_AT_SITE_RADIUS: i32 = 6;
+
+/// Heal-5: cadence at which `chief_healer_assignment_system`
+/// reconciles Healer headcount with injured-member demand. Matches the
+/// `BUREAUCRAT_ASSIGNMENT_CADENCE` / `CRAFTER_ASSIGNMENT_CADENCE` so
+/// chief decisions about specialized labour share a heartbeat.
+pub const HEALER_ASSIGNMENT_CADENCE: u64 =
+    (crate::world::seasons::TICKS_PER_DAY / 4) as u64;
+/// Number of injured agents one Healer is expected to serve before the
+/// chief promotes a second. Healing takes minutes per limb so one
+/// Healer can comfortably cycle through ~4 patients before backlog.
+pub const HEALER_PER_INJURY_DIVISOR: u32 = 4;
+/// Asymmetric hysteresis: tolerate this many Healers above target
+/// before demoting on the next cadence. Mirrors `HUNTER_DEMOTE_BUFFER`
+/// / `BUREAUCRAT_DEMOTE_BUFFER` so a single-tick injured-count drop
+/// doesn't churn the roster.
+pub const HEALER_DEMOTE_BUFFER: usize = 1;
+/// Hard cap: never let more than `member_count / HEALER_MAX_DIVISOR` of
+/// the band be Healers. Matches the Crafter cap so specialized labour
+/// stays a minority share of the population.
+pub const HEALER_MAX_DIVISOR: usize = 3;
 
 /// HTN dispatcher for `AgentGoal::ProvideCare`. Iterates Healers
 /// (and Apprentices targeting Medicine) under the ProvideCare goal,
@@ -268,6 +296,362 @@ pub fn heal_task_system(
             // Body fully intact — patient recovered.
             aq.advance();
             ai.task_id = PersonAI::UNEMPLOYED;
+        }
+    }
+}
+
+/// Heal-3b: dispatcher for `AgentGoal::SeekCare`. Routes an injured
+/// agent to the nearest faction-owned `Shrine` (a known recovery
+/// site that Healers `htn_provide_care_dispatch_system` will sweep)
+/// or, when no Shrine exists, to the faction's `home_tile`. Patients
+/// already inside `SEEK_CARE_AT_SITE_RADIUS` of the chosen site stay
+/// put so Healers can converge without ping-pong. ParallelB schedule,
+/// after `htn_provide_care_dispatch_system`.
+#[allow(clippy::too_many_arguments)]
+pub fn htn_seek_care_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    faction_registry: Res<crate::simulation::faction::FactionRegistry>,
+    ownership: Res<crate::simulation::capital::WorkshopOwnership>,
+    mut query: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &AgentGoal,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+        ),
+        (Without<Drafted>, With<Injury>),
+    >,
+) {
+    use crate::simulation::capital::WorkshopKind;
+    for (mut ai, mut aq, goal, transform, member, lod) in query.iter_mut() {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::SeekCare) {
+            continue;
+        }
+        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        // Recovery site: nearest faction-owned Shrine, else faction
+        // home_tile. SOLO agents have no home_tile / Shrines, so skip.
+        let mut target: Option<(i32, i32)> = None;
+        let mut best_dist = i32::MAX;
+        for entry in ownership.workshops_for(member.faction_id) {
+            if entry.kind != WorkshopKind::Shrine {
+                continue;
+            }
+            let d = (entry.tile.0 - cur_tx).abs().max((entry.tile.1 - cur_ty).abs());
+            if d < best_dist {
+                best_dist = d;
+                target = Some(entry.tile);
+            }
+        }
+        if target.is_none() {
+            target = faction_registry.home_tile(member.faction_id);
+            if let Some(t) = target {
+                best_dist = (t.0 - cur_tx).abs().max((t.1 - cur_ty).abs());
+            }
+        }
+        let Some(dest) = target else {
+            continue;
+        };
+
+        // Already at the site — idle in place so the Healer can sweep
+        // us. Avoids per-tick re-dispatch loops.
+        if best_dist <= SEEK_CARE_AT_SITE_RADIUS {
+            continue;
+        }
+
+        let dispatched = assign_task_with_routing(
+            &mut ai,
+            (cur_tx, cur_ty),
+            cur_chunk,
+            dest,
+            TaskKind::SeekCare,
+            None,
+            &chunk_graph,
+            &chunk_router,
+            &chunk_map,
+            &chunk_connectivity,
+        );
+        if !dispatched {
+            continue;
+        }
+        let z = ai.target_z;
+        aq.dispatch(Task::WalkTo {
+            tile: dest,
+            z,
+            why: crate::simulation::typed_task::WalkReason::SeekCare,
+        });
+    }
+}
+
+/// Heal-5: chief-driven Healer assignment. Mirrors
+/// `chief_bureaucrat_appointment_system` / `chief_craft_assignment_system`
+/// in shape — EV-ranked promote, apprenticeship for sub-`APPRENTICE_THRESHOLD`
+/// Medicine, asymmetric demote buffer, survival override — but the
+/// target headcount is driven by the *injured-member tally* rather
+/// than a wage signal. The faction needs a Healer when its people are
+/// hurt, not when there's a paid heal-job EMA (no such job-kind ships
+/// yet); a future `JobKind::Heal` can replace the injured-count proxy
+/// without changing this system's shape.
+///
+/// Target per faction:
+///   - `per_head_food < FARMER_SURVIVAL_FLOOR` → 0 (specialized labour
+///     surrenders to the Farmer ramp during famine).
+///   - no injured members → 0 (Healers demote out when the band is
+///     fully healed).
+///   - else → `min(max(1, injured.div_ceil(HEALER_PER_INJURY_DIVISOR)),
+///     member_count / HEALER_MAX_DIVISOR)`. A faction of 12 with 6
+///     injured wants `max(1, 6/4) = 2` Healers; a faction of 4 with 3
+///     injured wants `min(1, 4/3) = 1`.
+///
+/// Apprentice path: sub-`APPRENTICE_THRESHOLD` Medicine candidates
+/// route through `Profession::Apprentice` with
+/// `ApprenticeProgress::target_profession = Healer`, bound to a master
+/// Healer (`Skills[Medicine] >= MASTER_THRESHOLD`, no live `MentorOf`).
+/// Without a master the candidate falls back to direct promotion so a
+/// faction without elders can still bootstrap.
+#[allow(clippy::too_many_arguments)]
+pub fn chief_healer_assignment_system(
+    clock: Res<SimClock>,
+    registry: Res<crate::simulation::faction::FactionRegistry>,
+    reservations: Res<crate::simulation::faction::StorageReservations>,
+    ownership: Res<crate::simulation::capital::WorkshopOwnership>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    plots: Query<&crate::simulation::land::Plot>,
+    mentors_q: Query<&crate::simulation::apprenticeship::MentorOf>,
+    injured_q: Query<&FactionMember, With<Injury>>,
+    mut commands: Commands,
+    mut activity: EventWriter<crate::ui::activity_log::ActivityLogEvent>,
+    mut query: Query<(
+        Entity,
+        &mut Profession,
+        &FactionMember,
+        &Skills,
+        &crate::economy::agent::EconomicAgent,
+        &crate::simulation::carry::Carrier,
+        &Transform,
+        Option<&crate::simulation::reproduction::HouseholdMember>,
+        Option<&mut PersonAI>,
+        Option<&mut ActionQueue>,
+    )>,
+) {
+    use crate::simulation::apprenticeship::{
+        ApprenticeOf, ApprenticeProgress, MentorOf, APPRENTICE_THRESHOLD, MASTER_THRESHOLD,
+    };
+    use crate::simulation::faction::{FARMER_SURVIVAL_FLOOR, SOLO};
+    use crate::simulation::person::Profession;
+
+    if clock.tick % HEALER_ASSIGNMENT_CADENCE != 0 {
+        return;
+    }
+
+    // Pass 1: per-faction injured tally + Healer / Apprentice census.
+    let mut injured_per_faction: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
+    for member in injured_q.iter() {
+        if member.faction_id == SOLO {
+            continue;
+        }
+        *injured_per_faction.entry(member.faction_id).or_insert(0) += 1;
+    }
+    let mut current_healers: ahash::AHashMap<u32, usize> = ahash::AHashMap::default();
+    let mut available_mentors: ahash::AHashMap<u32, Vec<Entity>> = ahash::AHashMap::default();
+    for (entity, prof, member, skills, _, _, _, _, _, _) in query.iter() {
+        if member.faction_id == SOLO {
+            continue;
+        }
+        match *prof {
+            Profession::Healer => {
+                *current_healers.entry(member.faction_id).or_insert(0) += 1;
+                let medicine = skills.0[SkillKind::Medicine as usize];
+                if medicine >= MASTER_THRESHOLD && mentors_q.get(entity).is_err() {
+                    available_mentors
+                        .entry(member.faction_id)
+                        .or_default()
+                        .push(entity);
+                }
+            }
+            Profession::Apprentice => {
+                // Apprentice headcount counts toward Healer target only
+                // when their training targets Healer. Crafter-targeted
+                // apprentices are not Healer-trainees and stay invisible
+                // to this system.
+                // We can't read ApprenticeProgress in this query without
+                // pushing the param count over Bevy's ceiling; instead,
+                // the safer assumption is "Apprentice doesn't count
+                // toward Healer headcount" — at worst we over-promote a
+                // Healer while a Crafter-apprentice graduates, which
+                // self-corrects on the next cadence.
+            }
+            _ => {}
+        }
+    }
+
+    // Pass 2: build per-faction targets.
+    let mut targets: ahash::AHashMap<u32, usize> = ahash::AHashMap::default();
+    for (&fid, faction) in registry.factions.iter() {
+        if fid == SOLO {
+            continue;
+        }
+        let per_head = if faction.member_count > 0 {
+            faction.storage.food_total() / faction.member_count as f32
+        } else {
+            f32::INFINITY
+        };
+        if per_head < FARMER_SURVIVAL_FLOOR {
+            targets.insert(fid, 0);
+            continue;
+        }
+        let injured = injured_per_faction.get(&fid).copied().unwrap_or(0);
+        if injured == 0 {
+            targets.insert(fid, 0);
+            continue;
+        }
+        let demand = ((injured + HEALER_PER_INJURY_DIVISOR - 1) / HEALER_PER_INJURY_DIVISOR)
+            .max(1) as usize;
+        let cap = (faction.member_count as usize) / HEALER_MAX_DIVISOR;
+        let target = demand.min(cap.max(1));
+        targets.insert(fid, target);
+    }
+
+    if targets.is_empty() {
+        return;
+    }
+
+    // Pass 3: EV-ranked candidate buckets per faction.
+    let mut by_faction_healers: ahash::AHashMap<u32, Vec<(Entity, f32, u32)>> =
+        ahash::AHashMap::default();
+    let mut by_faction_none: ahash::AHashMap<u32, Vec<(Entity, f32, u32)>> =
+        ahash::AHashMap::default();
+    for (entity, prof, member, skills, agent, carrier, xf, household_opt, _, _) in query.iter() {
+        if member.faction_id == SOLO || !targets.contains_key(&member.faction_id) {
+            continue;
+        }
+        let medicine = skills.0[SkillKind::Medicine as usize];
+        let tile = crate::world::terrain::world_to_tile(xf.translation.truncate());
+        let cap = crate::simulation::capital::capital_factor(
+            agent,
+            carrier,
+            tile,
+            member.faction_id,
+            household_opt,
+            Profession::Healer,
+            &ownership,
+            &plots,
+            &plot_index,
+        );
+        let ev = registry
+            .factions
+            .get(&member.faction_id)
+            .map(|f| {
+                crate::simulation::profession_choice::expected_wage(
+                    f,
+                    Profession::Healer,
+                    skills,
+                    cap,
+                )
+            })
+            .unwrap_or(0.0);
+        match *prof {
+            Profession::Healer => by_faction_healers
+                .entry(member.faction_id)
+                .or_default()
+                .push((entity, ev, medicine)),
+            Profession::None => by_faction_none
+                .entry(member.faction_id)
+                .or_default()
+                .push((entity, ev, medicine)),
+            _ => {}
+        }
+    }
+
+    let mut promote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut demote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    for (&fid, &want) in &targets {
+        let mut healers = by_faction_healers.remove(&fid).unwrap_or_default();
+        let mut none = by_faction_none.remove(&fid).unwrap_or_default();
+        if healers.len() < want {
+            none.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.2.cmp(&a.2))
+            });
+            for (e, _, _) in none.into_iter().take(want - healers.len()) {
+                promote.insert(e);
+            }
+        } else if healers.len() > want.saturating_add(HEALER_DEMOTE_BUFFER) || want == 0 {
+            healers.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.2.cmp(&b.2))
+            });
+            let extra = healers.len() - want;
+            for (e, _, _) in healers.into_iter().take(extra) {
+                demote.insert(e);
+            }
+        }
+    }
+
+    if promote.is_empty() && demote.is_empty() {
+        return;
+    }
+
+    for (entity, mut prof, member, skills, _agent, _carrier, _xf, _household, ai_opt, aq_opt) in
+        query.iter_mut()
+    {
+        if promote.contains(&entity) {
+            let medicine = skills.0[SkillKind::Medicine as usize];
+            if medicine < APPRENTICE_THRESHOLD {
+                if let Some(pool) = available_mentors.get_mut(&member.faction_id) {
+                    if let Some(mentor) = pool.pop() {
+                        *prof = Profession::Apprentice;
+                        commands
+                            .entity(entity)
+                            .insert(ApprenticeOf { mentor })
+                            .insert(ApprenticeProgress {
+                                ticks: 0,
+                                target_ticks: ApprenticeProgress::default().target_ticks,
+                                target_profession: Profession::Healer,
+                            });
+                        commands.entity(mentor).insert(MentorOf { apprentice: entity });
+                        activity.send(crate::ui::activity_log::ActivityLogEvent {
+                            tick: clock.tick,
+                            actor: entity,
+                            faction_id: member.faction_id,
+                            kind:
+                                crate::ui::activity_log::ActivityEntryKind::ApprenticeshipStarted {
+                                    mentor,
+                                },
+                        });
+                        continue;
+                    }
+                }
+            }
+            *prof = Profession::Healer;
+        } else if demote.contains(&entity) {
+            *prof = Profession::None;
+            crate::simulation::profession_choice::demote_profession_state(
+                entity,
+                ai_opt.map(|x| x.into_inner()),
+                aq_opt.map(|x| x.into_inner()),
+                &reservations,
+                &mut commands,
+            );
         }
     }
 }

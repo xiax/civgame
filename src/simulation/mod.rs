@@ -387,6 +387,13 @@ impl Plugin for SimulationPlugin {
                     // newly-tasked Healers are reached.
                     medicine::htn_provide_care_dispatch_system
                         .after(htn::htn_combat_faction_dispatch_system),
+                    // Heal-3b: SeekCare patient routes to the nearest
+                    // faction Shrine (or home_tile) so Healers can
+                    // converge. Ordered after ProvideCare so a Healer
+                    // who is also a patient (rare) prefers serving
+                    // others first.
+                    medicine::htn_seek_care_dispatch_system
+                        .after(medicine::htn_provide_care_dispatch_system),
                     // Pluralist Economy R10 follow-on: trader route
                     // dispatcher. Same ParallelB shape as bureaucrat
                     // admin (idle + UNEMPLOYED gate + Lead routing);
@@ -799,8 +806,18 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    apprenticeship::apprentice_progress_system
+                    // Heal-5: chief Healer assignment. Same Economy
+                    // cadence as the other specialized-labour systems.
+                    // Promotes 1 Healer per `HEALER_PER_INJURY_DIVISOR`
+                    // injured members, capped at `member_count /
+                    // HEALER_MAX_DIVISOR`. Honors the survival override.
+                    // Lives in this second Economy block because the
+                    // primary tuple sits at Bevy's 20-element ceiling.
+                    medicine::chief_healer_assignment_system
                         .after(faction::chief_craft_assignment_system),
+                    apprenticeship::apprentice_progress_system
+                        .after(faction::chief_craft_assignment_system)
+                        .after(medicine::chief_healer_assignment_system),
                     // Phase 4b unified cross-profession switcher: agents
                     // can move directly between Hunter / Bureaucrat /
                     // Crafter when their EV in another role exceeds
