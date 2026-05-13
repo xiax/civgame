@@ -63,9 +63,14 @@ impl WorkshopKind {
             // Phase 5a: Crafter — Workbench is the primary station for
             // tool/weapon recipes; Loom for cloth recipes. Both lift
             // EV when within `WORKSHOP_AFFINITY_RADIUS` of the agent.
-            // Healer (Phase 5b) will claim `Shrine` once that variant
-            // lands.
             Profession::Crafter => matches!(self, WorkshopKind::Workbench | WorkshopKind::Loom),
+            // Phase 5b-stretch: Healer is shrine-affine. Scaffolding-
+            // only today — no auto-promotion path until a Heal-job
+            // pipeline lands — but the workshop term is correct so the
+            // inspector's EV table and the cross-switcher's `EV(Healer)`
+            // computation read a non-trivial capital factor when a
+            // household holds a Shrine.
+            Profession::Healer => matches!(self, WorkshopKind::Shrine),
             _ => false,
         }
     }

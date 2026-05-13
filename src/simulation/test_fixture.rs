@@ -499,6 +499,7 @@ impl PersonBuilder {
                     Indexed::new(IndexedKind::Person),
                     PersonKnowledge::paleolithic_seed(now_tick as u32),
                     crate::simulation::typed_task::ActionQueue::idle(),
+                    crate::simulation::goal_scorers::Disposition::default(),
                 ),
             ))
             .id();
@@ -1364,6 +1365,12 @@ mod smoke {
             let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.state_funds_public_works = true;
         }
+        // Phase 4b: keep per_head above `FARMER_SURVIVAL_FLOOR` so the
+        // bureaucrat assignment isn't zeroed by the survival override
+        // before the treasury-streak path can fire. Seeded via ground
+        // items on a storage tile so `compute_faction_storage_system`
+        // recompute picks them up each Economy tick.
+        sim.seed_faction_food(sim.player_faction_id, 4 * 32);
 
         // Tick once so auto_found_default_settlements_system spawns a
         // settlement, then seed the treasury directly.
@@ -1853,6 +1860,12 @@ mod smoke {
             let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.state_funds_public_works = true;
         }
+        // Phase 4b: keep per_head above `FARMER_SURVIVAL_FLOOR` so the
+        // bureaucrat assignment isn't zeroed by the survival override
+        // before the treasury-streak path can fire. Seeded via ground
+        // items on a storage tile so `compute_faction_storage_system`
+        // recompute picks them up each Economy tick.
+        sim.seed_faction_food(sim.player_faction_id, 4 * 32);
 
         sim.tick_n(120);
 
@@ -11475,5 +11488,903 @@ mod wage_aware_phase0_phase1 {
         assert_eq!(p.by_key.len(), PerceivedFactionWages::CAP);
         // Earliest entries (low tick) must have been evicted.
         assert!(p.by_key.iter().all(|(_, (_, t))| *t >= 5));
+    }
+
+    /// Phase 5b: a low-Crafting None candidate slated for Crafter promotion
+    /// is routed through `Profession::Apprentice` and bound to an available
+    /// master via `ApprenticeOf` / `MentorOf`.
+    #[test]
+    fn phase5b_low_skill_crafter_promotion_routes_to_apprentice() {
+        use crate::simulation::apprenticeship::{
+            ApprenticeOf, ApprenticeProgress, MentorOf, MASTER_THRESHOLD,
+        };
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::WageEMA;
+        use crate::simulation::skills::SkillKind;
+
+        let mut sim = TestSim::new(0xA77E);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        // Master crafter — high Crafting skill, current Profession::Crafter.
+        let master = sim.spawn_person(fid, (0, 0), |b| {
+            let mut s = Skills::default();
+            s.0[SkillKind::Crafting as usize] = MASTER_THRESHOLD + 20;
+            b.skills(s).profession(Profession::Crafter);
+        });
+        // Novice candidate — Crafting below APPRENTICE_THRESHOLD but
+        // highest in the None pool so deterministic sort picks them
+        // first. Will route to Apprentice when chief_craft_assignment_system
+        // fires.
+        let novice = sim.spawn_person(fid, (1, 0), |b| {
+            let mut s = Skills::default();
+            s.0[SkillKind::Crafting as usize] = 20;
+            b.skills(s).profession(Profession::None);
+        });
+        // Fillers so `member_count / CRAFTER_MAX_DIVISOR` >= 2 — the target
+        // headcount can exceed the existing 1 master and pull one promote.
+        // Set them to Farmer so they don't compete in the None pool.
+        for tx in 2..7 {
+            sim.spawn_person(fid, (tx, 0), |b| {
+                b.profession(Profession::Farmer);
+            });
+        }
+
+        // Seed wage signal so target = ratio-driven (member_count = 7,
+        // target = max(1, round(7*0.25)) = 2, capped at 7/3 = 2).
+        // Inject a sustained Craft EMA above CRAFTER_WAGE_PROMOTE_FLOOR.
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let faction = registry.factions.get_mut(&fid).unwrap();
+            faction.member_count = 7;
+            faction.wage_signal.insert(
+                (JobKind::Craft, None),
+                WageEMA {
+                    ema_per_day: 5.0,
+                    last_update_tick: 0,
+                    samples: 5,
+                },
+            );
+        }
+        // Phase 4b: keep per_head above `FARMER_SURVIVAL_FLOOR` so the
+        // crafter target isn't zeroed before the wage-driven promotion
+        // can fire.
+        sim.seed_faction_food(fid, 7 * 32);
+
+        // Advance to a CRAFTER_ASSIGNMENT_CADENCE multiple so the system
+        // fires next tick (cadence = TICKS_PER_DAY / 4 = 900). Need two
+        // ticks — the first warms FixedUpdate / drains the clock advance,
+        // the second observes the new cadence boundary in Economy.
+        {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = crate::simulation::faction::CRAFTER_ASSIGNMENT_CADENCE - 1;
+        }
+        sim.tick_n(2);
+
+        // Novice should now be Profession::Apprentice with the binding.
+        let world = sim.app.world();
+        let prof = *world.get::<Profession>(novice).unwrap();
+        assert_eq!(
+            prof,
+            Profession::Apprentice,
+            "low-skill candidate must route through Apprentice when a master is available"
+        );
+        let link = world
+            .get::<ApprenticeOf>(novice)
+            .expect("Apprentice must carry ApprenticeOf link");
+        assert_eq!(link.mentor, master);
+        let progress = world
+            .get::<ApprenticeProgress>(novice)
+            .expect("Apprentice must carry ApprenticeProgress");
+        assert_eq!(progress.ticks, 0);
+        let mentor_link = world
+            .get::<MentorOf>(master)
+            .expect("Master must carry MentorOf link");
+        assert_eq!(mentor_link.apprentice, novice);
+    }
+
+    /// Phase 5b: an Apprentice whose `ApprenticeProgress.ticks` crosses
+    /// `target_ticks` graduates to `Crafter`, gets a Crafting floor of
+    /// `APPRENTICE_THRESHOLD`, and dissolves both link components.
+    #[test]
+    fn phase5b_apprentice_graduates_to_crafter_on_completion() {
+        use crate::simulation::apprenticeship::{
+            apprentice_progress_system, ApprenticeOf, ApprenticeProgress, MentorOf,
+            APPRENTICE_THRESHOLD,
+        };
+        use crate::simulation::skills::SkillKind;
+
+        let mut sim = TestSim::new(0xB088);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        let mentor = sim.spawn_person(fid, (0, 0), |b| {
+            let mut s = Skills::default();
+            s.0[SkillKind::Crafting as usize] = 120;
+            b.skills(s).profession(Profession::Crafter);
+        });
+        let apprentice = sim.spawn_person(fid, (1, 0), |b| {
+            let mut s = Skills::default();
+            s.0[SkillKind::Crafting as usize] = 5;
+            b.skills(s).profession(Profession::Apprentice);
+        });
+        // Wire the binding components and an almost-complete progress
+        // ledger so a single daily tick graduates the apprentice.
+        sim.app
+            .world_mut()
+            .entity_mut(apprentice)
+            .insert(ApprenticeOf { mentor })
+            .insert(ApprenticeProgress {
+                ticks: TICKS_PER_DAY * 30 - TICKS_PER_DAY,
+                target_ticks: TICKS_PER_DAY * 30,
+                target_profession: Profession::Crafter,
+            });
+        sim.app
+            .world_mut()
+            .entity_mut(mentor)
+            .insert(MentorOf {
+                apprentice,
+            });
+
+        // Land the next tick on a TICKS_PER_DAY boundary so
+        // `apprentice_progress_system`'s daily gate fires.
+        {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = TICKS_PER_DAY as u64 - 1;
+        }
+        // Run the system directly to avoid having to wait for the full
+        // Economy schedule. We're testing the system contract, not its
+        // ordering — which is covered elsewhere.
+        sim.app
+            .world_mut()
+            .resource_mut::<SimClock>()
+            .tick = TICKS_PER_DAY as u64;
+        sim.app.add_systems(Update, apprentice_progress_system);
+        sim.tick_n(1);
+
+        let world = sim.app.world();
+        let prof = *world.get::<Profession>(apprentice).unwrap();
+        assert_eq!(prof, Profession::Crafter, "completed apprentice must graduate to Crafter");
+        let skills = world.get::<Skills>(apprentice).unwrap();
+        assert!(
+            skills.0[SkillKind::Crafting as usize] >= APPRENTICE_THRESHOLD,
+            "graduate Crafting must clear APPRENTICE_THRESHOLD floor: got {}",
+            skills.0[SkillKind::Crafting as usize]
+        );
+        assert!(world.get::<ApprenticeOf>(apprentice).is_none());
+        assert!(world.get::<ApprenticeProgress>(apprentice).is_none());
+        assert!(world.get::<MentorOf>(mentor).is_none());
+    }
+
+    /// Phase 4b: the asymmetric demotion buffer holds hunters stable
+    /// when current_count exceeds the natural target by exactly one —
+    /// preventing single-tick flapping when prey density rounds the
+    /// target down. Excess by 2+ still demotes.
+    #[test]
+    fn phase4b_hunter_demote_buffer_absorbs_unit_excess() {
+        use crate::simulation::faction::{FactionRegistry, HUNTER_ASSIGNMENT_CADENCE};
+        use crate::simulation::technology::HUNTING_SPEAR;
+
+        let mut sim = TestSim::new(0xBFFA);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        // Spawn 5 members; the natural Hunter target with
+        // HUNTER_MIN_RATIO=0.20 and density_scale=1.0 is round(5*0.20)=1,
+        // capped at adults/2=2. We seed *2* current hunters — exactly
+        // 1 over target — and assert the buffer holds them in place.
+        let hunter_a = sim.spawn_person(fid, (0, 0), |b| {
+            b.profession(Profession::Hunter);
+        });
+        let hunter_b = sim.spawn_person(fid, (1, 0), |b| {
+            b.profession(Profession::Hunter);
+        });
+        for tx in 2..5 {
+            sim.spawn_person(fid, (tx, 0), |_| {});
+        }
+
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let f = registry.factions.get_mut(&fid).unwrap();
+            f.member_count = 5;
+            f.techs.unlock(HUNTING_SPEAR);
+            // Low prey count so density_scale stays at the 1.0 floor —
+            // natural target rounds to 1. Hunters learn HUNTING_SPEAR
+            // implicitly so existing hunters aren't kicked by tech gate.
+            f.nearby_prey_count = 1;
+        }
+        // Keep per_head above the survival floor.
+        sim.seed_faction_food(fid, 5 * 32);
+
+        // Fire the hunter system once.
+        {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = HUNTER_ASSIGNMENT_CADENCE - 1;
+        }
+        sim.tick_n(2);
+
+        let pa = *sim.app.world().get::<Profession>(hunter_a).unwrap();
+        let pb = *sim.app.world().get::<Profession>(hunter_b).unwrap();
+        // Both hunters should remain hunters — current 2 > target 1
+        // but within the HUNTER_DEMOTE_BUFFER tolerance.
+        assert_eq!(pa, Profession::Hunter, "hunter A held by demote buffer");
+        assert_eq!(pb, Profession::Hunter, "hunter B held by demote buffer");
+    }
+
+    /// Phase 4b: when a faction's food per head drops below
+    /// `FARMER_SURVIVAL_FLOOR`, the Hunter / Bureaucrat / Crafter
+    /// assignment systems force their target headcount to zero and
+    /// demote existing incumbents back to `Profession::None` so the
+    /// Farmer ramp can claim the labor.
+    #[test]
+    fn phase4b_survival_floor_demotes_hunter() {
+        use crate::simulation::faction::{
+            chief_craft_assignment_system as _, // doc-link
+            faction_hunter_assignment_system, FactionRegistry, FARMER_SURVIVAL_FLOOR,
+            HUNTER_ASSIGNMENT_CADENCE,
+        };
+        use crate::simulation::technology::HUNTING_SPEAR;
+
+        let mut sim = TestSim::new(0xF005A);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        // Set up a faction with a hunter and starving food reserves.
+        // Member_count = 4 → adults/2 cap = 2; HUNTER_MIN_RATIO=0.20
+        // would normally target max(1, 4*0.20) = 1 hunter.
+        let hunter = sim.spawn_person(fid, (0, 0), |b| {
+            b.profession(Profession::Hunter);
+        });
+        for tx in 1..4 {
+            sim.spawn_person(fid, (tx, 0), |_| {});
+        }
+
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let faction = registry.factions.get_mut(&fid).unwrap();
+            faction.member_count = 4;
+            faction.techs.unlock(HUNTING_SPEAR);
+            // Below the floor: 4 members, 32 food units → per_head = 8 < 16.
+            faction
+                .storage
+                .totals
+                .insert(crate::economy::core_ids::fruit(), 32);
+            faction.nearby_prey_count = 100; // plenty of game; survival overrides
+        }
+
+        // Sanity-check: per_head below the floor.
+        let per_head = {
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            let f = registry.factions.get(&fid).unwrap();
+            f.storage.food_total() / f.member_count as f32
+        };
+        assert!(
+            per_head < FARMER_SURVIVAL_FLOOR,
+            "test pre-condition: per_head ({}) must be below FARMER_SURVIVAL_FLOOR ({})",
+            per_head,
+            FARMER_SURVIVAL_FLOOR
+        );
+
+        // Fire the hunter assignment system at its cadence.
+        {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = HUNTER_ASSIGNMENT_CADENCE - 1;
+        }
+        sim.tick_n(2);
+
+        // The hunter must have demoted to None — labor surrendered to
+        // the Farmer ramp.
+        let prof = *sim.app.world().get::<Profession>(hunter).unwrap();
+        assert_eq!(
+            prof,
+            Profession::None,
+            "starving faction must demote Hunter to None (FARMER_SURVIVAL_FLOOR override)"
+        );
+        let _ = faction_hunter_assignment_system; // silence unused import
+    }
+
+    /// Phase 5b: the deliberate-practice 2× XP multiplier doubles the
+    /// Crafting XP an apprentice receives at the canonical grant
+    /// sites, verified through the `xp_with_apprentice_bonus` helper
+    /// alongside an `ApprenticeOf` link.
+    #[test]
+    fn phase5b_apprentice_doubles_crafting_xp() {
+        use crate::simulation::apprenticeship::{
+            xp_with_apprentice_bonus, ApprenticeOf, APPRENTICE_XP_MULT,
+        };
+
+        let mut sim = TestSim::new(0xBADD1E);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let plain = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let apprentice = sim.spawn_person(sim.player_faction_id, (1, 0), |_| {});
+        let stub_mentor = sim.spawn_person(sim.player_faction_id, (2, 0), |_| {});
+        sim.app
+            .world_mut()
+            .entity_mut(apprentice)
+            .insert(ApprenticeOf {
+                mentor: stub_mentor,
+            });
+
+        // Run the same XP-grant code path the craft / butcher sites
+        // use to confirm the multiplier flows through.
+        for entity in [plain, apprentice] {
+            let app_link = sim
+                .app
+                .world()
+                .get::<ApprenticeOf>(entity)
+                .copied();
+            let xp = xp_with_apprentice_bonus(5, app_link.as_ref());
+            let mut s = sim.app.world_mut().get_mut::<Skills>(entity).unwrap();
+            s.gain_xp(SkillKind::Crafting, xp);
+        }
+        sim.tick_n(1);
+
+        let plain_skill = sim
+            .app
+            .world()
+            .get::<Skills>(plain)
+            .unwrap()
+            .0[SkillKind::Crafting as usize];
+        let app_skill = sim
+            .app
+            .world()
+            .get::<Skills>(apprentice)
+            .unwrap()
+            .0[SkillKind::Crafting as usize];
+        // Default Skills floor = 5; plain receives +5, apprentice +10.
+        assert_eq!(plain_skill, 5 + 5);
+        assert_eq!(app_skill, 5 + 5 * APPRENTICE_XP_MULT);
+    }
+
+    /// Phase 5b: an apprentice claimant on a paid posting receives only
+    /// `WAGE_FRACTION_APPRENTICE (0.4)` of the equivalent solo share;
+    /// the mentor collects `WAGE_FRACTION_MENTOR_FEE (0.1)` as a
+    /// supervision fee; the remaining 0.5 stays in the escrow and is
+    /// refunded to the poster on despawn. Currency invariant holds.
+    #[test]
+    fn phase5b_apprentice_payout_splits_share_with_mentor() {
+        use crate::simulation::apprenticeship::{ApprenticeOf, MentorOf};
+
+        let mut sim = TestSim::new(0xAFEED);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let poster = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let mentor = sim.spawn_person(sim.player_faction_id, (1, 0), |_| {});
+        let apprentice = sim.spawn_person(sim.player_faction_id, (2, 0), |_| {});
+        set_currency(&mut sim.app, poster, 100.0);
+        set_currency(&mut sim.app, mentor, 0.0);
+        set_currency(&mut sim.app, apprentice, 0.0);
+
+        // Bind the apprentice → mentor link before payout so the
+        // payout path sees the relationship.
+        sim.app
+            .world_mut()
+            .entity_mut(apprentice)
+            .insert(ApprenticeOf { mentor });
+        sim.app
+            .world_mut()
+            .entity_mut(mentor)
+            .insert(MentorOf {
+                apprentice,
+            });
+
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        let reward = 10.0;
+        let fid = sim.player_faction_id;
+        let job_id = post_paid_stockpile_contract(&mut sim, poster, fid, apprentice, reward);
+        sim.app
+            .world_mut()
+            .resource_mut::<bevy::ecs::event::Events<JobCompletedEvent>>()
+            .send(JobCompletedEvent {
+                job_id,
+                faction_id: fid,
+                kind: JobKind::Stockpile,
+                claimants: vec![apprentice],
+                completed: true,
+                target_rid: None,
+            });
+        sim.tick_n(3);
+
+        // Apprentice: 10 * 0.4 = 4.0
+        assert_currency(&sim.app, apprentice, 4.0);
+        // Mentor: 10 * 0.1 = 1.0
+        assert_currency(&sim.app, mentor, 1.0);
+        // Poster: initial 100 - 10 (escrow) + 5 (refund of residual) = 95
+        assert_currency(&sim.app, poster, 95.0);
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+    }
+
+    /// Phase 5b: an apprentice whose mentor link goes stale (master
+    /// despawned or `MentorOf` removed) is demoted to `Profession::None`
+    /// on the next daily progress tick. Progress is discarded; the
+    /// next chief_craft_assignment_system pass may rebind.
+    #[test]
+    fn phase5b_orphaned_apprentice_demotes_to_none() {
+        use crate::simulation::apprenticeship::{
+            apprentice_progress_system, ApprenticeOf, ApprenticeProgress,
+        };
+        use crate::simulation::skills::SkillKind;
+
+        let mut sim = TestSim::new(0xDEAD);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        // A live "mentor" entity that has *no* MentorOf — simulates the
+        // post-demote state where the master was demoted out of Crafter
+        // and the apprenticeship link was broken from the master side.
+        let stale_mentor = sim.spawn_person(fid, (0, 0), |b| {
+            let mut s = Skills::default();
+            s.0[SkillKind::Crafting as usize] = 120;
+            b.skills(s).profession(Profession::None);
+        });
+        let apprentice = sim.spawn_person(fid, (1, 0), |b| {
+            let mut s = Skills::default();
+            s.0[SkillKind::Crafting as usize] = 5;
+            b.skills(s).profession(Profession::Apprentice);
+        });
+        sim.app
+            .world_mut()
+            .entity_mut(apprentice)
+            .insert(ApprenticeOf {
+                mentor: stale_mentor,
+            })
+            .insert(ApprenticeProgress::default());
+
+        sim.app
+            .world_mut()
+            .resource_mut::<SimClock>()
+            .tick = TICKS_PER_DAY as u64;
+        sim.app.add_systems(Update, apprentice_progress_system);
+        sim.tick_n(1);
+
+        let world = sim.app.world();
+        assert_eq!(
+            *world.get::<Profession>(apprentice).unwrap(),
+            Profession::None,
+            "orphaned apprentice must demote to None"
+        );
+        assert!(world.get::<ApprenticeOf>(apprentice).is_none());
+        assert!(world.get::<ApprenticeProgress>(apprentice).is_none());
+    }
+
+    /// Phase 6 (wage-aware-labor-market-v2): the `EarnIncome`
+    /// procedural override rewrites a generic gather-fallback goal to
+    /// the kind matching the highest-reward paid posting in the
+    /// agent's faction, when the agent has a profession and the
+    /// faction is in Mixed/Market mode.
+    #[test]
+    fn phase6_earnincome_override_rewrites_gather_to_craft() {
+        use crate::economy::core_ids;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::goals::{AgentGoal, GoalReason};
+        use crate::simulation::jobs::{JobBoard, JobKind, JobPosting, JobProgress, JobSource, PosterClass};
+
+        let mut sim = TestSim::new(0xEAA1);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        // Crafter with moderate Crafting skill — qualifies for the
+        // posting's `Craft` kind via `job_kinds_for(Crafter)`.
+        // Needs are pumped up so the default-zero `Needs` doesn't
+        // push goal_update_system into Play (low willpower) or
+        // Socialize (high social).
+        let mut full_needs = crate::simulation::needs::Needs::default();
+        full_needs.willpower = 255.0;
+        let crafter = sim.spawn_person(fid, (0, 0), |b| {
+            let mut s = Skills::default();
+            s.0[SkillKind::Crafting as usize] = 80;
+            b.skills(s)
+                .needs(full_needs)
+                .profession(Profession::Crafter)
+                .goal(AgentGoal::GatherFood);
+        });
+
+        // Flip the faction into Mixed/Market mode by populating
+        // `economic_policy` (the discriminator the override gates on).
+        // Use `apply_preset(Market)` so every catalog resource gets a
+        // capitalist policy entry — mirrors the wired `spawn_population`
+        // setup so other systems can't reset the map by reading the
+        // legacy preset.
+        // Flip the faction into Market mode so EarnIncome's
+        // economic_policy gate passes. `apply_preset(Market)` is the
+        // wired-in production setup mirror.
+        let catalog = sim
+            .app
+            .world()
+            .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+            .clone();
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let faction = registry.factions.get_mut(&fid).unwrap();
+            crate::economy::policy::apply_preset(
+                &mut faction.economic_policy,
+                crate::game_state::EconomyPreset::Market,
+                &catalog,
+            );
+        }
+
+        // Drop a paid Craft posting onto the faction's job board.
+        {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let postings = board.faction_postings_mut(fid);
+            postings.push(JobPosting {
+                id: 9001,
+                faction_id: fid,
+                kind: JobKind::Craft,
+                progress: JobProgress::Crafting {
+                    crafted: 0,
+                    target: 1,
+                    recipe: 0,
+                    bench: None,
+                    tech_payload: None,
+                },
+                claimants: Vec::new(),
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::HouseholdHead,
+                settlement_id: None,
+                reward: 25.0,
+            });
+        }
+
+        // Two ticks: the first warms FixedUpdate's accumulator; the
+        // second observes `goal_update_system` setting the fallback
+        // gather goal and `earnincome_goal_override_system` rewriting
+        // it. Matches the cadence pattern other wage-aware tests use.
+        sim.tick_n(2);
+
+        let world = sim.app.world();
+        let goal = *world.get::<AgentGoal>(crafter).unwrap();
+        assert_eq!(
+            goal,
+            AgentGoal::Craft,
+            "Crafter in Market faction with a paid Craft posting must have goal overridden to Craft",
+        );
+        let reason = world.get::<GoalReason>(crafter).map(|r| r.0);
+        assert_eq!(
+            reason,
+            Some("Earning Income"),
+            "Goal reason must surface the EarnIncome branch",
+        );
+    }
+
+    /// Regression guard: workers still claim chief postings after the
+    /// Phase 6 EarnIncome override + GoalScorer infrastructure lands.
+    /// Subsistence faction (empty `economic_policy`) — chief posts
+    /// reward=0 contracts, workers claim them via the legacy U_bid
+    /// path. EarnIncome must opt out cleanly here.
+    #[test]
+    fn chief_postings_still_claimed_subsistence_after_earnincome() {
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass};
+
+        let mut sim = TestSim::new(0xCAFE_FACE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let worker = sim.spawn_person(fid, (0, 0), |b| {
+            b.profession(Profession::None);
+        });
+
+        // Subsistence faction: empty economic_policy is the default.
+        // Verify EarnIncome won't fire.
+        {
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            let faction = registry.factions.get(&fid).unwrap();
+            assert!(
+                faction.economic_policy.is_empty(),
+                "test precondition: default faction must be Subsistence"
+            );
+        }
+
+        // Drop a chief Stockpile{food} posting with reward=0 onto the board.
+        {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id: 7777,
+                faction_id: fid,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Calories {
+                    deposited: 0,
+                    target: 100,
+                },
+                claimants: Vec::new(),
+                priority: 200,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                settlement_id: None,
+                reward: 0.0,
+            });
+        }
+
+        // Run a few ticks for job_claim_system to fire (ParallelB).
+        sim.tick_n(3);
+
+        let claimed = sim.app.world().get::<JobClaim>(worker).is_some();
+        assert!(
+            claimed,
+            "Subsistence None worker must still claim chief Stockpile posting via legacy U_bid"
+        );
+    }
+
+    /// Regression guard #2: in a Mixed/Market faction, a chief
+    /// Stockpile posting *funded* via `chief_post_funding_system` is
+    /// claimed by a worker even when the EarnIncome override is live.
+    #[test]
+    fn chief_postings_still_claimed_market_after_earnincome() {
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass};
+
+        let mut sim = TestSim::new(0xFEED_BEEF);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let worker = sim.spawn_person(fid, (0, 0), |b| {
+            b.profession(Profession::Farmer);
+        });
+
+        // Market preset + funded treasury so chief_post_funding_system
+        // can fund the posting.
+        let catalog = sim
+            .app
+            .world()
+            .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+            .clone();
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let faction = registry.factions.get_mut(&fid).unwrap();
+            crate::economy::policy::apply_preset(
+                &mut faction.economic_policy,
+                crate::game_state::EconomyPreset::Market,
+                &catalog,
+            );
+            faction.treasury = 500.0;
+        }
+
+        // Pre-funded chief Stockpile{food} posting (`reward = 5.0`).
+        // Skip the funding system; just bake the reward in directly.
+        {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id: 7778,
+                faction_id: fid,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Calories {
+                    deposited: 0,
+                    target: 100,
+                },
+                claimants: Vec::new(),
+                priority: 200,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                settlement_id: None,
+                reward: 5.0,
+            });
+        }
+
+        sim.tick_n(3);
+
+        let claimed = sim.app.world().get::<JobClaim>(worker).is_some();
+        assert!(
+            claimed,
+            "Market Farmer must still claim chief Stockpile posting under EarnIncome override"
+        );
+    }
+
+    /// Phase 6 (wage-aware-labor-market-v2): the `Disposition.entrepreneurial`
+    /// multiplier in the new `EarnIncomeScorer` proper goal-scorer
+    /// entry. Two side-by-side identical Crafters in a Market faction
+    /// see the same paid posting; only the agent with high
+    /// entrepreneurial disposition outscores a stub `Discretionary`
+    /// scorer that would otherwise win for the low-disposition agent.
+    /// Pins the upgrade from procedural form to proper scorer entry.
+    #[test]
+    fn phase6_earnincome_scorer_respects_disposition() {
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::goal_scorers::{
+            Disposition, EarnIncomeScorer, GoalClass, GoalScoringContext, GoalScorer,
+        };
+        use crate::simulation::jobs::{
+            JobBoard, JobKind, JobPosting, JobProgress, JobSource, PosterClass,
+        };
+
+        let mut sim = TestSim::new(0xD15B0);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        let crafter = sim.spawn_person(fid, (0, 0), |b| {
+            let mut s = Skills::default();
+            s.0[SkillKind::Crafting as usize] = 128;
+            b.skills(s).profession(Profession::Crafter);
+        });
+
+        // Stamp Market preset + insert a 20-currency Craft posting.
+        let catalog = sim
+            .app
+            .world()
+            .resource::<crate::economy::resource_catalog::ResourceCatalog>()
+            .clone();
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let faction = registry.factions.get_mut(&fid).unwrap();
+            crate::economy::policy::apply_preset(
+                &mut faction.economic_policy,
+                crate::game_state::EconomyPreset::Market,
+                &catalog,
+            );
+        }
+        {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id: 8001,
+                faction_id: fid,
+                kind: JobKind::Craft,
+                progress: JobProgress::Crafting {
+                    crafted: 0,
+                    target: 1,
+                    recipe: 0,
+                    bench: None,
+                    tech_payload: None,
+                },
+                claimants: Vec::new(),
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::HouseholdHead,
+                settlement_id: None,
+                reward: 20.0,
+            });
+        }
+
+        // Build a context against the live entity and score it twice —
+        // once with min entrepreneurial, once with max.
+        let scorer = EarnIncomeScorer;
+        let world = sim.app.world();
+        let needs = *world.get::<crate::simulation::needs::Needs>(crafter).unwrap();
+        let agent = *world.get::<crate::economy::agent::EconomicAgent>(crafter).unwrap();
+        let member = *world.get::<FactionMember>(crafter).unwrap();
+        let skills = *world.get::<Skills>(crafter).unwrap();
+        let registry = world.resource::<FactionRegistry>();
+        let faction = registry.factions.get(&fid).unwrap();
+        let board = world.resource::<JobBoard>();
+
+        let lo = scorer
+            .score(&GoalScoringContext {
+                agent: crafter,
+                agent_tile: (0, 0),
+                now: 0,
+                needs: &needs,
+                profession: Profession::Crafter,
+                skills: &skills,
+                disposition: Disposition {
+                    entrepreneurial: 0,
+                    ..Disposition::default()
+                },
+                economic_agent: &agent,
+                faction_member: &member,
+                faction,
+                board,
+            })
+            .expect("scorer must fire at min disposition (paid posting exists)");
+        let hi = scorer
+            .score(&GoalScoringContext {
+                agent: crafter,
+                agent_tile: (0, 0),
+                now: 0,
+                needs: &needs,
+                profession: Profession::Crafter,
+                skills: &skills,
+                disposition: Disposition {
+                    entrepreneurial: 255,
+                    ..Disposition::default()
+                },
+                economic_agent: &agent,
+                faction_member: &member,
+                faction,
+                board,
+            })
+            .expect("scorer must fire at max disposition");
+        assert_eq!(lo.class, GoalClass::Enterprise);
+        assert_eq!(hi.class, GoalClass::Enterprise);
+        // High entrepreneurial → 2× multiplier; low → 1×. Doubled
+        // exactly within fp slop.
+        assert!(
+            (hi.score / lo.score - 2.0).abs() < 1e-3,
+            "high-disposition score must be 2× low-disposition score (got {:.3} vs {:.3})",
+            hi.score,
+            lo.score
+        );
+    }
+
+    /// Phase 4b unified cross-profession switcher: a Hunter with weak
+    /// Combat skill and a faction whose Craft wage signal massively
+    /// outweighs its Stockpile signal should switch directly to Crafter
+    /// on the next daily switch pass — no round-trip through `None`.
+    #[test]
+    fn phase4b_cross_switch_hunter_to_crafter_on_wage_spread() {
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::WageEMA;
+        use crate::simulation::skills::SkillKind;
+        use crate::simulation::technology::HUNTING_SPEAR;
+
+        let mut sim = TestSim::new(0xCAFE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        // Low-combat hunter with moderate Crafting (above the
+        // apprenticeship floor so the switch lands as direct Crafter).
+        let hunter = sim.spawn_person(fid, (0, 0), |b| {
+            let mut s = Skills::default();
+            s.0[SkillKind::Combat as usize] = 10;
+            s.0[SkillKind::Crafting as usize] = 60;
+            b.skills(s).profession(Profession::Hunter);
+        });
+        // Fillers so `adults/CRAFTER_MAX_DIVISOR (3)` ≥ 3 — the chief
+        // craft assignment ramps to 2 Crafters at this member count
+        // before the cross-switcher runs, leaving 1 slot for the
+        // hunter's switch target.
+        for tx in 1..9 {
+            sim.spawn_person(fid, (tx, 0), |_| {});
+        }
+        // The chief-tech sync rebuilds `faction.techs` from
+        // `chief.aware` every Economy tick. Surface HUNTING_SPEAR on
+        // every member's `PersonKnowledge.aware` so whichever member
+        // `chief_selection_system` elects, the bit persists. Without
+        // this, `faction_hunter_assignment_system` would compute
+        // `target = 0` (has_tech=false) and demote our hunter to None
+        // before the cross-switcher fires.
+        let aware_bit = 1u64 << HUNTING_SPEAR;
+        let mut knowledge_query =
+            sim.app.world_mut().query::<&mut crate::simulation::knowledge::PersonKnowledge>();
+        for mut k in knowledge_query.iter_mut(sim.app.world_mut()) {
+            k.aware |= aware_bit;
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let faction = registry.factions.get_mut(&fid).unwrap();
+            faction.member_count = 9;
+            faction.techs.unlock(HUNTING_SPEAR);
+            // Strong Craft signal vs. anaemic Stockpile signal.
+            faction.wage_signal.insert(
+                (JobKind::Craft, None),
+                WageEMA {
+                    ema_per_day: 20.0,
+                    last_update_tick: 0,
+                    samples: 5,
+                },
+            );
+            faction.wage_signal.insert(
+                (JobKind::Stockpile, None),
+                WageEMA {
+                    ema_per_day: 1.0,
+                    last_update_tick: 0,
+                    samples: 5,
+                },
+            );
+        }
+        // Keep per_head above FARMER_SURVIVAL_FLOOR so the cross-switcher
+        // isn't locked out by the survival override. `seed_faction_food`
+        // spawns a storage tile + ground item; the daily
+        // `compute_faction_storage_system` will fold this into
+        // `faction.storage.totals` before the cross-switcher reads it.
+        sim.seed_faction_food(fid, 9 * 40);
+
+        // Switcher fires daily — set clock just below the boundary.
+        {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = crate::world::seasons::TICKS_PER_DAY as u64 - 1;
+        }
+        sim.tick_n(2);
+
+        let prof = *sim.app.world().get::<Profession>(hunter).unwrap();
+        assert_eq!(
+            prof,
+            Profession::Crafter,
+            "Hunter must switch directly to Crafter when Craft EV beats Hunter EV by ≥ 20%",
+        );
     }
 }

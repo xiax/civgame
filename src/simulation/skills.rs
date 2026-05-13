@@ -154,6 +154,20 @@ pub fn skill_peaks_tracker_system(
     }
 }
 
+/// Peak-derived floor for a skill — the value the decay system pulls
+/// toward. Exposed publicly so the inspector / UI can surface the same
+/// number the decay system applies. Mastered skills (peak ≥
+/// `SKILL_MASTERY_LINE`) sink only to `SKILL_MASTERED_FLOOR`; lower-peak
+/// skills sink to `max(SKILL_FLOOR_BASE, peak × SKILL_PEAK_FLOOR_FRACTION)`.
+pub fn skill_floor(peak: u32) -> u32 {
+    if peak >= SKILL_MASTERY_LINE {
+        SKILL_MASTERED_FLOOR
+    } else {
+        let proportional = (peak as f32 * SKILL_PEAK_FLOOR_FRACTION) as u32;
+        SKILL_FLOOR_BASE.max(proportional)
+    }
+}
+
 /// Phase 1: half-life decay toward a peak-derived floor. Runs once per
 /// game day. For each skill whose last-use is at least one game day old:
 /// `floor = peak ≥ MASTERY_LINE ? MASTERED_FLOOR : max(FLOOR_BASE, peak * 0.30)`
@@ -174,12 +188,7 @@ pub fn skill_decay_system(
                 continue;
             }
             let peak = peaks.0[i];
-            let floor = if peak >= SKILL_MASTERY_LINE {
-                SKILL_MASTERED_FLOOR
-            } else {
-                let proportional = (peak as f32 * SKILL_PEAK_FLOOR_FRACTION) as u32;
-                SKILL_FLOOR_BASE.max(proportional)
-            };
+            let floor = skill_floor(peak);
             let s = skills.0[i];
             if s <= floor {
                 continue;

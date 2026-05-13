@@ -221,9 +221,10 @@ pub fn butcher_task_system(
         &mut Skills,
         Option<&FactionMember>,
         Option<&Carrying>,
+        Option<&crate::simulation::apprenticeship::ApprenticeOf>,
     )>,
 ) {
-    for (entity, mut ai, mut aq, transform, slot, lod, mut skills, member, carrying) in
+    for (entity, mut ai, mut aq, transform, slot, lod, mut skills, member, carrying, apprentice) in
         agents.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -264,7 +265,10 @@ pub fn butcher_task_system(
         for &(rid, qty) in species_yield(species).iter() {
             spawn_or_merge_ground_item(&mut commands, &spatial, &mut item_query, tx, ty, rid, qty);
         }
-        skills.gain_xp(SkillKind::Crafting, 5);
+        // Phase 5b: deliberate-practice multiplier for apprentices —
+        // butchering counts as a craft-skill activity.
+        let xp = crate::simulation::apprenticeship::xp_with_apprentice_bonus(5, apprentice);
+        skills.gain_xp(SkillKind::Crafting, xp);
 
         let activity_name: &'static str = match species {
             CorpseSpecies::Wolf => "Butchered Wolf",

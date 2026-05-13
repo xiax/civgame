@@ -120,6 +120,10 @@ Implement the ε-greedy system.
 
 X - Overhaul faction construction planning and fix doors being blocked by walls or other buildings, all doors should have an adjacent road on the opening side, not diagonal. The construction system should generate layouts randomly but with rules to make it logical and looks good and organic, rather than have a fixed plan.
 
-Hunting system is currently buggy. Hunters lose target and just stand there doing nothing. They don't appear to chase. And they seem to hunt without weapons when they really shouldn't.
+X - Hunting system is currently buggy. Hunters lose target and just stand there doing nothing. They don't appear to chase. And they seem to hunt without weapons when they really shouldn't.
 
-Update walls
+X - Update walls
+
+Add water usage and drinking for both humans and animals
+
+The way pack camp and pitch camp actually works isn't very realistic. The workers don't actually physically pack the camp. They don't carry the goods to the new camp, the camp itself just magically moves.

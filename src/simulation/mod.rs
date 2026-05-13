@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 
 pub mod animals;
+pub mod apprenticeship;
 pub mod archetype;
 pub mod building_template;
 pub mod camp;
@@ -18,6 +19,7 @@ pub mod doormat;
 pub mod faction;
 pub mod gather;
 pub mod gather_claims;
+pub mod goal_scorers;
 pub mod goals;
 pub mod htn;
 pub mod items;
@@ -119,6 +121,15 @@ impl Plugin for SimulationPlugin {
             .insert_resource(nomad::PendingCampOps::default())
             .insert_resource(SimClock::default())
             .insert_resource(goals::ForceGoalReevaluate::default())
+            .insert_resource({
+                // Phase 6: scorer registry, pre-populated with the
+                // default set (`EarnIncomeScorer` today; future
+                // scorers — Socialize, Esteem, HealSeeker — pushed
+                // alongside in `register_default_scorers`).
+                let mut r = goal_scorers::GoalScorerRegistry::default();
+                goal_scorers::register_default_scorers(&mut r);
+                r
+            })
             .insert_resource(faction::FactionRegistry::default())
             .insert_resource(faction::PlayerFaction::default())
             .insert_resource(faction::StorageTileMap::default())
@@ -258,6 +269,18 @@ impl Plugin for SimulationPlugin {
                     // honoured first; before the dispatchers in
                     // ParallelB so blocked goals never run.
                     goals::mobile_state_goal_gate_system.after(goals::goal_update_system),
+                    // Phase 6 (wage-aware-labor-market-v2):
+                    // procedural-form `EarnIncomeScorer` fold-in. Runs
+                    // after `goal_update_system` so the fallback
+                    // gather goal is already set, and before the
+                    // dispatchers (ParallelB) so they see the
+                    // overridden goal. Tier = Enterprise: rewrites
+                    // gather fallback to a paid-posting-matching
+                    // goal for professioned agents in Mixed / Market
+                    // factions.
+                    goals::earnincome_goal_override_system
+                        .after(goals::goal_update_system)
+                        .after(goals::mobile_state_goal_gate_system),
                     animals::animal_sense_system,
                     // Bug-fix #2: re-snap tamed animals' target_tile
                     // toward their faction's `home_tile` every
@@ -715,6 +738,40 @@ impl Plugin for SimulationPlugin {
                     faction::household_contract_posting_system
                         .after(faction::tribute_payment_system),
                     corpse::corpse_decay_system,
+                )
+                    .in_set(SimulationSet::Economy),
+            )
+            // Phase 5b (wage-aware-labor-market-v2): daily apprentice
+            // progress + graduation. Ordered after the Crafter
+            // assignment system so a freshly-bound apprenticeship lands
+            // before the progress sweep reads it. Separate add_systems
+            // call — the Economy tuple above is at Bevy's 20-element
+            // ceiling.
+            .add_systems(
+                FixedUpdate,
+                (
+                    apprenticeship::apprentice_progress_system
+                        .after(faction::chief_craft_assignment_system),
+                    // Phase 4b unified cross-profession switcher: agents
+                    // can move directly between Hunter / Bureaucrat /
+                    // Crafter when their EV in another role exceeds
+                    // their current by 20%. Runs after the four
+                    // per-profession assignment systems so the legacy
+                    // None ↔ X transitions settle first, then the
+                    // switcher picks up X → Y reassignments.
+                    profession_choice::cross_profession_switch_system
+                        .after(faction::faction_profession_system)
+                        .after(faction::faction_hunter_assignment_system)
+                        .after(faction::chief_bureaucrat_appointment_system)
+                        .after(faction::chief_craft_assignment_system)
+                        .after(apprenticeship::apprentice_progress_system),
+                    // Phase 6 (inspector surfacing): emit ProfessionChanged
+                    // activity-log entries on real transitions. Ordered
+                    // after every profession-mutation system on the
+                    // Economy schedule so a promote-then-graduate within
+                    // the same tick collapses to one log entry.
+                    profession_choice::profession_change_log_system
+                        .after(profession_choice::cross_profession_switch_system),
                 )
                     .in_set(SimulationSet::Economy),
             )

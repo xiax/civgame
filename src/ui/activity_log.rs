@@ -82,6 +82,21 @@ pub enum ActivityEntryKind {
         amount: f32,
         kind: crate::simulation::jobs::JobKind,
     },
+    /// Phase 6 (inspector surfacing) — an agent's profession changed.
+    /// `actor` is the agent whose role transitioned.
+    ProfessionChanged {
+        from: crate::simulation::person::Profession,
+        to: crate::simulation::person::Profession,
+    },
+    /// Phase 5b — agent began an apprenticeship under a same-faction
+    /// master. `actor` is the apprentice; mentor entity index inlines
+    /// into the rendered label.
+    ApprenticeshipStarted {
+        mentor: Entity,
+    },
+    /// Phase 5b — apprentice graduated; profession is now `Crafter`.
+    /// `actor` is the now-graduate.
+    ApprenticeshipGraduated,
 }
 
 #[derive(Clone)]
@@ -213,6 +228,21 @@ pub fn activity_log_ingest_system(
             &ActivityEntryKind::WagePaid { amount, kind } => (
                 "earned",
                 format!("{:.2}c ({:?})", amount, kind),
+                ResultLink::HeldByActor,
+            ),
+            &ActivityEntryKind::ProfessionChanged { from, to } => (
+                "became",
+                format!("{:?} (was {:?})", to, from),
+                ResultLink::HeldByActor,
+            ),
+            &ActivityEntryKind::ApprenticeshipStarted { mentor } => (
+                "apprenticed to",
+                format!("#{}", mentor.index()),
+                ResultLink::HeldByActor,
+            ),
+            ActivityEntryKind::ApprenticeshipGraduated => (
+                "graduated",
+                "(now a Crafter)".to_string(),
                 ResultLink::HeldByActor,
             ),
         };

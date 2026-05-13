@@ -62,6 +62,13 @@ pub const HUNT_INVALIDATE_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
 /// counts. ~Once per quarter game-day; re-rolling every tick churns plans.
 pub const HUNTER_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
 
+/// Phase 4b asymmetric hysteresis: number of hunters above target the
+/// system tolerates before demoting. Promotion stays eager (any
+/// shortfall promotes immediately); demotion only fires when the
+/// excess exceeds this buffer. Stops single-tick flapping when prey
+/// density rounds the target up and down across cadence cycles.
+pub const HUNTER_DEMOTE_BUFFER: usize = 1;
+
 // ── Pluralist Economy R5: Bureaucrat constants ─────────────────────────
 
 /// Floor proportion of adults the chief tries to maintain as
@@ -85,6 +92,11 @@ pub const BUREAUCRAT_QUIT_DAYS: u32 = 3;
 /// Cadence at which `chief_bureaucrat_appointment_system` reconciles
 /// bureaucrat headcount. Mirrors `HUNTER_ASSIGNMENT_CADENCE`.
 pub const BUREAUCRAT_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
+
+/// Phase 4b asymmetric hysteresis (matches `HUNTER_DEMOTE_BUFFER`):
+/// tolerate one bureaucrat above target before demoting. Promotion
+/// stays eager; demotion fires only on excess > buffer.
+pub const BUREAUCRAT_DEMOTE_BUFFER: usize = 1;
 
 // ── Phase 5a (wage-aware-labor-market-v2): Crafter constants ──────────
 
@@ -265,7 +277,17 @@ pub fn faction_hunter_assignment_system(
         } else {
             1.0
         };
-        let mut target = if has_tech && adults > 0 {
+        // Phase 4b survival override: starving factions zero hunter
+        // target so labor surrenders to the Farmer ramp. Don't gate on
+        // `nearby_prey_count > 0` here — even with prey available, if
+        // food per head is critical we want everyone farming first.
+        let per_head = if adults > 0 {
+            faction.storage.food_total() / adults as f32
+        } else {
+            f32::INFINITY
+        };
+        let survival = per_head < FARMER_SURVIVAL_FLOOR;
+        let mut target = if has_tech && adults > 0 && !survival {
             let floor = (adults as f32 * HUNTER_MIN_RATIO).round().max(1.0);
             (floor * martial_scale * density_scale).round() as usize
         } else {
@@ -366,7 +388,12 @@ pub fn faction_hunter_assignment_system(
             for (e, _, _) in none.into_iter().take(need) {
                 promote.insert(e);
             }
-        } else if hunters.len() > want {
+        } else if hunters.len() > want.saturating_add(HUNTER_DEMOTE_BUFFER) || want == 0 {
+            // Asymmetric hysteresis: tolerate `HUNTER_DEMOTE_BUFFER`
+            // hunters above target. The `want == 0` arm forces full
+            // demotion when the survival floor or HUNTING_SPEAR gate
+            // collapses the target — the buffer applies only to
+            // non-zero target oscillation.
             // Lowest (EV, skill) first.
             hunters.sort_by(|a, b| {
                 a.1.partial_cmp(&b.1)
@@ -450,7 +477,16 @@ pub fn chief_bureaucrat_appointment_system(
         if fid == SOLO || !faction.state_funds_public_works {
             continue;
         }
-        let mut target = if faction.member_count > 0 {
+        // Phase 4b survival override: starving factions zero
+        // bureaucrat target. Administration is the first thing to
+        // surrender when food runs out.
+        let per_head = if faction.member_count > 0 {
+            faction.storage.food_total() / faction.member_count as f32
+        } else {
+            f32::INFINITY
+        };
+        let survival = per_head < FARMER_SURVIVAL_FLOOR;
+        let mut target = if faction.member_count > 0 && !survival {
             (faction.member_count as f32 * BUREAUCRAT_MIN_RATIO)
                 .round()
                 .max(1.0) as usize
@@ -529,7 +565,11 @@ pub fn chief_bureaucrat_appointment_system(
             for (e, _, _) in none.into_iter().take(want - bureaucrats.len()) {
                 promote.insert(e);
             }
-        } else if bureaucrats.len() > want {
+        } else if bureaucrats.len() > want.saturating_add(BUREAUCRAT_DEMOTE_BUFFER) || want == 0 {
+            // Asymmetric hysteresis: tolerate `BUREAUCRAT_DEMOTE_BUFFER`
+            // bureaucrats above target. `want == 0` (treasury-quit or
+            // survival override) forces full demotion bypassing the
+            // buffer so destitute factions actually shed administration.
             bureaucrats.sort_by(|a, b| {
                 a.1.partial_cmp(&b.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -584,7 +624,9 @@ pub fn chief_craft_assignment_system(
     ownership: Res<crate::simulation::capital::WorkshopOwnership>,
     plot_index: Res<crate::simulation::land::PlotIndex>,
     plots: Query<&crate::simulation::land::Plot>,
+    mentors_q: Query<&crate::simulation::apprenticeship::MentorOf>,
     mut commands: Commands,
+    mut activity: EventWriter<crate::ui::activity_log::ActivityLogEvent>,
     mut query: Query<(
         Entity,
         &mut Profession,
@@ -604,15 +646,37 @@ pub fn chief_craft_assignment_system(
 
     // Pre-pass: count current crafters per faction so the deadband
     // can hold steady when ema sits between the promote / demote
-    // thresholds. Pre-passing also lets us short-circuit the candidate
-    // walk for factions that have neither crafters nor a live signal.
+    // thresholds. Apprentices count toward the headcount target — they
+    // are committed Crafters-in-training. Pre-passing also lets us
+    // short-circuit the candidate walk for factions that have neither
+    // crafters nor a live signal.
+    // Also collect available mentors (Crafter, Skills[Crafting] >=
+    // MASTER_THRESHOLD, not already mentoring) per faction — Phase 5b
+    // routes sub-`APPRENTICE_THRESHOLD` promotions through apprenticeship.
     let mut current_crafters: AHashMap<u32, usize> = AHashMap::default();
-    for (_, prof, member, _, _, _, _, _, _, _) in query.iter() {
+    let mut available_mentors: AHashMap<u32, Vec<Entity>> = AHashMap::default();
+    for (entity, prof, member, skills, _, _, _, _, _, _) in query.iter() {
         if member.faction_id == SOLO {
             continue;
         }
-        if matches!(*prof, Profession::Crafter) {
-            *current_crafters.entry(member.faction_id).or_insert(0) += 1;
+        match *prof {
+            Profession::Crafter => {
+                *current_crafters.entry(member.faction_id).or_insert(0) += 1;
+                let crafting = skills.0[SkillKind::Crafting as usize];
+                if crafting
+                    >= crate::simulation::apprenticeship::MASTER_THRESHOLD
+                    && mentors_q.get(entity).is_err()
+                {
+                    available_mentors
+                        .entry(member.faction_id)
+                        .or_default()
+                        .push(entity);
+                }
+            }
+            Profession::Apprentice => {
+                *current_crafters.entry(member.faction_id).or_insert(0) += 1;
+            }
+            _ => {}
         }
     }
 
@@ -626,6 +690,19 @@ pub fn chief_craft_assignment_system(
     let mut targets: AHashMap<u32, usize> = AHashMap::default();
     for (&fid, faction) in registry.factions.iter() {
         if fid == SOLO {
+            continue;
+        }
+        // Phase 4b survival override: starving factions zero crafter
+        // target. Specialized labor surrenders before bureaucracy when
+        // food is critical; crafters are slightly more affordable
+        // than hunters, but both yield to a Farmer ramp.
+        let per_head = if faction.member_count > 0 {
+            faction.storage.food_total() / faction.member_count as f32
+        } else {
+            f32::INFINITY
+        };
+        if per_head < FARMER_SURVIVAL_FLOOR {
+            targets.insert(fid, 0);
             continue;
         }
         // Highest active Craft EMA across all resource variants.
@@ -723,10 +800,41 @@ pub fn chief_craft_assignment_system(
         return;
     }
 
-    for (entity, mut prof, _member, _skills, _agent, _carrier, _xf, _household, ai_opt, aq_opt) in
+    for (entity, mut prof, member, skills, _agent, _carrier, _xf, _household, ai_opt, aq_opt) in
         query.iter_mut()
     {
         if promote.contains(&entity) {
+            // Phase 5b: candidates below APPRENTICE_THRESHOLD route through
+            // a master mentor when one is available; otherwise fall back to
+            // direct Crafter promotion so a faction without any masters
+            // can still bootstrap.
+            let crafting = skills.0[SkillKind::Crafting as usize];
+            if crafting < crate::simulation::apprenticeship::APPRENTICE_THRESHOLD {
+                if let Some(pool) = available_mentors.get_mut(&member.faction_id) {
+                    if let Some(mentor) = pool.pop() {
+                        *prof = Profession::Apprentice;
+                        commands
+                            .entity(entity)
+                            .insert(crate::simulation::apprenticeship::ApprenticeOf { mentor })
+                            .insert(
+                                crate::simulation::apprenticeship::ApprenticeProgress::default(),
+                            );
+                        commands.entity(mentor).insert(
+                            crate::simulation::apprenticeship::MentorOf { apprentice: entity },
+                        );
+                        activity.send(crate::ui::activity_log::ActivityLogEvent {
+                            tick: clock.tick,
+                            actor: entity,
+                            faction_id: member.faction_id,
+                            kind:
+                                crate::ui::activity_log::ActivityEntryKind::ApprenticeshipStarted {
+                                    mentor,
+                                },
+                        });
+                        continue;
+                    }
+                }
+            }
             *prof = Profession::Crafter;
         } else if demote.contains(&entity) {
             *prof = Profession::None;
@@ -1285,6 +1393,17 @@ fn decide_for_faction(
 /// Hysteresis prevents the role from flapping while reserves hover at target.
 const FARMER_PROMOTE_PER_HEAD: f32 = 32.0;
 const FARMER_DEMOTE_RATIO: f32 = 1.6;
+
+/// Phase 4b (wage-aware-labor-market-v2) survival override. When per-head
+/// food reserves drop below this floor, the Hunter / Bureaucrat / Crafter
+/// assignment systems zero their target headcount for the affected
+/// faction — labor surrenders back to `Profession::None`, which the
+/// Farmer ramp then poaches into food production. The floor is set
+/// well below the `FARMER_PROMOTE_PER_HEAD = 32` ramp trigger so it
+/// only fires in genuine emergencies; bouncing between the two thresholds
+/// (e.g. a single bad season) leaves the Farmer ramp in charge while
+/// hunters keep working.
+pub const FARMER_SURVIVAL_FLOOR: f32 = 16.0;
 /// Anchor farmer reassignment to game time, not every tick. Six game-hours
 /// (~`TICKS_PER_DAY/4`) is enough to react to harvest spikes without flapping.
 pub const FARMER_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;

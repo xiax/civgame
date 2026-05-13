@@ -48,7 +48,7 @@ pub enum AiState {
     Attacking = 5,
 }
 
-#[derive(Component, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Component, Default, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Profession {
     #[default]
     None,
@@ -76,6 +76,30 @@ pub enum Profession {
     /// Phase 5b apprenticeship layers on top — sub-`APPRENTICE_THRESHOLD`
     /// candidates route through `Profession::Apprentice` instead.
     Crafter,
+    /// Phase 5b (wage-aware-labor-market-v2): novice training toward
+    /// `Crafter`. Routed by `chief_craft_assignment_system` when a
+    /// low-`Crafting` (< `APPRENTICE_THRESHOLD`) candidate is bound to
+    /// a same-faction master via `ApprenticeOf` / `MentorOf`. Lives in
+    /// the role for `APPRENTICESHIP_DURATION_DAYS` of in-game time;
+    /// `apprentice_progress_system` ratchets `ApprenticeProgress.ticks`
+    /// daily and graduates to `Crafter` on completion. Profession-choice
+    /// systems treat Apprentices as committed — they're skipped from
+    /// Farmer / Hunter / Bureaucrat promotion pools.
+    Apprentice,
+    /// Phase 5b-stretch (wage-aware-labor-market-v2): medicine
+    /// practitioner. Currently *scaffolding-only* — the variant is
+    /// recognised by `profession_choice` (primary skill = Medicine;
+    /// shrine-affine workshop), the cross-profession switcher's
+    /// `faction_cap_for`, and the inspector's EV table, but no
+    /// `chief_heal_assignment_system` exists yet to promote Healers
+    /// from `None`. A future Heal-job pipeline (post-paid heal contracts
+    /// when members are injured, executed against `Health` deltas) is
+    /// the precondition for Healers to receive a wage signal and
+    /// therefore become EV-promotable. Until then, the variant lands
+    /// additively so downstream consumers (capital affinity, inspector,
+    /// apprenticeship plumbing) don't have to be re-wired when the
+    /// Heal-job pipeline lands.
+    Healer,
 }
 
 /// Pluralist Economy R10 follow-on: per-trader arbitrage state. Tracks
@@ -568,6 +592,17 @@ pub fn spawn_population(
                             clock.tick as u32,
                         ),
                         crate::simulation::typed_task::ActionQueue::idle(),
+                        // Phase 6 of wage-aware-labor-market-v2:
+                        // per-agent psychological profile. Scattered
+                        // by fastrand at spawn so populations have
+                        // heterogeneous goal preferences (the
+                        // `EarnIncomeScorer` multiplier among others).
+                        crate::simulation::goal_scorers::Disposition {
+                            entrepreneurial: fastrand::u8(..),
+                            gregariousness: fastrand::u8(..),
+                            curiosity: fastrand::u8(..),
+                            martial: fastrand::u8(..),
+                        },
                     ),
                 ))
                 .id();

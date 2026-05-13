@@ -952,6 +952,150 @@ fn should_craft(
         })
 }
 
+/// Phase 6 (wage-aware-labor-market-v2) — `EarnIncome` procedural
+/// branch (degraded form, no peer-plan `GoalScorer` dependency).
+///
+/// `goal_update_system`'s cascade ends in a generic `gather_goal`
+/// fallback (`GatherFood / GatherWood / GatherStone`) for any
+/// professioned agent whose subsistence / social / sleep / chief
+/// needs are all met. In Mixed / Market factions that ignores a real
+/// signal: the agent could be earning currency right now by claiming
+/// a paid posting whose `JobKind` matches their profession. This
+/// system runs in `ParallelA` after `goal_update_system` and rewrites
+/// any fallback gather goal to the matching `JobKind`'s goal when:
+///
+/// 1. The agent has no `JobClaim` (claimed workers are owned by
+///    `job_goal_lock_system`).
+/// 2. The agent's `Profession` is non-`None` and non-`Apprentice` —
+///    professioned agents have a wage-signal anchor; idle Nones still
+///    drift toward subsistence work via the legacy cascade.
+/// 3. The agent's faction's `economic_policy` map is non-empty (the
+///    Mixed / Market discriminator). Pure-Subsistence factions keep
+///    communal labor allocation untouched.
+/// 4. There's an unclaimed paid posting (`reward > 0`) in the
+///    faction's `JobBoard` whose `JobKind` matches one of the
+///    profession's `job_kinds_for(...)` entries.
+///
+/// Ranking is `posting.reward × skill_competence(primary_skill)` —
+/// the same scoring the plan's `EarnIncomeScorer` calls for, modulo
+/// the `(1 + disposition.entrepreneurial / 255)` factor that waits on
+/// the still-deferred `Disposition` component. Travel cost is also
+/// omitted today; `job_claim_system`'s `U_bid` already penalises
+/// distance at claim time, so the goal layer can stay coarse.
+///
+/// Tier matches the plan's `GoalClass::Enterprise`: above the generic
+/// gather fallback (which would otherwise win), below
+/// Survive / Sleep / Socialize / Play / TameHorse / Build (personal) /
+/// Craft / faction war state — all of which would have already won
+/// in the upstream cascade and produced a goal that this system
+/// short-circuits on (the `matches!` filter restricts the rewrite to
+/// gather-fallback goals).
+pub fn earnincome_goal_override_system(
+    clock: Res<SimClock>,
+    registry: Res<FactionRegistry>,
+    board: Res<crate::simulation::jobs::JobBoard>,
+    scorer_registry: Res<crate::simulation::goal_scorers::GoalScorerRegistry>,
+    mut commands: Commands,
+    mut query: Query<
+        (
+            Entity,
+            &mut AgentGoal,
+            &mut PersonAI,
+            &mut TargetItem,
+            &FactionMember,
+            &crate::simulation::person::Profession,
+            &crate::simulation::skills::Skills,
+            &Needs,
+            &crate::economy::agent::EconomicAgent,
+            &Transform,
+            Option<&crate::simulation::goal_scorers::Disposition>,
+            Option<&mut GoalReason>,
+        ),
+        (Without<Drafted>, Without<JobClaim>),
+    >,
+) {
+    use crate::simulation::goal_scorers::{
+        Disposition, GoalClass, GoalScoringContext,
+    };
+
+    for (
+        entity,
+        mut goal,
+        mut ai,
+        mut target_item,
+        member,
+        prof,
+        skills,
+        needs,
+        agent,
+        transform,
+        disposition_opt,
+        reason_opt,
+    ) in query.iter_mut()
+    {
+        // Only rewrite the generic gather-fallback goals; everything
+        // else won an upstream branch and shouldn't be overridden.
+        if !matches!(
+            *goal,
+            AgentGoal::GatherFood | AgentGoal::GatherWood | AgentGoal::GatherStone
+        ) {
+            continue;
+        }
+        if member.faction_id == SOLO {
+            continue;
+        }
+        let Some(faction) = registry.factions.get(&member.faction_id) else {
+            continue;
+        };
+        let disposition = disposition_opt.copied().unwrap_or_default();
+        let agent_tile = (
+            (transform.translation.x / TILE_SIZE).floor() as i32,
+            (transform.translation.y / TILE_SIZE).floor() as i32,
+        );
+        let ctx = GoalScoringContext {
+            agent: entity,
+            agent_tile,
+            now: clock.tick,
+            needs,
+            profession: *prof,
+            skills,
+            disposition,
+            economic_agent: agent,
+            faction_member: member,
+            faction,
+            board: &board,
+        };
+        let Some(best) = scorer_registry.best(&ctx) else {
+            continue;
+        };
+        // Only act on scorers at `Enterprise` tier or higher — the
+        // legacy cascade in `goal_update_system` already drove every
+        // Subsistence / Safety / Survival branch and we don't want
+        // to double-act on those tiers here. Discretionary scorers
+        // (future Play overrides, etc.) also pass through this gate
+        // by virtue of running ONLY when the fallback gather goal
+        // is set (the `matches!` filter above).
+        if best.class < GoalClass::Enterprise {
+            continue;
+        }
+        // For deterministic naming carry both the scorer's `reason`
+        // (used by inspector / activity log) AND the goal it picks.
+        let _ = (best.score, Disposition::default());
+        if *goal != best.goal {
+            *goal = best.goal;
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.target_entity = None;
+            target_item.0 = None;
+        }
+        if let Some(mut r) = reason_opt {
+            r.0 = best.reason;
+        } else {
+            commands.entity(entity).insert(GoalReason(best.reason));
+        }
+    }
+}
+
 /// Phase 5: when `goal_update_system` flips an agent's `AgentGoal`, the
 /// in-flight method's chain is dropped on the next `goal_dispatch_system`
 /// tick (unless it's `MF_UNINTERRUPTIBLE`, in which case the preserve-arm

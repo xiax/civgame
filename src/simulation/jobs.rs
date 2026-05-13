@@ -545,28 +545,46 @@ pub fn job_payout_system(world: &mut World) {
             let share = amount / n as f32;
             let mut paid_total = 0.0_f32;
             for worker in payable {
+                // Phase 5b: apprentice claimants take a reduced share;
+                // their mentor collects a small fee; the residual stays
+                // in the escrow and refunds to the beneficiary on
+                // despawn. Currency invariant preserved end-to-end —
+                // apprentice + mentor + residual = `share`.
+                let apprentice_mentor: Option<Entity> = world
+                    .get::<crate::simulation::apprenticeship::ApprenticeOf>(worker)
+                    .map(|link| link.mentor);
+                let (worker_pay, mentor_pay) = if apprentice_mentor.is_some() {
+                    (
+                        share * crate::simulation::apprenticeship::WAGE_FRACTION_APPRENTICE,
+                        share * crate::simulation::apprenticeship::WAGE_FRACTION_MENTOR_FEE,
+                    )
+                } else {
+                    (share, 0.0)
+                };
+
                 // Direct escrow → worker credit. The escrow already
                 // holds the funds (debited at posting time); we don't
                 // re-debit the beneficiary. Invariant: agents_total
-                // gains `share`, escrowed loses `share`, net zero.
+                // gains `worker_pay + mentor_pay`, escrowed loses
+                // the same amount, net zero.
                 let credited = {
                     if let Some(mut to_agent) =
                         world.get_mut::<crate::economy::agent::EconomicAgent>(worker)
                     {
-                        to_agent.currency += share;
+                        to_agent.currency += worker_pay;
                         true
                     } else {
                         false
                     }
                 };
                 if credited {
-                    paid_total += share;
+                    paid_total += worker_pay;
                     // Log the earning on the worker.
                     if let Some(mut earnings) = world.get_mut::<Earnings>(worker) {
                         earnings.push(EarningEntry {
                             job_kind: ev.kind,
                             target_rid: ev.target_rid,
-                            amount: share,
+                            amount: worker_pay,
                             tick: now,
                         });
                     } else {
@@ -577,7 +595,7 @@ pub fn job_payout_system(world: &mut World) {
                         e.push(EarningEntry {
                             job_kind: ev.kind,
                             target_rid: ev.target_rid,
-                            amount: share,
+                            amount: worker_pay,
                             tick: now,
                         });
                         world.entity_mut(worker).insert(e);
@@ -594,10 +612,68 @@ pub fn job_payout_system(world: &mut World) {
                         actor: worker,
                         faction_id,
                         kind: crate::ui::activity_log::ActivityEntryKind::WagePaid {
-                            amount: share,
+                            amount: worker_pay,
                             kind,
                         },
                     });
+                }
+
+                // Mentor fee — only credited if mentor is alive and
+                // is not the beneficiary (avoid self-shuffling for
+                // the rare case of a mentor-funded posting). Failed
+                // mentor lookup leaves the residual in the escrow,
+                // which refunds to the beneficiary on despawn.
+                if let Some(mentor_entity) = apprentice_mentor {
+                    if mentor_pay > 0.0 && mentor_entity != beneficiary {
+                        let mentor_credited = {
+                            if let Some(mut to_agent) = world
+                                .get_mut::<crate::economy::agent::EconomicAgent>(mentor_entity)
+                            {
+                                to_agent.currency += mentor_pay;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if mentor_credited {
+                            paid_total += mentor_pay;
+                            if let Some(mut earnings) =
+                                world.get_mut::<Earnings>(mentor_entity)
+                            {
+                                earnings.push(EarningEntry {
+                                    job_kind: ev.kind,
+                                    target_rid: ev.target_rid,
+                                    amount: mentor_pay,
+                                    tick: now,
+                                });
+                            } else {
+                                let mut e = Earnings::default();
+                                e.push(EarningEntry {
+                                    job_kind: ev.kind,
+                                    target_rid: ev.target_rid,
+                                    amount: mentor_pay,
+                                    tick: now,
+                                });
+                                world.entity_mut(mentor_entity).insert(e);
+                            }
+                            let faction_id = ev.faction_id;
+                            let kind = ev.kind;
+                            let mut events_log = world
+                                .resource_mut::<bevy::ecs::event::Events<
+                                    crate::ui::activity_log::ActivityLogEvent,
+                                >>();
+                            events_log.send(crate::ui::activity_log::ActivityLogEvent {
+                                tick: now as u64,
+                                actor: mentor_entity,
+                                faction_id,
+                                kind:
+                                    crate::ui::activity_log::ActivityEntryKind::WagePaid {
+                                        amount: mentor_pay,
+                                        kind,
+                                    },
+                            });
+                        }
+                    }
                 }
             }
             // Zero the escrow (so on_remove hook is a no-op for the

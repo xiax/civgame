@@ -109,6 +109,33 @@ pub struct TaskDisplayParams<'w, 's> {
     pub carrying_q: Query<'w, 's, &'static crate::simulation::corpse::Carrying>,
 }
 
+/// Wage-aware-labor-market inspector surface: skill peaks, earnings,
+/// per-profession EV, apprenticeship progress, perceived cross-faction
+/// wages. Bundled as a SystemParam so the main panel query stays under
+/// Bevy's per-tuple ceiling.
+#[derive(SystemParam)]
+pub struct WageInspectorParams<'w, 's> {
+    pub peaks_q: Query<'w, 's, &'static crate::simulation::skills::SkillPeaks>,
+    pub earnings_q: Query<'w, 's, &'static crate::simulation::jobs::Earnings>,
+    pub perceived_q:
+        Query<'w, 's, &'static crate::simulation::jobs::PerceivedFactionWages>,
+    pub apprentice_q: Query<
+        'w,
+        's,
+        (
+            Option<&'static crate::simulation::apprenticeship::ApprenticeOf>,
+            Option<&'static crate::simulation::apprenticeship::ApprenticeProgress>,
+            Option<&'static crate::simulation::apprenticeship::MentorOf>,
+        ),
+    >,
+    pub household_q: Query<'w, 's, &'static crate::simulation::reproduction::HouseholdMember>,
+    pub disposition_q:
+        Query<'w, 's, &'static crate::simulation::goal_scorers::Disposition>,
+    pub ownership: Res<'w, crate::simulation::capital::WorkshopOwnership>,
+    pub plot_q: Query<'w, 's, &'static crate::simulation::land::Plot>,
+    pub plot_index: Res<'w, crate::simulation::land::PlotIndex>,
+}
+
 pub fn inspector_panel_system(
     mut contexts: EguiContexts,
     selected: Res<SelectedEntity>,
@@ -122,6 +149,7 @@ pub fn inspector_panel_system(
     task_display: TaskDisplayParams,
     rel_query: Query<&RelationshipMemory>,
     mut job_params: JobInspectorParams,
+    wage_params: WageInspectorParams,
     repro_query: Query<(
         Option<&Pregnancy>,
         Option<&CoSleepTracker>,
@@ -198,7 +226,51 @@ pub fn inspector_panel_system(
                             ui.label(sex.name());
                         });
                         ui.label(format!("Personality: {}", personality.name()));
-                        ui.label(format!("Profession: {:?}", profession));
+                        let (appr_link, appr_progress, mentor_link) =
+                            wage_params.apprentice_q.get(entity).unwrap_or((None, None, None));
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Profession: {:?}", profession));
+                            if matches!(profession, Profession::Apprentice) {
+                                if let Some(p) = appr_progress {
+                                    let frac =
+                                        (p.ticks as f32 / p.target_ticks.max(1) as f32).min(1.0);
+                                    let days_done = p.ticks / crate::world::seasons::TICKS_PER_DAY;
+                                    let total_days =
+                                        p.target_ticks / crate::world::seasons::TICKS_PER_DAY;
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "apprentice {}/{} d ({:.0}%)",
+                                            days_done,
+                                            total_days,
+                                            frac * 100.0
+                                        ))
+                                        .color(egui::Color32::from_rgb(180, 200, 255))
+                                        .small(),
+                                    );
+                                }
+                            } else if let Some(m) = mentor_link {
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "mentoring #{}",
+                                        m.apprentice.index()
+                                    ))
+                                    .color(egui::Color32::from_rgb(180, 220, 180))
+                                    .small(),
+                                );
+                            }
+                        });
+                        if let Some(link) = appr_link {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  Master: #{}",
+                                    link.mentor.index()
+                                ))
+                                .color(egui::Color32::from_gray(170))
+                                .small(),
+                            );
+                        }
                         ui.horizontal(|ui| {
                             ui.label(format!("Goal: {}", goal.name()));
                             let reason_text = goal_reason.map(|r| r.0).unwrap_or("—");
@@ -376,9 +448,30 @@ pub fn inspector_panel_system(
                 egui::CollapsingHeader::new(egui::RichText::new("Skills").strong())
                     .default_open(false)
                     .show(ui, |ui| {
+                        let peaks = wage_params.peaks_q.get(entity).ok().copied();
                         for i in 0..SKILL_COUNT {
                             let kind = unsafe { std::mem::transmute::<u8, SkillKind>(i as u8) };
-                            ui.label(format!("  {}: {}", kind.name(), skills.0[i]));
+                            let cur = skills.0[i];
+                            let (peak, floor) = match peaks {
+                                Some(p) => {
+                                    let pk = p.0[i];
+                                    (pk, crate::simulation::skills::skill_floor(pk))
+                                }
+                                None => (cur, cur),
+                            };
+                            let mastered =
+                                peak >= crate::simulation::skills::SKILL_MASTERY_LINE;
+                            let mut line = egui::RichText::new(format!(
+                                "  {}: {} / peak {} (floor {})",
+                                kind.name(),
+                                cur,
+                                peak,
+                                floor
+                            ));
+                            if mastered {
+                                line = line.color(egui::Color32::from_rgb(180, 220, 180));
+                            }
+                            ui.label(line);
                         }
                     });
                 egui::CollapsingHeader::new(egui::RichText::new("Stats").strong())
@@ -399,6 +492,23 @@ pub fn inspector_panel_system(
                         } else {
                             ui.label("  (no stats)");
                         }
+                    });
+                egui::CollapsingHeader::new(egui::RichText::new("Wage & Labor").strong())
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        wage_labor_section(
+                            ui,
+                            entity,
+                            agent,
+                            carrier,
+                            transform,
+                            skills,
+                            member,
+                            profession,
+                            &registry,
+                            &sim_clock,
+                            &wage_params,
+                        );
                     });
                 egui::CollapsingHeader::new(egui::RichText::new("Knowledge").strong())
                     .default_open(false)
@@ -1511,6 +1621,243 @@ pub fn inspector_action_system(
                 actors: vec![],
                 command: crate::simulation::player_command::PlayerCommand::EncodeTablet { tech },
             });
+        }
+    }
+}
+
+/// Render the "Wage & Labor" inspector section (Phase 6 of
+/// wage-aware-labor-market-v2). Surfaces:
+/// - Earnings ring summary (count + total in window)
+/// - Per-profession EV table — `expected_wage = wage × competence × capital`
+/// - Own-faction `wage_signal` rows by EMA per game-day
+/// - Cross-faction perceived wages from gossip
+#[allow(clippy::too_many_arguments)]
+fn wage_labor_section(
+    ui: &mut egui::Ui,
+    entity: Entity,
+    agent: &EconomicAgent,
+    carrier: Option<&Carrier>,
+    transform: &Transform,
+    skills: &Skills,
+    member: &FactionMember,
+    profession: &Profession,
+    registry: &FactionRegistry,
+    sim_clock: &SimClock,
+    wage_params: &WageInspectorParams,
+) {
+    use crate::simulation::profession_choice::{
+        aggregate_wage_per_day, expected_wage, primary_skill_for,
+    };
+
+    let now = sim_clock.tick as u32;
+    let day = crate::world::seasons::TICKS_PER_DAY;
+    let window_start = now.saturating_sub(day);
+
+    // --- Earnings -----------------------------------------------------
+    if let Ok(earn) = wage_params.earnings_q.get(entity) {
+        let mut day_total = 0.0_f32;
+        let mut day_count = 0u32;
+        let mut ring_total = 0.0_f32;
+        for e in earn.recent.iter() {
+            ring_total += e.amount;
+            if e.tick >= window_start {
+                day_total += e.amount;
+                day_count += 1;
+            }
+        }
+        ui.label(format!(
+            "Earnings (24h): {:.1} ({} payouts) • ring: {:.1}",
+            day_total, day_count, ring_total
+        ));
+        if !earn.recent.is_empty() {
+            let last = earn.recent.back().copied().unwrap();
+            let rid_str = last
+                .target_rid
+                .and_then(|r| {
+                    crate::economy::core_ids::catalog()
+                        .get(r)
+                        .map(|d| d.display_name.clone())
+                })
+                .unwrap_or_else(|| "—".to_string());
+            ui.label(
+                egui::RichText::new(format!(
+                    "  last: {} {} +{:.2} @{}",
+                    last.job_kind.name(),
+                    rid_str,
+                    last.amount,
+                    last.tick
+                ))
+                .small()
+                .color(egui::Color32::from_gray(170)),
+            );
+        }
+    } else {
+        ui.label(
+            egui::RichText::new("Earnings: (no ring component)")
+                .small()
+                .color(egui::Color32::from_gray(140)),
+        );
+    }
+
+    // --- Disposition ---------------------------------------------------
+    let disposition = wage_params
+        .disposition_q
+        .get(entity)
+        .copied()
+        .unwrap_or_default();
+    ui.separator();
+    ui.label(
+        egui::RichText::new(format!(
+            "Disposition: ent {} • greg {} • cur {} • mar {}",
+            disposition.entrepreneurial,
+            disposition.gregariousness,
+            disposition.curiosity,
+            disposition.martial
+        ))
+        .small()
+        .color(egui::Color32::from_gray(170)),
+    );
+
+    // --- Per-profession EV table -------------------------------------
+    let village_id = registry.root_faction(member.faction_id);
+    let faction = registry.factions.get(&village_id);
+    if member.faction_id != SOLO {
+        if let Some(faction) = faction {
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!(
+                    "Expected wage per day (EarnIncome ×{:.2})",
+                    disposition.earn_income_multiplier()
+                ))
+                .strong()
+                .small(),
+            );
+            let agent_tile = (
+                (transform.translation.x / TILE_SIZE).floor() as i32,
+                (transform.translation.y / TILE_SIZE).floor() as i32,
+            );
+            let household = wage_params.household_q.get(entity).ok();
+            let candidates = [
+                Profession::Farmer,
+                Profession::Hunter,
+                Profession::Crafter,
+                Profession::Bureaucrat,
+                Profession::Trader,
+                Profession::Healer,
+            ];
+            for prof in candidates {
+                let cap = match carrier {
+                    Some(c) => crate::simulation::capital::capital_factor(
+                        agent,
+                        c,
+                        agent_tile,
+                        village_id,
+                        household,
+                        prof,
+                        &wage_params.ownership,
+                        &wage_params.plot_q,
+                        &wage_params.plot_index,
+                    ),
+                    None => 1.0,
+                };
+                let ev = expected_wage(faction, prof, skills, cap);
+                let agg = aggregate_wage_per_day(faction, prof);
+                let comp = primary_skill_for(prof)
+                    .map(|k| {
+                        crate::simulation::profession_choice::skill_competence(
+                            skills.get(k),
+                        )
+                    })
+                    .unwrap_or(1.0);
+                let mut text = egui::RichText::new(format!(
+                    "  {:?}: EV {:.2} (wage {:.2} × comp {:.2} × cap {:.2})",
+                    prof, ev, agg, comp, cap
+                ))
+                .small();
+                if *profession == prof {
+                    text = text.color(egui::Color32::from_rgb(200, 220, 120));
+                } else if ev <= 0.0 {
+                    text = text.color(egui::Color32::from_gray(130));
+                }
+                ui.label(text);
+            }
+        }
+    }
+
+    // --- Own-faction wage_signal --------------------------------------
+    if let Some(faction) = faction {
+        if !faction.wage_signal.is_empty() {
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!(
+                    "Faction #{} wage signal",
+                    village_id
+                ))
+                .strong()
+                .small(),
+            );
+            let mut rows: Vec<_> = faction.wage_signal.iter().collect();
+            rows.sort_by(|a, b| {
+                b.1.ema_per_day
+                    .partial_cmp(&a.1.ema_per_day)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for ((kind, rid), ema) in rows.into_iter().take(6) {
+                let rid_str = rid
+                    .and_then(|r| {
+                        crate::economy::core_ids::catalog()
+                            .get(r)
+                            .map(|d| d.display_name.clone())
+                    })
+                    .unwrap_or_else(|| "—".to_string());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "  {:?}/{}: {:.2}/day (n={})",
+                        kind, rid_str, ema.ema_per_day, ema.samples
+                    ))
+                    .small(),
+                );
+            }
+        } else if member.faction_id != SOLO {
+            ui.label(
+                egui::RichText::new("Faction wage signal: (no payouts yet)")
+                    .small()
+                    .color(egui::Color32::from_gray(140)),
+            );
+        }
+    }
+
+    // --- Perceived cross-faction wages (gossip) ----------------------
+    if let Ok(perceived) = wage_params.perceived_q.get(entity) {
+        if !perceived.by_key.is_empty() {
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Perceived wages (gossip)").strong().small(),
+            );
+            let mut rows: Vec<_> = perceived.by_key.iter().collect();
+            rows.sort_by(|a, b| {
+                b.1 .0
+                    .partial_cmp(&a.1 .0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for ((fid, kind, rid), (ema, observed)) in rows.into_iter().take(6) {
+                let rid_str = rid
+                    .and_then(|r| {
+                        crate::economy::core_ids::catalog()
+                            .get(r)
+                            .map(|d| d.display_name.clone())
+                    })
+                    .unwrap_or_else(|| "—".to_string());
+                let age = now.saturating_sub(*observed);
+                let days_old = age as f32 / day as f32;
+                ui.label(
+                    egui::RichText::new(format!(
+                        "  #{} {:?}/{}: {:.2}/day ({:.1}d old)",
+                        fid, kind, rid_str, ema, days_old
+                    ))
+                    .small(),
+                );
+            }
         }
     }
 }

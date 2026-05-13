@@ -587,14 +587,27 @@ pub fn craft_order_system(
         &LodLevel,
         &Transform,
         Option<&JobClaim>,
+        Option<&crate::simulation::apprenticeship::ApprenticeOf>,
     )>,
 ) {
     let mut order_haulers: AHashMap<Entity, Vec<(Entity, [u32; MAX_CRAFT_INPUTS])>> =
         AHashMap::new();
     let mut order_workers: AHashMap<Entity, Vec<Entity>> = AHashMap::new();
 
-    for (entity, mut ai, mut aq, agent, carrier, _skills, _member, slot, lod, _transform, _claim) in
-        agent_query.iter_mut()
+    for (
+        entity,
+        mut ai,
+        mut aq,
+        agent,
+        carrier,
+        _skills,
+        _member,
+        slot,
+        lod,
+        _transform,
+        _claim,
+        _apprentice,
+    ) in agent_query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
@@ -790,6 +803,7 @@ pub fn craft_order_system(
         _lod,
         transform,
         claim,
+        apprentice,
     ) in agent_query.iter_mut()
     {
         for &(ae, id, qty) in &good_removals {
@@ -805,7 +819,10 @@ pub fn craft_order_system(
         if xp_grants.contains(&entity) {
             // Crafting XP is granted at recipe-completion (per craft); per-tick
             // workers also get a small Crafting XP nudge so labor is rewarded.
-            skills.gain_xp(SkillKind::Crafting, 1);
+            // Phase 5b: apprentices earn at `APPRENTICE_XP_MULT` rate while a
+            // mentor is supervising — deliberate-practice multiplier.
+            let xp = crate::simulation::apprenticeship::xp_with_apprentice_bonus(1, apprentice);
+            skills.gain_xp(SkillKind::Crafting, xp);
         }
 
         // Output payout & job credit for the lead worker on completed orders.
@@ -828,7 +845,12 @@ pub fn craft_order_system(
             // inventories and ground-item piles.
             output_item.tech_payload = tech_payload;
             agent.add_item(output_item, recipe.output_qty);
-            skills.gain_xp(SkillKind::Crafting, recipe.crafting_xp);
+            // Phase 5b: deliberate-practice multiplier for apprentices.
+            let xp = crate::simulation::apprenticeship::xp_with_apprentice_bonus(
+                recipe.crafting_xp,
+                apprentice,
+            );
+            skills.gain_xp(SkillKind::Crafting, xp);
         }
         // Job-board credit: post recipe-completion to the worker's matching
         // Craft posting (if any).
