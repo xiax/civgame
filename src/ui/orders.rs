@@ -226,6 +226,7 @@ pub fn right_click_context_menu_system(
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
     selected: Res<SelectedEntity>,
+    selected_many: Res<SelectedEntities>,
     member_q: OrderMemberQueries,
     player_faction: Res<PlayerFaction>,
     faction_registry: Res<FactionRegistry>,
@@ -543,8 +544,29 @@ pub fn right_click_context_menu_system(
 
     if let Some(action) = chosen {
         if let Some(cmd) = menu_action_to_command(action, target_tile, target_z) {
+            // Broadcast to every non-drafted player-faction worker in
+            // `SelectedEntities`. Drafted units are owned by
+            // `military_right_click_system`; filtering them here avoids
+            // double-commanding hunters who happen to be in the drag-rect.
+            let mut actors: Vec<Entity> = selected_many
+                .ids
+                .iter()
+                .copied()
+                .filter(|&e| {
+                    let is_player = member_q
+                        .faction_q
+                        .get(e)
+                        .map(|m| m.faction_id == player_faction.faction_id)
+                        .unwrap_or(false);
+                    let is_drafted = member_q.drafted_q.get(e).is_ok();
+                    is_player && !is_drafted
+                })
+                .collect();
+            if actors.is_empty() {
+                actors.push(sel_entity);
+            }
             cmd_events.send(crate::simulation::player_command::PlayerCommandEvent {
-                actors: vec![sel_entity],
+                actors,
                 command: cmd,
             });
         }
