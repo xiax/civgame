@@ -136,6 +136,21 @@ pub enum PlayerCommand {
         tile: (i32, i32),
         z: i8,
     },
+    /// Phase 2: dispatch a single member of the actor's faction as a
+    /// manual scout. `direction` is one of 8 cardinals (0=N, 1=NE, 2=E,
+    /// ...). The scout walks `range` chebyshev tiles toward that
+    /// cardinal and folds the local cluster summary into
+    /// `FactionData.candidate_sites` on arrival.
+    SendScout {
+        direction: u8,
+        range: u32,
+    },
+    /// Phase 3: set the active migration intent for the actor's
+    /// faction. Reweights `pick_migration_target`'s component scores
+    /// on the next survey / candidate refresh.
+    SetMigrationIntent {
+        intent: crate::simulation::faction::MigrationIntent,
+    },
 }
 
 /// Per-actor authority marker. Replaces `PlayerOrder` once Commit 3 lands.
@@ -432,6 +447,10 @@ pub fn player_command_lifecycle_system(
                     _ => None,
                 }
             }
+            // Phase 2/3: stamp-and-done faction commands.
+            PlayerCommand::SendScout { .. } | PlayerCommand::SetMigrationIntent { .. } => {
+                Some(CommandStatus::Completed)
+            }
         };
         if let Some(new_status) = outcome {
             cmd.status = new_status;
@@ -530,7 +549,10 @@ pub fn dispatch_player_command_system(
         // mutates the world next Sequential tick).
         if !matches!(
             cmd.command,
-            PlayerCommand::PackCamp | PlayerCommand::PitchCamp { .. }
+            PlayerCommand::PackCamp
+                | PlayerCommand::PitchCamp { .. }
+                | PlayerCommand::SendScout { .. }
+                | PlayerCommand::SetMigrationIntent { .. }
         ) {
             aq.cancel();
         }
@@ -934,6 +956,41 @@ fn dispatch_one(
             if !camp_ops.packs.iter().any(|(f, _)| *f == fid) {
                 camp_ops.packs.push((fid, faction.home_tile));
             }
+            DispatchOutcome::Active
+        }
+        SendScout { direction, range } => {
+            let _ = (target_item_q, lecture_req, player_craft);
+            let fid = registry.root_faction(faction_id);
+            let Some(faction) = registry.factions.get(&fid) else {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            };
+            if !faction.caps.home.is_mobile() {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            }
+            if !camp_ops
+                .manual_scouts
+                .iter()
+                .any(|s| s.fid == fid && s.direction == direction)
+            {
+                camp_ops
+                    .manual_scouts
+                    .push(crate::simulation::nomad::PendingManualScout {
+                        fid,
+                        direction,
+                        range,
+                    });
+            }
+            DispatchOutcome::Active
+        }
+        SetMigrationIntent { intent } => {
+            let fid = registry.root_faction(faction_id);
+            let Some(faction) = registry.factions.get(&fid) else {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            };
+            if !faction.caps.home.is_mobile() {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            }
+            camp_ops.intent_sets.push((fid, intent));
             DispatchOutcome::Active
         }
         PitchCamp { tile, z } => {

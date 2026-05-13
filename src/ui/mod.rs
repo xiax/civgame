@@ -8,6 +8,7 @@ pub mod hover;
 pub mod hud;
 pub mod inspector;
 pub mod job_board;
+pub mod migration_panel;
 pub mod orders;
 pub mod selection;
 pub mod spawn_select;
@@ -36,6 +37,7 @@ impl Plugin for UiPlugin {
             .insert_resource(activity_log::CameraFocusRequest::default())
             .insert_resource(inspector::PendingInspectorAction::default())
             .insert_resource(spawn_select::SpawnSelectTexture::default())
+            .insert_resource(migration_panel::MigrationPanelOpen::default())
             .add_event::<activity_log::ActivityLogEvent>()
             .add_systems(
                 Update,
@@ -54,6 +56,7 @@ impl Plugin for UiPlugin {
                     economy_panel::economy_panel_system,
                     hud::hud_system,
                     hud::apply_draft_toggle_system,
+                    migration_panel::migration_panel_system,
                     world_map::world_map_system,
                     tech_panel::tech_panel_system,
                     debug_panel::debug_panel_system,

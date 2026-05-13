@@ -414,6 +414,28 @@ pub enum Task {
         entity: bevy::prelude::Entity,
         blueprint: bevy::prelude::Entity,
     },
+    /// Part B: dismantle a Deployable nomadic structure. Worker walks
+    /// adjacent to the `structure` tile, accumulates work_progress for
+    /// `UNPITCH_WORK_TICKS`, then the executor despawns the entity and
+    /// transfers the packed good into the worker's inventory / hands
+    /// / a nearby pack animal / GroundItem (in that preference).
+    UnpitchStructure { structure: bevy::prelude::Entity },
+    /// Part B: drop `qty` units of `resource_id` from the worker's
+    /// hands or inventory at `tile`. Used to pre-stage cargo at the
+    /// new camp before pitching.
+    UnloadCampCargo {
+        resource_id: crate::economy::resource_catalog::ResourceId,
+        qty: u8,
+        tile: (i32, i32),
+    },
+    /// Part B: pitch a nomadic structure at `anchor`. Worker walks
+    /// adjacent, the executor consumes the matching packed good
+    /// (from inventory / hands / a co-located GroundItem) and spawns
+    /// the structure.
+    PitchStructureAt {
+        kind: crate::simulation::construction::BuildSiteKind,
+        anchor: (i32, i32),
+    },
 }
 
 impl Default for Task {
@@ -621,6 +643,38 @@ impl Task {
     pub fn as_clear_obstacle(&self) -> Option<(bevy::prelude::Entity, bevy::prelude::Entity)> {
         match *self {
             Task::ClearObstacle { entity, blueprint } => Some((entity, blueprint)),
+            _ => None,
+        }
+    }
+
+    /// Part B: accessor for `UnpitchStructure`.
+    pub fn as_unpitch_structure(&self) -> Option<bevy::prelude::Entity> {
+        match *self {
+            Task::UnpitchStructure { structure } => Some(structure),
+            _ => None,
+        }
+    }
+
+    /// Part B: accessor for `UnloadCampCargo`.
+    pub fn as_unload_camp_cargo(
+        &self,
+    ) -> Option<(crate::economy::resource_catalog::ResourceId, u8, (i32, i32))> {
+        match *self {
+            Task::UnloadCampCargo {
+                resource_id,
+                qty,
+                tile,
+            } => Some((resource_id, qty, tile)),
+            _ => None,
+        }
+    }
+
+    /// Part B: accessor for `PitchStructureAt`.
+    pub fn as_pitch_structure_at(
+        &self,
+    ) -> Option<(crate::simulation::construction::BuildSiteKind, (i32, i32))> {
+        match *self {
+            Task::PitchStructureAt { kind, anchor } => Some((kind, anchor)),
             _ => None,
         }
     }

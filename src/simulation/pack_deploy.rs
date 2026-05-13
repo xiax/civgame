@@ -25,11 +25,22 @@ use crate::economy::resource_catalog::ResourceId;
 ///
 /// Held by Bedrolls (always packable), Tents (refund-only, drops half
 /// their wood on teardown), Yurts (full carry via `PackedYurt` good).
-#[derive(Component, Clone, Copy, Debug)]
+///
+/// Phase 4: `packed_bundles` lets a structure pack into *multiple*
+/// liftable bundles (e.g. Yurt → 2× yurt_frame_bundle + 2×
+/// yurt_cover_bundle) rather than a single 80 kg good no member can
+/// carry. `packed_form` remains the legacy single-good path; new
+/// structures (Yurt v2) prefer `packed_bundles`.
+#[derive(Component, Clone, Debug)]
 pub struct Deployable {
     /// `Some(rid)` = packs into this resource good when the camp moves.
     /// `None` = not packable; teardown drops a refund and despawns.
     pub packed_form: Option<ResourceId>,
+    /// Phase 4: bundled pack form — pack into N copies of M different
+    /// resources rather than a single mega-good. Empty = legacy
+    /// `packed_form` path. Yurts use this so frame bundles and cover
+    /// bundles can be distributed across multiple carriers.
+    pub packed_bundles: Vec<(ResourceId, u32)>,
     /// Fraction of `refund_qty` returned as `GroundItem`s on teardown
     /// when `packed_form == None`. 0.0 = clean despawn, 1.0 = full refund.
     /// Ignored when `packed_form` is set.
@@ -47,6 +58,19 @@ impl Deployable {
     pub fn fully_packable(packed: ResourceId) -> Self {
         Self {
             packed_form: Some(packed),
+            packed_bundles: Vec::new(),
+            refund_pct: 0.0,
+            refund_resource: None,
+            refund_qty: 0,
+        }
+    }
+
+    /// Phase 4: yurt-style bundled pack — splits into N pieces so
+    /// individual members / pack animals can carry one each.
+    pub fn bundled(bundles: Vec<(ResourceId, u32)>) -> Self {
+        Self {
+            packed_form: None,
+            packed_bundles: bundles,
             refund_pct: 0.0,
             refund_resource: None,
             refund_qty: 0,
@@ -58,6 +82,7 @@ impl Deployable {
     pub fn refund_only(refund_pct: f32, refund_resource: ResourceId, refund_qty: u8) -> Self {
         Self {
             packed_form: None,
+            packed_bundles: Vec::new(),
             refund_pct: refund_pct.clamp(0.0, 1.0),
             refund_resource: Some(refund_resource),
             refund_qty,

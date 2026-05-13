@@ -84,6 +84,20 @@ pub enum TaskKind {
     /// `Gather` because the work is structure-prerequisite, not
     /// resource-acquisition; yields go to ground for haulers.
     ClearObstacle = 44,
+    /// Part B: worker walks to a `Deployable` nomadic structure (Bed
+    /// / TentShelter / Yurt / Campfire), ticks `work_progress` for
+    /// `UNPITCH_WORK_TICKS`, then despawns the entity and drops its
+    /// `packed_form` good (and / or `packed_bundles` entries; or
+    /// `refund_resource`) as `GroundItem`s at the structure tile.
+    UnpitchStructure = 45,
+    /// Part B: worker walks to a target tile carrying a packed good,
+    /// drops it as a `GroundItem`. Used by the Pitch slow-path to
+    /// pre-stage cargo at the new camp before structures pitch.
+    UnloadCampCargo = 46,
+    /// Part B: worker walks to `anchor`, consumes the matching packed
+    /// good from a co-located `GroundItem` (or inventory), and spawns
+    /// the structure of the named `BuildSiteKind`.
+    PitchStructureAt = 47,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -134,6 +148,9 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::AttendLecture as u16 => "Attending Lecture",
         x if x == TaskKind::Migrate as u16 => "Migrating to Camp",
         x if x == TaskKind::ClearObstacle as u16 => "Clearing Obstacle",
+        x if x == TaskKind::UnpitchStructure as u16 => "Packing Camp",
+        x if x == TaskKind::UnloadCampCargo as u16 => "Unloading Cargo",
+        x if x == TaskKind::PitchStructureAt as u16 => "Pitching Structure",
         _ => "Unemployed",
     }
 }
@@ -201,6 +218,8 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::WorkOnCraftOrder as u16
         || task_id == TaskKind::PickUpCorpse as u16
         || task_id == TaskKind::Butcher as u16
+        || task_id == TaskKind::UnpitchStructure as u16
+        || task_id == TaskKind::PitchStructureAt as u16
 }
 
 /// Tasks that count as productive labor — these drain willpower over time
@@ -762,6 +781,18 @@ pub fn goal_dispatch_system(
                     // cleared (or the executor naturally advances).
                     AgentGoal::Build if ai.task_id == TaskKind::ClearObstacle as u16 => {
                         Some(TaskKind::ClearObstacle as u16)
+                    }
+                    // Pack labor: a worker dispatched to dismantle a
+                    // shelter must stay on the task across goal flips.
+                    // `goal_update_system` may re-evaluate while the
+                    // worker walks (hunger / sleep / mobile-gate
+                    // demote) and `mobile_state_goal_gate_system`
+                    // doesn't include `FollowingPlayerCommand` /
+                    // anything Build-shaped for Packed bands, so we
+                    // pin the task here regardless of which goal the
+                    // worker carries.
+                    _ if ai.task_id == TaskKind::UnpitchStructure as u16 => {
+                        Some(TaskKind::UnpitchStructure as u16)
                     }
                     // Phase 5e-xiii-a: HTN-driven personal-blueprint chain
                     // (`WithdrawAndHaulToPersonalBlueprintMethod`) runs without

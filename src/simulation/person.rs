@@ -422,6 +422,12 @@ pub fn spawn_population(
             // form nomadic households automatically.
             if group_idx == 0 {
                 faction_data.lifestyle = options.lifestyle;
+                // Phase 1: player-driven nomadic factions take the
+                // manual command flow (Pack/Pitch + Scout + Route).
+                // AI nomadic factions keep autopilot on.
+                if matches!(options.lifestyle, crate::simulation::faction::Lifestyle::Nomadic) {
+                    faction_data.nomad_autopilot = false;
+                }
             }
             // P5: route through the archetype registry. `derive_from_archetype_key`
             // hits the registry when the key is authored (today: the

@@ -35,6 +35,7 @@ pub mod mood;
 pub mod movement;
 pub mod needs;
 pub mod nomad;
+pub mod nomad_pack_labor;
 pub mod nomad_pool;
 pub mod obstacle;
 pub mod organic_settlement;
@@ -420,6 +421,15 @@ impl Plugin for SimulationPlugin {
                     .before(construction::construction_system)
                     .in_set(SimulationSet::Sequential),
             )
+            // Part B: observable player Pack labor — worker walks to
+            // a Deployable, accumulates UNPITCH_WORK_TICKS, then
+            // despawns + drops packed goods on the ground.
+            .add_systems(
+                FixedUpdate,
+                nomad_pack_labor::unpitch_structure_task_system
+                    .after(movement::movement_system)
+                    .in_set(SimulationSet::Sequential),
+            )
             // Reactive: every newly-spawned `Blueprint` has its footprint
             // scanned for `ConstructionObstacle` entities. WorkerClear
             // hits land on `pending_clear`; Relocate hits move aside
@@ -615,6 +625,13 @@ impl Plugin for SimulationPlugin {
                         .after(nomad::nomad_migration_commit_system),
                     nomad::apply_pitch_camp_command_system
                         .after(nomad::apply_pack_camp_command_system),
+                    // Phase 2/3: player-driven nomad commands.
+                    nomad::apply_manual_scout_command_system
+                        .after(nomad::apply_pitch_camp_command_system),
+                    nomad::manual_scout_completion_system
+                        .after(nomad::apply_manual_scout_command_system),
+                    nomad::apply_migration_intent_system
+                        .after(nomad::manual_scout_completion_system),
                 )
                     .in_set(SimulationSet::Sequential),
             )

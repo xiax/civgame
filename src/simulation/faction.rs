@@ -1936,13 +1936,13 @@ impl Default for CampState {
     }
 }
 
-/// AI migration coarse phase. The player-flow only ever uses
-/// `CampState`; `MigrationPhase` is the AI-only state machine layered
-/// on top of the legacy `pending_migration` field. `Surveying` runs
-/// a few-day scout window before `pick_migration_target` is allowed
-/// to write `pending_migration`. `Walking` is set after commit and
-/// cleared by `nomad_migration_arrival_system` once every member's
-/// `MigrationTarget` marker has been consumed.
+/// Migration coarse phase. `Surveying` is the AI autopilot survey
+/// window (player factions never enter it — `nomad_autopilot` gates).
+/// `PendingCommit` is the AI's between-survey-and-commit slot. `Walking`
+/// is the post-commit "we just teleported to the new tile, members are
+/// catching up" tail; player flow uses `CampState::{Pitched, Packed}`
+/// only. Free-form player migration relies on Pack → wander → Pitch
+/// without going through this state machine.
 #[derive(Clone, Debug, Default)]
 pub enum MigrationPhase {
     #[default]
@@ -1959,6 +1959,121 @@ pub enum MigrationPhase {
     Walking {
         target: (i32, i32),
     },
+}
+
+/// Phase 3: player-facing knob that biases `pick_migration_target`'s
+/// component-score weights. AI factions default to `FreeRoute`
+/// (uniform weights, matching the pre-Phase 3 baseline). Players
+/// change this from the migration panel before scouting / committing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MigrationIntent {
+    #[default]
+    FreeRoute,
+    FollowWater,
+    FollowHerds,
+    SeekWinterShelter,
+    SeekSummerPasture,
+    AvoidDanger,
+}
+
+impl MigrationIntent {
+    /// Returns `[food, herd, water, biome, danger, distance_penalty]`
+    /// multipliers applied per-component inside `pick_migration_target`.
+    pub fn weights(self) -> [f32; 6] {
+        match self {
+            MigrationIntent::FreeRoute => [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            MigrationIntent::FollowWater => [1.0, 0.7, 2.0, 1.0, 1.0, 1.0],
+            MigrationIntent::FollowHerds => [0.8, 2.0, 1.0, 1.0, 1.0, 1.0],
+            MigrationIntent::SeekWinterShelter => [1.0, 0.6, 1.0, 2.5, 1.0, 0.8],
+            MigrationIntent::SeekSummerPasture => [1.5, 1.0, 1.0, 2.0, 1.0, 1.0],
+            MigrationIntent::AvoidDanger => [0.8, 0.6, 1.0, 1.0, 3.0, 1.0],
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MigrationIntent::FreeRoute => "Free Route",
+            MigrationIntent::FollowWater => "Follow Water",
+            MigrationIntent::FollowHerds => "Follow Herds",
+            MigrationIntent::SeekWinterShelter => "Seek Winter Shelter",
+            MigrationIntent::SeekSummerPasture => "Seek Summer Pasture",
+            MigrationIntent::AvoidDanger => "Avoid Danger",
+        }
+    }
+}
+
+/// Phase 2: persisted camp-site candidate discovered by a scout or by
+/// `pick_migration_target`. Stored in `FactionData.candidate_sites`
+/// (cap `MAX_CANDIDATE_SITES`). The migration panel renders these as
+/// map pins; the player picks one when setting a route. `validated`
+/// flips to true once a manual scout has personally reached the tile.
+#[derive(Clone, Debug)]
+pub struct CampSiteCandidate {
+    pub anchor: (i32, i32),
+    pub z: i8,
+    pub score: f32,
+    pub reasons: Vec<CandidateReason>,
+    pub discovered_tick: u32,
+    pub validated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateReason {
+    FreshWater,
+    Pasture,
+    Herd,
+    Wolves,
+    PoorShelter,
+    LongCarry,
+    SnowRisk,
+    EnemyFaction,
+    Sanitation,
+}
+
+impl CandidateReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            CandidateReason::FreshWater => "Fresh Water",
+            CandidateReason::Pasture => "Pasture",
+            CandidateReason::Herd => "Herd",
+            CandidateReason::Wolves => "Wolves",
+            CandidateReason::PoorShelter => "Poor Shelter",
+            CandidateReason::LongCarry => "Long Carry",
+            CandidateReason::SnowRisk => "Snow Risk",
+            CandidateReason::EnemyFaction => "Enemy Faction",
+            CandidateReason::Sanitation => "Sanitation",
+        }
+    }
+}
+
+pub const MAX_CANDIDATE_SITES: usize = 16;
+
+/// Phase 4: per-faction cargo manifest for an in-flight migration.
+/// `required` records "this is what the band needs to carry"
+/// (computed at Pack time from `pack_camp_assets`); `loaded` records
+/// where it ended up (which member or pack animal holds what);
+/// `abandoned` lists overflow that exceeded carry capacity;
+/// `deployed` accumulates redeposits as `Unpitch` runs at the new
+/// site. Cleared on `MigrationPhase` returning to `Idle`.
+#[derive(Clone, Debug, Default)]
+pub struct CampCargoManifest {
+    pub required: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
+    pub loaded: ahash::AHashMap<(Entity, crate::economy::resource_catalog::ResourceId), u32>,
+    pub abandoned: Vec<(crate::economy::resource_catalog::ResourceId, u32)>,
+    pub deployed: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
+}
+
+impl CampCargoManifest {
+    pub fn is_empty(&self) -> bool {
+        self.required.is_empty()
+            && self.loaded.is_empty()
+            && self.abandoned.is_empty()
+            && self.deployed.is_empty()
+    }
+
+    pub fn total_loaded(&self) -> u32 {
+        self.loaded.values().copied().sum()
+    }
 }
 
 pub struct FactionData {
@@ -2117,9 +2232,29 @@ pub struct FactionData {
     /// `nomad_migration_commit_system`; player-flow nomadic factions
     /// transition via `PlayerCommand::PackCamp` / `PitchCamp`.
     pub camp_state: CampState,
-    /// AI-only migration state machine (Surveying → PendingCommit →
-    /// Walking → Idle). The player flow uses only `camp_state`.
+    /// Unified migration state machine (Surveying → PendingCommit →
+    /// Traveling → Idle, with TemporaryCamp as an in-route halt).
+    /// Both AI (`nomad_autopilot == true`) and the player flow run
+    /// through this; AI auto-advances Surveying / commits / arrives
+    /// while a player-driven nomad stays in `Idle` until an explicit
+    /// command. The legacy `pending_migration` field mirrors
+    /// `PendingCommit.target` for back-compat readers.
     pub migration_phase: MigrationPhase,
+    /// Phase 1: when true, the AI Surveying / commit pipeline drives
+    /// the band autonomously. AI nomadic factions default to true;
+    /// player-controlled nomadic factions are flipped to false by
+    /// `spawn_population` so the band only moves on explicit player
+    /// command.
+    pub nomad_autopilot: bool,
+    /// Phase 3: player-facing scoring bias for the next
+    /// `pick_migration_target` evaluation. AI defaults to `FreeRoute`.
+    pub migration_intent: MigrationIntent,
+    /// Phase 2: scouted / surveyed camp-site candidates the player or
+    /// chief can pick from. Ring with cap `MAX_CANDIDATE_SITES`.
+    pub candidate_sites: std::collections::VecDeque<CampSiteCandidate>,
+    /// Phase 4: cargo manifest for an in-flight migration. `Default`
+    /// (`is_empty()`) outside of Pack→Pitch.
+    pub cargo_manifest: CampCargoManifest,
     /// Tick of the most recent `camp_state` or `migration_phase`
     /// transition. Used by HUD age display + telemetry.
     pub last_phase_change_tick: u32,
@@ -2247,6 +2382,10 @@ impl FactionRegistry {
                 recent_camps: std::collections::VecDeque::new(),
                 camp_state: CampState::default(),
                 migration_phase: MigrationPhase::default(),
+                nomad_autopilot: true,
+                migration_intent: MigrationIntent::default(),
+                candidate_sites: std::collections::VecDeque::new(),
+                cargo_manifest: CampCargoManifest::default(),
                 last_phase_change_tick: 0,
                 collapse_streak: 0,
                 // P1a: default = settled-Subsistence capabilities.

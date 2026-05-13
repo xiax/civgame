@@ -182,6 +182,7 @@ pub fn allowed_while_packed(goal: AgentGoal) -> bool {
             | AgentGoal::Play
             | AgentGoal::FollowingPlayerCommand
             | AgentGoal::MigrateToCamp
+            | AgentGoal::Scout
     )
 }
 
@@ -485,6 +486,15 @@ pub fn goal_update_system(
         }
 
         if *lod == LodLevel::Dormant {
+            continue;
+        }
+        // Pack labor: workers mid-dismantle keep their task across
+        // re-eval cycles. The goal stays whatever it was when
+        // `apply_pack_camp_command_system` stamped them
+        // (`FollowingPlayerCommand`); without this short-circuit
+        // hunger / sleep / mobile-gate would flip the goal and the
+        // dispatcher would clear the chain.
+        if ai.task_id == crate::simulation::tasks::TaskKind::UnpitchStructure as u16 {
             continue;
         }
         // Workers with an active job claim are owned by job_goal_lock_system (Economy).

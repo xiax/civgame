@@ -33,6 +33,7 @@ pub struct HudResources<'w> {
     pub tech_panel_open: ResMut<'w, TechPanelOpen>,
     pub debug_state: ResMut<'w, DebugPanelState>,
     pub draft_req: ResMut<'w, DraftToggleRequest>,
+    pub migration_panel: ResMut<'w, crate::ui::migration_panel::MigrationPanelOpen>,
     pub camera_view_z: Res<'w, CameraViewZ>,
     pub calendar: Res<'w, Calendar>,
     pub player_faction: Res<'w, PlayerFaction>,
@@ -55,6 +56,7 @@ pub fn hud_system(
     let tech_panel_open = &mut *res.tech_panel_open;
     let debug_state = &mut *res.debug_state;
     let draft_req = &mut *res.draft_req;
+    let migration_panel = &mut *res.migration_panel;
     let camera_view_z = &*res.camera_view_z;
     let calendar = &*res.calendar;
     let player_faction = &*res.player_faction;
@@ -233,6 +235,16 @@ pub fn hud_system(
                                             command: PlayerCommand::PackCamp,
                                         });
                                     }
+                                }
+                                // Phase 6: Plan Migration toggle.
+                                let plan_btn = egui::Button::new("Plan Migration")
+                                    .fill(if migration_panel.0 {
+                                        egui::Color32::from_rgb(100, 160, 220)
+                                    } else {
+                                        egui::Color32::from_gray(60)
+                                    });
+                                if ui.add(plan_btn).clicked() {
+                                    migration_panel.0 = !migration_panel.0;
                                 }
                             }
                         }

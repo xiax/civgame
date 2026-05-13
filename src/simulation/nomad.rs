@@ -90,11 +90,36 @@ pub const SURVEY_SCOUT_RADIUS: i32 = 100;
 /// quadrant assignment and the actual tile to walk toward. Stamped by
 /// `nomad_survey_trigger_system`; cleared by
 /// `nomad_survey_completion_system` when the survey window closes.
-#[derive(Component, Clone, Copy, Debug)]
+///
+/// Phase 2: also carries an optional `ScoutKind` discriminating
+/// AI-survey scouts (one of four quadrants) from player-dispatched
+/// manual scouts (one of eight cardinals), and an optional `report`
+/// populated on arrival.
+#[derive(Component, Clone, Debug)]
 pub struct ScoutAssignment {
-    pub quadrant: u8, // 0=NE, 1=NW, 2=SW, 3=SE
+    pub quadrant: u8, // 0=NE, 1=NW, 2=SW, 3=SE (AI) / 0..8 cardinal (manual)
     pub target_tile: (i32, i32),
     pub assigned_tick: u32,
+    pub kind: ScoutKind,
+    pub report: Option<ScoutReport>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoutKind {
+    AiSurvey,
+    PlayerManual { faction_id: u32 },
+}
+
+/// Phase 2: result of a scouting trip; populated when a scout arrives
+/// near `target_tile`. `candidates` is the local cluster summary
+/// (`CampSiteCandidate`s) scored by `pick_migration_target`'s
+/// component helpers; `danger_tiles` / `hostile_factions` flag risks.
+#[derive(Clone, Debug, Default)]
+pub struct ScoutReport {
+    pub candidates: Vec<crate::simulation::faction::CampSiteCandidate>,
+    pub danger_tiles: Vec<(i32, i32)>,
+    pub hostile_factions: Vec<u32>,
+    pub returned_tick: u32,
 }
 
 /// P3: composite-score helpers — each helper returns a signed score that's
@@ -151,10 +176,11 @@ pub const MIGRATE_STALL_TICKS: u32 = TICKS_PER_DAY / 2;
 /// safety margin for offset hearth layouts).
 pub const OLD_CAMP_RADIUS: i32 = 12;
 
-/// Minimum chebyshev distance between a Packed band's current centroid
-/// and a `PitchCamp` target tile, to prevent accidental same-spot
-/// re-pitch and to keep the dispatcher's validation strict.
-pub const MIN_PITCH_DISTANCE: i32 = 4;
+/// Minimum chebyshev distance from current centroid for a `PitchCamp`
+/// target. Set to 0 to give the player full freedom: they can pitch
+/// anywhere, including the exact tile they packed from. AI atomic
+/// migration doesn't use this constant.
+pub const MIN_PITCH_DISTANCE: i32 = 0;
 
 /// Queue of player-issued camp state changes drained by
 /// `apply_pack_camp_command_system` and `apply_pitch_camp_command_system`
@@ -166,6 +192,19 @@ pub const MIN_PITCH_DISTANCE: i32 = 4;
 pub struct PendingCampOps {
     pub packs: Vec<(u32, (i32, i32))>,
     pub pitches: Vec<PendingPitch>,
+    /// Phase 2: manual scout dispatch requests. The chief actor's
+    /// faction id + direction (8-cardinal) + range; apply system picks
+    /// a member and stamps `ScoutAssignment`.
+    pub manual_scouts: Vec<PendingManualScout>,
+    /// Phase 3: faction-scoped intent set requests.
+    pub intent_sets: Vec<(u32, crate::simulation::faction::MigrationIntent)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PendingManualScout {
+    pub fid: u32,
+    pub direction: u8,
+    pub range: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -204,6 +243,12 @@ pub fn nomad_migration_system(world: &mut World) {
             .iter()
             .filter_map(|(&fid, faction)| {
                 if !faction.caps.home.is_mobile() {
+                    return None;
+                }
+                // Phase 1: only autopilot factions auto-trigger Surveying.
+                // Player-driven nomads stay Idle until an explicit
+                // `PlayerCommand::SendScout` or `StartMigration`.
+                if !faction.nomad_autopilot {
                     return None;
                 }
                 if faction.member_count == 0 {
@@ -309,6 +354,8 @@ pub fn nomad_migration_system(world: &mut World) {
                     quadrant,
                     target_tile: target,
                     assigned_tick: now,
+                    kind: ScoutKind::AiSurvey,
+                    report: None,
                 });
             }
         }
@@ -381,6 +428,7 @@ pub fn nomad_survey_completion_system(world: &mut World) {
         home: (i32, i32),
         target: (i32, i32),
         scouts: Vec<Entity>,
+        candidates: Vec<crate::simulation::faction::CampSiteCandidate>,
     }
 
     // Gather completed surveys.
@@ -406,7 +454,7 @@ pub fn nomad_survey_completion_system(world: &mut World) {
                 if now.saturating_sub(*started_tick) < SURVEY_WINDOW_TICKS {
                     return None;
                 }
-                let target = pick_migration_target(
+                let candidates = pick_migration_candidates(
                     shared,
                     wild_herds,
                     chunk_map,
@@ -418,13 +466,19 @@ pub fn nomad_survey_completion_system(world: &mut World) {
                     faction.home_tile,
                     NOMAD_MIN_TARGET_DIST,
                     NOMAD_MAX_TARGET_DIST,
-                )
-                .unwrap_or_else(|| fallback_direction(fid, faction.home_tile, now));
+                    faction.migration_intent,
+                    crate::simulation::faction::MAX_CANDIDATE_SITES,
+                );
+                let target = candidates
+                    .first()
+                    .map(|c| c.anchor)
+                    .unwrap_or_else(|| fallback_direction(fid, faction.home_tile, now));
                 Some(Done {
                     fid,
                     home: faction.home_tile,
                     target,
                     scouts: scouts.clone(),
+                    candidates,
                 })
             })
             .collect()
@@ -468,6 +522,17 @@ pub fn nomad_survey_completion_system(world: &mut World) {
         let mut registry = world.resource_mut::<FactionRegistry>();
         for d in done.iter() {
             if let Some(faction) = registry.factions.get_mut(&d.fid) {
+                // Phase 2: persist the scored candidates so the panel /
+                // route-edit UI can re-rank without re-running the survey.
+                faction.candidate_sites.clear();
+                for cand in d.candidates.iter() {
+                    faction.candidate_sites.push_back(cand.clone());
+                    while faction.candidate_sites.len()
+                        > crate::simulation::faction::MAX_CANDIDATE_SITES
+                    {
+                        faction.candidate_sites.pop_front();
+                    }
+                }
                 faction.pending_migration = Some(d.target);
                 faction.migration_phase =
                     crate::simulation::faction::MigrationPhase::PendingCommit {
@@ -601,7 +666,7 @@ pub fn nomad_migration_commit_system(world: &mut World) {
             (p.fid, p.old_home, radius)
         })
         .collect();
-    pack_camp_assets(world, &packs);
+    pack_camp_assets_atomic(world, &packs);
 
     // ── Re-seed pass ────────────────────────────────────────────────
     // Reuse `seed_nomadic_camp` so the new camp matches the game-start
@@ -668,6 +733,10 @@ pub fn nomad_migration_commit_system(world: &mut World) {
                 faction.migration_phase =
                     crate::simulation::faction::MigrationPhase::Walking { target: p.target };
                 faction.last_phase_change_tick = now;
+                // Phase 4: AI atomic migration reseeds the camp's
+                // deployables at the target, so the manifest the pack
+                // pass just populated is no longer load-bearing.
+                faction.cargo_manifest = crate::simulation::faction::CampCargoManifest::default();
             }
         }
     }
@@ -796,7 +865,7 @@ fn chebyshev(a: (i32, i32), b: (i32, i32)) -> i32 {
 /// Each pack entry's third field is the chebyshev radius around the
 /// anchor to sweep — derive via `seed_nomadic_camp_extent(members, era)`
 /// for the precise band footprint. Bug-fix #6.
-pub(crate) fn pack_camp_assets(world: &mut World, packs: &[(u32, (i32, i32), i32)]) {
+pub(crate) fn pack_camp_assets_atomic(world: &mut World, packs: &[(u32, (i32, i32), i32)]) {
     if packs.is_empty() {
         return;
     }
@@ -877,10 +946,23 @@ pub(crate) fn pack_camp_assets(world: &mut World, packs: &[(u32, (i32, i32), i32
         )> = SystemState::new(world);
         let (deployable_q, mut animal_q, mut member_q, registry) = state.get_mut(world);
 
+        // Phase 4: collect per-faction load events for manifest update.
+        let mut load_events: Vec<(u32, crate::economy::resource_catalog::ResourceId, u32, Entity)> =
+            Vec::new();
         for (e, transform, deploy) in deployable_q.iter() {
-            let Some(packed_rid) = deploy.packed_form else {
+            // Phase 4: enumerate both legacy `packed_form` and the new
+            // `packed_bundles` so bundle-form structures (yurt v2) get
+            // packed into multiple carriers.
+            let mut load_set: Vec<(crate::economy::resource_catalog::ResourceId, u32)> = Vec::new();
+            if let Some(packed_rid) = deploy.packed_form {
+                load_set.push((packed_rid, 1));
+            }
+            for (rid, qty) in deploy.packed_bundles.iter() {
+                load_set.push((*rid, *qty));
+            }
+            if load_set.is_empty() {
                 continue;
-            };
+            }
             let tile = transform_tile(transform);
             let mut owner: Option<u32> = None;
             let mut best_dist = i32::MAX;
@@ -894,6 +976,9 @@ pub(crate) fn pack_camp_assets(world: &mut World, packs: &[(u32, (i32, i32), i32
             let Some(fid) = owner else {
                 continue;
             };
+            // For now, only the first entry uses the existing pack
+            // algorithm — bundle support extends below by looping.
+            let packed_rid = load_set[0].0;
             let unit_w = packed_rid.unit_weight_g().max(1);
             let mut chosen_animal: Option<(Entity, i32)> = None;
             for (a_e, a_t, tamed, inv) in animal_q.iter() {
@@ -913,6 +998,7 @@ pub(crate) fn pack_camp_assets(world: &mut World, packs: &[(u32, (i32, i32), i32
                 if let Ok((_, _, _, mut inv)) = animal_q.get_mut(a_e) {
                     let unfit = inv.add(packed_rid, 1);
                     if unfit == 0 {
+                        load_events.push((fid, packed_rid, 1, a_e));
                         let _ = e;
                         continue;
                     }
@@ -935,10 +1021,30 @@ pub(crate) fn pack_camp_assets(world: &mut World, packs: &[(u32, (i32, i32), i32
             if let Some((m_e, _)) = chosen_member {
                 if let Ok((_, _, _, mut agent)) = member_q.get_mut(m_e) {
                     let _unfit = agent.add_resource(packed_rid, 1);
+                    load_events.push((fid, packed_rid, 1, m_e));
                 }
             }
         }
         state.apply(world);
+
+        // Phase 4: fold load events into the manifest.
+        if !load_events.is_empty() {
+            let mut registry = world.resource_mut::<FactionRegistry>();
+            for (fid, rid, qty, carrier) in load_events.into_iter() {
+                if let Some(faction) = registry.factions.get_mut(&fid) {
+                    *faction
+                        .cargo_manifest
+                        .required
+                        .entry(rid)
+                        .or_insert(0) += qty;
+                    *faction
+                        .cargo_manifest
+                        .loaded
+                        .entry((carrier, rid))
+                        .or_insert(0) += qty;
+                }
+            }
+        }
     }
 
     // ── Despawn pass + refund drops ─────────────────────────────────
@@ -1042,9 +1148,268 @@ pub(crate) fn pack_camp_assets(world: &mut World, packs: &[(u32, (i32, i32), i32
     }
 }
 
+/// Phase 2: drain `PendingCampOps.manual_scouts` and stamp a fresh
+/// `ScoutAssignment` (with `ScoutKind::PlayerManual`) on a chosen
+/// member of each requesting faction. The dispatcher walks them to
+/// `target_tile`; the arrival system writes a `ScoutReport` and folds
+/// the local cluster summary into `candidate_sites`.
+pub fn apply_manual_scout_command_system(world: &mut World) {
+    let requests: Vec<PendingManualScout> = {
+        let mut ops = world.resource_mut::<PendingCampOps>();
+        if ops.manual_scouts.is_empty() {
+            return;
+        }
+        std::mem::take(&mut ops.manual_scouts)
+    };
+    let now = world.resource::<SimClock>().tick as u32;
+
+    // For each request, pick a free member with the lowest combined
+    // need score. Skip Drafted, skip chief.
+    struct Pick {
+        fid: u32,
+        member: Entity,
+        target: (i32, i32),
+        direction: u8,
+    }
+    let picks: Vec<Pick> = {
+        let mut state: SystemState<(
+            Query<
+                (
+                    Entity,
+                    &crate::simulation::faction::FactionMember,
+                    &crate::simulation::needs::Needs,
+                ),
+                Without<crate::simulation::person::Drafted>,
+            >,
+            Res<FactionRegistry>,
+        )> = SystemState::new(world);
+        let (q, registry) = state.get(world);
+        let mut picks = Vec::new();
+        for req in requests.iter() {
+            let Some(faction) = registry.factions.get(&req.fid) else {
+                continue;
+            };
+            let chief = faction.chief_entity;
+            let mut best: Option<(Entity, u32)> = None;
+            for (e, member, needs) in q.iter() {
+                if registry.root_faction(member.faction_id) != req.fid {
+                    continue;
+                }
+                if Some(e) == chief {
+                    continue;
+                }
+                let n = needs.shelter as u32 + needs.sleep as u32 + needs.hunger as u32;
+                if best.map_or(true, |(_, prev)| n < prev) {
+                    best = Some((e, n));
+                }
+            }
+            if let Some((member, _)) = best {
+                let (dx, dy) = direction_offset(req.direction);
+                let r = req.range as i32;
+                let target = (faction.home_tile.0 + dx * r, faction.home_tile.1 + dy * r);
+                picks.push(Pick {
+                    fid: req.fid,
+                    member,
+                    target,
+                    direction: req.direction,
+                });
+            }
+        }
+        picks
+    };
+
+    // Stamp the marker.
+    {
+        let mut state: SystemState<(
+            Commands,
+            Query<(
+                Entity,
+                &mut crate::simulation::goals::AgentGoal,
+                &mut crate::simulation::person::PersonAI,
+                &mut crate::simulation::typed_task::ActionQueue,
+            )>,
+        )> = SystemState::new(world);
+        let (mut commands, mut q) = state.get_mut(world);
+        for p in picks.iter() {
+            if let Ok((_, mut goal, mut ai, mut aq)) = q.get_mut(p.member) {
+                *goal = crate::simulation::goals::AgentGoal::Scout;
+                aq.cancel();
+                ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
+                ai.state = crate::simulation::person::AiState::Idle;
+            }
+            commands.entity(p.member).insert(ScoutAssignment {
+                quadrant: p.direction,
+                target_tile: p.target,
+                assigned_tick: now,
+                kind: ScoutKind::PlayerManual { faction_id: p.fid },
+                report: None,
+            });
+        }
+        state.apply(world);
+    }
+}
+
+/// Phase 2: arrival/completion pass for player-dispatched scouts.
+/// When the scout is within `MIGRATE_ARRIVAL_RADIUS` of
+/// `target_tile`, computes the local candidate set (using whatever
+/// faction-tier knowledge has accumulated) and folds it into
+/// `FactionData.candidate_sites`. Strips the marker and resets goal.
+pub fn manual_scout_completion_system(world: &mut World) {
+    use crate::simulation::faction::CampSiteCandidate;
+    let now = world.resource::<SimClock>().tick as u32;
+
+    struct Arrived {
+        entity: Entity,
+        fid: u32,
+        anchor: (i32, i32),
+    }
+    let arrived: Vec<Arrived> = {
+        let mut state: SystemState<Query<(Entity, &Transform, &ScoutAssignment)>> =
+            SystemState::new(world);
+        let q = state.get(world);
+        let mut out = Vec::new();
+        for (e, transform, scout) in q.iter() {
+            let ScoutKind::PlayerManual { faction_id } = scout.kind else {
+                continue;
+            };
+            let cur = transform_tile(transform);
+            if chebyshev(cur, scout.target_tile) <= MIGRATE_ARRIVAL_RADIUS {
+                out.push(Arrived {
+                    entity: e,
+                    fid: faction_id,
+                    anchor: scout.target_tile,
+                });
+            }
+        }
+        out
+    };
+    if arrived.is_empty() {
+        return;
+    }
+
+    // Compute candidates and fold them in.
+    let folded: Vec<(u32, Vec<CampSiteCandidate>)> = {
+        let registry = world.resource::<FactionRegistry>();
+        let shared = world.resource::<SharedKnowledge>();
+        let wild_herds = world.resource::<WildHerdRegistry>();
+        let chunk_map = world.resource::<ChunkMap>();
+        let globe = world.resource::<Globe>();
+        let calendar = world.resource::<Calendar>();
+        let mut acc = Vec::new();
+        for a in arrived.iter() {
+            let Some(faction) = registry.factions.get(&a.fid) else {
+                continue;
+            };
+            // Score local clusters within ±SCOUT_LOCAL_RADIUS of arrival anchor.
+            let cands = pick_migration_candidates(
+                shared,
+                wild_herds,
+                chunk_map,
+                globe,
+                calendar.season,
+                &faction.recent_camps,
+                now,
+                a.fid,
+                a.anchor,
+                0,
+                NOMAD_MAX_TARGET_DIST,
+                faction.migration_intent,
+                4,
+            );
+            acc.push((a.fid, cands));
+        }
+        acc
+    };
+
+    {
+        let mut registry = world.resource_mut::<FactionRegistry>();
+        for (fid, cands) in folded.iter() {
+            if let Some(faction) = registry.factions.get_mut(fid) {
+                for cand in cands.iter() {
+                    let mut cand = cand.clone();
+                    cand.validated = true;
+                    faction.candidate_sites.push_back(cand);
+                    while faction.candidate_sites.len()
+                        > crate::simulation::faction::MAX_CANDIDATE_SITES
+                    {
+                        faction.candidate_sites.pop_front();
+                    }
+                }
+            }
+        }
+    }
+
+    // Strip marker + reset scouts.
+    {
+        let mut state: SystemState<(
+            Commands,
+            Query<(
+                Entity,
+                &mut crate::simulation::goals::AgentGoal,
+                &mut crate::simulation::person::PersonAI,
+                &mut crate::simulation::typed_task::ActionQueue,
+            )>,
+            ResMut<crate::simulation::goals::ForceGoalReevaluate>,
+        )> = SystemState::new(world);
+        let (mut commands, mut q, mut force_reeval) = state.get_mut(world);
+        for a in arrived.iter() {
+            if let Ok((_, mut goal, mut ai, mut aq)) = q.get_mut(a.entity) {
+                if matches!(*goal, crate::simulation::goals::AgentGoal::Scout) {
+                    *goal = crate::simulation::goals::AgentGoal::GatherFood;
+                }
+                aq.cancel();
+                ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
+                ai.state = crate::simulation::person::AiState::Idle;
+            }
+            commands.entity(a.entity).remove::<ScoutAssignment>();
+            force_reeval.0.insert(a.entity);
+        }
+        state.apply(world);
+    }
+}
+
+/// Phase 3: apply intent set requests. Pure registry write.
+pub fn apply_migration_intent_system(world: &mut World) {
+    let sets: Vec<(u32, crate::simulation::faction::MigrationIntent)> = {
+        let mut ops = world.resource_mut::<PendingCampOps>();
+        if ops.intent_sets.is_empty() {
+            return;
+        }
+        std::mem::take(&mut ops.intent_sets)
+    };
+    let mut registry = world.resource_mut::<FactionRegistry>();
+    for (fid, intent) in sets.into_iter() {
+        if let Some(faction) = registry.factions.get_mut(&fid) {
+            faction.migration_intent = intent;
+        }
+    }
+}
+
+
+/// 8-cardinal direction unit vector for `SendScout`. 0=N, 1=NE, ...
+fn direction_offset(dir: u8) -> (i32, i32) {
+    match dir % 8 {
+        0 => (0, 1),
+        1 => (1, 1),
+        2 => (1, 0),
+        3 => (1, -1),
+        4 => (0, -1),
+        5 => (-1, -1),
+        6 => (-1, 0),
+        _ => (-1, 1),
+    }
+}
+
 /// Apply system for `PlayerCommand::PackCamp`. Drains
-/// `PendingCampOps.packs`, calls `pack_camp_assets`, and flips each
-/// faction to `CampState::Packed`. Sequential, exclusive `&mut World`.
+/// `PendingCampOps.packs` and dispatches one `Task::UnpitchStructure`
+/// per Deployable structure in the camp to the nearest eligible band
+/// member. The faction is flipped to `CampState::Packed` immediately
+/// so the goal gate stops settled-life work; the per-structure
+/// dismantle is observable labor running over many ticks in
+/// `unpitch_structure_task_system`. Sequential, exclusive `&mut World`.
+///
+/// AI atomic migration keeps the synchronous fast path via
+/// `pack_camp_assets_atomic` inside `nomad_migration_commit_system`.
 pub fn apply_pack_camp_command_system(world: &mut World) {
     let raw: Vec<(u32, (i32, i32))> = {
         let mut ops = world.resource_mut::<PendingCampOps>();
@@ -1053,7 +1418,6 @@ pub fn apply_pack_camp_command_system(world: &mut World) {
         }
         std::mem::take(&mut ops.packs)
     };
-    // Bug-fix #6: derive sweep radius from each band's member count.
     let packs: Vec<(u32, (i32, i32), i32)> = {
         let registry = world.resource::<FactionRegistry>();
         raw.iter()
@@ -1069,7 +1433,9 @@ pub fn apply_pack_camp_command_system(world: &mut World) {
             })
             .collect()
     };
-    pack_camp_assets(world, &packs);
+
+    crate::simulation::nomad_pack_labor::dispatch_unpitch_tasks(world, &packs);
+
     let now = world.resource::<SimClock>().tick as u32;
     let mut registry = world.resource_mut::<FactionRegistry>();
     for (fid, _anchor, _radius) in packs.iter() {
@@ -1077,6 +1443,8 @@ pub fn apply_pack_camp_command_system(world: &mut World) {
             faction.camp_state = crate::simulation::faction::CampState::Packed { since_tick: now };
             faction.migration_phase = crate::simulation::faction::MigrationPhase::Idle;
             faction.last_phase_change_tick = now;
+            // Reset the manifest for this Pack episode.
+            faction.cargo_manifest = crate::simulation::faction::CampCargoManifest::default();
         }
     }
     for (fid, anchor, _radius) in packs.iter() {
@@ -1173,6 +1541,22 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
                 faction.camp_state = crate::simulation::faction::CampState::Pitched;
                 faction.migration_phase = crate::simulation::faction::MigrationPhase::Idle;
                 faction.last_phase_change_tick = now;
+            }
+        }
+    }
+
+    // Sync `Camp.home_tile` to the new anchor.
+    {
+        let mut state: SystemState<(
+            Res<crate::simulation::camp::CampMap>,
+            Query<&mut crate::simulation::camp::Camp>,
+        )> = SystemState::new(world);
+        let (map, mut q) = state.get_mut(world);
+        for r in resolved.iter() {
+            if let Some(e) = map.entity_for_faction(r.fid) {
+                if let Ok(mut camp) = q.get_mut(e) {
+                    camp.home_tile = r.target;
+                }
             }
         }
     }
@@ -1308,6 +1692,10 @@ pub struct MigrationScore {
 /// P3 picker. Composite-scores known food clusters + wild-herd leaders,
 /// adding water/biome-season bonuses and predator/recency penalties; picks
 /// the highest-total candidate within the distance band.
+///
+/// Phase 3: the `intent` weight vector multiplies per-component scores
+/// before summing. AI passes `MigrationIntent::FreeRoute` for the
+/// uniform pre-Phase-3 baseline.
 #[allow(clippy::too_many_arguments)]
 pub fn pick_migration_target(
     shared: &SharedKnowledge,
@@ -1321,14 +1709,54 @@ pub fn pick_migration_target(
     home: (i32, i32),
     min_d: i32,
     max_d: i32,
+    intent: crate::simulation::faction::MigrationIntent,
 ) -> Option<(i32, i32)> {
-    let mut best: Option<((i32, i32), MigrationScore)> = None;
+    pick_migration_candidates(
+        shared,
+        wild_herds,
+        chunk_map,
+        globe,
+        season,
+        recent_camps,
+        now,
+        fid,
+        home,
+        min_d,
+        max_d,
+        intent,
+        1,
+    )
+    .into_iter()
+    .next()
+    .map(|c| c.anchor)
+}
+
+/// Phase 2: returns the top-`k` scored `CampSiteCandidate`s, in
+/// descending score order. Used by the survey completion path to seed
+/// `FactionData.candidate_sites` and by the player-side migration
+/// panel for "show me my options" pin rendering.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_migration_candidates(
+    shared: &SharedKnowledge,
+    wild_herds: &WildHerdRegistry,
+    chunk_map: &ChunkMap,
+    globe: &Globe,
+    season: Season,
+    recent_camps: &VecDeque<((i32, i32), u32)>,
+    now: u32,
+    fid: u32,
+    home: (i32, i32),
+    min_d: i32,
+    max_d: i32,
+    intent: crate::simulation::faction::MigrationIntent,
+    k: usize,
+) -> Vec<crate::simulation::faction::CampSiteCandidate> {
+    use crate::simulation::faction::{CampSiteCandidate, CandidateReason};
+    let w = intent.weights();
+    let mut scored: Vec<(CampSiteCandidate, i32)> = Vec::new();
 
     let mut consider = |tile: (i32, i32), food: i32, herd: i32| {
         let d = chebyshev(tile, home);
-        // Phase D: drop the hard annulus filter — `min_d` is just a
-        // soft floor (rejects literally-on-camp candidates) and
-        // `max_d` is a generous safety cap.
         if d < min_d || d > max_d {
             return;
         }
@@ -1336,22 +1764,52 @@ pub fn pick_migration_target(
         let biome_season = score_biome_season(globe, tile, season);
         let danger = score_danger(shared, fid, tile);
         let recency = score_recency(recent_camps, tile, now);
-        // Continuous distance penalty: discourages migration to
-        // far-away spots unless their food/herd score really earns it.
-        let dist_pen = -((d as f32 * DIST_WEIGHT) as i32);
-        let total = food + herd + water + biome_season + danger + recency + dist_pen;
-        let score = MigrationScore {
-            food,
-            herd,
-            water,
-            biome_season,
-            danger,
-            recency,
-            total,
-        };
-        if best.map_or(true, |(_, s)| total > s.total) {
-            best = Some((tile, score));
+        let dist_pen = -((d as f32 * DIST_WEIGHT * w[5]) as i32);
+        // Apply intent weights to each component.
+        let weighted_food = (food as f32 * w[0]) as i32;
+        let weighted_herd = (herd as f32 * w[1]) as i32;
+        let weighted_water = (water as f32 * w[2]) as i32;
+        let weighted_biome = (biome_season as f32 * w[3]) as i32;
+        // Danger is a negative — weighting it higher means the player
+        // *cares more* about avoiding it.
+        let weighted_danger = (danger as f32 * w[4]) as i32;
+        let total = weighted_food
+            + weighted_herd
+            + weighted_water
+            + weighted_biome
+            + weighted_danger
+            + recency
+            + dist_pen;
+        let mut reasons = Vec::new();
+        if water >= 20 {
+            reasons.push(CandidateReason::FreshWater);
         }
+        if food >= 4 {
+            reasons.push(CandidateReason::Pasture);
+        }
+        if herd >= 20 {
+            reasons.push(CandidateReason::Herd);
+        }
+        if danger <= -10 {
+            reasons.push(CandidateReason::Wolves);
+        }
+        if biome_season <= -10 {
+            reasons.push(CandidateReason::SnowRisk);
+        }
+        if d > 80 {
+            reasons.push(CandidateReason::LongCarry);
+        }
+        scored.push((
+            CampSiteCandidate {
+                anchor: tile,
+                z: 0,
+                score: total as f32,
+                reasons,
+                discovered_tick: now,
+                validated: false,
+            },
+            total,
+        ));
     };
 
     if let Some(map) = shared.map(KnowledgeTier::Faction(fid)) {
@@ -1363,13 +1821,12 @@ pub fn pick_migration_target(
         }
     }
     for herd in wild_herds.herds.values() {
-        // Wild herd score mirrors the legacy weighting: a 120-head herd
-        // contributes 60, comfortably outranking a typical 4-rep cluster.
         let herd_score = (herd.aggregate_count as i32 / 2).max(20);
         consider(herd.leader_tile, 0, herd_score);
     }
 
-    best.map(|(t, _)| t)
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.into_iter().take(k.max(1)).map(|(c, _)| c).collect()
 }
 
 /// +30 at the candidate tile when adjacent water; falls off ~3 per chebyshev
