@@ -131,9 +131,7 @@ impl PersonKnowledge {
             k.aware |= 1u64 << def.id;
             let should_learn = match (tech_scale(def.id), role) {
                 (
-                    AdoptionScale::Personal
-                    | AdoptionScale::Household
-                    | AdoptionScale::Subsistence,
+                    AdoptionScale::Personal | AdoptionScale::Household | AdoptionScale::Subsistence,
                     _,
                 ) => true,
                 (
@@ -337,7 +335,9 @@ pub fn try_discover_from_action(
             let bump = complexity(def.id) as u32 * INSIGHT_PROGRESS_PER_COMPLEXITY;
             let capped = bump.min(threshold.saturating_sub(1));
             let entry = knowledge.study_progress.entry(def.id).or_insert(0);
-            *entry = (*entry).saturating_add(capped).min(threshold.saturating_sub(1));
+            *entry = (*entry)
+                .saturating_add(capped)
+                .min(threshold.saturating_sub(1));
             return Some(def.id);
         }
     }

@@ -109,8 +109,18 @@ pub fn movement_system(
 
     // Movement can't be fully parallel because it writes Transform (position sync)
     // and can read ChunkMap for passability. Run sequentially.
-    for (entity, mut transform, mut ai, lod, mut mv, mut pf, slot, rel_opt, mounted_opt, sickness_opt) in
-        query.iter_mut()
+    for (
+        entity,
+        mut transform,
+        mut ai,
+        lod,
+        mut mv,
+        mut pf,
+        slot,
+        rel_opt,
+        mounted_opt,
+        sickness_opt,
+    ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
             continue;

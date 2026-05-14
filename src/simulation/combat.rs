@@ -525,17 +525,8 @@ pub fn hunt_chase_system(
     )>,
 ) {
     let now = clock.tick;
-    for (
-        _entity,
-        mut ai,
-        mut aq,
-        mut history,
-        mut combat_target,
-        mut pf,
-        transform,
-        lod,
-        slot,
-    ) in query.iter_mut()
+    for (_entity, mut ai, mut aq, mut history, mut combat_target, mut pf, transform, lod, slot) in
+        query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;

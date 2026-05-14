@@ -117,8 +117,7 @@ pub struct TaskDisplayParams<'w, 's> {
 pub struct WageInspectorParams<'w, 's> {
     pub peaks_q: Query<'w, 's, &'static crate::simulation::skills::SkillPeaks>,
     pub earnings_q: Query<'w, 's, &'static crate::simulation::jobs::Earnings>,
-    pub perceived_q:
-        Query<'w, 's, &'static crate::simulation::jobs::PerceivedFactionWages>,
+    pub perceived_q: Query<'w, 's, &'static crate::simulation::jobs::PerceivedFactionWages>,
     pub apprentice_q: Query<
         'w,
         's,
@@ -129,8 +128,7 @@ pub struct WageInspectorParams<'w, 's> {
         ),
     >,
     pub household_q: Query<'w, 's, &'static crate::simulation::reproduction::HouseholdMember>,
-    pub disposition_q:
-        Query<'w, 's, &'static crate::simulation::goal_scorers::Disposition>,
+    pub disposition_q: Query<'w, 's, &'static crate::simulation::goal_scorers::Disposition>,
     pub ownership: Res<'w, crate::simulation::capital::WorkshopOwnership>,
     pub plot_q: Query<'w, 's, &'static crate::simulation::land::Plot>,
     pub plot_index: Res<'w, crate::simulation::land::PlotIndex>,
@@ -228,8 +226,10 @@ pub fn inspector_panel_system(
                             ui.label(sex.name());
                         });
                         ui.label(format!("Personality: {}", personality.name()));
-                        let (appr_link, appr_progress, mentor_link) =
-                            wage_params.apprentice_q.get(entity).unwrap_or((None, None, None));
+                        let (appr_link, appr_progress, mentor_link) = wage_params
+                            .apprentice_q
+                            .get(entity)
+                            .unwrap_or((None, None, None));
                         ui.horizontal(|ui| {
                             ui.label(format!("Profession: {:?}", profession));
                             if matches!(profession, Profession::Apprentice) {
@@ -265,12 +265,9 @@ pub fn inspector_panel_system(
                         });
                         if let Some(link) = appr_link {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "  Master: #{}",
-                                    link.mentor.index()
-                                ))
-                                .color(egui::Color32::from_gray(170))
-                                .small(),
+                                egui::RichText::new(format!("  Master: #{}", link.mentor.index()))
+                                    .color(egui::Color32::from_gray(170))
+                                    .small(),
                             );
                         }
                         ui.horizontal(|ui| {
@@ -295,11 +292,8 @@ pub fn inspector_panel_system(
                             let red = (180.0 + 75.0 * sev).clamp(180.0, 255.0) as u8;
                             let green = (180.0 - 150.0 * sev).clamp(30.0, 180.0) as u8;
                             let age_ticks = sim_clock.tick.saturating_sub(inj.applied_tick);
-                            let age_days =
-                                age_ticks / crate::world::seasons::TICKS_PER_DAY as u64;
-                            let since_damage = sim_clock
-                                .tick
-                                .saturating_sub(inj.last_damage_tick);
+                            let age_days = age_ticks / crate::world::seasons::TICKS_PER_DAY as u64;
+                            let since_damage = sim_clock.tick.saturating_sub(inj.last_damage_tick);
                             let recency = if since_damage
                                 < (crate::world::seasons::TICKS_PER_DAY / 2) as u64
                             {
@@ -495,8 +489,7 @@ pub fn inspector_panel_system(
                                 }
                                 None => (cur, cur),
                             };
-                            let mastered =
-                                peak >= crate::simulation::skills::SKILL_MASTERY_LINE;
+                            let mastered = peak >= crate::simulation::skills::SKILL_MASTERY_LINE;
                             let mut line = egui::RichText::new(format!(
                                 "  {}: {} / peak {} (floor {})",
                                 kind.name(),
@@ -1799,11 +1792,7 @@ fn wage_labor_section(
                 let ev = expected_wage(faction, prof, skills, cap);
                 let agg = aggregate_wage_per_day(faction, prof);
                 let comp = primary_skill_for(prof)
-                    .map(|k| {
-                        crate::simulation::profession_choice::skill_competence(
-                            skills.get(k),
-                        )
-                    })
+                    .map(|k| crate::simulation::profession_choice::skill_competence(skills.get(k)))
                     .unwrap_or(1.0);
                 let mut text = egui::RichText::new(format!(
                     "  {:?}: EV {:.2} (wage {:.2} × comp {:.2} × cap {:.2})",
@@ -1825,12 +1814,9 @@ fn wage_labor_section(
         if !faction.wage_signal.is_empty() {
             ui.separator();
             ui.label(
-                egui::RichText::new(format!(
-                    "Faction #{} wage signal",
-                    village_id
-                ))
-                .strong()
-                .small(),
+                egui::RichText::new(format!("Faction #{} wage signal", village_id))
+                    .strong()
+                    .small(),
             );
             let mut rows: Vec<_> = faction.wage_signal.iter().collect();
             rows.sort_by(|a, b| {
@@ -1868,7 +1854,9 @@ fn wage_labor_section(
         if !perceived.by_key.is_empty() {
             ui.separator();
             ui.label(
-                egui::RichText::new("Perceived wages (gossip)").strong().small(),
+                egui::RichText::new("Perceived wages (gossip)")
+                    .strong()
+                    .small(),
             );
             let mut rows: Vec<_> = perceived.by_key.iter().collect();
             rows.sort_by(|a, b| {

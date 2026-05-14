@@ -16,7 +16,9 @@
 //!   them without re-importing every dependency.
 
 use crate::economy::resource_catalog::ResourceId;
-use crate::simulation::faction::{release_reservation, FactionData, FactionMember, StorageReservations};
+use crate::simulation::faction::{
+    release_reservation, FactionData, FactionMember, StorageReservations,
+};
 use crate::simulation::jobs::JobKind;
 use crate::simulation::person::{AiState, PersonAI, Profession};
 use crate::simulation::schedule::SimClock;
@@ -423,7 +425,15 @@ pub fn cross_profession_switch_system(
         let agent_tile = crate::world::terrain::world_to_tile(xf.translation.truncate());
 
         let cap_current = crate::simulation::capital::capital_factor(
-            agent, carrier, agent_tile, fid, household, *prof, &ownership, &plots, &plot_index,
+            agent,
+            carrier,
+            agent_tile,
+            fid,
+            household,
+            *prof,
+            &ownership,
+            &plots,
+            &plot_index,
         );
         let ev_current = expected_wage(faction, *prof, skills, cap_current);
         let regret = switching_cost_skill_regret(faction, *prof, peaks);
@@ -441,16 +451,21 @@ pub fn cross_profession_switch_system(
                 continue;
             }
             let cap = crate::simulation::capital::capital_factor(
-                agent, carrier, agent_tile, fid, household, target, &ownership, &plots,
+                agent,
+                carrier,
+                agent_tile,
+                fid,
+                household,
+                target,
+                &ownership,
+                &plots,
                 &plot_index,
             );
             let ev = expected_wage(faction, target, skills, cap) - regret;
             if ev <= 0.0 {
                 continue;
             }
-            if ev > ev_current * EV_SWITCH_HYSTERESIS
-                && best.map(|(_, b)| ev > b).unwrap_or(true)
-            {
+            if ev > ev_current * EV_SWITCH_HYSTERESIS && best.map(|(_, b)| ev > b).unwrap_or(true) {
                 best = Some((target, ev));
             }
         }
@@ -487,8 +502,7 @@ pub fn cross_profession_switch_system(
         new_prof.insert(*e, *p);
     }
 
-    for (entity, mut prof, _member, _skills, _peaks, _, _, _, _, ai_opt, aq_opt) in
-        query.iter_mut()
+    for (entity, mut prof, _member, _skills, _peaks, _, _, _, _, ai_opt, aq_opt) in query.iter_mut()
     {
         if !plan_set.contains(&entity) {
             continue;

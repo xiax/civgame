@@ -153,10 +153,9 @@ pub fn apprentice_progress_system(
             // floor to `SkillKind::Medicine` instead of `Crafting` so a
             // future heal-job pipeline sees graduates at the same
             // baseline competence Crafters get.
-            let target_skill = crate::simulation::profession_choice::primary_skill_for(
-                progress.target_profession,
-            )
-            .unwrap_or(SkillKind::Crafting);
+            let target_skill =
+                crate::simulation::profession_choice::primary_skill_for(progress.target_profession)
+                    .unwrap_or(SkillKind::Crafting);
             let cur = skills.0[target_skill as usize];
             skills.0[target_skill as usize] = cur.max(APPRENTICE_THRESHOLD).min(SKILL_MAX);
             *prof = progress.target_profession;
@@ -216,6 +215,8 @@ mod tests {
         // Apprentice + mentor fee + residual must conserve currency.
         let residual = 1.0 - WAGE_FRACTION_APPRENTICE - WAGE_FRACTION_MENTOR_FEE;
         assert!(residual > 0.0);
-        assert!((WAGE_FRACTION_APPRENTICE + WAGE_FRACTION_MENTOR_FEE + residual - 1.0).abs() < 1e-6);
+        assert!(
+            (WAGE_FRACTION_APPRENTICE + WAGE_FRACTION_MENTOR_FEE + residual - 1.0).abs() < 1e-6
+        );
     }
 }

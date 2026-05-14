@@ -273,8 +273,7 @@ fn reseed_nomadic_camp_for(world: &mut World, faction_id: u32, tile: (i32, i32))
         .factions
         .get(&faction_id)
         .map(|f| {
-            let adoption =
-                crate::simulation::technology_adoption::community_adoption_bitset(f);
+            let adoption = crate::simulation::technology_adoption::community_adoption_bitset(f);
             (
                 f.member_count,
                 current_era(&adoption),

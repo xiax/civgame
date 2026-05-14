@@ -251,10 +251,8 @@ pub fn hud_system(
                                             PackedMigrationAutonomy::Hold
                                         }
                                     };
-                                    let auto_label = format!(
-                                        "Autonomy: {}",
-                                        player_fac.packed_autonomy.label()
-                                    );
+                                    let auto_label =
+                                        format!("Autonomy: {}", player_fac.packed_autonomy.label());
                                     let auto_fill = match player_fac.packed_autonomy {
                                         PackedMigrationAutonomy::Hold => {
                                             egui::Color32::from_rgb(160, 120, 60)
@@ -277,12 +275,13 @@ pub fn hud_system(
                                     }
                                 }
                                 // Phase 6: Plan Migration toggle.
-                                let plan_btn = egui::Button::new("Plan Migration")
-                                    .fill(if migration_panel.0 {
+                                let plan_btn = egui::Button::new("Plan Migration").fill(
+                                    if migration_panel.0 {
                                         egui::Color32::from_rgb(100, 160, 220)
                                     } else {
                                         egui::Color32::from_gray(60)
-                                    });
+                                    },
+                                );
                                 if ui.add(plan_btn).clicked() {
                                     migration_panel.0 = !migration_panel.0;
                                 }

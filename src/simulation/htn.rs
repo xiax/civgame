@@ -3925,42 +3925,42 @@ pub fn htn_acquire_food_dispatch_system(
             // **Correction:** Filter storage tiles to ensure they actually
             // contain edible items, preventing a loop where agents walk to
             // a seed-only tile under Survive.
-            let nearest_storage_tile =
-                if let Some(tiles) = storage_tile_map.by_faction.get(&member.faction_id) {
-                    let agent_tile_3d = (cur_tx, cur_ty, ai.current_z);
-                    let pick = |reachable_only: bool| {
-                        tiles
-                            .iter()
-                            .filter(|&&(tx, ty)| {
-                                if reachable_only {
-                                    let tz = chunk_map
-                                        .nearest_standable_z(tx, ty, ai.current_z as i32)
-                                        as i8;
-                                    if !chunk_connectivity.tile_reachable(
-                                        &chunk_graph,
-                                        agent_tile_3d,
-                                        (tx, ty, tz),
-                                    ) {
-                                        return false;
-                                    }
+            let nearest_storage_tile = if let Some(tiles) =
+                storage_tile_map.by_faction.get(&member.faction_id)
+            {
+                let agent_tile_3d = (cur_tx, cur_ty, ai.current_z);
+                let pick = |reachable_only: bool| {
+                    tiles
+                        .iter()
+                        .filter(|&&(tx, ty)| {
+                            if reachable_only {
+                                let tz = chunk_map.nearest_standable_z(tx, ty, ai.current_z as i32)
+                                    as i8;
+                                if !chunk_connectivity.tile_reachable(
+                                    &chunk_graph,
+                                    agent_tile_3d,
+                                    (tx, ty, tz),
+                                ) {
+                                    return false;
                                 }
+                            }
 
-                                // Ensure at least one edible item exists on this tile
-                                spatial.get(tx, ty).iter().any(|&e| {
-                                    if let Ok(gi) = item_query.get(e) {
-                                        gi.item.resource_id.is_edible() && gi.qty > 0
-                                    } else {
-                                        false
-                                    }
-                                })
+                            // Ensure at least one edible item exists on this tile
+                            spatial.get(tx, ty).iter().any(|&e| {
+                                if let Ok(gi) = item_query.get(e) {
+                                    gi.item.resource_id.is_edible() && gi.qty > 0
+                                } else {
+                                    false
+                                }
                             })
-                            .min_by_key(|&&(tx, ty)| (tx - cur_tx).abs() + (ty - cur_ty).abs())
-                            .copied()
-                    };
-                    pick(true).or_else(|| pick(false))
-                } else {
-                    None
+                        })
+                        .min_by_key(|&&(tx, ty)| (tx - cur_tx).abs() + (ty - cur_ty).abs())
+                        .copied()
                 };
+                pick(true).or_else(|| pick(false))
+            } else {
+                None
+            };
             // `food_stock` returns f32 because it sums Fruit/Meat/Grain at
             // floating-point granularity in some legacy code; for ctx purposes
             // we want a u32 tally. Floor the value — under-counting is the
@@ -5938,14 +5938,9 @@ pub fn htn_scout_dispatch_system(
             };
 
             let abstract_task = AbstractTask::Scout;
-            let Some(pick) = dispatch_for_goal(
-                &method_registry,
-                abstract_task,
-                &ctx,
-                &history,
-                now,
-                None,
-            ) else {
+            let Some(pick) =
+                dispatch_for_goal(&method_registry, abstract_task, &ctx, &history, now, None)
+            else {
                 return;
             };
             let method = pick.method;
@@ -6153,14 +6148,9 @@ pub fn htn_return_surplus_dispatch_system(
             };
 
             let abstract_task = AbstractTask::ReturnSurplus;
-            let Some(pick) = dispatch_for_goal(
-                &method_registry,
-                abstract_task,
-                &ctx,
-                &history,
-                now,
-                None,
-            ) else {
+            let Some(pick) =
+                dispatch_for_goal(&method_registry, abstract_task, &ctx, &history, now, None)
+            else {
                 return;
             };
             let method = pick.method;
@@ -6350,14 +6340,9 @@ pub fn htn_tame_horse_dispatch_system(
         };
 
         let abstract_task = AbstractTask::TameWildHorse;
-        let Some(pick) = dispatch_for_goal(
-            &method_registry,
-            abstract_task,
-            &ctx,
-            &history,
-            now,
-            None,
-        ) else {
+        let Some(pick) =
+            dispatch_for_goal(&method_registry, abstract_task, &ctx, &history, now, None)
+        else {
             continue;
         };
         let method = pick.method;
@@ -9623,14 +9608,9 @@ pub fn htn_harvest_plant_dispatch_system(
         };
 
         let abstract_task = AbstractTask::HarvestPlant;
-        let Some(pick) = dispatch_for_goal(
-            &method_registry,
-            abstract_task,
-            &ctx,
-            &history,
-            now,
-            None,
-        ) else {
+        let Some(pick) =
+            dispatch_for_goal(&method_registry, abstract_task, &ctx, &history, now, None)
+        else {
             continue;
         };
         let method = pick.method;

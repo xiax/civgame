@@ -17,6 +17,9 @@
 
 use bevy::prelude::*;
 
+use crate::pathfinding::chunk_graph::ChunkGraph;
+use crate::pathfinding::chunk_router::ChunkRouter;
+use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::combat::Body;
 use crate::simulation::faction::FactionMember;
 use crate::simulation::goals::AgentGoal;
@@ -26,9 +29,6 @@ use crate::simulation::schedule::SimClock;
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::typed_task::{ActionQueue, Task};
-use crate::pathfinding::chunk_graph::ChunkGraph;
-use crate::pathfinding::chunk_router::ChunkRouter;
-use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::terrain::TILE_SIZE;
 
@@ -207,8 +207,7 @@ pub const SEEK_CARE_AT_SITE_RADIUS: i32 = 6;
 /// reconciles Healer headcount with injured-member demand. Matches the
 /// `BUREAUCRAT_ASSIGNMENT_CADENCE` / `CRAFTER_ASSIGNMENT_CADENCE` so
 /// chief decisions about specialized labour share a heartbeat.
-pub const HEALER_ASSIGNMENT_CADENCE: u64 =
-    (crate::world::seasons::TICKS_PER_DAY / 4) as u64;
+pub const HEALER_ASSIGNMENT_CADENCE: u64 = (crate::world::seasons::TICKS_PER_DAY / 4) as u64;
 /// Number of injured agents one Healer is expected to serve before the
 /// chief promotes a second. Healing takes minutes per limb so one
 /// Healer can comfortably cycle through ~4 patients before backlog.
@@ -363,7 +362,10 @@ pub fn heal_task_system(
         let mut healed_something = false;
         for limb in body.parts.iter_mut() {
             if limb.current < limb.max {
-                limb.current = limb.current.saturating_add(HEAL_LIMB_HP_PER_TICK).min(limb.max);
+                limb.current = limb
+                    .current
+                    .saturating_add(HEAL_LIMB_HP_PER_TICK)
+                    .min(limb.max);
                 healed_something = true;
                 break;
             }
@@ -438,7 +440,9 @@ pub fn htn_seek_care_dispatch_system(
             if entry.kind != WorkshopKind::Shrine {
                 continue;
             }
-            let d = (entry.tile.0 - cur_tx).abs().max((entry.tile.1 - cur_ty).abs());
+            let d = (entry.tile.0 - cur_tx)
+                .abs()
+                .max((entry.tile.1 - cur_ty).abs());
             if d < best_dist {
                 best_dist = d;
                 target = Some(entry.tile);
@@ -606,8 +610,8 @@ pub fn chief_healer_assignment_system(
             targets.insert(fid, 0);
             continue;
         }
-        let demand = ((injured + HEALER_PER_INJURY_DIVISOR - 1) / HEALER_PER_INJURY_DIVISOR)
-            .max(1) as usize;
+        let demand =
+            ((injured + HEALER_PER_INJURY_DIVISOR - 1) / HEALER_PER_INJURY_DIVISOR).max(1) as usize;
         let cap = (faction.member_count as usize) / HEALER_MAX_DIVISOR;
         let target = demand.min(cap.max(1));
         targets.insert(fid, target);
@@ -712,7 +716,9 @@ pub fn chief_healer_assignment_system(
                                 target_ticks: ApprenticeProgress::default().target_ticks,
                                 target_profession: Profession::Healer,
                             });
-                        commands.entity(mentor).insert(MentorOf { apprentice: entity });
+                        commands
+                            .entity(mentor)
+                            .insert(MentorOf { apprentice: entity });
                         activity.send(crate::ui::activity_log::ActivityLogEvent {
                             tick: clock.tick,
                             actor: entity,

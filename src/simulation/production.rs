@@ -260,7 +260,19 @@ pub fn production_system(
             }
         }
 
-        if agent.is_inventory_full() {
+        // Only abort the Working tasks this system actually drives. The bare
+        // `is_inventory_full` clear used to fire for any Working agent and
+        // ended up nuking sibling tasks like Eat the same tick their
+        // dispatcher set them up — a hungry worker carrying food in hand with
+        // a full inventory of non-food (e.g. seeds + bedrolls) would flash
+        // between Eat and Unemployed forever, hunger pinned at 255.
+        if matches!(
+            task,
+            x if x == TaskKind::Planter as u16
+                || x == TaskKind::PlayPlant as u16
+                || x == TaskKind::PlayThrow as u16
+        ) && agent.is_inventory_full()
+        {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;

@@ -2066,14 +2066,12 @@ pub fn animal_water_seek_system(
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
 
-        let Some(water_tile) =
-            crate::simulation::drink::nearest_fresh_drinkable_tile(
-                &chunk_map,
-                &globe,
-                (cur_tx, cur_ty),
-                SCAN_RADIUS,
-            )
-        else {
+        let Some(water_tile) = crate::simulation::drink::nearest_fresh_drinkable_tile(
+            &chunk_map,
+            &globe,
+            (cur_tx, cur_ty),
+            SCAN_RADIUS,
+        ) else {
             continue;
         };
 

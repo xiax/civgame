@@ -227,6 +227,24 @@ pub fn allowed_while_packed(goal: AgentGoal) -> bool {
     )
 }
 
+/// Stricter allowance for AI caravan phases. Normal camp life should not
+/// pull people off pack/travel/pitch work; only survival and migration
+/// control goals are allowed through.
+#[inline]
+fn allowed_while_ai_caravan(goal: AgentGoal) -> bool {
+    matches!(
+        goal,
+        AgentGoal::Survive
+            | AgentGoal::Defend
+            | AgentGoal::Rescue
+            | AgentGoal::SeekCare
+            | AgentGoal::ProvideCare
+            | AgentGoal::Drink
+            | AgentGoal::FollowingPlayerCommand
+            | AgentGoal::MigrateToCamp
+    )
+}
+
 impl AgentGoal {
     pub fn name(self) -> &'static str {
         match self {
@@ -553,7 +571,10 @@ pub fn goal_update_system(
         // (`FollowingPlayerCommand`); without this short-circuit
         // hunger / sleep / mobile-gate would flip the goal and the
         // dispatcher would clear the chain.
-        if ai.task_id == crate::simulation::tasks::TaskKind::UnpitchStructure as u16 {
+        if ai.task_id == crate::simulation::tasks::TaskKind::UnpitchStructure as u16
+            || ai.task_id == crate::simulation::tasks::TaskKind::UnloadCampCargo as u16
+            || ai.task_id == crate::simulation::tasks::TaskKind::PitchStructureAt as u16
+        {
             continue;
         }
         // Pack duty: agents with PackingDuty stay on FollowingPlayerCommand
@@ -1440,11 +1461,25 @@ pub fn mobile_state_goal_gate_system(
             continue;
         }
 
-        if allowed_while_packed(*goal) {
+        let active_ai_caravan = faction.nomad_autopilot
+            && matches!(
+                faction.migration_phase,
+                crate::simulation::faction::MigrationPhase::PackingCamp { .. }
+                    | crate::simulation::faction::MigrationPhase::Traveling { .. }
+                    | crate::simulation::faction::MigrationPhase::PitchingCamp { .. }
+            );
+        if active_ai_caravan && allowed_while_ai_caravan(*goal) {
+            continue;
+        }
+        if !active_ai_caravan && allowed_while_packed(*goal) {
             continue;
         }
         // Settled-life goal on a Packed band — demote.
-        *goal = AgentGoal::GatherFood;
+        *goal = if active_ai_caravan {
+            AgentGoal::FollowingPlayerCommand
+        } else {
+            AgentGoal::GatherFood
+        };
         aq.cancel();
         ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
         ai.state = crate::simulation::person::AiState::Idle;

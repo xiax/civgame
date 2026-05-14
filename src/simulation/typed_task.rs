@@ -61,10 +61,9 @@ pub enum WalkReason {
     /// `GatherFromKnownMethod` (Phase 5c-ii-c) — scaffolding only at
     /// 5c-ii-c-i; no dispatcher emits this reason yet.
     Gather,
-    /// P1: nomadic-band member walking with the band to the new camp
-    /// tile after a migration commit. Arrival is detected by
-    /// `nomad_migration_arrival_system`, which removes the
-    /// `MigrationTarget` component and drops the agent back to Idle.
+    /// Nomadic-band member walking with the caravan to the final camp
+    /// target. Route-waypoint arrival clears only `MigrationTarget.route_tile`;
+    /// final arrival removes the marker.
     Migration,
     /// Heal-3: patient walking to the nearest same-faction Healer to
     /// receive care, or Healer walking to a patient.

@@ -218,9 +218,9 @@ pub fn agent_defecation_system(
         if let Some(mut c) = cadence {
             c.last_emit_tick = now;
         } else {
-            commands
-                .entity(entity)
-                .insert(DefecationCadence { last_emit_tick: now });
+            commands.entity(entity).insert(DefecationCadence {
+                last_emit_tick: now,
+            });
         }
     }
 }
@@ -279,8 +279,7 @@ mod tests {
     fn drink_threshold_check() {
         let mut m = SanitationMap::default();
         m.cells.insert((1, 1), CONTAMINATION_DRINK_THRESHOLD + 0.1);
-        m.cells
-            .insert((2, 2), CONTAMINATION_DRINK_THRESHOLD - 0.1);
+        m.cells.insert((2, 2), CONTAMINATION_DRINK_THRESHOLD - 0.1);
         assert!(m.is_contaminated((1, 1)));
         assert!(!m.is_contaminated((2, 2)));
     }

@@ -1,17 +1,10 @@
-//! Nomadic-mode systems: migration trigger + commit.
+//! Nomadic-mode systems: migration trigger + caravan lifecycle.
 //!
-//! Two-phase pipeline. `nomad_migration_system` (Economy, daily) decides
-//! whether each nomadic band wants to move and writes a target tile into
-//! `FactionData.pending_migration`. The trailing `nomad_migration_commit_system`
-//! (Sequential, every tick) finds factions with a pending target, tears down
-//! the old camp's deployable structures within `OLD_CAMP_RADIUS` of the
-//! current `home_tile`, then updates `home_tile = target` and clears the
-//! pending flag.
-//!
-//! MVP commit semantics: despawn-only — no refund drops, no re-seed at the
-//! new camp. The chief's `nomad_chief_directives` (Phase 7 follow-on) will
-//! own replenishment of lost shelter; for now nomads sleep in-place via
-//! `Task::Sleep { bed: None }` at the new home until they rebuild.
+//! AI nomads survey for a final camp target, validate it before teardown,
+//! pack the old camp through observable labor, physically travel as a
+//! caravan, then unload/pitch a minimal final camp before normal chief
+//! shelter repair resumes. Player nomads keep the explicit Pack → Move →
+//! Pitch command flow.
 
 use bevy::ecs::system::SystemState;
 use bevy::prelude::*;
@@ -131,13 +124,14 @@ pub const RECENT_CAMP_TTL: u32 = TICKS_PER_SEASON * 2;
 pub const RECENT_CAMP_RING_CAP: usize = 6;
 const PREDATOR_PROBE_RADIUS: i32 = 6;
 
-/// P1: per-agent component pinning the destination of an in-flight
-/// migration. Inserted on every band member by `nomad_migration_commit_system`
-/// after `home_tile` flips; removed by `nomad_migration_arrival_system`
-/// on arrival or timeout.
+/// P1: per-agent component pinning the final destination of an in-flight
+/// migration. `tile` is always the final camp target. Connectivity self-heal
+/// may temporarily route a member toward `route_tile`, but route waypoints
+/// never count as camps and never unlock repair.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct MigrationTarget {
     pub tile: (i32, i32),
+    pub route_tile: Option<(i32, i32)>,
     pub started_tick: u32,
     /// Tick of the last successful `assign_task_with_routing` in
     /// `nomad_migration_dispatch_system`. Used by the arrival system's
@@ -178,8 +172,8 @@ pub const OLD_CAMP_RADIUS: i32 = 12;
 
 /// Minimum chebyshev distance from current centroid for a `PitchCamp`
 /// target. Set to 0 to give the player full freedom: they can pitch
-/// anywhere, including the exact tile they packed from. AI atomic
-/// migration doesn't use this constant.
+/// anywhere, including the exact tile they packed from. AI caravan
+/// migration validates its final target separately before teardown.
 pub const MIN_PITCH_DISTANCE: i32 = 0;
 
 /// Queue of player-issued camp state changes drained by
@@ -200,8 +194,7 @@ pub struct PendingCampOps {
     pub intent_sets: Vec<(u32, crate::simulation::faction::MigrationIntent)>,
     /// Player-locked migration: faction-scoped autonomy mode for
     /// packed nomads. Drained alongside intent_sets.
-    pub autonomy_sets:
-        Vec<(u32, crate::simulation::faction::PackedMigrationAutonomy)>,
+    pub autonomy_sets: Vec<(u32, crate::simulation::faction::PackedMigrationAutonomy)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -612,243 +605,1049 @@ pub fn nomad_survey_dispatch_system(
     }
 }
 
-/// Commit pass — Sequential, every tick (exclusive system). Drains every
-/// faction's `pending_migration`: despawns Beds/Bedrolls/Campfires/Tents/
-/// Yurts within `OLD_CAMP_RADIUS` of the current `home_tile`, removes them
-/// from `BedMap` / `CampfireMap`, then re-seeds a fresh camp at the target
-/// tile via `seed_nomadic_camp` and stamps `last_migration_tick`.
+struct AiPackingMigration {
+    fid: u32,
+    target: (i32, i32),
+    old_home: (i32, i32),
+    radius: i32,
+}
+
+struct AiTravelingMigration {
+    fid: u32,
+    target: (i32, i32),
+    old_home: (i32, i32),
+}
+
+struct AiPitchingMigration {
+    fid: u32,
+    target: (i32, i32),
+    pitch_started_tick: u32,
+}
+
+/// Caravan lifecycle pass — Sequential, every tick (exclusive system).
+/// Advances AI nomads through PendingCommit → PackingCamp → Traveling →
+/// PitchingCamp → Idle without teleporting the camp structures or members.
 ///
 /// Exclusive (`&mut World`) because it touches several SystemParam bundles
 /// (`FurnitureMaps`, `Commands`, multiple Queries) that together blow past
 /// Bevy's 16-param ceiling. Early-outs cheaply when no faction has a
 /// pending order.
 pub fn nomad_migration_commit_system(world: &mut World) {
-    // Snapshot pending migrations + the per-faction context the seeder
-    // needs (member count, era for tier selection). Done first so the
-    // registry borrow drops before we hand the world to other system
-    // states.
-    struct Pending {
+    let now = world.resource::<SimClock>().tick as u32;
+    start_pending_ai_migrations(world, now);
+    progress_packing_ai_migrations(world, now);
+    progress_traveling_ai_migrations(world, now);
+    progress_pitching_ai_migrations(world, now);
+}
+
+fn start_pending_ai_migrations(world: &mut World, now: u32) {
+    struct Start {
         fid: u32,
         old_home: (i32, i32),
         target: (i32, i32),
-        members: u32,
-        era: crate::simulation::technology::Era,
-        hearth_tier: crate::simulation::construction::HearthTier,
+        radius: i32,
     }
 
-    let pending: Vec<Pending> = {
+    let starts: Vec<Start> = {
         let registry = world.resource::<FactionRegistry>();
         registry
             .factions
             .iter()
             .filter_map(|(&fid, f)| {
-                f.pending_migration.map(|target| {
-                    let adoption =
-                        crate::simulation::technology_adoption::community_adoption_bitset(f);
-                    Pending {
-                        fid,
-                        old_home: f.home_tile,
-                        target,
-                        members: f.member_count,
-                        era: current_era(&adoption),
-                        hearth_tier: best_hearth_for(&adoption),
-                    }
+                if !f.nomad_autopilot {
+                    return None;
+                }
+                let crate::simulation::faction::MigrationPhase::PendingCommit { target, .. } =
+                    f.migration_phase
+                else {
+                    return None;
+                };
+                if f.pending_migration != Some(target) {
+                    return None;
+                }
+                let adoption = crate::simulation::technology_adoption::community_adoption_bitset(f);
+                let era = current_era(&adoption);
+                let radius =
+                    crate::simulation::construction::seed_nomadic_camp_extent(f.member_count, era);
+                Some(Start {
+                    fid,
+                    old_home: f.home_tile,
+                    target,
+                    radius,
                 })
             })
             .collect()
     };
-    if pending.is_empty() {
+    if starts.is_empty() {
         return;
     }
-    let now = world.resource::<SimClock>().tick as u32;
 
-    let packs: Vec<(u32, (i32, i32), i32)> = pending
+    let decisions: Vec<(&Start, bool)> = starts
         .iter()
-        .map(|p| {
-            let radius =
-                crate::simulation::construction::seed_nomadic_camp_extent(p.members, p.era);
-            (p.fid, p.old_home, radius)
-        })
+        .map(|s| (s, migration_target_ready(world, s.old_home, s.target)))
         .collect();
-    pack_camp_assets_atomic(world, &packs);
-
-    // ── Re-seed pass ────────────────────────────────────────────────
-    // Reuse `seed_nomadic_camp` so the new camp matches the game-start
-    // layout (hearth ring + bedrolls + tents + Neo+ yurts). Run one
-    // SystemState per migration since `seed_nomadic_camp` mutates the
-    // command buffer + furniture maps each call.
-    for p in pending.iter() {
-        let mut seed_state: SystemState<(
-            Commands,
-            FurnitureMaps,
-            Res<ChunkMap>,
-            EventWriter<TileChangedEvent>,
-        )> = SystemState::new(world);
-        let (mut commands, mut maps, chunk_map, mut tile_changed) = seed_state.get_mut(world);
-        let mut used: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
-        used.insert(p.target);
-        seed_nomadic_camp(
-            &mut commands,
-            &mut maps,
-            &chunk_map,
-            &mut tile_changed,
-            &mut used,
-            p.fid,
-            p.target,
-            p.members,
-            p.era,
-            p.hearth_tier,
-        );
-        seed_state.apply(world);
-    }
-
-    // ── Registry mutation ───────────────────────────────────────────
-    // Capture each faction's chief (or any first member) for the
-    // ActivityLogEvent's `actor`, then mutate registry state.
-    let mut actor_per_faction: ahash::AHashMap<u32, Entity> = ahash::AHashMap::new();
-    {
-        let mut state: SystemState<Query<(Entity, &crate::simulation::faction::FactionMember)>> =
-            SystemState::new(world);
-        let q = state.get(world);
-        for (entity, member) in q.iter() {
-            actor_per_faction.entry(member.faction_id).or_insert(entity);
-        }
-    }
+    let mut accepted: Vec<(u32, (i32, i32), i32)> = Vec::new();
     {
         let mut registry = world.resource_mut::<FactionRegistry>();
-        for p in pending.iter() {
-            if let Some(faction) = registry.factions.get_mut(&p.fid) {
-                // P3: push the now-vacated camp tile into the recent-camps
-                // ring before mutating home_tile, so the next migration
-                // pick penalises returning here.
-                faction.recent_camps.push_back((p.old_home, now));
-                while faction.recent_camps.len() > RECENT_CAMP_RING_CAP {
-                    faction.recent_camps.pop_front();
-                }
-                faction.home_tile = p.target;
-                faction.last_migration_tick = now;
+        for (s, valid) in decisions {
+            let Some(faction) = registry.factions.get_mut(&s.fid) else {
+                continue;
+            };
+            if !valid {
                 faction.pending_migration = None;
-                // Phase A: AI flow stays Pitched throughout (atomic
-                // pack+despawn+reseed). MigrationPhase tracks the
-                // post-commit walking window so other systems can
-                // treat "still receiving stragglers" distinctly from
-                // "fully resettled".
-                faction.camp_state = crate::simulation::faction::CampState::Pitched;
-                faction.migration_phase =
-                    crate::simulation::faction::MigrationPhase::Walking { target: p.target };
+                faction.migration_phase = crate::simulation::faction::MigrationPhase::Idle;
                 faction.last_phase_change_tick = now;
-                // Phase 4: AI atomic migration reseeds the camp's
-                // deployables at the target, so the manifest the pack
-                // pass just populated is no longer load-bearing.
-                faction.cargo_manifest = crate::simulation::faction::CampCargoManifest::default();
+                continue;
+            }
+            faction.camp_state = crate::simulation::faction::CampState::Packed { since_tick: now };
+            faction.migration_phase = crate::simulation::faction::MigrationPhase::PackingCamp {
+                target: s.target,
+                old_home: s.old_home,
+                started_tick: now,
+                radius: s.radius,
+            };
+            faction.last_phase_change_tick = now;
+            faction.cargo_manifest = crate::simulation::faction::CampCargoManifest::default();
+            accepted.push((s.fid, s.old_home, s.radius));
+        }
+    }
+
+    if accepted.is_empty() {
+        return;
+    }
+    let fids: Vec<u32> = accepted.iter().map(|(fid, _, _)| *fid).collect();
+    crate::simulation::nomad_pack_labor::stamp_pack_duty(world, &fids);
+    crate::simulation::nomad_pack_labor::dispatch_unpitch_tasks(world, &accepted);
+}
+
+fn progress_packing_ai_migrations(world: &mut World, now: u32) {
+    let packing: Vec<AiPackingMigration> = {
+        let registry = world.resource::<FactionRegistry>();
+        registry
+            .factions
+            .iter()
+            .filter_map(|(&fid, f)| {
+                if !f.nomad_autopilot {
+                    return None;
+                }
+                let crate::simulation::faction::MigrationPhase::PackingCamp {
+                    target,
+                    old_home,
+                    radius,
+                    ..
+                } = f.migration_phase
+                else {
+                    return None;
+                };
+                Some(AiPackingMigration {
+                    fid,
+                    target,
+                    old_home,
+                    radius,
+                })
+            })
+            .collect()
+    };
+    if packing.is_empty() {
+        return;
+    }
+
+    let packs: Vec<(u32, (i32, i32), i32)> = packing
+        .iter()
+        .map(|p| (p.fid, p.old_home, p.radius))
+        .collect();
+    let remaining = crate::simulation::nomad_pack_labor::pack_targets_remaining(world, &packs);
+    let ready: Vec<AiPackingMigration> = packing
+        .into_iter()
+        .filter(|p| !remaining.contains(&p.fid))
+        .collect();
+    if ready.is_empty() {
+        crate::simulation::nomad_pack_labor::dispatch_unpitch_tasks(world, &packs);
+        return;
+    }
+    let still_packing: Vec<(u32, (i32, i32), i32)> = packs
+        .iter()
+        .copied()
+        .filter(|(fid, _, _)| remaining.contains(fid))
+        .collect();
+    if !still_packing.is_empty() {
+        crate::simulation::nomad_pack_labor::dispatch_unpitch_tasks(world, &still_packing);
+    }
+
+    let fids: Vec<u32> = ready.iter().map(|p| p.fid).collect();
+    crate::simulation::nomad_pack_labor::clear_pack_duty(world, &fids);
+    stamp_members_for_caravan_travel(world, &ready, now);
+    redirect_owned_pack_animals(world, &ready, now);
+
+    {
+        let mut registry = world.resource_mut::<FactionRegistry>();
+        for p in ready.iter() {
+            if let Some(faction) = registry.factions.get_mut(&p.fid) {
+                faction.migration_phase = crate::simulation::faction::MigrationPhase::Traveling {
+                    target: p.target,
+                    old_home: p.old_home,
+                    departed_tick: now,
+                    caravan_tile: p.old_home,
+                };
+                faction.last_phase_change_tick = now;
+            }
+        }
+    }
+}
+
+fn stamp_members_for_caravan_travel(world: &mut World, ready: &[AiPackingMigration], now: u32) {
+    let targets: ahash::AHashMap<u32, (i32, i32)> =
+        ready.iter().map(|p| (p.fid, p.target)).collect();
+    let mut state: SystemState<(
+        Commands,
+        Query<(
+            Entity,
+            &crate::simulation::faction::FactionMember,
+            &mut crate::simulation::goals::AgentGoal,
+            &mut crate::simulation::person::PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
+        )>,
+        Res<FactionRegistry>,
+    )> = SystemState::new(world);
+    let (mut commands, mut q, registry) = state.get_mut(world);
+    for (e, member, mut goal, mut ai, mut aq) in q.iter_mut() {
+        let root = registry.root_faction(member.faction_id);
+        let Some(&target) = targets.get(&root) else {
+            continue;
+        };
+        commands
+            .entity(e)
+            .insert(MigrationTarget {
+                tile: target,
+                route_tile: None,
+                started_tick: now,
+                last_dispatched_tick: now,
+                bounce_count: 0,
+            })
+            .insert(crate::simulation::construction::HomeBed(None));
+        *goal = crate::simulation::goals::AgentGoal::MigrateToCamp;
+        aq.cancel();
+        ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
+        ai.state = crate::simulation::person::AiState::Idle;
+    }
+    state.apply(world);
+}
+
+fn redirect_owned_pack_animals(world: &mut World, ready: &[AiPackingMigration], now: u32) {
+    let targets: ahash::AHashMap<u32, (i32, i32)> =
+        ready.iter().map(|p| (p.fid, p.target)).collect();
+    let mut state: SystemState<(Commands, Query<(Entity, &Tamed, &mut AnimalAI)>)> =
+        SystemState::new(world);
+    let (mut commands, mut q) = state.get_mut(world);
+    for (e, tamed, mut ai) in q.iter_mut() {
+        let Some(&target) = targets.get(&tamed.owner_faction) else {
+            continue;
+        };
+        commands
+            .entity(e)
+            .insert(crate::simulation::animals::FollowingBand {
+                faction: tamed.owner_faction,
+                last_redirect_tick: now,
+            });
+        let seed = tamed.owner_faction.wrapping_mul(0x85EB_CA6B);
+        let dx = ((seed & 0b11) as i32) - 2;
+        let dy = (((seed >> 2) & 0b11) as i32) - 2;
+        ai.target_tile = (target.0 + dx, target.1 + dy);
+    }
+    state.apply(world);
+}
+
+fn progress_traveling_ai_migrations(world: &mut World, now: u32) {
+    let traveling: Vec<AiTravelingMigration> = {
+        let registry = world.resource::<FactionRegistry>();
+        registry
+            .factions
+            .iter()
+            .filter_map(|(&fid, f)| {
+                if !f.nomad_autopilot {
+                    return None;
+                }
+                let crate::simulation::faction::MigrationPhase::Traveling {
+                    target, old_home, ..
+                } = f.migration_phase
+                else {
+                    return None;
+                };
+                Some(AiTravelingMigration {
+                    fid,
+                    target,
+                    old_home,
+                })
+            })
+            .collect()
+    };
+    if traveling.is_empty() {
+        return;
+    }
+
+    let mut caravan_tiles: ahash::AHashMap<u32, (i32, i32)> = ahash::AHashMap::default();
+    let mut arrived: Vec<AiTravelingMigration> = Vec::new();
+    for t in traveling.iter() {
+        let caravan = caravan_tile_for(world, t.fid, t.old_home);
+        caravan_tiles.insert(t.fid, caravan);
+        if any_member_near(world, t.fid, t.target, MIGRATE_ARRIVAL_RADIUS) {
+            arrived.push(AiTravelingMigration {
+                fid: t.fid,
+                target: t.target,
+                old_home: t.old_home,
+            });
+        }
+    }
+
+    {
+        let mut registry = world.resource_mut::<FactionRegistry>();
+        for (fid, caravan_tile) in caravan_tiles.iter() {
+            if let Some(faction) = registry.factions.get_mut(fid) {
+                if let crate::simulation::faction::MigrationPhase::Traveling {
+                    target,
+                    old_home,
+                    departed_tick,
+                    ..
+                } = faction.migration_phase
+                {
+                    faction.migration_phase =
+                        crate::simulation::faction::MigrationPhase::Traveling {
+                            target,
+                            old_home,
+                            departed_tick,
+                            caravan_tile: *caravan_tile,
+                        };
+                }
             }
         }
     }
 
-    // ── P1: stamp every band member with `MigrationTarget` + flip their
-    // goal to MigrateToCamp so the dispatcher actively walks them with
-    // the band. Survive-tier needs (raid / starvation / rescue) preempt
-    // naturally in `goal_update_system`.
+    if arrived.is_empty() {
+        return;
+    }
+
+    start_pitching_at_destination(world, &arrived, now);
+}
+
+fn start_pitching_at_destination(world: &mut World, arrived: &[AiTravelingMigration], now: u32) {
     {
-        let migrating: ahash::AHashMap<u32, (i32, i32)> =
-            pending.iter().map(|p| (p.fid, p.target)).collect();
+        let mut registry = world.resource_mut::<FactionRegistry>();
+        for t in arrived.iter() {
+            if let Some(faction) = registry.factions.get_mut(&t.fid) {
+                faction.recent_camps.push_back((t.old_home, now));
+                while faction.recent_camps.len() > RECENT_CAMP_RING_CAP {
+                    faction.recent_camps.pop_front();
+                }
+                faction.home_tile = t.target;
+                faction.last_migration_tick = now;
+                faction.camp_state =
+                    crate::simulation::faction::CampState::Packed { since_tick: now };
+                faction.migration_phase =
+                    crate::simulation::faction::MigrationPhase::PitchingCamp {
+                        target: t.target,
+                        old_home: t.old_home,
+                        started_tick: now,
+                        pitch_started_tick: now,
+                        repair_unlocked: false,
+                    };
+                faction.last_phase_change_tick = now;
+                faction.cargo_manifest.pitching_started_tick = Some(now);
+                faction.cargo_manifest.repair_unlocked = false;
+            }
+        }
+    }
+
+    sync_camp_home_tiles(world, arrived.iter().map(|t| (t.fid, t.target)));
+    emit_camp_moved_events(world, arrived, now);
+}
+
+fn progress_pitching_ai_migrations(world: &mut World, now: u32) {
+    let pitching: Vec<AiPitchingMigration> = {
+        let registry = world.resource::<FactionRegistry>();
+        registry
+            .factions
+            .iter()
+            .filter_map(|(&fid, f)| {
+                if !f.nomad_autopilot {
+                    return None;
+                }
+                let crate::simulation::faction::MigrationPhase::PitchingCamp {
+                    target,
+                    pitch_started_tick,
+                    ..
+                } = f.migration_phase
+                else {
+                    return None;
+                };
+                Some(AiPitchingMigration {
+                    fid,
+                    target,
+                    pitch_started_tick,
+                })
+            })
+            .collect()
+    };
+    if pitching.is_empty() {
+        return;
+    }
+
+    unload_pack_animals_at_destination(world, &pitching);
+    dispatch_member_unload_tasks(world, &pitching);
+    dispatch_pitch_tasks(world, &pitching);
+
+    let mut completed: Vec<u32> = Vec::new();
+    for p in pitching.iter() {
+        if !minimal_final_camp_exists(world, p.target) {
+            continue;
+        }
+        let enough_arrived = caravan_arrival_threshold_met(world, p.fid, p.target);
+        let waited = now.saturating_sub(p.pitch_started_tick) >= TICKS_PER_DAY / 2;
+        if enough_arrived || waited {
+            completed.push(p.fid);
+        }
+    }
+    if completed.is_empty() {
+        return;
+    }
+
+    {
+        let completed_set: ahash::AHashSet<u32> = completed.iter().copied().collect();
+        let mut registry = world.resource_mut::<FactionRegistry>();
+        for fid in completed.iter() {
+            if let Some(faction) = registry.factions.get_mut(fid) {
+                faction.pending_migration = None;
+                faction.camp_state = crate::simulation::faction::CampState::Pitched;
+                faction.migration_phase = crate::simulation::faction::MigrationPhase::Idle;
+                faction.last_phase_change_tick = now;
+                faction.cargo_manifest = crate::simulation::faction::CampCargoManifest::default();
+            }
+        }
+        drop(registry);
+        finish_caravan_member_markers(world, &completed_set);
+    }
+}
+
+fn migration_target_ready(world: &mut World, old_home: (i32, i32), target: (i32, i32)) -> bool {
+    let mut state: SystemState<(
+        Res<ChunkMap>,
+        Res<crate::pathfinding::chunk_graph::ChunkGraph>,
+        Res<crate::pathfinding::connectivity::ChunkConnectivity>,
+    )> = SystemState::new(world);
+    let (chunk_map, chunk_graph, connectivity) = state.get(world);
+    if !chunk_map.is_passable(target.0, target.1) {
+        return false;
+    }
+    let oz = chunk_map.nearest_standable_z(old_home.0, old_home.1, 0) as i8;
+    let tz = chunk_map.nearest_standable_z(target.0, target.1, oz as i32) as i8;
+    connectivity.tile_reachable(
+        &chunk_graph,
+        (old_home.0, old_home.1, oz),
+        (target.0, target.1, tz),
+    )
+}
+
+fn caravan_tile_for(world: &mut World, fid: u32, fallback: (i32, i32)) -> (i32, i32) {
+    let chief = {
+        let registry = world.resource::<FactionRegistry>();
+        registry.factions.get(&fid).and_then(|f| f.chief_entity)
+    };
+    if let Some(chief) = chief {
+        let mut state: SystemState<Query<&Transform>> = SystemState::new(world);
+        let q = state.get(world);
+        if let Ok(transform) = q.get(chief) {
+            return transform_tile(transform);
+        }
+    }
+
+    let mut state: SystemState<(
+        Query<(&crate::simulation::faction::FactionMember, &Transform)>,
+        Res<FactionRegistry>,
+    )> = SystemState::new(world);
+    let (q, registry) = state.get(world);
+    let mut sx = 0i64;
+    let mut sy = 0i64;
+    let mut n = 0i64;
+    for (member, transform) in q.iter() {
+        if registry.root_faction(member.faction_id) != fid {
+            continue;
+        }
+        let tile = transform_tile(transform);
+        sx += tile.0 as i64;
+        sy += tile.1 as i64;
+        n += 1;
+    }
+    if n == 0 {
+        fallback
+    } else {
+        ((sx / n) as i32, (sy / n) as i32)
+    }
+}
+
+fn any_member_near(world: &mut World, fid: u32, target: (i32, i32), radius: i32) -> bool {
+    let mut state: SystemState<(
+        Query<(&crate::simulation::faction::FactionMember, &Transform)>,
+        Res<FactionRegistry>,
+    )> = SystemState::new(world);
+    let (q, registry) = state.get(world);
+    q.iter().any(|(member, transform)| {
+        registry.root_faction(member.faction_id) == fid
+            && chebyshev(transform_tile(transform), target) <= radius
+    })
+}
+
+fn sync_camp_home_tiles<I>(world: &mut World, homes: I)
+where
+    I: IntoIterator<Item = (u32, (i32, i32))>,
+{
+    let homes: Vec<(u32, (i32, i32))> = homes.into_iter().collect();
+    if homes.is_empty() {
+        return;
+    }
+    let mut state: SystemState<(
+        Res<crate::simulation::camp::CampMap>,
+        Query<&mut crate::simulation::camp::Camp>,
+    )> = SystemState::new(world);
+    let (map, mut q) = state.get_mut(world);
+    for (fid, target) in homes {
+        if let Some(e) = map.entity_for_faction(fid) {
+            if let Ok(mut camp) = q.get_mut(e) {
+                camp.home_tile = target;
+            }
+        }
+    }
+}
+
+fn emit_camp_moved_events(world: &mut World, arrived: &[AiTravelingMigration], now: u32) {
+    let actor_per_faction = {
         let mut state: SystemState<(
-            Commands,
-            Query<(
+            Query<(Entity, &crate::simulation::faction::FactionMember)>,
+            Res<FactionRegistry>,
+        )> = SystemState::new(world);
+        let (q, registry) = state.get(world);
+        let mut actors: ahash::AHashMap<u32, Entity> = ahash::AHashMap::default();
+        for (entity, member) in q.iter() {
+            let root = registry.root_faction(member.faction_id);
+            actors.entry(root).or_insert(entity);
+        }
+        actors
+    };
+
+    let mut state: SystemState<EventWriter<crate::ui::activity_log::ActivityLogEvent>> =
+        SystemState::new(world);
+    let mut writer = state.get_mut(world);
+    for t in arrived.iter() {
+        let Some(&actor) = actor_per_faction.get(&t.fid) else {
+            continue;
+        };
+        writer.send(crate::ui::activity_log::ActivityLogEvent {
+            tick: now as u64,
+            actor,
+            faction_id: t.fid,
+            kind: crate::ui::activity_log::ActivityEntryKind::CampMoved {
+                from: t.old_home,
+                to: t.target,
+            },
+        });
+    }
+    state.apply(world);
+}
+
+fn unload_pack_animals_at_destination(world: &mut World, pitching: &[AiPitchingMigration]) {
+    let targets: ahash::AHashMap<u32, (i32, i32)> =
+        pitching.iter().map(|p| (p.fid, p.target)).collect();
+    if targets.is_empty() {
+        return;
+    }
+    let cargo = caravan_cargo_resources();
+    let mut state: SystemState<(
+        Commands,
+        Query<(
+            &Transform,
+            &Tamed,
+            &mut crate::simulation::animals::PackAnimalInventory,
+        )>,
+    )> = SystemState::new(world);
+    let (mut commands, mut q) = state.get_mut(world);
+    for (transform, tamed, mut inv) in q.iter_mut() {
+        let Some(&target) = targets.get(&tamed.owner_faction) else {
+            continue;
+        };
+        if chebyshev(transform_tile(transform), target) > MIGRATE_ARRIVAL_RADIUS + 3 {
+            continue;
+        }
+        for rid in cargo.iter().copied() {
+            let qty = inv.quantity_of(rid);
+            if qty == 0 {
+                continue;
+            }
+            let removed = inv.remove(rid, qty);
+            if removed > 0 {
+                crate::simulation::gather::spawn_ground_drop(
+                    &mut commands,
+                    target.0,
+                    target.1,
+                    rid,
+                    removed,
+                );
+            }
+        }
+    }
+    state.apply(world);
+}
+
+fn dispatch_member_unload_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
+    let targets: ahash::AHashMap<u32, (i32, i32)> =
+        pitching.iter().map(|p| (p.fid, p.target)).collect();
+    if targets.is_empty() {
+        return;
+    }
+    let cargo = caravan_cargo_resources();
+    let mut state: SystemState<(
+        Res<ChunkMap>,
+        Res<crate::pathfinding::chunk_graph::ChunkGraph>,
+        Res<crate::pathfinding::chunk_router::ChunkRouter>,
+        Res<crate::pathfinding::connectivity::ChunkConnectivity>,
+        Res<FactionRegistry>,
+        Query<
+            (
                 Entity,
                 &crate::simulation::faction::FactionMember,
-                &mut crate::simulation::goals::AgentGoal,
+                &Transform,
+                &crate::economy::agent::EconomicAgent,
                 &mut crate::simulation::person::PersonAI,
                 &mut crate::simulation::typed_task::ActionQueue,
+                &mut crate::simulation::goals::AgentGoal,
+            ),
+            With<crate::simulation::person::Person>,
+        >,
+    )> = SystemState::new(world);
+    let (chunk_map, chunk_graph, chunk_router, connectivity, registry, mut q) =
+        state.get_mut(world);
+    for (_e, member, transform, agent, mut ai, mut aq, mut goal) in q.iter_mut() {
+        let root = registry.root_faction(member.faction_id);
+        let Some(&target) = targets.get(&root) else {
+            continue;
+        };
+        let worker_tile = transform_tile(transform);
+        if chebyshev(worker_tile, target) > MIGRATE_ARRIVAL_RADIUS + 4 {
+            continue;
+        }
+        if ai.task_id != crate::simulation::person::PersonAI::UNEMPLOYED
+            || !matches!(aq.current, crate::simulation::typed_task::Task::Idle)
+        {
+            continue;
+        }
+        let Some((rid, have)) = cargo.iter().find_map(|rid| {
+            let have = agent.quantity_of_resource(*rid);
+            (have > 0).then_some((*rid, have))
+        }) else {
+            continue;
+        };
+        let qty = have.min(4).min(u8::MAX as u32) as u8;
+        let chunk = crate::world::chunk::ChunkCoord(
+            worker_tile
+                .0
+                .div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+            worker_tile
+                .1
+                .div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+        );
+        let routed = crate::simulation::tasks::assign_task_with_routing(
+            &mut ai,
+            worker_tile,
+            chunk,
+            target,
+            crate::simulation::tasks::TaskKind::UnloadCampCargo,
+            None,
+            &chunk_graph,
+            &chunk_router,
+            &chunk_map,
+            &connectivity,
+        );
+        if routed {
+            aq.cancel();
+            aq.dispatch(crate::simulation::typed_task::Task::UnloadCampCargo {
+                resource_id: rid,
+                qty,
+                tile: target,
+            });
+            *goal = crate::simulation::goals::AgentGoal::FollowingPlayerCommand;
+        }
+    }
+    state.apply(world);
+}
+
+fn dispatch_pitch_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
+    use crate::simulation::construction::BuildSiteKind;
+
+    struct PitchRequest {
+        fid: u32,
+        kind: BuildSiteKind,
+        anchor: (i32, i32),
+    }
+
+    let targets: ahash::AHashMap<u32, (i32, i32)> =
+        pitching.iter().map(|p| (p.fid, p.target)).collect();
+    if targets.is_empty() {
+        return;
+    }
+
+    let requests: Vec<PitchRequest> = {
+        let mut state: SystemState<(
+            Res<ChunkMap>,
+            Res<BedMap>,
+            Res<CampfireMap>,
+            Query<(&TentShelter, &Transform)>,
+            Query<(&crate::simulation::items::GroundItem, &Transform)>,
+            Query<(
+                &crate::simulation::faction::FactionMember,
+                &crate::simulation::typed_task::ActionQueue,
             )>,
             Res<FactionRegistry>,
         )> = SystemState::new(world);
-        let (mut commands, mut q, registry) = state.get_mut(world);
-        for (e, member, mut goal, mut ai, mut aq) in q.iter_mut() {
+        let (chunk_map, bed_map, campfire_map, tent_q, ground_q, active_q, registry) =
+            state.get(world);
+        let bedroll_id = crate::economy::core_ids::bedroll();
+        let yurt_id = crate::economy::core_ids::packed_yurt();
+        let mut out = Vec::new();
+
+        for p in pitching.iter() {
+            let mut used: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::default();
+            for tile in bed_map.0.keys().copied() {
+                if chebyshev(tile, p.target) <= 8 {
+                    used.insert(tile);
+                }
+            }
+            for tile in campfire_map.0.keys().copied() {
+                if chebyshev(tile, p.target) <= 4 {
+                    used.insert(tile);
+                }
+            }
+            let mut yurt_built = 0u32;
+            for (shelter, transform) in tent_q.iter() {
+                if matches!(
+                    shelter.tier,
+                    crate::simulation::construction::ShelterTier::Yurt
+                ) && chebyshev(transform_tile(transform), p.target) <= 8
+                {
+                    yurt_built += 1;
+                    used.insert(transform_tile(transform));
+                }
+            }
+
+            let mut active_bedroll = 0u32;
+            let mut active_yurt = 0u32;
+            let mut active_campfire = false;
+            for (member, aq) in active_q.iter() {
+                if registry.root_faction(member.faction_id) != p.fid {
+                    continue;
+                }
+                let Some((kind, anchor)) = aq.current.as_pitch_structure_at() else {
+                    continue;
+                };
+                if chebyshev(anchor, p.target) > 8 {
+                    continue;
+                }
+                used.insert(anchor);
+                match kind {
+                    BuildSiteKind::Bedroll => active_bedroll += 1,
+                    BuildSiteKind::Yurt => active_yurt += 1,
+                    BuildSiteKind::Campfire => active_campfire = true,
+                    _ => {}
+                }
+            }
+
+            let campfire_built = campfire_map
+                .0
+                .keys()
+                .any(|tile| chebyshev(*tile, p.target) <= 2);
+            if !campfire_built && !active_campfire {
+                if let Some(anchor) =
+                    find_pitch_anchor(p.target, BuildSiteKind::Campfire, &mut used, &chunk_map)
+                {
+                    out.push(PitchRequest {
+                        fid: p.fid,
+                        kind: BuildSiteKind::Campfire,
+                        anchor,
+                    });
+                }
+            }
+
+            let ground_bedrolls = ground_q
+                .iter()
+                .filter(|(gi, t)| {
+                    gi.item.resource_id == bedroll_id && chebyshev(transform_tile(t), p.target) <= 6
+                })
+                .fold(0u32, |acc, (gi, _)| acc.saturating_add(gi.qty));
+            let desired_bedroll_tasks = ground_bedrolls.min(4).saturating_sub(active_bedroll);
+            for _ in 0..desired_bedroll_tasks {
+                if let Some(anchor) =
+                    find_pitch_anchor(p.target, BuildSiteKind::Bedroll, &mut used, &chunk_map)
+                {
+                    out.push(PitchRequest {
+                        fid: p.fid,
+                        kind: BuildSiteKind::Bedroll,
+                        anchor,
+                    });
+                }
+            }
+
+            let ground_yurts = ground_q
+                .iter()
+                .filter(|(gi, t)| {
+                    gi.item.resource_id == yurt_id && chebyshev(transform_tile(t), p.target) <= 6
+                })
+                .fold(0u32, |acc, (gi, _)| acc.saturating_add(gi.qty));
+            if ground_yurts > active_yurt && yurt_built < 2 {
+                if let Some(anchor) =
+                    find_pitch_anchor(p.target, BuildSiteKind::Yurt, &mut used, &chunk_map)
+                {
+                    out.push(PitchRequest {
+                        fid: p.fid,
+                        kind: BuildSiteKind::Yurt,
+                        anchor,
+                    });
+                }
+            }
+        }
+        out
+    };
+    if requests.is_empty() {
+        return;
+    }
+
+    struct Worker {
+        entity: Entity,
+        tile: (i32, i32),
+        chunk: crate::world::chunk::ChunkCoord,
+        z: i8,
+    }
+    let workers_by_faction: ahash::AHashMap<u32, Vec<Worker>> = {
+        let mut state: SystemState<(
+            Query<
+                (
+                    Entity,
+                    &crate::simulation::faction::FactionMember,
+                    &Transform,
+                    &crate::simulation::person::PersonAI,
+                    &crate::simulation::typed_task::ActionQueue,
+                ),
+                With<crate::simulation::person::Person>,
+            >,
+            Res<FactionRegistry>,
+        )> = SystemState::new(world);
+        let (q, registry) = state.get(world);
+        let mut acc: ahash::AHashMap<u32, Vec<Worker>> = ahash::AHashMap::default();
+        for (entity, member, transform, ai, aq) in q.iter() {
             let root = registry.root_faction(member.faction_id);
-            let Some(&target) = migrating.get(&root) else {
+            if !targets.contains_key(&root) {
                 continue;
-            };
-            commands.entity(e).insert(MigrationTarget {
-                tile: target,
-                started_tick: now,
-                last_dispatched_tick: now,
-                bounce_count: 0,
-            });
-            *goal = crate::simulation::goals::AgentGoal::MigrateToCamp;
-            // Cancel current chain so the dispatcher picks up MigrateToCamp
-            // immediately instead of finishing a pre-migration gather.
-            aq.cancel();
-            ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
-            ai.state = crate::simulation::person::AiState::Idle;
-        }
-        state.apply(world);
-    }
-
-    // ── Activity log ────────────────────────────────────────────────
-    // Emit one CampMoved per migrated faction so the player's UI shows
-    // "moved camp (x,y) → (x',y')". Chief or first-found member is the
-    // notional actor.
-    {
-        let mut state: SystemState<EventWriter<crate::ui::activity_log::ActivityLogEvent>> =
-            SystemState::new(world);
-        let mut writer = state.get_mut(world);
-        for p in pending.iter() {
-            let Some(&actor) = actor_per_faction.get(&p.fid) else {
+            }
+            if ai.task_id != crate::simulation::person::PersonAI::UNEMPLOYED
+                || !matches!(aq.current, crate::simulation::typed_task::Task::Idle)
+            {
                 continue;
-            };
-            writer.send(crate::ui::activity_log::ActivityLogEvent {
-                tick: now as u64,
-                actor,
-                faction_id: p.fid,
-                kind: crate::ui::activity_log::ActivityEntryKind::CampMoved {
-                    from: p.old_home,
-                    to: p.target,
-                },
+            }
+            let tile = transform_tile(transform);
+            let chunk = crate::world::chunk::ChunkCoord(
+                tile.0.div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+                tile.1.div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
+            );
+            acc.entry(root).or_default().push(Worker {
+                entity,
+                tile,
+                chunk,
+                z: ai.current_z,
             });
         }
-        state.apply(world);
+        acc
+    };
+
+    let mut assignments: Vec<(
+        Entity,
+        PitchRequest,
+        (i32, i32),
+        crate::world::chunk::ChunkCoord,
+        i8,
+    )> = Vec::new();
+    let mut used_workers: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    for req in requests.into_iter() {
+        let Some(pool) = workers_by_faction.get(&req.fid) else {
+            continue;
+        };
+        let Some(worker) = pool
+            .iter()
+            .filter(|w| !used_workers.contains(&w.entity))
+            .min_by_key(|w| chebyshev(w.tile, req.anchor))
+        else {
+            continue;
+        };
+        used_workers.insert(worker.entity);
+        assignments.push((worker.entity, req, worker.tile, worker.chunk, worker.z));
+    }
+    if assignments.is_empty() {
+        return;
     }
 
-    // ── Phase 5 minimum: Tamed animals follow camp ──────────────────
-    // Redirect every Tamed animal whose `owner_faction` just migrated to
-    // wander toward the new camp tile. The animal_movement_system then
-    // walks them there at standard ANIMAL_SPEED. Members of nomadic
-    // bands' herds (tamed horses, etc.) thus drift with the camp instead
-    // of being abandoned at the old site.
-    {
-        let mut tamed_state: SystemState<(Commands, Query<(Entity, &Tamed, &mut AnimalAI)>)> =
-            SystemState::new(world);
-        let (mut commands, mut tamed_q) = tamed_state.get_mut(world);
-        let new_homes: ahash::AHashMap<u32, (i32, i32)> =
-            pending.iter().map(|p| (p.fid, p.target)).collect();
-        for (e, tamed, mut ai) in tamed_q.iter_mut() {
-            let Some(target) = new_homes.get(&tamed.owner_faction) else {
-                continue;
-            };
-            // Bug-fix #2: stamp `FollowingBand` so the redirect
-            // survives Dormant LOD; the standalone redirect system
-            // re-snaps target_tile every quarter-day.
-            commands
-                .entity(e)
-                .insert(crate::simulation::animals::FollowingBand {
-                    faction: tamed.owner_faction,
-                    last_redirect_tick: now,
-                });
-            let seed = tamed.owner_faction.wrapping_mul(0x85EB_CA6B);
-            let dx = ((seed & 0b11) as i32) - 2;
-            let dy = (((seed >> 2) & 0b11) as i32) - 2;
-            ai.target_tile = (target.0 + dx, target.1 + dy);
-        }
-        tamed_state.apply(world);
-    }
-
-    for p in pending.iter() {
-        info!(
-            "Faction {} migration committed ({:?} -> {:?}) tick {now}",
-            p.fid, p.old_home, p.target,
+    let mut state: SystemState<(
+        Res<ChunkMap>,
+        Res<crate::pathfinding::chunk_graph::ChunkGraph>,
+        Res<crate::pathfinding::chunk_router::ChunkRouter>,
+        Res<crate::pathfinding::connectivity::ChunkConnectivity>,
+        Query<(
+            &mut crate::simulation::person::PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
+            &mut crate::simulation::goals::AgentGoal,
+        )>,
+    )> = SystemState::new(world);
+    let (chunk_map, chunk_graph, chunk_router, connectivity, mut q) = state.get_mut(world);
+    for (entity, req, worker_tile, worker_chunk, worker_z) in assignments.into_iter() {
+        let Ok((mut ai, mut aq, mut goal)) = q.get_mut(entity) else {
+            continue;
+        };
+        ai.current_z = worker_z;
+        let routed = crate::simulation::tasks::assign_task_with_routing(
+            &mut ai,
+            worker_tile,
+            worker_chunk,
+            req.anchor,
+            crate::simulation::tasks::TaskKind::PitchStructureAt,
+            None,
+            &chunk_graph,
+            &chunk_router,
+            &chunk_map,
+            &connectivity,
         );
+        if routed {
+            aq.cancel();
+            aq.dispatch(crate::simulation::typed_task::Task::PitchStructureAt {
+                kind: req.kind,
+                anchor: req.anchor,
+            });
+            *goal = crate::simulation::goals::AgentGoal::FollowingPlayerCommand;
+        }
     }
+    state.apply(world);
+}
+
+fn find_pitch_anchor(
+    target: (i32, i32),
+    kind: crate::simulation::construction::BuildSiteKind,
+    used: &mut ahash::AHashSet<(i32, i32)>,
+    chunk_map: &ChunkMap,
+) -> Option<(i32, i32)> {
+    let (min_ring, max_ring): (i32, i32) = match kind {
+        crate::simulation::construction::BuildSiteKind::Campfire => (0, 2),
+        crate::simulation::construction::BuildSiteKind::Bedroll => (2, 6),
+        crate::simulation::construction::BuildSiteKind::Yurt => (3, 6),
+        _ => (1, 4),
+    };
+    for ring in min_ring..=max_ring {
+        for dy in -ring..=ring {
+            for dx in -ring..=ring {
+                if dx.abs().max(dy.abs()) != ring {
+                    continue;
+                }
+                let tile = (target.0 + dx, target.1 + dy);
+                if used.contains(&tile) || !chunk_map.is_passable(tile.0, tile.1) {
+                    continue;
+                }
+                let Some(kind) = chunk_map.tile_kind_at(tile.0, tile.1) else {
+                    continue;
+                };
+                if kind == TileKind::Wall || kind == TileKind::Stone {
+                    continue;
+                }
+                used.insert(tile);
+                return Some(tile);
+            }
+        }
+    }
+    None
+}
+
+fn minimal_final_camp_exists(world: &mut World, target: (i32, i32)) -> bool {
+    let mut state: SystemState<(Res<BedMap>, Res<CampfireMap>)> = SystemState::new(world);
+    let (bed_map, campfire_map) = state.get(world);
+    let has_campfire = campfire_map
+        .0
+        .keys()
+        .any(|tile| chebyshev(*tile, target) <= 2);
+    let has_bedroll = bed_map.0.keys().any(|tile| chebyshev(*tile, target) <= 6);
+    has_campfire && has_bedroll
+}
+
+fn caravan_arrival_threshold_met(world: &mut World, fid: u32, target: (i32, i32)) -> bool {
+    let mut state: SystemState<(
+        Query<(&crate::simulation::faction::FactionMember, &Transform)>,
+        Res<FactionRegistry>,
+    )> = SystemState::new(world);
+    let (q, registry) = state.get(world);
+    let mut total = 0u32;
+    let mut arrived = 0u32;
+    for (member, transform) in q.iter() {
+        if registry.root_faction(member.faction_id) != fid {
+            continue;
+        }
+        total += 1;
+        if chebyshev(transform_tile(transform), target) <= MIGRATE_ARRIVAL_RADIUS + 4 {
+            arrived += 1;
+        }
+    }
+    total == 0 || arrived.saturating_mul(5) >= total.saturating_mul(4)
+}
+
+fn finish_caravan_member_markers(world: &mut World, completed: &ahash::AHashSet<u32>) {
+    if completed.is_empty() {
+        return;
+    }
+    let fids: Vec<u32> = completed.iter().copied().collect();
+    crate::simulation::nomad_pack_labor::clear_pack_duty(world, &fids);
+
+    let mut state: SystemState<(
+        Commands,
+        Query<(
+            Entity,
+            &crate::simulation::faction::FactionMember,
+            &mut crate::simulation::goals::AgentGoal,
+            &mut crate::simulation::person::PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
+        )>,
+        Res<FactionRegistry>,
+        ResMut<crate::simulation::goals::ForceGoalReevaluate>,
+    )> = SystemState::new(world);
+    let (mut commands, mut q, registry, mut force_reeval) = state.get_mut(world);
+    for (entity, member, mut goal, mut ai, mut aq) in q.iter_mut() {
+        let root = registry.root_faction(member.faction_id);
+        if !completed.contains(&root) {
+            continue;
+        }
+        commands
+            .entity(entity)
+            .remove::<MigrationTarget>()
+            .remove::<crate::simulation::nomad_pack_labor::PackingDuty>();
+        if matches!(
+            *goal,
+            crate::simulation::goals::AgentGoal::MigrateToCamp
+                | crate::simulation::goals::AgentGoal::FollowingPlayerCommand
+        ) {
+            *goal = crate::simulation::goals::AgentGoal::GatherFood;
+            force_reeval.0.insert(entity);
+        }
+        aq.cancel();
+        ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
+        ai.state = crate::simulation::person::AiState::Idle;
+    }
+    state.apply(world);
+}
+
+fn caravan_cargo_resources() -> [crate::economy::resource_catalog::ResourceId; 4] {
+    [
+        crate::economy::core_ids::bedroll(),
+        crate::economy::core_ids::packed_yurt(),
+        crate::economy::core_ids::wood(),
+        crate::economy::core_ids::skin(),
+    ]
 }
 
 #[inline]
@@ -858,13 +1657,10 @@ fn chebyshev(a: (i32, i32), b: (i32, i32)) -> i32 {
 
 /// Pack and despawn the camp assets of the given factions at their
 /// anchor tiles. Three passes (band redistribution → pack-into-animals
-/// → despawn + refund drops) shared between the AI atomic
-/// `nomad_migration_commit_system` and the player-driven
-/// `apply_pack_camp_command_system`. Does **not** mutate `home_tile`,
-/// `camp_state`, or `migration_phase` — caller decides whether the
-/// pack is part of an atomic AI shift (followed by reseed at target)
-/// or a player Pack Camp command (which leaves the band Packed
-/// indefinitely).
+/// → despawn + refund drops). Retained as a synchronous utility for
+/// legacy callers/debug tooling; AI caravan migration uses observable
+/// `UnpitchStructure` labor instead. Does **not** mutate `home_tile`,
+/// `camp_state`, or `migration_phase`.
 ///
 /// Each pack entry's third field is the chebyshev radius around the
 /// anchor to sweep — derive via `seed_nomadic_camp_extent(members, era)`
@@ -951,8 +1747,12 @@ pub(crate) fn pack_camp_assets_atomic(world: &mut World, packs: &[(u32, (i32, i3
         let (deployable_q, mut animal_q, mut member_q, registry) = state.get_mut(world);
 
         // Phase 4: collect per-faction load events for manifest update.
-        let mut load_events: Vec<(u32, crate::economy::resource_catalog::ResourceId, u32, Entity)> =
-            Vec::new();
+        let mut load_events: Vec<(
+            u32,
+            crate::economy::resource_catalog::ResourceId,
+            u32,
+            Entity,
+        )> = Vec::new();
         for (e, transform, deploy) in deployable_q.iter() {
             // Phase 4: enumerate both legacy `packed_form` and the new
             // `packed_bundles` so bundle-form structures (yurt v2) get
@@ -1036,11 +1836,7 @@ pub(crate) fn pack_camp_assets_atomic(world: &mut World, packs: &[(u32, (i32, i3
             let mut registry = world.resource_mut::<FactionRegistry>();
             for (fid, rid, qty, carrier) in load_events.into_iter() {
                 if let Some(faction) = registry.factions.get_mut(&fid) {
-                    *faction
-                        .cargo_manifest
-                        .required
-                        .entry(rid)
-                        .or_insert(0) += qty;
+                    *faction.cargo_manifest.required.entry(rid).or_insert(0) += qty;
                     *faction
                         .cargo_manifest
                         .loaded
@@ -1408,7 +2204,6 @@ pub fn apply_packed_autonomy_system(world: &mut World) {
     }
 }
 
-
 /// 8-cardinal direction unit vector for `SendScout`. 0=N, 1=NE, ...
 fn direction_offset(dir: u8) -> (i32, i32) {
     match dir % 8 {
@@ -1431,8 +2226,6 @@ fn direction_offset(dir: u8) -> (i32, i32) {
 /// dismantle is observable labor running over many ticks in
 /// `unpitch_structure_task_system`. Sequential, exclusive `&mut World`.
 ///
-/// AI atomic migration keeps the synchronous fast path via
-/// `pack_camp_assets_atomic` inside `nomad_migration_commit_system`.
 pub fn apply_pack_camp_command_system(world: &mut World) {
     let raw: Vec<(u32, (i32, i32))> = {
         let mut ops = world.resource_mut::<PendingCampOps>();
@@ -1481,8 +2274,7 @@ pub fn apply_pack_camp_command_system(world: &mut World) {
             // `Hold` so the band defaults to "Awaiting Orders" between
             // Pack and Pitch. The player flips to `Forage` via the
             // migration panel / HUD when they want the old behavior.
-            faction.packed_autonomy =
-                crate::simulation::faction::PackedMigrationAutonomy::Hold;
+            faction.packed_autonomy = crate::simulation::faction::PackedMigrationAutonomy::Hold;
         }
     }
     for (fid, anchor, _radius) in packs.iter() {
@@ -1630,8 +2422,7 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
                 .find(|r| r.fid == player_fid)
                 .map(|r| r.target);
             if let Some(target) = new_home {
-                let world_pos =
-                    crate::world::terrain::tile_to_world(target.0, target.1);
+                let world_pos = crate::world::terrain::tile_to_world(target.0, target.1);
                 let mut state: SystemState<
                     Query<
                         &mut Transform,
@@ -1781,7 +2572,12 @@ fn despawn_old_camp_leftovers(world: &mut World, resolved: &[PitchResolved]) {
 
     let footprints: ahash::AHashMap<u32, ((i32, i32), i32)> = resolved
         .iter()
-        .map(|r| (r.fid, (r.old_home, seed_nomadic_camp_extent(r.members, r.era))))
+        .map(|r| {
+            (
+                r.fid,
+                (r.old_home, seed_nomadic_camp_extent(r.members, r.era)),
+            )
+        })
         .collect();
 
     // Collect tear-down targets first so we don't hold queries while
@@ -1939,10 +2735,7 @@ fn consume_band_packed_goods_after_pitch(world: &mut World, resolved: &[PitchRes
     {
         let mut state: SystemState<(
             Res<FactionRegistry>,
-            Query<(
-                &Tamed,
-                &mut crate::simulation::animals::PackAnimalInventory,
-            )>,
+            Query<(&Tamed, &mut crate::simulation::animals::PackAnimalInventory)>,
         )> = SystemState::new(world);
         let (registry, mut q) = state.get_mut(world);
         for (tamed, mut inv) in q.iter_mut() {
@@ -2603,8 +3396,20 @@ pub fn nomad_migration_dispatch_system(
         }
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-        // Already arrived? Skip — arrival system will strip the marker.
-        if chebyshev((cur_tx, cur_ty), target.tile) <= MIGRATE_ARRIVAL_RADIUS {
+        let route_tile = target.route_tile.unwrap_or(target.tile);
+        if target.route_tile.is_some()
+            && chebyshev((cur_tx, cur_ty), route_tile) <= MIGRATE_ARRIVAL_RADIUS
+        {
+            target.route_tile = None;
+            aq.cancel();
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.state = AiState::Idle;
+            continue;
+        }
+        // Already at final camp? Skip — arrival system will strip the marker.
+        if target.route_tile.is_none()
+            && chebyshev((cur_tx, cur_ty), target.tile) <= MIGRATE_ARRIVAL_RADIUS
+        {
             continue;
         }
         let cur_chunk = ChunkCoord(
@@ -2617,11 +3422,11 @@ pub fn nomad_migration_dispatch_system(
         // rejecting the request. Release the marker so the agent picks a
         // normal goal next tick instead of cycling dispatch ↔ path-fail.
         let target_z =
-            chunk_map.nearest_standable_z(target.tile.0, target.tile.1, ai.current_z as i32) as i8;
+            chunk_map.nearest_standable_z(route_tile.0, route_tile.1, ai.current_z as i32) as i8;
         if !chunk_connectivity.tile_reachable(
             &chunk_graph,
             (cur_tx, cur_ty, ai.current_z),
-            (target.tile.0, target.tile.1, target_z),
+            (route_tile.0, route_tile.1, target_z),
         ) {
             // Bug-fix #4: rather than dropping the marker outright,
             // reroute toward the band centroid (median tile of other
@@ -2646,7 +3451,7 @@ pub fn nomad_migration_dispatch_system(
                 if !peers.is_empty() {
                     peers.sort_by_key(|&(x, y)| (x, y));
                     let mid = peers[peers.len() / 2];
-                    target.tile = mid;
+                    target.route_tile = Some(mid);
                     target.bounce_count = target.bounce_count.saturating_add(1);
                 } else {
                     commands.entity(e).remove::<MigrationTarget>();
@@ -2669,7 +3474,7 @@ pub fn nomad_migration_dispatch_system(
             &mut ai,
             (cur_tx, cur_ty),
             cur_chunk,
-            target.tile,
+            target.route_tile.unwrap_or(target.tile),
             TaskKind::Migrate,
             None,
             &chunk_graph,
@@ -2682,8 +3487,9 @@ pub fn nomad_migration_dispatch_system(
         }
         ai.state = AiState::Routing;
         let z = ai.target_z;
+        let walk_tile = target.route_tile.unwrap_or(target.tile);
         aq.dispatch(Task::WalkTo {
-            tile: target.tile,
+            tile: walk_tile,
             z,
             why: WalkReason::Migration,
         });
@@ -2701,11 +3507,10 @@ pub fn nomad_migration_dispatch_system(
 pub fn nomad_migration_arrival_system(
     mut commands: Commands,
     clock: Res<SimClock>,
-    mut registry: ResMut<FactionRegistry>,
     mut force_reeval: ResMut<crate::simulation::goals::ForceGoalReevaluate>,
     mut q: Query<(
         Entity,
-        &MigrationTarget,
+        &mut MigrationTarget,
         &Transform,
         &crate::simulation::faction::FactionMember,
         &mut crate::simulation::goals::AgentGoal,
@@ -2716,10 +3521,18 @@ pub fn nomad_migration_arrival_system(
     use crate::simulation::person::{AiState, PersonAI};
     use crate::world::terrain::TILE_SIZE;
     let now = clock.tick as u32;
-    let mut still_walking: ahash::AHashSet<u32> = ahash::AHashSet::default();
-    for (e, target, transform, member, mut goal, mut ai, mut aq) in q.iter_mut() {
+    for (e, mut target, transform, _member, mut goal, mut ai, mut aq) in q.iter_mut() {
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        if let Some(route_tile) = target.route_tile {
+            if chebyshev((cur_tx, cur_ty), route_tile) <= MIGRATE_ARRIVAL_RADIUS {
+                target.route_tile = None;
+                aq.cancel();
+                ai.task_id = PersonAI::UNEMPLOYED;
+                ai.state = AiState::Idle;
+                continue;
+            }
+        }
         let arrived = chebyshev((cur_tx, cur_ty), target.tile) <= MIGRATE_ARRIVAL_RADIUS;
         let timed_out = now.saturating_sub(target.started_tick) > MIGRATE_TIMEOUT_TICKS;
         // Stall release: dispatch hasn't advanced `last_dispatched_tick`
@@ -2731,35 +3544,21 @@ pub fn nomad_migration_arrival_system(
             && ai.state == AiState::Idle
             && now.saturating_sub(target.last_dispatched_tick) > MIGRATE_STALL_TICKS;
         if !(arrived || timed_out || stalled) {
-            still_walking.insert(registry.root_faction(member.faction_id));
             continue;
         }
         commands.entity(e).remove::<MigrationTarget>();
         if *goal == crate::simulation::goals::AgentGoal::MigrateToCamp {
-            // Bug-fix #3: don't hardcode GatherFood — Survive-tier
-            // needs (severe hunger / sleep) should preempt naturally
-            // on the next goal-update tick. ForceGoalReevaluate
-            // bypasses the 200-tick cadence so the flip happens
-            // immediately.
-            *goal = crate::simulation::goals::AgentGoal::GatherFood;
+            *goal = if arrived {
+                crate::simulation::goals::AgentGoal::FollowingPlayerCommand
+            } else {
+                crate::simulation::goals::AgentGoal::GatherFood
+            };
             force_reeval.0.insert(e);
         }
         // Stop the walk; a normal goal will pick up next tick.
         aq.cancel();
         ai.task_id = PersonAI::UNEMPLOYED;
         ai.state = AiState::Idle;
-    }
-    // Phase A: any faction still in `Walking` with no remaining migrators
-    // returns to `Idle` so survey/migration can be retriggered later.
-    for (fid, faction) in registry.factions.iter_mut() {
-        if matches!(
-            faction.migration_phase,
-            crate::simulation::faction::MigrationPhase::Walking { .. }
-        ) && !still_walking.contains(fid)
-        {
-            faction.migration_phase = crate::simulation::faction::MigrationPhase::Idle;
-            faction.last_phase_change_tick = now;
-        }
     }
 }
 
@@ -2881,6 +3680,7 @@ mod tests {
         sim.app.world_mut().entity_mut(agent).insert((
             MigrationTarget {
                 tile: (50, 50),
+                route_tile: None,
                 started_tick,
                 last_dispatched_tick: started_tick,
                 bounce_count: 0,
@@ -2903,10 +3703,10 @@ mod tests {
             .world()
             .get::<crate::simulation::goals::AgentGoal>(agent)
             .copied();
-        assert_eq!(
+        assert_ne!(
             goal,
-            Some(crate::simulation::goals::AgentGoal::GatherFood),
-            "stall arrival should flip MigrateToCamp → GatherFood",
+            Some(crate::simulation::goals::AgentGoal::MigrateToCamp),
+            "stall arrival should release the migration goal",
         );
     }
 
@@ -2930,6 +3730,7 @@ mod tests {
         sim.app.world_mut().entity_mut(agent).insert((
             MigrationTarget {
                 tile: (0, 0),
+                route_tile: None,
                 started_tick: now,
                 last_dispatched_tick: now,
                 bounce_count: 0,
@@ -2939,5 +3740,42 @@ mod tests {
         // One tick is enough — arrival runs in Sequential after movement.
         sim.tick_n(2);
         assert!(sim.app.world().get::<MigrationTarget>(agent).is_none());
+    }
+
+    /// Temporary route waypoints should not be treated as camp arrival.
+    /// Reaching the route tile only clears `route_tile`; the final
+    /// migration target remains pinned until the member reaches the real
+    /// camp.
+    #[test]
+    fn arrival_route_tile_does_not_release_final_target() {
+        use crate::simulation::test_fixture::TestSim;
+        use crate::world::tile::TileKind;
+
+        let mut sim = TestSim::new(0xCA2A_u64);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let agent = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        sim.tick();
+        let now = sim.tick_count() as u32;
+        sim.app.world_mut().entity_mut(agent).insert((
+            MigrationTarget {
+                tile: (8, 0),
+                route_tile: Some((0, 0)),
+                started_tick: now,
+                last_dispatched_tick: now,
+                bounce_count: 1,
+            },
+            crate::simulation::goals::AgentGoal::MigrateToCamp,
+        ));
+
+        sim.tick_n(1);
+
+        let marker = sim
+            .app
+            .world()
+            .get::<MigrationTarget>(agent)
+            .copied()
+            .expect("route arrival should keep the final migration marker");
+        assert_eq!(marker.tile, (8, 0));
+        assert_eq!(marker.route_tile, None);
     }
 }

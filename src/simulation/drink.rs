@@ -77,7 +77,11 @@ pub fn perform_drink(
                 return DrinkOutcome::SourceGone;
             }
             // Chebyshev adjacency to the source tile.
-            if (agent_tile.0 - tile.0).abs().max((agent_tile.1 - tile.1).abs()) > 1 {
+            if (agent_tile.0 - tile.0)
+                .abs()
+                .max((agent_tile.1 - tile.1).abs())
+                > 1
+            {
                 return DrinkOutcome::SourceGone;
             }
             let raw = !matches!(kind, TileKind::River);
@@ -285,8 +289,8 @@ pub fn htn_drink_dispatch_system(
             );
 
             // Method 1: drink from inventory if clean_water in hands or stack.
-            let inv_clean = agent.quantity_of_resource(clean_water)
-                + carrier.quantity_of_resource(clean_water);
+            let inv_clean =
+                agent.quantity_of_resource(clean_water) + carrier.quantity_of_resource(clean_water);
             if inv_clean > 0 {
                 ai.state = AiState::Working;
                 ai.task_id = TaskKind::Drink as u16;

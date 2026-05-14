@@ -5146,11 +5146,7 @@ mod smoke {
         // Force thirst above the trigger; baseline hunger/sleep low so
         // ThirstScorer wins the registry argmax cleanly.
         {
-            let mut needs = sim
-                .app
-                .world_mut()
-                .get_mut::<Needs>(agent)
-                .expect("Needs");
+            let mut needs = sim.app.world_mut().get_mut::<Needs>(agent).expect("Needs");
             needs.hunger = 0.0;
             needs.thirst = THIRST_TRIGGER + 20.0;
             needs.sleep = 0.0;
@@ -5183,7 +5179,10 @@ mod smoke {
             .get::<EconomicAgent>(agent)
             .unwrap()
             .quantity_of_resource(core_ids::clean_water());
-        assert!(remaining <= 2, "expected ≤ 2 clean_water left, got {remaining}");
+        assert!(
+            remaining <= 2,
+            "expected ≤ 2 clean_water left, got {remaining}"
+        );
 
         // No Health damage from a clean inventory drink.
         let ending_hp = sim
@@ -5243,6 +5242,70 @@ mod baseline_behaviour {
             "expected hungry agent to eat at least one Fruit (started {}, ended {})",
             initial_food,
             final_food
+        );
+    }
+
+    /// Repro for the in-game report: a worker with a full inventory of
+    /// non-edibles (berry_seed + bedroll) and a few Fruits in their right
+    /// hand flashes between Eating and Unemployed while hunger stays at 255.
+    /// Mirrors the exact inspector snapshot:
+    ///   Inventory: Berry Seed ×25, Bedroll ×3   (5.0 / 5.0 kg)
+    ///   Hand R: Fruit ×3
+    ///   Hunger 255
+    /// Asserts the hand-eat path actually drops hunger.
+    #[test]
+    fn hand_eat_with_full_non_edible_inventory_drops_hunger() {
+        use crate::economy::item::Item;
+        use crate::simulation::carry::{Carrier, HeldStack};
+        use crate::simulation::goals::AgentGoal;
+
+        let mut sim = TestSim::new(7);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
+            b.hunger(255.0)
+                .add_inventory(crate::economy::core_ids::berry_seed(), 25)
+                .add_inventory(crate::economy::core_ids::bedroll(), 3)
+                .goal(AgentGoal::Survive);
+        });
+
+        // Place Fruit ×3 in the agent's right hand (the user-reported shape).
+        {
+            let mut carrier = sim.app.world_mut().get_mut::<Carrier>(person).unwrap();
+            carrier.right = Some(HeldStack {
+                item: Item::new_commodity(crate::economy::core_ids::fruit()),
+                qty: 3,
+                two_handed: false,
+            });
+        }
+
+        let hunger_before = sim
+            .app
+            .world()
+            .get::<crate::simulation::needs::Needs>(person)
+            .unwrap()
+            .hunger;
+        assert_eq!(hunger_before, 255.0);
+
+        // 40 ticks is well past TICKS_EAT (8) plus dispatcher warm-up.
+        sim.tick_n(40);
+
+        let needs = sim
+            .app
+            .world()
+            .get::<crate::simulation::needs::Needs>(person)
+            .unwrap();
+        let carrier = sim.app.world().get::<Carrier>(person).unwrap();
+        let fruit_left = carrier.quantity_of_resource(crate::economy::core_ids::fruit());
+
+        assert!(
+            needs.hunger < 255.0,
+            "hunger should drop after eating hand fruit; got {}",
+            needs.hunger
+        );
+        assert!(
+            fruit_left < 3,
+            "expected at least one fruit consumed from hand; got {}",
+            fruit_left
         );
     }
 
@@ -8081,10 +8144,7 @@ mod baseline_behaviour {
             crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::GroundItem),
         ));
         {
-            let mut map = sim
-                .app
-                .world_mut()
-                .resource_mut::<StorageTileMap>();
+            let mut map = sim.app.world_mut().resource_mut::<StorageTileMap>();
             map.by_faction
                 .entry(sim.player_faction_id)
                 .or_default()
@@ -8092,10 +8152,7 @@ mod baseline_behaviour {
         }
         // Refresh faction.storage.totals so the dispatcher sees the stock.
         {
-            let mut registry = sim
-                .app
-                .world_mut()
-                .resource_mut::<FactionRegistry>();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
             let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.storage = FactionStorage::default();
             f.storage.totals.insert(weapon_id, 1);
@@ -8105,10 +8162,7 @@ mod baseline_behaviour {
 
         // Hunt order AFTER warm-up so chief_hunt_order_system doesn't clear it.
         {
-            let mut registry = sim
-                .app
-                .world_mut()
-                .resource_mut::<FactionRegistry>();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
             let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.hunt_order = Some(HuntOrder::Hunt {
                 species: CorpseSpecies::Deer,
@@ -8188,18 +8242,13 @@ mod baseline_behaviour {
                 CombatCooldown::default(),
                 LodLevel::Full,
                 BucketSlot(0),
-                crate::world::spatial::Indexed::new(
-                    crate::world::spatial::IndexedKind::Deer,
-                ),
+                crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Deer),
             ))
             .id();
 
         sim.tick_n(5);
         {
-            let mut registry = sim
-                .app
-                .world_mut()
-                .resource_mut::<FactionRegistry>();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
             let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.hunt_order = Some(HuntOrder::Hunt {
                 species: CorpseSpecies::Deer,
@@ -8299,18 +8348,13 @@ mod baseline_behaviour {
                 CombatCooldown::default(),
                 LodLevel::Full,
                 BucketSlot(0),
-                crate::world::spatial::Indexed::new(
-                    crate::world::spatial::IndexedKind::Deer,
-                ),
+                crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Deer),
             ))
             .id();
 
         sim.tick_n(5);
         {
-            let mut registry = sim
-                .app
-                .world_mut()
-                .resource_mut::<FactionRegistry>();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
             let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.hunt_order = Some(HuntOrder::Hunt {
                 species: CorpseSpecies::Deer,
@@ -8402,18 +8446,13 @@ mod baseline_behaviour {
                 CombatCooldown::default(),
                 LodLevel::Full,
                 BucketSlot(0),
-                crate::world::spatial::Indexed::new(
-                    crate::world::spatial::IndexedKind::Deer,
-                ),
+                crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Deer),
             ))
             .id();
 
         sim.tick_n(5);
         {
-            let mut registry = sim
-                .app
-                .world_mut()
-                .resource_mut::<FactionRegistry>();
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
             let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
             f.hunt_order = Some(HuntOrder::Hunt {
                 species: CorpseSpecies::Deer,
@@ -11123,19 +11162,11 @@ mod baseline_behaviour {
 
         // Directly arm the Healer to treat the patient.
         {
-            let mut aq = sim
-                .app
-                .world_mut()
-                .get_mut::<ActionQueue>(healer)
-                .unwrap();
+            let mut aq = sim.app.world_mut().get_mut::<ActionQueue>(healer).unwrap();
             aq.dispatch(Task::Heal { patient });
         }
         {
-            let mut ai = sim
-                .app
-                .world_mut()
-                .get_mut::<PersonAI>(healer)
-                .unwrap();
+            let mut ai = sim.app.world_mut().get_mut::<PersonAI>(healer).unwrap();
             ai.state = AiState::Working;
             ai.task_id = TaskKind::Heal as u16;
         }
@@ -11213,11 +11244,7 @@ mod baseline_behaviour {
             let mut ai = sim.app.world_mut().get_mut::<PersonAI>(patient).unwrap();
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.state = crate::simulation::person::AiState::Idle;
-            let mut aq = sim
-                .app
-                .world_mut()
-                .get_mut::<ActionQueue>(patient)
-                .unwrap();
+            let mut aq = sim.app.world_mut().get_mut::<ActionQueue>(patient).unwrap();
             aq.cancel();
         }
         sim.tick_n(2);
@@ -11302,11 +11329,7 @@ mod baseline_behaviour {
 
         // Damage filler torso → injury_tracking_system inserts Injury.
         {
-            let mut body = sim
-                .app
-                .world_mut()
-                .get_mut::<Body>(injured_filler)
-                .unwrap();
+            let mut body = sim.app.world_mut().get_mut::<Body>(injured_filler).unwrap();
             let torso = body.get_mut(BodyPart::Torso);
             torso.current = 4;
         }
@@ -11332,11 +11355,7 @@ mod baseline_behaviour {
         // Heal the filler by restoring the torso. injury_tracking_system
         // clears Injury once Body.fraction() == 1.0.
         {
-            let mut body = sim
-                .app
-                .world_mut()
-                .get_mut::<Body>(injured_filler)
-                .unwrap();
+            let mut body = sim.app.world_mut().get_mut::<Body>(injured_filler).unwrap();
             for limb in body.parts.iter_mut() {
                 limb.current = limb.max;
             }
@@ -12162,9 +12181,7 @@ mod wage_aware_phase0_phase1 {
         sim.app
             .world_mut()
             .entity_mut(mentor)
-            .insert(MentorOf {
-                apprentice,
-            });
+            .insert(MentorOf { apprentice });
 
         // Land the next tick on a TICKS_PER_DAY boundary so
         // `apprentice_progress_system`'s daily gate fires.
@@ -12175,16 +12192,17 @@ mod wage_aware_phase0_phase1 {
         // Run the system directly to avoid having to wait for the full
         // Economy schedule. We're testing the system contract, not its
         // ordering — which is covered elsewhere.
-        sim.app
-            .world_mut()
-            .resource_mut::<SimClock>()
-            .tick = TICKS_PER_DAY as u64;
+        sim.app.world_mut().resource_mut::<SimClock>().tick = TICKS_PER_DAY as u64;
         sim.app.add_systems(Update, apprentice_progress_system);
         sim.tick_n(1);
 
         let world = sim.app.world();
         let prof = *world.get::<Profession>(apprentice).unwrap();
-        assert_eq!(prof, Profession::Crafter, "completed apprentice must graduate to Crafter");
+        assert_eq!(
+            prof,
+            Profession::Crafter,
+            "completed apprentice must graduate to Crafter"
+        );
         let skills = world.get::<Skills>(apprentice).unwrap();
         assert!(
             skills.0[SkillKind::Crafting as usize] >= APPRENTICE_THRESHOLD,
@@ -12260,7 +12278,9 @@ mod wage_aware_phase0_phase1 {
     fn phase4b_survival_floor_demotes_hunter() {
         use crate::simulation::faction::{
             chief_craft_assignment_system as _, // doc-link
-            faction_hunter_assignment_system, FactionRegistry, FARMER_SURVIVAL_FLOOR,
+            faction_hunter_assignment_system,
+            FactionRegistry,
+            FARMER_SURVIVAL_FLOOR,
             HUNTER_ASSIGNMENT_CADENCE,
         };
         use crate::simulation::technology::HUNTING_SPEAR;
@@ -12348,29 +12368,17 @@ mod wage_aware_phase0_phase1 {
         // Run the same XP-grant code path the craft / butcher sites
         // use to confirm the multiplier flows through.
         for entity in [plain, apprentice] {
-            let app_link = sim
-                .app
-                .world()
-                .get::<ApprenticeOf>(entity)
-                .copied();
+            let app_link = sim.app.world().get::<ApprenticeOf>(entity).copied();
             let xp = xp_with_apprentice_bonus(5, app_link.as_ref());
             let mut s = sim.app.world_mut().get_mut::<Skills>(entity).unwrap();
             s.gain_xp(SkillKind::Crafting, xp);
         }
         sim.tick_n(1);
 
-        let plain_skill = sim
-            .app
-            .world()
-            .get::<Skills>(plain)
-            .unwrap()
-            .0[SkillKind::Crafting as usize];
-        let app_skill = sim
-            .app
-            .world()
-            .get::<Skills>(apprentice)
-            .unwrap()
-            .0[SkillKind::Crafting as usize];
+        let plain_skill =
+            sim.app.world().get::<Skills>(plain).unwrap().0[SkillKind::Crafting as usize];
+        let app_skill =
+            sim.app.world().get::<Skills>(apprentice).unwrap().0[SkillKind::Crafting as usize];
         // Default Skills floor = 5; plain receives +5, apprentice +10.
         assert_eq!(plain_skill, 5 + 5);
         assert_eq!(app_skill, 5 + 5 * APPRENTICE_XP_MULT);
@@ -12403,9 +12411,7 @@ mod wage_aware_phase0_phase1 {
         sim.app
             .world_mut()
             .entity_mut(mentor)
-            .insert(MentorOf {
-                apprentice,
-            });
+            .insert(MentorOf { apprentice });
 
         let baseline = CurrencySnapshot::capture(&mut sim.app);
 
@@ -12469,10 +12475,7 @@ mod wage_aware_phase0_phase1 {
             })
             .insert(ApprenticeProgress::default());
 
-        sim.app
-            .world_mut()
-            .resource_mut::<SimClock>()
-            .tick = TICKS_PER_DAY as u64;
+        sim.app.world_mut().resource_mut::<SimClock>().tick = TICKS_PER_DAY as u64;
         sim.app.add_systems(Update, apprentice_progress_system);
         sim.tick_n(1);
 
@@ -12496,7 +12499,9 @@ mod wage_aware_phase0_phase1 {
         use crate::economy::core_ids;
         use crate::simulation::faction::FactionRegistry;
         use crate::simulation::goals::{AgentGoal, GoalReason};
-        use crate::simulation::jobs::{JobBoard, JobKind, JobPosting, JobProgress, JobSource, PosterClass};
+        use crate::simulation::jobs::{
+            JobBoard, JobKind, JobPosting, JobProgress, JobSource, PosterClass,
+        };
 
         let mut sim = TestSim::new(0xEAA1);
         sim.flat_world(1, 0, TileKind::Grass);
@@ -12689,7 +12694,9 @@ mod wage_aware_phase0_phase1 {
     #[test]
     fn chief_postings_still_claimed_subsistence_after_earnincome() {
         use crate::simulation::faction::FactionRegistry;
-        use crate::simulation::jobs::{JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass};
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass,
+        };
 
         let mut sim = TestSim::new(0xCAFE_FACE);
         sim.flat_world(2, 0, TileKind::Grass);
@@ -12747,7 +12754,9 @@ mod wage_aware_phase0_phase1 {
     #[test]
     fn chief_postings_still_claimed_market_after_earnincome() {
         use crate::simulation::faction::FactionRegistry;
-        use crate::simulation::jobs::{JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass};
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass,
+        };
 
         let mut sim = TestSim::new(0xFEED_BEEF);
         sim.flat_world(2, 0, TileKind::Grass);
@@ -12817,7 +12826,7 @@ mod wage_aware_phase0_phase1 {
     fn phase6_earnincome_scorer_respects_disposition() {
         use crate::simulation::faction::FactionRegistry;
         use crate::simulation::goal_scorers::{
-            Disposition, EarnIncomeScorer, GoalClass, GoalScoringContext, GoalScorer,
+            Disposition, EarnIncomeScorer, GoalClass, GoalScorer, GoalScoringContext,
         };
         use crate::simulation::jobs::{
             JobBoard, JobKind, JobPosting, JobProgress, JobSource, PosterClass,
@@ -12876,8 +12885,12 @@ mod wage_aware_phase0_phase1 {
         // once with min entrepreneurial, once with max.
         let scorer = EarnIncomeScorer;
         let world = sim.app.world();
-        let needs = *world.get::<crate::simulation::needs::Needs>(crafter).unwrap();
-        let agent = *world.get::<crate::economy::agent::EconomicAgent>(crafter).unwrap();
+        let needs = *world
+            .get::<crate::simulation::needs::Needs>(crafter)
+            .unwrap();
+        let agent = *world
+            .get::<crate::economy::agent::EconomicAgent>(crafter)
+            .unwrap();
         let member = *world.get::<FactionMember>(crafter).unwrap();
         let skills = *world.get::<Skills>(crafter).unwrap();
         let registry = world.resource::<FactionRegistry>();
@@ -12973,8 +12986,10 @@ mod wage_aware_phase0_phase1 {
         // `target = 0` (has_tech=false) and demote our hunter to None
         // before the cross-switcher fires.
         let aware_bit = 1u64 << HUNTING_SPEAR;
-        let mut knowledge_query =
-            sim.app.world_mut().query::<&mut crate::simulation::knowledge::PersonKnowledge>();
+        let mut knowledge_query = sim
+            .app
+            .world_mut()
+            .query::<&mut crate::simulation::knowledge::PersonKnowledge>();
         for mut k in knowledge_query.iter_mut(sim.app.world_mut()) {
             k.aware |= aware_bit;
         }

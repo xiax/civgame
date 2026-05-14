@@ -27,14 +27,14 @@ use crate::simulation::faction::{FactionMember, FactionRegistry};
 use crate::simulation::knowledge::PersonKnowledge;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::technology::{
-    TechId, TECH_COUNT, TECH_TREE, ANIMAL_HUSBANDRY, ARD_PLOW, BONE_TOOLS, BOW_AND_ARROW,
-    BRONZE_CASTING, BRONZE_TOOLS, BRONZE_WEAPONS, CITY_STATE_ORG, COPPER_TOOLS, COPPER_WORKING,
-    CROP_CULTIVATION, CUNEIFORM_WRITING, DOG_DOMESTICATION, DRIED_MEAT, DUGOUT_CANOE,
-    FERMENTATION, FIRE_MAKING, FIRED_POTTERY, FISHING, FLINT_KNAPPING, FOOD_SMOKING, GRANARY,
-    HORSE_TAMING, HORSEBACK_RIDING, HUNTING_SPEAR, IRRIGATION, LOG_RAFT, LONG_DIST_TRADE,
-    LOOM_WEAVING, LUNAR_CALENDAR, MICROLITHIC_TOOLS, MONUMENTAL_BUILDING, OCHRE_PAINTING,
-    OX_CART, PERM_SETTLEMENT, PORTABLE_DWELLINGS, POTTERS_WHEEL, PROFESSIONAL_ARMY,
-    SACRED_RITUAL, SADDLE_QUERN, SCALE_ARMOR, TALLY_MARKS, TIN_PROSPECTING, WAR_CHARIOT,
+    TechId, ANIMAL_HUSBANDRY, ARD_PLOW, BONE_TOOLS, BOW_AND_ARROW, BRONZE_CASTING, BRONZE_TOOLS,
+    BRONZE_WEAPONS, CITY_STATE_ORG, COPPER_TOOLS, COPPER_WORKING, CROP_CULTIVATION,
+    CUNEIFORM_WRITING, DOG_DOMESTICATION, DRIED_MEAT, DUGOUT_CANOE, FERMENTATION, FIRED_POTTERY,
+    FIRE_MAKING, FISHING, FLINT_KNAPPING, FOOD_SMOKING, GRANARY, HORSEBACK_RIDING, HORSE_TAMING,
+    HUNTING_SPEAR, IRRIGATION, LOG_RAFT, LONG_DIST_TRADE, LOOM_WEAVING, LUNAR_CALENDAR,
+    MICROLITHIC_TOOLS, MONUMENTAL_BUILDING, OCHRE_PAINTING, OX_CART, PERM_SETTLEMENT,
+    PORTABLE_DWELLINGS, POTTERS_WHEEL, PROFESSIONAL_ARMY, SACRED_RITUAL, SADDLE_QUERN, SCALE_ARMOR,
+    TALLY_MARKS, TECH_COUNT, TECH_TREE, TIN_PROSPECTING, WAR_CHARIOT,
 };
 
 pub const TICKS_PER_DAY: u32 = 3600;
@@ -183,10 +183,7 @@ pub struct PerTechCounts {
 /// bronze can still post a contract; a worker still needs `has_learned` to
 /// claim it.
 #[inline]
-pub fn can_direct_tech(
-    faction: &crate::simulation::faction::FactionData,
-    tech: TechId,
-) -> bool {
+pub fn can_direct_tech(faction: &crate::simulation::faction::FactionData, tech: TechId) -> bool {
     faction.techs.has(tech)
 }
 
@@ -286,9 +283,7 @@ pub fn derive_stage(
         AdoptionScale::Subsistence => {
             let households_used = recent_30d; // proxy: any recent use this season
             let threshold = ((adults as f32) * 0.30).ceil() as u32;
-            if broadly_learned
-                || (counts.learned >= 1 && households_used >= threshold)
-            {
+            if broadly_learned || (counts.learned >= 1 && households_used >= threshold) {
                 if adopted_long_enough && has_artifact {
                     AdoptionStage::Institutionalized
                 } else {
@@ -362,8 +357,7 @@ pub fn derive_stage(
             //       permanent-settlement know-how even without a stone
             //       wall yet). Without this, tiny test fixtures and
             //       early-game bands can never reach Adopted.
-            let civic_path =
-                chief_learned && prereqs_adopted && has_civic_building && scale_pop_ok;
+            let civic_path = chief_learned && prereqs_adopted && has_civic_building && scale_pop_ok;
             let broad_path = chief_learned && prereqs_adopted && broadly_learned;
             if civic_path || broad_path {
                 let preserved = has_artifact || counts.learned >= 2;
@@ -423,9 +417,12 @@ pub fn derive_tech_adoption_system(
     let mut per_faction: AHashMap<u32, (FactionMemberAggregate, [PerTechCounts; TECH_COUNT])> =
         AHashMap::new();
     for (fm, knowledge) in members_q.iter() {
-        let entry = per_faction
-            .entry(fm.faction_id)
-            .or_insert_with(|| (FactionMemberAggregate::default(), [PerTechCounts::default(); TECH_COUNT]));
+        let entry = per_faction.entry(fm.faction_id).or_insert_with(|| {
+            (
+                FactionMemberAggregate::default(),
+                [PerTechCounts::default(); TECH_COUNT],
+            )
+        });
         entry.0.members += 1;
         entry.0.adults += 1;
         for id in 0..TECH_COUNT as TechId {
@@ -442,7 +439,10 @@ pub fn derive_tech_adoption_system(
     for (fid, faction) in registry.factions.iter_mut() {
         let (agg, counts) = match per_faction.get(fid) {
             Some(v) => *v,
-            None => (FactionMemberAggregate::default(), [PerTechCounts::default(); TECH_COUNT]),
+            None => (
+                FactionMemberAggregate::default(),
+                [PerTechCounts::default(); TECH_COUNT],
+            ),
         };
         let chief_techs = faction.techs.0;
         let workshops_owned = workshops.workshops_for(*fid);
@@ -474,15 +474,9 @@ pub fn derive_tech_adoption_system(
                 .prerequisites
                 .iter()
                 .all(|&p| (new_stages[p as usize] as u8) >= (AdoptionStage::Adopted as u8));
-            let has_station = required_station(id)
-                .map(has_workshop)
-                .unwrap_or(true);
-            let has_civic = matches!(
-                scale,
-                AdoptionScale::Institutional,
-            ) && required_station(id)
-                .map(has_workshop)
-                .unwrap_or(true);
+            let has_station = required_station(id).map(has_workshop).unwrap_or(true);
+            let has_civic = matches!(scale, AdoptionScale::Institutional,)
+                && required_station(id).map(has_workshop).unwrap_or(true);
             let has_artifact = false; // Tablets / books not counted yet; future work.
             let recent = faction.recent_tech_use.get(&id);
             let stage_since = faction.stage_changed_at_tick[idx];
@@ -611,7 +605,10 @@ mod tests {
     use super::*;
 
     fn agg(members: u32) -> FactionMemberAggregate {
-        FactionMemberAggregate { members, adults: members }
+        FactionMemberAggregate {
+            members,
+            adults: members,
+        }
     }
 
     fn counts(learned: u32, aware: u32) -> PerTechCounts {
@@ -714,10 +711,19 @@ mod tests {
 
     #[test]
     fn step_down_walks_one_stage_at_a_time() {
-        assert_eq!(step_down(AdoptionStage::Institutionalized), AdoptionStage::Adopted);
+        assert_eq!(
+            step_down(AdoptionStage::Institutionalized),
+            AdoptionStage::Adopted
+        );
         assert_eq!(step_down(AdoptionStage::Adopted), AdoptionStage::Practiced);
-        assert_eq!(step_down(AdoptionStage::Practiced), AdoptionStage::Demonstrated);
-        assert_eq!(step_down(AdoptionStage::Demonstrated), AdoptionStage::Rumored);
+        assert_eq!(
+            step_down(AdoptionStage::Practiced),
+            AdoptionStage::Demonstrated
+        );
+        assert_eq!(
+            step_down(AdoptionStage::Demonstrated),
+            AdoptionStage::Rumored
+        );
         assert_eq!(step_down(AdoptionStage::Rumored), AdoptionStage::Unknown);
         assert_eq!(step_down(AdoptionStage::Unknown), AdoptionStage::Unknown);
     }

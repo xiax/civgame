@@ -73,8 +73,18 @@ pub fn migration_panel_system(
                     MigrationPhase::Surveying { .. } => "Surveying (AI)".to_string(),
                     MigrationPhase::PendingCommit { target, .. } =>
                         format!("Pending → ({}, {})", target.0, target.1),
-                    MigrationPhase::Walking { target } =>
-                        format!("Walking → ({}, {})", target.0, target.1),
+                    MigrationPhase::PackingCamp { target, .. } =>
+                        format!("Packing → ({}, {})", target.0, target.1),
+                    MigrationPhase::Traveling {
+                        target,
+                        caravan_tile,
+                        ..
+                    } => format!(
+                        "Traveling ({}, {}) → ({}, {})",
+                        caravan_tile.0, caravan_tile.1, target.0, target.1
+                    ),
+                    MigrationPhase::PitchingCamp { target, .. } =>
+                        format!("Pitching → ({}, {})", target.0, target.1),
                 }
             ));
             ui.label(format!("Intent: {}", faction.migration_intent.label()));

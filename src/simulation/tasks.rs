@@ -71,11 +71,9 @@ pub enum TaskKind {
     /// Mirrors `WithdrawMaterial` for the FactionTile path; reaches
     /// the executor by `take_from_member_task_system`.
     TakeFromMember = 42,
-    /// P1 (active migration): walking with the band toward the new
-    /// camp tile after `nomad_migration_commit_system` flipped the
-    /// faction's `home_tile`. Driven by `MigrationTarget` component
-    /// + `nomad_migration_dispatch_system` (ParallelB) +
-    /// `nomad_migration_arrival_system` (Sequential, after movement).
+    /// Active migration: walking with the caravan toward the final camp
+    /// target. `MigrationTarget.tile` remains final; temporary reroutes
+    /// live in `MigrationTarget.route_tile`.
     Migrate = 43,
     /// Worker walks adjacent to a `ConstructionObstacle`-tagged entity
     /// inside a blueprint's footprint, accumulates work_progress, then
@@ -242,6 +240,7 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::PickUpCorpse as u16
         || task_id == TaskKind::Butcher as u16
         || task_id == TaskKind::UnpitchStructure as u16
+        || task_id == TaskKind::UnloadCampCargo as u16
         || task_id == TaskKind::PitchStructureAt as u16
         || task_id == TaskKind::Heal as u16
         || task_id == TaskKind::Drink as u16
@@ -268,6 +267,9 @@ pub fn task_is_labor(task_id: u16) -> bool {
         || task_id == TaskKind::WithdrawMaterial as u16
         || task_id == TaskKind::HaulToCraftOrder as u16
         || task_id == TaskKind::WorkOnCraftOrder as u16
+        || task_id == TaskKind::UnpitchStructure as u16
+        || task_id == TaskKind::UnloadCampCargo as u16
+        || task_id == TaskKind::PitchStructureAt as u16
         || task_id == TaskKind::HaulCorpse as u16
         || task_id == TaskKind::Butcher as u16
 }
@@ -591,11 +593,7 @@ pub fn assign_task_with_routing(
                 if !(-1..=1).contains(&dz) {
                     return false;
                 }
-                chunk_connectivity.tile_reachable(
-                    chunk_graph,
-                    agent_tile_3d,
-                    (ntx, nty, nz as i8),
-                )
+                chunk_connectivity.tile_reachable(chunk_graph, agent_tile_3d, (ntx, nty, nz as i8))
             })
             .min_by_key(|&(ntx, nty)| (ntx - ax).abs() + (nty - ay).abs())
             .map(|(ntx, nty)| (ntx as i32, nty as i32));
@@ -746,8 +744,7 @@ pub fn goal_dispatch_system(
                     // non-hunter WithdrawMaterial/Equip chains still
                     // respect their own goal preserve-arms below.
                     _ if ai.task_id == TaskKind::WithdrawMaterial as u16
-                        && ai.reserved_resource
-                            == Some(crate::economy::core_ids::weapon()) =>
+                        && ai.reserved_resource == Some(crate::economy::core_ids::weapon()) =>
                     {
                         Some(TaskKind::WithdrawMaterial as u16)
                     }
@@ -813,8 +810,9 @@ pub fn goal_dispatch_system(
                     AgentGoal::Build if ai.task_id == TaskKind::ClearObstacle as u16 => {
                         Some(TaskKind::ClearObstacle as u16)
                     }
-                    // Pack labor: a worker dispatched to dismantle a
-                    // shelter must stay on the task across goal flips.
+                    // Pack/pitch labor: workers dispatched to dismantle,
+                    // unload, or re-pitch camp gear must stay on the task
+                    // across goal flips.
                     // `goal_update_system` may re-evaluate while the
                     // worker walks (hunger / sleep / mobile-gate
                     // demote) and `mobile_state_goal_gate_system`
@@ -824,6 +822,12 @@ pub fn goal_dispatch_system(
                     // worker carries.
                     _ if ai.task_id == TaskKind::UnpitchStructure as u16 => {
                         Some(TaskKind::UnpitchStructure as u16)
+                    }
+                    _ if ai.task_id == TaskKind::UnloadCampCargo as u16 => {
+                        Some(TaskKind::UnloadCampCargo as u16)
+                    }
+                    _ if ai.task_id == TaskKind::PitchStructureAt as u16 => {
+                        Some(TaskKind::PitchStructureAt as u16)
                     }
                     // Phase 5e-xiii-a: HTN-driven personal-blueprint chain
                     // (`WithdrawAndHaulToPersonalBlueprintMethod`) runs without

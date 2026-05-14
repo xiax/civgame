@@ -411,8 +411,19 @@ pub fn faction_hunter_assignment_system(
         return;
     }
 
-    for (entity, mut prof, _member, _skills, _agent, _carrier, _xf, _household, ai_opt, aq_opt, _knowledge) in
-        query.iter_mut()
+    for (
+        entity,
+        mut prof,
+        _member,
+        _skills,
+        _agent,
+        _carrier,
+        _xf,
+        _household,
+        ai_opt,
+        aq_opt,
+        _knowledge,
+    ) in query.iter_mut()
     {
         if promote.contains(&entity) {
             *prof = Profession::Hunter;
@@ -663,8 +674,7 @@ pub fn chief_craft_assignment_system(
             Profession::Crafter => {
                 *current_crafters.entry(member.faction_id).or_insert(0) += 1;
                 let crafting = skills.0[SkillKind::Crafting as usize];
-                if crafting
-                    >= crate::simulation::apprenticeship::MASTER_THRESHOLD
+                if crafting >= crate::simulation::apprenticeship::MASTER_THRESHOLD
                     && mentors_q.get(entity).is_err()
                 {
                     available_mentors
@@ -1941,11 +1951,11 @@ impl Default for CampState {
 
 /// Migration coarse phase. `Surveying` is the AI autopilot survey
 /// window (player factions never enter it — `nomad_autopilot` gates).
-/// `PendingCommit` is the AI's between-survey-and-commit slot. `Walking`
-/// is the post-commit "we just teleported to the new tile, members are
-/// catching up" tail; player flow uses `CampState::{Pitched, Packed}`
-/// only. Free-form player migration relies on Pack → wander → Pitch
-/// without going through this state machine.
+/// `PendingCommit` validates the final target before the camp is touched.
+/// AI factions then physically pack, travel, and pitch at the final
+/// destination; player flow uses `CampState::{Pitched, Packed}` only.
+/// Free-form player migration relies on Pack → wander → Pitch without
+/// going through this state machine.
 #[derive(Clone, Debug, Default)]
 pub enum MigrationPhase {
     #[default]
@@ -1959,8 +1969,24 @@ pub enum MigrationPhase {
         target: (i32, i32),
         chosen_tick: u32,
     },
-    Walking {
+    PackingCamp {
         target: (i32, i32),
+        old_home: (i32, i32),
+        started_tick: u32,
+        radius: i32,
+    },
+    Traveling {
+        target: (i32, i32),
+        old_home: (i32, i32),
+        departed_tick: u32,
+        caravan_tile: (i32, i32),
+    },
+    PitchingCamp {
+        target: (i32, i32),
+        old_home: (i32, i32),
+        started_tick: u32,
+        pitch_started_tick: u32,
+        repair_unlocked: bool,
     },
 }
 
@@ -2093,6 +2119,8 @@ pub struct CampCargoManifest {
     pub loaded: ahash::AHashMap<(Entity, crate::economy::resource_catalog::ResourceId), u32>,
     pub abandoned: Vec<(crate::economy::resource_catalog::ResourceId, u32)>,
     pub deployed: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
+    pub pitching_started_tick: Option<u32>,
+    pub repair_unlocked: bool,
 }
 
 impl CampCargoManifest {
@@ -2101,6 +2129,8 @@ impl CampCargoManifest {
             && self.loaded.is_empty()
             && self.abandoned.is_empty()
             && self.deployed.is_empty()
+            && self.pitching_started_tick.is_none()
+            && !self.repair_unlocked
     }
 
     pub fn total_loaded(&self) -> u32 {
@@ -2256,21 +2286,20 @@ pub struct FactionData {
     /// `RECENT_CAMP_RING_CAP` camp tiles + the tick they were vacated.
     /// `pick_migration_target` reads this for the recency penalty so a
     /// band doesn't oscillate between two known-good clusters when both
-    /// dry up. Pushed by `nomad_migration_commit_system` on every commit.
+    /// dry up. Pushed when an AI caravan starts pitching at the final
+    /// camp or when the player pitches manually.
     pub recent_camps: std::collections::VecDeque<((i32, i32), u32)>,
     /// Camp lifecycle state: shelters Pitched at `home_tile`, or fully
     /// Packed (mobile band). Settled factions remain `Pitched`. AI
-    /// nomadic factions pack+pitch atomically inside
+    /// nomadic factions progress through pack/travel/pitch phases in
     /// `nomad_migration_commit_system`; player-flow nomadic factions
     /// transition via `PlayerCommand::PackCamp` / `PitchCamp`.
     pub camp_state: CampState,
-    /// Unified migration state machine (Surveying → PendingCommit →
-    /// Traveling → Idle, with TemporaryCamp as an in-route halt).
-    /// Both AI (`nomad_autopilot == true`) and the player flow run
-    /// through this; AI auto-advances Surveying / commits / arrives
-    /// while a player-driven nomad stays in `Idle` until an explicit
-    /// command. The legacy `pending_migration` field mirrors
-    /// `PendingCommit.target` for back-compat readers.
+    /// Unified AI migration state machine (Surveying → PendingCommit →
+    /// PackingCamp → Traveling → PitchingCamp → Idle). Player-driven
+    /// nomads stay in `Idle` and use explicit Pack/Pitch commands. The
+    /// legacy `pending_migration` field mirrors the final target while
+    /// an AI migration is active.
     pub migration_phase: MigrationPhase,
     /// Phase 1: when true, the AI Surveying / commit pipeline drives
     /// the band autonomously. AI nomadic factions default to true;
@@ -3663,11 +3692,7 @@ mod tests {
             "raised tile must be reachable via the stair-step cross-chunk edge"
         );
         assert!(
-            !conn.tile_reachable(
-                &graph,
-                agent_tile,
-                (isolated_tile.0, isolated_tile.1, 0),
-            ),
+            !conn.tile_reachable(&graph, agent_tile, (isolated_tile.0, isolated_tile.1, 0),),
             "isolated chunk must be unreachable"
         );
 
@@ -3678,8 +3703,7 @@ mod tests {
         let mut stm = StorageTileMap::default();
         stm.tiles.insert(raised_tile, 7);
         stm.tiles.insert(isolated_tile, 7);
-        stm.by_faction
-            .insert(7, vec![raised_tile, isolated_tile]);
+        stm.by_faction.insert(7, vec![raised_tile, isolated_tile]);
 
         let picked =
             stm.nearest_for_faction_reachable(7, (5, 5), agent_tile, &chunk_map, &graph, &conn);

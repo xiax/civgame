@@ -173,9 +173,7 @@ pub fn tech_panel_system(
                                     );
                                 });
                                 if let Some((label, colour)) = chief_label {
-                                    ui.label(
-                                        egui::RichText::new(label).size(11.0).color(colour),
-                                    );
+                                    ui.label(egui::RichText::new(label).size(11.0).color(colour));
                                 }
 
                                 ui.separator();

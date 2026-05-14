@@ -626,8 +626,8 @@ pub fn job_payout_system(world: &mut World) {
                 if let Some(mentor_entity) = apprentice_mentor {
                     if mentor_pay > 0.0 && mentor_entity != beneficiary {
                         let mentor_credited = {
-                            if let Some(mut to_agent) = world
-                                .get_mut::<crate::economy::agent::EconomicAgent>(mentor_entity)
+                            if let Some(mut to_agent) =
+                                world.get_mut::<crate::economy::agent::EconomicAgent>(mentor_entity)
                             {
                                 to_agent.currency += mentor_pay;
                                 true
@@ -637,9 +637,7 @@ pub fn job_payout_system(world: &mut World) {
                         };
                         if mentor_credited {
                             paid_total += mentor_pay;
-                            if let Some(mut earnings) =
-                                world.get_mut::<Earnings>(mentor_entity)
-                            {
+                            if let Some(mut earnings) = world.get_mut::<Earnings>(mentor_entity) {
                                 earnings.push(EarningEntry {
                                     job_kind: ev.kind,
                                     target_rid: ev.target_rid,
@@ -658,19 +656,18 @@ pub fn job_payout_system(world: &mut World) {
                             }
                             let faction_id = ev.faction_id;
                             let kind = ev.kind;
-                            let mut events_log = world
-                                .resource_mut::<bevy::ecs::event::Events<
+                            let mut events_log =
+                                world.resource_mut::<bevy::ecs::event::Events<
                                     crate::ui::activity_log::ActivityLogEvent,
                                 >>();
                             events_log.send(crate::ui::activity_log::ActivityLogEvent {
                                 tick: now as u64,
                                 actor: mentor_entity,
                                 faction_id,
-                                kind:
-                                    crate::ui::activity_log::ActivityEntryKind::WagePaid {
-                                        amount: mentor_pay,
-                                        kind,
-                                    },
+                                kind: crate::ui::activity_log::ActivityEntryKind::WagePaid {
+                                    amount: mentor_pay,
+                                    kind,
+                                },
                             });
                         }
                     }
@@ -3237,11 +3234,11 @@ pub fn job_claim_system(
                 let expected_reward = p.reward * wealth_mod * disp_mod;
                 let c_action = dist * BID_DIST_DISCOUNT;
                 let c_opportunity = 0.0_f32; // R9 stub; R10+ wires this
-                // Phase 5a: Crafter claiming a Craft posting outscores
-                // an equidistant generalist via `CRAFTER_AFFINITY_BONUS`.
-                // Matches the unpaid-path `profession_bias` shape but
-                // sized for currency units (the unpaid path lives in
-                // skill-norm units).
+                                             // Phase 5a: Crafter claiming a Craft posting outscores
+                                             // an equidistant generalist via `CRAFTER_AFFINITY_BONUS`.
+                                             // Matches the unpaid-path `profession_bias` shape but
+                                             // sized for currency units (the unpaid path lives in
+                                             // skill-norm units).
                 let affinity_bonus = if matches!(profession, Profession::Crafter)
                     && matches!(p.kind, JobKind::Craft)
                 {
@@ -3263,9 +3260,7 @@ pub fn job_claim_system(
                 // which restores competitive parity when chief wage
                 // ≈ household reward.
                 let priority_bonus = (p.priority as f32) * 0.01;
-                expected_reward + affinity_bonus + priority_bonus
-                    - c_action
-                    - c_opportunity
+                expected_reward + affinity_bonus + priority_bonus - c_action - c_opportunity
             } else {
                 (p.priority as f32) * 0.01
                     + skill_norm

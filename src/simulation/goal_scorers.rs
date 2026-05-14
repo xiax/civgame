@@ -155,10 +155,9 @@ impl Default for InterruptPolicy {
 
 pub fn default_class_for_goal(goal: AgentGoal) -> GoalClass {
     match goal {
-        AgentGoal::Survive
-        | AgentGoal::Sleep
-        | AgentGoal::SeekCare
-        | AgentGoal::Drink => GoalClass::Survival,
+        AgentGoal::Survive | AgentGoal::Sleep | AgentGoal::SeekCare | AgentGoal::Drink => {
+            GoalClass::Survival
+        }
         AgentGoal::Raid
         | AgentGoal::Defend
         | AgentGoal::Rescue

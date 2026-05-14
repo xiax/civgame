@@ -473,18 +473,19 @@ impl Plugin for SimulationPlugin {
                     .before(construction::construction_system)
                     .in_set(SimulationSet::Sequential),
             )
-            // Part B: observable player Pack labor — worker walks to
-            // a Deployable, accumulates UNPITCH_WORK_TICKS, then
-            // despawns + transfers packed good into the worker's
-            // inventory. The continue system periodically re-dispatches
-            // idle PackingDuty members to the next remaining shelter,
-            // and strips PackingDuty when the camp is fully packed.
+            // Observable nomad pack/pitch labor — workers dismantle old
+            // camp structures, unload caravan cargo, then pitch minimal
+            // final-camp structures before the chief repairs the rest.
             .add_systems(
                 FixedUpdate,
                 (
                     nomad_pack_labor::unpitch_structure_task_system,
+                    nomad_pack_labor::unload_camp_cargo_task_system,
+                    nomad_pack_labor::pitch_structure_at_task_system,
                     nomad_pack_labor::continue_pack_labor_system
-                        .after(nomad_pack_labor::unpitch_structure_task_system),
+                        .after(nomad_pack_labor::unpitch_structure_task_system)
+                        .after(nomad_pack_labor::unload_camp_cargo_task_system)
+                        .after(nomad_pack_labor::pitch_structure_at_task_system),
                 )
                     .after(movement::movement_system)
                     .in_set(SimulationSet::Sequential),
@@ -728,8 +729,7 @@ impl Plugin for SimulationPlugin {
                         .after(nomad::apply_manual_scout_command_system),
                     nomad::apply_migration_intent_system
                         .after(nomad::manual_scout_completion_system),
-                    nomad::apply_packed_autonomy_system
-                        .after(nomad::apply_migration_intent_system),
+                    nomad::apply_packed_autonomy_system.after(nomad::apply_migration_intent_system),
                 )
                     .in_set(SimulationSet::Sequential),
             )

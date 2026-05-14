@@ -103,10 +103,7 @@ impl GameSpeed {
 
 /// PreUpdate: mirror `GameSpeed` onto `Time<Virtual>`. Only writes when
 /// `GameSpeed` changed this frame, so it's cheap to schedule every frame.
-pub fn sync_game_speed_to_virtual_time(
-    speed: Res<GameSpeed>,
-    mut vtime: ResMut<Time<Virtual>>,
-) {
+pub fn sync_game_speed_to_virtual_time(speed: Res<GameSpeed>, mut vtime: ResMut<Time<Virtual>>) {
     if !speed.is_changed() {
         return;
     }
@@ -193,12 +190,7 @@ pub fn fixed_tick_timing_end_system(
     if diag.recent_worst_window.len() > TIMING_WINDOW_CAP {
         diag.recent_worst_window.pop_front();
     }
-    diag.worst_tick_us_recent = diag
-        .recent_worst_window
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    diag.worst_tick_us_recent = diag.recent_worst_window.iter().copied().max().unwrap_or(0);
 }
 
 /// Per-render-frame: how many fixed ticks ran since the last Update? Bevy
@@ -286,7 +278,8 @@ mod tests {
         sim.tick_n(10);
         let after = sim.app.world().resource::<SimClock>().tick;
         assert_eq!(
-            after, baseline,
+            after,
+            baseline,
             "Paused: SimClock advanced by {} ticks (should be 0)",
             after - baseline
         );
@@ -393,4 +386,3 @@ mod tests {
         );
     }
 }
-

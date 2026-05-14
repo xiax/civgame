@@ -144,10 +144,7 @@ mod tests {
     use super::*;
 
     fn approx(a: f32, b: f32, eps: f32) {
-        assert!(
-            (a - b).abs() <= eps,
-            "expected {a} ≈ {b} (within {eps})"
-        );
+        assert!((a - b).abs() <= eps, "expected {a} ≈ {b} (within {eps})");
     }
 
     #[test]
@@ -194,7 +191,10 @@ mod tests {
         let mut prev = -0.01_f32;
         for h in 0..=255 {
             let v = hunger_utility(h as f32);
-            assert!(v >= prev - 1e-6, "hunger_utility regressed at {h}: {prev} → {v}");
+            assert!(
+                v >= prev - 1e-6,
+                "hunger_utility regressed at {h}: {prev} → {v}"
+            );
             prev = v;
         }
     }
@@ -218,7 +218,10 @@ mod tests {
         let normal = social_utility(150.0, 128);
         let gregarious = social_utility(150.0, 230);
         assert!(loner < normal, "loner {loner} should < normal {normal}");
-        assert!(normal < gregarious, "normal {normal} should < gregarious {gregarious}");
+        assert!(
+            normal < gregarious,
+            "normal {normal} should < gregarious {gregarious}"
+        );
         // Endpoints sane
         approx(social_utility(0.0, 128), 0.0, 0.05);
         approx(social_utility(255.0, 128), 1.0, 0.05);
@@ -262,5 +265,4 @@ mod tests {
         approx(disposition_lift(255, 1.0), 2.0, 1e-6);
         approx(disposition_lift(128, 1.0), 1.0 + 128.0 / 255.0, 1e-6);
     }
-
 }

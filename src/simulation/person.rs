@@ -425,7 +425,10 @@ pub fn spawn_population(
                 // Phase 1: player-driven nomadic factions take the
                 // manual command flow (Pack/Pitch + Scout + Route).
                 // AI nomadic factions keep autopilot on.
-                if matches!(options.lifestyle, crate::simulation::faction::Lifestyle::Nomadic) {
+                if matches!(
+                    options.lifestyle,
+                    crate::simulation::faction::Lifestyle::Nomadic
+                ) {
                     faction_data.nomad_autopilot = false;
                 }
             }

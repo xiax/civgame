@@ -1,4 +1,4 @@
-//! Part B: observable HTN slow-path for player-driven Pack Camp.
+//! Observable HTN slow-path for nomadic pack, unload, and pitch labor.
 //!
 //! When the player issues `PlayerCommand::PackCamp`, the band's
 //! `CampState` flips to `Packed` immediately (the goal gate stops
@@ -11,23 +11,27 @@
 //! and `unpitch_structure_task_system` then despawns the entity and
 //! drops its packed form (or refund) as `GroundItem`s at the tile.
 //! Members pick up the goods naturally via existing scavenge / pack
-//! animal AI as they migrate.
-//!
-//! AI factions still use the synchronous `pack_camp_assets_atomic`
-//! inside `nomad_migration_commit_system` so dormant LOD bands
-//! continue to migrate in one tick.
+//! animal AI as they migrate. AI autopilot migrations reuse the same
+//! pack labor during `MigrationPhase::PackingCamp`; the only special
+//! case is that campfires are also dismantled as no-cargo teardown.
 
 use bevy::ecs::system::SystemState;
 use bevy::prelude::*;
 
-use crate::simulation::camp::CampMap;
-use crate::simulation::construction::{Bed, BedMap, Campfire, CampfireMap, TentShelter};
+use crate::economy::resource_catalog::ResourceId;
+use crate::pathfinding::chunk_graph::ChunkGraph;
+use crate::pathfinding::chunk_router::ChunkRouter;
+use crate::pathfinding::connectivity::ChunkConnectivity;
+use crate::simulation::construction::{
+    Bed, BedMap, BuildSiteKind, Campfire, CampfireMap, ShelterTier, StructureLabel, TentShelter,
+};
 use crate::simulation::faction::{
     release_reservation, FactionMember, FactionRegistry, StorageReservations,
 };
 use crate::simulation::gather::spawn_ground_drop;
 use crate::simulation::gather_claims::{release_gather_claim, GatherClaims};
 use crate::simulation::goals::AgentGoal;
+use crate::simulation::items::GroundItem;
 use crate::simulation::jobs::{release_claimant, ClaimTarget, JobBoard, JobClaim};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::pack_deploy::Deployable;
@@ -35,17 +39,20 @@ use crate::simulation::person::{AiState, Drafted, Person, PersonAI};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::typed_task::{ActionQueue, Task};
-use crate::pathfinding::chunk_graph::ChunkGraph;
-use crate::pathfinding::chunk_router::ChunkRouter;
-use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::chunk_streaming::TileChangedEvent;
-use crate::world::terrain::TILE_SIZE;
+use crate::world::spatial::{Indexed, IndexedKind};
+use crate::world::terrain::{tile_to_world, TILE_SIZE};
 
 /// Work ticks each `UnpitchStructure` task accumulates before the
 /// structure despawns. ~2 seconds at 20 Hz feels like real labor
 /// without dragging the pack-up out unbearably for a 12-shelter camp.
 pub const UNPITCH_WORK_TICKS: u32 = 40;
+
+/// Work ticks for final-destination `PitchStructureAt` tasks. Kept equal
+/// to unpitching for now so a full caravan move has visible labor on
+/// both sides without making the destination setup crawl.
+pub const PITCH_WORK_TICKS: u32 = 40;
 
 /// Cadence for `continue_pack_labor_system`. Fires often enough that
 /// idle workers pick up the next shelter before they wander, but not
@@ -83,7 +90,7 @@ fn transform_tile(transform: &Transform) -> (i32, i32) {
     )
 }
 
-/// Snapshot of a Deployable structure that needs dismantling.
+/// Snapshot of a camp structure that needs dismantling.
 struct StructureToUnpitch {
     fid: u32,
     entity: Entity,
@@ -184,27 +191,37 @@ pub fn continue_pack_labor_system(world: &mut World) {
         return;
     }
 
-    // Collect every faction that's currently Packed (player flow).
+    // Collect every faction that's currently packing. Player flow is
+    // keyed on CampState::Packed; AI caravan flow is keyed on the
+    // explicit MigrationPhase::PackingCamp, even though CampState is
+    // also Packed for the duration.
     let packs: Vec<(u32, (i32, i32), i32)> = {
         let registry = world.resource::<FactionRegistry>();
         registry
             .factions
             .iter()
             .filter_map(|(&fid, f)| {
+                if let crate::simulation::faction::MigrationPhase::PackingCamp {
+                    old_home,
+                    radius,
+                    ..
+                } = f.migration_phase
+                {
+                    return Some((fid, old_home, radius));
+                }
                 if !matches!(
                     f.camp_state,
                     crate::simulation::faction::CampState::Packed { .. }
                 ) {
                     return None;
                 }
-                // Skip AI autopilot factions; they use the atomic
-                // pack pass during commit and never sit in `Packed`
-                // for long enough to need re-dispatch.
+                // AI autopilot factions are handled by PackingCamp
+                // above. A Packed AI faction outside that phase is
+                // either mid-pitch or recovering from a cancelled route.
                 if f.nomad_autopilot {
                     return None;
                 }
-                let adoption =
-                    crate::simulation::technology_adoption::community_adoption_bitset(f);
+                let adoption = crate::simulation::technology_adoption::community_adoption_bitset(f);
                 let era = crate::simulation::technology::current_era(&adoption);
                 let radius =
                     crate::simulation::construction::seed_nomadic_camp_extent(f.member_count, era);
@@ -216,31 +233,12 @@ pub fn continue_pack_labor_system(world: &mut World) {
         return;
     }
 
-    // Which factions still have Deployables in their pack radius?
-    let factions_done: Vec<u32> = {
-        let mut state: SystemState<Query<&Transform, With<Deployable>>> = SystemState::new(world);
-        let q = state.get(world);
-        let mut tiles_per_fid: ahash::AHashMap<u32, usize> = ahash::AHashMap::default();
-        for transform in q.iter() {
-            let tile = transform_tile(transform);
-            for &(fid, home, radius) in packs.iter() {
-                if chebyshev(tile, home) <= radius {
-                    *tiles_per_fid.entry(fid).or_insert(0) += 1;
-                    break;
-                }
-            }
-        }
-        packs
-            .iter()
-            .filter_map(|(fid, _, _)| {
-                if tiles_per_fid.get(fid).copied().unwrap_or(0) == 0 {
-                    Some(*fid)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    };
+    // Which factions still have pack targets in their pack radius?
+    let remaining_fids = pack_targets_remaining(world, &packs);
+    let factions_done: Vec<u32> = packs
+        .iter()
+        .filter_map(|(fid, _, _)| (!remaining_fids.contains(fid)).then_some(*fid))
+        .collect();
     if !factions_done.is_empty() {
         clear_pack_duty(world, &factions_done);
     }
@@ -259,7 +257,33 @@ pub fn continue_pack_labor_system(world: &mut World) {
     dispatch_unpitch_tasks(world, &remaining);
 }
 
-/// Dispatch a `Task::UnpitchStructure` for every Deployable found
+/// Return the set of faction ids that still have a pack target in their
+/// pack radius. Targets include all `Deployable` shelters plus campfires,
+/// which are no-cargo teardown for AI caravan moves.
+pub fn pack_targets_remaining(
+    world: &mut World,
+    packs: &[(u32, (i32, i32), i32)],
+) -> ahash::AHashSet<u32> {
+    if packs.is_empty() {
+        return ahash::AHashSet::default();
+    }
+    let mut state: SystemState<Query<&Transform, Or<(With<Deployable>, With<Campfire>)>>> =
+        SystemState::new(world);
+    let q = state.get(world);
+    let mut remaining: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    for transform in q.iter() {
+        let tile = transform_tile(transform);
+        for &(fid, home, radius) in packs.iter() {
+            if chebyshev(tile, home) <= radius {
+                remaining.insert(fid);
+                break;
+            }
+        }
+    }
+    remaining
+}
+
+/// Dispatch a `Task::UnpitchStructure` for every pack target found
 /// within `radius` of each pack anchor. Workers are picked by
 /// chebyshev distance to the structure; each worker may only be
 /// assigned one Unpitch task per pack episode (further structures go
@@ -272,8 +296,9 @@ pub fn dispatch_unpitch_tasks(world: &mut World, packs: &[(u32, (i32, i32), i32)
 
     // ── Snapshot structures ────────────────────────────────────────
     let structures: Vec<StructureToUnpitch> = {
-        let mut state: SystemState<Query<(Entity, &Transform), With<Deployable>>> =
-            SystemState::new(world);
+        let mut state: SystemState<
+            Query<(Entity, &Transform), Or<(With<Deployable>, With<Campfire>)>>,
+        > = SystemState::new(world);
         let q = state.get(world);
         let mut out = Vec::new();
         for (entity, transform) in q.iter() {
@@ -374,11 +399,7 @@ pub fn dispatch_unpitch_tasks(world: &mut World, packs: &[(u32, (i32, i32), i32)
         Res<ChunkGraph>,
         Res<ChunkRouter>,
         Res<ChunkConnectivity>,
-        Query<(
-            &mut PersonAI,
-            &mut ActionQueue,
-            &mut AgentGoal,
-        )>,
+        Query<(&mut PersonAI, &mut ActionQueue, &mut AgentGoal)>,
     )> = SystemState::new(world);
     let (chunk_map, chunk_graph, chunk_router, chunk_connectivity, mut q) = state.get_mut(world);
     for a in assignments.iter() {
@@ -423,10 +444,7 @@ pub fn unpitch_structure_task_system(
     mut bed_map: ResMut<BedMap>,
     mut campfire_map: ResMut<CampfireMap>,
     mut tile_changed: EventWriter<TileChangedEvent>,
-    deployable_q: Query<(&Transform, &Deployable)>,
-    bed_q: Query<&Bed>,
-    campfire_q: Query<&Campfire>,
-    tent_q: Query<&TentShelter>,
+    structure_q: Query<(&Transform, Option<&Deployable>, Has<Bed>, Has<Campfire>)>,
     mut workers: Query<
         (
             &mut PersonAI,
@@ -453,7 +471,7 @@ pub fn unpitch_structure_task_system(
             continue;
         };
         // Structure gone (raced or already despawned): clean exit.
-        let Ok((transform, deploy)) = deployable_q.get(structure) else {
+        let Ok((transform, deploy, is_bed, is_campfire)) = structure_q.get(structure) else {
             ai.state = AiState::Idle;
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
@@ -468,42 +486,42 @@ pub fn unpitch_structure_task_system(
         // inventory if they fit; spill to ground otherwise so the
         // band can scavenge as it moves.
         let tile = transform_tile(transform);
-        let mut stash_or_drop =
-            |commands: &mut Commands,
-             agent: &mut crate::economy::agent::EconomicAgent,
-             rid: crate::economy::resource_catalog::ResourceId,
-             qty: u32| {
-                let mut remaining = qty;
-                if remaining > 0 {
-                    let unfit = agent.add_resource(rid, remaining);
-                    remaining = unfit;
+        let stash_or_drop = |commands: &mut Commands,
+                             agent: &mut crate::economy::agent::EconomicAgent,
+                             rid: crate::economy::resource_catalog::ResourceId,
+                             qty: u32| {
+            let mut remaining = qty;
+            if remaining > 0 {
+                let unfit = agent.add_resource(rid, remaining);
+                remaining = unfit;
+            }
+            if remaining > 0 {
+                spawn_ground_drop(commands, tile.0, tile.1, rid, remaining);
+            }
+        };
+        if let Some(deploy) = deploy {
+            if let Some(packed_rid) = deploy.packed_form {
+                stash_or_drop(&mut commands, &mut agent, packed_rid, 1);
+            }
+            for (rid, qty) in deploy.packed_bundles.iter() {
+                stash_or_drop(&mut commands, &mut agent, *rid, *qty);
+            }
+            if deploy.packed_form.is_none() && deploy.packed_bundles.is_empty() {
+                if let Some((rid, qty)) = deploy.compute_refund_drop() {
+                    // Tent-style loose materials: drop on the ground rather
+                    // than stash. A wood pile isn't a packed shelter.
+                    spawn_ground_drop(&mut commands, tile.0, tile.1, rid, qty);
                 }
-                if remaining > 0 {
-                    spawn_ground_drop(commands, tile.0, tile.1, rid, remaining);
-                }
-            };
-        if let Some(packed_rid) = deploy.packed_form {
-            stash_or_drop(&mut commands, &mut agent, packed_rid, 1);
-        }
-        for (rid, qty) in deploy.packed_bundles.iter() {
-            stash_or_drop(&mut commands, &mut agent, *rid, *qty);
-        }
-        if deploy.packed_form.is_none() && deploy.packed_bundles.is_empty() {
-            if let Some((rid, qty)) = deploy.compute_refund_drop() {
-                // Tent-style loose materials: drop on the ground rather
-                // than stash. A wood pile isn't a packed shelter.
-                spawn_ground_drop(&mut commands, tile.0, tile.1, rid, qty);
             }
         }
 
         // ── Drop from maps if registered there.
-        if bed_q.get(structure).is_ok() {
+        if is_bed {
             bed_map.0.remove(&tile);
         }
-        if campfire_q.get(structure).is_ok() {
+        if is_campfire {
             campfire_map.0.remove(&tile);
         }
-        let _ = tent_q; // marker query — no map cleanup needed.
 
         commands.entity(structure).despawn_recursive();
         tile_changed.send(TileChangedEvent {
@@ -516,8 +534,196 @@ pub fn unpitch_structure_task_system(
         ai.work_progress = 0;
         aq.advance();
     }
+}
 
-    // Avoid unused-import warning when CampMap isn't actually queried;
-    // its presence here documents the intended faction-scope link.
-    let _ = std::marker::PhantomData::<CampMap>;
+/// Executor for `Task::UnloadCampCargo`. Members drop a small stack of
+/// carried camp cargo near the destination so the pitch workers can
+/// consume it from the ground.
+pub fn unload_camp_cargo_task_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    mut workers: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut crate::economy::agent::EconomicAgent,
+            &BucketSlot,
+            &LodLevel,
+        ),
+        With<Person>,
+    >,
+) {
+    for (mut ai, mut aq, mut agent, slot, lod) in workers.iter_mut() {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        if ai.state != AiState::Working || ai.task_id != TaskKind::UnloadCampCargo as u16 {
+            continue;
+        }
+        let Some((rid, qty, tile)) = aq.current.as_unload_camp_cargo() else {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.work_progress = 0;
+            aq.advance();
+            continue;
+        };
+        let removed = agent.remove_resource(rid, qty as u32);
+        if removed > 0 {
+            spawn_ground_drop(&mut commands, tile.0, tile.1, rid, removed);
+        }
+        ai.state = AiState::Idle;
+        ai.task_id = PersonAI::UNEMPLOYED;
+        ai.work_progress = 0;
+        aq.advance();
+    }
+}
+
+/// Executor for `Task::PitchStructureAt`. This is the slow final-camp
+/// setup path used by AI caravans: bedrolls and yurts consume their
+/// unloaded packed goods, while the basic campfire is a no-cargo labor
+/// placement at the final anchor.
+pub fn pitch_structure_at_task_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    mut bed_map: ResMut<BedMap>,
+    mut campfire_map: ResMut<CampfireMap>,
+    mut tile_changed: EventWriter<TileChangedEvent>,
+    mut ground_q: Query<(Entity, &Transform, &mut GroundItem)>,
+    mut workers: Query<(&mut PersonAI, &mut ActionQueue, &BucketSlot, &LodLevel), With<Person>>,
+) {
+    for (mut ai, mut aq, slot, lod) in workers.iter_mut() {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        if ai.state != AiState::Working || ai.task_id != TaskKind::PitchStructureAt as u16 {
+            continue;
+        }
+        let Some((kind, anchor)) = aq.current.as_pitch_structure_at() else {
+            ai.state = AiState::Idle;
+            ai.task_id = PersonAI::UNEMPLOYED;
+            ai.work_progress = 0;
+            aq.advance();
+            continue;
+        };
+        if (ai.work_progress as u32) < PITCH_WORK_TICKS {
+            continue;
+        }
+
+        let already_present = match kind {
+            BuildSiteKind::Bedroll | BuildSiteKind::Bed => bed_map.0.contains_key(&anchor),
+            BuildSiteKind::Campfire => campfire_map.0.contains_key(&anchor),
+            _ => false,
+        };
+        if already_present {
+            finish_pitch_worker(&mut ai, &mut aq);
+            continue;
+        }
+
+        let needs_good = match kind {
+            BuildSiteKind::Bedroll => Some(crate::economy::core_ids::bedroll()),
+            BuildSiteKind::Yurt => Some(crate::economy::core_ids::packed_yurt()),
+            BuildSiteKind::Campfire => None,
+            _ => None,
+        };
+        if let Some(rid) = needs_good {
+            if !consume_ground_resource_near(&mut commands, &mut ground_q, anchor, rid, 1) {
+                // Cargo has not arrived yet. Drop the task so the pitch
+                // dispatcher can reassign once a matching stack appears.
+                finish_pitch_worker(&mut ai, &mut aq);
+                continue;
+            }
+        }
+
+        let world_pos = tile_to_world(anchor.0, anchor.1);
+        match kind {
+            BuildSiteKind::Bedroll => {
+                let e = commands
+                    .spawn((
+                        Bed::default(),
+                        Deployable::fully_packable(crate::economy::core_ids::bedroll()),
+                        StructureLabel("Bedroll"),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                        Indexed::new(IndexedKind::Bed),
+                    ))
+                    .id();
+                bed_map.0.insert(anchor, e);
+            }
+            BuildSiteKind::Yurt => {
+                commands.spawn((
+                    TentShelter {
+                        tier: ShelterTier::Yurt,
+                    },
+                    Deployable::fully_packable(crate::economy::core_ids::packed_yurt()),
+                    StructureLabel("Yurt"),
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ));
+            }
+            BuildSiteKind::Campfire => {
+                let campfire = Campfire::default();
+                let label = campfire.tier.label();
+                let e = commands
+                    .spawn((
+                        campfire,
+                        StructureLabel(label),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id();
+                campfire_map.0.insert(anchor, e);
+            }
+            _ => {}
+        }
+        tile_changed.send(TileChangedEvent {
+            tx: anchor.0,
+            ty: anchor.1,
+        });
+        finish_pitch_worker(&mut ai, &mut aq);
+    }
+}
+
+fn finish_pitch_worker(ai: &mut PersonAI, aq: &mut ActionQueue) {
+    ai.state = AiState::Idle;
+    ai.task_id = PersonAI::UNEMPLOYED;
+    ai.work_progress = 0;
+    aq.advance();
+}
+
+fn consume_ground_resource_near(
+    commands: &mut Commands,
+    ground_q: &mut Query<(Entity, &Transform, &mut GroundItem)>,
+    anchor: (i32, i32),
+    rid: ResourceId,
+    qty: u32,
+) -> bool {
+    if qty == 0 {
+        return true;
+    }
+    let mut remaining = qty;
+    for (entity, transform, mut ground) in ground_q.iter_mut() {
+        if ground.item.resource_id != rid || ground.qty == 0 {
+            continue;
+        }
+        let tile = transform_tile(transform);
+        if chebyshev(tile, anchor) > 2 {
+            continue;
+        }
+        let take = remaining.min(ground.qty);
+        ground.qty -= take;
+        remaining -= take;
+        if ground.qty == 0 {
+            commands.entity(entity).despawn_recursive();
+        }
+        if remaining == 0 {
+            return true;
+        }
+    }
+    false
 }
