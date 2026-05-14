@@ -19,6 +19,7 @@ pub mod dig;
 pub mod doormat;
 pub mod drink;
 pub mod faction;
+pub mod farm;
 pub mod gather;
 pub mod gather_claims;
 pub mod goal_scorers;
@@ -207,6 +208,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(settlement::ZoneOverlayToggle::default())
             .insert_resource(land::PlotIndex::default())
             .insert_resource(land::LandListings::default())
+            .insert_resource(farm::FarmPlotAssignments::default())
             .insert_resource(military::ActiveRallyPoints::default())
             .insert_resource(military::MilitaryFormationGroupGen::default())
             .insert_resource(military::PendingFormationSlots::default())
@@ -269,6 +271,35 @@ impl Plugin for SimulationPlugin {
                     settlement::auto_found_default_settlements_system
                         .after(person::spawn_population)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Era-aware seeding priming: project the chief's
+                    // awareness onto `FactionData.techs`, derive the
+                    // community `tech_adoption` table, and ratchet
+                    // `Settlement.peak_population` from spawned
+                    // `member_count` — all *before* the survey + seed
+                    // pass reads them. Reuses the same Economy-schedule
+                    // systems (idempotent at tick 0) so OnEnter priming
+                    // and per-tick maintenance share one source of
+                    // truth.
+                    faction::sync_faction_techs_from_chief_system
+                        .after(person::spawn_population)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    technology_adoption::derive_tech_adoption_system
+                        .after(faction::sync_faction_techs_from_chief_system)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Founder-band override: at tick 0 the runtime
+                    // adoption gates (Specialist needs ≤8 members or
+                    // every adult Learned; Institutional needs a civic
+                    // building) reject Neolithic+ starts of typical
+                    // population sizes, leaving `PERM_SETTLEMENT` short
+                    // of `Adopted`. Force-stamp every era-prior
+                    // chief-Aware tech to `Adopted` so the seed pass
+                    // sees a competent civilization.
+                    technology_adoption::seed_prime_tech_adoption_system
+                        .after(technology_adoption::derive_tech_adoption_system)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    settlement::settlement_peak_population_system
+                        .after(settlement::auto_found_default_settlements_system)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     // Run a one-shot survey so `SettlementBrain` (parcels,
                     // road tiles, frontage_edge) exists before the seed
                     // pass picks house anchors. Unified-build-pipeline
@@ -276,6 +307,9 @@ impl Plugin for SimulationPlugin {
                     // runtime survey loop uses.
                     organic_settlement::kickoff_initial_survey_system
                         .after(settlement::auto_found_default_settlements_system)
+                        .after(technology_adoption::derive_tech_adoption_system)
+                        .after(technology_adoption::seed_prime_tech_adoption_system)
+                        .after(settlement::settlement_peak_population_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     construction::seed_starting_buildings_system
                         .after(person::spawn_population)
@@ -290,11 +324,19 @@ impl Plugin for SimulationPlugin {
                     clear_obstacle::clear_obstacles_under_seeded_structures
                         .after(construction::seed_starting_buildings_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Farm-planner §15: ensure every starting village has at
+                    // least one Agricultural plot + seed grain in storage so
+                    // farming can start on tick 1 instead of waiting for the
+                    // organic carve pipeline.
+                    farm::seed_starting_farms_system
+                        .after(construction::seed_starting_buildings_system)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     // Flip the warmup gate now that the initial survey +
                     // seed have applied. Future systems can opt in via
                     // `.run_if(in_state(SimulationState::Active))`.
                     mark_warmup_complete_system
                         .after(clear_obstacle::clear_obstacles_under_seeded_structures)
+                        .after(farm::seed_starting_farms_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                 ),
             )
@@ -1017,6 +1059,14 @@ impl Plugin for SimulationPlugin {
                     land::household_land_acquisition_system.after(land::land_listing_system),
                     land::rent_collection_system.after(land::household_land_acquisition_system),
                     land::evicted_plot_cleanup_system.after(land::rent_collection_system),
+                    // Farm plot ↔ farmer matching (chief mode). Runs after
+                    // plot carving so newly-carved Agricultural plots are
+                    // visible, and before chief_job_posting_system so that
+                    // system can read the assignments to post plot-scoped
+                    // Farm jobs.
+                    farm::chief_farm_plot_assignment_system
+                        .after(land::carve_plots_system)
+                        .before(jobs::chief_job_posting_system),
                     // Nomadic mode (Phase 8). Runs after storage rollup so
                     // the migration trigger reads fresh `faction.storage`
                     // numbers, and after household systems so a

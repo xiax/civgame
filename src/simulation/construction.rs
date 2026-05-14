@@ -20,7 +20,7 @@ use crate::simulation::technology::{
     current_era, Era, TechId, BRIDGE_BUILDING, BRONZE_CASTING, BRONZE_TOOLS, CITY_STATE_ORG,
     COPPER_TOOLS, COPPER_WORKING, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING, GRANARY,
     LONG_DIST_TRADE, LOOM_WEAVING, MONUMENTAL_BUILDING, PERM_SETTLEMENT, PORTABLE_DWELLINGS,
-    PROFESSIONAL_ARMY, SACRED_RITUAL,
+    PROFESSIONAL_ARMY, SACRED_RITUAL, TECH_TREE,
 };
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::{Calendar, Season};
@@ -957,6 +957,17 @@ pub fn best_hearth_for(techs: &FactionTechs) -> HearthTier {
     }
 }
 
+fn techs_through_era(era: Era) -> FactionTechs {
+    let mut techs = FactionTechs::default();
+    let era_rank = era as u8;
+    for def in TECH_TREE.iter() {
+        if (def.era as u8) <= era_rank {
+            techs.unlock(def.id);
+        }
+    }
+    techs
+}
+
 /// True if the faction has the tech needed for this wall material.
 pub fn faction_can_build(kind: BuildSiteKind, techs: &FactionTechs) -> bool {
     match recipe_for(kind).tech_gate {
@@ -1444,8 +1455,8 @@ fn find_unfilled_civic_zone_tile(
                 continue;
             }
             let mut best: Option<(i32, (i32, i32))> = None;
-            let zcx = (rect.x0 as i32 + rect.w as i32 / 2);
-            let zcy = (rect.y0 as i32 + rect.h as i32 / 2);
+            let zcx = rect.x0 as i32 + rect.w as i32 / 2;
+            let zcy = rect.y0 as i32 + rect.h as i32 / 2;
             for dy in 0..rect.h as i32 {
                 for dx in 0..rect.w as i32 {
                     let tx = rect.x0 as i32 + dx;
@@ -2490,6 +2501,7 @@ pub fn chief_directive_system(
                     &plot_index,
                     &plot_q,
                     peak_pop,
+                    None,
                 );
                 if brain_pending_first_survey {
                     candidates.retain(|c| {
@@ -2582,6 +2594,7 @@ fn generate_candidates(
     plot_index: &crate::simulation::land::PlotIndex,
     plot_q: &Query<&crate::simulation::land::Plot>,
     peak_pop: u32,
+    seed_techs: Option<&FactionTechs>,
 ) -> Vec<BuildCandidate> {
     let pending_of = |k: BuildSiteKind| -> u32 { pending_kinds.get(&k).copied().unwrap_or(0) };
     // Walls are tracked per-material (`Wall(Palisade)`, `Wall(Stone)`, …);
@@ -2604,9 +2617,11 @@ fn generate_candidates(
     // bronze beds for everyone. The local `techs` binding is the
     // adoption snapshot — every `techs.has(X)` below means "X is at
     // adoption stage ≥ Adopted across the village."
-    let community_techs =
-        crate::simulation::technology_adoption::community_adoption_bitset(faction);
+    let community_techs = seed_techs.cloned().unwrap_or_else(|| {
+        crate::simulation::technology_adoption::community_adoption_bitset(faction)
+    });
     let techs = &community_techs;
+    let seed_mode = seed_techs.is_some();
     let culture = &faction.culture;
     let wall_mat = best_wall_material(techs);
 
@@ -2822,12 +2837,12 @@ fn generate_candidates(
             } else {
                 roll_rng.f32() < 0.6
             };
-            // Small chance (10%) of an LShape farmstead alongside the
-            // Hut/Longhouse — only when bed_deficit is modest so we don't
-            // blow the budget on a fancy footprint while people sleep on
-            // the floor. The LShape candidate is added below if a 4×2 slot
-            // accepts it.
-            let try_lshape = bed_deficit >= 2.0 && bed_deficit < 4.0 && roll_rng.f32() < 0.10;
+            // Composite L-shapes are temporarily disabled for shelter
+            // auto-builds: the current 2×2 + 2×1 mask has no true interior
+            // cells, so `plan_composite_building` emits walls/door but no
+            // beds. Keep layout stable with huts/longhouses until the
+            // composite template grows a real room interior.
+            let try_lshape = false;
             if try_lshape {
                 // L-shape main block (2×2) + east extension (2×1) — 4×2
                 // bounding box. Use the bounding-box search to find a
@@ -3053,11 +3068,12 @@ fn generate_candidates(
         && count_granaries_near(&maps.granary_map, home, 25)
             + pending_of(BuildSiteKind::Granary) as usize
             == 0
-        && crate::simulation::civic_milestones::civic_milestone_allows(
-            crate::simulation::civic_milestones::CivicKind::Granary,
-            era,
-            peak_pop,
-        )
+        && (seed_mode
+            || crate::simulation::civic_milestones::civic_milestone_allows(
+                crate::simulation::civic_milestones::CivicKind::Granary,
+                era,
+                peak_pop,
+            ))
     {
         if let Some(tile) = find_clear_tile_in_zone(
             chunk_map,
@@ -3084,11 +3100,12 @@ fn generate_candidates(
         && count_shrines_near(&maps.shrine_map, home, 25)
             + pending_of(BuildSiteKind::Shrine) as usize
             == 0
-        && crate::simulation::civic_milestones::civic_milestone_allows(
-            crate::simulation::civic_milestones::CivicKind::Shrine,
-            era,
-            peak_pop,
-        )
+        && (seed_mode
+            || crate::simulation::civic_milestones::civic_milestone_allows(
+                crate::simulation::civic_milestones::CivicKind::Shrine,
+                era,
+                peak_pop,
+            ))
     {
         if let Some(tile) = find_clear_tile_in_zone(
             chunk_map,
@@ -3112,11 +3129,12 @@ fn generate_candidates(
 
     // 7. Market — LONG_DIST_TRADE + (era, peak_pop) milestone.
     if techs.has(LONG_DIST_TRADE)
-        && crate::simulation::civic_milestones::civic_milestone_allows(
-            crate::simulation::civic_milestones::CivicKind::Market,
-            era,
-            peak_pop,
-        )
+        && (seed_mode
+            || crate::simulation::civic_milestones::civic_milestone_allows(
+                crate::simulation::civic_milestones::CivicKind::Market,
+                era,
+                peak_pop,
+            ))
     {
         let target_count = if culture.mercantile > 180 { 2 } else { 1 };
         let market_count = count_markets_near(&maps.market_map, home, 25)
@@ -3148,11 +3166,12 @@ fn generate_candidates(
         && count_barracks_near(&maps.barracks_map, home, 25)
             + pending_of(BuildSiteKind::Barracks) as usize
             == 0
-        && crate::simulation::civic_milestones::civic_milestone_allows(
-            crate::simulation::civic_milestones::CivicKind::Barracks,
-            era,
-            peak_pop,
-        )
+        && (seed_mode
+            || crate::simulation::civic_milestones::civic_milestone_allows(
+                crate::simulation::civic_milestones::CivicKind::Barracks,
+                era,
+                peak_pop,
+            ))
     {
         if let Some(tile) = find_clear_tile_in_zone(
             chunk_map,
@@ -3179,11 +3198,12 @@ fn generate_candidates(
         && count_monuments_near(&maps.monument_map, home, 30)
             + pending_of(BuildSiteKind::Monument) as usize
             == 0
-        && crate::simulation::civic_milestones::civic_milestone_allows(
-            crate::simulation::civic_milestones::CivicKind::Monument,
-            era,
-            peak_pop,
-        )
+        && (seed_mode
+            || crate::simulation::civic_milestones::civic_milestone_allows(
+                crate::simulation::civic_milestones::CivicKind::Monument,
+                era,
+                peak_pop,
+            ))
     {
         if let Some(tile) = find_clear_tile_in_zone(
             chunk_map,
@@ -3333,6 +3353,180 @@ fn spawn_intent(
 /// at seed time — the runtime chief picks them up if conditions still hold.
 /// In practice they're rolled only ~10% on small bed deficits, so the seed
 /// loop usually picks Hut / Longhouse anyway.
+fn seed_single_tile_clear(
+    tile: (i32, i32),
+    used: &AHashSet<(i32, i32)>,
+    maps: &FurnitureMaps,
+    chunk_map: &ChunkMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
+) -> bool {
+    if used.contains(&tile) || doormat.is_reserved(tile) {
+        return false;
+    }
+    if !chunk_map.is_passable(tile.0, tile.1) {
+        return false;
+    }
+    let Some(k) = chunk_map.tile_kind_at(tile.0, tile.1) else {
+        return false;
+    };
+    if k == TileKind::Wall || k == TileKind::Stone || k == TileKind::Road {
+        return false;
+    }
+    !maps.bed_map.0.contains_key(&tile)
+        && !maps.wall_map.0.contains_key(&tile)
+        && !maps.campfire_map.0.contains_key(&tile)
+        && !maps.door_map.0.contains_key(&tile)
+        && !maps.workbench_map.0.contains_key(&tile)
+        && !maps.loom_map.0.contains_key(&tile)
+        && !maps.table_map.0.contains_key(&tile)
+        && !maps.chair_map.0.contains_key(&tile)
+        && !maps.granary_map.0.contains_key(&tile)
+        && !maps.shrine_map.0.contains_key(&tile)
+        && !maps.market_map.0.contains_key(&tile)
+        && !maps.barracks_map.0.contains_key(&tile)
+        && !maps.monument_map.0.contains_key(&tile)
+        && !maps.bridge_map.0.contains_key(&tile)
+}
+
+fn find_clear_seed_single_tile(
+    anchor: (i32, i32),
+    used: &AHashSet<(i32, i32)>,
+    maps: &FurnitureMaps,
+    chunk_map: &ChunkMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
+    max_radius: i32,
+) -> Option<(i32, i32)> {
+    for ring in 0..=max_radius {
+        for dy in -ring..=ring {
+            for dx in -ring..=ring {
+                if dx.abs().max(dy.abs()) != ring {
+                    continue;
+                }
+                let tile = (anchor.0 + dx, anchor.1 + dy);
+                if seed_single_tile_clear(tile, used, maps, chunk_map, doormat) {
+                    return Some(tile);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn seed_house_footprint_clear(
+    anchor: (i32, i32),
+    used: &AHashSet<(i32, i32)>,
+    maps: &FurnitureMaps,
+    chunk_map: &ChunkMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
+    half_w: i32,
+    half_h: i32,
+) -> bool {
+    for dy in -half_h..=half_h {
+        for dx in -half_w..=half_w {
+            let tile = (anchor.0 + dx, anchor.1 + dy);
+            if !seed_single_tile_clear(tile, used, maps, chunk_map, doormat) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn seed_walled_house_or_nearby(
+    commands: &mut Commands,
+    maps: &mut FurnitureMaps,
+    chunk_map: &mut ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    anchor: (i32, i32),
+    half_w: i32,
+    half_h: i32,
+    interior_beds: &[(i32, i32)],
+    wall_material: WallMaterial,
+    faction_id: u32,
+    home: (i32, i32),
+    door_dir: Option<crate::simulation::land::TileEdge>,
+    doormat: &mut crate::simulation::doormat::DoormatReservations,
+    road_carve: &mut RoadCarveQueue,
+    seed_techs: &FactionTechs,
+) -> Option<(i32, i32)> {
+    if seed_walled_house_at(
+        commands,
+        maps,
+        chunk_map,
+        tile_changed,
+        used,
+        anchor.0,
+        anchor.1,
+        half_w,
+        half_h,
+        interior_beds,
+        wall_material,
+        faction_id,
+        home,
+        door_dir,
+        doormat,
+        road_carve,
+        seed_techs,
+    ) {
+        return Some(anchor);
+    }
+
+    // `generate_candidates` is shared with runtime planning and cannot see the
+    // seed pass's transient `used` reservations. On real terrain, this can
+    // produce a good-looking residential anchor that fails to stamp because a
+    // freshly-seeded yard, doormat, or failed candidate already claimed part of
+    // it. Keep the startup capacity goal moving by searching outward from that
+    // planned anchor and using the normal verified house stamper at the first
+    // nearby footprint that actually works.
+    const SEED_HOUSE_RELOCATE_RADIUS: i32 = 24;
+    for ring in 1..=SEED_HOUSE_RELOCATE_RADIUS {
+        for dy in -ring..=ring {
+            for dx in -ring..=ring {
+                if dx.abs().max(dy.abs()) != ring {
+                    continue;
+                }
+                let candidate = (anchor.0 + dx, anchor.1 + dy);
+                if blocks_cardinal_corridor(candidate.0, candidate.1, half_w, half_h, home) {
+                    continue;
+                }
+                if !seed_house_footprint_clear(
+                    candidate, used, maps, chunk_map, doormat, half_w, half_h,
+                ) {
+                    continue;
+                }
+                let (_, spread) =
+                    footprint_z_stats(chunk_map, candidate.0, candidate.1, half_w, half_h);
+                if spread > MAX_TERRAFORM_SPREAD {
+                    continue;
+                }
+                if seed_walled_house_at(
+                    commands,
+                    maps,
+                    chunk_map,
+                    tile_changed,
+                    used,
+                    candidate.0,
+                    candidate.1,
+                    half_w,
+                    half_h,
+                    interior_beds,
+                    wall_material,
+                    faction_id,
+                    home,
+                    None,
+                    doormat,
+                    road_carve,
+                    seed_techs,
+                ) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn seed_apply_intent(
     commands: &mut Commands,
     maps: &mut FurnitureMaps,
@@ -3346,36 +3540,41 @@ fn seed_apply_intent(
     intent: BuildIntent,
     tile: (i32, i32),
     door_dir: Option<crate::simulation::land::TileEdge>,
-) -> bool {
+    seed_techs: &FactionTechs,
+) -> Option<(i32, i32)> {
     match intent {
         BuildIntent::Single(kind) => {
-            // Refuse if the tile is already used (kind-specific footprint
-            // should be free; the candidate generator gates on its own
-            // count_X helper but seed loop also feeds `used` so we don't
-            // restamp a structure on top of itself).
-            if used.contains(&tile) {
-                return false;
-            }
+            // Seed candidate generation is intentionally shared with the
+            // runtime chief and cannot see the per-faction `used` set. If the
+            // selected civic anchor is the reserved home tile or another
+            // freshly-stamped seed tile, nudge the single-tile structure to the
+            // nearest valid neighbor instead of starving the rest of the seed
+            // loop on the same high-score candidate.
+            let Some(place_tile) =
+                find_clear_seed_single_tile(tile, used, maps, chunk_map, doormat, 8)
+            else {
+                return None;
+            };
             spawn_seeded_structure_at_tile(
                 commands,
                 maps,
                 chunk_map,
                 tile_changed,
                 used,
-                tile,
+                place_tile,
                 faction_id,
                 kind,
+                seed_techs,
             );
-            true
+            Some(place_tile)
         }
-        BuildIntent::Hut(wall_mat) => seed_walled_house_at(
+        BuildIntent::Hut(wall_mat) => seed_walled_house_or_nearby(
             commands,
             maps,
             chunk_map,
             tile_changed,
             used,
-            tile.0,
-            tile.1,
+            (tile.0, tile.1),
             1,
             1,
             &[(0, 0)],
@@ -3385,15 +3584,15 @@ fn seed_apply_intent(
             door_dir,
             doormat,
             road_carve,
+            seed_techs,
         ),
-        BuildIntent::Longhouse(wall_mat) => seed_walled_house_at(
+        BuildIntent::Longhouse(wall_mat) => seed_walled_house_or_nearby(
             commands,
             maps,
             chunk_map,
             tile_changed,
             used,
-            tile.0,
-            tile.1,
+            (tile.0, tile.1),
             2,
             1,
             &[(-1, 0), (1, 0)],
@@ -3403,6 +3602,7 @@ fn seed_apply_intent(
             door_dir,
             doormat,
             road_carve,
+            seed_techs,
         ),
         BuildIntent::PalisadeSegment(wall_mat, _) => seed_apply_wall_tile(
             commands,
@@ -3413,14 +3613,15 @@ fn seed_apply_intent(
             doormat,
             tile,
             wall_mat,
-        ),
+        )
+        .then_some(tile),
         BuildIntent::CompositeHouse { .. } => {
             // Seed defers composite footprints to the runtime chief — the
             // shape-aware door picker in `plan_composite_building` needs
             // blueprint-aware tile checks, and the candidate is rare
             // enough at seed time (10% roll on modest bed deficit) that
             // skipping it loses ~zero variety.
-            false
+            None
         }
     }
 }
@@ -3831,6 +4032,35 @@ fn pick_clear_door_cardinal(
     preferred: crate::simulation::land::TileEdge,
     home: (i32, i32),
 ) -> Option<(crate::simulation::land::TileEdge, (i32, i32), (i32, i32))> {
+    pick_clear_door_cardinal_filtered(
+        chunk_map,
+        bed_map,
+        bp_map,
+        doormat,
+        centre,
+        half_w,
+        half_h,
+        preferred,
+        home,
+        |_| false,
+    )
+}
+
+fn pick_clear_door_cardinal_filtered<F>(
+    chunk_map: &ChunkMap,
+    bed_map: &BedMap,
+    bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
+    centre: (i32, i32),
+    half_w: i32,
+    half_h: i32,
+    preferred: crate::simulation::land::TileEdge,
+    home: (i32, i32),
+    extra_blocked: F,
+) -> Option<(crate::simulation::land::TileEdge, (i32, i32), (i32, i32))>
+where
+    F: Fn((i32, i32)) -> bool,
+{
     use crate::simulation::land::TileEdge;
     let cardinals = [
         TileEdge::North,
@@ -3843,6 +4073,9 @@ fn pick_clear_door_cardinal(
         let door_tile = (centre.0 + entrance_offset.0, centre.1 + entrance_offset.1);
         let (dx, dy) = e.delta();
         let dm = (door_tile.0 + dx, door_tile.1 + dy);
+        if extra_blocked(dm) {
+            return None;
+        }
         if !doormat_tile_clear(chunk_map, bed_map, bp_map, doormat, dm) {
             return None;
         }
@@ -4442,6 +4675,11 @@ pub fn construction_system(
             let (tx, ty) = (tile.0 as i32, tile.1 as i32);
 
             let world_pos = tile_to_world(tx, ty);
+            let build_techs = registry
+                .factions
+                .get(&bp.faction_id)
+                .map(crate::simulation::technology_adoption::community_adoption_bitset)
+                .unwrap_or_default();
             let result_entity: Entity = match bp.kind {
                 BuildSiteKind::Wall(material) => {
                     let surf_z = bp.target_z as i32;
@@ -4483,7 +4721,10 @@ pub fn construction_system(
                     wall_entity
                 }
                 BuildSiteKind::Bed => {
-                    let bed = Bed::default();
+                    let bed = Bed {
+                        owner: None,
+                        tier: best_bed_for(&build_techs),
+                    };
                     let label = bed.tier.label();
                     let bed_entity = commands
                         .spawn((
@@ -4574,7 +4815,9 @@ pub fn construction_system(
                     e
                 }
                 BuildSiteKind::Campfire => {
-                    let campfire = Campfire::default();
+                    let campfire = Campfire {
+                        tier: best_hearth_for(&build_techs),
+                    };
                     let label = campfire.tier.label();
                     let campfire_entity = commands
                         .spawn((
@@ -4610,7 +4853,7 @@ pub fn construction_system(
                     let door = Door {
                         faction_id: bp.faction_id,
                         open: false,
-                        tier: DoorTier::default(),
+                        tier: best_door_for(&build_techs),
                         dir: door_edge,
                         doormat_tile,
                     };
@@ -4661,7 +4904,7 @@ pub fn construction_system(
                 BuildSiteKind::Workbench => {
                     let wb = Workbench {
                         faction_id: bp.faction_id,
-                        tier: WorkbenchTier::default(),
+                        tier: best_workbench_for(&build_techs),
                     };
                     let label = wb.tier.label();
                     let e = commands
@@ -5699,7 +5942,6 @@ pub(crate) fn next_clear_tile(
     None
 }
 
-
 /// Stamp a single-tile structure at an explicit tile (caller has already
 /// resolved placement via plan / brain / seed loop). Mirrors the body of
 /// `spawn_seeded_structure` but skips the radial `pick_seed_tile` search.
@@ -5714,13 +5956,17 @@ fn spawn_seeded_structure_at_tile(
     tile: (i32, i32),
     faction_id: u32,
     kind: BuildSiteKind,
+    seed_techs: &FactionTechs,
 ) {
     used.insert(tile);
     let world_pos = tile_to_world(tile.0, tile.1);
 
     match kind {
         BuildSiteKind::Bed => {
-            let bed = Bed::default();
+            let bed = Bed {
+                owner: None,
+                tier: best_bed_for(seed_techs),
+            };
             let label = bed.tier.label();
             let e = commands
                 .spawn((
@@ -5786,7 +6032,9 @@ fn spawn_seeded_structure_at_tile(
             ));
         }
         BuildSiteKind::Campfire => {
-            let campfire = Campfire::default();
+            let campfire = Campfire {
+                tier: best_hearth_for(seed_techs),
+            };
             let label = campfire.tier.label();
             let e = commands
                 .spawn((
@@ -5803,7 +6051,7 @@ fn spawn_seeded_structure_at_tile(
         BuildSiteKind::Workbench => {
             let wb = Workbench {
                 faction_id,
-                tier: WorkbenchTier::default(),
+                tier: best_workbench_for(seed_techs),
             };
             let label = wb.tier.label();
             let e = commands
@@ -5941,7 +6189,6 @@ fn spawn_seeded_structure_at_tile(
     });
 }
 
-
 /// Per-faction starting structures, dispatched on `OnEnter(GameState::Playing)`
 /// after `spawn_population`. Reads `GameStartOptions::era` and
 /// `GameStartOptions::seed_buildings` (sandbox mode disables seeding).
@@ -5973,6 +6220,7 @@ pub fn seed_starting_buildings_system(
     }
 
     let era = options.era;
+    let seed_techs = techs_through_era(era);
     let hearth_tier = match era {
         Era::Paleolithic | Era::Mesolithic => HearthTier::Open,
         Era::Neolithic => HearthTier::Ringed,
@@ -6115,7 +6363,7 @@ pub fn seed_starting_buildings_system(
         const MAX_SEED_ITERATIONS: u32 = 512;
         let mut last_progress_iter: u32 = 0;
         for iter in 0..MAX_SEED_ITERATIONS {
-            let candidates = generate_candidates(
+            let mut candidates = generate_candidates(
                 faction_id,
                 faction,
                 plan_ref,
@@ -6127,64 +6375,76 @@ pub fn seed_starting_buildings_system(
                 &plot_index,
                 &plot_q,
                 peak_pop,
+                Some(&seed_techs),
             );
-            let Some(best) = candidates.into_iter().max_by(|a, b| {
-                a.score
-                    .partial_cmp(&b.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }) else {
+            if candidates.is_empty() {
                 break;
-            };
-            let intent = best.intent;
-            let tile = best.tile;
-            let door_dir = best.door_dir;
-            let applied = seed_apply_intent(
-                &mut commands,
-                &mut maps,
-                &mut chunk_map,
-                &mut tile_changed,
-                &mut used,
-                &mut doormat_reservations,
-                &mut road_carve_queue,
-                faction_id,
-                home,
-                intent,
-                tile,
-                door_dir,
-            );
-            if applied {
-                last_progress_iter = iter;
-                // Farmstead yard for residential footprints. Yards bump
-                // fertility on adjacent tiles and reserve them in `used`
-                // so the next iteration's footprint search avoids them.
-                let (half_w, half_h) = match intent {
-                    BuildIntent::Hut(_) => (1, 1),
-                    BuildIntent::Longhouse(_) => (2, 1),
-                    _ => (0, 0),
-                };
-                if half_w > 0 {
-                    let yard_side = if (era as u8) >= (Era::BronzeAge as u8) {
-                        3
-                    } else {
-                        2
+            }
+            candidates.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let mut applied_any = false;
+            for best in candidates {
+                let intent = best.intent;
+                let tile = best.tile;
+                let door_dir = best.door_dir;
+                let applied_tile = seed_apply_intent(
+                    &mut commands,
+                    &mut maps,
+                    &mut chunk_map,
+                    &mut tile_changed,
+                    &mut used,
+                    &mut doormat_reservations,
+                    &mut road_carve_queue,
+                    faction_id,
+                    home,
+                    intent,
+                    tile,
+                    door_dir,
+                    &seed_techs,
+                );
+                if let Some(applied_tile) = applied_tile {
+                    applied_any = true;
+                    last_progress_iter = iter;
+                    // Farmstead yard for residential footprints. Yards bump
+                    // fertility on adjacent tiles and reserve them in `used`
+                    // so the next iteration's footprint search avoids them.
+                    let (half_w, half_h) = match intent {
+                        BuildIntent::Hut(_) => (1, 1),
+                        BuildIntent::Longhouse(_) => (2, 1),
+                        _ => (0, 0),
                     };
-                    seed_farmstead_yard(
-                        &mut chunk_map,
-                        &mut tile_changed,
-                        &mut used,
-                        &doormat_reservations,
-                        tile.0,
-                        tile.1,
-                        half_w,
-                        half_h,
-                        yard_side,
-                        yard_side,
-                    );
+                    if half_w > 0 {
+                        let yard_side = if (era as u8) >= (Era::BronzeAge as u8) {
+                            3
+                        } else {
+                            2
+                        };
+                        seed_farmstead_yard(
+                            &mut chunk_map,
+                            &mut tile_changed,
+                            &mut used,
+                            &doormat_reservations,
+                            applied_tile.0,
+                            applied_tile.1,
+                            half_w,
+                            half_h,
+                            yard_side,
+                            yard_side,
+                        );
+                    }
+                    break;
                 }
-            } else {
-                // Mark tile as used so the next generate_candidates call
-                // doesn't re-emit the same blocked anchor and stall.
+                // Mark tile as used so lower-priority candidates in this pass
+                // and the next generate_candidates call can make progress away
+                // from a blocked anchor.
                 used.insert(tile);
+            }
+
+            if !applied_any {
                 // Stall guard: 32 consecutive no-progress iterations means
                 // generate_candidates is stuck on blocked anchors with no
                 // path forward. Bail.
@@ -6195,7 +6455,6 @@ pub fn seed_starting_buildings_system(
         }
     }
 }
-
 
 /// Place a fully-built walled house at `(cx, cy)` with `half_w × half_h`
 /// footprint, mirroring `plan_building`'s perimeter+entrance+interior-beds
@@ -6221,6 +6480,7 @@ fn seed_walled_house_at(
     door_dir: Option<crate::simulation::land::TileEdge>,
     doormat: &mut crate::simulation::doormat::DoormatReservations,
     road_carve: &mut RoadCarveQueue,
+    seed_techs: &FactionTechs,
 ) -> bool {
     // Pre-flight: every tile in the footprint must be clear (passable, not a
     // wall/stone/road, not already used, not reserved as another building's
@@ -6255,7 +6515,7 @@ fn seed_walled_house_at(
     // than placing nothing.
     let preferred_edge =
         door_dir.unwrap_or_else(|| crate::simulation::land::TileEdge::toward((cx, cy), home));
-    let Some((door_edge, entrance, _planned_doormat)) = pick_clear_door_cardinal(
+    let Some((door_edge, entrance, _planned_doormat)) = pick_clear_door_cardinal_filtered(
         chunk_map,
         &maps.bed_map,
         // seeded path has no blueprint map at hand — pass an empty one. The
@@ -6268,6 +6528,7 @@ fn seed_walled_house_at(
         half_h,
         preferred_edge,
         home,
+        |tile| used.contains(&tile),
     ) else {
         return false;
     };
@@ -6296,7 +6557,7 @@ fn seed_walled_house_at(
                 let door = Door {
                     faction_id,
                     open: false,
-                    tier: DoorTier::default(),
+                    tier: best_door_for(seed_techs),
                     dir: door_edge,
                     doormat_tile,
                 };
@@ -6359,7 +6620,10 @@ fn seed_walled_house_at(
                 maps.wall_map.0.insert(tile, e);
             }
             BuildSiteKind::Bed => {
-                let bed = Bed::default();
+                let bed = Bed {
+                    owner: None,
+                    tier: best_bed_for(seed_techs),
+                };
                 let label = bed.tier.label();
                 let e = commands
                     .spawn((
@@ -6392,8 +6656,6 @@ fn seed_walled_house_at(
     }
     true
 }
-
-
 
 /// Stamp a `yard_w × yard_h` patch of `Farmland` tiles adjacent to the
 /// house centred at `(cx, cy)` with `half_w × half_h` footprint. The yard
@@ -6865,7 +7127,6 @@ fn seed_paleo_beds_around_hearth(
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

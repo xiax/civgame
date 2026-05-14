@@ -177,8 +177,10 @@ pub fn land_policy_for(preset: crate::game_state::EconomyPreset) -> LandPolicy {
 ///
 /// - `Subsistence`: leave the map empty — every resource falls through to
 ///   the all-communist default (today's pre-pluralist behaviour).
-/// - `Mixed`: insert `mixed()` (chief + private both allowed) for every
-///   non-staple resource. Wood, Stone, and edibles stay communal.
+/// - `Mixed`: insert `mixed()` (chief + private both allowed) for **every**
+///   resource, including staples. Chief postings still fire on state-owned
+///   plots; private actors (farmer households on their own cropland) work
+///   alongside via `FarmWorkScorer`.
 /// - `Market`: insert `capitalist()` for every catalog resource.
 pub fn apply_preset(
     map: &mut ahash::AHashMap<ResourceId, ResourceControlPolicy>,
@@ -189,12 +191,7 @@ pub fn apply_preset(
     match preset {
         EconomyPreset::Subsistence => {}
         EconomyPreset::Mixed => {
-            let wood = crate::economy::core_ids::wood();
-            let stone = crate::economy::core_ids::stone();
             for (id, _def) in catalog.iter() {
-                if id == wood || id == stone || id.is_edible() {
-                    continue;
-                }
                 map.insert(id, ResourceControlPolicy::mixed());
             }
         }
@@ -259,5 +256,37 @@ mod tests {
         let p = land_policy_for(crate::game_state::EconomyPreset::Market);
         assert!(p.state_sells_land);
         assert!(p.private_freehold_allowed);
+    }
+
+    #[test]
+    fn mixed_preset_applies_mixed_policy_to_grain_and_other_staples() {
+        // Mixed preset must enable private_actors_allowed for grain/wood/stone/edibles
+        // so private farmer households can work their own plots while the chief
+        // continues to allocate on state-owned plots. (Pre-farm-planner behaviour
+        // skipped these resources entirely.)
+        let catalog = crate::economy::resource_catalog::load_resource_catalog();
+        crate::economy::core_ids::install_catalog(catalog.clone());
+        let mut map = ahash::AHashMap::new();
+        apply_preset(
+            &mut map,
+            crate::game_state::EconomyPreset::Mixed,
+            &catalog,
+        );
+        let grain = crate::economy::core_ids::grain();
+        let wood = crate::economy::core_ids::wood();
+        let stone = crate::economy::core_ids::stone();
+        for id in [grain, wood, stone] {
+            let p = map.get(&id).copied().unwrap_or_default();
+            assert!(
+                p.private_actors_allowed,
+                "Mixed preset must allow private actors for staple {:?}",
+                id
+            );
+            assert!(
+                p.chief_allocates_labor,
+                "Mixed preset still allocates labor via chief for staple {:?}",
+                id
+            );
+        }
     }
 }

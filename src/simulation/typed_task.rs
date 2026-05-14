@@ -383,7 +383,14 @@ pub enum Task {
     /// `GatherFromKnownMethod` produces the variant in unit tests, but no
     /// dispatcher consumes the typed channel yet — the legacy `GatherWood` /
     /// `GatherStone` plans (PlanId 2/3) remain authoritative.
-    DepositToFactionStorage { resource_id: ResourceId },
+    /// Optional `target_faction_id` overrides the default routing (which uses
+    /// the actor's own faction's storage map). Set to `Some(household_id)` for
+    /// private farm harvest so crops land in the household's storage tile
+    /// rather than village storage. `None` preserves legacy behaviour.
+    DepositToFactionStorage {
+        resource_id: ResourceId,
+        target_faction_id: Option<u32>,
+    },
     /// Walk to a random reachable tile near the agent's faction home, hoping
     /// to record a `MemoryKind::{kind}` sighting along the way. Produced by
     /// `ExploreForFoodMethod` (under `AcquireFood`) and `ExploreForMaterialMethod`
@@ -929,7 +936,20 @@ impl Task {
     /// typed task records what the chain produced for inspection.
     pub fn as_deposit_to_faction_storage(&self) -> Option<ResourceId> {
         match *self {
-            Task::DepositToFactionStorage { resource_id } => Some(resource_id),
+            Task::DepositToFactionStorage { resource_id, .. } => Some(resource_id),
+            _ => None,
+        }
+    }
+
+    /// Like `as_deposit_to_faction_storage` but also returns the override
+    /// faction id (private farm harvests route to the household sub-faction's
+    /// storage tile when this is `Some`).
+    pub fn as_deposit_to_faction_storage_full(&self) -> Option<(ResourceId, Option<u32>)> {
+        match *self {
+            Task::DepositToFactionStorage {
+                resource_id,
+                target_faction_id,
+            } => Some((resource_id, target_faction_id)),
             _ => None,
         }
     }

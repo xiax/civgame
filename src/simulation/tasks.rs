@@ -541,6 +541,42 @@ pub fn find_nearest_unplanted_farmland(
     best
 }
 
+/// Plot-scoped variant of `find_nearest_unplanted_farmland`. Walks every tile
+/// inside `(x0, y0, w, h)` and returns the unplanted-farmable tile closest
+/// (Manhattan) to `from`. Used by farm-planner §11 so chief-posted plot Farm
+/// jobs only plant inside the assigned plot's rect, not on random nearby grass.
+pub fn find_nearest_unplanted_in_rect(
+    chunk_map: &ChunkMap,
+    plant_map: &PlantMap,
+    from: (i32, i32),
+    rect_min: (i32, i32),
+    rect_max: (i32, i32),
+) -> Option<(i32, i32)> {
+    let mut best: Option<(i32, i32)> = None;
+    let mut best_dist = i32::MAX;
+    for ty in rect_min.1..=rect_max.1 {
+        for tx in rect_min.0..=rect_max.0 {
+            if plant_map.0.contains_key(&(tx, ty)) {
+                continue;
+            }
+            let plantable = match chunk_map.tile_kind_at(tx, ty) {
+                Some(TileKind::Grass) => true,
+                Some(k) if k.is_soil_like() => true,
+                _ => false,
+            };
+            if !plantable {
+                continue;
+            }
+            let dist = (tx - from.0).abs() + (ty - from.1).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best = Some((tx, ty));
+            }
+        }
+    }
+    best
+}
+
 pub fn assign_task_with_routing(
     ai: &mut PersonAI,
     cur_tile: (i32, i32),

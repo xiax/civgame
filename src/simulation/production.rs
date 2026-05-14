@@ -163,18 +163,26 @@ pub fn production_system(
                             plant_kind,
                             GrowthStage::Seed,
                         );
-                        // Stamp ownership on the new plant. Household member
-                        // → household-owned; chief Farm posting → faction-owned;
-                        // unhoused private planter → personal. Wild reseed
-                        // (plants.rs:overripe path) leaves no LandClaim → Public.
+                        // Chief Farm posting takes precedence even for household
+                        // members — otherwise a household member working a
+                        // chief-posted communal plot would silently steal the
+                        // crop for the household. Cascade order:
+                        //   1. JobClaim::Farm → Faction-owned
+                        //   2. HouseholdMember (private planting) → Household
+                        //   3. unhoused → Person
+                        // Wild reseed (plants.rs:overripe) leaves no LandClaim → Public.
                         if let Some(plant_entity) = spawned {
-                            let owner = if let Some(hm) = household_member {
+                            let on_farm_job = matches!(
+                                claim_opt.map(|c| c.kind),
+                                Some(JobKind::Farm),
+                            );
+                            let owner = if on_farm_job && faction_member.is_some() {
+                                crate::simulation::shared_knowledge::ResourceOwner::Faction(
+                                    faction_member.unwrap().faction_id,
+                                )
+                            } else if let Some(hm) = household_member {
                                 crate::simulation::shared_knowledge::ResourceOwner::Household(
                                     hm.household_id,
-                                )
-                            } else if let (Some(_), Some(fm)) = (claim_opt, faction_member) {
-                                crate::simulation::shared_knowledge::ResourceOwner::Faction(
-                                    fm.faction_id,
                                 )
                             } else {
                                 crate::simulation::shared_knowledge::ResourceOwner::Person(actor)

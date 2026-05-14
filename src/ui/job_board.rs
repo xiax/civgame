@@ -426,6 +426,8 @@ fn build_player_posting(
                 min: (home_tile.0 - radius, home_tile.1 - radius),
                 max: (home_tile.0 + radius, home_tile.1 + radius),
             },
+            plot_id: None,
+            assigned_farmer: None,
         },
         JobKind::Craft => JobProgress::Crafting {
             crafted: 0,

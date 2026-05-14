@@ -244,7 +244,8 @@ pub enum AbstractTask {
     /// Farmer under `AgentGoal::Farm` harvests a remembered mature edible
     /// plant (Grain / BerryBush) and deposits the harvest at faction storage.
     /// Single expansion `[Task::Gather { tile },
-    /// Task::DepositToFactionStorage { resource_id }]`. Replaces the legacy
+    /// Task::DepositToFactionStorage { resource_id, target_faction_id: None }]`.
+    /// Replaces the legacy
     /// `FarmFood` plan (PlanId 1) + `[StepId(1) FarmFarmland, StepId(12)
     /// DepositGoods]`. The companion `htn_plant_from_storage_dispatch_system`
     /// owns the planting half of `AgentGoal::Farm`; together they retire the
@@ -1858,7 +1859,10 @@ impl Method for GatherFromKnownMethod {
         };
         vec![
             Task::Gather { tile },
-            Task::DepositToFactionStorage { resource_id },
+            Task::DepositToFactionStorage {
+                resource_id,
+                target_faction_id: None,
+            },
         ]
     }
 
@@ -1956,7 +1960,10 @@ impl Method for ScavengeFromGroundMethod {
         }
         vec![
             Task::Scavenge { target },
-            Task::DepositToFactionStorage { resource_id },
+            Task::DepositToFactionStorage {
+                resource_id,
+                target_faction_id: None,
+            },
         ]
     }
 
@@ -2192,7 +2199,10 @@ impl Method for ScavengeFoodForStorageMethod {
         };
         vec![
             Task::Scavenge { target },
-            Task::DepositToFactionStorage { resource_id },
+            Task::DepositToFactionStorage {
+                resource_id,
+                target_faction_id: None,
+            },
         ]
     }
 
@@ -2318,9 +2328,9 @@ impl Method for ForageFromKnownForStorageMethod {
             return false;
         }
         // Need both the harvest tile (head Task::Gather { tile }) and the
-        // good (trailing Task::DepositToFactionStorage { good }). Without
-        // the good the chain can't be expressed in typed form, even though
-        // the deposit executor itself is parameterless.
+        // good (trailing Task::DepositToFactionStorage { good, target_faction_id: None }).
+        // Without the good the chain can't be expressed in typed form, even
+        // though the deposit executor itself is parameterless.
         ctx.gather_target_tile.is_some() && ctx.forage_food_good.is_some()
     }
 
@@ -2340,7 +2350,10 @@ impl Method for ForageFromKnownForStorageMethod {
         };
         vec![
             Task::Gather { tile },
-            Task::DepositToFactionStorage { resource_id },
+            Task::DepositToFactionStorage {
+                resource_id,
+                target_faction_id: None,
+            },
         ]
     }
 
@@ -2471,7 +2484,7 @@ impl Method for WithdrawAndEquipHuntingSpearMethod {
 }
 
 /// Sole method for `AbstractTask::ReturnSurplus`. Single-leg expansion
-/// `[Task::DepositToFactionStorage { resource_id: <picked food> }]` — the
+/// `[Task::DepositToFactionStorage { resource_id: <picked food>, target_faction_id: None }]` — the
 /// agent is holding food from a foraging trip and walks back to faction
 /// storage to drop it off. The `resource_id` payload is informational (the
 /// `drop_items_at_destination_system` executor dumps everything in hands +
@@ -2506,7 +2519,10 @@ impl Method for DepositSurplusAtStorageMethod {
         let Some(resource_id) = ctx.scavenge_food_good else {
             return Vec::new();
         };
-        vec![Task::DepositToFactionStorage { resource_id }]
+        vec![Task::DepositToFactionStorage {
+            resource_id,
+            target_faction_id: None,
+        }]
     }
 
     fn name(&self) -> &'static str {
@@ -4779,7 +4795,7 @@ pub fn htn_acquire_good_dispatch_system(
                     }
                 }
 
-                // Push the trailing `Task::DepositToFactionStorage { good }`
+                // Push the trailing `Task::DepositToFactionStorage { good, target_faction_id: None }`
                 // (and any future tail) onto the prefetch ring. After
                 // `gather_system` (or `item_pickup_system` for the scavenge
                 // chain) finishes the head, its exit handoff promotes the
@@ -5052,7 +5068,7 @@ pub fn htn_acquire_good_dispatch_system(
 ///    `ExploreForFoodForStorageMethod` (0.3) is the fallback.
 /// 3. Route the head `Task::Scavenge { target }` (or `Task::Explore { kind }`)
 ///    via `assign_task_with_routing` and `aq.dispatch` it. Push the trailing
-///    `Task::DepositToFactionStorage { good }` (if any) onto the prefetch
+///    `Task::DepositToFactionStorage { good, target_faction_id: None }` (if any) onto the prefetch
 ///    ring.
 ///
 /// The chain handoff is shared with the AcquireGood scavenge branch:
@@ -5499,7 +5515,7 @@ pub fn htn_stockpile_food_dispatch_system(
                 }
                 Task::Gather { tile: gather_tile } => {
                     // Forage dispatch under StockpileFood. The trailing leg
-                    // is `Task::DepositToFactionStorage { good }`; the existing
+                    // is `Task::DepositToFactionStorage { good, target_faction_id: None }`; the existing
                     // `finish_gather` exit handoff routes to the nearest
                     // faction storage tile and primes
                     // `TaskKind::DepositResource`.
@@ -6163,7 +6179,10 @@ pub fn htn_return_surplus_dispatch_system(
             }
             let head = tasks.remove(0);
             match head {
-                Task::DepositToFactionStorage { resource_id } => {
+                Task::DepositToFactionStorage {
+                    resource_id,
+                    target_faction_id,
+                } => {
                     let dispatched = assign_task_with_routing(
                         &mut ai,
                         (cur_tx, cur_ty),
@@ -6181,7 +6200,10 @@ pub fn htn_return_surplus_dispatch_system(
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
                         return;
                     }
-                    aq.dispatch(Task::DepositToFactionStorage { resource_id });
+                    aq.dispatch(Task::DepositToFactionStorage {
+                        resource_id,
+                        target_faction_id,
+                    });
                 }
                 _ => {
                     ai.active_method = None;
@@ -6415,6 +6437,15 @@ pub fn htn_tame_horse_dispatch_system(
 /// method's `tech_gate`). The dispatcher runs after `htn_tame_horse_dispatch_system`
 /// in ParallelB; it doesn't compete with food/haul/scout/spear/return-surplus
 /// dispatchers because Farm is a distinct goal arena.
+/// Bundle of farm-planner inputs read by `htn_plant_from_storage_dispatch_system`
+/// to keep the outer signature under Bevy's 16-param ceiling.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct FarmPlantingPlotParams<'w, 's> {
+    pub board: Res<'w, crate::simulation::jobs::JobBoard>,
+    pub plot_index: Res<'w, crate::simulation::land::PlotIndex>,
+    pub plot_q: Query<'w, 's, &'static crate::simulation::land::Plot>,
+}
+
 pub fn htn_plant_from_storage_dispatch_system(
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
@@ -6428,6 +6459,7 @@ pub fn htn_plant_from_storage_dispatch_system(
     spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<SimClock>,
     item_query: Query<&crate::simulation::items::GroundItem>,
+    farm_plot_params: FarmPlantingPlotParams,
     mut query: Query<
         (
             &mut PersonAI,
@@ -6438,15 +6470,16 @@ pub fn htn_plant_from_storage_dispatch_system(
             &FactionMember,
             &LodLevel,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
+            Option<&crate::simulation::jobs::JobClaim>,
         ),
         Without<Drafted>,
     >,
 ) {
     use crate::simulation::plants::PlantKind;
-    use crate::simulation::tasks::find_nearest_unplanted_farmland;
+    use crate::simulation::tasks::{find_nearest_unplanted_farmland, find_nearest_unplanted_in_rect};
     const VIEW_RADIUS: i32 = 15;
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, goal, transform, member, lod, knowledge_opt) in
+    for (mut ai, mut aq, mut history, goal, transform, member, lod, knowledge_opt, claim_opt) in
         query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -6534,12 +6567,66 @@ pub fn htn_plant_from_storage_dispatch_system(
             continue;
         };
 
-        // Find nearest unplanted farmland tile near the agent. Reuses the
-        // legacy resolver from `tasks.rs` so behaviour matches the dead plans'
-        // `StepTarget::NearestTile(GRASS_TILES)` override.
-        let Some(plant_tile) =
-            find_nearest_unplanted_farmland(&chunk_map, &plant_map, (cur_tx, cur_ty), VIEW_RADIUS)
-        else {
+        // Farm-planner §11: when the worker holds a plot-scoped Farm
+        // posting (chief-assigned plot), restrict the planting search to
+        // that plot's rect so they don't wander to a closer tile outside
+        // the assigned area. Falls through to the radius search for
+        // bootstrap (`plot_id = None`) and non-Farm goals.
+        let plot_scope: Option<((i32, i32), (i32, i32))> = claim_opt.and_then(|c| {
+            if !matches!(c.kind, crate::simulation::jobs::JobKind::Farm) {
+                return None;
+            }
+            // Lookup posting by id on the worker's faction's board.
+            let postings = farm_plot_params
+                .board
+                .faction_postings(c.faction_id);
+            let posting = postings.iter().find(|p| p.id == c.job_id)?;
+            let (plot_id, area) =
+                if let crate::simulation::jobs::JobProgress::Planting {
+                    plot_id,
+                    area,
+                    ..
+                } = posting.progress
+                {
+                    (plot_id, area)
+                } else {
+                    return None;
+                };
+            // Prefer the plot's actual rect (in case the area drifted)
+            // but fall back to the posting's snapshot.
+            if let Some(pid) = plot_id {
+                if let Some(&plot_ent) = farm_plot_params.plot_index.by_id.get(&pid) {
+                    if let Ok(plot) = farm_plot_params.plot_q.get(plot_ent) {
+                        return Some((
+                            (plot.rect.x0, plot.rect.y0),
+                            (
+                                plot.rect.x0 + plot.rect.w as i32 - 1,
+                                plot.rect.y0 + plot.rect.h as i32 - 1,
+                            ),
+                        ));
+                    }
+                }
+            }
+            Some((area.min, area.max))
+        });
+
+        let plant_tile = if let Some((rmin, rmax)) = plot_scope {
+            find_nearest_unplanted_in_rect(
+                &chunk_map,
+                &plant_map,
+                (cur_tx, cur_ty),
+                rmin,
+                rmax,
+            )
+        } else {
+            find_nearest_unplanted_farmland(
+                &chunk_map,
+                &plant_map,
+                (cur_tx, cur_ty),
+                VIEW_RADIUS,
+            )
+        };
+        let Some(plant_tile) = plant_tile else {
             continue;
         };
 
@@ -8836,7 +8923,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
 /// Single-method registry under `AbstractTaskKind::WorkOnCraftOrder` —
 /// dispatcher fires only when at least one satisfied order exists, so there
 /// are no siblings to outrank. Expansion is `[Task::WorkOnCraftOrder { order
-/// }, Task::DepositToFactionStorage { resource_id: output }]`. The trailing
+/// }, Task::DepositToFactionStorage { resource_id: output, target_faction_id: None }]`. The trailing
 /// deposit chain handoff lives in `craft_order_system`'s completion path —
 /// after `aq.advance()` promotes the queued deposit, the system routes the
 /// agent to the nearest faction storage tile and primes
@@ -8874,6 +8961,7 @@ impl Method for WorkOnSatisfiedCraftOrderMethod {
             Task::WorkOnCraftOrder { order },
             Task::DepositToFactionStorage {
                 resource_id: output,
+                target_faction_id: None,
             },
         ]
     }
@@ -8899,7 +8987,7 @@ impl Method for WorkOnSatisfiedCraftOrderMethod {
 /// Routes via `assign_task_with_routing(... TaskKind::WorkOnCraftOrder,
 /// Some(order) ...)` to the order's `anchor_tile` and dispatches the head
 /// `Task::WorkOnCraftOrder { order }`; the trailing
-/// `Task::DepositToFactionStorage { resource_id: output }` rides the prefetch
+/// `Task::DepositToFactionStorage { resource_id: output, target_faction_id: None }` rides the prefetch
 /// ring. The chain handoff lives in `craft_order_system`'s completion path:
 /// after producing the output and calling `aq.advance()`, if the new
 /// `current` is a `DepositToFactionStorage`, route to the nearest faction
@@ -9407,7 +9495,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
 /// legacy `FarmFood` plan (PlanId 1) — the last live legacy plan.
 ///
 /// `forage_food_good` carries the plant's primary harvest yield so the trailing
-/// `Task::DepositToFactionStorage { resource_id }` reflects what's about to land
+/// `Task::DepositToFactionStorage { resource_id, target_faction_id: None }` reflects what's about to land
 /// in the agent's hands (informational — the deposit executor itself dumps
 /// everything in inventory regardless). Utility is `UTIL_BASELINE` (1.0) with a
 /// full-trip distance discount across agent → plant → storage when both ctx tiles
@@ -9438,7 +9526,10 @@ impl Method for HarvestMaturePlantForStorageMethod {
         };
         vec![
             Task::Gather { tile },
-            Task::DepositToFactionStorage { resource_id },
+            Task::DepositToFactionStorage {
+                resource_id,
+                target_faction_id: None,
+            },
         ]
     }
 
@@ -11405,7 +11496,8 @@ mod tests {
             vec![
                 Task::Gather { tile: (6, 9) },
                 Task::DepositToFactionStorage {
-                    resource_id: crate::economy::core_ids::wood()
+                    resource_id: crate::economy::core_ids::wood(),
+                    target_faction_id: None,
                 },
             ]
         );
@@ -11437,7 +11529,8 @@ mod tests {
             vec![
                 Task::Gather { tile: (0, 0) },
                 Task::DepositToFactionStorage {
-                    resource_id: crate::economy::core_ids::wood()
+                    resource_id: crate::economy::core_ids::wood(),
+                    target_faction_id: None,
                 },
             ]
         );
@@ -11446,7 +11539,8 @@ mod tests {
             vec![
                 Task::Gather { tile: (0, 0) },
                 Task::DepositToFactionStorage {
-                    resource_id: crate::economy::core_ids::stone()
+                    resource_id: crate::economy::core_ids::stone(),
+                    target_faction_id: None,
                 },
             ]
         );
@@ -11591,8 +11685,8 @@ mod tests {
             tasks,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage {
-                    resource_id: crate::economy::core_ids::wood()
+                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::wood(),
+                    target_faction_id: None,
                 },
             ]
         );
@@ -11623,8 +11717,8 @@ mod tests {
             wood,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage {
-                    resource_id: crate::economy::core_ids::wood()
+                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::wood(),
+                    target_faction_id: None,
                 },
             ]
         );
@@ -11632,8 +11726,8 @@ mod tests {
             stone,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage {
-                    resource_id: crate::economy::core_ids::stone()
+                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::stone(),
+                    target_faction_id: None,
                 },
             ]
         );
@@ -12742,8 +12836,8 @@ mod tests {
             tasks,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage {
-                    resource_id: crate::economy::core_ids::fruit()
+                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::fruit(),
+                    target_faction_id: None,
                 },
             ]
         );
@@ -12773,8 +12867,8 @@ mod tests {
             fruit,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage {
-                    resource_id: crate::economy::core_ids::fruit()
+                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::fruit(),
+                    target_faction_id: None,
                 },
             ]
         );
@@ -12782,8 +12876,8 @@ mod tests {
             meat,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage {
-                    resource_id: crate::economy::core_ids::meat()
+                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::meat(),
+                    target_faction_id: None,
                 },
             ]
         );
@@ -13051,8 +13145,8 @@ mod tests {
             tasks,
             vec![
                 Task::Gather { tile: (6, 9) },
-                Task::DepositToFactionStorage {
-                    resource_id: crate::economy::core_ids::fruit()
+                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::fruit(),
+                    target_faction_id: None,
                 },
             ]
         );
@@ -13077,15 +13171,15 @@ mod tests {
         );
         assert_eq!(
             m.expand(AbstractTask::StockpileFood, &grain_ctx).last(),
-            Some(&Task::DepositToFactionStorage {
-                resource_id: crate::economy::core_ids::grain()
-            })
+            Some(&Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::grain(),
+                    target_faction_id: None,
+                })
         );
         assert_eq!(
             m.expand(AbstractTask::StockpileFood, &fruit_ctx).last(),
-            Some(&Task::DepositToFactionStorage {
-                resource_id: crate::economy::core_ids::fruit()
-            })
+            Some(&Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::fruit(),
+                    target_faction_id: None,
+                })
         );
     }
 

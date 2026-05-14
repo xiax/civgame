@@ -1016,6 +1016,43 @@ impl GoalScorer for ProvideCareScorer {
     }
 }
 
+/// Subsistence-class scorer for private (non-chief-allocated) farming.
+/// Fires when a `Profession::Farmer` worker's faction has flipped grain to
+/// `private_actors_allowed=true` (Mixed / Market presets). The actual
+/// "do you have seeds / mature crops on your plot" check happens at HTN
+/// dispatch time — the scorer just nominates `AgentGoal::Farm` so the
+/// dispatcher gets a chance to plan.
+pub struct FarmWorkScorer;
+
+impl GoalScorer for FarmWorkScorer {
+    fn score(&self, ctx: &GoalScoringContext) -> Option<GoalScore> {
+        if !matches!(ctx.profession, Profession::Farmer) {
+            return None;
+        }
+        // Private farming is gated on grain's `private_actors_allowed`.
+        // Communal villages still fall through chief Farm postings via the
+        // claim system; this scorer is the *self-directed* path.
+        let policy = ctx
+            .faction
+            .policy_for(crate::economy::core_ids::grain());
+        if !policy.private_actors_allowed {
+            return None;
+        }
+        // Score: comfortably above generic stockpile (0.85) but below
+        // survival/subsistence crisis scorers.
+        Some(GoalScore::new(
+            AgentGoal::Farm,
+            GoalClass::Subsistence,
+            0.90,
+            "Private Farmer Working Plot",
+        ))
+    }
+
+    fn name(&self) -> &'static str {
+        "FarmWorkScorer"
+    }
+}
+
 /// Convenience: install the default scorer set on a `GoalScorerRegistry`.
 /// Phase 6's `EarnIncomeScorer` plus Phase B's behavioural-richness
 /// scorers. Consumed by `goal_update_system` (the only goal-selection
@@ -1031,6 +1068,10 @@ pub fn register_default_scorers(registry: &mut GoalScorerRegistry) {
     registry.scorers.push(Box::new(TameHorseScorer));
     registry.scorers.push(Box::new(PersonalBuildScorer));
     registry.scorers.push(Box::new(CraftDemandScorer));
+    // Farm-planner §10: register before StockpileScorer so a private farmer
+    // defaults to working their own plot rather than wandering off to chief
+    // postings (survival scorers still preempt via class precedence).
+    registry.scorers.push(Box::new(FarmWorkScorer));
     registry.scorers.push(Box::new(StockpileScorer));
     registry.scorers.push(Box::new(HealNeedScorer));
     registry.scorers.push(Box::new(ProvideCareScorer));

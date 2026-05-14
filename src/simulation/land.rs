@@ -213,7 +213,29 @@ impl LandListings {
 /// so a faction with hundreds of carved plots doesn't dump all of them
 /// at once. The affordability ratios stop a household from blowing its
 /// entire treasury on housing in one tick.
+///
+/// Pre-farm-planner this was a single global cap (8) shared across all
+/// zone kinds, which let agricultural plots crowd out residential when
+/// they triple-listed (Sale + Lease + Sharecrop). Now per-zone so each
+/// market track gets its own budget — counted by `plot_id`, not row, so
+/// one plot triple-listing still consumes only one slot.
 pub const TARGET_LISTINGS_PER_FACTION: usize = 8;
+pub const RESIDENTIAL_LISTINGS_CAP: usize = 6;
+pub const AGRICULTURAL_LISTINGS_CAP: usize = 6;
+pub const CRAFTING_LISTINGS_CAP: usize = 4;
+
+/// Per-faction, per-zone-kind listing budget. `Civic / Sacred / Market /
+/// Defense` are not listed at all (handled by the early-skip at the top of
+/// `land_listing_system`).
+fn listings_cap_for(zone: ZoneKind) -> usize {
+    match zone {
+        ZoneKind::Residential => RESIDENTIAL_LISTINGS_CAP,
+        ZoneKind::Agricultural => AGRICULTURAL_LISTINGS_CAP,
+        ZoneKind::Crafting | ZoneKind::Storage => CRAFTING_LISTINGS_CAP,
+        // Public-works zones — never listed.
+        ZoneKind::Civic | ZoneKind::Sacred | ZoneKind::Market | ZoneKind::Defense => 0,
+    }
+}
 pub const HOUSEHOLD_MIN_TREASURY_FOR_LEASE: f32 = 5.0;
 pub const HOUSEHOLD_LEASE_AFFORDABILITY: f32 = 0.40;
 pub const HOUSEHOLD_BUY_AFFORDABILITY: f32 = 0.70;
@@ -495,7 +517,7 @@ fn plot_size_for(kind: ZoneKind) -> Option<(u16, u16)> {
         ZoneKind::Residential => Some((6, 6)),
         ZoneKind::Crafting => Some((4, 4)),
         ZoneKind::Storage => Some((4, 4)),
-        ZoneKind::Agricultural => Some((10, 10)),
+        ZoneKind::Agricultural => Some((16, 16)),
         ZoneKind::Civic | ZoneKind::Sacred | ZoneKind::Market | ZoneKind::Defense => None,
     }
 }
@@ -729,14 +751,21 @@ pub fn land_listing_system(
         return;
     }
 
-    // Snapshot existing listings so we don't double-list.
+    // Snapshot existing listings so we don't double-list. Count is per-
+    // (faction, zone_kind) and per-plot — a plot already publishing under
+    // multiple kinds (Sale + Lease + Sharecrop) only consumes one slot.
     let mut listed: AHashSet<PlotId> = AHashSet::new();
-    let mut count_by_faction: AHashMap<u32, usize> = AHashMap::new();
+    let mut count_by_faction_zone: AHashMap<(u32, ZoneKind), usize> = AHashMap::new();
+    let mut counted_plots: AHashSet<PlotId> = AHashSet::new();
     for l in listings.for_sale.iter().chain(listings.for_lease.iter()) {
         listed.insert(l.plot_id);
-        if let Some(&entity) = plot_index.by_id.get(&l.plot_id) {
-            if let Ok(plot) = plot_q.get(entity) {
-                *count_by_faction.entry(plot.faction_id).or_insert(0) += 1;
+        if counted_plots.insert(l.plot_id) {
+            if let Some(&entity) = plot_index.by_id.get(&l.plot_id) {
+                if let Ok(plot) = plot_q.get(entity) {
+                    *count_by_faction_zone
+                        .entry((plot.faction_id, plot.zone_kind))
+                        .or_insert(0) += 1;
+                }
             }
         }
     }
@@ -774,10 +803,19 @@ pub fn land_listing_system(
         if plot.base_value <= 0.0 {
             continue;
         }
-        let count = count_by_faction.entry(plot.faction_id).or_insert(0);
-        if *count >= TARGET_LISTINGS_PER_FACTION {
+        // Per-(faction, zone_kind) cap, counted by *plot id* — a plot that
+        // publishes Sale + Lease + Sharecrop still consumes one slot, not
+        // three.
+        let cap = listings_cap_for(plot.zone_kind);
+        if cap == 0 {
             continue;
         }
+        let key = (plot.faction_id, plot.zone_kind);
+        let count = count_by_faction_zone.entry(key).or_insert(0);
+        if *count >= cap {
+            continue;
+        }
+        let mut published_this_plot = false;
 
         if lp.state_sells_land {
             listings.for_sale.push(Listing {
@@ -787,7 +825,7 @@ pub fn land_listing_system(
                 listed_tick: now,
                 unsold_days: 0,
             });
-            *count += 1;
+            published_this_plot = true;
         }
         if lp.state_rents_land {
             let rent = (plot.base_value * lp.rent_yield_pct).max(MIN_MONTHLY_RENT);
@@ -798,7 +836,7 @@ pub fn land_listing_system(
                 listed_tick: now,
                 unsold_days: 0,
             });
-            *count += 1;
+            published_this_plot = true;
         }
         // Phase 6: agricultural plots also get sharecrop listings —
         // tenant farmer model. `asking` here carries the *share* fraction
@@ -813,6 +851,9 @@ pub fn land_listing_system(
                 listed_tick: now,
                 unsold_days: 0,
             });
+            published_this_plot = true;
+        }
+        if published_this_plot {
             *count += 1;
         }
     }
@@ -868,32 +909,48 @@ pub fn lookup_sharecrop_split(
 /// crude proxy for credit constraints. Households at or below
 /// `HOUSEHOLD_MIN_TREASURY_FOR_LEASE` skip this tick entirely.
 pub fn household_land_acquisition_system(
+    mut commands: Commands,
     clock: Res<SimClock>,
     mut registry: ResMut<FactionRegistry>,
     plot_index: Res<PlotIndex>,
     mut plot_q: Query<&mut Plot>,
     mut listings: ResMut<LandListings>,
+    profession_q: Query<&crate::simulation::person::Profession>,
+    storage_q: Query<&crate::simulation::faction::FactionStorageTile>,
 ) {
     if clock.tick % TICKS_PER_DAY as u64 != 0 {
         return;
     }
 
-    // Snapshot which households already own/lease a plot — Phase 4 caps
-    // each household at one plot until further phases add land hunger
-    // signals (more members, second-house ambition).
-    let mut households_with_plot: AHashSet<u32> = AHashSet::new();
+    // Snapshot which households already hold a plot of each zone kind.
+    // Pre-farm-planner this was a single-plot cap; now per-zone so a
+    // household with housing can still acquire cropland.
+    let mut households_zones: AHashMap<u32, AHashSet<ZoneKind>> = AHashMap::new();
     for (_, &entity) in plot_index.by_id.iter() {
         if let Ok(plot) = plot_q.get(entity) {
             if let TenureHolder::Household { faction_id } = plot.holder {
-                households_with_plot.insert(faction_id);
+                households_zones
+                    .entry(faction_id)
+                    .or_default()
+                    .insert(plot.zone_kind);
             }
         }
+    }
+
+    // Snapshot which households already have a `FactionStorageTile`. A
+    // farmer household acquiring an agricultural plot gets its own tile
+    // spawned (so private harvest/withdrawal stays out of village storage)
+    // — but only once per household.
+    let mut households_with_storage: AHashSet<u32> = AHashSet::new();
+    for st in storage_q.iter() {
+        households_with_storage.insert(st.faction_id);
     }
 
     struct Cand {
         household_id: u32,
         treasury: f32,
         parent_id: u32,
+        head_is_farmer: bool,
     }
     let mut candidates: Vec<Cand> = Vec::new();
     for (&fid, faction) in registry.factions.iter() {
@@ -903,16 +960,18 @@ pub fn household_land_acquisition_system(
         let Some(parent_id) = faction.parent_faction else {
             continue;
         };
-        if households_with_plot.contains(&fid) {
-            continue;
-        }
         if faction.treasury < HOUSEHOLD_MIN_TREASURY_FOR_LEASE {
             continue;
         }
+        let head_is_farmer = faction
+            .household_head
+            .and_then(|h| profession_q.get(h).ok())
+            .map_or(false, |p| matches!(*p, crate::simulation::person::Profession::Farmer));
         candidates.push(Cand {
             household_id: fid,
             treasury: faction.treasury,
             parent_id,
+            head_is_farmer,
         });
     }
     if candidates.is_empty() {
@@ -922,80 +981,102 @@ pub fn household_land_acquisition_system(
     let now = clock.tick;
     let mut consumed: AHashSet<PlotId> = AHashSet::new();
 
-    for cand in candidates {
-        let max_lease = cand.treasury * HOUSEHOLD_LEASE_AFFORDABILITY;
-        let max_buy = cand.treasury * HOUSEHOLD_BUY_AFFORDABILITY;
+    // Are there any Farmer-headed households at all? If not, fall back to any
+    // household with treasury for agricultural acquisitions — bootstrapping a
+    // fresh village whose adults haven't selected Farmer yet.
+    let any_farmer_household = candidates.iter().any(|c| c.head_is_farmer);
 
-        let mut best_sale: Option<(PlotId, f32, u32)> = None;
-        for l in listings.for_sale.iter() {
-            if consumed.contains(&l.plot_id) {
-                continue;
-            }
-            if l.asking > max_buy {
-                continue;
-            }
-            let Some(&entity) = plot_index.by_id.get(&l.plot_id) else {
-                continue;
-            };
-            let Ok(plot) = plot_q.get(entity) else {
-                continue;
-            };
-            if plot.faction_id != cand.parent_id {
-                continue;
-            }
-            if best_sale.as_ref().map(|b| l.asking < b.1).unwrap_or(true) {
-                best_sale = Some((l.plot_id, l.asking, plot.faction_id));
-            }
-        }
-        let mut best_lease: Option<(PlotId, f32, u32)> = None;
-        let mut best_sharecrop: Option<(PlotId, f32, u32)> = None;
-        for l in listings.for_lease.iter() {
-            if consumed.contains(&l.plot_id) {
-                continue;
-            }
-            let Some(&entity) = plot_index.by_id.get(&l.plot_id) else {
-                continue;
-            };
-            let Ok(plot) = plot_q.get(entity) else {
-                continue;
-            };
-            if plot.faction_id != cand.parent_id {
-                continue;
-            }
-            match l.kind {
-                ListingKind::Lease => {
-                    if l.asking > max_lease {
-                        continue;
-                    }
-                    if best_lease.as_ref().map(|b| l.asking < b.1).unwrap_or(true) {
-                        best_lease = Some((l.plot_id, l.asking, plot.faction_id));
-                    }
-                }
-                ListingKind::Sharecrop => {
-                    // Sharecrop has no upfront cost — household just
-                    // needs to be eligible. `asking` carries the share
-                    // fraction; lower share = better deal for tenant.
-                    if best_sharecrop
-                        .as_ref()
-                        .map(|b| l.asking < b.1)
-                        .unwrap_or(true)
-                    {
-                        best_sharecrop = Some((l.plot_id, l.asking, plot.faction_id));
-                    }
-                }
-                ListingKind::Sale => {} // Sale lives on for_sale.
-            }
-        }
+    // Acquire one plot per zone kind per candidate per tick. Residential is
+    // the priority track (housing first); Agricultural is the secondary track
+    // for farmer households (or any household when no farmers exist yet).
+    let target_zones = [ZoneKind::Residential, ZoneKind::Agricultural];
 
-        // Preference order: own outright (Sale) → rent (Lease) →
-        // sharecrop (no upfront, but harvest-time tax). Households
-        // would rather buy than rent, and rent than sharecrop.
-        let (kind, pid, asking, landlord) = match (best_sale, best_lease, best_sharecrop) {
-            (Some((p, a, f)), _, _) => (ListingKind::Sale, p, a, f),
-            (None, Some((p, a, f)), _) => (ListingKind::Lease, p, a, f),
-            (None, None, Some((p, a, f))) => (ListingKind::Sharecrop, p, a, f),
-            _ => continue,
-        };
+    for cand in &candidates {
+        for &target_zone in target_zones.iter() {
+            // Skip if this household already holds a plot of this zone kind.
+            if households_zones
+                .get(&cand.household_id)
+                .map_or(false, |s| s.contains(&target_zone))
+            {
+                continue;
+            }
+            // Agricultural acquisition prefers Farmer households. If any
+            // farmer households exist, non-farmers skip the agricultural
+            // track; if none exist yet, allow any household to bootstrap.
+            if matches!(target_zone, ZoneKind::Agricultural)
+                && any_farmer_household
+                && !cand.head_is_farmer
+            {
+                continue;
+            }
+
+            let max_lease = cand.treasury * HOUSEHOLD_LEASE_AFFORDABILITY;
+            let max_buy = cand.treasury * HOUSEHOLD_BUY_AFFORDABILITY;
+
+            let mut best_sale: Option<(PlotId, f32, u32)> = None;
+            for l in listings.for_sale.iter() {
+                if consumed.contains(&l.plot_id) {
+                    continue;
+                }
+                if l.asking > max_buy {
+                    continue;
+                }
+                let Some(&entity) = plot_index.by_id.get(&l.plot_id) else {
+                    continue;
+                };
+                let Ok(plot) = plot_q.get(entity) else {
+                    continue;
+                };
+                if plot.faction_id != cand.parent_id || plot.zone_kind != target_zone {
+                    continue;
+                }
+                if best_sale.as_ref().map(|b| l.asking < b.1).unwrap_or(true) {
+                    best_sale = Some((l.plot_id, l.asking, plot.faction_id));
+                }
+            }
+            let mut best_lease: Option<(PlotId, f32, u32)> = None;
+            let mut best_sharecrop: Option<(PlotId, f32, u32)> = None;
+            for l in listings.for_lease.iter() {
+                if consumed.contains(&l.plot_id) {
+                    continue;
+                }
+                let Some(&entity) = plot_index.by_id.get(&l.plot_id) else {
+                    continue;
+                };
+                let Ok(plot) = plot_q.get(entity) else {
+                    continue;
+                };
+                if plot.faction_id != cand.parent_id || plot.zone_kind != target_zone {
+                    continue;
+                }
+                match l.kind {
+                    ListingKind::Lease => {
+                        if l.asking > max_lease {
+                            continue;
+                        }
+                        if best_lease.as_ref().map(|b| l.asking < b.1).unwrap_or(true) {
+                            best_lease = Some((l.plot_id, l.asking, plot.faction_id));
+                        }
+                    }
+                    ListingKind::Sharecrop => {
+                        if best_sharecrop
+                            .as_ref()
+                            .map(|b| l.asking < b.1)
+                            .unwrap_or(true)
+                        {
+                            best_sharecrop = Some((l.plot_id, l.asking, plot.faction_id));
+                        }
+                    }
+                    ListingKind::Sale => {}
+                }
+            }
+
+            let (kind, pid, asking, landlord) = match (best_sale, best_lease, best_sharecrop) {
+                (Some((p, a, f)), _, _) => (ListingKind::Sale, p, a, f),
+                (None, Some((p, a, f)), _) => (ListingKind::Lease, p, a, f),
+                (None, None, Some((p, a, f))) => (ListingKind::Sharecrop, p, a, f),
+                _ => continue,
+            };
 
         // Sharecrop has no upfront cost — skip the currency transfer.
         // Sale / Lease move treasury household → landlord atomically.
@@ -1122,10 +1203,66 @@ pub fn household_land_acquisition_system(
                             child_plot.parent_plot = Some(pid);
                             child_plot.missed_payments = 0;
                             consumed.insert(cid);
+                            // Mark this household as holding an agricultural
+                            // plot too, so the outer per-zone loop won't try
+                            // to re-acquire one for the same household.
+                            households_zones
+                                .entry(cand.household_id)
+                                .or_default()
+                                .insert(ZoneKind::Agricultural);
                         }
                     }
                 }
             }
+        }
+            // Spawn a household-private FactionStorageTile when the farmer
+            // household has just acquired its first agricultural plot. The
+            // tile sits at the household's residential plot access_tile if
+            // any, else the agricultural plot's access_tile, else the centre
+            // of whichever plot we have. Only spawn once per household.
+            if matches!(target_zone, ZoneKind::Agricultural)
+                && !households_with_storage.contains(&cand.household_id)
+            {
+                let mut storage_tile: Option<(i32, i32)> = None;
+                // Prefer a residential plot held by the same household.
+                for (&_other_pid, &ent) in plot_index.by_id.iter() {
+                    if let Ok(other) = plot_q.get(ent) {
+                        if matches!(other.holder, TenureHolder::Household { faction_id }
+                            if faction_id == cand.household_id)
+                            && other.zone_kind == ZoneKind::Residential
+                        {
+                            storage_tile = other.access_tile.or(Some(other.rect.center()));
+                            break;
+                        }
+                    }
+                }
+                if storage_tile.is_none() {
+                    if let Some(&ent) = plot_index.by_id.get(&pid) {
+                        if let Ok(plot) = plot_q.get(ent) {
+                            storage_tile = plot.access_tile.or(Some(plot.rect.center()));
+                        }
+                    }
+                }
+                if let Some((sx, sy)) = storage_tile {
+                    let world_pos = crate::world::terrain::tile_to_world(sx, sy);
+                    commands.spawn((
+                        crate::simulation::faction::FactionStorageTile {
+                            faction_id: cand.household_id,
+                        },
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
+                        GlobalTransform::default(),
+                        Visibility::Hidden,
+                        InheritedVisibility::default(),
+                    ));
+                    households_with_storage.insert(cand.household_id);
+                }
+            }
+            // Mark the just-acquired zone as held so the next iteration of
+            // `target_zones` skips it for this candidate.
+            households_zones
+                .entry(cand.household_id)
+                .or_default()
+                .insert(target_zone);
         }
     }
 
@@ -1430,7 +1567,7 @@ mod tests {
     #[test]
     fn plot_size_for_zone_kinds() {
         assert_eq!(plot_size_for(ZoneKind::Residential), Some((6, 6)));
-        assert_eq!(plot_size_for(ZoneKind::Agricultural), Some((10, 10)));
+        assert_eq!(plot_size_for(ZoneKind::Agricultural), Some((16, 16)));
         assert_eq!(plot_size_for(ZoneKind::Civic), None);
     }
 

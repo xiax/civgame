@@ -6512,7 +6512,7 @@ mod baseline_behaviour {
     /// `GatherWood` plan (PlanId 2, `[Gather, DepositGoods]`). Pins the
     /// third multi-task chain in the runtime — the dispatcher routes the head
     /// `Task::Gather { tile }` and `aq.enqueue`s the trailing
-    /// `Task::DepositToFactionStorage { good: Wood }` onto the prefetch ring.
+    /// `Task::DepositToFactionStorage { good: Wood, target_faction_id: None }` onto the prefetch ring.
     #[test]
     fn gather_wood_goal_dispatches_gather_then_deposit_chain() {
         use crate::simulation::goals::AgentGoal;
@@ -6636,7 +6636,9 @@ mod baseline_behaviour {
             "expected exactly one queued task (DepositToFactionStorage) behind Gather"
         );
         match aq.peek_next() {
-            Some(Task::DepositToFactionStorage { resource_id }) => {
+            Some(Task::DepositToFactionStorage {resource_id,
+                    target_faction_id: None,
+                }) => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::wood(),
@@ -6771,7 +6773,7 @@ mod baseline_behaviour {
 
     /// Phase 5c-ii-d-ii-a: when a `GatherWood`-goal agent has a visible loose
     /// `Wood` `GroundItem` within `VIEW_RADIUS=15`, the scavenge chain
-    /// (`[Task::Scavenge { target }, Task::DepositToFactionStorage { Wood }]`)
+    /// (`[Task::Scavenge { target }, Task::DepositToFactionStorage { Wood, target_faction_id: None }]`)
     /// is preferred over the gather chain because
     /// `ScavengeFromGroundMethod`'s utility (1.5) outranks
     /// `GatherFromKnownMethod`'s (1.0). Mirrors the
@@ -6888,7 +6890,9 @@ mod baseline_behaviour {
             "expected exactly one queued task (DepositToFactionStorage) behind Scavenge"
         );
         match aq.peek_next() {
-            Some(Task::DepositToFactionStorage { resource_id }) => {
+            Some(Task::DepositToFactionStorage {resource_id,
+                    target_faction_id: None,
+                }) => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::wood(),
@@ -7075,7 +7079,7 @@ mod baseline_behaviour {
     /// (5c-ii-d-iii-ii) but for the chief-driven storage-fill goal: agent
     /// not hungry, goal pinned to GatherFood, fruit on the ground →
     /// `htn_stockpile_food_dispatch_system` dispatches
-    /// `Task::Scavenge { target }` with `Task::DepositToFactionStorage { Fruit }`
+    /// `Task::Scavenge { target }` with `Task::DepositToFactionStorage { Fruit, target_faction_id: None }`
     /// queued behind it.
     ///
     /// Pins the goal across `goal_update_system` ticks via a
@@ -7190,9 +7194,9 @@ mod baseline_behaviour {
         );
         assert_eq!(
             aq.peek_next(),
-            Some(Task::DepositToFactionStorage {
-                resource_id: crate::economy::core_ids::fruit()
-            }),
+            Some(Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::fruit(),
+                    target_faction_id: None,
+                }),
             "the trailing DepositToFactionStorage{{Fruit}} should be queued \
              behind the Scavenge head"
         );
@@ -7675,7 +7679,7 @@ mod baseline_behaviour {
     /// (set by `posting_claim_target` for the chief-posted CraftOrder demand)
     /// scavenges a visible loose Skin GroundItem via
     /// `htn_acquire_good_dispatch_system`'s extended Stockpile branch and
-    /// dispatches `[Task::Scavenge { target }, Task::DepositToFactionStorage { Skin }]`.
+    /// dispatches `[Task::Scavenge { target }, Task::DepositToFactionStorage { Skin, target_faction_id: None }]`.
     /// Replaces the legacy `DeliverHideToCraftOrder` plan (PlanId 13) which
     /// chained Hunt → CollectSkin → HaulToCraftOrder; the new flow has skin
     /// land in storage first, then a separate worker delivers via
@@ -7777,7 +7781,9 @@ mod baseline_behaviour {
             ),
         }
         match aq.peek_next() {
-            Some(Task::DepositToFactionStorage { resource_id }) => {
+            Some(Task::DepositToFactionStorage {resource_id,
+                    target_faction_id: None,
+                }) => {
                 assert_eq!(
                     resource_id, skin_id,
                     "queued DepositToFactionStorage should carry the Skin resource"
@@ -8879,7 +8885,9 @@ mod baseline_behaviour {
             "expected exactly one queued task (DepositToFactionStorage) behind WorkOnCraftOrder"
         );
         match aq.peek_next() {
-            Some(Task::DepositToFactionStorage { resource_id }) => {
+            Some(Task::DepositToFactionStorage {resource_id,
+                    target_faction_id: None,
+                }) => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::weapon(),
@@ -9166,6 +9174,8 @@ mod baseline_behaviour {
                         min: (-10, -10),
                         max: (10, 10),
                     },
+                    plot_id: None,
+                    assigned_farmer: None,
                 },
                 claimants: vec![person],
                 priority: 100,
@@ -9224,7 +9234,9 @@ mod baseline_behaviour {
             "expected one queued task (DepositToFactionStorage) behind Gather"
         );
         match aq.peek_next() {
-            Some(Task::DepositToFactionStorage { resource_id }) => {
+            Some(Task::DepositToFactionStorage {resource_id,
+                    target_faction_id: None,
+                }) => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::grain(),
@@ -9711,7 +9723,7 @@ mod baseline_behaviour {
     /// `GroundItem` within `VIEW_RADIUS=15` and hauls it to faction
     /// storage. Stone has no plant kind, so this exercises the Scavenge
     /// branch of `htn_acquire_good_dispatch_system` instead of Forage —
-    /// `[Task::Scavenge { target }, Task::DepositToFactionStorage { stone }]`.
+    /// `[Task::Scavenge { target }, Task::DepositToFactionStorage { stone, target_faction_id: None }]`.
     #[test]
     fn gather_stone_goal_completes_to_storage_deposit() {
         use crate::simulation::faction::FactionRegistry;
@@ -13469,5 +13481,277 @@ mod military_formation {
                 "no formation slot should stick after Failed dispatch"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod onenter_era_seeding {
+    //! End-to-end coverage of the `OnEnter(GameState::Playing)` chain for
+    //! era-aware seeding. Drives the real state transition (vs. the rest of
+    //! the fixture which deliberately stays in `SpawnSelect`) so the test
+    //! exercises the priming systems wired in `SimulationPlugin::build`:
+    //! `sync_faction_techs_from_chief_system → derive_tech_adoption_system →
+    //! seed_prime_tech_adoption_system → settlement_peak_population_system →
+    //! kickoff_initial_survey_system → seed_starting_buildings_system`.
+    use super::*;
+    use crate::simulation::construction::{
+        Barracks, Bed, BedMap, BedTier, Campfire, Door, DoorTier, HearthTier, Market, Monument,
+        Wall, Workbench, WorkbenchTier,
+    };
+    use crate::simulation::faction::{FactionRegistry, SOLO};
+    use crate::simulation::technology::{Era, PERM_SETTLEMENT};
+    use crate::simulation::technology_adoption::AdoptionStage;
+
+    /// Build a fixture whose ChunkMap covers the spawn region so
+    /// `spawn_population::find_tile` succeeds. Mega-chunk `(0, 0)` has
+    /// `center_cx = 8`, `start_cx = 8 - 16 = -8`, so the spawn rect is
+    /// `(-8..24) × (-8..24)` chunks. `flat_world(radius=24)` covers
+    /// `(-24..=24) × (-24..=24)` chunks — comfortable headroom.
+    fn fixture_with_flat_world() -> TestSim {
+        let mut sim = TestSim::new(0xE7A_5EED);
+        sim.flat_world(24, 4, TileKind::Grass);
+        {
+            let mut pending = sim.app.world_mut().resource_mut::<crate::PendingSpawn>();
+            pending.0 = Some((0, 0));
+        }
+        sim
+    }
+
+    fn configure_start(sim: &mut TestSim, era: Era) {
+        let mut opts = sim
+            .app
+            .world_mut()
+            .resource_mut::<crate::game_state::GameStartOptions>();
+        opts.era = era;
+        opts.player_population = 20;
+        opts.seed_buildings = true;
+    }
+
+    fn trigger_onenter(sim: &mut TestSim) {
+        sim.app
+            .world_mut()
+            .resource_mut::<NextState<crate::GameState>>()
+            .set(crate::GameState::Playing);
+        // First update flushes the state transition + runs OnEnter.
+        sim.tick();
+    }
+
+    fn player_seeded_beds_near_home(sim: &TestSim) -> (usize, u32, (i32, i32)) {
+        let world = sim.app.world();
+        let player_faction_id = world
+            .resource::<crate::simulation::faction::PlayerFaction>()
+            .faction_id;
+        let registry = world.resource::<FactionRegistry>();
+        let faction = registry
+            .factions
+            .get(&player_faction_id)
+            .expect("player faction should exist after OnEnter");
+        let home = faction.home_tile;
+        let beds = world
+            .resource::<BedMap>()
+            .0
+            .keys()
+            .filter(|&&(x, y)| (x - home.0).abs().max((y - home.1).abs()) <= 30)
+            .count();
+        assert!(
+            faction.member_count > 0,
+            "player faction {player_faction_id} spawned no members"
+        );
+        (beds, faction.member_count, home)
+    }
+
+    fn assert_perm_settlement_adopted(sim: &TestSim, label: &str) {
+        let registry = sim.app.world().resource::<FactionRegistry>();
+        let mut checked = 0u32;
+        for (&fid, faction) in registry.factions.iter() {
+            if fid == SOLO || faction.member_count == 0 {
+                continue;
+            }
+            // Skip nomadic factions: lifestyle::Nomadic isn't the player faction
+            // here but checking only the player faction is enough.
+            checked += 1;
+            let stage = faction.tech_adoption[PERM_SETTLEMENT as usize];
+            assert!(
+                (stage as u8) >= (AdoptionStage::Adopted as u8),
+                "{label}: faction {fid} PERM_SETTLEMENT stage = {stage:?}, expected ≥ Adopted"
+            );
+            // chief-Aware projection should reflect the era.
+            assert!(
+                faction.techs.has(PERM_SETTLEMENT),
+                "{label}: faction {fid} chief not Aware of PERM_SETTLEMENT after sync"
+            );
+        }
+        assert!(
+            checked >= 1,
+            "{label}: no member-bearing factions spawned (population check)"
+        );
+    }
+
+    #[test]
+    fn neolithic_start_primes_perm_settlement_adoption() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+        assert_perm_settlement_adopted(&sim, "Neolithic");
+    }
+
+    #[test]
+    fn chalcolithic_start_primes_perm_settlement_adoption() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Chalcolithic);
+        trigger_onenter(&mut sim);
+        assert_perm_settlement_adopted(&sim, "Chalcolithic");
+    }
+
+    #[test]
+    fn bronze_start_primes_perm_settlement_adoption() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::BronzeAge);
+        trigger_onenter(&mut sim);
+        assert_perm_settlement_adopted(&sim, "BronzeAge");
+    }
+
+    #[test]
+    fn bronze_start_seeds_growth_civics_despite_low_founder_population() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::BronzeAge);
+        trigger_onenter(&mut sim);
+
+        let world = sim.app.world_mut();
+        let markets = world.query::<&Market>().iter(world).count();
+        let barracks = world.query::<&Barracks>().iter(world).count();
+        let monuments = world.query::<&Monument>().iter(world).count();
+        assert!(markets > 0, "Bronze seed stamped zero markets");
+        assert!(barracks > 0, "Bronze seed stamped zero barracks");
+        assert!(monuments > 0, "Bronze seed stamped zero monuments");
+    }
+
+    #[test]
+    fn bronze_start_uses_era_appropriate_structure_tiers() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::BronzeAge);
+        trigger_onenter(&mut sim);
+
+        let world = sim.app.world_mut();
+        assert!(
+            world
+                .query::<&Campfire>()
+                .iter(world)
+                .any(|c| c.tier == HearthTier::Lined),
+            "Bronze seed did not stamp any lined hearths"
+        );
+        assert!(
+            world
+                .query::<&Workbench>()
+                .iter(world)
+                .any(|w| w.tier == WorkbenchTier::Bronze),
+            "Bronze seed did not stamp any bronze workbenches"
+        );
+        assert!(
+            world
+                .query::<&Door>()
+                .iter(world)
+                .any(|d| d.tier == DoorTier::Reinforced),
+            "Bronze seed did not stamp any reinforced doors"
+        );
+        assert!(
+            world
+                .query::<&Bed>()
+                .iter(world)
+                .any(|b| b.tier == BedTier::Carved),
+            "Bronze seed did not stamp any carved beds"
+        );
+    }
+
+    #[test]
+    fn neolithic_start_seeds_beds_for_player_population() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+
+        let (beds, members, home) = player_seeded_beds_near_home(&sim);
+        assert!(
+            beds >= members as usize,
+            "Neolithic seed placed {beds} beds near player home {home:?}, expected at least {members}"
+        );
+    }
+
+    #[test]
+    fn bronze_start_seeds_beds_for_player_population() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::BronzeAge);
+        trigger_onenter(&mut sim);
+
+        let (beds, members, home) = player_seeded_beds_near_home(&sim);
+        assert!(
+            beds >= members as usize,
+            "Bronze seed placed {beds} beds near player home {home:?}, expected at least {members}"
+        );
+    }
+
+    #[test]
+    fn bronze_start_scales_beds_to_larger_player_population() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::BronzeAge);
+        {
+            let mut opts = sim
+                .app
+                .world_mut()
+                .resource_mut::<crate::game_state::GameStartOptions>();
+            opts.player_population = 60;
+        }
+        trigger_onenter(&mut sim);
+
+        let (beds, members, home) = player_seeded_beds_near_home(&sim);
+        assert_eq!(members, 60, "fixture did not spawn requested population");
+        assert!(
+            beds >= members as usize,
+            "Bronze seed placed {beds} beds near player home {home:?}, expected at least {members}"
+        );
+    }
+
+    #[test]
+    fn neolithic_start_stamps_walls_and_doors() {
+        // Walled-house seeding requires `PERM_SETTLEMENT` adopted at the
+        // moment `generate_candidates` runs. Without OnEnter priming, the
+        // Neo+ branch silently falls back to the Paleolithic radial-bed
+        // pattern: walls = 0, doors = 0, beds-only.
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+
+        let world = sim.app.world_mut();
+        let wall_count = world.query::<&Wall>().iter(world).count();
+        let door_count = world.query::<&Door>().iter(world).count();
+        assert!(
+            wall_count > 0,
+            "Neolithic seed stamped zero walls (radial-bed fallback)"
+        );
+        assert!(
+            door_count > 0,
+            "Neolithic seed stamped zero doors (radial-bed fallback)"
+        );
+    }
+
+    #[test]
+    fn paleolithic_start_stays_in_band_camp_branch() {
+        // Regression guard: priming Adopted era-prior techs must not
+        // accidentally upgrade Paleolithic starts. Walls/doors should stay
+        // zero (Paleo seed lays campfires + radial beds only).
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Paleolithic);
+        trigger_onenter(&mut sim);
+
+        let world = sim.app.world_mut();
+        let wall_count = world.query::<&Wall>().iter(world).count();
+        let door_count = world.query::<&Door>().iter(world).count();
+        assert_eq!(
+            wall_count, 0,
+            "Paleolithic seed stamped walls (unexpected upgrade)"
+        );
+        assert_eq!(
+            door_count, 0,
+            "Paleolithic seed stamped doors (unexpected upgrade)"
+        );
     }
 }

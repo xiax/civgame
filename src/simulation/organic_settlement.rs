@@ -1966,7 +1966,7 @@ fn pressure_to_intent(
             OrganicBuildKind::Single(BuildSiteKind::Bed)
         }
         SettlementPressureKind::Shelter => {
-            shelter_kind(faction, pressure.population_scope, wall_mat)
+            shelter_kind(era, &community_techs, pressure.population_scope, wall_mat)
         }
         SettlementPressureKind::Storage => OrganicBuildKind::Single(BuildSiteKind::Granary),
         SettlementPressureKind::Craft => OrganicBuildKind::Single(BuildSiteKind::Workbench),
@@ -2001,25 +2001,12 @@ fn pressure_to_intent(
 }
 
 fn shelter_kind(
-    faction: &FactionData,
+    era: Era,
+    community_techs: &crate::simulation::faction::FactionTechs,
     bed_deficit: u32,
     wall_mat: WallMaterial,
 ) -> OrganicBuildKind {
-    let era = current_era(&faction.techs);
-    let roll_seed = faction.culture.seed ^ bed_deficit.wrapping_mul(0x9E37_79B9);
-    let mut rng = fastrand::Rng::with_seed(roll_seed as u64);
-    if matches!(era, Era::Chalcolithic | Era::BronzeAge) && bed_deficit <= 4 && rng.f32() < 0.12 {
-        OrganicBuildKind::CompositeHouse {
-            shape: FootprintShape::LShape {
-                w1: 2,
-                h1: 2,
-                w2: 2,
-                h2: 1,
-            },
-            rotation: Rotation::R0,
-            wall_material: wall_mat,
-        }
-    } else if faction.community_has(CITY_STATE_ORG)
+    if community_techs.has(CITY_STATE_ORG)
         || (matches!(era, Era::Chalcolithic | Era::BronzeAge) && bed_deficit >= 2)
     {
         OrganicBuildKind::Longhouse(wall_mat)
@@ -2603,7 +2590,7 @@ fn parcel_size(kind: DistrictKind, phase: SettlementPhase) -> (u16, u16) {
                 (5, 5)
             }
         }
-        DistrictKind::Agricultural => (8, 8),
+        DistrictKind::Agricultural => (16, 16),
         DistrictKind::Crafting | DistrictKind::Storage | DistrictKind::Market => (5, 4),
         DistrictKind::Civic | DistrictKind::Sacred => (5, 5),
         DistrictKind::Defense => (3, 3),

@@ -208,10 +208,14 @@ fn finish_scavenge(
     aq.advance();
 
     match aq.current {
-        Task::DepositToFactionStorage { .. } => {
+        Task::DepositToFactionStorage {
+            target_faction_id, ..
+        } => {
             // 5c-ii-d-ii-a: AcquireGood scavenge tail. Walk to nearest faction
             // storage and prime DepositResource.
-            let Some(fid) = faction_id else {
+            // `target_faction_id` overrides actor faction (private farm harvest
+            // routes to household sub-faction storage).
+            let Some(fid) = target_faction_id.or(faction_id) else {
                 record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 return;

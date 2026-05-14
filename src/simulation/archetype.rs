@@ -689,11 +689,16 @@ mod tests {
         assert!(caps.land.policy.state_rents_land);
         assert!(caps.land.policy.state_sharecrops);
         assert!(!caps.land.policy.state_sells_land);
-        // Non-staples flipped to mixed; Wood/Stone/edibles stay
-        // communal (omitted from the map).
+        // Farm-planner: Mixed now applies `mixed()` to *every* resource,
+        // including Wood/Stone/edibles (chief still allocates AND private
+        // actors allowed). The previous skip prevented private grain.
         let wood = crate::economy::core_ids::wood();
         let stone = crate::economy::core_ids::stone();
-        assert!(!caps.economic_policy.contains_key(&wood));
-        assert!(!caps.economic_policy.contains_key(&stone));
+        let wp = caps.economic_policy.get(&wood).copied().unwrap_or_default();
+        let sp = caps.economic_policy.get(&stone).copied().unwrap_or_default();
+        assert!(wp.private_actors_allowed);
+        assert!(sp.private_actors_allowed);
+        assert!(wp.chief_allocates_labor);
+        assert!(sp.chief_allocates_labor);
     }
 }

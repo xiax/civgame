@@ -259,8 +259,12 @@ fn finish_gather(
 
     // Chain handoff: route based on what the prefetch ring promoted.
     match aq.current {
-        Task::DepositToFactionStorage { .. } => {
-            let Some(fid) = faction_id else {
+        Task::DepositToFactionStorage {
+            target_faction_id, ..
+        } => {
+            // `target_faction_id` overrides the actor's own faction (private
+            // farm harvest routes to the household sub-faction's storage).
+            let Some(fid) = target_faction_id.or(faction_id) else {
                 // SOLO agent — no faction storage. The dispatcher already
                 // filters SOLO out, so this is defensive.
                 record_routing_failure(method_history, ai, now);

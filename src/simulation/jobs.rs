@@ -121,10 +121,15 @@ pub enum JobProgress {
         target: u32,
     },
     /// Farm: tiles successfully planted within the designated area.
+    /// `plot_id` and `assigned_farmer` are populated when the chief posts a
+    /// plot-scoped Farm job (see §7-8 of farm-planner). `None`/`None` is the
+    /// legacy bootstrap posting that uses `home_tile ±5`.
     Planting {
         planted: u32,
         target: u32,
         area: TileAabb,
+        plot_id: Option<crate::simulation::land::PlotId>,
+        assigned_farmer: Option<Entity>,
     },
     /// Craft: units of a specific recipe produced. `tech_payload` is set when
     /// the recipe is Clay Tablet / Book — it travels through the spawned
@@ -1895,6 +1900,15 @@ const FARM_TILES_PER_POST: u32 = 6;
 /// craftable goods. Reconciliation is idempotent: stale unclaimed Chief
 /// postings whose target no longer needs work are dropped before new ones are
 /// added.
+/// Bundle of farm-planner inputs read by `chief_job_posting_system` so the
+/// outer signature stays under Bevy's 16-param ceiling.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct FarmJobPostingParams<'w, 's> {
+    pub assignments: Res<'w, crate::simulation::farm::FarmPlotAssignments>,
+    pub plot_index: Res<'w, crate::simulation::land::PlotIndex>,
+    pub plot_q: Query<'w, 's, &'static crate::simulation::land::Plot>,
+}
+
 pub fn chief_job_posting_system(
     mut commands: Commands,
     clock: Res<SimClock>,
@@ -1909,6 +1923,7 @@ pub fn chief_job_posting_system(
     shared: Res<crate::simulation::shared_knowledge::SharedKnowledge>,
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
     calendar: Res<crate::world::seasons::Calendar>,
+    farm_params: FarmJobPostingParams,
     mut board: ResMut<JobBoard>,
     mut completed_events: EventWriter<JobCompletedEvent>,
 ) {
@@ -2468,6 +2483,11 @@ pub fn chief_job_posting_system(
         // chief has flipped Grain to `chief_allocates_labor=false`,
         // private farmers handle planting and selling at the
         // regional market; no chief Farm posting.
+        // Farm-planner: when communal Agricultural plots exist (and
+        // farmers are assigned), post one plot-scoped Farm job per
+        // assignment. Bootstrap fallback (`home_tile ±5`, no plot_id)
+        // fires only when no agricultural plots are carved yet so the
+        // first season still gets food on the table.
         let farm_chief_allocates = faction
             .policy_for(crate::economy::core_ids::grain())
             .chief_allocates_labor;
@@ -2475,14 +2495,99 @@ pub fn chief_job_posting_system(
             && faction_can_perform(faction, JobKind::Farm)
             && faction.member_count > 0
         {
-            let already_farm = board
-                .faction_postings(faction_id)
-                .iter()
-                .any(|p| matches!(p.kind, JobKind::Farm));
             let grain = faction.storage.stock_of(crate::economy::core_ids::grain());
             let seed = faction.storage.seed_total();
-            // Post farm if grain is low and seeds are available.
-            if !already_farm && grain < faction.member_count * 4 && seed > 0 {
+            let need_food = grain < faction.member_count * 4 && seed > 0;
+
+            // Existing plot-scoped Farm postings (de-dup keyed on plot_id).
+            let posted_plots: ahash::AHashSet<crate::simulation::land::PlotId> = board
+                .faction_postings(faction_id)
+                .iter()
+                .filter_map(|p| {
+                    if matches!(p.kind, JobKind::Farm) {
+                        if let JobProgress::Planting { plot_id, .. } = p.progress {
+                            return plot_id;
+                        }
+                    }
+                    None
+                })
+                .collect();
+            let already_bootstrap_farm = board
+                .faction_postings(faction_id)
+                .iter()
+                .any(|p| {
+                    matches!(p.kind, JobKind::Farm)
+                        && matches!(
+                            p.progress,
+                            JobProgress::Planting { plot_id: None, .. }
+                        )
+                });
+
+            // Plot-scoped: walk this faction's farmer→plot assignments.
+            let mut posted_any_plot_job = false;
+            if need_food {
+                for (&farmer, &pid) in farm_params.assignments.farmer_to_plot.iter() {
+                    if posted_plots.contains(&pid) {
+                        continue;
+                    }
+                    let Some(&plot_ent) = farm_params.plot_index.by_id.get(&pid) else {
+                        continue;
+                    };
+                    let Ok(plot) = farm_params.plot_q.get(plot_ent) else {
+                        continue;
+                    };
+                    if plot.faction_id != faction_id {
+                        continue;
+                    }
+                    let area = TileAabb {
+                        min: (plot.rect.x0, plot.rect.y0),
+                        max: (
+                            plot.rect.x0 + plot.rect.w as i32 - 1,
+                            plot.rect.y0 + plot.rect.h as i32 - 1,
+                        ),
+                    };
+                    let plot_tile_count = (plot.rect.w as u32) * (plot.rect.h as u32);
+                    let target = FARM_TILES_PER_POST.min(seed).min(plot_tile_count);
+                    if target == 0 {
+                        continue;
+                    }
+                    let id = board.alloc_id();
+                    let progress = JobProgress::Planting {
+                        planted: 0,
+                        target,
+                        area,
+                        plot_id: Some(pid),
+                        assigned_farmer: Some(farmer),
+                    };
+                    let priority = compute_priority(
+                        faction,
+                        faction_id,
+                        JobKind::Farm,
+                        &progress,
+                        &projects,
+                    );
+                    board.faction_postings_mut(faction_id).push(JobPosting {
+                        id,
+                        faction_id,
+                        kind: JobKind::Farm,
+                        progress,
+                        claimants: Vec::new(),
+                        priority,
+                        source: JobSource::Chief,
+                        posted_tick,
+                        expiry_tick: None,
+                        poster_class: crate::simulation::jobs::PosterClass::Chief,
+                        reward: 0.0,
+                        settlement_id: None,
+                    });
+                    posted_any_plot_job = true;
+                }
+            }
+
+            // Bootstrap fallback: if no plot-scoped postings fired AND no
+            // bootstrap posting exists, emit the legacy `home_tile ±5` job
+            // so a fresh village without carved plots still farms.
+            if need_food && !posted_any_plot_job && !already_bootstrap_farm {
                 let area = TileAabb {
                     min: (
                         faction.home_tile.0.saturating_sub(5),
@@ -2498,6 +2603,8 @@ pub fn chief_job_posting_system(
                     planted: 0,
                     target: FARM_TILES_PER_POST.min(seed),
                     area,
+                    plot_id: None,
+                    assigned_farmer: None,
                 };
                 let priority =
                     compute_priority(faction, faction_id, JobKind::Farm, &progress, &projects);
@@ -3178,6 +3285,19 @@ pub fn job_claim_system(
             // Skip postings that completed but haven't been removed yet.
             if p.progress.is_complete() {
                 continue;
+            }
+            // Farm-planner §9: plot-scoped Farm postings restrict claiming
+            // to the assigned farmer entity. Anyone else fails this gate
+            // and the post stays open until the assigned farmer picks it
+            // up (or the assignment is released by the daily reconciler).
+            if let JobProgress::Planting {
+                assigned_farmer: Some(assigned),
+                ..
+            } = p.progress
+            {
+                if assigned != worker {
+                    continue;
+                }
             }
             // Per-person craft tech-gate: a worker can only claim a Craft
             // posting whose recipe `tech_gate` they have personally Learned.

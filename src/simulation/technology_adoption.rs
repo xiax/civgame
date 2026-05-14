@@ -589,6 +589,47 @@ pub fn community_adoption_bitset(
     crate::simulation::faction::FactionTechs(bits)
 }
 
+/// One-shot OnEnter pass: every era-prior tech the faction chief is Aware of
+/// is forced to `Adopted` (no downgrade). The runtime `derive_tech_adoption_system`
+/// gates Specialist / Institutional techs behind workshops + recent-use buffers
+/// + small-band / broad-learning shortcuts that fail for a default 20-person
+/// founder band at tick 0 — Specialist scale needs `members ≤ 8` or every adult
+/// Learned, and Institutional needs a civic building or every adult Learned.
+/// Neither holds for a freshly-spawned Neolithic+ village whose role distribution
+/// follows `PersonKnowledge::seeded_realistic_through_era` (chief + ~1/8 Specialists
+/// Learned, rest Common). Without this priming, `community_adoption_bitset`
+/// returns 0 for PERM_SETTLEMENT at seed time, dropping `generate_candidates` into
+/// the Paleolithic radial-Bed branch regardless of `GameStartOptions.era`.
+///
+/// Runs once at `OnEnter(Playing)` after `derive_tech_adoption_system` and before
+/// `seed_starting_buildings_system`. The runtime derive pass at the first Economy
+/// cadence may walk stages back if conditions don't hold — that's intentional;
+/// the seed pass only needs the correct answer at tick 0.
+pub fn seed_prime_tech_adoption_system(
+    options: Res<crate::GameStartOptions>,
+    mut registry: ResMut<FactionRegistry>,
+) {
+    if !options.seed_buildings {
+        return;
+    }
+    let era_rank = options.era as u8;
+    let adopted = AdoptionStage::Adopted;
+    for (_, faction) in registry.factions.iter_mut() {
+        for def in crate::simulation::technology::TECH_TREE.iter() {
+            if (def.era as u8) > era_rank {
+                continue;
+            }
+            if !faction.techs.has(def.id) {
+                continue;
+            }
+            let idx = def.id as usize;
+            if (faction.tech_adoption[idx] as u8) < (adopted as u8) {
+                faction.tech_adoption[idx] = adopted;
+            }
+        }
+    }
+}
+
 /// Stamp `(faction, tech, now)` into the recent-use ring. Call from craft /
 /// hunt / build executors whenever the tech is successfully exercised.
 pub fn record_tech_use(
