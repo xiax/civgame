@@ -790,9 +790,14 @@ pub fn animal_movement_system(
             // handled by `Time<Virtual>::set_relative_speed` driving extra
             // FixedUpdate ticks per real second, not by an inline factor.
             let step = dir * ANIMAL_SPEED * sim_dt;
-            let new_pos = pos + step;
-            transform.translation.x = new_pos.x;
-            transform.translation.y = new_pos.y;
+            if step.length() >= dist {
+                transform.translation.x = target_world.x;
+                transform.translation.y = target_world.y;
+            } else {
+                let new_pos = pos + step;
+                transform.translation.x = new_pos.x;
+                transform.translation.y = new_pos.y;
+            }
         } else {
             transform.translation.x = target_world.x;
             transform.translation.y = target_world.y;
