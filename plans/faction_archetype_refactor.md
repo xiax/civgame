@@ -150,18 +150,14 @@ Eviction in `rent_collection_system` emits `PlotEvictedEvent { plot, structures 
 
 ## Phasing
 
-Each phase ships green. Tests stay green by computing capabilities from the current `(Lifestyle, EconomyPreset)` pair until Phase 4 swaps the source of truth.
-
-| Phase | Scope | Risk |
+| Phase | Scope | Status |
 |---|---|---|
-| **1. Capabilities + adapter** | Add `FactionCapabilities` struct, computed from `(lifestyle, preset)` at `spawn_population`. Migrate every `is_nomadic()` and `EconomyPreset` match to capability checks. No behavior change. | Low — pure refactor, mechanical translation. |
-| **2. StorageBackend trait** | Trait + 3 impls (`FactionTile`, `MemberPool`, `Hybrid`). Migrate `compute_faction_storage_system` and HTN `WithdrawMaterialFromStorageMethod` / deposit dispatch. Eliminates the dual-pass. | Medium — touches HTN preconditions; needs careful test coverage. |
-| **3. Lifecycle events** | Add `SettlementLifecycleEvent` queue + processor. Migrate `auto_found_default_settlements_system`, `nomad_migration_commit_system`, `nomad_sedentarize_system` to emit events. Fixes sedentarize policy carryover en route (re-apply on `SwitchArchetype`). | Medium — event ordering matters; processor must run exclusive-World. |
-| **4. RON archetype registry** | Define `FactionArchetype` schema, write 4 RON files for current archetypes, build `FactionArchetypeRegistry`. Replace `(Lifestyle, EconomyPreset)` in `GameStartOptions` with `archetype_key: String`. UI spawn-select reads the registry. Old enums kept as labels only. | Medium — schema stability; must round-trip through save format. |
-| **5. Bug fixes folded in** | Income flow as capability (fixes subsistence skim leak), evicted-plot cleanup event, validate `Inheritance` spec on archetype load (rejects Nomadic+Market-style incoherence at boot, not at runtime). | Low — local additions on top of refactored substrate. |
-| **6. Future-model proofs** | Author `caravan_hybrid.ron` and `feudal_lord.ron`; implement `CaravanBundleBackend` and `Holder::Vassal`. Each is a one-archetype + one-backend addition with no further code branching. | Medium — caravan crew round-trip and feudal rent chain need new tests but no existing-system rewrites. |
-
-Phases 1-5 deliver the unification + bug fixes. Phase 6 validates extensibility by actually shipping the requested future models on the new substrate.
+| **1. Capabilities + adapter** | `FactionCapabilities` + `derive_from_legacy`; every `is_nomadic()` / `match preset` site migrated. | **shipped** |
+| **2. StorageBackend trait** | `economy/storage_backend.rs` with `WithdrawSource` / `DepositTarget`; `compute_faction_storage_system` backend-symmetric. | **shipped** |
+| **3. Lifecycle events** | `SettlementLifecycleEvent` queue + `process_settlement_lifecycle_system`; nomad migrate / sedentarize / reverse-collapse emit through it. | **shipped** |
+| **4. RON archetype registry** | `FactionArchetypeRegistry` loads `assets/data/factions/archetypes/*.ron` (`settled_subsistence` / `settled_mixed` / `settled_market` / `nomadic_subsistence`). | **shipped** |
+| **5. Bug fixes** | `caps.income.household_skim_pct` plumbed; `evicted_plot_cleanup_system` consumes `PlotEvictedEvent` with `caps.land.eviction_policy`. | **shipped** |
+| **6. Future-model proofs** | Author `caravan_hybrid.ron` and `feudal_lord.ron`; implement `CaravanBundleBackend` and `Holder::Vassal`. Caravan crew round-trip and feudal rent chain need new tests but no existing-system rewrites. | **deferred** |
 
 ## Critical files to modify
 

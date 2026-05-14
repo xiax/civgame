@@ -786,7 +786,10 @@ pub fn animal_movement_system(
 
         if dist > 2.0 {
             let dir = to_target.normalize();
-            let step = dir * ANIMAL_SPEED * dt * clock.speed;
+            // Use `sim_dt` (bucket-compensated) — speed multiplication is
+            // handled by `Time<Virtual>::set_relative_speed` driving extra
+            // FixedUpdate ticks per real second, not by an inline factor.
+            let step = dir * ANIMAL_SPEED * sim_dt;
             let new_pos = pos + step;
             transform.translation.x = new_pos.x;
             transform.translation.y = new_pos.y;

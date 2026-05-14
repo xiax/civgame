@@ -45,12 +45,16 @@ impl Plugin for PathfindingPlugin {
                         .after(chunk_graph::startup_initial_build_system),
                 ),
             )
+            .add_systems(PreUpdate, chunk_graph::poll_rebuild_task_system)
+            // Path drain lives on FixedUpdate so its budget scales with
+            // sim speed (more `Time<Virtual>` ticks per real second at
+            // higher speeds). Runs before `SimulationSet::Sequential` so
+            // freshly-resolved paths land before `movement_system`
+            // consumes them on the same tick.
             .add_systems(
-                PreUpdate,
-                (
-                    chunk_graph::poll_rebuild_task_system,
-                    worker::drain_path_requests_system.after(chunk_graph::poll_rebuild_task_system),
-                ),
+                FixedUpdate,
+                worker::drain_path_requests_system
+                    .before(crate::simulation::SimulationSet::Sequential),
             )
             .add_systems(
                 PostUpdate,

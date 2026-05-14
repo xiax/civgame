@@ -61,6 +61,7 @@ pub mod settlement;
 pub mod shared_knowledge;
 pub mod skills;
 pub mod sound;
+pub mod speed;
 pub mod stats;
 pub mod tasks;
 pub mod teaching;
@@ -128,6 +129,9 @@ impl Plugin for SimulationPlugin {
             .insert_resource(player_command::PlayerCommandIdGen::default())
             .insert_resource(nomad::PendingCampOps::default())
             .insert_resource(SimClock::default())
+            .insert_resource(speed::GameSpeed::default())
+            .insert_resource(speed::SimTimingDiagnostics::default())
+            .insert_resource(speed::TickTimer::default())
             .insert_resource(goals::ForceGoalReevaluate::default())
             .insert_resource({
                 // Phase 6: scorer registry, pre-populated with the
@@ -203,6 +207,25 @@ impl Plugin for SimulationPlugin {
                     SimulationSet::Sequential.after(SimulationSet::ParallelB),
                     SimulationSet::Economy.after(SimulationSet::Sequential),
                 ),
+            )
+            // Speed/pause: mirror `GameSpeed` onto `Time<Virtual>` every
+            // PreUpdate. Per-frame tick counter lives on Update so it ticks
+            // even when sim is paused. The keyboard handler lives in
+            // `UiPlugin` (it depends on egui + `ButtonInput<KeyCode>`,
+            // neither of which the headless test fixture loads).
+            .add_systems(PreUpdate, speed::sync_game_speed_to_virtual_time)
+            .add_systems(Update, speed::frame_tick_count_system)
+            // Sim-tick CPU timing: stamp the start of each FixedUpdate
+            // before any sim work and read it at the end to fold into the
+            // EMA + worst-tick window. Both systems live outside
+            // `SimulationSet` so they bracket every other tick body.
+            .add_systems(
+                FixedUpdate,
+                speed::fixed_tick_timing_start_system.before(SimulationSet::Input),
+            )
+            .add_systems(
+                FixedUpdate,
+                speed::fixed_tick_timing_end_system.after(SimulationSet::Economy),
             )
             .add_systems(
                 OnEnter(crate::GameState::Playing),

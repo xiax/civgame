@@ -6,6 +6,11 @@ pub struct BucketSlot(pub u32);
 
 /// Governs staggered simulation updates.
 /// Each frame processes `bucket_size` entities, cycling through the population.
+///
+/// Game-speed and pause now live on [`crate::simulation::speed::GameSpeed`],
+/// which drives `Time<Virtual>::set_relative_speed` / `pause`. FixedUpdate
+/// fires more often per real second at higher speeds, so per-tick `dt` stays
+/// 1/20 s and every system that ticks once per fixed update scales naturally.
 #[derive(Resource)]
 pub struct SimClock {
     pub tick: u64,
@@ -13,9 +18,6 @@ pub struct SimClock {
     pub population: u32,
     pub current_start: u32,
     pub current_end: u32,
-    pub speed: f32,
-    /// Accumulated time for speed scaling.
-    pub accum: f32,
 }
 
 impl Default for SimClock {
@@ -26,8 +28,6 @@ impl Default for SimClock {
             population: 0,
             current_start: 0,
             current_end: 0,
-            speed: 1.0,
-            accum: 0.0,
         }
     }
 }
@@ -40,13 +40,17 @@ impl SimClock {
         slot >= self.current_start && slot < self.current_end
     }
 
-    /// How many real seconds pass per sim-second for a given entity
-    /// (accounts for the fact that each entity is updated every N frames).
+    /// Bucket compensation: how many ticks pass between updates for any
+    /// single entity, given `bucket_size` of the population is active per
+    /// tick. Multiplied into `dt` so per-entity decay/cooldown rates are
+    /// invariant to bucket assignment. Speed is **not** part of this — it
+    /// rides on `Time<Virtual>::relative_speed` and shows up as more
+    /// FixedUpdate firings per real second.
     pub fn scale_factor(&self) -> f32 {
         if self.population == 0 || self.bucket_size == 0 {
             return 1.0;
         }
-        (self.population as f32 / self.bucket_size as f32).max(1.0) * self.speed
+        (self.population as f32 / self.bucket_size as f32).max(1.0)
     }
 }
 

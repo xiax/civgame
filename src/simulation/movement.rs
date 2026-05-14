@@ -99,7 +99,9 @@ pub fn movement_system(
     )>,
 ) {
     let dt = time.delta_secs();
-    let speed = clock.speed;
+    // Game speed lives on `Time<Virtual>::set_relative_speed` and drives
+    // extra FixedUpdate firings per real second — no inline multiplier
+    // needed here. `sim_dt` only carries bucket compensation.
     let sim_dt = dt * clock.scale_factor();
     let now_ms = time.elapsed().as_millis() as u64;
 
@@ -260,20 +262,15 @@ pub fn movement_system(
                     // hard-wall guard below misses (another agent camping the
                     // next tile, sub-tile oscillation, stale segment_path).
                     //
-                    // Skip the heartbeat entirely when the game is paused
-                    // (`speed == 0.0`): paused agents can't move, so otherwise
-                    // every paused tick would count as "stuck" and trip the
-                    // limit ~1.5 s after the user clicks ⏸ — destroying the
-                    // diagnostic state they paused to inspect.
+                    // `Time<Virtual>::pause` stops FixedUpdate from firing
+                    // at all, so paused ticks can no longer count as stuck.
                     const STUCK_LIMIT: u8 = 30;
                     let here = (cur_tx as i32, cur_ty as i32, ai.current_z);
-                    if speed > 0.0 {
-                        if pf.recent_tiles[0] == here {
-                            pf.stuck_ticks = pf.stuck_ticks.saturating_add(1);
-                        } else {
-                            pf.recent_tiles[0] = here;
-                            pf.stuck_ticks = 0;
-                        }
+                    if pf.recent_tiles[0] == here {
+                        pf.stuck_ticks = pf.stuck_ticks.saturating_add(1);
+                    } else {
+                        pf.recent_tiles[0] = here;
+                        pf.stuck_ticks = 0;
                     }
                     if pf.stuck_ticks >= STUCK_LIMIT {
                         if path_flags.verbose_logs {
@@ -408,7 +405,7 @@ pub fn movement_system(
                 &workbench_map,
                 &loom_map,
             );
-            let step = dir * effective_speed * dt * speed;
+            let step = dir * effective_speed * dt;
             // Overshoot arrival: when the smooth step would reach or pass the
             // final target tile this tick, clamp to target_world and fall
             // through to the arrival branch. Without this, agents within
@@ -591,7 +588,7 @@ pub fn movement_system(
             }
             AiState::Idle => {
                 // Random wander, with 35% chance to drift toward the most-liked nearby friend.
-                mv.wander_timer -= dt * speed;
+                mv.wander_timer -= dt;
                 if mv.wander_timer <= 0.0 {
                     mv.wander_timer = IDLE_WANDER_INTERVAL;
 

@@ -17,9 +17,13 @@ use crate::simulation::tasks::task_kind_label;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 
 /// Maximum number of `PathRequest`s the worker drains in one tick. Sized
-/// to keep worker time well under 4 ms with 2k agents (target in plan):
-/// at ~50 µs per A* segment that's ~3 ms worst case.
-pub const PATH_BUDGET_PER_TICK: usize = 64;
+/// for the FixedUpdate-resident drain — at 20 Hz baseline this is
+/// 192 × 20 ≈ 3840 req/s (parity with the previous PreUpdate 64/frame
+/// budget at 60 fps). Higher game speeds run FixedUpdate more often via
+/// `Time<Virtual>::set_relative_speed`, so the budget scales with sim
+/// demand without further tuning. At ~50 µs per A* segment worst case
+/// that's ~10 ms/tick, well inside the 5× speed budget of 10 ms.
+pub const PATH_BUDGET_PER_TICK: usize = 192;
 
 /// Per-tick pathfinding telemetry, surfaced in the debug panel.
 /// Counters that are listed in the plan as "running totals" stay across

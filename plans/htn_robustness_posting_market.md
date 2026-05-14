@@ -26,50 +26,28 @@ Two parallel tracks:
 
 Track A ships first; Track B builds on it.
 
-## Track A — Personal-needs reflex (Phases 1–3)
+## Track A — Personal-needs reflex (Phases 1–3) — shipped
 
-### Phase 1 — Live `PlantMap` fast path in food/good dispatchers
-Before consulting vision/SharedKnowledge, probe `PlantMap` for a mature plant of the right kind within chebyshev radius 2. If hit and unclaimed, dispatch directly.
-- `src/simulation/plants.rs` — add `nearest_mature_plant_under_agent(plant_map, plant_q, kind_filter, from, radius)`.
-- `src/simulation/htn.rs:3624–3650, 4689–4723` (and StockpileFood / HarvestGrainForCraftOrder branches) — call probe before `current_vision.nearest_gather_target`.
-- Test: `htn::tests::agent_on_wheat_tile_dispatches_gather` via `TestSim`.
-
-### Phase 2 — Neighbor-scan fallback on empty arrival
-When `gather_system` finds the target plant despawned/immature, scan chebyshev≤2 for a same-kind replacement before `finish_gather`. Atomically swap claim, rewrite `aq.current = Task::Gather { new_tile }`. One re-target per chain via `ai.last_retarget_tick` cooldown (40 ticks).
-- `src/simulation/gather.rs:343–388` and the "completed stone tile" / "invalid target" exits.
-- Test: `gather::tests::empty_arrival_retargets_adjacent_grain`.
-
-### Phase 3 — Cluster-rep spread via claim pressure at pick time
-For the personal `Survive` foraging path, use the LRU 4-rep slots already on `ResourceCluster`. Pick the least-pressured rep, not the closest. (Productive forage paths land in Track B.)
-- `src/simulation/shared_knowledge.rs` — add `ResourceCluster::pick_least_pressured_rep(from, claim_penalty)` and `KnowledgeMap::nearest_with_pressure`.
-- `src/simulation/htn.rs:3624–3650` (AcquireFood) — pass `|t| gather_claims.pressure(t, now, actor) * 4`.
+- Phase 1: `plants::nearest_mature_plant_under_agent` wired into food/good dispatchers.
+- Phase 2: `gather::retarget_neighbor` (chebyshev≤2, 40-tick cooldown) swaps cluster claim and rewrites `aq.current` on stale arrival.
+- Phase 3: `ResourceCluster::pick_least_pressured_rep(from, penalty)` plumbed into `KnowledgeMap::nearest` and `nearest_in_tier_set`.
 
 ## Track B — Close the posting bypass (Phases 4–7)
 
-### Phase 4 — Make `GatherClaims` cluster-aware exclusive
-Make claims a real mutex *at the cluster-slot level*, not per-tile. Loser's dispatch backs out cleanly; cluster scoring filters out fully-claimed clusters.
-- `src/simulation/gather_claims.rs` — add `try_claim_cluster_slot(cluster_id, claimant, expires) -> bool`. Each cluster holds slot count = `cluster.estimated_count.min(MAX_PARALLEL_GATHERERS)`.
-- Existing per-tile `GatherClaim` collapses to a derived view; `pressure()` becomes "how many slots taken in this cluster."
-- Update all dispatchers' claim-stake sites (htn.rs:4202–4208 + sisters) to use cluster-slot semantics.
-- Test: `gather_claims::tests::cluster_slot_exclusion`.
+### Phase 4 — Make `GatherClaims` cluster-aware exclusive — partially shipped
+Per-tile `GatherClaim` remains; cluster-saturation skip (`cluster_is_saturated`, `MAX_PARALLEL_GATHERERS_PER_CLUSTER = 3`) and pressure-aware rep selection ship. `try_claim_cluster_slot` strict-mutex semantics still deferred.
 
-### Phase 5 — Self-posting for autonomous productive fallback
-When `goal_update_system` would fall through to autonomous `GatherWood`/`GatherStone`/`GatherFood` (for storage, not personal hunger), instead **scan the faction posting board** for a fitting Stockpile posting. If none exists *and* the faction's `ResourceControlPolicy` allows private posters (`private_actors_allowed=true` for that resource), self-post one at default wage from the agent's own currency (or a chief-treasury-funded posting if `chief_allocates_labor=true` and no chief posting exists yet). Then claim normally.
-- `src/simulation/goals.rs:554–622` — replace direct goal assignment with a `try_acquire_or_post_stockpile_job(agent, faction, resource_id, policy)` helper.
-- `src/simulation/jobs.rs` — extend `post_craft_contract` style API to `post_stockpile_self(faction_id, resource_id, target_qty, reward, author, poster_class)`. Default wage formula: `reward = market_price(resource_id) * target_qty * SELF_POST_MARGIN` (margin small, e.g. 0.1) so self-posters don't undercut market.
-- Subsistence factions (`chief_allocates_labor=true, private_actors_allowed=false`): no self-posting, no autonomous fallback — workers wait for chief postings or run personal-needs only. (Fine: chief reposts every `TICKS_PER_DAY`.)
-- Mixed factions: chief posts staples; private actors self-post non-staples.
-- Market factions: any worker can self-post any resource; chief posts almost nothing.
-- Test: `jobs::tests::market_faction_worker_self_posts_stockpile_when_idle`, `goals::tests::subsistence_faction_no_autonomous_gather`.
+### Phase 5 — Self-posting for autonomous productive fallback — shipped
+`post_stockpile_self`, `worker_self_post_stockpile_system` (every `TICKS_PER_DAY`), `SELF_POST_MARGIN = 0.1`. Policy gates honored (Subsistence skips, Mixed/Market participate).
 
-### Phase 6 — Precondition re-validation at task execution
+### Phase 6 — Precondition re-validation at task execution — deferred
 Before doing work on the first tick after walk-arrival, re-check the load-bearing precondition. If invalid: push `MethodOutcome::FailedTarget`, `aq.cancel()`, release cluster slot.
 - `src/simulation/gather.rs` — extend stage check to a generic "is the resource still here?" guard.
 - `src/simulation/production.rs` — `withdraw_material_task_system` re-checks `FactionStorage.totals` minus other-agent reservations.
 - `src/simulation/construction.rs` — `HaulToBlueprint` arrival re-checks `bp.slot_satisfied(rid)`.
 - Test: `gather::tests::stale_target_aborts_on_arrival`, `production::tests::storage_emptied_between_dispatch_and_arrival_aborts`.
 
-### Phase 7 — Posting slot enforcement at claim time + cluster-slot clamp
+### Phase 7 — Posting slot enforcement at claim time + cluster-slot clamp — deferred
 Hard skip claims when `posting.claimants.len() >= posting_target_workers(p)`. For Stockpile postings, clamp `target_workers` by `SharedKnowledge::cluster_slot_estimate(faction, kind, near, radius)` (floor 1).
 - `src/simulation/jobs.rs:2073` (claim path) and `posting_target_workers` callers near 920–975.
 - Test: `jobs::tests::posting_caps_enforce_at_claim`, `jobs::tests::cluster_slot_clamp_prevents_overstaffing`.

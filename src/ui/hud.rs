@@ -11,6 +11,7 @@ use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
 use crate::simulation::person::{Drafted, Person, Profession};
 use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
 use crate::simulation::schedule::SimClock;
+use crate::simulation::speed::{GameSpeed, SpeedPreset};
 use crate::simulation::technology::HUNTING_SPEAR;
 use crate::ui::debug_panel::DebugPanelState;
 use crate::ui::selection::SelectedEntities;
@@ -28,6 +29,7 @@ pub struct DraftToggleRequest(pub bool);
 #[derive(SystemParam)]
 pub struct HudResources<'w> {
     pub clock: ResMut<'w, SimClock>,
+    pub speed: ResMut<'w, GameSpeed>,
     pub mode: ResMut<'w, EconomicMode>,
     pub auto_build: ResMut<'w, AutonomousBuildingToggle>,
     pub tech_panel_open: ResMut<'w, TechPanelOpen>,
@@ -51,6 +53,7 @@ pub fn hud_system(
     mut cmd_events: EventWriter<PlayerCommandEvent>,
 ) {
     let clock = &mut *res.clock;
+    let speed = &mut *res.speed;
     let mode = &mut *res.mode;
     let auto_build = &mut *res.auto_build;
     let tech_panel_open = &mut *res.tech_panel_open;
@@ -96,17 +99,15 @@ pub fn hud_system(
                         ui.label(egui::RichText::new("Speed:").color(egui::Color32::WHITE));
 
                         let active_fill = egui::Color32::from_rgb(60, 120, 200);
-                        for (label, target) in
-                            [("⏸", 0.0_f32), ("1×", 1.0), ("2×", 2.0), ("5×", 5.0)]
-                        {
-                            let btn = egui::Button::new(label);
-                            let btn = if (clock.speed - target).abs() < 0.01 {
+                        for preset in SpeedPreset::all() {
+                            let btn = egui::Button::new(preset.label());
+                            let btn = if speed.current == preset {
                                 btn.fill(active_fill)
                             } else {
                                 btn
                             };
                             if ui.add(btn).clicked() {
-                                clock.speed = target;
+                                speed.set(preset);
                             }
                         }
 

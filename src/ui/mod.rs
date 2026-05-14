@@ -65,6 +65,7 @@ impl Plugin for UiPlugin {
                     activity_log::activity_log_ingest_system,
                     activity_log::activity_log_panel_system,
                     activity_log::camera_focus_system,
+                    crate::simulation::speed::handle_speed_keybinds_system,
                 )
                     .run_if(in_state(crate::GameState::Playing)),
             );

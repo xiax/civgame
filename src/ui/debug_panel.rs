@@ -83,6 +83,8 @@ pub struct PathPanelParams<'w> {
     pub diag: Res<'w, PathfindingDiagnostics>,
     pub chunk_graph: Res<'w, ChunkGraph>,
     pub connectivity: Res<'w, ChunkConnectivity>,
+    pub timing: Res<'w, crate::simulation::speed::SimTimingDiagnostics>,
+    pub game_speed: Res<'w, crate::simulation::speed::GameSpeed>,
 }
 
 #[derive(SystemParam)]
@@ -707,6 +709,59 @@ pub fn debug_panel_system(
                             path.failure_log.clear();
                         }
                     });
+                });
+
+                ui.add_space(4.0);
+
+                // ── Sim Timing ────────────────────────────────────────────────
+                egui::CollapsingHeader::new(
+                    egui::RichText::new("Sim Timing")
+                        .strong()
+                        .color(egui::Color32::from_rgb(180, 180, 240)),
+                )
+                .default_open(false)
+                .show(ui, |ui| {
+                    let avg_ms = path.timing.avg_tick_us_ema / 1000.0;
+                    let worst_ms = path.timing.worst_tick_us_recent as f32 / 1000.0;
+                    let budget_ms = path.game_speed.current.budget_ms_per_tick();
+                    let over_budget = avg_ms > budget_ms;
+                    let avg_color = if over_budget {
+                        egui::Color32::from_rgb(220, 80, 80)
+                    } else {
+                        egui::Color32::GRAY
+                    };
+                    let budget_label = if budget_ms.is_finite() {
+                        format!("{budget_ms:.0} ms")
+                    } else {
+                        "∞ (paused)".to_string()
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Speed: {}  •  budget {}",
+                            path.game_speed.current.label(),
+                            budget_label,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Fixed ticks/frame: {}",
+                            path.timing.fixed_ticks_this_frame
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("Avg tick: {avg_ms:.2} ms"))
+                            .color(avg_color)
+                            .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("Worst tick (60): {worst_ms:.2} ms"))
+                            .color(egui::Color32::GRAY)
+                            .size(11.0),
+                    );
                 });
 
                 ui.add_space(4.0);
