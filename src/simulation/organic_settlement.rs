@@ -191,7 +191,7 @@ pub struct SettlementBrain {
 }
 
 impl SettlementBrain {
-    fn new(settlement_id: SettlementId, owner_faction: u32, seed: u64) -> Self {
+    pub fn new(settlement_id: SettlementId, owner_faction: u32, seed: u64) -> Self {
         Self {
             settlement_id,
             owner_faction,
@@ -222,7 +222,7 @@ pub struct SettlementParcelIndex {
 }
 
 impl SettlementParcelIndex {
-    fn rebuild(&mut self, brains: &SettlementBrains) {
+    pub fn rebuild(&mut self, brains: &SettlementBrains) {
         self.by_tile.clear();
         self.by_settlement.clear();
         self.by_faction.clear();
@@ -446,8 +446,74 @@ pub struct OrganicStructureMaps<'w> {
     pub structure_index: Res<'w, StructureIndex>,
 }
 
-pub fn settlement_survey_system(
-    clock: Res<SimClock>,
+/// Shared per-settlement survey body. Called by `survey_task::survey_cursor_system`
+/// (one settlement per tick, paced so each settlement re-surveys at the
+/// legacy `SURVEY_INTERVAL = 120` ticks cadence) and by
+/// `kickoff_initial_survey_system` once at `OnEnter(GameState::Playing)` so
+/// `SettlementBrain` exists *before* `seed_starting_buildings_system` picks
+/// house anchors. Same effect either way — fold a fresh brain (or update
+/// the existing one) into `SettlementBrains`, recompute road segments /
+/// parcels / frontier, and enqueue any newly-required desire-path road
+/// extensions.
+///
+/// Caller is expected to have already filtered out SOLO / non-settled
+/// factions. Pure-function refactor (snapshot-based input → output) is
+/// deferred — see `plans/evaluate-this-plan-please-eager-dolphin.md` Step
+/// 2 ("Background survey infrastructure"); this helper is the bridge that
+/// keeps both call sites converging on a single survey body.
+#[allow(clippy::too_many_arguments)]
+pub fn survey_one_settlement(
+    settlement: &Settlement,
+    faction: &FactionData,
+    tick: u64,
+    brains: &mut SettlementBrains,
+    road_queue: &mut RoadCarveQueue,
+    chunk_map: &ChunkMap,
+    maps: &OrganicStructureMaps,
+    member_q: &Query<(&FactionMember, &Transform)>,
+) {
+    let seed = organic_seed(settlement, faction);
+    let brain = brains
+        .0
+        .entry(settlement.id)
+        .or_insert_with(|| SettlementBrain::new(settlement.id, settlement.owner_faction, seed));
+
+    brain.owner_faction = settlement.owner_faction;
+    brain.seed = seed;
+    brain.phase = phase_for(faction, settlement.peak_population);
+    brain.last_survey_tick = tick;
+    decay_traffic(&mut brain.traffic_heat);
+    accumulate_traffic(brain, faction.home_tile, settlement.owner_faction, member_q);
+    brain.anchors = collect_anchors(faction, settlement, chunk_map, maps);
+    brain.districts = build_districts(faction, settlement, brain);
+    let member_offsets =
+        collect_member_offsets(faction.home_tile, settlement.owner_faction, member_q);
+    brain.road_segments = build_road_network(faction, brain, chunk_map, &member_offsets);
+    brain.road_tiles = road_tiles_for_segments(&brain.road_segments);
+    brain.frontier = build_frontier(faction, brain, chunk_map, maps);
+    brain.parcels = build_parcels(faction, settlement, brain, chunk_map);
+    brain.layout_hash = layout_hash(faction, brain);
+
+    maybe_queue_desire_path(
+        brain,
+        faction.home_tile,
+        settlement.owner_faction,
+        tick,
+        chunk_map,
+        road_queue,
+    );
+}
+
+/// Initial-survey pass run once at `OnEnter(GameState::Playing)` so the
+/// `seed_starting_buildings_system` can read `SettlementBrain.parcels` (and
+/// their `frontage_edge`) when choosing seed-time house anchors. Without
+/// this, the very first runtime survey wouldn't fire until tick 120 —
+/// well after the seed pass has stamped walled houses on legacy
+/// zone-driven anchors that don't sit on road frontage.
+///
+/// Sandbox-bypassed for parity with `seed_starting_buildings_system`.
+#[allow(clippy::too_many_arguments)]
+pub fn kickoff_initial_survey_system(
     mut brains: ResMut<SettlementBrains>,
     mut parcel_index: ResMut<SettlementParcelIndex>,
     mut road_queue: ResMut<RoadCarveQueue>,
@@ -457,10 +523,6 @@ pub fn settlement_survey_system(
     maps: OrganicStructureMaps,
     member_q: Query<(&FactionMember, &Transform)>,
 ) {
-    if clock.tick % SURVEY_INTERVAL != 0 {
-        return;
-    }
-
     for settlement in settlements.iter() {
         let Some(faction) = registry.factions.get(&settlement.owner_faction) else {
             continue;
@@ -468,42 +530,17 @@ pub fn settlement_survey_system(
         if settlement.owner_faction == SOLO || !faction.caps.settlement.is_full_settlement() {
             continue;
         }
-
-        let seed = organic_seed(settlement, faction);
-        let brain = brains
-            .0
-            .entry(settlement.id)
-            .or_insert_with(|| SettlementBrain::new(settlement.id, settlement.owner_faction, seed));
-
-        brain.owner_faction = settlement.owner_faction;
-        brain.seed = seed;
-        brain.phase = phase_for(faction, settlement.peak_population);
-        brain.last_survey_tick = clock.tick;
-        decay_traffic(&mut brain.traffic_heat);
-        accumulate_traffic(
-            brain,
-            faction.home_tile,
-            settlement.owner_faction,
+        survey_one_settlement(
+            settlement,
+            faction,
+            0,
+            &mut brains,
+            &mut road_queue,
+            &chunk_map,
+            &maps,
             &member_q,
         );
-        brain.anchors = collect_anchors(faction, settlement, &chunk_map, &maps);
-        brain.districts = build_districts(faction, settlement, brain);
-        brain.road_segments = build_road_network(faction, brain);
-        brain.road_tiles = road_tiles_for_segments(&brain.road_segments);
-        brain.frontier = build_frontier(faction, brain, &chunk_map, &maps);
-        brain.parcels = build_parcels(faction, settlement, brain, &chunk_map);
-        brain.layout_hash = layout_hash(faction, brain);
-
-        maybe_queue_desire_path(
-            brain,
-            faction.home_tile,
-            settlement.owner_faction,
-            clock.tick,
-            &chunk_map,
-            &mut road_queue,
-        );
     }
-
     parcel_index.rebuild(&brains);
 }
 
@@ -663,20 +700,35 @@ pub fn compat_plan_from_brain(
     tick: u64,
     brain: &SettlementBrain,
 ) -> SettlementPlan {
-    let mut by_kind: AHashMap<ZoneKind, TileRect> = AHashMap::default();
+    // Emit one Zone per parcel — preserves per-parcel granularity so
+    // downstream consumers (chief_directive_system, generate_candidates)
+    // produce one candidate per parcel instead of cramming into a
+    // single union rect.
     let fallback = crate::simulation::settlement::build_settlement_plan(faction_id, faction, tick);
+    let mut zones: Vec<Zone> = Vec::new();
+    let mut kinds_with_parcels: AHashSet<ZoneKind> = AHashSet::default();
+
     for parcel in &brain.parcels {
         let Some(kind) = parcel.district_hint.map(DistrictKind::zone_kind) else {
             continue;
         };
-        let rect = parcel.rect();
-        by_kind
-            .entry(kind)
-            .and_modify(|r| *r = union_rect(*r, rect))
-            .or_insert(rect);
+        kinds_with_parcels.insert(kind);
+        zones.push(Zone {
+            kind,
+            rect: parcel.rect(),
+            priority: zone_priority(kind, faction),
+            capacity: zone_capacity(kind, faction.member_count),
+            filled: 0,
+        });
     }
+
+    // Districts only fall back as a broad zone when no parcel of that
+    // kind exists yet (e.g. early survey before parcels are carved).
     for district in &brain.districts {
         let kind = district.kind.zone_kind();
+        if kinds_with_parcels.contains(&kind) {
+            continue;
+        }
         let r = district.radius as i32;
         let rect = TileRect::new(
             district.centre.0 - r,
@@ -684,35 +736,30 @@ pub fn compat_plan_from_brain(
             (r * 2 + 1) as u16,
             (r * 2 + 1) as u16,
         );
-        by_kind
-            .entry(kind)
-            .and_modify(|existing| *existing = union_rect(*existing, rect))
-            .or_insert(rect);
+        zones.push(Zone {
+            kind,
+            rect,
+            priority: zone_priority(kind, faction),
+            capacity: zone_capacity(kind, faction.member_count),
+            filled: 0,
+        });
     }
 
     // The land-tenure layer still carves plots from SettlementPlan zones.
-    // Organic parcels are authoritative for new placement, but while this
-    // compatibility projection exists we preserve the old listable surfaces
-    // when the organic survey has not produced that district yet.
+    // Preserve a single legacy fallback zone only when the organic survey
+    // has produced neither parcels nor a district for that kind yet.
+    let kinds_emitted: AHashSet<ZoneKind> = zones.iter().map(|z| z.kind).collect();
     for legacy in fallback.zones.iter().filter(|z| {
         matches!(
             z.kind,
             ZoneKind::Residential | ZoneKind::Agricultural | ZoneKind::Crafting | ZoneKind::Storage
         )
     }) {
-        by_kind.entry(legacy.kind).or_insert(legacy.rect);
+        if !kinds_emitted.contains(&legacy.kind) {
+            zones.push(legacy.clone());
+        }
     }
 
-    let mut zones: Vec<Zone> = by_kind
-        .into_iter()
-        .map(|(kind, rect)| Zone {
-            kind,
-            rect,
-            priority: zone_priority(kind, faction),
-            capacity: zone_capacity(kind, faction.member_count),
-            filled: 0,
-        })
-        .collect();
     zones.sort_by_key(|z| z.kind.label());
 
     if !zones.iter().any(|z| z.kind == ZoneKind::Civic) {
@@ -781,6 +828,24 @@ fn decay_traffic(traffic: &mut AHashMap<(i32, i32), u8>) {
         *heat = ((*heat as f32) * 0.82).round() as u8;
         *heat > 2
     });
+}
+
+/// Collect `(dx, dy)` offsets from `home` for every faction member.
+/// Used by `primary_axis` for PCA-lite cluster axis derivation.
+fn collect_member_offsets(
+    home: (i32, i32),
+    faction_id: u32,
+    member_q: &Query<(&FactionMember, &Transform)>,
+) -> Vec<(i32, i32)> {
+    let mut out = Vec::new();
+    for (member, transform) in member_q.iter() {
+        if member.faction_id != faction_id {
+            continue;
+        }
+        let tile = world_to_tile(transform.translation.truncate());
+        out.push((tile.0 - home.0, tile.1 - home.1));
+    }
+    out
 }
 
 fn accumulate_traffic(
@@ -1036,37 +1101,238 @@ fn build_districts(
     districts
 }
 
-fn build_road_network(faction: &FactionData, brain: &SettlementBrain) -> Vec<StreetSegment> {
+/// Primary axis for street layout. Derived per settlement from river
+/// orientation, dominant external anchors, or member-cluster geometry —
+/// never hard-coded to a cardinal default. Diagonals are supported so
+/// settlements following a NE-SW river or trade route can run their
+/// spine along it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpokeAxis {
+    EW,
+    NS,
+    NeSw,
+    NwSe,
+}
+
+impl SpokeAxis {
+    /// Unit-step along the axis. Diagonals step by (±1, ±1) per Bresenham
+    /// tile so segment endpoints reach `radius` chebyshev tiles from home.
+    pub fn dir(self) -> (i32, i32) {
+        match self {
+            SpokeAxis::EW => (1, 0),
+            SpokeAxis::NS => (0, 1),
+            SpokeAxis::NeSw => (1, -1),
+            SpokeAxis::NwSe => (1, 1),
+        }
+    }
+
+    /// Perpendicular axis used for parallel-street offsets and cross
+    /// streets. (-dy, dx) rotates 90° counter-clockwise.
+    pub fn perp(self) -> SpokeAxis {
+        match self {
+            SpokeAxis::EW => SpokeAxis::NS,
+            SpokeAxis::NS => SpokeAxis::EW,
+            SpokeAxis::NeSw => SpokeAxis::NwSe,
+            SpokeAxis::NwSe => SpokeAxis::NeSw,
+        }
+    }
+}
+
+/// Discretise a (dx, dy) offset to one of the four axes. Pure helper
+/// for axis derivation; never invents a primary axis on `(0, 0)` —
+/// callers should fall through to the next priority instead.
+fn classify_axis(dx: i32, dy: i32) -> SpokeAxis {
+    let ax = dx.abs();
+    let ay = dy.abs();
+    if ax == 0 && ay == 0 {
+        return SpokeAxis::EW;
+    }
+    let major = ax.max(ay) as f32;
+    let minor = ax.min(ay) as f32;
+    // ratio < 0.4 → strongly cardinal; otherwise call it diagonal.
+    if minor / major < 0.4 {
+        if ax >= ay {
+            SpokeAxis::EW
+        } else {
+            SpokeAxis::NS
+        }
+    } else if dx.signum() == dy.signum() {
+        SpokeAxis::NwSe
+    } else {
+        SpokeAxis::NeSw
+    }
+}
+
+/// Derive the primary street axis for a settlement. Priority order:
+/// 1. Parallel to a nearby river.
+/// 2. Toward the dominant external anchor (gate, market spur, distant high-weight anchor).
+/// 3. Largest eigen-direction of member-cluster offsets from home.
+/// 4. Cardinal E-W fallback.
+pub fn primary_axis(
+    faction: &FactionData,
+    brain: &SettlementBrain,
+    chunk_map: &ChunkMap,
+    member_offsets: &[(i32, i32)],
+) -> SpokeAxis {
+    let home = faction.home_tile;
+
+    // 1. River — already classified by river_context.
+    if let Some(river_axis) =
+        crate::simulation::river_context::river_orientation_near(chunk_map, home, 10)
+    {
+        use crate::simulation::river_context::RiverAxis;
+        return match river_axis {
+            RiverAxis::EW => SpokeAxis::EW,
+            RiverAxis::NS => SpokeAxis::NS,
+            RiverAxis::NeSw => SpokeAxis::NeSw,
+            RiverAxis::NwSe => SpokeAxis::NwSe,
+        };
+    }
+
+    // 2. Highest-weight anchor at chebyshev ≥ 10 — captures gates, market spurs,
+    //    and water-access points that pull a primary street toward them.
+    let mut external: Option<(f32, (i32, i32))> = None;
+    for anchor in &brain.anchors {
+        if matches!(anchor.kind, SettlementAnchorKind::CivicCore) {
+            continue;
+        }
+        if cheb(anchor.tile, home) < 10 {
+            continue;
+        }
+        if external.map_or(true, |(w, _)| anchor.weight > w) {
+            external = Some((anchor.weight, anchor.tile));
+        }
+    }
+    if let Some((_, tile)) = external {
+        return classify_axis(tile.0 - home.0, tile.1 - home.1);
+    }
+
+    // 3. Member-cluster principal axis (PCA-lite over dx/dy offsets).
+    let mut sxx = 0.0f32;
+    let mut syy = 0.0f32;
+    let mut sxy = 0.0f32;
+    let mut n = 0.0f32;
+    for &(dx, dy) in member_offsets {
+        let fx = dx as f32;
+        let fy = dy as f32;
+        sxx += fx * fx;
+        syy += fy * fy;
+        sxy += fx * fy;
+        n += 1.0;
+    }
+    if n >= 2.0 {
+        let trace = sxx + syy;
+        let det = sxx * syy - sxy * sxy;
+        let disc = (trace * trace / 4.0 - det).max(0.0).sqrt();
+        let lambda = trace / 2.0 + disc;
+        let vx = lambda - syy;
+        let vy = sxy;
+        if vx.abs() + vy.abs() > 0.01 {
+            return classify_axis(vx.round() as i32, vy.round() as i32);
+        }
+    }
+
+    // 4. Cardinal fallback — only when no signal at all.
+    SpokeAxis::EW
+}
+
+/// Lay a straight street segment of length ~`half_extent * 2` centred on
+/// `centre` along `axis`. Returns endpoints suitable for `StreetSegment`.
+fn line_through(centre: (i32, i32), axis: SpokeAxis, half_extent: i32) -> StreetSegment {
+    let (dx, dy) = axis.dir();
+    StreetSegment {
+        start: (centre.0 - dx * half_extent, centre.1 - dy * half_extent),
+        end: (centre.0 + dx * half_extent, centre.1 + dy * half_extent),
+        tier: StreetTier::Primary,
+    }
+}
+
+fn build_road_network(
+    faction: &FactionData,
+    brain: &SettlementBrain,
+    chunk_map: &ChunkMap,
+    member_offsets: &[(i32, i32)],
+) -> Vec<StreetSegment> {
     if !faction.community_has(PERM_SETTLEMENT) {
+        return Vec::new();
+    }
+    if matches!(brain.phase, SettlementPhase::Camp) {
         return Vec::new();
     }
 
     let home = faction.home_tile;
     let radius = road_network_radius(brain.phase);
+    if radius <= 0 {
+        return Vec::new();
+    }
+    let has_bridges = faction.community_has(BRIDGE_BUILDING);
+    let axis = primary_axis(faction, brain, chunk_map, member_offsets);
+    let perp = axis.perp();
+    let (ax, ay) = axis.dir();
+    let (px, py) = perp.dir();
+
     let mut segments = Vec::new();
 
-    // A settlement's roads are the skeleton: carve the main street first, then
-    // hang lots from it. Larger phases add a crossing street before organic
-    // anchor paths so the core cannot be sealed by houses.
-    push_unique_segment(
-        &mut segments,
-        StreetSegment {
-            start: (home.0 - radius, home.1),
-            end: (home.0 + radius, home.1),
-            tier: StreetTier::Primary,
-        },
-    );
-    if !matches!(brain.phase, SettlementPhase::Hamlet) || faction.member_count >= 10 {
-        push_unique_segment(
-            &mut segments,
-            StreetSegment {
-                start: (home.0, home.1 - radius),
-                end: (home.0, home.1 + radius),
-                tier: StreetTier::Primary,
-            },
-        );
+    // Primary spine through home along the derived axis.
+    push_unique_segment(&mut segments, line_through(home, axis, radius));
+
+    // Phase-scaled additions. Minimum spacing between parallel streets is
+    // 12 tiles (≈ 18 m at 1.5 m/tile) — tight enough for one row of 3×3
+    // huts + yards between two parallel streets, anything tighter wouldn't
+    // fit a hut.
+    match brain.phase {
+        SettlementPhase::Camp | SettlementPhase::Hamlet => {
+            // Spine only. No grid. Lets a hamlet whose only purpose is its
+            // connection to a parent city run a single spine that direction.
+        }
+        SettlementPhase::Village => {
+            if faction.member_count >= 12 {
+                push_unique_segment(&mut segments, line_through(home, perp, radius));
+            }
+        }
+        SettlementPhase::Chiefdom => {
+            for off in [-18, 18] {
+                let mid = (home.0 + px * off, home.1 + py * off);
+                let mut seg = line_through(mid, axis, radius);
+                seg.tier = StreetTier::Secondary;
+                push_unique_segment(&mut segments, seg);
+            }
+            let mut cross = line_through(home, perp, radius);
+            cross.tier = StreetTier::Secondary;
+            push_unique_segment(&mut segments, cross);
+        }
+        SettlementPhase::ProtoUrban => {
+            for off in [-30, -15, 15, 30] {
+                let mid = (home.0 + px * off, home.1 + py * off);
+                let mut seg = line_through(mid, axis, radius);
+                seg.tier = StreetTier::Secondary;
+                push_unique_segment(&mut segments, seg);
+            }
+            for off in [-12, 0, 12] {
+                let mid = (home.0 + ax * off, home.1 + ay * off);
+                let mut seg = line_through(mid, perp, radius);
+                seg.tier = StreetTier::Secondary;
+                push_unique_segment(&mut segments, seg);
+            }
+        }
+        SettlementPhase::Urban => {
+            for off in [-24, -12, 12, 24] {
+                let mid = (home.0 + px * off, home.1 + py * off);
+                let mut seg = line_through(mid, axis, radius);
+                seg.tier = StreetTier::Secondary;
+                push_unique_segment(&mut segments, seg);
+            }
+            for off in [-18, -9, 0, 9, 18] {
+                let mid = (home.0 + ax * off, home.1 + ay * off);
+                let mut seg = line_through(mid, perp, radius);
+                seg.tier = StreetTier::Secondary;
+                push_unique_segment(&mut segments, seg);
+            }
+        }
     }
 
+    // Anchor/desire-path segments — append after the grid so they connect
+    // into the base network rather than competing for primary position.
     let mut endpoints: Vec<(f32, (i32, i32), StreetTier)> = Vec::new();
     for anchor in &brain.anchors {
         let tier = match anchor.kind {
@@ -1077,11 +1343,26 @@ fn build_road_network(faction: &FactionData, brain: &SettlementBrain) -> Vec<Str
             _ => StreetTier::Secondary,
         };
         if cheb(anchor.tile, home) >= 4 {
+            // Pre-bridge: only consider anchors reachable on the same bank.
+            // Post-bridge: take any anchor — the emitter will back-fill
+            // crossings short enough for `MAX_BRIDGE_SPAN`.
+            if !has_bridges
+                && !crate::simulation::river_context::same_bank_bfs(
+                    chunk_map, home, anchor.tile,
+                )
+            {
+                continue;
+            }
             endpoints.push((anchor.weight, anchor.tile, tier));
         }
     }
     for (&tile, &heat) in &brain.traffic_heat {
         if heat >= 80 && cheb(tile, home) >= 4 {
+            if !has_bridges
+                && !crate::simulation::river_context::same_bank_bfs(chunk_map, home, tile)
+            {
+                continue;
+            }
             endpoints.push((heat as f32 / 255.0, tile, StreetTier::Alley));
         }
     }
@@ -1101,24 +1382,28 @@ fn build_road_network(faction: &FactionData, brain: &SettlementBrain) -> Vec<Str
         );
     }
 
-    if matches!(
-        brain.phase,
-        SettlementPhase::Chiefdom | SettlementPhase::ProtoUrban | SettlementPhase::Urban
-    ) {
-        let branch = (radius / 2).max(5);
-        for offset in [-branch, branch] {
-            push_unique_segment(
-                &mut segments,
-                StreetSegment {
-                    start: (home.0 + offset, home.1 - branch),
-                    end: (home.0 + offset, home.1 + branch),
-                    tier: StreetTier::Secondary,
-                },
-            );
-        }
+    // Pre-bridge: drop any segment whose Bresenham trace touches a River
+    // tile. Without bridges, `road_carve_system` would silently skip the
+    // wet cells and leave disconnected stubs — better to never plan them.
+    // Post-bridge: keep crossings; `bridge_intent_emitter_system` walks
+    // these same segments and back-fills short runs with Bridge blueprints.
+    if !has_bridges {
+        segments.retain(|seg| !trace_crosses_river(chunk_map, *seg));
     }
 
     segments
+}
+
+fn trace_crosses_river(chunk_map: &ChunkMap, seg: StreetSegment) -> bool {
+    for (tx, ty) in bresenham_tiles(seg.start, seg.end) {
+        if matches!(
+            chunk_map.tile_kind_at(tx, ty),
+            Some(crate::world::tile::TileKind::River)
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 fn road_network_radius(phase: SettlementPhase) -> i32 {
@@ -1241,6 +1526,25 @@ fn build_parcels(
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
 ) -> Vec<Parcel> {
+    // Permanent settlements with a road skeleton: sweep road tiles for
+    // road-fronted parcel candidates. Camps & nomadic factions (no
+    // PERM_SETTLEMENT) and survey-gap settlements (road network not yet
+    // sketched) fall back to the legacy frontier-first allocation.
+    if faction.community_has(PERM_SETTLEMENT) && !brain.road_tiles.is_empty() {
+        build_parcels_road_driven(faction, settlement, brain, chunk_map)
+    } else {
+        build_parcels_frontier_driven(faction, settlement, brain, chunk_map)
+    }
+}
+
+/// Frontier-first parcel allocation. Used for camps and nomadic factions
+/// that don't run the road sweep. Identical to the historical algorithm.
+fn build_parcels_frontier_driven(
+    faction: &FactionData,
+    settlement: &Settlement,
+    brain: &SettlementBrain,
+    chunk_map: &ChunkMap,
+) -> Vec<Parcel> {
     let mut parcels = Vec::new();
     let mut occupied: Vec<TileRect> = Vec::new();
     let mut counts: AHashMap<DistrictKind, usize> = AHashMap::default();
@@ -1283,6 +1587,157 @@ fn build_parcels(
         next_id = next_id.wrapping_add(1);
     }
     parcels
+}
+
+/// Road-tile-driven parcel allocation. For each road tile, derives one
+/// candidate rect per cardinal × district kind, scores by
+/// `suitability × deficit × proximity`, and greedily accepts non-overlapping
+/// rects. Every resulting parcel has a guaranteed `frontage_edge` +
+/// `access_tile` because the rect's edge is by construction adjacent to a
+/// road tile.
+fn build_parcels_road_driven(
+    faction: &FactionData,
+    settlement: &Settlement,
+    brain: &SettlementBrain,
+    chunk_map: &ChunkMap,
+) -> Vec<Parcel> {
+    let targets = parcel_targets(faction, settlement, brain.phase);
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let home = faction.home_tile;
+    let mut road_tiles: Vec<(i32, i32)> = brain.road_tiles.iter().copied().collect();
+    road_tiles.sort_by_key(|t| (cheb(*t, home), t.0, t.1));
+
+    struct Cand {
+        rect: TileRect,
+        edge: TileEdge,
+        access_tile: (i32, i32),
+        kind: DistrictKind,
+        suitability: ParcelSuitability,
+        score: f32,
+        home_dist: i32,
+        tile_hash: u64,
+    }
+    let mut candidates: Vec<Cand> = Vec::new();
+
+    const KIND_ORDER: [DistrictKind; 8] = [
+        DistrictKind::Residential,
+        DistrictKind::Agricultural,
+        DistrictKind::Crafting,
+        DistrictKind::Storage,
+        DistrictKind::Civic,
+        DistrictKind::Defense,
+        DistrictKind::Sacred,
+        DistrictKind::Market,
+    ];
+    const EDGES: [TileEdge; 4] = [
+        TileEdge::North,
+        TileEdge::East,
+        TileEdge::South,
+        TileEdge::West,
+    ];
+
+    for &road_tile in &road_tiles {
+        for edge in EDGES {
+            for kind in KIND_ORDER {
+                let target = *targets.get(&kind).unwrap_or(&0);
+                if target == 0 {
+                    continue;
+                }
+                let (w, h) = parcel_size(kind, brain.phase);
+                let rect = parcel_rect_from_road(road_tile, edge, w, h);
+                if !rect_clear_for_parcel(chunk_map, rect, &brain.road_tiles) {
+                    continue;
+                }
+                let centre = rect.center();
+                let suit = parcel_suitability(faction, settlement, brain, chunk_map, centre);
+                let s = suit.for_district(kind);
+                let threshold = match kind {
+                    DistrictKind::Residential | DistrictKind::Civic => 0.25,
+                    DistrictKind::Agricultural => 0.35,
+                    _ => 0.4,
+                };
+                if s < threshold {
+                    continue;
+                }
+                let home_dist = cheb(centre, home);
+                let score = s * (target as f32) * (1.0 / (1.0 + home_dist as f32 * 0.05));
+                let tile_hash = ((centre.0 as i64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64)
+                    ^ centre.1 as i64) as u64;
+                candidates.push(Cand {
+                    rect,
+                    edge,
+                    access_tile: road_tile,
+                    kind,
+                    suitability: suit,
+                    score,
+                    home_dist,
+                    tile_hash,
+                });
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.home_dist.cmp(&b.home_dist))
+            .then_with(|| a.tile_hash.cmp(&b.tile_hash))
+    });
+
+    let mut parcels = Vec::new();
+    let mut occupied: Vec<TileRect> = Vec::new();
+    let mut counts: AHashMap<DistrictKind, usize> = AHashMap::default();
+    let mut next_id = 0u32;
+    for cand in candidates {
+        if parcels.len() >= MAX_PARCELS {
+            break;
+        }
+        let target = *targets.get(&cand.kind).unwrap_or(&0);
+        let already = *counts.get(&cand.kind).unwrap_or(&0);
+        if already >= target {
+            continue;
+        }
+        if occupied.iter().any(|r| rects_overlap(*r, cand.rect)) {
+            continue;
+        }
+        parcels.push(Parcel {
+            id: next_id,
+            shape: ParcelShape::Rect(cand.rect),
+            frontage_edge: Some(cand.edge),
+            access_tile: Some(cand.access_tile),
+            holder: TenureHolder::State {
+                faction_id: settlement.owner_faction,
+            },
+            district_hint: Some(cand.kind),
+            suitability: cand.suitability,
+        });
+        occupied.push(cand.rect);
+        *counts.entry(cand.kind).or_insert(0) += 1;
+        next_id = next_id.wrapping_add(1);
+    }
+    parcels
+}
+
+/// Place a parcel rect of size `(w, h)` so that its `edge` side is adjacent
+/// to the road tile (i.e. the road sits exactly one tile beyond `edge`).
+fn parcel_rect_from_road(road: (i32, i32), edge: TileEdge, w: u16, h: u16) -> TileRect {
+    let w_i = w as i32;
+    let h_i = h as i32;
+    match edge {
+        // Road is north of parcel; parcel's north edge faces road.
+        TileEdge::North => TileRect::new(road.0 - w_i / 2, road.1 - h_i, w, h),
+        // Road is south of parcel; parcel's south edge faces road.
+        TileEdge::South => TileRect::new(road.0 - w_i / 2, road.1 + 1, w, h),
+        // Road is east of parcel; parcel's east edge faces road.
+        TileEdge::East => TileRect::new(road.0 - w_i, road.1 - h_i / 2, w, h),
+        // Road is west of parcel; parcel's west edge faces road.
+        TileEdge::West => TileRect::new(road.0 + 1, road.1 - h_i / 2, w, h),
+    }
 }
 
 fn append_pressures_for_faction(
@@ -2557,7 +3012,8 @@ mod tests {
         let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
         brain.phase = SettlementPhase::Hamlet;
 
-        let segments = build_road_network(&faction, &brain);
+        let map = ChunkMap::default();
+        let segments = build_road_network(&faction, &brain, &map, &[]);
         let tiles = road_tiles_for_segments(&segments);
 
         assert!(!segments.is_empty());
@@ -2623,6 +3079,82 @@ mod tests {
     }
 
     #[test]
+    fn pre_bridge_road_network_skips_river_crossing_spokes() {
+        let mut faction = dummy_faction((0, 0), 8);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.phase = SettlementPhase::Hamlet;
+
+        // NS river right through home — the default E-W primary spoke
+        // would cross it; pre-tech, it must be dropped.
+        let mut map = grass_map();
+        let r: Vec<(i32, i32)> = (-30..=30).map(|y| (0, y)).collect();
+        write_river_at(&mut map, &r);
+
+        let segments = build_road_network(&faction, &brain, &map, &[]);
+        for seg in &segments {
+            assert!(
+                !trace_crosses_river(&map, *seg),
+                "pre-bridge planner produced a river-crossing segment: {:?}",
+                seg
+            );
+        }
+    }
+
+    #[test]
+    fn post_bridge_road_network_keeps_river_crossings() {
+        let mut faction = dummy_faction((0, 0), 8);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        force_adopt(&mut faction, BRIDGE_BUILDING);
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.phase = SettlementPhase::Hamlet;
+
+        let mut map = grass_map();
+        let r: Vec<(i32, i32)> = (-30..=30).map(|y| (0, y)).collect();
+        write_river_at(&mut map, &r);
+
+        let segments = build_road_network(&faction, &brain, &map, &[]);
+        let any_crossing = segments
+            .iter()
+            .any(|seg| trace_crosses_river(&map, *seg));
+        assert!(
+            any_crossing,
+            "post-bridge planner should retain crossings so the emitter can bridge them"
+        );
+    }
+
+    #[test]
+    fn parallel_spine_promoted_along_ns_river() {
+        let mut faction = dummy_faction((0, 0), 8);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.phase = SettlementPhase::Hamlet;
+        // Hamlet phase only stamps the FIRST primary spoke (the second one
+        // is gated on `member_count >= 10`). With an NS river nearby, that
+        // first spoke must run N-S (parallel to water), not E-W.
+
+        let mut map = grass_map();
+        let r: Vec<(i32, i32)> = (-30..=30).map(|y| (5, y)).collect();
+        write_river_at(&mut map, &r);
+
+        let segments = build_road_network(&faction, &brain, &map, &[]);
+        // Exactly one Primary spoke survives at hamlet phase; assert it's NS.
+        let primaries: Vec<&StreetSegment> = segments
+            .iter()
+            .filter(|s| s.tier == StreetTier::Primary)
+            .collect();
+        assert!(!primaries.is_empty(), "expected a primary spine");
+        let ns_aligned = primaries
+            .iter()
+            .any(|s| s.start.0 == s.end.0 && s.start.1 != s.end.1);
+        assert!(
+            ns_aligned,
+            "primary spine should be N-S parallel to the river; got {:?}",
+            primaries
+        );
+    }
+
+    #[test]
     fn detect_runs_skips_run_without_two_banks() {
         let mut m = grass_map();
         write_river_at(&mut m, &[(0, 0)]);
@@ -2630,6 +3162,175 @@ mod tests {
         let trace: Vec<(i32, i32)> = (0..=4).map(|x| (x, 0)).collect();
         let runs = detect_bridge_runs_in_trace(&m, &trace);
         assert!(runs.is_empty());
+    }
+
+    /// `SettlementPhase::Village` with `member_count >= 12` must emit BOTH
+    /// a primary-axis spine AND a perpendicular cross at home. Below the
+    /// threshold the cross is suppressed (single-spine hamlet behaviour).
+    /// Verifies the shipped phase-scaled road network.
+    #[test]
+    fn village_phase_emits_cross_when_population_reaches_threshold() {
+        let mut faction = dummy_faction((0, 0), 12);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.phase = SettlementPhase::Village;
+        let map = grass_map();
+        let offsets: Vec<(i32, i32)> = (0..12).map(|i| (i - 6, 0)).collect();
+
+        let segs = build_road_network(&faction, &brain, &map, &offsets);
+        // With no river and a horizontal member cluster, primary axis is
+        // EW. Village @ pop≥12 should have ≥2 segments (spine + cross).
+        assert!(
+            segs.len() >= 2,
+            "village @ pop=12 expected ≥2 road segments, got {}",
+            segs.len()
+        );
+
+        // Drop to 8 members — Village still (peak_population can stay high
+        // but member_count gates the cross). Confirm cross is suppressed.
+        faction.member_count = 8;
+        let segs_small = build_road_network(&faction, &brain, &map, &offsets[..8]);
+        assert_eq!(
+            segs_small.len(),
+            1,
+            "village @ pop=8 should emit only the primary spine (no cross)"
+        );
+    }
+
+    /// Urban-phase parallel streets must respect the 12-tile minimum block
+    /// spacing (≈18 m at 1.5 m/tile — the floor for fitting one row of
+    /// houses with yards between two parallel roads). The shipped Urban
+    /// schedule uses ±12 / ±24 offsets along the primary axis; check that
+    /// every adjacent pair along the perpendicular axis is ≥12 apart.
+    #[test]
+    fn urban_block_spacing_meets_realistic_floor() {
+        let mut faction = dummy_faction((0, 0), 100);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.phase = SettlementPhase::Urban;
+        let map = grass_map();
+        let offsets: Vec<(i32, i32)> = (0..30).map(|i| (i - 15, 0)).collect();
+
+        let segs = build_road_network(&faction, &brain, &map, &offsets);
+        // Urban → primary spine + 4 parallel offsets (±12, ±24) along axis.
+        assert!(
+            segs.len() >= 5,
+            "urban expected ≥5 segments, got {}",
+            segs.len()
+        );
+
+        // Collect Y-coordinate of horizontal (EW-axis) primary-axis spines:
+        // segments whose start.y == end.y. Sort, then check spacing.
+        let mut ys: Vec<i32> = segs
+            .iter()
+            .filter(|s| s.start.1 == s.end.1)
+            .map(|s| s.start.1)
+            .collect();
+        ys.sort();
+        ys.dedup();
+        if ys.len() >= 2 {
+            for w in ys.windows(2) {
+                let gap = (w[1] - w[0]).abs();
+                assert!(
+                    gap >= 12,
+                    "urban parallel street spacing {} violates 12-tile floor (ys={:?})",
+                    gap,
+                    ys
+                );
+            }
+        }
+    }
+
+    /// Every Residential parcel emitted by `build_parcels_road_driven`
+    /// must have `frontage_edge.is_some()` and `access_tile.is_some()` —
+    /// the road-tile-driven sweep derives candidate rects from cardinal
+    /// neighbours of road tiles, so frontage is inherent. This is the
+    /// invariant the seed pipeline relies on for door placement.
+    #[test]
+    fn permanent_residential_parcels_have_frontage_invariant() {
+        use crate::economy::market::SettlementMarket;
+        let mut faction = dummy_faction((0, 0), 30);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.phase = SettlementPhase::Chiefdom;
+        let map = grass_map();
+        let offsets: Vec<(i32, i32)> = (0..30).map(|i| (i - 15, 0)).collect();
+
+        // Populate the road skeleton so build_parcels takes the
+        // road-driven branch.
+        brain.road_segments = build_road_network(&faction, &brain, &map, &offsets);
+        brain.road_tiles = road_tiles_for_segments(&brain.road_segments);
+        assert!(
+            !brain.road_tiles.is_empty(),
+            "chiefdom should have a road skeleton"
+        );
+
+        let settlement = Settlement {
+            id: SettlementId(1),
+            owner_faction: 1,
+            market_tile: (0, 0),
+            founding_tick: 0,
+            name: "Test".into(),
+            treasury: 0.0,
+            market: SettlementMarket::default(),
+            peak_population: 30,
+        };
+
+        let parcels = build_parcels(&faction, &settlement, &brain, &map);
+        let residential: Vec<_> = parcels
+            .iter()
+            .filter(|p| p.district_hint == Some(DistrictKind::Residential))
+            .collect();
+        assert!(
+            !residential.is_empty(),
+            "chiefdom with 30 members + road network should produce ≥1 Residential parcel"
+        );
+        for p in &residential {
+            assert!(
+                p.frontage_edge.is_some(),
+                "Residential parcel #{} lacks frontage_edge (rect={:?})",
+                p.id,
+                p.rect()
+            );
+            assert!(
+                p.access_tile.is_some(),
+                "Residential parcel #{} lacks access_tile",
+                p.id
+            );
+        }
+    }
+
+    /// `survey_one_settlement`'s expensive sub-functions
+    /// (`build_road_network` + `build_parcels` + `road_tiles_for_segments`)
+    /// are pure on `(faction, brain, chunk_map, member_offsets)`. Calling
+    /// them twice with the same inputs must produce identical outputs —
+    /// this is the determinism guarantee that lets the OnEnter kickoff
+    /// survey and the FixedUpdate runtime survey share the same body and
+    /// converge on the same brain.
+    #[test]
+    fn survey_subfunctions_are_deterministic() {
+        let mut faction = dummy_faction((0, 0), 16);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.phase = SettlementPhase::Village;
+        let map = grass_map();
+        let member_offsets: Vec<(i32, i32)> = (0..16).map(|i| (i - 8, 0)).collect();
+
+        let segs_a = build_road_network(&faction, &brain, &map, &member_offsets);
+        let segs_b = build_road_network(&faction, &brain, &map, &member_offsets);
+        assert_eq!(
+            segs_a.len(),
+            segs_b.len(),
+            "road network must be deterministic across re-runs"
+        );
+        for (a, b) in segs_a.iter().zip(segs_b.iter()) {
+            assert_eq!(a.start, b.start);
+            assert_eq!(a.end, b.end);
+        }
+
+        let tiles_a = road_tiles_for_segments(&segs_a);
+        let tiles_b = road_tiles_for_segments(&segs_b);
+        assert_eq!(tiles_a, tiles_b);
     }
 }
 

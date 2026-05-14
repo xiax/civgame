@@ -1854,6 +1854,57 @@ fn entrance_cell_for_edge(
     }
 }
 
+/// Canonical wall+door+bed enumeration for a rectangular walled house.
+///
+/// One source of truth shared by both seed-time direct stamping
+/// (`seed_walled_house_at`) and runtime blueprint emission (`plan_building`).
+/// Returns tiles in stable order: perimeter cells (walls + door) first in
+/// row-major scan order, then interior beds in caller order. The door cell
+/// carries `Some(door_edge)`; every other cell carries `None`.
+///
+/// Note: this is pure layout — it does NOT pick the door cardinal or check
+/// for clear ground. Callers run `pick_clear_door_cardinal` first and pass
+/// the resolved entrance offset + edge.
+pub(crate) fn walled_house_tile_plan(
+    cx: i32,
+    cy: i32,
+    half_w: i32,
+    half_h: i32,
+    entrance: (i32, i32),
+    door_edge: crate::simulation::land::TileEdge,
+    wall_material: WallMaterial,
+    interior_beds: &[(i32, i32)],
+) -> Vec<(
+    BuildSiteKind,
+    (i32, i32),
+    Option<crate::simulation::land::TileEdge>,
+)> {
+    let mut plan: Vec<(
+        BuildSiteKind,
+        (i32, i32),
+        Option<crate::simulation::land::TileEdge>,
+    )> = Vec::new();
+    for dy in -half_h..=half_h {
+        for dx in -half_w..=half_w {
+            if dx.abs() < half_w && dy.abs() < half_h {
+                continue; // interior — beds go via the second loop below
+            }
+            let tile = (cx + dx, cy + dy);
+            let (kind, edge) = if (dx, dy) == entrance {
+                (BuildSiteKind::Door, Some(door_edge))
+            } else {
+                (BuildSiteKind::Wall(wall_material), None)
+            };
+            plan.push((kind, tile, edge));
+        }
+    }
+    for &(bdx, bdy) in interior_beds {
+        let tile = (cx + bdx, cy + bdy);
+        plan.push((BuildSiteKind::Bed, tile, None));
+    }
+    plan
+}
+
 fn plan_building(
     commands: &mut Commands,
     bp_map: &mut BlueprintMap,
@@ -1894,37 +1945,19 @@ fn plan_building(
 
     let (target_z, _spread) = footprint_z_stats(chunk_map, cx, cy, half_w, half_h);
 
-    // Build the wall+bed plan. We always compute it first so the deferred
+    // Build the wall+door+bed plan. We always compute it first so the deferred
     // path (footprint_completion_system) can spawn the same blueprints once
-    // terraform completes.
-    let mut wall_plan: Vec<(
-        BuildSiteKind,
-        (i32, i32),
-        Option<crate::simulation::land::TileEdge>,
-    )> = Vec::new();
-    for dy in -half_h..=half_h {
-        for dx in -half_w..=half_w {
-            if dx.abs() < half_w && dy.abs() < half_h {
-                continue;
-            } // interior — beds go here
-            let tile = ((cx + dx) as i32, (cy + dy) as i32);
-            let kind = if (dx, dy) == entrance {
-                BuildSiteKind::Door
-            } else {
-                BuildSiteKind::Wall(wall_material)
-            };
-            let edge = if (dx, dy) == entrance {
-                Some(door_edge)
-            } else {
-                None
-            };
-            wall_plan.push((kind, tile, edge));
-        }
-    }
-    for &(bdx, bdy) in interior_beds {
-        let tile = ((cx + bdx) as i32, (cy + bdy) as i32);
-        wall_plan.push((BuildSiteKind::Bed, tile, None));
-    }
+    // terraform completes. Same enumeration the seed path uses.
+    let wall_plan = walled_house_tile_plan(
+        cx,
+        cy,
+        half_w,
+        half_h,
+        entrance,
+        door_edge,
+        wall_material,
+        interior_beds,
+    );
 
     // Collect the tiles that need terraforming (footprint covers walls AND
     // interior — every tile under the building must sit at target_z so the
@@ -2103,6 +2136,55 @@ pub struct BuildingMapsRO<'w> {
     pub doormat: Res<'w, crate::simulation::doormat::DoormatReservations>,
     pub organic_selected: Res<'w, crate::simulation::organic_settlement::SelectedSettlementIntents>,
     pub organic_brains: Res<'w, crate::simulation::organic_settlement::SettlementBrains>,
+}
+
+/// Read-only borrow of the structure-map set that `generate_candidates` needs.
+/// Produced from either `BuildingMapsRO` (chief path) or `FurnitureMaps` (seed
+/// path) so the same candidate generator drives both contexts. Doormat /
+/// organic_selected / organic_brains stay separate parameters because the
+/// chief and seed paths have different access patterns.
+pub struct GenCandidatesMaps<'a> {
+    pub bed_map: &'a BedMap,
+    pub wall_map: &'a WallMap,
+    pub campfire_map: &'a CampfireMap,
+    pub workbench_map: &'a WorkbenchMap,
+    pub granary_map: &'a GranaryMap,
+    pub shrine_map: &'a ShrineMap,
+    pub market_map: &'a MarketMap,
+    pub barracks_map: &'a BarracksMap,
+    pub monument_map: &'a MonumentMap,
+}
+
+impl<'w> BuildingMapsRO<'w> {
+    pub fn as_view(&self) -> GenCandidatesMaps<'_> {
+        GenCandidatesMaps {
+            bed_map: &self.bed_map,
+            wall_map: &self.wall_map,
+            campfire_map: &self.campfire_map,
+            workbench_map: &self.workbench_map,
+            granary_map: &self.granary_map,
+            shrine_map: &self.shrine_map,
+            market_map: &self.market_map,
+            barracks_map: &self.barracks_map,
+            monument_map: &self.monument_map,
+        }
+    }
+}
+
+impl<'w> FurnitureMaps<'w> {
+    pub fn as_view(&self) -> GenCandidatesMaps<'_> {
+        GenCandidatesMaps {
+            bed_map: &self.bed_map,
+            wall_map: &self.wall_map,
+            campfire_map: &self.campfire_map,
+            workbench_map: &self.workbench_map,
+            granary_map: &self.granary_map,
+            shrine_map: &self.shrine_map,
+            market_map: &self.market_map,
+            barracks_map: &self.barracks_map,
+            monument_map: &self.monument_map,
+        }
+    }
 }
 
 /// One thing the chief is considering building this tick. The selector
@@ -2374,6 +2456,22 @@ pub fn chief_directive_system(
             .and_then(|&e| settlement_q.get(e).ok())
             .map(|s| s.peak_population)
             .unwrap_or(faction.member_count);
+        // Brain-readiness gate: when an organic survey has been initiated
+        // for this faction's settlement but hasn't completed its first
+        // survey (last_survey_tick == 0), suppress shelter-class candidates
+        // from the legacy `generate_candidates` fallback. Otherwise the
+        // chief would stamp Hut/Longhouse/CompositeHouse into broad legacy
+        // zones before parcel-driven placement has had its first pass —
+        // leading to houses on planned roads or on land marked for other
+        // districts. Non-shelter candidates (Hearth, Granary, civic, etc.)
+        // remain allowed so the settlement still gets useful work.
+        let brain_for_faction = settlement_map
+            .first_for_faction(faction_id)
+            .and_then(|sid| maps.organic_brains.0.get(&sid));
+        let brain_pending_first_survey = brain_for_faction
+            .map(|b| b.last_survey_tick == 0)
+            .unwrap_or(false);
+
         let best = maps
             .organic_selected
             .0
@@ -2385,7 +2483,7 @@ pub fn chief_directive_system(
                     faction,
                     plan,
                     &chunk_map,
-                    &maps,
+                    &maps.as_view(),
                     &bp_map,
                     &*maps.doormat,
                     pending_kinds,
@@ -2393,6 +2491,16 @@ pub fn chief_directive_system(
                     &plot_q,
                     peak_pop,
                 );
+                if brain_pending_first_survey {
+                    candidates.retain(|c| {
+                        !matches!(
+                            c.intent,
+                            BuildIntent::Hut(_)
+                                | BuildIntent::Longhouse(_)
+                                | BuildIntent::CompositeHouse { .. }
+                        )
+                    });
+                }
                 // Stage 3 feedback: penalize candidates whose required inputs include
                 // a chronically-deficient good (per `material_deficit_ema`). Skips the
                 // upgrade-rebuild path which short-circuits with score 5000 from
@@ -2467,7 +2575,7 @@ fn generate_candidates(
     faction: &FactionData,
     plan: Option<&crate::simulation::settlement::SettlementPlan>,
     chunk_map: &ChunkMap,
-    maps: &BuildingMapsRO,
+    maps: &GenCandidatesMaps,
     bp_map: &BlueprintMap,
     doormat: &crate::simulation::doormat::DoormatReservations,
     pending_kinds: &AHashMap<BuildSiteKind, u32>,
@@ -3211,6 +3319,170 @@ fn spawn_intent(
             );
         }
     }
+}
+
+/// Seed-mode mirror of `spawn_intent`: stamps tiles + spawns structure
+/// entities directly instead of emitting `Blueprint`s for workers to
+/// construct. Drives the unified `generate_candidates` candidate stream at
+/// `OnEnter(Playing)` so the seed pipeline goes through the same intent
+/// logic the runtime chief uses (rather than duplicating placement logic
+/// in seed-only helpers). Returns `true` if the intent was applied; the
+/// caller tracks `used` tiles to avoid restamping.
+///
+/// Composite houses fall back to `plan_composite_building` (blueprint emit)
+/// at seed time — the runtime chief picks them up if conditions still hold.
+/// In practice they're rolled only ~10% on small bed deficits, so the seed
+/// loop usually picks Hut / Longhouse anyway.
+fn seed_apply_intent(
+    commands: &mut Commands,
+    maps: &mut FurnitureMaps,
+    chunk_map: &mut ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    doormat: &mut crate::simulation::doormat::DoormatReservations,
+    road_carve: &mut RoadCarveQueue,
+    faction_id: u32,
+    home: (i32, i32),
+    intent: BuildIntent,
+    tile: (i32, i32),
+    door_dir: Option<crate::simulation::land::TileEdge>,
+) -> bool {
+    match intent {
+        BuildIntent::Single(kind) => {
+            // Refuse if the tile is already used (kind-specific footprint
+            // should be free; the candidate generator gates on its own
+            // count_X helper but seed loop also feeds `used` so we don't
+            // restamp a structure on top of itself).
+            if used.contains(&tile) {
+                return false;
+            }
+            spawn_seeded_structure_at_tile(
+                commands,
+                maps,
+                chunk_map,
+                tile_changed,
+                used,
+                tile,
+                faction_id,
+                kind,
+            );
+            true
+        }
+        BuildIntent::Hut(wall_mat) => seed_walled_house_at(
+            commands,
+            maps,
+            chunk_map,
+            tile_changed,
+            used,
+            tile.0,
+            tile.1,
+            1,
+            1,
+            &[(0, 0)],
+            wall_mat,
+            faction_id,
+            home,
+            door_dir,
+            doormat,
+            road_carve,
+        ),
+        BuildIntent::Longhouse(wall_mat) => seed_walled_house_at(
+            commands,
+            maps,
+            chunk_map,
+            tile_changed,
+            used,
+            tile.0,
+            tile.1,
+            2,
+            1,
+            &[(-1, 0), (1, 0)],
+            wall_mat,
+            faction_id,
+            home,
+            door_dir,
+            doormat,
+            road_carve,
+        ),
+        BuildIntent::PalisadeSegment(wall_mat, _) => seed_apply_wall_tile(
+            commands,
+            maps,
+            chunk_map,
+            tile_changed,
+            used,
+            doormat,
+            tile,
+            wall_mat,
+        ),
+        BuildIntent::CompositeHouse { .. } => {
+            // Seed defers composite footprints to the runtime chief — the
+            // shape-aware door picker in `plan_composite_building` needs
+            // blueprint-aware tile checks, and the candidate is rare
+            // enough at seed time (10% roll on modest bed deficit) that
+            // skipping it loses ~zero variety.
+            false
+        }
+    }
+}
+
+/// Stamp a single Wall tile at `tile` and spawn the matching `Wall` entity.
+/// Used by the seed-mode resolver for `BuildIntent::PalisadeSegment` so the
+/// candidate generator's per-segment palisade emission progresses tile-by-tile
+/// at game start. Refuses tiles that are already used / impassable / already a
+/// Wall or Road / reserved as someone's doormat.
+fn seed_apply_wall_tile(
+    commands: &mut Commands,
+    maps: &mut FurnitureMaps,
+    chunk_map: &mut ChunkMap,
+    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    doormat: &crate::simulation::doormat::DoormatReservations,
+    tile: (i32, i32),
+    material: WallMaterial,
+) -> bool {
+    if used.contains(&tile) || doormat.is_reserved(tile) {
+        return false;
+    }
+    if !chunk_map.is_passable(tile.0, tile.1) {
+        return false;
+    }
+    let Some(k) = chunk_map.tile_kind_at(tile.0, tile.1) else {
+        return false;
+    };
+    if k == TileKind::Wall || k == TileKind::Road {
+        return false;
+    }
+    let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
+    chunk_map.set_tile(
+        tile.0,
+        tile.1,
+        surf_z + 1,
+        TileData {
+            kind: TileKind::Wall,
+            elevation: 0,
+            fertility: 0,
+            flags: 0b0001,
+            ore: 0,
+        },
+    );
+    let world_pos = tile_to_world(tile.0, tile.1);
+    let e = commands
+        .spawn((
+            Wall { material },
+            StructureLabel(material.label()),
+            Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
+        ))
+        .id();
+    maps.wall_map.0.insert(tile, e);
+    used.insert(tile);
+    tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+        tx: tile.0,
+        ty: tile.1,
+    });
+    true
 }
 
 /// Place wall / door / bed blueprints over an arbitrary shape mask. Perimeter
@@ -5427,88 +5699,22 @@ pub(crate) fn next_clear_tile(
     None
 }
 
-/// Map a seeded structure to the SettlementPlan zone where it belongs.
-/// Used by `seed_starting_buildings_system` so seeded settlements respect
-/// the same zone layout as grown ones (Phase 4 follow-on).
-fn seed_zone_for(kind: BuildSiteKind) -> Option<crate::simulation::settlement::ZoneKind> {
-    use crate::simulation::settlement::ZoneKind;
-    match kind {
-        BuildSiteKind::Bed | BuildSiteKind::Bedroll => Some(ZoneKind::Residential),
-        BuildSiteKind::Campfire => Some(ZoneKind::Civic),
-        BuildSiteKind::Workbench | BuildSiteKind::Loom => Some(ZoneKind::Crafting),
-        BuildSiteKind::Granary => Some(ZoneKind::Storage),
-        BuildSiteKind::Shrine | BuildSiteKind::Monument => Some(ZoneKind::Sacred),
-        BuildSiteKind::Market => Some(ZoneKind::Market),
-        BuildSiteKind::Barracks => Some(ZoneKind::Defense),
-        // Furniture / non-civic kinds keep the radial fallback.
-        _ => None,
-    }
-}
 
-/// Pick a clear seed tile inside the SettlementPlan zone matching `kind`,
-/// falling back to a radial spiral around `home` when the zone is missing
-/// or full. Mirrors the layout `chief_directive_system` would produce so
-/// seeded structures land where they'd organically grow.
-fn pick_seed_tile(
-    plan: Option<&crate::simulation::settlement::SettlementPlan>,
-    kind: BuildSiteKind,
-    home: (i32, i32),
-    used: &AHashSet<(i32, i32)>,
-    chunk_map: &ChunkMap,
-) -> Option<(i32, i32)> {
-    if let (Some(plan), Some(zk)) = (plan, seed_zone_for(kind)) {
-        if let Some(rect) = plan.zones.iter().find(|z| z.kind == zk).map(|z| z.rect) {
-            // Scan within the zone rect for the first clear tile, picking
-            // the candidate closest to home for visual coherence.
-            let (hx, hy) = home;
-            let mut best: Option<(i32, (i32, i32))> = None;
-            for ty in rect.y0..rect.y0 + rect.h as i32 {
-                for tx in rect.x0..rect.x0 + rect.w as i32 {
-                    let pos = (tx, ty);
-                    if used.contains(&pos) {
-                        continue;
-                    }
-                    if !chunk_map.is_passable(tx, ty) {
-                        continue;
-                    }
-                    let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
-                        continue;
-                    };
-                    if k == TileKind::Wall || k == TileKind::Stone {
-                        continue;
-                    }
-                    let d = (tx - hx).abs() + (ty - hy).abs();
-                    if best.as_ref().map_or(true, |b| d < b.0) {
-                        best = Some((d, pos));
-                    }
-                }
-            }
-            if let Some((_, pos)) = best {
-                return Some(pos);
-            }
-        }
-    }
-    // Fallback: original radial spiral.
-    next_clear_tile(home, used, chunk_map, 8)
-}
-
-/// Spawn one `BuildSiteKind` instance, preferring the structure's target
-/// zone in `plan`; falling back to a radial slot when no plan / zone
-/// exists. Inserts into the matching map and emits a `TileChangedEvent`.
-fn spawn_seeded_structure(
+/// Stamp a single-tile structure at an explicit tile (caller has already
+/// resolved placement via plan / brain / seed loop). Mirrors the body of
+/// `spawn_seeded_structure` but skips the radial `pick_seed_tile` search.
+/// Used by the seed-mode intent resolver so candidates produced by
+/// `generate_candidates` land at the chosen tile.
+fn spawn_seeded_structure_at_tile(
     commands: &mut Commands,
     maps: &mut FurnitureMaps,
-    chunk_map: &mut ChunkMap,
+    _chunk_map: &mut ChunkMap,
     tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
     used: &mut AHashSet<(i32, i32)>,
-    home: (i32, i32),
+    tile: (i32, i32),
     faction_id: u32,
     kind: BuildSiteKind,
-    plan: Option<&crate::simulation::settlement::SettlementPlan>,
 ) {
-    let Some(tile) = pick_seed_tile(plan, kind, home, used, chunk_map) else {
-        return;
-    };
     used.insert(tile);
     let world_pos = tile_to_world(tile.0, tile.1);
 
@@ -5735,137 +5941,6 @@ fn spawn_seeded_structure(
     });
 }
 
-/// Lay a square `Wall` perimeter of side `2*half+1` centred on `home`, with one
-/// `Door` on the perimeter facing east. Skips tiles that aren't passable
-/// (rivers, existing walls, etc.) — those gaps just become passive openings.
-fn seed_perimeter(
-    commands: &mut Commands,
-    maps: &mut FurnitureMaps,
-    chunk_map: &mut ChunkMap,
-    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
-    used: &mut AHashSet<(i32, i32)>,
-    home: (i32, i32),
-    half: i32,
-    material: WallMaterial,
-    faction_id: u32,
-    doormat: &mut crate::simulation::doormat::DoormatReservations,
-    road_carve: &mut RoadCarveQueue,
-) {
-    let (hx, hy) = home;
-    // Door tile: east side, mid-height. The palisade gets a 3-tile gateway
-    // on each cardinal so traffic flow isn't choked through a single tile,
-    // matching `find_palisade_site`'s chief-built ring.
-    let door_tile = (hx + half, hy);
-    let door_edge = crate::simulation::land::TileEdge::East;
-    let gateway_half = 1i32;
-
-    for dy in -half..=half {
-        for dx in -half..=half {
-            // Only perimeter tiles.
-            if dx.abs() != half && dy.abs() != half {
-                continue;
-            }
-            let tile = (hx + dx, hy + dy);
-            // 3-tile cardinal gateways: leave Grass (no wall, no door) on
-            // gateway tiles except for the canonical east `door_tile` which
-            // gets the Door entity itself.
-            let on_top_or_bottom = dy.abs() == half && dx.abs() != half;
-            let on_left_or_right = dx.abs() == half && dy.abs() != half;
-            let in_horizontal_gateway = on_top_or_bottom && dx.abs() <= gateway_half;
-            let in_vertical_gateway = on_left_or_right && dy.abs() <= gateway_half;
-            if (in_horizontal_gateway || in_vertical_gateway) && tile != door_tile {
-                continue;
-            }
-            if used.contains(&tile) {
-                continue;
-            }
-            if !chunk_map.is_passable(tile.0, tile.1) {
-                continue;
-            }
-            let Some(k) = chunk_map.tile_kind_at(tile.0, tile.1) else {
-                continue;
-            };
-            if k == TileKind::Wall || k == TileKind::Road {
-                continue;
-            }
-
-            let world_pos = tile_to_world(tile.0, tile.1);
-
-            if tile == door_tile {
-                let (ddx, ddy) = door_edge.delta();
-                let doormat_tile = (tile.0 + ddx, tile.1 + ddy);
-                let door = Door {
-                    faction_id,
-                    open: false,
-                    tier: DoorTier::default(),
-                    dir: door_edge,
-                    doormat_tile,
-                };
-                let label = door.tier.label();
-                let e = commands
-                    .spawn((
-                        door,
-                        StructureLabel(label),
-                        Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
-                        GlobalTransform::default(),
-                        Visibility::Visible,
-                        InheritedVisibility::default(),
-                    ))
-                    .id();
-                maps.door_map.0.insert(
-                    tile,
-                    DoorEntry {
-                        entity: e,
-                        open: false,
-                    },
-                );
-                doormat.0.insert(
-                    doormat_tile,
-                    crate::simulation::doormat::DoormatEntry {
-                        owner_door: e,
-                        door_tile: tile,
-                        dir: door_edge,
-                    },
-                );
-                let needs_extension = !road_within(chunk_map, doormat_tile, 4);
-                write_road_tile(chunk_map, tile_changed, doormat_tile);
-                if needs_extension {
-                    road_carve.0.push((faction_id, doormat_tile, home));
-                }
-            } else {
-                let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
-                chunk_map.set_tile(
-                    tile.0,
-                    tile.1,
-                    surf_z + 1,
-                    TileData {
-                        kind: TileKind::Wall,
-                        elevation: 0,
-                        fertility: 0,
-                        flags: 0b0001,
-                        ore: 0,
-                    },
-                );
-                let e = commands
-                    .spawn((
-                        Wall { material },
-                        StructureLabel(material.label()),
-                        Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
-                        GlobalTransform::default(),
-                        Visibility::Visible,
-                        InheritedVisibility::default(),
-                    ))
-                    .id();
-                maps.wall_map.0.insert(tile, e);
-            }
-            used.insert(tile);
-            tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
-                tx: tile.0,
-                ty: tile.1,
-            });
-        }
-    }
-}
 
 /// Per-faction starting structures, dispatched on `OnEnter(GameState::Playing)`
 /// after `spawn_population`. Reads `GameStartOptions::era` and
@@ -5887,6 +5962,11 @@ pub fn seed_starting_buildings_system(
     options: Res<crate::GameStartOptions>,
     mut doormat_reservations: ResMut<crate::simulation::doormat::DoormatReservations>,
     mut road_carve_queue: ResMut<RoadCarveQueue>,
+    brains: Res<crate::simulation::organic_settlement::SettlementBrains>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    plot_q: Query<&crate::simulation::land::Plot>,
+    settlement_q: Query<&crate::simulation::settlement::Settlement>,
 ) {
     if !options.seed_buildings {
         return;
@@ -5898,11 +5978,12 @@ pub fn seed_starting_buildings_system(
         Era::Neolithic => HearthTier::Ringed,
         Era::Chalcolithic | Era::BronzeAge => HearthTier::Lined,
     };
-    let wall_material = match era {
-        Era::Chalcolithic => Some(WallMaterial::Palisade),
-        Era::BronzeAge => Some(WallMaterial::Mudbrick),
-        _ => None,
-    };
+
+    // Generate-candidates needs an empty bp_map at seed time; we don't spawn
+    // any blueprints in seed mode, so the chief's pending-blueprint accounting
+    // is always zero. Likewise pending_kinds is empty.
+    let empty_bp_map = BlueprintMap::default();
+    let empty_pending: AHashMap<BuildSiteKind, u32> = AHashMap::new();
 
     for (&faction_id, faction) in registry.factions.iter() {
         if faction_id == SOLO || faction.member_count == 0 {
@@ -5917,11 +5998,8 @@ pub fn seed_starting_buildings_system(
         used.insert(home);
 
         // ── Nomadic camps short-circuit the era ladder ─────────────────
-        // No walls, plots, granaries, or pre-built houses. Just hearths,
-        // a Bedroll per founder, a couple of Tents (sticks-and-leaves
-        // shelter), and — at Neolithic+ — one or two Yurts (packable felt
-        // shelters) near the central hearth.
-        // Capability check: Camp settlement mode = nomadic-style camp seeding.
+        // Camps still use the nomad-specific seeder (deployable shelters,
+        // packable yurts) which the unified intent loop doesn't model.
         if faction.caps.settlement.is_camp() {
             seed_nomadic_camp(
                 &mut commands,
@@ -5938,36 +6016,53 @@ pub fn seed_starting_buildings_system(
             continue;
         }
 
-        // Build the settlement plan inline so seeded structures land in
-        // their intended zones (Granary in Storage, Shrine in Sacred, etc.).
-        // Tick 0 is fine — the planner is pure on (faction_id, faction).
-        let plan = crate::simulation::settlement::build_settlement_plan(faction_id, faction, 0);
+        // Settlement plan for the candidate generator. Prefer the brain-derived
+        // compat plan (one zone per parcel — matches what the runtime chief
+        // sees) and fall back to the deterministic `build_settlement_plan`
+        // when no brain exists yet (sandbox / camp / first-tick edge cases).
+        let brain_ref = settlement_map
+            .by_faction
+            .get(&faction_id)
+            .and_then(|ids| ids.first().copied())
+            .and_then(|sid| brains.0.get(&sid));
+        let plan = if let Some(b) = brain_ref {
+            crate::simulation::organic_settlement::compat_plan_from_brain(faction_id, faction, 0, b)
+        } else {
+            crate::simulation::settlement::build_settlement_plan(faction_id, faction, 0)
+        };
         let plan_ref = Some(&plan);
 
-        // Bed count: house every founder. Per-era floor preserves the
-        // legacy minimum so very-small factions still get a basic camp.
-        let era_min: u32 = match era {
-            Era::Paleolithic => 4,
-            Era::Mesolithic => 6,
-            _ => 8,
-        };
-        let target_beds: u32 = members.max(era_min);
+        // Peak population for civic-milestone gates. At seed time this falls
+        // back to current member_count (the Settlement entity hasn't yet
+        // ratcheted peak via `settlement_peak_population_system`).
+        let peak_pop = settlement_map
+            .first_for_faction(faction_id)
+            .and_then(|sid| settlement_map.by_id.get(&sid))
+            .and_then(|&e| settlement_q.get(e).ok())
+            .map(|s| s.peak_population)
+            .unwrap_or(faction.member_count);
 
+        // Branch on era. Paleo / Meso keep the band-camp seeder
+        // (`paleolithic_hearth_positions_river_aware` provides the canonical
+        // multi-hearth layout that the unified candidate loop doesn't
+        // reproduce — its bootstrap path only fires when no plan exists).
+        // Neo+ runs through the unified `generate_candidates` loop so seed
+        // and runtime emit the same intent stream.
         if (era as u8) < (Era::Neolithic as u8) {
-            // ── Paleo / Meso: multi-hearth band camp ────────────────────
-            // Use the same deterministic hearth offsets the planner +
-            // Paleolithic-hearth-cadence code use, so seeding aligns with
-            // grown-band layout.
+            // Per-era founder count: house every member with a Paleo / Meso
+            // floor so very-small bands still get a basic camp.
+            let era_min: u32 = match era {
+                Era::Paleolithic => 4,
+                _ => 6,
+            };
+            let target_beds: u32 = members.max(era_min);
             let hearth_positions =
                 crate::simulation::settlement::paleolithic_hearth_positions_river_aware(
                     &chunk_map, faction_id, home, members,
                 );
             let n_hearths = hearth_positions.len().max(1) as u32;
             let beds_per_hearth = (target_beds + n_hearths - 1) / n_hearths;
-
             for &offset_pos in hearth_positions.iter() {
-                // Snap offset to the nearest passable tile (offsets are
-                // float-rounded so may land on water / wall).
                 let hearth_tile = if !used.contains(&offset_pos)
                     && chunk_map.is_passable(offset_pos.0, offset_pos.1)
                 {
@@ -5994,7 +6089,6 @@ pub fn seed_starting_buildings_system(
                     tx: hearth_tile.0,
                     ty: hearth_tile.1,
                 });
-
                 seed_paleo_beds_around_hearth(
                     &mut commands,
                     &mut maps,
@@ -6005,258 +6099,103 @@ pub fn seed_starting_buildings_system(
                     beds_per_hearth,
                 );
             }
-        } else {
-            // ── Neolithic+: single civic hearth, founders in walled houses ─
-            if let Some(tile) =
-                pick_seed_tile(plan_ref, BuildSiteKind::Campfire, home, &used, &chunk_map)
-            {
-                used.insert(tile);
-                let world_pos = tile_to_world(tile.0, tile.1);
-                let e = commands
-                    .spawn((
-                        Campfire { tier: hearth_tier },
-                        StructureLabel(hearth_tier.label()),
-                        Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
-                        GlobalTransform::default(),
-                        Visibility::Visible,
-                        InheritedVisibility::default(),
-                    ))
-                    .id();
-                maps.campfire_map.0.insert(tile, e);
-                tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
-                    tx: tile.0,
-                    ty: tile.1,
-                });
-            }
-
-            // House every founder. For Chalcolithic+ (CITY_STATE_ORG era),
-            // alternate Longhouse (2 beds) and Hut (1 bed) for visual
-            // variety; for Neolithic, all Huts.
-            let house_wall_mat = wall_material.unwrap_or(WallMaterial::WattleDaub);
-            let mut remaining = target_beds as i32;
-            let allow_longhouse = (era as u8) >= (Era::Chalcolithic as u8);
-            let mut alternate = false;
-            while remaining > 0 {
-                let want_longhouse = allow_longhouse && alternate && remaining >= 2;
-                let (half_w, half_h, beds_per_house): (i32, i32, &[(i32, i32)]) = if want_longhouse
-                {
-                    (2, 1, &[(-1, 0), (1, 0)])
-                } else {
-                    (1, 1, &[(0, 0)])
-                };
-                let Some((cx, cy)) =
-                    pick_seed_house_anchor(plan_ref, &chunk_map, &used, home, half_w, half_h)
-                else {
-                    break; // Out of room — fall through to civic seeding.
-                };
-                if !seed_walled_house_at(
-                    &mut commands,
-                    &mut maps,
-                    &mut chunk_map,
-                    &mut tile_changed,
-                    &mut used,
-                    cx,
-                    cy,
-                    half_w,
-                    half_h,
-                    beds_per_house,
-                    house_wall_mat,
-                    faction_id,
-                    home,
-                    None,
-                    &mut doormat_reservations,
-                    &mut road_carve_queue,
-                ) {
-                    // Failed anchor (footprint blocked OR all door cardinals
-                    // blocked). Mark the centre tile as used so the next
-                    // `pick_seed_house_anchor` call doesn't return the same
-                    // spot and stall the loop. Try another anchor.
-                    used.insert((cx, cy));
-                    continue;
-                }
-                // Farmstead yard: 2×2 (Neo/Chalc) or 3×3 (Bronze).
-                let yard_side: i32 = if (era as u8) >= (Era::BronzeAge as u8) {
-                    3
-                } else {
-                    2
-                };
-                seed_farmstead_yard(
-                    &mut chunk_map,
-                    &mut tile_changed,
-                    &mut used,
-                    &doormat_reservations,
-                    cx,
-                    cy,
-                    half_w,
-                    half_h,
-                    yard_side,
-                    yard_side,
-                );
-                remaining -= beds_per_house.len() as i32;
-                alternate = !alternate;
-            }
+            continue;
         }
 
-        // Neolithic+ workshops & storage.
-        if (era as u8) >= (Era::Neolithic as u8) {
-            spawn_seeded_structure(
-                &mut commands,
-                &mut maps,
-                &mut chunk_map,
-                &mut tile_changed,
-                &mut used,
-                home,
+        // ── Neolithic+: unified intent loop ────────────────────────────
+        // Drives `generate_candidates` (the runtime chief's selector)
+        // until it stops returning candidates or the safety cap fires.
+        // Stamps each chosen intent via `seed_apply_intent`; the next
+        // iteration sees the updated bed / hearth / civic / wall counts
+        // and gates accordingly. One pipeline, two consumers.
+        //
+        // Cap reasoning: a Bronze 80-pop start needs ~80 huts + 1 of each
+        // civic + ~48 palisade tiles ≈ 130 candidates. 512 is comfortable
+        // headroom against any future intent kind.
+        const MAX_SEED_ITERATIONS: u32 = 512;
+        let mut last_progress_iter: u32 = 0;
+        for iter in 0..MAX_SEED_ITERATIONS {
+            let candidates = generate_candidates(
                 faction_id,
-                BuildSiteKind::Workbench,
+                faction,
                 plan_ref,
+                &chunk_map,
+                &maps.as_view(),
+                &empty_bp_map,
+                &doormat_reservations,
+                &empty_pending,
+                &plot_index,
+                &plot_q,
+                peak_pop,
             );
-            spawn_seeded_structure(
-                &mut commands,
-                &mut maps,
-                &mut chunk_map,
-                &mut tile_changed,
-                &mut used,
-                home,
-                faction_id,
-                BuildSiteKind::Granary,
-                plan_ref,
-            );
-            spawn_seeded_structure(
-                &mut commands,
-                &mut maps,
-                &mut chunk_map,
-                &mut tile_changed,
-                &mut used,
-                home,
-                faction_id,
-                BuildSiteKind::Loom,
-                plan_ref,
-            );
-        }
-
-        // Chalcolithic+ adds a shrine.
-        if (era as u8) >= (Era::Chalcolithic as u8) {
-            spawn_seeded_structure(
-                &mut commands,
-                &mut maps,
-                &mut chunk_map,
-                &mut tile_changed,
-                &mut used,
-                home,
-                faction_id,
-                BuildSiteKind::Shrine,
-                plan_ref,
-            );
-        }
-
-        // Bronze Age civic structures.
-        if (era as u8) >= (Era::BronzeAge as u8) {
-            spawn_seeded_structure(
-                &mut commands,
-                &mut maps,
-                &mut chunk_map,
-                &mut tile_changed,
-                &mut used,
-                home,
-                faction_id,
-                BuildSiteKind::Market,
-                plan_ref,
-            );
-            spawn_seeded_structure(
-                &mut commands,
-                &mut maps,
-                &mut chunk_map,
-                &mut tile_changed,
-                &mut used,
-                home,
-                faction_id,
-                BuildSiteKind::Barracks,
-                plan_ref,
-            );
-            spawn_seeded_structure(
-                &mut commands,
-                &mut maps,
-                &mut chunk_map,
-                &mut tile_changed,
-                &mut used,
-                home,
-                faction_id,
-                BuildSiteKind::Monument,
-                plan_ref,
-            );
-        }
-
-        // Defensive perimeter (Chalco onward). Built last so all furniture
-        // is already inside it. Wall ring tracks the actual extent of
-        // seeded structures: take the bounding box of every used tile
-        // (houses + civic + storage + crafting) and expand by a 2-tile
-        // buffer for breathing room. Unioned with the planned Defense
-        // rect so very-small settlements still get the planner's
-        // culture.defensive padding. Falls back to the legacy r=5 ring
-        // when neither bbox nor Defense zone are available.
-        if let Some(material) = wall_material {
-            let bbox = used_bbox_with_buffer(&used, 2);
-            let defense_rect = plan_ref.and_then(|p| {
-                p.zones
-                    .iter()
-                    .find(|z| z.kind == crate::simulation::settlement::ZoneKind::Defense)
-                    .map(|z| z.rect)
-            });
-            let final_rect = match (bbox, defense_rect) {
-                (Some(a), Some(b)) => Some(union_rect(a, b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
+            let Some(best) = candidates.into_iter().max_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) else {
+                break;
             };
-            if let Some(rect) = final_rect {
-                seed_perimeter_rect(
-                    &mut commands,
-                    &mut maps,
-                    &mut chunk_map,
-                    &mut tile_changed,
-                    &mut used,
-                    rect,
-                    material,
-                    faction_id,
-                    home,
-                    &mut doormat_reservations,
-                    &mut road_carve_queue,
-                );
+            let intent = best.intent;
+            let tile = best.tile;
+            let door_dir = best.door_dir;
+            let applied = seed_apply_intent(
+                &mut commands,
+                &mut maps,
+                &mut chunk_map,
+                &mut tile_changed,
+                &mut used,
+                &mut doormat_reservations,
+                &mut road_carve_queue,
+                faction_id,
+                home,
+                intent,
+                tile,
+                door_dir,
+            );
+            if applied {
+                last_progress_iter = iter;
+                // Farmstead yard for residential footprints. Yards bump
+                // fertility on adjacent tiles and reserve them in `used`
+                // so the next iteration's footprint search avoids them.
+                let (half_w, half_h) = match intent {
+                    BuildIntent::Hut(_) => (1, 1),
+                    BuildIntent::Longhouse(_) => (2, 1),
+                    _ => (0, 0),
+                };
+                if half_w > 0 {
+                    let yard_side = if (era as u8) >= (Era::BronzeAge as u8) {
+                        3
+                    } else {
+                        2
+                    };
+                    seed_farmstead_yard(
+                        &mut chunk_map,
+                        &mut tile_changed,
+                        &mut used,
+                        &doormat_reservations,
+                        tile.0,
+                        tile.1,
+                        half_w,
+                        half_h,
+                        yard_side,
+                        yard_side,
+                    );
+                }
             } else {
-                seed_perimeter(
-                    &mut commands,
-                    &mut maps,
-                    &mut chunk_map,
-                    &mut tile_changed,
-                    &mut used,
-                    home,
-                    5,
-                    material,
-                    faction_id,
-                    &mut doormat_reservations,
-                    &mut road_carve_queue,
-                );
+                // Mark tile as used so the next generate_candidates call
+                // doesn't re-emit the same blocked anchor and stall.
+                used.insert(tile);
+                // Stall guard: 32 consecutive no-progress iterations means
+                // generate_candidates is stuck on blocked anchors with no
+                // path forward. Bail.
+                if iter.saturating_sub(last_progress_iter) > 32 {
+                    break;
+                }
             }
         }
     }
 }
 
-/// Smallest `TileRect` that contains both `a` and `b`.
-fn union_rect(
-    a: crate::simulation::settlement::TileRect,
-    b: crate::simulation::settlement::TileRect,
-) -> crate::simulation::settlement::TileRect {
-    let x0 = a.x0.min(b.x0);
-    let y0 = a.y0.min(b.y0);
-    let x_end = (a.x0 + a.w as i32).max(b.x0 + b.w as i32);
-    let y_end = (a.y0 + a.h as i32).max(b.y0 + b.h as i32);
-    crate::simulation::settlement::TileRect::new(
-        x0,
-        y0,
-        (x_end - x0).max(1) as u16,
-        (y_end - y0).max(1) as u16,
-    )
-}
 
 /// Place a fully-built walled house at `(cx, cy)` with `half_w × half_h`
 /// footprint, mirroring `plan_building`'s perimeter+entrance+interior-beds
@@ -6333,15 +6272,25 @@ fn seed_walled_house_at(
         return false;
     };
 
-    // Place perimeter tiles: walls everywhere except the entrance (door).
-    for dy in -half_h..=half_h {
-        for dx in -half_w..=half_w {
-            if dx.abs() < half_w && dy.abs() < half_h {
-                continue; // interior — beds go here
-            }
-            let tile = (cx + dx, cy + dy);
-            let world_pos = tile_to_world(tile.0, tile.1);
-            if (dx, dy) == entrance {
+    // Stamp tiles using the shared wall+door+bed plan (same enumeration the
+    // runtime blueprint path uses). The seed path resolves each plan entry by
+    // writing tiles directly into `chunk_map` instead of spawning Blueprints.
+    let plan = walled_house_tile_plan(
+        cx,
+        cy,
+        half_w,
+        half_h,
+        entrance,
+        door_edge,
+        wall_material,
+        interior_beds,
+    );
+    for (kind, tile, edge) in &plan {
+        let tile = *tile;
+        let world_pos = tile_to_world(tile.0, tile.1);
+        match kind {
+            BuildSiteKind::Door => {
+                let door_edge = edge.expect("door entry carries its edge");
                 let (ddx, ddy) = door_edge.delta();
                 let doormat_tile = (tile.0 + ddx, tile.1 + ddy);
                 let door = Door {
@@ -6382,7 +6331,8 @@ fn seed_walled_house_at(
                 // from doormat → home so the door connects back to the spine.
                 write_road_tile(&mut *chunk_map, tile_changed, doormat_tile);
                 road_carve.0.push((faction_id, doormat_tile, home));
-            } else {
+            }
+            BuildSiteKind::Wall(mat) => {
                 let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
                 chunk_map.set_tile(
                     tile.0,
@@ -6398,10 +6348,8 @@ fn seed_walled_house_at(
                 );
                 let e = commands
                     .spawn((
-                        Wall {
-                            material: wall_material,
-                        },
-                        StructureLabel(wall_material.label()),
+                        Wall { material: *mat },
+                        StructureLabel(mat.label()),
                         Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                         GlobalTransform::default(),
                         Visibility::Visible,
@@ -6410,32 +6358,32 @@ fn seed_walled_house_at(
                     .id();
                 maps.wall_map.0.insert(tile, e);
             }
-            used.insert(tile);
-            tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
-                tx: tile.0,
-                ty: tile.1,
-            });
+            BuildSiteKind::Bed => {
+                let bed = Bed::default();
+                let label = bed.tier.label();
+                let e = commands
+                    .spawn((
+                        bed,
+                        StructureLabel(label),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                        crate::world::spatial::Indexed::new(
+                            crate::world::spatial::IndexedKind::Bed,
+                        ),
+                    ))
+                    .id();
+                maps.bed_map.0.insert(tile, e);
+            }
+            _ => {
+                debug_assert!(
+                    false,
+                    "walled_house_tile_plan emitted unexpected BuildSiteKind {:?}",
+                    kind
+                );
+            }
         }
-    }
-
-    // Interior beds.
-    for &(bdx, bdy) in interior_beds {
-        let tile = (cx + bdx, cy + bdy);
-        let world_pos = tile_to_world(tile.0, tile.1);
-        let bed = Bed::default();
-        let label = bed.tier.label();
-        let e = commands
-            .spawn((
-                bed,
-                StructureLabel(label),
-                Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
-                GlobalTransform::default(),
-                Visibility::Visible,
-                InheritedVisibility::default(),
-                crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Bed),
-            ))
-            .id();
-        maps.bed_map.0.insert(tile, e);
         used.insert(tile);
         tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
             tx: tile.0,
@@ -6445,118 +6393,7 @@ fn seed_walled_house_at(
     true
 }
 
-/// Find the best 3×3 (Hut, half=1) or 5×3 (Longhouse, half_w=2/half_h=1)
-/// site inside the Residential zone (or radial fallback) for a built-house
-/// seed. Returns the centre. Walks the zone in row-major order picking the
-/// closest-to-home clear footprint with z-spread ≤ 1 (seeded houses don't
-/// terraform — they need flat ground).
-fn pick_seed_house_anchor(
-    plan: Option<&crate::simulation::settlement::SettlementPlan>,
-    chunk_map: &ChunkMap,
-    used: &AHashSet<(i32, i32)>,
-    home: (i32, i32),
-    half_w: i32,
-    half_h: i32,
-) -> Option<(i32, i32)> {
-    let footprint_clear = |cx: i32, cy: i32| -> bool {
-        let mut min_z = i32::MAX;
-        let mut max_z = i32::MIN;
-        for dy in -half_h..=half_h {
-            for dx in -half_w..=half_w {
-                let t = (cx + dx, cy + dy);
-                if used.contains(&t) {
-                    return false;
-                }
-                if !chunk_map.is_passable(t.0, t.1) {
-                    return false;
-                }
-                let Some(k) = chunk_map.tile_kind_at(t.0, t.1) else {
-                    return false;
-                };
-                if k == TileKind::Wall || k == TileKind::Stone || k == TileKind::Road {
-                    return false;
-                }
-                let z = chunk_map.surface_z_at(t.0, t.1);
-                min_z = min_z.min(z);
-                max_z = max_z.max(z);
-            }
-        }
-        (max_z - min_z).max(0) <= 1
-    };
 
-    let (hx, hy) = home;
-    if let Some(plan) = plan {
-        if let Some(rect) = plan
-            .zones
-            .iter()
-            .find(|z| z.kind == crate::simulation::settlement::ZoneKind::Residential)
-            .map(|z| z.rect)
-        {
-            let cx_min = rect.x0 + half_w;
-            let cy_min = rect.y0 + half_h;
-            let cx_max = rect.x0 + rect.w as i32 - half_w - 1;
-            let cy_max = rect.y0 + rect.h as i32 - half_h - 1;
-            let mut best: Option<(i32, (i32, i32))> = None;
-            for cy in cy_min..=cy_max {
-                for cx in cx_min..=cx_max {
-                    if !footprint_clear(cx, cy) {
-                        continue;
-                    }
-                    let d = (cx - hx).abs() + (cy - hy).abs();
-                    if best.as_ref().map_or(true, |b| d < b.0) {
-                        best = Some((d, (cx, cy)));
-                    }
-                }
-            }
-            if let Some((_, p)) = best {
-                return Some(p);
-            }
-        }
-    }
-    // Radial fallback.
-    for ring in (half_w.max(half_h) + 1)..=20 {
-        for dy in -ring..=ring {
-            for dx in -ring..=ring {
-                if dx.abs().max(dy.abs()) != ring {
-                    continue;
-                }
-                let cx = hx + dx;
-                let cy = hy + dy;
-                if footprint_clear(cx, cy) {
-                    return Some((cx, cy));
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Compute the inclusive-exclusive `TileRect` bounding box of every tile in
-/// `used`, expanded by `buffer` tiles on each side. Returns `None` for an
-/// empty set.
-fn used_bbox_with_buffer(
-    used: &AHashSet<(i32, i32)>,
-    buffer: i32,
-) -> Option<crate::simulation::settlement::TileRect> {
-    let mut min_x = i32::MAX;
-    let mut min_y = i32::MAX;
-    let mut max_x = i32::MIN;
-    let mut max_y = i32::MIN;
-    for &(x, y) in used.iter() {
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x);
-        max_y = max_y.max(y);
-    }
-    if min_x == i32::MAX {
-        return None;
-    }
-    let x0 = min_x - buffer;
-    let y0 = min_y - buffer;
-    let w = (max_x - min_x + 1 + 2 * buffer).max(1) as u16;
-    let h = (max_y - min_y + 1 + 2 * buffer).max(1) as u16;
-    Some(crate::simulation::settlement::TileRect::new(x0, y0, w, h))
-}
 
 /// Stamp a `yard_w × yard_h` patch of `Farmland` tiles adjacent to the
 /// house centred at `(cx, cy)` with `half_w × half_h` footprint. The yard
@@ -7029,141 +6866,6 @@ fn seed_paleo_beds_around_hearth(
     }
 }
 
-/// Lay walls along the perimeter of `rect`, with one Door on the eastern
-/// edge at the rect's vertical midpoint. Mirrors `seed_perimeter` but
-/// driven by an arbitrary `TileRect` (the `Defense` zone) instead of a
-/// home-centred square ring.
-fn seed_perimeter_rect(
-    commands: &mut Commands,
-    maps: &mut FurnitureMaps,
-    chunk_map: &mut ChunkMap,
-    tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
-    used: &mut AHashSet<(i32, i32)>,
-    rect: crate::simulation::settlement::TileRect,
-    material: WallMaterial,
-    faction_id: u32,
-    home: (i32, i32),
-    doormat: &mut crate::simulation::doormat::DoormatReservations,
-    road_carve: &mut RoadCarveQueue,
-) {
-    let x0 = rect.x0;
-    let y0 = rect.y0;
-    let x1 = rect.x0 + rect.w as i32 - 1;
-    let y1 = rect.y0 + rect.h as i32 - 1;
-    let door_tile = (x1, y0 + (rect.h as i32) / 2);
-    let door_edge = crate::simulation::land::TileEdge::East;
-    // 3-tile gateways centred on each cardinal axis through `home`. Use home
-    // coords (clamped to the rect span) as the gateway centre so traffic
-    // funnels through the home-facing axis even when the defense rect isn't
-    // centred on home.
-    let gateway_half = 1i32;
-    let gate_cx = home.0.clamp(x0, x1);
-    let gate_cy = home.1.clamp(y0, y1);
-
-    for ty in y0..=y1 {
-        for tx in x0..=x1 {
-            // Only perimeter tiles.
-            let on_perimeter = tx == x0 || tx == x1 || ty == y0 || ty == y1;
-            if !on_perimeter {
-                continue;
-            }
-            let tile = (tx, ty);
-            // Skip gateway tiles (except the canonical east `door_tile`).
-            let in_top_bottom_gateway =
-                (ty == y0 || ty == y1) && (tx - gate_cx).abs() <= gateway_half;
-            let in_left_right_gateway =
-                (tx == x0 || tx == x1) && (ty - gate_cy).abs() <= gateway_half;
-            if (in_top_bottom_gateway || in_left_right_gateway) && tile != door_tile {
-                continue;
-            }
-            if used.contains(&tile) {
-                continue;
-            }
-            if !chunk_map.is_passable(tx, ty) {
-                continue;
-            }
-            let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
-                continue;
-            };
-            if k == TileKind::Wall || k == TileKind::Road {
-                continue;
-            }
-            let world_pos = tile_to_world(tx, ty);
-            if tile == door_tile {
-                let (ddx, ddy) = door_edge.delta();
-                let doormat_tile = (tile.0 + ddx, tile.1 + ddy);
-                let door = Door {
-                    faction_id,
-                    open: false,
-                    tier: DoorTier::default(),
-                    dir: door_edge,
-                    doormat_tile,
-                };
-                let label = door.tier.label();
-                let e = commands
-                    .spawn((
-                        door,
-                        StructureLabel(label),
-                        Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
-                        GlobalTransform::default(),
-                        Visibility::Visible,
-                        InheritedVisibility::default(),
-                    ))
-                    .id();
-                maps.door_map.0.insert(
-                    tile,
-                    DoorEntry {
-                        entity: e,
-                        open: false,
-                    },
-                );
-                doormat.0.insert(
-                    doormat_tile,
-                    crate::simulation::doormat::DoormatEntry {
-                        owner_door: e,
-                        door_tile: tile,
-                        dir: door_edge,
-                    },
-                );
-                let needs_extension = !road_within(chunk_map, doormat_tile, 4);
-                write_road_tile(chunk_map, tile_changed, doormat_tile);
-                if needs_extension {
-                    road_carve.0.push((faction_id, doormat_tile, home));
-                }
-            } else {
-                let surf_z = chunk_map.surface_z_at(tx, ty);
-                chunk_map.set_tile(
-                    tx,
-                    ty,
-                    surf_z + 1,
-                    TileData {
-                        kind: TileKind::Wall,
-                        elevation: 0,
-                        fertility: 0,
-                        flags: 0b0001,
-                        ore: 0,
-                    },
-                );
-                let e = commands
-                    .spawn((
-                        Wall { material },
-                        StructureLabel(material.label()),
-                        Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
-                        GlobalTransform::default(),
-                        Visibility::Visible,
-                        InheritedVisibility::default(),
-                    ))
-                    .id();
-                maps.wall_map.0.insert(tile, e);
-            }
-            used.insert(tile);
-            tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
-                tx: tile.0,
-                ty: tile.1,
-            });
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -7223,6 +6925,103 @@ mod tests {
         assert_eq!(bp.worker_target_tile(), (4, 5));
         bp.work_stand = Some((6, 5));
         assert_eq!(bp.worker_target_tile(), (6, 5));
+    }
+
+    #[test]
+    fn walled_house_tile_plan_3x3_door_east() {
+        // Hut footprint at (10,10), half=1, east entrance.
+        let plan = walled_house_tile_plan(
+            10,
+            10,
+            1,
+            1,
+            (1, 0),
+            TileEdge::East,
+            WallMaterial::WattleDaub,
+            &[(0, 0)],
+        );
+        // 8 perimeter + 1 interior bed = 9 entries.
+        assert_eq!(plan.len(), 9);
+        // Exactly one Door cell, on the east side carrying its edge.
+        let doors: Vec<_> = plan
+            .iter()
+            .filter(|(k, _, _)| matches!(k, BuildSiteKind::Door))
+            .collect();
+        assert_eq!(doors.len(), 1);
+        assert_eq!(doors[0].1, (11, 10));
+        assert_eq!(doors[0].2, Some(TileEdge::East));
+        // Exactly 7 walls, none carrying an edge.
+        let walls: Vec<_> = plan
+            .iter()
+            .filter(|(k, _, _)| matches!(k, BuildSiteKind::Wall(_)))
+            .collect();
+        assert_eq!(walls.len(), 7);
+        assert!(walls.iter().all(|(_, _, e)| e.is_none()));
+        // Exactly one bed at the interior.
+        let beds: Vec<_> = plan
+            .iter()
+            .filter(|(k, _, _)| matches!(k, BuildSiteKind::Bed))
+            .collect();
+        assert_eq!(beds.len(), 1);
+        assert_eq!(beds[0].1, (10, 10));
+    }
+
+    #[test]
+    fn walled_house_tile_plan_propagates_wall_material() {
+        // Both seed and runtime paths must stamp the requested material —
+        // regression-guard the BuildSiteKind::Wall(mat) propagation.
+        let plan = walled_house_tile_plan(
+            0,
+            0,
+            1,
+            1,
+            (1, 0),
+            TileEdge::East,
+            WallMaterial::Mudbrick,
+            &[],
+        );
+        let mats: Vec<_> = plan
+            .iter()
+            .filter_map(|(k, _, _)| match k {
+                BuildSiteKind::Wall(m) => Some(*m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mats.len(), 7);
+        assert!(mats.iter().all(|m| *m == WallMaterial::Mudbrick));
+    }
+
+    #[test]
+    fn walled_house_tile_plan_longhouse_door_on_long_side() {
+        // Longhouse half_w=2, half_h=1 (5×3). East entrance at (+2, 0).
+        // Two interior beds at offsets (-1,0) and (1,0).
+        let plan = walled_house_tile_plan(
+            0,
+            0,
+            2,
+            1,
+            (2, 0),
+            TileEdge::East,
+            WallMaterial::WattleDaub,
+            &[(-1, 0), (1, 0)],
+        );
+        // Perimeter cells: 5*3 - (3*1 interior) = 15 - 3 = 12.
+        // Plus 2 bed entries = 14.
+        assert_eq!(plan.len(), 14);
+        let door = plan
+            .iter()
+            .find(|(k, _, _)| matches!(k, BuildSiteKind::Door))
+            .unwrap();
+        assert_eq!(door.1, (2, 0));
+        // Bed cells exactly where requested.
+        let bed_tiles: Vec<_> = plan
+            .iter()
+            .filter_map(|(k, t, _)| match k {
+                BuildSiteKind::Bed => Some(*t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bed_tiles, vec![(-1, 0), (1, 0)]);
     }
 
     #[test]

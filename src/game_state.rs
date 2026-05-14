@@ -14,6 +14,24 @@ pub enum GameState {
     Playing,
 }
 
+/// Sub-state of `GameState::Playing` gating the unified settlement build
+/// pipeline. `Warmup` covers the first ticks after `OnEnter(Playing)` while
+/// the initial `SettlementBrain` survey + seed pass runs; per-tick agent
+/// simulation is **not** gated on `Active` today (the agents still tick
+/// during Warmup) but this state exists so future systems can opt in via
+/// `.run_if(in_state(SimulationState::Active))` without further plumbing.
+///
+/// Flipped to `Active` by `mark_warmup_complete_system` once every settled
+/// faction has had its initial survey applied and `seed_starting_buildings_system`
+/// has run.
+#[derive(SubStates, Clone, Copy, Eq, PartialEq, Hash, Debug, Default)]
+#[source(GameState = GameState::Playing)]
+pub enum SimulationState {
+    #[default]
+    Warmup,
+    Active,
+}
+
 /// Pending spawn-cell choice from the spawn-select UI. Read once on
 /// `OnEnter(Playing)` to position the camera and seed the player faction.
 #[derive(Resource, Default, Debug, Clone, Copy)]

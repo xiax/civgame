@@ -10,7 +10,8 @@ mod ui;
 mod world;
 
 pub use game_state::{
-    EconomyPreset, GameStartOptions, GameState, PendingSpawn, RegenerateWorldRequest, WorldSeed,
+    EconomyPreset, GameStartOptions, GameState, PendingSpawn, RegenerateWorldRequest,
+    SimulationState, WorldSeed,
 };
 
 fn main() {
@@ -32,6 +33,7 @@ fn main() {
         ..default()
     }))
     .init_state::<GameState>()
+    .add_sub_state::<SimulationState>()
     .insert_resource(PendingSpawn::default())
     .insert_resource(GameStartOptions::default())
     .insert_resource(simulation::region::SettledRegions::default())

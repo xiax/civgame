@@ -64,6 +64,7 @@ pub mod skills;
 pub mod sound;
 pub mod speed;
 pub mod stats;
+pub mod survey_task;
 pub mod tasks;
 pub mod teaching;
 pub mod technology;
@@ -86,6 +87,16 @@ pub enum SimulationSet {
     ParallelB,
     Sequential,
     Economy,
+}
+
+/// Flip `SimulationState::Warmup → Active` after the `OnEnter(Playing)`
+/// pass has spawned factions, run the initial settlement survey, and
+/// stamped seed structures. Future per-tick systems can opt in to the
+/// gate via `.run_if(in_state(SimulationState::Active))`; current
+/// FixedUpdate sim systems run unconditionally to avoid a one-tick
+/// idle gap on game start.
+fn mark_warmup_complete_system(mut next: ResMut<NextState<crate::SimulationState>>) {
+    next.set(crate::SimulationState::Active);
 }
 
 pub struct SimulationPlugin;
@@ -130,6 +141,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(player_command::PlayerCommandIdGen::default())
             .insert_resource(nomad::PendingCampOps::default())
             .insert_resource(SimClock::default())
+            .insert_resource(survey_task::SurveyCursor::default())
+            .insert_resource(survey_task::InFlightSurveys::default())
             .insert_resource(speed::GameSpeed::default())
             .insert_resource(speed::SimTimingDiagnostics::default())
             .insert_resource(speed::TickTimer::default())
@@ -244,8 +257,27 @@ impl Plugin for SimulationPlugin {
                     faction::center_camera_on_player_faction
                         .after(person::spawn_population)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Promote Settlement spawning to OnEnter so the kickoff
+                    // survey + seed pass downstream see live `Settlement`
+                    // entities. `auto_found_default_settlements_system` is
+                    // idempotent (gates on `map.by_faction.contains_key`);
+                    // the FixedUpdate registration in the Economy schedule
+                    // remains so post-startup faction creation still flows
+                    // through it.
+                    settlement::auto_found_default_settlements_system
+                        .after(person::spawn_population)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Run a one-shot survey so `SettlementBrain` (parcels,
+                    // road tiles, frontage_edge) exists before the seed
+                    // pass picks house anchors. Unified-build-pipeline
+                    // step: same `survey_one_settlement` body the
+                    // runtime survey loop uses.
+                    organic_settlement::kickoff_initial_survey_system
+                        .after(settlement::auto_found_default_settlements_system)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     construction::seed_starting_buildings_system
                         .after(person::spawn_population)
+                        .after(organic_settlement::kickoff_initial_survey_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     // Seeded structures (walls, beds, hearths, nomadic shelters)
                     // bypass the blueprint pipeline, so the per-blueprint
@@ -255,6 +287,12 @@ impl Plugin for SimulationPlugin {
                     // loose rocks relocate aside.
                     clear_obstacle::clear_obstacles_under_seeded_structures
                         .after(construction::seed_starting_buildings_system)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Flip the warmup gate now that the initial survey +
+                    // seed have applied. Future systems can opt in via
+                    // `.run_if(in_state(SimulationState::Active))`.
+                    mark_warmup_complete_system
+                        .after(clear_obstacle::clear_obstacles_under_seeded_structures)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                 ),
             )
@@ -834,11 +872,11 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    organic_settlement::settlement_survey_system
+                    survey_task::survey_cursor_system
                         .after(settlement::auto_found_default_settlements_system)
                         .before(settlement::settlement_planner_system),
                     organic_settlement::settlement_pressure_system
-                        .after(organic_settlement::settlement_survey_system)
+                        .after(survey_task::survey_cursor_system)
                         .before(organic_settlement::settlement_morphology_system),
                     organic_settlement::settlement_morphology_system
                         .after(organic_settlement::settlement_pressure_system)
@@ -847,7 +885,7 @@ impl Plugin for SimulationPlugin {
                         .after(organic_settlement::settlement_morphology_system)
                         .before(construction::chief_directive_system),
                     organic_settlement::bridge_intent_emitter_system
-                        .after(organic_settlement::settlement_survey_system)
+                        .after(survey_task::survey_cursor_system)
                         .before(construction::chief_directive_system),
                 )
                     .in_set(SimulationSet::Economy),
@@ -856,10 +894,10 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 (
                     settlement::settlement_planner_system
-                        .after(organic_settlement::settlement_survey_system)
+                        .after(survey_task::survey_cursor_system)
                         .before(construction::chief_directive_system),
                     settlement::auto_found_default_settlements_system
-                        .before(organic_settlement::settlement_survey_system)
+                        .before(survey_task::survey_cursor_system)
                         .before(settlement::settlement_planner_system),
                     construction::building_upgrade_system
                         .after(settlement::settlement_planner_system)
