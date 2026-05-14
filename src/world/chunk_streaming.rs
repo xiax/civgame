@@ -8,6 +8,9 @@ use crate::pathfinding::path_request::PathFollow;
 use crate::rendering::camera::CameraViewZ;
 use crate::rendering::color_map::{shaded_ore_tile_color, shaded_tile_color, z_bucket};
 use crate::rendering::fog::{apply_fog_to_material, FogMap, FogTileMaterials};
+use crate::rendering::projection::{
+    skirt_sprite, ElevationSkirt, MapProjection, MapViewMode, ProjectedAnchor, ProjectionState,
+};
 use crate::simulation::construction::{StructureLabel, Wall, WallMap, WallMaterial};
 use crate::simulation::faction::{FactionCenter, StorageTileMap};
 use crate::simulation::items::GroundItem;
@@ -68,6 +71,15 @@ pub struct ChunkStreamEvents<'w> {
     pub unloaded: EventWriter<'w, ChunkUnloadedEvent>,
 }
 
+/// Sub-bundle pulling sim-focus + map-view-projection into one slot of
+/// `chunk_streaming_system`'s param list. Keeps the system under Bevy's
+/// 16-param ceiling.
+#[derive(SystemParam)]
+pub struct StreamFocusParams<'w> {
+    pub focus: Res<'w, crate::simulation::region::SimulationFocus>,
+    pub view_projection: crate::rendering::projection::ViewProjection<'w>,
+}
+
 /// Rebuild `SimulationFocus` from camera + every settled region's mega-chunk
 /// centre. Runs each tick before `chunk_streaming_system` so the loader sees
 /// the current focus set.
@@ -75,14 +87,24 @@ pub fn update_simulation_focus_system(
     mut focus: ResMut<crate::simulation::region::SimulationFocus>,
     settled: Res<crate::simulation::region::SettledRegions>,
     camera_q: Query<&Transform, With<Camera>>,
+    map_view_mode: Res<crate::rendering::projection::MapViewMode>,
+    map_projection: Res<crate::rendering::projection::MapProjection>,
 ) {
     use crate::simulation::region::{FocusPoint, MegaChunkCoord};
 
     focus.points.clear();
 
     if let Ok(cam) = camera_q.get_single() {
+        // Convert camera position from view-space (potentially tilted) to
+        // logical world coords so chunk loading tracks the tile actually
+        // centred on screen, not the projected pixel position.
+        let logical = crate::rendering::projection::camera_view_to_logical(
+            cam.translation.truncate(),
+            *map_view_mode,
+            &map_projection,
+        );
         focus.points.push(FocusPoint {
-            world_pos: cam.translation.truncate(),
+            world_pos: logical,
             chunk_radius: LOAD_RADIUS,
             is_camera: true,
         });
@@ -246,6 +268,11 @@ pub struct TileSpriteIndex {
     pub by_chunk: AHashMap<ChunkCoord, Vec<Entity>>,
     /// Per-tile lookup for TileSprite entities (excludes Wall entities).
     pub by_tile: AHashMap<(i32, i32), Entity>,
+    /// Per-tile lookup for `ElevationSkirt` entities (south face only).
+    /// Used by `attach_late_south_skirts_system` to detect tiles that
+    /// missed their skirt at chunk-spawn time because the southern
+    /// neighbour's chunk hadn't loaded yet.
+    pub skirt_by_tile: AHashMap<(i32, i32), Entity>,
 }
 
 #[derive(Component)]
@@ -335,6 +362,7 @@ pub fn setup_tile_materials(
 }
 
 /// Spawn tile sprites for a single chunk; populates both by_chunk and by_tile.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_chunk_sprites(
     commands: &mut Commands,
     tile_materials: &TileMaterials,
@@ -347,6 +375,8 @@ pub fn spawn_chunk_sprites(
     globe: &Globe,
     coord: ChunkCoord,
     camera_view_z: i32,
+    map_view_mode: MapViewMode,
+    map_projection: &MapProjection,
 ) {
     let Some(chunk) = chunk_map.0.get(&coord) else {
         return;
@@ -384,6 +414,10 @@ pub fn spawn_chunk_sprites(
                             GlobalTransform::default(),
                             Visibility::Visible,
                             InheritedVisibility::default(),
+                            ProjectedAnchor::Static {
+                                z: surf_z.clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+                            },
+                            ProjectionState::default(),
                         ))
                         .id();
                     wall_map.0.insert(tile_pos, entity);
@@ -428,14 +462,150 @@ pub fn spawn_chunk_sprites(
                     GlobalTransform::default(),
                     visibility,
                     InheritedVisibility::default(),
+                    ProjectedAnchor::Static {
+                        z: surf_z.clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+                    },
+                    ProjectionState::default(),
                 ))
                 .id();
             entities.push(entity);
             sprite_index.by_tile.insert(tile_pos, entity);
+
+            // South-facing cliff skirt — only attaches when this tile is
+            // taller than its (already-loaded) southern neighbour. Neighbours
+            // in unloaded chunks return `Z_MIN - 1` so they're skipped here;
+            // `attach_late_south_skirts_system` back-fills them when the
+            // southern chunk loads.
+            let south_z = chunk_map.surface_z_at(global_tx, global_ty - 1);
+            if south_z >= Z_MIN && surf_z > south_z {
+                let delta = (surf_z - south_z) as u8;
+                let skirt = spawn_skirt_for_tile(
+                    commands,
+                    &mut entities,
+                    global_tx,
+                    global_ty,
+                    south_z,
+                    delta,
+                    map_view_mode,
+                    map_projection,
+                );
+                sprite_index
+                    .skirt_by_tile
+                    .insert((global_tx, global_ty), skirt);
+            }
         }
     }
 
     sprite_index.by_chunk.insert(coord, entities);
+}
+
+/// Spawn the south-facing cliff skirt sibling for a tile. Anchored at the
+/// south neighbour's projected top edge so the visual band exactly fills
+/// the elevation gap; world position uses the south neighbour's surface_z
+/// for `ProjectedAnchor::Static` so it inherits that neighbour's lift.
+/// Returns the spawned entity so the caller can register it in
+/// `TileSpriteIndex.skirt_by_tile`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_skirt_for_tile(
+    commands: &mut Commands,
+    entities: &mut Vec<Entity>,
+    tx: i32,
+    ty: i32,
+    south_z: i32,
+    delta_z: u8,
+    map_view_mode: MapViewMode,
+    map_projection: &MapProjection,
+) -> Entity {
+    // Logical anchor: midpoint of the southern shared edge between (tx, ty)
+    // and (tx, ty - 1). In TopDown this collapses to a thin seam under the
+    // tile; in Tilted the projection lift makes the skirt's top edge land
+    // exactly on the upper tile's projected south edge.
+    let wx = tx as f32 * TILE_SIZE + TILE_SIZE * 0.5;
+    let wy = ty as f32 * TILE_SIZE; // shared edge logical y
+    let z_layer = 0.05; // just above terrain (0.0), below entities (0.5)
+    let entity = commands
+        .spawn((
+            ElevationSkirt { delta_z },
+            skirt_sprite(delta_z, map_projection, map_view_mode),
+            Transform::from_xyz(wx, wy, z_layer),
+            GlobalTransform::default(),
+            if map_view_mode == MapViewMode::Tilted {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            },
+            InheritedVisibility::default(),
+            ProjectedAnchor::Static {
+                z: south_z.clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+            },
+            ProjectionState::default(),
+        ))
+        .id();
+    entities.push(entity);
+    entity
+}
+
+/// Back-fill south skirts that were skipped at chunk-spawn time because
+/// the southern neighbour's chunk wasn't loaded yet. Fires on every
+/// `ChunkLoadedEvent`: for the row of tiles immediately *north* of the
+/// freshly-loaded chunk's top edge, those tiles' southern neighbours are
+/// now loaded — so we can compute the elevation step and spawn a skirt
+/// for any cliff that was missed.
+///
+/// Bounded to one row per loaded chunk per fire (32 tiles). Cheap.
+pub fn attach_late_south_skirts_system(
+    mut commands: Commands,
+    mut events: EventReader<ChunkLoadedEvent>,
+    chunk_map: Res<ChunkMap>,
+    mut sprite_index: ResMut<TileSpriteIndex>,
+    view_projection: crate::rendering::projection::ViewProjection,
+) {
+    let map_view_mode = *view_projection.mode;
+    let map_projection = *view_projection.proj;
+
+    for ev in events.read() {
+        let coord = ev.coord;
+        // Tiles immediately north of this chunk's top row would have been
+        // spawned by an earlier load of the chunk at (coord.0, coord.1+1).
+        // Their `ty - 1` lookups now hit the freshly-loaded chunk.
+        let x0 = coord.0 * CHUNK_SIZE as i32;
+        let north_ty = (coord.1 + 1) * CHUNK_SIZE as i32;
+        for lx in 0..CHUNK_SIZE as i32 {
+            let tx = x0 + lx;
+            let ty = north_ty;
+            // Only act if a TileSprite exists (i.e. the northern chunk is
+            // loaded with sprites) AND no skirt has been registered yet.
+            if !sprite_index.by_tile.contains_key(&(tx, ty))
+                || sprite_index.skirt_by_tile.contains_key(&(tx, ty))
+            {
+                continue;
+            }
+            let our_z = chunk_map.surface_z_at(tx, ty);
+            let south_z = chunk_map.surface_z_at(tx, ty - 1);
+            if our_z < Z_MIN || south_z < Z_MIN || our_z <= south_z {
+                continue;
+            }
+            let delta = (our_z - south_z) as u8;
+            // Skirt belongs to the *northern* tile's chunk so it gets
+            // cleaned up when that chunk unloads.
+            let northern_chunk = ChunkCoord(coord.0, coord.1 + 1);
+            let entities = sprite_index
+                .by_chunk
+                .entry(northern_chunk)
+                .or_default();
+            let skirt = spawn_skirt_for_tile(
+                &mut commands,
+                entities,
+                tx,
+                ty,
+                south_z,
+                delta,
+                map_view_mode,
+                &map_projection,
+            );
+            sprite_index.skirt_by_tile.insert((tx, ty), skirt);
+        }
+    }
 }
 
 /// Determine what to render at a tile given the camera view Z.
@@ -627,6 +797,7 @@ pub fn spawn_chunk_loose_rocks(commands: &mut Commands, chunk_map: &ChunkMap, co
 
             let qty = (h % 3 + 1) as u32;
             let world_pos = tile_to_world(global_tx, global_ty);
+            let surf_z = chunk.surface_z[ty][tx] as i32;
             commands.spawn((
                 GroundItem {
                     item: Item::new_commodity(crate::economy::core_ids::stone()),
@@ -640,6 +811,10 @@ pub fn spawn_chunk_loose_rocks(commands: &mut Commands, chunk_map: &ChunkMap, co
                 crate::simulation::obstacle::ConstructionObstacle {
                     resolution: crate::simulation::obstacle::ObstacleResolution::Relocate,
                 },
+                ProjectedAnchor::Static {
+                    z: surf_z.clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+                },
+                ProjectionState::default(),
             ));
         }
     }
@@ -662,12 +837,15 @@ pub fn chunk_streaming_system(
     camera_view_z: Res<CameraViewZ>,
     retention: Res<ChunkRetention>,
     mut stream_events: ChunkStreamEvents,
-    focus: Res<crate::simulation::region::SimulationFocus>,
+    focus_view: StreamFocusParams,
 ) {
     let now = Instant::now();
+    let focus = &focus_view.focus;
     if focus.points.is_empty() {
         return;
     }
+    let map_view_mode = *focus_view.view_projection.mode;
+    let map_projection = *focus_view.view_projection.proj;
 
     let total_cx = GLOBE_WIDTH * GLOBE_CELL_CHUNKS;
     let total_cy = GLOBE_HEIGHT * GLOBE_CELL_CHUNKS;
@@ -730,6 +908,8 @@ pub fn chunk_streaming_system(
                         &globe,
                         coord,
                         camera_view_z.0,
+                        map_view_mode,
+                        &map_projection,
                     );
 
                     spawn_chunk_plants(
@@ -788,6 +968,7 @@ pub fn chunk_streaming_system(
                 let tx = x0 + lx;
                 let ty = y0 + ly;
                 sprite_index.by_tile.remove(&(tx, ty));
+                sprite_index.skirt_by_tile.remove(&(tx, ty));
             }
         }
 
@@ -890,6 +1071,10 @@ pub fn refresh_changed_tiles_system(
                         GlobalTransform::default(),
                         Visibility::Visible,
                         InheritedVisibility::default(),
+                        ProjectedAnchor::Static {
+                            z: surf_z.clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+                        },
+                        ProjectionState::default(),
                     ))
                     .id();
                 wall_map.0.insert((tx, ty), new_entity);
@@ -932,6 +1117,10 @@ pub fn refresh_changed_tiles_system(
                     GlobalTransform::default(),
                     visibility,
                     InheritedVisibility::default(),
+                    ProjectedAnchor::Static {
+                        z: surf_z.clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+                    },
+                    ProjectionState::default(),
                 ))
                 .id();
             sprite_index.by_tile.insert((tx, ty), new_entity);

@@ -224,10 +224,8 @@ pub struct RoutingResources<'w, 's> {
 }
 
 pub fn right_click_context_menu_system(
-    mut contexts: EguiContexts,
+    mut cursor: crate::rendering::projection::CursorParams,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    camera_q: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
     selected: Res<SelectedEntity>,
     selected_many: Res<SelectedEntities>,
     member_q: OrderMemberQueries,
@@ -262,17 +260,13 @@ pub fn right_click_context_menu_system(
         return;
     }
 
-    let ctx = contexts.ctx_mut();
-
     // Detect right-click in the world (not over any egui panel).
-    if !ctx.is_pointer_over_area() && mouse_buttons.just_pressed(MouseButton::Right) {
-        if let (Ok(window), Ok((camera, cam_transform))) =
-            (windows.get_single(), camera_q.get_single())
-        {
-            if let Some(cursor_pos) = window.cursor_position() {
-                if let Ok(world_pos) = camera.viewport_to_world_2d(cam_transform, cursor_pos) {
-                    let tx = (world_pos.x / TILE_SIZE).floor() as i32;
-                    let ty = (world_pos.y / TILE_SIZE).floor() as i32;
+    if mouse_buttons.just_pressed(MouseButton::Right) {
+        if let Some(pick) = cursor.cursor_pick() {
+            {
+                {
+                    let (tx, ty) = pick.tile;
+                    let cursor_pos = pick.screen_pos;
 
                     let underground = routing.camera_view_z.0 != i32::MAX;
                     let target_z_i32 = if underground {
@@ -430,7 +424,7 @@ pub fn right_click_context_menu_system(
 
     // Close on left-click outside the menu.
     if menu_state.open
-        && !ctx.is_pointer_over_area()
+        && !cursor.egui_owns_pointer()
         && mouse_buttons.just_pressed(MouseButton::Left)
     {
         menu_state.open = false;
@@ -465,6 +459,7 @@ pub fn right_click_context_menu_system(
         .collect();
     let mut chosen: Option<MenuAction> = None;
 
+    let ctx = cursor.contexts.ctx_mut();
     egui::Area::new("context_menu".into())
         .fixed_pos(menu_state.screen_pos)
         .show(ctx, |ui| {
@@ -796,10 +791,8 @@ pub struct ClassifyQueries<'w, 's> {
 }
 
 pub fn military_right_click_system(
-    mut contexts: EguiContexts,
+    mut cursor: crate::rendering::projection::CursorParams,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    camera_q: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
     selected_many: Res<SelectedEntities>,
     player_faction: Res<PlayerFaction>,
     classify: ClassifyQueries,
@@ -830,24 +823,15 @@ pub fn military_right_click_system(
         return;
     }
 
-    let ctx = contexts.ctx_mut();
-
     // Right-click: classify and either resolve immediately or open the
     // neutral popup.
-    if !ctx.is_pointer_over_area() && mouse_buttons.just_pressed(MouseButton::Right) {
-        let (Ok(window), Ok((camera, cam_transform))) =
-            (windows.get_single(), camera_q.get_single())
-        else {
+    if mouse_buttons.just_pressed(MouseButton::Right) {
+        let Some(pick) = cursor.cursor_pick() else {
             return;
         };
-        let Some(cursor_pos) = window.cursor_position() else {
-            return;
-        };
-        let Ok(world_pos) = camera.viewport_to_world_2d(cam_transform, cursor_pos) else {
-            return;
-        };
-        let tx = (world_pos.x / TILE_SIZE).floor() as i32;
-        let ty = (world_pos.y / TILE_SIZE).floor() as i32;
+        let cursor_pos = pick.screen_pos;
+        let world_pos = pick.world_logical;
+        let (tx, ty) = pick.tile;
         let underground = camera_view_z.0 != i32::MAX;
         let target_z = if underground {
             camera_view_z.0 as i8
@@ -934,7 +918,7 @@ pub fn military_right_click_system(
 
     // Close the neutral popup on left-click outside.
     if menu_state.open
-        && !ctx.is_pointer_over_area()
+        && !cursor.egui_owns_pointer()
         && mouse_buttons.just_pressed(MouseButton::Left)
     {
         menu_state.open = false;
@@ -946,6 +930,7 @@ pub fn military_right_click_system(
 
     let mut chosen_attack = false;
     let mut chosen_move = false;
+    let ctx = cursor.contexts.ctx_mut();
     egui::Area::new("military_menu".into())
         .fixed_pos(menu_state.screen_pos)
         .show(ctx, |ui| {

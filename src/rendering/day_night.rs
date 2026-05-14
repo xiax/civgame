@@ -4,7 +4,11 @@ use bevy::prelude::*;
 #[derive(Component)]
 pub struct DayNightOverlay;
 
-const OVERLAY_Z: f32 = 90.0;
+/// Day-night overlay's render-z. Pinned at 90.0 so it sits above every
+/// world sprite (terrain ~0, ground items ~0.3, walls ~0.4, entities ~0.5)
+/// even after the tilted-view projection bakes a depth offset onto each
+/// anchored entity. Verified by `projection::tests::tilted_dz_below_day_night`.
+pub const OVERLAY_Z: f32 = 90.0;
 const OVERLAY_HALF_SIZE: f32 = 1_000_000.0;
 
 pub fn spawn_day_night_overlay(mut commands: Commands) {

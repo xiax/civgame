@@ -4,6 +4,7 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::mode::EconomicMode;
 use crate::rendering::camera::CameraViewZ;
+use crate::rendering::projection::MapViewMode;
 use crate::simulation::combat::CombatTarget;
 use crate::simulation::construction::AutonomousBuildingToggle;
 use crate::simulation::faction::HuntOrder;
@@ -37,6 +38,7 @@ pub struct HudResources<'w> {
     pub draft_req: ResMut<'w, DraftToggleRequest>,
     pub migration_panel: ResMut<'w, crate::ui::migration_panel::MigrationPanelOpen>,
     pub camera_view_z: Res<'w, CameraViewZ>,
+    pub map_view_mode: ResMut<'w, MapViewMode>,
     pub calendar: Res<'w, Calendar>,
     pub player_faction: Res<'w, PlayerFaction>,
     pub registry: Res<'w, FactionRegistry>,
@@ -61,6 +63,7 @@ pub fn hud_system(
     let draft_req = &mut *res.draft_req;
     let migration_panel = &mut *res.migration_panel;
     let camera_view_z = &*res.camera_view_z;
+    let map_view_mode = &mut *res.map_view_mode;
     let calendar = &*res.calendar;
     let player_faction = &*res.player_faction;
     let registry = &*res.registry;
@@ -328,6 +331,16 @@ pub fn hud_system(
                             egui::RichText::new(format!("Tick: {}", clock.tick))
                                 .color(egui::Color32::GRAY),
                         );
+
+                        ui.separator();
+                        let view_btn = egui::Button::new(format!("{} (V)", map_view_mode.label()))
+                            .fill(match *map_view_mode {
+                                MapViewMode::TopDown => egui::Color32::from_gray(60),
+                                MapViewMode::Tilted => egui::Color32::from_rgb(80, 140, 200),
+                            });
+                        if ui.add(view_btn).clicked() {
+                            *map_view_mode = map_view_mode.toggled();
+                        }
 
                         ui.separator();
                         let z_label = if camera_view_z.0 == i32::MAX {

@@ -56,11 +56,10 @@ fn chunk_center(coord: ChunkCoord) -> Vec2 {
 pub fn selected_agent_path_gizmo_system(
     overlay: Res<PathDebugOverlay>,
     selected: Res<SelectedEntity>,
-    chunk_map: Res<ChunkMap>,
     agents: Query<(&Transform, &PathFollow, &PersonAI)>,
+    projector: crate::rendering::projection::LogicalProjector,
     mut gizmos: Gizmos,
 ) {
-    let _ = chunk_map;
     if !overlay.show_selected_path {
         return;
     }
@@ -69,7 +68,7 @@ pub fn selected_agent_path_gizmo_system(
         return;
     };
 
-    let agent_pos = transform.translation.truncate();
+    let agent_pos = projector.project(transform.translation.truncate());
 
     // Yellow polyline: current PathFollow segment, agent → step 0 → … → segment end.
     let path_color = Color::srgba(1.0, 0.95, 0.2, 0.95);
@@ -77,24 +76,28 @@ pub fn selected_agent_path_gizmo_system(
         let cursor = (pf.segment_cursor as usize).min(pf.segment_path.len());
         let mut prev = agent_pos;
         for &(tx, ty, _z) in &pf.segment_path[cursor..] {
-            let p = tile_center(tx as i32, ty as i32);
+            let p = projector.project(tile_center(tx as i32, ty as i32));
             gizmos.line_2d(prev, p, path_color);
             gizmos.circle_2d(p, 1.5, path_color);
             prev = p;
         }
         if let Some(&(tx, ty, _)) = pf.segment_path.last() {
-            gizmos.circle_2d(tile_center(tx as i32, ty as i32), 4.0, path_color);
+            gizmos.circle_2d(
+                projector.project(tile_center(tx as i32, ty as i32)),
+                4.0,
+                path_color,
+            );
         }
     }
 
     // Magenta: line to the immediate target tile.
-    let target_pos = tile_center(ai.target_tile.0 as i32, ai.target_tile.1 as i32);
+    let target_pos = projector.project(tile_center(ai.target_tile.0 as i32, ai.target_tile.1 as i32));
     let target_color = Color::srgba(1.0, 0.3, 0.9, 0.85);
     gizmos.line_2d(agent_pos, target_pos, target_color);
     gizmos.circle_2d(target_pos, 3.0, target_color);
 
     // Cyan: line to the final destination tile (often differs from target).
-    let dest_pos = tile_center(ai.dest_tile.0 as i32, ai.dest_tile.1 as i32);
+    let dest_pos = projector.project(tile_center(ai.dest_tile.0 as i32, ai.dest_tile.1 as i32));
     if ai.dest_tile != ai.target_tile {
         let dest_color = Color::srgba(0.3, 0.9, 1.0, 0.85);
         gizmos.line_2d(agent_pos, dest_pos, dest_color);
@@ -108,7 +111,7 @@ pub fn selected_agent_path_gizmo_system(
         if (i as u8) < pf.route_cursor {
             continue;
         }
-        let c = chunk_center(*coord);
+        let c = projector.project(chunk_center(*coord));
         gizmos.line_2d(c + Vec2::new(-r, -r), c + Vec2::new(r, r), chunk_color);
         gizmos.line_2d(c + Vec2::new(-r, r), c + Vec2::new(r, -r), chunk_color);
     }
@@ -120,6 +123,7 @@ pub fn flow_field_gizmo_system(
     view_z: Res<CameraViewZ>,
     camera_query: Query<(&Transform, &OrthographicProjection), With<Camera>>,
     windows: Query<&Window>,
+    projector: crate::rendering::projection::LogicalProjector,
     mut gizmos: Gizmos,
 ) {
     if !overlay.show_flow_fields {
@@ -171,7 +175,8 @@ pub fn flow_field_gizmo_system(
                     continue;
                 }
                 let (dx, dy) = DIR_VEC[dir as usize];
-                let center = tile_center(origin_x + lx as i32, origin_y + ly as i32);
+                let center =
+                    projector.project(tile_center(origin_x + lx as i32, origin_y + ly as i32));
                 let mag = ((dx * dx + dy * dy) as f32).sqrt().max(1.0);
                 let off = Vec2::new(dx as f32, dy as f32) * (arrow_len / mag);
                 gizmos.line_2d(center - off * 0.5, center + off * 0.5, arrow_color);
@@ -180,10 +185,10 @@ pub fn flow_field_gizmo_system(
             }
         }
 
-        let goal = tile_center(
+        let goal = projector.project(tile_center(
             origin_x + field.goal_tile.0 as i32,
             origin_y + field.goal_tile.1 as i32,
-        );
+        ));
         gizmos.circle_2d(goal, 4.0, goal_color);
     }
 }
@@ -191,6 +196,7 @@ pub fn flow_field_gizmo_system(
 pub fn chunk_graph_gizmo_system(
     overlay: Res<PathDebugOverlay>,
     graph: Res<ChunkGraph>,
+    projector: crate::rendering::projection::LogicalProjector,
     mut gizmos: Gizmos,
 ) {
     if !overlay.show_chunk_graph {
@@ -201,7 +207,7 @@ pub fn chunk_graph_gizmo_system(
 
     let mut drawn: AHashSet<(ChunkCoord, ChunkCoord)> = AHashSet::new();
     for (&coord, edges) in &graph.edges {
-        let a = chunk_center(coord);
+        let a = projector.project(chunk_center(coord));
         gizmos.circle_2d(a, 3.0, node_color);
         for edge in edges {
             let key = if (coord.0, coord.1) <= (edge.neighbor.0, edge.neighbor.1) {
@@ -212,7 +218,7 @@ pub fn chunk_graph_gizmo_system(
             if !drawn.insert(key) {
                 continue;
             }
-            let b = chunk_center(edge.neighbor);
+            let b = projector.project(chunk_center(edge.neighbor));
             gizmos.line_2d(a, b, edge_color);
         }
     }
@@ -251,6 +257,7 @@ pub fn connectivity_component_gizmo_system(
     view_z: Res<CameraViewZ>,
     camera_query: Query<(&Transform, &OrthographicProjection), With<Camera>>,
     windows: Query<&Window>,
+    projector: crate::rendering::projection::LogicalProjector,
     mut gizmos: Gizmos,
 ) {
     if !overlay.show_connectivity_components {
@@ -286,7 +293,7 @@ pub fn connectivity_component_gizmo_system(
         if coord.0 < cx_min || coord.0 > cx_max || coord.1 < cy_min || coord.1 > cy_max {
             continue;
         }
-        let c = chunk_center(coord);
+        let c = projector.project(chunk_center(coord));
         let color = component_color(id);
         gizmos.rect_2d(c, Vec2::splat(chunk_world - 2.0), color);
         // Bright corner ticks make components visually pop even when the
@@ -315,6 +322,7 @@ pub fn recent_failures_gizmo_system(
     overlay: Res<PathDebugOverlay>,
     failures: Res<FailureLog>,
     view_z: Res<CameraViewZ>,
+    projector: crate::rendering::projection::LogicalProjector,
     mut gizmos: Gizmos,
 ) {
     if !overlay.show_recent_failures {
@@ -335,8 +343,8 @@ pub fn recent_failures_gizmo_system(
                 continue;
             }
         }
-        let s = tile_center(rec.start.0, rec.start.1);
-        let g = tile_center(rec.goal.0, rec.goal.1);
+        let s = projector.project(tile_center(rec.start.0, rec.start.1));
+        let g = projector.project(tile_center(rec.goal.0, rec.goal.1));
         gizmos.line_2d(s, g, line_color);
         gizmos.circle_2d(g, 3.0, goal_color);
         // Small X at the start.
@@ -353,6 +361,7 @@ pub fn selected_agent_failures_gizmo_system(
     overlay: Res<PathDebugOverlay>,
     failures: Res<FailureLog>,
     selected: Res<SelectedEntity>,
+    projector: crate::rendering::projection::LogicalProjector,
     mut gizmos: Gizmos,
 ) {
     if !overlay.show_selected_failures {
@@ -362,8 +371,8 @@ pub fn selected_agent_failures_gizmo_system(
     let highlight = Color::srgba(1.0, 0.85, 0.2, 0.9);
 
     for rec in failures.for_agent(entity) {
-        let s = tile_center(rec.start.0, rec.start.1);
-        let g = tile_center(rec.goal.0, rec.goal.1);
+        let s = projector.project(tile_center(rec.start.0, rec.start.1));
+        let g = projector.project(tile_center(rec.goal.0, rec.goal.1));
         gizmos.line_2d(s, g, highlight);
         gizmos.circle_2d(g, 4.0, highlight);
         let r = 3.5;

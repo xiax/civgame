@@ -44,6 +44,7 @@ pub fn world_map_system(
     mut settled: ResMut<SettledRegions>,
     mut camera_q: Query<&mut Transform, With<Camera>>,
     mut camera_state: ResMut<crate::rendering::camera::CameraState>,
+    view_projection: crate::rendering::projection::ViewProjection,
 ) {
     // Suppress camera input while map is open
     if open.0 {
@@ -128,10 +129,13 @@ pub fn world_map_system(
                     .rect_stroke(r, 0.0, egui::Stroke::new(2.0, color));
             }
 
-            // Draw current camera position as a white rectangle.
+            // Draw current camera position as a white rectangle. Convert
+            // through `camera_view_to_logical` so the marker tracks the
+            // logical (top-down) tile under the camera in tilted mode.
             if let Ok(cam_t) = camera_q.get_single() {
-                let tile_x = cam_t.translation.x / TILE_SIZE;
-                let tile_y = cam_t.translation.y / TILE_SIZE;
+                let logical = view_projection.camera_to_logical(cam_t.translation.truncate());
+                let tile_x = logical.x / TILE_SIZE;
+                let tile_y = logical.y / TILE_SIZE;
 
                 let nx = tile_x / total_tiles_x;
                 let ny = 1.0 - tile_y / total_tiles_y;
@@ -165,18 +169,25 @@ pub fn world_map_system(
                     if let Some(&region_id) = settled.by_megachunk.get(&target) {
                         // Bookmark current camera pos under the region currently containing it.
                         if let Ok(mut cam_t) = camera_q.get_single_mut() {
-                            let cur_tx = (cam_t.translation.x / TILE_SIZE).floor() as i32;
-                            let cur_ty = (cam_t.translation.y / TILE_SIZE).floor() as i32;
+                            let cur_logical =
+                                view_projection.camera_to_logical(cam_t.translation.truncate());
+                            let cur_tx = (cur_logical.x / TILE_SIZE).floor() as i32;
+                            let cur_ty = (cur_logical.y / TILE_SIZE).floor() as i32;
                             let cur_mc = MegaChunkCoord::from_tile(cur_tx, cur_ty);
                             if let Some(&cur_region_id) = settled.by_megachunk.get(&cur_mc) {
                                 if let Some(cr) = settled.by_id.get_mut(&cur_region_id) {
-                                    cr.camera_bookmark = cam_t.translation.truncate();
+                                    // Bookmarks always store logical
+                                    // coords so they survive mode toggles.
+                                    cr.camera_bookmark = cur_logical;
                                 }
                             }
-                            // Jump to the target region's bookmark.
+                            // Jump to the target region's bookmark — bookmark
+                            // is logical, project it to the camera's view space.
                             if let Some(target_region) = settled.by_id.get(&region_id) {
-                                cam_t.translation.x = target_region.camera_bookmark.x;
-                                cam_t.translation.y = target_region.camera_bookmark.y;
+                                let view = view_projection
+                                    .logical_to_camera(target_region.camera_bookmark);
+                                cam_t.translation.x = view.x;
+                                cam_t.translation.y = view.y;
                             }
                         }
                     }

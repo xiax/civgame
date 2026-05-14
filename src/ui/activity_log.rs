@@ -410,6 +410,7 @@ pub fn activity_log_panel_system(
 pub fn camera_focus_system(
     mut req: ResMut<CameraFocusRequest>,
     mut cam: Query<&mut Transform, With<Camera2d>>,
+    view_projection: crate::rendering::projection::ViewProjection,
 ) {
     let Some(target) = req.0.take() else {
         return;
@@ -417,8 +418,12 @@ pub fn camera_focus_system(
     let Ok(mut tf) = cam.get_single_mut() else {
         return;
     };
-    tf.translation.x = target.x;
-    tf.translation.y = target.y;
+    // `target` is a logical (top-down) world position read from an
+    // entity's Transform during Update — project it into camera-space so
+    // the focused entity lands under the visual centre in tilted mode.
+    let view = view_projection.logical_to_camera(target);
+    tf.translation.x = view.x;
+    tf.translation.y = view.y;
 }
 
 fn link_button(ui: &mut egui::Ui, text: &str, alive: bool) -> egui::Response {

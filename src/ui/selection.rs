@@ -1,5 +1,10 @@
+use crate::rendering::projection::{
+    project_delta, MapProjection, MapViewMode, ProjectedAnchor, ViewProjection,
+};
 use crate::simulation::faction::{FactionMember, PlayerFaction};
 use crate::simulation::person::{Drafted, Person};
+use crate::world::chunk::ChunkMap;
+use crate::world::terrain::TILE_SIZE;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::EguiContexts;
@@ -41,6 +46,8 @@ pub fn selection_input_system(
     mut selected: ResMut<SelectedEntity>,
     mut selected_many: ResMut<SelectedEntities>,
     mut drag: ResMut<SelectionDrag>,
+    view_projection: ViewProjection,
+    chunk_map: Res<ChunkMap>,
 ) {
     if contexts.ctx_mut().is_pointer_over_area() || contexts.ctx_mut().wants_pointer_input() {
         // Clicking on a panel should never start a drag, but if a drag is
@@ -81,11 +88,31 @@ pub fn selection_input_system(
         return;
     };
 
+    let mode = *view_projection.mode;
+    let proj = *view_projection.proj;
+    // Project a person's logical Transform.translation into view-space so
+    // hit-tests against the cursor (also view-space) work in tilted mode.
+    let project_person = |logical: Vec2| -> Vec2 {
+        if mode == MapViewMode::TopDown {
+            return logical;
+        }
+        let tx = (logical.x / TILE_SIZE).floor() as i32;
+        let ty = (logical.y / TILE_SIZE).floor() as i32;
+        let elev_z_i32 = chunk_map.surface_z_at(tx, ty);
+        let elev_z = if elev_z_i32 >= crate::world::chunk::Z_MIN {
+            elev_z_i32.clamp(i8::MIN as i32, i8::MAX as i32) as i8
+        } else {
+            0
+        };
+        let (dy, _dz) = project_delta(logical.y, elev_z, mode, &proj);
+        Vec2::new(logical.x, logical.y + dy)
+    };
+
     if start.distance(end) < DRAG_THRESHOLD_PX {
-        // Single-click: pick nearest Person within radius.
+        // Single-click: pick nearest Person within radius (view-space).
         let mut best: Option<(Entity, f32)> = None;
         for (entity, transform, _faction) in persons.iter() {
-            let pos = transform.translation.truncate();
+            let pos = project_person(transform.translation.truncate());
             let dist = pos.distance(end);
             if dist < SINGLE_CLICK_RADIUS_PX && best.map(|(_, d)| dist < d).unwrap_or(true) {
                 best = Some((entity, dist));
@@ -104,7 +131,8 @@ pub fn selection_input_system(
         return;
     }
 
-    // Drag-select: collect all player-faction Persons inside the rect.
+    // Drag-select: collect all player-faction Persons whose *projected*
+    // position falls inside the screen-space rect.
     let min = Vec2::new(start.x.min(end.x), start.y.min(end.y));
     let max = Vec2::new(start.x.max(end.x), start.y.max(end.y));
     let mut hits: Vec<Entity> = Vec::new();
@@ -113,7 +141,7 @@ pub fn selection_input_system(
         if member.faction_id != player_faction.faction_id {
             continue;
         }
-        let p = transform.translation.truncate();
+        let p = project_person(transform.translation.truncate());
         if p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y {
             hits.push(entity);
         }
@@ -123,14 +151,19 @@ pub fn selection_input_system(
 }
 
 /// Draws the in-progress drag rectangle and a colored ring under each
-/// selected entity (red for drafted, yellow otherwise).
+/// selected entity (red for drafted, yellow otherwise). Selection rings
+/// project to view-space so they line up with the rendered (tilted) sprite,
+/// not the underlying logical Transform that simulation reads.
 pub fn selection_gizmo_system(
     drag: Res<SelectionDrag>,
     selected_many: Res<SelectedEntities>,
     transforms: Query<&Transform>,
     drafted_q: Query<(), With<Drafted>>,
+    view_projection: ViewProjection,
+    chunk_map: Res<ChunkMap>,
     mut gizmos: Gizmos,
 ) {
+    // Drag rect lives in view-space (cursor coords) so it draws as-is.
     if let (Some(s), Some(c)) = (drag.start_world, drag.current_world) {
         let center = (s + c) * 0.5;
         let size = (c - s).abs();
@@ -139,9 +172,27 @@ pub fn selection_gizmo_system(
         }
     }
 
+    let mode = *view_projection.mode;
+    let proj = *view_projection.proj;
+    let project_pos = |logical: Vec2| -> Vec2 {
+        if mode == MapViewMode::TopDown {
+            return logical;
+        }
+        let tx = (logical.x / TILE_SIZE).floor() as i32;
+        let ty = (logical.y / TILE_SIZE).floor() as i32;
+        let elev_z_i32 = chunk_map.surface_z_at(tx, ty);
+        let elev_z = if elev_z_i32 >= crate::world::chunk::Z_MIN {
+            elev_z_i32.clamp(i8::MIN as i32, i8::MAX as i32) as i8
+        } else {
+            0
+        };
+        let (dy, _dz) = project_delta(logical.y, elev_z, mode, &proj);
+        Vec2::new(logical.x, logical.y + dy)
+    };
+
     for &e in &selected_many.ids {
         let Ok(t) = transforms.get(e) else { continue };
-        let pos = t.translation.truncate();
+        let pos = project_pos(t.translation.truncate());
         let color = if drafted_q.get(e).is_ok() {
             Color::srgba(1.0, 0.35, 0.25, 0.95)
         } else {

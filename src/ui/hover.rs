@@ -1,7 +1,6 @@
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
-use bevy_egui::{egui, EguiContexts};
+use bevy_egui::egui;
 
 use crate::economy::agent::EconomicAgent;
 use crate::simulation::animals::{AnimalAI, Deer, Wolf};
@@ -39,9 +38,7 @@ use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_at_3d, world_to_tile, WorldGen};
 
 pub fn hover_info_system(
-    mut contexts: EguiContexts,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    camera_query: Query<(&Camera, &GlobalTransform), With<Camera>>,
+    mut cursor: crate::rendering::projection::CursorParams,
     chunk_map: Res<ChunkMap>,
     gen: Res<WorldGen>,
     globe: Res<Globe>,
@@ -84,25 +81,11 @@ pub fn hover_info_system(
     plot_index: Res<PlotIndex>,
     plot_query: Query<&Plot>,
 ) {
-    let Ok(window) = windows.get_single() else {
+    let Some(pick) = cursor.cursor_pick() else {
         return;
     };
-    let Ok((camera, cam_transform)) = camera_query.get_single() else {
-        return;
-    };
-
-    let ctx = contexts.ctx_mut();
-    if ctx.is_pointer_over_area() || ctx.wants_pointer_input() {
-        return;
-    }
-
-    let Some(cursor_pos) = window.cursor_position() else {
-        return;
-    };
-    let Ok(world_pos) = camera.viewport_to_world_2d(cam_transform, cursor_pos) else {
-        return;
-    };
-    let (tx, ty) = world_to_tile(world_pos);
+    let (tx, ty) = pick.tile;
+    let ctx = cursor.contexts.ctx_mut();
 
     let tooltip_id = egui::Id::new("hover_tooltip");
     egui::show_tooltip_at_pointer(

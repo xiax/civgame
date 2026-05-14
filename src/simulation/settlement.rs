@@ -988,6 +988,7 @@ pub fn zone_overlay_gizmo_system(
     plans: Res<SettlementPlans>,
     player_faction: Res<PlayerFaction>,
     toggle: Res<ZoneOverlayToggle>,
+    projector: crate::rendering::projection::LogicalProjector,
 ) {
     if !toggle.show {
         return;
@@ -1011,9 +1012,21 @@ pub fn zone_overlay_gizmo_system(
             let y_max = (r.y0 as f32 + r.h as f32) * TILE_SIZE;
             let cx = (x_min + x_max) * 0.5;
             let cy = (y_min + y_max) * 0.5;
-            let size = Vec2::new(x_max - x_min, y_max - y_min);
+            let center = projector.project(Vec2::new(cx, cy));
+            // Width in projected space matches logical (X is preserved);
+            // height compresses with `y_scale`. Approximate by re-projecting
+            // the four corners and taking their bounding box — handles cases
+            // where the zone spans multiple elevation tiers and avoids a
+            // hard `y_scale` constant here.
+            let tl = projector.project(Vec2::new(x_min, y_min));
+            let tr = projector.project(Vec2::new(x_max, y_min));
+            let bl = projector.project(Vec2::new(x_min, y_max));
+            let br = projector.project(Vec2::new(x_max, y_max));
+            let proj_min = tl.min(tr).min(bl).min(br);
+            let proj_max = tl.max(tr).max(bl).max(br);
+            let size = proj_max - proj_min;
             gizmos.rect_2d(
-                Isometry2d::from_translation(Vec2::new(cx, cy)),
+                Isometry2d::from_translation(center),
                 size,
                 zone_color(zone.kind),
             );

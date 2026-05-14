@@ -9,6 +9,7 @@ pub mod entity_sprites;
 pub mod fog;
 pub mod path_debug;
 pub mod pixel_art;
+pub mod projection;
 pub mod sprite_library;
 pub mod tile_render;
 
@@ -18,6 +19,8 @@ impl Plugin for RenderingPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(camera::CameraState::default())
             .insert_resource(camera::CameraViewZ::default())
+            .insert_resource(projection::MapViewMode::default())
+            .insert_resource(projection::MapProjection::default())
             .insert_resource(chunk_streaming::TileMaterials::default())
             .insert_resource(chunk_streaming::TileSpriteIndex::default())
             .insert_resource(chunk_streaming::ChunkBoundaryOverlay::default())
@@ -69,6 +72,7 @@ impl Plugin for RenderingPlugin {
                     path_debug::connectivity_component_gizmo_system,
                     path_debug::recent_failures_gizmo_system,
                     path_debug::selected_agent_failures_gizmo_system,
+                    projection::update_skirt_visibility_system,
                     day_night::update_day_night_overlay_system,
                 )
                     .run_if(in_state(crate::GameState::Playing)),
@@ -87,6 +91,11 @@ impl Plugin for RenderingPlugin {
                     chunk_streaming::update_simulation_focus_system
                         .before(chunk_streaming::chunk_streaming_system),
                     chunk_streaming::chunk_streaming_system,
+                    // Back-fill south skirts for cliffs whose southern
+                    // neighbour just loaded — runs after streaming so it
+                    // sees this tick's `ChunkLoadedEvent`s.
+                    chunk_streaming::attach_late_south_skirts_system
+                        .after(chunk_streaming::chunk_streaming_system),
                 )
                     .run_if(in_state(crate::GameState::Playing)),
             )
@@ -156,6 +165,74 @@ impl Plugin for RenderingPlugin {
                         .after(animations::update_animations),
                 ),
             )
-            .add_systems(PostUpdate, fog::apply_fog_to_tiles_system);
+            .add_systems(PostUpdate, fog::apply_fog_to_tiles_system)
+            // Tilt-view projection layer. PreUpdate restores logical
+            // Transform values so sim systems read top-down coords;
+            // PostUpdate re-projects after every Transform writer is done.
+            // Both systems early-return in TopDown mode for bit-exact
+            // identity behaviour.
+            .add_systems(
+                PreUpdate,
+                projection::revert_view_projection_system
+                    .run_if(in_state(crate::GameState::Playing)),
+            )
+            .add_systems(
+                PostUpdate,
+                projection::apply_view_projection_system
+                    .run_if(in_state(crate::GameState::Playing)),
+            )
+            .add_systems(
+                Update,
+                (
+                    projection::toggle_view_mode_system,
+                    projection::camera_recenter_on_mode_change_system
+                        .after(projection::toggle_view_mode_system),
+                )
+                    .run_if(in_state(crate::GameState::Playing)),
+            )
+            // Auto-attach `ProjectedAnchor::Dynamic` to every world-living
+            // entity carrying one of these marker components. Saves
+            // touching ~40 spawn sites scattered across construction.rs /
+            // person.rs / animals / nomad / reproduction.
+            .add_systems(
+                Update,
+                (
+                    projection::auto_attach_dynamic::<crate::simulation::person::Person>,
+                    projection::auto_attach_dynamic::<crate::simulation::animals::Wolf>,
+                    projection::auto_attach_dynamic::<crate::simulation::animals::Deer>,
+                    projection::auto_attach_dynamic::<crate::simulation::animals::Horse>,
+                    projection::auto_attach_dynamic::<crate::simulation::animals::Cow>,
+                    projection::auto_attach_dynamic::<crate::simulation::animals::Pig>,
+                    projection::auto_attach_dynamic::<crate::simulation::animals::Rabbit>,
+                    projection::auto_attach_dynamic::<crate::simulation::animals::Fox>,
+                    projection::auto_attach_dynamic::<crate::simulation::animals::Cat>,
+                    projection::auto_attach_dynamic::<crate::simulation::corpse::Corpse>,
+                    projection::auto_attach_dynamic::<crate::simulation::plants::Plant>,
+                    projection::auto_attach_dynamic::<crate::simulation::items::GroundItem>,
+                )
+                    .run_if(in_state(crate::GameState::Playing)),
+            )
+            .add_systems(
+                Update,
+                (
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Bed>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Wall>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Door>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Workbench>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Loom>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Table>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Chair>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Campfire>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Granary>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Shrine>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Market>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Barracks>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Monument>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Bridge>,
+                    projection::auto_attach_dynamic::<crate::simulation::construction::Blueprint>,
+                    projection::auto_attach_dynamic::<crate::simulation::faction::FactionCenter>,
+                )
+                    .run_if(in_state(crate::GameState::Playing)),
+            );
     }
 }

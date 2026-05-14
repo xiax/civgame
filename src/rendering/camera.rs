@@ -1,3 +1,4 @@
+use crate::rendering::projection::{MapProjection, MapViewMode};
 use crate::world::chunk::CHUNK_SIZE;
 use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 use crate::world::terrain::TILE_SIZE;
@@ -92,9 +93,21 @@ pub fn camera_input_system(
     mut camera_state: ResMut<CameraState>,
     mut camera_view_z: ResMut<CameraViewZ>,
     mut camera_query: Query<(&mut Transform, &mut OrthographicProjection), With<Camera>>,
+    map_view_mode: Res<MapViewMode>,
+    map_projection: Res<MapProjection>,
 ) {
     let Ok((mut transform, mut projection)) = camera_query.get_single_mut() else {
         return;
+    };
+
+    // In tilted view, Y is compressed by `y_scale` so the same view-space
+    // delta advances ~1.7× more logical tiles than TopDown — pan-Y feels
+    // jarringly fast. Scale Y deltas down by `y_scale` so a keypress moves
+    // the camera the same logical-tile distance per second in both modes.
+    let pan_y_factor = if *map_view_mode == MapViewMode::Tilted {
+        map_projection.y_scale
+    } else {
+        1.0
     };
 
     let egui_wants_mouse =
@@ -121,14 +134,14 @@ pub fn camera_input_system(
     if pan != Vec2::ZERO {
         let delta = pan.normalize() * speed * dt;
         transform.translation.x += delta.x;
-        transform.translation.y += delta.y;
+        transform.translation.y += delta.y * pan_y_factor;
     }
 
     // Middle-mouse drag
     if mouse_buttons.pressed(MouseButton::Middle) && !egui_wants_mouse {
         for ev in motion_events.read() {
             transform.translation.x -= ev.delta.x * projection.scale;
-            transform.translation.y += ev.delta.y * projection.scale;
+            transform.translation.y += ev.delta.y * projection.scale * pan_y_factor;
         }
     } else {
         motion_events.clear();
@@ -142,7 +155,7 @@ pub fn camera_input_system(
         match ev.unit {
             MouseScrollUnit::Pixel => {
                 transform.translation.x -= ev.x * projection.scale;
-                transform.translation.y += ev.y * projection.scale;
+                transform.translation.y += ev.y * projection.scale * pan_y_factor;
             }
             MouseScrollUnit::Line => {
                 projection.scale =

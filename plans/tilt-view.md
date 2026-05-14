@@ -1,5 +1,25 @@
 # Tilted Elevation View
 
+## Status
+Shipped (v1):
+- core scaffolding, `V` toggle, HUD button, projection helpers, auto-attached `ProjectedAnchor` covering tiles + walls + ground items + every world-living marker type
+- mode-toggle camera anchor (`camera_recenter_on_mode_change_system`) so the same logical tile stays under the visual centre on TopDown↔Tilted flip
+- camera focus through `camera_view_to_logical` (chunk loader)
+- world-map bookmark jumps + activity-log focus through `camera_view_to_logical` / `logical_to_view_camera` (bookmarks stored as logical coords so they survive mode toggles)
+- elevation skirts as `Sprite` quads (south face only, per-cliff sibling spawned in `spawn_chunk_sprites`, sized per frame from `z_step_px`, hidden in TopDown)
+- chunk-seam back-fill: `attach_late_south_skirts_system` listens for `ChunkLoadedEvent` and back-fills the northern row's skirts via `TileSpriteIndex.skirt_by_tile`
+- bumped `z_step_px` 3 → 6 px / Z for visible relief
+- elevation-aware cursor picking via `CursorParams` SystemParam (`hover_info_system`, `right_click_context_menu_system`, `military_right_click_system`) — uses `pick_cliff_aware`, walking every Z-band candidate and selecting the tile actually projecting under the cursor (closest tile_y to camera wins ties)
+- projected drag-select + selection rings (`selection_input_system`, `selection_gizmo_system`)
+- debug gizmos via `LogicalProjector` SystemParam (path debug overlays, zone overlay) project all logical positions before drawing
+- camera pan-Y normalization (WASD / middle-drag / scroll-pan multiply Y deltas by `y_scale` in tilted mode so a keypress moves the same logical-tile distance per second in either mode)
+- day-night `z = 90` regression test (`tilted_dz_below_day_night`) sweeps the full Z range and asserts projected depth offset stays well below the overlay layer
+
+TopDown remains bit-exact (689 tests pass, including 5 projection unit tests).
+
+Deferred (intentional, won't fix):
+- east/west cliff skirts (pure oblique-no-skew projection collapses east/west faces to 0-px-wide seams; south skirts cover all visible cliff faces)
+
 ## Summary
 Add a toggleable 2.5D **oblique** projection (no X-rotation), implemented as a rendering-only layer. Simulation, pathfinding, AI, and tile storage stay on the existing logical tile grid. `V` toggles TopDown ↔ Tilted; TopDown is a bit-exact identity fallback.
 
