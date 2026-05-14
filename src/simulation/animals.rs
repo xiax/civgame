@@ -786,10 +786,9 @@ pub fn animal_movement_system(
 
         if dist > 2.0 {
             let dir = to_target.normalize();
-            // Use `sim_dt` (bucket-compensated) — speed multiplication is
-            // handled by `Time<Virtual>::set_relative_speed` driving extra
-            // FixedUpdate ticks per real second, not by an inline factor.
-            let step = dir * ANIMAL_SPEED * sim_dt;
+            // Use `dt` for smooth every-frame movement. Simulation timers
+            // use `sim_dt` inside the bucket-active block below.
+            let step = dir * ANIMAL_SPEED * dt;
             if step.length() >= dist {
                 transform.translation.x = target_world.x;
                 transform.translation.y = target_world.y;
