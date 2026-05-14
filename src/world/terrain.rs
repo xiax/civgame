@@ -265,7 +265,22 @@ pub fn topsoil_kind(biome: Biome, river_d: u8) -> TileKind {
 /// Local-detail amplitude for `surface_v`: the per-tile Perlin field can
 /// only push the macro value by ±this much. Lower = terrain hugs globe
 /// elevation more tightly; higher = more within-biome variation.
-const LOCAL_DETAIL_AMP: f32 = 0.20;
+/// Per-biome amplitude for the local Perlin detail layered on top of the
+/// globe's macro elevation. Lower values keep gameplay terrain tightly
+/// anchored to the world-map preview; higher values let mountain ridges and
+/// badland scree retain jagged character. Bounded so even the noisiest biome
+/// can't drift more than ±~5 Z from the macro signal.
+fn local_detail_amp(biome: Biome) -> f32 {
+    match biome {
+        // Coasts, lowlands, and dry flats: stick close to the macro elevation
+        // so a "lowland" on the world map doesn't render as a plateau.
+        Biome::Ocean | Biome::Wetland | Biome::Desert | Biome::Steppe => 0.07,
+        // Generic vegetated belts: moderate rolling terrain.
+        Biome::Grassland | Biome::Temperate | Biome::Taiga | Biome::Tropical | Biome::Tundra => 0.10,
+        // Mountain ridges and badland uplift: more relief to read as rugged.
+        Biome::Mountain | Biome::Badlands => 0.15,
+    }
+}
 
 /// Fractional surface noise value at (tx, ty). Range [0, 1].
 ///
@@ -277,12 +292,17 @@ const LOCAL_DETAIL_AMP: f32 = 0.20;
 /// could still show a tall plateau in-world — the cognitive dissonance read
 /// as "everything is tall."
 ///
-/// **Local detail**: 3-octave Perlin perturbation, ±LOCAL_DETAIL_AMP,
-/// breaks up the macro into recognisable terrain (rolling grass, jagged
-/// mountain ridges, coastal shelves) without overpowering the anchor.
+/// **Local detail**: 3-octave Perlin perturbation, biome-conditional
+/// amplitude via `local_detail_amp`. Breaks up the macro into recognisable
+/// terrain (rolling grass, jagged mountain ridges, coastal shelves) without
+/// overpowering the anchor.
 pub fn surface_v(tx: i32, ty: i32, gen: &WorldGen, globe: &Globe) -> f32 {
-    let (elev_u, _, _) = globe.sample_climate(tx, ty);
+    let (elev_u, temp_c, rain_u) = globe.sample_climate(tx, ty);
     let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
+    let temp_f = ((temp_c + 30.0) / 80.0).clamp(0.0, 1.0);
+    let rain_f = (rain_u / 255.0).clamp(0.0, 1.0);
+    let biome = biome_mod::classify(macro_f, temp_f, rain_f);
+    let amp = local_detail_amp(biome);
 
     let nx = tx as f64 * 0.04;
     let ny = ty as f64 * 0.04;
@@ -292,7 +312,7 @@ pub fn surface_v(tx: i32, ty: i32, gen: &WorldGen, globe: &Globe) -> f32 {
     // Weighted sum normalised so output stays roughly in [-1, 1].
     let detail = (d0 * 0.60 + d1 * 0.28 + d2 * 0.12) as f32;
 
-    (macro_f + detail * LOCAL_DETAIL_AMP).clamp(0.0, 1.0)
+    (macro_f + detail * amp).clamp(0.0, 1.0)
 }
 
 /// Compute discrete surface Z level at world tile (tx, ty). O(1).
@@ -910,6 +930,35 @@ mod tests {
         let b = proc_tile(10, 20, 0, &gen, &g, Biome::Temperate, u8::MAX);
         assert_eq!(a.kind, b.kind);
         assert_eq!(a.ore, b.ore);
+    }
+
+    #[test]
+    fn surface_v_stays_anchored_to_macro_elevation() {
+        // Per-biome detail amp caps at 0.15, so per-tile `surface_v` can
+        // never diverge from the globe macro signal by more than 0.15. In
+        // discrete Z that's ±ceil(0.15 * 32) = ±5 Z. Sample widely enough
+        // to hit Ocean / Grassland / Mountain / Desert / Wetland.
+        let gen = WorldGen::new();
+        let g = test_globe();
+        let max_amp = 0.15_f32;
+        let max_z_delta = (max_amp * CHUNK_HEIGHT as f32).ceil() as i32 + 1;
+        for (tx, ty) in (0..200).map(|i| (i * 137, i * 211)) {
+            let v = surface_v(tx, ty, &gen, &g);
+            let (elev_u, _, _) = g.sample_climate(tx, ty);
+            let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
+            let macro_z = (Z_MIN as f32 + macro_f * CHUNK_HEIGHT as f32).round() as i32;
+            let z = (Z_MIN as f32 + v * CHUNK_HEIGHT as f32).round() as i32;
+            assert!(
+                (z - macro_z).abs() <= max_z_delta,
+                "tile ({},{}): z={}, macro_z={}, delta={} (cap {})",
+                tx,
+                ty,
+                z,
+                macro_z,
+                z - macro_z,
+                max_z_delta
+            );
+        }
     }
 
     #[test]

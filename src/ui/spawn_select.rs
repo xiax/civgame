@@ -269,8 +269,11 @@ pub fn spawn_select_system(
                         egui::vec2(cell_w, cell_h),
                     );
                     let (tx, ty) = MegaChunkCoord::center_tile(mx, my);
+                    let (tx0, ty0, tx1, ty1) = MegaChunkCoord::tile_bounds(mx, my);
                     let center_biome = sample_dominant_biome(&globe, mx, my);
                     let (elev_u, temp_c, _rain_u) = globe.sample_climate(tx, ty);
+                    let (elev_min, elev_max, elev_mean) =
+                        sample_elevation_stats(&globe, tx0, ty0, tx1, ty1);
                     let habitable = center_biome.is_habitable();
                     let stroke_color = if habitable {
                         egui::Color32::WHITE
@@ -280,10 +283,33 @@ pub fn spawn_select_system(
                     ui.painter()
                         .rect_stroke(highlight_rect, 0.0, egui::Stroke::new(2.0, stroke_color));
 
+                    // Centre dot — gameplay home is constrained to this cell,
+                    // pulled toward the centre by the soft centre-bias in
+                    // `pick_player_home_in_megachunk`. Without a `ChunkMap`
+                    // we can't render the exact predicted home tile here;
+                    // the centre dot is the honest visual anchor.
+                    let dot_color = if habitable {
+                        egui::Color32::from_rgb(240, 220, 80)
+                    } else {
+                        egui::Color32::from_rgb(180, 80, 80)
+                    };
+                    ui.painter().circle_filled(
+                        highlight_rect.center(),
+                        (cell_w.min(cell_h) * 0.18).clamp(2.0, 6.0),
+                        dot_color,
+                    );
+
                     // Tooltip with biome / coord / climate info.
                     egui::show_tooltip(ctx, ui.layer_id(), egui::Id::new("spawn_tooltip"), |ui| {
                         ui.label(format!("Mega-chunk ({}, {})", mx, my));
                         ui.label(format!("Centre tile: ({}, {})", tx, ty));
+                        ui.label(format!(
+                            "Tile bounds: ({},{})–({},{})",
+                            tx0,
+                            ty0,
+                            tx1 - 1,
+                            ty1 - 1
+                        ));
                         ui.label(format!("Dominant biome: {}", center_biome.name()));
                         let elev_label = if elev_u < 56.0 {
                             "below sea level"
@@ -295,10 +321,19 @@ pub fn spawn_select_system(
                             "mountain"
                         };
                         ui.label(format!(
-                            "Elevation: {} ({:.0}/255)",
+                            "Elevation centre: {} ({:.0}/255)",
                             elev_label, elev_u
                         ));
+                        ui.label(format!(
+                            "Elevation range: min={:.0} mean={:.0} max={:.0}",
+                            elev_min, elev_mean, elev_max
+                        ));
                         ui.label(format!("Temperature: {:.0}°C", temp_c));
+                        ui.label(
+                            egui::RichText::new("Player home stays inside this cell.")
+                                .small()
+                                .weak(),
+                        );
                         if !habitable {
                             ui.colored_label(
                                 egui::Color32::from_rgb(220, 100, 100),
@@ -371,4 +406,27 @@ fn sample_dominant_biome(globe: &Globe, mx: i32, my: i32) -> Biome {
         10 => Biome::Badlands,
         _ => Biome::Ocean,
     }
+}
+
+/// Sample globe elevation on a 4×4 grid spanning `[tx0..tx1) × [ty0..ty1)` and
+/// return `(min, max, mean)` in raw 0..255 units. Cheap (16 bilinear lookups);
+/// fed straight into the spawn-select tooltip.
+fn sample_elevation_stats(globe: &Globe, tx0: i32, ty0: i32, tx1: i32, ty1: i32) -> (f32, f32, f32) {
+    const N: i32 = 4;
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    let mut sum = 0.0_f32;
+    let dx = (tx1 - tx0) / N;
+    let dy = (ty1 - ty0) / N;
+    for j in 0..N {
+        for i in 0..N {
+            let tx = tx0 + dx * i + dx / 2;
+            let ty = ty0 + dy * j + dy / 2;
+            let (e, _, _) = globe.sample_climate(tx, ty);
+            mn = mn.min(e);
+            mx = mx.max(e);
+            sum += e;
+        }
+    }
+    (mn, mx, sum / (N * N) as f32)
 }

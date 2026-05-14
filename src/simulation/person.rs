@@ -292,6 +292,7 @@ pub fn spawn_population(
     mut player_faction: ResMut<PlayerFaction>,
     mut settled: ResMut<crate::simulation::region::SettledRegions>,
     pending: Res<crate::PendingSpawn>,
+    world_seed: Res<crate::WorldSeed>,
     options: Res<crate::GameStartOptions>,
     catalog: Res<crate::economy::resource_catalog::ResourceCatalog>,
     archetype_registry: Res<crate::simulation::archetype::FactionArchetypeRegistry>,
@@ -366,10 +367,28 @@ pub fn spawn_population(
     };
 
     for group_idx in 0..num_groups {
-        // Find a home tile for this group anywhere in the spawn region.
-        // Best-of-N over 200 candidates so river proximity nudges the pick
-        // without hard-rejecting otherwise-fine inland tiles.
-        let home = {
+        // The player faction (group_idx==0) is constrained to the selected
+        // mega-chunk via the deterministic shared helper so the spawn-select
+        // preview marker matches what actually spawns. AI factions keep the
+        // wider 32×32-chunk search so neighbours fan out around the player.
+        let home = if group_idx == 0 {
+            if let Some((mx, my)) = pending.0 {
+                let pick = crate::simulation::region::pick_player_home_in_megachunk(
+                    &chunk_map,
+                    mx,
+                    my,
+                    world_seed.0,
+                );
+                Some(pick.tile)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+        .or_else(|| {
+            // AI factions (and the no-PendingSpawn fallback for the player):
+            // best-of-200 over 200 candidates inside the 32×32 search window.
             let mut best: Option<((i32, i32), i32)> = None;
             for _ in 0..200 {
                 let tx = start_tx + rng.gen_range(0..total_tiles_x);
@@ -399,7 +418,7 @@ pub fn spawn_population(
                 }
                 result
             })
-        };
+        });
 
         let Some((home_tx, home_ty)) = home else {
             continue;

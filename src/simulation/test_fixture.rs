@@ -97,6 +97,7 @@ impl TestSim {
         app.init_state::<crate::GameState>();
         app.add_sub_state::<crate::SimulationState>();
         app.insert_resource(crate::PendingSpawn::default());
+        app.insert_resource(crate::game_state::WorldSeed(seed));
         // GameStartOptions is consumed by `bonding_system` (to apply
         // the world's `EconomyPreset` to bonding-formed factions) in
         // addition to spawn_population. Tests that want non-default
