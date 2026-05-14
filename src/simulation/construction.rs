@@ -17,10 +17,10 @@ use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::{
-    current_era, Era, TechId, BRONZE_CASTING, BRONZE_TOOLS, CITY_STATE_ORG, COPPER_TOOLS,
-    COPPER_WORKING, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING, GRANARY, LONG_DIST_TRADE,
-    LOOM_WEAVING, MONUMENTAL_BUILDING, PERM_SETTLEMENT, PORTABLE_DWELLINGS, PROFESSIONAL_ARMY,
-    SACRED_RITUAL,
+    current_era, Era, TechId, BRIDGE_BUILDING, BRONZE_CASTING, BRONZE_TOOLS, CITY_STATE_ORG,
+    COPPER_TOOLS, COPPER_WORKING, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING, GRANARY,
+    LONG_DIST_TRADE, LOOM_WEAVING, MONUMENTAL_BUILDING, PERM_SETTLEMENT, PORTABLE_DWELLINGS,
+    PROFESSIONAL_ARMY, SACRED_RITUAL,
 };
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::{Calendar, Season};
@@ -109,6 +109,23 @@ pub struct BarracksMap(pub AHashMap<(i32, i32), Entity>);
 #[derive(Resource, Default)]
 pub struct MonumentMap(pub AHashMap<(i32, i32), Entity>);
 
+/// Maps tile positions to bridge entities placed there. Bridge entities own
+/// their tile slot exclusively (one Bridge per River cell). Lookup avoids
+/// touching `chunk_map` for deconstruct / inspector paths.
+#[derive(Resource, Default)]
+pub struct BridgeMap(pub AHashMap<(i32, i32), Entity>);
+
+/// Constructed timber span. The tile slot is mutated to `TileKind::Bridge`
+/// at finalize; on deconstruct we read `restore_tile` to put the original
+/// tile back (always `River` for the current build path, but stored
+/// explicitly to keep deconstruct correct if the rule ever loosens).
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Bridge {
+    pub faction_id: u32,
+    pub tile: (i32, i32),
+    pub restore_tile: TileKind,
+}
+
 /// Display name for any constructed entity (Wall, Bed, Door, Blueprint, …).
 /// The hover panel reads this directly so adding a new structure variant
 /// only needs to set the right label at its spawn site — no inspector edits.
@@ -166,6 +183,7 @@ pub struct FurnitureMaps<'w> {
     pub market_map: ResMut<'w, MarketMap>,
     pub barracks_map: ResMut<'w, BarracksMap>,
     pub monument_map: ResMut<'w, MonumentMap>,
+    pub bridge_map: ResMut<'w, BridgeMap>,
 }
 
 /// Bed construction tier. Tracks how the bed was built so the upgrade pipeline
@@ -452,6 +470,11 @@ pub enum BuildSiteKind {
     /// the village's contamination signature stays bounded around the
     /// latrine rather than smearing across living space.
     Latrine,
+    /// Timber span over a single `TileKind::River` tile. Finalisation
+    /// rewrites the tile to `TileKind::Bridge`; deconstruction restores
+    /// the original `River` tile via the `Bridge` component's
+    /// `restore_tile`. Tech-gated on `BRIDGE_BUILDING` (Chalcolithic).
+    Bridge,
 }
 
 /// Marker component on tile entities representing portable shelter.
@@ -497,7 +520,16 @@ impl BuildSiteKind {
             BuildSiteKind::Tent => "Tent",
             BuildSiteKind::Yurt => "Yurt",
             BuildSiteKind::Latrine => "Latrine",
+            BuildSiteKind::Bridge => "Bridge",
         }
+    }
+
+    /// True for blueprints whose anchor sits on impassable water and whose
+    /// workers must stand on an adjacent passable bank tile. Today: only
+    /// `Bridge`. Used by `is_clear_footprint`-style checks to bypass the
+    /// passability gate, and by `work_stand_for` to route gather/build legs.
+    pub fn is_water_anchored(self) -> bool {
+        matches!(self, BuildSiteKind::Bridge)
     }
 }
 
@@ -542,6 +574,11 @@ pub struct Blueprint {
     /// `None` for non-door blueprints (and for legacy door blueprints whose
     /// direction wasn't sourced from a frontage / road halo).
     pub door_dir: Option<crate::simulation::land::TileEdge>,
+    /// Adjacent passable bank tile for water-anchored blueprints
+    /// (`BuildSiteKind::Bridge`). Workers route here for haul/build legs
+    /// because `tile` itself sits on impassable `River`. `None` for every
+    /// other kind — the executor uses `tile` directly.
+    pub work_stand: Option<(i32, i32)>,
 }
 
 impl Blueprint {
@@ -574,7 +611,16 @@ impl Blueprint {
             build_progress: 0,
             pending_clear: Vec::new(),
             door_dir: None,
+            work_stand: None,
         }
+    }
+
+    /// Tile workers should route to. For water-anchored blueprints
+    /// (`BuildSiteKind::Bridge`) this is the cached bank `work_stand`;
+    /// everyone else routes to the anchor `tile`.
+    #[inline]
+    pub fn worker_target_tile(&self) -> (i32, i32) {
+        self.work_stand.unwrap_or(self.tile)
     }
 
     /// Builder: stamp the door's opening cardinal. Caller must only set this
@@ -655,6 +701,7 @@ enum BuildRecipeIdx {
     Tent,
     Yurt,
     Latrine,
+    Bridge,
 }
 
 fn build_recipes_table() -> Vec<BuildRecipe> {
@@ -827,6 +874,16 @@ fn build_recipes_table() -> Vec<BuildRecipe> {
             tech_gate: None,
             deconstruct_refund: vec![(wood, 1)],
         },
+        // Timber bridge spanning one river tile. Player-deconstruct returns
+        // half the inputs; the actual drop site is the nearest passable bank
+        // tile, not the river cell itself (see deconstruct path).
+        BuildRecipe {
+            name: "Timber Bridge",
+            inputs: vec![(wood, 4), (stone, 2)],
+            work_ticks: 120,
+            tech_gate: Some(BRIDGE_BUILDING),
+            deconstruct_refund: vec![(wood, 2), (stone, 1)],
+        },
     ]
 }
 
@@ -932,8 +989,76 @@ pub fn recipe_for(kind: BuildSiteKind) -> &'static BuildRecipe {
         BuildSiteKind::Barracks => BuildRecipeIdx::Barracks,
         BuildSiteKind::Monument => BuildRecipeIdx::Monument,
         BuildSiteKind::Latrine => BuildRecipeIdx::Latrine,
+        BuildSiteKind::Bridge => BuildRecipeIdx::Bridge,
     };
     &build_recipes()[idx as usize]
+}
+
+/// Spiral search outward from `(tx, ty)` for the nearest tile that is
+/// passable + non-water-like. Used by Bridge deconstruct so refunds drop on
+/// solid ground, not the restored River tile (where they'd be unreachable).
+/// Returns `None` only if the chunk_map has no passable land within the cap.
+pub fn nearest_passable_bank(
+    chunk_map: &ChunkMap,
+    origin: (i32, i32),
+) -> Option<(i32, i32)> {
+    const MAX_RADIUS: i32 = 8;
+    for r in 1..=MAX_RADIUS {
+        for dx in -r..=r {
+            for dy in -r..=r {
+                // Only walk the ring at chebyshev distance r.
+                if dx.abs().max(dy.abs()) != r {
+                    continue;
+                }
+                let nx = origin.0 + dx;
+                let ny = origin.1 + dy;
+                if let Some(kind) = chunk_map.tile_kind_at(nx, ny) {
+                    if kind.is_passable() && !kind.is_water_like() {
+                        return Some((nx, ny));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Adjacent passable, non-Bridge-blueprint cell for a water-anchored
+/// blueprint. Workers stand here while building / depositing. Returns the
+/// best cardinal first, then diagonals; `None` if every neighbour is sealed.
+pub fn work_stand_for_bridge(
+    chunk_map: &ChunkMap,
+    blueprint_tile: (i32, i32),
+    bp_map: &BlueprintMap,
+) -> Option<(i32, i32)> {
+    // Cardinals first, then diagonals — workers prefer not to take a
+    // diagonal step onto the bank.
+    const NEIGHBORS: [(i32, i32); 8] = [
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1),
+        (1, 1),
+        (1, -1),
+        (-1, 1),
+        (-1, -1),
+    ];
+    for (dx, dy) in NEIGHBORS {
+        let nx = blueprint_tile.0 + dx;
+        let ny = blueprint_tile.1 + dy;
+        if bp_map.0.contains_key(&(nx, ny)) {
+            // Another blueprint (Bridge or otherwise) — skip; the next stand
+            // candidate is preferred. Two adjacent Bridge blueprints don't
+            // both claim each other.
+            continue;
+        }
+        if let Some(kind) = chunk_map.tile_kind_at(nx, ny) {
+            if kind.is_passable() && !kind.is_water_like() {
+                return Some((nx, ny));
+            }
+        }
+    }
+    None
 }
 
 /// Count how many of the 4 cardinal directions have a wall (or higher-z terrain)
@@ -2497,9 +2622,10 @@ fn generate_candidates(
         // deterministic hearth offsets directly so even the very first fire
         // lands at the proper distance from home rather than adjacent to it.
         if tile_opt.is_none() && !techs.has(PERM_SETTLEMENT) && plan.is_none() {
-            let hearths = crate::simulation::settlement::paleolithic_hearth_positions(
-                faction_id, home, members,
-            );
+            let hearths =
+                crate::simulation::settlement::paleolithic_hearth_positions_river_aware(
+                    chunk_map, faction_id, home, members,
+                );
             'outer: for (hx, hy) in hearths {
                 for dy in -1i32..=1 {
                     for dx in -1i32..=1 {
@@ -4448,6 +4574,44 @@ pub fn construction_system(
                         InheritedVisibility::default(),
                     ))
                     .id(),
+                BuildSiteKind::Bridge => {
+                    // Tile-replacing finalize: stash the prior tile (River
+                    // in the current build path), then rewrite to Bridge.
+                    // The downstream `TileChangedEvent` triggers chunk-graph
+                    // rebuild so pathfinding picks up the new road-speed cell.
+                    let prior = chunk_map
+                        .tile_kind_at(tx, ty)
+                        .unwrap_or(TileKind::River);
+                    let surf_z = bp.target_z as i32;
+                    chunk_map.set_tile(
+                        tx,
+                        ty,
+                        surf_z,
+                        TileData {
+                            kind: TileKind::Bridge,
+                            elevation: 0,
+                            fertility: 0,
+                            flags: 0b0001,
+                            ore: 0,
+                        },
+                    );
+                    let bridge_entity = commands
+                        .spawn((
+                            Bridge {
+                                faction_id: bp.faction_id,
+                                tile,
+                                restore_tile: prior,
+                            },
+                            StructureLabel(BuildSiteKind::Bridge.label()),
+                            Transform::from_xyz(world_pos.x, world_pos.y, 0.30),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        ))
+                        .id();
+                    maps.bridge_map.0.insert(tile, bridge_entity);
+                    bridge_entity
+                }
             };
 
             // Emit a TileChangedEvent so pathfinding caches (flow fields,
@@ -4973,6 +5137,7 @@ pub fn deconstruct_system(
     )>,
     person_home_query: Query<(Entity, &HomeBed)>,
     wall_query: Query<&Wall>,
+    bridge_query: Query<&Bridge>,
     storage_tile_map: Res<StorageTileMap>,
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
@@ -5023,6 +5188,8 @@ pub fn deconstruct_system(
             removed = Some((e, BuildSiteKind::Barracks, false));
         } else if let Some(e) = maps.monument_map.0.remove(&tile) {
             removed = Some((e, BuildSiteKind::Monument, false));
+        } else if let Some(e) = maps.bridge_map.0.remove(&tile) {
+            removed = Some((e, BuildSiteKind::Bridge, false));
         } else if let Some(e) = maps.wall_map.0.remove(&tile) {
             // Walls: revert chunk_map to Grass + emit TileChangedEvent so the
             // sprite refreshes. The recipe-determined refund is given via the
@@ -5062,6 +5229,29 @@ pub fn deconstruct_system(
             continue;
         };
 
+        // Bridge restores the prior River tile; drop site is the nearest
+        // passable bank tile (refunds dropped at the now-River cell would
+        // be unrecoverable since the tile is impassable again).
+        let bridge_refund_tile: Option<(i32, i32)> = if matches!(kind, BuildSiteKind::Bridge) {
+            let restore = bridge_query
+                .get(target_entity)
+                .map(|b| b.restore_tile)
+                .unwrap_or(TileKind::River);
+            let surf_z = chunk_map.surface_z_at(tile.0 as i32, tile.1 as i32);
+            chunk_map.set_tile(
+                tile.0 as i32,
+                tile.1 as i32,
+                surf_z as i32,
+                TileData {
+                    kind: restore,
+                    ..Default::default()
+                },
+            );
+            nearest_passable_bank(&chunk_map, (tile.0 as i32, tile.1 as i32))
+        } else {
+            None
+        };
+
         // Furniture removal can change tile passability/speed; tell pathing
         // caches to invalidate. (The Wall arm above already emits one — a
         // duplicate event is harmless, the invalidator dedupes by chunk.)
@@ -5099,7 +5289,8 @@ pub fn deconstruct_system(
                     0
                 };
                 if after_inv > 0 {
-                    let pos = tile_to_world(tile.0 as i32, tile.1 as i32);
+                    let (dx, dy) = bridge_refund_tile.unwrap_or((tile.0 as i32, tile.1 as i32));
+                    let pos = tile_to_world(dx, dy);
                     commands.spawn((
                         crate::simulation::items::GroundItem {
                             item,
@@ -5767,9 +5958,10 @@ pub fn seed_starting_buildings_system(
             // Use the same deterministic hearth offsets the planner +
             // Paleolithic-hearth-cadence code use, so seeding aligns with
             // grown-band layout.
-            let hearth_positions = crate::simulation::settlement::paleolithic_hearth_positions(
-                faction_id, home, members,
-            );
+            let hearth_positions =
+                crate::simulation::settlement::paleolithic_hearth_positions_river_aware(
+                    &chunk_map, faction_id, home, members,
+                );
             let n_hearths = hearth_positions.len().max(1) as u32;
             let beds_per_hearth = (target_beds + n_hearths - 1) / n_hearths;
 
@@ -6512,7 +6704,9 @@ pub(crate) fn seed_nomadic_camp(
     hearth_tier: HearthTier,
 ) {
     let hearth_positions =
-        crate::simulation::settlement::paleolithic_hearth_positions(faction_id, home, members);
+        crate::simulation::settlement::paleolithic_hearth_positions_river_aware(
+            chunk_map, faction_id, home, members,
+        );
     let n_hearths = hearth_positions.len().max(1) as u32;
     // Bedroll per founder, evenly split across hearths (round up).
     let bedrolls_per_hearth = (members.max(1) + n_hearths - 1) / n_hearths;
@@ -7007,6 +7201,28 @@ mod tests {
                 edge
             );
         }
+    }
+
+    #[test]
+    fn bridge_recipe_gated_on_bridge_building() {
+        let r = recipe_for(BuildSiteKind::Bridge);
+        assert_eq!(r.tech_gate, Some(BRIDGE_BUILDING));
+        assert!(!r.deconstruct_refund.is_empty());
+    }
+
+    #[test]
+    fn bridge_kind_is_water_anchored() {
+        assert!(BuildSiteKind::Bridge.is_water_anchored());
+        assert!(!BuildSiteKind::Wall(WallMaterial::Palisade).is_water_anchored());
+        assert!(!BuildSiteKind::Bed.is_water_anchored());
+    }
+
+    #[test]
+    fn blueprint_worker_target_falls_back_to_anchor() {
+        let mut bp = Blueprint::new(0, None, BuildSiteKind::Bed, (4, 5), 0);
+        assert_eq!(bp.worker_target_tile(), (4, 5));
+        bp.work_stand = Some((6, 5));
+        assert_eq!(bp.worker_target_tile(), (6, 5));
     }
 
     #[test]

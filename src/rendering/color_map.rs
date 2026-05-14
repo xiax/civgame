@@ -32,6 +32,8 @@ pub fn tile_color(kind: TileKind) -> Color {
         TileKind::Silt => Color::srgb(0.55, 0.45, 0.30),
         TileKind::Clay => Color::srgb(0.60, 0.40, 0.30),
         TileKind::SandySoil => Color::srgb(0.72, 0.60, 0.40),
+        // Constructed timber span over a river.
+        TileKind::Bridge => Color::srgb(0.55, 0.38, 0.22),
     }
 }
 

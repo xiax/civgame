@@ -1782,6 +1782,9 @@ pub fn spawn_blueprint_sprites(
             BuildSiteKind::Monument => textures.wall_cutstone_ascii.clone(),
             // Stub: reuse the wall_stone sprite until dedicated latrine art ships.
             BuildSiteKind::Latrine => textures.wall_stone_ascii.clone(),
+            // Stub: reuse table sprite (planks-over-water suggestion) until
+            // a dedicated bridge blueprint sprite ships.
+            BuildSiteKind::Bridge => textures.table_ascii.clone(),
         };
 
         let mut ghost_sprite = Sprite::from_image(ghost_img);

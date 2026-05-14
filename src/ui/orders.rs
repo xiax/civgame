@@ -91,6 +91,7 @@ impl MenuAction {
                 BuildSiteKind::Barracks => "Build Barracks",
                 BuildSiteKind::Monument => "Build Monument",
                 BuildSiteKind::Latrine => "Build Latrine",
+                BuildSiteKind::Bridge => "Build Bridge",
             },
             MenuAction::DigDown => "Dig Down",
             MenuAction::Deconstruct => "Deconstruct",
@@ -320,6 +321,13 @@ pub fn right_click_context_menu_system(
                     if let Some(kind) = target_kind {
                         if matches!(kind, TileKind::Wall | TileKind::Stone) {
                             actions.push(MenuAction::Mine);
+                        }
+                        // Bridge build is the only construction option on a
+                        // river tile. Gated on `BRIDGE_BUILDING`.
+                        if matches!(kind, TileKind::River) && !underground && !already_built {
+                            let bk = BuildSiteKind::Bridge;
+                            let unlocked = faction_can_build(bk, &player_techs);
+                            build_options.push((MenuAction::Build(bk), unlocked));
                         }
                         if kind.is_passable() && !underground {
                             actions.push(MenuAction::DigDown);

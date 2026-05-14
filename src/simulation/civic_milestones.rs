@@ -21,6 +21,10 @@ pub enum CivicKind {
     Market,
     Barracks,
     Monument,
+    /// Timber bridge over a river tile. Smaller scale threshold than
+    /// Market — bridges are public utility, not status; settlements
+    /// don't need full civic capacity to coordinate one span.
+    Bridge,
 }
 
 /// Returns true iff a faction in `era` with `peak_population` may commission
@@ -33,6 +37,7 @@ pub fn civic_milestone_allows(kind: CivicKind, era: Era, peak_population: u32) -
         CivicKind::Market => (Era::Chalcolithic, 40),
         CivicKind::Barracks => (Era::Chalcolithic, 30),
         CivicKind::Monument => (Era::BronzeAge, 80),
+        CivicKind::Bridge => (Era::Chalcolithic, 20),
     };
     (era as u8) >= (min_era as u8) && peak_population >= min_pop
 }
@@ -49,9 +54,29 @@ mod tests {
             CivicKind::Market,
             CivicKind::Barracks,
             CivicKind::Monument,
+            CivicKind::Bridge,
         ] {
             assert!(!civic_milestone_allows(kind, Era::Paleolithic, 1000));
         }
+    }
+
+    #[test]
+    fn chalcolithic_20_unlocks_bridge() {
+        assert!(civic_milestone_allows(
+            CivicKind::Bridge,
+            Era::Chalcolithic,
+            20
+        ));
+        assert!(!civic_milestone_allows(
+            CivicKind::Bridge,
+            Era::Chalcolithic,
+            19
+        ));
+        assert!(!civic_milestone_allows(
+            CivicKind::Bridge,
+            Era::Neolithic,
+            40
+        ));
     }
 
     #[test]

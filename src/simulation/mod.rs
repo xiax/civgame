@@ -54,6 +54,7 @@ pub mod projects;
 pub mod raid;
 pub mod region;
 pub mod reproduction;
+pub mod river_context;
 pub mod sanitation;
 pub mod schedule;
 pub mod sedentary_collapse;
@@ -171,6 +172,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::MarketMap::default())
             .insert_resource(construction::BarracksMap::default())
             .insert_resource(construction::MonumentMap::default())
+            .insert_resource(construction::BridgeMap::default())
             .insert_resource(construction::StructureIndex::default())
             .insert_resource(construction::BlueprintMap::default())
             .insert_resource(crafting::CraftOrderMap::default())
@@ -843,6 +845,9 @@ impl Plugin for SimulationPlugin {
                         .before(organic_settlement::settlement_project_selection_system),
                     organic_settlement::settlement_project_selection_system
                         .after(organic_settlement::settlement_morphology_system)
+                        .before(construction::chief_directive_system),
+                    organic_settlement::bridge_intent_emitter_system
+                        .after(organic_settlement::settlement_survey_system)
                         .before(construction::chief_directive_system),
                 )
                     .in_set(SimulationSet::Economy),

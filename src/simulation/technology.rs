@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 pub type TechId = u16;
-pub const TECH_COUNT: usize = 44;
+pub const TECH_COUNT: usize = 45;
 pub const ACTIVITY_COUNT: usize = 13;
 
 // ── Tech ID constants ─────────────────────────────────────────────────────────
@@ -57,6 +57,9 @@ pub const LUNAR_CALENDAR: TechId = 42;
 // Nomadic-mode addition. Sits in Neolithic so Neolithic+ factions
 // (settled or nomadic) get it Aware+Learned via `seeded_through_era`.
 pub const PORTABLE_DWELLINGS: TechId = 43;
+// Chalcolithic public-works tech. Gates `BuildSiteKind::Bridge` (timber
+// span over a river tile) and AI bridge-intent generation.
+pub const BRIDGE_BUILDING: TechId = 44;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -1127,6 +1130,16 @@ pub static TECH_TREE: [TechDef; TECH_COUNT] = [
             activity: ActivityKind::Foraging,
             per_unit_chance: 0.001,
         }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: BRIDGE_BUILDING,
+        era: Era::Chalcolithic,
+        name: "Bridge Building",
+        description: "Timber spans and causeways across river channels — settlements link \
+             both banks and routes no longer have to detour around water.",
+        prerequisites: &[PERM_SETTLEMENT, DUGOUT_CANOE, COPPER_TOOLS],
+        triggers: &[],
         bonus: TechBonus::ZERO,
     },
 ];

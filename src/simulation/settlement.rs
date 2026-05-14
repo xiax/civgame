@@ -449,6 +449,40 @@ pub fn paleolithic_hearth_positions(
     hearths
 }
 
+/// River-aware overlay on `paleolithic_hearth_positions`. Each radial
+/// candidate is run through `river_context::project_to_safe_bank` so
+/// hearths never land in rivers or across the channel from `home`. Tiles
+/// at `river_distance_at <= 1` are also rejected (flood band). Falls back
+/// to the raw radial position when no projection succeeds within the
+/// spiral radius — keeps Paleolithic seeding deterministic in fixtures
+/// where rivers aren't present.
+pub fn paleolithic_hearth_positions_river_aware(
+    chunk_map: &crate::world::chunk::ChunkMap,
+    faction_id: u32,
+    home: (i32, i32),
+    members: u32,
+) -> Vec<(i32, i32)> {
+    let raw = paleolithic_hearth_positions(faction_id, home, members);
+    raw.into_iter()
+        .map(|c| {
+            // Reject flood-band tiles before projection so a projected
+            // candidate that happens to sit at distance 1 also fails.
+            let too_close = chunk_map.river_distance_at(c.0, c.1) <= 1;
+            let needs_projection = too_close
+                || chunk_map
+                    .tile_kind_at(c.0, c.1)
+                    .map(|k| k.is_water_like() || !k.is_passable())
+                    .unwrap_or(false);
+            if needs_projection {
+                crate::simulation::river_context::project_to_safe_bank(chunk_map, c, home)
+                    .unwrap_or(c)
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Era-parametrized streetspine generation. Pre-Neolithic factions stay
 /// `None` (radial behavior preserved). Neolithic+ generates spine geometry
 /// scaled to `base_r`. The plaza node is the home tile so the spine doesn't
@@ -1054,3 +1088,57 @@ pub fn settlement_planner_system(
         plans.0.insert(fid, plan);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE};
+    use crate::world::tile::{TileData, TileKind};
+
+    fn flat_chunk(kind: TileKind) -> Chunk {
+        let surface_z = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_kind = Box::new([[kind; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_fertility = Box::new([[8u8; CHUNK_SIZE]; CHUNK_SIZE]);
+        Chunk::new(surface_z, surface_kind, surface_fertility)
+    }
+
+    fn flat_map_with_river(river_x: i32) -> ChunkMap {
+        let mut m = ChunkMap::default();
+        for cy in -1..=1 {
+            for cx in -1..=1 {
+                m.0.insert(ChunkCoord(cx, cy), flat_chunk(TileKind::Grass));
+            }
+        }
+        for y in -30..=30 {
+            m.set_tile(
+                river_x,
+                y,
+                0,
+                TileData {
+                    kind: TileKind::River,
+                    ..Default::default()
+                },
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn paleo_river_aware_keeps_hearths_off_river() {
+        // Home is east of an NS river. Project should not return any
+        // hearth on a river tile, and all hearths should be passable.
+        let m = flat_map_with_river(0);
+        let hearths = paleolithic_hearth_positions_river_aware(&m, 1, (4, 0), 6);
+        assert!(!hearths.is_empty());
+        for (hx, hy) in hearths {
+            let kind = m.tile_kind_at(hx, hy).unwrap();
+            assert!(
+                kind.is_passable() && !kind.is_water_like(),
+                "hearth on bad tile {:?} (kind={:?})",
+                (hx, hy),
+                kind
+            );
+        }
+    }
+}
+

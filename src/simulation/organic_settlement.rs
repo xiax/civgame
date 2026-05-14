@@ -27,8 +27,8 @@ use crate::simulation::settlement::{
     Zone, ZoneKind,
 };
 use crate::simulation::technology::{
-    current_era, Era, CITY_STATE_ORG, CROP_CULTIVATION, FLINT_KNAPPING, GRANARY, LONG_DIST_TRADE,
-    MONUMENTAL_BUILDING, PERM_SETTLEMENT, PROFESSIONAL_ARMY, SACRED_RITUAL,
+    current_era, Era, BRIDGE_BUILDING, CITY_STATE_ORG, CROP_CULTIVATION, FLINT_KNAPPING, GRANARY,
+    LONG_DIST_TRADE, MONUMENTAL_BUILDING, PERM_SETTLEMENT, PROFESSIONAL_ARMY, SACRED_RITUAL,
 };
 use crate::simulation::terraform::PendingFootprints;
 use crate::world::chunk::ChunkMap;
@@ -2563,5 +2563,245 @@ mod tests {
         assert!(!segments.is_empty());
         assert!(tiles.contains(&(1, 0)));
         assert!(tiles.contains(&(-1, 0)));
+    }
+
+    fn flat_chunk(kind: crate::world::tile::TileKind) -> crate::world::chunk::Chunk {
+        let surface_z = Box::new([[0i8; crate::world::chunk::CHUNK_SIZE]; crate::world::chunk::CHUNK_SIZE]);
+        let surface_kind = Box::new([[kind; crate::world::chunk::CHUNK_SIZE]; crate::world::chunk::CHUNK_SIZE]);
+        let surface_fertility = Box::new([[8u8; crate::world::chunk::CHUNK_SIZE]; crate::world::chunk::CHUNK_SIZE]);
+        crate::world::chunk::Chunk::new(surface_z, surface_kind, surface_fertility)
+    }
+
+    fn grass_map() -> ChunkMap {
+        let mut m = ChunkMap::default();
+        for cy in -1..=1 {
+            for cx in -1..=1 {
+                m.0.insert(
+                    crate::world::chunk::ChunkCoord(cx, cy),
+                    flat_chunk(crate::world::tile::TileKind::Grass),
+                );
+            }
+        }
+        m
+    }
+
+    fn write_river_at(m: &mut ChunkMap, tiles: &[(i32, i32)]) {
+        for &(x, y) in tiles {
+            m.set_tile(
+                x,
+                y,
+                0,
+                crate::world::tile::TileData {
+                    kind: crate::world::tile::TileKind::River,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn detect_runs_finds_two_tile_crossing() {
+        let mut m = grass_map();
+        // 2-tile river at x=0 and x=1, rest grass.
+        write_river_at(&mut m, &[(0, 0), (1, 0)]);
+        let trace: Vec<(i32, i32)> = (-3..=4).map(|x| (x, 0)).collect();
+        let runs = detect_bridge_runs_in_trace(&m, &trace);
+        assert_eq!(runs.len(), 1, "should detect one crossing");
+        let (s, e) = runs[0];
+        assert_eq!((trace[s], trace[e]), ((0, 0), (1, 0)));
+    }
+
+    #[test]
+    fn detect_runs_rejects_overlong_crossing() {
+        let mut m = grass_map();
+        // 5-tile river — exceeds MAX_BRIDGE_SPAN = 4.
+        let r: Vec<(i32, i32)> = (0..5).map(|x| (x, 0)).collect();
+        write_river_at(&mut m, &r);
+        let trace: Vec<(i32, i32)> = (-3..=8).map(|x| (x, 0)).collect();
+        let runs = detect_bridge_runs_in_trace(&m, &trace);
+        assert!(runs.is_empty(), "5-tile river should not be bridged");
+    }
+
+    #[test]
+    fn detect_runs_skips_run_without_two_banks() {
+        let mut m = grass_map();
+        write_river_at(&mut m, &[(0, 0)]);
+        // Trace starts inside the river — no preceding bank tile.
+        let trace: Vec<(i32, i32)> = (0..=4).map(|x| (x, 0)).collect();
+        let runs = detect_bridge_runs_in_trace(&m, &trace);
+        assert!(runs.is_empty());
+    }
+}
+
+// ── Bridge intent emitter ─────────────────────────────────────────────────────
+
+/// Maximum number of consecutive River tiles a road segment may cross to
+/// be eligible for bridge construction. Longer spans are rejected and the
+/// planner picks an alternate route.
+pub const MAX_BRIDGE_SPAN: i32 = 4;
+
+/// Walks each settled faction's planned road segments and emits Bridge
+/// blueprints for any short river crossings. Gated on:
+/// - `BRIDGE_BUILDING` adopted by the community,
+/// - civic-milestone threshold (`Chalcolithic, 20`) reached,
+/// - the river run is `1..=MAX_BRIDGE_SPAN` tiles between two passable
+///   bank tiles inside the segment.
+///
+/// Spawns one or more `BuildSiteKind::Bridge` blueprints (one per river
+/// cell in the crossing). Each blueprint pre-computes its `work_stand`
+/// at the adjacent bank so dispatchers route correctly. Skipping any
+/// crossing that already has a blueprint at one of its river tiles keeps
+/// emission idempotent across system ticks.
+pub fn bridge_intent_emitter_system(
+    clock: Res<SimClock>,
+    registry: Res<FactionRegistry>,
+    settlements: Query<&Settlement>,
+    brains: Res<SettlementBrains>,
+    chunk_map: Res<ChunkMap>,
+    mut bp_map: ResMut<BlueprintMap>,
+    mut commands: Commands,
+) {
+    if clock.tick % PRESSURE_INTERVAL != 0 {
+        return;
+    }
+    for settlement in settlements.iter() {
+        let Some(faction) = registry.factions.get(&settlement.owner_faction) else {
+            continue;
+        };
+        if settlement.owner_faction == SOLO || !faction.caps.settlement.is_full_settlement() {
+            continue;
+        }
+        if !faction.community_has(BRIDGE_BUILDING) {
+            continue;
+        }
+        let era = current_era(&faction.techs);
+        if !civic_milestone_allows(CivicKind::Bridge, era, settlement.peak_population) {
+            continue;
+        }
+        let Some(brain) = brains.0.get(&settlement.id) else {
+            continue;
+        };
+        emit_bridges_for_segments(
+            settlement.owner_faction,
+            &brain.road_segments,
+            &chunk_map,
+            &mut bp_map,
+            &mut commands,
+        );
+    }
+}
+
+/// Pure helper: returns the river runs detected along a single Bresenham
+/// trace, as `(run_start_idx, run_end_idx)` pairs, restricted to runs that
+/// are `1..=MAX_BRIDGE_SPAN` and bounded on both sides by passable
+/// non-water-like bank tiles. Tested independently of the spawn pipeline.
+pub fn detect_bridge_runs_in_trace(
+    chunk_map: &ChunkMap,
+    trace: &[(i32, i32)],
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while idx < trace.len() {
+        let (rx, ry) = trace[idx];
+        let kind = match chunk_map.tile_kind_at(rx, ry) {
+            Some(k) => k,
+            None => {
+                idx += 1;
+                continue;
+            }
+        };
+        if !matches!(kind, crate::world::tile::TileKind::River) {
+            idx += 1;
+            continue;
+        }
+        let run_start = idx;
+        let mut run_end = idx;
+        while run_end + 1 < trace.len() {
+            let (nx, ny) = trace[run_end + 1];
+            if matches!(
+                chunk_map.tile_kind_at(nx, ny),
+                Some(crate::world::tile::TileKind::River)
+            ) {
+                run_end += 1;
+            } else {
+                break;
+            }
+        }
+        let run_len = (run_end - run_start + 1) as i32;
+        let prev_passable = run_start > 0
+            && chunk_map
+                .tile_kind_at(trace[run_start - 1].0, trace[run_start - 1].1)
+                .map(|k| k.is_passable() && !k.is_water_like())
+                .unwrap_or(false);
+        let next_passable = run_end + 1 < trace.len()
+            && chunk_map
+                .tile_kind_at(trace[run_end + 1].0, trace[run_end + 1].1)
+                .map(|k| k.is_passable() && !k.is_water_like())
+                .unwrap_or(false);
+        if run_len <= MAX_BRIDGE_SPAN && prev_passable && next_passable {
+            out.push((run_start, run_end));
+        }
+        idx = run_end + 1;
+    }
+    out
+}
+
+fn emit_bridges_for_segments(
+    faction_id: u32,
+    segments: &[StreetSegment],
+    chunk_map: &ChunkMap,
+    bp_map: &mut BlueprintMap,
+    commands: &mut Commands,
+) {
+    // Cap to one new bridge blueprint per system tick per faction. Bigger
+    // bursts wait for the next cadence; keeps `BlueprintMap` writes
+    // bounded and prevents a long-river settlement from spawning N=20
+    // bridges simultaneously.
+    let mut bridges_emitted: u32 = 0;
+    for seg in segments {
+        if bridges_emitted >= 1 {
+            return;
+        }
+        let trace = bresenham_tiles(seg.start, seg.end);
+        let runs = detect_bridge_runs_in_trace(chunk_map, &trace);
+        for (run_start, run_end) in runs {
+            // Skip if any river tile in this run already has a blueprint.
+            let mut already = false;
+            for k in run_start..=run_end {
+                if bp_map.0.contains_key(&trace[k]) {
+                    already = true;
+                    break;
+                }
+            }
+            if already {
+                continue;
+            }
+            // Spawn one Bridge blueprint at the start of the run. Multi-
+            // tile crossings get re-evaluated on subsequent ticks once the
+            // prior bridge finalises (its tile becomes `Bridge`, no
+            // longer matching `River`).
+            let tile = trace[run_start];
+            let bz = chunk_map.surface_z_at(tile.0, tile.1) as i8;
+            let mut bp = Blueprint::new(faction_id, None, BuildSiteKind::Bridge, tile, bz);
+            bp.work_stand =
+                crate::simulation::construction::work_stand_for_bridge(chunk_map, tile, bp_map);
+            if bp.work_stand.is_some() {
+                let wp = crate::world::terrain::tile_to_world(tile.0, tile.1);
+                let bp_e = commands
+                    .spawn((
+                        bp,
+                        Transform::from_xyz(wp.x, wp.y, 0.3),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id();
+                bp_map.0.insert(tile, bp_e);
+                bridges_emitted += 1;
+                if bridges_emitted >= 1 {
+                    return;
+                }
+            }
+        }
     }
 }

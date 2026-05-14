@@ -6,7 +6,7 @@ pub const FURNITURE_SPEED_FACTOR: f32 = 0.5;
 pub fn tile_speed_multiplier(kind: TileKind) -> f32 {
     match kind {
         TileKind::Grass | TileKind::Stone | TileKind::Ramp => 1.0,
-        TileKind::Road => 1.4,
+        TileKind::Road | TileKind::Bridge => 1.4,
         TileKind::Forest => 0.7,
         TileKind::Dirt => 0.9,
         // New climate surfaces
@@ -80,5 +80,23 @@ mod tests {
     #[test]
     fn road_costs_less_than_grass() {
         assert!(tile_step_cost(TileKind::Road) < tile_step_cost(TileKind::Grass));
+    }
+
+    #[test]
+    fn bridge_is_road_speed() {
+        assert_eq!(
+            tile_speed_multiplier(TileKind::Bridge),
+            tile_speed_multiplier(TileKind::Road)
+        );
+        assert_eq!(
+            tile_step_cost(TileKind::Bridge),
+            tile_step_cost(TileKind::Road)
+        );
+    }
+
+    #[test]
+    fn river_remains_impassable() {
+        assert_eq!(tile_speed_multiplier(TileKind::River), 0.0);
+        assert_eq!(tile_step_cost(TileKind::River), IMPASSABLE);
     }
 }

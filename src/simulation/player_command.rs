@@ -772,9 +772,22 @@ fn dispatch_one(
             } else {
                 let wp = tile_to_world(tile.0, tile.1);
                 let bz = routing.chunk_map.surface_z_at(tile.0, tile.1) as i8;
+                let mut bp = Blueprint::new(faction_id, Some(actor), kind, tile, bz);
+                // Water-anchored blueprints (Bridge) need a passable bank
+                // tile so workers don't try to path onto the river anchor.
+                if bp.kind.is_water_anchored() {
+                    bp.work_stand = crate::simulation::construction::work_stand_for_bridge(
+                        &routing.chunk_map,
+                        tile,
+                        &routing.bp_map,
+                    );
+                    if bp.work_stand.is_none() {
+                        return DispatchOutcome::Failed(CommandFailure::Unreachable);
+                    }
+                }
                 let bp_e = commands
                     .spawn((
-                        Blueprint::new(faction_id, Some(actor), kind, tile, bz),
+                        bp,
                         Transform::from_xyz(wp.x, wp.y, 0.3),
                         GlobalTransform::default(),
                         Visibility::Visible,
@@ -789,11 +802,23 @@ fn dispatch_one(
             } else {
                 TaskKind::Construct
             };
+            // For water-anchored blueprints route to the bank, not the
+            // impassable anchor tile.
+            let routing_tile = if kind.is_water_anchored() {
+                crate::simulation::construction::work_stand_for_bridge(
+                    &routing.chunk_map,
+                    tile,
+                    &routing.bp_map,
+                )
+                .unwrap_or(tile)
+            } else {
+                tile
+            };
             let routed = assign_task_with_routing(
                 ai,
                 cur_tile,
                 cur_chunk,
-                tile,
+                routing_tile,
                 task_kind,
                 bp_entity,
                 &routing.chunk_graph,

@@ -30,6 +30,12 @@ pub enum TileKind {
     Silt = 20,      // riverbank topsoil; very fertile
     Clay = 21,      // wet topsoil; tropical/wetland
     SandySoil = 22, // dry desert/badlands topsoil
+    /// Constructed timber span over a `River` tile. Passable + road-speed for
+    /// pathfinding, yet `is_water_like` / `is_freshwater` remain true so
+    /// nomad water-search and herd water-seek treat the channel below as
+    /// freshwater. Built via `BuildSiteKind::Bridge` and restores to `River`
+    /// on deconstruct (the prior tile is stamped on the `Bridge` component).
+    Bridge = 23,
 }
 
 impl TileKind {
@@ -38,6 +44,7 @@ impl TileKind {
             self,
             TileKind::Water | TileKind::River | TileKind::Wall | TileKind::Air | TileKind::Ore
         )
+        // NOTE: `Bridge` is intentionally passable (handled by default fallthrough).
     }
 
     /// Solid tiles cannot be entered from any direction.
@@ -57,24 +64,29 @@ impl TileKind {
         !matches!(self, TileKind::Air | TileKind::Water | TileKind::River)
     }
 
-    /// Water-shaped: ocean/lake (`Water`) or river channel (`River`).
-    /// Use this when behaviour ("don't walk into it", "looks blue") doesn't
-    /// care whether the water is fresh or salt.
+    /// Water-shaped: ocean/lake (`Water`) or river channel (`River`), plus
+    /// `Bridge` — water still flows below the decking so nomads and herds
+    /// scoring "is there water here" should treat bridges as water-adjacent.
+    /// Callers that actually want "blocks walking" should use `!is_passable`.
     pub fn is_water_like(self) -> bool {
-        matches!(self, TileKind::Water | TileKind::River)
+        matches!(self, TileKind::Water | TileKind::River | TileKind::Bridge)
     }
 
-    /// Drinkable freshwater. Currently only `River`; lakes stay `Water` until
-    /// `LakeBasin` learns a fresh/salt flag.
+    /// Drinkable freshwater. River channel and (bridged) river — the channel
+    /// is still fresh; the decking above doesn't remove the water. Lakes stay
+    /// `Water` until `LakeBasin` learns a fresh/salt flag.
     pub fn is_freshwater(self) -> bool {
-        matches!(self, TileKind::River)
+        matches!(self, TileKind::River | TileKind::Bridge)
     }
 
     /// True when the tile carries some kind of water (fresh or salt); the
     /// caller is responsible for using `water_kind_at` to disambiguate when
     /// it matters (e.g. drinking / collecting). Rivers are always fresh.
     pub fn is_drinkable_candidate(self) -> bool {
-        matches!(self, TileKind::Water | TileKind::River | TileKind::Marsh)
+        matches!(
+            self,
+            TileKind::Water | TileKind::River | TileKind::Marsh | TileKind::Bridge
+        )
     }
 
     /// Generic "this tile is rock" — covers the legacy `Stone` plus all four
@@ -313,5 +325,19 @@ mod tests {
     #[test]
     fn loam_more_fertile_than_sandy() {
         assert!(TileKind::Loam.soil_fertility_mult() > TileKind::SandySoil.soil_fertility_mult());
+    }
+
+    #[test]
+    fn bridge_is_passable_floor_waterlike() {
+        let k = TileKind::Bridge;
+        assert!(k.is_passable());
+        assert!(k.is_floor());
+        assert!(k.is_water_like(), "bridge should report water below");
+        assert!(k.is_freshwater(), "river still flows under a bridge");
+        assert!(k.is_drinkable_candidate());
+        assert!(!k.is_solid());
+        assert!(!k.is_opaque());
+        assert!(!k.is_stone_like());
+        assert!(!k.is_soil_like());
     }
 }

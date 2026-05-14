@@ -4830,7 +4830,7 @@ pub fn htn_acquire_good_dispatch_system(
                 .map(|bp| !bp.slot_satisfied(resource_id))
                 .unwrap_or(false);
             if let (Ok(bp), true) = (bp_query.get(blueprint), bp_needs_more) {
-                let bp_tile = bp.tile;
+                let bp_tile = bp.worker_target_tile();
                 let dispatched = assign_task_with_routing(
                     &mut ai,
                     (cur_tx, cur_ty),
@@ -6790,7 +6790,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
         let Ok(bp) = bp_query.get(bp_entity) else {
             continue;
         };
-        let bp_tile = bp.tile;
+        let bp_tile = bp.worker_target_tile();
 
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;

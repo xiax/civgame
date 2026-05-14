@@ -27,8 +27,8 @@ use crate::simulation::faction::{FactionMember, FactionRegistry};
 use crate::simulation::knowledge::PersonKnowledge;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::technology::{
-    TechId, ANIMAL_HUSBANDRY, ARD_PLOW, BONE_TOOLS, BOW_AND_ARROW, BRONZE_CASTING, BRONZE_TOOLS,
-    BRONZE_WEAPONS, CITY_STATE_ORG, COPPER_TOOLS, COPPER_WORKING, CROP_CULTIVATION,
+    TechId, ANIMAL_HUSBANDRY, ARD_PLOW, BONE_TOOLS, BOW_AND_ARROW, BRIDGE_BUILDING, BRONZE_CASTING,
+    BRONZE_TOOLS, BRONZE_WEAPONS, CITY_STATE_ORG, COPPER_TOOLS, COPPER_WORKING, CROP_CULTIVATION,
     CUNEIFORM_WRITING, DOG_DOMESTICATION, DRIED_MEAT, DUGOUT_CANOE, FERMENTATION, FIRED_POTTERY,
     FIRE_MAKING, FISHING, FLINT_KNAPPING, FOOD_SMOKING, GRANARY, HORSEBACK_RIDING, HORSE_TAMING,
     HUNTING_SPEAR, IRRIGATION, LOG_RAFT, LONG_DIST_TRADE, LOOM_WEAVING, LUNAR_CALENDAR,
@@ -111,7 +111,7 @@ pub fn tech_scale(tech: TechId) -> AdoptionScale {
         // Institutional — requires civic scale + officials + buildings.
         PERM_SETTLEMENT | GRANARY | SACRED_RITUAL | LONG_DIST_TRADE | TALLY_MARKS
         | CUNEIFORM_WRITING | CITY_STATE_ORG | MONUMENTAL_BUILDING | LUNAR_CALENDAR | OX_CART
-        | PORTABLE_DWELLINGS => AdoptionScale::Institutional,
+        | PORTABLE_DWELLINGS | BRIDGE_BUILDING => AdoptionScale::Institutional,
         // Household default catches FOOD_SMOKING, DRIED_MEAT, and any future
         // additions until they're explicitly classified.
         FOOD_SMOKING | DRIED_MEAT => AdoptionScale::Household,
@@ -749,6 +749,23 @@ mod tests {
         );
         // Only Aware remains → Rumored.
         assert_eq!(s, AdoptionStage::Rumored);
+    }
+
+    #[test]
+    fn bridge_building_is_institutional() {
+        assert_eq!(tech_scale(BRIDGE_BUILDING), AdoptionScale::Institutional);
+    }
+
+    #[test]
+    fn bridge_building_tech_def_chalcolithic_with_prereqs() {
+        let def = crate::simulation::technology::tech_def(BRIDGE_BUILDING);
+        assert_eq!(def.era, crate::simulation::technology::Era::Chalcolithic);
+        // Must require permanent settlement, dugout canoe, and copper tools.
+        let mut prereqs: Vec<TechId> = def.prerequisites.to_vec();
+        prereqs.sort_unstable();
+        let mut expected = vec![PERM_SETTLEMENT, DUGOUT_CANOE, COPPER_TOOLS];
+        expected.sort_unstable();
+        assert_eq!(prereqs, expected);
     }
 
     #[test]

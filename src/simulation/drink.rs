@@ -84,7 +84,8 @@ pub fn perform_drink(
             {
                 return DrinkOutcome::SourceGone;
             }
-            let raw = !matches!(kind, TileKind::River);
+            // River and bridged-river both expose fresh, non-raw water.
+            let raw = !matches!(kind, TileKind::River | TileKind::Bridge);
             needs.thirst = (needs.thirst - DRINK_THIRST_REDUCTION).max(0.0);
             DrinkOutcome::Drank { raw }
         }
