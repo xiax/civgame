@@ -21,6 +21,7 @@ use crate::simulation::construction::{Blueprint, BlueprintMap, BuildSiteKind};
 use crate::simulation::corpse::Carrying;
 use crate::simulation::faction::{FactionMember, SOLO};
 use crate::simulation::items::TargetItem;
+use crate::simulation::military::{MilitaryFormationSlot, PendingFormationSlots};
 use crate::simulation::person::{AiState, Drafted, PersonAI};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::TechId;
@@ -285,6 +286,11 @@ pub fn reap_terminal_commands_system(mut commands: Commands, query: Query<(Entit
     for (entity, c) in query.iter() {
         if c.status.is_terminal() {
             commands.entity(entity).remove::<Commanded>();
+            // Formation slot is transient — only meaningful while a
+            // MilitaryMove order is active.
+            if matches!(c.command, PlayerCommand::MilitaryMove { .. }) {
+                commands.entity(entity).remove::<MilitaryFormationSlot>();
+            }
         }
     }
 }
@@ -409,7 +415,13 @@ pub fn player_command_lifecycle_system(
                 Some(CommandStatus::Completed)
             }
             PlayerCommand::MilitaryMove { tile, .. } => {
-                if chebyshev(cur, tile) <= 1 {
+                // Multi-actor formation moves route each unit to its own
+                // slot tile; `ai.dest_tile` holds that slot (or the anchor
+                // for single-actor moves). Completing on slot arrival
+                // keeps the group spread out instead of letting one unit
+                // mark the whole order done by stepping on the anchor.
+                let _ = tile;
+                if chebyshev(cur, ai.dest_tile) <= 1 {
                     Some(CommandStatus::Completed)
                 } else {
                     None
@@ -536,6 +548,7 @@ pub fn dispatch_player_command_system(
     mut lecture_req: ResMut<crate::simulation::teaching::LectureRequest>,
     registry: Res<crate::simulation::faction::FactionRegistry>,
     mut camp_ops: ResMut<crate::simulation::nomad::PendingCampOps>,
+    pending_slots: Res<PendingFormationSlots>,
 ) {
     for (actor, mut cmd, mut ai, mut aq, transform, member) in actors.iter_mut() {
         if cmd.status != CommandStatus::Pending {
@@ -564,6 +577,11 @@ pub fn dispatch_player_command_system(
         ) {
             aq.cancel();
         }
+        // A fresh MilitaryMove supersedes any prior formation slot the
+        // actor was holding — drop it so the new dispatch starts clean.
+        if matches!(cmd.command, PlayerCommand::MilitaryMove { .. }) {
+            commands.entity(actor).remove::<MilitaryFormationSlot>();
+        }
 
         let outcome = dispatch_one(
             actor,
@@ -581,6 +599,7 @@ pub fn dispatch_player_command_system(
             &mut commands,
             &registry,
             &mut camp_ops,
+            &pending_slots,
         );
 
         match outcome {
@@ -616,6 +635,7 @@ fn dispatch_one(
     commands: &mut Commands,
     registry: &crate::simulation::faction::FactionRegistry,
     camp_ops: &mut crate::simulation::nomad::PendingCampOps,
+    pending_slots: &PendingFormationSlots,
 ) -> DispatchOutcome {
     use PlayerCommand::*;
     match *command {
@@ -911,7 +931,17 @@ fn dispatch_one(
             DispatchOutcome::Active
         }
         MilitaryMove { tile, z } => {
-            // Register the rally-point hotspot once per dispatch (idempotent).
+            // Per-actor slot for multi-actor dispatches; falls back to the
+            // anchor for single-actor moves (absent from the side-table).
+            let (slot_tile, slot_meta) = match pending_slots.map.get(&actor) {
+                Some(None) => {
+                    return DispatchOutcome::Failed(CommandFailure::Unreachable);
+                }
+                Some(Some(a)) => (a.slot_tile, Some(*a)),
+                None => (tile, None),
+            };
+            // Anchor (not slot) seeds the rally-point flow field so the
+            // whole group shares one hotspot.
             routing
                 .hotspots
                 .register((tile.0, tile.1, z), HotspotKind::RallyPoint);
@@ -919,7 +949,7 @@ fn dispatch_one(
                 ai,
                 cur_tile,
                 cur_chunk,
-                tile,
+                slot_tile,
                 TaskKind::MilitaryMove,
                 None,
                 &routing.chunk_graph,
@@ -932,12 +962,19 @@ fn dispatch_one(
             }
             ai.target_z = z;
             aq.dispatch(Task::WalkTo {
-                tile,
+                tile: slot_tile,
                 z,
                 why: WalkReason::MilitaryMove,
             });
             if let Ok(mut ct) = combat_target_q.get_mut(actor) {
                 ct.0 = None;
+            }
+            if let Some(m) = slot_meta {
+                commands.entity(actor).insert(MilitaryFormationSlot {
+                    anchor: tile,
+                    slot_index: m.slot_index,
+                    group: m.group,
+                });
             }
             DispatchOutcome::Active
         }

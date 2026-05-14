@@ -13145,3 +13145,329 @@ mod wage_aware_phase0_phase1 {
         );
     }
 }
+
+#[cfg(test)]
+mod military_formation {
+    //! Multi-unit `MilitaryMove` formation tests. The single clicked tile
+    //! (the *anchor*) is expanded into a compact ring of per-actor slot
+    //! tiles; drafted units route to their own slot instead of stacking on
+    //! the anchor.
+    use super::*;
+    use crate::simulation::military::MilitaryFormationSlot;
+    use crate::simulation::player_command::{
+        CommandFailure, CommandStatus, Commanded, PlayerCommand, PlayerCommandEvent,
+    };
+    use ahash::AHashSet;
+
+    fn spawn_drafted_at(sim: &mut TestSim, tile: (i32, i32)) -> Entity {
+        let person = sim.spawn_person(sim.player_faction_id, tile, |b| {
+            b.hunger(0.0);
+        });
+        sim.app.world_mut().entity_mut(person).insert(Drafted);
+        person
+    }
+
+    fn agent_dest_tile(app: &App, entity: Entity) -> (i32, i32) {
+        let ai = app.world().get::<PersonAI>(entity).unwrap();
+        ai.dest_tile
+    }
+
+    fn agent_current_tile(app: &App, entity: Entity) -> (i32, i32) {
+        let t = app.world().get::<Transform>(entity).unwrap().translation;
+        (
+            (t.x / crate::world::terrain::TILE_SIZE).floor() as i32,
+            (t.y / crate::world::terrain::TILE_SIZE).floor() as i32,
+        )
+    }
+
+    /// Eight co-located drafted units issued one `MilitaryMove` spread to
+    /// distinct slot tiles in a compact ring around the anchor.
+    #[test]
+    fn multi_unit_military_move_spreads_to_distinct_slots() {
+        let mut sim = TestSim::new(11);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Spawn 8 drafted units at the same tile.
+        let mut units = Vec::with_capacity(8);
+        for _ in 0..8 {
+            units.push(spawn_drafted_at(&mut sim, (0, 0)));
+        }
+
+        let anchor = (20, 0);
+        sim.app.world_mut().send_event(PlayerCommandEvent {
+            actors: units.clone(),
+            command: PlayerCommand::MilitaryMove {
+                tile: anchor,
+                z: 0,
+            },
+        });
+
+        // Tick 1: drain + expand. Tick 2: dispatch flips Pending → Active
+        // and stamps the formation slot.
+        sim.tick_n(2);
+
+        let mut dests: AHashSet<(i32, i32)> = AHashSet::new();
+        let mut groups: AHashSet<u32> = AHashSet::new();
+        let mut slot_indices: AHashSet<u8> = AHashSet::new();
+        for &u in &units {
+            let dest = agent_dest_tile(&sim.app, u);
+            assert!(
+                dests.insert(dest),
+                "two units share dest_tile {:?}",
+                dest
+            );
+            let d = (dest.0 - anchor.0).abs().max((dest.1 - anchor.1).abs());
+            assert!(
+                d <= 2,
+                "dest {:?} is more than Chebyshev 2 from anchor {:?}",
+                dest,
+                anchor
+            );
+            let slot = sim
+                .app
+                .world()
+                .get::<MilitaryFormationSlot>(u)
+                .expect("multi-actor MilitaryMove should attach MilitaryFormationSlot");
+            assert_eq!(slot.anchor, anchor);
+            groups.insert(slot.group);
+            assert!(
+                slot_indices.insert(slot.slot_index),
+                "duplicate slot_index {}",
+                slot.slot_index
+            );
+        }
+        assert_eq!(groups.len(), 1, "all units should share one group id");
+    }
+
+    /// Walking the formation to arrival completes every `Commanded` and
+    /// strips every `MilitaryFormationSlot`.
+    #[test]
+    fn multi_unit_military_move_completes_for_every_unit() {
+        let mut sim = TestSim::new(13);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let mut units = Vec::with_capacity(8);
+        for _ in 0..8 {
+            units.push(spawn_drafted_at(&mut sim, (0, 0)));
+        }
+        let anchor = (12, 0);
+        sim.app.world_mut().send_event(PlayerCommandEvent {
+            actors: units.clone(),
+            command: PlayerCommand::MilitaryMove {
+                tile: anchor,
+                z: 0,
+            },
+        });
+
+        // Snapshot each unit's slot tile from the freshly-dispatched
+        // formation so we can compare against the eventual final position
+        // (movement can take many ticks; we don't want to gate on a
+        // specific tick count).
+        sim.tick_n(2);
+        let slot_tiles: Vec<(i32, i32)> = units
+            .iter()
+            .map(|&u| agent_dest_tile(&sim.app, u))
+            .collect();
+        // Every slot must sit within Chebyshev 2 of the anchor.
+        for slot in &slot_tiles {
+            let d = (slot.0 - anchor.0).abs().max((slot.1 - anchor.1).abs());
+            assert!(
+                d <= 2,
+                "planner emitted slot {:?} more than Cheb 2 from anchor {:?}",
+                slot,
+                anchor
+            );
+        }
+
+        // Give the group plenty of ticks to walk + complete + reap.
+        sim.tick_n(4000);
+
+        // Every Commanded reaped + every MilitaryFormationSlot cleared.
+        for &u in &units {
+            assert!(
+                sim.app.world().get::<Commanded>(u).is_none(),
+                "Commanded should be reaped after completion"
+            );
+            assert!(
+                sim.app.world().get::<MilitaryFormationSlot>(u).is_none(),
+                "MilitaryFormationSlot should be removed at terminal"
+            );
+        }
+    }
+
+    /// Single-unit `MilitaryMove` short-circuits the planner — no
+    /// `MilitaryFormationSlot` attached, `dest_tile` matches the anchor.
+    #[test]
+    fn single_unit_military_move_skips_formation_planner() {
+        let mut sim = TestSim::new(17);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let unit = spawn_drafted_at(&mut sim, (0, 0));
+        let anchor = (8, 3);
+        sim.app.world_mut().send_event(PlayerCommandEvent {
+            actors: vec![unit],
+            command: PlayerCommand::MilitaryMove {
+                tile: anchor,
+                z: 0,
+            },
+        });
+        sim.tick_n(2);
+
+        let status = sim.app.world().get::<Commanded>(unit).map(|c| c.status);
+        assert_eq!(status, Some(CommandStatus::Active));
+        assert_eq!(
+            agent_dest_tile(&sim.app, unit),
+            anchor,
+            "single-unit move should route to the anchor"
+        );
+        assert!(
+            sim.app.world().get::<MilitaryFormationSlot>(unit).is_none(),
+            "single-actor moves should not attach a formation slot"
+        );
+    }
+
+    /// A second `MilitaryMove` issued mid-walk supersedes the first: the
+    /// old slot component is removed, a fresh group id is allocated, and
+    /// the new dest_tiles reference the new anchor.
+    #[test]
+    fn second_military_move_supersedes_prior_formation() {
+        let mut sim = TestSim::new(19);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let mut units = Vec::with_capacity(4);
+        for _ in 0..4 {
+            units.push(spawn_drafted_at(&mut sim, (0, 0)));
+        }
+
+        // First move.
+        sim.app.world_mut().send_event(PlayerCommandEvent {
+            actors: units.clone(),
+            command: PlayerCommand::MilitaryMove {
+                tile: (10, 0),
+                z: 0,
+            },
+        });
+        sim.tick_n(2);
+
+        let first_groups: AHashSet<u32> = units
+            .iter()
+            .map(|&u| {
+                sim.app
+                    .world()
+                    .get::<MilitaryFormationSlot>(u)
+                    .map(|s| s.group)
+                    .expect("formation slot after first dispatch")
+            })
+            .collect();
+        assert_eq!(first_groups.len(), 1);
+        let first_group = *first_groups.iter().next().unwrap();
+
+        // Second move to a different anchor.
+        sim.app.world_mut().send_event(PlayerCommandEvent {
+            actors: units.clone(),
+            command: PlayerCommand::MilitaryMove {
+                tile: (-10, 0),
+                z: 0,
+            },
+        });
+        sim.tick_n(2);
+
+        let mut new_groups: AHashSet<u32> = AHashSet::new();
+        for &u in &units {
+            let slot = sim
+                .app
+                .world()
+                .get::<MilitaryFormationSlot>(u)
+                .expect("formation slot after second dispatch");
+            assert_eq!(slot.anchor, (-10, 0));
+            new_groups.insert(slot.group);
+            // dest_tile should reference the new anchor neighbourhood,
+            // not the old (+x) anchor.
+            let dest = agent_dest_tile(&sim.app, u);
+            let d_new = (dest.0 - (-10)).abs().max(dest.1.abs());
+            assert!(
+                d_new <= 2,
+                "after supersede, dest {:?} should sit near (-10, 0)",
+                dest
+            );
+        }
+        assert_eq!(new_groups.len(), 1, "second dispatch shares one group");
+        let new_group = *new_groups.iter().next().unwrap();
+        assert_ne!(
+            new_group, first_group,
+            "second dispatch should allocate a fresh group id"
+        );
+    }
+
+    /// Walled-in anchor: every candidate slot inside the planner's search
+    /// radius is impassable. The planner returns zero slots and every
+    /// dispatched actor fails with `Unreachable`. No panic, no Commanded
+    /// left in a non-terminal state.
+    #[test]
+    fn fully_walled_anchor_fails_every_actor_cleanly() {
+        let mut sim = TestSim::new(23);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Wall the anchor and a generous ring around it so the planner's
+        // ring walk finds no passable slot tile.
+        let anchor = (40, 0);
+        const PAD: i32 = 16;
+        {
+            let world = sim.app.world_mut();
+            let mut chunk_map = world.resource_mut::<crate::world::chunk::ChunkMap>();
+            for dy in -PAD..=PAD {
+                for dx in -PAD..=PAD {
+                    let t = (anchor.0 + dx, anchor.1 + dy);
+                    chunk_map.set_tile(
+                        t.0,
+                        t.1,
+                        0,
+                        crate::world::tile::TileData {
+                            kind: TileKind::Wall,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+        }
+
+        let mut units = Vec::with_capacity(4);
+        for _ in 0..4 {
+            units.push(spawn_drafted_at(&mut sim, (0, 0)));
+        }
+
+        sim.app.world_mut().send_event(PlayerCommandEvent {
+            actors: units.clone(),
+            command: PlayerCommand::MilitaryMove {
+                tile: anchor,
+                z: 0,
+            },
+        });
+        sim.tick_n(2);
+
+        for &u in &units {
+            let status = sim
+                .app
+                .world()
+                .get::<Commanded>(u)
+                .map(|c| c.status)
+                .or_else(|| {
+                    // Already reaped by `reap_terminal_commands_system` if
+                    // we ran one extra tick — also a valid terminal path.
+                    None
+                });
+            match status {
+                Some(CommandStatus::Failed(CommandFailure::Unreachable)) => {}
+                None => {} // reaped → also acceptable
+                other => panic!(
+                    "expected Failed(Unreachable) (or reaped), got {:?}",
+                    other
+                ),
+            }
+            // Formation slot should never have been left behind.
+            assert!(
+                sim.app.world().get::<MilitaryFormationSlot>(u).is_none(),
+                "no formation slot should stick after Failed dispatch"
+            );
+        }
+    }
+}

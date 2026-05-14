@@ -208,6 +208,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(land::PlotIndex::default())
             .insert_resource(land::LandListings::default())
             .insert_resource(military::ActiveRallyPoints::default())
+            .insert_resource(military::MilitaryFormationGroupGen::default())
+            .insert_resource(military::PendingFormationSlots::default())
             .insert_resource(corpse::CorpseMap::default())
             .insert_resource(teaching::LectureRequest::default())
             .insert_resource(jobs::PlayerCraftRequest::default())
@@ -298,7 +300,16 @@ impl Plugin for SimulationPlugin {
             )
             .add_systems(
                 FixedUpdate,
-                (player_command::drain_player_command_events_system,).in_set(SimulationSet::Input),
+                (
+                    player_command::drain_player_command_events_system,
+                    // Pre-dispatch: expand multi-actor `MilitaryMove`
+                    // events into per-actor slot tiles around the anchor.
+                    // Reads `PlayerCommandEvent` directly (independent
+                    // `EventReader` from drain) so ordering doesn't
+                    // matter inside `Input`.
+                    military::expand_military_move_system,
+                )
+                    .in_set(SimulationSet::Input),
             )
             .add_systems(
                 FixedUpdate,
