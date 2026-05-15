@@ -57,11 +57,6 @@ const TICK_DURATION: Duration = Duration::from_nanos(50_000_000); // 1/20 s
 pub struct TestSim {
     pub app: App,
     pub player_faction_id: u32,
-    /// When `false`, `tick()` skips the per-agent `task_id` ↔ `aq.current`
-    /// coherence invariant. Tests that deliberately drive desynced state
-    /// (e.g. exercising the prefetch-queue advance mechanics with the
-    /// legacy channel left untouched) opt out via `skip_coherence_check()`.
-    pub coherence_check_enabled: bool,
 }
 
 impl TestSim {
@@ -179,16 +174,13 @@ impl TestSim {
         Self {
             app,
             player_faction_id,
-            coherence_check_enabled: true,
         }
     }
 
-    /// Disable the per-agent `task_id` ↔ `aq.current` coherence invariant
-    /// for this `TestSim`. Use sparingly — only for tests that deliberately
-    /// construct desynced state to exercise the typed-channel queue
-    /// machinery (e.g. `advance_promotes_queued_task_after_executor_exit`).
+    /// Backwards-compat shim. The `task_id` mirror is gone — the coherence
+    /// assertion this used to gate was deleted with the field — so every
+    /// call is a no-op, kept only so existing tests compile without churn.
     pub fn skip_coherence_check(&mut self) -> &mut Self {
-        self.coherence_check_enabled = false;
         self
     }
 
@@ -346,45 +338,13 @@ impl TestSim {
     /// Run a single frame. With `TimeUpdateStrategy::ManualDuration`
     /// installed, each call advances `Time` by exactly one fixed
     /// timestep so `FixedUpdate` fires once per call.
-    ///
-    /// After the tick lands, asserts the legacy `PersonAI.task_id` agrees
-    /// with `ActionQueue.current` for every agent in the world. Every
-    /// existing fixture-based test thus doubles as an invariant test for the
-    /// dual-state coherence the codebase has been maintaining by convention
-    /// (see `src/simulation/CLAUDE.md`). The runtime app does *not* register
-    /// this check — defence-in-depth in executors recovers from desync at
-    /// zero cost; the assertion's job is to catch the regression at the
-    /// source in tests.
     pub fn tick(&mut self) {
         self.app.update();
-        if self.coherence_check_enabled {
-            self.assert_task_state_coherent();
-        }
     }
 
-    /// Invariant: legacy `task_id` and typed `aq.current` agree on which
-    /// task family every agent is running. Called automatically by `tick()`.
-    pub fn assert_task_state_coherent(&mut self) {
-        use crate::simulation::goals::AgentGoal;
-        use crate::simulation::person::PersonAI;
-        use crate::simulation::schedule::SimClock;
-        use crate::simulation::typed_task::{task_id_matches_current, ActionQueue};
-        let tick = self.app.world().resource::<SimClock>().tick;
-        let mut q = self
-            .app
-            .world_mut()
-            .query::<(bevy::prelude::Entity, &PersonAI, &ActionQueue, &AgentGoal)>();
-        for (entity, ai, aq, goal) in q.iter(self.app.world()) {
-            assert!(
-                task_id_matches_current(ai.task_id, aq.current),
-                "tick {tick}: task_id ↔ aq.current desync on {entity:?}: task_id={} aq.current={:?} goal={:?} state={:?}",
-                ai.task_id,
-                aq.current,
-                goal,
-                ai.state
-            );
-        }
-    }
+    /// Backwards-compat shim. The `task_id` mirror is gone, so the
+    /// task-state coherence invariant this used to assert is vacuous.
+    pub fn assert_task_state_coherent(&mut self) {}
 
     /// Convenience: tick `n` times.
     pub fn tick_n(&mut self, n: u32) {
@@ -507,7 +467,6 @@ impl PersonBuilder {
                     SkillsLastSeen::default(),
                     Stats::roll_3d6(),
                     PersonAI {
-                        task_id: PersonAI::UNEMPLOYED,
                         state: AiState::Idle,
                         target_tile: self.tile,
                         dest_tile: self.tile,
@@ -639,7 +598,6 @@ pub fn clear_trader_for_dispatch(app: &mut App, entity: Entity) {
         aq.current = Task::Idle;
     }
     if let Some(mut ai) = app.world_mut().get_mut::<PersonAI>(entity) {
-        ai.task_id = PersonAI::UNEMPLOYED;
         ai.state = AiState::Idle;
     }
     if let Some(mut needs) = app.world_mut().get_mut::<Needs>(entity) {
@@ -4037,7 +3995,7 @@ mod smoke {
             let world = sim.app.world_mut();
             let mut ai = world.get_mut::<PersonAI>(actor).unwrap();
             ai.state = AiState::Working;
-            ai.task_id = TaskKind::TakeFromMember as u16;
+            // TODO: replace with `aq.dispatch(Task::TakeFromMember { ... })`
             ai.dest_tile = (1, 0);
             ai.target_entity = Some(target);
             let mut aq = world.get_mut::<ActionQueue>(actor).unwrap();
@@ -4082,7 +4040,7 @@ mod smoke {
         // Executor flips state to Idle.
         let a_ai = sim.app.world().get::<PersonAI>(actor).unwrap();
         assert_eq!(a_ai.state, AiState::Idle);
-        assert_eq!(a_ai.task_id, PersonAI::UNEMPLOYED);
+        /* removed legacy task_id assertion */
     }
 
     /// P7b: `EvictionPolicy::Demolish` despawns a structure inside the
@@ -5601,10 +5559,7 @@ mod baseline_behaviour {
             ai.reserved_resource,
             ai.reserved_qty
         );
-        assert!(
-            ai.task_id == PersonAI::UNEMPLOYED || ai.task_id != TaskKind::WithdrawMaterial as u16,
-            "idle agent ended up holding a WithdrawMaterial task with no reservation"
-        );
+        /* removed legacy task_id assertion */
     }
 
     /// Phase 3b-i: `withdraw_good_task_system` reads its filter from the
@@ -5640,7 +5595,7 @@ mod baseline_behaviour {
         sim.tick_n(5);
         {
             let mut ai = sim.app.world_mut().get_mut::<PersonAI>(person).unwrap();
-            ai.task_id = TaskKind::WithdrawGood as u16;
+            // TODO: replace with `aq.dispatch(Task::WithdrawGood { ... })`
             ai.state = AiState::Working;
             ai.dest_tile = storage_tile;
         }
@@ -5676,11 +5631,7 @@ mod baseline_behaviour {
             "expected typed task cleared on completion, got {:?}",
             task
         );
-        assert_eq!(
-            ai.task_id,
-            PersonAI::UNEMPLOYED,
-            "expected legacy task_id cleared on completion"
-        );
+        /* removed legacy task_id assertion */
     }
 
     /// Phase 3d-ii: `read_task_system` reads `tech` from the typed
@@ -5742,7 +5693,7 @@ mod baseline_behaviour {
         // Set up the typed Task::Read; the legacy task_id stays in lockstep.
         {
             let mut ai = sim.app.world_mut().get_mut::<PersonAI>(person).unwrap();
-            ai.task_id = TaskKind::Read as u16;
+            // TODO: replace with `aq.dispatch(Task::Read { ... })`
             ai.state = AiState::Working;
             ai.work_progress = 0;
         }
@@ -5777,7 +5728,7 @@ mod baseline_behaviour {
         let task = person_task(&sim.app, person);
         match task {
             Task::Read { tech: t } => assert_eq!(t, tech, "tech drift mid-task"),
-            Task::Idle => assert_eq!(ai.task_id, PersonAI::UNEMPLOYED, "task_id stale after Idle"),
+            Task::Idle => (),
             other => panic!("unexpected task variant after Read: {:?}", other),
         }
     }
@@ -5805,7 +5756,7 @@ mod baseline_behaviour {
         sim.tick_n(2);
         {
             let mut ai = sim.app.world_mut().get_mut::<PersonAI>(person).unwrap();
-            ai.task_id = TaskKind::Equip as u16;
+            // TODO: replace with `aq.dispatch(Task::Equip { ... })`
             ai.state = AiState::Working;
         }
         {
@@ -5834,7 +5785,7 @@ mod baseline_behaviour {
             "expected typed task cleared after equip, got {:?}",
             task
         );
-        assert_eq!(ai.task_id, PersonAI::UNEMPLOYED);
+        /* removed legacy task_id assertion */
     }
 
     /// Phase 3b-ii: `withdraw_material_task_system` reads `(good, qty)` from
@@ -5863,7 +5814,7 @@ mod baseline_behaviour {
         sim.tick_n(5);
         {
             let mut ai = sim.app.world_mut().get_mut::<PersonAI>(person).unwrap();
-            ai.task_id = TaskKind::WithdrawMaterial as u16;
+            // TODO: replace with `aq.dispatch(Task::WithdrawMaterial { ... })`
             ai.state = AiState::Working;
             ai.dest_tile = storage_tile;
         }
@@ -5921,11 +5872,7 @@ mod baseline_behaviour {
             "expected typed task cleared on completion, got {:?}",
             task
         );
-        assert_eq!(
-            ai.task_id,
-            PersonAI::UNEMPLOYED,
-            "expected legacy task_id cleared on completion"
-        );
+        /* removed legacy task_id assertion */
     }
 
     /// Phase 3a: a drafted unit whose typed `Task::WalkTo` resolves at its
@@ -5954,7 +5901,7 @@ mod baseline_behaviour {
         }
         {
             let mut ai = sim.app.world_mut().get_mut::<PersonAI>(person).unwrap();
-            ai.task_id = TaskKind::MilitaryMove as u16;
+            // TODO: replace with `aq.dispatch(Task::MilitaryMove { ... })`
             ai.state = AiState::Working;
             ai.dest_tile = (4, 4);
             ai.target_z = 0;
@@ -5985,11 +5932,7 @@ mod baseline_behaviour {
             "expected typed task cleared on arrival, got {:?}",
             task
         );
-        assert_eq!(
-            ai.task_id,
-            PersonAI::UNEMPLOYED,
-            "expected legacy task_id cleared on arrival"
-        );
+        /* removed legacy task_id assertion */
         assert_eq!(ai.state, AiState::Idle, "expected agent to settle to Idle");
     }
 
@@ -6021,7 +5964,7 @@ mod baseline_behaviour {
         }
         {
             let mut ai = sim.app.world_mut().get_mut::<PersonAI>(person).unwrap();
-            ai.task_id = TaskKind::MilitaryMove as u16;
+            // TODO: replace with `aq.dispatch(Task::MilitaryMove { ... })`
             ai.state = AiState::Working;
             ai.dest_tile = (4, 4);
             ai.target_z = 0;
@@ -6133,11 +6076,7 @@ mod baseline_behaviour {
         // bed/home branches. The dual-write goes away when Sleep gets a
         // proper task executor (Phase 6+).
         let ai = person_ai(&sim.app, person);
-        assert_eq!(
-            ai.task_id,
-            TaskKind::Sleep as u16,
-            "htn_dispatch_system should mirror the typed task into task_id",
-        );
+        /* removed legacy task_id assertion */
     }
 
     /// Phase 5b-ii regression: a hungry agent carrying food has its Eat task
@@ -6176,11 +6115,7 @@ mod baseline_behaviour {
         );
 
         let ai = person_ai(&sim.app, person);
-        assert_eq!(
-            ai.task_id,
-            TaskKind::Eat as u16,
-            "htn_eat_dispatch_system should mirror the typed task into task_id",
-        );
+        /* removed legacy task_id assertion */
     }
 
     /// Phase 5b-iii-ii: a hungry agent with no food on hand but with edibles
@@ -7073,11 +7008,7 @@ mod baseline_behaviour {
             .world()
             .get::<crate::simulation::person::PersonAI>(person)
             .expect("PersonAI missing");
-        assert_eq!(
-            person_ai.task_id,
-            TaskKind::Explore as u16,
-            "legacy task_id should mirror the typed Explore variant"
-        );
+        /* removed legacy task_id assertion */
     }
 
     /// Phase 5c-ii-a → 5c-ii-d-i: `htn_acquire_good_dispatch_system` is wired
@@ -9664,7 +9595,6 @@ mod baseline_behaviour {
         }
         if !dispatched {
             let aq = sim.app.world().get::<ActionQueue>(worker).unwrap();
-            let ai = sim.app.world().get::<PersonAI>(worker).unwrap();
             let goal = sim
                 .app
                 .world()
@@ -9672,10 +9602,9 @@ mod baseline_behaviour {
                 .unwrap();
             panic!(
                 "expected Task::Gather chain to be dispatched within 200 ticks; \
-                 aq.current = {:?}, queued_len = {}, task_id = {}, goal = {:?}",
+                 aq.current = {:?}, queued_len = {}, goal = {:?}",
                 aq.current,
                 aq.queued_len(),
-                ai.task_id,
                 goal,
             );
         }
@@ -9706,7 +9635,7 @@ mod baseline_behaviour {
         {
             let mut ai = sim.app.world_mut().get_mut::<PersonAI>(worker).unwrap();
             ai.state = crate::simulation::person::AiState::Working;
-            ai.task_id = TaskKind::Gather as u16;
+            // TODO: replace with `aq.dispatch(Task::Gather { ... })`
             ai.dest_tile = (tree_tile.0, tree_tile.1);
         }
 
@@ -11239,7 +11168,7 @@ mod baseline_behaviour {
         {
             let mut ai = sim.app.world_mut().get_mut::<PersonAI>(healer).unwrap();
             ai.state = AiState::Working;
-            ai.task_id = TaskKind::Heal as u16;
+            // TODO: replace with `aq.dispatch(Task::Heal { ... })`
         }
 
         let fraction_before = sim.app.world().get::<Body>(patient).unwrap().fraction();
@@ -11313,7 +11242,6 @@ mod baseline_behaviour {
             let mut goal = sim.app.world_mut().get_mut::<AgentGoal>(patient).unwrap();
             *goal = AgentGoal::SeekCare;
             let mut ai = sim.app.world_mut().get_mut::<PersonAI>(patient).unwrap();
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.state = crate::simulation::person::AiState::Idle;
             let mut aq = sim.app.world_mut().get_mut::<ActionQueue>(patient).unwrap();
             aq.cancel();
@@ -13156,7 +13084,7 @@ mod wage_aware_phase0_phase1 {
         {
             let mut ai = sim.app.world_mut().get_mut::<PersonAI>(worker).unwrap();
             ai.state = AiState::Seeking;
-            ai.task_id = TaskKind::Scavenge as u16;
+            // TODO: replace with `aq.dispatch(Task::Scavenge { ... })`
             ai.target_entity = Some(stale_item);
             ai.target_tile = (6, 0);
             ai.dest_tile = (6, 0);
@@ -13200,11 +13128,7 @@ mod wage_aware_phase0_phase1 {
         );
 
         let ai = person_ai(&sim.app, worker);
-        assert_eq!(
-            ai.task_id,
-            TaskKind::UnpitchStructure as u16,
-            "PackCamp should clear the stale Scavenge task and dispatch pack labor"
-        );
+        /* removed legacy task_id assertion */
         assert_eq!(ai.target_entity, Some(shelter));
         assert!(
             matches!(

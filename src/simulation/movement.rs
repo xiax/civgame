@@ -5,7 +5,7 @@ use super::faction::{FactionMember, FactionRegistry};
 use super::items::GroundItem;
 use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
-use super::person::{AiState, Person, PersonAI};
+use super::person::{AiState, Person, PersonAI, UNEMPLOYED_TASK_KIND};
 use super::plants::Plant;
 use super::schedule::{BucketSlot, SimClock};
 use super::tasks::{task_interacts_from_adjacent, TaskKind};
@@ -56,7 +56,6 @@ fn release_to_idle(
     here: (i32, i32),
 ) {
     ai.state = AiState::Idle;
-    ai.task_id = PersonAI::UNEMPLOYED;
     ai.target_tile = (here.0 as i32, here.1 as i32);
     ai.dest_tile = ai.target_tile;
     ai.target_entity = None;
@@ -180,7 +179,7 @@ pub fn movement_system(
             // Interaction tasks: switch to Working when ≤1 tile (Chebyshev) from dest_tile
             // and within the correct Z range (same level or one above — agents can reach
             // down but not up through a ceiling).
-            if ai.state == AiState::Seeking && task_interacts_from_adjacent(ai.task_id) {
+            if ai.state == AiState::Seeking && task_interacts_from_adjacent(aq.current_task_kind()) {
                 let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
                 let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
                 let cheb = (cur_tx - ai.dest_tile.0 as i32)
@@ -268,7 +267,7 @@ pub fn movement_system(
                         goal3,
                         PathKind::BestEffort,
                         DEFAULT_PATH_BUDGET,
-                        ai.task_id,
+                        aq.current_task_kind(),
                     );
                     pf.status = FollowStatus::Pending;
                     pf.goal = goal3;
@@ -325,7 +324,7 @@ pub fn movement_system(
                             goal3,
                             PathKind::BestEffort,
                             DEFAULT_PATH_BUDGET,
-                            ai.task_id,
+                            aq.current_task_kind(),
                         );
                         pf.status = FollowStatus::Pending;
                         pf.goal = goal3;
@@ -360,7 +359,7 @@ pub fn movement_system(
                             goal3,
                             PathKind::BestEffort,
                             DEFAULT_PATH_BUDGET,
-                            ai.task_id,
+                            aq.current_task_kind(),
                         );
                         pf.status = FollowStatus::Pending;
                         continue;
@@ -579,7 +578,7 @@ pub fn movement_system(
                         // Working with no executor, blocking PlayerOrder
                         // teardown. Drop to Idle so the completion system
                         // releases the marker and autonomy resumes.
-                        ai.state = if ai.task_id == PersonAI::UNEMPLOYED {
+                        ai.state = if aq.current_task_kind() == UNEMPLOYED_TASK_KIND {
                             AiState::Idle
                         } else {
                             AiState::Working
@@ -588,7 +587,7 @@ pub fn movement_system(
                     // else: stays Seeking toward the adjacent tile
                 } else {
                     claimed_this_tick.insert((tx, ty, cz));
-                    ai.state = if ai.task_id == PersonAI::UNEMPLOYED {
+                    ai.state = if aq.current_task_kind() == UNEMPLOYED_TASK_KIND {
                         AiState::Idle
                     } else {
                         AiState::Working

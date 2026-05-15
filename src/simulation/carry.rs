@@ -389,6 +389,7 @@ pub fn drop_carrier_to_ground(
 /// `Bulk::TwoHand` (Wood, Stone) so `try_pick_up` doesn't spill to ground.
 fn gather_target_yield_bulk(
     ai: &crate::simulation::person::PersonAI,
+    aq: &crate::simulation::typed_task::ActionQueue,
     agent: &crate::economy::agent::EconomicAgent,
     plant_map: &crate::simulation::plants::PlantMap,
     plant_query: &Query<&crate::simulation::plants::Plant>,
@@ -401,7 +402,7 @@ fn gather_target_yield_bulk(
     let tx = ai.dest_tile.0 as i32;
     let ty = ai.dest_tile.1 as i32;
 
-    if ai.task_id == TaskKind::Gather as u16 {
+    if aq.current_task_kind() == TaskKind::Gather as u16 {
         if let Some(entity) = plant_map.0.get(&(tx, ty)).copied() {
             if let Ok(plant) = plant_query.get(entity) {
                 return Some(plant.kind.harvest_yield_bulk(agent.has_tool()));
@@ -411,7 +412,7 @@ fn gather_target_yield_bulk(
             Some(TileKind::Stone) | Some(TileKind::Wall) => Some(Bulk::TwoHand),
             _ => None,
         }
-    } else if ai.task_id == TaskKind::Dig as u16 {
+    } else if aq.current_task_kind() == TaskKind::Dig as u16 {
         // Dig always yields Stone.
         Some(Bulk::TwoHand)
     } else {
@@ -440,6 +441,7 @@ pub fn enforce_hand_state_system(
     mut agents: Query<
         (
             &crate::simulation::person::PersonAI,
+            &crate::simulation::typed_task::ActionQueue,
             &mut Carrier,
             &Transform,
             &crate::simulation::lod::LodLevel,
@@ -454,7 +456,7 @@ pub fn enforce_hand_state_system(
     use crate::simulation::tasks::{task_drops_hand_load, task_requires_free_hands};
     use crate::world::terrain::world_to_tile;
 
-    for (ai, mut carrier, transform, lod, agent) in agents.iter_mut() {
+    for (ai, aq, mut carrier, transform, lod, agent) in agents.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -465,13 +467,13 @@ pub fn enforce_hand_state_system(
             continue;
         }
 
-        let drop_all = task_drops_hand_load(ai.task_id);
+        let drop_all = task_drops_hand_load(aq.current_task_kind());
         // Default per-task requirement, upgraded for Gather/Dig whose yield is
         // TwoHand (Wood, Stone) — the worker needs *both* hands free or
         // `try_pick_up` will spill the yield to ground.
-        let mut need_free = task_requires_free_hands(ai.task_id);
+        let mut need_free = task_requires_free_hands(aq.current_task_kind());
         if matches!(
-            gather_target_yield_bulk(ai, agent, &plant_map, &plant_query, &chunk_map),
+            gather_target_yield_bulk(ai, aq, agent, &plant_map, &plant_query, &chunk_map),
             Some(Bulk::TwoHand)
         ) {
             need_free = 2;

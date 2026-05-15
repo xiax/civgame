@@ -6,7 +6,7 @@ use crate::simulation::construction::{Blueprint, BlueprintMap};
 use crate::simulation::faction::{FactionData, FactionMember, FactionRegistry, SOLO};
 use crate::simulation::goals::{AgentGoal, Personality};
 use crate::simulation::lod::LodLevel;
-use crate::simulation::person::{PersonAI, Profession};
+use crate::simulation::person::{PersonAI, Profession, UNEMPLOYED_TASK_KIND};
 use crate::simulation::projects::{compute_priority, ProjectPhase, Projects, PRIORITY_PLAYER};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::skills::{SkillKind, Skills};
@@ -3187,6 +3187,7 @@ pub fn job_claim_system(
             Entity,
             &FactionMember,
             &PersonAI,
+            &crate::simulation::typed_task::ActionQueue,
             &LodLevel,
             &Skills,
             &Personality,
@@ -3229,6 +3230,7 @@ pub fn job_claim_system(
         worker,
         member,
         ai,
+        aq,
         lod,
         skills,
         personality,
@@ -3242,7 +3244,7 @@ pub fn job_claim_system(
         if *lod == LodLevel::Dormant {
             continue;
         }
-        if ai.task_id != PersonAI::UNEMPLOYED {
+        if aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         let faction_id = member.faction_id;
@@ -3855,7 +3857,12 @@ pub fn job_claim_release_system(
     mut board: ResMut<JobBoard>,
     mut completed_events: EventWriter<JobCompletedEvent>,
     bench_query: Query<(), With<crate::simulation::construction::Workbench>>,
-    mut workers: Query<(Entity, &PersonAI, &mut JobClaim)>,
+    mut workers: Query<(
+        Entity,
+        &PersonAI,
+        &crate::simulation::typed_task::ActionQueue,
+        &mut JobClaim,
+    )>,
     entities: &Entities,
 ) {
     if clock.tick % RELEASE_SWEEP_INTERVAL != 0 {
@@ -3910,8 +3917,8 @@ pub fn job_claim_release_system(
     // than STUCK_FAIL_INTERVAL since the claim was posted have their
     // fail_count incremented; once they hit MAX_FAIL_COUNT the claim is
     // released so the worker can pick something else.
-    for (worker, ai, mut claim) in workers.iter_mut() {
-        if ai.task_id != PersonAI::UNEMPLOYED {
+    for (worker, ai, aq, mut claim) in workers.iter_mut() {
+        if aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         if (clock.tick as u32).saturating_sub(claim.posted_tick) < STUCK_FAIL_INTERVAL as u32 {

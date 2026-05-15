@@ -6,7 +6,7 @@ use crate::simulation::goals::AgentGoal;
 use crate::simulation::jobs::JobClaim;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
-use crate::simulation::person::{AiState, Drafted, Person, PersonAI, Profession, TraderPlan};
+use crate::simulation::person::{AiState, Drafted, Person, PersonAI, Profession, TraderPlan, UNEMPLOYED_TASK_KIND};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::typed_task::{ActionQueue, Task};
 
@@ -209,7 +209,7 @@ pub fn can_demote_to_cohort(
     if has_pin || has_claim || has_trader_plan {
         return false;
     }
-    if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+    if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
         return false;
     }
     if !matches!(aq.current, Task::Idle) || !aq.queued_is_empty() {
@@ -341,7 +341,6 @@ mod tests {
     #[test]
     fn demotion_requires_aggregate_idle_unpinned_agent() {
         let ai = PersonAI {
-            task_id: PersonAI::UNEMPLOYED,
             state: AiState::Idle,
             ..PersonAI::default()
         };

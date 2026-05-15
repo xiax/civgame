@@ -40,7 +40,7 @@ pub fn dig_system(
         if ai.state != AiState::Working {
             continue;
         }
-        if ai.task_id != TaskKind::Dig as u16 {
+        if aq.current_task_kind() != TaskKind::Dig as u16 {
             continue;
         }
 
@@ -60,7 +60,6 @@ pub fn dig_system(
 
         if kind == TileKind::Air || kind.is_water_like() || surf_z <= Z_MIN {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             aq.advance();
             continue;
         }
@@ -105,7 +104,6 @@ pub fn dig_system(
         skills.gain_xp(SkillKind::Mining, DIG_XP);
 
         ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
         aq.advance();
     }
 }

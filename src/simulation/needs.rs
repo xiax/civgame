@@ -151,6 +151,7 @@ pub fn tick_needs_system(
         &BucketSlot,
         &mut Needs,
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &LodLevel,
         &Transform,
         Option<&Stats>,
@@ -160,7 +161,7 @@ pub fn tick_needs_system(
 
     query
         .par_iter_mut()
-        .for_each(|(slot, mut needs, mut ai, lod, transform, stats)| {
+        .for_each(|(slot, mut needs, mut ai, mut aq, lod, transform, stats)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -196,7 +197,13 @@ pub fn tick_needs_system(
                 };
                 needs.willpower = (needs.willpower + willpower_gain * dt).clamp(0.0, 255.0);
                 if needs.sleep < 10.0 {
-                    ai.state = AiState::Idle;
+                    // Rested — exit the typed `Task::Sleep` slot, not just
+                    // `ai.state`. Without `aq.advance()` the next tick's
+                    // `htn_dispatch_system` sees Idle+Sleep-goal and re-dispatches
+                    // Sleep into the queue (stacks to ACTION_QUEUE_CAP → panic).
+                    // `goal_update_system` flips off the Sleep goal on its next
+                    // cadence; until then this exit is the canonical wake.
+                    aq.finish_task(&mut ai);
                 }
             } else {
                 needs.sleep = (needs.sleep + SLEEP_RATE * dt * con_scale).clamp(0.0, 255.0);
@@ -224,7 +231,7 @@ pub fn tick_needs_system(
 
             // Table+Chair social bonus: agents in the Socialize task within
             // one tile of both a Table and a Chair recover social need 2× faster.
-            if ai.task_id == TaskKind::Socialize as u16 {
+            if aq.current_task_kind() == TaskKind::Socialize as u16 {
                 let tile = (cur_tx as i32, cur_ty as i32);
                 let mut near_table = false;
                 let mut near_chair = false;
@@ -252,11 +259,11 @@ pub fn tick_needs_system(
             // the entertainment value of the agent's chosen target. Sleeping
             // agents don't drain — rest is restorative.
             if ai.state != AiState::Sleeping
-                && ai.task_id != TaskKind::Play as u16
-                && ai.task_id != TaskKind::PlayPlant as u16
-                && ai.task_id != TaskKind::PlayThrow as u16
+                && aq.current_task_kind() != TaskKind::Play as u16
+                && aq.current_task_kind() != TaskKind::PlayPlant as u16
+                && aq.current_task_kind() != TaskKind::PlayThrow as u16
             {
-                let drain = if task_is_labor(ai.task_id) {
+                let drain = if task_is_labor(aq.current_task_kind()) {
                     WILLPOWER_WORK_DRAIN
                 } else {
                     WILLPOWER_IDLE_DRAIN

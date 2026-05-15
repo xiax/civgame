@@ -24,7 +24,7 @@ use crate::simulation::combat::Body;
 use crate::simulation::faction::FactionMember;
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
-use crate::simulation::person::{AiState, Drafted, PersonAI, Profession};
+use crate::simulation::person::{AiState, Drafted, PersonAI, Profession, UNEMPLOYED_TASK_KIND};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
@@ -259,7 +259,7 @@ pub fn htn_provide_care_dispatch_system(
         if !matches!(*profession, Profession::Healer | Profession::Apprentice) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
 
@@ -341,7 +341,6 @@ pub fn heal_task_system(
         }
         let Ok(patient_t) = transform_query.get(patient) else {
             aq.advance();
-            ai.task_id = PersonAI::UNEMPLOYED;
             continue;
         };
         let hx = (healer_t.translation.x / TILE_SIZE).floor() as i32;
@@ -351,12 +350,10 @@ pub fn heal_task_system(
         let d = (px - hx).abs().max((py - hy).abs());
         if d > HEAL_ADJACENCY_RADIUS {
             aq.advance();
-            ai.task_id = PersonAI::UNEMPLOYED;
             continue;
         }
         let Ok(mut body) = body_query.get_mut(patient) else {
             aq.advance();
-            ai.task_id = PersonAI::UNEMPLOYED;
             continue;
         };
         let mut healed_something = false;
@@ -381,7 +378,6 @@ pub fn heal_task_system(
         } else {
             // Body fully intact — patient recovered.
             aq.advance();
-            ai.task_id = PersonAI::UNEMPLOYED;
         }
     }
 }
@@ -421,7 +417,7 @@ pub fn htn_seek_care_dispatch_system(
         if !matches!(*goal, AgentGoal::SeekCare) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
 

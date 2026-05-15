@@ -515,7 +515,6 @@ pub fn pregnancy_system(
                     SkillsLastSeen::default(),
                     child_stats,
                     PersonAI {
-                        task_id: PersonAI::UNEMPLOYED,
                         state: AiState::Idle,
                         target_tile: (tx as i32, ty as i32),
                         dest_tile: (tx as i32, ty as i32),

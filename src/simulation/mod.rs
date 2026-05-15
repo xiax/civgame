@@ -134,6 +134,7 @@ impl Plugin for SimulationPlugin {
         app.add_plugins(jobs::JobsPlugin)
             .add_plugins(projects::ProjectsPlugin)
             .add_event::<combat::CombatEvent>()
+            .add_event::<combat::CombatRetaliationStartedEvent>()
             .add_event::<combat::DistressCallEvent>()
             .add_event::<combat::HandDropEvent>()
             .add_event::<knowledge::DiscoveryActionEvent>()
@@ -707,6 +708,7 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 (
                     combat::hand_drop_event_handler.after(combat::combat_system),
+                    combat::combat_retaliation_cleanup_system.after(combat::combat_system),
                     reproduction::cosleep_observation_system
                         .after(movement::sync_indexed_after_move_system),
                     tasks::play_system.after(movement::sync_indexed_after_move_system),

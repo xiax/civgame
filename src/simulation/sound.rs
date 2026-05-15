@@ -246,7 +246,6 @@ pub fn respond_to_distress_system(
             // Drop a carried corpse if any — combat takes priority over the
             // hunt; the corpse stays on the ground for later retrieval.
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             // Phase 5e-vii: rescue is an external preempt — drop any
             // typed-channel task so the rescued agent doesn't fall back

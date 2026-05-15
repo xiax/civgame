@@ -46,13 +46,12 @@ pub fn clear_obstacle_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || ai.task_id != TaskKind::ClearObstacle as u16 {
+        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::ClearObstacle as u16 {
             continue;
         }
 
         let Some((obstacle_entity, bp_entity)) = aq.current.as_clear_obstacle() else {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             ai.target_entity = None;
             aq.advance();
@@ -66,7 +65,6 @@ pub fn clear_obstacle_task_system(
                 bp.pending_clear.retain(|&e| e != obstacle_entity);
             }
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             ai.target_entity = None;
             aq.advance();
@@ -85,7 +83,6 @@ pub fn clear_obstacle_task_system(
                 bp.pending_clear.retain(|&e| e != obstacle_entity);
             }
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             ai.target_entity = None;
             aq.advance();
@@ -120,7 +117,6 @@ pub fn clear_obstacle_task_system(
 
         skills.gain_xp(skill, skill_xp);
         ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
         ai.target_entity = None;
         aq.advance();

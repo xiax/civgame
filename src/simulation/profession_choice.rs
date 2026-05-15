@@ -139,7 +139,6 @@ pub fn demote_profession_state(
             release_reservation(reservations, ai);
         }
         ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
         ai.target_entity = None;
         ai.work_progress = 0;
     }

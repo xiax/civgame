@@ -369,7 +369,6 @@ pub fn market_buy_system(
     mut settlements: Query<&mut Settlement, Without<Camp>>,
     mut camps: Query<&mut Camp, Without<Settlement>>,
     mut query: Query<(
-        &mut PersonAI,
         &mut EconomicAgent,
         &Needs,
         &BucketSlot,
@@ -377,7 +376,7 @@ pub fn market_buy_system(
         &FactionMember,
     )>,
 ) {
-    for (mut ai, mut agent, needs, slot, lod, member) in query.iter_mut() {
+    for (mut agent, needs, slot, lod, member) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -400,10 +399,6 @@ pub fn market_buy_system(
             };
             if let Some(it) = bought_item {
                 agent.add_item(it, qty);
-                if ai.task_id == crate::simulation::tasks::TaskKind::Trader as u16 {
-                    ai.state = AiState::Idle;
-                    ai.task_id = PersonAI::UNEMPLOYED;
-                }
             }
         }
 

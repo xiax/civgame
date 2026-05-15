@@ -78,7 +78,6 @@ fn setup_sandbox(
             SkillUseTicks::default(),
             SkillsLastSeen::default(),
             PersonAI {
-                task_id: PersonAI::UNEMPLOYED,
                 state: AiState::Idle,
                 target_tile: (cx as i32, cy as i32),
                 dest_tile: (cx as i32, cy as i32),

@@ -13,7 +13,7 @@ use crate::simulation::faction::{FactionMember, SOLO};
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
-use crate::simulation::person::{AiState, Drafted, PersonAI};
+use crate::simulation::person::{AiState, Drafted, PersonAI, UNEMPLOYED_TASK_KIND};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
@@ -95,6 +95,7 @@ pub fn terraform_dispatch_system(
     mut agent_query: Query<
         (
             &mut PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
             &AgentGoal,
             &FactionMember,
             &Transform,
@@ -106,7 +107,7 @@ pub fn terraform_dispatch_system(
     if terraform_map.0.is_empty() {
         return;
     }
-    for (mut ai, goal, member, transform, lod) in agent_query.iter_mut() {
+    for (mut ai, mut aq, goal, member, transform, lod) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -116,7 +117,7 @@ pub fn terraform_dispatch_system(
         if !matches!(goal, AgentGoal::Build) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
 
@@ -141,7 +142,7 @@ pub fn terraform_dispatch_system(
             }
         }
         if let Some((tile, _)) = best {
-            assign_task_with_routing(
+            let routed = assign_task_with_routing(
                 &mut ai,
                 (cur_tx as i32, cur_ty as i32),
                 cur_chunk,
@@ -153,6 +154,9 @@ pub fn terraform_dispatch_system(
                 &chunk_map,
                 &chunk_connectivity,
             );
+            if routed {
+                aq.dispatch(crate::simulation::typed_task::Task::Terraform { tile });
+            }
         }
     }
 }
@@ -171,6 +175,7 @@ pub fn terraform_system(
     globe: Res<Globe>,
     mut agent_query: Query<(
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut EconomicAgent,
         &mut Carrier,
         &mut Skills,
@@ -178,14 +183,14 @@ pub fn terraform_system(
         &LodLevel,
     )>,
 ) {
-    for (mut ai, mut agent, mut carrier, mut skills, slot, lod) in agent_query.iter_mut() {
+    for (mut ai, mut aq, mut agent, mut carrier, mut skills, slot, lod) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
         if ai.state != AiState::Working {
             continue;
         }
-        if ai.task_id != TaskKind::Terraform as u16 {
+        if aq.current_task_kind() != TaskKind::Terraform as u16 {
             continue;
         }
         if ai.work_progress < TERRAFORM_WORK_TICKS {
@@ -195,14 +200,12 @@ pub fn terraform_system(
 
         let dest = ai.dest_tile;
         let Some(&site_entity) = terraform_map.0.get(&dest) else {
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
+            aq.cancel_chain(&mut ai);
             continue;
         };
         let Ok(site) = site_query.get(site_entity) else {
             terraform_map.0.remove(&dest);
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
+            aq.cancel_chain(&mut ai);
             continue;
         };
 
@@ -252,8 +255,7 @@ pub fn terraform_system(
             let in_hand = carrier.quantity_of_resource(fill_id);
             let in_inv = agent.quantity_of_resource(fill_id);
             if in_hand + in_inv < 1 {
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
+                aq.cancel_chain(&mut ai);
                 continue;
             }
             let target_floor = surf + 1;
@@ -274,8 +276,9 @@ pub fn terraform_system(
             terraform_map.0.remove(&dest);
         }
 
-        ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
+        // One unit of terraform work done. Exit the typed slot so the next
+        // dispatcher tick re-plans (another tile may still need carving/filling).
+        aq.finish_task(&mut ai);
     }
 }
 

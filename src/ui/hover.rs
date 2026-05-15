@@ -71,6 +71,7 @@ pub fn hover_info_system(
         (
             &FactionMember,
             &PersonAI,
+            &crate::simulation::typed_task::ActionQueue,
             &EconomicAgent,
             &Carrier,
             &LodLevel,
@@ -328,7 +329,7 @@ pub fn hover_info_system(
                     let mut slot_carriers = [0u32; 3];
 
                     let bp_pos = (tx, ty);
-                    for (member, ai, agent, carrier, lod, transform) in worker_query.iter() {
+                    for (member, ai, aq, agent, carrier, lod, transform) in worker_query.iter() {
                         let allowed = match bp.personal_owner {
                             Some(_) => false, // personal blueprint — only owner counts
                             None => member.faction_id == bp.faction_id,
@@ -341,7 +342,7 @@ pub fn hover_info_system(
 
                         // On-site count: target_entity points at this bp AND task matches.
                         if ai.target_entity == Some(bp_entity) {
-                            let t = ai.task_id;
+                            let t = aq.current_task_kind();
                             if t == TaskKind::Construct as u16 || t == TaskKind::ConstructBed as u16
                             {
                                 on_site_workers += 1;

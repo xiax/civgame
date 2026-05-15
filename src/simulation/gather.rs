@@ -241,7 +241,6 @@ fn finish_gather(
     release_gather_claim(&routing.gather_claims, ai, actor);
 
     ai.state = AiState::Idle;
-    ai.task_id = PersonAI::UNEMPLOYED;
     ai.target_entity = None;
     ai.work_progress = 0;
 
@@ -306,7 +305,6 @@ fn finish_gather(
             // tick. The Gather executor leaves harvested food in
             // hands/inventory; `eat_task_system` reads from both.
             ai.state = AiState::Working;
-            ai.task_id = TaskKind::Eat as u16;
         }
         Task::HaulToBlueprint { blueprint } => {
             // Phase 5e-xiii-b: gather-for-personal-build chain trailing leg.
@@ -437,7 +435,7 @@ pub fn gather_system(
         if ai.state != AiState::Working {
             continue;
         }
-        if ai.task_id != TaskKind::Gather as u16 {
+        if aq.current_task_kind() != TaskKind::Gather as u16 {
             continue;
         }
 

@@ -19,7 +19,7 @@ use crate::simulation::items::{
 use crate::simulation::memory::{RelEntry, RelationshipMemory};
 use crate::simulation::mood::Mood;
 use crate::simulation::needs::Needs;
-use crate::simulation::person::{AiState, PersonAI, Profession};
+use crate::simulation::person::{AiState, PersonAI, Profession, UNEMPLOYED_TASK_KIND};
 use crate::simulation::plants::{Plant, PlantMap};
 use crate::simulation::reproduction::{
     BiologicalSex, CoSleepTracker, MaleConceptionCooldown, Pregnancy, PREGNANCY_TICKS,
@@ -924,7 +924,7 @@ pub fn inspector_panel_system(
                 egui::CollapsingHeader::new(egui::RichText::new("Task & State").strong())
                     .default_open(true)
                     .show(ui, |ui| {
-                        let task_name = task_kind_label(ai.task_id);
+                        let task_name = task_kind_label(aq.current_task_kind());
                         ui.label(format!("Task: {}", task_name));
                         if let Some(c) = commanded {
                             ui.label(
@@ -946,7 +946,7 @@ pub fn inspector_panel_system(
                         ui.label(format!("Method: {}", method_label));
 
                         let now = sim_clock.tick;
-                        if ai.task_id == PersonAI::UNEMPLOYED && aq.current == Task::Idle {
+                        if aq.current_task_kind() == UNEMPLOYED_TASK_KIND && aq.current == Task::Idle {
                             let last_attempt = method_history
                                 .and_then(|h| {
                                     h.entries
@@ -1032,7 +1032,7 @@ pub fn inspector_panel_system(
                                 let ty = ai.target_tile.1 as i32;
                                 let mut work_str = "Working".to_string();
 
-                                if ai.task_id == TaskKind::Gather as u16 {
+                                if aq.current_task_kind() == TaskKind::Gather as u16 {
                                     if let Some(&p_entity) = plant_map.0.get(&(tx, ty)) {
                                         if let Ok(plant) = task_display.plants.get(p_entity) {
                                             work_str = format!("Harvesting {:?}", plant.kind);
@@ -1049,17 +1049,17 @@ pub fn inspector_panel_system(
                                         (ai.work_progress as u32 * 100) / 30
                                     );
                                 // 30 is base stone work_ticks
-                                } else if ai.task_id == TaskKind::Planter as u16 {
+                                } else if aq.current_task_kind() == TaskKind::Planter as u16 {
                                     work_str = format!(
                                         "Planting Seeds ({}%)",
                                         (ai.work_progress as u32 * 100) / 40
                                     );
                                 // 40 is TICKS_FARMER_PLANT
-                                } else if ai.task_id == TaskKind::Raid as u16 {
+                                } else if aq.current_task_kind() == TaskKind::Raid as u16 {
                                     work_str = "Stealing Goods".to_string();
-                                } else if ai.task_id == TaskKind::Scavenge as u16 {
+                                } else if aq.current_task_kind() == TaskKind::Scavenge as u16 {
                                     work_str = "Picking up item".to_string();
-                                } else if ai.task_id == TaskKind::WithdrawMaterial as u16 {
+                                } else if aq.current_task_kind() == TaskKind::WithdrawMaterial as u16 {
                                     if let Some((rid, qty)) = aq.current.as_withdraw_material() {
                                         work_str = format!(
                                             "Withdrawing {} \u{00d7} {}",
@@ -1069,14 +1069,14 @@ pub fn inspector_panel_system(
                                     } else {
                                         work_str = "Withdrawing".to_string();
                                     }
-                                } else if ai.task_id == TaskKind::Butcher as u16 {
+                                } else if aq.current_task_kind() == TaskKind::Butcher as u16 {
                                     work_str = format!(
                                         "Butchering ({}%)",
                                         (ai.work_progress as u32 * 100) / 60
                                     );
-                                } else if ai.task_id == TaskKind::WorkOnCraftOrder as u16 {
+                                } else if aq.current_task_kind() == TaskKind::WorkOnCraftOrder as u16 {
                                     work_str = format!("Crafting (step: {})", ai.work_progress);
-                                } else if ai.task_id == TaskKind::WithdrawGood as u16 {
+                                } else if aq.current_task_kind() == TaskKind::WithdrawGood as u16 {
                                     use crate::simulation::typed_task::WithdrawGoodFilter;
                                     let good_label = match aq.current.as_withdraw_good() {
                                         Some(WithdrawGoodFilter::AnyEntertainment) => {
@@ -1088,12 +1088,12 @@ pub fn inspector_panel_system(
                                         None => "good".to_owned(),
                                     };
                                     work_str = format!("Withdrawing {}", good_label);
-                                } else if ai.task_id == TaskKind::PlayPlant as u16 {
+                                } else if aq.current_task_kind() == TaskKind::PlayPlant as u16 {
                                     work_str = format!(
                                         "Play-Planting ({}%)",
                                         (ai.work_progress as u32 * 100) / 40
                                     );
-                                } else if ai.task_id == TaskKind::PlayThrow as u16 {
+                                } else if aq.current_task_kind() == TaskKind::PlayThrow as u16 {
                                     work_str = format!(
                                         "Play-Throwing ({}%)",
                                         (ai.work_progress as u32 * 100) / 30

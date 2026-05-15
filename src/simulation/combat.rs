@@ -151,6 +151,19 @@ pub struct DistressCallEvent {
     pub faction_id: u32,
 }
 
+/// Fired by `combat_system`'s retaliation branches when a victim's
+/// `CombatTarget` is armed in response to a hit. `combat_system` cannot clear
+/// the victim's `ActionQueue` directly: `attacker_query` already holds
+/// `Option<&mut ActionQueue>` mutably across its iteration, so a sibling
+/// `Query<&mut ActionQueue>` would alias. `combat_retaliation_cleanup_system`
+/// drains this event in `Sequential` immediately after `combat_system` and
+/// calls `aq.cancel_chain(&mut ai)` so the victim's stale plan doesn't carry
+/// into the next dispatcher tick.
+#[derive(Event, Clone, Copy)]
+pub struct CombatRetaliationStartedEvent {
+    pub victim: Entity,
+}
+
 /// Per-victim throttle so a series of cooldown-bounded swings doesn't re-run
 /// the audible BFS every tick.
 #[derive(Component, Clone, Copy, Default)]
@@ -163,6 +176,16 @@ pub struct CombatCooldown(pub f32);
 
 const ATTACK_DAMAGE: u8 = 2;
 const BASE_ATTACK_COOLDOWN: f32 = 1.0;
+
+/// Bundles `combat_system`'s three event writers into one `SystemParam`
+/// to stay under Bevy's 16-parameter ceiling after retaliation cleanup
+/// joined the system.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct CombatEventWriters<'w> {
+    pub combat: EventWriter<'w, CombatEvent>,
+    pub discovery: EventWriter<'w, crate::simulation::knowledge::DiscoveryActionEvent>,
+    pub retaliation: EventWriter<'w, CombatRetaliationStartedEvent>,
+}
 
 pub fn combat_system(
     time: Res<Time>,
@@ -191,8 +214,7 @@ pub fn combat_system(
     mut rel_query: Query<Option<&mut RelationshipMemory>>,
     mut faction_registry: ResMut<FactionRegistry>,
     clock: Res<SimClock>,
-    mut combat_events: EventWriter<CombatEvent>,
-    mut discovery_events: EventWriter<crate::simulation::knowledge::DiscoveryActionEvent>,
+    mut events: CombatEventWriters,
 ) {
     let dt = time.delta_secs();
 
@@ -263,7 +285,6 @@ pub fn combat_system(
         if target_is_dead || (!health_query.contains(target) && !body_query.contains(target)) {
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
             }
             // Phase 5e-vii: drain the typed channel after a kill so a stale
             // `Task::Hunt { prey: <dead> }` doesn't linger in `aq.current`.
@@ -314,7 +335,7 @@ pub fn combat_system(
                 ai.state = AiState::Attacking;
             }
 
-            combat_events.send(CombatEvent { attacker, target });
+            events.combat.send(CombatEvent { attacker, target });
 
             let atk_dex = attacker_stats
                 .map(|s| stats::modifier(s.dexterity))
@@ -391,7 +412,6 @@ pub fn combat_system(
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
                 if ai.state == AiState::Attacking {
                     ai.state = AiState::Idle;
-                    ai.task_id = PersonAI::UNEMPLOYED;
                     if let Some(ref mut aq) = attacker_aq {
                         aq.advance();
                     }
@@ -416,8 +436,14 @@ pub fn combat_system(
             if target_combat.0.is_none() {
                 if let Ok(mut target_ai) = ai_query.get_mut(target) {
                     target_combat.0 = Some(attacker);
-                    // Setting target will trigger combat_system on next tick
+                    // Setting target will trigger combat_system on next tick.
+                    // The victim's ActionQueue is unreachable from here
+                    // (attacker_query holds Option<&mut ActionQueue> mutably);
+                    // combat_retaliation_cleanup_system drains the event below.
                     target_ai.state = AiState::Idle;
+                    events
+                        .retaliation
+                        .send(CombatRetaliationStartedEvent { victim: target });
                 } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target)
                 {
                     if maybe_deer.is_none() {
@@ -447,6 +473,9 @@ pub fn combat_system(
                 if let Ok(mut target_ai) = ai_query.get_mut(target) {
                     target_combat.0 = Some(attacker);
                     target_ai.state = AiState::Idle;
+                    events
+                        .retaliation
+                        .send(CombatRetaliationStartedEvent { victim: target });
                 } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target)
                 {
                     if maybe_deer.is_none() {
@@ -467,10 +496,30 @@ pub fn combat_system(
     }
     // Per-attacker discovery rolls (knowledge-system).
     for attacker in combat_activity_attackers {
-        discovery_events.send(crate::simulation::knowledge::DiscoveryActionEvent {
+        events.discovery.send(crate::simulation::knowledge::DiscoveryActionEvent {
             actor: attacker,
             activity: ActivityKind::Combat,
         });
+    }
+}
+
+/// Drains `CombatRetaliationStartedEvent` and cancels the victim's typed-task
+/// chain. Runs in `Sequential` after `combat_system`, where `attacker_query`'s
+/// mutable borrow is released and a non-aliasing `&mut ActionQueue` is finally
+/// reachable for the victim.
+///
+/// Uses `aq.cancel_chain(&mut ai)` (not `advance`) because combat onset
+/// invalidates the entire pre-combat plan — every leg of the prefetch ring
+/// belongs to the old goal. The next tick's `goal_update_system` will land on
+/// `Defend` (or similar) and replan from scratch.
+pub fn combat_retaliation_cleanup_system(
+    mut events: EventReader<CombatRetaliationStartedEvent>,
+    mut q: Query<(&mut PersonAI, &mut crate::simulation::typed_task::ActionQueue)>,
+) {
+    for ev in events.read() {
+        if let Ok((mut ai, mut aq)) = q.get_mut(ev.victim) {
+            aq.cancel_chain(&mut ai);
+        }
     }
 }
 
@@ -548,7 +597,6 @@ pub fn hunt_chase_system(
             crate::simulation::htn::record_target_failure(&mut history, &mut ai, now);
             combat_target.0 = None;
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             aq.cancel();
             continue;
         };
@@ -577,7 +625,6 @@ pub fn hunt_chase_system(
             crate::simulation::htn::record_target_failure(&mut history, &mut ai, now);
             combat_target.0 = None;
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             aq.cancel();
             continue;
         }

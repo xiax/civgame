@@ -28,7 +28,7 @@ use crate::simulation::faction::FactionMember;
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::{Needs, DRINK_THIRST_REDUCTION, THIRST_SEVERE, THIRST_TRIGGER};
-use crate::simulation::person::{AiState, Drafted, PersonAI};
+use crate::simulation::person::{AiState, Drafted, PersonAI, UNEMPLOYED_TASK_KIND};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::typed_task::{ActionQueue, DrinkSource, Task};
@@ -180,7 +180,7 @@ pub fn drink_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.task_id != TaskKind::Drink as u16 {
+        if aq.current_task_kind() != TaskKind::Drink as u16 {
             continue;
         }
         let Some(source) = aq.current.as_drink() else {
@@ -278,7 +278,7 @@ pub fn htn_drink_dispatch_system(
             if *goal != AgentGoal::Drink {
                 return;
             }
-            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
                 return;
             }
             if needs.thirst < THIRST_TRIGGER {
@@ -309,7 +309,6 @@ pub fn htn_drink_dispatch_system(
                 agent.quantity_of_resource(clean_water) + carrier.quantity_of_resource(clean_water);
             if inv_clean > 0 {
                 ai.state = AiState::Working;
-                ai.task_id = TaskKind::Drink as u16;
                 ai.work_progress = 0;
                 ai.dest_tile = (cur_tx, cur_ty);
                 aq.dispatch(Task::Drink {

@@ -2829,7 +2829,7 @@ pub fn drop_items_at_destination_system(
         if *lod == LodLevel::Dormant {
             continue;
         }
-        if ai.state != AiState::Working || ai.task_id != TaskKind::DepositResource as u16 {
+        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::DepositResource as u16 {
             continue;
         }
 
@@ -3017,7 +3017,6 @@ pub fn drop_items_at_destination_system(
         }
 
         ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
         // Phase 5c-ii-c-ii: clear the typed `Task::DepositToFactionStorage`
         // (or any pending DepositResource variant) so the next tick's HTN
         // dispatcher sees a clean Idle slot. `advance()` promotes any further

@@ -1,37 +1,19 @@
-//! Typed Task variants — Phases 3 and 4 of the Plan/Task System Redesign.
+//! Typed Task variants — `ActionQueue.current` is canonical "what task is
+//! running right now" for every agent.
 //!
-//! Today the agent's "current action" is encoded as `PersonAI.task_id: u16`
-//! plus a smear of loose target fields (`dest_tile`, `target_z`,
-//! `target_entity`, `withdraw_good`, ...). Every executor reads its parameters
-//! out of those fields, and every plan-end path has to remember to clear
-//! them. The redesign moves task parameters onto a single typed `Task`
-//! variant so executors get their inputs from one well-known place and
-//! teardowns are mechanical (replace the variant with `Idle`).
-//!
-//! Phase 3 introduced the `Task` enum and migrated each task family one at a
-//! time. Phase 4a promoted the typed task off `PersonAI` and onto a dedicated
-//! `ActionQueue` component. Phase 4b-i added the `queued` ring (capacity 4) so
-//! a future dispatcher can pre-decompose multi-step plans into a sequence of
-//! typed tasks and executors can pop the next one without re-entering plan
-//! selection. Phase 4b-ii wires the ring into the live runtime:
-//!
-//! - **Producer.** Plan dispatchers (`plan_execution_system`, the player-order
-//!   handlers in `ui/orders.rs`, the Read player-order handler in `teaching.rs`)
-//!   route through `ActionQueue::dispatch(task)` instead of writing `current`
-//!   directly. `dispatch` enqueues the task and immediately promotes it into
-//!   `current` if `current` is `Idle` — so single-task dispatches are
-//!   behaviourally identical to the old direct write, while multi-task chains
-//!   from a future method library accumulate behind `current` correctly.
-//! - **Consumer.** Executors that today wrote `aq.current = Task::Idle` on
-//!   completion now call `aq.advance()`, which pops the head of the queue
-//!   (or sets `current = Idle` when empty). With no producer pushing chains
-//!   yet, this is a no-op behaviourally; once Phase 5 method bodies push
-//!   multi-task expansions, executor exit transitions are already wired to
-//!   promote the next task without re-entering plan selection.
-//! - **External preempts.** Sites that abort an in-flight plan (player muster,
-//!   chief hunter demote, goal-flip stale reset in `goal_dispatch_system`) call
-//!   `aq.cancel()` instead of `current = Idle`, dropping both `current` and
-//!   the prefetched queue so a chained follow-up doesn't outlive its plan.
+//! - **Producer.** HTN dispatchers, player-order handlers in `ui/orders.rs`
+//!   and `player_command::dispatch_one`, the Read player-order handler in
+//!   `teaching.rs`, and the legacy-only producers (`building_upgrade_system`,
+//!   `terraform_dispatch_system`, `military_task_system` reroute) all route
+//!   through `ActionQueue::dispatch(task)`. `dispatch` enqueues the task and
+//!   immediately promotes it into `current` if `current` is `Idle`.
+//! - **Consumer.** Executors call `aq.finish_task(&mut ai)` on success
+//!   (Idle + work_progress=0 + advance) and `aq.cancel_chain(&mut ai)` on
+//!   chain abort (same fields + cancel). Both leave the typed channel as
+//!   the sole signal of intent.
+//! - **External preempts.** Player commands, hunter demote, stale reset, and
+//!   goal-flip preempts call `aq.cancel()`, dropping both `current` and the
+//!   queue so a chained follow-up doesn't outlive its plan.
 //!
 //! Per-tick "pin" sites that re-assert the current task while an activity
 //! component is alive (lecture/teach pin in `teaching.rs`) deliberately stay
@@ -39,10 +21,11 @@
 //! state, not fresh dispatches, and routing them through `dispatch()` would
 //! pile duplicates onto the queue every tick.
 //!
-//! The legacy `task_id` / `dest_tile` / `target_z` / `target_entity` fields
-//! still co-exist on `PersonAI` because not every consumer has migrated to
-//! the typed channel yet. They get retired family-by-family as Phase 4
-//! progresses.
+//! `PersonAI.task_id` is gone (Phase 4 step 3). Sites that previously read
+//! the legacy `u16` discriminant now read `aq.current_task_kind()`, which
+//! derives the same `TaskKind` projection from the typed channel via
+//! `task_kind_for(...)`. `UNEMPLOYED_TASK_KIND` is the sentinel returned for
+//! `Task::Idle`.
 
 use bevy::prelude::Component;
 
@@ -464,6 +447,26 @@ pub enum Task {
     /// Salt-water tiles never produce this variant — the dispatcher rejects
     /// them.
     Drink { source: DrinkSource },
+    /// Build a Bed blueprint (kept distinct from `Construct` only for the
+    /// reward-scaling / labor-tracking branch in `construction_system`).
+    /// The executor reads the blueprint from this variant; the legacy
+    /// `target_entity` is still populated by `assign_task_with_routing`'s
+    /// caller for routing fall-back.
+    ConstructBed { blueprint: bevy::prelude::Entity },
+    /// Worker walks adjacent to a placed structure tile and dismantles it,
+    /// then chains into `DepositResource` to carry refunds to storage.
+    /// The destination tile lives on this variant; legacy `dest_tile` is
+    /// kept for routing during `assign_task_with_routing`.
+    Deconstruct { tile: (i32, i32) },
+    /// Worker level-shifts the given footprint tile toward
+    /// `TerraformSite.target_z` — one Z step per `TERRAFORM_WORK_TICKS`.
+    /// Mirrors the shape of `Dig` / `Gather` — the variant only owns the
+    /// destination tile; the `TerraformSite` entity is looked up out of
+    /// `TerraformMap` by the executor.
+    Terraform { tile: (i32, i32) },
+    /// Drafted unit chases the named foe to attack adjacent. The dispatcher
+    /// also writes `target_entity` for `combat_system` engagement.
+    MilitaryAttack { foe: bevy::prelude::Entity },
 }
 
 /// Source for a `Task::Drink`. Inventory drinks consume one `clean_water`
@@ -480,6 +483,16 @@ impl Default for Task {
         Task::Idle
     }
 }
+
+/// Legacy sentinel returned by `task_kind_for(Task::Idle)` and historically by
+/// `PersonAI.task_id` when the agent was not running any task. The typed
+/// `ActionQueue::current` channel is now the source of truth for "what is the
+/// agent doing right now"; this constant exists only because
+/// `task_kind_for(...)` still projects the typed task back to the legacy
+/// `TaskKind` discriminant for the handful of consumers
+/// (`task_kind_label` / `task_requires_free_hands` / `task_is_labor` / etc.)
+/// that read it via `ActionQueue::current_task_kind()`.
+pub const UNEMPLOYED_TASK_KIND: u16 = u16::MAX;
 
 /// Cap on the prefetched-task queue. Four slots is enough to hold the typed
 /// task chains that today are spread across consecutive plan steps (e.g.
@@ -505,10 +518,8 @@ pub const ACTION_QUEUE_CAP: usize = 4;
 ///   reaching into `PersonAI`.
 ///
 /// Every `Person` entity carries one `ActionQueue`, defaulting to
-/// `ActionQueue::idle()`. When the legacy `task_id` is `PersonAI::UNEMPLOYED`
-/// the typed `current` is always `Task::Idle`; the inverse is *not*
-/// guaranteed during dispatch transitions, so executors still validate the
-/// pair via the inconsistent-state guard pattern.
+/// `ActionQueue::idle()`. The legacy `PersonAI.task_id` mirror is gone — the
+/// typed channel is the sole source of truth.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActionQueue {
     pub current: Task,
@@ -529,6 +540,20 @@ impl ActionQueue {
             queued: [Task::Idle; ACTION_QUEUE_CAP],
             queued_len: 0,
         }
+    }
+
+    /// Derived `TaskKind` discriminant of the running task. Returns
+    /// `UNEMPLOYED_TASK_KIND` (`u16::MAX`) when idle. Replaces the legacy
+    /// `PersonAI.task_id` field — the typed queue is the only source of truth.
+    pub fn current_task_kind(&self) -> u16 {
+        task_kind_for(self.current)
+    }
+
+    /// `true` when the queue is idle and nothing is prefetched. Used at every
+    /// HTN dispatcher's preflight gate; replaces the legacy
+    /// `ai.task_id == UNEMPLOYED_TASK_KIND && aq.current == Task::Idle` pair.
+    pub fn is_idle(&self) -> bool {
+        self.current == Task::Idle
     }
 
     /// Number of prefetched tasks waiting behind `current`.
@@ -599,6 +624,23 @@ impl ActionQueue {
     /// `debug_assert!` — every production caller is expected to size its
     /// chains within `ACTION_QUEUE_CAP`.
     pub fn dispatch(&mut self, task: Task) -> DispatchOutcome {
+        // Desync guard: the dispatcher believed the agent was idle (queue
+        // empty), but `current` is still holding a task of the same kind.
+        // This is the canonical "stale typed-channel" pattern — e.g. an
+        // executor exit forgot to advance/cancel, or an external mutation
+        // wrote `PersonAI.state = Idle` without touching `aq`. We don't
+        // panic on the legit chain-prefetch case where the queue carries a
+        // tail of the same kind (`WalkTo → Withdraw → WalkTo → Deposit`),
+        // because that path always has `queued_len > 0` at the moment of
+        // the second dispatch.
+        debug_assert!(
+            !(self.queued_len == 0
+                && self.current != Task::Idle
+                && task_kind_for(self.current) == task_kind_for(task)),
+            "ActionQueue::dispatch desync — pushing {:?} while current is still {:?} and queue is empty",
+            task,
+            self.current,
+        );
         if !self.enqueue(task) {
             debug_assert!(
                 false,
@@ -648,22 +690,9 @@ impl ActionQueue {
     }
 
     /// Canonical executor-success exit: reset `PersonAI.state` to `Idle`,
-    /// clear the legacy `task_id`, zero `work_progress`, and `advance()`
-    /// to the next prefetched task. Use this in place of the four-line pattern
-    ///
-    /// ```text
-    /// ai.state = AiState::Idle;
-    /// ai.task_id = PersonAI::UNEMPLOYED;
-    /// ai.work_progress = 0;
-    /// aq.advance();
-    /// ```
-    ///
-    /// Bundling the writes guarantees the legacy and typed channels stay
-    /// coherent — every executor that forgot one of the four lines is the
-    /// historical source of the `task_id`/`aq.current` desync class.
+    /// zero `work_progress`, and `advance()` to the next prefetched task.
     pub fn finish_task(&mut self, ai: &mut PersonAI) {
         ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
         self.advance();
     }
@@ -673,7 +702,6 @@ impl ActionQueue {
     /// was invalidated, or defence-in-depth code recovered from a desync.
     pub fn cancel_chain(&mut self, ai: &mut PersonAI) {
         ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
         self.cancel();
     }
@@ -714,14 +742,16 @@ impl DispatchOutcome {
     }
 }
 
-/// Map a typed `Task` variant back to the legacy `TaskKind` `u16`. Used by
-/// the test-fixture invariant assertion to verify `PersonAI.task_id` agrees
-/// with `ActionQueue.current` after every simulated tick. Phase 4 will retire
-/// the legacy `task_id` channel entirely and this helper along with it.
+/// Map a typed `Task` variant back to the legacy `TaskKind` `u16`. Backs
+/// `ActionQueue::current_task_kind()`, which is how consumers read the
+/// current task family in terms of the (still-extant) `TaskKind` enum used
+/// by `task_requires_free_hands` / `task_is_labor` / `task_interacts_from_adjacent`
+/// / `task_kind_label` and the handful of executor-gate checks that still
+/// compare against `TaskKind::X as u16`.
 pub fn task_kind_for(task: Task) -> u16 {
     use TaskKind as TK;
     let kind = match task {
-        Task::Idle => return PersonAI::UNEMPLOYED,
+        Task::Idle => return UNEMPLOYED_TASK_KIND,
         Task::WalkTo { why, .. } => match why {
             WalkReason::MilitaryMove => TK::MilitaryMove,
             WalkReason::Gather => TK::Gather,
@@ -769,29 +799,12 @@ pub fn task_kind_for(task: Task) -> u16 {
         Task::PitchStructureAt { .. } => TK::PitchStructureAt,
         Task::Heal { .. } => TK::Heal,
         Task::Drink { .. } => TK::Drink,
+        Task::ConstructBed { .. } => TK::ConstructBed,
+        Task::Deconstruct { .. } => TK::Deconstruct,
+        Task::Terraform { .. } => TK::Terraform,
+        Task::MilitaryAttack { .. } => TK::MilitaryAttack,
     };
     kind as u16
-}
-
-/// `true` if the legacy `task_id` and the typed `current` agree on which
-/// task family the agent is running. `UNEMPLOYED` ↔ `Task::Idle` is the only
-/// shape-changing pair we tolerate; every other `task_id` value must
-/// `task_kind_for(current)` to itself.
-///
-/// Wired into the behavioural test fixture (`TestSim::tick`) so every
-/// existing test doubles as an invariant test. Not registered as a runtime
-/// system in the main app — defence-in-depth in each executor recovers from
-/// desync at zero cost; Phase 4 deletes `task_id` entirely and this helper
-/// with it.
-pub fn task_id_matches_current(task_id: u16, current: Task) -> bool {
-    // `task_id == UNEMPLOYED` (the canonical "no task") and `task_id == 0`
-    // (TaskKind::Idle, the default integer that lingers at some spawn sites)
-    // are both semantically "agent has no active task" — both must pair
-    // with `Task::Idle`.
-    if task_id == PersonAI::UNEMPLOYED || task_id == TaskKind::Idle as u16 {
-        return matches!(current, Task::Idle);
-    }
-    task_kind_for(current) == task_id
 }
 
 impl Task {
@@ -1126,6 +1139,38 @@ impl Task {
             _ => None,
         }
     }
+
+    /// Convenience accessor for the ConstructBed variant.
+    pub fn as_construct_bed(&self) -> Option<bevy::prelude::Entity> {
+        match *self {
+            Task::ConstructBed { blueprint } => Some(blueprint),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the Deconstruct variant.
+    pub fn as_deconstruct(&self) -> Option<(i32, i32)> {
+        match *self {
+            Task::Deconstruct { tile } => Some(tile),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the Terraform variant.
+    pub fn as_terraform(&self) -> Option<(i32, i32)> {
+        match *self {
+            Task::Terraform { tile } => Some(tile),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the MilitaryAttack variant.
+    pub fn as_military_attack(&self) -> Option<bevy::prelude::Entity> {
+        match *self {
+            Task::MilitaryAttack { foe } => Some(foe),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1134,6 +1179,15 @@ mod tests {
 
     fn dig(x: i32) -> Task {
         Task::Dig { tile: (x, 0) }
+    }
+
+    /// A non-`Dig` task used to seed `current` in tests that exercise
+    /// `dispatch_while_busy` paths. The dispatch-desync `debug_assert!`
+    /// fires when `current` and the incoming task share a `TaskKind` and the
+    /// queue is empty — so synthetic "current is busy" setups must seed with
+    /// a different kind, mirroring how real chains interleave variants.
+    fn sleep_task() -> Task {
+        Task::Sleep { bed: None }
     }
 
     #[test]
@@ -1205,10 +1259,10 @@ mod tests {
     #[test]
     fn dispatch_while_busy_queues_behind_current() {
         let mut aq = ActionQueue::idle();
-        aq.current = dig(1);
+        aq.current = sleep_task();
         assert_eq!(aq.dispatch(dig(2)), DispatchOutcome::Queued);
         assert_eq!(aq.dispatch(dig(3)), DispatchOutcome::Queued);
-        assert_eq!(aq.current, dig(1));
+        assert_eq!(aq.current, sleep_task());
         assert_eq!(aq.queued_len(), 2);
         assert_eq!(aq.peek_next(), Some(dig(2)));
     }
@@ -1234,7 +1288,7 @@ mod tests {
     #[should_panic(expected = "ActionQueue::dispatch rejected")]
     fn dispatch_at_capacity_panics_in_debug() {
         let mut aq = ActionQueue::idle();
-        aq.current = dig(0);
+        aq.current = sleep_task();
         for i in 0..ACTION_QUEUE_CAP {
             assert_eq!(aq.dispatch(dig(i as i32 + 1)), DispatchOutcome::Queued);
         }
@@ -1246,7 +1300,7 @@ mod tests {
     #[cfg(not(debug_assertions))]
     fn dispatch_at_capacity_returns_rejected_in_release() {
         let mut aq = ActionQueue::idle();
-        aq.current = dig(0);
+        aq.current = sleep_task();
         for i in 0..ACTION_QUEUE_CAP {
             assert_eq!(aq.dispatch(dig(i as i32 + 1)), DispatchOutcome::Queued);
         }

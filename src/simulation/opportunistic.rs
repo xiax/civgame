@@ -279,7 +279,6 @@ pub fn opportunistic_interrupt_system(
         // Flip
         *goal = pick.goal;
         ai.state = crate::simulation::person::AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
         ai.target_entity = None;
         aq.cancel();
         if let Some(mut r) = reason_opt {

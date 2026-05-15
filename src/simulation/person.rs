@@ -195,9 +195,12 @@ pub fn generate_person_name(sex: BiologicalSex) -> &'static str {
 }
 
 /// Core person AI component.
+///
+/// "What task is running" lives on the typed `ActionQueue` component —
+/// `aq.current` is canonical and `aq.current_task_kind()` projects it back
+/// to the legacy `TaskKind` discriminant for consumers that still read it.
 #[derive(Component, Clone, Copy)]
 pub struct PersonAI {
-    pub task_id: u16,
     pub state: AiState,
     /// Progress ticks toward the next production event.
     pub work_progress: u8,
@@ -243,14 +246,17 @@ pub struct PersonAI {
     pub last_retarget_tick: u64,
 }
 
-impl PersonAI {
-    pub const UNEMPLOYED: u16 = u16::MAX;
-}
+/// Re-export of the typed-task sentinel for "no current task".
+///
+/// Pre-Phase-4-step-3 this lived on `PersonAI::UNEMPLOYED`; the field-side
+/// const went away when the legacy `task_id` mirror was deleted. Callers that
+/// compare `ActionQueue::current_task_kind()` against the legacy `TaskKind`
+/// space use this constant; new sites should prefer `aq.is_idle()`.
+pub use crate::simulation::typed_task::UNEMPLOYED_TASK_KIND;
 
 impl Default for PersonAI {
     fn default() -> Self {
         Self {
-            task_id: 0,
             state: AiState::default(),
             work_progress: 0,
             target_tile: (0, 0),
@@ -570,7 +576,6 @@ pub fn spawn_population(
                         SkillsLastSeen::default(),
                         Stats::roll_3d6(),
                         PersonAI {
-                            task_id: PersonAI::UNEMPLOYED,
                             state: AiState::Idle,
                             target_tile: (tx as i32, ty as i32),
                             dest_tile: (tx as i32, ty as i32),

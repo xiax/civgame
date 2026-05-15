@@ -35,7 +35,7 @@ use crate::simulation::items::GroundItem;
 use crate::simulation::jobs::{release_claimant, ClaimTarget, JobBoard, JobClaim};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::pack_deploy::Deployable;
-use crate::simulation::person::{AiState, Drafted, Person, PersonAI};
+use crate::simulation::person::{AiState, Drafted, Person, PersonAI, UNEMPLOYED_TASK_KIND};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::typed_task::{ActionQueue, Task};
@@ -138,7 +138,6 @@ pub fn stamp_pack_duty(world: &mut World, fids: &[u32]) {
 
             aq.cancel();
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.target_tile = tile;
             ai.dest_tile = tile;
@@ -326,7 +325,13 @@ pub fn dispatch_unpitch_tasks(world: &mut World, packs: &[(u32, (i32, i32), i32)
     let workers_by_faction: ahash::AHashMap<u32, Vec<Worker>> = {
         let mut state: SystemState<(
             Query<
-                (Entity, &FactionMember, &Transform, &PersonAI),
+                (
+                    Entity,
+                    &FactionMember,
+                    &Transform,
+                    &PersonAI,
+                    &crate::simulation::typed_task::ActionQueue,
+                ),
                 (With<Person>, With<PackingDuty>, Without<Drafted>),
             >,
             Res<FactionRegistry>,
@@ -334,14 +339,14 @@ pub fn dispatch_unpitch_tasks(world: &mut World, packs: &[(u32, (i32, i32), i32)
         let (q, registry) = state.get(world);
         let csz = CHUNK_SIZE as i32;
         let mut acc: ahash::AHashMap<u32, Vec<Worker>> = ahash::AHashMap::default();
-        for (entity, member, transform, ai) in q.iter() {
+        for (entity, member, transform, ai, aq) in q.iter() {
             let root = registry.root_faction(member.faction_id);
             if !packs.iter().any(|(fid, _, _)| *fid == root) {
                 continue;
             }
             // Only re-dispatch to workers who are currently UNEMPLOYED.
             // Members already on an UnpitchStructure task stay on it.
-            if ai.task_id != PersonAI::UNEMPLOYED {
+            if aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
                 continue;
             }
             let tile = transform_tile(transform);
@@ -460,12 +465,11 @@ pub fn unpitch_structure_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || ai.task_id != TaskKind::UnpitchStructure as u16 {
+        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::UnpitchStructure as u16 {
             continue;
         }
         let Some(structure) = aq.current.as_unpitch_structure() else {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             aq.advance();
             continue;
@@ -473,7 +477,6 @@ pub fn unpitch_structure_task_system(
         // Structure gone (raced or already despawned): clean exit.
         let Ok((transform, deploy, is_bed, is_campfire)) = structure_q.get(structure) else {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             aq.advance();
             continue;
@@ -530,7 +533,6 @@ pub fn unpitch_structure_task_system(
         });
 
         ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
         aq.advance();
     }
@@ -557,12 +559,11 @@ pub fn unload_camp_cargo_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || ai.task_id != TaskKind::UnloadCampCargo as u16 {
+        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::UnloadCampCargo as u16 {
             continue;
         }
         let Some((rid, qty, tile)) = aq.current.as_unload_camp_cargo() else {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             aq.advance();
             continue;
@@ -572,7 +573,6 @@ pub fn unload_camp_cargo_task_system(
             spawn_ground_drop(&mut commands, tile.0, tile.1, rid, removed);
         }
         ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
         aq.advance();
     }
@@ -595,12 +595,11 @@ pub fn pitch_structure_at_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || ai.task_id != TaskKind::PitchStructureAt as u16 {
+        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::PitchStructureAt as u16 {
             continue;
         }
         let Some((kind, anchor)) = aq.current.as_pitch_structure_at() else {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             aq.advance();
             continue;
@@ -691,7 +690,6 @@ pub fn pitch_structure_at_task_system(
 
 fn finish_pitch_worker(ai: &mut PersonAI, aq: &mut ActionQueue) {
     ai.state = AiState::Idle;
-    ai.task_id = PersonAI::UNEMPLOYED;
     ai.work_progress = 0;
     aq.advance();
 }

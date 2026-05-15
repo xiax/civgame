@@ -394,7 +394,7 @@ pub fn faction_craft_order_system(
     // Timeout sweep: despawn orders older than `CRAFT_ORDER_TIMEOUT_TICKS`
     // (stuck on materials / station / no worker) and prune map entries whose
     // entity has already gone away. Workers attached to a despawned order will
-    // self-clear next tick — `craft_order_system` resets `ai.task_id` when
+    // self-clear next tick — `craft_order_system` resets `aq.current_task_kind()` when
     // `order_query.get()` fails, and `plan_execution_system`'s safety net at
     // the top releases any lingering storage reservation.
     {
@@ -634,7 +634,7 @@ pub fn craft_order_system(
         if ai.state != AiState::Working {
             continue;
         }
-        let task = ai.task_id;
+        let task = aq.current_task_kind();
         let is_hauler = task == TaskKind::HaulToCraftOrder as u16;
         let is_worker = task == TaskKind::WorkOnCraftOrder as u16;
         if !is_hauler && !is_worker {
@@ -642,7 +642,6 @@ pub fn craft_order_system(
         }
         let Some(order_entity) = ai.target_entity else {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             // Phase 5e-xi-a: drain typed channel for HTN-driven HaulToCraftOrder
             // chains. Legacy plan-driven flow leaves `aq.current = Idle`, so
@@ -652,7 +651,6 @@ pub fn craft_order_system(
         };
         let Ok(order) = order_query.get(order_entity) else {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             ai.target_entity = None;
             aq.advance();
@@ -676,9 +674,9 @@ pub fn craft_order_system(
                 }
             }
             if !useful {
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
-                ai.work_progress = 0;
+                // Hauler has nothing the order still needs — drop the chain.
+                // Mirrors the paired `aq.advance()` at lines 649/656 above.
+                aq.cancel_chain(&mut ai);
                 ai.target_entity = None;
                 continue;
             }
@@ -906,7 +904,6 @@ pub fn craft_order_system(
 
         if is_completed || is_hauler_done || is_orphaned {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.work_progress = 0;
             // Phase 5e-xi-a: drain the typed channel so HTN-driven

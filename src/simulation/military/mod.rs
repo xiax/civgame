@@ -75,7 +75,7 @@ pub fn military_task_system(
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
 
-        if ai.task_id == move_id {
+        if aq.current_task_kind() == move_id {
             // Phase 3a: dest/z come from the typed `Task::WalkTo` variant.
             // The legacy `dest_tile`/`target_z` fields are still written by
             // `assign_task_with_routing` because `movement_system` reads them,
@@ -88,7 +88,6 @@ pub fn military_task_system(
                 // Inconsistent state: task_id says MilitaryMove but the typed
                 // task variant disagrees. Drop back to idle so the agent
                 // doesn't loop.
-                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.state = AiState::Idle;
                 ai.target_entity = None;
                 continue;
@@ -105,19 +104,17 @@ pub fn military_task_system(
             // do, so we go straight back to Idle.
             if ai.state == AiState::Working && (cur_tx, cur_ty) == (dest.0, dest.1) {
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
                 aq.advance();
             }
             continue;
         }
 
-        if ai.task_id == attack_id {
+        if aq.current_task_kind() == attack_id {
             // Foe gone or dead → idle in place, stay drafted.
             let foe = match ai.target_entity {
                 Some(e) => e,
                 None => {
-                    ai.task_id = PersonAI::UNEMPLOYED;
                     ai.state = AiState::Idle;
                     combat.0 = None;
                     continue;
@@ -126,7 +123,6 @@ pub fn military_task_system(
             let foe_alive = health_q.get(foe).map(|h| !h.is_dead()).unwrap_or(false);
             let foe_transform = transform_q.get(foe).ok();
             if !foe_alive || foe_transform.is_none() {
-                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.state = AiState::Idle;
                 ai.target_entity = None;
                 combat.0 = None;
@@ -155,7 +151,7 @@ pub fn military_task_system(
                         cur_tx.div_euclid(CHUNK_SIZE as i32),
                         cur_ty.div_euclid(CHUNK_SIZE as i32),
                     );
-                    assign_task_with_routing(
+                    let routed = assign_task_with_routing(
                         &mut ai,
                         (cur_tx as i32, cur_ty as i32),
                         cur_chunk,
@@ -167,6 +163,12 @@ pub fn military_task_system(
                         &chunk_map,
                         &chunk_connectivity,
                     );
+                    if routed {
+                        // Keep typed channel in sync with the rerouted attack
+                        // so executors / coherence checks see consistent state.
+                        aq.cancel();
+                        aq.dispatch(crate::simulation::typed_task::Task::MilitaryAttack { foe });
+                    }
                 }
                 combat.0 = None;
             }

@@ -68,19 +68,19 @@ UI emits `PlayerCommandEvent` (event bus). Sim drains in `SimulationSet::Input` 
 
 `aq.current: Task` is canonical "task running now"; `Task::Idle` default. Behind it sits a fixed `queued: [Task; 4]` prefetch ring (private; access via `enqueue` / `pop_next` / `peek_next` / `queued_len` / `clear_queued`).
 
-- **Producers** (HTN dispatchers, `ui/orders.rs`, `teaching.rs::ReadItem`) route through `aq.dispatch(task)` — enqueues then promotes head into `current` if `current == Idle`. Returns `DispatchOutcome::{Promoted, Queued, Rejected}`. `Rejected` (queue full) fires `debug_assert!` inside `dispatch`; silent burial is no longer possible. Most callers ignore the outcome since `Queued` is legitimate for chain prefetch.
-- **Consumers** (executor exit paths in `gather.rs`, `dig.rs`, `corpse.rs`, `construction.rs`, `items.rs`, `production.rs`, `teaching.rs`, plus `MilitaryMove` arrival) call `aq.advance()` instead of writing `current = Idle`. Canonical exit helpers: `aq.finish_task(&mut ai)` (success — Idle + UNEMPLOYED + work_progress=0 + advance) and `aq.cancel_chain(&mut ai)` (chain abort — same fields + cancel).
-- **External preempts** (`dispatch_player_command_system`, hunter demote, stale reset, `movement::release_to_idle` on path failure / stranded-Z recovery) call `aq.cancel()`, dropping both `current` and queue. **`goal_update_system` overrides (Lead/Defend/Raid/Rescue/Scout/Migrate chief / commanded forced-flip / earnincome override) must also call `aq.cancel()` when they clear `task_id`** — historically these only cleared the legacy channel, leaving the typed channel carrying a stale task that the next dispatcher's `aq.dispatch` would silently park behind.
+- **Producers** (HTN dispatchers, `ui/orders.rs`, `teaching.rs::ReadItem`, legacy-only producers `building_upgrade_system` / `terraform_dispatch_system` / `military_task_system` reroute) route through `aq.dispatch(task)` — enqueues then promotes head into `current` if `current == Idle`. Returns `DispatchOutcome::{Promoted, Queued, Rejected}`. `Rejected` (queue full) fires `debug_assert!` inside `dispatch`; silent burial is no longer possible. Most callers ignore the outcome since `Queued` is legitimate for chain prefetch.
+- **Consumers** (executor exit paths in `gather.rs`, `dig.rs`, `corpse.rs`, `construction.rs`, `items.rs`, `production.rs`, `teaching.rs`, plus `MilitaryMove` arrival) call `aq.advance()` instead of writing `current = Idle`. Canonical exit helpers: `aq.finish_task(&mut ai)` (success — `state = Idle` + `work_progress = 0` + advance) and `aq.cancel_chain(&mut ai)` (chain abort — same fields + cancel).
+- **External preempts** (`dispatch_player_command_system`, hunter demote, stale reset, `movement::release_to_idle` on path failure / stranded-Z recovery, `combat::combat_retaliation_cleanup_system` draining `CombatRetaliationStartedEvent`) call `aq.cancel()` / `aq.cancel_chain(&mut ai)`, dropping both `current` and queue. The retaliation cleanup runs in `Sequential` right after `combat_system` because `combat_system`'s `attacker_query` holds `Option<&mut ActionQueue>` mutably across iteration, so the victim's `ActionQueue` is only reachable post-iteration via the event-deferred system. `goal_update_system` overrides (Lead/Defend/Raid/Rescue/Scout/Migrate chief / commanded forced-flip / earnincome override) must also call `aq.cancel()` — otherwise the typed channel carries a stale task that the next dispatcher's `aq.dispatch` would silently park behind. **Debug-time enforcement:** `aq.dispatch` fires a `debug_assert!` when the incoming task shares a `TaskKind` with `current` *and* the queue is empty — the canonical stale-typed-channel pattern. Legit chain prefetch interleaves variants and always has `queued_len > 0` at that point, so the assert doesn't fire on it.
 - Per-tick "pin" sites (lecture/teach pin writes) stay as direct `aq.current = X` writes — idempotent re-assertions.
 
-**Variants:** `Idle`, `WalkTo { tile, z, why }`, `WithdrawGood { filter }`, `WithdrawMaterial { resource_id, qty }`, `WithdrawFood { tile }`, `Equip { slot, resource_id }`, `Construct { blueprint }`, `Gather`, `Dig`, `Scavenge`, `Read/Teach/HoldLecture/AttendLecture`, `PickUpCorpse`, `HuntPartyMuster`, `Hunt`, `HaulCorpse`, `Butcher`, `TameAnimal`, `Sleep`, `Eat`, `HaulToBlueprint`, `HaulToCraftOrder`, `WorkOnCraftOrder`, `DepositToFactionStorage`, `WalkAndTakeFromMember`, `PlayThrow`, `PlayPlant`, `Explore`, `Migrate`, `UnpitchStructure`, `UnloadCampCargo`, `PitchStructureAt`, plus `Lead`/`Defend`/`Raid`/`RescueAlly`/`Socialize`/`Play`.
+**Variants:** `Idle`, `WalkTo { tile, z, why }`, `WithdrawGood { filter }`, `WithdrawMaterial { resource_id, qty }`, `WithdrawFood { tile }`, `Equip { slot, resource_id }`, `Construct { blueprint }`, `ConstructBed { blueprint }`, `Deconstruct { tile }`, `Terraform { tile }`, `MilitaryAttack { foe }`, `Gather`, `Dig`, `Scavenge`, `Read/Teach/HoldLecture/AttendLecture`, `PickUpCorpse`, `HuntPartyMuster`, `Hunt`, `HaulCorpse`, `Butcher`, `TameAnimal`, `Sleep`, `Eat`, `HaulToBlueprint`, `HaulToCraftOrder`, `WorkOnCraftOrder`, `DepositToFactionStorage`, `WalkAndTakeFromMember`, `PlayThrow`, `PlayPlant`, `Explore`, `Migrate`, `UnpitchStructure`, `UnloadCampCargo`, `PitchStructureAt`, plus `Lead`/`Defend`/`Raid`/`RescueAlly`/`Socialize`/`Play`.
 
 **Rules:**
 
-- Systems mutating typed task **must** include `&mut ActionQueue` alongside `&mut PersonAI`. The `test_fixture::TestSim::tick` asserts `task_id ↔ aq.current` coherence after every tick via `typed_task::task_id_matches_current`; existing tests catch regressions automatically. Tests that deliberately drive desynced state opt out via `sim.skip_coherence_check()`.
-- Every executor exit must `aq.advance()` (success) or `aq.cancel()` (chain-drop). Prefer the bundled helpers `aq.finish_task(&mut ai)` / `aq.cancel_chain(&mut ai)` over the four-line pattern — they keep the legacy and typed channels coherent in one call.
-- External teardowns clear both `aq` and the legacy `task_id`.
-- `military_task_system`, `withdraw_good_task_system`, `withdraw_material_task_system`, `drink_task_system` fall back to `Idle` if `task_id == X` but `aq.current` is the wrong variant — defence in depth.
+- Systems mutating typed task **must** include `&mut ActionQueue` alongside `&mut PersonAI`.
+- Every executor exit must `aq.advance()` (success) or `aq.cancel()` (chain-drop). Prefer the bundled helpers `aq.finish_task(&mut ai)` / `aq.cancel_chain(&mut ai)`.
+- `military_task_system`, `withdraw_good_task_system`, `withdraw_material_task_system`, `drink_task_system` fall back to `Idle` if `aq.current_task_kind() == X` but `aq.current` is the wrong variant — defence in depth.
+- **Reading the task discriminant.** All consumers read `aq.current_task_kind()` (derives `u16` from `aq.current` via `task_kind_for`). The legacy `PersonAI.task_id` mirror is gone; `UNEMPLOYED_TASK_KIND` (`u16::MAX`) is the "no task" sentinel returned for `Task::Idle`.
 
 ## HTN domain (`htn.rs`)
 
@@ -117,7 +117,7 @@ UI emits `PlayerCommandEvent` (event bus). Sim drains in `SimulationSet::Input` 
 
 ### Dispatch + chain handoffs
 
-All dispatchers run `ParallelB` after `goal_dispatch_system`. Each gates on goal + Idle + non-Dormant + `task_id == UNEMPLOYED`, builds `PlannerCtx`, runs argmax, routes the head via `assign_task_with_routing`, prefetches the tail. SOLO/unsettled skip storage-dependent methods. Spear-arming runs *before* food dispatchers so unarmed hunters fetch a spear first.
+All dispatchers run `ParallelB` after `goal_dispatch_system`. Each gates on goal + Idle + non-Dormant + `aq.is_idle()`, builds `PlannerCtx`, runs argmax, routes the head via `assign_task_with_routing` + `aq.dispatch(...)`, prefetches the tail. SOLO/unsettled skip storage-dependent methods. Spear-arming runs *before* food dispatchers so unarmed hunters fetch a spear first.
 
 Trailing legs of multi-task chains live in exit helpers on the head executor:
 
@@ -129,7 +129,7 @@ Trailing legs of multi-task chains live in exit helpers on the head executor:
 
 ### Stale-reset (`goal_dispatch_system`)
 
-Runs before HTN dispatchers. Stale `task_id != UNEMPLOYED` clears to `(Idle, UNEMPLOYED)` (with `aq.cancel()`) unless a preserve-arm for the (goal, task_id) pair applies. Catch-all resets `Explore` arrivals.
+Runs before HTN dispatchers. Stale `aq.current_task_kind() != UNEMPLOYED_TASK_KIND` clears with `aq.cancel()` unless a preserve-arm for the (goal, task-kind) pair applies. Catch-all resets `Explore` arrivals.
 
 ### Adding a method
 

@@ -3,7 +3,7 @@ use super::faction::{FactionChief, FactionMember, FactionRegistry, StorageTileMa
 use super::jobs::JobClaim;
 use super::lod::LodLevel;
 use super::needs::Needs;
-use super::person::{AiState, Drafted, PersonAI};
+use super::person::{AiState, Drafted, PersonAI, UNEMPLOYED_TASK_KIND};
 use super::schedule::{BucketSlot, SimClock};
 use crate::economy::agent::EconomicAgent;
 use crate::pathfinding::chunk_graph::ChunkGraph;
@@ -572,9 +572,9 @@ pub fn goal_update_system(
         // (`FollowingPlayerCommand`); without this short-circuit
         // hunger / sleep / mobile-gate would flip the goal and the
         // dispatcher would clear the chain.
-        if ai.task_id == crate::simulation::tasks::TaskKind::UnpitchStructure as u16
-            || ai.task_id == crate::simulation::tasks::TaskKind::UnloadCampCargo as u16
-            || ai.task_id == crate::simulation::tasks::TaskKind::PitchStructureAt as u16
+        if aq.current_task_kind() == crate::simulation::tasks::TaskKind::UnpitchStructure as u16
+            || aq.current_task_kind() == crate::simulation::tasks::TaskKind::UnloadCampCargo as u16
+            || aq.current_task_kind() == crate::simulation::tasks::TaskKind::PitchStructureAt as u16
         {
             continue;
         }
@@ -602,7 +602,7 @@ pub fn goal_update_system(
         }
         // Unemployed agents need immediate goal re-evaluation (e.g. just finished a deposit).
         // Bucket-gate only agents that are actively working a task.
-        if ai.task_id != PersonAI::UNEMPLOYED && !clock.is_active(slot.0) {
+        if aq.current_task_kind() != UNEMPLOYED_TASK_KIND && !clock.is_active(slot.0) {
             continue;
         }
 
@@ -624,7 +624,7 @@ pub fn goal_update_system(
         // after the re-evaluation completes (or earlier on bypass).
         let force_now = force_reeval.0.contains(&entity);
         if !force_now
-            && ai.task_id != PersonAI::UNEMPLOYED
+            && aq.current_task_kind() != UNEMPLOYED_TASK_KIND
             && clock.tick.saturating_sub(ai.last_goal_eval_tick) < 200
         {
             continue;
@@ -636,7 +636,6 @@ pub fn goal_update_system(
             // without it the typed channel keeps a stale task and a
             // subsequent `aq.dispatch` silently parks behind it. See the
             // 6 override branches below.
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             target_item.0 = None;
             aq.cancel();
@@ -654,7 +653,7 @@ pub fn goal_update_system(
         // `MethodHistory` for failure-biased rescoring. Re-checking
         // here just races those paths and thrashes movement.
         if matches!(ai.state, AiState::Routing | AiState::Seeking) {
-            let tid = ai.task_id;
+            let tid = aq.current_task_kind();
             let mut invalid = false;
 
             if tid == TaskKind::Gather as u16 {
@@ -682,7 +681,6 @@ pub fn goal_update_system(
 
             if invalid {
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
                 target_item.0 = None;
                 aq.cancel();
@@ -698,7 +696,6 @@ pub fn goal_update_system(
                 if *goal != AgentGoal::Rescue {
                     *goal = AgentGoal::Rescue;
                     ai.state = AiState::Idle;
-                    ai.task_id = PersonAI::UNEMPLOYED;
                     aq.cancel();
                 }
                 if let Some(mut r) = reason_opt {
@@ -724,7 +721,6 @@ pub fn goal_update_system(
             if *goal != AgentGoal::Scout {
                 *goal = AgentGoal::Scout;
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 aq.cancel();
             }
             if let Some(mut r) = reason_opt {
@@ -744,7 +740,6 @@ pub fn goal_update_system(
             if *goal != AgentGoal::MigrateToCamp {
                 *goal = AgentGoal::MigrateToCamp;
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 aq.cancel();
             }
             if let Some(mut r) = reason_opt {
@@ -768,7 +763,6 @@ pub fn goal_update_system(
                 if *goal != AgentGoal::Defend {
                     *goal = AgentGoal::Defend;
                     ai.state = AiState::Idle;
-                    ai.task_id = PersonAI::UNEMPLOYED;
                     aq.cancel();
                 }
                 if let Some(mut r) = reason_opt {
@@ -784,7 +778,6 @@ pub fn goal_update_system(
                 if *goal != AgentGoal::Raid {
                     *goal = AgentGoal::Raid;
                     ai.state = AiState::Idle;
-                    ai.task_id = PersonAI::UNEMPLOYED;
                     aq.cancel();
                 }
                 if let Some(mut r) = reason_opt {
@@ -809,7 +802,6 @@ pub fn goal_update_system(
             if *goal != AgentGoal::Lead {
                 *goal = AgentGoal::Lead;
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 aq.cancel();
             }
             if let Some(mut r) = reason_opt {
@@ -1110,7 +1102,6 @@ pub fn goal_update_system(
         if *goal != new_goal {
             *goal = new_goal;
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             target_item.0 = None;
             aq.cancel();
@@ -1349,7 +1340,6 @@ pub fn earnincome_goal_override_system(
         if *goal != best.goal {
             *goal = best.goal;
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             target_item.0 = None;
             aq.cancel();
@@ -1467,7 +1457,6 @@ pub fn mobile_state_goal_gate_system(
                 commands.entity(e).insert(GoalReason("Awaiting Orders"));
             }
             aq.cancel();
-            ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
             ai.state = crate::simulation::person::AiState::Idle;
             if claim.is_some() {
                 commands
@@ -1498,7 +1487,6 @@ pub fn mobile_state_goal_gate_system(
             AgentGoal::GatherFood
         };
         aq.cancel();
-        ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
         ai.state = crate::simulation::person::AiState::Idle;
         if claim.is_some() {
             commands

@@ -22,7 +22,7 @@ use crate::simulation::corpse::Carrying;
 use crate::simulation::faction::{FactionMember, SOLO};
 use crate::simulation::items::TargetItem;
 use crate::simulation::military::{MilitaryFormationSlot, PendingFormationSlots};
-use crate::simulation::person::{AiState, Drafted, PersonAI};
+use crate::simulation::person::{AiState, Drafted, PersonAI, UNEMPLOYED_TASK_KIND};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::TechId;
 use crate::simulation::typed_task::{ActionQueue, Task, WalkReason};
@@ -315,11 +315,12 @@ pub fn player_command_lifecycle_system(
         Entity,
         &mut Commanded,
         &PersonAI,
+        &crate::simulation::typed_task::ActionQueue,
         &Transform,
         Option<&FactionMember>,
     )>,
 ) {
-    for (entity, mut cmd, ai, transform, member) in q.iter_mut() {
+    for (entity, mut cmd, ai, aq, transform, member) in q.iter_mut() {
         if cmd.status != CommandStatus::Active {
             continue;
         }
@@ -338,7 +339,7 @@ pub fn player_command_lifecycle_system(
                 }
             }
             PlayerCommand::Gather { tile, .. } => {
-                completion_when_gather_target_gone(tile, ai, &plant_query, &chunk_map)
+                completion_when_gather_target_gone(tile, ai, aq, &plant_query, &chunk_map)
             }
             PlayerCommand::Mine { tile, .. } => {
                 // Walls turn into floor / loose rock when mined. The mine
@@ -348,21 +349,21 @@ pub fn player_command_lifecycle_system(
                 if !matches!(kind, Some(TileKind::Wall) | Some(TileKind::Stone)) {
                     Some(CommandStatus::Completed)
                 } else {
-                    completion_when_agent_idle(ai)
+                    completion_when_agent_idle(ai, aq)
                 }
             }
             PlayerCommand::DigDown { tile, .. } => {
                 // DigDown creates a Dirt floor (cave carved out). When the
                 // dig finishes, the executor sets the agent Idle+UNEMPLOYED.
                 let _ = tile;
-                completion_when_agent_idle(ai)
+                completion_when_agent_idle(ai, aq)
             }
             PlayerCommand::Deconstruct { tile, .. } => {
                 // Deconstruction completes when the structure at the tile is
                 // gone (StructureIndex entry would be removed). Fall back to
                 // idle check.
                 let _ = tile;
-                completion_when_agent_idle(ai)
+                completion_when_agent_idle(ai, aq)
             }
             PlayerCommand::Build { tile, .. } => {
                 // Build completes when the blueprint at this tile is gone
@@ -407,7 +408,7 @@ pub fn player_command_lifecycle_system(
                 // teaching/encoding systems that strip the legacy
                 // `PlayerOrder` marker. We mirror by completing when the
                 // agent is idle and unemployed (the legacy completion rule).
-                completion_when_agent_idle(ai)
+                completion_when_agent_idle(ai, aq)
             }
             PlayerCommand::Muster | PlayerCommand::Disband => {
                 // Muster / Disband are stamp-and-done: after the dispatcher
@@ -477,8 +478,11 @@ pub fn player_command_lifecycle_system(
     }
 }
 
-fn completion_when_agent_idle(ai: &PersonAI) -> Option<CommandStatus> {
-    if ai.state == crate::simulation::person::AiState::Idle && ai.task_id == PersonAI::UNEMPLOYED {
+fn completion_when_agent_idle(
+    ai: &PersonAI,
+    aq: &crate::simulation::typed_task::ActionQueue,
+) -> Option<CommandStatus> {
+    if ai.state == crate::simulation::person::AiState::Idle && aq.current_task_kind() == UNEMPLOYED_TASK_KIND {
         Some(CommandStatus::Completed)
     } else {
         None
@@ -488,6 +492,7 @@ fn completion_when_agent_idle(ai: &PersonAI) -> Option<CommandStatus> {
 fn completion_when_gather_target_gone(
     tile: (i32, i32),
     ai: &PersonAI,
+    aq: &crate::simulation::typed_task::ActionQueue,
     plant_query: &Query<&crate::simulation::plants::Plant>,
     chunk_map: &crate::world::chunk::ChunkMap,
 ) -> Option<CommandStatus> {
@@ -504,7 +509,7 @@ fn completion_when_gather_target_gone(
         // Mining-like gather: completed when no longer Wall/Stone.
         return None;
     }
-    completion_when_agent_idle(ai)
+    completion_when_agent_idle(ai, aq)
 }
 
 fn chebyshev(a: (i32, i32), b: (i32, i32)) -> i32 {
@@ -712,6 +717,7 @@ fn dispatch_one(
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
+            aq.dispatch(Task::Deconstruct { tile });
             DispatchOutcome::Active
         }
         PickUpItem { item, tile, .. } => {
@@ -850,7 +856,11 @@ fn dispatch_one(
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
             if let Some(bp) = bp_entity {
-                aq.dispatch(Task::Construct { blueprint: bp });
+                if matches!(kind, BuildSiteKind::Bed) {
+                    aq.dispatch(Task::ConstructBed { blueprint: bp });
+                } else {
+                    aq.dispatch(Task::Construct { blueprint: bp });
+                }
             }
             DispatchOutcome::Active
         }
@@ -875,7 +885,7 @@ fn dispatch_one(
             }
             // Adjacency markers (`TeachingPair` / `BeingTaught`) are inserted
             // by `apply_teach_order_system` once the teacher arrives — keyed
-            // off `ai.task_id == TaskKind::Teach`, which `assign_task_with_routing`
+            // off `aq.current_task_kind() == TaskKind::Teach`, which `assign_task_with_routing`
             // just set. No legacy marker required.
             DispatchOutcome::Active
         }
@@ -883,7 +893,6 @@ fn dispatch_one(
             // Pin the agent in place and stamp the Read task. `read_task_system`
             // accumulates study progress against the matching tablet/book in
             // the agent's inventory.
-            ai.task_id = TaskKind::Read as u16;
             ai.state = AiState::Working;
             ai.work_progress = 0;
             aq.dispatch(Task::Read { tech });
@@ -911,18 +920,23 @@ fn dispatch_one(
             // (player faction + Hunter profession for the HUD button; current
             // selection for the R-key toggle). Sim resets task state and
             // attaches `Drafted`. Carrying / reservations cleared so the
-            // unit goes military-clean.
+            // unit goes military-clean. `aq.cancel()` drops any in-flight
+            // task chain (Forage, Build, etc.) — without it the queue holds
+            // a stale task that resumes when `Disband` later removes the
+            // `Drafted` marker.
+            aq.cancel();
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.work_progress = 0;
             commands.entity(actor).remove::<Carrying>().insert(Drafted);
             DispatchOutcome::Active
         }
         Disband => {
-            // Inverse of Muster. Removes `Drafted` and idles tasks.
+            // Inverse of Muster. Removes `Drafted` and idles tasks. Also
+            // drops the typed queue so a stale military-side task can't bleed
+            // back into autonomous execution.
+            aq.cancel();
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             commands.entity(actor).remove::<Drafted>();
             if let Ok(mut ct) = combat_target_q.get_mut(actor) {
@@ -1000,6 +1014,7 @@ fn dispatch_one(
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
+            aq.dispatch(Task::MilitaryAttack { foe });
             if let Ok(mut ct) = combat_target_q.get_mut(actor) {
                 ct.0 = None;
             }

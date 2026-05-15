@@ -132,7 +132,7 @@ pub fn production_system(
 
         let tx = ai.dest_tile.0 as i32;
         let ty = ai.dest_tile.1 as i32;
-        let task = ai.task_id;
+        let task = aq.current_task_kind();
 
         // Planter and PlayPlant share the plant-on-grass pipeline. The only
         // difference is that PlayPlant frames the activity as recreation,
@@ -227,7 +227,6 @@ pub fn production_system(
                     }
                 }
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 // Phase 5e-v: drain the typed channel so an HTN
                 // PlantFromStorage chain (or PlayPlant — both use this branch)
                 // doesn't leave a stale `Task::Planter` / `Task::Idle`
@@ -238,7 +237,6 @@ pub fn production_system(
                 // Check if tile is still valid for planting
                 if plant_map.0.contains_key(&(tx, ty)) {
                     ai.state = AiState::Idle;
-                    ai.task_id = PersonAI::UNEMPLOYED;
                     aq.advance();
                 }
             }
@@ -263,7 +261,6 @@ pub fn production_system(
                     needs.willpower = (needs.willpower + WILLPOWER_PLAY_BURST).clamp(0.0, 255.0);
                 }
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 aq.advance();
             }
         }
@@ -281,9 +278,11 @@ pub fn production_system(
                 || x == TaskKind::PlayThrow as u16
         ) && agent.is_inventory_full()
         {
-            ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
-            ai.work_progress = 0;
+            // Inventory full — abort the chain. Without `aq.cancel_chain` the
+            // typed task stays in `current` and the next dispatcher tick
+            // re-enqueues a duplicate (Planter chain has a queued tail under
+            // PlantFromStorage), risking ACTION_QUEUE_CAP overflow.
+            aq.cancel_chain(&mut ai);
         }
     }
 }
@@ -313,7 +312,7 @@ pub fn withdraw_good_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || ai.task_id != TaskKind::WithdrawGood as u16 {
+        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::WithdrawGood as u16 {
             continue;
         }
 
@@ -322,14 +321,12 @@ pub fn withdraw_good_task_system(
         // bail rather than read stale `craft_recipe_id`.
         let Some(filter) = aq.current.as_withdraw_good() else {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             aq.advance();
             continue;
         };
 
         if member.faction_id == SOLO {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             aq.advance();
             continue;
         }
@@ -338,7 +335,6 @@ pub fn withdraw_good_task_system(
 
         if storage_tile_map.tiles.get(&(tx, ty)) != Some(&member.faction_id) {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             aq.advance();
             continue;
         }
@@ -374,7 +370,6 @@ pub fn withdraw_good_task_system(
         }
 
         ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
         aq.advance();
     }
@@ -439,7 +434,7 @@ pub fn withdraw_material_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || ai.task_id != TaskKind::WithdrawMaterial as u16 {
+        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::WithdrawMaterial as u16 {
             continue;
         }
 
@@ -661,7 +656,6 @@ fn finish_withdraw_material(
                 crate::simulation::htn::record_target_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
                 return;
             };
@@ -682,7 +676,6 @@ fn finish_withdraw_material(
                 crate::simulation::htn::record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
             }
         }
@@ -696,7 +689,6 @@ fn finish_withdraw_material(
                 crate::simulation::htn::record_target_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
                 return;
             };
@@ -717,7 +709,6 @@ fn finish_withdraw_material(
                 crate::simulation::htn::record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
             }
         }
@@ -729,7 +720,6 @@ fn finish_withdraw_material(
             // up next tick. Mirrors `finish_withdraw_food`'s priming pattern
             // for the AcquireFood Eat tail.
             ai.state = AiState::Working;
-            ai.task_id = TaskKind::Equip as u16;
             ai.work_progress = 0;
         }
         Task::Planter { tile } => {
@@ -756,7 +746,6 @@ fn finish_withdraw_material(
                 crate::simulation::htn::record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
             }
         }
@@ -769,7 +758,6 @@ fn finish_withdraw_material(
             // branch picks up next tick. Mirrors `Equip`'s priming pattern
             // for the hunter-arm chain.
             ai.state = AiState::Working;
-            ai.task_id = TaskKind::PlayThrow as u16;
             ai.work_progress = 0;
         }
         Task::Play { partner: _ } => {
@@ -781,7 +769,6 @@ fn finish_withdraw_material(
             // from `Carrier`. Prime the legacy channel so the play_system
             // executor picks up next tick.
             ai.state = AiState::Working;
-            ai.task_id = TaskKind::Play as u16;
             ai.work_progress = 0;
             // target_entity should already be None (the WithdrawMaterial head
             // dispatch passed None to `assign_task_with_routing`) — the solo
@@ -815,13 +802,11 @@ fn finish_withdraw_material(
                 crate::simulation::htn::record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
             }
         }
         Task::Idle => {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
         }
         _ => {
             // No other task family is expected as a chained follow-up to
@@ -830,7 +815,6 @@ fn finish_withdraw_material(
             crate::simulation::htn::record_target_failure(method_history, ai, now);
             aq.cancel();
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
         }
     }
 }
@@ -884,7 +868,7 @@ pub fn take_from_member_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || ai.task_id != TaskKind::TakeFromMember as u16 {
+        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::TakeFromMember as u16 {
             continue;
         }
         let Task::WalkAndTakeFromMember {
@@ -947,7 +931,6 @@ pub fn take_from_member_task_system(
         // promotes it.
         a_aq.advance();
         a_ai.state = AiState::Idle;
-        a_ai.task_id = PersonAI::UNEMPLOYED;
         a_ai.target_entity = None;
         a_ai.work_progress = 0;
     }
@@ -956,7 +939,6 @@ pub fn take_from_member_task_system(
         if let Ok((_, mut ai, mut aq, _, _, _, _, _)) = query.get_mut(actor) {
             aq.cancel();
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.work_progress = 0;
         }
@@ -993,7 +975,7 @@ pub fn withdraw_food_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || ai.task_id != TaskKind::WithdrawFood as u16 {
+        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::WithdrawFood as u16 {
             continue;
         }
         if member.faction_id == SOLO {
@@ -1080,11 +1062,9 @@ fn finish_withdraw_food(ai: &mut PersonAI, aq: &mut crate::simulation::typed_tas
         Task::Eat => {
             // Hand off straight into the Eat executor.
             ai.state = AiState::Working;
-            ai.task_id = TaskKind::Eat as u16;
         }
         Task::Idle => {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
         }
         _ => {
             // No other task family is expected as a chained follow-up to
@@ -1092,7 +1072,6 @@ fn finish_withdraw_food(ai: &mut PersonAI, aq: &mut crate::simulation::typed_tas
             // mis-built expansion can't strand the agent.
             aq.cancel();
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
         }
     }
 }
@@ -1140,14 +1119,13 @@ pub fn eat_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.task_id != TaskKind::Eat as u16 {
+        if aq.current_task_kind() != TaskKind::Eat as u16 {
             continue;
         }
 
         // No food on hand or in inventory — nothing to eat. Abort cleanly.
         if total_edible(&agent, &carrier) == 0 {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             // Phase 6b-ii: drain the typed channel so
             // `htn_method_completion_system` can record `MethodOutcome::Success`
@@ -1320,7 +1298,6 @@ pub fn eat_task_system(
         }
 
         ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
         ai.work_progress = 0;
         // Phase 6b-ii: drain the typed channel on natural completion so
         // `htn_method_completion_system` (Economy, after deposit) sees
@@ -1357,7 +1334,7 @@ pub fn tame_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || ai.task_id != TaskKind::TameAnimal as u16 {
+        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::TameAnimal as u16 {
             continue;
         }
 
@@ -1366,7 +1343,6 @@ pub fn tame_task_system(
         // (still the only producer pre-migration) keeps working.
         let Some(target) = aq.current.as_tame_animal().or(ai.target_entity) else {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             aq.advance();
             continue;
@@ -1384,7 +1360,6 @@ pub fn tame_task_system(
         let Some(tech_id) = required_tech else {
             // Target is gone, dead, already tamed, or not a tameable species
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             ai.target_entity = None;
             aq.advance();
@@ -1398,7 +1373,6 @@ pub fn tame_task_system(
             .unwrap_or(false);
         if !has_tech {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             ai.target_entity = None;
             aq.advance();
@@ -1410,7 +1384,6 @@ pub fn tame_task_system(
                 owner_faction: member.faction_id,
             });
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             ai.target_entity = None;
             aq.advance();

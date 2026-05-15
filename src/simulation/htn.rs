@@ -50,7 +50,7 @@ use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::MemoryKind;
 use crate::simulation::needs::{Needs, EAT_TRIGGER_HUNGER};
-use crate::simulation::person::{AiState, Drafted, PersonAI, Profession};
+use crate::simulation::person::{AiState, Drafted, PersonAI, Profession, UNEMPLOYED_TASK_KIND};
 use crate::simulation::plants::{
     nearest_mature_plant_under_agent, GrowthStage, Plant, PlantKind, PlantMap,
 };
@@ -3436,7 +3436,7 @@ pub fn htn_dispatch_system(
             // set across the Working→Sleeping transition; it gets cleared
             // when the goal flips off Sleep via the `aq.cancel()` stale-reset
             // path in `goal_dispatch_system`.
-            if ai.state == AiState::Working && ai.task_id == TaskKind::Sleep as u16 {
+            if ai.state == AiState::Working && aq.current_task_kind() == TaskKind::Sleep as u16 {
                 ai.state = AiState::Sleeping;
                 return;
             }
@@ -3446,7 +3446,7 @@ pub fn htn_dispatch_system(
                 ai.state,
                 AiState::Working | AiState::Seeking | AiState::Routing
             );
-            if is_active && ai.task_id == TaskKind::Sleep as u16 {
+            if is_active && aq.current_task_kind() == TaskKind::Sleep as u16 {
                 return;
             }
 
@@ -3559,7 +3559,7 @@ pub fn htn_dispatch_system(
                     bed: Some(bed_entity),
                 } => {
                     if let Some(bed_tile) = home_bed_tile {
-                        assign_task_with_routing(
+                        let routed = assign_task_with_routing(
                             &mut ai,
                             (cur_tx, cur_ty),
                             cur_chunk,
@@ -3571,9 +3571,21 @@ pub fn htn_dispatch_system(
                             &chunk_map,
                             &chunk_connectivity,
                         );
-                        aq.dispatch(Task::Sleep {
-                            bed: Some(bed_entity),
-                        });
+                        if routed {
+                            aq.dispatch(Task::Sleep {
+                                bed: Some(bed_entity),
+                            });
+                        } else {
+                            // Bed unreachable (walled in, sealed by blueprints,
+                            // wrong connectivity component). Falling back to
+                            // in-place sleep keeps the agent's AiState in sync
+                            // with the dispatched task — without this, the
+                            // routing failure leaves AiState::Idle and the
+                            // next tick re-dispatches Task::Sleep, piling up
+                            // in the prefetch ring until it overflows.
+                            ai.state = AiState::Sleeping;
+                            aq.dispatch(Task::Sleep { bed: None });
+                        }
                     } else {
                         // Defensive: the method already filters bed by
                         // home_bed_tile.is_some(), so this branch shouldn't
@@ -3581,7 +3593,6 @@ pub fn htn_dispatch_system(
                         // skips the filter), drop to in-place to avoid a
                         // null-route panic.
                         ai.state = AiState::Sleeping;
-                        ai.task_id = TaskKind::Sleep as u16;
                         aq.dispatch(Task::Sleep { bed: None });
                     }
                 }
@@ -3592,7 +3603,7 @@ pub fn htn_dispatch_system(
                         let dx = cur_tx - home.0;
                         let dy = cur_ty - home.1;
                         if dx * dx + dy * dy > 5 * 5 {
-                            assign_task_with_routing(
+                            let routed = assign_task_with_routing(
                                 &mut ai,
                                 (cur_tx, cur_ty),
                                 cur_chunk,
@@ -3604,14 +3615,21 @@ pub fn htn_dispatch_system(
                                 &chunk_map,
                                 &chunk_connectivity,
                             );
-                            aq.dispatch(Task::Sleep { bed: None });
+                            if routed {
+                                aq.dispatch(Task::Sleep { bed: None });
+                            } else {
+                                // Home unreachable from here. Sleep in place
+                                // so AiState matches the dispatched task and
+                                // the next tick doesn't re-dispatch Sleep.
+                                ai.state = AiState::Sleeping;
+                                aq.dispatch(Task::Sleep { bed: None });
+                            }
                             return;
                         }
                     }
                     // Solo, no home, or already at home with no bed: sleep
                     // here.
                     ai.state = AiState::Sleeping;
-                    ai.task_id = TaskKind::Sleep as u16;
                     aq.dispatch(Task::Sleep { bed: None });
                 }
                 _ => {
@@ -3692,7 +3710,7 @@ pub fn htn_eat_dispatch_system(
             // `plan_execution_system`. We only fire when the agent has no
             // plan and an idle task slot — the same gate
             // `plan_execution_system` uses to start a fresh plan.
-            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
                 return;
             }
 
@@ -3792,7 +3810,6 @@ pub fn htn_eat_dispatch_system(
                     // discriminates the executor branch. The typed dispatch
                     // mirrors the legacy state.
                     ai.state = AiState::Working;
-                    ai.task_id = TaskKind::Eat as u16;
                     ai.work_progress = 0;
                     aq.dispatch(Task::Eat);
                 }
@@ -3912,7 +3929,7 @@ pub fn htn_acquire_food_dispatch_system(
 
             // Same gating as `htn_eat_dispatch_system`: don't preempt an
             // in-flight plan, only fire on a clean (Idle, UNEMPLOYED) slot.
-            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
                 return;
             }
 
@@ -4475,7 +4492,7 @@ pub fn htn_acquire_good_dispatch_system(
         if *lod == LodLevel::Dormant {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         if member.faction_id == SOLO {
@@ -5160,7 +5177,7 @@ pub fn htn_stockpile_food_dispatch_system(
             if !matches!(*goal, AgentGoal::GatherFood) {
                 return;
             }
-            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
                 return;
             }
             if member.faction_id == SOLO {
@@ -5642,7 +5659,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
         // any goal (Lead / Defend / Socialize / Survive / etc.). All that
         // matters is they're an unarmed Hunter with stock available.
         // Profession + tech + idle + weapon-absence gates suffice.
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         if member.faction_id == SOLO {
@@ -5888,7 +5905,7 @@ pub fn htn_scout_dispatch_system(
             if !matches!(*goal, AgentGoal::Survive | AgentGoal::GatherFood) {
                 return;
             }
-            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
                 return;
             }
             if *profession != Profession::Hunter {
@@ -6080,7 +6097,7 @@ pub fn htn_return_surplus_dispatch_system(
             if !matches!(*goal, AgentGoal::ReturnCamp) {
                 return;
             }
-            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
                 return;
             }
             if member.faction_id == SOLO {
@@ -6284,7 +6301,7 @@ pub fn htn_tame_horse_dispatch_system(
         if !matches!(*goal, AgentGoal::TameHorse) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         // Faction-tech gate. The executor double-checks per-target on each
@@ -6672,7 +6689,7 @@ pub fn htn_plant_from_storage_dispatch_system(
         if !matches!(*goal, AgentGoal::Farm) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         if member.faction_id == SOLO {
@@ -6996,7 +7013,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
         if !matches!(*goal, AgentGoal::Build) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
 
@@ -7421,7 +7438,7 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
         if *lod == LodLevel::Dormant {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
 
@@ -7639,7 +7656,7 @@ pub fn htn_engage_prey_dispatch_system(
             // Delivery phase belongs to `htn_deliver_hunt_kill_dispatch_system`.
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         // Per-person tech gate: matches the legacy plan's tech_gate +
@@ -7980,7 +7997,7 @@ pub fn htn_join_hunt_party_dispatch_system(
         if carrying_opt.is_some() {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         let Ok(knowledge) = knowledge_query.get(agent) else {
@@ -8210,7 +8227,7 @@ pub fn htn_socialize_dispatch_system(
         if !matches!(*goal, AgentGoal::Socialize) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
 
@@ -8393,7 +8410,7 @@ pub fn htn_combat_faction_dispatch_system(
         if *lod == LodLevel::Dormant {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
 
@@ -8626,7 +8643,7 @@ pub fn bureaucrat_admin_dispatch_system(
         if *prof != crate::simulation::person::Profession::Bureaucrat {
             continue;
         }
-        if ai.task_id != PersonAI::UNEMPLOYED {
+        if aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         if ai.state != AiState::Idle {
@@ -8817,7 +8834,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
         if !matches!(*goal, AgentGoal::Craft) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         if member.faction_id == SOLO {
@@ -9190,7 +9207,7 @@ pub fn htn_work_on_craft_order_dispatch_system(
         if !matches!(*goal, AgentGoal::Craft) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         if member.faction_id == SOLO {
@@ -9447,7 +9464,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
         if !matches!(*goal, AgentGoal::Craft) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         if member.faction_id == SOLO {
@@ -9788,7 +9805,7 @@ pub fn htn_harvest_plant_dispatch_system(
         if !matches!(*goal, AgentGoal::Farm) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         if member.faction_id == SOLO {
@@ -10333,7 +10350,7 @@ pub fn htn_play_dispatch_system(
         if !matches!(*goal, AgentGoal::Play) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
 
@@ -10797,7 +10814,7 @@ pub fn htn_clear_obstacle_dispatch_system(
         if !matches!(*goal, AgentGoal::Build) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
 

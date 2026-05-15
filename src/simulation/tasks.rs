@@ -5,7 +5,7 @@ use super::items::GroundItem;
 use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::needs::Needs;
-use super::person::{AiState, Drafted, PersonAI};
+use super::person::{AiState, Drafted, PersonAI, UNEMPLOYED_TASK_KIND};
 use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
 
 use crate::pathfinding::chunk_graph::ChunkGraph;
@@ -119,7 +119,7 @@ pub enum TaskKind {
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
-/// for unknown ids (notably `PersonAI::UNEMPLOYED == u16::MAX`).
+/// for unknown ids (notably `UNEMPLOYED_TASK_KIND == u16::MAX`).
 pub fn task_kind_label(task_id: u16) -> &'static str {
     match task_id {
         x if x == TaskKind::Idle as u16 => "Idle",
@@ -668,7 +668,9 @@ pub fn assign_task_with_routing(
         target
     };
 
-    ai.task_id = task as u16;
+    // Note: `task` only drives the adjacency / routing decisions above. The
+    // canonical "what task is running" channel is the typed `ActionQueue`,
+    // dispatched by the caller via `aq.dispatch(...)` after this returns.
     ai.dest_tile = target;
     ai.target_entity = target_entity;
 
@@ -737,17 +739,17 @@ pub fn goal_dispatch_system(
                 return;
             }
 
-            if ai.task_id != PersonAI::UNEMPLOYED {
+            if aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
                 // Sleep dispatches via `htn_dispatch_system`, not a plan, so its
                 // task is expected to outlive the plan reset. Everything else
                 // is plan-driven — when an agent has no `ActivePlan`, any
                 // lingering task is stale and gets cleared.
                 let expected_task = match *goal {
                     AgentGoal::Sleep => Some(TaskKind::Sleep as u16),
-                    AgentGoal::Survive if ai.task_id == TaskKind::Eat as u16 => {
+                    AgentGoal::Survive if aq.current_task_kind() == TaskKind::Eat as u16 => {
                         Some(TaskKind::Eat as u16)
                     }
-                    AgentGoal::Survive if ai.task_id == TaskKind::WithdrawFood as u16 => {
+                    AgentGoal::Survive if aq.current_task_kind() == TaskKind::WithdrawFood as u16 => {
                         Some(TaskKind::WithdrawFood as u16)
                     }
                     // Phase 5c-ii-d-iii-ii: AcquireFood scavenge chain runs
@@ -755,17 +757,17 @@ pub fn goal_dispatch_system(
                     // and trailing Eat both need to survive across
                     // goal-dispatch ticks until completion or external
                     // preempt.
-                    AgentGoal::Survive if ai.task_id == TaskKind::Scavenge as u16 => {
+                    AgentGoal::Survive if aq.current_task_kind() == TaskKind::Scavenge as u16 => {
                         Some(TaskKind::Scavenge as u16)
                     }
                     // Phase 5c-ii-b: AcquireGood haul chain runs without an
                     // ActivePlan. Both legs (storage withdraw + haul to
                     // blueprint) need to survive across goal-dispatch ticks
                     // until either completion or external preempt.
-                    AgentGoal::Haul if ai.task_id == TaskKind::WithdrawMaterial as u16 => {
+                    AgentGoal::Haul if aq.current_task_kind() == TaskKind::WithdrawMaterial as u16 => {
                         Some(TaskKind::WithdrawMaterial as u16)
                     }
-                    AgentGoal::Haul if ai.task_id == TaskKind::HaulMaterials as u16 => {
+                    AgentGoal::Haul if aq.current_task_kind() == TaskKind::HaulMaterials as u16 => {
                         Some(TaskKind::HaulMaterials as u16)
                     }
                     // Phase 5e-ii: hunter-arm chain (`htn_equip_hunting_spear_dispatch_system`)
@@ -779,12 +781,12 @@ pub fn goal_dispatch_system(
                     // in `finish_withdraw_material`). Weapon-specific so
                     // non-hunter WithdrawMaterial/Equip chains still
                     // respect their own goal preserve-arms below.
-                    _ if ai.task_id == TaskKind::WithdrawMaterial as u16
+                    _ if aq.current_task_kind() == TaskKind::WithdrawMaterial as u16
                         && ai.reserved_resource == Some(crate::economy::core_ids::weapon()) =>
                     {
                         Some(TaskKind::WithdrawMaterial as u16)
                     }
-                    _ if ai.task_id == TaskKind::Equip as u16
+                    _ if aq.current_task_kind() == TaskKind::Equip as u16
                         && aq.current.as_equip().map(|(_slot, rid)| rid)
                             == Some(crate::economy::core_ids::weapon()) =>
                     {
@@ -794,14 +796,14 @@ pub fn goal_dispatch_system(
                     // an ActivePlan under ReturnCamp. The DepositResource walk
                     // needs to survive across goal-dispatch ticks until
                     // `drop_items_at_destination_system` fires.
-                    AgentGoal::ReturnCamp if ai.task_id == TaskKind::DepositResource as u16 => {
+                    AgentGoal::ReturnCamp if aq.current_task_kind() == TaskKind::DepositResource as u16 => {
                         Some(TaskKind::DepositResource as u16)
                     }
                     // Phase 5e-iv: HTN-driven TameWildHorse chain runs without
                     // an ActivePlan under TameHorse. The TameAnimal walk +
                     // 100-tick adjacency work need to survive across
                     // goal-dispatch ticks until `tame_task_system` finalises.
-                    AgentGoal::TameHorse if ai.task_id == TaskKind::TameAnimal as u16 => {
+                    AgentGoal::TameHorse if aq.current_task_kind() == TaskKind::TameAnimal as u16 => {
                         Some(TaskKind::TameAnimal as u16)
                     }
                     // Phase 5e-v: HTN-driven PlantFromStorage chain runs without
@@ -811,10 +813,10 @@ pub fn goal_dispatch_system(
                     // `MF_UNINTERRUPTIBLE` and the dead legacy plans'
                     // `PF_NONE` (the legacy plans were never reachable
                     // anyway, so the new HTN path defines the contract).
-                    AgentGoal::Farm if ai.task_id == TaskKind::WithdrawMaterial as u16 => {
+                    AgentGoal::Farm if aq.current_task_kind() == TaskKind::WithdrawMaterial as u16 => {
                         Some(TaskKind::WithdrawMaterial as u16)
                     }
-                    AgentGoal::Farm if ai.task_id == TaskKind::Planter as u16 => {
+                    AgentGoal::Farm if aq.current_task_kind() == TaskKind::Planter as u16 => {
                         Some(TaskKind::Planter as u16)
                     }
                     // FarmFood (PlanId 1) → HTN migration: harvest chain
@@ -822,10 +824,10 @@ pub fn goal_dispatch_system(
                     // DepositToFactionStorage]`) runs without an ActivePlan
                     // under Farm. Both legs need to survive across goal-dispatch
                     // ticks until completion or external preempt.
-                    AgentGoal::Farm if ai.task_id == TaskKind::Gather as u16 => {
+                    AgentGoal::Farm if aq.current_task_kind() == TaskKind::Gather as u16 => {
                         Some(TaskKind::Gather as u16)
                     }
-                    AgentGoal::Farm if ai.task_id == TaskKind::DepositResource as u16 => {
+                    AgentGoal::Farm if aq.current_task_kind() == TaskKind::DepositResource as u16 => {
                         Some(TaskKind::DepositResource as u16)
                     }
                     // Phase 5e-vi: HTN-driven ConstructBlueprint chain runs without
@@ -833,17 +835,17 @@ pub fn goal_dispatch_system(
                     // labor must survive across goal-dispatch ticks until
                     // `construction_system`'s pass-3 cleanup fires `aq.advance()`
                     // — mirrors the legacy `ClaimedBuild` plan's `PF_UNINTERRUPTIBLE`.
-                    AgentGoal::Build if ai.task_id == TaskKind::Construct as u16 => {
+                    AgentGoal::Build if aq.current_task_kind() == TaskKind::Construct as u16 => {
                         Some(TaskKind::Construct as u16)
                     }
-                    AgentGoal::Build if ai.task_id == TaskKind::ConstructBed as u16 => {
+                    AgentGoal::Build if aq.current_task_kind() == TaskKind::ConstructBed as u16 => {
                         Some(TaskKind::ConstructBed as u16)
                     }
                     // ClearObstacle is a Build-prerequisite chain — preserve
                     // across goal-dispatch ticks the same way as Construct,
                     // so the worker stays committed until the obstacle is
                     // cleared (or the executor naturally advances).
-                    AgentGoal::Build if ai.task_id == TaskKind::ClearObstacle as u16 => {
+                    AgentGoal::Build if aq.current_task_kind() == TaskKind::ClearObstacle as u16 => {
                         Some(TaskKind::ClearObstacle as u16)
                     }
                     // Pack/pitch labor: workers dispatched to dismantle,
@@ -856,13 +858,13 @@ pub fn goal_dispatch_system(
                     // anything Build-shaped for Packed bands, so we
                     // pin the task here regardless of which goal the
                     // worker carries.
-                    _ if ai.task_id == TaskKind::UnpitchStructure as u16 => {
+                    _ if aq.current_task_kind() == TaskKind::UnpitchStructure as u16 => {
                         Some(TaskKind::UnpitchStructure as u16)
                     }
-                    _ if ai.task_id == TaskKind::UnloadCampCargo as u16 => {
+                    _ if aq.current_task_kind() == TaskKind::UnloadCampCargo as u16 => {
                         Some(TaskKind::UnloadCampCargo as u16)
                     }
-                    _ if ai.task_id == TaskKind::PitchStructureAt as u16 => {
+                    _ if aq.current_task_kind() == TaskKind::PitchStructureAt as u16 => {
                         Some(TaskKind::PitchStructureAt as u16)
                     }
                     // Phase 5e-xiii-a: HTN-driven personal-blueprint chain
@@ -872,10 +874,10 @@ pub fn goal_dispatch_system(
                     // until completion or external preempt — mirrors the
                     // method's `MF_UNINTERRUPTIBLE` and the legacy
                     // `HaulFromStorageAndBuild` plan's `PF_UNINTERRUPTIBLE`.
-                    AgentGoal::Build if ai.task_id == TaskKind::WithdrawMaterial as u16 => {
+                    AgentGoal::Build if aq.current_task_kind() == TaskKind::WithdrawMaterial as u16 => {
                         Some(TaskKind::WithdrawMaterial as u16)
                     }
-                    AgentGoal::Build if ai.task_id == TaskKind::HaulMaterials as u16 => {
+                    AgentGoal::Build if aq.current_task_kind() == TaskKind::HaulMaterials as u16 => {
                         Some(TaskKind::HaulMaterials as u16)
                     }
                     // Phase 5c-ii-c-ii: AcquireGood gather chain runs without
@@ -883,12 +885,12 @@ pub fn goal_dispatch_system(
                     // storage) need to survive across goal-dispatch ticks
                     // until either completion or external preempt.
                     AgentGoal::GatherWood | AgentGoal::GatherStone
-                        if ai.task_id == TaskKind::Gather as u16 =>
+                        if aq.current_task_kind() == TaskKind::Gather as u16 =>
                     {
                         Some(TaskKind::Gather as u16)
                     }
                     AgentGoal::GatherWood | AgentGoal::GatherStone
-                        if ai.task_id == TaskKind::DepositResource as u16 =>
+                        if aq.current_task_kind() == TaskKind::DepositResource as u16 =>
                     {
                         Some(TaskKind::DepositResource as u16)
                     }
@@ -896,7 +898,7 @@ pub fn goal_dispatch_system(
                     // without an ActivePlan. Same lifecycle as the gather
                     // chain — Scavenge head, DepositResource tail.
                     AgentGoal::GatherWood | AgentGoal::GatherStone
-                        if ai.task_id == TaskKind::Scavenge as u16 =>
+                        if aq.current_task_kind() == TaskKind::Scavenge as u16 =>
                     {
                         Some(TaskKind::Scavenge as u16)
                     }
@@ -904,16 +906,16 @@ pub fn goal_dispatch_system(
                     // items of any catalog resource the chief has posted
                     // (Skin etc.) and deposit at faction storage. Mirrors
                     // GatherWood/GatherStone preserve arms.
-                    AgentGoal::Stockpile if ai.task_id == TaskKind::Scavenge as u16 => {
+                    AgentGoal::Stockpile if aq.current_task_kind() == TaskKind::Scavenge as u16 => {
                         Some(TaskKind::Scavenge as u16)
                     }
-                    AgentGoal::Stockpile if ai.task_id == TaskKind::Gather as u16 => {
+                    AgentGoal::Stockpile if aq.current_task_kind() == TaskKind::Gather as u16 => {
                         Some(TaskKind::Gather as u16)
                     }
-                    AgentGoal::Stockpile if ai.task_id == TaskKind::DepositResource as u16 => {
+                    AgentGoal::Stockpile if aq.current_task_kind() == TaskKind::DepositResource as u16 => {
                         Some(TaskKind::DepositResource as u16)
                     }
-                    AgentGoal::Stockpile if ai.task_id == TaskKind::Explore as u16 => {
+                    AgentGoal::Stockpile if aq.current_task_kind() == TaskKind::Explore as u16 => {
                         Some(TaskKind::Explore as u16)
                     }
                     // Phase 5c-ii-d-iv-ii: HTN Explore fallback (`ExploreForFoodMethod`
@@ -921,11 +923,11 @@ pub fn goal_dispatch_system(
                     // The walk-to-random-tile leg shouldn't be reset every
                     // tick by the absence of a plan; the catch-all below
                     // handles arrival-then-Idle once `state == Working`.
-                    AgentGoal::Survive if ai.task_id == TaskKind::Explore as u16 => {
+                    AgentGoal::Survive if aq.current_task_kind() == TaskKind::Explore as u16 => {
                         Some(TaskKind::Explore as u16)
                     }
                     AgentGoal::GatherWood | AgentGoal::GatherStone
-                        if ai.task_id == TaskKind::Explore as u16 =>
+                        if aq.current_task_kind() == TaskKind::Explore as u16 =>
                     {
                         Some(TaskKind::Explore as u16)
                     }
@@ -934,13 +936,13 @@ pub fn goal_dispatch_system(
                     // DepositResource tail, Explore fallback — all need to
                     // survive across goal-dispatch ticks. Mirrors the
                     // GatherWood/GatherStone arms above.
-                    AgentGoal::GatherFood if ai.task_id == TaskKind::Scavenge as u16 => {
+                    AgentGoal::GatherFood if aq.current_task_kind() == TaskKind::Scavenge as u16 => {
                         Some(TaskKind::Scavenge as u16)
                     }
-                    AgentGoal::GatherFood if ai.task_id == TaskKind::DepositResource as u16 => {
+                    AgentGoal::GatherFood if aq.current_task_kind() == TaskKind::DepositResource as u16 => {
                         Some(TaskKind::DepositResource as u16)
                     }
-                    AgentGoal::GatherFood if ai.task_id == TaskKind::Explore as u16 => {
+                    AgentGoal::GatherFood if aq.current_task_kind() == TaskKind::Explore as u16 => {
                         Some(TaskKind::Explore as u16)
                     }
                     // Phase 5e-viii-a: HTN-driven DeliverHuntKill chain runs
@@ -950,10 +952,10 @@ pub fn goal_dispatch_system(
                     // of the agent's goal — `Carrying` is a per-agent
                     // obligation that takes precedence over need-driven goal
                     // flips. Mirrors the method's `MF_UNINTERRUPTIBLE` flag.
-                    _ if ai.task_id == TaskKind::HaulCorpse as u16 => {
+                    _ if aq.current_task_kind() == TaskKind::HaulCorpse as u16 => {
                         Some(TaskKind::HaulCorpse as u16)
                     }
-                    _ if ai.task_id == TaskKind::Butcher as u16 => Some(TaskKind::Butcher as u16),
+                    _ if aq.current_task_kind() == TaskKind::Butcher as u16 => Some(TaskKind::Butcher as u16),
                     // Phase 5e-viii-b: HTN-driven EngagePrey runs without an
                     // ActivePlan after the truncated `HuntFood` plan completes
                     // at Travel. Hunt walks to prey + engages combat;
@@ -962,8 +964,8 @@ pub fn goal_dispatch_system(
                     // `HuntOrder::Hunt` is the standing obligation that
                     // overrides need-driven goal flips. Mirrors the methods'
                     // `MF_UNINTERRUPTIBLE` flag.
-                    _ if ai.task_id == TaskKind::Hunter as u16 => Some(TaskKind::Hunter as u16),
-                    _ if ai.task_id == TaskKind::PickUpCorpse as u16 => {
+                    _ if aq.current_task_kind() == TaskKind::Hunter as u16 => Some(TaskKind::Hunter as u16),
+                    _ if aq.current_task_kind() == TaskKind::PickUpCorpse as u16 => {
                         Some(TaskKind::PickUpCorpse as u16)
                     }
                     // Phase 5e-viii-c: HTN-driven JoinHuntParty's Muster leg
@@ -973,7 +975,7 @@ pub fn goal_dispatch_system(
                     // catch-all below flips Idle on arrival). Goal-agnostic
                     // because the chief's HuntOrder::Hunt is a faction-level
                     // obligation that overrides need-driven goal flips.
-                    _ if ai.task_id == TaskKind::HuntPartyMuster as u16 => {
+                    _ if aq.current_task_kind() == TaskKind::HuntPartyMuster as u16 => {
                         Some(TaskKind::HuntPartyMuster as u16)
                     }
                     // Phase 5e-ix: HTN-driven Socialize runs without an
@@ -987,10 +989,10 @@ pub fn goal_dispatch_system(
                     // (WithdrawMaterial + HaulToCraftOrder) survive across
                     // goal-dispatch ticks until completion or external preempt
                     // — mirrors the legacy plan's `PF_UNINTERRUPTIBLE`.
-                    AgentGoal::Craft if ai.task_id == TaskKind::WithdrawMaterial as u16 => {
+                    AgentGoal::Craft if aq.current_task_kind() == TaskKind::WithdrawMaterial as u16 => {
                         Some(TaskKind::WithdrawMaterial as u16)
                     }
-                    AgentGoal::Craft if ai.task_id == TaskKind::HaulToCraftOrder as u16 => {
+                    AgentGoal::Craft if aq.current_task_kind() == TaskKind::HaulToCraftOrder as u16 => {
                         Some(TaskKind::HaulToCraftOrder as u16)
                     }
                     // Phase 5e-xi-b: HTN-driven WorkOnCraftOrder chain runs
@@ -1000,16 +1002,16 @@ pub fn goal_dispatch_system(
                     // Both must survive across goal-dispatch ticks until
                     // completion or external preempt — mirrors the legacy plan's
                     // `PF_UNINTERRUPTIBLE`.
-                    AgentGoal::Craft if ai.task_id == TaskKind::WorkOnCraftOrder as u16 => {
+                    AgentGoal::Craft if aq.current_task_kind() == TaskKind::WorkOnCraftOrder as u16 => {
                         Some(TaskKind::WorkOnCraftOrder as u16)
                     }
-                    AgentGoal::Craft if ai.task_id == TaskKind::DepositResource as u16 => {
+                    AgentGoal::Craft if aq.current_task_kind() == TaskKind::DepositResource as u16 => {
                         Some(TaskKind::DepositResource as u16)
                     }
                     // Phase 5e-xi-c: HTN-driven HarvestGrainForCraftOrder
                     // chain runs without an ActivePlan under Craft. Gather +
                     // HaulToCraftOrder must survive across goal-dispatch ticks.
-                    AgentGoal::Craft if ai.task_id == TaskKind::Gather as u16 => {
+                    AgentGoal::Craft if aq.current_task_kind() == TaskKind::Gather as u16 => {
                         Some(TaskKind::Gather as u16)
                     }
                     // Phase 5e-xii-a: HTN-driven Play (PlaySocial / PlaySolo)
@@ -1017,7 +1019,7 @@ pub fn goal_dispatch_system(
                     // Single Task::Play survives across goal-dispatch ticks
                     // until `play_system` finalises on duration / willpower
                     // or the goal flips off Play.
-                    AgentGoal::Play if ai.task_id == TaskKind::Play as u16 => {
+                    AgentGoal::Play if aq.current_task_kind() == TaskKind::Play as u16 => {
                         Some(TaskKind::Play as u16)
                     }
                     // Phase 5e-xii-b: HTN-driven `WithdrawAndThrowStonesAsPlayMethod`
@@ -1025,10 +1027,10 @@ pub fn goal_dispatch_system(
                     // (WithdrawMaterial + PlayThrow) survive across
                     // goal-dispatch ticks until completion or external
                     // preempt — mirrors the method's `MF_UNINTERRUPTIBLE`.
-                    AgentGoal::Play if ai.task_id == TaskKind::WithdrawMaterial as u16 => {
+                    AgentGoal::Play if aq.current_task_kind() == TaskKind::WithdrawMaterial as u16 => {
                         Some(TaskKind::WithdrawMaterial as u16)
                     }
-                    AgentGoal::Play if ai.task_id == TaskKind::PlayThrow as u16 => {
+                    AgentGoal::Play if aq.current_task_kind() == TaskKind::PlayThrow as u16 => {
                         Some(TaskKind::PlayThrow as u16)
                     }
                     // Phase 5e-xii-d: HTN-driven `WithdrawAndPlantGrainSeedAsPlayMethod`
@@ -1037,10 +1039,10 @@ pub fn goal_dispatch_system(
                     // leg walks to the destination grass tile and plants;
                     // survives across goal-dispatch ticks until completion or
                     // external preempt — mirrors the methods' `MF_UNINTERRUPTIBLE`.
-                    AgentGoal::Play if ai.task_id == TaskKind::PlayPlant as u16 => {
+                    AgentGoal::Play if aq.current_task_kind() == TaskKind::PlayPlant as u16 => {
                         Some(TaskKind::PlayPlant as u16)
                     }
-                    AgentGoal::Socialize if ai.task_id == TaskKind::Socialize as u16 => {
+                    AgentGoal::Socialize if aq.current_task_kind() == TaskKind::Socialize as u16 => {
                         Some(TaskKind::Socialize as u16)
                     }
                     // Phase 5e-x: HTN-driven combat/faction tasks run
@@ -1050,19 +1052,19 @@ pub fn goal_dispatch_system(
                     // agent off (faction stops being under raid /
                     // raid_target clears / RescueTarget timeout / chief
                     // hunger).
-                    AgentGoal::Raid if ai.task_id == TaskKind::Raid as u16 => {
+                    AgentGoal::Raid if aq.current_task_kind() == TaskKind::Raid as u16 => {
                         Some(TaskKind::Raid as u16)
                     }
-                    AgentGoal::Defend if ai.task_id == TaskKind::Defend as u16 => {
+                    AgentGoal::Defend if aq.current_task_kind() == TaskKind::Defend as u16 => {
                         Some(TaskKind::Defend as u16)
                     }
-                    AgentGoal::Lead if ai.task_id == TaskKind::Lead as u16 => {
+                    AgentGoal::Lead if aq.current_task_kind() == TaskKind::Lead as u16 => {
                         Some(TaskKind::Lead as u16)
                     }
                     // RescueAlly's HTN method dispatches with
                     // TaskKind::Defend (mirrors the legacy step's
                     // task field) so the same arm shape covers it.
-                    AgentGoal::Rescue if ai.task_id == TaskKind::Defend as u16 => {
+                    AgentGoal::Rescue if aq.current_task_kind() == TaskKind::Defend as u16 => {
                         Some(TaskKind::Defend as u16)
                     }
                     // P1: MigrateToCamp dispatcher emits a single
@@ -1071,33 +1073,33 @@ pub fn goal_dispatch_system(
                     // `nomad_migration_arrival_system` strips the
                     // `MigrationTarget` component on chebyshev arrival
                     // or timeout. Mirrors the Lead/Defend long-walk shape.
-                    AgentGoal::MigrateToCamp if ai.task_id == TaskKind::Migrate as u16 => {
+                    AgentGoal::MigrateToCamp if aq.current_task_kind() == TaskKind::Migrate as u16 => {
                         Some(TaskKind::Migrate as u16)
                     }
                     // Phase D scout: preserve the Explore chain so the
                     // agent walks the full survey leg without
                     // goal_dispatch tearing it down between goal-update
                     // ticks (200 ticks = 10 s, scout walks may be 30-60s).
-                    AgentGoal::Scout if ai.task_id == TaskKind::Explore as u16 => {
+                    AgentGoal::Scout if aq.current_task_kind() == TaskKind::Explore as u16 => {
                         Some(TaskKind::Explore as u16)
                     }
                     // Heal-3b: SeekCare patient walking to the recovery
                     // site. The walk leg outlives goal-eval ticks; the
                     // patient stays SeekCare until injury_tracking_system
                     // clears their `Injury`.
-                    AgentGoal::SeekCare if ai.task_id == TaskKind::SeekCare as u16 => {
+                    AgentGoal::SeekCare if aq.current_task_kind() == TaskKind::SeekCare as u16 => {
                         Some(TaskKind::SeekCare as u16)
                     }
                     // Drink walk: agent routed to a fresh-water tile. The walk
                     // leg outlives goal-eval ticks until adjacency / executor
                     // completion or external preempt.
-                    AgentGoal::Drink if ai.task_id == TaskKind::Drink as u16 => {
+                    AgentGoal::Drink if aq.current_task_kind() == TaskKind::Drink as u16 => {
                         Some(TaskKind::Drink as u16)
                     }
                     _ => None,
                 };
 
-                if Some(ai.task_id) != expected_task {
+                if Some(aq.current_task_kind()) != expected_task {
                     // Phase 5 contract note: this branch fires both for
                     // genuine goal flips *and* for working chains whose
                     // (goal, task) pair is missing a preserve arm above
@@ -1115,7 +1117,6 @@ pub fn goal_dispatch_system(
                     // flip preempts the chain before `finish_gather` runs.
                     release_gather_claim(&gather_claims, &mut ai, actor);
                     ai.state = AiState::Idle;
-                    ai.task_id = PersonAI::UNEMPLOYED;
                     // Phase 4b-ii: a goal flip is an external preempt — any
                     // prefetched tasks belong to the abandoned plan. `cancel()`
                     // drops both `current` and the queue so executors with the
@@ -1146,11 +1147,10 @@ pub fn goal_dispatch_system(
             // current). `cancel()` drops `current` and the queue so the next
             // dispatch starts clean.
             if !matches!(*goal, AgentGoal::Sleep)
-                && ai.task_id == TaskKind::Explore as u16
+                && aq.current_task_kind() == TaskKind::Explore as u16
                 && ai.state == AiState::Working
             {
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
                 aq.cancel();
             }
         });
@@ -1250,7 +1250,7 @@ pub fn play_system(
         if *lod == LodLevel::Dormant {
             continue;
         }
-        if ai.task_id != TaskKind::Play as u16 {
+        if aq.current_task_kind() != TaskKind::Play as u16 {
             continue;
         }
         if ai.state != AiState::Working {
@@ -1311,7 +1311,6 @@ pub fn play_system(
         if ai.work_progress as u32 >= PLAY_DURATION_TICKS || needs.willpower >= PLAY_FULL_WILLPOWER
         {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.work_progress = 0;
             // Phase 5e-xii-a: drain the typed channel so HTN-driven Play

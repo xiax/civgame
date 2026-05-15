@@ -12,7 +12,7 @@ use crate::simulation::jobs::{
 };
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
-use crate::simulation::person::{AiState, Person, PersonAI};
+use crate::simulation::person::{AiState, Person, PersonAI, UNEMPLOYED_TASK_KIND};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
@@ -4249,7 +4249,14 @@ pub fn building_upgrade_system(
     chunk_map: Res<ChunkMap>,
     wall_map: Res<WallMap>,
     wall_query: Query<&Wall>,
-    mut agent_query: Query<(Entity, &mut PersonAI, &FactionMember, &Transform, &LodLevel)>,
+    mut agent_query: Query<(
+        Entity,
+        &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
+        &FactionMember,
+        &Transform,
+        &LodLevel,
+    )>,
 ) {
     if clock.tick % UPGRADE_INTERVAL_TICKS != 0 {
         return;
@@ -4320,14 +4327,14 @@ pub fn building_upgrade_system(
 
         // Find the closest idle, non-dormant faction member.
         let mut nearest: Option<(Entity, i32, (i32, i32))> = None;
-        for (e, ai, member, transform, lod) in agent_query.iter() {
+        for (e, ai, aq, member, transform, lod) in agent_query.iter() {
             if member.faction_id != faction_id {
                 continue;
             }
             if *lod == LodLevel::Dormant {
                 continue;
             }
-            if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+            if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
                 continue;
             }
             let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
@@ -4342,12 +4349,12 @@ pub fn building_upgrade_system(
         };
 
         // Assign the Deconstruct task at the wall's tile.
-        if let Ok((_, mut ai, _, _, _)) = agent_query.get_mut(agent_e) {
+        if let Ok((_, mut ai, mut aq, _, _, _)) = agent_query.get_mut(agent_e) {
             let cur_chunk = ChunkCoord(
                 (cur_tile.0 as i32).div_euclid(CHUNK_SIZE as i32),
                 (cur_tile.1 as i32).div_euclid(CHUNK_SIZE as i32),
             );
-            assign_task_with_routing(
+            let routed = assign_task_with_routing(
                 &mut ai,
                 cur_tile,
                 cur_chunk,
@@ -4359,6 +4366,9 @@ pub fn building_upgrade_system(
                 &chunk_map,
                 &chunk_connectivity,
             );
+            if routed {
+                aq.dispatch(crate::simulation::typed_task::Task::Deconstruct { tile });
+            }
             // Mark the slot as in-flight so the chief and selector know.
             if let Some(faction) = registry.factions.get_mut(&faction_id) {
                 faction.active_upgrade = Some(tile);
@@ -4423,7 +4433,7 @@ pub fn construction_system(
         if ai.state != AiState::Working {
             continue;
         }
-        let task = ai.task_id;
+        let task = aq.current_task_kind();
         let is_hauler = task == TaskKind::HaulMaterials as u16;
         let is_worker = task == TaskKind::Construct as u16 || task == TaskKind::ConstructBed as u16;
         if !is_hauler && !is_worker {
@@ -4431,18 +4441,21 @@ pub fn construction_system(
         }
 
         // Phase 3c-ii: workers read the blueprint from the typed
-        // `Task::Construct` variant; haulers still use `target_entity`
-        // (HaulMaterials hasn't migrated yet). Falls through to
-        // `target_entity` for workers when the typed task is absent so
-        // legacy dispatch paths that haven't been migrated still work.
+        // `Task::Construct` / `Task::ConstructBed` variant; haulers still
+        // use `target_entity` (HaulMaterials hasn't migrated yet). Falls
+        // through to `target_entity` for workers when the typed task is
+        // absent so legacy dispatch paths that haven't been migrated still
+        // work.
         let bp_entity_opt = if is_worker {
-            aq.current.as_construct().or(ai.target_entity)
+            aq.current
+                .as_construct()
+                .or_else(|| aq.current.as_construct_bed())
+                .or(ai.target_entity)
         } else {
             ai.target_entity
         };
         let Some(bp_entity) = bp_entity_opt else {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             aq.advance();
             continue;
@@ -4456,7 +4469,6 @@ pub fn construction_system(
             .map(|bp| (bp.deposits, bp.deposit_count));
         let Some((deposits, count)) = bp_info else {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.work_progress = 0;
             ai.target_entity = None;
             aq.advance();
@@ -4483,9 +4495,10 @@ pub fn construction_system(
             }
             if !useful {
                 // Nothing to drop here — release back to plan so it can re-route.
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
-                ai.work_progress = 0;
+                // `aq.cancel_chain` drains the typed `Task::HaulToBlueprint`
+                // (and any prefetched tail) so the next dispatcher tick re-plans
+                // cleanly. Without it the stale haul task stacks until overflow.
+                aq.cancel_chain(&mut ai);
                 ai.target_entity = None;
                 // Fix 2: also drop the Haul JobClaim if it points to this
                 // satisfied bp. Without this, `job_claim_system` would re-claim
@@ -5223,7 +5236,6 @@ pub fn construction_system(
 
         if is_completed || is_hauler_done || is_orphaned {
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             ai.work_progress = 0;
             aq.advance();
@@ -5645,6 +5657,7 @@ pub fn deconstruct_system(
     mut agent_query: Query<(
         Entity,
         &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
         &mut EconomicAgent,
         &mut crate::simulation::carry::Carrier,
         &FactionMember,
@@ -5663,8 +5676,8 @@ pub fn deconstruct_system(
     // Collect agents that just finished deconstruction.
     let mut to_complete: Vec<(Entity, (i32, i32), u32, (i32, i32))> = Vec::new();
 
-    for (entity, mut ai, _, _, member, transform) in agent_query.iter_mut() {
-        if ai.state != AiState::Working || ai.task_id != TaskKind::Deconstruct as u16 {
+    for (entity, mut ai, aq, _, _, member, transform) in agent_query.iter_mut() {
+        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::Deconstruct as u16 {
             continue;
         }
         ai.work_progress = ai.work_progress.saturating_add(1);
@@ -5736,10 +5749,10 @@ pub fn deconstruct_system(
         // finalises at the same tile (or after a stuck-cleanup timeout).
 
         let Some((target_entity, kind, was_bed)) = removed else {
-            // Already gone — just idle the agent.
-            if let Ok((_, mut ai, _, _, _, _)) = agent_query.get_mut(agent_entity) {
-                ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
+            // Already gone — clear the typed `Task::Deconstruct` so the next
+            // tick's dispatcher sees a clean Idle slot.
+            if let Ok((_, mut ai, mut aq, _, _, _, _)) = agent_query.get_mut(agent_entity) {
+                aq.finish_task(&mut ai);
             }
             continue;
         };
@@ -5788,16 +5801,22 @@ pub fn deconstruct_system(
             }
         }
 
-        if let Ok((_, mut ai, mut economic_agent, mut carrier, _, _)) =
+        if let Ok((_, mut ai, mut aq, mut economic_agent, mut carrier, _, _)) =
             agent_query.get_mut(agent_entity)
         {
             // Recovered materials prefer the agent's hands so they can be hauled to
             // storage; fall back to inventory; spill any remainder at the deconstructed
             // tile as a GroundItem.
+            let mut hand_qty: u32 = 0;
+            let mut first_refund_rid: Option<crate::economy::resource_catalog::ResourceId> = None;
             for &(rid, qty) in &recipe_for(kind).deconstruct_refund {
                 let qty = qty as u32;
+                if first_refund_rid.is_none() {
+                    first_refund_rid = Some(rid);
+                }
                 let item = crate::economy::item::Item::new_commodity(rid);
                 let after_hand = carrier.try_pick_up(item, qty);
+                hand_qty = hand_qty.saturating_add(qty.saturating_sub(after_hand));
                 let after_inv = if after_hand > 0 {
                     economic_agent.add_item(item, after_hand)
                 } else {
@@ -5828,10 +5847,26 @@ pub fn deconstruct_system(
                 cur_y.div_euclid(CHUNK_SIZE as i32),
             );
 
-            if let Some(storage_tile) =
+            // Exit the typed `Task::Deconstruct` slot. If a refund landed in
+            // hands and we have a reachable faction storage tile, queue a
+            // `Task::DepositToFactionStorage` and route the agent so
+            // `drop_items_at_destination_system` picks up on arrival. Mirrors
+            // the canonical handoff in `gather::finish_gather`.
+            aq.advance();
+
+            let storage = if hand_qty > 0 {
                 storage_tile_map.nearest_for_faction(faction_id, (tile.0 as i32, tile.1 as i32))
-            {
-                assign_task_with_routing(
+            } else {
+                None
+            };
+
+            if let Some(storage_tile) = storage {
+                let rid = first_refund_rid.unwrap_or_else(crate::economy::core_ids::wood);
+                aq.dispatch(crate::simulation::typed_task::Task::DepositToFactionStorage {
+                    resource_id: rid,
+                    target_faction_id: None,
+                });
+                let dispatched = assign_task_with_routing(
                     &mut ai,
                     cur_tile,
                     cur_chunk,
@@ -5843,9 +5878,11 @@ pub fn deconstruct_system(
                     &chunk_map,
                     &chunk_connectivity,
                 );
+                if !dispatched {
+                    aq.cancel_chain(&mut ai);
+                }
             } else {
                 ai.state = AiState::Idle;
-                ai.task_id = PersonAI::UNEMPLOYED;
             }
         }
     }

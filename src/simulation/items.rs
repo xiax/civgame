@@ -193,7 +193,6 @@ fn finish_scavenge(
     outcome: FinishGatherOutcome,
 ) {
     ai.state = AiState::Idle;
-    ai.task_id = PersonAI::UNEMPLOYED;
     ai.target_entity = None;
 
     if outcome == FinishGatherOutcome::TargetInvalid {
@@ -250,7 +249,6 @@ fn finish_scavenge(
             // `production::finish_withdraw_food`'s Task::Eat handoff for the
             // [WithdrawFood, Eat] chain.
             ai.state = AiState::Working;
-            ai.task_id = TaskKind::Eat as u16;
             ai.work_progress = 0;
         }
         _ => {
@@ -305,7 +303,7 @@ pub fn item_pickup_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || ai.task_id != TaskKind::Scavenge as u16 {
+        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::Scavenge as u16 {
             continue;
         }
 
@@ -490,7 +488,7 @@ pub fn equip_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.task_id != TaskKind::Equip as u16 {
+        if aq.current_task_kind() != TaskKind::Equip as u16 {
             continue;
         }
         // Equip is in-place — fire as soon as the dispatcher pushes the agent
@@ -499,7 +497,6 @@ pub fn equip_task_system(
         let Some((target_slot, wanted)) = aq.current.as_equip() else {
             // Inconsistent state: task_id says Equip but typed task disagrees.
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             aq.advance();
             continue;
         };
@@ -508,7 +505,6 @@ pub fn equip_task_system(
             // Nothing to wield — bail and let the plan layer record a
             // FailedNoTarget on its next dispatch tick.
             ai.state = AiState::Idle;
-            ai.task_id = PersonAI::UNEMPLOYED;
             aq.advance();
             continue;
         };
@@ -546,7 +542,6 @@ pub fn equip_task_system(
         }
 
         ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
         aq.advance();
     }
 }

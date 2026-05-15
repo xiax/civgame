@@ -10,6 +10,7 @@ use bevy::ecs::system::SystemState;
 use bevy::prelude::*;
 
 use crate::simulation::animals::{AnimalAI, Tamed};
+use crate::simulation::person::UNEMPLOYED_TASK_KIND;
 use crate::simulation::construction::{
     best_hearth_for, seed_nomadic_camp, Bed, BedMap, Campfire, CampfireMap, FurnitureMaps,
     TentShelter,
@@ -344,7 +345,6 @@ pub fn nomad_migration_system(world: &mut World) {
                 if let Ok((_, mut goal, mut ai, mut aq)) = q.get_mut(e) {
                     *goal = crate::simulation::goals::AgentGoal::Scout;
                     aq.cancel();
-                    ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
                     ai.state = crate::simulation::person::AiState::Idle;
                 }
                 commands.entity(e).insert(ScoutAssignment {
@@ -504,7 +504,6 @@ pub fn nomad_survey_completion_system(world: &mut World) {
                         *goal = crate::simulation::goals::AgentGoal::GatherFood;
                     }
                     aq.cancel();
-                    ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
                     ai.state = crate::simulation::person::AiState::Idle;
                 }
                 commands.entity(e).remove::<ScoutAssignment>();
@@ -563,7 +562,7 @@ pub fn nomad_survey_dispatch_system(
         &crate::simulation::lod::LodLevel,
     )>,
 ) {
-    use crate::simulation::person::{AiState, PersonAI};
+    use crate::simulation::person::{AiState, PersonAI, UNEMPLOYED_TASK_KIND};
     use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
     use crate::simulation::typed_task::Task;
     use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
@@ -575,7 +574,7 @@ pub fn nomad_survey_dispatch_system(
         if !matches!(*goal, crate::simulation::goals::AgentGoal::Scout) {
             continue;
         }
-        if ai.state != AiState::Idle || ai.task_id != PersonAI::UNEMPLOYED {
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
@@ -827,7 +826,6 @@ fn stamp_members_for_caravan_travel(world: &mut World, ready: &[AiPackingMigrati
             .insert(crate::simulation::construction::HomeBed(None));
         *goal = crate::simulation::goals::AgentGoal::MigrateToCamp;
         aq.cancel();
-        ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
         ai.state = crate::simulation::person::AiState::Idle;
     }
     state.apply(world);
@@ -1232,7 +1230,7 @@ fn dispatch_member_unload_tasks(world: &mut World, pitching: &[AiPitchingMigrati
         if chebyshev(worker_tile, target) > MIGRATE_ARRIVAL_RADIUS + 4 {
             continue;
         }
-        if ai.task_id != crate::simulation::person::PersonAI::UNEMPLOYED
+        if aq.current_task_kind() != crate::simulation::person::UNEMPLOYED_TASK_KIND
             || !matches!(aq.current, crate::simulation::typed_task::Task::Idle)
         {
             continue;
@@ -1443,7 +1441,7 @@ fn dispatch_pitch_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
             if !targets.contains_key(&root) {
                 continue;
             }
-            if ai.task_id != crate::simulation::person::PersonAI::UNEMPLOYED
+            if aq.current_task_kind() != crate::simulation::person::UNEMPLOYED_TASK_KIND
                 || !matches!(aq.current, crate::simulation::typed_task::Task::Idle)
             {
                 continue;
@@ -1635,7 +1633,6 @@ fn finish_caravan_member_markers(world: &mut World, completed: &ahash::AHashSet<
             force_reeval.0.insert(entity);
         }
         aq.cancel();
-        ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
         ai.state = crate::simulation::person::AiState::Idle;
     }
     state.apply(world);
@@ -2034,7 +2031,6 @@ pub fn apply_manual_scout_command_system(world: &mut World) {
             if let Ok((_, mut goal, mut ai, mut aq)) = q.get_mut(p.member) {
                 *goal = crate::simulation::goals::AgentGoal::Scout;
                 aq.cancel();
-                ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
                 ai.state = crate::simulation::person::AiState::Idle;
             }
             commands.entity(p.member).insert(ScoutAssignment {
@@ -2158,7 +2154,6 @@ pub fn manual_scout_completion_system(world: &mut World) {
                     *goal = crate::simulation::goals::AgentGoal::GatherFood;
                 }
                 aq.cancel();
-                ai.task_id = crate::simulation::person::PersonAI::UNEMPLOYED;
                 ai.state = crate::simulation::person::AiState::Idle;
             }
             commands.entity(a.entity).remove::<ScoutAssignment>();
@@ -3372,7 +3367,7 @@ pub fn nomad_migration_dispatch_system(
         if *goal != crate::simulation::goals::AgentGoal::MigrateToCamp {
             continue;
         }
-        if ai.task_id != PersonAI::UNEMPLOYED {
+        if aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         // Self-heal: `release_to_idle` (movement.rs) wipes `task_id` and
@@ -3402,7 +3397,6 @@ pub fn nomad_migration_dispatch_system(
         {
             target.route_tile = None;
             aq.cancel();
-            ai.task_id = PersonAI::UNEMPLOYED;
             ai.state = AiState::Idle;
             continue;
         }
@@ -3457,7 +3451,6 @@ pub fn nomad_migration_dispatch_system(
                     commands.entity(e).remove::<MigrationTarget>();
                     *goal = crate::simulation::goals::AgentGoal::GatherFood;
                     aq.cancel();
-                    ai.task_id = PersonAI::UNEMPLOYED;
                     ai.state = AiState::Idle;
                     continue;
                 }
@@ -3465,7 +3458,6 @@ pub fn nomad_migration_dispatch_system(
                 commands.entity(e).remove::<MigrationTarget>();
                 *goal = crate::simulation::goals::AgentGoal::GatherFood;
                 aq.cancel();
-                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.state = AiState::Idle;
                 continue;
             }
@@ -3528,7 +3520,6 @@ pub fn nomad_migration_arrival_system(
             if chebyshev((cur_tx, cur_ty), route_tile) <= MIGRATE_ARRIVAL_RADIUS {
                 target.route_tile = None;
                 aq.cancel();
-                ai.task_id = PersonAI::UNEMPLOYED;
                 ai.state = AiState::Idle;
                 continue;
             }
@@ -3540,7 +3531,7 @@ pub fn nomad_migration_arrival_system(
         // they're filtered out of the dispatcher (Drafted, PlayerOrder)
         // or stranded by repeated path-worker failures. Either way, no
         // further forward progress will happen on its own.
-        let stalled = ai.task_id == PersonAI::UNEMPLOYED
+        let stalled = aq.current_task_kind() == UNEMPLOYED_TASK_KIND
             && ai.state == AiState::Idle
             && now.saturating_sub(target.last_dispatched_tick) > MIGRATE_STALL_TICKS;
         if !(arrived || timed_out || stalled) {
@@ -3557,7 +3548,6 @@ pub fn nomad_migration_arrival_system(
         }
         // Stop the walk; a normal goal will pick up next tick.
         aq.cancel();
-        ai.task_id = PersonAI::UNEMPLOYED;
         ai.state = AiState::Idle;
     }
 }

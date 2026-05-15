@@ -39,7 +39,7 @@ use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::AgentMemory;
-use crate::simulation::person::{AiState, Drafted, PersonAI, Profession, TraderPhase, TraderPlan};
+use crate::simulation::person::{AiState, Drafted, PersonAI, Profession, TraderPhase, TraderPlan, UNEMPLOYED_TASK_KIND};
 use crate::simulation::settlement::{Settlement, SettlementId, SettlementMap};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::typed_task::{ActionQueue, Task};
@@ -242,7 +242,7 @@ pub fn trader_market_step_system(world: &mut World) {
                 tile,
                 plan: plan.copied(),
                 aq_current_idle: matches!(aq.current, Task::Idle),
-                task_unemployed: ai.task_id == PersonAI::UNEMPLOYED,
+                task_unemployed: aq.current_task_kind() == UNEMPLOYED_TASK_KIND,
                 visited: memory.known_settlements().map(|(id, _)| id).collect(),
                 currency: econ.currency,
             });
@@ -291,7 +291,6 @@ pub fn trader_market_step_system(world: &mut World) {
                         aq.cancel();
                     }
                     if let Some(mut ai) = world.get_mut::<PersonAI>(snap.entity) {
-                        ai.task_id = PersonAI::UNEMPLOYED;
                         ai.state = AiState::Idle;
                     }
                     continue;
@@ -309,7 +308,6 @@ pub fn trader_market_step_system(world: &mut World) {
                         aq.cancel();
                     }
                     if let Some(mut ai) = world.get_mut::<PersonAI>(snap.entity) {
-                        ai.task_id = PersonAI::UNEMPLOYED;
                         ai.state = AiState::Idle;
                     }
                     continue;
@@ -388,7 +386,7 @@ pub fn trader_route_dispatch_system(
         if goal_preempts_trade(goal) {
             continue;
         }
-        if ai.task_id != PersonAI::UNEMPLOYED {
+        if aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         if !matches!(aq.current, Task::Idle) {
