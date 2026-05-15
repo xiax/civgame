@@ -43,6 +43,18 @@ use crate::world::tile::TileKind;
 /// Short — drinking a sip is faster than eating a meal.
 pub const TICKS_DRINK: u8 = 4;
 
+/// Maximum sips consumed in a single Drink action. One sip reduces thirst by
+/// `DRINK_THIRST_REDUCTION` (80); even a fully-thirsty agent (thirst 255)
+/// drops to ~0 in 4 sips. Mirrors the multi-bite loop in `eat_task_system`
+/// so a worker that walked to a river fully quenches before leaving instead
+/// of sipping, idling, then being re-dispatched as thirst climbs back.
+pub const MAX_SIPS_PER_ACTION: u32 = 4;
+
+/// Stop drinking when thirst falls below this — the next sip would waste
+/// more than 50% of its `DRINK_THIRST_REDUCTION`. Mirrors eat's
+/// "majority waste" stop condition.
+pub const DRINK_SATIETY_FLOOR: f32 = 40.0;
+
 /// Resolve one drink for an agent. Returns true if the drink succeeded
 /// (thirst reduced + resource consumed if applicable); false if the
 /// source is no longer valid (clean_water missing / tile no longer
@@ -223,31 +235,51 @@ pub fn drink_task_system(
             (transform.translation.y / TILE_SIZE).floor() as i32,
         );
 
-        let outcome = perform_drink(
-            source,
-            &mut agent,
-            &mut carrier,
-            &mut needs,
-            agent_tile,
-            &chunk_map,
-            &well_map,
-        );
+        // Multi-sip loop. Mirrors the multi-bite loop in `eat_task_system`:
+        // keep drinking until quenched, until the source is exhausted (inventory
+        // drink running out of `clean_water`), or until the next sip would be
+        // majority waste. Tile / Well drinks don't exhaust here — the agent is
+        // standing adjacent to the source — so the loop naturally drains thirst
+        // in one dispatch.
+        let mut sips: u32 = 0;
+        let mut last_drank_raw: Option<bool> = None;
+        while needs.thirst > DRINK_SATIETY_FLOOR && sips < MAX_SIPS_PER_ACTION {
+            match perform_drink(
+                source,
+                &mut agent,
+                &mut carrier,
+                &mut needs,
+                agent_tile,
+                &chunk_map,
+                &well_map,
+            ) {
+                DrinkOutcome::Drank { raw } => {
+                    sips += 1;
+                    last_drank_raw = Some(raw);
+                }
+                DrinkOutcome::SourceGone => break,
+            }
+        }
 
         // Sickness roll: raw source or `SanitationMap`-contaminated tile.
-        if let DrinkOutcome::Drank { raw } = outcome {
+        // Severity scales with sips taken — three sips of raw river water
+        // is worse than one — capped at `u8::MAX` so the existing constants
+        // still drive the per-sip step.
+        if let Some(raw) = last_drank_raw {
             let contaminated = match source {
                 DrinkSource::Tile { tile } => sanitation.is_contaminated(tile),
                 DrinkSource::Well { tile } => sanitation.is_contaminated(tile),
                 DrinkSource::Inventory => false,
             };
-            let severity = if contaminated {
+            let per_sip = if contaminated {
                 crate::simulation::medicine::SICKNESS_CONTAMINATED_DRINK_SEVERITY
             } else if raw {
                 crate::simulation::medicine::SICKNESS_RAW_DRINK_SEVERITY
             } else {
                 0
             };
-            if severity > 0 {
+            if per_sip > 0 {
+                let severity = (per_sip as u32).saturating_mul(sips).min(u8::MAX as u32) as u8;
                 if let Some(fresh) = crate::simulation::medicine::apply_sickness_severity(
                     sickness.as_deref_mut(),
                     severity,
@@ -351,18 +383,18 @@ pub fn htn_drink_dispatch_system(
             // Method 2: walk to the nearest well within scan. Wells beat
             // rivers because the dispatcher checks them first; settlements
             // with a well don't send their members on a multi-tile hike to
-            // the riverbank for every sip.
-            if let Some((well_tile, stand_tile)) = nearest_well_with_stand(
-                &well_map,
-                &chunk_map,
-                (cur_tx, cur_ty),
-                scan,
-            ) {
+            // the riverbank for every sip. `TaskKind::Drink` routes via
+            // `task_interacts_from_adjacent`, so passing the well tile here
+            // lands the agent chebyshev-1 off it on the routing layer's
+            // pick.
+            if let Some(well_tile) =
+                nearest_well_tile(&well_map, (cur_tx, cur_ty), scan)
+            {
                 let routed = assign_task_with_routing(
                     &mut ai,
                     (cur_tx, cur_ty),
                     cur_chunk,
-                    stand_tile,
+                    well_tile,
                     TaskKind::Drink,
                     None,
                     &chunk_graph,
@@ -411,18 +443,16 @@ pub fn htn_drink_dispatch_system(
     );
 }
 
-/// Scan chebyshev rings around `from` for the closest known well within
-/// `max_radius`. For the first well whose chebyshev-1 ring contains a
-/// passable, non-well tile, return `(well_tile, stand_tile)`. The stand
-/// tile is what the agent walks to; the well itself stays untouched.
-fn nearest_well_with_stand(
+/// Chebyshev-nearest well tile within `max_radius`. The routing layer
+/// (`assign_task_with_routing`) handles adjacency selection because
+/// `task_interacts_from_adjacent(TaskKind::Drink)` is true.
+fn nearest_well_tile(
     well_map: &WellMap,
-    chunk_map: &ChunkMap,
     from: (i32, i32),
     max_radius: i32,
-) -> Option<((i32, i32), (i32, i32))> {
+) -> Option<(i32, i32)> {
     let mut best: Option<((i32, i32), i32)> = None;
-    for (&well_tile, _) in well_map.0.iter() {
+    for &well_tile in well_map.0.keys() {
         let d = (well_tile.0 - from.0).abs().max((well_tile.1 - from.1).abs());
         if d > max_radius {
             continue;
@@ -431,24 +461,5 @@ fn nearest_well_with_stand(
             best = Some((well_tile, d));
         }
     }
-    let (well_tile, _) = best?;
-    for dy in -1..=1 {
-        for dx in -1..=1 {
-            if dx == 0 && dy == 0 {
-                continue;
-            }
-            let stand = (well_tile.0 + dx, well_tile.1 + dy);
-            if well_map.0.contains_key(&stand) {
-                continue;
-            }
-            let Some(kind) = chunk_map.tile_kind_at(stand.0, stand.1) else {
-                continue;
-            };
-            if !kind.is_passable() {
-                continue;
-            }
-            return Some((well_tile, stand));
-        }
-    }
-    None
+    best.map(|(t, _)| t)
 }

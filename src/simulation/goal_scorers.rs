@@ -34,7 +34,7 @@ use crate::simulation::needs::Needs;
 use crate::simulation::person::Profession;
 use crate::simulation::skills::Skills;
 use crate::simulation::utility_curves::{
-    disposition_lift, hunger_utility, play_utility, sleep_utility, social_utility,
+    disposition_lift, hunger_utility, play_utility, sleep_utility, social_utility, thirst_utility,
 };
 
 /// Per-agent psychological profile — the Big-Five-ish personality the
@@ -686,14 +686,18 @@ pub struct ThirstScorer;
 impl GoalScorer for ThirstScorer {
     fn score(&self, ctx: &GoalScoringContext) -> Option<GoalScore> {
         let t = ctx.needs.thirst;
+        // Task-side gate: dispatcher refuses Drink below THIRST_TRIGGER, so
+        // scoring it here would pin a goal that can't decompose.
         if t < crate::simulation::needs::THIRST_TRIGGER {
             return None;
         }
-        // Linear urgency from THIRST_TRIGGER → 255. Severe thirst lifts
-        // toward 1.0; at the trigger this starts at ~0.30 so a fresh
-        // dispatch slightly outranks moderate hunger when the agent has
-        // food on hand but not water.
-        let urgency = ((t - crate::simulation::needs::THIRST_TRIGGER) / 75.0).clamp(0.30, 1.0);
+        // Two-stage smoothstep mirroring hunger but tilted higher — dehydration
+        // kills faster than starvation, so a parched agent should outrank an
+        // equally hungry one. Hits ~0.60 at TRIGGER (180), ~0.95 at SEVERE (230).
+        let urgency = thirst_utility(t);
+        if urgency < 0.10 {
+            return None;
+        }
         let reason: &'static str = if t >= crate::simulation::needs::THIRST_SEVERE {
             "Parched"
         } else {

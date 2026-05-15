@@ -40,6 +40,26 @@ pub fn hunger_utility(hunger: f32) -> f32 {
     (low + high).clamp(0.0, 1.0)
 }
 
+/// Thirst → urgency.
+///
+/// Anchored on `needs.rs` thresholds (need range `0–255`):
+/// - `thirst ≤ 100`              → ~0.0 (sated)
+/// - `thirst == 150`             → ~0.30 (rising; trigger soon)
+/// - `thirst == 180` (TRIGGER)   → ~0.60 (at-or-above hunger's 0.55 at same value)
+/// - `thirst == 230` (SEVERE)    → ~0.95
+/// - `thirst ≥ 250`              → ~1.0
+///
+/// Same two-stage smoothstep shape as `hunger_utility` but with weights tilted
+/// `0.60 / 0.40`. Rationale: dehydration kills in ~3 days vs starvation in ~3
+/// weeks, so a parched agent should outrank an equally hungry one at the
+/// trigger band.
+#[inline]
+pub fn thirst_utility(thirst: f32) -> f32 {
+    let low = smoothstep(thirst, 100.0, 180.0) * 0.60;
+    let high = smoothstep(thirst, 180.0, 230.0) * 0.40;
+    (low + high).clamp(0.0, 1.0)
+}
+
 /// Sleep need → urgency. Higher `sleep` value = more tired.
 ///
 /// `time_of_day_bonus` ∈ `[0.0, 1.0]` lifts the curve at night so a
@@ -194,6 +214,35 @@ mod tests {
             assert!(
                 v >= prev - 1e-6,
                 "hunger_utility regressed at {h}: {prev} → {v}"
+            );
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn thirst_anchored_to_legacy_thresholds() {
+        // Sated: ~0
+        approx(thirst_utility(50.0), 0.0, 0.05);
+        // Rising before trigger
+        assert!(thirst_utility(150.0) > 0.20);
+        assert!(thirst_utility(150.0) < 0.50);
+        // At THIRST_TRIGGER (180): firmly urgent — at-or-above hunger curve.
+        assert!(thirst_utility(180.0) > 0.55);
+        assert!(thirst_utility(180.0) >= hunger_utility(180.0));
+        // At THIRST_SEVERE (230): near-saturated.
+        assert!(thirst_utility(230.0) > 0.90);
+        // Dying of thirst: saturated.
+        approx(thirst_utility(255.0), 1.0, 0.05);
+    }
+
+    #[test]
+    fn thirst_monotonic() {
+        let mut prev = -0.01_f32;
+        for t in 0..=255 {
+            let v = thirst_utility(t as f32);
+            assert!(
+                v >= prev - 1e-6,
+                "thirst_utility regressed at {t}: {prev} → {v}"
             );
             prev = v;
         }
