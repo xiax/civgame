@@ -363,10 +363,13 @@ pub fn spawn_population(
             (dx * dx + dy * dy).sqrt() < 300.0
         });
         let spacing = if too_close { -100 } else { 50 };
+        // Settlements need to fit on one bank — `base_r` for a 20-person band
+        // is ~12 tiles, and bridges aren't available until Chalcolithic.
         let river_score = match chunk_map.river_distance_at(tx, ty) {
-            0..=1 => -50,
-            2..=4 => 60,
-            5..=8 => 30,
+            0..=4 => -80,
+            5..=9 => -20,
+            10..=12 => 20,
+            13..=16 => 60,
             _ => 0,
         };
         spacing + river_score

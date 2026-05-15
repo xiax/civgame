@@ -234,10 +234,15 @@ pub fn pick_player_home_in_megachunk(
 
     let score_tile = |tx: i32, ty: i32| -> i32 {
         let river_d = chunk_map.river_distance_at(tx, ty);
+        // Match the AI faction picker: settlements need to fit on one bank
+        // since bridges aren't available until Chalcolithic. Nomadic starts
+        // get the same rule — they still drop seeded furniture + the full
+        // member group at the home tile.
         let river_score = match river_d {
-            0..=1 => -50,
-            2..=4 => 60,
-            5..=8 => 30,
+            0..=4 => -80,
+            5..=9 => -20,
+            10..=12 => 20,
+            13..=16 => 60,
             _ => 0,
         };
         // Soft centre-pull (weight 10): edge-of-cell → 0, dead centre → +10.

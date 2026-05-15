@@ -483,8 +483,12 @@ pub fn tile_at_3d(
 }
 
 /// Riparian feather radius (tiles outside the channel that still get the
-/// river-distance flag and a moisture/fertility boost).
-pub const RIVER_FEATHER_DIST: u8 = 5;
+/// river-distance flag). The biome/fertility/topsoil effects only fire on
+/// `river_d <= 5` (see `riparian_moisture_boost`, `river_fertility_mult`,
+/// `topsoil_kind`); the wider feather exists so settlement spawn pickers
+/// (`score_home_candidate`, `score_tile`) can score candidates up to 16
+/// tiles from a river and place the initial `base_r` footprint on one bank.
+pub const RIVER_FEATHER_DIST: u8 = 16;
 
 /// Build a new Chunk: empty delta map + surface_z, surface_kind, fertility,
 /// and river-distance caches pre-filled. Per-tile biome via
