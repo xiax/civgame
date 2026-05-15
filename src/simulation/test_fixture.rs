@@ -13736,4 +13736,41 @@ mod onenter_era_seeding {
             "Paleolithic seed stamped doors (unexpected upgrade)"
         );
     }
+
+    #[test]
+    fn neolithic_start_seeds_at_least_one_well() {
+        // Neolithic+ chiefs are Aware of WELL_DIGGING via
+        // `seeded_realistic_through_era`, and `seed_prime_tech_adoption_system`
+        // ratchets it to Adopted at tick 0 — so `generate_candidates` should
+        // stamp one well for the player faction's settlement.
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+
+        let world = sim.app.world();
+        let well_count = world
+            .resource::<crate::simulation::construction::WellMap>()
+            .0
+            .len();
+        assert!(
+            well_count >= 1,
+            "Neolithic seed stamped zero wells (expected >= 1)"
+        );
+    }
+
+    #[test]
+    fn paleolithic_start_seeds_no_wells() {
+        // Paleo starts predate WELL_DIGGING; no well should appear in any
+        // faction's WellMap.
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Paleolithic);
+        trigger_onenter(&mut sim);
+
+        let world = sim.app.world();
+        let well_count = world
+            .resource::<crate::simulation::construction::WellMap>()
+            .0
+            .len();
+        assert_eq!(well_count, 0, "Paleolithic seed stamped wells unexpectedly");
+    }
 }

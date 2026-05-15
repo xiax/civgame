@@ -16,8 +16,8 @@ use crate::simulation::civic_milestones::{civic_milestone_allows, CivicKind};
 use crate::simulation::construction::{
     best_wall_material, faction_can_build, recipe_for, BarracksMap, BedMap, Blueprint,
     BlueprintMap, BuildSiteKind, CampfireMap, DoorMap, GranaryMap, LoomMap, MarketMap, MonumentMap,
-    RoadCarveQueue, ShrineMap, StructureIndex, TableMap, WallMap, WallMaterial, WorkbenchMap,
-    MAX_BLUEPRINTS_SAFETY_CAP,
+    RoadCarveQueue, ShrineMap, StructureIndex, TableMap, WallMap, WallMaterial, WellMap,
+    WorkbenchMap, MAX_BLUEPRINTS_SAFETY_CAP,
 };
 use crate::simulation::faction::{FactionData, FactionMember, FactionRegistry, SOLO};
 use crate::simulation::land::{tile_buildable_by, Plot, PlotIndex, TenureHolder, TileEdge};
@@ -29,6 +29,7 @@ use crate::simulation::settlement::{
 use crate::simulation::technology::{
     current_era, Era, BRIDGE_BUILDING, CITY_STATE_ORG, CROP_CULTIVATION, FLINT_KNAPPING, GRANARY,
     LONG_DIST_TRADE, MONUMENTAL_BUILDING, PERM_SETTLEMENT, PROFESSIONAL_ARMY, SACRED_RITUAL,
+    WELL_DIGGING,
 };
 use crate::simulation::terraform::PendingFootprints;
 use crate::world::chunk::ChunkMap;
@@ -257,6 +258,7 @@ pub enum SettlementPressureKind {
     Military,
     Monument,
     Governance,
+    WaterAccess,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -443,6 +445,7 @@ pub struct OrganicStructureMaps<'w> {
     pub market_map: Res<'w, MarketMap>,
     pub barracks_map: Res<'w, BarracksMap>,
     pub monument_map: Res<'w, MonumentMap>,
+    pub well_map: Res<'w, WellMap>,
     pub structure_index: Res<'w, StructureIndex>,
 }
 
@@ -548,6 +551,7 @@ pub fn settlement_pressure_system(
     clock: Res<SimClock>,
     registry: Res<FactionRegistry>,
     settlements: Query<&Settlement>,
+    chunk_map: Res<ChunkMap>,
     maps: OrganicStructureMaps,
     bp_map: Res<BlueprintMap>,
     bp_query: Query<&Blueprint>,
@@ -572,6 +576,7 @@ pub fn settlement_pressure_system(
             faction_id,
             faction,
             settlement,
+            &chunk_map,
             &maps,
             pending.get(&faction_id),
             &mut out,
@@ -929,6 +934,17 @@ fn collect_anchors(
         42,
         SettlementAnchorKind::Market,
         0.8,
+    );
+    // Built wells are first-class water anchors — orient road / parcel
+    // planning around them so the village's water source lands on the
+    // street network.
+    add_map_anchors(
+        &mut anchors,
+        &maps.well_map.0,
+        home,
+        42,
+        SettlementAnchorKind::WaterAccess,
+        0.9,
     );
     add_door_gate_anchors(&mut anchors, &maps.door_map.0, home, 42);
 
@@ -1744,6 +1760,7 @@ fn append_pressures_for_faction(
     _faction_id: u32,
     faction: &FactionData,
     settlement: &Settlement,
+    chunk_map: &ChunkMap,
     maps: &OrganicStructureMaps,
     pending: Option<&AHashMap<BuildSiteKind, u32>>,
     out: &mut Vec<SettlementPressure>,
@@ -1835,6 +1852,36 @@ fn append_pressures_for_faction(
             material_budget: 4,
             reason: "food storage",
         });
+    }
+
+    // Wells: gate on community adoption (mirrors Granary). Suppress the
+    // first well when the home tile already abuts fresh water; second and
+    // third wells emit anyway and are pushed away from the river by site
+    // scoring.
+    if faction.community_has(WELL_DIGGING) {
+        let built_wells = count_near(&maps.well_map.0, home, 30);
+        let pending_wells = pending_of(BuildSiteKind::Well) as usize;
+        let target = if settlement.peak_population < 40 {
+            1
+        } else if settlement.peak_population < 90 {
+            2
+        } else {
+            3
+        };
+        let have = built_wells + pending_wells;
+        let near_fresh_water = fresh_water_within(chunk_map, home, 6);
+        if have < target && !(built_wells == 0 && near_fresh_water) {
+            let nearest_clean = nearest_fresh_or_well_distance(chunk_map, &maps.well_map.0, home, 10);
+            let dist_norm = (nearest_clean as f32 / 10.0).clamp(0.0, 1.0);
+            out.push(SettlementPressure {
+                kind: SettlementPressureKind::WaterAccess,
+                urgency: 190.0 + 60.0 * (1.0 - dist_norm),
+                sponsor: SettlementSponsor::Chief,
+                population_scope: members,
+                material_budget: 4,
+                reason: "well coverage",
+            });
+        }
     }
 
     if faction.community_has(SACRED_RITUAL)
@@ -1976,6 +2023,7 @@ fn pressure_to_intent(
         SettlementPressureKind::Military => OrganicBuildKind::Single(BuildSiteKind::Barracks),
         SettlementPressureKind::Monument => OrganicBuildKind::Single(BuildSiteKind::Monument),
         SettlementPressureKind::Governance => OrganicBuildKind::Single(BuildSiteKind::Table),
+        SettlementPressureKind::WaterAccess => OrganicBuildKind::Single(BuildSiteKind::Well),
         SettlementPressureKind::Field => return None,
     };
     let district = district_for_pressure(pressure.kind);
@@ -2047,7 +2095,8 @@ fn choose_site_for_intent(
             continue;
         }
         let frontage_bonus = parcel.frontage_edge.map(|_| 8.0).unwrap_or(0.0);
-        candidates.push((suitability * 100.0 + frontage_bonus, tile));
+        let spread = well_spread_adjustment(build_kind, tile, chunk_map, maps);
+        candidates.push((suitability * 100.0 + frontage_bonus + spread, tile));
     }
     for &tile in &brain.frontier {
         if road_frontage_required {
@@ -2059,8 +2108,10 @@ fn choose_site_for_intent(
         if !intent_site_clear(build_kind, tile, chunk_map, maps, bp_map, doormat, brain) {
             continue;
         }
+        let spread = well_spread_adjustment(build_kind, tile, chunk_map, maps);
         candidates.push((
-            site_bonus(brain, district, tile) - cheb(tile, faction.home_tile) as f32 * 0.2,
+            site_bonus(brain, district, tile) - cheb(tile, faction.home_tile) as f32 * 0.2
+                + spread,
             tile,
         ));
     }
@@ -2070,6 +2121,46 @@ fn choose_site_for_intent(
             .then_with(|| a.1.cmp(&b.1))
     });
     candidates.first().map(|(_, tile)| *tile)
+}
+
+/// Per-well penalty that pushes 2nd/3rd wells away from existing wells and
+/// from rivers/bridges. Zero for non-Well intents. Penalty falls off
+/// linearly to zero past 10 chebyshev tiles.
+fn well_spread_adjustment(
+    build_kind: OrganicBuildKind,
+    tile: (i32, i32),
+    chunk_map: &ChunkMap,
+    maps: &OrganicStructureMaps,
+) -> f32 {
+    if !matches!(build_kind, OrganicBuildKind::Single(BuildSiteKind::Well)) {
+        return 0.0;
+    }
+    let mut penalty = 0.0;
+    for &well_tile in maps.well_map.0.keys() {
+        let d = cheb(tile, well_tile);
+        if d < 10 {
+            penalty -= (10 - d) as f32 * 8.0;
+        }
+    }
+    for r in 1i32..=10 {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs().max(dy.abs()) != r {
+                    continue;
+                }
+                let probe = (tile.0 + dx, tile.1 + dy);
+                if let Some(kind) = chunk_map.tile_kind_at(probe.0, probe.1) {
+                    if matches!(kind, TileKind::River | TileKind::Bridge) {
+                        penalty -= (10 - r) as f32 * 4.0;
+                        // Only count the single nearest fresh-water tile
+                        // (rings expand outward, so the first hit wins).
+                        return penalty;
+                    }
+                }
+            }
+        }
+    }
+    penalty
 }
 
 fn build_kind_requires_frontage(build_kind: OrganicBuildKind) -> bool {
@@ -2238,6 +2329,7 @@ fn archetype_id_for(
         SettlementPressureKind::Military => "barracks",
         SettlementPressureKind::Monument => "monument",
         SettlementPressureKind::Governance => "assembly",
+        SettlementPressureKind::WaterAccess => "well",
     };
     if archetypes.for_era(era).any(|a| a.id == wanted) {
         wanted
@@ -2256,6 +2348,7 @@ fn district_for_pressure(kind: SettlementPressureKind) -> DistrictKind {
         SettlementPressureKind::Ritual | SettlementPressureKind::Monument => DistrictKind::Sacred,
         SettlementPressureKind::Trade => DistrictKind::Market,
         SettlementPressureKind::Defense | SettlementPressureKind::Military => DistrictKind::Defense,
+        SettlementPressureKind::WaterAccess => DistrictKind::Civic,
     }
 }
 
@@ -2836,6 +2929,52 @@ fn count_near(map: &AHashMap<(i32, i32), Entity>, home: (i32, i32), radius: i32)
     map.keys()
         .filter(|&&tile| cheb(tile, home) <= radius)
         .count()
+}
+
+fn fresh_water_within(chunk_map: &ChunkMap, home: (i32, i32), radius: i32) -> bool {
+    for r in 0..=radius {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs().max(dy.abs()) != r {
+                    continue;
+                }
+                let tile = (home.0 + dx, home.1 + dy);
+                if let Some(kind) = chunk_map.tile_kind_at(tile.0, tile.1) {
+                    if matches!(kind, TileKind::River | TileKind::Bridge) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn nearest_fresh_or_well_distance(
+    chunk_map: &ChunkMap,
+    well_map: &AHashMap<(i32, i32), Entity>,
+    home: (i32, i32),
+    radius: i32,
+) -> i32 {
+    for r in 0..=radius {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs().max(dy.abs()) != r {
+                    continue;
+                }
+                let tile = (home.0 + dx, home.1 + dy);
+                if well_map.contains_key(&tile) {
+                    return r;
+                }
+                if let Some(kind) = chunk_map.tile_kind_at(tile.0, tile.1) {
+                    if matches!(kind, TileKind::River | TileKind::Bridge) {
+                        return r;
+                    }
+                }
+            }
+        }
+    }
+    radius
 }
 
 fn union_rect(a: TileRect, b: TileRect) -> TileRect {

@@ -1,5 +1,8 @@
 # Add Wells To CivGame
 
+## Status
+Shipped. 711 tests green. Surfaces: `WELL_DIGGING` tech (Neolithic, Institutional), `BuildSiteKind::Well` recipe (4 stone + 2 wood, 120 ticks), `WellMap` resource, `DrinkSource::Well` typed variant + well-priority dispatcher, `SettlementPressureKind::WaterAccess` + intent + anchor, per-era seed targets (Neo 1 / Chalco 2 / Bronze 3), right-click "Build Well", `building_well` sprite. Doc updates in `src/simulation/CLAUDE.md` thirst section.
+
 ## Context
 Neolithic public-water structure: gated on a new `WELL_DIGGING` tech, integrated with the thirst pipeline so people prefer it over walking to a river, planned by `organic_settlement` when local water is weak, and seeded into Neolithic+ starts.
 

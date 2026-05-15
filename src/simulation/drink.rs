@@ -24,6 +24,7 @@ use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::carry::Carrier;
+use crate::simulation::construction::WellMap;
 use crate::simulation::faction::FactionMember;
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
@@ -54,6 +55,7 @@ pub fn perform_drink(
     needs: &mut Needs,
     agent_tile: (i32, i32),
     chunk_map: &ChunkMap,
+    well_map: &WellMap,
 ) -> DrinkOutcome {
     match source {
         DrinkSource::Inventory => {
@@ -88,6 +90,25 @@ pub fn perform_drink(
             let raw = !matches!(kind, TileKind::River | TileKind::Bridge);
             needs.thirst = (needs.thirst - DRINK_THIRST_REDUCTION).max(0.0);
             DrinkOutcome::Drank { raw }
+        }
+        DrinkSource::Well { tile } => {
+            // Well must still exist (deconstruct cleared the map entry).
+            if !well_map.0.contains_key(&tile) {
+                return DrinkOutcome::SourceGone;
+            }
+            // Chebyshev adjacency to the well tile (the well itself is
+            // impassable; the agent stands one step off and draws water).
+            if (agent_tile.0 - tile.0)
+                .abs()
+                .max((agent_tile.1 - tile.1).abs())
+                > 1
+            {
+                return DrinkOutcome::SourceGone;
+            }
+            // Well water is treated as clean; `SanitationMap` may still
+            // mark it contaminated, handled by the caller.
+            needs.thirst = (needs.thirst - DRINK_THIRST_REDUCTION).max(0.0);
+            DrinkOutcome::Drank { raw: false }
         }
     }
 }
@@ -149,6 +170,7 @@ pub fn drink_task_system(
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
     sanitation: Res<crate::simulation::sanitation::SanitationMap>,
+    well_map: Res<WellMap>,
     mut commands: Commands,
     mut query: Query<(
         Entity,
@@ -208,12 +230,14 @@ pub fn drink_task_system(
             &mut needs,
             agent_tile,
             &chunk_map,
+            &well_map,
         );
 
         // Sickness roll: raw source or `SanitationMap`-contaminated tile.
         if let DrinkOutcome::Drank { raw } = outcome {
             let contaminated = match source {
                 DrinkSource::Tile { tile } => sanitation.is_contaminated(tile),
+                DrinkSource::Well { tile } => sanitation.is_contaminated(tile),
                 DrinkSource::Inventory => false,
             };
             let severity = if contaminated {
@@ -254,6 +278,7 @@ pub fn htn_drink_dispatch_system(
     chunk_router: Res<ChunkRouter>,
     chunk_connectivity: Res<ChunkConnectivity>,
     globe: Res<Globe>,
+    well_map: Res<WellMap>,
     mut query: Query<
         (
             &mut PersonAI,
@@ -317,17 +342,48 @@ pub fn htn_drink_dispatch_system(
                 return;
             }
 
-            // Method 2: walk to nearest fresh-water tile.
-            //
-            // Severe-tier thirst widens the scan. Below severe the agent
-            // gives up cleanly when no nearby source is visible; the chief
-            // posting / boiling pipeline (Phase 6) will eventually surface
-            // clean_water in storage.
             let scan = if needs.thirst >= THIRST_SEVERE {
                 DRINK_TILE_SCAN_RADIUS * 2
             } else {
                 DRINK_TILE_SCAN_RADIUS
             };
+
+            // Method 2: walk to the nearest well within scan. Wells beat
+            // rivers because the dispatcher checks them first; settlements
+            // with a well don't send their members on a multi-tile hike to
+            // the riverbank for every sip.
+            if let Some((well_tile, stand_tile)) = nearest_well_with_stand(
+                &well_map,
+                &chunk_map,
+                (cur_tx, cur_ty),
+                scan,
+            ) {
+                let routed = assign_task_with_routing(
+                    &mut ai,
+                    (cur_tx, cur_ty),
+                    cur_chunk,
+                    stand_tile,
+                    TaskKind::Drink,
+                    None,
+                    &chunk_graph,
+                    &chunk_router,
+                    &chunk_map,
+                    &chunk_connectivity,
+                );
+                if routed {
+                    aq.dispatch(Task::Drink {
+                        source: DrinkSource::Well { tile: well_tile },
+                    });
+                    return;
+                }
+            }
+
+            // Method 3: walk to nearest fresh-water tile.
+            //
+            // Severe-tier thirst widens the scan. Below severe the agent
+            // gives up cleanly when no nearby source is visible; the chief
+            // posting / boiling pipeline (Phase 6) will eventually surface
+            // clean_water in storage.
             let Some(tile) =
                 nearest_fresh_drinkable_tile(&chunk_map, &globe, (cur_tx, cur_ty), scan)
             else {
@@ -353,4 +409,46 @@ pub fn htn_drink_dispatch_system(
             }
         },
     );
+}
+
+/// Scan chebyshev rings around `from` for the closest known well within
+/// `max_radius`. For the first well whose chebyshev-1 ring contains a
+/// passable, non-well tile, return `(well_tile, stand_tile)`. The stand
+/// tile is what the agent walks to; the well itself stays untouched.
+fn nearest_well_with_stand(
+    well_map: &WellMap,
+    chunk_map: &ChunkMap,
+    from: (i32, i32),
+    max_radius: i32,
+) -> Option<((i32, i32), (i32, i32))> {
+    let mut best: Option<((i32, i32), i32)> = None;
+    for (&well_tile, _) in well_map.0.iter() {
+        let d = (well_tile.0 - from.0).abs().max((well_tile.1 - from.1).abs());
+        if d > max_radius {
+            continue;
+        }
+        if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+            best = Some((well_tile, d));
+        }
+    }
+    let (well_tile, _) = best?;
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let stand = (well_tile.0 + dx, well_tile.1 + dy);
+            if well_map.0.contains_key(&stand) {
+                continue;
+            }
+            let Some(kind) = chunk_map.tile_kind_at(stand.0, stand.1) else {
+                continue;
+            };
+            if !kind.is_passable() {
+                continue;
+            }
+            return Some((well_tile, stand));
+        }
+    }
+    None
 }

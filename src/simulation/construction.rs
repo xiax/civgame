@@ -20,7 +20,7 @@ use crate::simulation::technology::{
     current_era, Era, TechId, BRIDGE_BUILDING, BRONZE_CASTING, BRONZE_TOOLS, CITY_STATE_ORG,
     COPPER_TOOLS, COPPER_WORKING, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING, GRANARY,
     LONG_DIST_TRADE, LOOM_WEAVING, MONUMENTAL_BUILDING, PERM_SETTLEMENT, PORTABLE_DWELLINGS,
-    PROFESSIONAL_ARMY, SACRED_RITUAL, TECH_TREE,
+    PROFESSIONAL_ARMY, SACRED_RITUAL, TECH_TREE, WELL_DIGGING,
 };
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::{Calendar, Season};
@@ -115,6 +115,20 @@ pub struct MonumentMap(pub AHashMap<(i32, i32), Entity>);
 #[derive(Resource, Default)]
 pub struct BridgeMap(pub AHashMap<(i32, i32), Entity>);
 
+/// Maps tile positions to well entities placed there. Read by the drink
+/// HTN dispatcher (`htn_drink_dispatch_system`) for the well-priority scan,
+/// and by `organic_settlement` for placement scoring + anchor emission.
+#[derive(Resource, Default)]
+pub struct WellMap(pub AHashMap<(i32, i32), Entity>);
+
+/// Lined public well. Drinks fire from a chebyshev-adjacent tile via
+/// `DrinkSource::Well`. No tile rewrite — sits on whatever surface was
+/// underneath.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Well {
+    pub faction_id: u32,
+}
+
 /// Constructed timber span. The tile slot is mutated to `TileKind::Bridge`
 /// at finalize; on deconstruct we read `restore_tile` to put the original
 /// tile back (always `River` for the current build path, but stored
@@ -184,6 +198,7 @@ pub struct FurnitureMaps<'w> {
     pub barracks_map: ResMut<'w, BarracksMap>,
     pub monument_map: ResMut<'w, MonumentMap>,
     pub bridge_map: ResMut<'w, BridgeMap>,
+    pub well_map: ResMut<'w, WellMap>,
 }
 
 /// Bed construction tier. Tracks how the bed was built so the upgrade pipeline
@@ -475,6 +490,10 @@ pub enum BuildSiteKind {
     /// the original `River` tile via the `Bridge` component's
     /// `restore_tile`. Tech-gated on `BRIDGE_BUILDING` (Chalcolithic).
     Bridge,
+    /// Lined public well. 1-tile, impassable — agents drink from a
+    /// chebyshev-adjacent tile via `DrinkSource::Well`. Tech-gated on
+    /// `WELL_DIGGING` (Neolithic). No tile rewrite on finalize/deconstruct.
+    Well,
 }
 
 /// Marker component on tile entities representing portable shelter.
@@ -521,6 +540,7 @@ impl BuildSiteKind {
             BuildSiteKind::Yurt => "Yurt",
             BuildSiteKind::Latrine => "Latrine",
             BuildSiteKind::Bridge => "Bridge",
+            BuildSiteKind::Well => "Well",
         }
     }
 
@@ -702,6 +722,7 @@ enum BuildRecipeIdx {
     Yurt,
     Latrine,
     Bridge,
+    Well,
 }
 
 fn build_recipes_table() -> Vec<BuildRecipe> {
@@ -884,6 +905,16 @@ fn build_recipes_table() -> Vec<BuildRecipe> {
             tech_gate: Some(BRIDGE_BUILDING),
             deconstruct_refund: vec![(wood, 2), (stone, 1)],
         },
+        // Lined public well. Stone surround over a wooden frame. Tech-gated
+        // on `WELL_DIGGING` (Neolithic). Mirrors the Granary recipe shape
+        // (heavier than a workshop) since the shaft + lining is real labor.
+        BuildRecipe {
+            name: "Well",
+            inputs: vec![(stone, 4), (wood, 2)],
+            work_ticks: 120,
+            tech_gate: Some(WELL_DIGGING),
+            deconstruct_refund: vec![(stone, 2), (wood, 1)],
+        },
     ]
 }
 
@@ -1001,6 +1032,7 @@ pub fn recipe_for(kind: BuildSiteKind) -> &'static BuildRecipe {
         BuildSiteKind::Monument => BuildRecipeIdx::Monument,
         BuildSiteKind::Latrine => BuildRecipeIdx::Latrine,
         BuildSiteKind::Bridge => BuildRecipeIdx::Bridge,
+        BuildSiteKind::Well => BuildRecipeIdx::Well,
     };
     &build_recipes()[idx as usize]
 }
@@ -1130,6 +1162,14 @@ fn count_workbenches_near(map: &WorkbenchMap, home: (i32, i32), radius: i32) -> 
 }
 
 fn count_granaries_near(map: &GranaryMap, home: (i32, i32), radius: i32) -> usize {
+    let (hx, hy) = (home.0 as i32, home.1 as i32);
+    map.0
+        .keys()
+        .filter(|&&pos| (pos.0 as i32 - hx).abs() <= radius && (pos.1 as i32 - hy).abs() <= radius)
+        .count()
+}
+
+fn count_wells_near(map: &WellMap, home: (i32, i32), radius: i32) -> usize {
     let (hx, hy) = (home.0 as i32, home.1 as i32);
     map.0
         .keys()
@@ -2144,6 +2184,7 @@ pub struct BuildingMapsRO<'w> {
     pub market_map: Res<'w, MarketMap>,
     pub barracks_map: Res<'w, BarracksMap>,
     pub monument_map: Res<'w, MonumentMap>,
+    pub well_map: Res<'w, WellMap>,
     pub doormat: Res<'w, crate::simulation::doormat::DoormatReservations>,
     pub organic_selected: Res<'w, crate::simulation::organic_settlement::SelectedSettlementIntents>,
     pub organic_brains: Res<'w, crate::simulation::organic_settlement::SettlementBrains>,
@@ -2164,6 +2205,7 @@ pub struct GenCandidatesMaps<'a> {
     pub market_map: &'a MarketMap,
     pub barracks_map: &'a BarracksMap,
     pub monument_map: &'a MonumentMap,
+    pub well_map: &'a WellMap,
 }
 
 impl<'w> BuildingMapsRO<'w> {
@@ -2178,6 +2220,7 @@ impl<'w> BuildingMapsRO<'w> {
             market_map: &self.market_map,
             barracks_map: &self.barracks_map,
             monument_map: &self.monument_map,
+            well_map: &self.well_map,
         }
     }
 }
@@ -2194,6 +2237,7 @@ impl<'w> FurnitureMaps<'w> {
             market_map: &self.market_map,
             barracks_map: &self.barracks_map,
             monument_map: &self.monument_map,
+            well_map: &self.well_map,
         }
     }
 }
@@ -3095,6 +3139,46 @@ fn generate_candidates(
         }
     }
 
+    // 5b. Well — gated by WELL_DIGGING. Per-era target: Paleo/Meso 0,
+    // Neo 1, Chalco 2, Bronze 3. Seed mode bypasses civic gates.
+    if techs.has(WELL_DIGGING) {
+        let target_wells = match era {
+            Era::Paleolithic | Era::Mesolithic => 0,
+            Era::Neolithic => 1,
+            Era::Chalcolithic => 2,
+            Era::BronzeAge => 3,
+        };
+        if target_wells > 0 {
+            let built = count_wells_near(&maps.well_map, home, 25);
+            let pending = pending_of(BuildSiteKind::Well) as usize;
+            if built + pending < target_wells {
+                // Try civic, then storage, then residential zones.
+                let zone = [ZoneKind::Civic, ZoneKind::Storage, ZoneKind::Residential]
+                    .into_iter()
+                    .find_map(|z| {
+                        find_clear_tile_in_zone(
+                            chunk_map,
+                            &maps.bed_map,
+                            bp_map,
+                            doormat,
+                            plan,
+                            z,
+                            home,
+                            12,
+                        )
+                    });
+                if let Some(tile) = zone {
+                    out.push(BuildCandidate {
+                        intent: BuildIntent::Single(BuildSiteKind::Well),
+                        tile,
+                        score: 175.0,
+                        door_dir: None,
+                    });
+                }
+            }
+        }
+    }
+
     // 6. Shrine — gated by SACRED_RITUAL + (era, peak_pop) milestone.
     if techs.has(SACRED_RITUAL)
         && count_shrines_near(&maps.shrine_map, home, 25)
@@ -3386,6 +3470,7 @@ fn seed_single_tile_clear(
         && !maps.barracks_map.0.contains_key(&tile)
         && !maps.monument_map.0.contains_key(&tile)
         && !maps.bridge_map.0.contains_key(&tile)
+        && !maps.well_map.0.contains_key(&tile)
 }
 
 fn find_clear_seed_single_tile(
@@ -5140,6 +5225,22 @@ pub fn construction_system(
                     maps.bridge_map.0.insert(tile, bridge_entity);
                     bridge_entity
                 }
+                BuildSiteKind::Well => {
+                    let well_entity = commands
+                        .spawn((
+                            Well {
+                                faction_id: bp.faction_id,
+                            },
+                            StructureLabel(BuildSiteKind::Well.label()),
+                            Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        ))
+                        .id();
+                    maps.well_map.0.insert(tile, well_entity);
+                    well_entity
+                }
             };
 
             // Emit a TileChangedEvent so pathfinding caches (flow fields,
@@ -5718,6 +5819,8 @@ pub fn deconstruct_system(
             removed = Some((e, BuildSiteKind::Monument, false));
         } else if let Some(e) = maps.bridge_map.0.remove(&tile) {
             removed = Some((e, BuildSiteKind::Bridge, false));
+        } else if let Some(e) = maps.well_map.0.remove(&tile) {
+            removed = Some((e, BuildSiteKind::Well, false));
         } else if let Some(e) = maps.wall_map.0.remove(&tile) {
             // Walls: revert chunk_map to Grass + emit TileChangedEvent so the
             // sprite refreshes. The recipe-determined refund is given via the
@@ -6215,6 +6318,19 @@ fn spawn_seeded_structure_at_tile(
                 ))
                 .id();
             maps.monument_map.0.insert(tile, e);
+        }
+        BuildSiteKind::Well => {
+            let e = commands
+                .spawn((
+                    Well { faction_id },
+                    StructureLabel(BuildSiteKind::Well.label()),
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            maps.well_map.0.insert(tile, e);
         }
         // Wall and Door are placed by `seed_perimeter`, not here.
         _ => return,
@@ -7208,6 +7324,43 @@ mod tests {
         let r = recipe_for(BuildSiteKind::Bridge);
         assert_eq!(r.tech_gate, Some(BRIDGE_BUILDING));
         assert!(!r.deconstruct_refund.is_empty());
+    }
+
+    #[test]
+    fn well_digging_tech_def() {
+        let def = &TECH_TREE[WELL_DIGGING as usize];
+        assert_eq!(def.id, WELL_DIGGING);
+        assert_eq!(def.era, Era::Neolithic);
+        assert!(def.prerequisites.contains(&FLINT_KNAPPING));
+        assert!(def.prerequisites.contains(&PERM_SETTLEMENT));
+        assert_eq!(
+            crate::simulation::technology_adoption::tech_scale(WELL_DIGGING),
+            crate::simulation::technology_adoption::AdoptionScale::Institutional
+        );
+    }
+
+    #[test]
+    fn well_recipe_inputs_and_gate() {
+        use crate::economy::core_ids;
+        let _ = core_ids::catalog();
+        let r = recipe_for(BuildSiteKind::Well);
+        assert_eq!(r.tech_gate, Some(WELL_DIGGING));
+        assert_eq!(r.work_ticks, 120);
+        let stone = core_ids::stone();
+        let wood = core_ids::wood();
+        assert!(r.inputs.contains(&(stone, 4)));
+        assert!(r.inputs.contains(&(wood, 2)));
+        assert!(r.deconstruct_refund.contains(&(stone, 2)));
+        assert!(r.deconstruct_refund.contains(&(wood, 1)));
+    }
+
+    #[test]
+    fn faction_cannot_build_well_without_well_digging() {
+        let techs = FactionTechs::default();
+        assert!(!faction_can_build(BuildSiteKind::Well, &techs));
+        let mut techs2 = FactionTechs::default();
+        techs2.unlock(WELL_DIGGING);
+        assert!(faction_can_build(BuildSiteKind::Well, &techs2));
     }
 
     #[test]

@@ -471,11 +471,13 @@ pub enum Task {
 
 /// Source for a `Task::Drink`. Inventory drinks consume one `clean_water`
 /// unit; tile drinks read the adjacency tile and gate on freshness via
-/// `world::biome::water_kind_at`.
+/// `world::biome::water_kind_at`; well drinks read the adjacency tile against
+/// `WellMap` and treat the result as clean unless `SanitationMap` flags it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrinkSource {
     Inventory,
     Tile { tile: (i32, i32) },
+    Well { tile: (i32, i32) },
 }
 
 impl Default for Task {

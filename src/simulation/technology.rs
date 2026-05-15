@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 pub type TechId = u16;
-pub const TECH_COUNT: usize = 45;
+pub const TECH_COUNT: usize = 46;
 pub const ACTIVITY_COUNT: usize = 13;
 
 // ── Tech ID constants ─────────────────────────────────────────────────────────
@@ -60,6 +60,9 @@ pub const PORTABLE_DWELLINGS: TechId = 43;
 // Chalcolithic public-works tech. Gates `BuildSiteKind::Bridge` (timber
 // span over a river tile) and AI bridge-intent generation.
 pub const BRIDGE_BUILDING: TechId = 44;
+// Neolithic public-water structure. Gates `BuildSiteKind::Well` and
+// the organic-settlement WaterAccess pressure.
+pub const WELL_DIGGING: TechId = 45;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -1140,6 +1143,19 @@ pub static TECH_TREE: [TechDef; TECH_COUNT] = [
              both banks and routes no longer have to detour around water.",
         prerequisites: &[PERM_SETTLEMENT, DUGOUT_CANOE, COPPER_TOOLS],
         triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: WELL_DIGGING,
+        era: Era::Neolithic,
+        name: "Well Digging",
+        description: "Lined shafts reach the water table — settlements gain a clean public \
+             water source independent of rivers and springs.",
+        prerequisites: &[FLINT_KNAPPING, PERM_SETTLEMENT],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::StoneMining,
+            per_unit_chance: 0.001,
+        }],
         bonus: TechBonus::ZERO,
     },
 ];

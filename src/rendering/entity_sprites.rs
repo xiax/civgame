@@ -3,7 +3,7 @@ use crate::rendering::pixel_art::{AnimalTextures, ArtMode, EntityTextures};
 use crate::rendering::sprite_library::SpriteLibrary;
 use crate::simulation::animals::{Cat, Cow, Deer, Fox, Horse, Pig, Rabbit, Wolf};
 use crate::simulation::construction::{
-    Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, Loom, Table, Wall, WallMaterial,
+    Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, Loom, Table, Wall, WallMaterial, Well,
     Workbench,
 };
 use crate::simulation::faction::{
@@ -104,6 +104,9 @@ pub struct WorkbenchVisual;
 
 #[derive(Component)]
 pub struct LoomVisual;
+
+#[derive(Component)]
+pub struct WellVisual;
 
 #[derive(Component)]
 pub struct GroundItemVisual;
@@ -401,6 +404,33 @@ pub fn spawn_loom_sprites(
         commands
             .entity(entity)
             .insert((LoomVisual, EntityFogState::default(), FogPersistent));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+pub fn spawn_well_sprites(
+    mut commands: Commands,
+    query: Query<Entity, (With<Well>, Without<WellVisual>)>,
+    sprite_lib: Res<SpriteLibrary>,
+) {
+    let Some(handle) = sprite_lib.get("building_well") else {
+        return;
+    };
+    for entity in query.iter() {
+        let mut sprite = Sprite::from_image(handle.clone());
+        sprite.anchor = Anchor::BottomCenter;
+        commands
+            .entity(entity)
+            .insert((WellVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -1749,6 +1779,7 @@ pub fn spawn_blueprint_sprites(
     mut commands: Commands,
     query: Query<(Entity, &Blueprint), (With<Blueprint>, Without<BlueprintVisual>)>,
     textures: Res<EntityTextures>,
+    sprite_lib: Res<SpriteLibrary>,
 ) {
     for (entity, bp) in query.iter() {
         let scaffold_img = textures.blueprint_ascii.clone();
@@ -1785,6 +1816,10 @@ pub fn spawn_blueprint_sprites(
             // Stub: reuse table sprite (planks-over-water suggestion) until
             // a dedicated bridge blueprint sprite ships.
             BuildSiteKind::Bridge => textures.table_ascii.clone(),
+            BuildSiteKind::Well => sprite_lib
+                .get("building_well")
+                .cloned()
+                .unwrap_or_else(|| textures.wall_stone_ascii.clone()),
         };
 
         let mut ghost_sprite = Sprite::from_image(ghost_img);
