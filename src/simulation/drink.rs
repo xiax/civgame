@@ -281,6 +281,18 @@ pub fn htn_drink_dispatch_system(
             if needs.thirst < THIRST_TRIGGER {
                 return;
             }
+            // Normalize orphan ActionQueue. PersonAI being clean (Idle,
+            // UNEMPLOYED) is supposed to imply aq.current == Idle, but
+            // executors that exit with `aq.advance()` while queued is
+            // non-empty leave `aq.current` pointing at the promoted-but-
+            // unrouted next task. Subsequent `aq.dispatch(Task::Drink)`
+            // can't promote (current != Idle) and Drink gets buried in
+            // queued, leading to a frozen Working state because
+            // `drink_task_system` reads `aq.current.as_drink()` → None.
+            // Drop the orphan so promotion can proceed.
+            if aq.current != Task::Idle {
+                aq.cancel();
+            }
 
             let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
             let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;

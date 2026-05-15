@@ -136,3 +136,6 @@ And can we add farms to the settlement planner? Farming should be portioned and 
 
 Add bridges to settlement planner
 
+Workers should be able to do more than one task at a time, like work and socialize at the same time.
+
+Make water flow work properly

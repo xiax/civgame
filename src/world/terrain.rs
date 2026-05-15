@@ -461,6 +461,22 @@ pub fn tile_at_3d(
     if let Some(d) = chunk_map.tile_delta_at(tx, ty, tz) {
         return d;
     }
+    // Surface-level reads consult the chunk's `surface_kind` cache. `proc_tile`
+    // re-derives surface kind from biome bands alone and so doesn't see
+    // post-procgen rewrites like river polyline stamping or lake fill — the
+    // chunk cache is the authoritative source for those. Without this branch,
+    // hover / inspector / any tile_at_3d caller reads "Silt"/"Wall" for tiles
+    // that were stamped to `River` (depressed Z) or `Water` (lake fill).
+    let chunk_surf_z = chunk_map.surface_z_at(tx, ty);
+    if chunk_surf_z >= Z_MIN && tz == chunk_surf_z {
+        if let Some(kind) = chunk_map.tile_kind_at(tx, ty) {
+            return TileData {
+                kind,
+                fertility: chunk_map.tile_fertility_at(tx, ty).unwrap_or(0),
+                ..Default::default()
+            };
+        }
+    }
     let biome = biome_mod::classify_at_tile(globe, tx, ty);
     let river_d = chunk_map.river_distance_at(tx, ty);
     proc_tile(tx, ty, tz, gen, globe, biome, river_d)

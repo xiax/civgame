@@ -1131,17 +1131,27 @@ pub fn goal_dispatch_system(
             // can pick a fresh plan next tick.
             //
             // Phase 5c-ii-d-iv-ii: HTN-dispatched Explore (`ExploreForFoodMethod`
-            // / `ExploreForMaterialMethod`) lands here too on arrival. Calling
-            // `aq.advance()` flips the typed channel to `Task::Idle` so the
-            // next HTN dispatch tick re-evaluates with a fresh ctx (memory
-            // populated en route may now reveal a concrete target).
+            // / `ExploreForMaterialMethod`) lands here too on arrival.
+            //
+            // Must use `aq.cancel()` (not `aq.advance()`): if a prior tick's
+            // `aq.dispatch(Task::Explore)` couldn't promote because `current`
+            // was non-Idle, the Explore sits in `queued`. `aq.advance()` would
+            // then promote that stale Explore into `current` while task_id has
+            // already been cleared to UNEMPLOYED — orphaning it. The next
+            // goal's dispatcher then re-runs `aq.dispatch(Task::X)`, which sees
+            // `current = Explore` (not Idle), enqueues X behind Explore, and
+            // never promotes. Symptom: `task_id = X` but `aq.current = Explore`,
+            // executor's `aq.current.as_x()` silently returns None, agent
+            // freezes (e.g. parked at a river with Drink task but Explore in
+            // current). `cancel()` drops `current` and the queue so the next
+            // dispatch starts clean.
             if !matches!(*goal, AgentGoal::Sleep)
                 && ai.task_id == TaskKind::Explore as u16
                 && ai.state == AiState::Working
             {
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
-                aq.advance();
+                aq.cancel();
             }
         });
 }

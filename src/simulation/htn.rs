@@ -1135,6 +1135,13 @@ pub struct PlannerCtx {
     /// engage-prey and join-hunt-party dispatchers; everywhere else
     /// defaults to `false` (the hunting methods are the only readers).
     pub agent_has_weapon: bool,
+    /// Farm-planner follow-up: when a `AgentGoal::Farm` harvest should route
+    /// its trailing `Task::DepositToFactionStorage` to a household-specific
+    /// `FactionStorageTile` instead of the actor's faction storage, the
+    /// harvest dispatcher snapshots `Some(household_id)` here. Read by
+    /// `HarvestMaturePlantForStorageMethod::expand`. `None` everywhere else
+    /// preserves the actor-faction default.
+    pub deposit_target_faction_override: Option<u32>,
 }
 
 /// A single decomposition rule for an `AbstractTask`. Scoring (`utility`) and
@@ -3519,6 +3526,7 @@ pub fn htn_dispatch_system(
                 play_plant_destination_tile: None,
                 personal_bp_resource: None,
                 agent_has_weapon: false,
+                deposit_target_faction_override: None,
             };
 
             // Argmax over applicable methods. f32 has no total order; ties
@@ -3748,6 +3756,7 @@ pub fn htn_eat_dispatch_system(
                 play_plant_destination_tile: None,
                 personal_bp_resource: None,
                 agent_has_weapon: false,
+                deposit_target_faction_override: None,
             };
 
             let abstract_task = AbstractTask::Eat;
@@ -4107,6 +4116,7 @@ pub fn htn_acquire_food_dispatch_system(
                 play_plant_destination_tile: None,
                 personal_bp_resource: None,
                 agent_has_weapon: false,
+                deposit_target_faction_override: None,
             };
 
             let abstract_task = AbstractTask::AcquireFood;
@@ -4651,6 +4661,7 @@ pub fn htn_acquire_good_dispatch_system(
                     play_plant_destination_tile: None,
                     personal_bp_resource: None,
                     agent_has_weapon: false,
+                    deposit_target_faction_override: None,
                 };
 
                 let abstract_task = AbstractTask::AcquireGood {
@@ -4966,6 +4977,7 @@ pub fn htn_acquire_good_dispatch_system(
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         };
 
         let abstract_task = AbstractTask::AcquireGood { resource_id };
@@ -5377,6 +5389,7 @@ pub fn htn_stockpile_food_dispatch_system(
                 play_plant_destination_tile: None,
                 personal_bp_resource: None,
                 agent_has_weapon: false,
+                deposit_target_faction_override: None,
             };
 
             let abstract_task = AbstractTask::StockpileFood;
@@ -5753,6 +5766,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         };
 
         let abstract_task = AbstractTask::EquipHuntingSpear;
@@ -5951,6 +5965,7 @@ pub fn htn_scout_dispatch_system(
                 play_plant_destination_tile: None,
                 personal_bp_resource: None,
                 agent_has_weapon: false,
+                deposit_target_faction_override: None,
             };
 
             let abstract_task = AbstractTask::Scout;
@@ -6161,6 +6176,7 @@ pub fn htn_return_surplus_dispatch_system(
                 play_plant_destination_tile: None,
                 personal_bp_resource: None,
                 agent_has_weapon: false,
+                deposit_target_faction_override: None,
             };
 
             let abstract_task = AbstractTask::ReturnSurplus;
@@ -6359,6 +6375,7 @@ pub fn htn_tame_horse_dispatch_system(
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         };
 
         let abstract_task = AbstractTask::TameWildHorse;
@@ -6438,12 +6455,164 @@ pub fn htn_tame_horse_dispatch_system(
 /// in ParallelB; it doesn't compete with food/haul/scout/spear/return-surplus
 /// dispatchers because Farm is a distinct goal arena.
 /// Bundle of farm-planner inputs read by `htn_plant_from_storage_dispatch_system`
-/// to keep the outer signature under Bevy's 16-param ceiling.
+/// and `htn_harvest_plant_dispatch_system` to keep the outer signature under
+/// Bevy's 16-param ceiling. Drives the shared `FarmScope` resolver below.
 #[derive(bevy::ecs::system::SystemParam)]
-pub struct FarmPlantingPlotParams<'w, 's> {
+pub struct FarmScopeParams<'w, 's> {
     pub board: Res<'w, crate::simulation::jobs::JobBoard>,
     pub plot_index: Res<'w, crate::simulation::land::PlotIndex>,
     pub plot_q: Query<'w, 's, &'static crate::simulation::land::Plot>,
+}
+
+/// Where a `AgentGoal::Farm` worker should source seeds / harvest crops, and
+/// where deposits should land. Resolved once per dispatch by
+/// [`resolve_farm_scope`] and consumed by both farm dispatchers.
+#[derive(Clone, Copy, Debug)]
+pub enum FarmScope {
+    /// Chief-assigned communal plot. Seeds withdraw from village storage,
+    /// harvest deposits to village storage. `source_faction_id ==
+    /// member.faction_id`. `deposit_override == None`.
+    Communal {
+        plot_rect: crate::simulation::settlement::TileRect,
+        source_faction_id: u32,
+    },
+    /// Private farmer working their household's Agricultural plot. Seeds
+    /// withdraw from household storage (`source_faction_id == household_id`),
+    /// harvest deposits to household storage (`deposit_override ==
+    /// Some(household_id)`).
+    Private {
+        plot_rect: crate::simulation::settlement::TileRect,
+        source_faction_id: u32,
+    },
+    /// No qualifying plot. Planting falls back to the legacy radius-15
+    /// farmland search; harvest falls back to the legacy `MemoryKind::AnyEdible`
+    /// search; both route through `member.faction_id` storage. Covers the
+    /// pre-carving bootstrap window and any non-`Farmer` worker that ends up
+    /// on `AgentGoal::Farm`.
+    Bootstrap { source_faction_id: u32 },
+}
+
+impl FarmScope {
+    pub fn source_faction_id(&self) -> u32 {
+        match self {
+            FarmScope::Communal { source_faction_id, .. }
+            | FarmScope::Private { source_faction_id, .. }
+            | FarmScope::Bootstrap { source_faction_id } => *source_faction_id,
+        }
+    }
+
+    pub fn plot_rect(&self) -> Option<crate::simulation::settlement::TileRect> {
+        match self {
+            FarmScope::Communal { plot_rect, .. }
+            | FarmScope::Private { plot_rect, .. } => Some(*plot_rect),
+            FarmScope::Bootstrap { .. } => None,
+        }
+    }
+
+    pub fn deposit_override(&self) -> Option<u32> {
+        match self {
+            FarmScope::Private { source_faction_id, .. } => Some(*source_faction_id),
+            FarmScope::Communal { .. } | FarmScope::Bootstrap { .. } => None,
+        }
+    }
+}
+
+/// Resolver for [`FarmScope`]. Mirrors the ownership cascade in
+/// `production.rs` plant-stamping: chief Farm claim wins over household
+/// tenure wins over Person/Bootstrap.
+///
+/// 1. **Communal** — the worker holds `JobClaim::Farm` whose posting carries
+///    `JobProgress::Planting { plot_id: Some(_), assigned_farmer: Some(self), .. }`.
+///    Resolves to the plot's live `rect` (falling back to the posting's
+///    `area` snapshot if the plot vanished).
+/// 2. **Private** — no qualifying communal claim, but the worker is
+///    `Profession::Farmer` + `HouseholdMember` and the household holds a
+///    `ZoneKind::Agricultural` plot. Scans `plot_index.by_id` (small N) for
+///    `TenureHolder::Household { faction_id: household_id }`.
+/// 3. **Bootstrap** — everything else.
+pub fn resolve_farm_scope(
+    actor: Entity,
+    member_faction_id: u32,
+    claim_opt: Option<&crate::simulation::jobs::JobClaim>,
+    household_member_opt: Option<&crate::simulation::reproduction::HouseholdMember>,
+    profession_opt: Option<&crate::simulation::person::Profession>,
+    params: &FarmScopeParams,
+) -> FarmScope {
+    use crate::simulation::jobs::{JobKind, JobProgress};
+    use crate::simulation::land::TenureHolder;
+    use crate::simulation::settlement::{TileRect, ZoneKind};
+
+    // Path 1: communal chief-assigned plot.
+    if let Some(claim) = claim_opt {
+        if matches!(claim.kind, JobKind::Farm) {
+            if let Some(posting) = params
+                .board
+                .faction_postings(claim.faction_id)
+                .iter()
+                .find(|p| p.id == claim.job_id)
+            {
+                if let JobProgress::Planting {
+                    plot_id,
+                    assigned_farmer,
+                    area,
+                    ..
+                } = posting.progress
+                {
+                    let mine = assigned_farmer.map_or(true, |a| a == actor);
+                    if mine {
+                        if let Some(pid) = plot_id {
+                            if let Some(&ent) = params.plot_index.by_id.get(&pid) {
+                                if let Ok(plot) = params.plot_q.get(ent) {
+                                    return FarmScope::Communal {
+                                        plot_rect: plot.rect,
+                                        source_faction_id: member_faction_id,
+                                    };
+                                }
+                            }
+                            // Plot vanished — fall back to posting's snapshot.
+                            let w = (area.max.0 - area.min.0 + 1).max(1) as u16;
+                            let h = (area.max.1 - area.min.1 + 1).max(1) as u16;
+                            return FarmScope::Communal {
+                                plot_rect: TileRect::new(area.min.0, area.min.1, w, h),
+                                source_faction_id: member_faction_id,
+                            };
+                        }
+                        // Bootstrap chief posting (no plot_id). Fall through.
+                    }
+                }
+            }
+        }
+    }
+
+    // Path 2: private farmer with a household-held Agricultural plot.
+    let is_farmer = matches!(
+        profession_opt,
+        Some(crate::simulation::person::Profession::Farmer),
+    );
+    if is_farmer {
+        if let Some(hm) = household_member_opt {
+            let hh = hm.household_id;
+            for (_, &ent) in params.plot_index.by_id.iter() {
+                if let Ok(plot) = params.plot_q.get(ent) {
+                    if plot.zone_kind == ZoneKind::Agricultural
+                        && matches!(
+                            plot.holder,
+                            TenureHolder::Household { faction_id } if faction_id == hh
+                        )
+                    {
+                        return FarmScope::Private {
+                            plot_rect: plot.rect,
+                            source_faction_id: hh,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    FarmScope::Bootstrap {
+        source_faction_id: member_faction_id,
+    }
 }
 
 pub fn htn_plant_from_storage_dispatch_system(
@@ -6459,9 +6628,10 @@ pub fn htn_plant_from_storage_dispatch_system(
     spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<SimClock>,
     item_query: Query<&crate::simulation::items::GroundItem>,
-    farm_plot_params: FarmPlantingPlotParams,
+    farm_plot_params: FarmScopeParams,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -6471,6 +6641,8 @@ pub fn htn_plant_from_storage_dispatch_system(
             &LodLevel,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
             Option<&crate::simulation::jobs::JobClaim>,
+            Option<&crate::simulation::reproduction::HouseholdMember>,
+            Option<&crate::simulation::person::Profession>,
         ),
         Without<Drafted>,
     >,
@@ -6479,8 +6651,20 @@ pub fn htn_plant_from_storage_dispatch_system(
     use crate::simulation::tasks::{find_nearest_unplanted_farmland, find_nearest_unplanted_in_rect};
     const VIEW_RADIUS: i32 = 15;
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, goal, transform, member, lod, knowledge_opt, claim_opt) in
-        query.iter_mut()
+    for (
+        actor,
+        mut ai,
+        mut aq,
+        mut history,
+        goal,
+        transform,
+        member,
+        lod,
+        knowledge_opt,
+        claim_opt,
+        household_member_opt,
+        profession_opt,
+    ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
             continue;
@@ -6503,10 +6687,24 @@ pub fn htn_plant_from_storage_dispatch_system(
             continue;
         }
 
-        // Walk PlantKind::ALL for the seed with the highest faction stock.
-        // Adding a new plantable seed = new PlantKind::ALL entry + arm in
-        // `PlantKind::seed_resource()`; this loop stays unchanged.
-        let Some(faction) = faction_registry.factions.get(&member.faction_id) else {
+        // Resolve which storage / plot the worker is bound to. Communal/
+        // Private use the assigned plot's rect for planting search and pull
+        // seeds from the matching faction (village vs. household); Bootstrap
+        // falls back to the village + radius-15 farmland search.
+        let scope = resolve_farm_scope(
+            actor,
+            member.faction_id,
+            claim_opt,
+            household_member_opt,
+            profession_opt,
+            &farm_plot_params,
+        );
+        let source_fid = scope.source_faction_id();
+
+        // Walk PlantKind::ALL for the seed with the highest source-faction
+        // stock. Adding a new plantable seed = new PlantKind::ALL entry +
+        // arm in `PlantKind::seed_resource()`; this loop stays unchanged.
+        let Some(faction) = faction_registry.factions.get(&source_fid) else {
             continue;
         };
         let mut best_seed: Option<(crate::economy::resource_catalog::ResourceId, u32)> = None;
@@ -6534,9 +6732,9 @@ pub fn htn_plant_from_storage_dispatch_system(
         );
 
         // Find nearest storage tile holding the chosen seed (effective after
-        // reservations). Mirrors the per-tile scan in the AcquireGood Haul
-        // and EquipHuntingSpear branches.
-        let Some(tiles) = storage_tile_map.by_faction.get(&member.faction_id) else {
+        // reservations). Source-faction keyed so Private routes through
+        // household storage, Communal/Bootstrap through village storage.
+        let Some(tiles) = storage_tile_map.by_faction.get(&source_fid) else {
             continue;
         };
         let mut best_tile: Option<(i32, i32)> = None;
@@ -6567,50 +6765,11 @@ pub fn htn_plant_from_storage_dispatch_system(
             continue;
         };
 
-        // Farm-planner §11: when the worker holds a plot-scoped Farm
-        // posting (chief-assigned plot), restrict the planting search to
-        // that plot's rect so they don't wander to a closer tile outside
-        // the assigned area. Falls through to the radius search for
-        // bootstrap (`plot_id = None`) and non-Farm goals.
-        let plot_scope: Option<((i32, i32), (i32, i32))> = claim_opt.and_then(|c| {
-            if !matches!(c.kind, crate::simulation::jobs::JobKind::Farm) {
-                return None;
-            }
-            // Lookup posting by id on the worker's faction's board.
-            let postings = farm_plot_params
-                .board
-                .faction_postings(c.faction_id);
-            let posting = postings.iter().find(|p| p.id == c.job_id)?;
-            let (plot_id, area) =
-                if let crate::simulation::jobs::JobProgress::Planting {
-                    plot_id,
-                    area,
-                    ..
-                } = posting.progress
-                {
-                    (plot_id, area)
-                } else {
-                    return None;
-                };
-            // Prefer the plot's actual rect (in case the area drifted)
-            // but fall back to the posting's snapshot.
-            if let Some(pid) = plot_id {
-                if let Some(&plot_ent) = farm_plot_params.plot_index.by_id.get(&pid) {
-                    if let Ok(plot) = farm_plot_params.plot_q.get(plot_ent) {
-                        return Some((
-                            (plot.rect.x0, plot.rect.y0),
-                            (
-                                plot.rect.x0 + plot.rect.w as i32 - 1,
-                                plot.rect.y0 + plot.rect.h as i32 - 1,
-                            ),
-                        ));
-                    }
-                }
-            }
-            Some((area.min, area.max))
-        });
-
-        let plant_tile = if let Some((rmin, rmax)) = plot_scope {
+        // Farm-planner §11: Communal/Private restrict the planting search
+        // to the assigned plot's rect; Bootstrap keeps the radius search.
+        let plant_tile = if let Some(rect) = scope.plot_rect() {
+            let rmin = (rect.x0, rect.y0);
+            let rmax = (rect.x0 + rect.w as i32 - 1, rect.y0 + rect.h as i32 - 1);
             find_nearest_unplanted_in_rect(
                 &chunk_map,
                 &plant_map,
@@ -6676,6 +6835,7 @@ pub fn htn_plant_from_storage_dispatch_system(
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         };
 
         let abstract_task = AbstractTask::PlantFromStorage {
@@ -7097,6 +7257,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             play_plant_destination_tile: None,
             personal_bp_resource,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         };
 
         let abstract_task = AbstractTask::ConstructBlueprint;
@@ -7331,6 +7492,7 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         };
 
         let abstract_task = AbstractTask::DeliverHuntKill;
@@ -7648,6 +7810,7 @@ pub fn htn_engage_prey_dispatch_system(
                 || equipment_opt
                     .map(|eq| eq.has_resource(weapon_id))
                     .unwrap_or(false),
+            deposit_target_faction_override: None,
         };
 
         let abstract_task = AbstractTask::EngagePrey;
@@ -7912,6 +8075,7 @@ pub fn htn_join_hunt_party_dispatch_system(
                 || equipment_opt
                     .map(|eq| eq.has_resource(weapon_id))
                     .unwrap_or(false),
+            deposit_target_faction_override: None,
         };
 
         let abstract_task = AbstractTask::JoinHuntParty;
@@ -8126,6 +8290,7 @@ pub fn htn_socialize_dispatch_system(
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         };
 
         let disposition = disposition_opt.copied().unwrap_or_default();
@@ -8357,6 +8522,7 @@ pub fn htn_combat_faction_dispatch_system(
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         };
 
         let methods = method_registry.methods_for(abstract_kind);
@@ -8847,6 +9013,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         };
 
         let abstract_task = AbstractTask::DeliverMaterialToCraftOrder {
@@ -9110,6 +9277,7 @@ pub fn htn_work_on_craft_order_dispatch_system(
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         };
 
         let abstract_task = AbstractTask::WorkOnCraftOrder;
@@ -9427,6 +9595,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         };
 
         let abstract_task = AbstractTask::HarvestGrainForCraftOrder;
@@ -9528,7 +9697,7 @@ impl Method for HarvestMaturePlantForStorageMethod {
             Task::Gather { tile },
             Task::DepositToFactionStorage {
                 resource_id,
-                target_faction_id: None,
+                target_faction_id: ctx.deposit_target_faction_override,
             },
         ]
     }
@@ -9552,14 +9721,20 @@ impl Method for HarvestMaturePlantForStorageMethod {
 /// `[StepId(1) FarmFarmland, StepId(12) DepositGoods]`.
 ///
 /// Gates on `AgentGoal::Farm` + Learned `CROP_CULTIVATION` + non-SOLO + no
-/// `ActivePlan` + Idle. Walks `AgentMemory::best_for(MemoryKind::AnyEdible)`
-/// paired with `PlantMap` to find a remembered live mature plant (Grain or
-/// BerryBush — whichever the agent remembers); reads the plant's
-/// `harvest_yield(false).0` to thread the resource through to the trailing
-/// deposit. Snapshots `gather_target_tile` + `forage_food_good` +
-/// `gather_deposit_tile` into ctx and dispatches the head `Task::Gather { tile }`.
-/// `gather::finish_gather`'s existing `DepositToFactionStorage` arm routes to
-/// the nearest faction storage tile on harvest completion.
+/// `ActivePlan` + Idle. Resolves [`FarmScope`] for the worker:
+///
+/// - **Communal / Private**: walks the assigned plot's rect via `PlantMap`,
+///   picking the nearest live mature plant (Chebyshev). Private routes the
+///   trailing `Task::DepositToFactionStorage` to household storage via
+///   `deposit_target_faction_override = Some(household_id)`.
+/// - **Bootstrap**: falls back to the legacy
+///   `GatherKnowledge::nearest_target_tile(MemoryKind::AnyEdible)` lookup so
+///   pre-carving villages keep farming.
+///
+/// Reads the chosen plant's `harvest_yield(false).0` to thread the resource
+/// through to the trailing deposit. Snapshots `gather_target_tile` +
+/// `forage_food_good` + `gather_deposit_tile` (+ override) into ctx and
+/// dispatches the head `Task::Gather { tile }`.
 pub fn htn_harvest_plant_dispatch_system(
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
@@ -9572,6 +9747,7 @@ pub fn htn_harvest_plant_dispatch_system(
     plant_query: Query<&Plant>,
     clock: Res<SimClock>,
     gk: crate::simulation::shared_knowledge::GatherKnowledge,
+    farm_plot_params: FarmScopeParams,
     mut query: Query<
         (
             Entity,
@@ -9584,6 +9760,8 @@ pub fn htn_harvest_plant_dispatch_system(
             &LodLevel,
             Option<&crate::simulation::knowledge::PersonKnowledge>,
             Option<&crate::simulation::reproduction::HouseholdMember>,
+            Option<&crate::simulation::jobs::JobClaim>,
+            Option<&crate::simulation::person::Profession>,
         ),
         Without<Drafted>,
     >,
@@ -9600,6 +9778,8 @@ pub fn htn_harvest_plant_dispatch_system(
         lod,
         knowledge_opt,
         household_member,
+        claim_opt,
+        profession_opt,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -9628,30 +9808,70 @@ pub fn htn_harvest_plant_dispatch_system(
             cur_ty.div_euclid(CHUNK_SIZE as i32),
         );
 
-        // Find a remembered mature edible plant via SharedKnowledge.
-        // Confirms the plant is live and Mature via `PlantMap` + `Plant.stage`.
-        let harvest_candidate = gk
-            .nearest_target_tile(
-                actor,
-                member.faction_id,
-                household_member.map(|h| h.household_id),
-                MemoryKind::AnyEdible,
-                (cur_tx, cur_ty),
-                now,
-            )
-            .and_then(|tile| {
-                let entity = plant_map.0.get(&tile).copied()?;
-                let plant = plant_query.get(entity).ok()?;
-                if plant.stage != GrowthStage::Mature {
-                    return None;
+        let scope = resolve_farm_scope(
+            actor,
+            member.faction_id,
+            claim_opt,
+            household_member,
+            profession_opt,
+            &farm_plot_params,
+        );
+
+        // Communal / Private restrict the mature-plant search to the
+        // assigned plot's rect (no more wandering off to harvest wild
+        // berries or a neighbour's bush). Bootstrap keeps the legacy
+        // AnyEdible memory search.
+        let harvest_candidate: Option<((i32, i32), crate::economy::resource_catalog::ResourceId)> =
+            if let Some(rect) = scope.plot_rect() {
+                let x0 = rect.x0;
+                let y0 = rect.y0;
+                let x1 = rect.x0 + rect.w as i32;
+                let y1 = rect.y0 + rect.h as i32;
+                let mut best: Option<(i32, (i32, i32), crate::economy::resource_catalog::ResourceId)> =
+                    None;
+                for ty in y0..y1 {
+                    for tx in x0..x1 {
+                        let Some(entity) = plant_map.0.get(&(tx, ty)).copied() else {
+                            continue;
+                        };
+                        let Ok(plant) = plant_query.get(entity) else {
+                            continue;
+                        };
+                        if plant.stage != GrowthStage::Mature {
+                            continue;
+                        }
+                        let (id, _) = plant.kind.harvest_yield(false);
+                        let dist = (tx - cur_tx).abs().max((ty - cur_ty).abs());
+                        if best.map_or(true, |(d, _, _)| dist < d) {
+                            best = Some((dist, (tx, ty), id));
+                        }
+                    }
                 }
-                let (id, _) = plant.kind.harvest_yield(false);
-                Some((tile, id))
-            });
+                best.map(|(_, tile, id)| (tile, id))
+            } else {
+                gk.nearest_target_tile(
+                    actor,
+                    member.faction_id,
+                    household_member.map(|h| h.household_id),
+                    MemoryKind::AnyEdible,
+                    (cur_tx, cur_ty),
+                    now,
+                )
+                .and_then(|tile| {
+                    let entity = plant_map.0.get(&tile).copied()?;
+                    let plant = plant_query.get(entity).ok()?;
+                    if plant.stage != GrowthStage::Mature {
+                        return None;
+                    }
+                    let (id, _) = plant.kind.harvest_yield(false);
+                    Some((tile, id))
+                })
+            };
         let Some((plant_tile, harvest_id)) = harvest_candidate else {
             continue;
         };
-        let deposit_tile = storage_tile_map.nearest_for_faction(member.faction_id, plant_tile);
+        let deposit_fid = scope.source_faction_id();
+        let deposit_tile = storage_tile_map.nearest_for_faction(deposit_fid, plant_tile);
 
         let ctx = PlannerCtx {
             scope: ScoringScope::Geometric,
@@ -9696,6 +9916,7 @@ pub fn htn_harvest_plant_dispatch_system(
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: scope.deposit_override(),
         };
 
         let abstract_task = AbstractTask::HarvestPlant;
@@ -10377,6 +10598,7 @@ pub fn htn_play_dispatch_system(
             play_plant_destination_tile,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         };
 
         let abstract_task = AbstractTask::Play;
@@ -10829,6 +11051,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         }
     }
 
@@ -10876,6 +11099,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         }
     }
 
@@ -10923,6 +11147,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         }
     }
 
@@ -10974,6 +11199,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         }
     }
 
@@ -11024,6 +11250,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         }
     }
 
@@ -11084,6 +11311,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         }
     }
 
@@ -11438,6 +11666,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         }
     }
 
@@ -11613,6 +11842,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         }
     }
 
@@ -11821,6 +12051,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         }
     }
 
@@ -12069,6 +12300,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         }
     }
 
@@ -12729,6 +12961,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: false,
+            deposit_target_faction_override: None,
         }
     }
 
@@ -13354,6 +13587,7 @@ mod tests {
             play_plant_destination_tile: None,
             personal_bp_resource: None,
             agent_has_weapon: true,
+            deposit_target_faction_override: None,
         }
     }
 

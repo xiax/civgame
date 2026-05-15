@@ -9,6 +9,7 @@ use super::person::{AiState, Person, PersonAI};
 use super::plants::Plant;
 use super::schedule::{BucketSlot, SimClock};
 use super::tasks::{task_interacts_from_adjacent, TaskKind};
+use super::typed_task::ActionQueue;
 use super::technology::HORSEBACK_RIDING;
 use crate::pathfinding::path_request::{
     cooldown_for_streak, FollowStatus, PathDebugFlags, PathFollow, PathKind, PathRequestQueue,
@@ -50,6 +51,7 @@ pub struct MountedOn(pub Entity);
 fn release_to_idle(
     ai: &mut PersonAI,
     pf: &mut PathFollow,
+    aq: &mut ActionQueue,
     transform: &mut Transform,
     here: (i32, i32),
 ) {
@@ -58,6 +60,12 @@ fn release_to_idle(
     ai.target_tile = (here.0 as i32, here.1 as i32);
     ai.dest_tile = ai.target_tile;
     ai.target_entity = None;
+    // Path-failure release is an external preempt — drop the stale typed task
+    // along with PersonAI state. Without this, the next dispatcher tick
+    // enqueues a new Task but `ActionQueue::dispatch` won't promote it
+    // (current != Idle), so the executor's `aq.current.as_drink()`-style
+    // accessors keep returning None and the agent silently freezes.
+    aq.cancel();
 
     pf.status = FollowStatus::Idle;
     pf.segment_path.clear();
@@ -89,6 +97,7 @@ pub fn movement_system(
         Entity,
         &mut Transform,
         &mut PersonAI,
+        &mut ActionQueue,
         &LodLevel,
         &mut MovementState,
         &mut PathFollow,
@@ -113,6 +122,7 @@ pub fn movement_system(
         entity,
         mut transform,
         mut ai,
+        mut aq,
         lod,
         mut mv,
         mut pf,
@@ -229,7 +239,7 @@ pub fn movement_system(
                     // Worker rejected the request; release so dispatch picks
                     // a different goal. Re-requesting the same goal would
                     // just fail again.
-                    release_to_idle(&mut ai, &mut pf, &mut transform, (cur_tx, cur_ty));
+                    release_to_idle(&mut ai, &mut pf, &mut aq, &mut transform, (cur_tx, cur_ty));
                     continue;
                 }
                 FollowStatus::Pending => {
@@ -249,7 +259,7 @@ pub fn movement_system(
                             < cooldown_for_streak(pf.last_fail_streak)
                     {
                         path_diag.path_request_skipped_cooldown += 1;
-                        release_to_idle(&mut ai, &mut pf, &mut transform, (cur_tx, cur_ty));
+                        release_to_idle(&mut ai, &mut pf, &mut aq, &mut transform, (cur_tx, cur_ty));
                         continue;
                     }
                     path_queue.enqueue(
@@ -306,7 +316,7 @@ pub fn movement_system(
                                 < cooldown_for_streak(pf.last_fail_streak)
                         {
                             path_diag.path_request_skipped_cooldown += 1;
-                            release_to_idle(&mut ai, &mut pf, &mut transform, (cur_tx, cur_ty));
+                            release_to_idle(&mut ai, &mut pf, &mut aq, &mut transform, (cur_tx, cur_ty));
                             continue;
                         }
                         path_queue.enqueue(
@@ -511,7 +521,7 @@ pub fn movement_system(
         } else {
             let prev_tx = (pos.x / TILE_SIZE).floor() as i32;
             let prev_ty = (pos.y / TILE_SIZE).floor() as i32;
-            release_to_idle(&mut ai, &mut pf, &mut transform, (prev_tx, prev_ty));
+            release_to_idle(&mut ai, &mut pf, &mut aq, &mut transform, (prev_tx, prev_ty));
             continue;
         }
 
@@ -896,13 +906,14 @@ pub fn recover_stranded_agents_system(
             Entity,
             &mut Transform,
             &mut PersonAI,
+            &mut ActionQueue,
             &LodLevel,
             &mut PathFollow,
         ),
         (With<Person>, Without<MountedOn>),
     >,
 ) {
-    for (entity, mut transform, mut ai, lod, mut pf) in query.iter_mut() {
+    for (entity, mut transform, mut ai, mut aq, lod, mut pf) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -925,7 +936,7 @@ pub fn recover_stranded_agents_system(
         );
         ai.current_z = new_z as i8;
         ai.target_z = new_z as i8;
-        release_to_idle(&mut ai, &mut pf, &mut transform, (tx, ty));
+        release_to_idle(&mut ai, &mut pf, &mut aq, &mut transform, (tx, ty));
     }
 }
 
