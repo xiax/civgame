@@ -49,6 +49,8 @@ use bevy::prelude::Component;
 use crate::economy::resource_catalog::ResourceId;
 use crate::simulation::items::EquipmentSlot;
 use crate::simulation::memory::MemoryKind;
+use crate::simulation::person::{AiState, PersonAI};
+use crate::simulation::tasks::TaskKind;
 use crate::simulation::technology::TechId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -586,17 +588,31 @@ impl ActionQueue {
     /// — if `current` is `Idle` — immediately promotes the head so the
     /// executor sees the new task this tick. This is the canonical write-path
     /// for plan dispatchers and player-order systems: they never touch
-    /// `current` directly. Returns `false` (without modifying anything) when
-    /// the queue is at capacity, which is a producer bug — dispatchers must
-    /// not try to push more than `ACTION_QUEUE_CAP` ahead of the running task.
-    pub fn dispatch(&mut self, task: Task) -> bool {
+    /// `current` directly.
+    ///
+    /// Returns a `DispatchOutcome` distinguishing `Promoted` (current was Idle,
+    /// task is now running), `Queued` (task is parked behind a running one),
+    /// and `Rejected` (queue full — producer bug). The previous bool-returning
+    /// shape buried `Queued` inside the `true` branch, so callers that expected
+    /// the task to actually start had no signal when it silently parked behind
+    /// a stale `current`. In debug builds, `Rejected` fires a
+    /// `debug_assert!` — every production caller is expected to size its
+    /// chains within `ACTION_QUEUE_CAP`.
+    pub fn dispatch(&mut self, task: Task) -> DispatchOutcome {
         if !self.enqueue(task) {
-            return false;
+            debug_assert!(
+                false,
+                "ActionQueue::dispatch rejected — queue full (current={:?})",
+                self.current
+            );
+            return DispatchOutcome::Rejected;
         }
         if self.current == Task::Idle {
             self.current = self.pop_next();
+            DispatchOutcome::Promoted
+        } else {
+            DispatchOutcome::Queued
         }
-        true
     }
 
     /// Called by an executor when its current task finishes (success, soft
@@ -630,6 +646,152 @@ impl ActionQueue {
         self.current = Task::Idle;
         self.clear_queued();
     }
+
+    /// Canonical executor-success exit: reset `PersonAI.state` to `Idle`,
+    /// clear the legacy `task_id`, zero `work_progress`, and `advance()`
+    /// to the next prefetched task. Use this in place of the four-line pattern
+    ///
+    /// ```text
+    /// ai.state = AiState::Idle;
+    /// ai.task_id = PersonAI::UNEMPLOYED;
+    /// ai.work_progress = 0;
+    /// aq.advance();
+    /// ```
+    ///
+    /// Bundling the writes guarantees the legacy and typed channels stay
+    /// coherent — every executor that forgot one of the four lines is the
+    /// historical source of the `task_id`/`aq.current` desync class.
+    pub fn finish_task(&mut self, ai: &mut PersonAI) {
+        ai.state = AiState::Idle;
+        ai.task_id = PersonAI::UNEMPLOYED;
+        ai.work_progress = 0;
+        self.advance();
+    }
+
+    /// Canonical chain-abort exit: same field writes as `finish_task` but
+    /// drops the prefetched queue too. Use when a target despawned, the plan
+    /// was invalidated, or defence-in-depth code recovered from a desync.
+    pub fn cancel_chain(&mut self, ai: &mut PersonAI) {
+        ai.state = AiState::Idle;
+        ai.task_id = PersonAI::UNEMPLOYED;
+        ai.work_progress = 0;
+        self.cancel();
+    }
+}
+
+/// Outcome of `ActionQueue::dispatch`. Replaces the prior `bool` return so
+/// callers can distinguish "task is running now" (`Promoted`) from "task is
+/// parked behind something" (`Queued`), and `Rejected` (queue full) is no
+/// longer collapsed into the same `false` as legitimate failures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    /// `current` was `Idle`; the new task was promoted into it and will run
+    /// this tick. The canonical outcome for every HTN dispatcher's leading
+    /// task and for player-order dispatch (which always cancels first).
+    Promoted,
+    /// `current` was already running; the task is parked in the prefetched
+    /// queue and will promote when `advance()` runs. Legitimate for chain
+    /// prefetch (`WalkTo → WithdrawMaterial → WalkTo → Deposit`).
+    Queued,
+    /// The queue was at capacity. The task was *not* enqueued. Producer bug —
+    /// dispatchers must not try to push more than `ACTION_QUEUE_CAP` ahead of
+    /// `current`. Fires `debug_assert!` inside `dispatch`.
+    Rejected,
+}
+
+impl DispatchOutcome {
+    /// `true` when the dispatched task is now `current` (i.e. running this
+    /// tick, not parked).
+    pub fn is_promoted(self) -> bool {
+        matches!(self, DispatchOutcome::Promoted)
+    }
+
+    /// `true` when the queue accepted the task — `Promoted` or `Queued`.
+    /// `false` only on `Rejected`. Use at sites that don't care whether the
+    /// task ran this tick or the next.
+    pub fn is_accepted(self) -> bool {
+        !matches!(self, DispatchOutcome::Rejected)
+    }
+}
+
+/// Map a typed `Task` variant back to the legacy `TaskKind` `u16`. Used by
+/// the test-fixture invariant assertion to verify `PersonAI.task_id` agrees
+/// with `ActionQueue.current` after every simulated tick. Phase 4 will retire
+/// the legacy `task_id` channel entirely and this helper along with it.
+pub fn task_kind_for(task: Task) -> u16 {
+    use TaskKind as TK;
+    let kind = match task {
+        Task::Idle => return PersonAI::UNEMPLOYED,
+        Task::WalkTo { why, .. } => match why {
+            WalkReason::MilitaryMove => TK::MilitaryMove,
+            WalkReason::Gather => TK::Gather,
+            WalkReason::Migration => TK::Migrate,
+            WalkReason::SeekCare => TK::SeekCare,
+        },
+        Task::WithdrawGood { .. } => TK::WithdrawGood,
+        Task::WithdrawMaterial { .. } => TK::WithdrawMaterial,
+        Task::WalkAndTakeFromMember { .. } => TK::TakeFromMember,
+        Task::Equip { .. } => TK::Equip,
+        Task::Construct { .. } => TK::Construct,
+        Task::Gather { .. } => TK::Gather,
+        Task::Dig { .. } => TK::Dig,
+        Task::Scavenge { .. } => TK::Scavenge,
+        Task::Read { .. } => TK::Read,
+        Task::Teach { .. } => TK::Teach,
+        Task::HoldLecture { .. } => TK::HoldLecture,
+        Task::AttendLecture { .. } => TK::AttendLecture,
+        Task::PickUpCorpse { .. } => TK::PickUpCorpse,
+        Task::Socialize { .. } => TK::Socialize,
+        Task::Raid { .. } => TK::Raid,
+        Task::Defend { .. } => TK::Defend,
+        Task::Lead { .. } => TK::Lead,
+        Task::RescueAlly { .. } => TK::Defend,
+        Task::HuntPartyMuster { .. } => TK::HuntPartyMuster,
+        Task::Hunt { .. } => TK::Hunter,
+        Task::HaulCorpse { .. } => TK::HaulCorpse,
+        Task::Butcher => TK::Butcher,
+        Task::TameAnimal { .. } => TK::TameAnimal,
+        Task::Planter { .. } => TK::Planter,
+        Task::Sleep { .. } => TK::Sleep,
+        Task::Eat => TK::Eat,
+        Task::WithdrawFood { .. } => TK::WithdrawFood,
+        Task::HaulToBlueprint { .. } => TK::HaulMaterials,
+        Task::HaulToCraftOrder { .. } => TK::HaulToCraftOrder,
+        Task::Play { .. } => TK::Play,
+        Task::PlayThrow => TK::PlayThrow,
+        Task::PlayPlant { .. } => TK::PlayPlant,
+        Task::WorkOnCraftOrder { .. } => TK::WorkOnCraftOrder,
+        Task::DepositToFactionStorage { .. } => TK::DepositResource,
+        Task::Explore { .. } => TK::Explore,
+        Task::ClearObstacle { .. } => TK::ClearObstacle,
+        Task::UnpitchStructure { .. } => TK::UnpitchStructure,
+        Task::UnloadCampCargo { .. } => TK::UnloadCampCargo,
+        Task::PitchStructureAt { .. } => TK::PitchStructureAt,
+        Task::Heal { .. } => TK::Heal,
+        Task::Drink { .. } => TK::Drink,
+    };
+    kind as u16
+}
+
+/// `true` if the legacy `task_id` and the typed `current` agree on which
+/// task family the agent is running. `UNEMPLOYED` ↔ `Task::Idle` is the only
+/// shape-changing pair we tolerate; every other `task_id` value must
+/// `task_kind_for(current)` to itself.
+///
+/// Wired into the behavioural test fixture (`TestSim::tick`) so every
+/// existing test doubles as an invariant test. Not registered as a runtime
+/// system in the main app — defence-in-depth in each executor recovers from
+/// desync at zero cost; Phase 4 deletes `task_id` entirely and this helper
+/// with it.
+pub fn task_id_matches_current(task_id: u16, current: Task) -> bool {
+    // `task_id == UNEMPLOYED` (the canonical "no task") and `task_id == 0`
+    // (TaskKind::Idle, the default integer that lingers at some spawn sites)
+    // are both semantically "agent has no active task" — both must pair
+    // with `Task::Idle`.
+    if task_id == PersonAI::UNEMPLOYED || task_id == TaskKind::Idle as u16 {
+        return matches!(current, Task::Idle);
+    }
+    task_kind_for(current) == task_id
 }
 
 impl Task {
@@ -1035,7 +1197,7 @@ mod tests {
     #[test]
     fn dispatch_to_idle_promotes_immediately() {
         let mut aq = ActionQueue::idle();
-        assert!(aq.dispatch(dig(1)));
+        assert_eq!(aq.dispatch(dig(1)), DispatchOutcome::Promoted);
         assert_eq!(aq.current, dig(1));
         assert!(aq.queued_is_empty());
     }
@@ -1044,8 +1206,8 @@ mod tests {
     fn dispatch_while_busy_queues_behind_current() {
         let mut aq = ActionQueue::idle();
         aq.current = dig(1);
-        assert!(aq.dispatch(dig(2)));
-        assert!(aq.dispatch(dig(3)));
+        assert_eq!(aq.dispatch(dig(2)), DispatchOutcome::Queued);
+        assert_eq!(aq.dispatch(dig(3)), DispatchOutcome::Queued);
         assert_eq!(aq.current, dig(1));
         assert_eq!(aq.queued_len(), 2);
         assert_eq!(aq.peek_next(), Some(dig(2)));
@@ -1068,14 +1230,28 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_at_capacity_returns_false() {
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "ActionQueue::dispatch rejected")]
+    fn dispatch_at_capacity_panics_in_debug() {
         let mut aq = ActionQueue::idle();
         aq.current = dig(0);
         for i in 0..ACTION_QUEUE_CAP {
-            assert!(aq.dispatch(dig(i as i32 + 1)));
+            assert_eq!(aq.dispatch(dig(i as i32 + 1)), DispatchOutcome::Queued);
         }
         assert!(aq.queued_is_full());
-        assert!(!aq.dispatch(dig(99)));
+        let _ = aq.dispatch(dig(99));
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn dispatch_at_capacity_returns_rejected_in_release() {
+        let mut aq = ActionQueue::idle();
+        aq.current = dig(0);
+        for i in 0..ACTION_QUEUE_CAP {
+            assert_eq!(aq.dispatch(dig(i as i32 + 1)), DispatchOutcome::Queued);
+        }
+        assert!(aq.queued_is_full());
+        assert_eq!(aq.dispatch(dig(99)), DispatchOutcome::Rejected);
         assert_eq!(aq.queued_len(), ACTION_QUEUE_CAP);
     }
 

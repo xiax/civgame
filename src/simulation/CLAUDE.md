@@ -68,19 +68,19 @@ UI emits `PlayerCommandEvent` (event bus). Sim drains in `SimulationSet::Input` 
 
 `aq.current: Task` is canonical "task running now"; `Task::Idle` default. Behind it sits a fixed `queued: [Task; 4]` prefetch ring (private; access via `enqueue` / `pop_next` / `peek_next` / `queued_len` / `clear_queued`).
 
-- **Producers** (HTN dispatchers, `ui/orders.rs`, `teaching.rs::ReadItem`) route through `aq.dispatch(task)` — enqueues then promotes head into `current` if `current == Idle`.
-- **Consumers** (executor exit paths in `gather.rs`, `dig.rs`, `corpse.rs`, `construction.rs`, `items.rs`, `production.rs`, `teaching.rs`, plus `MilitaryMove` arrival) call `aq.advance()` instead of writing `current = Idle`.
-- **External preempts** (`dispatch_player_command_system`, hunter demote, stale reset, `movement::release_to_idle` on path failure / stranded-Z recovery) call `aq.cancel()`, dropping both `current` and queue.
+- **Producers** (HTN dispatchers, `ui/orders.rs`, `teaching.rs::ReadItem`) route through `aq.dispatch(task)` — enqueues then promotes head into `current` if `current == Idle`. Returns `DispatchOutcome::{Promoted, Queued, Rejected}`. `Rejected` (queue full) fires `debug_assert!` inside `dispatch`; silent burial is no longer possible. Most callers ignore the outcome since `Queued` is legitimate for chain prefetch.
+- **Consumers** (executor exit paths in `gather.rs`, `dig.rs`, `corpse.rs`, `construction.rs`, `items.rs`, `production.rs`, `teaching.rs`, plus `MilitaryMove` arrival) call `aq.advance()` instead of writing `current = Idle`. Canonical exit helpers: `aq.finish_task(&mut ai)` (success — Idle + UNEMPLOYED + work_progress=0 + advance) and `aq.cancel_chain(&mut ai)` (chain abort — same fields + cancel).
+- **External preempts** (`dispatch_player_command_system`, hunter demote, stale reset, `movement::release_to_idle` on path failure / stranded-Z recovery) call `aq.cancel()`, dropping both `current` and queue. **`goal_update_system` overrides (Lead/Defend/Raid/Rescue/Scout/Migrate chief / commanded forced-flip / earnincome override) must also call `aq.cancel()` when they clear `task_id`** — historically these only cleared the legacy channel, leaving the typed channel carrying a stale task that the next dispatcher's `aq.dispatch` would silently park behind.
 - Per-tick "pin" sites (lecture/teach pin writes) stay as direct `aq.current = X` writes — idempotent re-assertions.
 
 **Variants:** `Idle`, `WalkTo { tile, z, why }`, `WithdrawGood { filter }`, `WithdrawMaterial { resource_id, qty }`, `WithdrawFood { tile }`, `Equip { slot, resource_id }`, `Construct { blueprint }`, `Gather`, `Dig`, `Scavenge`, `Read/Teach/HoldLecture/AttendLecture`, `PickUpCorpse`, `HuntPartyMuster`, `Hunt`, `HaulCorpse`, `Butcher`, `TameAnimal`, `Sleep`, `Eat`, `HaulToBlueprint`, `HaulToCraftOrder`, `WorkOnCraftOrder`, `DepositToFactionStorage`, `WalkAndTakeFromMember`, `PlayThrow`, `PlayPlant`, `Explore`, `Migrate`, `UnpitchStructure`, `UnloadCampCargo`, `PitchStructureAt`, plus `Lead`/`Defend`/`Raid`/`RescueAlly`/`Socialize`/`Play`.
 
 **Rules:**
 
-- Systems mutating typed task **must** include `&mut ActionQueue` alongside `&mut PersonAI`.
-- Every executor exit must `aq.advance()` (success) or `aq.cancel()` (chain-drop).
+- Systems mutating typed task **must** include `&mut ActionQueue` alongside `&mut PersonAI`. The `test_fixture::TestSim::tick` asserts `task_id ↔ aq.current` coherence after every tick via `typed_task::task_id_matches_current`; existing tests catch regressions automatically. Tests that deliberately drive desynced state opt out via `sim.skip_coherence_check()`.
+- Every executor exit must `aq.advance()` (success) or `aq.cancel()` (chain-drop). Prefer the bundled helpers `aq.finish_task(&mut ai)` / `aq.cancel_chain(&mut ai)` over the four-line pattern — they keep the legacy and typed channels coherent in one call.
 - External teardowns clear both `aq` and the legacy `task_id`.
-- `military_task_system`, `withdraw_good_task_system`, `withdraw_material_task_system` fall back to `Idle` if `task_id == X` but `aq.current` is the wrong variant — defence in depth.
+- `military_task_system`, `withdraw_good_task_system`, `withdraw_material_task_system`, `drink_task_system` fall back to `Idle` if `task_id == X` but `aq.current` is the wrong variant — defence in depth.
 
 ## HTN domain (`htn.rs`)
 

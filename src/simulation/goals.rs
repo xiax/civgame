@@ -506,6 +506,7 @@ pub fn goal_update_system(
             (
                 Option<&crate::simulation::nomad::MigrationTarget>,
                 Option<&crate::simulation::nomad::ScoutAssignment>,
+                &mut crate::simulation::typed_task::ActionQueue,
             ),
         ),
         Without<Drafted>,
@@ -537,7 +538,7 @@ pub fn goal_update_system(
         reason_opt,
         chief_opt,
         claim_opt,
-        (migration_target, scout_assignment),
+        (migration_target, scout_assignment, mut aq),
     ) in query.iter_mut()
     {
         // Player command authority: when `Commanded` is non-terminal, force
@@ -631,9 +632,14 @@ pub fn goal_update_system(
         if force_now {
             // Drop any stale task so the dispatchers see clean state on
             // the goal flip. Mirrors the goal-flip cleanup below.
+            // `aq.cancel()` is required alongside the `task_id` clear —
+            // without it the typed channel keeps a stale task and a
+            // subsequent `aq.dispatch` silently parks behind it. See the
+            // 6 override branches below.
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             target_item.0 = None;
+            aq.cancel();
             force_reeval.0.remove(&entity);
         }
         ai.last_goal_eval_tick = clock.tick;
@@ -679,6 +685,7 @@ pub fn goal_update_system(
                 ai.task_id = PersonAI::UNEMPLOYED;
                 ai.target_entity = None;
                 target_item.0 = None;
+                aq.cancel();
             }
         }
 
@@ -692,6 +699,7 @@ pub fn goal_update_system(
                     *goal = AgentGoal::Rescue;
                     ai.state = AiState::Idle;
                     ai.task_id = PersonAI::UNEMPLOYED;
+                    aq.cancel();
                 }
                 if let Some(mut r) = reason_opt {
                     r.0 = "Helping Ally";
@@ -717,6 +725,7 @@ pub fn goal_update_system(
                 *goal = AgentGoal::Scout;
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
+                aq.cancel();
             }
             if let Some(mut r) = reason_opt {
                 r.0 = "Scouting";
@@ -736,6 +745,7 @@ pub fn goal_update_system(
                 *goal = AgentGoal::MigrateToCamp;
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
+                aq.cancel();
             }
             if let Some(mut r) = reason_opt {
                 r.0 = "Migrating to Camp";
@@ -759,6 +769,7 @@ pub fn goal_update_system(
                     *goal = AgentGoal::Defend;
                     ai.state = AiState::Idle;
                     ai.task_id = PersonAI::UNEMPLOYED;
+                    aq.cancel();
                 }
                 if let Some(mut r) = reason_opt {
                     r.0 = "Under Raid";
@@ -774,6 +785,7 @@ pub fn goal_update_system(
                     *goal = AgentGoal::Raid;
                     ai.state = AiState::Idle;
                     ai.task_id = PersonAI::UNEMPLOYED;
+                    aq.cancel();
                 }
                 if let Some(mut r) = reason_opt {
                     r.0 = "Participating in Raid";
@@ -798,6 +810,7 @@ pub fn goal_update_system(
                 *goal = AgentGoal::Lead;
                 ai.state = AiState::Idle;
                 ai.task_id = PersonAI::UNEMPLOYED;
+                aq.cancel();
             }
             if let Some(mut r) = reason_opt {
                 r.0 = "Leading";
@@ -1100,6 +1113,7 @@ pub fn goal_update_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             target_item.0 = None;
+            aq.cancel();
         }
         if let Some(mut r) = reason_opt {
             r.0 = reason;
@@ -1232,6 +1246,7 @@ pub fn earnincome_goal_override_system(
             Entity,
             &mut AgentGoal,
             &mut PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
             &mut TargetItem,
             &FactionMember,
             &crate::simulation::person::Profession,
@@ -1251,6 +1266,7 @@ pub fn earnincome_goal_override_system(
         entity,
         mut goal,
         mut ai,
+        mut aq,
         mut target_item,
         member,
         prof,
@@ -1336,6 +1352,7 @@ pub fn earnincome_goal_override_system(
             ai.task_id = PersonAI::UNEMPLOYED;
             ai.target_entity = None;
             target_item.0 = None;
+            aq.cancel();
         }
         if let Some(mut r) = reason_opt {
             r.0 = best.reason;

@@ -57,6 +57,11 @@ const TICK_DURATION: Duration = Duration::from_nanos(50_000_000); // 1/20 s
 pub struct TestSim {
     pub app: App,
     pub player_faction_id: u32,
+    /// When `false`, `tick()` skips the per-agent `task_id` ↔ `aq.current`
+    /// coherence invariant. Tests that deliberately drive desynced state
+    /// (e.g. exercising the prefetch-queue advance mechanics with the
+    /// legacy channel left untouched) opt out via `skip_coherence_check()`.
+    pub coherence_check_enabled: bool,
 }
 
 impl TestSim {
@@ -174,7 +179,17 @@ impl TestSim {
         Self {
             app,
             player_faction_id,
+            coherence_check_enabled: true,
         }
+    }
+
+    /// Disable the per-agent `task_id` ↔ `aq.current` coherence invariant
+    /// for this `TestSim`. Use sparingly — only for tests that deliberately
+    /// construct desynced state to exercise the typed-channel queue
+    /// machinery (e.g. `advance_promotes_queued_task_after_executor_exit`).
+    pub fn skip_coherence_check(&mut self) -> &mut Self {
+        self.coherence_check_enabled = false;
+        self
     }
 
     /// Inject a sighting into the faction-tier `SharedKnowledge` for tests
@@ -331,8 +346,44 @@ impl TestSim {
     /// Run a single frame. With `TimeUpdateStrategy::ManualDuration`
     /// installed, each call advances `Time` by exactly one fixed
     /// timestep so `FixedUpdate` fires once per call.
+    ///
+    /// After the tick lands, asserts the legacy `PersonAI.task_id` agrees
+    /// with `ActionQueue.current` for every agent in the world. Every
+    /// existing fixture-based test thus doubles as an invariant test for the
+    /// dual-state coherence the codebase has been maintaining by convention
+    /// (see `src/simulation/CLAUDE.md`). The runtime app does *not* register
+    /// this check — defence-in-depth in executors recovers from desync at
+    /// zero cost; the assertion's job is to catch the regression at the
+    /// source in tests.
     pub fn tick(&mut self) {
         self.app.update();
+        if self.coherence_check_enabled {
+            self.assert_task_state_coherent();
+        }
+    }
+
+    /// Invariant: legacy `task_id` and typed `aq.current` agree on which
+    /// task family every agent is running. Called automatically by `tick()`.
+    pub fn assert_task_state_coherent(&mut self) {
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::person::PersonAI;
+        use crate::simulation::schedule::SimClock;
+        use crate::simulation::typed_task::{task_id_matches_current, ActionQueue};
+        let tick = self.app.world().resource::<SimClock>().tick;
+        let mut q = self
+            .app
+            .world_mut()
+            .query::<(bevy::prelude::Entity, &PersonAI, &ActionQueue, &AgentGoal)>();
+        for (entity, ai, aq, goal) in q.iter(self.app.world()) {
+            assert!(
+                task_id_matches_current(ai.task_id, aq.current),
+                "tick {tick}: task_id ↔ aq.current desync on {entity:?}: task_id={} aq.current={:?} goal={:?} state={:?}",
+                ai.task_id,
+                aq.current,
+                goal,
+                ai.state
+            );
+        }
     }
 
     /// Convenience: tick `n` times.
@@ -5954,6 +6005,11 @@ mod baseline_behaviour {
         use crate::simulation::typed_task::{Task, WalkReason};
 
         let mut sim = TestSim::new(5);
+        // This fixture deliberately leaves task_id at UNEMPLOYED while
+        // promoting a typed Dig into `aq.current` to verify advance()
+        // semantics — that's a desynced state by design, so opt out of
+        // the coherence invariant.
+        sim.skip_coherence_check();
         sim.flat_world(1, 0, TileKind::Grass);
         let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
             b.hunger(0.0);
@@ -6014,6 +6070,7 @@ mod baseline_behaviour {
             aq.queued_len()
         );
     }
+
 
     /// Phase 5a-ii regression: when goal flips to Sleep, `htn_dispatch_system`
     /// (which since Phase 5a-ii owns the Sleep dispatch path that used to

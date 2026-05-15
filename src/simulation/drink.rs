@@ -184,6 +184,12 @@ pub fn drink_task_system(
             continue;
         }
         let Some(source) = aq.current.as_drink() else {
+            // Defence in depth: legacy task_id says Drink but the typed
+            // channel disagrees. Recover by dropping the chain so the next
+            // dispatcher pass can re-plan, mirroring withdraw_good_task_system
+            // (production.rs:323-327). Without this branch a desynced agent
+            // freezes here forever — see the user-reported frozen-worker bug.
+            aq.cancel_chain(&mut ai);
             continue;
         };
         if ai.state != AiState::Working || ai.work_progress < TICKS_DRINK {
@@ -228,10 +234,7 @@ pub fn drink_task_system(
             }
         }
 
-        ai.state = AiState::Idle;
-        ai.task_id = PersonAI::UNEMPLOYED;
-        ai.work_progress = 0;
-        aq.advance();
+        aq.finish_task(&mut ai);
     }
 }
 

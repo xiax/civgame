@@ -138,4 +138,11 @@ Add bridges to settlement planner
 
 Workers should be able to do more than one task at a time, like work and socialize at the same time.
 
-Make water flow work properly
+Make water actually flow, calculate z levels properly for water level and banks of river and make it more realistic with varying river sizes and stuff.
+
+Make edges between different biomes more organic, right now the edges are these jagged square blocks.
+
+
+
+
+
