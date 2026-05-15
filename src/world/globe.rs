@@ -245,6 +245,29 @@ impl Globe {
         let rx = lerp(lerp(r00, r10, tx), lerp(r01, r11, tx), ty);
         (ex, tt, rx)
     }
+
+    /// Chebyshev distance in tiles from `(tx, ty)` to the nearest river
+    /// polyline point on the globe. Iterates `rivers.edge_polylines`, so it's
+    /// O(total river vertices) — fine at hover / overlay-toggle cadence but
+    /// not for per-tick use. Returns `u32::MAX` when no rivers exist or all
+    /// of them are farther than ~`u32::MAX` away (effectively "far").
+    pub fn nearest_river_chebyshev(&self, tx: i32, ty: i32) -> u32 {
+        let mut best = u32::MAX;
+        for poly in &self.rivers.edge_polylines {
+            for &(rx, ry) in poly {
+                let dx = (rx - tx).unsigned_abs();
+                let dy = (ry - ty).unsigned_abs();
+                let d = dx.max(dy);
+                if d < best {
+                    best = d;
+                    if best == 0 {
+                        return 0;
+                    }
+                }
+            }
+        }
+        best
+    }
 }
 
 pub fn generate_globe(seed: u64) -> Globe {

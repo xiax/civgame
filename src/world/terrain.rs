@@ -359,11 +359,7 @@ pub fn proc_tile(
 
     if tz == surf_z {
         let kind = biome_bands(biome).pick(v);
-        let fertility = if matches!(kind, TileKind::Grass) {
-            ((1.0 - (v - 0.45).abs() * 5.0).max(0.0) * 255.0) as u8
-        } else {
-            0
-        };
+        let fertility = surface_fertility_of(kind, v);
         return TileData {
             kind,
             elevation: (v * 255.0) as u8,
@@ -623,11 +619,11 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
                 }
             }
             let kind = surface_kind[ly][lx];
-            if !matches!(kind, TileKind::Grass) {
+            let v = v_cache[ly][lx];
+            let base = surface_fertility_of(kind, v) as f32;
+            if base <= 0.0 {
                 continue;
             }
-            let v = v_cache[ly][lx];
-            let base = (1.0 - (v - 0.45).abs() * 5.0).max(0.0) * 255.0;
             let mult = river_fertility_mult(river_d);
             let fert = (base * mult).min(255.0) as u8;
             surface_fertility[ly][lx] = fert;
@@ -674,12 +670,73 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// "far from river" → 1.0×; the riparian band 2..=5 tiles out gets
 /// 1.6× / 1.3× depending on distance. Tiles inside the channel never use
 /// this (their kind is `River`, not Grass/Farmland, so fertility is 0).
-fn river_fertility_mult(river_d: u8) -> f32 {
+pub fn river_fertility_mult(river_d: u8) -> f32 {
     match river_d {
         2 | 3 => 1.6,
         4 | 5 => 1.3,
         _ => 1.0,
     }
+}
+
+/// Elevation-driven surface-fertility curve in `[0, 255]`. Peaks at
+/// `v == 0.45` and falls linearly to 0 by `v == -0.05` or `v == 0.95` —
+/// effectively always positive across the playable `v ∈ [0, 1]` range, so
+/// vegetation at biome-band edges keeps a sensible baseline instead of
+/// snapping to zero. Apply `kind_fertility_factor(kind)` to scale per
+/// surface kind. Shared by chunk-gen and the climate-only estimator.
+#[inline]
+pub fn elevation_fertility_curve(v: f32) -> f32 {
+    (1.0 - (v - 0.45).abs() * 2.0).max(0.0) * 255.0
+}
+
+/// Per-surface-kind productivity multiplier on the elevation curve. Captures
+/// the rough ecological capacity of each surface type:
+/// - `Grass`: full prairie, peak forage.
+/// - `Marsh`: wetland — very high biomass, nearly grass-equivalent.
+/// - `Forest`: closed canopy + understory — productive but less than open prairie.
+/// - `Scrub`: sparse cover — low but non-zero.
+/// - Everything else (Sand/Snow/Stone/Water/...): zero.
+#[inline]
+pub fn kind_fertility_factor(kind: TileKind) -> f32 {
+    match kind {
+        TileKind::Grass => 1.00,
+        TileKind::Marsh => 0.90,
+        TileKind::Forest => 0.70,
+        TileKind::Scrub => 0.30,
+        _ => 0.0,
+    }
+}
+
+/// Composite per-tile fertility: kind × elevation curve, clamped to `u8`.
+/// Use this in both chunk-gen and the climate-only estimator so the two
+/// stay in lockstep.
+#[inline]
+pub fn surface_fertility_of(kind: TileKind, v: f32) -> u8 {
+    let f = kind_fertility_factor(kind);
+    if f <= 0.0 {
+        return 0;
+    }
+    (f * elevation_fertility_curve(v)).min(255.0) as u8
+}
+
+/// Climate-only expected fertility at a tile. Mirrors the chunk-gen formula
+/// but drops the per-tile Perlin term that `surface_v` would normally add —
+/// since that term is zero-mean variation around climate elevation, this
+/// function returns the *expected* (average) fertility chunk-gen would
+/// produce at that tile. Used by world-map / spawn-select aggregates so they
+/// can show fertility for unloaded megachunks without loading chunks.
+pub fn climate_fertility_estimate_at(globe: &Globe, tx: i32, ty: i32) -> u8 {
+    let (elev_u, _temp, _rain) = globe.sample_climate(tx, ty);
+    let v = (elev_u / 255.0).clamp(0.0, 1.0);
+    let biome = biome_mod::classify_at_tile(globe, tx, ty);
+    let kind = biome_bands(biome).pick(v);
+    let base = surface_fertility_of(kind, v) as f32;
+    if base <= 0.0 {
+        return 0;
+    }
+    let river_d = globe.nearest_river_chebyshev(tx, ty).min(u8::MAX as u32) as u8;
+    let mult = river_fertility_mult(river_d);
+    (base * mult).min(255.0) as u8
 }
 
 /// Vegetation-density rank used to gate the riparian re-classification.

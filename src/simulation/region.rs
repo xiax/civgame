@@ -8,8 +8,8 @@
 //! contain mixed biomes and a biome can span many mega-chunks.
 
 use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
-use crate::world::globe::MEGACHUNK_SIZE_CHUNKS;
-use crate::world::terrain::TILE_SIZE;
+use crate::world::globe::{Globe, MEGACHUNK_SIZE_CHUNKS};
+use crate::world::terrain::{climate_fertility_estimate_at, TILE_SIZE};
 use crate::world::tile::TileKind;
 use ahash::AHashMap;
 use bevy::prelude::*;
@@ -122,6 +122,40 @@ impl MegaChunkCoord {
     pub fn contains_tile(mx: i32, my: i32, tx: i32, ty: i32) -> bool {
         let (x0, y0, x1, y1) = Self::tile_bounds(mx, my);
         tx >= x0 && tx < x1 && ty >= y0 && ty < y1
+    }
+}
+
+/// Stride (`N×N`) used when sampling expected fertility across a mega-chunk.
+/// Cost dominates on river-distance lookups (`Globe::nearest_river_chebyshev`
+/// is O(river-vertex-count)), so this is kept modest. 8×8 covers a 512×512
+/// mega-chunk at 64-tile spacing — enough to register narrow riparian bands
+/// without exploding the world-map overlay's compute budget.
+pub const MEGACHUNK_FERTILITY_SAMPLES_PER_SIDE: i32 = 8;
+
+/// Average climate-derived fertility across a mega-chunk on an
+/// `MEGACHUNK_FERTILITY_SAMPLES_PER_SIDE²` grid. Mirrors the chunk-gen
+/// fertility formula but uses pure-climate elevation (no per-tile Perlin),
+/// so it returns the *expected* fertility chunks at this mega-chunk would
+/// produce — usable on the world map without loading any chunks.
+pub fn average_fertility_in_megachunk(globe: &Globe, mx: i32, my: i32) -> u8 {
+    let (tx0, ty0, tx1, ty1) = MegaChunkCoord::tile_bounds(mx, my);
+    let n = MEGACHUNK_FERTILITY_SAMPLES_PER_SIDE;
+    let dx = (tx1 - tx0) / n;
+    let dy = (ty1 - ty0) / n;
+    let mut sum: u32 = 0;
+    let mut count: u32 = 0;
+    for j in 0..n {
+        for i in 0..n {
+            let tx = tx0 + dx * i + dx / 2;
+            let ty = ty0 + dy * j + dy / 2;
+            sum += climate_fertility_estimate_at(globe, tx, ty) as u32;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0
+    } else {
+        (sum / count).min(255) as u8
     }
 }
 

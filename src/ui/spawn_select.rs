@@ -9,7 +9,7 @@ use crate::game_state::{
     EconomyPreset, GameStartOptions, GameState, PendingSpawn, RegenerateWorldRequest, WorldSeed,
 };
 use crate::simulation::faction::Lifestyle;
-use crate::simulation::region::MegaChunkCoord;
+use crate::simulation::region::{average_fertility_in_megachunk, MegaChunkCoord};
 use crate::simulation::technology::Era;
 use crate::ui::world_map::{build_globe_image, WORLD_MAP_OVERSAMPLE};
 use crate::world::globe::{
@@ -163,7 +163,7 @@ pub fn spawn_select_system(
         });
 
     if tex_cache.handle.is_none() {
-        let (pixels, [w, h]) = build_globe_image(&globe, false, WORLD_MAP_OVERSAMPLE);
+        let (pixels, [w, h]) = build_globe_image(&globe, false, WORLD_MAP_OVERSAMPLE, false);
         let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
         tex_cache.handle =
             Some(ctx.load_texture("spawn_select_globe", image, egui::TextureOptions::NEAREST));
@@ -274,6 +274,7 @@ pub fn spawn_select_system(
                     let (elev_u, temp_c, _rain_u) = globe.sample_climate(tx, ty);
                     let (elev_min, elev_max, elev_mean) =
                         sample_elevation_stats(&globe, tx0, ty0, tx1, ty1);
+                    let avg_fertility = average_fertility_in_megachunk(&globe, mx, my);
                     let habitable = center_biome.is_habitable();
                     let stroke_color = if habitable {
                         egui::Color32::WHITE
@@ -328,6 +329,7 @@ pub fn spawn_select_system(
                             "Elevation range: min={:.0} mean={:.0} max={:.0}",
                             elev_min, elev_mean, elev_max
                         ));
+                        ui.label(format!("Avg fertility: {}/255", avg_fertility));
                         ui.label(format!("Temperature: {:.0}°C", temp_c));
                         ui.label(
                             egui::RichText::new("Player home stays inside this cell.")

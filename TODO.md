@@ -142,7 +142,7 @@ Make water actually flow, calculate z levels properly for water level and banks 
 
 Make edges between different biomes more organic, right now the edges are these jagged square blocks.
 
-
+Change how construction fallbacks work to be more unique per era rather than just fallback to previous era's construction policies. For example in neolithic if there is not material to build walls the planner shouldn't fall back to building beds and hearths in crescent shapes, they should be building beds in sort of slums on the outskirts of the faction where there is free space.
 
 
 

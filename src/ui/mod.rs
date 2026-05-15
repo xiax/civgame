@@ -27,6 +27,7 @@ impl Plugin for UiPlugin {
             .insert_resource(SelectionDrag::default())
             .insert_resource(hud::DraftToggleRequest::default())
             .insert_resource(world_map::WorldMapOpen::default())
+            .insert_resource(world_map::WorldMapView::default())
             .insert_resource(world_map::WorldMapTexture::default())
             .insert_resource(orders::ContextMenuState::default())
             .insert_resource(orders::MilitaryMenuState::default())

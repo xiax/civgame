@@ -1,7 +1,9 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::simulation::region::{MegaChunkCoord, SettledRegions};
+use crate::simulation::region::{
+    average_fertility_in_megachunk, MegaChunkCoord, SettledRegions,
+};
 use crate::world::globe::{
     Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH, MEGACHUNK_SIZE_CHUNKS,
 };
@@ -14,12 +16,21 @@ pub const WORLD_MAP_OVERSAMPLE: u32 = 2;
 #[derive(Resource, Default)]
 pub struct WorldMapOpen(pub bool);
 
+/// User-toggleable overlays on the world map.
+#[derive(Resource, Default)]
+pub struct WorldMapView {
+    /// Tint every mega-chunk by its expected average fertility (climate-derived).
+    pub show_fertility: bool,
+}
+
 /// Cache so we don't re-upload the texture every frame unless globe changed.
 #[derive(Resource, Default)]
 pub struct WorldMapTexture {
     handle: Option<egui::TextureHandle>,
     /// Last count of explored cells when we built the texture — rebuild when it changes.
     last_explored: u32,
+    /// Whether the cached texture has the fertility overlay baked in.
+    last_show_fertility: bool,
 }
 
 impl WorldMapTexture {
@@ -39,6 +50,7 @@ pub fn world_map_toggle_system(keys: Res<ButtonInput<KeyCode>>, mut open: ResMut
 pub fn world_map_system(
     mut contexts: EguiContexts,
     open: Res<WorldMapOpen>,
+    mut view: ResMut<WorldMapView>,
     globe: Res<Globe>,
     mut tex_cache: ResMut<WorldMapTexture>,
     mut settled: ResMut<SettledRegions>,
@@ -57,14 +69,19 @@ pub fn world_map_system(
 
     let ctx = contexts.ctx_mut();
 
-    // Rebuild texture if explored cells changed
+    // Rebuild texture if explored cells changed or the fertility toggle flipped.
     let explored_count = globe.cells.iter().filter(|c| c.explored).count() as u32;
-    if tex_cache.handle.is_none() || tex_cache.last_explored != explored_count {
-        let (pixels, [w, h]) = build_globe_image(&globe, true, WORLD_MAP_OVERSAMPLE);
+    if tex_cache.handle.is_none()
+        || tex_cache.last_explored != explored_count
+        || tex_cache.last_show_fertility != view.show_fertility
+    {
+        let (pixels, [w, h]) =
+            build_globe_image(&globe, true, WORLD_MAP_OVERSAMPLE, view.show_fertility);
         let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
         let handle = ctx.load_texture("world_map", image, egui::TextureOptions::NEAREST);
         tex_cache.handle = Some(handle);
         tex_cache.last_explored = explored_count;
+        tex_cache.last_show_fertility = view.show_fertility;
     }
 
     let Some(ref tex) = tex_cache.handle else {
@@ -78,6 +95,16 @@ pub fn world_map_system(
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.label("Tab — close   |   Click a settled region to switch view");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut view.show_fertility, "Show fertility");
+                ui.label(
+                    egui::RichText::new(
+                        "(green = high, brown = low; estimated from climate)",
+                    )
+                    .small()
+                    .weak(),
+                );
+            });
 
             // Scale image to fit within ~800×400 px
             let scale = 10.0f32;
@@ -157,6 +184,37 @@ pub fn world_map_system(
                 );
             }
 
+            // Hover tooltip: show mega-chunk coords + biome + avg fertility.
+            if let Some(pos) = response.hover_pos() {
+                if rect.contains(pos) {
+                    let mx = ((pos.x - rect.min.x) / cell_w) as i32;
+                    let screen_my = ((pos.y - rect.min.y) / cell_h) as i32;
+                    let my = mc_grid_h - 1 - screen_my;
+                    let mx = mx.clamp(0, mc_grid_w - 1);
+                    let my = my.clamp(0, mc_grid_h - 1);
+                    let (tx, ty) = MegaChunkCoord::center_tile(mx, my);
+                    let biome = crate::world::biome::classify_at_tile(&globe, tx, ty);
+                    let fert = average_fertility_in_megachunk(&globe, mx, my);
+                    let settled_here = settled.by_megachunk.contains_key(&(mx, my));
+                    egui::show_tooltip(
+                        ctx,
+                        ui.layer_id(),
+                        egui::Id::new("world_map_tooltip"),
+                        |ui| {
+                            ui.label(format!("Mega-chunk ({}, {})", mx, my));
+                            ui.label(format!("Centre biome: {}", biome.name()));
+                            ui.label(format!("Avg fertility: {}/255", fert));
+                            if settled_here {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 220, 100),
+                                    "Settled — click to jump.",
+                                );
+                            }
+                        },
+                    );
+                }
+            }
+
             // Click handling: jump camera to the settled region under cursor.
             if let Some(pos) = response.interact_pointer_pos() {
                 if response.clicked() && rect.contains(pos) {
@@ -200,11 +258,16 @@ pub fn world_map_system(
 /// climate cell (1 = legacy block-colour render, 2+ = bilinear sub-cell
 /// detail matching the in-game `biome::classify_at_tile` field). When
 /// `respect_fog` is true, unexplored cells render as dark grey
-/// (player-facing in-game map). Returns `(pixels, [width, height])`.
+/// (player-facing in-game map). When `show_fertility` is true, each
+/// mega-chunk is tinted by `average_fertility_in_megachunk` (climate-derived)
+/// after biome/hillshade/lake/faction passes but before the river polyline
+/// overlay, so coastlines and rivers still read clearly. Returns
+/// `(pixels, [width, height])`.
 pub fn build_globe_image(
     globe: &Globe,
     respect_fog: bool,
     oversample: u32,
+    show_fertility: bool,
 ) -> (Vec<u8>, [usize; 2]) {
     let oversample = oversample.max(1);
     let img_w = GLOBE_WIDTH as u32 * oversample;
@@ -276,6 +339,51 @@ pub fn build_globe_image(
             pixels[idx + 1] = rgba[1];
             pixels[idx + 2] = rgba[2];
             pixels[idx + 3] = rgba[3];
+        }
+    }
+
+    // ── Fertility overlay (optional) ──────────────────────────────────────
+    // Tint each mega-chunk by its expected average fertility, blended at ~65%
+    // alpha so coast/river overlays drawn after still read clearly. The
+    // climate estimator is chunk-independent so this works without any
+    // chunks loaded — see `average_fertility_in_megachunk`.
+    if show_fertility {
+        let mc_grid_w = (GLOBE_WIDTH * GLOBE_CELL_CHUNKS) / MEGACHUNK_SIZE_CHUNKS;
+        let mc_grid_h = (GLOBE_HEIGHT * GLOBE_CELL_CHUNKS) / MEGACHUNK_SIZE_CHUNKS;
+        // Mega-chunk pixel side = climate-cells-per-megachunk * oversample.
+        let mc_cells = MEGACHUNK_SIZE_CHUNKS / GLOBE_CELL_CHUNKS;
+        let mc_px_w = (mc_cells as u32 * oversample) as i32;
+        let mc_px_h = mc_px_w;
+        let alpha = 0.65f32;
+        for my in 0..mc_grid_h {
+            for mx in 0..mc_grid_w {
+                let fert = average_fertility_in_megachunk(globe, mx, my);
+                let (fr, fg, fb) = fertility_ramp_color(fert);
+                let x0 = mx * mc_px_w;
+                let y0 = my * mc_px_h;
+                let x1 = (x0 + mc_px_w).min(img_w as i32);
+                let y1 = (y0 + mc_px_h).min(img_h as i32);
+                for py in y0..y1 {
+                    for px in x0..x1 {
+                        if respect_fog {
+                            let cgx = ((px as f32 + 0.5) / oversample as f32) as i32;
+                            let cgy = ((py as f32 + 0.5) / oversample as f32) as i32;
+                            if let Some(cell) = globe.cell(cgx, cgy) {
+                                if !cell.explored {
+                                    continue;
+                                }
+                            }
+                        }
+                        let idx = ((py * img_w as i32 + px) * 4) as usize;
+                        let r = pixels[idx] as f32;
+                        let g = pixels[idx + 1] as f32;
+                        let b = pixels[idx + 2] as f32;
+                        pixels[idx] = (r * (1.0 - alpha) + fr as f32 * alpha) as u8;
+                        pixels[idx + 1] = (g * (1.0 - alpha) + fg as f32 * alpha) as u8;
+                        pixels[idx + 2] = (b * (1.0 - alpha) + fb as f32 * alpha) as u8;
+                    }
+                }
+            }
         }
     }
 
@@ -377,4 +485,28 @@ pub fn build_globe_image(
         flipped[dst..dst + row_bytes].copy_from_slice(&pixels[src..src + row_bytes]);
     }
     (flipped, [img_w as usize, img_h as usize])
+}
+
+/// Two-stop colour ramp for the fertility overlay: dark brown (0) → tan (~128)
+/// → deep green (255). Returns sRGB bytes.
+fn fertility_ramp_color(fert: u8) -> (u8, u8, u8) {
+    let t = fert as f32 / 255.0;
+    if t < 0.5 {
+        let k = t * 2.0;
+        let r = lerp_u8(70, 200, k);
+        let g = lerp_u8(45, 175, k);
+        let b = lerp_u8(30, 90, k);
+        (r, g, b)
+    } else {
+        let k = (t - 0.5) * 2.0;
+        let r = lerp_u8(200, 30, k);
+        let g = lerp_u8(175, 140, k);
+        let b = lerp_u8(90, 40, k);
+        (r, g, b)
+    }
+}
+
+#[inline]
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)) as u8
 }
