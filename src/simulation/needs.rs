@@ -1,4 +1,4 @@
-use super::construction::{enclosure_score, BedMap, CampfireMap, ChairMap, TableMap};
+use super::construction::{enclosure_score, CampfireMap, ChairMap, TableMap};
 use super::lod::LodLevel;
 use super::person::{AiState, PersonAI};
 use super::schedule::{BucketSlot, SimClock};
@@ -125,7 +125,12 @@ const HUNGER_RATE: f32 = 2.0;
 /// decay for high-Constitution agents (same floor `0.25×` as hunger).
 const THIRST_RATE: f32 = 4.0;
 const SLEEP_RATE: f32 = 1.2;
-const SLEEP_RECOVER_RATE: f32 = 6.0;
+/// `needs.sleep` recovery per real second while `AiState::Sleeping` (doubled
+/// on a bed). Consumed by `sleep::sleep_task_system`, which owns recovery.
+pub const SLEEP_RECOVER_RATE: f32 = 6.0;
+/// `needs.sleep` below this retires the typed `Task::Sleep` (canonical wake).
+/// Consumed by `sleep::sleep_task_system`.
+pub const SLEEP_WAKE_THRESHOLD: f32 = 10.0;
 const SHELTER_RATE: f32 = 0.1;
 const SHELTER_FILL_PER_SCORE: f32 = 0.15; // filled per enclosure-score point per second
 const SAFETY_RATE: f32 = 0.1;
@@ -137,21 +142,21 @@ const WILLPOWER_WORK_DRAIN: f32 = 1.8;
 const WILLPOWER_IDLE_DRAIN: f32 = 0.15;
 /// Willpower regen while AiState::Sleeping (per real second). Doubled when
 /// the sleeper is on a bed, mirroring the bed bonus on SLEEP_RECOVER_RATE.
-const WILLPOWER_SLEEP_RECOVER: f32 = 3.0;
+/// Consumed by `sleep::sleep_task_system`, which owns recovery.
+pub const WILLPOWER_SLEEP_RECOVER: f32 = 3.0;
 
 pub fn tick_needs_system(
     time: Res<Time>,
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
-    bed_map: Res<BedMap>,
     campfire_map: Res<CampfireMap>,
     table_map: Res<TableMap>,
     chair_map: Res<ChairMap>,
     mut query: Query<(
         &BucketSlot,
         &mut Needs,
-        &mut PersonAI,
-        &mut crate::simulation::typed_task::ActionQueue,
+        &PersonAI,
+        &crate::simulation::typed_task::ActionQueue,
         &LodLevel,
         &Transform,
         Option<&Stats>,
@@ -161,7 +166,7 @@ pub fn tick_needs_system(
 
     query
         .par_iter_mut()
-        .for_each(|(slot, mut needs, mut ai, mut aq, lod, transform, stats)| {
+        .for_each(|(slot, mut needs, ai, aq, lod, transform, stats)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -181,31 +186,11 @@ pub fn tick_needs_system(
             needs.hunger = (needs.hunger + HUNGER_RATE * dt * con_scale).clamp(0.0, 255.0);
             needs.thirst = (needs.thirst + THIRST_RATE * dt * con_scale).clamp(0.0, 255.0);
 
-            if ai.state == AiState::Sleeping {
-                // Double sleep recovery when resting on a bed.
-                let on_bed = bed_map.0.contains_key(&(cur_tx as i32, cur_ty as i32));
-                let recovery = if on_bed {
-                    SLEEP_RECOVER_RATE * 2.0
-                } else {
-                    SLEEP_RECOVER_RATE
-                };
-                needs.sleep = (needs.sleep - recovery * dt).clamp(0.0, 255.0);
-                let willpower_gain = if on_bed {
-                    WILLPOWER_SLEEP_RECOVER * 2.0
-                } else {
-                    WILLPOWER_SLEEP_RECOVER
-                };
-                needs.willpower = (needs.willpower + willpower_gain * dt).clamp(0.0, 255.0);
-                if needs.sleep < 10.0 {
-                    // Rested — exit the typed `Task::Sleep` slot, not just
-                    // `ai.state`. Without `aq.advance()` the next tick's
-                    // `htn_dispatch_system` sees Idle+Sleep-goal and re-dispatches
-                    // Sleep into the queue (stacks to ACTION_QUEUE_CAP → panic).
-                    // `goal_update_system` flips off the Sleep goal on its next
-                    // cadence; until then this exit is the canonical wake.
-                    aq.finish_task(&mut ai);
-                }
-            } else {
+            // Sleep recovery + retirement is owned by `sleep::sleep_task_system`
+            // (keyed on the typed `Task::Sleep`, not on `ai.state`, so an
+            // external preempt that resets state can't strand the task). Here
+            // we only accrue the sleep need while the agent is not resting.
+            if ai.state != AiState::Sleeping {
                 needs.sleep = (needs.sleep + SLEEP_RATE * dt * con_scale).clamp(0.0, 255.0);
             }
 

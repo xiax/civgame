@@ -116,6 +116,12 @@ pub enum TaskKind {
     /// tile. The variant carries the tile so the executor can verify
     /// adjacency at arrival and roll sickness on raw sources.
     Drink = 50,
+    /// Step 5: agent walks to the faction's market node and buys one unit
+    /// of a construction material with treasury-funded escrow capital, then
+    /// the chain continues into `HaulMaterials`. Executor is the exclusive
+    /// `production::buy_material_task_system`. Mirrors `WithdrawMaterial`
+    /// (interacts-from-adjacent, labor, Haul-goal preserve-arm).
+    BuyMaterialAtMarket = 51,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -142,6 +148,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::Eat as u16 => "Eating",
         x if x == TaskKind::WithdrawFood as u16 => "Withdrawing Food",
         x if x == TaskKind::WithdrawMaterial as u16 => "Withdrawing Material",
+        x if x == TaskKind::BuyMaterialAtMarket as u16 => "Buying Material",
         x if x == TaskKind::TakeFromMember as u16 => "Taking From Teammate",
         x if x == TaskKind::TameAnimal as u16 => "Taming",
         x if x == TaskKind::Craft as u16 => "Crafter",
@@ -227,6 +234,7 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::Scavenge as u16
         || task_id == TaskKind::WithdrawFood as u16
         || task_id == TaskKind::WithdrawMaterial as u16
+        || task_id == TaskKind::BuyMaterialAtMarket as u16
         || task_id == TaskKind::Socialize as u16
         || task_id == TaskKind::Raid as u16
         || task_id == TaskKind::Defend as u16
@@ -265,6 +273,7 @@ pub fn task_is_labor(task_id: u16) -> bool {
         || task_id == TaskKind::TameAnimal as u16
         || task_id == TaskKind::WithdrawFood as u16
         || task_id == TaskKind::WithdrawMaterial as u16
+        || task_id == TaskKind::BuyMaterialAtMarket as u16
         || task_id == TaskKind::HaulToCraftOrder as u16
         || task_id == TaskKind::WorkOnCraftOrder as u16
         || task_id == TaskKind::UnpitchStructure as u16
@@ -766,6 +775,13 @@ pub fn goal_dispatch_system(
                     // until either completion or external preempt.
                     AgentGoal::Haul if aq.current_task_kind() == TaskKind::WithdrawMaterial as u16 => {
                         Some(TaskKind::WithdrawMaterial as u16)
+                    }
+                    // Step 5: Market-haul chain — `[BuyMaterialAtMarket,
+                    // HaulToBlueprint]`. The buy leg must survive goal-dispatch
+                    // ticks while the agent walks to the market node; the haul
+                    // leg is covered by the HaulMaterials arm below.
+                    AgentGoal::Haul if aq.current_task_kind() == TaskKind::BuyMaterialAtMarket as u16 => {
+                        Some(TaskKind::BuyMaterialAtMarket as u16)
                     }
                     AgentGoal::Haul if aq.current_task_kind() == TaskKind::HaulMaterials as u16 => {
                         Some(TaskKind::HaulMaterials as u16)

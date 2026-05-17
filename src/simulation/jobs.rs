@@ -96,6 +96,22 @@ impl TileAabb {
     }
 }
 
+/// Where a `JobProgress::Haul` worker acquires the material before hauling it
+/// to the blueprint. `Storage` (the default) is the legacy withdraw-from-
+/// faction-storage path. `Market` routes the worker to the faction's market
+/// node to buy the material with treasury-funded escrow capital, then reuses
+/// the same `HaulToBlueprint` deposit leg. `max_unit_price` is the price
+/// ceiling locked at posting time so a later price spike can't overspend the
+/// escrowed purchase pool.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum HaulSource {
+    #[default]
+    Storage,
+    Market {
+        max_unit_price: f32,
+    },
+}
+
 /// Quantitative completion criterion for a posting. The job auto-releases when
 /// `is_complete()` returns true.
 #[derive(Clone, Debug)]
@@ -119,6 +135,10 @@ pub enum JobProgress {
         resource_id: crate::economy::resource_catalog::ResourceId,
         delivered: u32,
         target: u32,
+        /// Acquisition source for the hauled material. Defaults to `Storage`
+        /// (legacy behaviour). `Market` is stamped by Phase 3c when the
+        /// material is scarce-but-procurable for a state-authored blueprint.
+        source: HaulSource,
     },
     /// Farm: tiles successfully planted within the designated area.
     /// `plot_id` and `assigned_farmer` are populated when the chief posts a
@@ -251,6 +271,10 @@ impl JobProgress {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PosterClass {
     Chief,
+    /// Settlement-scoped construction authority (sleepy-dove). Authors
+    /// build/haul postings whose blueprint the chief couldn't gate
+    /// because the chief hasn't personally Learned the construction tech.
+    Architect,
     Bureaucrat,
     HouseholdHead,
     Individual,
@@ -373,6 +397,11 @@ pub enum ClaimKind {
 pub struct ClaimTarget {
     pub blueprint: Option<Entity>,
     pub kind: ClaimKind,
+    /// Step 5: for `JobKind::Haul` claims, the posting's `HaulSource`
+    /// snapshot so the dispatcher can pick the Market-buy chain without
+    /// re-querying the `JobBoard`. `None` for non-Haul / Storage hauls
+    /// (the default — keeps every other claim path byte-identical).
+    pub haul_source: Option<HaulSource>,
 }
 
 impl ClaimTarget {
@@ -426,8 +455,25 @@ impl ClaimTarget {
 /// refunds via the hook. No per-cancel-site refund logic anywhere.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct JobEscrow {
+    /// Wage pool — paid to claimants on completion via `job_payout_system`,
+    /// refunded to `beneficiary` on cancellation/expiry via the remove hook.
     pub amount: f32,
     pub beneficiary: Entity,
+    /// Procurement capital for `HaulSource::Market` hauls (Step 4). Sized at
+    /// funding time as `max_unit_price * target`. The worker draws an advance
+    /// from this pool to buy the material and returns the unspent remainder
+    /// in the same atomic step (Step 5); whatever residual survives to
+    /// completion is refunded to `beneficiary` (Step 6). `0.0` for every
+    /// non-Market posting — keeps the wage-only paths byte-identical.
+    pub purchase_pool: f32,
+}
+
+impl JobEscrow {
+    /// Total currency held by this escrow (wage + unspent procurement
+    /// capital). Used by the remove hook and the system-wide invariant.
+    pub fn held(&self) -> f32 {
+        self.amount + self.purchase_pool
+    }
 }
 
 pub fn on_job_escrow_remove(
@@ -438,14 +484,15 @@ pub fn on_job_escrow_remove(
     let Some(escrow) = world.get::<JobEscrow>(entity).copied() else {
         return;
     };
-    if !(escrow.amount > 0.0) {
+    let refund = escrow.held();
+    if !(refund > 0.0) {
         // Cleared on successful payout; nothing to refund.
         return;
     }
     if let Some(mut econ) =
         world.get_mut::<crate::economy::agent::EconomicAgent>(escrow.beneficiary)
     {
-        econ.currency += escrow.amount;
+        econ.currency += refund;
     }
     // Beneficiary may have despawned (e.g. employer died mid-job).
     // In that case the escrowed currency is lost — same semantics as
@@ -458,7 +505,7 @@ pub fn on_job_escrow_remove(
 /// invariant accounts for funds-in-flight.
 pub fn total_escrowed_currency(world: &mut World) -> f32 {
     let mut q = world.query::<&JobEscrow>();
-    q.iter(world).map(|e| e.amount).sum()
+    q.iter(world).map(|e| e.held()).sum()
 }
 
 /// Phase 0 (wage payout): map from `JobId → escrow sidecar entity` so
@@ -781,7 +828,8 @@ pub fn chief_post_funding_system(world: &mut World) {
     // 1. Snapshot candidate postings: (job_id, faction_id, wage, chief_entity).
     //    Skip postings already funded, non-chief sources, or factions
     //    without a chief / without a non-empty policy map.
-    let mut candidates: Vec<(JobId, u32, f32, Entity)> = Vec::new();
+    // (job_id, faction_id, wage, purchase_pool, chief)
+    let mut candidates: Vec<(JobId, u32, f32, f32, Entity)> = Vec::new();
     {
         let registry = world.resource::<crate::simulation::faction::FactionRegistry>();
         let board = world.resource::<JobBoard>();
@@ -807,7 +855,20 @@ pub fn chief_post_funding_system(world: &mut World) {
                 if wage <= 0.0 {
                     continue;
                 }
-                candidates.push((p.id, faction_id, wage, chief));
+                // Market hauls also need procurement capital escrowed:
+                // `max_unit_price * target`. Sized at funding time; the
+                // worker draws an advance and returns the remainder atomically
+                // (Step 5), residual refunds to the chief on completion
+                // (Step 6). Zero for every other posting.
+                let purchase_pool = match &p.progress {
+                    JobProgress::Haul {
+                        source: HaulSource::Market { max_unit_price },
+                        target,
+                        ..
+                    } => max_unit_price.max(0.0) * (*target as f32),
+                    _ => 0.0,
+                };
+                candidates.push((p.id, faction_id, wage, purchase_pool, chief));
             }
         }
     }
@@ -817,16 +878,21 @@ pub fn chief_post_funding_system(world: &mut World) {
 
     // 2. For each candidate, check treasury, debit, spawn escrow, set
     //    reward, index it.
-    for (job_id, faction_id, wage, chief) in candidates {
+    for (job_id, faction_id, wage, purchase_pool, chief) in candidates {
+        // Total escrowed = wage + procurement capital. The per-candidate
+        // debit reads the live (already-debited) treasury, so concurrent
+        // Market hauls in one pass are naturally serialized — no separate
+        // running tally needed.
+        let total = wage + purchase_pool;
         let funded = {
             let mut registry = world.resource_mut::<crate::simulation::faction::FactionRegistry>();
             let Some(faction) = registry.factions.get_mut(&faction_id) else {
                 continue;
             };
-            if faction.treasury < wage {
+            if faction.treasury < total {
                 false
             } else {
-                faction.treasury -= wage;
+                faction.treasury -= total;
                 true
             }
         };
@@ -838,6 +904,7 @@ pub fn chief_post_funding_system(world: &mut World) {
             .spawn(JobEscrow {
                 amount: wage,
                 beneficiary: chief,
+                purchase_pool,
             })
             .id();
         {
@@ -1241,6 +1308,7 @@ pub fn post_craft_contract(
         .spawn(JobEscrow {
             amount: reward,
             beneficiary: poster,
+            purchase_pool: 0.0,
         })
         .id();
     // Phase 0: register the escrow against the job_id so
@@ -1344,6 +1412,7 @@ pub fn post_craft_contract_from_treasury(
         .spawn(JobEscrow {
             amount: reward,
             beneficiary: head,
+            purchase_pool: 0.0,
         })
         .id();
     world
@@ -1458,6 +1527,7 @@ pub fn post_stockpile_self(
         .spawn(JobEscrow {
             amount: reward,
             beneficiary: author,
+            purchase_pool: 0.0,
         })
         .id();
     world
@@ -1907,6 +1977,127 @@ pub struct FarmJobPostingParams<'w, 's> {
     pub assignments: Res<'w, crate::simulation::farm::FarmPlotAssignments>,
     pub plot_index: Res<'w, crate::simulation::land::PlotIndex>,
     pub plot_q: Query<'w, 's, &'static crate::simulation::land::Plot>,
+    /// sleepy-dove Phase 6: classify build/haul postings by the
+    /// authoring blueprint's poster (Architect vs Chief). Bundled here
+    /// so `chief_job_posting_system` stays under the 16-param ceiling.
+    pub poster_prof_q: Query<'w, 's, &'static crate::simulation::person::Profession>,
+}
+
+/// Step 3: rebuild every faction's `procurement_plan` once per chief-posting
+/// cadence. For each wall-ladder construction input it classifies scarcity via
+/// `construction::classify_resource` (deposited storage, raw-gatherable
+/// knowledge, market stock/price at the faction's node, treasury budget) and
+/// records `HaulSource::Market` for inputs that are scarce-but-affordably-
+/// procurable. `Storage`/absent inputs are left out (the default). Runs
+/// `.before(chief_job_posting_system)` so Phase 3c reads a fresh plan.
+pub fn classify_construction_procurement_system(
+    clock: Res<SimClock>,
+    mut registry: ResMut<FactionRegistry>,
+    shared: Res<crate::simulation::shared_knowledge::SharedKnowledge>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    camp_map: Res<crate::simulation::camp::CampMap>,
+    settlement_q: Query<&crate::simulation::settlement::Settlement>,
+    camp_q: Query<&crate::simulation::camp::Camp>,
+) {
+    if clock.tick % CHIEF_POSTING_INTERVAL != 0 {
+        return;
+    }
+    use crate::economy::resource_catalog::ResourceId;
+    use crate::simulation::camp::MarketNodeRef;
+    use crate::simulation::construction::{
+        classify_resource, recipe_for, BuildSiteKind, MaterialAvailabilityView, Scarcity,
+        WallMaterial,
+    };
+    use crate::simulation::memory::MemoryKind;
+
+    // Union of wall-ladder recipe inputs; per-rid `need` is the *largest*
+    // single-structure input across the ladder (conservative — a faction with
+    // 3 stone still reads short against the 4-stone Cut Stone rung).
+    let mut need_by_rid: AHashMap<ResourceId, u32> = AHashMap::new();
+    for m in WallMaterial::ALL {
+        for &(rid, qty) in &recipe_for(BuildSiteKind::Wall(m)).inputs {
+            let e = need_by_rid.entry(rid).or_insert(0);
+            *e = (*e).max(qty as u32);
+        }
+    }
+    if need_by_rid.is_empty() {
+        return;
+    }
+
+    for (&faction_id, faction) in registry.factions.iter_mut() {
+        faction.procurement_plan.clear();
+        faction.procurement_market = None;
+        let mut view = MaterialAvailabilityView::default();
+        if faction_id == SOLO {
+            faction.material_view = view;
+            continue;
+        }
+        let node = crate::simulation::camp::faction_market_node(
+            &settlement_map,
+            &camp_map,
+            faction_id,
+        );
+        // Cache (node_entity, market_tile) so the Market-haul dispatcher can
+        // route without resolving the node itself.
+        faction.procurement_market = match node {
+            Some(MarketNodeRef::Settlement(e)) => settlement_q
+                .get(e)
+                .ok()
+                .map(|s| (e, s.market_tile)),
+            Some(MarketNodeRef::Camp(e)) => {
+                camp_q.get(e).ok().map(|c| (e, c.home_tile))
+            }
+            None => None,
+        };
+        let home = (faction.home_tile.0 as i32, faction.home_tile.1 as i32);
+        let treasury = faction.treasury;
+        for (&rid, &need) in need_by_rid.iter() {
+            let stored = faction.storage.stock_of(rid);
+            let supply = faction
+                .resource_supply
+                .get(&rid)
+                .copied()
+                .unwrap_or(stored);
+            let raw_gatherable = crate::simulation::shared_knowledge::faction_knows_cluster(
+                &shared,
+                &settlement_map,
+                faction_id,
+                MemoryKind::Resource(rid),
+                home,
+                16,
+            );
+            let (mkt_stock, mkt_price) = match node {
+                Some(MarketNodeRef::Settlement(e)) => settlement_q
+                    .get(e)
+                    .map(|s| (s.market.stock_of(rid), s.market.price_of(rid)))
+                    .unwrap_or((0.0, 0.0)),
+                Some(MarketNodeRef::Camp(e)) => camp_q
+                    .get(e)
+                    .map(|c| (c.market.stock_of(rid), c.market.price_of(rid)))
+                    .unwrap_or((0.0, 0.0)),
+                None => (0.0, 0.0),
+            };
+            let av = classify_resource(
+                stored,
+                supply,
+                mkt_stock,
+                mkt_price,
+                treasury,
+                raw_gatherable,
+                need,
+            );
+            if av.scarcity == Scarcity::Scarce {
+                faction.procurement_plan.insert(
+                    rid,
+                    HaulSource::Market {
+                        max_unit_price: av.market_price,
+                    },
+                );
+            }
+            view.insert(rid, av);
+        }
+        faction.material_view = view;
+    }
 }
 
 pub fn chief_job_posting_system(
@@ -1930,6 +2121,25 @@ pub fn chief_job_posting_system(
     if clock.tick % CHIEF_POSTING_INTERVAL != 0 {
         return;
     }
+    // Resolve the `poster_class` for a blueprint-backed posting from the
+    // blueprint's snapshotted `posted_by`. Architect-authored work
+    // carries `PosterClass::Architect`; everything else (chief, seed,
+    // legacy author-less) stays `Chief`.
+    let poster_class_for_bp = |bp_e: Entity| -> PosterClass {
+        bp_query
+            .get(bp_e)
+            .ok()
+            .and_then(|b| b.posted_by)
+            .and_then(|e| farm_params.poster_prof_q.get(e).ok())
+            .map(|p| {
+                if *p == crate::simulation::person::Profession::Architect {
+                    PosterClass::Architect
+                } else {
+                    PosterClass::Chief
+                }
+            })
+            .unwrap_or(PosterClass::Chief)
+    };
     // Anticipatory food buffer: tribes need a fatter reserve heading into
     // winter than they do at the height of summer foraging. Multiplier is
     // applied to the food deficit target before the GATHER_TARGET_CAP clamp.
@@ -2127,7 +2337,7 @@ pub fn chief_job_posting_system(
                 source: JobSource::Chief,
                 posted_tick,
                 expiry_tick: None,
-                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                poster_class: poster_class_for_bp(bp_entity),
                 reward: 0.0,
                 settlement_id: None,
             });
@@ -2443,6 +2653,51 @@ pub fn chief_job_posting_system(
                     let slot_id = slot.resource_id;
                     let avail = storage_remaining.get(&slot_id).copied().unwrap_or(0);
                     if avail == 0 {
+                        // Storage can't cover this slot. If the classifier
+                        // flagged the resource scarce-but-procurable AND this
+                        // is a state-funded public-works blueprint authored by
+                        // the chief / an Architect, post a treasury-funded
+                        // Market haul instead of stalling. (Inert until the
+                        // worker chain + escrow funding land in Steps 4-5;
+                        // an unworked posting just refunds its escrow.)
+                        if let Some(HaulSource::Market { max_unit_price }) =
+                            faction.procurement_plan.get(&slot_id).copied()
+                        {
+                            let pc = poster_class_for_bp(bp_entity);
+                            if faction.state_funds_public_works
+                                && matches!(pc, PosterClass::Chief | PosterClass::Architect)
+                            {
+                                let id = board.alloc_id();
+                                let progress = JobProgress::Haul {
+                                    blueprint: bp_entity,
+                                    resource_id: slot_id,
+                                    delivered: 0,
+                                    target: remaining,
+                                    source: HaulSource::Market { max_unit_price },
+                                };
+                                let priority = compute_priority(
+                                    faction,
+                                    faction_id,
+                                    JobKind::Haul,
+                                    &progress,
+                                    &projects,
+                                );
+                                board.faction_postings_mut(faction_id).push(JobPosting {
+                                    id,
+                                    faction_id,
+                                    kind: JobKind::Haul,
+                                    progress,
+                                    claimants: Vec::new(),
+                                    priority,
+                                    source: JobSource::Chief,
+                                    posted_tick,
+                                    expiry_tick: None,
+                                    poster_class: pc,
+                                    reward: 0.0,
+                                    settlement_id: None,
+                                });
+                            }
+                        }
                         continue;
                     }
                     let target = remaining.min(avail);
@@ -2457,6 +2712,7 @@ pub fn chief_job_posting_system(
                         resource_id: slot_id,
                         delivered: 0,
                         target,
+                        source: HaulSource::Storage,
                     };
                     let priority =
                         compute_priority(faction, faction_id, JobKind::Haul, &progress, &projects);
@@ -2470,7 +2726,7 @@ pub fn chief_job_posting_system(
                         source: JobSource::Chief,
                         posted_tick,
                         expiry_tick: None,
-                        poster_class: crate::simulation::jobs::PosterClass::Chief,
+                        poster_class: poster_class_for_bp(bp_entity),
                         reward: 0.0,
                         settlement_id: None,
                     });
@@ -3520,22 +3776,27 @@ pub fn posting_claim_target(p: &JobPosting) -> ClaimTarget {
         JobProgress::Stockpile { resource_id, .. } => ClaimTarget {
             blueprint: None,
             kind: ClaimKind::Specific(*resource_id),
+            haul_source: None,
         },
         JobProgress::Haul {
             blueprint,
             resource_id,
+            source,
             ..
         } => ClaimTarget {
             blueprint: Some(*blueprint),
             kind: ClaimKind::Specific(*resource_id),
+            haul_source: Some(*source),
         },
         JobProgress::Building { blueprint } => ClaimTarget {
             blueprint: Some(*blueprint),
             kind: ClaimKind::None,
+            haul_source: None,
         },
         JobProgress::Calories { .. } => ClaimTarget {
             blueprint: None,
             kind: ClaimKind::AnyEdible,
+            haul_source: None,
         },
         _ => ClaimTarget::default(),
     }

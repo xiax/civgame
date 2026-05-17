@@ -433,24 +433,34 @@ pub fn combat_system(
         if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _)) =
             attacker_query.get_mut(target)
         {
-            if target_combat.0.is_none() {
-                if let Ok(mut target_ai) = ai_query.get_mut(target) {
+            if let Ok(mut target_ai) = ai_query.get_mut(target) {
+                // Combat-target assignment must happen exactly once.
+                // The wake/cancel, however, must fire whenever a *sleeping*
+                // victim is hit — even if they already have a combat target
+                // (multi-attacker, or the 2nd of a body+health damage pair):
+                // otherwise the deferred typed-task cancel is skipped and the
+                // `Task::Sleep` is orphaned -> ActionQueue::dispatch desync.
+                // Idempotent: after the wake `state != Sleeping`, so a later
+                // hit won't re-send.
+                let wake = target_combat.0.is_none() || target_ai.state == AiState::Sleeping;
+                if target_combat.0.is_none() {
                     target_combat.0 = Some(attacker);
-                    // Setting target will trigger combat_system on next tick.
-                    // The victim's ActionQueue is unreachable from here
-                    // (attacker_query holds Option<&mut ActionQueue> mutably);
-                    // combat_retaliation_cleanup_system drains the event below.
+                }
+                if wake {
+                    // Setting target triggers combat_system next tick. The
+                    // victim's ActionQueue is unreachable here (attacker_query
+                    // holds it mutably); combat_retaliation_cleanup_system
+                    // drains the event below and cancels the chain.
                     target_ai.state = AiState::Idle;
                     events
                         .retaliation
                         .send(CombatRetaliationStartedEvent { victim: target });
-                } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target)
-                {
-                    if maybe_deer.is_none() {
-                        target_combat.0 = Some(attacker);
-                        target_animal.target_entity = Some(attacker);
-                        target_animal.state = AnimalState::Chase;
-                    }
+                }
+            } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target) {
+                if target_combat.0.is_none() && maybe_deer.is_none() {
+                    target_combat.0 = Some(attacker);
+                    target_animal.target_entity = Some(attacker);
+                    target_animal.state = AnimalState::Chase;
                 }
             }
         }
@@ -469,20 +479,25 @@ pub fn combat_system(
         if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _)) =
             attacker_query.get_mut(target)
         {
-            if target_combat.0.is_none() {
-                if let Ok(mut target_ai) = ai_query.get_mut(target) {
+            if let Ok(mut target_ai) = ai_query.get_mut(target) {
+                // Same decoupling as the health-damage block above: wake a
+                // sleeping victim (cancel the orphaned typed task) regardless
+                // of whether they already have a combat target.
+                let wake = target_combat.0.is_none() || target_ai.state == AiState::Sleeping;
+                if target_combat.0.is_none() {
                     target_combat.0 = Some(attacker);
+                }
+                if wake {
                     target_ai.state = AiState::Idle;
                     events
                         .retaliation
                         .send(CombatRetaliationStartedEvent { victim: target });
-                } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target)
-                {
-                    if maybe_deer.is_none() {
-                        target_combat.0 = Some(attacker);
-                        target_animal.target_entity = Some(attacker);
-                        target_animal.state = AnimalState::Chase;
-                    }
+                }
+            } else if let Ok((mut target_animal, maybe_deer)) = animal_ai_query.get_mut(target) {
+                if target_combat.0.is_none() && maybe_deer.is_none() {
+                    target_combat.0 = Some(attacker);
+                    target_animal.target_entity = Some(attacker);
+                    target_animal.state = AnimalState::Chase;
                 }
             }
         }

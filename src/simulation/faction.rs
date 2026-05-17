@@ -115,6 +115,15 @@ pub const CRAFTER_MAX_DIVISOR: usize = 3;
 /// headcount. Mirrors `HUNTER_ASSIGNMENT_CADENCE`.
 pub const CRAFTER_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
 
+/// Cadence at which `chief_architect_appointment_system` reconciles the
+/// per-settlement architect (sleepy-dove Phase 3). Mirrors the other
+/// specialised-labour assignment systems.
+pub const ARCHITECT_ASSIGNMENT_CADENCE: u64 = (TICKS_PER_DAY / 4) as u64;
+
+/// Demotion hysteresis for architects: tolerate this many over target
+/// before demoting (consistent with Hunter/Bureaucrat patterns).
+pub const ARCHITECT_DEMOTE_BUFFER: usize = 1;
+
 /// Phase 4b/5a hysteresis deadband: promote crafters only when the
 /// faction's Craft `wage_signal` has accumulated past this floor
 /// (~one day of sustained paid craft work). A single first-day payout
@@ -602,6 +611,240 @@ pub fn chief_bureaucrat_appointment_system(
     {
         if promote.contains(&entity) {
             *prof = Profession::Bureaucrat;
+        } else if demote.contains(&entity) {
+            *prof = Profession::None;
+            crate::simulation::profession_choice::demote_profession_state(
+                entity,
+                ai_opt.map(|x| x.into_inner()),
+                aq_opt.map(|x| x.into_inner()),
+                &reservations,
+                &mut commands,
+            );
+        }
+    }
+}
+
+/// sleepy-dove Phase 3: chief-driven, per-settlement architect
+/// appointment. An architect is a settlement-scoped construction
+/// authority — they author build/haul postings whose blueprint the
+/// chief couldn't gate because the chief hasn't personally **Learned**
+/// the construction tech.
+///
+/// Per-settlement target:
+/// - **0** unless the chief is *Aware* of at least one construction tech
+///   they haven't personally **Learned** (the chief can't cover
+///   everything). Paleolithic bands — whose construction is all no-tech
+///   (Crude beds / Open hearths / Wood doors) — naturally get 0.
+/// - **1** otherwise. (Per user direction: one architect per settlement,
+///   not population-scaled.)
+///
+/// Candidate filter: residents of that settlement, `Profession::None`,
+/// who have personally **Learned** at least one construction tech the
+/// chief lacks. Ranked by coverage gain → Building → Social → entity id.
+/// Demotion uses `ARCHITECT_DEMOTE_BUFFER` hysteresis and the shared
+/// `demote_profession_state` helper; in-flight blueprints keep their
+/// snapshotted `posted_by` + `design_techs`, so demotion is a no-op for
+/// work already authored.
+///
+/// Scheduled after `chief_bureaucrat_appointment_system`, before
+/// `chief_craft_assignment_system`, so it gets first pick of
+/// Building-skilled `None` candidates without starving the wage-economy
+/// roles. Real contention is rare (one per settlement, tech-gated).
+pub fn chief_architect_appointment_system(
+    clock: Res<SimClock>,
+    registry: Res<FactionRegistry>,
+    reservations: Res<StorageReservations>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    settlement_q: Query<&crate::simulation::settlement::Settlement>,
+    chief_knowledge_q: Query<
+        &crate::simulation::knowledge::PersonKnowledge,
+        With<FactionChief>,
+    >,
+    mut commands: Commands,
+    mut query: Query<
+        (
+            Entity,
+            &mut Profession,
+            &FactionMember,
+            &Skills,
+            &Transform,
+            &crate::simulation::knowledge::PersonKnowledge,
+            Option<&mut PersonAI>,
+            Option<&mut crate::simulation::typed_task::ActionQueue>,
+        ),
+        Without<FactionChief>,
+    >,
+) {
+    if clock.tick % ARCHITECT_ASSIGNMENT_CADENCE != 0 {
+        return;
+    }
+
+    let constr_techs = crate::simulation::construction::construction_relevant_techs();
+
+    // Per-faction: the construction techs the chief is Aware of but has
+    // NOT personally Learned. Non-empty → settlements want an architect.
+    // Also stash the chief's Learned set for the coverage-gain rank.
+    let mut chief_gap: AHashMap<u32, Vec<crate::simulation::technology::TechId>> =
+        AHashMap::default();
+    for (&fid, faction) in registry.factions.iter() {
+        if fid == SOLO || faction.member_count == 0 {
+            continue;
+        }
+        // Camps / no-posting archetypes don't run chief construction.
+        if faction.caps.posting.is_disabled() {
+            continue;
+        }
+        if matches!(faction.camp_state, CampState::Packed { .. }) {
+            continue;
+        }
+        let Some(chief) = faction.chief_entity else {
+            continue;
+        };
+        let Ok(ck) = chief_knowledge_q.get(chief) else {
+            continue;
+        };
+        let gap: Vec<_> = constr_techs
+            .iter()
+            .copied()
+            .filter(|&t| ck.is_aware(t) && !ck.has_learned(t))
+            .collect();
+        if !gap.is_empty() {
+            chief_gap.insert(fid, gap);
+        }
+    }
+
+    if chief_gap.is_empty() {
+        // Still need to demote any orphaned architects (faction lost the
+        // gap, or chief learned everything). Fall through with empty gap.
+    }
+
+    // Bucket current architects + None candidates by (faction, resident
+    // settlement). Coverage gain = how many of the chief's missing
+    // construction techs this member has personally Learned.
+    type Bucket = AHashMap<
+        (u32, crate::simulation::settlement::SettlementId),
+        Vec<(Entity, u32 /*coverage*/, u32 /*building*/, u32 /*social*/)>,
+    >;
+    let mut architects: Bucket = AHashMap::default();
+    let mut nones: Bucket = AHashMap::default();
+
+    for (entity, prof, member, skills, xf, knowledge, _, _) in query.iter() {
+        let fid = member.faction_id;
+        if fid == SOLO {
+            continue;
+        }
+        let Some(gap) = chief_gap.get(&fid) else {
+            // No architect demand for this faction. Still bucket existing
+            // architects so they get demoted.
+            if *prof == Profession::Architect {
+                if let Some(sid) = settlement_map.first_for_faction(fid) {
+                    architects.entry((fid, sid)).or_default().push((
+                        entity, 0, 0, 0,
+                    ));
+                }
+            }
+            continue;
+        };
+        let coverage = gap
+            .iter()
+            .filter(|&&t| knowledge.has_learned(t))
+            .count() as u32;
+        let tile = crate::world::terrain::world_to_tile(xf.translation.truncate());
+        // Resident settlement = nearest same-faction settlement.
+        let mut best: Option<(crate::simulation::settlement::SettlementId, i32)> = None;
+        for &sid in settlement_map.for_faction(fid) {
+            let Some(&se) = settlement_map.by_id.get(&sid) else {
+                continue;
+            };
+            let Ok(s) = settlement_q.get(se) else {
+                continue;
+            };
+            let d = (s.market_tile.0 - tile.0)
+                .abs()
+                .max((s.market_tile.1 - tile.1).abs());
+            if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((sid, d));
+            }
+        }
+        let Some((sid, _)) = best else {
+            continue;
+        };
+        let building = skills.0[SkillKind::Building as usize];
+        let social = skills.0[SkillKind::Social as usize];
+        match *prof {
+            Profession::Architect => architects
+                .entry((fid, sid))
+                .or_default()
+                .push((entity, coverage, building, social)),
+            Profession::None if coverage > 0 => nones
+                .entry((fid, sid))
+                .or_default()
+                .push((entity, coverage, building, social)),
+            _ => {}
+        }
+    }
+
+    let mut promote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut demote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+
+    // Every settlement that has demand (gap non-empty) targets exactly 1.
+    let mut settlement_keys: ahash::AHashSet<(u32, crate::simulation::settlement::SettlementId)> =
+        ahash::AHashSet::default();
+    for k in architects.keys() {
+        settlement_keys.insert(*k);
+    }
+    for k in nones.keys() {
+        settlement_keys.insert(*k);
+    }
+
+    for key in settlement_keys {
+        let (fid, _sid) = key;
+        let want: usize = if chief_gap.contains_key(&fid) { 1 } else { 0 };
+        let mut cur = architects.remove(&key).unwrap_or_default();
+        let mut cands = nones.remove(&key).unwrap_or_default();
+
+        // Demote architects who no longer cover any chief gap (lost the
+        // tech via LRU eviction, or faction lost demand entirely).
+        cur.retain(|&(e, cov, _, _)| {
+            if want == 0 || cov == 0 {
+                demote.insert(e);
+                false
+            } else {
+                true
+            }
+        });
+
+        if cur.len() < want {
+            cands.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then(b.2.cmp(&a.2))
+                    .then(b.3.cmp(&a.3))
+                    .then(a.0.cmp(&b.0))
+            });
+            for (e, _, _, _) in cands.into_iter().take(want - cur.len()) {
+                promote.insert(e);
+            }
+        } else if cur.len() > want + ARCHITECT_DEMOTE_BUFFER {
+            cur.sort_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then(a.2.cmp(&b.2))
+                    .then(a.3.cmp(&b.3))
+                    .then(a.0.cmp(&b.0))
+            });
+            let extra = cur.len() - want;
+            for (e, _, _, _) in cur.into_iter().take(extra) {
+                demote.insert(e);
+            }
+        }
+    }
+
+    if promote.is_empty() && demote.is_empty() {
+        return;
+    }
+
+    for (entity, mut prof, _member, _skills, _xf, _knowledge, ai_opt, aq_opt) in query.iter_mut() {
+        if promote.contains(&entity) {
+            *prof = Profession::Architect;
         } else if demote.contains(&entity) {
             *prof = Profession::None;
             crate::simulation::profession_choice::demote_profession_state(
@@ -1899,7 +2142,7 @@ impl FactionLineage {
 }
 
 /// u64 bitset storing which technologies are unlocked (bits 0-42).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct FactionTechs(pub u64);
 
 impl FactionTechs {
@@ -1910,6 +2153,13 @@ impl FactionTechs {
     #[inline]
     pub fn unlock(&mut self, id: TechId) {
         self.0 |= 1u64 << id;
+    }
+    /// Bitwise OR of two tech sets. Used by the construction poster pool
+    /// to fold resident chief + architect Learned snapshots into the
+    /// settlement's buildable surface.
+    #[inline]
+    pub fn union(&self, other: &FactionTechs) -> FactionTechs {
+        FactionTechs(self.0 | other.0)
     }
 }
 
@@ -2145,12 +2395,21 @@ pub struct FactionData {
     pub raid_target: Option<u32>,
     pub under_raid: bool,
     pub techs: FactionTechs,
+    /// **The single construction-tech surface.** Union of every resident
+    /// chief + architect `PersonKnowledge.learned` across the faction's
+    /// settlements (+ chief fallback), rewritten read-only every tick by
+    /// `construction::refresh_construction_poster_pool_system`. Every
+    /// build/civic/tier/shelter gate (`community_has`,
+    /// `community_adoption_bitset`) reads this — construction no longer
+    /// gates on community *adoption* anywhere. Empty until the first pool
+    /// refresh; seeding drives tiers from `SeedConstructionProfile`
+    /// instead, so the tick-0 emptiness is never observed by a gate.
+    pub buildable_techs: FactionTechs,
     /// Community adoption stage per tech, derived every
     /// `ADOPTION_DERIVE_CADENCE` ticks by
-    /// `technology_adoption::derive_tech_adoption_system` from
-    /// member-knowledge aggregates + workshop ownership + recent use.
-    /// `community_has_adopted(faction, tech)` reads this directly; civic
-    /// gates that previously consulted `techs` should switch over.
+    /// `technology_adoption::derive_tech_adoption_system`. **Analytics /
+    /// UI only** — no construction/civic/tier/shelter gate reads this.
+    /// The single build-tech surface is `buildable_techs`.
     pub tech_adoption: [crate::simulation::technology_adoption::AdoptionStage;
         crate::simulation::technology::TECH_COUNT],
     /// Tick at which each tech's `tech_adoption[i]` last *changed* (in
@@ -2215,6 +2474,27 @@ pub struct FactionData {
     /// tribute (R11), public-works funding (R5+), and inter-faction
     /// transfers.
     pub treasury: f32,
+    /// Construction-procurement plan, rebuilt every chief-posting cadence by
+    /// `classify_construction_procurement_system`. Maps a construction input
+    /// `ResourceId` to the `HaulSource` Phase 3c should stamp on its Haul
+    /// posting: `Market { max_unit_price }` when the resource is scarce-but-
+    /// affordably-procurable (absent / `Storage` = legacy withdraw-from-storage).
+    pub procurement_plan:
+        ahash::AHashMap<crate::economy::resource_catalog::ResourceId, crate::simulation::jobs::HaulSource>,
+    /// Resolved economic node for procurement: `(node_entity, market_tile)`,
+    /// refreshed alongside `procurement_plan` by
+    /// `classify_construction_procurement_system`. The Market-haul dispatcher
+    /// reads this to route a worker to the market without needing
+    /// `SettlementMap`/`CampMap` params (16-param ceiling). `None` when the
+    /// faction has no settlement/camp node.
+    pub procurement_market: Option<(Entity, (i32, i32))>,
+    /// Full per-input scarcity snapshot, refreshed alongside
+    /// `procurement_plan` by `classify_construction_procurement_system`.
+    /// `generate_candidates` reads it (runtime only) so the era-aware
+    /// `select_wall_material` can return `EmergencyShelter` and emit
+    /// era-appropriate emergency bedding when every wall rung is
+    /// unobtainable. Empty in seed mode (selector passed `None`).
+    pub material_view: crate::simulation::construction::MaterialAvailabilityView,
     /// Per-resource economic policy. Pluralist Economy R4: each entry
     /// is `ResourceId → ResourceControlPolicy` (composable flags
     /// describing whether the chief allocates labor, private actors
@@ -2352,18 +2632,15 @@ pub struct FactionData {
 }
 
 impl FactionData {
-    /// Has the community *adopted* `tech` — i.e. `tech_adoption[tech] >=
-    /// Adopted`? Use this for civic / tier / material gates. Chief-Aware
-    /// for planning lives on `self.techs.has(tech)`; per-person execution
-    /// lives on `PersonKnowledge::has_learned`.
+    /// Can the faction *build with* `tech`? Reads `buildable_techs` — the
+    /// poster-pool union of resident chief + architect Learned. There is
+    /// no longer a community-*adoption* gate anywhere in the construction
+    /// path; this is the one consistent surface. Chief-Aware for planning
+    /// authority lives on `self.techs.has(tech)`; per-person execution on
+    /// `PersonKnowledge::has_learned`.
     #[inline]
     pub fn community_has(&self, tech: crate::simulation::technology::TechId) -> bool {
-        let idx = tech as usize;
-        if idx >= crate::simulation::technology::TECH_COUNT {
-            return false;
-        }
-        (self.tech_adoption[idx] as u8)
-            >= (crate::simulation::technology_adoption::AdoptionStage::Adopted as u8)
+        self.buildable_techs.has(tech)
     }
 
     /// Look up the policy for `resource_id`, falling back to the
@@ -2415,6 +2692,7 @@ impl FactionRegistry {
                 raid_target: None,
                 under_raid: false,
                 techs,
+                buildable_techs: FactionTechs::default(),
                 tech_adoption: [crate::simulation::technology_adoption::AdoptionStage::Unknown;
                     crate::simulation::technology::TECH_COUNT],
                 stage_changed_at_tick: [0; crate::simulation::technology::TECH_COUNT],
@@ -2432,6 +2710,9 @@ impl FactionRegistry {
                 hunt_order: None,
                 nearby_prey_count: 0,
                 treasury: 0.0,
+                procurement_plan: ahash::AHashMap::default(),
+                procurement_market: None,
+                material_view: crate::simulation::construction::MaterialAvailabilityView::default(),
                 economic_policy: ahash::AHashMap::default(),
                 land_policy: crate::economy::policy::LandPolicy::default(),
                 parent_faction: None,

@@ -525,6 +525,13 @@ pub struct CommandRouting<'w, 's> {
     pub chunk_connectivity: Res<'w, ChunkConnectivity>,
     pub bp_map: ResMut<'w, BlueprintMap>,
     pub hotspots: ResMut<'w, HotspotFlowFields>,
+    // sleepy-dove Phase 6: re-resolve the construction poster at dispatch
+    // time (the pool may have shifted between menu open and command
+    // processing). Author the manual blueprint with the resolved
+    // poster's `design_techs` so it diffuses adoption like an
+    // autonomous build.
+    pub poster_pool: Res<'w, crate::simulation::construction::ConstructionPosterPool>,
+    pub settlement_map: Res<'w, crate::simulation::settlement::SettlementMap>,
     #[system_param(ignore)]
     pub _marker: std::marker::PhantomData<&'s ()>,
 }
@@ -792,13 +799,40 @@ fn dispatch_one(
             DispatchOutcome::Active
         }
         Build { kind, tile, z: _z } => {
+            // sleepy-dove Phase 6: re-resolve the poster at execution
+            // time. The worker is the executor; authority comes from the
+            // faction chief / settlement architect. No poster knows the
+            // construction tech → reject (the right-click menu greys
+            // these out; this guards the race where the pool shifted
+            // between menu open and command processing). The author-less
+            // fallback only applies to fixture factions with no chief
+            // knowledge at all (empty pool entry).
+            let settlement_id = routing.settlement_map.first_for_faction(faction_id);
+            let resolved_author = routing
+                .poster_pool
+                .select_poster_for_kind(faction_id, settlement_id, kind)
+                .map(|cap| cap.author());
+            let author_missing_but_pool_populated = resolved_author.is_none()
+                && (routing.poster_pool.chief_by_faction.contains_key(&faction_id)
+                    || settlement_id
+                        .map(|sid| {
+                            routing
+                                .poster_pool
+                                .by_settlement
+                                .contains_key(&(faction_id, sid))
+                        })
+                        .unwrap_or(false));
+            if author_missing_but_pool_populated {
+                return DispatchOutcome::Failed(CommandFailure::Ineligible);
+            }
             // Spawn the personal blueprint if there isn't one at this tile.
             let bp_entity = if let Some(&e) = routing.bp_map.0.get(&tile) {
                 Some(e)
             } else {
                 let wp = tile_to_world(tile.0, tile.1);
                 let bz = routing.chunk_map.surface_z_at(tile.0, tile.1) as i8;
-                let mut bp = Blueprint::new(faction_id, Some(actor), kind, tile, bz);
+                let mut bp = Blueprint::new(faction_id, Some(actor), kind, tile, bz)
+                    .with_author(resolved_author);
                 // Water-anchored blueprints (Bridge) need a passable bank
                 // tile so workers don't try to path onto the river anchor.
                 if bp.kind.is_water_anchored() {

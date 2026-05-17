@@ -5,14 +5,13 @@ use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::faction::{
     FactionChief, FactionData, FactionMember, FactionRegistry, FactionTechs, StorageTileMap, SOLO,
 };
-use crate::simulation::goals::AgentGoal;
 use crate::simulation::jobs::{
-    record_progress_filtered, release_claimant, ClaimTarget, JobBoard, JobClaim, JobCompletedEvent,
-    JobKind, JobProgress,
+    record_progress_filtered, release_claimant, ClaimTarget, HaulSource, JobBoard, JobClaim,
+    JobCompletedEvent, JobKind, JobProgress,
 };
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
-use crate::simulation::person::{AiState, Person, PersonAI, UNEMPLOYED_TASK_KIND};
+use crate::simulation::person::{AiState, Person, PersonAI, Profession, UNEMPLOYED_TASK_KIND};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
@@ -599,6 +598,15 @@ pub struct Blueprint {
     /// because `tile` itself sits on impassable `River`. `None` for every
     /// other kind — the executor uses `tile` directly.
     pub work_stand: Option<(i32, i32)>,
+    /// Entity that authorized this build (chief or architect). `None` for
+    /// seed-time direct emission. Read at completion to call
+    /// `record_tech_use` so practice diffuses tech adoption. Snapshot —
+    /// survives the poster's death.
+    pub posted_by: Option<Entity>,
+    /// Poster's `Learned` bitset at intent-spawn time. Read at completion
+    /// by tier helpers (`best_bed_for` etc.) so the structure upgrades to
+    /// the design tier even if the build paused across succession.
+    pub design_techs: FactionTechs,
 }
 
 impl Blueprint {
@@ -632,7 +640,38 @@ impl Blueprint {
             pending_clear: Vec::new(),
             door_dir: None,
             work_stand: None,
+            posted_by: None,
+            design_techs: FactionTechs::default(),
         }
+    }
+
+    /// Stamp the (entity, learned-bitset) of the poster onto an existing
+    /// blueprint. No-op when `author` is None — preserves the legacy
+    /// `Blueprint::new` defaults (posted_by None, design_techs empty).
+    pub fn with_author(mut self, author: Option<BlueprintAuthor>) -> Self {
+        if let Some(a) = author {
+            self.posted_by = Some(a.posted_by);
+            self.design_techs = a.design_techs;
+        }
+        self
+    }
+
+    /// Same as `new`, but stamps the authoring poster and their `Learned`
+    /// bitset. Used by runtime intent emission once the poster pool exists;
+    /// seed-time and legacy call sites stay on `new` (posted_by = None).
+    pub fn new_with_poster(
+        faction_id: u32,
+        personal_owner: Option<Entity>,
+        kind: BuildSiteKind,
+        tile: (i32, i32),
+        target_z: i8,
+        posted_by: Option<Entity>,
+        design_techs: FactionTechs,
+    ) -> Self {
+        let mut bp = Self::new(faction_id, personal_owner, kind, tile, target_z);
+        bp.posted_by = posted_by;
+        bp.design_techs = design_techs;
+        bp
     }
 
     /// Tile workers should route to. For water-anchored blueprints
@@ -677,6 +716,34 @@ impl Blueprint {
             }
         }
         true
+    }
+}
+
+/// Who authorised a runtime construction and what `Learned` set they were
+/// carrying when they authored it. Threaded through `spawn_intent` ⇒
+/// `plan_building` ⇒ `plan_composite_building` ⇒ deferred `PendingFootprint`
+/// so every blueprint a poster emits carries their snapshot. The snapshot
+/// freezes tier picks at intent time (chief succession or architect death
+/// mid-build doesn't change the design) and feeds `record_tech_use` at
+/// completion so practice diffuses tech adoption.
+///
+/// `None` callers (seed paths, legacy emission sites) keep producing
+/// blueprints with `posted_by = None`, `design_techs = FactionTechs(0)`,
+/// which `construction_system` interprets as "not practice — skip
+/// diffusion." This is the forward-compatible bridge: a call site can
+/// adopt `BlueprintAuthor` without changing the rest of the pipeline.
+#[derive(Clone, Copy, Debug)]
+pub struct BlueprintAuthor {
+    pub posted_by: Entity,
+    pub design_techs: FactionTechs,
+}
+
+impl BlueprintAuthor {
+    pub fn new(posted_by: Entity, design_techs: FactionTechs) -> Self {
+        Self {
+            posted_by,
+            design_techs,
+        }
     }
 }
 
@@ -923,6 +990,56 @@ fn build_recipes() -> &'static [BuildRecipe] {
     TABLE.get_or_init(build_recipes_table).as_slice()
 }
 
+/// How obtainable a single construction-input resource is for a faction at
+/// chief-decision time. Drives the era-aware material selector and the
+/// `HaulSource` stamped on Phase 3c Haul postings.
+///
+/// `stored` is **deposited faction storage only** (never agent inventories —
+/// posting/candidate scoring must not double-count carried goods). `inventory`
+/// is informational (faction `supply - stored`). `raw_gatherable` is the
+/// coarse "is there a known accessible resource cluster" signal — clusters
+/// carry no quantity, so this is boolean, not a reserve estimate.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // consumed by the selector/classifier in Step 2+
+pub struct ResourceAvailability {
+    pub stored: u32,
+    pub inventory: u32,
+    pub market_stock: f32,
+    pub market_price: f32,
+    pub affordable_qty: u32,
+    pub raw_gatherable: bool,
+    pub scarcity: Scarcity,
+}
+
+/// Scarcity tier for one construction input, relative to the recipe quantity
+/// needed for one structure. `Tight` means short in storage but raw-gatherable
+/// (the existing gather pipeline resolves it — no procurement). `Scarce` means
+/// not stored / not gatherable but affordably procurable at the market node.
+/// `Unavailable` means none of the above — substitute down the ladder, then
+/// emergency shelter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the selector/classifier in Step 2+
+pub enum Scarcity {
+    Available,
+    Tight,
+    Scarce,
+    Unavailable,
+}
+
+/// Result of the era-aware wall-material selector. `Material` carries the
+/// chosen ladder rung plus how its scarce inputs (if any) must be acquired.
+/// `EmergencyShelter` means every ladder rung's inputs are `Unavailable` and
+/// not procurable — the caller emits era-appropriate emergency bedding instead
+/// of a walled house.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WallSelection {
+    Material {
+        mat: WallMaterial,
+        source: HaulSource,
+    },
+    EmergencyShelter,
+}
+
 /// Most advanced wall material a faction's tech bitset allows. Used by the
 /// chief to upgrade defensive walls automatically; the player may still pick
 /// any unlocked material via the right-click menu.
@@ -942,6 +1059,193 @@ pub fn best_wall_material(techs: &FactionTechs) -> WallMaterial {
     } else {
         WallMaterial::Palisade
     }
+}
+
+/// Wall materials in **tech-progression order** (low → high tech). This is
+/// NOT the `WallMaterial` enum discriminant order (there Stone=2, Mudbrick=3
+/// are swapped relative to their tech gates). `best_wall_material` walks tech
+/// gates in exactly this order; `select_wall_material` steps *down* it when a
+/// rung's recipe input is unavailable.
+const WALL_LADDER_BY_TECH: [WallMaterial; 5] = [
+    WallMaterial::Palisade,
+    WallMaterial::WattleDaub,
+    WallMaterial::Mudbrick,
+    WallMaterial::Stone,
+    WallMaterial::CutStone,
+];
+
+/// Per-rid availability snapshot for every construction input the wall ladder
+/// (and doors) may require. Built once per chief tick by
+/// `classify_construction_materials`; consumed by `select_wall_material` and
+/// (Step 3) Phase 3c Haul-source stamping.
+#[derive(Clone, Debug, Default)]
+#[allow(dead_code)] // populated/consumed at chief cadence in Step 3+
+pub struct MaterialAvailabilityView {
+    by_rid: AHashMap<crate::economy::resource_catalog::ResourceId, ResourceAvailability>,
+}
+
+#[allow(dead_code)] // accessors used by Step 3 wiring + Step 2 unit tests
+impl MaterialAvailabilityView {
+    pub fn insert(
+        &mut self,
+        rid: crate::economy::resource_catalog::ResourceId,
+        av: ResourceAvailability,
+    ) {
+        self.by_rid.insert(rid, av);
+    }
+
+    pub fn get(
+        &self,
+        rid: crate::economy::resource_catalog::ResourceId,
+    ) -> Option<&ResourceAvailability> {
+        self.by_rid.get(&rid)
+    }
+
+    /// True until the chief-cadence classifier has run at least once. An
+    /// empty view must be treated as "not yet classified" (pass `None` to
+    /// `select_wall_material` → unconstrained / legacy `best_wall_material`),
+    /// NOT as "everything Unavailable" — otherwise a band emits emergency
+    /// beds during the first classification window even when materials are
+    /// readily gatherable.
+    pub fn is_empty(&self) -> bool {
+        self.by_rid.is_empty()
+    }
+
+    fn scarcity_of(&self, rid: crate::economy::resource_catalog::ResourceId) -> Scarcity {
+        // Absent = never classified = treat as Unavailable (conservative: the
+        // selector will step down rather than emit an unfunded Market haul).
+        self.by_rid
+            .get(&rid)
+            .map(|a| a.scarcity)
+            .unwrap_or(Scarcity::Unavailable)
+    }
+
+    /// Per-slot `HaulSource` for Phase 3c: `Market` only when the resource is
+    /// `Scarce` (not stored, not gatherable, affordably procurable).
+    pub fn haul_source_for(
+        &self,
+        rid: crate::economy::resource_catalog::ResourceId,
+    ) -> HaulSource {
+        match self.by_rid.get(&rid) {
+            Some(a) if a.scarcity == Scarcity::Scarce => HaulSource::Market {
+                max_unit_price: a.market_price,
+            },
+            _ => HaulSource::Storage,
+        }
+    }
+}
+
+/// Classify one construction input against the quantity `need`ed for one
+/// structure. `stored` is **deposited faction storage only**; `supply` is the
+/// faction total (storage + agent inventories) used solely to fill the
+/// informational `inventory` field — the scarcity decision keys on `stored`
+/// (deposited-only, per the posting/candidate-scoring rule).
+#[allow(dead_code)] // wired into chief-cadence classification in Step 3
+pub fn classify_resource(
+    stored: u32,
+    supply: u32,
+    market_stock: f32,
+    market_price: f32,
+    treasury_budget: f32,
+    raw_gatherable: bool,
+    need: u32,
+) -> ResourceAvailability {
+    let price = if market_price > 0.0 { market_price } else { 1.0 };
+    let affordable_qty = if treasury_budget > 0.0 {
+        ((treasury_budget / price).floor()).max(0.0).min(market_stock.max(0.0)) as u32
+    } else {
+        0
+    };
+    let scarcity = if stored >= need {
+        Scarcity::Available
+    } else if raw_gatherable {
+        // Short in storage but a known accessible cluster exists — the
+        // existing gather pipeline resolves this, no procurement.
+        Scarcity::Tight
+    } else if affordable_qty >= need {
+        Scarcity::Scarce
+    } else {
+        Scarcity::Unavailable
+    };
+    ResourceAvailability {
+        stored,
+        inventory: supply.saturating_sub(stored),
+        market_stock,
+        market_price: price,
+        affordable_qty,
+        raw_gatherable,
+        scarcity,
+    }
+}
+
+impl WallSelection {
+    /// The chosen wall material, or `None` for `EmergencyShelter`.
+    pub fn mat(self) -> Option<WallMaterial> {
+        match self {
+            WallSelection::Material { mat, .. } => Some(mat),
+            WallSelection::EmergencyShelter => None,
+        }
+    }
+}
+
+/// Era-aware wall-material selector. `avail == None` (seed mode + the
+/// wall-upgrade pass — materials there are stamped for free / are a deliberate
+/// chief tier-bump) returns the pure tech-best rung verbatim, exactly matching
+/// legacy `best_wall_material` behaviour. `Some(view)` applies **procure-
+/// primary-first**: keep the highest tech rung that's buildable, market-haul
+/// its scarce inputs; step down the tech ladder only when a rung has a truly
+/// `Unavailable` input; return `EmergencyShelter` when every rung is blocked.
+pub fn select_wall_material(
+    techs: &FactionTechs,
+    avail: Option<&MaterialAvailabilityView>,
+) -> WallSelection {
+    let top = best_wall_material(techs);
+    let Some(view) = avail else {
+        return WallSelection::Material {
+            mat: top,
+            source: HaulSource::Storage,
+        };
+    };
+    let top_idx = WALL_LADDER_BY_TECH
+        .iter()
+        .position(|m| *m == top)
+        .unwrap_or(0);
+    for idx in (0..=top_idx).rev() {
+        let mat = WALL_LADDER_BY_TECH[idx];
+        let recipe = recipe_for(BuildSiteKind::Wall(mat));
+        // Defensive: the era ladder isn't a strict prereq chain, so skip any
+        // rung whose own tech gate the faction can't meet.
+        if let Some(gate) = recipe.tech_gate {
+            if !techs.has(gate) {
+                continue;
+            }
+        }
+        let mut unavailable = false;
+        let mut market_src: Option<HaulSource> = None;
+        for &(rid, qty) in &recipe.inputs {
+            match view.scarcity_of(rid) {
+                Scarcity::Available | Scarcity::Tight => {}
+                Scarcity::Scarce => {
+                    if market_src.is_none() {
+                        market_src = Some(view.haul_source_for(rid));
+                    }
+                    let _ = qty;
+                }
+                Scarcity::Unavailable => {
+                    unavailable = true;
+                    break;
+                }
+            }
+        }
+        if unavailable {
+            continue; // step down one tech rung
+        }
+        return WallSelection::Material {
+            mat,
+            source: market_src.unwrap_or(HaulSource::Storage),
+        };
+    }
+    WallSelection::EmergencyShelter
 }
 
 /// Best bed tier the faction's tech bitset allows.
@@ -999,11 +1303,463 @@ fn techs_through_era(era: Era) -> FactionTechs {
     techs
 }
 
+/// sleepy-dove Phase 7: explicit, typed description of what a fresh
+/// founder band is *given* at game start — distinct from what they have
+/// *adopted*. Seeding is "given," not "practiced," so seed-emitted
+/// structures carry `posted_by = None` and never call `record_tech_use`.
+///
+/// `from_era` resolves the era-appropriate tier ladder once. The seed
+/// pipeline still threads a `FactionTechs` bitset into the shared
+/// `generate_candidates` / `seed_apply_intent` path (so seed and runtime
+/// emit the same intent stream); `seed_techs()` exposes it. This makes
+/// the seed driver a named profile rather than an `Option<&FactionTechs>`
+/// that quietly impersonates community adoption.
+///
+/// Note: `seed_prime_tech_adoption_system` is **retained**, not removed —
+/// the audit found non-construction consumers (`nomad`, settlement spawn
+/// scoring in `settlement.rs`, `lifecycle`, `ui/tech_panel`) still read
+/// the primed `tech_adoption` / `community_adoption_bitset` at tick 0.
+/// Construction seeding no longer depends on the prime (it drives tiers
+/// from this profile's `seed_techs()`), but the prime stays for those.
+#[derive(Clone, Copy, Debug)]
+pub struct SeedConstructionProfile {
+    pub era: Era,
+    pub hearth_tier: HearthTier,
+    pub bed_tier: BedTier,
+    pub door_tier: DoorTier,
+    pub workbench_tier: WorkbenchTier,
+    /// `None` = no defensive walls at this era (Paleo/Meso band camps).
+    pub wall_material: Option<WallMaterial>,
+    seed_techs: FactionTechs,
+}
+
+impl SeedConstructionProfile {
+    pub fn from_era(era: Era) -> Self {
+        let techs = techs_through_era(era);
+        // Walls only from Neolithic+ (Palisade unlocks at PERM_SETTLEMENT);
+        // Paleo/Meso bands run the deterministic band-camp seeder which
+        // emits no walls regardless.
+        let wall_material = if (era as u8) >= (Era::Neolithic as u8) {
+            // Seed mode: materials are stamped for free, so pass `None`
+            // (unconstrained) — identical to legacy `best_wall_material`.
+            select_wall_material(&techs, None).mat()
+        } else {
+            None
+        };
+        // Band-camp hearth tier reproduces today's explicit era table
+        // (NOT `best_hearth_for`, which would hand Paleo a Ringed hearth
+        // because FLINT_KNAPPING is a Paleolithic tech). Neo+ stamps its
+        // Campfire via `best_hearth_for(seed_techs)` in the shared
+        // pipeline regardless; this field only drives the deterministic
+        // Paleo/Meso band-camp + nomad seeder.
+        let hearth_tier = match era {
+            Era::Paleolithic | Era::Mesolithic => HearthTier::Open,
+            Era::Neolithic => HearthTier::Ringed,
+            Era::Chalcolithic | Era::BronzeAge => HearthTier::Lined,
+        };
+        Self {
+            era,
+            hearth_tier,
+            bed_tier: best_bed_for(&techs),
+            door_tier: best_door_for(&techs),
+            workbench_tier: best_workbench_for(&techs),
+            wall_material,
+            seed_techs: techs,
+        }
+    }
+
+    /// The `FactionTechs` bitset threaded into the shared seed pipeline.
+    /// Drives tier picks in `generate_candidates` / `seed_apply_intent`
+    /// via the same `best_*_for` ladder the runtime chief uses.
+    #[inline]
+    pub fn seed_techs(&self) -> &FactionTechs {
+        &self.seed_techs
+    }
+}
+
 /// True if the faction has the tech needed for this wall material.
 pub fn faction_can_build(kind: BuildSiteKind, techs: &FactionTechs) -> bool {
     match recipe_for(kind).tech_gate {
         Some(t) => techs.has(t),
         None => true,
+    }
+}
+
+/// Techs that would gate this `BuildSiteKind`: the recipe's `tech_gate`
+/// only. Tier-driving techs (wall material, bed/door/hearth) are absorbed
+/// by the tier picker (`best_*_for`); we record_tech_use on the tier
+/// chosen at completion (see `gating_techs_for_completed_blueprint`).
+pub fn build_kind_required_techs(kind: BuildSiteKind) -> Vec<TechId> {
+    let mut out = Vec::new();
+    if let Some(t) = recipe_for(kind).tech_gate {
+        out.push(t);
+    }
+    out
+}
+
+/// Whether a poster carrying `learned` knows enough to author a build of
+/// `kind`. Checks the recipe `tech_gate` only — tier picks happen later
+/// via `best_*_for(design_techs)` and naturally fall back to the lowest
+/// tier the poster knows.
+pub fn poster_can_post_kind(kind: BuildSiteKind, learned: &FactionTechs) -> bool {
+    build_kind_required_techs(kind)
+        .iter()
+        .all(|t| learned.has(*t))
+}
+
+/// Techs whose successful exercise this completed blueprint represents.
+/// Used by `construction_system`'s finalize path to call `record_tech_use`
+/// so practice diffuses adoption. Includes the recipe gate plus any
+/// tier-driving tech that the chosen tier itself required.
+pub fn gating_techs_for_completed_blueprint(bp: &Blueprint) -> Vec<TechId> {
+    let mut out = build_kind_required_techs(bp.kind);
+    let techs = &bp.design_techs;
+    // Tier-driving techs the poster's design relied on. We resolve the
+    // chosen tier from `design_techs` and credit the tech that unlocked it.
+    match bp.kind {
+        BuildSiteKind::Wall(_) => {
+            // Wall variants are pre-resolved to a `WallMaterial` at intent
+            // time; credit the unlocking tech for that material.
+            if let BuildSiteKind::Wall(mat) = bp.kind {
+                match mat {
+                    WallMaterial::CutStone => out.push(MONUMENTAL_BUILDING),
+                    WallMaterial::Stone => out.push(COPPER_WORKING),
+                    WallMaterial::Mudbrick => out.push(FIRED_POTTERY),
+                    WallMaterial::WattleDaub => out.push(PERM_SETTLEMENT),
+                    WallMaterial::Palisade => {}
+                }
+            }
+        }
+        BuildSiteKind::Bed => match best_bed_for(techs) {
+            BedTier::Carved => out.push(COPPER_TOOLS),
+            BedTier::Framed => out.push(FLINT_KNAPPING),
+            BedTier::Crude => {}
+        },
+        BuildSiteKind::Door => match best_door_for(techs) {
+            DoorTier::Reinforced => out.push(BRONZE_TOOLS),
+            DoorTier::Plank => out.push(FLINT_KNAPPING),
+            DoorTier::Wood => {}
+        },
+        BuildSiteKind::Campfire => match best_hearth_for(techs) {
+            HearthTier::Lined => out.push(FIRED_POTTERY),
+            HearthTier::Ringed => out.push(FLINT_KNAPPING),
+            HearthTier::Open => {}
+        },
+        BuildSiteKind::Workbench => match best_workbench_for(techs) {
+            WorkbenchTier::Bronze => out.push(BRONZE_CASTING),
+            WorkbenchTier::Copper => out.push(COPPER_WORKING),
+            WorkbenchTier::Stone => {}
+        },
+        _ => {}
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Whether a poster carrying `learned` can author *every* gated part of
+/// `intent`. Composite intents (Hut/Longhouse/CompositeHouse) require one
+/// poster covering all pieces — no Frankenstein mixing of two architects'
+/// techs (Improvement #3 / plan strength bullet 3).
+pub fn poster_can_post_intent(intent: BuildIntent, learned: &FactionTechs) -> bool {
+    intent
+        .required_kinds()
+        .iter()
+        .all(|&k| poster_can_post_kind(k, learned))
+}
+
+/// Every tech that gates *some* construction: each build recipe's
+/// `tech_gate` plus the tier-driving techs (wall material / bed / door /
+/// hearth / workbench ladders). Used by `chief_architect_appointment_system`
+/// to decide whether a settlement needs an architect — it does only when a
+/// resident knows a construction tech the chief hasn't personally Learned.
+pub fn construction_relevant_techs() -> Vec<TechId> {
+    let mut out: Vec<TechId> = build_recipes()
+        .iter()
+        .filter_map(|r| r.tech_gate)
+        .collect();
+    // Tier-driving techs absorbed by the `best_*_for` ladders (not a recipe
+    // `tech_gate`, but still construction knowledge a chief may lack).
+    out.extend_from_slice(&[
+        PERM_SETTLEMENT,
+        FIRED_POTTERY,
+        COPPER_WORKING,
+        MONUMENTAL_BUILDING,
+        FLINT_KNAPPING,
+        COPPER_TOOLS,
+        BRONZE_TOOLS,
+        BRONZE_CASTING,
+    ]);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+// ── Construction poster pool (sleepy-dove Phase 2) ────────────────────────────
+
+/// Which authority class a resolved poster belongs to. Mirrors
+/// `jobs::PosterClass` but scoped to the two construction-relevant classes
+/// so `JobPosting.poster_class` can be stamped from a resolved capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstructionPosterClass {
+    Chief,
+    Architect,
+}
+
+impl ConstructionPosterClass {
+    pub fn to_job_poster_class(self) -> crate::simulation::jobs::PosterClass {
+        match self {
+            ConstructionPosterClass::Chief => crate::simulation::jobs::PosterClass::Chief,
+            ConstructionPosterClass::Architect => crate::simulation::jobs::PosterClass::Architect,
+        }
+    }
+}
+
+/// A single resolved construction authority: who they are, where they
+/// reside, and the `Learned` snapshot they would stamp into a blueprint's
+/// `design_techs`. Refreshed read-only every `ParallelA` tick.
+#[derive(Clone, Debug)]
+pub struct PosterCapability {
+    pub entity: Entity,
+    pub faction_id: u32,
+    pub settlement_id: Option<crate::simulation::settlement::SettlementId>,
+    pub learned: FactionTechs,
+    pub building_skill: u32,
+    pub social_skill: u32,
+    pub class: ConstructionPosterClass,
+}
+
+impl PosterCapability {
+    /// The `BlueprintAuthor` snapshot to stamp onto every blueprint this
+    /// poster authorises. Freezes tier picks at intent-spawn time.
+    pub fn author(&self) -> BlueprintAuthor {
+        BlueprintAuthor::new(self.entity, self.learned)
+    }
+}
+
+/// Settlement-scoped construction authority index. Replaces the
+/// faction-wide `community_adoption_bitset` gate for runtime construction:
+/// a band can build whatever any single resident chief or architect has
+/// personally **Learned**, regardless of community adoption stage.
+///
+/// Refreshed read-only by `refresh_construction_poster_pool_system` in
+/// `SimulationSet::ParallelA` so construction planning (ParallelB/Economy)
+/// never queries `PersonKnowledge` per-tick.
+#[derive(Resource, Default)]
+pub struct ConstructionPosterPool {
+    /// Per-settlement resident posters (chief if resident + architects).
+    pub by_settlement: AHashMap<
+        (u32, crate::simulation::settlement::SettlementId),
+        Vec<PosterCapability>,
+    >,
+    /// Faction chief fallback for factions whose chief isn't pinned to a
+    /// specific settlement (single-settlement factions, camps).
+    pub chief_by_faction: AHashMap<u32, PosterCapability>,
+}
+
+impl ConstructionPosterPool {
+    /// Union of every resident poster's `Learned` set for the given
+    /// settlement, plus the faction chief fallback. This is the
+    /// candidate-*enumeration* surface — what `generate_candidates` is
+    /// allowed to consider building. Actual emission is still filtered
+    /// per-intent through `select_poster_for_intent`.
+    pub fn union_of_learned(
+        &self,
+        faction_id: u32,
+        settlement_id: Option<crate::simulation::settlement::SettlementId>,
+    ) -> FactionTechs {
+        let mut acc = FactionTechs::default();
+        if let Some(chief) = self.chief_by_faction.get(&faction_id) {
+            acc = acc.union(&chief.learned);
+        }
+        if let Some(sid) = settlement_id {
+            if let Some(list) = self.by_settlement.get(&(faction_id, sid)) {
+                for cap in list {
+                    acc = acc.union(&cap.learned);
+                }
+            }
+        }
+        acc
+    }
+
+    /// Convenience wrapper: resolve a poster for a single-tile build
+    /// (`BuildIntent::Single`). Used by manual player construction
+    /// (`PlayerCommand::Build`) and the right-click menu lock state.
+    pub fn select_poster_for_kind(
+        &self,
+        faction_id: u32,
+        settlement_id: Option<crate::simulation::settlement::SettlementId>,
+        kind: BuildSiteKind,
+    ) -> Option<&PosterCapability> {
+        self.select_poster_for_intent(faction_id, settlement_id, BuildIntent::Single(kind))
+    }
+
+    /// Resolve the best poster able to author every gated part of
+    /// `intent` for this settlement. Chief preferred (broadest authority);
+    /// else the resident architect with the widest tech coverage, then
+    /// Building skill, Social skill, entity id (deterministic).
+    pub fn select_poster_for_intent(
+        &self,
+        faction_id: u32,
+        settlement_id: Option<crate::simulation::settlement::SettlementId>,
+        intent: BuildIntent,
+    ) -> Option<&PosterCapability> {
+        if let Some(chief) = self.chief_by_faction.get(&faction_id) {
+            if poster_can_post_intent(intent, &chief.learned) {
+                return Some(chief);
+            }
+        }
+        let sid = settlement_id?;
+        let list = self.by_settlement.get(&(faction_id, sid))?;
+        list.iter()
+            .filter(|c| poster_can_post_intent(intent, &c.learned))
+            .max_by(|a, b| {
+                a.learned
+                    .0
+                    .count_ones()
+                    .cmp(&b.learned.0.count_ones())
+                    .then(a.building_skill.cmp(&b.building_skill))
+                    .then(a.social_skill.cmp(&b.social_skill))
+                    .then(b.entity.cmp(&a.entity))
+            })
+    }
+}
+
+/// Rebuild `ConstructionPosterPool` **and** write each faction's
+/// `buildable_techs` — the one construction-tech surface the whole game
+/// reads (`community_has` / `community_adoption_bitset`). Nothing gates
+/// on community *adoption* any more; this is the single consistent
+/// system. Runs in `ParallelA` (and once at `OnEnter` before seeding so
+/// the surface is populated before any gate observes it).
+///
+/// Chief is resolved by `faction.chief_entity` (not the `FactionChief`
+/// marker, which `chief_selection_system` only sets on an Economy
+/// cadence — resolving by id keeps the surface correct at tick 0).
+/// Architects reside at the nearest same-faction settlement; the
+/// faction-wide `buildable_techs` is the union of the chief + every
+/// resident architect, so a band builds whatever any single resident
+/// authority has personally Learned.
+pub fn refresh_construction_poster_pool_system(
+    mut pool: ResMut<ConstructionPosterPool>,
+    mut registry: ResMut<FactionRegistry>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    settlement_q: Query<&crate::simulation::settlement::Settlement>,
+    person_q: Query<(
+        Entity,
+        &FactionMember,
+        &Profession,
+        &crate::simulation::knowledge::PersonKnowledge,
+        &Skills,
+        &Transform,
+    )>,
+) {
+    pool.by_settlement.clear();
+    pool.chief_by_faction.clear();
+
+    // Index every person once so the chief can be resolved by entity id
+    // regardless of whether the `FactionChief` marker has been stamped.
+    let mut by_entity: AHashMap<Entity, (FactionTechs, u32, u32, (i32, i32))> =
+        AHashMap::new();
+    let mut architects: Vec<(Entity, u32, FactionTechs, u32, u32, (i32, i32))> = Vec::new();
+    for (entity, member, prof, knowledge, skills, xf) in person_q.iter() {
+        if member.faction_id == SOLO {
+            continue;
+        }
+        let learned = knowledge.learned_bitset();
+        let building = skills.0[SkillKind::Building as usize];
+        let social = skills.0[SkillKind::Social as usize];
+        let tile = crate::world::terrain::world_to_tile(xf.translation.truncate());
+        by_entity.insert(entity, (learned, building, social, tile));
+        if *prof == Profession::Architect {
+            architects.push((
+                entity,
+                member.faction_id,
+                learned,
+                building,
+                social,
+                tile,
+            ));
+        }
+    }
+
+    // Per-faction accumulated buildable surface (chief ∪ all architects).
+    let mut union_by_faction: AHashMap<u32, FactionTechs> = AHashMap::new();
+
+    // Chief capability + fallback.
+    for (&faction_id, faction) in registry.factions.iter() {
+        if faction_id == SOLO {
+            continue;
+        }
+        let Some(chief) = faction.chief_entity else {
+            continue;
+        };
+        let Some(&(learned, building, social, _tile)) = by_entity.get(&chief) else {
+            continue;
+        };
+        let sid = settlement_map.first_for_faction(faction_id);
+        let cap = PosterCapability {
+            entity: chief,
+            faction_id,
+            settlement_id: sid,
+            learned,
+            building_skill: building,
+            social_skill: social,
+            class: ConstructionPosterClass::Chief,
+        };
+        if let Some(sid) = sid {
+            pool.by_settlement
+                .entry((faction_id, sid))
+                .or_default()
+                .push(cap.clone());
+        }
+        pool.chief_by_faction.insert(faction_id, cap);
+        let acc = union_by_faction.entry(faction_id).or_default();
+        *acc = acc.union(&learned);
+    }
+
+    // Architects: resident at the nearest same-faction settlement.
+    for (entity, faction_id, learned, building, social, tile) in architects {
+        let mut best: Option<(crate::simulation::settlement::SettlementId, i32)> = None;
+        for &sid in settlement_map.for_faction(faction_id) {
+            let Some(&se) = settlement_map.by_id.get(&sid) else {
+                continue;
+            };
+            let Ok(s) = settlement_q.get(se) else {
+                continue;
+            };
+            let d = (s.market_tile.0 - tile.0)
+                .abs()
+                .max((s.market_tile.1 - tile.1).abs());
+            if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((sid, d));
+            }
+        }
+        if let Some((sid, _)) = best {
+            pool.by_settlement
+                .entry((faction_id, sid))
+                .or_default()
+                .push(PosterCapability {
+                    entity,
+                    faction_id,
+                    settlement_id: Some(sid),
+                    learned,
+                    building_skill: building,
+                    social_skill: social,
+                    class: ConstructionPosterClass::Architect,
+                });
+        }
+        // Architect knowledge counts toward the faction surface even
+        // before a settlement exists to pin them to.
+        let acc = union_by_faction.entry(faction_id).or_default();
+        *acc = acc.union(&learned);
+    }
+
+    // Write the one construction-tech surface every gate reads.
+    for (&faction_id, faction) in registry.factions.iter_mut() {
+        faction.buildable_techs = union_by_faction
+            .get(&faction_id)
+            .copied()
+            .unwrap_or_default();
     }
 }
 
@@ -1561,24 +2317,6 @@ fn find_unfilled_civic_zone_tile(
 /// flank the approach path on either side, leaving the home-facing and
 /// far-facing corridors clear. Diagonal corners (≥45° off-axis) are
 /// excluded; the chosen tile balances bed counts across the two crescents.
-/// Count beds (placed, not blueprinted) sitting inside the annulus
-/// `inner_r..=outer_r` around `hearth`. Used by the Neolithic hearth gate to
-/// decide when a household cluster is "full" and a new hearth should open.
-fn count_beds_in_crescent(bed_map: &BedMap, hearth: (i32, i32), inner_r: i32, outer_r: i32) -> u32 {
-    let inner_sq = inner_r * inner_r;
-    let outer_sq = outer_r * outer_r;
-    let mut n = 0u32;
-    for &(bx, by) in bed_map.0.keys() {
-        let dx = bx as i32 - hearth.0 as i32;
-        let dy = by as i32 - hearth.1 as i32;
-        let d2 = dx * dx + dy * dy;
-        if d2 >= inner_sq && d2 <= outer_sq {
-            n += 1;
-        }
-    }
-    n
-}
-
 fn find_bed_tile_around_hearth(
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
@@ -1744,6 +2482,50 @@ fn is_clear_footprint(
         }
     }
     true
+}
+
+/// Step 7: emergency-shelter bed placement when every wall ladder rung is
+/// unobtainable (`select_wall_material → EmergencyShelter`). Picks a single
+/// clear tile on a deterministic outward sweep through an **era-keyed
+/// annulus** around `home` — Neolithic flings emergency beds to the
+/// outskirts/slum fringe, Chalcolithic packs work-yard bunk rows mid-ring,
+/// Bronze packs civic-overflow rows nearer the core. One era-parameterised
+/// finder rather than three near-duplicates (the annulus *is* the era
+/// distinction). Reuses `is_clear_footprint` (1×1) so it rejects roads,
+/// walls, water, blueprints, beds, and doormats exactly like every other
+/// placement helper. Determinism: the angular phase is seeded from the
+/// faction layout seed XOR `bed_count`, so successive emergency beds form a
+/// loose row instead of stacking on one bearing.
+pub(crate) fn find_emergency_bed_tile(
+    chunk_map: &ChunkMap,
+    bed_map: &BedMap,
+    bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
+    home: (i32, i32),
+    era: Era,
+    layout_seed: u64,
+    bed_count: i32,
+) -> Option<(i32, i32)> {
+    let (inner, outer) = match era {
+        Era::Neolithic => (12, 32),   // outskirts / slum rows
+        Era::Chalcolithic => (8, 22), // work-yard bunk rows
+        _ => (6, 18),                 // Bronze: civic-overflow rows
+    };
+    let mut rng =
+        fastrand::Rng::with_seed(layout_seed ^ (bed_count as u64).wrapping_mul(0x9E37_79B9));
+    let base_ang = rng.f32() * std::f32::consts::TAU;
+    for r in inner..=outer {
+        let steps = (r * 6).max(8);
+        for s in 0..steps {
+            let ang = base_ang + (s as f32 / steps as f32) * std::f32::consts::TAU;
+            let tx = home.0 + (ang.cos() * r as f32).round() as i32;
+            let ty = home.1 + (ang.sin() * r as f32).round() as i32;
+            if is_clear_footprint(chunk_map, bed_map, bp_map, doormat, tx, ty, 0, 0) {
+                return Some((tx, ty));
+            }
+        }
+    }
+    None
 }
 
 /// Shape-aware variant of `is_clear_footprint`: walks every tile in the
@@ -1973,6 +2755,7 @@ fn plan_building(
     interior_beds: &[(i32, i32)],
     wall_material: WallMaterial,
     door_dir: Option<crate::simulation::land::TileEdge>,
+    author: Option<BlueprintAuthor>,
 ) {
     // Door direction: prefer the sourced cardinal (plot frontage); fall back
     // to cardinal-toward-home. If that cardinal's doormat is blocked, try
@@ -2032,7 +2815,7 @@ fn plan_building(
                 continue;
             }
             let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
-            let mut bp = Blueprint::new(faction_id, None, *kind, *tile, target_z);
+            let mut bp = Blueprint::new(faction_id, None, *kind, *tile, target_z).with_author(author);
             if let Some(e) = edge {
                 bp = bp.with_door_dir(*e);
             }
@@ -2076,6 +2859,7 @@ fn plan_building(
         target_z,
         terraform_tiles,
         wall_plan,
+        author,
     });
 }
 
@@ -2188,6 +2972,9 @@ pub struct BuildingMapsRO<'w> {
     pub doormat: Res<'w, crate::simulation::doormat::DoormatReservations>,
     pub organic_selected: Res<'w, crate::simulation::organic_settlement::SelectedSettlementIntents>,
     pub organic_brains: Res<'w, crate::simulation::organic_settlement::SettlementBrains>,
+    // sleepy-dove Phase 4: bundled here so `chief_directive_system`
+    // stays under Bevy's 16-param ceiling.
+    pub poster_pool: Res<'w, ConstructionPosterPool>,
 }
 
 /// Read-only borrow of the structure-map set that `generate_candidates` needs.
@@ -2404,6 +3191,35 @@ impl BuildIntent {
         }
         totals
     }
+
+    /// Every `BuildSiteKind` this intent would emit at least one blueprint
+    /// for. Used by the poster pool: a single poster must be able to author
+    /// *all* gated parts (no Frankenstein composite mixing two architects'
+    /// tech). Tier-flattened wall material is preserved so the recipe gate
+    /// (`poster_can_post_kind`) sees the actual material the intent picked.
+    pub fn required_kinds(self) -> Vec<BuildSiteKind> {
+        let mut out: Vec<BuildSiteKind> = Vec::with_capacity(4);
+        let mut push = |k: BuildSiteKind| {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        };
+        match self {
+            BuildIntent::Single(kind) => push(kind),
+            BuildIntent::Hut(mat) | BuildIntent::Longhouse(mat) => {
+                push(BuildSiteKind::Wall(mat));
+                push(BuildSiteKind::Door);
+                push(BuildSiteKind::Bed);
+            }
+            BuildIntent::PalisadeSegment(mat, _) => push(BuildSiteKind::Wall(mat)),
+            BuildIntent::CompositeHouse { wall_material, .. } => {
+                push(BuildSiteKind::Wall(wall_material));
+                push(BuildSiteKind::Door);
+                push(BuildSiteKind::Bed);
+            }
+        }
+        out
+    }
 }
 
 /// Maintains the faction build queue every 60 ticks. One project at a time per
@@ -2422,7 +3238,10 @@ pub fn chief_directive_system(
     mut pending_footprints: ResMut<crate::simulation::terraform::PendingFootprints>,
     bp_query: Query<&Blueprint>,
     plans: Res<crate::simulation::settlement::SettlementPlans>,
-    chief_query: Query<(&FactionMember, &AgentGoal), With<FactionChief>>,
+    // Chief PersonKnowledge powers the sleepy-dove BlueprintAuthor snapshot
+    // for runtime intent emission. Replaces the prior unused chief_query
+    // (`AgentGoal`-gating was retired — see comment block below).
+    chief_knowledge_q: Query<&crate::simulation::knowledge::PersonKnowledge, With<FactionChief>>,
     plot_index: Res<crate::simulation::land::PlotIndex>,
     plot_q: Query<&crate::simulation::land::Plot>,
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
@@ -2431,10 +3250,16 @@ pub fn chief_directive_system(
     if clock.tick % 60 != 0 || !auto_build.0 {
         return;
     }
+    // sleepy-dove Phase 4: poster pool (bundled in `maps`) replaces the
+    // faction-wide community-adoption gate. The settlement's buildable
+    // surface is the union of resident chief + architect Learned; each
+    // emitted intent is filtered to one poster who can author every part.
+    let poster_pool = &maps.poster_pool;
 
     // Chief AgentGoal::Lead is no longer required — construction queueing reads
-    // FactionData and shouldn't pause when the chief eats or sleeps.
-    let _ = chief_query;
+    // FactionData and shouldn't pause when the chief eats or sleeps. The chief
+    // query was replaced with `chief_knowledge_q` (sleepy-dove): we need the
+    // chief's `PersonKnowledge.learned` to snapshot into `BlueprintAuthor`.
 
     let mut faction_bp_count: AHashMap<u32, usize> = AHashMap::new();
     // Pending-blueprint kind counters per faction. Every civic gate inside
@@ -2527,6 +3352,11 @@ pub fn chief_directive_system(
             .map(|b| b.last_survey_tick == 0)
             .unwrap_or(false);
 
+        // sleepy-dove Phase 4: buildable surface for this settlement is
+        // the poster-pool union of resident chief + architect Learned.
+        let settlement_id = settlement_map.first_for_faction(faction_id);
+        let available_techs = poster_pool.union_of_learned(faction_id, settlement_id);
+
         let best = maps
             .organic_selected
             .0
@@ -2546,6 +3376,7 @@ pub fn chief_directive_system(
                     &plot_q,
                     peak_pop,
                     None,
+                    available_techs,
                 );
                 if brain_pending_first_survey {
                     candidates.retain(|c| {
@@ -2607,6 +3438,46 @@ pub fn chief_directive_system(
             continue;
         }
 
+        // sleepy-dove Phase 4: resolve the poster for this intent from the
+        // pool — chief if they can author every gated part, else the
+        // resident architect with the widest coverage. No viable poster
+        // → skip the intent (a silent stall is correct here: the band
+        // genuinely can't build this yet). Stamps `posted_by` +
+        // `design_techs` so tier picks freeze at intent time and
+        // `record_tech_use` fires at completion (diffusion).
+        //
+        // Fallback: factions whose chief entity carries no
+        // `PersonKnowledge` (test fixtures, SOLO-ish) have an empty pool;
+        // fall back to the legacy chief-knowledge author so existing
+        // headless tests keep emitting blueprints.
+        let author = match poster_pool.select_poster_for_intent(
+            faction_id,
+            settlement_id,
+            best.intent,
+        ) {
+            Some(cap) => Some(cap.author()),
+            None => {
+                let chief_fallback = faction.chief_entity.and_then(|chief| {
+                    chief_knowledge_q
+                        .get(chief)
+                        .ok()
+                        .map(|k| BlueprintAuthor::new(chief, k.learned_bitset()))
+                });
+                match chief_fallback {
+                    // Chief exists but pool had no entry (no settlement
+                    // yet at tick 0) — author from chief knowledge if the
+                    // chief can actually post this intent; else skip.
+                    Some(a) if poster_can_post_intent(best.intent, &a.design_techs) => {
+                        Some(a)
+                    }
+                    Some(_) => continue,
+                    // No chief knowledge at all (pure fixture faction):
+                    // emit author-less so legacy behaviour is preserved.
+                    None => None,
+                }
+            }
+        };
+
         spawn_intent(
             &mut commands,
             &mut bp_map,
@@ -2620,6 +3491,7 @@ pub fn chief_directive_system(
             best.intent,
             best.tile,
             best.door_dir,
+            author,
         );
     }
 }
@@ -2639,6 +3511,13 @@ fn generate_candidates(
     plot_q: &Query<&crate::simulation::land::Plot>,
     peak_pop: u32,
     seed_techs: Option<&FactionTechs>,
+    // sleepy-dove Phase 4: runtime buildable surface = union of the
+    // settlement's resident chief + architect Learned sets (from
+    // `ConstructionPosterPool`). Ignored when `seed_techs` is `Some`
+    // (seed mode drives tiers from the era profile instead). Replaces
+    // the faction-wide `community_adoption_bitset` gate so a band can
+    // build whatever a single member learned.
+    available_techs: FactionTechs,
 ) -> Vec<BuildCandidate> {
     let pending_of = |k: BuildSiteKind| -> u32 { pending_kinds.get(&k).copied().unwrap_or(0) };
     // Walls are tracked per-material (`Wall(Palisade)`, `Wall(Stone)`, …);
@@ -2655,19 +3534,26 @@ fn generate_candidates(
     let mut out: Vec<BuildCandidate> = Vec::with_capacity(8);
     let home = faction.home_tile;
     let members = faction.member_count;
-    // `faction.techs` is the chief-Aware projection. All civic / tier /
-    // material gates inside this function query the *community-adoption*
-    // bitset instead so a chief who's only *heard* of bronze can't unlock
-    // bronze beds for everyone. The local `techs` binding is the
-    // adoption snapshot — every `techs.has(X)` below means "X is at
-    // adoption stage ≥ Adopted across the village."
-    let community_techs = seed_techs.cloned().unwrap_or_else(|| {
-        crate::simulation::technology_adoption::community_adoption_bitset(faction)
-    });
+    // sleepy-dove Phase 4: the buildable surface. In seed mode it's the
+    // era profile (`seed_techs`); at runtime it's the poster-pool union
+    // of resident chief + architect **Learned** sets — NOT the
+    // faction-wide `community_adoption_bitset`. A band can build whatever
+    // any single resident learned regardless of community adoption stage;
+    // adoption is now a downstream emergent signal fed by `record_tech_use`
+    // at completion, not a precondition. `select_poster_for_intent` still
+    // filters each emitted intent to one poster who can author every part.
+    let community_techs = seed_techs.cloned().unwrap_or(available_techs);
     let techs = &community_techs;
     let seed_mode = seed_techs.is_some();
     let culture = &faction.culture;
-    let wall_mat = best_wall_material(techs);
+    // Step 2: route through the era-aware selector. Seed mode passes `None`
+    // (unconstrained — materials are stamped for free). Runtime also passes
+    // `None` until Step 3 threads the chief-cadence `MaterialAvailabilityView`
+    // in, at which point a `Scarce` input keeps this rung + market-hauls it and
+    // an all-`Unavailable` ladder returns `EmergencyShelter` (handled at the
+    // residential branch in Step 7). `mat()` is always `Some` under `None`.
+    let wall_sel = select_wall_material(techs, None);
+    let wall_mat = wall_sel.mat().unwrap_or_else(|| best_wall_material(techs));
 
     // 0. Upgrade rebuild — if a structure has been deconstructed for upgrade
     //    and the slot is now empty, prioritise refilling it with the upgraded
@@ -2751,21 +3637,15 @@ fn generate_candidates(
             .is_none();
         crescents_saturated && bed_deficit_pre > 0
     } else if matches!(era, Era::Neolithic) {
-        // Open a new hearth only when every existing hearth has filled its
-        // crescent ring with at least NEOLITHIC_BEDS_PER_HEARTH beds.
+        // One hearth per ~8-person extended-family cluster. `desired_hearths`
+        // already caps the total at ceil(members/8); require each existing
+        // hearth to be "earning" its 8-person share before opening another.
+        // The old gate inspected a paleo crescent ring around each hearth —
+        // meaningless at Neolithic, where beds live *inside* walled huts the
+        // seed planner clusters near home, incidentally overlapping the ring
+        // and tripping the gate into queueing redundant campfires.
         existing_hearths < desired_hearths
-            && maps
-                .campfire_map
-                .0
-                .keys()
-                .copied()
-                .filter(|&(cx, cy)| {
-                    (cx as i32 - home.0 as i32).abs() <= 25
-                        && (cy as i32 - home.1 as i32).abs() <= 25
-                })
-                .all(|h| {
-                    count_beds_in_crescent(&maps.bed_map, h, 2, 6) >= NEOLITHIC_BEDS_PER_HEARTH
-                })
+            && (existing_hearths as u32) * NEOLITHIC_BEDS_PER_HEARTH <= members
     } else {
         false // Chalcolithic+: single civic hearth
     };
@@ -2828,14 +3708,61 @@ fn generate_candidates(
 
     let bed_deficit = bed_deficit_pre as f32;
 
+    // Step 7: era-appropriate emergency shelter. At runtime (never seed —
+    // seed stamps materials for free), if every wall ladder rung is
+    // unobtainable (`select_wall_material → EmergencyShelter`: not stored,
+    // not raw-gatherable, not affordably procurable) a Neolithic+ band would
+    // otherwise stall shelter-less forever. Emit a low-score bare `Bed`
+    // candidate on a deterministic era-keyed annulus so the band gets
+    // *something* — the walled-house candidate below is still emitted and
+    // far out-scores this, so the moment any real wall material arrives the
+    // band resumes proper huts and these emergency beds stop. Paleo/Meso are
+    // excluded (their crescent-bed branch is the native pattern). Non-shelter
+    // builds get no previous-era substitute — they simply defer (no
+    // candidate), which is the pre-existing behaviour.
+    let emergency_shelter = !seed_mode
+        && bed_deficit > 0.0
+        && !matches!(era, Era::Paleolithic | Era::Mesolithic)
+        && !faction.material_view.is_empty()
+        && matches!(
+            select_wall_material(techs, Some(&faction.material_view)),
+            WallSelection::EmergencyShelter
+        );
+    if emergency_shelter {
+        let layout_seed = plan.map(|p| p.culture_hash).unwrap_or(faction_id as u64);
+        if let Some(tile) = find_emergency_bed_tile(
+            chunk_map,
+            &maps.bed_map,
+            bp_map,
+            doormat,
+            home,
+            era,
+            layout_seed,
+            bed_count,
+        ) {
+            out.push(BuildCandidate {
+                intent: BuildIntent::Single(BuildSiteKind::Bed),
+                tile,
+                // Below every walled-house score (Hut 230+, Longhouse 260+)
+                // so proper shelter always wins once buildable.
+                score: 100.0 + bed_deficit * 20.0,
+                door_dir: None,
+            });
+        }
+    }
+
     // 2. Residential — the principal growth axis. Pre-settlement: simple beds.
     //    Post-settlement: walled huts; with CITY_STATE_ORG, longhouses preferred.
     if bed_deficit > 0.0 {
-        if !techs.has(PERM_SETTLEMENT) {
-            // Paleolithic: cluster beds in a crescent annulus around the
-            // nearest hearth. Defer if no fire exists yet — the campfire
-            // candidate above (score 1000) will resolve first, matching the
-            // historical ordering of fire-then-shelter.
+        if matches!(era, Era::Paleolithic | Era::Mesolithic) {
+            // Paleolithic/Mesolithic: cluster beds in a crescent annulus
+            // around the nearest hearth. Defer if no fire exists yet — the
+            // campfire candidate above (score 1000) will resolve first,
+            // matching the historical ordering of fire-then-shelter.
+            // Era-gated (not `!techs.has(PERM_SETTLEMENT)`) so a Neolithic+
+            // band never degenerates to outdoor beds if the poster pool
+            // transiently lacks PERM_SETTLEMENT (e.g. chief-death gap) — it
+            // simply emits no bed candidate that tick and retries.
             let hearths: Vec<(i32, i32)> = maps
                 .campfire_map
                 .0
@@ -2866,6 +3793,16 @@ fn generate_candidates(
                     });
                 }
             }
+        } else if !seed_mode && faction.material_view.is_empty() {
+            // Step 7: scarcity not yet classified this chief window. Emitting
+            // a higher-tier hut now would stall (no material) and fill the
+            // per-faction concurrency cap, after which the emergency Bed can
+            // never be *selected*. Defer one window — the emergency block
+            // above handles the truly-unobtainable case once classified.
+        } else if emergency_shelter {
+            // Emergency Bed already emitted above. Suppress the walled house
+            // so it can't out-score the fallback or hog the concurrency cap
+            // with a blueprint that can never finalize.
         } else if techs.has(CITY_STATE_ORG) && bed_deficit >= 2.0 {
             // Frontage-first: prefer vacant residential lots whose access tile
             // sits on the carved spine; fall back to zone-area scoring.
@@ -3326,6 +4263,7 @@ fn spawn_intent(
     intent: BuildIntent,
     tile: (i32, i32),
     door_dir: Option<crate::simulation::land::TileEdge>,
+    author: Option<BlueprintAuthor>,
 ) {
     match intent {
         BuildIntent::Single(kind) => {
@@ -3333,7 +4271,7 @@ fn spawn_intent(
             let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
             let e = commands
                 .spawn((
-                    Blueprint::new(faction_id, None, kind, tile, target_z),
+                    Blueprint::new(faction_id, None, kind, tile, target_z).with_author(author),
                     Transform::from_xyz(wp.x, wp.y, 0.3),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -3360,6 +4298,7 @@ fn spawn_intent(
                 &[(0, 0)],
                 wall_mat,
                 door_dir,
+                author,
             );
         }
         BuildIntent::Longhouse(wall_mat) => {
@@ -3380,6 +4319,7 @@ fn spawn_intent(
                 &[(-1, 0), (1, 0)],
                 wall_mat,
                 door_dir,
+                author,
             );
         }
         BuildIntent::PalisadeSegment(wall_mat, _) => {
@@ -3393,7 +4333,8 @@ fn spawn_intent(
                         BuildSiteKind::Wall(wall_mat),
                         tile,
                         target_z,
-                    ),
+                    )
+                    .with_author(author),
                     Transform::from_xyz(wp.x, wp.y, 0.3),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -3420,6 +4361,7 @@ fn spawn_intent(
                 faction_id,
                 home,
                 door_dir,
+                author,
             );
         }
     }
@@ -3790,6 +4732,7 @@ fn plan_composite_building(
     faction_id: u32,
     camp_home: (i32, i32),
     door_dir: Option<crate::simulation::land::TileEdge>,
+    author: Option<BlueprintAuthor>,
 ) {
     use crate::simulation::building_template::shape_tiles;
     let tiles = shape_tiles(shape, anchor, rotation);
@@ -3882,7 +4825,7 @@ fn plan_composite_building(
             None
         };
         let wp = tile_to_world(tx, ty);
-        let mut bp = Blueprint::new(faction_id, None, kind, pos, target_z);
+        let mut bp = Blueprint::new(faction_id, None, kind, pos, target_z).with_author(author);
         if let Some(e) = edge {
             bp = bp.with_door_dir(e);
         }
@@ -4360,13 +5303,14 @@ pub fn building_upgrade_system(
         .iter()
         .filter(|(&id, _)| id != SOLO)
         .map(|(&id, f)| {
-            // Target material is a *community-adoption* gate — mirrors
-            // `chief_directive_system`. A chief who only heard of bronze
-            // doesn't trigger village-wide wall upgrades.
+            // Target wall material comes from the one poster-pool
+            // surface (`buildable_techs`) — same as `chief_directive_
+            // system`. A chief who only *heard* of bronze (Aware, not
+            // Learned) doesn't trigger village-wide wall upgrades.
             (
                 id,
                 f.home_tile,
-                crate::simulation::technology_adoption::community_adoption_bitset(f),
+                f.buildable_techs,
                 f.active_upgrade.is_some(),
                 f.under_raid,
                 f.storage.totals.clone(),
@@ -4379,7 +5323,12 @@ pub fn building_upgrade_system(
             continue;
         }
 
-        let target_mat = best_wall_material(&techs);
+        // Wall-upgrade pass: a deliberate chief tier-bump. Pass `None`
+        // (unconstrained) — treasury procurement is out of scope here and
+        // would surprise-drain on every upgrade tick. Identical to legacy.
+        let target_mat = select_wall_material(&techs, None)
+            .mat()
+            .unwrap_or_else(|| best_wall_material(&techs));
         let target_rank = target_mat as u8;
 
         // Find one outdated wall within radius 25 of home.
@@ -4773,11 +5722,23 @@ pub fn construction_system(
             let (tx, ty) = (tile.0 as i32, tile.1 as i32);
 
             let world_pos = tile_to_world(tx, ty);
-            let build_techs = registry
-                .factions
-                .get(&bp.faction_id)
-                .map(crate::simulation::technology_adoption::community_adoption_bitset)
-                .unwrap_or_default();
+            // sleepy-dove: tier picks read the poster's frozen
+            // `design_techs` snapshot so a build started under one chief
+            // (or architect) finalizes at the design tier even across
+            // succession / poster death. Author-less blueprints
+            // (`posted_by == None` — bridge / nomad emitters) fall back
+            // to the faction's live `buildable_techs` (the same
+            // poster-pool surface, just not snapshotted). Both branches
+            // are the one consistent system — no community adoption.
+            let build_techs = if bp.posted_by.is_some() {
+                bp.design_techs
+            } else {
+                registry
+                    .factions
+                    .get(&bp.faction_id)
+                    .map(|f| f.buildable_techs)
+                    .unwrap_or_default()
+            };
             let result_entity: Entity = match bp.kind {
                 BuildSiteKind::Wall(material) => {
                     let surf_z = bp.target_z as i32;
@@ -5251,6 +6212,24 @@ pub fn construction_system(
             });
 
             bp_map.0.remove(&tile);
+
+            // Phase 5 (knowledge-posted construction): diffuse adoption from
+            // practice. Posted-by Some marks a runtime build whose poster
+            // (chief or architect) actually exercised the gating techs; seed
+            // emissions (`posted_by == None`) don't count — seeding is not
+            // practice. Records every tech the design relied on (recipe gate
+            // + tier-driving tech). Drives `derive_stage`'s recent-use signal.
+            if bp.posted_by.is_some() {
+                if let Some(faction) = registry.factions.get_mut(&bp.faction_id) {
+                    let now = clock.tick as u32;
+                    for tech in gating_techs_for_completed_blueprint(&bp) {
+                        crate::simulation::technology_adoption::record_tech_use(
+                            faction, tech, now,
+                        );
+                    }
+                }
+            }
+
             commands.entity(bp_entity).despawn_recursive();
 
             // Clear `active_upgrade` if the rebuild slot has just been filled.
@@ -6373,12 +7352,13 @@ pub fn seed_starting_buildings_system(
     }
 
     let era = options.era;
-    let seed_techs = techs_through_era(era);
-    let hearth_tier = match era {
-        Era::Paleolithic | Era::Mesolithic => HearthTier::Open,
-        Era::Neolithic => HearthTier::Ringed,
-        Era::Chalcolithic | Era::BronzeAge => HearthTier::Lined,
-    };
+    // sleepy-dove Phase 7: the seed driver is now a typed profile, not a
+    // raw `techs_through_era` bitset masquerading as adoption state. The
+    // bitset is an implementation detail threaded through the shared
+    // seed pipeline via `profile.seed_techs()`.
+    let profile = SeedConstructionProfile::from_era(era);
+    let seed_techs = *profile.seed_techs();
+    let hearth_tier = profile.hearth_tier;
 
     // Generate-candidates needs an empty bp_map at seed time; we don't spawn
     // any blueprints in seed mode, so the chief's pending-blueprint accounting
@@ -6529,6 +7509,9 @@ pub fn seed_starting_buildings_system(
                 &plot_q,
                 peak_pop,
                 Some(&seed_techs),
+                // Ignored in seed mode (seed_techs is Some); pass the
+                // same era profile for clarity.
+                seed_techs,
             );
             if candidates.is_empty() {
                 break;
@@ -7485,5 +8468,292 @@ mod tests {
         // gets dx=0.
         let e = entrance_cell_for_edge(2, 1, TileEdge::North, (10, 20), (10, 10));
         assert_eq!(e, (0, 1));
+    }
+
+    // ── sleepy-dove: poster-authorization primitives ─────────────────────
+
+    #[test]
+    fn poster_can_post_kind_gates_on_recipe_tech() {
+        // Bed has no recipe tech_gate → any poster can post it (tier
+        // falls back to Crude via best_bed_for).
+        let none = FactionTechs::default();
+        assert!(poster_can_post_kind(BuildSiteKind::Bed, &none));
+        assert!(poster_can_post_kind(BuildSiteKind::Door, &none));
+        // A Mudbrick wall's recipe IS gated. Empty knowledge can't post it;
+        // a poster who Learned the gating tech can.
+        let gate = recipe_for(BuildSiteKind::Wall(WallMaterial::Mudbrick)).tech_gate;
+        if let Some(t) = gate {
+            assert!(!poster_can_post_kind(
+                BuildSiteKind::Wall(WallMaterial::Mudbrick),
+                &none
+            ));
+            let mut learned = FactionTechs::default();
+            learned.unlock(t);
+            assert!(poster_can_post_kind(
+                BuildSiteKind::Wall(WallMaterial::Mudbrick),
+                &learned
+            ));
+        }
+    }
+
+    #[test]
+    fn poster_can_post_intent_requires_all_parts() {
+        // A Hut needs Wall + Door + Bed. With a gated wall material, a
+        // poster lacking the wall tech can't author the whole Hut even
+        // though Door/Bed are no-tech.
+        let none = FactionTechs::default();
+        if let Some(t) = recipe_for(BuildSiteKind::Wall(WallMaterial::Mudbrick)).tech_gate {
+            assert!(!poster_can_post_intent(
+                BuildIntent::Hut(WallMaterial::Mudbrick),
+                &none
+            ));
+            let mut learned = FactionTechs::default();
+            learned.unlock(t);
+            assert!(poster_can_post_intent(
+                BuildIntent::Hut(WallMaterial::Mudbrick),
+                &learned
+            ));
+        }
+        // A Palisade Hut is all no-tech → empty knowledge can author it.
+        assert!(poster_can_post_intent(
+            BuildIntent::Hut(WallMaterial::Palisade),
+            &none
+        ));
+    }
+
+    #[test]
+    fn construction_relevant_techs_nonempty_and_includes_tier_drivers() {
+        let v = construction_relevant_techs();
+        assert!(v.contains(&FIRED_POTTERY));
+        assert!(v.contains(&PERM_SETTLEMENT));
+        // Sorted + deduped.
+        let mut sorted = v.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(v, sorted);
+    }
+
+    #[test]
+    fn seed_profile_reproduces_era_table() {
+        // Paleo band-camp hearth must stay Open even though FLINT_KNAPPING
+        // (a Paleolithic tech) would otherwise drive best_hearth_for to
+        // Ringed. Guards the regression that motivated the explicit table.
+        let paleo = SeedConstructionProfile::from_era(Era::Paleolithic);
+        assert_eq!(paleo.hearth_tier, HearthTier::Open);
+        assert!(paleo.wall_material.is_none());
+        // Neolithic+ resolves tiers via the ladder and unlocks walls.
+        let neo = SeedConstructionProfile::from_era(Era::Neolithic);
+        assert!(neo.wall_material.is_some());
+        let bronze = SeedConstructionProfile::from_era(Era::BronzeAge);
+        assert_eq!(bronze.hearth_tier, HearthTier::Lined);
+        // seed_techs() must match the legacy era derivation exactly.
+        assert_eq!(
+            bronze.seed_techs().0,
+            techs_through_era(Era::BronzeAge).0
+        );
+    }
+
+    #[test]
+    fn poster_pool_union_and_select() {
+        use crate::simulation::settlement::SettlementId;
+        let mut pool = ConstructionPosterPool::default();
+        let chief = Entity::from_raw(1);
+        let architect = Entity::from_raw(2);
+        let sid = SettlementId(7);
+        // Chief knows nothing gated; architect knows FIRED_POTTERY.
+        let chief_cap = PosterCapability {
+            entity: chief,
+            faction_id: 3,
+            settlement_id: Some(sid),
+            learned: FactionTechs::default(),
+            building_skill: 10,
+            social_skill: 5,
+            class: ConstructionPosterClass::Chief,
+        };
+        let mut arch_learned = FactionTechs::default();
+        arch_learned.unlock(FIRED_POTTERY);
+        let arch_cap = PosterCapability {
+            entity: architect,
+            faction_id: 3,
+            settlement_id: Some(sid),
+            learned: arch_learned,
+            building_skill: 50,
+            social_skill: 2,
+            class: ConstructionPosterClass::Architect,
+        };
+        pool.chief_by_faction.insert(3, chief_cap.clone());
+        pool.by_settlement
+            .insert((3, sid), vec![chief_cap, arch_cap]);
+
+        // Union covers FIRED_POTTERY (from the architect).
+        let u = pool.union_of_learned(3, Some(sid));
+        assert!(u.has(FIRED_POTTERY));
+
+        // A Mudbrick wall (FIRED_POTTERY-gated) resolves to the architect,
+        // since the chief can't author it.
+        let resolved = pool
+            .select_poster_for_kind(3, Some(sid), BuildSiteKind::Wall(WallMaterial::Mudbrick))
+            .expect("architect should cover the Mudbrick wall");
+        assert_eq!(resolved.class, ConstructionPosterClass::Architect);
+
+        // A no-tech Bed resolves to the chief (preferred when capable).
+        let resolved = pool
+            .select_poster_for_kind(3, Some(sid), BuildSiteKind::Bed)
+            .expect("chief covers a no-tech Bed");
+        assert_eq!(resolved.class, ConstructionPosterClass::Chief);
+
+        // Unknown faction → no poster.
+        assert!(pool
+            .select_poster_for_kind(99, Some(sid), BuildSiteKind::Bed)
+            .is_none());
+    }
+
+    // ---- Step 2: era-aware material selector + scarcity classifier ----
+
+    use crate::economy::core_ids;
+
+    fn neo_techs() -> FactionTechs {
+        techs_through_era(Era::Neolithic)
+    }
+
+    /// Build a view that classifies `rid` at exactly the requested scarcity
+    /// tier via `classify_resource` (so the test exercises the real classifier
+    /// rather than hand-stamping `ResourceAvailability`).
+    fn view_with(
+        entries: &[(crate::economy::resource_catalog::ResourceId, Scarcity)],
+    ) -> MaterialAvailabilityView {
+        let mut v = MaterialAvailabilityView::default();
+        for &(rid, sc) in entries {
+            let av = match sc {
+                Scarcity::Available => classify_resource(8, 8, 0.0, 0.0, 0.0, false, 1),
+                Scarcity::Tight => classify_resource(0, 0, 0.0, 0.0, 0.0, true, 1),
+                Scarcity::Scarce => classify_resource(0, 0, 99.0, 2.0, 999.0, false, 1),
+                Scarcity::Unavailable => classify_resource(0, 0, 0.0, 0.0, 0.0, false, 1),
+            };
+            assert_eq!(av.scarcity, sc, "view_with mis-classified {:?}", sc);
+            v.insert(rid, av);
+        }
+        v
+    }
+
+    #[test]
+    fn classify_returns_available_when_stored() {
+        let a = classify_resource(5, 5, 0.0, 0.0, 0.0, false, 3);
+        assert_eq!(a.scarcity, Scarcity::Available);
+    }
+
+    #[test]
+    fn classify_tight_when_gatherable() {
+        let a = classify_resource(0, 0, 0.0, 0.0, 0.0, true, 3);
+        assert_eq!(a.scarcity, Scarcity::Tight);
+    }
+
+    #[test]
+    fn classify_returns_scarce_when_market_affordable_not_gatherable() {
+        // stored 0, not gatherable, market has 10 @ price 2, budget 100 →
+        // affordable_qty = min(floor(100/2), 10) = 10 ≥ need(3).
+        let a = classify_resource(0, 0, 10.0, 2.0, 100.0, false, 3);
+        assert_eq!(a.scarcity, Scarcity::Scarce);
+        assert_eq!(a.affordable_qty, 10);
+        assert_eq!(a.market_price, 2.0);
+    }
+
+    #[test]
+    fn classify_returns_unavailable_when_broke_and_no_market() {
+        let a = classify_resource(0, 0, 0.0, 0.0, 0.0, false, 3);
+        assert_eq!(a.scarcity, Scarcity::Unavailable);
+        assert_eq!(a.affordable_qty, 0);
+    }
+
+    #[test]
+    fn classify_not_available_when_stock0_supply_positive() {
+        // Deposited-only rule: agent-held inventory must NOT read as Available.
+        let a = classify_resource(0, 9, 0.0, 0.0, 0.0, false, 3);
+        assert_ne!(a.scarcity, Scarcity::Available);
+        assert_eq!(a.scarcity, Scarcity::Unavailable);
+        assert_eq!(a.inventory, 9);
+        assert_eq!(a.stored, 0);
+    }
+
+    #[test]
+    fn select_unconstrained_none_equals_best_wall_material() {
+        for era in [
+            Era::Paleolithic,
+            Era::Mesolithic,
+            Era::Neolithic,
+            Era::Chalcolithic,
+            Era::BronzeAge,
+        ] {
+            let t = techs_through_era(era);
+            assert_eq!(
+                select_wall_material(&t, None).mat(),
+                Some(best_wall_material(&t)),
+                "selector(None) must equal best_wall_material for {:?}",
+                era
+            );
+        }
+    }
+
+    #[test]
+    fn select_keeps_top_when_available() {
+        // Neolithic top rung = Mudbrick (stone 2 + wood 1).
+        let t = neo_techs();
+        assert_eq!(best_wall_material(&t), WallMaterial::Mudbrick);
+        let v = view_with(&[
+            (core_ids::stone(), Scarcity::Available),
+            (core_ids::wood(), Scarcity::Available),
+        ]);
+        assert_eq!(
+            select_wall_material(&t, Some(&v)),
+            WallSelection::Material {
+                mat: WallMaterial::Mudbrick,
+                source: HaulSource::Storage,
+            }
+        );
+    }
+
+    #[test]
+    fn select_keeps_top_with_market_source_when_scarce() {
+        let t = neo_techs();
+        let v = view_with(&[
+            (core_ids::stone(), Scarcity::Scarce),
+            (core_ids::wood(), Scarcity::Available),
+        ]);
+        match select_wall_material(&t, Some(&v)) {
+            WallSelection::Material {
+                mat: WallMaterial::Mudbrick,
+                source: HaulSource::Market { max_unit_price },
+            } => {
+                assert!(max_unit_price > 0.0, "market source must carry a price");
+            }
+            other => panic!("expected Mudbrick + Market, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn select_steps_down_ladder_when_unavailable() {
+        // Mudbrick needs stone; mark stone Unavailable but WattleDaub's inputs
+        // (wood + grain) available → step down to WattleDaub (not emergency).
+        let t = neo_techs();
+        let v = view_with(&[
+            (core_ids::stone(), Scarcity::Unavailable),
+            (core_ids::wood(), Scarcity::Available),
+            (core_ids::grain(), Scarcity::Available),
+        ]);
+        assert_eq!(
+            select_wall_material(&t, Some(&v)).mat(),
+            Some(WallMaterial::WattleDaub)
+        );
+    }
+
+    #[test]
+    fn select_returns_emergency_when_all_rungs_unavailable() {
+        let t = neo_techs();
+        // Empty view → every input classifies Unavailable → no rung buildable.
+        let v = MaterialAvailabilityView::default();
+        assert_eq!(
+            select_wall_material(&t, Some(&v)),
+            WallSelection::EmergencyShelter
+        );
     }
 }

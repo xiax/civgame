@@ -159,6 +159,15 @@ impl PersonKnowledge {
         (self.learned >> id) & 1 != 0
     }
 
+    /// Snapshot of this person's Learned set as a `FactionTechs` bitset.
+    /// Used by the construction poster pool: a poster's snapshot becomes
+    /// the blueprint's `design_techs`, locking tier picks at intent time
+    /// so a build started under one chief survives succession.
+    #[inline]
+    pub fn learned_bitset(&self) -> super::faction::FactionTechs {
+        super::faction::FactionTechs(self.learned)
+    }
+
     /// OR another agent's awareness into ours (gossip transfer).
     pub fn merge_awareness(&mut self, other_aware: u64) {
         self.aware |= other_aware;

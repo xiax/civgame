@@ -64,6 +64,10 @@ pub fn job_kinds_for(prof: Profession) -> &'static [JobKind] {
         // for Healers to be EV-promotable). Today the `Craft` slot is
         // the closest analogue for a paid skilled service.
         Profession::Healer => &[JobKind::Craft],
+        // sleepy-dove scaffolding: Architects author construction
+        // blueprints. They earn wages from Build postings when the
+        // poster-pool wiring lands; no payroll today.
+        Profession::Architect => &[JobKind::Build],
     }
 }
 
@@ -80,6 +84,8 @@ pub fn primary_skill_for(prof: Profession) -> Option<SkillKind> {
         // training toward.
         Profession::Apprentice => Some(SkillKind::Crafting),
         Profession::Healer => Some(SkillKind::Medicine),
+        // sleepy-dove scaffolding: Architects rank on Building skill.
+        Profession::Architect => Some(SkillKind::Building),
     }
 }
 
@@ -242,6 +248,11 @@ pub fn faction_cap_for(faction: &FactionData, target: Profession) -> Option<usiz
         // is in place for when the Heal-job pipeline ships and the
         // switcher / inspector EV table evaluate Healer as a target.
         Profession::Healer => Some(adults / CRAFTER_MAX_DIVISOR),
+        // sleepy-dove scaffolding: no faction-wide cap. Gating is
+        // per-settlement (one architect per settlement that needs one);
+        // returning None until the appointment system ships keeps the
+        // cross-profession switcher from promoting into Architect.
+        Profession::Architect => None,
     }
 }
 

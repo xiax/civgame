@@ -62,6 +62,7 @@ pub mod sedentary_collapse;
 pub mod settlement;
 pub mod shared_knowledge;
 pub mod skills;
+pub mod sleep;
 pub mod sound;
 pub mod speed;
 pub mod stats;
@@ -191,6 +192,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::WellMap::default())
             .insert_resource(construction::StructureIndex::default())
             .insert_resource(construction::BlueprintMap::default())
+            .insert_resource(construction::ConstructionPosterPool::default())
             .insert_resource(crafting::CraftOrderMap::default())
             .insert_resource(construction::RoadCarveQueue::default())
             .insert_resource(doormat::DoormatReservations::default())
@@ -288,16 +290,15 @@ impl Plugin for SimulationPlugin {
                     technology_adoption::derive_tech_adoption_system
                         .after(faction::sync_faction_techs_from_chief_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
-                    // Founder-band override: at tick 0 the runtime
-                    // adoption gates (Specialist needs ≤8 members or
-                    // every adult Learned; Institutional needs a civic
-                    // building) reject Neolithic+ starts of typical
-                    // population sizes, leaving `PERM_SETTLEMENT` short
-                    // of `Adopted`. Force-stamp every era-prior
-                    // chief-Aware tech to `Adopted` so the seed pass
-                    // sees a competent civilization.
-                    technology_adoption::seed_prime_tech_adoption_system
-                        .after(technology_adoption::derive_tech_adoption_system)
+                    // sleepy-dove: populate the one construction-tech
+                    // surface (`faction.buildable_techs`) from resident
+                    // chief + architect Learned before the seed pass /
+                    // initial survey read any `community_has` gate. This
+                    // replaces the old founder-band adoption prime — no
+                    // gate consults community adoption any more.
+                    construction::refresh_construction_poster_pool_system
+                        .after(person::spawn_population)
+                        .after(settlement::auto_found_default_settlements_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     settlement::settlement_peak_population_system
                         .after(settlement::auto_found_default_settlements_system)
@@ -310,7 +311,7 @@ impl Plugin for SimulationPlugin {
                     organic_settlement::kickoff_initial_survey_system
                         .after(settlement::auto_found_default_settlements_system)
                         .after(technology_adoption::derive_tech_adoption_system)
-                        .after(technology_adoption::seed_prime_tech_adoption_system)
+                        .after(construction::refresh_construction_poster_pool_system)
                         .after(settlement::settlement_peak_population_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     construction::seed_starting_buildings_system
@@ -385,6 +386,10 @@ impl Plugin for SimulationPlugin {
                     animals::animal_needs_tick_system,
                     goal_scorers::sample_decision_metrics_system,
                     cohort::rebuild_cohort_registry_system,
+                    // sleepy-dove Phase 2: rebuild the construction poster
+                    // pool read-only so chief/architect Learned snapshots
+                    // are stable when ParallelB/Economy planning reads them.
+                    construction::refresh_construction_poster_pool_system,
                 )
                     .in_set(SimulationSet::ParallelA),
             )
@@ -636,6 +641,19 @@ impl Plugin for SimulationPlugin {
                     .after(movement::movement_system)
                     .in_set(SimulationSet::Sequential),
             )
+            // Sleep executor: owns the full `Task::Sleep` lifecycle keyed on
+            // the typed task. After movement (arrival settled) and combat
+            // retaliation cleanup (don't re-assert Sleeping on a victim under
+            // attack); before cosleep (wake visible to household formation /
+            // conception the same tick `tick_needs` used to do it).
+            .add_systems(
+                FixedUpdate,
+                sleep::sleep_task_system
+                    .after(movement::movement_system)
+                    .after(combat::combat_retaliation_cleanup_system)
+                    .before(reproduction::cosleep_observation_system)
+                    .in_set(SimulationSet::Sequential),
+            )
             // Phase 3 (thirst): animal water seek + drink executors.
             // Seek runs in ParallelA after `animal_needs_tick_system`
             // (which has updated thirst this tick). Drink runs Sequential
@@ -770,7 +788,16 @@ impl Plugin for SimulationPlugin {
                     crafting::craft_order_system.after(gather::gather_system),
                     production::eat_task_system.after(movement::movement_system),
                     production::withdraw_food_task_system.after(movement::movement_system),
-                    production::withdraw_material_task_system.after(movement::movement_system),
+                    (
+                        production::withdraw_material_task_system
+                            .after(movement::movement_system),
+                        // Exclusive (`&mut World`) — `trader_buy_at_node`
+                        // needs world access. Nested with its sibling to
+                        // keep the Sequential tuple within Bevy's 20-arity
+                        // `IntoSystemConfigs` limit.
+                        production::buy_material_task_system
+                            .after(movement::movement_system),
+                    ),
                     production::take_from_member_task_system.after(movement::movement_system),
                     production::withdraw_good_task_system.after(movement::movement_system),
                     production::tame_task_system.after(movement::movement_system),
@@ -868,6 +895,9 @@ impl Plugin for SimulationPlugin {
                         .after(construction::chief_directive_system),
                     projects::workforce_budget_system.after(projects::project_lifecycle_system),
                     projects::project_stagnation_system.after(projects::project_lifecycle_system),
+                    jobs::classify_construction_procurement_system
+                        .after(faction::compute_faction_storage_system)
+                        .before(jobs::chief_job_posting_system),
                     jobs::chief_job_posting_system
                         .after(faction::compute_faction_storage_system)
                         .after(faction::chief_selection_system)
@@ -1011,6 +1041,13 @@ impl Plugin for SimulationPlugin {
                     // primary tuple sits at Bevy's 20-element ceiling.
                     medicine::chief_healer_assignment_system
                         .after(faction::chief_craft_assignment_system),
+                    // sleepy-dove Phase 3: per-settlement architect
+                    // appointment. Ordered after Bureaucrat, before
+                    // Crafter — first pick of Building-skilled `None`
+                    // candidates without starving wage-economy roles.
+                    faction::chief_architect_appointment_system
+                        .after(faction::chief_bureaucrat_appointment_system)
+                        .before(faction::chief_craft_assignment_system),
                     apprenticeship::apprentice_progress_system
                         .after(faction::chief_craft_assignment_system)
                         .after(medicine::chief_healer_assignment_system),

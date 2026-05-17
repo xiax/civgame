@@ -611,6 +611,229 @@ pub fn withdraw_material_task_system(
     }
 }
 
+/// Step 5: exclusive executor for `Task::BuyMaterialAtMarket`. The agent has
+/// walked to the faction's market node (`ai.state == Working`). In **one
+/// atomic invocation** per agent it: draws a purchase advance from the job's
+/// `JobEscrow.purchase_pool` into the agent's wallet, buys via
+/// `trader_buy_at_node` (agent currency → node treasury, goods → agent
+/// inventory), then returns the unspent remainder to the escrow and restores
+/// the agent's wallet to its pre-advance value. The agent therefore never
+/// carries job purchase-capital across a tick boundary — every existing
+/// `aq.cancel()` site stays correct unchanged.
+///
+/// On success the agent now carries the material; we drop to `Idle` and let
+/// the dispatcher's in-hand fast-path route the shared `HaulToBlueprint`
+/// deposit leg next tick (reuses tested machinery — no exclusive-system
+/// routing). On failure (stockout / price spike past `max_unit_price` /
+/// unfunded) the advance is fully returned and the agent idles; the periodic
+/// claim-release sweep frees a permanently-stuck worker.
+pub fn buy_material_task_system(world: &mut World) {
+    use crate::simulation::jobs::{ClaimTarget, HaulSource, JobClaim, JobEscrow, JobEscrowIndex};
+    use crate::simulation::typed_task::ActionQueue;
+
+    struct BuySnap {
+        entity: bevy::prelude::Entity,
+        resource_id: crate::economy::resource_catalog::ResourceId,
+        qty: u8,
+        node: bevy::prelude::Entity,
+        max_unit_price: f32,
+        job_id: Option<crate::simulation::jobs::JobId>,
+    }
+
+    // ── Pass 1: snapshot agents parked at a market with a Buy task ──
+    let snaps: Vec<BuySnap> = {
+        let mut q = world.query::<(
+            bevy::prelude::Entity,
+            &PersonAI,
+            &ActionQueue,
+            &LodLevel,
+            Option<&JobClaim>,
+            Option<&ClaimTarget>,
+        )>();
+        let mut out = Vec::new();
+        for (entity, ai, aq, lod, claim, claim_target) in q.iter(world) {
+            if *lod == LodLevel::Dormant {
+                continue;
+            }
+            if ai.state != AiState::Working
+                || aq.current_task_kind() != TaskKind::BuyMaterialAtMarket as u16
+            {
+                continue;
+            }
+            let Some((resource_id, qty, node)) = aq.current.as_buy_material_at_market() else {
+                continue;
+            };
+            // Price ceiling rides on the claim snapshot (kept off `Task` so
+            // `Task` stays `Eq`). No Market claim → can't price-gate → skip.
+            let Some(HaulSource::Market { max_unit_price }) =
+                claim_target.and_then(|t| t.haul_source)
+            else {
+                continue;
+            };
+            out.push(BuySnap {
+                entity,
+                resource_id,
+                qty,
+                node,
+                max_unit_price,
+                job_id: claim.map(|c| c.job_id),
+            });
+        }
+        out
+    };
+    if snaps.is_empty() {
+        return;
+    }
+
+    // ── Pass 2: atomic advance → buy → return, then drop to Idle ───
+    for s in snaps {
+        // Resolve the escrow + its available purchase pool.
+        let escrow_e = s
+            .job_id
+            .and_then(|jid| world.resource::<JobEscrowIndex>().0.get(&jid).copied());
+        let pool = escrow_e
+            .and_then(|e| world.get::<JobEscrow>(e).map(|x| x.purchase_pool))
+            .unwrap_or(0.0);
+
+        // Pre-read the node's live unit price; bail (no money moved) if the
+        // node is gone, price is non-positive, or it drifted past the ceiling.
+        let unit_price = if let Some(set) =
+            world.get::<crate::simulation::settlement::Settlement>(s.node)
+        {
+            Some(set.market.price_of(s.resource_id))
+        } else {
+            world
+                .get::<crate::simulation::camp::Camp>(s.node)
+                .map(|c| c.market.price_of(s.resource_id))
+        };
+
+        let mut bought = false;
+        if let (Some(price), Some(esc)) = (unit_price, escrow_e) {
+            if price > 0.0 && price <= s.max_unit_price && pool > 0.0 {
+                let advance = (price * s.qty as f32).min(pool);
+                if advance > 0.0 {
+                    // Snapshot pre-advance wallet; credit advance.
+                    let before = world
+                        .get::<EconomicAgent>(s.entity)
+                        .map(|a| a.currency)
+                        .unwrap_or(0.0);
+                    if let Some(mut a) = world.get_mut::<EconomicAgent>(s.entity) {
+                        a.currency += advance;
+                    }
+                    if let Some(mut e) = world.get_mut::<JobEscrow>(esc) {
+                        e.purchase_pool -= advance;
+                    }
+                    // Buy: debits agent currency, credits node treasury,
+                    // goods → agent inventory.
+                    let res = crate::economy::transactions::trader_buy_at_node(
+                        world,
+                        s.entity,
+                        // Re-resolve node kind for the dispatch.
+                        if world
+                            .get::<crate::simulation::settlement::Settlement>(s.node)
+                            .is_some()
+                        {
+                            crate::simulation::camp::MarketNodeRef::Settlement(s.node)
+                        } else {
+                            crate::simulation::camp::MarketNodeRef::Camp(s.node)
+                        },
+                        s.resource_id,
+                        s.qty as u32,
+                    );
+                    bought = res.is_some();
+                    // Return the unspent remainder: residual = current −
+                    // before (current = before + advance − spent). Restore
+                    // the wallet to `before` and credit residual back to the
+                    // escrow pool. Invariant: escrow ↓ exactly `spent`, node
+                    // treasury ↑ `spent`; agent net 0 (holds only goods).
+                    let now_cur = world
+                        .get::<EconomicAgent>(s.entity)
+                        .map(|a| a.currency)
+                        .unwrap_or(before);
+                    let residual = now_cur - before;
+                    if let Some(mut e) = world.get_mut::<JobEscrow>(esc) {
+                        e.purchase_pool += residual;
+                    }
+                    if let Some(mut a) = world.get_mut::<EconomicAgent>(s.entity) {
+                        a.currency = before;
+                        debug_assert!(
+                            (a.currency - before).abs() < 1e-3,
+                            "buy_material left job capital on the worker"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Drop the chain to Idle. On success the agent carries the material
+        // → the dispatcher in-hand fast-path routes HaulToBlueprint next
+        // tick. On failure the Market branch retries (or claim-release frees
+        // a permanently-stuck worker). The prefetched HaulToBlueprint leg is
+        // dropped deliberately — the in-hand path re-creates it.
+        let _ = bought;
+        if let Some(mut aq) = world.get_mut::<ActionQueue>(s.entity) {
+            aq.cancel();
+        }
+        if let Some(mut ai) = world.get_mut::<PersonAI>(s.entity) {
+            ai.state = AiState::Idle;
+            ai.target_entity = None;
+        }
+    }
+}
+
+/// Validate the claimed blueprint and route the agent's hand-load to it as a
+/// `TaskKind::HaulMaterials` walk. Shared by `finish_withdraw_material` (the
+/// storage chain) and `buy_material_task_system` (the Market chain) — the
+/// deposit leg is identical regardless of how the material was acquired. A
+/// despawned / unroutable blueprint records the failure, cancels the chain,
+/// and idles the agent.
+#[allow(clippy::too_many_arguments)]
+fn route_haul_to_blueprint_tail(
+    ai: &mut PersonAI,
+    aq: &mut crate::simulation::typed_task::ActionQueue,
+    method_history: &mut crate::simulation::htn::MethodHistory,
+    now: u64,
+    chunk_map: &crate::world::chunk::ChunkMap,
+    chunk_graph: &crate::pathfinding::chunk_graph::ChunkGraph,
+    chunk_router: &crate::pathfinding::chunk_router::ChunkRouter,
+    chunk_connectivity: &crate::pathfinding::connectivity::ChunkConnectivity,
+    bp_query: &Query<&crate::simulation::construction::Blueprint>,
+    blueprint: bevy::prelude::Entity,
+    cur_tile: (i32, i32),
+    cur_chunk: crate::world::chunk::ChunkCoord,
+) {
+    use crate::simulation::tasks::assign_task_with_routing;
+    // Blueprint may have been satisfied / despawned between dispatch and
+    // arrival. Drop the chain to Idle so the goal-dispatch path can
+    // re-evaluate next tick rather than strand the agent.
+    let Ok(bp) = bp_query.get(blueprint) else {
+        crate::simulation::htn::record_target_failure(method_history, ai, now);
+        aq.cancel();
+        ai.state = AiState::Idle;
+        ai.target_entity = None;
+        return;
+    };
+    let bp_tile = (bp.tile.0, bp.tile.1);
+    let dispatched = assign_task_with_routing(
+        ai,
+        cur_tile,
+        cur_chunk,
+        bp_tile,
+        TaskKind::HaulMaterials,
+        Some(blueprint),
+        chunk_graph,
+        chunk_router,
+        chunk_map,
+        chunk_connectivity,
+    );
+    if !dispatched {
+        crate::simulation::htn::record_routing_failure(method_history, ai, now);
+        aq.cancel();
+        ai.state = AiState::Idle;
+        ai.target_entity = None;
+    }
+}
+
 /// Shared exit path for `withdraw_material_task_system`. Releases the storage
 /// reservation, advances the prefetched ring, and primes the legacy channel
 /// for the next leg of the chain. When the next task is a chained
@@ -649,35 +872,20 @@ fn finish_withdraw_material(
 
     match aq.current {
         Task::HaulToBlueprint { blueprint } => {
-            // Blueprint may have been satisfied / despawned between dispatch
-            // and arrival. Drop the chain to Idle so the goal-dispatch path
-            // can re-evaluate next tick rather than strand the agent.
-            let Ok(bp) = bp_query.get(blueprint) else {
-                crate::simulation::htn::record_target_failure(method_history, ai, now);
-                aq.cancel();
-                ai.state = AiState::Idle;
-                ai.target_entity = None;
-                return;
-            };
-            let bp_tile = (bp.tile.0, bp.tile.1);
-            let dispatched = assign_task_with_routing(
+            route_haul_to_blueprint_tail(
                 ai,
-                cur_tile,
-                cur_chunk,
-                bp_tile,
-                TaskKind::HaulMaterials,
-                Some(blueprint),
+                aq,
+                method_history,
+                now,
+                chunk_map,
                 chunk_graph,
                 chunk_router,
-                chunk_map,
                 chunk_connectivity,
+                bp_query,
+                blueprint,
+                cur_tile,
+                cur_chunk,
             );
-            if !dispatched {
-                crate::simulation::htn::record_routing_failure(method_history, ai, now);
-                aq.cancel();
-                ai.state = AiState::Idle;
-                ai.target_entity = None;
-            }
         }
         Task::HaulToCraftOrder { order } => {
             // Phase 5e-xi-a: DeliverMaterialToCraftOrder chain.

@@ -56,6 +56,11 @@ pub struct PendingFootprint {
         (i32, i32),
         Option<crate::simulation::land::TileEdge>,
     )>,
+    /// sleepy-dove: who authored the deferred build, snapshotted at intent
+    /// time. Carried so blueprints spawned by `footprint_completion_system`
+    /// stamp the same `posted_by`/`design_techs` the immediate-spawn path
+    /// would. `None` for legacy / seed callers.
+    pub author: Option<crate::simulation::construction::BlueprintAuthor>,
 }
 
 #[derive(Resource, Default)]
@@ -339,7 +344,8 @@ pub fn footprint_completion_system(
                 continue;
             }
             let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
-            let mut bp = Blueprint::new(p.faction_id, None, *kind, *tile, p.target_z);
+            let mut bp = Blueprint::new(p.faction_id, None, *kind, *tile, p.target_z)
+                .with_author(p.author);
             if let Some(e) = edge {
                 bp = bp.with_door_dir(*e);
             }

@@ -221,6 +221,10 @@ pub struct RoutingResources<'w, 's> {
     pub barracks_map: Res<'w, BarracksMap>,
     pub monument_map: Res<'w, MonumentMap>,
     pub bp_map: ResMut<'w, BlueprintMap>,
+    // sleepy-dove Phase 6: build-menu lock state reads the construction
+    // poster pool, not faction-wide community adoption.
+    pub poster_pool: Res<'w, crate::simulation::construction::ConstructionPosterPool>,
+    pub settlement_map: Res<'w, crate::simulation::settlement::SettlementMap>,
     #[system_param(ignore)]
     pub _marker: std::marker::PhantomData<&'s ()>,
 }
@@ -285,18 +289,25 @@ pub fn right_click_context_menu_system(
                     let mut actions = vec![MenuAction::Move];
                     let mut build_options: Vec<(MenuAction, bool)> = Vec::new();
 
-                    // Build-menu unlock check uses the *community-adoption*
-                    // bitset, mirroring `chief_directive_system`. A chief
-                    // who's merely Aware of bronze doesn't get bronze
-                    // walls in their build menu — the village must have
-                    // adopted the gating tech first.
+                    // sleepy-dove Phase 6: build-menu unlock = the
+                    // construction poster pool's buildable surface (union
+                    // of the player settlement's resident chief +
+                    // architect Learned), NOT faction-wide community
+                    // adoption. An option greyed here is one no resident
+                    // authority knows how to design yet. `PlayerCommand::
+                    // Build` re-resolves the poster at dispatch so the
+                    // displayed lock state and the executed authority
+                    // agree.
                     let player_techs: FactionTechs = member_q
                         .faction_q
                         .get(sel_entity)
                         .ok()
-                        .and_then(|m| faction_registry.factions.get(&m.faction_id))
-                        .map(|f| {
-                            crate::simulation::technology_adoption::community_adoption_bitset(f)
+                        .map(|m| {
+                            let sid =
+                                routing.settlement_map.first_for_faction(m.faction_id);
+                            routing
+                                .poster_pool
+                                .union_of_learned(m.faction_id, sid)
                         })
                         .unwrap_or_default();
 

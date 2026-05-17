@@ -95,6 +95,20 @@ pub enum Task {
     /// collapses that into a `Drop` guard once the loose-target fields are
     /// fully retired.
     WithdrawMaterial { resource_id: ResourceId, qty: u8 },
+    /// Market-procurement counterpart of `WithdrawMaterial` (Step 5). The
+    /// agent walks to the faction's market `node` (Settlement/Camp entity)
+    /// and buys `qty` of `resource_id` with treasury-funded escrow capital,
+    /// then the chain continues into the shared `HaulToBlueprint` deposit
+    /// leg. The price ceiling lives on the claim's `ClaimTarget.haul_source`
+    /// (kept off `Task` so `Task` stays `Eq` — no `f32` field). Produced by
+    /// the Market-haul direct-dispatch branch in
+    /// `htn_acquire_good_dispatch_system`; the executor is the exclusive
+    /// `production::buy_material_task_system`.
+    BuyMaterialAtMarket {
+        resource_id: ResourceId,
+        qty: u8,
+        node: bevy::prelude::Entity,
+    },
     /// P2b: nomadic / member-pool counterpart to `WithdrawMaterial`. Walks
     /// the actor adjacent to `target` (a fellow faction member), then pulls
     /// `qty` units of `resource_id` out of the target's `EconomicAgent.inventory`
@@ -762,6 +776,7 @@ pub fn task_kind_for(task: Task) -> u16 {
         },
         Task::WithdrawGood { .. } => TK::WithdrawGood,
         Task::WithdrawMaterial { .. } => TK::WithdrawMaterial,
+        Task::BuyMaterialAtMarket { .. } => TK::BuyMaterialAtMarket,
         Task::WalkAndTakeFromMember { .. } => TK::TakeFromMember,
         Task::Equip { .. } => TK::Equip,
         Task::Construct { .. } => TK::Construct,
@@ -822,6 +837,20 @@ impl Task {
     pub fn as_withdraw_good(&self) -> Option<WithdrawGoodFilter> {
         match *self {
             Task::WithdrawGood { filter } => Some(filter),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the BuyMaterialAtMarket variant.
+    pub fn as_buy_material_at_market(
+        &self,
+    ) -> Option<(ResourceId, u8, bevy::prelude::Entity)> {
+        match *self {
+            Task::BuyMaterialAtMarket {
+                resource_id,
+                qty,
+                node,
+            } => Some((resource_id, qty, node)),
             _ => None,
         }
     }

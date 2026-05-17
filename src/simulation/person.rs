@@ -100,6 +100,13 @@ pub enum Profession {
     /// apprenticeship plumbing) don't have to be re-wired when the
     /// Heal-job pipeline lands.
     Healer,
+    /// Knowledge-posted construction (sleepy-dove plan): per-settlement
+    /// appointee whose Learned construction techs cover gaps the chief
+    /// lacks. Authors `Blueprint.posted_by` for runtime builds so design
+    /// tiers reflect the architect's tech set, not the chief's. Variant
+    /// is additive scaffolding — the appointment system + poster pool
+    /// integration is deferred (see `plans/evaluate-the-users-xiao1-civgame-plans-k-sleepy-dove.md`).
+    Architect,
 }
 
 /// Pluralist Economy R10 follow-on: per-trader arbitrage state. Tracks

@@ -866,6 +866,106 @@ mod smoke {
         assert_eq!(ids.len(), 1, "auto-found must be idempotent");
     }
 
+    /// sleepy-dove Phase 3: a settlement whose chief is *Aware* of a
+    /// construction tech they haven't *Learned*, but where a resident
+    /// member *has* Learned it, appoints that member as `Architect`.
+    #[test]
+    fn architect_appointed_when_member_covers_chief_construction_gap() {
+        use crate::simulation::faction::{
+            FactionChief, FactionRegistry, ARCHITECT_ASSIGNMENT_CADENCE,
+        };
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::person::Profession;
+        use crate::simulation::technology::FIRED_POTTERY;
+
+        let mut sim = TestSim::new(0xA5C);
+        sim.flat_world(16, 0, TileKind::Grass);
+
+        // Keep the target member well outside the chief's 3-tile passive
+        // -teaching radius so the chief can't *Learn* the gap tech across
+        // the ~900-tick window (which would dissolve the demand). Filler
+        // members give the survival/legacy profession systems other
+        // candidates so they don't all pile onto our target.
+        let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        let member = sim.spawn_person(sim.player_faction_id, (12, 0), |b| {
+            b.profession(Profession::None);
+        });
+        let _f1 = sim.spawn_person(sim.player_faction_id, (1, 0), |_| {});
+        let _f2 = sim.spawn_person(sim.player_faction_id, (2, 0), |_| {});
+
+        // Register member count (spawn_person only bumps the clock bucket;
+        // the appointment system gates on `faction.member_count`).
+        {
+            let mut reg = sim
+                .app
+                .world_mut()
+                .resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                reg.add_member(sim.player_faction_id);
+            }
+            reg.factions
+                .get_mut(&sim.player_faction_id)
+                .unwrap()
+                .chief_entity = Some(chief);
+        }
+        // Keep per-head food above the survival floor so the legacy
+        // Farmer ramp doesn't strip our target member's `None` slot
+        // before the architect pass can claim it.
+        sim.seed_faction_food(sim.player_faction_id, 4 * 64);
+
+        // Pin the chief deterministically.
+        sim.app
+            .world_mut()
+            .entity_mut(chief)
+            .insert(FactionChief);
+        sim.app
+            .world_mut()
+            .entity_mut(member)
+            .remove::<FactionChief>();
+
+        // Chief: Aware of FIRED_POTTERY but has NOT Learned it.
+        {
+            let mut ck = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonKnowledge>(chief)
+                .unwrap();
+            ck.aware |= 1u64 << FIRED_POTTERY;
+            ck.learned &= !(1u64 << FIRED_POTTERY);
+        }
+        // Member: has personally Learned FIRED_POTTERY.
+        {
+            let mut mk = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonKnowledge>(member)
+                .unwrap();
+            mk.aware |= 1u64 << FIRED_POTTERY;
+            mk.learned |= 1u64 << FIRED_POTTERY;
+        }
+
+        // Run past one architect-assignment cadence (settlement
+        // auto-founds within the first ticks; the pool refreshes every
+        // ParallelA tick).
+        sim.tick_n(ARCHITECT_ASSIGNMENT_CADENCE as u32 + 5);
+
+        // Re-assert the knowledge gap each-tick teaching/gossip can't
+        // close it within the window for this isolated 2-person band,
+        // but guard anyway: the member must still be the only coverer.
+        let prof = sim
+            .app
+            .world()
+            .get::<Profession>(member)
+            .copied()
+            .unwrap();
+        assert_eq!(
+            prof,
+            Profession::Architect,
+            "member who Learned the chief's missing construction tech \
+             should be appointed Architect"
+        );
+    }
+
     // ─── Pluralist Economy R2 — pay() + JobEscrow refund hook ───
 
     #[test]
@@ -937,6 +1037,7 @@ mod smoke {
             .spawn(JobEscrow {
                 amount,
                 beneficiary: employer,
+                purchase_pool: 0.0,
             })
             .id();
 
@@ -952,6 +1053,55 @@ mod smoke {
         sim.app.world_mut().despawn(escrow_entity);
 
         assert_currency(&sim.app, employer, 100.0);
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
+    }
+
+    #[test]
+    fn market_escrow_purchase_pool_is_invariant_safe() {
+        // Step 4: a Market-haul escrow holds wage + procurement capital.
+        // The system-wide snapshot must count `held()` (amount +
+        // purchase_pool), and the on_remove hook must refund the full
+        // held amount on cancellation. Mirrors post-and-cancel but with
+        // purchase_pool > 0.
+        use crate::simulation::jobs::JobEscrow;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        set_currency(&mut sim.app, chief, 200.0);
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+
+        let wage = 12.0_f32;
+        let purchase_pool = 30.0_f32; // max_unit_price * target
+        {
+            let mut econ = sim
+                .app
+                .world_mut()
+                .get_mut::<EconomicAgent>(chief)
+                .unwrap();
+            econ.currency -= wage + purchase_pool;
+        }
+        let escrow_entity = sim
+            .app
+            .world_mut()
+            .spawn(JobEscrow {
+                amount: wage,
+                beneficiary: chief,
+                purchase_pool,
+            })
+            .id();
+
+        // Mid-flight: 42 is now escrowed; snapshot must sum held().
+        assert_currency(&sim.app, chief, 200.0 - wage - purchase_pool);
+        let mid = CurrencySnapshot::capture(&mut sim.app);
+        assert!(
+            (mid.total() - baseline.total()).abs() < 1e-3,
+            "invariant broken mid-flight: baseline={baseline:?}, mid={mid:?}",
+        );
+
+        // Cancel: despawn → hook refunds amount + purchase_pool.
+        sim.app.world_mut().despawn(escrow_entity);
+        assert_currency(&sim.app, chief, 200.0);
         assert_total_currency_invariant(&mut sim.app, baseline, 1e-3);
     }
 
@@ -987,6 +1137,7 @@ mod smoke {
             .spawn(JobEscrow {
                 amount,
                 beneficiary: employer,
+                purchase_pool: 0.0,
             })
             .id();
 
@@ -6079,6 +6230,149 @@ mod baseline_behaviour {
         /* removed legacy task_id assertion */
     }
 
+    /// Regression for the `ActionQueue::dispatch` Sleep-orphan desync panic.
+    ///
+    /// `Task::Sleep` now has a dedicated executor (`sleep::sleep_task_system`)
+    /// keyed on the typed task, not on `ai.state`. We reproduce the exact
+    /// orphan `combat_system` retaliation used to create — `current == Sleep`
+    /// with `ai.state` externally forced to `Idle` (combat's deferred cancel
+    /// skipped for a 2nd attacker) — and assert (a) no desync panic in
+    /// `htn_dispatch_system`, (b) the queue never stacks, and (c) the agent
+    /// re-coheres back onto a valid Sleep flow.
+    #[test]
+    fn sleep_orphan_state_reset_recovers_without_panic() {
+        use crate::simulation::person::AiState;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(7);
+        sim.flat_world(1, 0, TileKind::Grass);
+        // Faction member (not SOLO) so `faction_home` is Some — the
+        // faction-home routed branch (htn.rs:3619, the panic site). Spawned
+        // outside the 5-tile home disc around the faction home `(0,0)`.
+        let person = sim.spawn_person(sim.player_faction_id, (8, 8), |b| {
+            b.hunger(0.0).needs(Needs {
+                hunger: 0.0,
+                sleep: 220.0,
+                shelter: 0.0,
+                safety: 0.0,
+                social: 0.0,
+                reproduction: 0.0,
+                willpower: 200.0,
+                esteem: 0.0,
+                self_actualization: 0.0,
+                thirst: 0.0,
+            });
+        });
+
+        sim.tick_n(60);
+        let task = person_task(&sim.app, person);
+        assert_eq!(
+            task,
+            Task::Sleep { bed: None },
+            "precondition: a live Sleep task, got {:?}",
+            task
+        );
+
+        // Inject the orphan exactly as the gated-out combat retaliation path
+        // does: force `ai.state = Idle` while leaving `aq.current == Sleep`
+        // (queue empty) and the goal still Sleep (agent still tired).
+        {
+            let mut ai = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonAI>(person)
+                .expect("PersonAI missing");
+            ai.state = AiState::Idle;
+        }
+        let queued_before = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .unwrap()
+            .queued_len();
+        assert_eq!(queued_before, 0, "precondition: empty prefetch ring");
+
+        // Without the fix, the next `htn_dispatch_system` tick re-dispatches
+        // Sleep while `current == Sleep` → `ActionQueue::dispatch` debug_assert
+        // panics here in the test build. Reaching the asserts proves no panic.
+        sim.tick_n(5);
+
+        let queued_after = sim
+            .app
+            .world()
+            .get::<ActionQueue>(person)
+            .unwrap()
+            .queued_len();
+        assert_eq!(
+            queued_after, 0,
+            "Sleep must not stack into the prefetch ring during recovery"
+        );
+        // The executor cancels the orphan (Sequential), then the dispatcher
+        // re-plans cleanly from `current == Idle`; the agent ends back on a
+        // coherent Sleep flow rather than stuck Idle with a phantom task.
+        let ai = person_ai(&sim.app, person);
+        let task = person_task(&sim.app, person);
+        assert!(
+            ai.state == AiState::Sleeping
+                && task == Task::Sleep { bed: None },
+            "agent should re-cohere onto Sleep, got state={:?} task={:?}",
+            ai.state,
+            task
+        );
+    }
+
+    /// The dedicated executor must still drive recovery and, crucially, keep
+    /// setting `AiState::Sleeping` while at rest — every Sleeping reader
+    /// (cosleep / household formation in `reproduction.rs`, the willpower-drain
+    /// skip in `needs.rs`, the "don't interrupt sleep" skip in
+    /// `goal_update_system`) depends on that contract surviving the move of
+    /// retirement off `ai.state`.
+    #[test]
+    fn sleep_executor_drives_recovery_and_sleeping_state() {
+        use crate::simulation::person::AiState;
+        use crate::simulation::typed_task::Task;
+
+        let mut sim = TestSim::new(7);
+        sim.flat_world(1, 0, TileKind::Grass);
+        // At the faction home `(0,0)` (within the 5-tile disc) → in-place
+        // Sleep dispatch, no walk; the executor flips/holds Sleeping.
+        let person = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.hunger(0.0).needs(Needs {
+                hunger: 0.0,
+                sleep: 220.0,
+                shelter: 0.0,
+                safety: 0.0,
+                social: 0.0,
+                reproduction: 0.0,
+                willpower: 100.0,
+                esteem: 0.0,
+                self_actualization: 0.0,
+                thirst: 0.0,
+            });
+        });
+
+        sim.tick_n(60);
+        let ai = person_ai(&sim.app, person);
+        assert_eq!(
+            ai.state,
+            AiState::Sleeping,
+            "executor must flip/hold Sleeping at rest (cosleep/willpower/goal \
+             readers depend on it), got {:?}",
+            ai.state
+        );
+        assert_eq!(person_task(&sim.app, person), Task::Sleep { bed: None });
+        let sleep_after = sim.app.world().get::<Needs>(person).unwrap().sleep;
+        let wp_after = sim.app.world().get::<Needs>(person).unwrap().willpower;
+        assert!(
+            sleep_after < 220.0,
+            "executor must drain the sleep need (was 220, now {sleep_after})"
+        );
+        assert!(
+            wp_after > 100.0,
+            "executor must restore willpower while sleeping (was 100, now {wp_after})"
+        );
+    }
+
     /// Phase 5b-ii regression: a hungry agent carrying food has its Eat task
     /// dispatched by `htn_eat_dispatch_system` (driven by the HTN registry's
     /// `EatFromInventoryMethod`), not by `plan_execution_system`. The legacy
@@ -6415,6 +6709,7 @@ mod baseline_behaviour {
                     resource_id: crate::economy::core_ids::wood(),
                     delivered: 0,
                     target: 2,
+                    source: crate::simulation::jobs::HaulSource::Storage,
                 },
                 claimants: vec![person],
                 priority: 100,
@@ -6449,6 +6744,7 @@ mod baseline_behaviour {
                 kind: crate::simulation::jobs::ClaimKind::Specific(
                     crate::economy::core_ids::wood(),
                 ),
+                haul_source: None,
             });
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::Haul;
@@ -7158,6 +7454,7 @@ mod baseline_behaviour {
                     crate::economy::core_ids::fruit(),
                 ),
                 blueprint: None,
+                haul_source: None,
             },
             AgentGoal::GatherFood,
         ));
@@ -7357,6 +7654,7 @@ mod baseline_behaviour {
             entity.insert(ClaimTarget {
                 blueprint: Some(blueprint),
                 kind: crate::simulation::jobs::ClaimKind::None,
+                haul_source: None,
             });
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::Build;
@@ -7745,6 +8043,7 @@ mod baseline_behaviour {
             entity.insert(ClaimTarget {
                 blueprint: None,
                 kind: crate::simulation::jobs::ClaimKind::Specific(skin_id),
+                haul_source: None,
             });
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::Stockpile;
@@ -10684,6 +10983,7 @@ mod baseline_behaviour {
                         // record_progress_filtered auto-removal never fires.
                         delivered: 0,
                         target: 3,
+                        source: crate::simulation::jobs::HaulSource::Storage,
                     },
                     claimants: vec![hauler],
                     priority: 100,
@@ -10706,6 +11006,7 @@ mod baseline_behaviour {
         sim.app.world_mut().entity_mut(hauler).insert(ClaimTarget {
             blueprint: Some(blueprint),
             kind: crate::simulation::jobs::ClaimKind::Specific(crate::economy::core_ids::wood()),
+            haul_source: None,
         });
 
         // Tick past CHIEF_POSTING_INTERVAL (60). Fix 1b's two-pass cleanup in
@@ -10832,6 +11133,7 @@ mod baseline_behaviour {
                         resource_id: crate::economy::core_ids::wood(),
                         delivered: 0,
                         target: 3,
+                        source: crate::simulation::jobs::HaulSource::Storage,
                     },
                     claimants: vec![hauler],
                     priority: 100,
@@ -10858,6 +11160,7 @@ mod baseline_behaviour {
                 kind: crate::simulation::jobs::ClaimKind::Specific(
                     crate::economy::core_ids::wood(),
                 ),
+                haul_source: None,
             });
             let mut goal = entity.get_mut::<AgentGoal>().unwrap();
             *goal = AgentGoal::Haul;
@@ -11570,6 +11873,7 @@ mod wage_aware_phase0_phase1 {
             .spawn(JobEscrow {
                 amount: reward,
                 beneficiary: poster,
+                purchase_pool: 0.0,
             })
             .id();
         world
@@ -13473,8 +13777,8 @@ mod onenter_era_seeding {
     //! the fixture which deliberately stays in `SpawnSelect`) so the test
     //! exercises the priming systems wired in `SimulationPlugin::build`:
     //! `sync_faction_techs_from_chief_system → derive_tech_adoption_system →
-    //! seed_prime_tech_adoption_system → settlement_peak_population_system →
-    //! kickoff_initial_survey_system → seed_starting_buildings_system`.
+    //! refresh_construction_poster_pool_system → settlement_peak_population_system
+    //! → kickoff_initial_survey_system → seed_starting_buildings_system`.
     use super::*;
     use crate::simulation::construction::{
         Barracks, Bed, BedMap, BedTier, Campfire, Door, DoorTier, HearthTier, Market, Monument,
@@ -13482,7 +13786,6 @@ mod onenter_era_seeding {
     };
     use crate::simulation::faction::{FactionRegistry, SOLO};
     use crate::simulation::technology::{Era, PERM_SETTLEMENT};
-    use crate::simulation::technology_adoption::AdoptionStage;
 
     /// Build a fixture whose ChunkMap covers the spawn region so
     /// `spawn_population::find_tile` succeeds. Mega-chunk `(0, 0)` has
@@ -13529,11 +13832,18 @@ mod onenter_era_seeding {
             .get(&player_faction_id)
             .expect("player faction should exist after OnEnter");
         let home = faction.home_tile;
+        // Count every seeded bed within a population-scaled radius. The
+        // single-faction flat test world means all `BedMap` entries
+        // belong to this faction; a tight fixed radius (was 30) clipped
+        // the legitimately-wider footprint of a 60-person Bronze
+        // settlement, making the lower-bound assertion flaky on seed
+        // placement geometry rather than on whether enough beds seeded.
+        let radius = 30 + faction.member_count as i32;
         let beds = world
             .resource::<BedMap>()
             .0
             .keys()
-            .filter(|&&(x, y)| (x - home.0).abs().max((y - home.1).abs()) <= 30)
+            .filter(|&&(x, y)| (x - home.0).abs().max((y - home.1).abs()) <= radius)
             .count();
         assert!(
             faction.member_count > 0,
@@ -13552,10 +13862,14 @@ mod onenter_era_seeding {
             // Skip nomadic factions: lifestyle::Nomadic isn't the player faction
             // here but checking only the player faction is enough.
             checked += 1;
-            let stage = faction.tech_adoption[PERM_SETTLEMENT as usize];
+            // sleepy-dove: construction reads the poster-pool surface
+            // (`buildable_techs`), not community adoption. The OnEnter
+            // pool refresh derives it from the chief's Learned set.
             assert!(
-                (stage as u8) >= (AdoptionStage::Adopted as u8),
-                "{label}: faction {fid} PERM_SETTLEMENT stage = {stage:?}, expected ≥ Adopted"
+                faction.community_has(PERM_SETTLEMENT),
+                "{label}: faction {fid} buildable_techs missing PERM_SETTLEMENT \
+                 (buildable = {:?})",
+                faction.buildable_techs.0
             );
             // chief-Aware projection should reflect the era.
             assert!(
@@ -13739,10 +14053,10 @@ mod onenter_era_seeding {
 
     #[test]
     fn neolithic_start_seeds_at_least_one_well() {
-        // Neolithic+ chiefs are Aware of WELL_DIGGING via
-        // `seeded_realistic_through_era`, and `seed_prime_tech_adoption_system`
-        // ratchets it to Adopted at tick 0 — so `generate_candidates` should
-        // stamp one well for the player faction's settlement.
+        // Neolithic+ chiefs Learn WELL_DIGGING via
+        // `seeded_realistic_through_era`; the OnEnter poster-pool refresh
+        // folds it into `buildable_techs`, so `generate_candidates`
+        // should stamp one well for the player faction's settlement.
         let mut sim = fixture_with_flat_world();
         configure_start(&mut sim, Era::Neolithic);
         trigger_onenter(&mut sim);
@@ -13772,5 +14086,363 @@ mod onenter_era_seeding {
             .0
             .len();
         assert_eq!(well_count, 0, "Paleolithic seed stamped wells unexpectedly");
+    }
+
+    /// Regression: a Neolithic 20-pop village seeded with walled huts +
+    /// interior beds + one hearth must NOT, at runtime, (a) emit any
+    /// standalone outdoor `BuildSiteKind::Bed` blueprint (the paleo
+    /// crescent branch is era-gated — Fix 2), nor (b) let the hearth
+    /// count exceed the population design cap `ceil(members/8)` (the
+    /// Neolithic campfire gate is population-driven, not crescent-driven
+    /// — Fix 1). The old crescent gate tripped on seeded interior beds
+    /// incidentally overlapping the hearth's 2..6 ring; the old bed gate
+    /// degenerated to outdoor beds whenever the community-adoption layer
+    /// dropped PERM_SETTLEMENT. The flat-grass world has no wood/stone so
+    /// runtime blueprints never *finalize* — the signal is in what the
+    /// chief *emits*, so poll blueprint kinds every tick.
+    /// Despawn every seeded `Bed` near the player home so a runtime shelter
+    /// deficit opens (seeding otherwise satisfies it, leaving the organic
+    /// pipeline idle — see `neolithic_runtime_no_paleo_beds_or_excess_hearths`).
+    /// Returns the player faction id + home tile.
+    fn open_runtime_bed_deficit(sim: &mut TestSim) -> (u32, (i32, i32)) {
+        let world = sim.app.world_mut();
+        let pid = world
+            .resource::<crate::simulation::faction::PlayerFaction>()
+            .faction_id;
+        let home = world
+            .resource::<FactionRegistry>()
+            .factions
+            .get(&pid)
+            .unwrap()
+            .home_tile;
+        let bed_entities: Vec<Entity> = world
+            .resource::<crate::simulation::construction::BedMap>()
+            .0
+            .values()
+            .copied()
+            .collect();
+        for e in bed_entities {
+            world.entity_mut(e).despawn();
+        }
+        world
+            .resource_mut::<crate::simulation::construction::BedMap>()
+            .0
+            .clear();
+        (pid, home)
+    }
+
+    /// Step 7 end-to-end: a Neolithic band with a runtime shelter deficit and
+    /// **no obtainable wall material** (flat grass → nothing gatherable, no
+    /// market stock, empty treasury) must emit an era-appropriate emergency
+    /// `Bed` blueprint on the outskirts annulus (r≈12..32) — never a Paleo
+    /// crescent bed (r≈2..6) and never an indefinite stall.
+    #[test]
+    fn neolithic_emergency_outskirts_bed_when_no_materials() {
+        use crate::simulation::construction::{Blueprint, BuildSiteKind};
+
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+        let (_pid, home) = open_runtime_bed_deficit(&mut sim);
+
+        let mut saw_outskirts_bed = false;
+        let mut saw_crescent_bed = false;
+        // Past several classifier (60) + chief-directive (60) windows; the
+        // organic pressure→intent→spawn chain needs the survey-paced cadence.
+        for _ in 0..1200 {
+            sim.tick();
+            let w = sim.app.world_mut();
+            for bp in w.query::<&Blueprint>().iter(w) {
+                if bp.kind != BuildSiteKind::Bed {
+                    continue;
+                }
+                let dx = (bp.tile.0 - home.0) as f32;
+                let dy = (bp.tile.1 - home.1) as f32;
+                let d = (dx * dx + dy * dy).sqrt();
+                if d <= 8.0 {
+                    saw_crescent_bed = true;
+                } else if (10.0..=34.0).contains(&d) {
+                    saw_outskirts_bed = true;
+                }
+            }
+        }
+
+        assert!(
+            !saw_crescent_bed,
+            "Neolithic emergency must NOT use the Paleo crescent (r≈2..6) — \
+             that branch is era-gated off and would be a regression."
+        );
+        assert!(
+            saw_outskirts_bed,
+            "Neolithic band with a runtime bed deficit and no obtainable wall \
+             material must emit an emergency outskirts Bed (r≈12..32); none seen."
+        );
+    }
+
+    /// Step 8 core: when the scarce construction input is unobtainable
+    /// locally but stocked at the faction market and the treasury is funded
+    /// for state public works, the chief posts a `HaulSource::Market` haul
+    /// and the worker buys it — and the system-wide currency invariant holds
+    /// at every sampled tick (including mid buy→return).
+    #[test]
+    fn market_procurement_preserves_currency_invariant() {
+        use crate::simulation::jobs::{HaulSource, JobBoard, JobProgress};
+
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+        let (pid, _home) = open_runtime_bed_deficit(&mut sim);
+
+        // Fund the faction treasury + flag state public works so Phase 3c may
+        // stamp a treasury-funded Market haul on a chief/architect blueprint.
+        {
+            let mut reg = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let f = reg.factions.get_mut(&pid).unwrap();
+            f.treasury = 800.0;
+            f.state_funds_public_works = true;
+        }
+        // Stock wood at the player faction's settlement market (not gatherable
+        // on flat grass → classifier reads it as Scarce-but-procurable).
+        {
+            let settlement_e = {
+                let map = sim
+                    .app
+                    .world()
+                    .resource::<crate::simulation::settlement::SettlementMap>();
+                let sid = map.first_for_faction(pid).expect("player settlement");
+                *map.by_id.get(&sid).unwrap()
+            };
+            let mut s = sim
+                .app
+                .world_mut()
+                .get_mut::<crate::simulation::settlement::Settlement>(settlement_e)
+                .unwrap();
+            s.market.set_stock(crate::economy::core_ids::wood(), 300.0);
+        }
+
+        let baseline = CurrencySnapshot::capture(&mut sim.app);
+        let mut saw_market_haul = false;
+        for i in 0..2000 {
+            sim.tick();
+            if i % 100 == 0 {
+                // Invariant must hold at every sample — including ticks where
+                // a worker is mid-chain holding an escrow advance.
+                assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+            }
+            let board = sim.app.world().resource::<JobBoard>();
+            if board.faction_postings(pid).iter().any(|p| {
+                matches!(
+                    p.progress,
+                    JobProgress::Haul {
+                        source: HaulSource::Market { .. },
+                        ..
+                    }
+                )
+            }) {
+                saw_market_haul = true;
+            }
+        }
+        assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);
+        assert!(
+            saw_market_haul,
+            "expected a HaulSource::Market posting once wood was scarce-but-\
+             procurable for a state-funded chief blueprint"
+        );
+    }
+
+    /// Policy carve-out: identical scarce-but-procurable setup, but with
+    /// `state_funds_public_works = false` — Phase 3c must NOT stamp a
+    /// treasury-funded Market haul (state procurement is gated on public-
+    /// works funding for chief/architect blueprints). Free-agent labor is
+    /// preserved; the band just defers/stalls that slot as before.
+    #[test]
+    fn market_haul_requires_state_public_works() {
+        use crate::simulation::jobs::{HaulSource, JobBoard, JobProgress};
+
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+        let (pid, _home) = open_runtime_bed_deficit(&mut sim);
+        {
+            let mut reg = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let f = reg.factions.get_mut(&pid).unwrap();
+            f.treasury = 800.0;
+            f.state_funds_public_works = false; // the carve-out under test
+        }
+        {
+            let settlement_e = {
+                let map = sim
+                    .app
+                    .world()
+                    .resource::<crate::simulation::settlement::SettlementMap>();
+                let sid = map.first_for_faction(pid).expect("player settlement");
+                *map.by_id.get(&sid).unwrap()
+            };
+            let mut s = sim
+                .app
+                .world_mut()
+                .get_mut::<crate::simulation::settlement::Settlement>(settlement_e)
+                .unwrap();
+            s.market.set_stock(crate::economy::core_ids::wood(), 300.0);
+        }
+        let mut saw_market_haul = false;
+        for _ in 0..1200 {
+            sim.tick();
+            let board = sim.app.world().resource::<JobBoard>();
+            if board.faction_postings(pid).iter().any(|p| {
+                matches!(
+                    p.progress,
+                    JobProgress::Haul {
+                        source: HaulSource::Market { .. },
+                        ..
+                    }
+                )
+            }) {
+                saw_market_haul = true;
+            }
+        }
+        assert!(
+            !saw_market_haul,
+            "Market haul stamped despite state_funds_public_works=false — \
+             treasury-funded procurement carve-out leaked"
+        );
+    }
+
+    /// Subsistence faction (empty `economic_policy`) never gets treasury-
+    /// funded Market procurement: `chief_post_funding_system` skips
+    /// Subsistence and `state_funds_public_works` defaults false. Even with
+    /// market stock + treasury, no Market haul is posted.
+    #[test]
+    fn subsistence_faction_no_market_haul() {
+        use crate::simulation::jobs::{HaulSource, JobBoard, JobProgress};
+
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+        let (pid, _home) = open_runtime_bed_deficit(&mut sim);
+        {
+            // Fund treasury but leave the faction Subsistence (default empty
+            // economic_policy, state_funds_public_works=false).
+            let mut reg = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let f = reg.factions.get_mut(&pid).unwrap();
+            f.treasury = 800.0;
+            assert!(
+                f.economic_policy.is_empty(),
+                "fixture faction expected to default to Subsistence"
+            );
+        }
+        {
+            let settlement_e = {
+                let map = sim
+                    .app
+                    .world()
+                    .resource::<crate::simulation::settlement::SettlementMap>();
+                let sid = map.first_for_faction(pid).expect("player settlement");
+                *map.by_id.get(&sid).unwrap()
+            };
+            let mut s = sim
+                .app
+                .world_mut()
+                .get_mut::<crate::simulation::settlement::Settlement>(settlement_e)
+                .unwrap();
+            s.market.set_stock(crate::economy::core_ids::wood(), 300.0);
+        }
+        let mut saw_market_haul = false;
+        for _ in 0..1200 {
+            sim.tick();
+            let board = sim.app.world().resource::<JobBoard>();
+            if board.faction_postings(pid).iter().any(|p| {
+                matches!(
+                    p.progress,
+                    JobProgress::Haul {
+                        source: HaulSource::Market { .. },
+                        ..
+                    }
+                )
+            }) {
+                saw_market_haul = true;
+            }
+        }
+        assert!(
+            !saw_market_haul,
+            "Subsistence faction must not receive treasury-funded Market hauls"
+        );
+    }
+
+    #[test]
+    fn neolithic_runtime_no_paleo_beds_or_excess_hearths() {
+        use crate::simulation::construction::{Blueprint, BuildSiteKind};
+
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+
+        let (members, home) = {
+            let world = sim.app.world();
+            let pid = world
+                .resource::<crate::simulation::faction::PlayerFaction>()
+                .faction_id;
+            let f = world
+                .resource::<FactionRegistry>()
+                .factions
+                .get(&pid)
+                .expect("player faction exists after OnEnter");
+            (f.member_count, f.home_tile)
+        };
+        // ceil(members / NEOLITHIC_BEDS_PER_HEARTH(=8))
+        let desired_hearths = ((members + 7) / 8).max(1) as usize;
+        // Scope to the player faction's settlement footprint. The flat
+        // test world spawns ~10 factions; counting campfires/beds globally
+        // would tally every neighbour's. Same radius convention as
+        // `player_seeded_beds_near_home` (covers a 20-pop footprint).
+        let radius = 30 + members as i32;
+        let near = |x: i32, y: i32| (x - home.0).abs().max((y - home.1).abs()) <= radius;
+
+        let mut saw_outdoor_bed_bp = false;
+        let mut max_existing_hearths = 0usize;
+        // ~1600 ticks: > derive cadence (900) and ~26 chief-directive
+        // windows (every 60), well past steady state for a 20-pop band.
+        for _ in 0..1600 {
+            sim.tick();
+            let world = sim.app.world_mut();
+            let mut bed_bp = 0usize;
+            let mut campfire_bp = 0usize;
+            for bp in world.query::<&Blueprint>().iter(world) {
+                if !near(bp.tile.0, bp.tile.1) {
+                    continue;
+                }
+                match bp.kind {
+                    BuildSiteKind::Bed => bed_bp += 1,
+                    BuildSiteKind::Campfire => campfire_bp += 1,
+                    _ => {}
+                }
+            }
+            if bed_bp > 0 {
+                saw_outdoor_bed_bp = true;
+            }
+            let campfire_entities = world
+                .resource::<crate::simulation::construction::CampfireMap>()
+                .0
+                .keys()
+                .filter(|&&(x, y)| near(x, y))
+                .count();
+            max_existing_hearths = max_existing_hearths.max(campfire_entities + campfire_bp);
+        }
+
+        assert!(
+            !saw_outdoor_bed_bp,
+            "Neolithic runtime emitted a standalone outdoor Bed blueprint \
+             (paleo crescent branch fired — Fix 2 regression). Beds at \
+             Neolithic must come from Hut/Longhouse footprints only."
+        );
+        assert!(
+            max_existing_hearths <= desired_hearths,
+            "Neolithic hearth count peaked at {max_existing_hearths}, \
+             exceeding the population cap {desired_hearths} \
+             (ceil({members}/8)) — campfire gate over-emitting (Fix 1 \
+             regression)."
+        );
+
+        assert_perm_settlement_adopted(&sim, "Neolithic runtime (t≈1600)");
     }
 }

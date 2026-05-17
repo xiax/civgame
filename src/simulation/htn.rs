@@ -3426,27 +3426,18 @@ pub fn htn_dispatch_system(
                 return;
             }
 
-            // Already asleep — nothing to do until the goal flips off Sleep.
-            if ai.state == AiState::Sleeping {
-                return;
-            }
-
-            // Arrived at the Sleep destination — flip the state. The typed
-            // `Task::Sleep` variant carries the bed claim (if any) and stays
-            // set across the Working→Sleeping transition; it gets cleared
-            // when the goal flips off Sleep via the `aq.cancel()` stale-reset
-            // path in `goal_dispatch_system`.
-            if ai.state == AiState::Working && aq.current_task_kind() == TaskKind::Sleep as u16 {
-                ai.state = AiState::Sleeping;
-                return;
-            }
-
-            // In flight on a Sleep task — wait for arrival.
-            let is_active = matches!(
-                ai.state,
-                AiState::Working | AiState::Seeking | AiState::Routing
-            );
-            if is_active && aq.current_task_kind() == TaskKind::Sleep as u16 {
+            // A Sleep task is already live — this dispatcher only does the
+            // *initial* plan+route+dispatch. Its entire downstream lifecycle
+            // (arrival `Working`→`Sleeping` flip, recovery, retirement, and
+            // orphan recovery when an external preempt resets `ai.state`) is
+            // owned by `sleep::sleep_task_system` (Sequential), keyed on the
+            // typed `Task::Sleep` rather than on `ai.state`. Re-planning here
+            // while `current == Sleep` is exactly the desync the
+            // `ActionQueue::dispatch` assert guards against (an external
+            // resetter could leave `state == Idle` with `current == Sleep`
+            // mid-flight), so never touch an agent whose Sleep task is live —
+            // subsumes the old Sleeping / in-flight / arrival guards.
+            if aq.current_task_kind() == TaskKind::Sleep as u16 {
                 return;
             }
 
@@ -4897,6 +4888,55 @@ pub fn htn_acquire_good_dispatch_system(
                 // Routing failed — fall through to the standard withdraw
                 // chain so the agent can re-route via storage if reachable.
             }
+        }
+
+        // Step 5: Market-haul direct dispatch. When the claim's snapshotted
+        // `HaulSource` is `Market`, the worker buys at the faction's market
+        // node instead of withdrawing from (empty) storage. Mirrors the
+        // in-hand fast-path: direct `aq.dispatch` bypassing the Method
+        // registry (avoids 55-site PlannerCtx churn for a special case).
+        if let Some(crate::simulation::jobs::HaulSource::Market { .. }) =
+            claim_target_opt.and_then(|t| t.haul_source)
+        {
+            let market = faction_registry
+                .factions
+                .get(&member.faction_id)
+                .and_then(|f| f.procurement_market);
+            if let Some((node, market_tile)) = market {
+                let bp_needs_more = bp_query
+                    .get(blueprint)
+                    .map(|bp| !bp.slot_satisfied(resource_id))
+                    .unwrap_or(false);
+                if bp_needs_more {
+                    let dispatched = assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx, cur_ty),
+                        cur_chunk,
+                        market_tile,
+                        TaskKind::BuyMaterialAtMarket,
+                        None,
+                        &chunk_graph,
+                        &chunk_router,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    );
+                    if dispatched {
+                        aq.dispatch(Task::BuyMaterialAtMarket {
+                            resource_id,
+                            qty: 1,
+                            node,
+                        });
+                        let _ = aq.enqueue(Task::HaulToBlueprint { blueprint });
+                        ai.active_method = None;
+                        continue;
+                    }
+                }
+            }
+            // Market claim but node unresolved / routing failed / bp already
+            // satisfied: skip this tick (chronic-failure release eventually
+            // frees the claim if it never resolves). No storage fallback —
+            // Market hauls are posted precisely because storage is empty.
+            continue;
         }
 
         // Faction-level stock check — mirrors `WithdrawAndHaulToBlueprintMethod`'s

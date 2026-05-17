@@ -14,10 +14,10 @@ use serde::Deserialize;
 use crate::simulation::building_template::{FootprintShape, Rotation};
 use crate::simulation::civic_milestones::{civic_milestone_allows, CivicKind};
 use crate::simulation::construction::{
-    best_wall_material, faction_can_build, recipe_for, BarracksMap, BedMap, Blueprint,
-    BlueprintMap, BuildSiteKind, CampfireMap, DoorMap, GranaryMap, LoomMap, MarketMap, MonumentMap,
-    RoadCarveQueue, ShrineMap, StructureIndex, TableMap, WallMap, WallMaterial, WellMap,
-    WorkbenchMap, MAX_BLUEPRINTS_SAFETY_CAP,
+    best_wall_material, faction_can_build, find_emergency_bed_tile, recipe_for, select_wall_material,
+    BarracksMap, BedMap, Blueprint, BlueprintMap, BuildSiteKind, CampfireMap, DoorMap, GranaryMap,
+    LoomMap, MarketMap, MonumentMap, RoadCarveQueue, ShrineMap, StructureIndex, TableMap, WallMap,
+    WallMaterial, WallSelection, WellMap, WorkbenchMap, MAX_BLUEPRINTS_SAFETY_CAP,
 };
 use crate::simulation::faction::{FactionData, FactionMember, FactionRegistry, SOLO};
 use crate::simulation::land::{tile_buildable_by, Plot, PlotIndex, TenureHolder, TileEdge};
@@ -2006,10 +2006,45 @@ fn pressure_to_intent(
     let community_techs =
         crate::simulation::technology_adoption::community_adoption_bitset(faction);
     let era = current_era(&community_techs);
-    let wall_mat = best_wall_material(&community_techs);
+    // Step 7: era-aware wall selection. An empty `material_view` means the
+    // chief-cadence classifier hasn't run yet → pass `None` (legacy
+    // `best_wall_material`, no emergency). Otherwise the selector applies
+    // procure-primary-first / substitute-down, and returns `EmergencyShelter`
+    // when every wall rung is unobtainable (not stored, not raw-gatherable,
+    // not affordably procurable) — at which point a Neolithic+ band would
+    // otherwise stall shelter-less forever, so emit a bare `Bed` on the
+    // era-keyed emergency annulus instead.
+    let view_opt = if faction.material_view.is_empty() {
+        None
+    } else {
+        Some(&faction.material_view)
+    };
+    let wall_sel = select_wall_material(&community_techs, view_opt);
+    let wall_mat = wall_sel
+        .mat()
+        .unwrap_or_else(|| best_wall_material(&community_techs));
+    // Defer post-PERM shelter one chief-classifier window when scarcity
+    // hasn't been computed yet (`view_opt == None`). Without this a doomed
+    // higher-tier hut is emitted on the cold-start tick, stalls forever for
+    // want of material, and fills the per-faction concurrency cap — after
+    // which the emergency Bed intent can never be *selected* even though it
+    // is generated. One-window defer (≤ chief cadence) is the "defer with
+    // reason" path; the classifier then routes to emergency or a real hut.
+    if matches!(pressure.kind, SettlementPressureKind::Shelter)
+        && community_techs.has(PERM_SETTLEMENT)
+        && view_opt.is_none()
+    {
+        return None;
+    }
+    let shelter_emergency = matches!(pressure.kind, SettlementPressureKind::Shelter)
+        && community_techs.has(PERM_SETTLEMENT)
+        && matches!(wall_sel, WallSelection::EmergencyShelter);
     let build_kind = match pressure.kind {
         SettlementPressureKind::Hearth => OrganicBuildKind::Single(BuildSiteKind::Campfire),
         SettlementPressureKind::Shelter if !community_techs.has(PERM_SETTLEMENT) => {
+            OrganicBuildKind::Single(BuildSiteKind::Bed)
+        }
+        SettlementPressureKind::Shelter if shelter_emergency => {
             OrganicBuildKind::Single(BuildSiteKind::Bed)
         }
         SettlementPressureKind::Shelter => {
@@ -2027,7 +2062,23 @@ fn pressure_to_intent(
         SettlementPressureKind::Field => return None,
     };
     let district = district_for_pressure(pressure.kind);
-    let tile = if matches!(pressure.kind, SettlementPressureKind::Defense) {
+    let tile = if shelter_emergency {
+        // Era-keyed emergency annulus (deterministic via the settlement
+        // layout hash + current bed count) — distinct geometry from the
+        // normal residential district so it reads as outskirts/bunk/overflow
+        // rows rather than proper housing.
+        let bed_count = count_near(&maps.bed_map.0, faction.home_tile, 32) as i32;
+        find_emergency_bed_tile(
+            chunk_map,
+            &maps.bed_map,
+            bp_map,
+            doormat,
+            faction.home_tile,
+            era,
+            brain.layout_hash,
+            bed_count,
+        )
+    } else if matches!(pressure.kind, SettlementPressureKind::Defense) {
         organic_palisade_site(chunk_map, maps, bp_map, doormat, brain, faction.home_tile)
     } else {
         choose_site_for_intent(
@@ -3079,7 +3130,11 @@ mod tests {
     /// community-Adopted so civic gates that now read the adoption layer
     /// (not chief-Aware) fire as the test expects.
     fn force_adopt(faction: &mut FactionData, tech: crate::simulation::technology::TechId) {
+        // `community_has` now reads `buildable_techs` (the poster-pool
+        // surface), not the legacy adoption layer. Set both so tests that
+        // inspect either stay correct.
         faction.techs.unlock(tech);
+        faction.buildable_techs.unlock(tech);
         faction.tech_adoption[tech as usize] =
             crate::simulation::technology_adoption::AdoptionStage::Adopted;
     }

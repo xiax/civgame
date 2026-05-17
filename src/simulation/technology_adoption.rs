@@ -187,19 +187,9 @@ pub fn can_direct_tech(faction: &crate::simulation::faction::FactionData, tech: 
     faction.techs.has(tech)
 }
 
-/// Community has adopted the tech: civic gates, tier picks, building
-/// upgrades. Strictly higher bar than `can_direct_tech`.
-#[inline]
-pub fn community_has_adopted(
-    faction: &crate::simulation::faction::FactionData,
-    tech: TechId,
-) -> bool {
-    let idx = tech as usize;
-    if idx >= TECH_COUNT {
-        return false;
-    }
-    (faction.tech_adoption[idx] as u8) >= (AdoptionStage::Adopted as u8)
-}
+// `community_has_adopted` was deleted (sleepy-dove): civic/tier/build
+// gates no longer consult community adoption. Use `FactionData::
+// community_has` (→ `buildable_techs`, the poster-pool surface) instead.
 
 /// Worker / individual can personally perform the tech.
 #[inline]
@@ -572,63 +562,26 @@ fn step_down(stage: AdoptionStage) -> AdoptionStage {
     }
 }
 
-/// Build a `FactionTechs` bitset where bit `i` is set iff
-/// `tech_adoption[i] >= Adopted`. Lets existing `best_X_for(&FactionTechs)`
-/// helpers keep their signatures: callers pass this snapshot in place of
-/// `faction.techs` (which is chief-Aware) and the helper now sees the
-/// community adoption layer.
+/// The faction's construction-tech surface. **No longer derived from
+/// community adoption** — it returns `faction.buildable_techs`, the
+/// poster-pool union of resident chief + architect `Learned`, rewritten
+/// every tick by `construction::refresh_construction_poster_pool_system`.
+/// Kept as a free function so the many existing `best_X_for(&FactionTechs)`
+/// call sites need no signature churn; they now uniformly see the one
+/// poster-pool surface.
+#[inline]
 pub fn community_adoption_bitset(
     faction: &crate::simulation::faction::FactionData,
 ) -> crate::simulation::faction::FactionTechs {
-    let mut bits: u64 = 0;
-    for id in 0..TECH_COUNT as TechId {
-        if (faction.tech_adoption[id as usize] as u8) >= (AdoptionStage::Adopted as u8) {
-            bits |= 1u64 << id;
-        }
-    }
-    crate::simulation::faction::FactionTechs(bits)
+    faction.buildable_techs
 }
 
-/// One-shot OnEnter pass: every era-prior tech the faction chief is Aware of
-/// is forced to `Adopted` (no downgrade). The runtime `derive_tech_adoption_system`
-/// gates Specialist / Institutional techs behind workshops + recent-use buffers
-/// + small-band / broad-learning shortcuts that fail for a default 20-person
-/// founder band at tick 0 — Specialist scale needs `members ≤ 8` or every adult
-/// Learned, and Institutional needs a civic building or every adult Learned.
-/// Neither holds for a freshly-spawned Neolithic+ village whose role distribution
-/// follows `PersonKnowledge::seeded_realistic_through_era` (chief + ~1/8 Specialists
-/// Learned, rest Common). Without this priming, `community_adoption_bitset`
-/// returns 0 for PERM_SETTLEMENT at seed time, dropping `generate_candidates` into
-/// the Paleolithic radial-Bed branch regardless of `GameStartOptions.era`.
-///
-/// Runs once at `OnEnter(Playing)` after `derive_tech_adoption_system` and before
-/// `seed_starting_buildings_system`. The runtime derive pass at the first Economy
-/// cadence may walk stages back if conditions don't hold — that's intentional;
-/// the seed pass only needs the correct answer at tick 0.
-pub fn seed_prime_tech_adoption_system(
-    options: Res<crate::GameStartOptions>,
-    mut registry: ResMut<FactionRegistry>,
-) {
-    if !options.seed_buildings {
-        return;
-    }
-    let era_rank = options.era as u8;
-    let adopted = AdoptionStage::Adopted;
-    for (_, faction) in registry.factions.iter_mut() {
-        for def in crate::simulation::technology::TECH_TREE.iter() {
-            if (def.era as u8) > era_rank {
-                continue;
-            }
-            if !faction.techs.has(def.id) {
-                continue;
-            }
-            let idx = def.id as usize;
-            if (faction.tech_adoption[idx] as u8) < (adopted as u8) {
-                faction.tech_adoption[idx] = adopted;
-            }
-        }
-    }
-}
+// `seed_prime_tech_adoption_system` was deleted (sleepy-dove): nothing
+// gates on community *adoption* any more. The construction-tech surface
+// is `faction.buildable_techs`, written every tick (and once at OnEnter)
+// by `construction::refresh_construction_poster_pool_system` from
+// resident chief + architect Learned. `tech_adoption` is now display /
+// analytics only (`ui/tech_panel`, activity log).
 
 /// Stamp `(faction, tech, now)` into the recent-use ring. Call from craft /
 /// hunt / build executors whenever the tech is successfully exercised.

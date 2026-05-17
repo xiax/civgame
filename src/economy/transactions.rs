@@ -84,6 +84,74 @@ pub fn trader_buy_at_settlement(
     Some(price_per_unit)
 }
 
+/// Camp counterpart of [`trader_buy_at_settlement`]. Identical currency /
+/// stock invariants; reads/writes `Camp.market` + `Camp.treasury` instead of
+/// `Settlement`. Lets nomadic factions procure construction material.
+pub fn trader_buy_at_camp(
+    world: &mut World,
+    trader: Entity,
+    camp: Entity,
+    resource_id: crate::economy::resource_catalog::ResourceId,
+    qty: u32,
+) -> Option<f32> {
+    if qty == 0 {
+        return None;
+    }
+    let (price_per_unit, stock_available) = {
+        let c = world.get::<Camp>(camp)?;
+        (c.market.price_of(resource_id), c.market.stock_of(resource_id))
+    };
+    let total = price_per_unit * qty as f32;
+    if stock_available < qty as f32 {
+        if let Some(mut c) = world.get_mut::<Camp>(camp) {
+            c.market.add_bid_stockout(resource_id, qty as f32);
+        }
+        return None;
+    }
+    let agent_currency = world.get::<EconomicAgent>(trader)?.currency;
+    if agent_currency < total {
+        if let Some(mut c) = world.get_mut::<Camp>(camp) {
+            c.market.add_bid_unaffordable(resource_id, qty as f32);
+        }
+        return None;
+    }
+    let item = crate::economy::item::Item::new_commodity(resource_id);
+    let leftover = world.get_mut::<EconomicAgent>(trader)?.add_item(item, qty);
+    let acquired = qty - leftover;
+    if acquired == 0 {
+        return None;
+    }
+    let actual_total = price_per_unit * acquired as f32;
+    {
+        let mut econ = world.get_mut::<EconomicAgent>(trader)?;
+        econ.currency -= actual_total;
+    }
+    {
+        let mut c = world.get_mut::<Camp>(camp)?;
+        c.market.add_bid_cleared(resource_id, acquired as f32);
+        let new_stock = (stock_available - acquired as f32).max(0.0);
+        c.market.set_stock(resource_id, new_stock);
+        c.treasury += actual_total;
+    }
+    Some(price_per_unit)
+}
+
+/// Buy `qty` of `resource_id` at a faction's economic node (Settlement or
+/// Camp). Thin dispatch over [`trader_buy_at_settlement`] /
+/// [`trader_buy_at_camp`]. Returns the per-unit price paid on success.
+pub fn trader_buy_at_node(
+    world: &mut World,
+    trader: Entity,
+    node: MarketNodeRef,
+    resource_id: crate::economy::resource_catalog::ResourceId,
+    qty: u32,
+) -> Option<f32> {
+    match node {
+        MarketNodeRef::Settlement(e) => trader_buy_at_settlement(world, trader, e, resource_id, qty),
+        MarketNodeRef::Camp(e) => trader_buy_at_camp(world, trader, e, resource_id, qty),
+    }
+}
+
 /// Pluralist Economy R10: trader sells `qty` of `resource_id` at the
 /// named settlement's market at the market's current price. Settlement
 /// treasury is debited (or capped at 0 if insufficient — the trader
