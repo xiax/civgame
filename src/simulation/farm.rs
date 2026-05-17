@@ -82,7 +82,11 @@ pub fn chief_farm_plot_assignment_system(
         .farmer_to_plot
         .keys()
         .copied()
-        .filter(|f| profession_q.get(*f).map_or(true, |(_, p, _, _)| !matches!(p, Profession::Farmer)))
+        .filter(|f| {
+            profession_q
+                .get(*f)
+                .map_or(true, |(_, p, _, _)| !matches!(p, Profession::Farmer))
+        })
         .collect();
     for f in stale_farmers {
         assignments.release_farmer(f);
@@ -100,8 +104,7 @@ pub fn chief_farm_plot_assignment_system(
             };
             // Drop if plot left state ownership (e.g. transferred to a
             // household via auction) or is no longer agricultural.
-            !matches!(plot.tenure, Tenure::StateOwned)
-                || plot.zone_kind != ZoneKind::Agricultural
+            !matches!(plot.tenure, Tenure::StateOwned) || plot.zone_kind != ZoneKind::Agricultural
         })
         .collect();
     for pid in stale_plots {
@@ -113,9 +116,7 @@ pub fn chief_farm_plot_assignment_system(
         if faction.parent_faction.is_some() {
             continue; // households don't own communal plots
         }
-        let chief_allocates = faction
-            .policy_for(core_ids::grain())
-            .chief_allocates_labor;
+        let chief_allocates = faction.policy_for(core_ids::grain()).chief_allocates_labor;
         if !chief_allocates {
             continue;
         }
@@ -314,4 +315,3 @@ pub fn seed_starting_farms_system(
         }
     }
 }
-

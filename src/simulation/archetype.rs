@@ -695,7 +695,11 @@ mod tests {
         let wood = crate::economy::core_ids::wood();
         let stone = crate::economy::core_ids::stone();
         let wp = caps.economic_policy.get(&wood).copied().unwrap_or_default();
-        let sp = caps.economic_policy.get(&stone).copied().unwrap_or_default();
+        let sp = caps
+            .economic_policy
+            .get(&stone)
+            .copied()
+            .unwrap_or_default();
         assert!(wp.private_actors_allowed);
         assert!(sp.private_actors_allowed);
         assert!(wp.chief_allocates_labor);

@@ -6,7 +6,9 @@ use crate::simulation::goals::AgentGoal;
 use crate::simulation::jobs::JobClaim;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
-use crate::simulation::person::{AiState, Drafted, Person, PersonAI, Profession, TraderPlan, UNEMPLOYED_TASK_KIND};
+use crate::simulation::person::{
+    AiState, Drafted, Person, PersonAI, Profession, TraderPlan, UNEMPLOYED_TASK_KIND,
+};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::typed_task::{ActionQueue, Task};
 

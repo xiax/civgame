@@ -45,11 +45,7 @@ pub const PROJECT_MAX_RADIUS: i32 = 6;
 /// are passable but `is_water_like()` so this BFS treats them as
 /// "wet ground". (Same-bank reachability is the dry-land question; the
 /// bridge-aware question uses regular A*.)
-pub fn same_bank_bfs(
-    chunk_map: &ChunkMap,
-    start: (i32, i32),
-    target: (i32, i32),
-) -> bool {
+pub fn same_bank_bfs(chunk_map: &ChunkMap, start: (i32, i32), target: (i32, i32)) -> bool {
     if start == target {
         return true;
     }
@@ -155,13 +151,13 @@ pub fn river_orientation_near(
             // with: count adjacent river cells along each of the four
             // axes.
             for (adx, ady, axis) in [
-                (0, 1, 0u8),  // NS
+                (0, 1, 0u8), // NS
                 (0, -1, 0),
-                (1, 0, 1),    // EW
+                (1, 0, 1), // EW
                 (-1, 0, 1),
-                (1, 1, 2),    // NwSe (diagonal: dx==dy)
+                (1, 1, 2), // NwSe (diagonal: dx==dy)
                 (-1, -1, 2),
-                (1, -1, 3),   // NeSw (diagonal: dx==-dy)
+                (1, -1, 3), // NeSw (diagonal: dx==-dy)
                 (-1, 1, 3),
             ] {
                 let mx = nx + adx;

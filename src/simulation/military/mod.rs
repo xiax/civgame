@@ -1,8 +1,8 @@
 pub mod formation;
 
 pub use formation::{
-    expand_military_move_system, plan_compact_ring, FormationAssignment,
-    MilitaryFormationGroupGen, MilitaryFormationSlot, PendingFormationSlots,
+    expand_military_move_system, plan_compact_ring, FormationAssignment, MilitaryFormationGroupGen,
+    MilitaryFormationSlot, PendingFormationSlots,
 };
 
 use ahash::AHashMap;

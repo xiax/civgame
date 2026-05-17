@@ -333,14 +333,8 @@ mod tests {
     fn plan_compact_ring_skips_blocked_cardinals() {
         let anchor = (10, 10);
         // Every cardinal of anchor blocked; diagonals + outer ring open.
-        let blocked: AHashSet<(i32, i32)> = [
-            (10, 9),
-            (10, 11),
-            (9, 10),
-            (11, 10),
-        ]
-        .into_iter()
-        .collect();
+        let blocked: AHashSet<(i32, i32)> =
+            [(10, 9), (10, 11), (9, 10), (11, 10)].into_iter().collect();
         let pass = |t: (i32, i32)| -> bool { !blocked.contains(&t) };
         let out = plan_compact_ring(anchor, 5, pass);
         assert_eq!(out.len(), 5);

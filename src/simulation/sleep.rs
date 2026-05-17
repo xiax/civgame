@@ -32,7 +32,9 @@ use bevy::prelude::*;
 
 use crate::simulation::construction::BedMap;
 use crate::simulation::lod::LodLevel;
-use crate::simulation::needs::{Needs, SLEEP_RECOVER_RATE, SLEEP_WAKE_THRESHOLD, WILLPOWER_SLEEP_RECOVER};
+use crate::simulation::needs::{
+    Needs, SLEEP_RECOVER_RATE, SLEEP_WAKE_THRESHOLD, WILLPOWER_SLEEP_RECOVER,
+};
 use crate::simulation::person::{AiState, PersonAI};
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::tasks::TaskKind;

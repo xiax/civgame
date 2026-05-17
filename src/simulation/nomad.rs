@@ -10,7 +10,6 @@ use bevy::ecs::system::SystemState;
 use bevy::prelude::*;
 
 use crate::simulation::animals::{AnimalAI, Tamed};
-use crate::simulation::person::UNEMPLOYED_TASK_KIND;
 use crate::simulation::construction::{
     best_hearth_for, seed_nomadic_camp, Bed, BedMap, Campfire, CampfireMap, FurnitureMaps,
     TentShelter,
@@ -18,6 +17,7 @@ use crate::simulation::construction::{
 use crate::simulation::faction::FactionRegistry;
 use crate::simulation::memory::MemoryKind;
 use crate::simulation::pack_deploy::Deployable;
+use crate::simulation::person::UNEMPLOYED_TASK_KIND;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::shared_knowledge::{KnowledgeTier, SharedKnowledge};
 use crate::simulation::technology::current_era;
@@ -79,6 +79,9 @@ pub const SURVEY_SCOUT_COUNT: usize = 3;
 /// Phase D: chebyshev radius from `home_tile` at which scouts are
 /// assigned within their quadrant.
 pub const SURVEY_SCOUT_RADIUS: i32 = 100;
+/// Maximum Chebyshev distance for one scout travel episode. Longer trips
+/// re-dispatch through checkpoints so maintenance can run between legs.
+const SCOUT_CHECKPOINT_STEP: i32 = 24;
 
 /// Phase D: per-agent companion to `AgentGoal::Scout`. Carries the
 /// quadrant assignment and the actual tile to walk toward. Stamped by
@@ -102,6 +105,24 @@ pub struct ScoutAssignment {
 pub enum ScoutKind {
     AiSurvey,
     PlayerManual { faction_id: u32 },
+}
+
+fn scout_checkpoint(current: (i32, i32), target: (i32, i32)) -> (i32, i32) {
+    let dx = target.0 - current.0;
+    let dy = target.1 - current.1;
+    let dist = dx.abs().max(dy.abs());
+    if dist <= SCOUT_CHECKPOINT_STEP {
+        return target;
+    }
+    let mut next = (
+        current.0 + dx.saturating_mul(SCOUT_CHECKPOINT_STEP) / dist,
+        current.1 + dy.saturating_mul(SCOUT_CHECKPOINT_STEP) / dist,
+    );
+    if next == current {
+        next.0 += dx.signum();
+        next.1 += dy.signum();
+    }
+    next
 }
 
 /// Phase 2: result of a scouting trip; populated when a scout arrives
@@ -583,7 +604,7 @@ pub fn nomad_survey_dispatch_system(
             cur_tx.div_euclid(CHUNK_SIZE as i32),
             cur_ty.div_euclid(CHUNK_SIZE as i32),
         );
-        let target = scout.target_tile;
+        let target = scout_checkpoint((cur_tx, cur_ty), scout.target_tile);
         let routed = assign_task_with_routing(
             &mut ai,
             (cur_tx, cur_ty),

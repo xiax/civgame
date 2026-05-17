@@ -946,7 +946,9 @@ pub fn inspector_panel_system(
                         ui.label(format!("Method: {}", method_label));
 
                         let now = sim_clock.tick;
-                        if aq.current_task_kind() == UNEMPLOYED_TASK_KIND && aq.current == Task::Idle {
+                        if aq.current_task_kind() == UNEMPLOYED_TASK_KIND
+                            && aq.current == Task::Idle
+                        {
                             let last_attempt = method_history
                                 .and_then(|h| {
                                     h.entries
@@ -1059,7 +1061,9 @@ pub fn inspector_panel_system(
                                     work_str = "Stealing Goods".to_string();
                                 } else if aq.current_task_kind() == TaskKind::Scavenge as u16 {
                                     work_str = "Picking up item".to_string();
-                                } else if aq.current_task_kind() == TaskKind::WithdrawMaterial as u16 {
+                                } else if aq.current_task_kind()
+                                    == TaskKind::WithdrawMaterial as u16
+                                {
                                     if let Some((rid, qty)) = aq.current.as_withdraw_material() {
                                         work_str = format!(
                                             "Withdrawing {} \u{00d7} {}",
@@ -1074,7 +1078,9 @@ pub fn inspector_panel_system(
                                         "Butchering ({}%)",
                                         (ai.work_progress as u32 * 100) / 60
                                     );
-                                } else if aq.current_task_kind() == TaskKind::WorkOnCraftOrder as u16 {
+                                } else if aq.current_task_kind()
+                                    == TaskKind::WorkOnCraftOrder as u16
+                                {
                                     work_str = format!("Crafting (step: {})", ai.work_progress);
                                 } else if aq.current_task_kind() == TaskKind::WithdrawGood as u16 {
                                     use crate::simulation::typed_task::WithdrawGoodFilter;

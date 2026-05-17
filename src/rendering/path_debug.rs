@@ -91,7 +91,10 @@ pub fn selected_agent_path_gizmo_system(
     }
 
     // Magenta: line to the immediate target tile.
-    let target_pos = projector.project(tile_center(ai.target_tile.0 as i32, ai.target_tile.1 as i32));
+    let target_pos = projector.project(tile_center(
+        ai.target_tile.0 as i32,
+        ai.target_tile.1 as i32,
+    ));
     let target_color = Color::srgba(1.0, 0.3, 0.9, 0.85);
     gizmos.line_2d(agent_pos, target_pos, target_color);
     gizmos.circle_2d(target_pos, 3.0, target_color);

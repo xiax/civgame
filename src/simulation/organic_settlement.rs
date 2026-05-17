@@ -14,10 +14,11 @@ use serde::Deserialize;
 use crate::simulation::building_template::{FootprintShape, Rotation};
 use crate::simulation::civic_milestones::{civic_milestone_allows, CivicKind};
 use crate::simulation::construction::{
-    best_wall_material, faction_can_build, find_emergency_bed_tile, recipe_for, select_wall_material,
-    BarracksMap, BedMap, Blueprint, BlueprintMap, BuildSiteKind, CampfireMap, DoorMap, GranaryMap,
-    LoomMap, MarketMap, MonumentMap, RoadCarveQueue, ShrineMap, StructureIndex, TableMap, WallMap,
-    WallMaterial, WallSelection, WellMap, WorkbenchMap, MAX_BLUEPRINTS_SAFETY_CAP,
+    best_wall_material, faction_can_build, find_emergency_bed_tile, recipe_for,
+    select_wall_material, BarracksMap, BedMap, Blueprint, BlueprintMap, BuildSiteKind, CampfireMap,
+    DoorMap, GranaryMap, LoomMap, MarketMap, MonumentMap, RoadCarveQueue, ShrineMap,
+    StructureIndex, TableMap, WallMap, WallMaterial, WallSelection, WellMap, WorkbenchMap,
+    MAX_BLUEPRINTS_SAFETY_CAP,
 };
 use crate::simulation::faction::{FactionData, FactionMember, FactionRegistry, SOLO};
 use crate::simulation::land::{tile_buildable_by, Plot, PlotIndex, TenureHolder, TileEdge};
@@ -1363,9 +1364,7 @@ fn build_road_network(
             // Post-bridge: take any anchor — the emitter will back-fill
             // crossings short enough for `MAX_BRIDGE_SPAN`.
             if !has_bridges
-                && !crate::simulation::river_context::same_bank_bfs(
-                    chunk_map, home, anchor.tile,
-                )
+                && !crate::simulation::river_context::same_bank_bfs(chunk_map, home, anchor.tile)
             {
                 continue;
             }
@@ -1680,8 +1679,7 @@ fn build_parcels_road_driven(
                 }
                 let home_dist = cheb(centre, home);
                 let score = s * (target as f32) * (1.0 / (1.0 + home_dist as f32 * 0.05));
-                let tile_hash = ((centre.0 as i64)
-                    .wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64)
+                let tile_hash = ((centre.0 as i64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64)
                     ^ centre.1 as i64) as u64;
                 candidates.push(Cand {
                     rect,
@@ -1871,7 +1869,8 @@ fn append_pressures_for_faction(
         let have = built_wells + pending_wells;
         let near_fresh_water = fresh_water_within(chunk_map, home, 6);
         if have < target && !(built_wells == 0 && near_fresh_water) {
-            let nearest_clean = nearest_fresh_or_well_distance(chunk_map, &maps.well_map.0, home, 10);
+            let nearest_clean =
+                nearest_fresh_or_well_distance(chunk_map, &maps.well_map.0, home, 10);
             let dist_norm = (nearest_clean as f32 / 10.0).clamp(0.0, 1.0);
             out.push(SettlementPressure {
                 kind: SettlementPressureKind::WaterAccess,
@@ -2161,8 +2160,7 @@ fn choose_site_for_intent(
         }
         let spread = well_spread_adjustment(build_kind, tile, chunk_map, maps);
         candidates.push((
-            site_bonus(brain, district, tile) - cheb(tile, faction.home_tile) as f32 * 0.2
-                + spread,
+            site_bonus(brain, district, tile) - cheb(tile, faction.home_tile) as f32 * 0.2 + spread,
             tile,
         ));
     }
@@ -3203,9 +3201,12 @@ mod tests {
     }
 
     fn flat_chunk(kind: crate::world::tile::TileKind) -> crate::world::chunk::Chunk {
-        let surface_z = Box::new([[0i8; crate::world::chunk::CHUNK_SIZE]; crate::world::chunk::CHUNK_SIZE]);
-        let surface_kind = Box::new([[kind; crate::world::chunk::CHUNK_SIZE]; crate::world::chunk::CHUNK_SIZE]);
-        let surface_fertility = Box::new([[8u8; crate::world::chunk::CHUNK_SIZE]; crate::world::chunk::CHUNK_SIZE]);
+        let surface_z =
+            Box::new([[0i8; crate::world::chunk::CHUNK_SIZE]; crate::world::chunk::CHUNK_SIZE]);
+        let surface_kind =
+            Box::new([[kind; crate::world::chunk::CHUNK_SIZE]; crate::world::chunk::CHUNK_SIZE]);
+        let surface_fertility =
+            Box::new([[8u8; crate::world::chunk::CHUNK_SIZE]; crate::world::chunk::CHUNK_SIZE]);
         crate::world::chunk::Chunk::new(surface_z, surface_kind, surface_fertility)
     }
 
@@ -3295,9 +3296,7 @@ mod tests {
         write_river_at(&mut map, &r);
 
         let segments = build_road_network(&faction, &brain, &map, &[]);
-        let any_crossing = segments
-            .iter()
-            .any(|seg| trace_crosses_river(&map, *seg));
+        let any_crossing = segments.iter().any(|seg| trace_crosses_river(&map, *seg));
         assert!(
             any_crossing,
             "post-bridge planner should retain crossings so the emitter can bridge them"

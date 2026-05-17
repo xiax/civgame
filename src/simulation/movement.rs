@@ -9,8 +9,8 @@ use super::person::{AiState, Person, PersonAI, UNEMPLOYED_TASK_KIND};
 use super::plants::Plant;
 use super::schedule::{BucketSlot, SimClock};
 use super::tasks::{task_interacts_from_adjacent, TaskKind};
-use super::typed_task::ActionQueue;
 use super::technology::HORSEBACK_RIDING;
+use super::typed_task::ActionQueue;
 use crate::pathfinding::path_request::{
     cooldown_for_streak, FollowStatus, PathDebugFlags, PathFollow, PathKind, PathRequestQueue,
     DEFAULT_PATH_BUDGET,
@@ -179,7 +179,8 @@ pub fn movement_system(
             // Interaction tasks: switch to Working when ≤1 tile (Chebyshev) from dest_tile
             // and within the correct Z range (same level or one above — agents can reach
             // down but not up through a ceiling).
-            if ai.state == AiState::Seeking && task_interacts_from_adjacent(aq.current_task_kind()) {
+            if ai.state == AiState::Seeking && task_interacts_from_adjacent(aq.current_task_kind())
+            {
                 let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
                 let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
                 let cheb = (cur_tx - ai.dest_tile.0 as i32)
@@ -258,7 +259,13 @@ pub fn movement_system(
                             < cooldown_for_streak(pf.last_fail_streak)
                     {
                         path_diag.path_request_skipped_cooldown += 1;
-                        release_to_idle(&mut ai, &mut pf, &mut aq, &mut transform, (cur_tx, cur_ty));
+                        release_to_idle(
+                            &mut ai,
+                            &mut pf,
+                            &mut aq,
+                            &mut transform,
+                            (cur_tx, cur_ty),
+                        );
                         continue;
                     }
                     path_queue.enqueue(
@@ -315,7 +322,13 @@ pub fn movement_system(
                                 < cooldown_for_streak(pf.last_fail_streak)
                         {
                             path_diag.path_request_skipped_cooldown += 1;
-                            release_to_idle(&mut ai, &mut pf, &mut aq, &mut transform, (cur_tx, cur_ty));
+                            release_to_idle(
+                                &mut ai,
+                                &mut pf,
+                                &mut aq,
+                                &mut transform,
+                                (cur_tx, cur_ty),
+                            );
                             continue;
                         }
                         path_queue.enqueue(
@@ -520,7 +533,13 @@ pub fn movement_system(
         } else {
             let prev_tx = (pos.x / TILE_SIZE).floor() as i32;
             let prev_ty = (pos.y / TILE_SIZE).floor() as i32;
-            release_to_idle(&mut ai, &mut pf, &mut aq, &mut transform, (prev_tx, prev_ty));
+            release_to_idle(
+                &mut ai,
+                &mut pf,
+                &mut aq,
+                &mut transform,
+                (prev_tx, prev_ty),
+            );
             continue;
         }
 

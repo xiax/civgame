@@ -896,10 +896,7 @@ mod smoke {
         // Register member count (spawn_person only bumps the clock bucket;
         // the appointment system gates on `faction.member_count`).
         {
-            let mut reg = sim
-                .app
-                .world_mut()
-                .resource_mut::<FactionRegistry>();
+            let mut reg = sim.app.world_mut().resource_mut::<FactionRegistry>();
             for _ in 0..4 {
                 reg.add_member(sim.player_faction_id);
             }
@@ -914,10 +911,7 @@ mod smoke {
         sim.seed_faction_food(sim.player_faction_id, 4 * 64);
 
         // Pin the chief deterministically.
-        sim.app
-            .world_mut()
-            .entity_mut(chief)
-            .insert(FactionChief);
+        sim.app.world_mut().entity_mut(chief).insert(FactionChief);
         sim.app
             .world_mut()
             .entity_mut(member)
@@ -952,12 +946,7 @@ mod smoke {
         // Re-assert the knowledge gap each-tick teaching/gossip can't
         // close it within the window for this isolated 2-person band,
         // but guard anyway: the member must still be the only coverer.
-        let prof = sim
-            .app
-            .world()
-            .get::<Profession>(member)
-            .copied()
-            .unwrap();
+        let prof = sim.app.world().get::<Profession>(member).copied().unwrap();
         assert_eq!(
             prof,
             Profession::Architect,
@@ -1074,11 +1063,7 @@ mod smoke {
         let wage = 12.0_f32;
         let purchase_pool = 30.0_f32; // max_unit_price * target
         {
-            let mut econ = sim
-                .app
-                .world_mut()
-                .get_mut::<EconomicAgent>(chief)
-                .unwrap();
+            let mut econ = sim.app.world_mut().get_mut::<EconomicAgent>(chief).unwrap();
             econ.currency -= wage + purchase_pool;
         }
         let escrow_entity = sim
@@ -6165,7 +6150,6 @@ mod baseline_behaviour {
         );
     }
 
-
     /// Phase 5a-ii regression: when goal flips to Sleep, `htn_dispatch_system`
     /// (which since Phase 5a-ii owns the Sleep dispatch path that used to
     /// live in `goal_dispatch_system`) consults the `MethodRegistry`,
@@ -6313,8 +6297,7 @@ mod baseline_behaviour {
         let ai = person_ai(&sim.app, person);
         let task = person_task(&sim.app, person);
         assert!(
-            ai.state == AiState::Sleeping
-                && task == Task::Sleep { bed: None },
+            ai.state == AiState::Sleeping && task == Task::Sleep { bed: None },
             "agent should re-cohere onto Sleep, got state={:?} task={:?}",
             ai.state,
             task
@@ -6925,9 +6908,10 @@ mod baseline_behaviour {
             "expected exactly one queued task (DepositToFactionStorage) behind Gather"
         );
         match aq.peek_next() {
-            Some(Task::DepositToFactionStorage {resource_id,
-                    target_faction_id: None,
-                }) => {
+            Some(Task::DepositToFactionStorage {
+                resource_id,
+                target_faction_id: None,
+            }) => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::wood(),
@@ -7179,9 +7163,10 @@ mod baseline_behaviour {
             "expected exactly one queued task (DepositToFactionStorage) behind Scavenge"
         );
         match aq.peek_next() {
-            Some(Task::DepositToFactionStorage {resource_id,
-                    target_faction_id: None,
-                }) => {
+            Some(Task::DepositToFactionStorage {
+                resource_id,
+                target_faction_id: None,
+            }) => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::wood(),
@@ -7480,9 +7465,10 @@ mod baseline_behaviour {
         );
         assert_eq!(
             aq.peek_next(),
-            Some(Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::fruit(),
-                    target_faction_id: None,
-                }),
+            Some(Task::DepositToFactionStorage {
+                resource_id: crate::economy::core_ids::fruit(),
+                target_faction_id: None,
+            }),
             "the trailing DepositToFactionStorage{{Fruit}} should be queued \
              behind the Scavenge head"
         );
@@ -8069,9 +8055,10 @@ mod baseline_behaviour {
             ),
         }
         match aq.peek_next() {
-            Some(Task::DepositToFactionStorage {resource_id,
-                    target_faction_id: None,
-                }) => {
+            Some(Task::DepositToFactionStorage {
+                resource_id,
+                target_faction_id: None,
+            }) => {
                 assert_eq!(
                     resource_id, skin_id,
                     "queued DepositToFactionStorage should carry the Skin resource"
@@ -9173,9 +9160,10 @@ mod baseline_behaviour {
             "expected exactly one queued task (DepositToFactionStorage) behind WorkOnCraftOrder"
         );
         match aq.peek_next() {
-            Some(Task::DepositToFactionStorage {resource_id,
-                    target_faction_id: None,
-                }) => {
+            Some(Task::DepositToFactionStorage {
+                resource_id,
+                target_faction_id: None,
+            }) => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::weapon(),
@@ -9522,9 +9510,10 @@ mod baseline_behaviour {
             "expected one queued task (DepositToFactionStorage) behind Gather"
         );
         match aq.peek_next() {
-            Some(Task::DepositToFactionStorage {resource_id,
-                    target_faction_id: None,
-                }) => {
+            Some(Task::DepositToFactionStorage {
+                resource_id,
+                target_faction_id: None,
+            }) => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::grain(),
@@ -13494,10 +13483,7 @@ mod military_formation {
         let anchor = (20, 0);
         sim.app.world_mut().send_event(PlayerCommandEvent {
             actors: units.clone(),
-            command: PlayerCommand::MilitaryMove {
-                tile: anchor,
-                z: 0,
-            },
+            command: PlayerCommand::MilitaryMove { tile: anchor, z: 0 },
         });
 
         // Tick 1: drain + expand. Tick 2: dispatch flips Pending → Active
@@ -13509,11 +13495,7 @@ mod military_formation {
         let mut slot_indices: AHashSet<u8> = AHashSet::new();
         for &u in &units {
             let dest = agent_dest_tile(&sim.app, u);
-            assert!(
-                dests.insert(dest),
-                "two units share dest_tile {:?}",
-                dest
-            );
+            assert!(dests.insert(dest), "two units share dest_tile {:?}", dest);
             let d = (dest.0 - anchor.0).abs().max((dest.1 - anchor.1).abs());
             assert!(
                 d <= 2,
@@ -13551,10 +13533,7 @@ mod military_formation {
         let anchor = (12, 0);
         sim.app.world_mut().send_event(PlayerCommandEvent {
             actors: units.clone(),
-            command: PlayerCommand::MilitaryMove {
-                tile: anchor,
-                z: 0,
-            },
+            command: PlayerCommand::MilitaryMove { tile: anchor, z: 0 },
         });
 
         // Snapshot each unit's slot tile from the freshly-dispatched
@@ -13603,10 +13582,7 @@ mod military_formation {
         let anchor = (8, 3);
         sim.app.world_mut().send_event(PlayerCommandEvent {
             actors: vec![unit],
-            command: PlayerCommand::MilitaryMove {
-                tile: anchor,
-                z: 0,
-            },
+            command: PlayerCommand::MilitaryMove { tile: anchor, z: 0 },
         });
         sim.tick_n(2);
 
@@ -13735,10 +13711,7 @@ mod military_formation {
 
         sim.app.world_mut().send_event(PlayerCommandEvent {
             actors: units.clone(),
-            command: PlayerCommand::MilitaryMove {
-                tile: anchor,
-                z: 0,
-            },
+            command: PlayerCommand::MilitaryMove { tile: anchor, z: 0 },
         });
         sim.tick_n(2);
 
@@ -13756,10 +13729,7 @@ mod military_formation {
             match status {
                 Some(CommandStatus::Failed(CommandFailure::Unreachable)) => {}
                 None => {} // reaped → also acceptable
-                other => panic!(
-                    "expected Failed(Unreachable) (or reaped), got {:?}",
-                    other
-                ),
+                other => panic!("expected Failed(Unreachable) (or reaped), got {:?}", other),
             }
             // Formation slot should never have been left behind.
             assert!(

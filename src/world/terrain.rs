@@ -276,7 +276,9 @@ fn local_detail_amp(biome: Biome) -> f32 {
         // so a "lowland" on the world map doesn't render as a plateau.
         Biome::Ocean | Biome::Wetland | Biome::Desert | Biome::Steppe => 0.07,
         // Generic vegetated belts: moderate rolling terrain.
-        Biome::Grassland | Biome::Temperate | Biome::Taiga | Biome::Tropical | Biome::Tundra => 0.10,
+        Biome::Grassland | Biome::Temperate | Biome::Taiga | Biome::Tropical | Biome::Tundra => {
+            0.10
+        }
         // Mountain ridges and badland uplift: more relief to read as rugged.
         Biome::Mountain | Biome::Badlands => 0.15,
     }

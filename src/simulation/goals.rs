@@ -16,6 +16,7 @@ use crate::simulation::technology::{
     BOW_AND_ARROW, BRONZE_WEAPONS, COPPER_TOOLS, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING,
     HORSE_TAMING, HUNTING_SPEAR, LOOM_WEAVING,
 };
+use crate::simulation::typed_task::ActionQueue;
 use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
 use crate::world::seasons::{Calendar, Season};
 use crate::world::terrain::TILE_SIZE;
@@ -54,6 +55,9 @@ const SLEEP_TIRED: f32 = 180.0;
 const SLEEP_WORK_CEILING: f32 = 170.0;
 /// Either-or threshold for "this agent is too needy to socialise/play."
 const NEED_BUSY: f32 = 100.0;
+/// Maximum uninterrupted ticks for long non-cargo work before the worker
+/// yields at a safe boundary and lets maintenance goals re-evaluate.
+pub const MAINTENANCE_WORK_SLICE_TICKS: u8 = 120;
 
 /// Bundles the storage-reachability lookup resources so `goal_update_system`
 /// stays under Bevy's 16-param limit.
@@ -200,6 +204,25 @@ pub enum AgentGoal {
     /// Decomposes via HTN into either an in-place sip from inventory
     /// clean_water or a walk-and-drink at an adjacent fresh-water tile.
     Drink = 24,
+}
+
+/// Survival-maintenance goals are allowed to run between durable work episodes
+/// without releasing obligations such as `JobClaim` or `ScoutAssignment`.
+#[inline]
+pub fn is_maintenance_goal(goal: AgentGoal) -> bool {
+    matches!(
+        goal,
+        AgentGoal::Survive | AgentGoal::Drink | AgentGoal::Sleep | AgentGoal::SeekCare
+    )
+}
+
+/// Cooperative yield for long non-cargo work. The current episode is ended at
+/// a safe boundary, the rest of the chain is dropped, and `active_method` is
+/// cleared so the HTN history does not record a fake full success.
+pub fn yield_for_maintenance_boundary(ai: &mut PersonAI, aq: &mut ActionQueue) {
+    ai.active_method = None;
+    ai.target_entity = None;
+    aq.cancel_chain(ai);
 }
 
 /// True if `goal` is permitted for a member of a faction whose
@@ -473,6 +496,39 @@ pub struct GoalValidationQueries<'w, 's> {
     pub packing_duty_q: Query<'w, 's, (), With<crate::simulation::nomad_pack_labor::PackingDuty>>,
 }
 
+fn maintenance_beats(
+    candidate: crate::simulation::goal_scorers::GoalScore,
+    current: crate::simulation::goal_scorers::GoalScore,
+) -> bool {
+    match candidate.class.cmp(&current.class) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => candidate.score > current.score,
+    }
+}
+
+fn best_maintenance_score(
+    registry: &crate::simulation::goal_scorers::GoalScorerRegistry,
+    ctx: &crate::simulation::goal_scorers::GoalScoringContext,
+) -> Option<crate::simulation::goal_scorers::GoalScorerPick> {
+    let mut best: Option<crate::simulation::goal_scorers::GoalScorerPick> = None;
+    for scorer in &registry.scorers {
+        let Some(candidate) = scorer.score(ctx) else {
+            continue;
+        };
+        if !is_maintenance_goal(candidate.goal) {
+            continue;
+        }
+        if best.map_or(true, |b| maintenance_beats(candidate, b.score)) {
+            best = Some(crate::simulation::goal_scorers::GoalScorerPick {
+                score: candidate,
+                scorer_name: scorer.name(),
+            });
+        }
+    }
+    best
+}
+
 pub fn goal_update_system(
     mut commands: Commands,
     clock: Res<SimClock>,
@@ -594,10 +650,11 @@ pub fn goal_update_system(
             }
             continue;
         }
-        // Workers with an active job claim are owned by job_goal_lock_system (Economy).
-        // Do not override their goal here or the ClaimedHaul/ClaimedBuild plans
-        // will never be reached by plan_execution_system (Sequential).
-        if claim_opt.is_some() {
+        // Durable obligations (claimed jobs and scout assignments) keep their
+        // current work episode intact. When they become idle, the block below
+        // admits only survival-maintenance goals before resuming the obligation.
+        let durable_assignment = claim_opt.is_some() || scout_assignment.is_some();
+        if durable_assignment && aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
         // Unemployed agents need immediate goal re-evaluation (e.g. just finished a deposit).
@@ -687,6 +744,116 @@ pub fn goal_update_system(
             }
         }
 
+        if durable_assignment {
+            let maintenance_pick =
+                if let Some(faction_data) = registry.factions.get(&member.faction_id) {
+                    let agent_tile = (
+                        (transform.translation.x / TILE_SIZE).floor() as i32,
+                        (transform.translation.y / TILE_SIZE).floor() as i32,
+                    );
+                    let disposition = scorer_inputs
+                        .disposition_q
+                        .get(entity)
+                        .copied()
+                        .unwrap_or_default();
+                    let skills_default = crate::simulation::skills::Skills::default();
+                    let skills_ref = scorer_inputs
+                        .skills_q
+                        .get(entity)
+                        .unwrap_or(&skills_default);
+                    let profession = scorer_inputs
+                        .profession_q
+                        .get(entity)
+                        .copied()
+                        .unwrap_or(crate::simulation::person::Profession::None);
+                    let faction_has_food =
+                        member.faction_id != SOLO && registry.food_stock(member.faction_id) >= 1.0;
+                    let is_starving = needs.hunger > HUNGER_STARVING && agent.total_food() == 0;
+                    let ctx = crate::simulation::goal_scorers::GoalScoringContext {
+                        agent: entity,
+                        agent_tile,
+                        now: clock.tick,
+                        needs,
+                        profession,
+                        skills: skills_ref,
+                        disposition,
+                        economic_agent: agent,
+                        faction_member: member,
+                        faction: faction_data,
+                        board: &scorer_inputs.board,
+                        opportunities: Some(&scorer_inputs.opportunities),
+                        is_starving,
+                        faction_has_food,
+                        can_return_camp: false,
+                        prioritize_food: false,
+                        fallback_gather: AgentGoal::GatherFood,
+                        fallback_gather_reason: "General Gathering (Food)",
+                        has_horse_taming: false,
+                        has_personal_build_site: false,
+                        should_craft: false,
+                        injury: scorer_inputs.injury_q.get(entity).ok().copied(),
+                        faction_has_injured: faction_has_injured.contains(&member.faction_id),
+                        time_of_day_bonus,
+                        age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
+                    };
+                    scorer_inputs.metrics.goal_evaluations =
+                        scorer_inputs.metrics.goal_evaluations.saturating_add(1);
+                    scorer_inputs.metrics.scorer_evaluations = scorer_inputs
+                        .metrics
+                        .scorer_evaluations
+                        .saturating_add(scorer_inputs.registry.scorers.len() as u64);
+                    best_maintenance_score(&scorer_inputs.registry, &ctx)
+                } else {
+                    None
+                };
+
+            if let Some(best_pick) = maintenance_pick {
+                if *goal != best_pick.score.goal {
+                    *goal = best_pick.score.goal;
+                    ai.state = AiState::Idle;
+                    ai.target_entity = None;
+                    target_item.0 = None;
+                    aq.cancel();
+                }
+                if let Ok(mut decision) = scorer_inputs.decision_q.get_mut(entity) {
+                    decision.record_score(best_pick.score, best_pick.scorer_name, clock.tick);
+                }
+                scorer_inputs.metrics.record_goal_pick(best_pick.score.goal);
+                if let Some(mut r) = reason_opt {
+                    r.0 = best_pick.score.reason;
+                } else {
+                    commands
+                        .entity(entity)
+                        .insert(GoalReason(best_pick.score.reason));
+                }
+                continue;
+            }
+
+            let (resume_goal, resume_reason) = if let Some(claim) = claim_opt {
+                let goal = scorer_inputs
+                    .board
+                    .get(claim.job_id)
+                    .map(crate::simulation::jobs::posting_goal)
+                    .unwrap_or_else(|| claim.kind.to_goal());
+                (goal, "Resuming Claimed Job")
+            } else {
+                (AgentGoal::Scout, "Scouting")
+            };
+            if *goal != resume_goal {
+                *goal = resume_goal;
+                ai.state = AiState::Idle;
+                ai.target_entity = None;
+                target_item.0 = None;
+                aq.cancel();
+            }
+            if let Some(mut r) = reason_opt {
+                r.0 = resume_reason;
+            } else {
+                commands.entity(entity).insert(GoalReason(resume_reason));
+            }
+            continue;
+        }
+
         // Rescue override: if a distress responder still has a live attacker target,
         // hold the Rescue goal until they engage / it dies / or it times out.
         if let Ok(rt) = validation.rescue_q.get(entity) {
@@ -709,26 +876,6 @@ pub fn goal_update_system(
                 // agent re-evaluates a normal goal next tick.
                 commands.entity(entity).remove::<RescueTarget>();
             }
-        }
-
-        // Phase D: active scout assignment. Hold AgentGoal::Scout so
-        // the dispatcher keeps routing the agent toward their quadrant
-        // tile. Survive-tier needs / under-raid / rescue above already
-        // preempt; everything else defers until the survey window
-        // closes and `nomad_survey_completion_system` strips the
-        // marker.
-        if scout_assignment.is_some() {
-            if *goal != AgentGoal::Scout {
-                *goal = AgentGoal::Scout;
-                ai.state = AiState::Idle;
-                aq.cancel();
-            }
-            if let Some(mut r) = reason_opt {
-                r.0 = "Scouting";
-            } else {
-                commands.entity(entity).insert(GoalReason("Scouting"));
-            }
-            continue;
         }
 
         // P1: active migration. While the band is moving, hold the
@@ -1545,11 +1692,10 @@ pub fn record_abandoned_method_system(
 ///   succeeded), so an agent that keeps starting tasks but losing them
 ///   to target races / routing failures gets released too.
 ///
-/// `Survive` / `Sleep` are exempt: a hungry agent who can't find food
-/// via methods AND can't make Explore-fallback work would otherwise
-/// be cooldown'd out of trying for food and starve. Same for sleep.
-/// The terminal Explore fallback (Phase 3) is the design's relief
-/// valve for chronic Survive/Sleep failure.
+/// Maintenance goals are exempt: a hungry/thirsty/injured/tired agent
+/// who can't complete the current method would otherwise be cooldown'd
+/// out of trying to stay alive. The terminal Explore fallback (Phase 3)
+/// is the design's relief valve for chronic food/sleep-style failure.
 ///
 /// Cadence: every `TICKS_PER_DAY/4` (~3 min); threshold 3 failures;
 /// cooldown duration matches `MethodHistory` TTL so bias and cooldown
@@ -1577,8 +1723,8 @@ pub fn chronic_failure_release_system(
     const COOLDOWN_DURATION_TICKS: u64 = METHOD_HISTORY_TTL_TICKS;
 
     for (entity, goal, history, claim_opt, cooldown_opt) in query.iter_mut() {
-        // Survive / Sleep exempt — see system-level doc.
-        if matches!(*goal, AgentGoal::Survive | AgentGoal::Sleep) {
+        // Maintenance exempt — see system-level doc.
+        if is_maintenance_goal(*goal) {
             continue;
         }
         let failures: u32 = history
@@ -1634,5 +1780,52 @@ pub fn chronic_failure_release_system(
             // immediately.
             force_reeval.0.insert(entity);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::economy::resource_catalog::ResourceId;
+    use crate::simulation::htn::MethodId;
+    use crate::simulation::typed_task::Task;
+
+    #[test]
+    fn maintenance_goal_filter_is_survival_only() {
+        assert!(is_maintenance_goal(AgentGoal::Survive));
+        assert!(is_maintenance_goal(AgentGoal::Drink));
+        assert!(is_maintenance_goal(AgentGoal::Sleep));
+        assert!(is_maintenance_goal(AgentGoal::SeekCare));
+        assert!(!is_maintenance_goal(AgentGoal::Socialize));
+        assert!(!is_maintenance_goal(AgentGoal::Play));
+        assert!(!is_maintenance_goal(AgentGoal::Build));
+        assert!(!is_maintenance_goal(AgentGoal::Scout));
+    }
+
+    #[test]
+    fn maintenance_boundary_clears_method_without_promoting_tail() {
+        let order = Entity::from_raw(10);
+        let mut ai = PersonAI {
+            state: AiState::Working,
+            work_progress: MAINTENANCE_WORK_SLICE_TICKS,
+            target_entity: Some(order),
+            active_method: Some(MethodId::WORK_ON_SATISFIED_CRAFT_ORDER),
+            ..Default::default()
+        };
+        let mut aq = ActionQueue::default();
+        aq.dispatch(Task::WorkOnCraftOrder { order });
+        assert!(aq.enqueue(Task::DepositToFactionStorage {
+            resource_id: ResourceId(1),
+            target_faction_id: None,
+        }));
+
+        yield_for_maintenance_boundary(&mut ai, &mut aq);
+
+        assert!(matches!(ai.state, AiState::Idle));
+        assert_eq!(ai.work_progress, 0);
+        assert_eq!(ai.target_entity, None);
+        assert_eq!(ai.active_method, None);
+        assert_eq!(aq.current_task_kind(), UNEMPLOYED_TASK_KIND);
+        assert!(aq.queued_is_empty());
     }
 }

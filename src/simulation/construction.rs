@@ -5,6 +5,7 @@ use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::faction::{
     FactionChief, FactionData, FactionMember, FactionRegistry, FactionTechs, StorageTileMap, SOLO,
 };
+use crate::simulation::goals::{yield_for_maintenance_boundary, MAINTENANCE_WORK_SLICE_TICKS};
 use crate::simulation::jobs::{
     record_progress_filtered, release_claimant, ClaimTarget, HaulSource, JobBoard, JobClaim,
     JobCompletedEvent, JobKind, JobProgress,
@@ -1122,10 +1123,7 @@ impl MaterialAvailabilityView {
 
     /// Per-slot `HaulSource` for Phase 3c: `Market` only when the resource is
     /// `Scarce` (not stored, not gatherable, affordably procurable).
-    pub fn haul_source_for(
-        &self,
-        rid: crate::economy::resource_catalog::ResourceId,
-    ) -> HaulSource {
+    pub fn haul_source_for(&self, rid: crate::economy::resource_catalog::ResourceId) -> HaulSource {
         match self.by_rid.get(&rid) {
             Some(a) if a.scarcity == Scarcity::Scarce => HaulSource::Market {
                 max_unit_price: a.market_price,
@@ -1150,9 +1148,15 @@ pub fn classify_resource(
     raw_gatherable: bool,
     need: u32,
 ) -> ResourceAvailability {
-    let price = if market_price > 0.0 { market_price } else { 1.0 };
+    let price = if market_price > 0.0 {
+        market_price
+    } else {
+        1.0
+    };
     let affordable_qty = if treasury_budget > 0.0 {
-        ((treasury_budget / price).floor()).max(0.0).min(market_stock.max(0.0)) as u32
+        ((treasury_budget / price).floor())
+            .max(0.0)
+            .min(market_stock.max(0.0)) as u32
     } else {
         0
     };
@@ -1474,10 +1478,7 @@ pub fn poster_can_post_intent(intent: BuildIntent, learned: &FactionTechs) -> bo
 /// to decide whether a settlement needs an architect — it does only when a
 /// resident knows a construction tech the chief hasn't personally Learned.
 pub fn construction_relevant_techs() -> Vec<TechId> {
-    let mut out: Vec<TechId> = build_recipes()
-        .iter()
-        .filter_map(|r| r.tech_gate)
-        .collect();
+    let mut out: Vec<TechId> = build_recipes().iter().filter_map(|r| r.tech_gate).collect();
     // Tier-driving techs absorbed by the `best_*_for` ladders (not a recipe
     // `tech_gate`, but still construction knowledge a chief may lack).
     out.extend_from_slice(&[
@@ -1548,10 +1549,8 @@ impl PosterCapability {
 #[derive(Resource, Default)]
 pub struct ConstructionPosterPool {
     /// Per-settlement resident posters (chief if resident + architects).
-    pub by_settlement: AHashMap<
-        (u32, crate::simulation::settlement::SettlementId),
-        Vec<PosterCapability>,
-    >,
+    pub by_settlement:
+        AHashMap<(u32, crate::simulation::settlement::SettlementId), Vec<PosterCapability>>,
     /// Faction chief fallback for factions whose chief isn't pinned to a
     /// specific settlement (single-settlement factions, camps).
     pub chief_by_faction: AHashMap<u32, PosterCapability>,
@@ -1658,8 +1657,7 @@ pub fn refresh_construction_poster_pool_system(
 
     // Index every person once so the chief can be resolved by entity id
     // regardless of whether the `FactionChief` marker has been stamped.
-    let mut by_entity: AHashMap<Entity, (FactionTechs, u32, u32, (i32, i32))> =
-        AHashMap::new();
+    let mut by_entity: AHashMap<Entity, (FactionTechs, u32, u32, (i32, i32))> = AHashMap::new();
     let mut architects: Vec<(Entity, u32, FactionTechs, u32, u32, (i32, i32))> = Vec::new();
     for (entity, member, prof, knowledge, skills, xf) in person_q.iter() {
         if member.faction_id == SOLO {
@@ -1671,14 +1669,7 @@ pub fn refresh_construction_poster_pool_system(
         let tile = crate::world::terrain::world_to_tile(xf.translation.truncate());
         by_entity.insert(entity, (learned, building, social, tile));
         if *prof == Profession::Architect {
-            architects.push((
-                entity,
-                member.faction_id,
-                learned,
-                building,
-                social,
-                tile,
-            ));
+            architects.push((entity, member.faction_id, learned, building, social, tile));
         }
     }
 
@@ -1797,10 +1788,7 @@ pub fn recipe_for(kind: BuildSiteKind) -> &'static BuildRecipe {
 /// passable + non-water-like. Used by Bridge deconstruct so refunds drop on
 /// solid ground, not the restored River tile (where they'd be unreachable).
 /// Returns `None` only if the chunk_map has no passable land within the cap.
-pub fn nearest_passable_bank(
-    chunk_map: &ChunkMap,
-    origin: (i32, i32),
-) -> Option<(i32, i32)> {
+pub fn nearest_passable_bank(chunk_map: &ChunkMap, origin: (i32, i32)) -> Option<(i32, i32)> {
     const MAX_RADIUS: i32 = 8;
     for r in 1..=MAX_RADIUS {
         for dx in -r..=r {
@@ -2815,7 +2803,8 @@ fn plan_building(
                 continue;
             }
             let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
-            let mut bp = Blueprint::new(faction_id, None, *kind, *tile, target_z).with_author(author);
+            let mut bp =
+                Blueprint::new(faction_id, None, *kind, *tile, target_z).with_author(author);
             if let Some(e) = edge {
                 bp = bp.with_door_dir(*e);
             }
@@ -3450,33 +3439,28 @@ pub fn chief_directive_system(
         // `PersonKnowledge` (test fixtures, SOLO-ish) have an empty pool;
         // fall back to the legacy chief-knowledge author so existing
         // headless tests keep emitting blueprints.
-        let author = match poster_pool.select_poster_for_intent(
-            faction_id,
-            settlement_id,
-            best.intent,
-        ) {
-            Some(cap) => Some(cap.author()),
-            None => {
-                let chief_fallback = faction.chief_entity.and_then(|chief| {
-                    chief_knowledge_q
-                        .get(chief)
-                        .ok()
-                        .map(|k| BlueprintAuthor::new(chief, k.learned_bitset()))
-                });
-                match chief_fallback {
-                    // Chief exists but pool had no entry (no settlement
-                    // yet at tick 0) — author from chief knowledge if the
-                    // chief can actually post this intent; else skip.
-                    Some(a) if poster_can_post_intent(best.intent, &a.design_techs) => {
-                        Some(a)
+        let author =
+            match poster_pool.select_poster_for_intent(faction_id, settlement_id, best.intent) {
+                Some(cap) => Some(cap.author()),
+                None => {
+                    let chief_fallback = faction.chief_entity.and_then(|chief| {
+                        chief_knowledge_q
+                            .get(chief)
+                            .ok()
+                            .map(|k| BlueprintAuthor::new(chief, k.learned_bitset()))
+                    });
+                    match chief_fallback {
+                        // Chief exists but pool had no entry (no settlement
+                        // yet at tick 0) — author from chief knowledge if the
+                        // chief can actually post this intent; else skip.
+                        Some(a) if poster_can_post_intent(best.intent, &a.design_techs) => Some(a),
+                        Some(_) => continue,
+                        // No chief knowledge at all (pure fixture faction):
+                        // emit author-less so legacy behaviour is preserved.
+                        None => None,
                     }
-                    Some(_) => continue,
-                    // No chief knowledge at all (pure fixture faction):
-                    // emit author-less so legacy behaviour is preserved.
-                    None => None,
                 }
-            }
-        };
+            };
 
         spawn_intent(
             &mut commands,
@@ -3669,10 +3653,9 @@ fn generate_candidates(
         // deterministic hearth offsets directly so even the very first fire
         // lands at the proper distance from home rather than adjacent to it.
         if tile_opt.is_none() && !techs.has(PERM_SETTLEMENT) && plan.is_none() {
-            let hearths =
-                crate::simulation::settlement::paleolithic_hearth_positions_river_aware(
-                    chunk_map, faction_id, home, members,
-                );
+            let hearths = crate::simulation::settlement::paleolithic_hearth_positions_river_aware(
+                chunk_map, faction_id, home, members,
+            );
             'outer: for (hx, hy) in hearths {
                 for dy in -1i32..=1 {
                     for dx in -1i32..=1 {
@@ -5582,6 +5565,10 @@ pub fn construction_system(
     // Workers waiting at an unsatisfied bp — clear their stale work_progress
     // counter (Fix 5). Pass 3 zeroes these.
     let mut work_progress_resets: Vec<Entity> = Vec::new();
+    // Workers who made real build progress on an unfinished blueprint. Pass 3
+    // yields them after a bounded slice so maintenance can run before they
+    // resume the same preserved claim.
+    let mut slice_candidates: Vec<Entity> = Vec::new();
     // (agent_entity, good, qty_to_remove)
     let mut good_removals: Vec<(Entity, crate::economy::resource_catalog::ResourceId, u32)> =
         Vec::new();
@@ -5707,6 +5694,9 @@ pub fn construction_system(
                     .saturating_add(workers.len() as u8)
                     .min(recipe.work_ticks);
                 xp_grants.extend(workers.iter().copied());
+                if bp.build_progress < recipe.work_ticks {
+                    slice_candidates.extend(workers.iter().copied());
+                }
             }
         } else if let Some(workers) = bp_workers.get(&bp_entity) {
             // Fix 5: workers on-site at an unsatisfied bp accumulate dead
@@ -6153,9 +6143,7 @@ pub fn construction_system(
                     // in the current build path), then rewrite to Bridge.
                     // The downstream `TileChangedEvent` triggers chunk-graph
                     // rebuild so pathfinding picks up the new road-speed cell.
-                    let prior = chunk_map
-                        .tile_kind_at(tx, ty)
-                        .unwrap_or(TileKind::River);
+                    let prior = chunk_map.tile_kind_at(tx, ty).unwrap_or(TileKind::River);
                     let surf_z = bp.target_z as i32;
                     chunk_map.set_tile(
                         tx,
@@ -6223,9 +6211,7 @@ pub fn construction_system(
                 if let Some(faction) = registry.factions.get_mut(&bp.faction_id) {
                     let now = clock.tick as u32;
                     for tech in gating_techs_for_completed_blueprint(&bp) {
-                        crate::simulation::technology_adoption::record_tech_use(
-                            faction, tech, now,
-                        );
+                        crate::simulation::technology_adoption::record_tech_use(faction, tech, now);
                     }
                 }
             }
@@ -6319,6 +6305,10 @@ pub fn construction_system(
             ai.target_entity = None;
             ai.work_progress = 0;
             aq.advance();
+        } else if slice_candidates.contains(&entity)
+            && ai.work_progress >= MAINTENANCE_WORK_SLICE_TICKS
+        {
+            yield_for_maintenance_boundary(&mut ai, &mut aq);
         }
     }
 }
@@ -6944,10 +6934,12 @@ pub fn deconstruct_system(
 
             if let Some(storage_tile) = storage {
                 let rid = first_refund_rid.unwrap_or_else(crate::economy::core_ids::wood);
-                aq.dispatch(crate::simulation::typed_task::Task::DepositToFactionStorage {
-                    resource_id: rid,
-                    target_faction_id: None,
-                });
+                aq.dispatch(
+                    crate::simulation::typed_task::Task::DepositToFactionStorage {
+                        resource_id: rid,
+                        target_faction_id: None,
+                    },
+                );
                 let dispatched = assign_task_with_routing(
                     &mut ai,
                     cur_tile,
@@ -7938,10 +7930,9 @@ pub(crate) fn seed_nomadic_camp(
     era: Era,
     hearth_tier: HearthTier,
 ) {
-    let hearth_positions =
-        crate::simulation::settlement::paleolithic_hearth_positions_river_aware(
-            chunk_map, faction_id, home, members,
-        );
+    let hearth_positions = crate::simulation::settlement::paleolithic_hearth_positions_river_aware(
+        chunk_map, faction_id, home, members,
+    );
     let n_hearths = hearth_positions.len().max(1) as u32;
     // Bedroll per founder, evenly split across hearths (round up).
     let bedrolls_per_hearth = (members.max(1) + n_hearths - 1) / n_hearths;
@@ -8547,10 +8538,7 @@ mod tests {
         let bronze = SeedConstructionProfile::from_era(Era::BronzeAge);
         assert_eq!(bronze.hearth_tier, HearthTier::Lined);
         // seed_techs() must match the legacy era derivation exactly.
-        assert_eq!(
-            bronze.seed_techs().0,
-            techs_through_era(Era::BronzeAge).0
-        );
+        assert_eq!(bronze.seed_techs().0, techs_through_era(Era::BronzeAge).0);
     }
 
     #[test]

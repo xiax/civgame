@@ -482,7 +482,9 @@ fn completion_when_agent_idle(
     ai: &PersonAI,
     aq: &crate::simulation::typed_task::ActionQueue,
 ) -> Option<CommandStatus> {
-    if ai.state == crate::simulation::person::AiState::Idle && aq.current_task_kind() == UNEMPLOYED_TASK_KIND {
+    if ai.state == crate::simulation::person::AiState::Idle
+        && aq.current_task_kind() == UNEMPLOYED_TASK_KIND
+    {
         Some(CommandStatus::Completed)
     } else {
         None
@@ -813,7 +815,10 @@ fn dispatch_one(
                 .select_poster_for_kind(faction_id, settlement_id, kind)
                 .map(|cap| cap.author());
             let author_missing_but_pool_populated = resolved_author.is_none()
-                && (routing.poster_pool.chief_by_faction.contains_key(&faction_id)
+                && (routing
+                    .poster_pool
+                    .chief_by_faction
+                    .contains_key(&faction_id)
                     || settlement_id
                         .map(|sid| {
                             routing

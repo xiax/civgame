@@ -1036,9 +1036,7 @@ impl GoalScorer for FarmWorkScorer {
         // Private farming is gated on grain's `private_actors_allowed`.
         // Communal villages still fall through chief Farm postings via the
         // claim system; this scorer is the *self-directed* path.
-        let policy = ctx
-            .faction
-            .policy_for(crate::economy::core_ids::grain());
+        let policy = ctx.faction.policy_for(crate::economy::core_ids::grain());
         if !policy.private_actors_allowed {
             return None;
         }

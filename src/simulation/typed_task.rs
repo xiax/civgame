@@ -842,9 +842,7 @@ impl Task {
     }
 
     /// Convenience accessor for the BuyMaterialAtMarket variant.
-    pub fn as_buy_material_at_market(
-        &self,
-    ) -> Option<(ResourceId, u8, bevy::prelude::Entity)> {
+    pub fn as_buy_material_at_market(&self) -> Option<(ResourceId, u8, bevy::prelude::Entity)> {
         match *self {
             Task::BuyMaterialAtMarket {
                 resource_id,

@@ -99,8 +99,7 @@ impl<'w> LogicalProjector<'w> {
 pub struct CursorParams<'w, 's> {
     pub contexts: EguiContexts<'w, 's>,
     pub windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
-    pub camera_query:
-        Query<'w, 's, (&'static Camera, &'static GlobalTransform), With<Camera>>,
+    pub camera_query: Query<'w, 's, (&'static Camera, &'static GlobalTransform), With<Camera>>,
     pub view_projection: ViewProjection<'w>,
     pub chunk_map: Res<'w, ChunkMap>,
 }
@@ -136,7 +135,9 @@ impl<'w, 's> CursorParams<'w, 's> {
         let window = self.windows.get_single().ok()?;
         let (camera, cam_transform) = self.camera_query.get_single().ok()?;
         let cursor_pos = window.cursor_position()?;
-        let world_view = camera.viewport_to_world_2d(cam_transform, cursor_pos).ok()?;
+        let world_view = camera
+            .viewport_to_world_2d(cam_transform, cursor_pos)
+            .ok()?;
 
         // Tilted-mode cliff picking: for each candidate elevation z in
         // [Z_MIN, Z_MAX], compute the logical tile that would project to
@@ -177,10 +178,7 @@ impl<'w, 's> CursorParams<'w, 's> {
         let mode = *self.view_projection.mode;
         // TopDown: identity unproject onto z=0 plane, no walk needed.
         if mode == MapViewMode::TopDown {
-            return (
-                self.view_projection.unproject_tile(world_view, 0),
-                0,
-            );
+            return (self.view_projection.unproject_tile(world_view, 0), 0);
         }
         let proj = &self.view_projection.proj;
         let tx = (world_view.x / TILE_SIZE).floor() as i32;
@@ -648,7 +646,7 @@ mod tests {
         let proj = MapProjection::default();
         let day_night_z = crate::rendering::day_night::OVERLAY_Z;
         let kind_bias_max: f32 = 1.0; // entity z constants top out near 0.5
-        // Sweep a generous tile_y range and full elev range.
+                                      // Sweep a generous tile_y range and full elev range.
         for tile_y_steps in 0..200 {
             let logical_y = tile_y_steps as f32 * 1024.0; // up to ~204800 tile-units
             for &elev_z in &[

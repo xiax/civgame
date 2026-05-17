@@ -303,11 +303,8 @@ pub fn right_click_context_menu_system(
                         .get(sel_entity)
                         .ok()
                         .map(|m| {
-                            let sid =
-                                routing.settlement_map.first_for_faction(m.faction_id);
-                            routing
-                                .poster_pool
-                                .union_of_learned(m.faction_id, sid)
+                            let sid = routing.settlement_map.first_for_faction(m.faction_id);
+                            routing.poster_pool.union_of_learned(m.faction_id, sid)
                         })
                         .unwrap_or_default();
 

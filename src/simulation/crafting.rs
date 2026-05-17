@@ -5,6 +5,7 @@ use crate::economy::item::{Item, ItemMaterial, ItemQuality};
 use crate::economy::resource_catalog::ResourceId;
 use crate::simulation::construction::{GoodNeed, LoomMap, WorkbenchMap, MAX_BUILD_INPUTS};
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
+use crate::simulation::goals::{yield_for_maintenance_boundary, MAINTENANCE_WORK_SLICE_TICKS};
 use crate::simulation::jobs::{
     record_progress, JobBoard, JobClaim, JobCompletedEvent, JobKind, JobProgress,
 };
@@ -697,6 +698,10 @@ pub fn craft_order_system(
     let mut hauler_done: Vec<Entity> = Vec::new();
     let mut orphaned_agents: Vec<Entity> = Vec::new();
     let mut xp_grants: Vec<Entity> = Vec::new();
+    // Workers who advanced an unfinished order. Pass 3 yields them after a
+    // bounded slice so maintenance can run without falsely promoting the
+    // queued deposit leg.
+    let mut slice_candidates: Vec<Entity> = Vec::new();
     // (agent_entity, resource_id, qty_to_remove)
     let mut good_removals: Vec<(Entity, crate::economy::resource_catalog::ResourceId, u32)> =
         Vec::new();
@@ -764,6 +769,9 @@ pub fn craft_order_system(
                     .saturating_add(advance)
                     .min(recipe.work_ticks);
                 xp_grants.extend(workers.iter().copied());
+                if order.work_progress < recipe.work_ticks {
+                    slice_candidates.extend(workers.iter().copied());
+                }
             }
         }
 
@@ -958,6 +966,10 @@ pub fn craft_order_system(
                     aq.cancel();
                 }
             }
+        } else if slice_candidates.contains(&entity)
+            && ai.work_progress >= MAINTENANCE_WORK_SLICE_TICKS
+        {
+            yield_for_maintenance_boundary(&mut ai, &mut aq);
         }
     }
 }

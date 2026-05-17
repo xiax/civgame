@@ -413,7 +413,13 @@ fn sample_dominant_biome(globe: &Globe, mx: i32, my: i32) -> Biome {
 /// Sample globe elevation on a 4×4 grid spanning `[tx0..tx1) × [ty0..ty1)` and
 /// return `(min, max, mean)` in raw 0..255 units. Cheap (16 bilinear lookups);
 /// fed straight into the spawn-select tooltip.
-fn sample_elevation_stats(globe: &Globe, tx0: i32, ty0: i32, tx1: i32, ty1: i32) -> (f32, f32, f32) {
+fn sample_elevation_stats(
+    globe: &Globe,
+    tx0: i32,
+    ty0: i32,
+    tx1: i32,
+    ty1: i32,
+) -> (f32, f32, f32) {
     const N: i32 = 4;
     let mut mn = f32::INFINITY;
     let mut mx = f32::NEG_INFINITY;

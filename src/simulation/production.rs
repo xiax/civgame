@@ -172,10 +172,8 @@ pub fn production_system(
                         //   3. unhoused → Person
                         // Wild reseed (plants.rs:overripe) leaves no LandClaim → Public.
                         if let Some(plant_entity) = spawned {
-                            let on_farm_job = matches!(
-                                claim_opt.map(|c| c.kind),
-                                Some(JobKind::Farm),
-                            );
+                            let on_farm_job =
+                                matches!(claim_opt.map(|c| c.kind), Some(JobKind::Farm),);
                             let owner = if on_farm_job && faction_member.is_some() {
                                 crate::simulation::shared_knowledge::ResourceOwner::Faction(
                                     faction_member.unwrap().faction_id,
@@ -434,7 +432,9 @@ pub fn withdraw_material_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::WithdrawMaterial as u16 {
+        if ai.state != AiState::Working
+            || aq.current_task_kind() != TaskKind::WithdrawMaterial as u16
+        {
             continue;
         }
 
@@ -697,15 +697,14 @@ pub fn buy_material_task_system(world: &mut World) {
 
         // Pre-read the node's live unit price; bail (no money moved) if the
         // node is gone, price is non-positive, or it drifted past the ceiling.
-        let unit_price = if let Some(set) =
-            world.get::<crate::simulation::settlement::Settlement>(s.node)
-        {
-            Some(set.market.price_of(s.resource_id))
-        } else {
-            world
-                .get::<crate::simulation::camp::Camp>(s.node)
-                .map(|c| c.market.price_of(s.resource_id))
-        };
+        let unit_price =
+            if let Some(set) = world.get::<crate::simulation::settlement::Settlement>(s.node) {
+                Some(set.market.price_of(s.resource_id))
+            } else {
+                world
+                    .get::<crate::simulation::camp::Camp>(s.node)
+                    .map(|c| c.market.price_of(s.resource_id))
+            };
 
         let mut bought = false;
         if let (Some(price), Some(esc)) = (unit_price, escrow_e) {
@@ -1076,7 +1075,8 @@ pub fn take_from_member_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::TakeFromMember as u16 {
+        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::TakeFromMember as u16
+        {
             continue;
         }
         let Task::WalkAndTakeFromMember {

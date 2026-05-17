@@ -656,10 +656,7 @@ pub fn chief_architect_appointment_system(
     reservations: Res<StorageReservations>,
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
     settlement_q: Query<&crate::simulation::settlement::Settlement>,
-    chief_knowledge_q: Query<
-        &crate::simulation::knowledge::PersonKnowledge,
-        With<FactionChief>,
-    >,
+    chief_knowledge_q: Query<&crate::simulation::knowledge::PersonKnowledge, With<FactionChief>>,
     mut commands: Commands,
     mut query: Query<
         (
@@ -723,7 +720,12 @@ pub fn chief_architect_appointment_system(
     // construction techs this member has personally Learned.
     type Bucket = AHashMap<
         (u32, crate::simulation::settlement::SettlementId),
-        Vec<(Entity, u32 /*coverage*/, u32 /*building*/, u32 /*social*/)>,
+        Vec<(
+            Entity,
+            u32, /*coverage*/
+            u32, /*building*/
+            u32, /*social*/
+        )>,
     >;
     let mut architects: Bucket = AHashMap::default();
     let mut nones: Bucket = AHashMap::default();
@@ -738,17 +740,15 @@ pub fn chief_architect_appointment_system(
             // architects so they get demoted.
             if *prof == Profession::Architect {
                 if let Some(sid) = settlement_map.first_for_faction(fid) {
-                    architects.entry((fid, sid)).or_default().push((
-                        entity, 0, 0, 0,
-                    ));
+                    architects
+                        .entry((fid, sid))
+                        .or_default()
+                        .push((entity, 0, 0, 0));
                 }
             }
             continue;
         };
-        let coverage = gap
-            .iter()
-            .filter(|&&t| knowledge.has_learned(t))
-            .count() as u32;
+        let coverage = gap.iter().filter(|&&t| knowledge.has_learned(t)).count() as u32;
         let tile = crate::world::terrain::world_to_tile(xf.translation.truncate());
         // Resident settlement = nearest same-faction settlement.
         let mut best: Option<(crate::simulation::settlement::SettlementId, i32)> = None;
@@ -2479,8 +2479,10 @@ pub struct FactionData {
     /// `ResourceId` to the `HaulSource` Phase 3c should stamp on its Haul
     /// posting: `Market { max_unit_price }` when the resource is scarce-but-
     /// affordably-procurable (absent / `Storage` = legacy withdraw-from-storage).
-    pub procurement_plan:
-        ahash::AHashMap<crate::economy::resource_catalog::ResourceId, crate::simulation::jobs::HaulSource>,
+    pub procurement_plan: ahash::AHashMap<
+        crate::economy::resource_catalog::ResourceId,
+        crate::simulation::jobs::HaulSource,
+    >,
     /// Resolved economic node for procurement: `(node_entity, market_tile)`,
     /// refreshed alongside `procurement_plan` by
     /// `classify_construction_procurement_system`. The Market-haul dispatcher
@@ -3110,7 +3112,9 @@ pub fn drop_items_at_destination_system(
         if *lod == LodLevel::Dormant {
             continue;
         }
-        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::DepositResource as u16 {
+        if ai.state != AiState::Working
+            || aq.current_task_kind() != TaskKind::DepositResource as u16
+        {
             continue;
         }
 

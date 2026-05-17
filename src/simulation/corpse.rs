@@ -312,7 +312,9 @@ pub fn wait_for_party_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if aq.current_task_kind() != TaskKind::HuntPartyMuster as u16 || ai.state != AiState::Working {
+        if aq.current_task_kind() != TaskKind::HuntPartyMuster as u16
+            || ai.state != AiState::Working
+        {
             continue;
         }
         let Some(faction) = registry.factions.get_mut(&member.faction_id) else {

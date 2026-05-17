@@ -465,7 +465,9 @@ pub fn unpitch_structure_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::UnpitchStructure as u16 {
+        if ai.state != AiState::Working
+            || aq.current_task_kind() != TaskKind::UnpitchStructure as u16
+        {
             continue;
         }
         let Some(structure) = aq.current.as_unpitch_structure() else {
@@ -559,7 +561,9 @@ pub fn unload_camp_cargo_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::UnloadCampCargo as u16 {
+        if ai.state != AiState::Working
+            || aq.current_task_kind() != TaskKind::UnloadCampCargo as u16
+        {
             continue;
         }
         let Some((rid, qty, tile)) = aq.current.as_unload_camp_cargo() else {
@@ -595,7 +599,9 @@ pub fn pitch_structure_at_task_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Working || aq.current_task_kind() != TaskKind::PitchStructureAt as u16 {
+        if ai.state != AiState::Working
+            || aq.current_task_kind() != TaskKind::PitchStructureAt as u16
+        {
             continue;
         }
         let Some((kind, anchor)) = aq.current.as_pitch_structure_at() else {

@@ -6552,23 +6552,30 @@ pub enum FarmScope {
 impl FarmScope {
     pub fn source_faction_id(&self) -> u32 {
         match self {
-            FarmScope::Communal { source_faction_id, .. }
-            | FarmScope::Private { source_faction_id, .. }
+            FarmScope::Communal {
+                source_faction_id, ..
+            }
+            | FarmScope::Private {
+                source_faction_id, ..
+            }
             | FarmScope::Bootstrap { source_faction_id } => *source_faction_id,
         }
     }
 
     pub fn plot_rect(&self) -> Option<crate::simulation::settlement::TileRect> {
         match self {
-            FarmScope::Communal { plot_rect, .. }
-            | FarmScope::Private { plot_rect, .. } => Some(*plot_rect),
+            FarmScope::Communal { plot_rect, .. } | FarmScope::Private { plot_rect, .. } => {
+                Some(*plot_rect)
+            }
             FarmScope::Bootstrap { .. } => None,
         }
     }
 
     pub fn deposit_override(&self) -> Option<u32> {
         match self {
-            FarmScope::Private { source_faction_id, .. } => Some(*source_faction_id),
+            FarmScope::Private {
+                source_faction_id, ..
+            } => Some(*source_faction_id),
             FarmScope::Communal { .. } | FarmScope::Bootstrap { .. } => None,
         }
     }
@@ -6705,7 +6712,9 @@ pub fn htn_plant_from_storage_dispatch_system(
     >,
 ) {
     use crate::simulation::plants::PlantKind;
-    use crate::simulation::tasks::{find_nearest_unplanted_farmland, find_nearest_unplanted_in_rect};
+    use crate::simulation::tasks::{
+        find_nearest_unplanted_farmland, find_nearest_unplanted_in_rect,
+    };
     const VIEW_RADIUS: i32 = 15;
     let now = clock.tick;
     for (
@@ -6827,20 +6836,9 @@ pub fn htn_plant_from_storage_dispatch_system(
         let plant_tile = if let Some(rect) = scope.plot_rect() {
             let rmin = (rect.x0, rect.y0);
             let rmax = (rect.x0 + rect.w as i32 - 1, rect.y0 + rect.h as i32 - 1);
-            find_nearest_unplanted_in_rect(
-                &chunk_map,
-                &plant_map,
-                (cur_tx, cur_ty),
-                rmin,
-                rmax,
-            )
+            find_nearest_unplanted_in_rect(&chunk_map, &plant_map, (cur_tx, cur_ty), rmin, rmax)
         } else {
-            find_nearest_unplanted_farmland(
-                &chunk_map,
-                &plant_map,
-                (cur_tx, cur_ty),
-                VIEW_RADIUS,
-            )
+            find_nearest_unplanted_farmland(&chunk_map, &plant_map, (cur_tx, cur_ty), VIEW_RADIUS)
         };
         let Some(plant_tile) = plant_tile else {
             continue;
@@ -9884,8 +9882,11 @@ pub fn htn_harvest_plant_dispatch_system(
                 let y0 = rect.y0;
                 let x1 = rect.x0 + rect.w as i32;
                 let y1 = rect.y0 + rect.h as i32;
-                let mut best: Option<(i32, (i32, i32), crate::economy::resource_catalog::ResourceId)> =
-                    None;
+                let mut best: Option<(
+                    i32,
+                    (i32, i32),
+                    crate::economy::resource_catalog::ResourceId,
+                )> = None;
                 for ty in y0..y1 {
                     for tx in x0..x1 {
                         let Some(entity) = plant_map.0.get(&(tx, ty)).copied() else {
@@ -11972,7 +11973,8 @@ mod tests {
             tasks,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::wood(),
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::wood(),
                     target_faction_id: None,
                 },
             ]
@@ -12004,7 +12006,8 @@ mod tests {
             wood,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::wood(),
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::wood(),
                     target_faction_id: None,
                 },
             ]
@@ -12013,7 +12016,8 @@ mod tests {
             stone,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::stone(),
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::stone(),
                     target_faction_id: None,
                 },
             ]
@@ -13126,7 +13130,8 @@ mod tests {
             tasks,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::fruit(),
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::fruit(),
                     target_faction_id: None,
                 },
             ]
@@ -13157,7 +13162,8 @@ mod tests {
             fruit,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::fruit(),
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::fruit(),
                     target_faction_id: None,
                 },
             ]
@@ -13166,7 +13172,8 @@ mod tests {
             meat,
             vec![
                 Task::Scavenge { target },
-                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::meat(),
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::meat(),
                     target_faction_id: None,
                 },
             ]
@@ -13435,7 +13442,8 @@ mod tests {
             tasks,
             vec![
                 Task::Gather { tile: (6, 9) },
-                Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::fruit(),
+                Task::DepositToFactionStorage {
+                    resource_id: crate::economy::core_ids::fruit(),
                     target_faction_id: None,
                 },
             ]
@@ -13461,15 +13469,17 @@ mod tests {
         );
         assert_eq!(
             m.expand(AbstractTask::StockpileFood, &grain_ctx).last(),
-            Some(&Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::grain(),
-                    target_faction_id: None,
-                })
+            Some(&Task::DepositToFactionStorage {
+                resource_id: crate::economy::core_ids::grain(),
+                target_faction_id: None,
+            })
         );
         assert_eq!(
             m.expand(AbstractTask::StockpileFood, &fruit_ctx).last(),
-            Some(&Task::DepositToFactionStorage {resource_id: crate::economy::core_ids::fruit(),
-                    target_faction_id: None,
-                })
+            Some(&Task::DepositToFactionStorage {
+                resource_id: crate::economy::core_ids::fruit(),
+                target_faction_id: None,
+            })
         );
     }
 

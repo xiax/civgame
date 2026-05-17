@@ -99,7 +99,10 @@ pub fn trader_buy_at_camp(
     }
     let (price_per_unit, stock_available) = {
         let c = world.get::<Camp>(camp)?;
-        (c.market.price_of(resource_id), c.market.stock_of(resource_id))
+        (
+            c.market.price_of(resource_id),
+            c.market.stock_of(resource_id),
+        )
     };
     let total = price_per_unit * qty as f32;
     if stock_available < qty as f32 {
@@ -147,7 +150,9 @@ pub fn trader_buy_at_node(
     qty: u32,
 ) -> Option<f32> {
     match node {
-        MarketNodeRef::Settlement(e) => trader_buy_at_settlement(world, trader, e, resource_id, qty),
+        MarketNodeRef::Settlement(e) => {
+            trader_buy_at_settlement(world, trader, e, resource_id, qty)
+        }
         MarketNodeRef::Camp(e) => trader_buy_at_camp(world, trader, e, resource_id, qty),
     }
 }

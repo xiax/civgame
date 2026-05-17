@@ -789,14 +789,12 @@ impl Plugin for SimulationPlugin {
                     production::eat_task_system.after(movement::movement_system),
                     production::withdraw_food_task_system.after(movement::movement_system),
                     (
-                        production::withdraw_material_task_system
-                            .after(movement::movement_system),
+                        production::withdraw_material_task_system.after(movement::movement_system),
                         // Exclusive (`&mut World`) — `trader_buy_at_node`
                         // needs world access. Nested with its sibling to
                         // keep the Sequential tuple within Bevy's 20-arity
                         // `IntoSystemConfigs` limit.
-                        production::buy_material_task_system
-                            .after(movement::movement_system),
+                        production::buy_material_task_system.after(movement::movement_system),
                     ),
                     production::take_from_member_task_system.after(movement::movement_system),
                     production::withdraw_good_task_system.after(movement::movement_system),

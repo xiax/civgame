@@ -387,9 +387,7 @@ pub fn htn_drink_dispatch_system(
             // `task_interacts_from_adjacent`, so passing the well tile here
             // lands the agent chebyshev-1 off it on the routing layer's
             // pick.
-            if let Some(well_tile) =
-                nearest_well_tile(&well_map, (cur_tx, cur_ty), scan)
-            {
+            if let Some(well_tile) = nearest_well_tile(&well_map, (cur_tx, cur_ty), scan) {
                 let routed = assign_task_with_routing(
                     &mut ai,
                     (cur_tx, cur_ty),
@@ -446,14 +444,12 @@ pub fn htn_drink_dispatch_system(
 /// Chebyshev-nearest well tile within `max_radius`. The routing layer
 /// (`assign_task_with_routing`) handles adjacency selection because
 /// `task_interacts_from_adjacent(TaskKind::Drink)` is true.
-fn nearest_well_tile(
-    well_map: &WellMap,
-    from: (i32, i32),
-    max_radius: i32,
-) -> Option<(i32, i32)> {
+fn nearest_well_tile(well_map: &WellMap, from: (i32, i32), max_radius: i32) -> Option<(i32, i32)> {
     let mut best: Option<((i32, i32), i32)> = None;
     for &well_tile in well_map.0.keys() {
-        let d = (well_tile.0 - from.0).abs().max((well_tile.1 - from.1).abs());
+        let d = (well_tile.0 - from.0)
+            .abs()
+            .max((well_tile.1 - from.1).abs());
         if d > max_radius {
             continue;
         }

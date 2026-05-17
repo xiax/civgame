@@ -454,12 +454,12 @@ mod tests {
         let r_chunks = mxy_range * MEGACHUNK_SIZE_CHUNKS;
         for cy in -r_chunks..r_chunks {
             for cx in -r_chunks..r_chunks {
-                map.0.insert(ChunkCoord(cx, cy), flat_chunk(0, TileKind::Grass));
+                map.0
+                    .insert(ChunkCoord(cx, cy), flat_chunk(0, TileKind::Grass));
             }
         }
         map
     }
-
 
     #[test]
     fn megachunk_coord_roundtrip() {
@@ -482,18 +482,8 @@ mod tests {
             MEGACHUNK_TILES - 1,
             MEGACHUNK_TILES - 1
         ));
-        assert!(!MegaChunkCoord::contains_tile(
-            0,
-            0,
-            MEGACHUNK_TILES,
-            0
-        ));
-        assert!(!MegaChunkCoord::contains_tile(
-            0,
-            0,
-            0,
-            MEGACHUNK_TILES
-        ));
+        assert!(!MegaChunkCoord::contains_tile(0, 0, MEGACHUNK_TILES, 0));
+        assert!(!MegaChunkCoord::contains_tile(0, 0, 0, MEGACHUNK_TILES));
     }
 
     #[test]

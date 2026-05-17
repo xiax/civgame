@@ -1,9 +1,7 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::simulation::region::{
-    average_fertility_in_megachunk, MegaChunkCoord, SettledRegions,
-};
+use crate::simulation::region::{average_fertility_in_megachunk, MegaChunkCoord, SettledRegions};
 use crate::world::globe::{
     Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH, MEGACHUNK_SIZE_CHUNKS,
 };
@@ -98,11 +96,9 @@ pub fn world_map_system(
             ui.horizontal(|ui| {
                 ui.checkbox(&mut view.show_fertility, "Show fertility");
                 ui.label(
-                    egui::RichText::new(
-                        "(green = high, brown = low; estimated from climate)",
-                    )
-                    .small()
-                    .weak(),
+                    egui::RichText::new("(green = high, brown = low; estimated from climate)")
+                        .small()
+                        .weak(),
                 );
             });
 

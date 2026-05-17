@@ -267,11 +267,7 @@ mod tests {
         let catalog = crate::economy::resource_catalog::load_resource_catalog();
         crate::economy::core_ids::install_catalog(catalog.clone());
         let mut map = ahash::AHashMap::new();
-        apply_preset(
-            &mut map,
-            crate::game_state::EconomyPreset::Mixed,
-            &catalog,
-        );
+        apply_preset(&mut map, crate::game_state::EconomyPreset::Mixed, &catalog);
         let grain = crate::economy::core_ids::grain();
         let wood = crate::economy::core_ids::wood();
         let stone = crate::economy::core_ids::stone();

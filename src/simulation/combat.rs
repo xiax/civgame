@@ -511,10 +511,12 @@ pub fn combat_system(
     }
     // Per-attacker discovery rolls (knowledge-system).
     for attacker in combat_activity_attackers {
-        events.discovery.send(crate::simulation::knowledge::DiscoveryActionEvent {
-            actor: attacker,
-            activity: ActivityKind::Combat,
-        });
+        events
+            .discovery
+            .send(crate::simulation::knowledge::DiscoveryActionEvent {
+                actor: attacker,
+                activity: ActivityKind::Combat,
+            });
     }
 }
 
@@ -529,7 +531,10 @@ pub fn combat_system(
 /// `Defend` (or similar) and replan from scratch.
 pub fn combat_retaliation_cleanup_system(
     mut events: EventReader<CombatRetaliationStartedEvent>,
-    mut q: Query<(&mut PersonAI, &mut crate::simulation::typed_task::ActionQueue)>,
+    mut q: Query<(
+        &mut PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
+    )>,
 ) {
     for ev in events.read() {
         if let Ok((mut ai, mut aq)) = q.get_mut(ev.victim) {

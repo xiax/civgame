@@ -344,8 +344,8 @@ pub fn footprint_completion_system(
                 continue;
             }
             let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
-            let mut bp = Blueprint::new(p.faction_id, None, *kind, *tile, p.target_z)
-                .with_author(p.author);
+            let mut bp =
+                Blueprint::new(p.faction_id, None, *kind, *tile, p.target_z).with_author(p.author);
             if let Some(e) = edge {
                 bp = bp.with_door_dir(*e);
             }

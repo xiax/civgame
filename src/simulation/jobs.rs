@@ -4,7 +4,7 @@ use bevy::prelude::*;
 
 use crate::simulation::construction::{Blueprint, BlueprintMap};
 use crate::simulation::faction::{FactionData, FactionMember, FactionRegistry, SOLO};
-use crate::simulation::goals::{AgentGoal, Personality};
+use crate::simulation::goals::{is_maintenance_goal, AgentGoal, Personality};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{PersonAI, Profession, UNEMPLOYED_TASK_KIND};
 use crate::simulation::projects::{compute_priority, ProjectPhase, Projects, PRIORITY_PLAYER};
@@ -2032,32 +2032,22 @@ pub fn classify_construction_procurement_system(
             faction.material_view = view;
             continue;
         }
-        let node = crate::simulation::camp::faction_market_node(
-            &settlement_map,
-            &camp_map,
-            faction_id,
-        );
+        let node =
+            crate::simulation::camp::faction_market_node(&settlement_map, &camp_map, faction_id);
         // Cache (node_entity, market_tile) so the Market-haul dispatcher can
         // route without resolving the node itself.
         faction.procurement_market = match node {
-            Some(MarketNodeRef::Settlement(e)) => settlement_q
-                .get(e)
-                .ok()
-                .map(|s| (e, s.market_tile)),
-            Some(MarketNodeRef::Camp(e)) => {
-                camp_q.get(e).ok().map(|c| (e, c.home_tile))
+            Some(MarketNodeRef::Settlement(e)) => {
+                settlement_q.get(e).ok().map(|s| (e, s.market_tile))
             }
+            Some(MarketNodeRef::Camp(e)) => camp_q.get(e).ok().map(|c| (e, c.home_tile)),
             None => None,
         };
         let home = (faction.home_tile.0 as i32, faction.home_tile.1 as i32);
         let treasury = faction.treasury;
         for (&rid, &need) in need_by_rid.iter() {
             let stored = faction.storage.stock_of(rid);
-            let supply = faction
-                .resource_supply
-                .get(&rid)
-                .copied()
-                .unwrap_or(stored);
+            let supply = faction.resource_supply.get(&rid).copied().unwrap_or(stored);
             let raw_gatherable = crate::simulation::shared_knowledge::faction_knows_cluster(
                 &shared,
                 &settlement_map,
@@ -2768,16 +2758,10 @@ pub fn chief_job_posting_system(
                     None
                 })
                 .collect();
-            let already_bootstrap_farm = board
-                .faction_postings(faction_id)
-                .iter()
-                .any(|p| {
-                    matches!(p.kind, JobKind::Farm)
-                        && matches!(
-                            p.progress,
-                            JobProgress::Planting { plot_id: None, .. }
-                        )
-                });
+            let already_bootstrap_farm = board.faction_postings(faction_id).iter().any(|p| {
+                matches!(p.kind, JobKind::Farm)
+                    && matches!(p.progress, JobProgress::Planting { plot_id: None, .. })
+            });
 
             // Plot-scoped: walk this faction's farmer→plot assignments.
             let mut posted_any_plot_job = false;
@@ -2815,13 +2799,8 @@ pub fn chief_job_posting_system(
                         plot_id: Some(pid),
                         assigned_farmer: Some(farmer),
                     };
-                    let priority = compute_priority(
-                        faction,
-                        faction_id,
-                        JobKind::Farm,
-                        &progress,
-                        &projects,
-                    );
+                    let priority =
+                        compute_priority(faction, faction_id, JobKind::Farm, &progress, &projects);
                     board.faction_postings_mut(faction_id).push(JobPosting {
                         id,
                         faction_id,
@@ -3441,6 +3420,7 @@ pub fn job_claim_system(
     workers: Query<
         (
             Entity,
+            &AgentGoal,
             &FactionMember,
             &PersonAI,
             &crate::simulation::typed_task::ActionQueue,
@@ -3484,8 +3464,9 @@ pub fn job_claim_system(
 
     for (
         worker,
+        goal,
         member,
-        ai,
+        _ai,
         aq,
         lod,
         skills,
@@ -3498,6 +3479,9 @@ pub fn job_claim_system(
     ) in workers.iter()
     {
         if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if is_maintenance_goal(*goal) {
             continue;
         }
         if aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
@@ -3713,9 +3697,8 @@ pub fn posting_goal(p: &JobPosting) -> AgentGoal {
 }
 
 /// After `goal_update_system` has run for the tick, lock claimed workers'
-/// goals to the job kind. If a crisis-class goal won (Survive/Defend/Raid/
-/// Rescue), drop the claim instead — the crisis takes precedence and the
-/// worker is freed from the job board.
+/// goals to the job kind. Survival-maintenance goals keep the claim and only
+/// refresh `ClaimTarget`; true external crisis goals still release the claim.
 ///
 /// Also refreshes the `ClaimTarget` companion component so plan resolvers
 /// can route to the specific blueprint/good named in the claimed posting.
@@ -3725,9 +3708,25 @@ pub fn job_goal_lock_system(
     mut workers: Query<(Entity, &mut AgentGoal, &JobClaim, Option<&mut ClaimTarget>)>,
 ) {
     for (worker, mut goal, claim, mut target_opt) in workers.iter_mut() {
+        let target = board
+            .get(claim.job_id)
+            .map(posting_claim_target)
+            .unwrap_or_default();
+        if is_maintenance_goal(*goal) {
+            match target_opt.as_mut() {
+                Some(existing) => {
+                    **existing = target;
+                }
+                None => {
+                    commands.entity(worker).insert(target);
+                }
+            }
+            continue;
+        }
+
         let crisis = matches!(
             *goal,
-            AgentGoal::Survive | AgentGoal::Defend | AgentGoal::Raid | AgentGoal::Rescue
+            AgentGoal::Defend | AgentGoal::Raid | AgentGoal::Rescue
         );
         if crisis {
             commands.entity(worker).remove::<JobClaim>();
@@ -4120,6 +4119,7 @@ pub fn job_claim_release_system(
     bench_query: Query<(), With<crate::simulation::construction::Workbench>>,
     mut workers: Query<(
         Entity,
+        &AgentGoal,
         &PersonAI,
         &crate::simulation::typed_task::ActionQueue,
         &mut JobClaim,
@@ -4178,7 +4178,10 @@ pub fn job_claim_release_system(
     // than STUCK_FAIL_INTERVAL since the claim was posted have their
     // fail_count incremented; once they hit MAX_FAIL_COUNT the claim is
     // released so the worker can pick something else.
-    for (worker, ai, aq, mut claim) in workers.iter_mut() {
+    for (worker, goal, _ai, aq, mut claim) in workers.iter_mut() {
+        if is_maintenance_goal(*goal) {
+            continue;
+        }
         if aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
@@ -4200,7 +4203,7 @@ pub fn job_claim_release_system(
 #[cfg(test)]
 mod posting_target_workers_tests {
     use super::*;
-    use bevy::prelude::Entity;
+    use bevy::prelude::{App, Entity, Update};
 
     fn stub_posting(kind: JobKind, progress: JobProgress) -> JobPosting {
         JobPosting {
@@ -4294,6 +4297,56 @@ mod posting_target_workers_tests {
             },
         );
         assert_eq!(posting_target_workers(&p), 1);
+    }
+
+    #[test]
+    fn job_goal_lock_preserves_maintenance_goal_and_claim() {
+        let mut app = App::new();
+        app.insert_resource(JobBoard::default());
+        app.add_systems(Update, job_goal_lock_system);
+
+        let blueprint = Entity::from_raw(42);
+        let job_id = 7;
+        let faction_id = 3;
+        let worker = app
+            .world_mut()
+            .spawn((
+                AgentGoal::Sleep,
+                JobClaim {
+                    job_id,
+                    faction_id,
+                    kind: JobKind::Build,
+                    posted_tick: 0,
+                    fail_count: 0,
+                },
+            ))
+            .id();
+
+        {
+            let mut board = app.world_mut().resource_mut::<JobBoard>();
+            let mut posting = stub_posting(JobKind::Build, JobProgress::Building { blueprint });
+            posting.id = job_id;
+            posting.faction_id = faction_id;
+            posting.claimants.push(worker);
+            board.faction_postings_mut(faction_id).push(posting);
+        }
+
+        app.update();
+
+        let worker_ref = app.world().entity(worker);
+        assert_eq!(
+            *worker_ref.get::<AgentGoal>().unwrap(),
+            AgentGoal::Sleep,
+            "maintenance goal should not be overwritten by claim lock"
+        );
+        assert!(
+            worker_ref.get::<JobClaim>().is_some(),
+            "maintenance should preserve the claim"
+        );
+        let target = worker_ref
+            .get::<ClaimTarget>()
+            .expect("claim target should still be refreshed during maintenance");
+        assert_eq!(target.blueprint, Some(blueprint));
     }
 }
 

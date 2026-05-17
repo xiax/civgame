@@ -33,8 +33,8 @@ use ahash::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 use crate::simulation::archetype::FactionCapabilities;
-use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::construction::RoadCarveQueue;
+use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::organic_settlement::{
     survey_one_settlement, OrganicStructureMaps, SettlementBrain, SettlementBrains,
     SettlementParcelIndex,
@@ -87,8 +87,7 @@ impl ChunkSnapshot {
     /// snapshot).
     pub fn capture(chunk_map: &ChunkMap, centre: (i32, i32)) -> Self {
         let half = SURVEY_WINDOW;
-        let mut tiles =
-            AHashMap::with_capacity(((2 * half + 1) * (2 * half + 1)) as usize);
+        let mut tiles = AHashMap::with_capacity(((2 * half + 1) * (2 * half + 1)) as usize);
         for dy in -half..=half {
             for dx in -half..=half {
                 let tx = centre.0 + dx;
@@ -276,9 +275,7 @@ pub fn survey_cursor_system(
             registry
                 .factions
                 .get(&s.owner_faction)
-                .map(|f| {
-                    s.owner_faction != SOLO && f.caps.settlement.is_full_settlement()
-                })
+                .map(|f| s.owner_faction != SOLO && f.caps.settlement.is_full_settlement())
                 .unwrap_or(false)
         })
         .collect();
@@ -294,7 +291,9 @@ pub fn survey_cursor_system(
     // at ≥1). Result: total work over 120 ticks = N settlements (same as
     // legacy); per-tick cost = one settlement (vs legacy's burst of N).
     let interval = (ASYNC_SURVEY_INTERVAL / eligible.len() as u64).max(1);
-    if cursor.last_advance_tick != 0 && clock.tick.saturating_sub(cursor.last_advance_tick) < interval {
+    if cursor.last_advance_tick != 0
+        && clock.tick.saturating_sub(cursor.last_advance_tick) < interval
+    {
         return;
     }
     cursor.last_advance_tick = clock.tick;

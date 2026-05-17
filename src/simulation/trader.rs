@@ -39,7 +39,9 @@ use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::AgentMemory;
-use crate::simulation::person::{AiState, Drafted, PersonAI, Profession, TraderPhase, TraderPlan, UNEMPLOYED_TASK_KIND};
+use crate::simulation::person::{
+    AiState, Drafted, PersonAI, Profession, TraderPhase, TraderPlan, UNEMPLOYED_TASK_KIND,
+};
 use crate::simulation::settlement::{Settlement, SettlementId, SettlementMap};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::typed_task::{ActionQueue, Task};

@@ -589,10 +589,7 @@ pub fn attach_late_south_skirts_system(
             // Skirt belongs to the *northern* tile's chunk so it gets
             // cleaned up when that chunk unloads.
             let northern_chunk = ChunkCoord(coord.0, coord.1 + 1);
-            let entities = sprite_index
-                .by_chunk
-                .entry(northern_chunk)
-                .or_default();
+            let entities = sprite_index.by_chunk.entry(northern_chunk).or_default();
             let skirt = spawn_skirt_for_tile(
                 &mut commands,
                 entities,
