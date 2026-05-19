@@ -47,6 +47,7 @@ pub mod opportunity;
 pub mod organic_settlement;
 pub mod pack_deploy;
 pub mod person;
+pub mod placement_reachability;
 pub mod plants;
 pub mod player_command;
 pub mod production;

@@ -546,8 +546,22 @@ pub fn spawn_population(
         // at tick 0, so household contracts can post immediately rather than
         // waiting on cosleep-bond formation (which takes a full game-week).
         let mut spawned_members: Vec<Entity> = Vec::with_capacity(group_size as usize);
+        // Draw member spawn tiles from a flood outward from the home tile, so
+        // every member is reachable-from-home *by construction* instead of
+        // random-scatter-then-passability (which could strand a member in a
+        // passable pocket across a river/cliff from home). `find_tile` stays
+        // as a last-resort only if the connected area is genuinely tiny.
+        let reachable_pool = crate::simulation::placement_reachability::spawn_tiles_from(
+            &chunk_map,
+            (home_tx, home_ty),
+            group_size as usize,
+        );
+        let mut pool_iter = reachable_pool.into_iter();
         for _ in 0..group_size {
-            let Some((tx, ty)) = find_tile(&mut rng, home_tx, home_ty) else {
+            let Some((tx, ty)) = pool_iter
+                .next()
+                .or_else(|| find_tile(&mut rng, home_tx, home_ty))
+            else {
                 continue;
             };
             // Founder role assignment for realistic seeding:
@@ -731,15 +745,33 @@ pub(crate) fn seed_market_households(
     use ahash::AHashSet;
     let mut used: AHashSet<(i32, i32)> = AHashSet::new();
     used.insert(village_home);
+    // Household plot tiles are drawn from a flood outward from the village
+    // home so each FactionStorageTile / home is reachable from the village by
+    // construction; the legacy spiral search is the fallback only when the
+    // reachable pool is exhausted.
+    let pool = crate::simulation::placement_reachability::spawn_tiles_from(
+        chunk_map,
+        village_home,
+        members.len() * 2 + 4,
+    );
+    let mut pool_iter = pool.into_iter();
     for &member in members {
-        let plot = match crate::simulation::construction::next_clear_tile(
-            village_home,
-            &used,
-            chunk_map,
-            16,
-        ) {
-            Some(t) => t,
-            None => continue,
+        let plot = loop {
+            match pool_iter.next() {
+                Some(t) if used.contains(&t) => continue,
+                Some(t) => break Some(t),
+                None => {
+                    break crate::simulation::construction::next_clear_tile(
+                        village_home,
+                        &used,
+                        chunk_map,
+                        16,
+                    )
+                }
+            }
+        };
+        let Some(plot) = plot else {
+            continue;
         };
         used.insert(plot);
         let household_id = registry.spawn_household(village_faction_id, plot, member, catalog);

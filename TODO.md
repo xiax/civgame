@@ -142,7 +142,7 @@ Make water actually flow, calculate z levels properly for water level and banks 
 
 Make edges between different biomes more organic, right now the edges are these jagged square blocks.
 
-Change how construction fallbacks work to be more unique per era rather than just fallback to previous era's construction policies. For example in neolithic if there is not material to build walls the planner shouldn't fall back to paleolithic patterns of building beds and hearths in crescent shapes, they should be building beds in sort of slums on the outskirts of the faction where there is free space, or longhouses with more beds in one house to save materials.
+X- Change how construction fallbacks work to be more unique per era rather than just fallback to previous era's construction policies. For example in neolithic if there is not material to build walls the planner shouldn't fall back to paleolithic patterns of building beds and hearths in crescent shapes, they should be building beds in sort of slums on the outskirts of the faction where there is free space, or longhouses with more beds in one house to save materials.
 
 Animals walk on water and walk through walls
 
@@ -150,9 +150,9 @@ Create a detailed plan to add pathfinding checks to the settlement planner to ma
 
 Player faction and factions with permanent settlements shouldn't auto-migrate anymore.
 
-Farming doesn't need the technology to be adopted by the faction, if either the chief or architect or any bureaucrat knows it, it can be planned and posted, only in free market does the individual farmer need to have the knowledge, though farmers with the knowledge work faster.
+X - Farming doesn't need the technology to be adopted by the faction, if either the chief or architect or any bureaucrat knows it, it can be planned and posted, only in free market does the individual farmer need to have the knowledge, though farmers with the knowledge work faster.
 
-Fix gap in survive goal for hunger when no tasks are available
+Fix gap in survive goal for hunger and drink when no tasks under the goal meet requirements
 
 
 

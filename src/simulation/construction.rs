@@ -2726,6 +2726,42 @@ pub(crate) fn walled_house_tile_plan(
     plan
 }
 
+/// Simulated-build reachability gate over a `walled_house_tile_plan`-style
+/// plan: with the finished walls in place, the doormat must connect to `home`
+/// and every interior bed must be reachable from the doormat *through the
+/// door*. Returns `true` (accept) when the plan has no door (nothing to gate).
+/// Shared by `plan_building` and `seed_walled_house_at`.
+fn plan_reachable_from_home(
+    chunk_map: &ChunkMap,
+    home: (i32, i32),
+    doormat: (i32, i32),
+    plan: &[(
+        BuildSiteKind,
+        (i32, i32),
+        Option<crate::simulation::land::TileEdge>,
+    )],
+) -> bool {
+    let mut walls: AHashSet<(i32, i32)> = AHashSet::new();
+    let mut beds: Vec<(i32, i32)> = Vec::new();
+    let mut door: Option<(i32, i32)> = None;
+    for (kind, tile, _edge) in plan {
+        match kind {
+            BuildSiteKind::Wall(_) => {
+                walls.insert(*tile);
+            }
+            BuildSiteKind::Bed => beds.push(*tile),
+            BuildSiteKind::Door => door = Some(*tile),
+            _ => {}
+        }
+    }
+    let Some(door) = door else {
+        return true;
+    };
+    crate::simulation::placement_reachability::simulate_house_reachable(
+        chunk_map, home, doormat, door, &walls, &beds,
+    )
+}
+
 fn plan_building(
     commands: &mut Commands,
     bp_map: &mut BlueprintMap,
@@ -2751,7 +2787,7 @@ fn plan_building(
     // door is strictly worse than placing nothing.
     let preferred_edge =
         door_dir.unwrap_or_else(|| crate::simulation::land::TileEdge::toward((cx, cy), camp_home));
-    let Some((door_edge, entrance, _planned_doormat)) = pick_clear_door_cardinal(
+    let Some((door_edge, entrance, planned_doormat)) = pick_clear_door_cardinal(
         chunk_map,
         bed_map,
         bp_map,
@@ -2780,6 +2816,14 @@ fn plan_building(
         wall_material,
         interior_beds,
     );
+
+    // Simulated-build reachability gate: validate the house *as it will exist
+    // once built* — doormat connects home through the finished walls and every
+    // interior bed is reachable from the doormat via the door. Aborting beats
+    // shipping a house whose bed is sealed behind its own wall ring.
+    if !plan_reachable_from_home(chunk_map, camp_home, planned_doormat, &wall_plan) {
+        return;
+    }
 
     // Collect the tiles that need terraforming (footprint covers walls AND
     // interior — every tile under the building must sit at target_z so the
@@ -3423,6 +3467,23 @@ pub fn chief_directive_system(
             continue;
         }
         if candidate_touches_planned_road(&best, faction_id, &settlement_map, &maps.organic_brains)
+        {
+            continue;
+        }
+
+        // Runtime pre-spawn reachability gate. One choke point covers both the
+        // organic-selected intent stream and the `generate_candidates`
+        // fallback (both flow through `best`): an intent surveyed before a
+        // terrain/wall change — or a parcel the planner placed across a river
+        // — is refused here rather than spawned as a build no worker can path
+        // to. The downstream door-cardinal check only proves doormat→home on
+        // *current* terrain; this proves the anchor itself is connected.
+        if best.tile != faction.home_tile
+            && !crate::simulation::placement_reachability::tile_reachable_from_home(
+                &chunk_map,
+                faction.home_tile,
+                best.tile,
+            )
         {
             continue;
         }
@@ -4782,6 +4843,41 @@ fn plan_composite_building(
     };
     let door_tile: Option<(i32, i32)> = Some(picked_door_tile);
 
+    // Simulated-build reachability gate: classify the footprint exactly as the
+    // spawn loop below does (perim → Wall, interior → Bed, the picked cell →
+    // Door), then verify doormat→home and door→every bed with the finished
+    // walls in place. Composite L/U shapes can otherwise seal an interior bed.
+    {
+        let (ddx, ddy) = door_edge.delta();
+        let doormat = (picked_door_tile.0 + ddx, picked_door_tile.1 + ddy);
+        let mut walls: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+        let mut beds: Vec<(i32, i32)> = Vec::new();
+        for &(tx, ty) in &tiles {
+            let pos = (tx, ty);
+            if Some(pos) == door_tile {
+                continue;
+            }
+            let is_perim = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                .iter()
+                .any(|&(ox, oy)| !tile_set.contains(&(tx + ox, ty + oy)));
+            if is_perim {
+                walls.insert(pos);
+            } else {
+                beds.push(pos);
+            }
+        }
+        if !crate::simulation::placement_reachability::simulate_house_reachable(
+            chunk_map,
+            camp_home,
+            doormat,
+            picked_door_tile,
+            &walls,
+            &beds,
+        ) {
+            return;
+        }
+    }
+
     // Same target_z as the rectangular path: use the anchor's surface_z so
     // composite walls form a consistent floor. (Spread checks happen in the
     // caller via `shape_z_stats`.)
@@ -4986,43 +5082,29 @@ fn doormat_tile_clear(
 /// caller to try another cardinal or abort. The cap is generous enough to
 /// cover even Bronze-Age city footprints (≤ 80 tile chebyshev) but small
 /// enough that placement stays cheap.
-const MAX_DOORMAT_BFS_STEPS: usize = 1500;
+/// Folded into the shared `placement_reachability` layer — no parallel
+/// reachability implementation survives. Preserves the legacy contract:
+/// `Wall` / unloaded chunks block, the `Stone`-aversion heuristic is kept so
+/// door selection on rocky starts is byte-stable, and the budget matches the
+/// old `MAX_DOORMAT_BFS_STEPS`. The step model is upgraded from a 2D
+/// 4-connected BFS to the agent-faithful 3D check, so a doormat is accepted
+/// iff a worker can genuinely walk it home (sealed courtyards still fail —
+/// `passable_diagonal_step` rejects wall-corner pinches exactly as before).
 fn doormat_reaches_home(chunk_map: &ChunkMap, start: (i32, i32), home: (i32, i32)) -> bool {
-    use std::collections::VecDeque;
+    use crate::simulation::placement_reachability as reach;
     if start == home {
         return true;
     }
-    let mut visited: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
-    visited.insert(start);
-    let mut q: VecDeque<(i32, i32)> = VecDeque::new();
-    q.push_back(start);
-    let mut steps = 0usize;
-    while let Some((x, y)) = q.pop_front() {
-        steps += 1;
-        if steps > MAX_DOORMAT_BFS_STEPS {
-            // Couldn't prove reachability within the budget — fail closed so
-            // we don't ship a sealed courtyard. False negatives are rare since
-            // 200 chebyshev hops covers any reasonable settlement extent.
-            return false;
-        }
-        for &(dx, dy) in &[(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            let n = (x + dx, y + dy);
-            if n == home {
-                return true;
-            }
-            if !visited.insert(n) {
-                continue;
-            }
-            match chunk_map.tile_kind_at(n.0, n.1) {
-                Some(k) if k == TileKind::Wall || k == TileKind::Stone => continue,
-                Some(k) if !k.is_passable() => continue,
-                None => continue,
-                _ => {}
-            }
-            q.push_back(n);
-        }
-    }
-    false
+    let stone_averse =
+        |t: (i32, i32, i32)| chunk_map.tile_kind_at(t.0, t.1) == Some(TileKind::Stone);
+    reach::path_exists(
+        chunk_map,
+        reach::resolve3(chunk_map, start),
+        reach::resolve3(chunk_map, home),
+        reach::ReachOpts::seed()
+            .with_cap(reach::DOORMAT_MAX_EXPANSIONS)
+            .with_blocked(&stone_averse),
+    )
 }
 
 /// Pick a door cardinal whose entrance cell's cardinal-out neighbour is a
@@ -7556,6 +7638,7 @@ pub fn seed_starting_buildings_system(
                             &mut tile_changed,
                             &mut used,
                             &doormat_reservations,
+                            home,
                             applied_tile.0,
                             applied_tile.1,
                             half_w,
@@ -7643,7 +7726,7 @@ fn seed_walled_house_at(
     // than placing nothing.
     let preferred_edge =
         door_dir.unwrap_or_else(|| crate::simulation::land::TileEdge::toward((cx, cy), home));
-    let Some((door_edge, entrance, _planned_doormat)) = pick_clear_door_cardinal_filtered(
+    let Some((door_edge, entrance, planned_doormat)) = pick_clear_door_cardinal_filtered(
         chunk_map,
         &maps.bed_map,
         // seeded path has no blueprint map at hand — pass an empty one. The
@@ -7674,6 +7757,15 @@ fn seed_walled_house_at(
         wall_material,
         interior_beds,
     );
+
+    // Simulated-build reachability gate (runs before any wall is stamped, so
+    // it sees pre-stamp terrain + the planned wall overlay): doormat connects
+    // home and every interior bed is reachable through the door. Refuse the
+    // anchor rather than seed a house with a sealed bed.
+    if !plan_reachable_from_home(chunk_map, home, planned_doormat, &plan) {
+        return false;
+    }
+
     for (kind, tile, edge) in &plan {
         let tile = *tile;
         let world_pos = tile_to_world(tile.0, tile.1);
@@ -7801,6 +7893,7 @@ fn seed_farmstead_yard(
     tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
     used: &mut AHashSet<(i32, i32)>,
     doormat: &crate::simulation::doormat::DoormatReservations,
+    home: (i32, i32),
     cx: i32,
     cy: i32,
     half_w: i32,
@@ -7847,9 +7940,17 @@ fn seed_farmstead_yard(
         true
     };
 
-    let chosen = candidates
-        .iter()
-        .find(|(x0, y0, _, _)| yard_clear(*x0, *y0, used, chunk_map, doormat));
+    // The yard must also be genuinely walkable from `home` *given the house
+    // walls that were just stamped* — otherwise the farmer can never reach it.
+    let chosen = candidates.iter().find(|(x0, y0, _, _)| {
+        yard_clear(*x0, *y0, used, chunk_map, doormat)
+            && crate::simulation::placement_reachability::rect_reachable_from_home(
+                chunk_map,
+                home,
+                (*x0, *y0),
+                (*x0 + yard_w - 1, *y0 + yard_h - 1),
+            )
+    });
     let Some(&(x0, y0, _, _)) = chosen else {
         return 0;
     };

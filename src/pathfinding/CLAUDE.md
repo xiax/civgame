@@ -43,6 +43,8 @@ Z-mismatch penalty is gone — components are exact, no "wrong z" choice to pena
 
 Internally: per-(chunk, ComponentId) → inter-chunk CC id (`tile_reachable` / `component_reachable`); per-(chunk, z) → list of CC ids (legacy overload). Both rebuilt together by `populate_connectivity_from_graph`.
 
+**Placement-time reachability** is *not* `ChunkConnectivity`: the graph is not reliably built at `OnEnter(Playing)` and would not reflect walls seeded during that pass. `simulation::placement_reachability::path_exists` is the seed-safe authoritative check — a bounded A* over the live `ChunkMap` using these same canonical step rules (`passable_step_3d` / `passable_diagonal_step`). `connectivity_prefilter` wraps `tile_reachable` as that module's optional O(1) runtime-only fast-reject.
+
 `z_band(z) = z.div_euclid(4)` survives only as a debug-overlay helper.
 
 ## Worker (`worker.rs`)

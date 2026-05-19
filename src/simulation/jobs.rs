@@ -1981,6 +1981,9 @@ pub struct FarmJobPostingParams<'w, 's> {
     /// authoring blueprint's poster (Architect vs Chief). Bundled here
     /// so `chief_job_posting_system` stays under the 16-param ceiling.
     pub poster_prof_q: Query<'w, 's, &'static crate::simulation::person::Profession>,
+    /// Plot-level reachability gate for Farm postings (validated once per
+    /// posting, not per tile). Bundled here to stay under the 16-param ceiling.
+    pub chunk_map: Res<'w, crate::world::chunk::ChunkMap>,
 }
 
 /// Step 3: rebuild every faction's `procurement_plan` once per chief-posting
@@ -2785,6 +2788,19 @@ pub fn chief_job_posting_system(
                             plot.rect.y0 + plot.rect.h as i32 - 1,
                         ),
                     };
+                    // Plot-level reachability — validated once per posting, not
+                    // per tile (a contiguous 16×16 plot is internally
+                    // connected, so the per-tile prefilter would be redundant
+                    // churn). A plot the planner carved across a river from
+                    // home never produces an unreachable Farm posting.
+                    if !crate::simulation::placement_reachability::rect_reachable_from_home(
+                        &farm_params.chunk_map,
+                        faction.home_tile,
+                        area.min,
+                        area.max,
+                    ) {
+                        continue;
+                    }
                     let plot_tile_count = (plot.rect.w as u32) * (plot.rect.h as u32);
                     let target = FARM_TILES_PER_POST.min(seed).min(plot_tile_count);
                     if target == 0 {

@@ -264,22 +264,35 @@ pub fn seed_starting_farms_system(
             (8, -24),
             (-24, -24),
         ];
-        let (ox, oy) = candidates
-            .iter()
-            .copied()
-            .find(|(dx, dy)| {
-                // Sample center tile of candidate plot.
-                let cx = home.0 + dx + PLOT_SIZE / 2;
-                let cy = home.1 + dy + PLOT_SIZE / 2;
-                let kind = chunk_map.tile_kind_at(cx, cy);
-                matches!(
-                    kind,
-                    Some(crate::world::tile::TileKind::Grass)
-                        | Some(crate::world::tile::TileKind::Loam)
-                        | Some(crate::world::tile::TileKind::Silt)
+        // Prefer a farmable (Loam/Silt/Grass) plot that is also genuinely
+        // walkable from `home`; if none qualify, fall back to the best
+        // *reachable* offset (any terrain) so workers can always path to it;
+        // only as a last resort take (8, 0).
+        let pick = |require_terrain: bool| -> Option<(i32, i32)> {
+            candidates.iter().copied().find(|(dx, dy)| {
+                let x0 = home.0 + dx;
+                let y0 = home.1 + dy;
+                if require_terrain {
+                    let cx = x0 + PLOT_SIZE / 2;
+                    let cy = y0 + PLOT_SIZE / 2;
+                    if !matches!(
+                        chunk_map.tile_kind_at(cx, cy),
+                        Some(crate::world::tile::TileKind::Grass)
+                            | Some(crate::world::tile::TileKind::Loam)
+                            | Some(crate::world::tile::TileKind::Silt)
+                    ) {
+                        return false;
+                    }
+                }
+                crate::simulation::placement_reachability::rect_reachable_from_home(
+                    &chunk_map,
+                    home,
+                    (x0, y0),
+                    (x0 + PLOT_SIZE - 1, y0 + PLOT_SIZE - 1),
                 )
             })
-            .unwrap_or((8, 0));
+        };
+        let (ox, oy) = pick(true).or_else(|| pick(false)).unwrap_or((8, 0));
         let rect = TileRect::new(home.0 + ox, home.1 + oy, PLOT_SIZE as u16, PLOT_SIZE as u16);
 
         let pid = plot_index.alloc_id();

@@ -2144,6 +2144,16 @@ fn choose_site_for_intent(
         if !intent_site_clear(build_kind, tile, chunk_map, maps, bp_map, doormat, brain) {
             continue;
         }
+        // Runtime reachability: the organic planner doesn't validate that a
+        // parcel is walkable from home (it can sit across a river). Reject
+        // parcels a worker could never path to.
+        if !crate::simulation::placement_reachability::tile_reachable_from_home(
+            chunk_map,
+            faction.home_tile,
+            tile,
+        ) {
+            continue;
+        }
         let frontage_bonus = parcel.frontage_edge.map(|_| 8.0).unwrap_or(0.0);
         let spread = well_spread_adjustment(build_kind, tile, chunk_map, maps);
         candidates.push((suitability * 100.0 + frontage_bonus + spread, tile));
@@ -2156,6 +2166,13 @@ fn choose_site_for_intent(
             continue;
         }
         if !intent_site_clear(build_kind, tile, chunk_map, maps, bp_map, doormat, brain) {
+            continue;
+        }
+        if !crate::simulation::placement_reachability::tile_reachable_from_home(
+            chunk_map,
+            faction.home_tile,
+            tile,
+        ) {
             continue;
         }
         let spread = well_spread_adjustment(build_kind, tile, chunk_map, maps);
