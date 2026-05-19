@@ -565,6 +565,12 @@ pub fn classify_reservoirs(raw: &[f32], filled: &[f32], dirs: &[u32]) -> (Vec<Re
 /// Local water-table height. Sits below the pit-filled surface — shallowest
 /// in wet lowlands, deepest in dry highlands — and is pinned to the water
 /// surface inside lake/wetland reservoirs.
+///
+/// Depth-to-water is calibrated against real groundwater tables at our 1.5 m
+/// tile scale: ~1 Z (1.5 m) in saturated lowland to ~16 Z (24 m) in true arid.
+/// The raw-frame depth (`filled - aquifer_level`) is later multiplied by
+/// `GLOBE_H_TO_Z = 8` everywhere it crosses into Z (well shafts, fluid sim
+/// seep gate, chunk-gen Pass 4.5), so 1..16 Z means raw 0.125..2.0.
 pub fn aquifer_table(
     filled: &[f32],
     rainfall_norm: &[f32],
@@ -583,8 +589,12 @@ pub fn aquifer_table(
         }
         let s = filled[i];
         let wet = rainfall_norm[i].clamp(0.0, 1.0);
-        // depth-to-water: 0.02 (saturated lowland) .. 0.20 (arid)
-        let depth = (0.20 - 0.18 * wet).max(0.0);
+        // Raw depth: 0.0625 (saturated, ~0.5 Z ≈ 0.75 m — damp lowland) ..
+        // 1.5 (true arid, ~12 Z ≈ 18 m). Multiplied by GLOBE_H_TO_Z=8
+        // downstream. The wet end lets per-tile jitter (~±1.5 Z amplitude)
+        // genuinely dip below the table in moist biomes; the arid end is
+        // well past max jitter so deserts produce no spurious marshes.
+        let depth = 0.0625 + 1.4375 * (1.0 - wet);
         a[i] = s - depth;
     }
     a

@@ -662,6 +662,9 @@ pub fn spawn_population(
                             martial: fastrand::u8(..),
                         },
                     ),
+                    // Always-present (never insert/removed at runtime — see
+                    // social_contact.rs) so the Person archetype stays stable.
+                    (crate::simulation::social_contact::SecondarySocial::inactive(),),
                 ))
                 .id();
 

@@ -18,7 +18,7 @@ use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::{
     current_era, Era, TechId, BRIDGE_BUILDING, BRONZE_CASTING, BRONZE_TOOLS, CITY_STATE_ORG,
-    COPPER_TOOLS, COPPER_WORKING, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING, GRANARY,
+    COPPER_TOOLS, COPPER_WORKING, DAM_BUILDING, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING, GRANARY,
     LONG_DIST_TRADE, LOOM_WEAVING, MONUMENTAL_BUILDING, PERM_SETTLEMENT, PORTABLE_DWELLINGS,
     PROFESSIONAL_ARMY, SACRED_RITUAL, TECH_TREE, WELL_DIGGING,
 };
@@ -522,8 +522,9 @@ pub enum BuildSiteKind {
     /// Finalisation rewrites the tile to `TileKind::Dam` and registers a
     /// hydrology barrier in `RuntimeWater` at the crest; deconstruction
     /// restores the prior tile via `Dam::restore_tile` and clears the
-    /// barrier (impounded water drains). Tech-gated on `BRIDGE_BUILDING`
-    /// (v1 reuses it; a dedicated `DAM_BUILDING` tech is v2).
+    /// barrier (impounded water drains). Tech-gated on the dedicated
+    /// `DAM_BUILDING` (Bronze Age; prereqs `BRIDGE_BUILDING` +
+    /// `MONUMENTAL_BUILDING`).
     Dam,
     /// Lined public well. 1-tile, impassable — agents drink from a
     /// chebyshev-adjacent tile via `DrinkSource::Well`. Tech-gated on
@@ -1022,15 +1023,16 @@ fn build_recipes_table() -> Vec<BuildRecipe> {
             deconstruct_refund: vec![(stone, 2), (wood, 1)],
         },
         // Dam barrier. Heavier than a bridge — it holds back water, not
-        // foot traffic — so more stone + longer work. v1 reuses
-        // `BRIDGE_BUILDING` (a dedicated `DAM_BUILDING` tech is v2).
+        // foot traffic — so more stone + longer work. Tech-gated on the
+        // dedicated `DAM_BUILDING` (Bronze Age) — impounding a watershed
+        // is later, larger-scale engineering than spanning one channel.
         // Player-deconstruct returns half; drop site is the nearest
         // passable bank (same as Bridge — see deconstruct path).
         BuildRecipe {
             name: "Dam",
             inputs: vec![(stone, 6), (wood, 4)],
             work_ticks: 180,
-            tech_gate: Some(BRIDGE_BUILDING),
+            tech_gate: Some(DAM_BUILDING),
             deconstruct_refund: vec![(stone, 3), (wood, 2)],
         },
     ]

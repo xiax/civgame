@@ -466,12 +466,13 @@ pub fn htn_drink_dispatch_system(
 /// physical-reachability condition, not an arbitrary gate.
 const WELL_REACH_Z: f32 = 4.0;
 
-/// True iff a well at `tile` reaches the water table: the aquifer surface
-/// (`HydroCell.aquifer_level` → Z via the single `GLOBE_H_TO_Z` factor) is
-/// at or above the well-shaft bottom (`surface_z − WELL_REACH_Z`). A well
-/// over a deep/arid water table reads dry. Falls back to "has water" when
-/// the chunk/hydrology isn't resolvable (don't strand agents on a missing
-/// cache read — the river fallback still applies downstream).
+/// True iff a well at `tile` reaches the water table: the per-cell aquifer
+/// surface is at or above the well-shaft bottom (`surface_z − WELL_REACH_Z`).
+/// The aquifer Z is computed in the same frame as `surface_z` — anchor on the
+/// per-cell macro elevation (jitter-free), subtract `aquifer_depth_z` — so the
+/// shaft-vs-table comparison is apples-to-apples (matches Pass 4.5 + fluid
+/// sim seep gate). Over a deep/arid table the well reads dry. Falls back to
+/// "has water" when the chunk/hydrology isn't resolvable.
 pub fn well_has_water(globe: &Globe, chunk_map: &ChunkMap, tile: (i32, i32)) -> bool {
     let surf = chunk_map.surface_z_at(tile.0, tile.1);
     if surf < crate::world::chunk::Z_MIN {
@@ -480,7 +481,13 @@ pub fn well_has_water(globe: &Globe, chunk_map: &ChunkMap, tile: (i32, i32)) -> 
     let Some(hc) = globe.hydro_cell_at(tile.0, tile.1) else {
         return true;
     };
-    well_reaches(surf, hc.aquifer_level * GLOBE_H_TO_Z)
+    let (elev_u, _, _) = globe.sample_climate(tile.0, tile.1);
+    let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
+    let cell_surface_z = crate::world::chunk::Z_MIN as f32
+        + macro_f * crate::world::chunk::CHUNK_HEIGHT as f32;
+    let aquifer_depth_z = (hc.filled_height - hc.aquifer_level) * GLOBE_H_TO_Z;
+    let aquifer_z = cell_surface_z - aquifer_depth_z;
+    well_reaches(surf, aquifer_z)
 }
 
 /// Pure shaft-vs-watertable test: the well bottom is `WELL_REACH_Z` below

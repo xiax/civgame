@@ -112,6 +112,7 @@ fn setup_sandbox(
             crate::simulation::typed_task::ActionQueue::idle(),
             crate::simulation::goal_scorers::AgentDecisionState::default(),
             crate::simulation::goal_scorers::Disposition::default(),
+            crate::simulation::social_contact::SecondarySocial::inactive(),
         ),
     ));
 

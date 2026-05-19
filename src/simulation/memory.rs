@@ -3,6 +3,7 @@ use super::lod::LodLevel;
 use super::person::Person;
 use super::schedule::{BucketSlot, SimClock};
 use super::shared_knowledge::ResourceOwner;
+use super::social_contact::{is_social_contact, SecondarySocial};
 use crate::economy::core_ids;
 use crate::economy::resource_catalog::ResourceId;
 use crate::world::chunk::ChunkMap;
@@ -529,6 +530,21 @@ pub fn vision_system(
     }
 }
 
+/// Per-tick affinity gain from a *deliberate* Socialize interaction.
+pub const DEDICATED_AFFINITY_STEP: i8 = 5;
+/// Per-tick affinity gain from *ambient* work-proximity contact. Slow:
+/// acquaintance, not courtship.
+pub const AMBIENT_AFFINITY_STEP: i8 = 1;
+/// Ceiling that ambient-only contact can raise affinity to. Must stay
+/// **below** the cohabitation/bed-reassignment thresholds in
+/// `construction.rs` (`PARTNER_AFFINITY_THRESHOLD = 60`,
+/// `REASSIGN_AFFINITY_THRESHOLD = 80`) so working near someone forms an
+/// acquaintance but never, by itself, a "move in together" bond — that
+/// requires deliberate Socialize. (Daily `relationship_decay` is far too
+/// weak to bound monotonic per-tick accrual on its own, so the cap, not a
+/// reduced rate alone, is what keeps ambient bonds sub-courtship.)
+pub const AMBIENT_AFFINITY_CAP: i8 = 40;
+
 /// Increment relationship affinity between socializing agents within 3
 /// tiles. The MemoryEntry tile-gossip half of this system was retired in
 /// Phase 7 — `cluster_tier_promotion_system` (knowledge.rs) now bubbles
@@ -536,32 +552,45 @@ pub fn vision_system(
 /// tiers when constituents talk to officials.
 pub fn conversation_memory_system(
     spatial: Res<SpatialIndex>,
+    clock: Res<SimClock>,
     mut query: Query<(
         Entity,
         &AgentGoal,
         &Transform,
         &mut RelationshipMemory,
         &LodLevel,
+        Option<&SecondarySocial>,
     )>,
 ) {
-    // Collect socializer entities first so the borrow-checker accepts a
-    // single mutable pass below.
-    let socializers: ahash::AHashSet<Entity> = query
-        .iter()
-        .filter(|(_, goal, _, _, lod)| {
-            matches!(goal, AgentGoal::Socialize) && **lod != LodLevel::Dormant
-        })
-        .map(|(e, _, _, _, _)| e)
-        .collect();
+    // Two-tier bonding (decision: reduced ambient rate). A *deliberate*
+    // Socialize pair bonds fast (+5/tick, uncapped → can reach the
+    // cohabitation thresholds). A purely *ambient* work-proximity pair
+    // bonds slowly (+1/tick) and only up to `AMBIENT_AFFINITY_CAP` — an
+    // acquaintance ceiling below courtship, so coworkers don't auto-move-in
+    // together. `dedicated` = on explicit `AgentGoal::Socialize`; a pair
+    // counts as dedicated if *either* end chose to socialize.
+    let now = clock.tick as u32;
+    let mut socializers: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut dedicated: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    for (e, goal, _, _, lod, sec) in query.iter() {
+        if !is_social_contact(*goal, *lod, sec, now) {
+            continue;
+        }
+        socializers.insert(e);
+        if matches!(goal, AgentGoal::Socialize) && *lod != LodLevel::Dormant {
+            dedicated.insert(e);
+        }
+    }
 
     if socializers.is_empty() {
         return;
     }
 
-    for (entity, goal, transform, mut rel, lod) in query.iter_mut() {
-        if *lod == LodLevel::Dormant || !matches!(goal, AgentGoal::Socialize) {
+    for (entity, goal, transform, mut rel, lod, sec) in query.iter_mut() {
+        if !is_social_contact(*goal, *lod, sec, now) {
             continue;
         }
+        let self_dedicated = dedicated.contains(&entity);
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         for dy in -3i32..=3 {
@@ -570,8 +599,21 @@ pub fn conversation_memory_system(
                     if other == entity {
                         continue;
                     }
-                    if socializers.contains(&other) {
-                        rel.update(other, 5);
+                    if !socializers.contains(&other) {
+                        continue;
+                    }
+                    if self_dedicated || dedicated.contains(&other) {
+                        // Chosen social time → fast, uncapped bonding.
+                        rel.update(other, DEDICATED_AFFINITY_STEP);
+                    } else {
+                        // Ambient work proximity → slow, capped at the
+                        // acquaintance ceiling (never raises an already
+                        // higher bond, never pushes past the cap).
+                        let cur = rel.get_affinity(other);
+                        if cur < AMBIENT_AFFINITY_CAP {
+                            let step = AMBIENT_AFFINITY_STEP.min(AMBIENT_AFFINITY_CAP - cur);
+                            rel.update(other, step);
+                        }
                     }
                 }
             }

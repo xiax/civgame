@@ -2,8 +2,11 @@
 
 ## Status
 
-**✅ COMPLETE — all 7 phases shipped. End-state docs: `src/world/CLAUDE.md` "Water system" +
-`src/simulation/CLAUDE.md` thirst/construction. v2 deferrals at the bottom of this file.**
+**✅ COMPLETE — all 7 phases + v2 (W1–W4: DAM_BUILDING tech, seasonal/spring/aquifer sim
+fidelity, per-cell routing, chunk retention, AI dam planning) + Pass 4.5 (chunk-gen per-tile
+aquifer marsh — closes the per-climate-cell classifier blind spot the runtime sim couldn't
+reach) shipped. End-state docs: `src/world/CLAUDE.md` "Water system" + `src/simulation/CLAUDE.md`
+Bridges&Dams. v2 log + the remaining v3 deferrals at the bottom of this file.**
 
 - **Phase 0** ✅ audit done (findings folded into `src/world/CLAUDE.md` "Water system").
 - **Phase 1** ✅ hydrology truth shipped, additive. `GLOBE_FILE_VERSION` 8.
@@ -195,16 +198,32 @@ trio.
   persist; deconstruct dam → drains/restores; world-map overlay matches gameplay.
 - Re-baselined locked tests carry a justifying comment.
 
-## Deferred (v2, actionable)
+## v2 — ✅ shipped (W1–W4; 814 tests green)
 
-- Dedicated `DAM_BUILDING` tech/civic gate (v1 reuses `BRIDGE_BUILDING`) — add tech in
-  `technology.rs`, swap the recipe `tech_gate` + `faction_can_build` gate in `ui/orders.rs`.
-- **Spring/aquifer-from-digging sources** (Phase 5 stubbed): in `spawn_water_sim_task_system`, set
-  `WaterCell.source` from `globe.hydro_cell_at(t).discharge`/spring flag, and from dug cells whose
-  floor Z < `HydroCell.aquifer_level` (bounded inflow, no rock flooding). Hook point is the per-tile
-  classify loop; `WaterCell::with_source` already exists.
-- **Per-cell flow routing** to replace the highest-boundary-inlet heuristic — walk
-  `RiverNetwork.edge_polylines` clipped to the active region to place inlet/outlet exactly.
-- Drowning, structural dam **breach** + flood damage, flood-evac AI, autonomous AI dam planning.
-- Sediment transport / meander migration / seasonal discharge variation.
-- Chunk-delta disk persistence (orthogonal; `RuntimeWater` rebuilds from entities for now).
+- **W1 — `DAM_BUILDING` tech.** `TechId=46` Bronze Age (`AdoptionScale::Institutional`,
+  prereqs `BRIDGE_BUILDING+MONUMENTAL_BUILDING`); Dam recipe `tech_gate` repointed off
+  `BRIDGE_BUILDING`; `technology_adoption::tech_scale` arm; `ui/orders.rs` auto-repoints
+  (dynamic `recipe_for(...).tech_gate`). `TECH_COUNT 46→47`. Tech-DAG validity tests added.
+- **W2 — sim fidelity.** (a) `Calendar::discharge_multiplier` snowmelt hydrograph
+  (Spring 1.5 / Summer 0.7 / Autumn 1.0 / Winter 0.25), full for river inlets, damped
+  `0.5+0.5·m` for aquifer seep. (b) Spring + aquifer-from-digging sources in the
+  classify loop, **capped at the table** (`bed+depth<aquifer_z`) so no rock flooding —
+  snapshot-time gate, zero `water.rs` change (conservation/determinism tests stand);
+  `aquifer_seep_emitter_system` bootstraps the region on dig (no global scan); `poll`
+  persists `source_rate` + keeps a still-fed drained cell alive (isolated wells refill).
+  (c) `RiverNetwork::edge_crossings_in_bbox` replaces the highest-boundary heuristic with
+  true channel inlet/outlet topology.
+- **W3 — chunk retention (the persistence answer).** `update_chunk_retention_system` pins
+  every dam + runtime/seep cell's chunk. **True cross-process persistence is N/A by
+  engine design** — only `world.bin` (Globe) serialises; everything else regenerates
+  from `Globe+seed`, so the in-session retention pin is the correct mechanism.
+- **W4 — AI dam planning.** `organic_settlement::dam_intent_emitter_system` mirrors the
+  bridge emitter; gated `DAM_BUILDING`+`CivicKind::Dam (Bronze,30)`; pure `score_dam_site`
+  composes irrigation / reservoir / road-crossing; one dam/settlement/cadence,
+  `DAM_MIN_SPACING` apart; author-less.
+
+## Still deferred (v3, actionable)
+
+- Drowning; structural dam **breach** + flood damage; flood-evac AI.
+- Sediment transport / meander migration.
+- (Cross-process disk persistence intentionally out of scope — see W3.)

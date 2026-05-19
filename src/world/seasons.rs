@@ -89,6 +89,22 @@ impl Calendar {
         }
     }
 
+    /// Seasonal scalar on river / spring discharge — a snowmelt-realistic
+    /// hydrograph: the **Spring freshet** runs high as the snowpack melts,
+    /// **Summer** falls to base-flow, **Autumn** is moderate, and **Winter**
+    /// drops to a frozen low (not zero — the channel still seeps). Applied to
+    /// fluid-sim inlet/spring source rates so a storage dam matters across
+    /// the year. Aquifer seep uses a *damped* form of this (groundwater lags
+    /// and buffers surface seasonality — see `water_runtime.rs`).
+    pub fn discharge_multiplier(&self) -> f32 {
+        match self.season {
+            Season::Spring => 1.5,
+            Season::Summer => 0.7,
+            Season::Autumn => 1.0,
+            Season::Winter => 0.25,
+        }
+    }
+
     /// Cumulative day count since founding (year 1, Spring, day 1 == 1).
     /// Useful for elapsed-time math that spans years.
     pub fn total_days(&self) -> u32 {
@@ -210,5 +226,26 @@ mod tests {
         // + day 2.
         let expected = 2 * 4 * DAYS_PER_SEASON + DAYS_PER_SEASON + 2;
         assert_eq!(cal.total_days(), expected);
+    }
+
+    #[test]
+    fn discharge_multiplier_is_a_snowmelt_hydrograph() {
+        let m = |s| {
+            Calendar {
+                season: s,
+                ..Calendar::default()
+            }
+            .discharge_multiplier()
+        };
+        // Spring freshet is the annual peak; Winter the frozen low but
+        // never zero (the channel still seeps under ice).
+        assert_eq!(m(Season::Spring), 1.5);
+        assert_eq!(m(Season::Summer), 0.7);
+        assert_eq!(m(Season::Autumn), 1.0);
+        assert_eq!(m(Season::Winter), 0.25);
+        assert!(m(Season::Spring) > m(Season::Autumn));
+        assert!(m(Season::Autumn) > m(Season::Summer));
+        assert!(m(Season::Summer) > m(Season::Winter));
+        assert!(m(Season::Winter) > 0.0);
     }
 }

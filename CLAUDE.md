@@ -42,7 +42,7 @@ Read once by `spawn_population` + `seed_starting_buildings_system`:
 ParallelA → ParallelB → Sequential → Economy
 ```
 
-- **ParallelA** — read-heavy (needs, mood, LOD, goal updates, animal sensing).
+- **ParallelA** — read-heavy (needs, mood, LOD, goal updates, ambient social pairing, animal sensing).
 - **ParallelB** — HTN dispatchers; `goal_dispatch_system` is the stale-reset / Explore-cleanup catch-all.
 - **Sequential** — mutating, ordered: gather → dig/construction → movement → combat → production.
 - **Economy** — gossip, faction storage rollup, reproduction, raids, technology, market prices.
@@ -65,7 +65,7 @@ ParallelA → ParallelB → Sequential → Economy
 - **Stone lithologies** (`is_stone_like`): `Stone` (legacy), `Granite`, `Limestone` (yields 3 vs. 2), `Sandstone`, `Basalt`, plus underground `Wall` and `Ore`.
 - **Soils** (`is_soil_like`): `Dirt`, `Loam` (1.5×), `Silt` (1.4×, riparian), `Clay`, `SandySoil` (0.6×), `Cropland` (1.3×).
 - **`Bridge`** — passable, road-speed, reports `is_freshwater()` (water flows under decking).
-- **`Dam`** — constructed barrier across a watercourse. Passable + road-speed (crest carries a road) but **not** water-like / freshwater / drinkable (water is blocked, not flowing under — unlike `Bridge`). Durable truth is the `Dam` entity in `DamMap`; the tile kind is its cache projection, restamped from `DamMap` on chunk reload by `restamp_runtime_water_on_chunk_load`. Crest barrier registered in `RuntimeWater.dam_crests` for the Phase 5 fluid sim.
+- **`Dam`** — constructed barrier across a watercourse. Passable + road-speed (crest carries a road) but **not** water-like / freshwater / drinkable (water is blocked, not flowing under — unlike `Bridge`). Durable truth is the `Dam` entity in `DamMap`; the tile kind is its cache projection, restamped from `DamMap` on chunk reload by `restamp_runtime_water_on_chunk_load`. Crest barrier registered in `RuntimeWater.dam_crests` for the fluid sim. Tech-gated on dedicated **`DAM_BUILDING`** (Bronze Age; prereqs `BRIDGE_BUILDING` + `MONUMENTAL_BUILDING`). AI plans dams autonomously via `organic_settlement::dam_intent_emitter_system` (composite irrigation / reservoir / road-crossing scorer, `CivicKind::Dam` at Bronze+30).
 - **`Cropland`** — tilled farm soil. Stamped over Grass/soil by `carve_plots_system` (+ `seed_starting_farms_system` / `seed_farmstead_yard`) for every tile of an Agricultural plot, so a field renders as a distinct golden-earth block. `is_soil_like` (plant/fertility plumbing accepts it), speed 0.9, and **never paved by road carving** (`tile_is_farm_protected` + an explicit `Cropland` writability reject in `write_road_tile` / `road_carve_system`).
 
 Helpers: `stone_yield_count`, `soil_fertility_mult`. There is no `Farmland` variant — wheat grows on high-fertility Grass/soil; an Agricultural plot's tiles are flipped to `Cropland` at carve time for legibility + road protection. Pathing speeds: Sand 0.75, Snow 0.6, Marsh 0.4, Scrub 0.9, soils 0.85–0.9 (Cropland 0.9), stone 1.0.

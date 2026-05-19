@@ -60,6 +60,7 @@ impl Plugin for WorldPlugin {
             .insert_resource(water_runtime::RuntimeWater::default())
             .insert_resource(water_runtime::WaterSim::default())
             .add_event::<chunk_streaming::TileChangedEvent>()
+            .add_event::<chunk_streaming::TileCarvedEvent>()
             .add_event::<chunk_streaming::ChunkLoadedEvent>()
             .add_event::<chunk_streaming::ChunkUnloadedEvent>()
             .add_event::<RegenerateWorldRequest>()
@@ -98,7 +99,11 @@ impl Plugin for WorldPlugin {
             )
             .add_systems(
                 PostUpdate,
-                water_runtime::spawn_water_sim_task_system
+                (
+                    water_runtime::aquifer_seep_emitter_system,
+                    water_runtime::spawn_water_sim_task_system,
+                )
+                    .chain()
                     .run_if(in_state(crate::GameState::Playing)),
             )
             .add_systems(PostUpdate, chunk_streaming::refresh_changed_tiles_system);

@@ -8,7 +8,7 @@ use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::TaskKind;
 use crate::world::chunk::{ChunkMap, Z_MIN};
-use crate::world::chunk_streaming::TileChangedEvent;
+use crate::world::chunk_streaming::{TileCarvedEvent, TileChangedEvent};
 use crate::world::globe::Globe;
 use crate::world::terrain::{tile_to_world, WorldGen};
 use crate::world::tile::TileKind;
@@ -21,6 +21,7 @@ pub fn dig_system(
     mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,
     mut tile_changed: EventWriter<TileChangedEvent>,
+    mut tile_carved: EventWriter<TileCarvedEvent>,
     clock: Res<SimClock>,
     gen: Res<WorldGen>,
     globe: Res<Globe>,
@@ -77,6 +78,17 @@ pub fn dig_system(
             target_floor_z,
             &mut tile_changed,
         );
+
+        // Signal a real excavation distinct from any other tile mutation.
+        // `aquifer_seep_emitter_system` consumes ONLY this event, so wall
+        // stamping / road carving / plant lifecycle no longer false-trigger
+        // groundwater seep on natural tiles whose climate-cell aquifer reads
+        // a hair above their per-tile jittered surface.
+        tile_carved.send(TileCarvedEvent {
+            tx,
+            ty,
+            new_floor_z: target_floor_z,
+        });
 
         for (resource_id, qty) in drops {
             if qty == 0 {

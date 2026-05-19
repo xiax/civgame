@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 pub type TechId = u16;
-pub const TECH_COUNT: usize = 46;
+pub const TECH_COUNT: usize = 47;
 pub const ACTIVITY_COUNT: usize = 13;
 
 // ── Tech ID constants ─────────────────────────────────────────────────────────
@@ -63,6 +63,11 @@ pub const BRIDGE_BUILDING: TechId = 44;
 // Neolithic public-water structure. Gates `BuildSiteKind::Well` and
 // the organic-settlement WaterAccess pressure.
 pub const WELL_DIGGING: TechId = 45;
+// Bronze-Age hydraulic engineering. Gates `BuildSiteKind::Dam` (the
+// recipe `tech_gate`) and the AI `dam_intent_emitter_system`. Distinct
+// from `BRIDGE_BUILDING` — impounding a watercourse is later, larger-
+// scale civil engineering than spanning one.
+pub const DAM_BUILDING: TechId = 46;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -1158,8 +1163,62 @@ pub static TECH_TREE: [TechDef; TECH_COUNT] = [
         }],
         bonus: TechBonus::ZERO,
     },
+    TechDef {
+        id: DAM_BUILDING,
+        era: Era::BronzeAge,
+        name: "Dam Building",
+        description: "Stone-and-timber barriers impound rivers for reservoirs, irrigation, \
+             and dry-season water security — a civilisation reshapes its watershed.",
+        prerequisites: &[BRIDGE_BUILDING, MONUMENTAL_BUILDING],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
 ];
 
 // Discovery is now per-person and per-action; see
 // `simulation::knowledge::discovery_system`. The old season-boundary
 // faction-level roller has been removed.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `tech_def` indexes `TECH_TREE[id]` directly, so the array MUST be
+    /// dense and ordered: entry `i` has `id == i`, and length == TECH_COUNT.
+    #[test]
+    fn tech_tree_is_dense_and_ordered() {
+        assert_eq!(TECH_TREE.len(), TECH_COUNT);
+        for (i, def) in TECH_TREE.iter().enumerate() {
+            assert_eq!(def.id as usize, i, "TECH_TREE[{i}].id must equal {i}");
+        }
+    }
+
+    /// Every prerequisite must be a lower id than the tech itself — the tree
+    /// is a DAG topologically sorted by id (era-monotone), which guards
+    /// against an unreachable tech and is relied on by seeding/discovery.
+    #[test]
+    fn prerequisites_precede_dependents() {
+        for def in TECH_TREE.iter() {
+            for &pre in def.prerequisites {
+                assert!(
+                    pre < def.id,
+                    "tech {} ({}) lists prereq {} that is not earlier",
+                    def.id,
+                    def.name,
+                    pre
+                );
+            }
+        }
+    }
+
+    /// DAM_BUILDING is the dedicated Bronze-Age dam gate (split from
+    /// BRIDGE_BUILDING), prereqed on bridge + monumental engineering.
+    #[test]
+    fn dam_building_is_bronze_age_engineering() {
+        let d = tech_def(DAM_BUILDING);
+        assert_eq!(d.era, Era::BronzeAge);
+        assert!(d.prerequisites.contains(&BRIDGE_BUILDING));
+        assert!(d.prerequisites.contains(&MONUMENTAL_BUILDING));
+        assert_eq!(complexity(DAM_BUILDING), 5);
+    }
+}

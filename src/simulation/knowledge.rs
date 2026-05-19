@@ -386,6 +386,7 @@ pub struct DiscoveryActionEvent {
 /// `conversation_memory_system`, before `tech_teaching_system`.
 pub fn awareness_gossip_system(
     spatial: Res<crate::world::spatial::SpatialIndex>,
+    clock: Res<crate::simulation::schedule::SimClock>,
     mut q: Query<(
         Entity,
         &Transform,
@@ -393,10 +394,11 @@ pub fn awareness_gossip_system(
         &super::lod::LodLevel,
         &mut PersonKnowledge,
         Option<&mut super::memory::AgentMemory>,
+        Option<&crate::simulation::social_contact::SecondarySocial>,
     )>,
 ) {
-    use super::goals::AgentGoal;
-    use super::lod::LodLevel;
+    use crate::simulation::social_contact::is_social_contact;
+    let now = clock.tick as u32;
 
     // Snapshot each socializing agent's tech-awareness (aware|learned)
     // AND visited settlements (Pluralist Economy R8 follow-on). Both
@@ -407,10 +409,8 @@ pub fn awareness_gossip_system(
         (u64, Vec<crate::simulation::settlement::SettlementId>),
     > = q
         .iter()
-        .filter(|(_, _, goal, lod, _, _)| {
-            matches!(goal, AgentGoal::Socialize) && **lod != LodLevel::Dormant
-        })
-        .map(|(e, _, _, _, k, mem_opt)| {
+        .filter(|(_, _, goal, lod, _, _, sec)| is_social_contact(**goal, **lod, *sec, now))
+        .map(|(e, _, _, _, k, mem_opt, _)| {
             let aware = k.aware | k.learned;
             let settlements: Vec<_> = mem_opt
                 .as_deref()
@@ -424,8 +424,8 @@ pub fn awareness_gossip_system(
         return;
     }
 
-    for (entity, transform, goal, lod, mut knowledge, mem_opt) in q.iter_mut() {
-        if *lod == LodLevel::Dormant || !matches!(goal, AgentGoal::Socialize) {
+    for (entity, transform, goal, lod, mut knowledge, mem_opt, sec) in q.iter_mut() {
+        if !is_social_contact(*goal, *lod, sec, now) {
             continue;
         }
         let tx = (transform.translation.x / TILE_SIZE_LOCAL).floor() as i32;
@@ -495,17 +495,18 @@ pub fn cluster_tier_promotion_system(
         Option<&super::faction::FactionMember>,
         Option<&super::faction::FactionChief>,
         Option<&crate::simulation::reproduction::HouseholdMember>,
+        Option<&crate::simulation::social_contact::SecondarySocial>,
     )>,
 ) {
-    use super::goals::AgentGoal;
-    use super::lod::LodLevel;
     use super::person::Profession;
     use crate::simulation::shared_knowledge::KnowledgeTier;
+    use crate::simulation::social_contact::is_social_contact;
 
     const TIER_PROMOTION_CADENCE: u64 = 200; // 10s game-time
     if clock.tick % TIER_PROMOTION_CADENCE != 0 {
         return;
     }
+    let now_contact = clock.tick as u32;
 
     // Snapshot socializing agents with their faction / household / official
     // status, keyed by tile for cheap neighbour lookup.
@@ -519,10 +520,10 @@ pub fn cluster_tier_promotion_system(
     }
     let snaps: Vec<Snap> = q
         .iter()
-        .filter(|(_, _, goal, lod, _, _, _, _)| {
-            matches!(goal, AgentGoal::Socialize) && **lod != LodLevel::Dormant
+        .filter(|(_, _, goal, lod, _, _, _, _, sec)| {
+            is_social_contact(**goal, **lod, *sec, now_contact)
         })
-        .filter_map(|(e, t, _, _, profession, fm, chief, hm)| {
+        .filter_map(|(e, t, _, _, profession, fm, chief, hm, _)| {
             let fm = fm?;
             let tx = (t.translation.x / TILE_SIZE_LOCAL).floor() as i32;
             let ty = (t.translation.y / TILE_SIZE_LOCAL).floor() as i32;
@@ -681,6 +682,12 @@ pub fn tech_teaching_system(
     use super::lod::LodLevel;
 
     // Pass 1: snapshot Learned bitsets from socializing agents.
+    //
+    // INTENTIONALLY not ambient-aware: deliberate mastery transfer stays
+    // gated to explicit `AgentGoal::Socialize`. Do NOT consult
+    // `social_contact::SecondarySocial` / `is_social_contact` here — casual
+    // work chatter must not become accidental instruction (awareness/wage
+    // gossip is free and does go ambient; *teaching* does not).
     let snapshots: ahash::AHashMap<Entity, u64> = q
         .iter()
         .filter(|(_, _, goal, _, lod, _, _)| {

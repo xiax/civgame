@@ -11,7 +11,8 @@ use crate::rendering::fog::{apply_fog_to_material, FogMap, FogTileMaterials};
 use crate::rendering::projection::{
     skirt_sprite, ElevationSkirt, MapProjection, MapViewMode, ProjectedAnchor, ProjectionState,
 };
-use crate::simulation::construction::{StructureLabel, Wall, WallMap, WallMaterial};
+use crate::simulation::construction::{DamMap, StructureLabel, Wall, WallMap, WallMaterial};
+use crate::world::water_runtime::RuntimeWater;
 use crate::simulation::faction::{FactionCenter, StorageTileMap};
 use crate::simulation::items::GroundItem;
 use crate::simulation::plants::{
@@ -61,6 +62,20 @@ pub struct ChunkLoadedEvent {
 #[derive(Event)]
 pub struct ChunkUnloadedEvent {
     pub coord: ChunkCoord,
+}
+
+/// Emitted by `simulation::dig::dig_system` when an agent actually carves a
+/// floor below the prior surface. Distinct from `TileChangedEvent` (which
+/// fires for any tile mutation — wall stamping, road carving, plant
+/// lifecycle, etc.) so consumers that only care about excavation —
+/// specifically `water_runtime::aquifer_seep_emitter_system` — can react to
+/// real digs without false-positives on every chunk-load wall stamp.
+#[derive(Event)]
+pub struct TileCarvedEvent {
+    pub tx: i32,
+    pub ty: i32,
+    /// The new floor Z after the dig (`= surf_z - 1` in `dig_system`).
+    pub new_floor_z: i32,
 }
 
 /// Bundles the load/unload event writers so `chunk_streaming_system` stays
@@ -125,16 +140,35 @@ pub fn update_simulation_focus_system(
 }
 
 /// Runs each tick before `chunk_streaming_system`. Rebuilds `ChunkRetention`
-/// from FactionCenter / StorageTileMap / PathFollow. Cheap — bounded by
-/// (factions + storage tiles + active path lengths), well under a millisecond
-/// in practice.
+/// from FactionCenter / StorageTileMap / PathFollow, plus every player-/AI-
+/// affected water tile (dams + persisted runtime/seep cells). Cheap —
+/// bounded by (factions + storage tiles + active path lengths + dams + seep
+/// cells), well under a millisecond in practice.
+///
+/// **Water retention is the v2 "persistence" mechanism.** `RuntimeWater` is
+/// off-chunk and survives unload *within a session*, but this engine has no
+/// ECS save/load — only `world.bin` (the Globe) serialises; everything else
+/// regenerates live from `Globe + seed`, so cross-process persistence of
+/// runtime water is N/A by design. Pinning the chunks under a dam pool or a
+/// dug-aquifer seep keeps the fluid sim's region + its backing tiles
+/// resident as the player roams, so pan-away/back stays desync-free without
+/// leaning solely on the reload restamp.
 pub fn update_chunk_retention_system(
     mut retention: ResMut<ChunkRetention>,
     storage: Res<StorageTileMap>,
+    dams: Res<DamMap>,
+    runtime_water: Res<RuntimeWater>,
     centers: Query<&Transform, With<FactionCenter>>,
     follows: Query<&PathFollow>,
 ) {
     retention.pinned.clear();
+
+    let chunk_of = |tx: i32, ty: i32| {
+        ChunkCoord(
+            tx.div_euclid(CHUNK_SIZE as i32),
+            ty.div_euclid(CHUNK_SIZE as i32),
+        )
+    };
 
     for transform in &centers {
         let coord = chunk_coord_from_world(transform.translation.x, transform.translation.y);
@@ -142,15 +176,22 @@ pub fn update_chunk_retention_system(
     }
 
     for &(tx, ty) in storage.tiles.keys() {
-        retention.pinned.insert(ChunkCoord(
-            (tx as i32).div_euclid(CHUNK_SIZE as i32),
-            (ty as i32).div_euclid(CHUNK_SIZE as i32),
-        ));
+        retention.pinned.insert(chunk_of(tx, ty));
     }
 
     for follow in &follows {
         for &coord in &follow.chunk_route {
             retention.pinned.insert(coord);
+        }
+    }
+
+    // Dams (durable truth) + every standing or spring-fed runtime cell.
+    for &(tx, ty) in dams.0.keys() {
+        retention.pinned.insert(chunk_of(tx, ty));
+    }
+    for (&(tx, ty), cell) in runtime_water.cells.iter() {
+        if cell.depth > 0.0 || cell.source_rate > 0.0 {
+            retention.pinned.insert(chunk_of(tx, ty));
         }
     }
 }

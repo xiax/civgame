@@ -30,6 +30,7 @@ use crate::simulation::jobs::{JobBoard, JobClaim};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{Drafted, PersonAI, Profession};
+use crate::simulation::social_contact::SecondarySocial;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::skills::Skills;
 use crate::simulation::typed_task::{ActionQueue, Task};
@@ -111,6 +112,7 @@ pub fn opportunistic_interrupt_system(
             Option<&mut GoalCooldown>,
             Option<&JobClaim>,
             Option<&mut AgentDecisionState>,
+            Option<&SecondarySocial>,
         ),
         Without<Drafted>,
     >,
@@ -134,6 +136,7 @@ pub fn opportunistic_interrupt_system(
         cooldown_opt,
         claim_opt,
         decision_opt,
+        secondary_opt,
     ) in query.iter_mut()
     {
         // ── Eligibility gates ──────────────────────────────────────
@@ -226,6 +229,15 @@ pub fn opportunistic_interrupt_system(
             time_of_day_bonus,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
         };
+        // Ambient-social suppression: a worker with a live ambient
+        // work-pairing is already getting social relief + relationships /
+        // gossip via the ambient pipeline. Don't let `SocialScorer` preempt
+        // durable work into a dedicated Socialize detour while the pairing
+        // holds. Only the Socialize challenger is suppressed — Play / other
+        // opportunistic scorers stay eligible.
+        let ambient_social_active = secondary_opt
+            .map(|ss| ss.is_active(now as u32))
+            .unwrap_or(false);
         let mut best: Option<(GoalScore, &'static str)> = None;
         inputs.metrics.goal_evaluations = inputs.metrics.goal_evaluations.saturating_add(1);
         inputs.metrics.scorer_evaluations = inputs
@@ -237,6 +249,9 @@ pub fn opportunistic_interrupt_system(
             let Some(s) = scorer.score(&ctx) else {
                 continue;
             };
+            if ambient_social_active && s.goal == AgentGoal::Socialize {
+                continue;
+            }
             if s.goal == *goal {
                 continue;
             }

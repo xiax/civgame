@@ -25,6 +25,10 @@ pub enum CivicKind {
     /// Market — bridges are public utility, not status; settlements
     /// don't need full civic capacity to coordinate one span.
     Bridge,
+    /// Stone-and-timber dam impounding a watercourse. Bronze-Age hydraulic
+    /// engineering — heavier coordination than a bridge (it reshapes the
+    /// watershed) but pure utility, so below the Monument status threshold.
+    Dam,
 }
 
 /// Returns true iff a faction in `era` with `peak_population` may commission
@@ -38,6 +42,7 @@ pub fn civic_milestone_allows(kind: CivicKind, era: Era, peak_population: u32) -
         CivicKind::Barracks => (Era::Chalcolithic, 30),
         CivicKind::Monument => (Era::BronzeAge, 80),
         CivicKind::Bridge => (Era::Chalcolithic, 20),
+        CivicKind::Dam => (Era::BronzeAge, 30),
     };
     (era as u8) >= (min_era as u8) && peak_population >= min_pop
 }
@@ -55,6 +60,7 @@ mod tests {
             CivicKind::Barracks,
             CivicKind::Monument,
             CivicKind::Bridge,
+            CivicKind::Dam,
         ] {
             assert!(!civic_milestone_allows(kind, Era::Paleolithic, 1000));
         }
@@ -76,6 +82,19 @@ mod tests {
             CivicKind::Bridge,
             Era::Neolithic,
             40
+        ));
+    }
+
+    #[test]
+    fn bronze_30_unlocks_dam_chalcolithic_does_not() {
+        assert!(civic_milestone_allows(CivicKind::Dam, Era::BronzeAge, 30));
+        assert!(!civic_milestone_allows(CivicKind::Dam, Era::BronzeAge, 29));
+        // A bridge-capable Chalcolithic town still can't dam (tech + civic
+        // both gate later than Bridge).
+        assert!(!civic_milestone_allows(
+            CivicKind::Dam,
+            Era::Chalcolithic,
+            200
         ));
     }
 

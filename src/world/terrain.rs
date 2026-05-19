@@ -271,16 +271,21 @@ pub fn topsoil_kind(biome: Biome, river_d: u8) -> TileKind {
 /// badland scree retain jagged character. Bounded so even the noisiest biome
 /// can't drift more than ±~5 Z from the macro signal.
 fn local_detail_amp(biome: Biome) -> f32 {
+    // Per-tile detail amplitudes calibrated against our 1.5 m tile scale.
+    // Numbers are in v-units (`v ∈ [0,1]` → `Z = -16 + v·32`), so multiplying
+    // by 32 gives the Z range (and by 48 the metres range). Halved from the
+    // legacy ±3–7 m values, which produced unrealistic micro-topography at
+    // tile scale.
     match biome {
-        // Coasts, lowlands, and dry flats: stick close to the macro elevation
-        // so a "lowland" on the world map doesn't render as a plateau.
-        Biome::Ocean | Biome::Wetland | Biome::Desert | Biome::Steppe => 0.07,
-        // Generic vegetated belts: moderate rolling terrain.
+        // Coasts, lowlands, dry flats: ±1.12 Z ≈ ±1.7 m.
+        Biome::Ocean | Biome::Wetland | Biome::Desert | Biome::Steppe => 0.035,
+        // Generic vegetated belts: ±1.6 Z ≈ ±2.4 m.
         Biome::Grassland | Biome::Temperate | Biome::Taiga | Biome::Tropical | Biome::Tundra => {
-            0.10
+            0.05
         }
-        // Mountain ridges and badland uplift: more relief to read as rugged.
-        Biome::Mountain | Biome::Badlands => 0.15,
+        // Mountain ridges, badland uplift: ±2.4 Z ≈ ±3.6 m — still rugged
+        // without absurd per-tile 6 m cliffs.
+        Biome::Mountain | Biome::Badlands => 0.075,
     }
 }
 
@@ -680,6 +685,53 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
             surface_water_depth[ly][lx] = depth;
             surface_reservoir_id[ly][lx] = res.id;
             surface_fertility[ly][lx] = 0;
+        }
+    }
+
+    // ── Pass 4.5: per-tile aquifer marsh ──
+    // Pass 4 stamps whole-basin Lake/Wetland at climate-cell resolution; per-tile bed
+    // jitter creates depressions that physically sit below the local water table but get
+    // left dry. The gate must live in the same Z frame as `surface_z`: anchor on the
+    // per-CELL macro elevation (from `sample_climate`, jitter-free, identical to the
+    // macro_f signal `surface_v` uses) and subtract the per-cell aquifer-depth-Z. A
+    // per-tile bed whose downward jitter exceeds that depth is genuinely below the
+    // cell-resolution water table ⇒ Marsh. Same gate used by `water_runtime` so the
+    // engine treats natural depressions and dug pits identically.
+    for ly in 0..CHUNK_SIZE {
+        for lx in 0..CHUNK_SIZE {
+            let kind = surface_kind[ly][lx];
+            if matches!(
+                kind,
+                TileKind::River | TileKind::Water | TileKind::Marsh
+            ) {
+                continue;
+            }
+            let tx = chunk_tx0 + lx as i32;
+            let ty = chunk_ty0 + ly as i32;
+            let Some(h) = globe.hydro_cell_at(tx, ty) else {
+                continue;
+            };
+            let (elev_u, _, _) = globe.sample_climate(tx, ty);
+            let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
+            let cell_surface_z = Z_MIN as f32 + macro_f * CHUNK_HEIGHT as f32;
+            let aquifer_depth_z = (h.filled_height - h.aquifer_level) * GLOBE_H_TO_Z;
+            let table_z = cell_surface_z - aquifer_depth_z;
+            let bed_z = surface_z[ly][lx] as f32;
+            if bed_z >= table_z {
+                continue;
+            }
+            let water_surf = (table_z.round() as i32).clamp(Z_MIN, Z_MAX);
+            let bed = (bed_z.round() as i32).clamp(Z_MIN, water_surf);
+            let depth = ((water_surf - bed) as f32).max(MIN_RIVER_DEPTH_Z);
+            surface_kind[ly][lx] = TileKind::Marsh;
+            surface_z[ly][lx] = water_surf as i8;
+            surface_ground_z[ly][lx] = bed as i8;
+            surface_water_depth[ly][lx] = depth;
+            // reservoir_id stays u32::MAX — these aren't part of any globe reservoir.
+            let v = v_cache[ly][lx];
+            let base = surface_fertility_of(TileKind::Marsh, v) as f32;
+            let mult = river_fertility_mult(surface_river_distance[ly][lx]);
+            surface_fertility[ly][lx] = (base * mult).min(255.0) as u8;
         }
     }
 
@@ -1155,5 +1207,184 @@ mod tests {
         let pos = tile_to_world(5, 7);
         let (tx, ty) = world_to_tile(pos);
         assert_eq!((tx, ty), (5, 7));
+    }
+
+    /// Pass 4.5 post-condition: after chunk generation, every dry land tile's bed
+    /// sits at or above the per-cell water table (cell macro elevation minus
+    /// aquifer depth). Tiles whose per-tile jitter dips below that gate have
+    /// been flipped to Marsh by Pass 4.5 (or already wet via Pass 2/4).
+    #[test]
+    fn pass_4_5_no_dry_tile_below_cell_table() {
+        let gen = WorldGen::new();
+        let g = test_globe();
+        let samples = [(0, 0), (40, 40), (-30, 20), (60, -20), (10, 80), (-60, -40)];
+        for (cx, cy) in samples {
+            let c = generate_chunk_from_globe(ChunkCoord(cx, cy), &g, &gen);
+            for ly in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    let k = c.surface_kind[ly][lx];
+                    if matches!(
+                        k,
+                        TileKind::River | TileKind::Water | TileKind::Marsh
+                    ) {
+                        continue;
+                    }
+                    let tx = cx * CHUNK_SIZE as i32 + lx as i32;
+                    let ty = cy * CHUNK_SIZE as i32 + ly as i32;
+                    let Some(h) = g.hydro_cell_at(tx, ty) else {
+                        continue;
+                    };
+                    let (elev_u, _, _) = g.sample_climate(tx, ty);
+                    let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
+                    let cell_surface_z = Z_MIN as f32 + macro_f * CHUNK_HEIGHT as f32;
+                    let aquifer_depth_z =
+                        (h.filled_height - h.aquifer_level) * GLOBE_H_TO_Z;
+                    let table_z = cell_surface_z - aquifer_depth_z;
+                    let bed_z = c.surface_ground_z[ly][lx] as f32;
+                    assert!(
+                        bed_z >= table_z - 1e-3,
+                        "dry tile ({tx},{ty}) kind={k:?} bed={bed_z} below cell table={table_z}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Diagnostic: print Pass-4.5 marsh fraction over a large area so we can
+    /// eyeball whether the aquifer-depth calibration produces reasonable rates
+    /// (lots in wet biomes, near-zero in deserts). Ignored by default; run with
+    /// `cargo test --bin civgame -- --ignored pass_4_5_marsh_frequency
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn pass_4_5_marsh_frequency_diagnostic() {
+        let gen = WorldGen::new();
+        let g = test_globe();
+        let mut total = 0u64;
+        let mut pass45 = 0u64;
+        let mut pass4 = 0u64;
+        // Distribution measurements for calibration.
+        let mut min_jitter_z = f32::INFINITY;
+        let mut max_jitter_z = f32::NEG_INFINITY;
+        let mut min_depth_z = f32::INFINITY;
+        let mut max_depth_z = f32::NEG_INFINITY;
+        let mut below_table_count = 0u64;
+        let mut sampled = 0u64;
+        for cy in -16..=16 {
+            for cx in -16..=16 {
+                let c = generate_chunk_from_globe(ChunkCoord(cx, cy), &g, &gen);
+                for ly in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        total += 1;
+                        let k = c.surface_kind[ly][lx];
+                        if k == TileKind::Marsh {
+                            if c.surface_reservoir_id[ly][lx] == u32::MAX {
+                                pass45 += 1;
+                            } else {
+                                pass4 += 1;
+                            }
+                        }
+                        // Skip non-land for the distribution stats.
+                        if matches!(
+                            k,
+                            TileKind::River | TileKind::Water | TileKind::Marsh
+                        ) {
+                            continue;
+                        }
+                        let tx = cx * CHUNK_SIZE as i32 + lx as i32;
+                        let ty = cy * CHUNK_SIZE as i32 + ly as i32;
+                        let Some(h) = g.hydro_cell_at(tx, ty) else {
+                            continue;
+                        };
+                        let (elev_u, _, _) = g.sample_climate(tx, ty);
+                        let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
+                        let cell_surface_z =
+                            Z_MIN as f32 + macro_f * CHUNK_HEIGHT as f32;
+                        let bed_z = c.surface_z[ly][lx] as f32;
+                        let jitter = bed_z - cell_surface_z;
+                        let depth =
+                            (h.filled_height - h.aquifer_level) * GLOBE_H_TO_Z;
+                        min_jitter_z = min_jitter_z.min(jitter);
+                        max_jitter_z = max_jitter_z.max(jitter);
+                        min_depth_z = min_depth_z.min(depth);
+                        max_depth_z = max_depth_z.max(depth);
+                        if bed_z < cell_surface_z - depth {
+                            below_table_count += 1;
+                        }
+                        sampled += 1;
+                    }
+                }
+            }
+        }
+        let pass45_pct = pass45 as f64 / total as f64 * 100.0;
+        let pass4_pct = pass4 as f64 / total as f64 * 100.0;
+        eprintln!(
+            "33x33 chunks ({} tiles): Pass-4 Marsh {:.2}%, Pass-4.5 Marsh {:.2}%, total Marsh {:.2}%",
+            total, pass4_pct, pass45_pct, pass4_pct + pass45_pct
+        );
+        eprintln!(
+            "land tiles sampled: {}; jitter_z range [{:.3}, {:.3}]; aquifer_depth_z range [{:.3}, {:.3}]; below-table fraction {:.3}%",
+            sampled,
+            min_jitter_z,
+            max_jitter_z,
+            min_depth_z,
+            max_depth_z,
+            below_table_count as f64 / sampled as f64 * 100.0
+        );
+    }
+
+    /// Existence test: locate a low-elevation wet-rainfall climate cell via
+    /// the Globe directly, generate its chunk, and assert at least one tile
+    /// flips to Marsh via Pass 4.5 (`reservoir_id == u32::MAX`,
+    /// distinguishing it from a Pass-4 reservoir-membership marsh). Skips
+    /// silently if the seed produces no qualifying wet cell anywhere (the
+    /// invariant test still guards the gate itself).
+    #[test]
+    fn pass_4_5_stamps_at_least_one_implicit_marsh() {
+        use crate::world::globe::{GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
+        let gen = WorldGen::new();
+        let g = test_globe();
+        // Walk climate cells looking for a moist non-reservoir cell.
+        let mut found_chunk: Option<ChunkCoord> = None;
+        'search: for gy in (GLOBE_HEIGHT / 4)..(GLOBE_HEIGHT * 3 / 4) {
+            for gx in 0..GLOBE_WIDTH {
+                let Some(cell) = g.cell(gx, gy) else { continue };
+                if cell.rainfall < 200 || cell.elevation < 30 || cell.elevation > 120 {
+                    continue;
+                }
+                let cx = gx * GLOBE_CELL_CHUNKS;
+                let cy = gy * GLOBE_CELL_CHUNKS;
+                found_chunk = Some(ChunkCoord(cx, cy));
+                break 'search;
+            }
+        }
+        let Some(chunk) = found_chunk else {
+            eprintln!("no qualifying wet climate cell on seed 42 globe — skipping");
+            return;
+        };
+        let mut found = 0u32;
+        for dy in 0..GLOBE_CELL_CHUNKS {
+            for dx in 0..GLOBE_CELL_CHUNKS {
+                let c = generate_chunk_from_globe(
+                    ChunkCoord(chunk.0 + dx, chunk.1 + dy),
+                    &g,
+                    &gen,
+                );
+                for ly in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        if c.surface_kind[ly][lx] == TileKind::Marsh
+                            && c.surface_reservoir_id[ly][lx] == u32::MAX
+                        {
+                            found += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found > 0,
+            "wet cell at chunk {:?} produced no Pass-4.5 Marsh tiles",
+            chunk
+        );
     }
 }

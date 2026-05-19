@@ -4,12 +4,14 @@ use super::jobs::{
     record_progress, record_progress_filtered, JobBoard, JobClaim, JobCompletedEvent, JobKind,
     RecipeId,
 };
+use super::goals::AgentGoal;
 use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::needs::Needs;
-use super::person::{AiState, PersonAI, Profession};
+use super::person::{AiState, Person, PersonAI, Profession};
 use super::plants::PlantKind;
 use super::schedule::{BucketSlot, SimClock};
+use super::social_contact::{is_social_contact, SecondarySocial};
 use super::skills::{SkillKind, Skills};
 use super::tasks::TaskKind;
 use crate::economy::agent::EconomicAgent;
@@ -29,7 +31,7 @@ use bevy::prelude::*;
 pub const SOLO: u32 = 0;
 pub const BOND_THRESHOLD: u8 = 180;
 const CAMP_KEEP: u32 = 0;
-const SOCIAL_RADIUS: i32 = 3;
+pub const SOCIAL_RADIUS: i32 = 3;
 
 // ── Chief-assigned hunting ───────────────────────────────────────────────────
 
@@ -3068,25 +3070,47 @@ pub fn social_fill_system(
         &Transform,
         &BucketSlot,
         &LodLevel,
+        &AgentGoal,
+        Option<&SecondarySocial>,
     )>,
+    member_q: Query<&FactionMember, With<Person>>,
 ) {
-    for (entity, mut needs, member, transform, slot, lod) in query.iter_mut() {
+    // Tightened (was: relief from ANY nearby indexed entity, ungated by
+    // goal). Social relief now requires the agent itself to be socially
+    // active — dedicated `AgentGoal::Socialize` OR a live ambient
+    // work-pairing (`SecondarySocial`) — and counts only same-root-faction
+    // `Person` neighbors. No more spurious relief from standing near
+    // animals / enemies / strangers / items, nor relief to socially-inactive
+    // lone workers. The ambient path is what keeps work-paired coworkers
+    // satisfied so `SocialScorer` doesn't fire a work-abandoning detour.
+    let now = clock.tick as u32;
+    for (entity, mut needs, member, transform, slot, lod, goal, sec) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
         if member.faction_id == SOLO {
             continue;
         }
+        if !is_social_contact(*goal, *lod, sec, now) {
+            continue;
+        }
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let self_root = registry.root_faction(member.faction_id);
 
         let mut nearby = 0u8;
         for dy in -SOCIAL_RADIUS..=SOCIAL_RADIUS {
             for dx in -SOCIAL_RADIUS..=SOCIAL_RADIUS {
                 for &other in spatial.get(tx + dx, ty + dy) {
-                    if other != entity {
-                        nearby = nearby.saturating_add(1);
+                    if other == entity {
+                        continue;
+                    }
+                    // Same-root-faction Person only.
+                    if let Ok(om) = member_q.get(other) {
+                        if registry.root_faction(om.faction_id) == self_root {
+                            nearby = nearby.saturating_add(1);
+                        }
                     }
                 }
             }

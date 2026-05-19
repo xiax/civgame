@@ -1116,11 +1116,11 @@ pub fn wage_gossip_system(
         &crate::simulation::lod::LodLevel,
         &crate::simulation::faction::FactionMember,
         Option<&mut PerceivedFactionWages>,
+        Option<&crate::simulation::social_contact::SecondarySocial>,
     )>,
     mut commands: Commands,
 ) {
-    use crate::simulation::goals::AgentGoal;
-    use crate::simulation::lod::LodLevel;
+    use crate::simulation::social_contact::is_social_contact;
     let now = clock.tick as u32;
 
     // Each socializing agent contributes up to TOP_K (fid, kind, rid,
@@ -1136,8 +1136,8 @@ pub fn wage_gossip_system(
     );
     let mut snapshots: ahash::AHashMap<Entity, Vec<GossipEntry>> = ahash::AHashMap::default();
 
-    for (entity, _t, goal, lod, fm, perceived) in q.iter() {
-        if *lod == LodLevel::Dormant || !matches!(goal, AgentGoal::Socialize) {
+    for (entity, _t, goal, lod, fm, perceived, sec) in q.iter() {
+        if !is_social_contact(*goal, *lod, sec, now) {
             continue;
         }
         let village_id = registry.root_faction(fm.faction_id);
@@ -1168,8 +1168,8 @@ pub fn wage_gossip_system(
         return;
     }
 
-    for (entity, transform, goal, lod, fm, perceived) in q.iter_mut() {
-        if *lod == LodLevel::Dormant || !matches!(goal, AgentGoal::Socialize) {
+    for (entity, transform, goal, lod, fm, perceived, sec) in q.iter_mut() {
+        if !is_social_contact(*goal, *lod, sec, now) {
             continue;
         }
         let tx = (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;

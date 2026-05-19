@@ -7,7 +7,7 @@ const SAVE_PATH: &str = "world.bin";
 /// On-disk schema version for `world.bin`. Bump whenever `Globe`, `WorldCell`,
 /// or any serialized geo-data layout changes — `load_or_generate` will discard
 /// older caches and regenerate.
-pub const GLOBE_FILE_VERSION: u32 = 8;
+pub const GLOBE_FILE_VERSION: u32 = 9;
 
 /// Climate-sample grid resolution. Each cell holds elevation/climate/biome
 /// samples; per-tile values are bilinearly interpolated. Resolution is
@@ -246,6 +246,93 @@ pub struct RiverNetwork {
     /// globe gen so chunk-rasterisation is just a per-segment Bresenham walk.
     #[serde(default)]
     pub edge_polylines: Vec<Vec<(i32, i32)>>,
+}
+
+/// Whether a river polyline crosses a region boundary flowing *in* or *out*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeCrossingKind {
+    /// River enters the region here (its upstream side is outside) — the
+    /// fluid sim injects this edge's discharge at this tile.
+    Inlet,
+    /// River leaves the region here (its downstream side is outside) — the
+    /// fluid sim pins this tile at the edge's level (a stable outflow).
+    Outlet,
+}
+
+/// One classified crossing of the active-region bbox by a river polyline.
+/// `level` is a water-surface height in **globe units** (caller scales by
+/// `GLOBE_H_TO_Z`).
+#[derive(Clone, Copy, Debug)]
+pub struct EdgeCrossing {
+    pub tile: (i32, i32),
+    pub kind: EdgeCrossingKind,
+    pub discharge: f32,
+    pub level: f32,
+}
+
+impl RiverNetwork {
+    /// Classify every river-polyline crossing of the inclusive axis-aligned
+    /// tile bbox `[min, max]`. Walking each polyline upstream→downstream
+    /// (its stored order), an outside→inside transition is an [`Inlet`] at
+    /// the first in-region tile (real river inflow, at the edge's
+    /// index-interpolated `from_level..to_level` and full `discharge`); an
+    /// inside→outside transition is an [`Outlet`] at the last in-region
+    /// tile. A polyline that starts/ends inside contributes no crossing —
+    /// that head/sink is fed by in-region hydrology (springs, reservoirs,
+    /// ocean pins), not an external inlet.
+    ///
+    /// Pure + deterministic (fixed edge order, integer bbox test). Replaces
+    /// the fluid sim's old "highest boundary watercourse = inlet" elevation
+    /// heuristic with the true channel topology.
+    ///
+    /// [`Inlet`]: EdgeCrossingKind::Inlet
+    /// [`Outlet`]: EdgeCrossingKind::Outlet
+    pub fn edge_crossings_in_bbox(
+        &self,
+        min: (i32, i32),
+        max: (i32, i32),
+    ) -> Vec<EdgeCrossing> {
+        let inside = |t: (i32, i32)| {
+            t.0 >= min.0 && t.0 <= max.0 && t.1 >= min.1 && t.1 <= max.1
+        };
+        let mut out = Vec::new();
+        for (ei, poly) in self.edge_polylines.iter().enumerate() {
+            if poly.len() < 2 {
+                continue;
+            }
+            let Some(edge) = self.edges.get(ei) else {
+                continue;
+            };
+            let last = poly.len() - 1;
+            let mut prev_in = inside(poly[0]);
+            for k in 1..poly.len() {
+                let cur_in = inside(poly[k]);
+                if cur_in != prev_in {
+                    // upstream→downstream: outside→inside = Inlet at the
+                    // first in-region tile; inside→outside = Outlet at the
+                    // last in-region tile.
+                    let (tile, kind, cross_idx) = if cur_in {
+                        (poly[k], EdgeCrossingKind::Inlet, k)
+                    } else {
+                        (poly[k - 1], EdgeCrossingKind::Outlet, k - 1)
+                    };
+                    // Level lerps from `from_level` (idx 0) to `to_level`
+                    // (idx last) — monotone non-increasing by construction.
+                    let frac = cross_idx as f32 / last as f32;
+                    let level =
+                        edge.from_level + (edge.to_level - edge.from_level) * frac;
+                    out.push(EdgeCrossing {
+                        tile,
+                        kind,
+                        discharge: edge.discharge,
+                        level,
+                    });
+                }
+                prev_in = cur_in;
+            }
+        }
+        out
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -945,5 +1032,45 @@ mod tests {
         // span (no hard step at the cell boundary).
         assert!((e0 - e1).abs() < 30.0, "discontinuity at cell boundary");
         assert!((e1 - e2).abs() < 30.0, "discontinuity at cell boundary");
+    }
+
+    #[test]
+    fn edge_crossings_classifies_inlet_and_outlet() {
+        // A single river edge whose polyline runs upstream→downstream along
+        // x = 0..20 at y = 5, descending from level 10.0 to 2.0.
+        let poly: Vec<(i32, i32)> = (0..=20).map(|x| (x, 5)).collect();
+        let net = RiverNetwork {
+            edges: vec![RiverEdge {
+                from: (0, 0),
+                to: (1, 0),
+                discharge: 128.0,
+                from_level: 10.0,
+                to_level: 2.0,
+                ..Default::default()
+            }],
+            edge_polylines: vec![poly],
+        };
+        // Region bbox covers x∈[5,15]: the channel enters at x=5 (Inlet) and
+        // leaves at x=15 (Outlet).
+        let cr = net.edge_crossings_in_bbox((5, 0), (15, 10));
+        let inlet = cr
+            .iter()
+            .find(|c| c.kind == EdgeCrossingKind::Inlet)
+            .expect("an inlet at the upstream boundary");
+        let outlet = cr
+            .iter()
+            .find(|c| c.kind == EdgeCrossingKind::Outlet)
+            .expect("an outlet at the downstream boundary");
+        assert_eq!(inlet.tile, (5, 5));
+        assert_eq!(outlet.tile, (15, 5));
+        assert_eq!(inlet.discharge, 128.0);
+        // Monotone level: the upstream inlet sits higher than the outlet.
+        assert!(inlet.level > outlet.level);
+        assert!(inlet.level < 10.0 && outlet.level > 2.0);
+
+        // A polyline fully inside the bbox contributes no crossing — its
+        // head/sink is fed by in-region hydrology, not an external inlet.
+        let none = net.edge_crossings_in_bbox((-5, -5), (50, 50));
+        assert!(none.is_empty());
     }
 }

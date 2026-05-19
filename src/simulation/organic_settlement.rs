@@ -16,7 +16,7 @@ use crate::simulation::civic_milestones::{civic_milestone_allows, CivicKind};
 use crate::simulation::construction::{
     best_wall_material, faction_can_build, find_emergency_bed_tile, recipe_for,
     select_wall_material, BarracksMap, BedMap, Blueprint, BlueprintMap, BuildSiteKind, CampfireMap,
-    DoorMap, GranaryMap, LoomMap, MarketMap, MonumentMap, RoadCarveQueue, ShrineMap,
+    DamMap, DoorMap, GranaryMap, LoomMap, MarketMap, MonumentMap, RoadCarveQueue, ShrineMap,
     StructureIndex, TableMap, WallMap, WallMaterial, WallSelection, WellMap, WorkbenchMap,
     MAX_BLUEPRINTS_SAFETY_CAP,
 };
@@ -28,12 +28,13 @@ use crate::simulation::settlement::{
     Zone, ZoneKind,
 };
 use crate::simulation::technology::{
-    current_era, Era, BRIDGE_BUILDING, CITY_STATE_ORG, CROP_CULTIVATION, FLINT_KNAPPING, GRANARY,
-    LONG_DIST_TRADE, MONUMENTAL_BUILDING, PERM_SETTLEMENT, PROFESSIONAL_ARMY, SACRED_RITUAL,
-    WELL_DIGGING,
+    current_era, Era, BRIDGE_BUILDING, CITY_STATE_ORG, CROP_CULTIVATION, DAM_BUILDING,
+    FLINT_KNAPPING, GRANARY, LONG_DIST_TRADE, MONUMENTAL_BUILDING, PERM_SETTLEMENT,
+    PROFESSIONAL_ARMY, SACRED_RITUAL, WELL_DIGGING,
 };
 use crate::simulation::terraform::PendingFootprints;
 use crate::world::chunk::ChunkMap;
+use crate::world::seasons::Calendar;
 use crate::world::terrain::world_to_tile;
 use crate::world::tile::TileKind;
 
@@ -4184,5 +4185,279 @@ fn emit_bridges_for_segments(
                 }
             }
         }
+    }
+}
+
+// ── Dam intent emitter ────────────────────────────────────────────────────────
+
+/// Chebyshev radius around the home / ag-belt reference within which the
+/// emitter looks for a dammable watercourse. Settlements spawn ~13..16 tiles
+/// off the river (`score_home_candidate`), so this reaches it without an
+/// unbounded scan.
+const DAM_SEARCH_RADIUS: i32 = 40;
+/// Don't plan a dam within this chebyshev of an existing dam — one barrier
+/// per reach; avoids walling an entire river.
+const DAM_MIN_SPACING: i32 = 24;
+/// A composite site must clear this to be worth a 6-stone/4-wood/180-work
+/// commitment (keeps low-value damming out of the build queue).
+const DAM_SCORE_THRESHOLD: f32 = 1.0;
+
+/// Which need a planned dam serves (scoring provenance + diagnostics).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DamMotive {
+    /// Impound upstream of the agricultural belt (water-table / dry-season
+    /// resilience for the fields).
+    Irrigation,
+    /// Reservoir near the settlement for drinking when the river is far or
+    /// runs seasonally low.
+    Reservoir,
+    /// A short road river-crossing where a dam (its crest carries the road)
+    /// both crosses and impounds — no separate bridge needed.
+    RoadCrossing,
+}
+
+/// A scored dam proposal: the watercourse `tile` to barrier and why.
+#[derive(Clone, Copy, Debug)]
+pub struct DamCandidate {
+    pub tile: (i32, i32),
+    pub score: f32,
+    pub motive: DamMotive,
+}
+
+/// A River/Water tile a dam can be built on (loaded; not already a
+/// Bridge/Dam).
+fn is_dammable_tile(chunk_map: &ChunkMap, t: (i32, i32)) -> bool {
+    matches!(
+        chunk_map.tile_kind_at(t.0, t.1),
+        Some(TileKind::River | TileKind::Water)
+    )
+}
+
+/// Nearest dammable watercourse tile to `from`, chebyshev-ring out to
+/// `max_r`. Deterministic (fixed ring order + min-tuple tiebreak). `None`
+/// if none in range.
+fn nearest_watercourse_tile(
+    chunk_map: &ChunkMap,
+    from: (i32, i32),
+    max_r: i32,
+) -> Option<(i32, i32)> {
+    if is_dammable_tile(chunk_map, from) {
+        return Some(from);
+    }
+    for r in 1..=max_r {
+        let mut best: Option<(i32, i32)> = None;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs() != r && dy.abs() != r {
+                    continue; // ring perimeter only
+                }
+                let t = (from.0 + dx, from.1 + dy);
+                if is_dammable_tile(chunk_map, t) {
+                    best = Some(best.map_or(t, |b| b.min(t)));
+                }
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+    }
+    None
+}
+
+/// Pure compositor: weigh the three dam motivations for one settlement and
+/// return the single best proposal (argmax), or `None` if nothing clears
+/// `DAM_SCORE_THRESHOLD`. `season_low ∈ [0,1]` is how far below its annual
+/// mean the current discharge sits (1 = deep seasonal low) — it lifts the
+/// Reservoir motive (storage matters most when the river runs thin).
+fn score_dam_site(
+    faction: &FactionData,
+    brain: &SettlementBrain,
+    chunk_map: &ChunkMap,
+    season_low: f32,
+) -> Option<DamCandidate> {
+    let mut best: Option<DamCandidate> = None;
+    let mut consider = |c: DamCandidate| {
+        if c.score >= DAM_SCORE_THRESHOLD && best.map_or(true, |b| c.score > b.score) {
+            best = Some(c);
+        }
+    };
+
+    // ── Irrigation: dam the watercourse just upstream of the Ag belt ──
+    let ag: Vec<(i32, i32)> = brain
+        .parcels
+        .iter()
+        .filter(|p| p.district_hint == Some(DistrictKind::Agricultural))
+        .map(|p| p.centre())
+        .collect();
+    if !ag.is_empty() {
+        let cx = ag.iter().map(|t| t.0).sum::<i32>() / ag.len() as i32;
+        let cy = ag.iter().map(|t| t.1).sum::<i32>() / ag.len() as i32;
+        if let Some(t) = nearest_watercourse_tile(chunk_map, (cx, cy), DAM_SEARCH_RADIUS) {
+            // Water must sit at/above the fields to gravity-feed them.
+            let belt_g = chunk_map.ground_z_at(cx, cy);
+            let water_g = chunk_map.surface_z_at(t.0, t.1);
+            if water_g >= belt_g {
+                let d = cheb(t, (cx, cy)) as f32;
+                let prox = (1.0 - d / DAM_SEARCH_RADIUS as f32).max(0.0);
+                let size = (ag.len() as f32).min(6.0) / 6.0;
+                consider(DamCandidate {
+                    tile: t,
+                    score: 2.0 * size * (0.4 + 0.6 * prox),
+                    motive: DamMotive::Irrigation,
+                });
+            }
+        }
+    }
+
+    // ── Reservoir: water security near home when the river is far/low ──
+    {
+        let home = faction.home_tile;
+        if let Some(t) = nearest_watercourse_tile(chunk_map, home, DAM_SEARCH_RADIUS) {
+            let rd = chunk_map.river_distance_at(home.0, home.1);
+            let dryness = if rd == u8::MAX {
+                1.0
+            } else {
+                (rd as f32 / 16.0).min(1.0)
+            };
+            let pop = (faction.member_count as f32 / 40.0).min(1.5);
+            let score = 1.5 * pop * (0.3 + 0.7 * dryness) * (1.0 + season_low);
+            consider(DamCandidate {
+                tile: t,
+                score,
+                motive: DamMotive::Reservoir,
+            });
+        }
+    }
+
+    // ── Road-crossing substitute: a short road run over a river ──
+    for seg in &brain.road_segments {
+        let trace = bresenham_tiles(seg.start, seg.end);
+        for (run_start, _run_end) in detect_bridge_runs_in_trace(chunk_map, &trace) {
+            consider(DamCandidate {
+                tile: trace[run_start],
+                score: 1.1,
+                motive: DamMotive::RoadCrossing,
+            });
+        }
+    }
+
+    best
+}
+
+/// Walks each settled faction and, when it can build dams (`DAM_BUILDING`
+/// + the `CivicKind::Dam` milestone), emits at most one `BuildSiteKind::Dam`
+/// blueprint per settlement per cadence at the highest-value site from
+/// `score_dam_site` (composing irrigation, reservoir water-access, and
+/// road-crossing motivations). Mirrors `bridge_intent_emitter_system`
+/// structurally: idempotent (skips a tile already blueprinted or near an
+/// existing dam) and **author-less** (`posted_by = None`) exactly like the
+/// bridge emitter — the Dam recipe has no tier picks, so finalize reads the
+/// faction's live `buildable_techs`.
+pub fn dam_intent_emitter_system(
+    clock: Res<SimClock>,
+    registry: Res<FactionRegistry>,
+    settlements: Query<&Settlement>,
+    brains: Res<SettlementBrains>,
+    chunk_map: Res<ChunkMap>,
+    calendar: Res<Calendar>,
+    dam_map: Res<DamMap>,
+    mut bp_map: ResMut<BlueprintMap>,
+    mut commands: Commands,
+) {
+    if clock.tick % PRESSURE_INTERVAL != 0 {
+        return;
+    }
+    // How far the season runs below its annual mean (mean of the four
+    // multipliers ≈ 0.8625) — lifts the Reservoir motive in lean seasons.
+    let season_low = ((0.8625 - calendar.discharge_multiplier()) / 0.8625).clamp(0.0, 1.0);
+
+    for settlement in settlements.iter() {
+        let Some(faction) = registry.factions.get(&settlement.owner_faction) else {
+            continue;
+        };
+        if settlement.owner_faction == SOLO || !faction.caps.settlement.is_full_settlement() {
+            continue;
+        }
+        if !faction.community_has(DAM_BUILDING) {
+            continue;
+        }
+        let era = current_era(&faction.techs);
+        if !civic_milestone_allows(CivicKind::Dam, era, settlement.peak_population) {
+            continue;
+        }
+        let Some(brain) = brains.0.get(&settlement.id) else {
+            continue;
+        };
+        let Some(cand) = score_dam_site(faction, brain, &chunk_map, season_low) else {
+            continue;
+        };
+        let tile = cand.tile;
+        // Idempotent + one-barrier-per-reach guards.
+        if bp_map.0.contains_key(&tile) || !is_dammable_tile(&chunk_map, tile) {
+            continue;
+        }
+        if dam_map.0.keys().any(|&d| cheb(d, tile) < DAM_MIN_SPACING) {
+            continue;
+        }
+        let cz = chunk_map.surface_z_at(tile.0, tile.1) as i8;
+        let mut bp = Blueprint::new(
+            settlement.owner_faction,
+            None,
+            BuildSiteKind::Dam,
+            tile,
+            cz,
+        );
+        bp.work_stand =
+            crate::simulation::construction::work_stand_for_bridge(&chunk_map, tile, &bp_map);
+        if bp.work_stand.is_none() {
+            continue; // no reachable bank to work from — skip this reach
+        }
+        let wp = crate::world::terrain::tile_to_world(tile.0, tile.1);
+        let e = commands
+            .spawn((
+                bp,
+                Transform::from_xyz(wp.x, wp.y, 0.3),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        bp_map.0.insert(tile, e);
+    }
+}
+
+#[cfg(test)]
+mod dam_emitter_tests {
+    use super::*;
+    use crate::world::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE};
+
+    /// 32×32 Grass chunk at z=4 with a vertical River line at `river_x`.
+    fn chunk_with_river(river_x: usize) -> ChunkMap {
+        let mut cm = ChunkMap::default();
+        let z = Box::new([[4i8; CHUNK_SIZE]; CHUNK_SIZE]);
+        let mut kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
+        for row in kind.iter_mut() {
+            row[river_x] = TileKind::River;
+        }
+        let fert = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
+        cm.0.insert(ChunkCoord(0, 0), Chunk::new(z, kind, fert));
+        cm
+    }
+
+    #[test]
+    fn nearest_watercourse_finds_the_river_deterministically() {
+        let cm = chunk_with_river(20);
+        // From (5,5) the closest River column is x=20 (chebyshev 15).
+        let a = nearest_watercourse_tile(&cm, (5, 5), DAM_SEARCH_RADIUS);
+        let b = nearest_watercourse_tile(&cm, (5, 5), DAM_SEARCH_RADIUS);
+        assert_eq!(a, b, "deterministic across calls");
+        let t = a.expect("a river within range");
+        assert_eq!(t.0, 20, "found the river column");
+        assert_eq!(cheb(t, (5, 5)), 15, "it is the nearest ring");
+
+        // Standing on water returns the tile itself.
+        assert_eq!(nearest_watercourse_tile(&cm, (20, 9), 4), Some((20, 9)));
+        // No river within a tight radius from far away.
+        assert_eq!(nearest_watercourse_tile(&cm, (0, 0), 3), None);
     }
 }

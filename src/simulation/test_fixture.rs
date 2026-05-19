@@ -131,6 +131,7 @@ impl TestSim {
         // the resource must exist.
         app.insert_resource(crate::world::water_runtime::RuntimeWater::default());
         app.add_event::<crate::world::chunk_streaming::TileChangedEvent>();
+        app.add_event::<crate::world::chunk_streaming::TileCarvedEvent>();
         app.add_event::<crate::world::chunk_streaming::ChunkLoadedEvent>();
         app.add_event::<crate::world::chunk_streaming::ChunkUnloadedEvent>();
 
@@ -519,6 +520,7 @@ impl PersonBuilder {
                     crate::simulation::goal_scorers::AgentDecisionState::default(),
                     crate::simulation::goal_scorers::Disposition::default(),
                 ),
+                (crate::simulation::social_contact::SecondarySocial::inactive(),),
             ))
             .id();
         if self.drafted {
@@ -14628,5 +14630,500 @@ mod onenter_era_seeding {
         );
 
         assert_perm_settlement_adopted(&sim, "Neolithic runtime (t≈1600)");
+    }
+
+    // ───────────── Ambient work-social multitasking ─────────────
+
+    /// Re-pin each agent's `AgentGoal` **and tile position** before every
+    /// tick. The goal pin makes the ParallelA `ambient_social_pairing_system`
+    /// (which runs before `goal_update_system`) observe the intended work
+    /// goal; the position pin holds agents co-located so the test isn't
+    /// confounded by emergent Explore-wandering (a `GatherWood` agent on a
+    /// resourceless flat world gets routed to Explore and drifts apart —
+    /// pairing then *correctly* unpairs, which is real behavior but noise
+    /// for these logic tests).
+    fn tick_pinned(sim: &mut TestSim, pins: &[(Entity, AgentGoal, (i32, i32))], n: u32) {
+        for _ in 0..n {
+            for &(e, g, tile) in pins {
+                let w = tile_to_world(tile.0, tile.1);
+                let world = sim.app.world_mut();
+                if let Some(mut goal) = world.get_mut::<AgentGoal>(e) {
+                    *goal = g;
+                }
+                if let Some(mut tf) = world.get_mut::<Transform>(e) {
+                    tf.translation.x = w.x;
+                    tf.translation.y = w.y;
+                }
+            }
+            sim.tick();
+        }
+    }
+
+    /// The raw (always-present) component.
+    fn secondary(
+        app: &App,
+        e: Entity,
+    ) -> crate::simulation::social_contact::SecondarySocial {
+        *app.world()
+            .get::<crate::simulation::social_contact::SecondarySocial>(e)
+            .expect("SecondarySocial is spawned on every Person")
+    }
+
+    /// The live ambient partner at the current sim tick, if any (the
+    /// component is always present; "not paired" == inactive).
+    fn paired_partner(sim: &TestSim, e: Entity) -> Option<Entity> {
+        let now = sim.tick_count() as u32;
+        let s = secondary(&sim.app, e);
+        if s.is_active(now) {
+            s.partner
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn ambient_pairing_stamps_secondary_social_on_working_coworkers() {
+        use crate::simulation::social_contact::{SocialMode, PAIRING_WINDOW};
+
+        let mut sim = TestSim::new(0xA31B);
+        sim.flat_world(2, 0, TileKind::Grass);
+        sim.seed_faction_food(sim.player_faction_id, 256);
+        let a = sim
+            .spawn_person(sim.player_faction_id, (0, 0), |b| {
+                b.goal(AgentGoal::GatherWood);
+            });
+        let c = sim
+            .spawn_person(sim.player_faction_id, (2, 0), |b| {
+                b.goal(AgentGoal::GatherWood);
+            });
+
+        tick_pinned(
+            &mut sim,
+            &[
+                (a, AgentGoal::GatherWood, (0, 0)),
+                (c, AgentGoal::GatherWood, (2, 0)),
+            ],
+            14,
+        );
+
+        let now = sim.tick_count() as u32;
+        assert_eq!(paired_partner(&sim, a), Some(c), "A paired with C");
+        assert_eq!(paired_partner(&sim, c), Some(a), "C paired with A");
+        let sa = secondary(&sim.app, a);
+        assert!(matches!(sa.mode, SocialMode::Ambient));
+        assert!(sa.expires_tick > now && sa.expires_tick <= now + PAIRING_WINDOW);
+        // Primary work channel untouched: still have an ActionQueue.
+        assert!(sim
+            .app
+            .world()
+            .get::<crate::simulation::typed_task::ActionQueue>(a)
+            .is_some());
+    }
+
+    #[test]
+    fn ambient_pairing_not_stamped_on_dedicated_socializer() {
+        use crate::simulation::needs::Needs;
+
+        let mut sim = TestSim::new(0xA32C);
+        sim.flat_world(2, 0, TileKind::Grass);
+        sim.seed_faction_food(sim.player_faction_id, 256);
+        let high_social = Needs {
+            hunger: 0.0,
+            sleep: 0.0,
+            shelter: 0.0,
+            safety: 0.0,
+            social: 220.0,
+            reproduction: 0.0,
+            willpower: 200.0,
+            esteem: 0.0,
+            self_actualization: 0.0,
+            thirst: 0.0,
+        };
+        let soc = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.needs(high_social).goal(AgentGoal::Socialize);
+        });
+        let w1 = sim.spawn_person(sim.player_faction_id, (1, 0), |b| {
+            b.goal(AgentGoal::GatherWood);
+        });
+        let w2 = sim.spawn_person(sim.player_faction_id, (2, 0), |b| {
+            b.goal(AgentGoal::GatherWood);
+        });
+
+        tick_pinned(
+            &mut sim,
+            &[
+                (w1, AgentGoal::GatherWood, (1, 0)),
+                (w2, AgentGoal::GatherWood, (2, 0)),
+            ],
+            14,
+        );
+
+        // Dedicated socialiser is goal-driven — its always-present marker
+        // stays inactive (and it is not a valid ambient-pairing partner).
+        assert_eq!(
+            paired_partner(&sim, soc),
+            None,
+            "dedicated Socialize agent must never be ambient-paired"
+        );
+        // The two workers pair with each other (the dedicated socialiser is
+        // not an ambient-work-compatible partner).
+        assert_eq!(paired_partner(&sim, w1), Some(w2));
+        assert_eq!(paired_partner(&sim, w2), Some(w1));
+    }
+
+    #[test]
+    fn ambient_pairing_clears_on_partner_despawn() {
+        let mut sim = TestSim::new(0xA33D);
+        sim.flat_world(2, 0, TileKind::Grass);
+        sim.seed_faction_food(sim.player_faction_id, 256);
+        let a = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.goal(AgentGoal::GatherWood);
+        });
+        let p = sim.spawn_person(sim.player_faction_id, (1, 0), |b| {
+            b.goal(AgentGoal::GatherWood);
+        });
+        tick_pinned(
+            &mut sim,
+            &[
+                (a, AgentGoal::GatherWood, (0, 0)),
+                (p, AgentGoal::GatherWood, (1, 0)),
+            ],
+            14,
+        );
+        assert_eq!(paired_partner(&sim, a), Some(p), "paired before despawn");
+
+        sim.app.world_mut().despawn(p);
+        tick_pinned(&mut sim, &[(a, AgentGoal::GatherWood, (0, 0))], 6);
+        assert_eq!(
+            paired_partner(&sim, a),
+            None,
+            "pairing reset to inactive when partner despawns"
+        );
+    }
+
+    #[test]
+    fn ambient_pairing_clears_when_partner_out_of_range() {
+        let mut sim = TestSim::new(0xA34E);
+        sim.flat_world(4, 0, TileKind::Grass);
+        sim.seed_faction_food(sim.player_faction_id, 256);
+        let a = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.goal(AgentGoal::GatherWood);
+        });
+        let p = sim.spawn_person(sim.player_faction_id, (1, 0), |b| {
+            b.goal(AgentGoal::GatherWood);
+        });
+        tick_pinned(
+            &mut sim,
+            &[
+                (a, AgentGoal::GatherWood, (0, 0)),
+                (p, AgentGoal::GatherWood, (1, 0)),
+            ],
+            14,
+        );
+        assert_eq!(paired_partner(&sim, a), Some(p), "paired before move");
+
+        // Hold the partner far away each tick (≫ SOCIAL_RADIUS).
+        tick_pinned(
+            &mut sim,
+            &[
+                (a, AgentGoal::GatherWood, (0, 0)),
+                (p, AgentGoal::GatherWood, (60, 0)),
+            ],
+            6,
+        );
+        assert_eq!(
+            paired_partner(&sim, a),
+            None,
+            "pairing reset to inactive when partner leaves SOCIAL_RADIUS"
+        );
+    }
+
+    #[test]
+    fn ambient_bonding_caps_at_acquaintance_dedicated_reaches_courtship() {
+        use crate::simulation::memory::{RelationshipMemory, AMBIENT_AFFINITY_CAP};
+        use crate::simulation::needs::Needs;
+
+        // Reduced-rate ambient bonding: ambient work-pairing grows affinity
+        // slowly and PLATEAUS at the acquaintance ceiling, staying below the
+        // cohabitation thresholds in construction.rs (PARTNER=60/REASSIGN=80)
+        // even over a long run — so coworkers don't auto-"move in together".
+        let mut sim = TestSim::new(0xA35F);
+        sim.flat_world(2, 0, TileKind::Grass);
+        sim.seed_faction_food(sim.player_faction_id, 256);
+        let a = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.goal(AgentGoal::GatherWood);
+        });
+        let c = sim.spawn_person(sim.player_faction_id, (1, 0), |b| {
+            b.goal(AgentGoal::GatherWood);
+        });
+        // 220 ticks: uncapped +1/tick would blow well past 60; capped must
+        // pin at AMBIENT_AFFINITY_CAP and never reach courtship.
+        tick_pinned(
+            &mut sim,
+            &[
+                (a, AgentGoal::GatherWood, (0, 0)),
+                (c, AgentGoal::GatherWood, (1, 0)),
+            ],
+            220,
+        );
+        assert_eq!(paired_partner(&sim, a), Some(c), "should be ambient-paired");
+        let aff = sim
+            .app
+            .world()
+            .get::<RelationshipMemory>(a)
+            .unwrap()
+            .get_affinity(c);
+        assert!(
+            aff > 0 && aff <= AMBIENT_AFFINITY_CAP,
+            "ambient affinity must grow but plateau at the acquaintance cap \
+             ({AMBIENT_AFFINITY_CAP}), well below courtship (60); got {aff}"
+        );
+
+        // Parity: a dedicated Socialize pair bonds fast and uncapped,
+        // reaching the cohabitation/courtship range.
+        let high_social = Needs {
+            hunger: 0.0,
+            sleep: 0.0,
+            shelter: 0.0,
+            safety: 0.0,
+            social: 220.0,
+            reproduction: 0.0,
+            willpower: 200.0,
+            esteem: 0.0,
+            self_actualization: 0.0,
+            thirst: 0.0,
+        };
+        let s1 = sim.spawn_person(sim.player_faction_id, (10, 10), |b| {
+            b.needs(high_social).goal(AgentGoal::Socialize);
+        });
+        let s2 = sim.spawn_person(sim.player_faction_id, (11, 10), |b| {
+            b.needs(high_social).goal(AgentGoal::Socialize);
+        });
+        tick_pinned(
+            &mut sim,
+            &[
+                (s1, AgentGoal::Socialize, (10, 10)),
+                (s2, AgentGoal::Socialize, (11, 10)),
+            ],
+            20,
+        );
+        let aff_dedicated = sim
+            .app
+            .world()
+            .get::<RelationshipMemory>(s1)
+            .unwrap()
+            .get_affinity(s2);
+        assert!(
+            aff_dedicated >= 60,
+            "dedicated Socialize must bond fast/uncapped into courtship \
+             range (≥60), got {aff_dedicated}"
+        );
+    }
+
+    #[test]
+    fn ambient_awareness_gossip_reaches_all_neighbors() {
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::technology::IRRIGATION;
+
+        let mut sim = TestSim::new(0xA360);
+        sim.flat_world(2, 0, TileKind::Grass);
+        sim.seed_faction_food(sim.player_faction_id, 256);
+        let a = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.goal(AgentGoal::GatherWood);
+        });
+        let b = sim.spawn_person(sim.player_faction_id, (1, 0), |bd| {
+            bd.goal(AgentGoal::GatherWood);
+        });
+        let c = sim.spawn_person(sim.player_faction_id, (2, 0), |bd| {
+            bd.goal(AgentGoal::GatherWood);
+        });
+        {
+            let mut k = sim.app.world_mut().get_mut::<PersonKnowledge>(a).unwrap();
+            k.aware |= 1u64 << IRRIGATION;
+        }
+        tick_pinned(
+            &mut sim,
+            &[
+                (a, AgentGoal::GatherWood, (0, 0)),
+                (b, AgentGoal::GatherWood, (1, 0)),
+                (c, AgentGoal::GatherWood, (2, 0)),
+            ],
+            16,
+        );
+
+        // Full strength, all neighbors: BOTH B and C learn it ambiently.
+        assert!(
+            sim.app
+                .world()
+                .get::<PersonKnowledge>(b)
+                .unwrap()
+                .is_aware(IRRIGATION),
+            "adjacent ambient coworker B should hear of the tech"
+        );
+        assert!(
+            sim.app
+                .world()
+                .get::<PersonKnowledge>(c)
+                .unwrap()
+                .is_aware(IRRIGATION),
+            "all in-radius ambient coworkers (incl. C) hear it — full strength"
+        );
+    }
+
+    #[test]
+    fn ambient_does_not_trigger_tech_teaching() {
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::technology::IRRIGATION;
+
+        let mut sim = TestSim::new(0xA371);
+        sim.flat_world(2, 0, TileKind::Grass);
+        sim.seed_faction_food(sim.player_faction_id, 256);
+        let teacher = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.goal(AgentGoal::GatherWood);
+        });
+        let student = sim.spawn_person(sim.player_faction_id, (1, 0), |b| {
+            b.goal(AgentGoal::GatherWood);
+        });
+        {
+            let mut k = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonKnowledge>(teacher)
+                .unwrap();
+            k.aware |= 1u64 << IRRIGATION;
+            k.learned |= 1u64 << IRRIGATION;
+        }
+        {
+            let mut k = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonKnowledge>(student)
+                .unwrap();
+            k.aware |= 1u64 << IRRIGATION;
+        }
+        // Long run: ambient pairing active the whole time, but neither agent
+        // is on AgentGoal::Socialize, so tech_teaching_system never fires.
+        tick_pinned(
+            &mut sim,
+            &[
+                (teacher, AgentGoal::GatherWood, (0, 0)),
+                (student, AgentGoal::GatherWood, (1, 0)),
+            ],
+            300,
+        );
+
+        assert!(
+            !sim.app
+                .world()
+                .get::<PersonKnowledge>(student)
+                .unwrap()
+                .has_learned(IRRIGATION),
+            "ambient work chatter must NOT transfer mastery — teaching stays \
+             gated to explicit AgentGoal::Socialize"
+        );
+    }
+
+    #[test]
+    fn ambient_pairing_drains_social_need() {
+        use crate::simulation::needs::Needs;
+
+        let mut sim = TestSim::new(0xA382);
+        sim.flat_world(2, 0, TileKind::Grass);
+        sim.seed_faction_food(sim.player_faction_id, 256);
+        let mid_social = Needs {
+            hunger: 0.0,
+            sleep: 0.0,
+            shelter: 0.0,
+            safety: 0.0,
+            social: 150.0,
+            reproduction: 0.0,
+            willpower: 200.0,
+            esteem: 0.0,
+            self_actualization: 0.0,
+            thirst: 0.0,
+        };
+        let a = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.needs(mid_social).goal(AgentGoal::GatherWood);
+        });
+        let c = sim.spawn_person(sim.player_faction_id, (1, 0), |b| {
+            b.needs(mid_social).goal(AgentGoal::GatherWood);
+        });
+        tick_pinned(
+            &mut sim,
+            &[
+                (a, AgentGoal::GatherWood, (0, 0)),
+                (c, AgentGoal::GatherWood, (1, 0)),
+            ],
+            40,
+        );
+
+        let social = sim.app.world().get::<Needs>(a).unwrap().social;
+        assert!(
+            social < 150.0,
+            "ambient-paired worker's social need should drain (the mechanism \
+             that suppresses work-abandoning Socialize detours), got {social}"
+        );
+    }
+
+    #[test]
+    fn social_fill_no_longer_relieves_socially_inactive_worker() {
+        use crate::simulation::needs::Needs;
+
+        let mut sim = TestSim::new(0xA393);
+        sim.flat_world(2, 0, TileKind::Grass);
+        sim.seed_faction_food(sim.player_faction_id, 256);
+        let n = Needs {
+            hunger: 0.0,
+            sleep: 0.0,
+            shelter: 0.0,
+            safety: 0.0,
+            social: 100.0,
+            reproduction: 0.0,
+            willpower: 200.0,
+            esteem: 0.0,
+            self_actualization: 0.0,
+            thirst: 0.0,
+        };
+        // X is on a maintenance goal (Survive) → never socially active and
+        // never ambient-paired. A neighbour is present but no longer grants
+        // relief (the deliberate tightening).
+        let x = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.needs(n).goal(AgentGoal::Survive);
+        });
+        let _neighbour = sim.spawn_person(sim.player_faction_id, (1, 0), |b| {
+            b.needs(n).goal(AgentGoal::Survive);
+        });
+        tick_pinned(&mut sim, &[(x, AgentGoal::Survive, (0, 0))], 20);
+        let inactive_social = sim.app.world().get::<Needs>(x).unwrap().social;
+        assert!(
+            inactive_social >= 100.0,
+            "socially-inactive worker near a neighbour gets NO social relief \
+             anymore (tightened); social should not drop, got {inactive_social}"
+        );
+
+        // Positive control: same setup but X works alongside a coworker →
+        // ambient-paired → relief resumes.
+        let mut sim2 = TestSim::new(0xA394);
+        sim2.flat_world(2, 0, TileKind::Grass);
+        sim2.seed_faction_food(sim2.player_faction_id, 256);
+        let y = sim2.spawn_person(sim2.player_faction_id, (0, 0), |b| {
+            b.needs(n).goal(AgentGoal::GatherWood);
+        });
+        let z = sim2.spawn_person(sim2.player_faction_id, (1, 0), |b| {
+            b.needs(n).goal(AgentGoal::GatherWood);
+        });
+        tick_pinned(
+            &mut sim2,
+            &[
+                (y, AgentGoal::GatherWood, (0, 0)),
+                (z, AgentGoal::GatherWood, (1, 0)),
+            ],
+            30,
+        );
+        let active_social = sim2.app.world().get::<Needs>(y).unwrap().social;
+        assert!(
+            active_social < 100.0,
+            "ambient-paired coworker DOES get relief, got {active_social}"
+        );
     }
 }

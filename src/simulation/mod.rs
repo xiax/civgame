@@ -64,6 +64,7 @@ pub mod settlement;
 pub mod shared_knowledge;
 pub mod skills;
 pub mod sleep;
+pub mod social_contact;
 pub mod sound;
 pub mod speed;
 pub mod stats;
@@ -393,6 +394,19 @@ impl Plugin for SimulationPlugin {
                     // are stable when ParallelB/Economy planning reads them.
                     construction::refresh_construction_poster_pool_system,
                 )
+                    .in_set(SimulationSet::ParallelA),
+            )
+            // Ambient work-social pairing: stamp/clear `SecondarySocial` on
+            // workers near same-faction coworkers. After needs settle, before
+            // goal selection / opportunistic interrupts so the marker is
+            // available to the social consumers (Economy) the same tick and
+            // the Socialize-detour suppression sees a current pairing.
+            .add_systems(
+                FixedUpdate,
+                social_contact::ambient_social_pairing_system
+                    .after(needs::tick_needs_system)
+                    .before(goals::goal_update_system)
+                    .before(opportunistic::opportunistic_interrupt_system)
                     .in_set(SimulationSet::ParallelA),
             )
             .add_systems(
@@ -971,6 +985,9 @@ impl Plugin for SimulationPlugin {
                         .after(organic_settlement::settlement_morphology_system)
                         .before(construction::chief_directive_system),
                     organic_settlement::bridge_intent_emitter_system
+                        .after(survey_task::survey_cursor_system)
+                        .before(construction::chief_directive_system),
+                    organic_settlement::dam_intent_emitter_system
                         .after(survey_task::survey_cursor_system)
                         .before(construction::chief_directive_system),
                 )

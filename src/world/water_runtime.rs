@@ -19,10 +19,11 @@ use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
 
 use crate::simulation::construction::{BridgeMap, DamMap};
 use crate::simulation::schedule::SimClock;
-use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE, Z_MIN, Z_MAX};
-use crate::world::chunk_streaming::{ChunkLoadedEvent, TileChangedEvent};
-use crate::world::globe::{Globe, Reservoir, ReservoirKind};
-use crate::world::terrain::GLOBE_H_TO_Z;
+use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_HEIGHT, CHUNK_SIZE, Z_MAX, Z_MIN};
+use crate::world::chunk_streaming::{ChunkLoadedEvent, TileCarvedEvent, TileChangedEvent};
+use crate::world::globe::{EdgeCrossingKind, Globe, Reservoir, ReservoirKind};
+use crate::world::seasons::Calendar;
+use crate::world::terrain::{WorldGen, GLOBE_H_TO_Z};
 use crate::world::tile::{TileData, TileKind};
 use crate::world::water::{CellRole, WaterCell, WaterGrid};
 
@@ -186,11 +187,20 @@ const WATER_SIM_RADIUS: i32 = 28;
 const WATER_SIM_CADENCE: u64 = 20;
 const WATER_SUBSTEPS: u32 = 30;
 const WATER_DT: f32 = 1.0;
-/// Z-units/substep injected at the upstream watercourse boundary (river
-/// discharge proxy — feeds the impoundment so a dammed river actually
-/// fills). Mildly scaled by `HydroCell.discharge`, capped. Spring/aquifer
-/// sources are a documented v2 follow-up.
+/// Z-units/substep injected where a real river polyline enters the active
+/// region (`RiverNetwork::edge_crossings_in_bbox` — true channel topology,
+/// not the old highest-boundary-elevation guess). Scaled by the edge's
+/// `discharge` and the seasonal snowmelt hydrograph.
 const INLET_BASE_RATE: f32 = 0.035;
+/// Z-units/substep seeped upward by a cell whose solid bed sits below the
+/// local water table (`HydroCell.aquifer_level`) — covers both natural
+/// springs and pits dug below the table. **Much** slower than a river inlet
+/// (groundwater is not surface runoff), and only emitted while the pool is
+/// still below the table (`bed + depth < aquifer_z`) so it can never flood
+/// rock above the water table. `WATER_SUBSTEPS · this ≪ 1` keeps the
+/// per-task overshoot negligible (re-clamped every snapshot) — no `water.rs`
+/// core change, so the conservation/determinism tests stand.
+const AQUIFER_SEEP_RATE: f32 = 0.004;
 /// Wet/dry passability hysteresis (deadband) so a cell hovering near the
 /// threshold doesn't flip kind — and spam pathfinding — every cadence.
 const WET_ON: f32 = 0.5;
@@ -201,6 +211,11 @@ struct WaterTileOut {
     tile: (i32, i32),
     ground_z: i8,
     depth: f32,
+    /// The snapshot's source rate for this cell (river inlet / aquifer
+    /// seep). Persisted into `RuntimeWater.source_rate` so a spring-fed pool
+    /// keeps re-seeding the bounded region across snapshots and survives
+    /// chunk reload, and so chunk-retention can pin player-affected water.
+    source: f32,
     /// Surface kind the chunk had *before* the sim — restored when the cell
     /// drains dry (so a temporarily-flooded land tile reverts correctly on
     /// the live chunk, not only on reload).
@@ -234,16 +249,23 @@ fn hydro_surface_z(globe: &Globe, t: (i32, i32), bed: f32) -> f32 {
 }
 
 /// PostUpdate. Snapshots the active region (union of `WATER_SIM_RADIUS`
-/// boxes around every dam) into a [`WaterGrid`] and hands it to
-/// `AsyncComputeTaskPool`. No dams ⇒ no work (the static Phase 2 stamp
-/// already handles undammed water; the sim only models impoundment
-/// dynamics). The main tick never blocks.
+/// boxes around every dam **and every persisted runtime/seep cell**) into a
+/// [`WaterGrid`] and hands it to `AsyncComputeTaskPool`. River inflow is
+/// placed at the true channel crossings via
+/// `RiverNetwork::edge_crossings_in_bbox` (not the old highest-elevation
+/// boundary guess); cells dug below the water table seep upward (capped at
+/// the table — no rock flooding); all inflow follows the seasonal snowmelt
+/// hydrograph. No dams **and** no runtime water ⇒ no work (self-terminating;
+/// the static Phase 2 stamp handles undammed water). The main tick never
+/// blocks.
 pub fn spawn_water_sim_task_system(
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
     runtime_water: Res<RuntimeWater>,
     dam_map: Res<DamMap>,
     globe: Res<Globe>,
+    gen: Res<WorldGen>,
+    calendar: Res<Calendar>,
     mut sim: ResMut<WaterSim>,
 ) {
     if sim.task.is_some() {
@@ -298,8 +320,38 @@ pub fn spawn_water_sim_task_system(
         grid.dam_crests.insert(t, crest);
     }
 
-    // Boundary watercourse cells, to classify the highest as inlet sources.
-    let mut boundary_watercourse: Vec<((i32, i32), f32)> = Vec::new();
+    // Per-cell flow routing: classify every place a real river polyline
+    // crosses the active region's bbox. An `Inlet` is where the channel
+    // enters (inject that edge's discharge); an `Outlet` is where it leaves
+    // (pin a stable outflow level). This replaces the old "highest boundary
+    // watercourse = inlet" elevation heuristic with true topology.
+    let (mut mnx, mut mny, mut mxx, mut mxy) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for &(x, y) in &region {
+        mnx = mnx.min(x);
+        mny = mny.min(y);
+        mxx = mxx.max(x);
+        mxy = mxy.max(y);
+    }
+    let mut inlet: AHashMap<(i32, i32), (f32, f32)> = AHashMap::new(); // (discharge, level)
+    let mut outlet: AHashMap<(i32, i32), f32> = AHashMap::new(); // level
+    for c in globe.rivers.edge_crossings_in_bbox((mnx, mny), (mxx, mxy)) {
+        match c.kind {
+            EdgeCrossingKind::Inlet => {
+                let e = inlet.entry(c.tile).or_insert((0.0, c.level));
+                e.0 = e.0.max(c.discharge);
+                e.1 = e.1.max(c.level);
+            }
+            EdgeCrossingKind::Outlet => {
+                let e = outlet.entry(c.tile).or_insert(c.level);
+                *e = e.max(c.level);
+            }
+        }
+    }
+
+    // Snowmelt hydrograph: river inlets follow it in full; aquifer/spring
+    // seep is *damped* (groundwater lags and buffers surface seasonality).
+    let season_full = calendar.discharge_multiplier();
+    let season_aq = 0.5 + 0.5 * season_full;
 
     for &t in &region {
         if grid.dam_crests.contains_key(&t) {
@@ -339,43 +391,63 @@ pub fn spawn_water_sim_task_system(
             continue;
         }
 
+        // River leaves the region here → stable pinned outflow.
+        if let Some(&lvl) = outlet.get(&t) {
+            let z = z_clampf(lvl * GLOBE_H_TO_Z).max(bed);
+            grid.cells.insert(t, WaterCell::pinned(z));
+            continue;
+        }
+
+        // River enters the region here → inject the edge's discharge
+        // (seasonally scaled) at the channel level so a dam downstream
+        // actually pools it.
+        if let Some(&(discharge, lvl)) = inlet.get(&t) {
+            let surf = z_clampf(lvl * GLOBE_H_TO_Z).max(bed + depth);
+            let rate =
+                INLET_BASE_RATE * (1.0 + (discharge / 256.0).min(2.0)) * season_full;
+            grid.cells
+                .insert(t, WaterCell::free(bed, (surf - bed).max(0.0)).with_source(rate));
+            continue;
+        }
+
+        // Non-river boundary watercourse (marsh/lake fringe with no mapped
+        // edge) → pin at its current surface so the interior stays stable.
         if on_boundary(t) && is_watercourse {
-            // Watercourse leaving/entering the region: pin at hydrology
-            // baseline so the interior has a stable boundary. The highest
-            // such cells become inlets (handled after this loop).
             let surf = bed + depth;
-            boundary_watercourse.push((t, surf));
             grid.cells.insert(t, WaterCell::pinned(surf.max(bed)));
             continue;
         }
 
-        grid.cells.insert(t, WaterCell::free(bed, depth));
-    }
-
-    // Turn the highest-surface boundary watercourse cells into inlet
-    // sources (water enters the loaded region here and flows downhill —
-    // a dam in the channel pools it). The rest stay pinned outlets.
-    if let Some(max_surf) = boundary_watercourse
-        .iter()
-        .map(|&(_, s)| s)
-        .fold(None, |acc: Option<f32>, s| Some(acc.map_or(s, |a| a.max(s))))
-    {
-        for &(t, s) in &boundary_watercourse {
-            if s >= max_surf - 0.75 {
-                let discharge = globe
-                    .hydro_cell_at(t.0, t.1)
-                    .map(|h| h.discharge)
-                    .unwrap_or(0.0);
-                let rate = INLET_BASE_RATE * (1.0 + (discharge / 256.0).min(2.0));
-                let bed = grid
-                    .cells
-                    .get(&t)
-                    .map(|c| c.bed)
-                    .unwrap_or(s);
-                grid.cells
-                    .insert(t, WaterCell::free(bed, s - bed).with_source(rate));
+        // Interior free cell. Seep on **any** tile whose bed sits below the
+        // per-tile natural water table — `natural_surface_z(tx,ty)` (jittered
+        // identically to chunk-gen) minus `(filled - aquifer) · GLOBE_H_TO_Z`
+        // (per-cell aquifer-depth-below-surface). Treats natural per-tile
+        // depressions and dug pits identically (both are bed-below-table —
+        // it'd be absurd for a dug pit to fill while a deeper natural hollow
+        // next to it stays dry). Cap with the same per-tile table so the
+        // pool never rises above its real local groundwater level (no rock
+        // flooding). Damped seasonal (groundwater lags surface). Note: the
+        // sim only sees tiles inside the active region (around dams + bootstrap
+        // seed cells from `aquifer_seep_emitter_system`); natural depressions
+        // outside any region are a chunk-gen-time static-stamping gap (the
+        // hydrology classifier is per-climate-cell, blind to per-tile jitter),
+        // unrelated to v2 and not addressed here.
+        let mut cell = WaterCell::free(bed, depth);
+        if let Some(h) = globe.hydro_cell_at(t.0, t.1) {
+            // Per-cell water table: anchor on the jitter-free macro elevation
+            // (same frame as surface_z). Per-tile lows below this gate are
+            // genuinely below the table — natural depressions and dug pits both
+            // seep through this single check, no asymmetry.
+            let (elev_u, _, _) = globe.sample_climate(t.0, t.1);
+            let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
+            let cell_surface_z = Z_MIN as f32 + macro_f * CHUNK_HEIGHT as f32;
+            let aquifer_depth_z = (h.filled_height - h.aquifer_level) * GLOBE_H_TO_Z;
+            let cell_table_z = cell_surface_z - aquifer_depth_z;
+            if bed < cell_table_z && bed + depth < cell_table_z {
+                cell = cell.with_source(AQUIFER_SEEP_RATE * season_aq);
             }
         }
+        grid.cells.insert(t, cell);
     }
 
     // Snapshot the pre-sim kinds for dry-back restoration.
@@ -404,6 +476,7 @@ pub fn spawn_water_sim_task_system(
                 tile: t,
                 ground_z: z_clampf(c.bed).round() as i8,
                 depth: c.depth,
+                source: c.source,
                 orig_kind: orig.get(&t).copied().unwrap_or(TileKind::Water),
             });
         }
@@ -438,6 +511,9 @@ pub fn poll_water_sim_task_system(
 
         if o.depth >= WET_ON || (was_wet && o.depth > WET_OFF) {
             // Wet: persist + project. RuntimeWater is the durable truth.
+            // `o.source` is this snapshot's classify verdict (re-derived per
+            // tile from the natural table); no preservation needed since the
+            // next snapshot re-derives independently from `Globe + seed`.
             runtime_water.set(
                 (tx, ty),
                 RuntimeWaterCell {
@@ -445,17 +521,54 @@ pub fn poll_water_sim_task_system(
                     depth: o.depth,
                     reservoir_id: u32::MAX,
                     salinity: 0.0,
-                    source_rate: 0.0,
+                    source_rate: o.source,
                 },
             );
             chunk_map.apply_water_column(tx, ty, o.ground_z, o.depth, u32::MAX);
             if !was_wet {
                 tile_changed.send(TileChangedEvent { tx, ty });
             }
+        } else if o.source > 0.0 {
+            // Not visually wet, but classify decided this cell is still
+            // source-fed (bed below the local table, pool not yet at the
+            // cap). Keep it as a depth-carrying runtime cell — bypassing
+            // `set`, which would drop a `depth <= 0` cell — so it survives
+            // reload AND keeps the sim region covering it (otherwise an
+            // isolated dug well would empty `runtime_water.cells`, the sim
+            // would self-terminate, and the well would never refill). No
+            // passability flip ⇒ no event.
+            runtime_water.cells.insert(
+                (tx, ty),
+                RuntimeWaterCell {
+                    ground_z: o.ground_z,
+                    depth: o.depth.max(0.0),
+                    reservoir_id: u32::MAX,
+                    salinity: 0.0,
+                    source_rate: o.source,
+                },
+            );
+            if was_wet {
+                // It just fell out of the wet band — restore the dry tile.
+                if o.orig_kind.is_passable() {
+                    let sz = chunk_map.surface_z_at(tx, ty);
+                    if sz >= Z_MIN {
+                        chunk_map.set_tile(
+                            tx,
+                            ty,
+                            sz,
+                            TileData {
+                                kind: o.orig_kind,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+                tile_changed.send(TileChangedEvent { tx, ty });
+            }
         } else {
-            // Drained: drop the runtime cell and restore the natural tile on
-            // the live chunk (reload would also fix it via the restamp gap,
-            // but the player is looking at it now).
+            // Drained, no source: drop the runtime cell and restore the
+            // natural tile on the live chunk (reload would also fix it via
+            // the restamp gap, but the player is looking at it now).
             let had_runtime = runtime_water.cells.remove(&(tx, ty)).is_some();
             if was_wet && o.orig_kind.is_passable() {
                 let sz = chunk_map.surface_z_at(tx, ty);
@@ -474,6 +587,52 @@ pub fn poll_water_sim_task_system(
             } else if had_runtime {
                 tile_changed.send(TileChangedEvent { tx, ty });
             }
+        }
+    }
+}
+
+/// PostUpdate, before [`spawn_water_sim_task_system`]. Pure region-bootstrap:
+/// on a real dig event ([`TileCarvedEvent`] from `dig_system`) that clears
+/// the per-tile natural water table, insert a depth-0 runtime cell so the
+/// sim's active region covers this excavation (without it, an isolated dug
+/// well far from any dam would never make `runtime_water.cells` non-empty,
+/// and the sim wouldn't run). The **source decision is not made here** —
+/// `spawn_water_sim_task_system`'s classify loop re-derives it per-tile from
+/// the natural table every snapshot, so natural depressions and dug pits
+/// both seep uniformly inside any active region.
+pub fn aquifer_seep_emitter_system(
+    mut carved: EventReader<TileCarvedEvent>,
+    globe: Res<Globe>,
+    gen: Res<WorldGen>,
+    mut runtime_water: ResMut<RuntimeWater>,
+) {
+    for ev in carved.read() {
+        let t = (ev.tx, ev.ty);
+        if let Some(existing) = runtime_water.cells.get(&t) {
+            if existing.source_rate > 0.0 {
+                continue; // already a tracked seep
+            }
+        }
+        let Some(h) = globe.hydro_cell_at(t.0, t.1) else {
+            continue;
+        };
+        // Per-cell water table (same gate as snapshot + Pass 4.5).
+        let (elev_u, _, _) = globe.sample_climate(t.0, t.1);
+        let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
+        let cell_surface_z = Z_MIN as f32 + macro_f * CHUNK_HEIGHT as f32;
+        let aquifer_depth_z = (h.filled_height - h.aquifer_level) * GLOBE_H_TO_Z;
+        let cell_table_z = cell_surface_z - aquifer_depth_z;
+        if (ev.new_floor_z as f32) < cell_table_z {
+            runtime_water.cells.insert(
+                t,
+                RuntimeWaterCell {
+                    ground_z: ev.new_floor_z as i8,
+                    depth: 0.0,
+                    reservoir_id: u32::MAX,
+                    salinity: 0.0,
+                    source_rate: AQUIFER_SEEP_RATE,
+                },
+            );
         }
     }
 }
