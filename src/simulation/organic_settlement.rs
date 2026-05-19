@@ -730,8 +730,15 @@ pub fn compat_plan_from_brain(
 
     // Districts only fall back as a broad zone when no parcel of that
     // kind exists yet (e.g. early survey before parcels are carved).
+    // Agricultural is EXCLUDED: fields come solely from `build_ag_belt`
+    // parcels (or frontier-driven camp parcels). A broad district zone
+    // here is centred on the home-biased `best_fertile_tile`, which is
+    // exactly the "farms carved all over the base" regression.
     for district in &brain.districts {
         let kind = district.kind.zone_kind();
+        if kind == ZoneKind::Agricultural {
+            continue;
+        }
         if kinds_with_parcels.contains(&kind) {
             continue;
         }
@@ -754,11 +761,15 @@ pub fn compat_plan_from_brain(
     // The land-tenure layer still carves plots from SettlementPlan zones.
     // Preserve a single legacy fallback zone only when the organic survey
     // has produced neither parcels nor a district for that kind yet.
+    // Agricultural is deliberately absent here too — the legacy
+    // `build_settlement_plan` ag zone is a home-centred megablock; carving
+    // it scattered farms across the whole settlement. No belt parcel ⇒ no
+    // Agricultural zone this survey (the belt retries as the layout evolves).
     let kinds_emitted: AHashSet<ZoneKind> = zones.iter().map(|z| z.kind).collect();
     for legacy in fallback.zones.iter().filter(|z| {
         matches!(
             z.kind,
-            ZoneKind::Residential | ZoneKind::Agricultural | ZoneKind::Crafting | ZoneKind::Storage
+            ZoneKind::Residential | ZoneKind::Crafting | ZoneKind::Storage
         )
     }) {
         if !kinds_emitted.contains(&legacy.kind) {
@@ -1546,7 +1557,23 @@ fn build_parcels(
     // PERM_SETTLEMENT) and survey-gap settlements (road network not yet
     // sketched) fall back to the legacy frontier-first allocation.
     if faction.community_has(PERM_SETTLEMENT) && !brain.road_tiles.is_empty() {
-        build_parcels_road_driven(faction, settlement, brain, chunk_map)
+        // Non-ag parcels via the road sweep, then the agricultural belt
+        // OUTSIDE the resulting built-up footprint. One combined Vec with a
+        // continuous id sequence; the belt shares the `MAX_PARCELS` budget.
+        let mut parcels = build_parcels_road_driven(faction, settlement, brain, chunk_map);
+        let occupied: Vec<TileRect> = parcels.iter().map(|p| p.rect()).collect();
+        let next_id = parcels
+            .iter()
+            .map(|p| p.id)
+            .max()
+            .map(|m| m.wrapping_add(1))
+            .unwrap_or(0);
+        let budget = MAX_PARCELS.saturating_sub(parcels.len());
+        let belt = build_ag_belt(
+            faction, settlement, brain, chunk_map, &occupied, next_id, budget,
+        );
+        parcels.extend(belt);
+        parcels
     } else {
         build_parcels_frontier_driven(faction, settlement, brain, chunk_map)
     }
@@ -1637,9 +1664,11 @@ fn build_parcels_road_driven(
     }
     let mut candidates: Vec<Cand> = Vec::new();
 
-    const KIND_ORDER: [DistrictKind; 8] = [
+    // Agricultural is deliberately absent: fields are NOT road-fronted core
+    // parcels. `build_ag_belt` allocates them as a contiguous belt OUTSIDE the
+    // built-up footprint (see `build_parcels`).
+    const KIND_ORDER: [DistrictKind; 7] = [
         DistrictKind::Residential,
-        DistrictKind::Agricultural,
         DistrictKind::Crafting,
         DistrictKind::Storage,
         DistrictKind::Civic,
@@ -1735,6 +1764,269 @@ fn build_parcels_road_driven(
         next_id = next_id.wrapping_add(1);
     }
     parcels
+}
+
+/// Agricultural-belt allocation. Fields are deliberately NOT road-fronted
+/// core parcels (that wove 16×16 farm blocks through the street grid). The
+/// belt is packed as contiguous 16×16 blocks OUTSIDE the built-up footprint,
+/// anchored on the Agricultural `DistrictInfluence` (the `Field` anchor from
+/// `best_fertile_tile`), grown as a connected blob from the most fertile seed,
+/// requiring only a short track to the road network (not full frontage).
+///
+/// Deterministic: fixed 16-aligned lattice, no RNG, explicit sort/selection
+/// with a `tile_hash` final tiebreak, no ahash-iteration dependence. `occupied`
+/// is the non-ag road-driven parcel set; `start_id` continues the parcel id
+/// sequence; `budget` is the remaining `MAX_PARCELS` headroom.
+fn build_ag_belt(
+    faction: &FactionData,
+    settlement: &Settlement,
+    brain: &SettlementBrain,
+    chunk_map: &ChunkMap,
+    occupied: &[TileRect],
+    start_id: u32,
+    budget: usize,
+) -> Vec<Parcel> {
+    const BELT_CLEARANCE: i32 = 3;
+    const ACCESS_SOFT: i32 = 12;
+
+    if budget == 0 {
+        return Vec::new();
+    }
+    let targets = parcel_targets(faction, settlement, brain.phase);
+    let ag_target = *targets.get(&DistrictKind::Agricultural).unwrap_or(&0);
+    if ag_target == 0 {
+        return Vec::new();
+    }
+    let home = faction.home_tile;
+
+    // Built-up footprint: non-ag parcels + Civic/Residential/Crafting
+    // district discs, each inflated by `BELT_CLEARANCE` so fields keep a
+    // breathing margin from houses/workshops.
+    let inflate = |r: TileRect| -> TileRect {
+        TileRect::new(
+            r.x0 - BELT_CLEARANCE,
+            r.y0 - BELT_CLEARANCE,
+            r.w + 2 * BELT_CLEARANCE as u16,
+            r.h + 2 * BELT_CLEARANCE as u16,
+        )
+    };
+    let mut footprint: Vec<TileRect> = occupied.iter().map(|r| inflate(*r)).collect();
+    for d in &brain.districts {
+        if matches!(
+            d.kind,
+            DistrictKind::Civic | DistrictKind::Residential | DistrictKind::Crafting
+        ) {
+            let r = d.radius as i32;
+            footprint.push(inflate(TileRect::new(
+                d.centre.0 - r,
+                d.centre.1 - r,
+                (2 * r + 1) as u16,
+                (2 * r + 1) as u16,
+            )));
+        }
+    }
+
+    let (bw, bh) = parcel_size(DistrictKind::Agricultural, brain.phase);
+    // Self-contained, home-anchored lattice — NO dependency on the fragile,
+    // home-biased `best_fertile_tile` Field anchor. Blocks tile edge-to-edge
+    // and stay seed-stable across re-surveys. The footprint keep-out forces
+    // the belt into the first clear ring(s) OUTSIDE the built-up area; the
+    // fertility ranking then steers it toward the best surrounding land.
+    let ox = home.0.div_euclid(bw as i32) * bw as i32;
+    let oy = home.1.div_euclid(bh as i32) * bh as i32;
+    // Scan must reach beyond the footprint plus a few block rings, with a
+    // sane cap so a sprawling settlement doesn't scan the whole map.
+    let fp_extent = footprint
+        .iter()
+        .map(|r| {
+            let xs = [r.x0, r.x0 + r.w as i32 - 1];
+            let ys = [r.y0, r.y0 + r.h as i32 - 1];
+            let mut m = 0;
+            for &x in &xs {
+                for &y in &ys {
+                    m = m.max(cheb((x, y), home));
+                }
+            }
+            m
+        })
+        .max()
+        .unwrap_or(0);
+    let sr = survey_radius(brain.phase);
+    let scan = (fp_extent + 4 * bw as i32)
+        .max(sr + 2 * bw as i32)
+        .min(sr * 2 + 96);
+    let span = scan / bw as i32 + 1;
+    let access_radius = (bw.max(bh) as i32) / 2 + ACCESS_SOFT;
+
+    struct AgCand {
+        rect: TileRect,
+        access_tile: Option<(i32, i32)>,
+        suitability: ParcelSuitability,
+        base_score: f32,
+        tile_hash: u64,
+    }
+    let mut cands: Vec<AgCand> = Vec::new();
+    for gy in -span..=span {
+        for gx in -span..=span {
+            let rect = TileRect::new(ox + gx * bw as i32, oy + gy * bh as i32, bw, bh);
+            if footprint.iter().any(|f| rects_overlap(*f, rect)) {
+                continue;
+            }
+            if !rect_clear_for_parcel(chunk_map, rect, &brain.road_tiles) {
+                continue;
+            }
+            // 5-sample mean fertility (centre + 4 corners), mirroring
+            // `compute_plot_value`'s terrain sampling. Only a `> 0` gate:
+            // fertility is 0 on non-vegetated ground (Sand/Snow/Stone), so
+            // this keeps fields off barren land WITHOUT an arbitrary floor
+            // that would silently leave a whole region farmless.
+            let c = rect.center();
+            let corners = [
+                c,
+                (rect.x0, rect.y0),
+                (rect.x0 + rect.w as i32 - 1, rect.y0),
+                (rect.x0, rect.y0 + rect.h as i32 - 1),
+                (rect.x0 + rect.w as i32 - 1, rect.y0 + rect.h as i32 - 1),
+            ];
+            let mean_fert = corners
+                .iter()
+                .map(|(x, y)| chunk_map.tile_fertility_at(*x, *y).unwrap_or(0) as f32 / 255.0)
+                .sum::<f32>()
+                / corners.len() as f32;
+            if mean_fert <= 0.0 {
+                continue;
+            }
+            // Road access is a SOFT preference, not a hard gate: a field with
+            // no nearby road is still viable (a track gets carved as traffic
+            // builds), so we never silently produce zero farms for lack of a
+            // road. Closer-to-road blocks just score higher.
+            let access_d = distance_to_road_network(chunk_map, brain, c, access_radius);
+            let access_tile = access_d
+                .and_then(|_| nearest_network_road_tile(chunk_map, brain, c, access_radius));
+            let road_bonus = match access_d {
+                Some(d) => 0.35 * (1.0 - d as f32 / access_radius as f32).clamp(0.0, 1.0),
+                None => 0.0,
+            };
+            let suitability = parcel_suitability(faction, settlement, brain, chunk_map, c);
+            // `suitability.agricultural` already = fertility*1.4 + water*0.5.
+            let base_score = suitability.agricultural + road_bonus;
+            let tile_hash = ((c.0 as i64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64)
+                ^ c.1 as i64) as u64;
+            cands.push(AgCand {
+                rect,
+                access_tile,
+                suitability,
+                base_score,
+                tile_hash,
+            });
+        }
+    }
+    if cands.is_empty() {
+        return Vec::new();
+    }
+
+    // Highest-fertility seed first, then grow a connected blob: each step
+    // picks the remaining candidate with the most edges shared with the
+    // already-accepted set (then fertility, then tile_hash) so the belt is
+    // contiguous, not scattered. All tiebreaks explicit → deterministic.
+    cands.sort_by(|a, b| {
+        b.base_score
+            .partial_cmp(&a.base_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.tile_hash.cmp(&b.tile_hash))
+    });
+    let block_adjacent = |a: TileRect, b: TileRect| -> bool {
+        let dx = (a.x0 - b.x0).abs();
+        let dy = (a.y0 - b.y0).abs();
+        (dx == bw as i32 && dy == 0) || (dy == bh as i32 && dx == 0)
+    };
+
+    let cap = ag_target.min(budget);
+    let mut accepted: Vec<usize> = Vec::new();
+    let mut used = vec![false; cands.len()];
+    while accepted.len() < cap {
+        let mut best: Option<usize> = None;
+        let mut best_key: (i32, f32, u64) = (-1, f32::MIN, u64::MAX);
+        for (i, c) in cands.iter().enumerate() {
+            if used[i] {
+                continue;
+            }
+            if accepted
+                .iter()
+                .any(|&j| rects_overlap(cands[j].rect, c.rect))
+            {
+                continue;
+            }
+            let adj = if accepted.is_empty() {
+                0
+            } else {
+                accepted
+                    .iter()
+                    .filter(|&&j| block_adjacent(cands[j].rect, c.rect))
+                    .count() as i32
+            };
+            // Rank: more shared edges (contiguity) → higher fertility →
+            // lower tile_hash. First pick has `accepted` empty so adj == 0
+            // for all and the highest-fertility seed wins.
+            let better = best.is_none()
+                || adj > best_key.0
+                || (adj == best_key.0 && c.base_score > best_key.1)
+                || (adj == best_key.0
+                    && c.base_score == best_key.1
+                    && c.tile_hash < best_key.2);
+            if better {
+                best = Some(i);
+                best_key = (adj, c.base_score, c.tile_hash);
+            }
+        }
+        let Some(idx) = best else { break };
+        used[idx] = true;
+        accepted.push(idx);
+    }
+
+    let mut parcels = Vec::with_capacity(accepted.len());
+    let mut next_id = start_id;
+    for idx in accepted {
+        let c = &cands[idx];
+        parcels.push(Parcel {
+            id: next_id,
+            shape: ParcelShape::Rect(c.rect),
+            frontage_edge: None,
+            access_tile: c.access_tile,
+            holder: TenureHolder::State {
+                faction_id: settlement.owner_faction,
+            },
+            district_hint: Some(DistrictKind::Agricultural),
+            suitability: c.suitability.clone(),
+        });
+        next_id = next_id.wrapping_add(1);
+    }
+    parcels
+}
+
+/// Nearest `is_network_road` tile to `tile` within chebyshev `radius`, or
+/// `None`. Companion to `distance_to_road_network` that returns the tile so a
+/// belt parcel can record a real `access_tile` track point.
+fn nearest_network_road_tile(
+    chunk_map: &ChunkMap,
+    brain: &SettlementBrain,
+    tile: (i32, i32),
+    radius: i32,
+) -> Option<(i32, i32)> {
+    let mut best: Option<(i32, (i32, i32))> = None;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let d = dx.abs().max(dy.abs());
+            if best.map_or(false, |(bd, _)| d >= bd) {
+                continue;
+            }
+            let probe = (tile.0 + dx, tile.1 + dy);
+            if is_network_road(chunk_map, brain, probe) {
+                best = Some((d, probe));
+            }
+        }
+    }
+    best.map(|(_, t)| t)
 }
 
 /// Place a parcel rect of size `(w, h)` so that its `edge` side is adjacent
@@ -2864,6 +3156,17 @@ fn maybe_queue_desire_path(
     if road_near(chunk_map, tile, 3) {
         return;
     }
+    // Never run a desire path through a farm field. The carve chokepoint
+    // (`road_carve_system`) would skip the tilled tiles anyway, but dropping
+    // the target here avoids queueing a doomed Bresenham across the belt.
+    if brain
+        .parcels
+        .iter()
+        .filter(|p| p.district_hint == Some(DistrictKind::Agricultural))
+        .any(|p| p.rect().contains(tile.0, tile.1))
+    {
+        return;
+    }
     road_queue.0.push((faction_id, tile, home));
     brain.last_path_carve_tick = tick;
 }
@@ -3495,6 +3798,182 @@ mod tests {
                 p.id
             );
         }
+    }
+
+    fn fertile_chunk(kind: crate::world::tile::TileKind) -> crate::world::chunk::Chunk {
+        let surface_z =
+            Box::new([[0i8; crate::world::chunk::CHUNK_SIZE]; crate::world::chunk::CHUNK_SIZE]);
+        let surface_kind =
+            Box::new([[kind; crate::world::chunk::CHUNK_SIZE]; crate::world::chunk::CHUNK_SIZE]);
+        // Fertility 200/255 ≈ 0.78 — comfortably above AG_BELT_MIN_FERT.
+        let surface_fertility =
+            Box::new([[200u8; crate::world::chunk::CHUNK_SIZE]; crate::world::chunk::CHUNK_SIZE]);
+        crate::world::chunk::Chunk::new(surface_z, surface_kind, surface_fertility)
+    }
+
+    fn fertile_grass_map() -> ChunkMap {
+        let mut m = ChunkMap::default();
+        for cy in -2..=3 {
+            for cx in -2..=3 {
+                m.0.insert(
+                    crate::world::chunk::ChunkCoord(cx, cy),
+                    fertile_chunk(crate::world::tile::TileKind::Grass),
+                );
+            }
+        }
+        m
+    }
+
+    fn ag_test_settlement() -> Settlement {
+        use crate::economy::market::SettlementMarket;
+        Settlement {
+            id: SettlementId(1),
+            owner_faction: 1,
+            market_tile: (0, 0),
+            founding_tick: 0,
+            name: "AgTest".into(),
+            treasury: 0.0,
+            market: SettlementMarket::default(),
+            peak_population: 30,
+        }
+    }
+
+    /// The ag belt is allocated as 16×16 blocks OUTSIDE the built-up
+    /// footprint, self-anchored on home (NOT the old home-biased Field
+    /// anchor), with no near-home fallback. Road access is now soft, so the
+    /// belt fires even without a nearby road.
+    #[test]
+    fn ag_belt_outside_footprint() {
+        let mut faction = dummy_faction((0, 0), 30);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        force_adopt(&mut faction, CROP_CULTIVATION);
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.phase = SettlementPhase::Chiefdom;
+        // Only a Civic disc — NO Agricultural district. The belt must still
+        // fire (it no longer depends on a Field anchor) and stay clear of
+        // the built-up footprint. No road tiles either (access is soft).
+        brain.districts = vec![DistrictInfluence {
+            kind: DistrictKind::Civic,
+            centre: (0, 0),
+            radius: 5,
+            weight: 1.0,
+        }];
+        let map = fertile_grass_map();
+        let settlement = ag_test_settlement();
+
+        let parcels = build_ag_belt(&faction, &settlement, &brain, &map, &[], 100, MAX_PARCELS);
+        assert!(
+            !parcels.is_empty(),
+            "robust belt must yield ≥1 ag block on fertile land even with no \
+             Field anchor and no road"
+        );
+
+        // Civic disc (home, r=5) inflated by BELT_CLEARANCE=3 → keep-out box.
+        let civic_keepout = TileRect::new(-8, -8, 17, 17);
+        for (i, p) in parcels.iter().enumerate() {
+            assert_eq!(p.district_hint, Some(DistrictKind::Agricultural));
+            assert!(p.id >= 100, "belt ids continue the parcel sequence");
+            assert!(
+                p.frontage_edge.is_none(),
+                "ag fields are not road-fronted (parcel {})",
+                p.id
+            );
+            let r = p.rect();
+            assert_eq!((r.w, r.h), (16, 16), "ag parcels are 16×16");
+            assert!(
+                !rects_overlap(r, civic_keepout),
+                "ag parcel {} overlaps the built-up footprint {:?}",
+                p.id,
+                r
+            );
+            // Strictly outside the civic radius (not hugging the base).
+            let cx = r.x0 + r.w as i32 / 2;
+            let cy = r.y0 + r.h as i32 / 2;
+            assert!(
+                (cx).abs().max(cy.abs()) > 5,
+                "ag parcel {} centre {:?} is inside the civic core",
+                p.id,
+                (cx, cy)
+            );
+            for (j, q) in parcels.iter().enumerate() {
+                if i != j {
+                    assert!(
+                        !rects_overlap(r, q.rect()),
+                        "ag parcels {} and {} overlap",
+                        p.id,
+                        q.id
+                    );
+                }
+            }
+        }
+    }
+
+    /// Belt allocation is deterministic: same brain/map → identical rects.
+    #[test]
+    fn ag_belt_deterministic() {
+        let mut faction = dummy_faction((0, 0), 30);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        force_adopt(&mut faction, CROP_CULTIVATION);
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.phase = SettlementPhase::Chiefdom;
+        brain.districts = vec![DistrictInfluence {
+            kind: DistrictKind::Civic,
+            centre: (0, 0),
+            radius: 5,
+            weight: 1.0,
+        }];
+        let map = fertile_grass_map();
+        let settlement = ag_test_settlement();
+
+        let a = build_ag_belt(&faction, &settlement, &brain, &map, &[], 0, MAX_PARCELS);
+        let b = build_ag_belt(&faction, &settlement, &brain, &map, &[], 0, MAX_PARCELS);
+        assert!(!a.is_empty());
+        let rects_a: Vec<TileRect> = a.iter().map(|p| p.rect()).collect();
+        let rects_b: Vec<TileRect> = b.iter().map(|p| p.rect()).collect();
+        assert_eq!(
+            rects_a, rects_b,
+            "build_ag_belt must be deterministic across calls"
+        );
+    }
+
+    /// Regression: with no belt/frontier Agricultural parcel, the compat
+    /// plan must NOT synthesize a home-centred Agricultural zone from the
+    /// district-broad or legacy `build_settlement_plan` fallback (that carved
+    /// farms all over the base). Belt parcels DO flow through verbatim.
+    #[test]
+    fn compat_plan_no_near_home_ag_fallback() {
+        let mut faction = dummy_faction((0, 0), 30);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        force_adopt(&mut faction, CROP_CULTIVATION);
+
+        // No parcels, no Agricultural district → no Agricultural zone.
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.phase = SettlementPhase::Chiefdom;
+        let plan = compat_plan_from_brain(1, &faction, 0, &brain);
+        assert!(
+            !plan.zones.iter().any(|z| z.kind == ZoneKind::Agricultural),
+            "no belt parcel ⇒ NO Agricultural zone (no near-home fallback)"
+        );
+
+        // A belt parcel far from home flows through unchanged.
+        let belt = TileRect::new(80, 80, 16, 16);
+        brain.parcels.push(Parcel {
+            id: 0,
+            shape: ParcelShape::Rect(belt),
+            frontage_edge: None,
+            access_tile: None,
+            holder: TenureHolder::State { faction_id: 1 },
+            district_hint: Some(DistrictKind::Agricultural),
+            suitability: ParcelSuitability::default(),
+        });
+        let plan2 = compat_plan_from_brain(1, &faction, 0, &brain);
+        let ag: Vec<_> = plan2
+            .zones
+            .iter()
+            .filter(|z| z.kind == ZoneKind::Agricultural)
+            .collect();
+        assert_eq!(ag.len(), 1, "the single belt parcel → one Agricultural zone");
+        assert_eq!(ag[0].rect, belt, "ag zone uses the belt rect, not home");
     }
 
     /// `survey_one_settlement`'s expensive sub-functions

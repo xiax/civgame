@@ -4844,39 +4844,69 @@ mod smoke {
         use bevy::ecs::system::RunSystemOnce;
         use crate::economy::core_ids;
         use crate::simulation::farm::seed_starting_farms_system;
-        use crate::simulation::land::{Plot, PlotIndex};
-        use crate::simulation::settlement::ZoneKind;
+        use crate::simulation::land::{Plot, PlotIndex, TenureHolder};
+        use crate::simulation::organic_settlement::{
+            DistrictKind, Parcel, ParcelShape, ParcelSuitability, SettlementBrain, SettlementBrains,
+        };
+        use crate::simulation::settlement::{SettlementMap, TileRect, ZoneKind};
 
         let mut sim = TestSim::new(0xF00D_FA12);
         sim.flat_world(2, 0, TileKind::Grass);
         let storage_tile = (0, 0);
         sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
 
-        // Let the normal settlement + storage-tile indexes populate, then run
-        // the one-shot startup farm seeder directly.
+        // Let the normal settlement + storage-tile indexes populate.
         sim.tick_n(2);
+
+        // Mirror the real OnEnter flow: the kickoff survey populates the
+        // settlement brain with an Agricultural BELT parcel BEFORE the farm
+        // seeder runs. Inject one far from home so we can assert the seed
+        // plot lands ON the belt (not a near-home fallback — that path is
+        // gone by design).
+        let fid = sim.player_faction_id;
+        let belt_rect = TileRect::new(40, 40, 16, 16);
+        {
+            let world = sim.app.world_mut();
+            let sid = world
+                .resource::<SettlementMap>()
+                .first_for_faction(fid)
+                .expect("player settlement should exist after tick_n(2)");
+            let mut brain = SettlementBrain::new(sid, fid, 42);
+            brain.parcels.push(Parcel {
+                id: 0,
+                shape: ParcelShape::Rect(belt_rect),
+                frontage_edge: None,
+                access_tile: None,
+                holder: TenureHolder::State { faction_id: fid },
+                district_hint: Some(DistrictKind::Agricultural),
+                suitability: ParcelSuitability::default(),
+            });
+            world.resource_mut::<SettlementBrains>().0.insert(sid, brain);
+        }
+
         sim.app
             .world_mut()
             .run_system_once(seed_starting_farms_system)
             .expect("seed_starting_farms_system should run");
 
-        let plot_count = {
+        let seeded: Vec<TileRect> = {
             let world = sim.app.world();
             let plot_index = world.resource::<PlotIndex>();
             plot_index
                 .by_id
                 .values()
-                .filter(|&&entity| {
-                    world.get::<Plot>(entity).map_or(false, |plot| {
-                        plot.faction_id == sim.player_faction_id
-                            && plot.zone_kind == ZoneKind::Agricultural
+                .filter_map(|&entity| {
+                    world.get::<Plot>(entity).and_then(|plot| {
+                        (plot.faction_id == fid && plot.zone_kind == ZoneKind::Agricultural)
+                            .then_some(plot.rect)
                     })
                 })
-                .count()
+                .collect()
         };
-        assert!(
-            plot_count >= 1,
-            "startup farm seeding should create an Agricultural plot"
+        assert_eq!(
+            seeded,
+            vec![belt_rect],
+            "startup farm must be sited ON the brain's belt parcel, not near home"
         );
 
         let grain_seed = core_ids::grain_seed();
@@ -4904,8 +4934,10 @@ mod smoke {
     fn chief_posts_farm_with_abundant_grain_when_seed_available() {
         use crate::economy::core_ids;
         use crate::simulation::faction::{FactionChief, FactionRegistry};
-        use crate::simulation::jobs::{JobBoard, JobKind};
+        use crate::simulation::jobs::{JobBoard, JobKind, JobProgress};
         use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
         use crate::simulation::technology::CROP_CULTIVATION;
 
         let mut sim = TestSim::new(0x5EED_600D);
@@ -4931,18 +4963,69 @@ mod smoke {
             faction.techs.unlock(CROP_CULTIVATION);
         }
 
+        // Farming is now ALWAYS plot-bound: the chief posts a Farm job only
+        // when a StateOwned Agricultural plot exists (the old `home_tile ±5`
+        // bootstrap that tilled the town centre is gone). Inject a belt-style
+        // plot far from home.
+        let fid = sim.player_faction_id;
+        let belt_rect = TileRect::new(40, 40, 16, 16);
+        {
+            let world = sim.app.world_mut();
+            let pid = {
+                let mut pi = world.resource_mut::<PlotIndex>();
+                pi.alloc_id()
+            };
+            let ent = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect: belt_rect,
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                })
+                .id();
+            world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
+        }
+
         sim.tick_n(120);
 
         let board = sim.app.world().resource::<JobBoard>();
-        let farm_count = board
-            .faction_postings(sim.player_faction_id)
+        let farm_postings: Vec<_> = board
+            .faction_postings(fid)
             .iter()
             .filter(|p| matches!(p.kind, JobKind::Farm))
-            .count();
+            .collect();
         assert!(
-            farm_count >= 1,
-            "available seeds should trigger Farm posting even with abundant grain"
+            !farm_postings.is_empty(),
+            "seeds + a StateOwned ag plot should trigger a Farm posting"
         );
+        // Every chief Farm posting must be plot-scoped (never the old
+        // home-centred bootstrap) so farmers plant ON the plot, not the town.
+        for p in &farm_postings {
+            match p.progress {
+                JobProgress::Planting { plot_id, area, .. } => {
+                    assert!(
+                        plot_id.is_some(),
+                        "chief Farm posting must carry a plot_id (no home±5 bootstrap)"
+                    );
+                    assert_eq!(
+                        (area.min, area.max),
+                        ((40, 40), (55, 55)),
+                        "Farm job area must be the plot rect, not home±5"
+                    );
+                }
+                _ => panic!("Farm posting must be JobProgress::Planting"),
+            }
+        }
     }
 
     #[test]

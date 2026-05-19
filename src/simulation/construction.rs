@@ -5218,6 +5218,9 @@ fn write_road_tile(
 ) {
     let cur = chunk_map.tile_kind_at(tile.0, tile.1);
     let writable = match cur {
+        // Tilled farm soil is never paved — universal, streaming-safe guard
+        // covering both the runtime and seed callers without plumbing.
+        Some(TileKind::Cropland) => false,
         Some(TileKind::Grass) => true,
         Some(TileKind::Scrub) | Some(TileKind::Sand) => true,
         Some(k) if k.is_soil_like() => true,
@@ -5245,13 +5248,16 @@ fn write_road_tile(
 /// Drains `RoadCarveQueue`. For each pending (faction_id, building_tile, home)
 /// triple, walks a Bresenham line from the building back to the home tile and
 /// converts each passable, non-Wall tile into `TileKind::Road`. Skips tiles
-/// already road, blueprint, bed, or wall. Emits `TileChangedEvent` for each
-/// converted tile so the renderer refreshes.
+/// already road, blueprint, bed, wall, tilled `Cropland`, or otherwise
+/// `tile_is_farm_protected` (inside an Agricultural plot / carrying a crop).
+/// Emits `TileChangedEvent` for each converted tile so the renderer refreshes.
 pub fn road_carve_system(
     mut queue: ResMut<RoadCarveQueue>,
     mut chunk_map: ResMut<ChunkMap>,
     bp_map: Res<BlueprintMap>,
     bed_map: Res<BedMap>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    plant_map: Res<crate::simulation::plants::PlantMap>,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
 ) {
     if queue.0.is_empty() {
@@ -5281,12 +5287,25 @@ pub fn road_carve_system(
                     let surf_z = chunk_map.surface_z_at(x0, y0);
                     let cur = chunk_map.tile_kind_at(x0, y0);
                     let writable = match cur {
+                        // Never pave tilled fields (universal TileKind guard).
+                        Some(TileKind::Cropland) => false,
                         Some(TileKind::Grass) => true,
                         Some(TileKind::Scrub) | Some(TileKind::Sand) => true,
                         Some(k) if k.is_soil_like() => true,
                         _ => false,
                     };
-                    if writable {
+                    // Plus the runtime chokepoint guard: every RoadCarveQueue
+                    // producer (doormat extension, spine drain, desire path,
+                    // survey) drains here, so guarding this one site protects
+                    // Agricultural-plot tiles and standing crops even before
+                    // they are stamped `Cropland`.
+                    if writable
+                        && !crate::simulation::land::tile_is_farm_protected(
+                            &plot_index,
+                            &plant_map,
+                            tile,
+                        )
+                    {
                         chunk_map.set_tile(
                             x0,
                             y0,
@@ -7877,7 +7896,7 @@ fn seed_walled_house_at(
     true
 }
 
-/// Stamp a `yard_w × yard_h` patch of `Farmland` tiles adjacent to the
+/// Stamp a `yard_w × yard_h` patch of tilled `Cropland` tiles adjacent to the
 /// house centred at `(cx, cy)` with `half_w × half_h` footprint. The yard
 /// extends out from the house's east wall by default; if east is blocked,
 /// tries west, south, north in turn. Tile mutations skip Wall / Stone /
@@ -7955,30 +7974,20 @@ fn seed_farmstead_yard(
         return 0;
     };
 
-    // Yard tiles preserve their natural surface kind (Grass / Loam / Silt /
-    // SandySoil / etc.) — we just tilled them, so bump fertility to 200 to
-    // mark a high-yield plot. Wheat planting is now soil-aware (see
-    // `find_nearest_unplanted_farmland`), so no synthetic Farmland tile is
-    // needed.
+    // Yard tiles are tilled into visible `Cropland` and bumped to fertility
+    // 200 (high-yield plot). `Cropland` is `is_soil_like`, so the soil-aware
+    // planting heuristics still pick it, and road carving never paves it.
     let mut placed = 0u32;
     for ty in y0..y0 + yard_h {
         for tx in x0..x0 + yard_w {
             let z = chunk_map.surface_z_at(tx, ty);
             let cur = chunk_map.tile_at(tx, ty, z as i32);
-            // Preserve the existing kind (or fall back to Loam if somehow
-            // the tile is bare rock and we still want to till it). Bump
-            // fertility to 200 so the planting heuristics pick this plot.
-            let kind = if cur.kind == TileKind::Grass || cur.kind.is_soil_like() {
-                cur.kind
-            } else {
-                TileKind::Loam
-            };
             chunk_map.set_tile(
                 tx,
                 ty,
                 z as i32,
                 TileData {
-                    kind,
+                    kind: TileKind::Cropland,
                     elevation: cur.elevation,
                     fertility: 200,
                     flags: cur.flags,

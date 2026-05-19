@@ -2760,11 +2760,6 @@ pub fn chief_job_posting_system(
                     None
                 })
                 .collect();
-            let already_bootstrap_farm = board.faction_postings(faction_id).iter().any(|p| {
-                matches!(p.kind, JobKind::Farm)
-                    && matches!(p.progress, JobProgress::Planting { plot_id: None, .. })
-            });
-
             // Plot-scoped: walk this faction's farmer→plot assignments.
             let mut posted_any_plot_job = false;
             if seed_available {
@@ -2834,44 +2829,95 @@ pub fn chief_job_posting_system(
                 }
             }
 
-            // Bootstrap fallback: if no plot-scoped postings fired AND no
-            // bootstrap posting exists, emit the legacy `home_tile ±5` job
-            // so a fresh village without carved plots still farms.
-            if seed_available && !posted_any_plot_job && !already_bootstrap_farm {
-                let area = TileAabb {
-                    min: (
-                        faction.home_tile.0.saturating_sub(5),
-                        faction.home_tile.1.saturating_sub(5),
-                    ),
-                    max: (
-                        faction.home_tile.0.saturating_add(5),
-                        faction.home_tile.1.saturating_add(5),
-                    ),
-                };
-                let id = board.alloc_id();
-                let progress = JobProgress::Planting {
-                    planted: 0,
-                    target: FARM_TILES_PER_POST.min(seed),
-                    area,
-                    plot_id: None,
-                    assigned_farmer: None,
-                };
-                let priority =
-                    compute_priority(faction, faction_id, JobKind::Farm, &progress, &projects);
-                board.faction_postings_mut(faction_id).push(JobPosting {
-                    id,
-                    faction_id,
-                    kind: JobKind::Farm,
-                    progress,
-                    claimants: Vec::new(),
-                    priority,
-                    source: JobSource::Chief,
-                    posted_tick,
-                    expiry_tick: None,
-                    poster_class: crate::simulation::jobs::PosterClass::Chief,
-                    reward: 0.0,
-                    settlement_id: None,
+            // Open-plot fallback: assignments are refreshed only once per
+            // game-day and need a `Profession::Farmer` to already exist, so
+            // for a fresh village (or any assignment gap) post an OPEN
+            // plot-scoped Farm job for the nearest unassigned StateOwned
+            // Agricultural plot (`assigned_farmer: None` → any farmer may
+            // claim it; `plot_id: Some` → `resolve_farm_scope` returns
+            // Communal, restricting planting to the plot rect). This replaces
+            // the old `home_tile ±5` job, which had farmers tilling the middle
+            // of the settlement. NO plot ⇒ NO Farm posting — farming waits for
+            // the belt to carve rather than tearing up the town centre.
+            if seed_available && !posted_any_plot_job {
+                let mut open: Vec<(
+                    crate::simulation::land::PlotId,
+                    crate::simulation::settlement::TileRect,
+                )> = Vec::new();
+                for (&pid, &ent) in farm_params.plot_index.by_id.iter() {
+                    if posted_plots.contains(&pid) {
+                        continue;
+                    }
+                    let Ok(plot) = farm_params.plot_q.get(ent) else {
+                        continue;
+                    };
+                    if plot.faction_id != faction_id
+                        || plot.zone_kind != crate::simulation::settlement::ZoneKind::Agricultural
+                        || !matches!(plot.tenure, crate::simulation::land::Tenure::StateOwned)
+                    {
+                        continue;
+                    }
+                    open.push((pid, plot.rect));
+                }
+                let chosen = open.into_iter().min_by_key(|(pid, r)| {
+                    let cx = r.x0 + r.w as i32 / 2;
+                    let cy = r.y0 + r.h as i32 / 2;
+                    (
+                        (cx - faction.home_tile.0)
+                            .abs()
+                            .max((cy - faction.home_tile.1).abs()),
+                        *pid,
+                    )
                 });
+                if let Some((pid, rect)) = chosen {
+                    let area = TileAabb {
+                        min: (rect.x0, rect.y0),
+                        max: (
+                            rect.x0 + rect.w as i32 - 1,
+                            rect.y0 + rect.h as i32 - 1,
+                        ),
+                    };
+                    if crate::simulation::placement_reachability::rect_reachable_from_home(
+                        &farm_params.chunk_map,
+                        faction.home_tile,
+                        area.min,
+                        area.max,
+                    ) {
+                        let plot_tile_count = (rect.w as u32) * (rect.h as u32);
+                        let target = FARM_TILES_PER_POST.min(seed).min(plot_tile_count);
+                        if target > 0 {
+                            let id = board.alloc_id();
+                            let progress = JobProgress::Planting {
+                                planted: 0,
+                                target,
+                                area,
+                                plot_id: Some(pid),
+                                assigned_farmer: None,
+                            };
+                            let priority = compute_priority(
+                                faction,
+                                faction_id,
+                                JobKind::Farm,
+                                &progress,
+                                &projects,
+                            );
+                            board.faction_postings_mut(faction_id).push(JobPosting {
+                                id,
+                                faction_id,
+                                kind: JobKind::Farm,
+                                progress,
+                                claimants: Vec::new(),
+                                priority,
+                                source: JobSource::Chief,
+                                posted_tick,
+                                expiry_tick: None,
+                                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                                reward: 0.0,
+                                settlement_id: None,
+                            });
+                        }
+                    }
+                }
             }
         }
 

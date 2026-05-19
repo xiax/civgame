@@ -34,6 +34,10 @@ pub fn tile_color(kind: TileKind) -> Color {
         TileKind::SandySoil => Color::srgb(0.72, 0.60, 0.40),
         // Constructed timber span over a river.
         TileKind::Bridge => Color::srgb(0.55, 0.38, 0.22),
+        // Tilled farm soil — golden-earth, deliberately distinct from Grass,
+        // Road (0.55,0.45,0.35), and Loam (0.42,0.30,0.18) so a field reads
+        // as a block.
+        TileKind::Cropland => Color::srgb(0.62, 0.47, 0.17),
     }
 }
 

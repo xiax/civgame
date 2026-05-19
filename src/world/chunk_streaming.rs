@@ -312,6 +312,7 @@ pub const RENDERABLE_KINDS: &[TileKind] = &[
     TileKind::Silt,
     TileKind::Clay,
     TileKind::SandySoil,
+    TileKind::Cropland,
 ];
 
 /// Ore variants rendered as `TileKind::Ore` tiles. Excludes `OreKind::None`,

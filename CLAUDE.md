@@ -60,13 +60,14 @@ ParallelA → ParallelB → Sequential → Economy
 
 ### Tile palette
 
-`TileKind` has 23 variants:
+`TileKind` has 24 variants:
 - **Surfaces**: `Grass`, `Forest`, `Sand`, `Snow`, `Marsh`, `Scrub`, `Water`, `River`, `Road`.
 - **Stone lithologies** (`is_stone_like`): `Stone` (legacy), `Granite`, `Limestone` (yields 3 vs. 2), `Sandstone`, `Basalt`, plus underground `Wall` and `Ore`.
-- **Soils** (`is_soil_like`): `Dirt`, `Loam` (1.5×), `Silt` (1.4×, riparian), `Clay`, `SandySoil` (0.6×).
+- **Soils** (`is_soil_like`): `Dirt`, `Loam` (1.5×), `Silt` (1.4×, riparian), `Clay`, `SandySoil` (0.6×), `Cropland` (1.3×).
 - **`Bridge`** — passable, road-speed, reports `is_freshwater()` (water flows under decking).
+- **`Cropland`** — tilled farm soil. Stamped over Grass/soil by `carve_plots_system` (+ `seed_starting_farms_system` / `seed_farmstead_yard`) for every tile of an Agricultural plot, so a field renders as a distinct golden-earth block. `is_soil_like` (plant/fertility plumbing accepts it), speed 0.9, and **never paved by road carving** (`tile_is_farm_protected` + an explicit `Cropland` writability reject in `write_road_tile` / `road_carve_system`).
 
-Helpers: `stone_yield_count`, `soil_fertility_mult`. Farmland is removed — wheat spawns on high-fertility Grass. Pathing speeds: Sand 0.75, Snow 0.6, Marsh 0.4, Scrub 0.9, soils 0.85–0.9, stone 1.0.
+Helpers: `stone_yield_count`, `soil_fertility_mult`. There is no `Farmland` variant — wheat grows on high-fertility Grass/soil; an Agricultural plot's tiles are flipped to `Cropland` at carve time for legibility + road protection. Pathing speeds: Sand 0.75, Snow 0.6, Marsh 0.4, Scrub 0.9, soils 0.85–0.9 (Cropland 0.9), stone 1.0.
 
 `river_distance_at(tx, ty)` returns chebyshev tiles to nearest river (`u8::MAX` = far/unloaded), populated at chunk-gen and read by riparian biome shift, fertility boost, settlement scoring, herd/nomad freshwater preference.
 

@@ -146,7 +146,7 @@ X- Change how construction fallbacks work to be more unique per era rather than 
 
 Animals walk on water and walk through walls
 
-Create a detailed plan to add pathfinding checks to the settlement planner to make sure each placed furniture is reachable. For seeding and placing houses make sure the interior of the house is reachable by pathfinding after fully built by simulating the build. Same should apply for farms.
+X - Create a detailed plan to add pathfinding checks to the settlement planner to make sure each placed furniture is reachable. For seeding and placing houses make sure the interior of the house is reachable by pathfinding after fully built by simulating the build. Same should apply for farms.
 
 Player faction and factions with permanent settlements shouldn't auto-migrate anymore.
 

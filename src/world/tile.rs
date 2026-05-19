@@ -36,6 +36,12 @@ pub enum TileKind {
     /// freshwater. Built via `BuildSiteKind::Bridge` and restores to `River`
     /// on deconstruct (the prior tile is stamped on the `Bridge` component).
     Bridge = 23,
+    /// Tilled farm soil. Stamped over Grass/soil by `carve_plots_system` (and
+    /// the seed-farm paths) for every tile inside an Agricultural plot, so a
+    /// field reads as a distinct block. Behaves as soil for fertility / plant
+    /// spawn (`is_soil_like`), pathing speed 0.9, and is protected from road
+    /// carving (`tile_is_farm_protected`).
+    Cropland = 24,
 }
 
 impl TileKind {
@@ -111,7 +117,12 @@ impl TileKind {
     pub fn is_soil_like(self) -> bool {
         matches!(
             self,
-            TileKind::Dirt | TileKind::Loam | TileKind::Silt | TileKind::Clay | TileKind::SandySoil
+            TileKind::Dirt
+                | TileKind::Loam
+                | TileKind::Silt
+                | TileKind::Clay
+                | TileKind::SandySoil
+                | TileKind::Cropland
         )
     }
 
@@ -140,6 +151,7 @@ impl TileKind {
             TileKind::Clay => 1.0,
             TileKind::Dirt => 1.0,
             TileKind::SandySoil => 0.6,
+            TileKind::Cropland => 1.3,
             TileKind::Grass => 1.0,
             _ => 1.0,
         }

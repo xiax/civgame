@@ -17,7 +17,7 @@ pub fn tile_speed_multiplier(kind: TileKind) -> f32 {
         // Stone lithologies — match generic Stone
         TileKind::Granite | TileKind::Limestone | TileKind::Sandstone | TileKind::Basalt => 1.0,
         // Soil variants — match generic Dirt; SandySoil is a touch slower
-        TileKind::Loam | TileKind::Silt | TileKind::Clay => 0.9,
+        TileKind::Loam | TileKind::Silt | TileKind::Clay | TileKind::Cropland => 0.9,
         TileKind::SandySoil => 0.85,
         TileKind::Water | TileKind::River | TileKind::Air | TileKind::Wall | TileKind::Ore => 0.0,
     }
@@ -96,6 +96,16 @@ mod tests {
             tile_step_cost(TileKind::Bridge),
             tile_step_cost(TileKind::Road)
         );
+    }
+
+    #[test]
+    fn cropland_is_soil_speed() {
+        assert_eq!(
+            tile_speed_multiplier(TileKind::Cropland),
+            tile_speed_multiplier(TileKind::Loam)
+        );
+        assert!(tile_speed_multiplier(TileKind::Cropland) > 0.0);
+        assert!(tile_step_cost(TileKind::Cropland) < IMPASSABLE);
     }
 
     #[test]

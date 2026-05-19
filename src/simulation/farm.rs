@@ -200,19 +200,21 @@ pub fn seed_starting_farms_system(
     registry: Res<crate::simulation::faction::FactionRegistry>,
     mut plot_index: ResMut<crate::simulation::land::PlotIndex>,
     plot_q: Query<&crate::simulation::land::Plot>,
-    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    mut chunk_map: ResMut<crate::world::chunk::ChunkMap>,
     storage_tiles: Query<(&crate::simulation::faction::FactionStorageTile, &Transform)>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     mut ground_items: Query<&mut crate::simulation::items::GroundItem>,
+    mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    brains: Res<crate::simulation::organic_settlement::SettlementBrains>,
 ) {
     use crate::simulation::land::Plot;
+    use crate::simulation::organic_settlement::ParcelShape;
     use crate::simulation::settlement::TileRect;
 
     if !options.seed_buildings {
         // Sandbox / minimal start — skip seeding farms.
         return;
     }
-    const PLOT_SIZE: i32 = 16;
     const PLOT_Z: i8 = 0;
     const STARTING_GRAIN_SEEDS: u32 = 32;
 
@@ -251,73 +253,86 @@ pub fn seed_starting_farms_system(
     }
 
     for (fid, sid, home) in work {
-        // Try a few candidate offsets near home_tile for a passable Loam/
-        // Silt/Grass patch. Prefer farmable terrain. If all fail, just
-        // place at offset (8, 8) and let the carve helpers cope.
-        let candidates: [(i32, i32); 8] = [
-            (8, 0),
-            (-24, 0),
-            (0, 8),
-            (0, -24),
-            (8, 8),
-            (-24, 8),
-            (8, -24),
-            (-24, -24),
-        ];
-        // Prefer a farmable (Loam/Silt/Grass) plot that is also genuinely
-        // walkable from `home`; if none qualify, fall back to the best
-        // *reachable* offset (any terrain) so workers can always path to it;
-        // only as a last resort take (8, 0).
-        let pick = |require_terrain: bool| -> Option<(i32, i32)> {
-            candidates.iter().copied().find(|(dx, dy)| {
-                let x0 = home.0 + dx;
-                let y0 = home.1 + dy;
-                if require_terrain {
-                    let cx = x0 + PLOT_SIZE / 2;
-                    let cy = y0 + PLOT_SIZE / 2;
-                    if !matches!(
-                        chunk_map.tile_kind_at(cx, cy),
-                        Some(crate::world::tile::TileKind::Grass)
-                            | Some(crate::world::tile::TileKind::Loam)
-                            | Some(crate::world::tile::TileKind::Silt)
-                    ) {
-                        return false;
+        // Site the starting plot on an Agricultural BELT parcel from the
+        // settlement brain (populated by the OnEnter kickoff survey) — so the
+        // tick-0 farm is already outside town, consistent with the runtime
+        // belt. Pick the belt parcel nearest home (deterministic tiebreak by
+        // origin). If the brain produced no belt parcel (e.g. no fertile land
+        // around the settlement), skip the plot entirely — `carve_plots_system`
+        // will carve belt plots once the layout settles; we still pre-seed the
+        // grain below so planting works the moment a plot exists. NO near-home
+        // fallback (that was the "farms all over the base" regression).
+        let belt_rect: Option<TileRect> = brains.0.get(&sid).and_then(|brain| {
+            brain
+                .parcels
+                .iter()
+                .filter_map(|p| match (p.district_hint, &p.shape) {
+                    (
+                        Some(crate::simulation::organic_settlement::DistrictKind::Agricultural),
+                        ParcelShape::Rect(r),
+                    ) => Some(*r),
+                    _ => None,
+                })
+                .min_by_key(|r| {
+                    let cx = r.x0 + r.w as i32 / 2;
+                    let cy = r.y0 + r.h as i32 / 2;
+                    (
+                        (cx - home.0).abs().max((cy - home.1).abs()),
+                        r.x0,
+                        r.y0,
+                    )
+                })
+        });
+
+        if let Some(rect) = belt_rect {
+            let pid = plot_index.alloc_id();
+            let plot = Plot {
+                id: pid,
+                settlement_id: sid.0,
+                faction_id: fid,
+                rect,
+                z: PLOT_Z,
+                zone_kind: ZoneKind::Agricultural,
+                tenure: Tenure::StateOwned,
+                holder: crate::simulation::land::TenureHolder::State { faction_id: fid },
+                base_value: crate::simulation::land::PLOT_BASE_VALUE,
+                last_valued_tick: 0,
+                missed_payments: 0,
+                frontage_edge: None,
+                access_tile: None,
+                parent_plot: None,
+            };
+            let entity = commands.spawn(plot).id();
+            plot_index.by_id.insert(pid, entity);
+            plot_index.by_settlement.entry(sid.0).or_default().push(pid);
+            for ty in rect.y0..rect.y0 + rect.h as i32 {
+                for tx in rect.x0..rect.x0 + rect.w as i32 {
+                    plot_index.by_tile.insert((tx, ty), pid);
+                    plot_index.ag_tiles.insert((tx, ty));
+                    // Stamp the seeded field as tilled `Cropland` so it is a
+                    // visible block from tick 0 (mirrors `carve_plots_system`).
+                    let z = chunk_map.surface_z_at(tx, ty);
+                    let cur = chunk_map.tile_at(tx, ty, z);
+                    let tillable = cur.kind == crate::world::tile::TileKind::Grass
+                        || (cur.kind.is_soil_like()
+                            && cur.kind != crate::world::tile::TileKind::Cropland);
+                    if tillable {
+                        chunk_map.set_tile(
+                            tx,
+                            ty,
+                            z,
+                            crate::world::tile::TileData {
+                                kind: crate::world::tile::TileKind::Cropland,
+                                elevation: cur.elevation,
+                                fertility: cur.fertility,
+                                flags: cur.flags,
+                                ore: cur.ore,
+                            },
+                        );
+                        tile_changed
+                            .send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
                     }
                 }
-                crate::simulation::placement_reachability::rect_reachable_from_home(
-                    &chunk_map,
-                    home,
-                    (x0, y0),
-                    (x0 + PLOT_SIZE - 1, y0 + PLOT_SIZE - 1),
-                )
-            })
-        };
-        let (ox, oy) = pick(true).or_else(|| pick(false)).unwrap_or((8, 0));
-        let rect = TileRect::new(home.0 + ox, home.1 + oy, PLOT_SIZE as u16, PLOT_SIZE as u16);
-
-        let pid = plot_index.alloc_id();
-        let plot = Plot {
-            id: pid,
-            settlement_id: sid.0,
-            faction_id: fid,
-            rect,
-            z: PLOT_Z,
-            zone_kind: ZoneKind::Agricultural,
-            tenure: Tenure::StateOwned,
-            holder: crate::simulation::land::TenureHolder::State { faction_id: fid },
-            base_value: crate::simulation::land::PLOT_BASE_VALUE,
-            last_valued_tick: 0,
-            missed_payments: 0,
-            frontage_edge: None,
-            access_tile: None,
-            parent_plot: None,
-        };
-        let entity = commands.spawn(plot).id();
-        plot_index.by_id.insert(pid, entity);
-        plot_index.by_settlement.entry(sid.0).or_default().push(pid);
-        for ty in rect.y0..rect.y0 + rect.h as i32 {
-            for tx in rect.x0..rect.x0 + rect.w as i32 {
-                plot_index.by_tile.insert((tx, ty), pid);
             }
         }
 

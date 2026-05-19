@@ -19,7 +19,9 @@ use crate::simulation::settlement::{
     Settlement, SettlementMap, SettlementPlans, StreetSegment, StreetSpine, TileRect, ZoneKind,
 };
 use crate::world::chunk::{ChunkMap, Z_MIN};
+use crate::world::chunk_streaming::TileChangedEvent;
 use crate::world::globe::Globe;
+use crate::world::tile::{TileData, TileKind};
 use crate::world::seasons::TICKS_PER_DAY;
 use crate::world::terrain::{tile_at_3d, WorldGen};
 
@@ -160,6 +162,12 @@ pub struct PlotIndex {
     /// — there's only ever one surface plot at a given column. When
     /// underground plots arrive, give them their own index alongside.
     pub by_tile: AHashMap<(i32, i32), PlotId>,
+    /// Surface tiles belonging to an `Agricultural` plot. Maintained in
+    /// lockstep with `by_tile` by `carve_plots_system`; lets
+    /// `tile_is_farm_protected` answer the road-carve guard in O(1) without
+    /// resolving the `Plot` component (so `road_carve_system` /
+    /// `write_road_tile` need only `Res<PlotIndex>`, not a `Query<&Plot>`).
+    pub ag_tiles: AHashSet<(i32, i32)>,
     pub by_faction_hash: AHashMap<u32, u64>,
     pub next_id: u32,
 }
@@ -175,6 +183,18 @@ impl PlotIndex {
     pub fn plot_at(&self, x: i32, y: i32) -> Option<PlotId> {
         self.by_tile.get(&(x, y)).copied()
     }
+}
+
+/// True when `tile` must never be overwritten by road carving — it is inside
+/// an `Agricultural` plot or carries a planted crop. The single predicate
+/// behind the `road_carve_system` / `write_road_tile` guard, so every
+/// `RoadCarveQueue` producer is protected at one chokepoint.
+pub fn tile_is_farm_protected(
+    plot_index: &PlotIndex,
+    plant_map: &crate::simulation::plants::PlantMap,
+    tile: (i32, i32),
+) -> bool {
+    plot_index.ag_tiles.contains(&tile) || plant_map.0.contains_key(&tile)
 }
 
 /// Open listings for state-owned (and, eventually, household-owned)
@@ -591,10 +611,11 @@ pub fn carve_plots_system(
     settlement_map: Res<SettlementMap>,
     settlement_q: Query<&Settlement>,
     registry: Res<FactionRegistry>,
-    chunk_map: Res<ChunkMap>,
+    mut chunk_map: ResMut<ChunkMap>,
     gen: Res<WorldGen>,
     globe: Res<Globe>,
     mut plot_index: ResMut<PlotIndex>,
+    mut tile_changed: EventWriter<TileChangedEvent>,
 ) {
     // Stage replan inputs first so we don't borrow `plans` while
     // mutating `plot_index`.
@@ -669,6 +690,19 @@ pub fn carve_plots_system(
                 }
             }
             let stale_set: AHashSet<PlotId> = stale_ids.into_iter().collect();
+            // Drop ag-tile entries for the torn-down plots before retaining
+            // `by_tile`, so `tile_is_farm_protected` doesn't keep guarding a
+            // field that no longer exists. (Tiles already stamped `Cropland`
+            // intentionally stay tilled-looking — see plan risk note.)
+            let stale_ag: Vec<(i32, i32)> = plot_index
+                .by_tile
+                .iter()
+                .filter(|(_, pid)| stale_set.contains(pid))
+                .map(|(t, _)| *t)
+                .collect();
+            for t in stale_ag {
+                plot_index.ag_tiles.remove(&t);
+            }
             plot_index.by_tile.retain(|_, pid| !stale_set.contains(pid));
         }
 
@@ -710,9 +744,37 @@ pub fn carve_plots_system(
                 let entity = commands.spawn(plot).id();
                 plot_index.by_id.insert(pid, entity);
                 new_ids.push(pid);
+                let is_ag = kind == ZoneKind::Agricultural;
                 for ty in r.y0..r.y0 + r.h as i32 {
                     for tx in r.x0..r.x0 + r.w as i32 {
                         plot_index.by_tile.insert((tx, ty), pid);
+                        if !is_ag {
+                            continue;
+                        }
+                        plot_index.ag_tiles.insert((tx, ty));
+                        // Stamp the field as tilled `Cropland` so it reads as
+                        // a distinct block. Only convert Grass / soil-like
+                        // ground (skip Road/Water/Wall/Cropland) and preserve
+                        // every other `TileData` field.
+                        let z = chunk_map.surface_z_at(tx, ty);
+                        let cur = chunk_map.tile_at(tx, ty, z);
+                        let tillable = cur.kind == TileKind::Grass
+                            || (cur.kind.is_soil_like() && cur.kind != TileKind::Cropland);
+                        if tillable {
+                            chunk_map.set_tile(
+                                tx,
+                                ty,
+                                z,
+                                TileData {
+                                    kind: TileKind::Cropland,
+                                    elevation: cur.elevation,
+                                    fertility: cur.fertility,
+                                    flags: cur.flags,
+                                    ore: cur.ore,
+                                },
+                            );
+                            tile_changed.send(TileChangedEvent { tx, ty });
+                        }
                     }
                 }
             }
@@ -1514,6 +1576,22 @@ pub fn evicted_plot_cleanup_system(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn farm_protected_for_ag_tiles_and_plants() {
+        use crate::simulation::plants::PlantMap;
+        let mut pi = PlotIndex::default();
+        pi.ag_tiles.insert((10, 10));
+        let mut pm = PlantMap::default();
+        pm.0.insert((20, 20), Entity::from_raw(1));
+
+        // In an Agricultural plot → protected.
+        assert!(tile_is_farm_protected(&pi, &pm, (10, 10)));
+        // Carries a planted crop → protected.
+        assert!(tile_is_farm_protected(&pi, &pm, (20, 20)));
+        // Neither → not protected (road carving may pave it).
+        assert!(!tile_is_farm_protected(&pi, &pm, (0, 0)));
+    }
 
     #[test]
     fn tile_edge_delta_cardinal_directions() {
