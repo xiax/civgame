@@ -4840,6 +4840,112 @@ mod smoke {
     }
 
     #[test]
+    fn seed_starting_farms_spawns_physical_grain_seed_at_storage() {
+        use bevy::ecs::system::RunSystemOnce;
+        use crate::economy::core_ids;
+        use crate::simulation::farm::seed_starting_farms_system;
+        use crate::simulation::land::{Plot, PlotIndex};
+        use crate::simulation::settlement::ZoneKind;
+
+        let mut sim = TestSim::new(0xF00D_FA12);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let storage_tile = (0, 0);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+
+        // Let the normal settlement + storage-tile indexes populate, then run
+        // the one-shot startup farm seeder directly.
+        sim.tick_n(2);
+        sim.app
+            .world_mut()
+            .run_system_once(seed_starting_farms_system)
+            .expect("seed_starting_farms_system should run");
+
+        let plot_count = {
+            let world = sim.app.world();
+            let plot_index = world.resource::<PlotIndex>();
+            plot_index
+                .by_id
+                .values()
+                .filter(|&&entity| {
+                    world.get::<Plot>(entity).map_or(false, |plot| {
+                        plot.faction_id == sim.player_faction_id
+                            && plot.zone_kind == ZoneKind::Agricultural
+                    })
+                })
+                .count()
+        };
+        assert!(
+            plot_count >= 1,
+            "startup farm seeding should create an Agricultural plot"
+        );
+
+        let grain_seed = core_ids::grain_seed();
+        let seed_qty: u32 = {
+            let world = sim.app.world_mut();
+            let mut q =
+                world.query::<(&crate::simulation::items::GroundItem, &Transform)>();
+            q.iter(world)
+                .filter(|(item, transform)| {
+                    item.item.resource_id == grain_seed
+                        && crate::world::terrain::world_to_tile(
+                            transform.translation.truncate(),
+                        ) == storage_tile
+                })
+                .map(|(item, _)| item.qty)
+                .sum()
+        };
+        assert_eq!(
+            seed_qty, 32,
+            "startup farm seeds must be physical GroundItems on storage"
+        );
+    }
+
+    #[test]
+    fn chief_posts_farm_with_abundant_grain_when_seed_available() {
+        use crate::economy::core_ids;
+        use crate::simulation::faction::{FactionChief, FactionRegistry};
+        use crate::simulation::jobs::{JobBoard, JobKind};
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::technology::CROP_CULTIVATION;
+
+        let mut sim = TestSim::new(0x5EED_600D);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let storage_tile = (0, 0);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+        sim.spawn_ground_item(storage_tile, core_ids::grain(), 1_000);
+        sim.spawn_ground_item(storage_tile, core_ids::grain_seed(), 12);
+
+        let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        {
+            let world = sim.app.world_mut();
+            let mut knowledge = world.get_mut::<PersonKnowledge>(chief).unwrap();
+            knowledge.aware |= 1u64 << CROP_CULTIVATION;
+            knowledge.learned |= 1u64 << CROP_CULTIVATION;
+            world.entity_mut(chief).insert(FactionChief);
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(sim.player_faction_id);
+            let faction = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            faction.chief_entity = Some(chief);
+            faction.techs.unlock(CROP_CULTIVATION);
+        }
+
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let farm_count = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| matches!(p.kind, JobKind::Farm))
+            .count();
+        assert!(
+            farm_count >= 1,
+            "available seeds should trigger Farm posting even with abundant grain"
+        );
+    }
+
+    #[test]
     fn market_preset_chief_posts_no_stockpile_farm_or_craft() {
         // End-to-end: drive `apply_preset(EconomyPreset::Market)` exactly
         // the way `spawn_population` does in `person.rs:432-439`, then run
@@ -5345,6 +5451,16 @@ mod smoke {
             sim.app.world().get::<Sickness>(agent).is_none(),
             "clean inventory drink should not roll sickness",
         );
+
+        // Once the need has been satisfied, Drink must not stick around just
+        // because survival goals use a protective interrupt policy.
+        sim.tick_n(220);
+        let goal = *sim.app.world().get::<AgentGoal>(agent).expect("AgentGoal");
+        assert_ne!(
+            goal,
+            AgentGoal::Drink,
+            "expected Drink goal to clear once thirst is below trigger"
+        );
     }
 }
 
@@ -5389,6 +5505,16 @@ mod baseline_behaviour {
             "expected hungry agent to eat at least one Fruit (started {}, ended {})",
             initial_food,
             final_food
+        );
+
+        // Once hunger has been satisfied, Survive must yield to ordinary goal
+        // selection instead of being held by its interrupt policy.
+        sim.tick_n(220);
+        let goal = *sim.app.world().get::<AgentGoal>(person).expect("AgentGoal");
+        assert_ne!(
+            goal,
+            AgentGoal::Survive,
+            "expected Survive goal to clear once hunger is satisfied"
         );
     }
 

@@ -340,13 +340,25 @@ pub fn pick_player_home_in_megachunk(
 }
 
 fn home_pick_seed(world_seed: u64, mx: i32, my: i32) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = ahash::AHasher::default();
-    "civgame::home_pick".hash(&mut h);
-    world_seed.hash(&mut h);
-    mx.hash(&mut h);
-    my.hash(&mut h);
-    h.finish()
+    // Splitmix64-style deterministic mix (matches the codebase convention in
+    // `world::hydrology` / `simulation::faction`). Must NOT use
+    // `ahash::AHasher::default()`: ahash's default hasher is keyed from
+    // per-process entropy/ASLR, so identical `(world_seed, mx, my)` inputs
+    // hashed differently every run — which made this "deterministic" home
+    // pick (and every settlement layout derived from the home tile)
+    // non-reproducible across processes and flaked seed-geometry tests.
+    const SALT: u64 = 0x6369_7667_616D_655F; // b"civgame_"
+    let mut x = world_seed
+        .wrapping_add(SALT)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (mx as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        ^ (my as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    x
 }
 
 /// Walk the chebyshev ring at `r` around `(cx, cy)`, returning the first tile
@@ -535,6 +547,25 @@ mod tests {
         // Different seed should usually move the home; not strictly required
         // but a regression check that the seed actually flows through.
         assert_ne!(a.tile, c.tile);
+    }
+
+    #[test]
+    fn home_pick_seed_is_process_stable() {
+        // Pins the exact `home_pick_seed` output. The previous
+        // `ahash::AHasher::default()` implementation was deterministic
+        // *within* a process (fixed per-process key) but differed *across*
+        // runs, so `home_pick_deterministic_for_same_inputs` never caught
+        // it. A hard-coded expected value fails the instant any
+        // entropy-keyed hasher or constant change is reintroduced.
+        assert_eq!(home_pick_seed(42, 0, 0), 0x80CE_B342_0616_B827);
+        assert_eq!(
+            home_pick_seed(42, 0, 0),
+            home_pick_seed(42, 0, 0),
+            "seed derivation must be pure"
+        );
+        assert_ne!(home_pick_seed(42, 0, 0), home_pick_seed(43, 0, 0));
+        assert_ne!(home_pick_seed(42, 0, 0), home_pick_seed(42, 1, 0));
+        assert_ne!(home_pick_seed(42, 0, 0), home_pick_seed(42, 0, 1));
     }
 
     #[test]

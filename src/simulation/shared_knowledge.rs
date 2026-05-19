@@ -180,26 +180,30 @@ impl ResourceCluster {
     /// the cluster's first-ever-sighted tile (typically the first thing
     /// harvested), causing a stale-tile loop after the LRU drained.
     pub fn nearest_target_tile(&self, from: (i32, i32)) -> Option<(i32, i32)> {
-        self.pick_least_pressured_rep(from, |_| 0)
+        self.pick_least_pressured_rep(
+            &|t: (i32, i32)| (t.0 - from.0).abs().max((t.1 - from.1).abs()),
+            |_| 0,
+        )
     }
 
-    /// P6c: select the rep that minimises `chebyshev(rep, from) + penalty(rep)`.
-    /// Generalises `nearest_target_tile` — when callers (HTN dispatchers, the
-    /// `nearest_in_tier_set` wrapper) pass a non-trivial penalty, multiple
-    /// agents querying the same cluster fan out across its `REPRESENTATIVE_TILES`
-    /// LRU slots: the closest rep loses on score once a peer claims it, so
-    /// the next agent picks the next rep over. With a zero-penalty closure
-    /// this collapses to "closest rep wins" — bit-for-bit identical to the
-    /// pre-P6c `nearest_target_tile` behaviour.
+    /// P6c: select the rep that minimises `dist(rep) + penalty(rep)`.
+    /// `dist` is the detour-aware (river-aware) distance from the agent —
+    /// `DetourEstimator::from` at the dispatcher layer, or plain chebyshev
+    /// for the existence-only / test callers. Generalises
+    /// `nearest_target_tile` — when callers pass a non-trivial penalty,
+    /// multiple agents querying the same cluster fan out across its
+    /// `REPRESENTATIVE_TILES` LRU slots: the closest rep loses on score
+    /// once a peer claims it, so the next agent picks the next rep over.
+    /// With a zero-penalty closure this collapses to "cheapest rep wins".
     pub fn pick_least_pressured_rep<P: Fn((i32, i32)) -> i32>(
         &self,
-        from: (i32, i32),
+        dist: &dyn Fn((i32, i32)) -> i32,
         penalty: P,
     ) -> Option<(i32, i32)> {
         let mut best: Option<((i32, i32), i32)> = None;
         for slot in self.representative_tiles.iter() {
             if let Some(t) = *slot {
-                let d = (t.0 - from.0).abs().max((t.1 - from.1).abs());
+                let d = dist(t);
                 let score = d + penalty(t);
                 if best.map_or(true, |(_, bs)| score < bs) {
                     best = Some((t, score));
@@ -340,6 +344,7 @@ impl KnowledgeMap {
         from: (i32, i32),
         owner_filter: F,
         claim_penalty: P,
+        dist: &dyn Fn((i32, i32)) -> i32,
         max_chunk_radius: i32,
     ) -> Option<ClusterId> {
         self.nearest_with_cluster_filter(
@@ -348,6 +353,7 @@ impl KnowledgeMap {
             owner_filter,
             claim_penalty,
             |_| true,
+            dist,
             max_chunk_radius,
         )
     }
@@ -365,6 +371,7 @@ impl KnowledgeMap {
         owner_filter: F,
         claim_penalty: P,
         cluster_filter: G,
+        dist: &dyn Fn((i32, i32)) -> i32,
         max_chunk_radius: i32,
     ) -> Option<ClusterId>
     where
@@ -402,25 +409,24 @@ impl KnowledgeMap {
                         // pressured-but-closest rep wins over a free-but-far
                         // rep on the same cluster, defeating the cluster
                         // mutex.
-                        let Some(target) = c.pick_least_pressured_rep(from, &claim_penalty) else {
+                        let Some(target) = c.pick_least_pressured_rep(dist, &claim_penalty)
+                        else {
                             continue;
                         };
-                        let raw = (target.0 - from.0).abs().max((target.1 - from.1).abs());
-                        let score = raw + claim_penalty(target);
+                        let score = dist(target) + claim_penalty(target);
                         if best.map_or(true, |(_, bs)| score < bs) {
                             best = Some((cid, score));
                         }
                     }
                 }
             }
-            // Early-out: if we found a cluster on a ring closer than the next
-            // ring's inner edge (= r+1 chunks ≈ (r+1)*CHUNK_SIZE tiles),
-            // anything farther can't beat it (claim penalties aside).
-            if let Some((_, bs)) = best {
-                if bs < (r + 1) * CHUNK_SIZE as i32 {
-                    break;
-                }
-            }
+            // No speculative ring early-out: detour distance is not
+            // monotone in chunk-ring radius (a closer ring on the far
+            // bank can cost more than a farther ring on the agent's
+            // bank), so the old `bs < (r+1)*CHUNK_SIZE` break would
+            // prune the cheaper far-ring same-bank cluster. `by_chunk`
+            // is sparse and `max_chunk_radius` (16) bounds the scan, so
+            // walking every ring is cheap.
         }
         best.map(|(c, _)| c)
     }
@@ -598,6 +604,7 @@ impl SharedKnowledge {
         from: (i32, i32),
         owner_filter: F,
         claim_penalty: P,
+        dist: &dyn Fn((i32, i32)) -> i32,
         max_chunk_radius: i32,
     ) -> Option<(KnowledgeTier, ClusterId, (i32, i32))> {
         self.nearest_in_tier_set_with_cluster_filter(
@@ -607,6 +614,7 @@ impl SharedKnowledge {
             owner_filter,
             claim_penalty,
             |_| true,
+            dist,
             max_chunk_radius,
         )
     }
@@ -623,6 +631,7 @@ impl SharedKnowledge {
         owner_filter: F,
         claim_penalty: P,
         cluster_filter: G,
+        dist: &dyn Fn((i32, i32)) -> i32,
         max_chunk_radius: i32,
     ) -> Option<(KnowledgeTier, ClusterId, (i32, i32))>
     where
@@ -640,6 +649,7 @@ impl SharedKnowledge {
                 &owner_filter,
                 &claim_penalty,
                 &cluster_filter,
+                dist,
                 max_chunk_radius,
             ) {
                 // P6c: extract the tile via the same pressure-aware
@@ -650,7 +660,7 @@ impl SharedKnowledge {
                 let Some(target) = m
                     .clusters
                     .get(&cid)
-                    .and_then(|c| c.pick_least_pressured_rep(from, &claim_penalty))
+                    .and_then(|c| c.pick_least_pressured_rep(dist, &claim_penalty))
                 else {
                     continue;
                 };
@@ -669,6 +679,9 @@ pub struct GatherKnowledge<'w> {
     pub shared: Res<'w, SharedKnowledge>,
     pub settlement_map: Res<'w, crate::simulation::settlement::SettlementMap>,
     pub claims: Res<'w, crate::simulation::gather_claims::GatherClaims>,
+    pub chunk_router: Res<'w, crate::pathfinding::chunk_router::ChunkRouter>,
+    pub chunk_graph: Res<'w, crate::pathfinding::chunk_graph::ChunkGraph>,
+    pub chunk_map: Res<'w, crate::world::chunk::ChunkMap>,
 }
 
 impl<'w> GatherKnowledge<'w> {
@@ -682,6 +695,7 @@ impl<'w> GatherKnowledge<'w> {
         household_id: Option<u32>,
         kind: MemoryKind,
         from: (i32, i32),
+        agent_z: i8,
         now: u64,
     ) -> Option<(i32, i32)> {
         let tier_set = agent_tier_set(faction_id, household_id, &self.settlement_map);
@@ -704,6 +718,17 @@ impl<'w> GatherKnowledge<'w> {
                 actor,
             )
         };
+        // Detour-aware (river-aware) distance: a target on the far bank
+        // of a river costs the walk-around, not the straight line.
+        let est = crate::pathfinding::detour::DetourEstimator::new(
+            &self.chunk_router,
+            &self.chunk_graph,
+        );
+        let z_of = |t: (i32, i32)| {
+            self.chunk_map
+                .nearest_standable_z(t.0, t.1, agent_z as i32) as i8
+        };
+        let dist = est.from(from, agent_z, z_of);
         self.shared
             .nearest_in_tier_set_with_cluster_filter(
                 tier_set,
@@ -712,6 +737,7 @@ impl<'w> GatherKnowledge<'w> {
                 owner_filter,
                 claim_pen,
                 cluster_filter,
+                &dist,
                 16,
             )
             .map(|(_, _, tile)| tile)
@@ -763,9 +789,12 @@ pub fn faction_knows_cluster(
         ResourceOwner::Person(_) | ResourceOwner::Household(_) => false,
     };
     let no_pen = |_t: (i32, i32)| 0;
+    // Existence-only gate: the boolean result is independent of the
+    // distance metric, so plain chebyshev (no router needed here).
+    let cheb = |t: (i32, i32)| (t.0 - from.0).abs().max((t.1 - from.1).abs());
 
     if let Some(m) = shared.tiers.get(&KnowledgeTier::Faction(faction_id)) {
-        if m.nearest(kind, from, &owner_filter, &no_pen, max_chunk_radius)
+        if m.nearest(kind, from, &owner_filter, &no_pen, &cheb, max_chunk_radius)
             .is_some()
         {
             return true;
@@ -773,7 +802,7 @@ pub fn faction_knows_cluster(
     }
     for &sid in &owned_settlements {
         if let Some(m) = shared.tiers.get(&KnowledgeTier::Settlement(sid)) {
-            if m.nearest(kind, from, &owner_filter, &no_pen, max_chunk_radius)
+            if m.nearest(kind, from, &owner_filter, &no_pen, &cheb, max_chunk_radius)
                 .is_some()
             {
                 return true;
@@ -800,6 +829,13 @@ mod tests {
 
     fn faction_tier(id: u32) -> KnowledgeTier {
         KnowledgeTier::Faction(id)
+    }
+
+    /// Plain chebyshev distance closure from `origin` — the unit tests
+    /// assert chebyshev-ordered picks, so they pass this where production
+    /// code passes a `DetourEstimator::from` closure.
+    fn cheb(origin: (i32, i32)) -> impl Fn((i32, i32)) -> i32 {
+        move |t: (i32, i32)| (t.0 - origin.0).abs().max((t.1 - origin.1).abs())
     }
 
     fn fake_kind() -> MemoryKind {
@@ -1009,7 +1045,7 @@ mod tests {
             ResourceCluster::new(ClusterId(0), fake_kind(), ResourceOwner::Public, (5, 5), 0);
         c.push_rep((20, 20));
         let zero = |_t: (i32, i32)| 0i32;
-        assert_eq!(c.pick_least_pressured_rep((0, 0), zero), Some((5, 5)));
+        assert_eq!(c.pick_least_pressured_rep(&cheb((0, 0)), zero), Some((5, 5)));
         assert_eq!(c.nearest_target_tile((0, 0)), Some((5, 5)));
     }
 
@@ -1023,7 +1059,7 @@ mod tests {
         c.push_rep((20, 20));
         // Penalty 100 on the close rep — far rep at chebyshev 20 wins on score.
         let pen = |t: (i32, i32)| if t == (5, 5) { 100 } else { 0 };
-        assert_eq!(c.pick_least_pressured_rep((0, 0), pen), Some((20, 20)));
+        assert_eq!(c.pick_least_pressured_rep(&cheb((0, 0)), pen), Some((20, 20)));
     }
 
     /// P4: a saturated cluster (with `cluster_filter` rejecting it) is
@@ -1050,7 +1086,15 @@ mod tests {
 
         // No filter: the close cluster wins.
         let got = m
-            .nearest_with_cluster_filter(fake_kind(), (0, 0), |_| true, |_| 0, |_| true, 32)
+            .nearest_with_cluster_filter(
+                fake_kind(),
+                (0, 0),
+                |_| true,
+                |_| 0,
+                |_| true,
+                &cheb((0, 0)),
+                32,
+            )
             .unwrap();
         assert_eq!(got, near_close);
 
@@ -1063,6 +1107,7 @@ mod tests {
                 |_| true,
                 |_| 0,
                 |c| c.id != near_close,
+                &cheb((0, 0)),
                 32,
             )
             .unwrap();
@@ -1096,14 +1141,14 @@ mod tests {
 
         // Without pressure: closest rep wins.
         let (_, _, t0) = sk
-            .nearest_in_tier_set(ts, fake_kind(), (0, 0), |_| true, |_| 0, 32)
+            .nearest_in_tier_set(ts, fake_kind(), (0, 0), |_| true, |_| 0, &cheb((0, 0)), 32)
             .unwrap();
         assert_eq!(t0, (5, 5));
 
         // With pressure on (5, 5), the farther rep wins.
         let pen = |t: (i32, i32)| if t == (5, 5) { 100 } else { 0 };
         let (_, _, t1) = sk
-            .nearest_in_tier_set(ts, fake_kind(), (0, 0), |_| true, pen, 32)
+            .nearest_in_tier_set(ts, fake_kind(), (0, 0), |_| true, pen, &cheb((0, 0)), 32)
             .unwrap();
         assert_eq!(t1, (12, 11));
     }
@@ -1126,7 +1171,9 @@ mod tests {
             0,
         );
         let m = sk.map(faction_tier(1)).unwrap();
-        let got = m.nearest(fake_kind(), (0, 0), |_| true, |_| 0, 32).unwrap();
+        let got = m
+            .nearest(fake_kind(), (0, 0), |_| true, |_| 0, &cheb((0, 0)), 32)
+            .unwrap();
         assert_eq!(got, near);
     }
 
@@ -1154,6 +1201,7 @@ mod tests {
                 (0, 0),
                 |o| matches!(o, ResourceOwner::Public),
                 |_| 0,
+                &cheb((0, 0)),
                 32,
             )
             .unwrap();
@@ -1186,7 +1234,7 @@ mod tests {
             faction: 1,
         };
         let (tier, _cid, target) = sk
-            .nearest_in_tier_set(ts, fake_kind(), (0, 0), |_| true, |_| 0, 32)
+            .nearest_in_tier_set(ts, fake_kind(), (0, 0), |_| true, |_| 0, &cheb((0, 0)), 32)
             .unwrap();
         assert_eq!(tier, KnowledgeTier::Household(42));
         assert_eq!(target, (3, 3));

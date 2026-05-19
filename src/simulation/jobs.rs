@@ -2731,9 +2731,9 @@ pub fn chief_job_posting_system(
         // regional market; no chief Farm posting.
         // Farm-planner: when communal Agricultural plots exist (and
         // farmers are assigned), post one plot-scoped Farm job per
-        // assignment. Bootstrap fallback (`home_tile ±5`, no plot_id)
-        // fires only when no agricultural plots are carved yet so the
-        // first season still gets food on the table.
+        // assignment whenever plantable seeds are stored. Bootstrap fallback
+        // (`home_tile ±5`, no plot_id) fires only when no agricultural plots
+        // are carved yet so the first season still gets food on the table.
         let farm_chief_allocates = faction
             .policy_for(crate::economy::core_ids::grain())
             .chief_allocates_labor;
@@ -2741,9 +2741,8 @@ pub fn chief_job_posting_system(
             && faction_can_perform(faction, JobKind::Farm)
             && faction.member_count > 0
         {
-            let grain = faction.storage.stock_of(crate::economy::core_ids::grain());
             let seed = faction.storage.seed_total();
-            let need_food = grain < faction.member_count * 4 && seed > 0;
+            let seed_available = seed > 0;
 
             // Existing plot-scoped Farm postings (de-dup keyed on plot_id).
             let posted_plots: ahash::AHashSet<crate::simulation::land::PlotId> = board
@@ -2765,7 +2764,7 @@ pub fn chief_job_posting_system(
 
             // Plot-scoped: walk this faction's farmer→plot assignments.
             let mut posted_any_plot_job = false;
-            if need_food {
+            if seed_available {
                 for (&farmer, &pid) in farm_params.assignments.farmer_to_plot.iter() {
                     if posted_plots.contains(&pid) {
                         continue;
@@ -2822,7 +2821,7 @@ pub fn chief_job_posting_system(
             // Bootstrap fallback: if no plot-scoped postings fired AND no
             // bootstrap posting exists, emit the legacy `home_tile ±5` job
             // so a fresh village without carved plots still farms.
-            if need_food && !posted_any_plot_job && !already_bootstrap_farm {
+            if seed_available && !posted_any_plot_job && !already_bootstrap_farm {
                 let area = TileAabb {
                     min: (
                         faction.home_tile.0.saturating_sub(5),
@@ -3417,6 +3416,9 @@ pub fn job_claim_system(
     clock: Res<SimClock>,
     registry: Res<FactionRegistry>,
     mut board: ResMut<JobBoard>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    chunk_graph: Res<crate::pathfinding::chunk_graph::ChunkGraph>,
+    chunk_router: Res<crate::pathfinding::chunk_router::ChunkRouter>,
     workers: Query<
         (
             Entity,
@@ -3466,7 +3468,7 @@ pub fn job_claim_system(
         worker,
         goal,
         member,
-        _ai,
+        ai,
         aq,
         lod,
         skills,
@@ -3562,11 +3564,18 @@ pub fn job_claim_system(
             }
             let skill_norm = skills.0[skill_for(p.kind) as usize] as f32 / 255.0;
             let target_tile = posting_target_tile(p);
+            // Detour-aware (river-aware) walk cost from the worker to the
+            // posting target: a job across a river costs the walk-around,
+            // not the straight line, so a worker doesn't out-bid a closer
+            // peer for a far-bank posting.
             let dist = match target_tile {
                 Some((tx, ty)) => {
-                    let dx = tx as f32 - worker_tile.0 as f32;
-                    let dy = ty as f32 - worker_tile.1 as f32;
-                    (dx * dx + dy * dy).sqrt()
+                    let est = crate::pathfinding::detour::DetourEstimator::new(
+                        &chunk_router,
+                        &chunk_graph,
+                    );
+                    let tz = chunk_map.nearest_standable_z(tx, ty, ai.current_z as i32) as i8;
+                    est.tiles(worker_tile, ai.current_z, (tx, ty), tz) as f32
                 }
                 None => 0.0,
             };

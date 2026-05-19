@@ -4017,9 +4017,17 @@ pub fn htn_acquire_food_dispatch_system(
                     (t.0, t.1, tz),
                 )
             };
+            // Detour-aware (river-aware) distance from the agent: a target
+            // across a river costs the walk-around, not the straight line.
+            let detour_est =
+                crate::pathfinding::detour::DetourEstimator::new(&chunk_router, &chunk_graph);
+            let detour_dist = |t: (i32, i32)| -> i32 {
+                let tz = chunk_map.nearest_standable_z(t.0, t.1, ai.current_z as i32) as i8;
+                detour_est.tiles((cur_tx, cur_ty), ai.current_z, t, tz)
+            };
             let scavenge = current_vision.nearest_scavenge_target(
                 MemoryKind::AnyEdible,
-                (cur_tx, cur_ty),
+                detour_dist,
                 |t| storage_tile_map.tiles.contains_key(&t),
                 reach_from_agent,
             );
@@ -4051,7 +4059,7 @@ pub fn htn_acquire_food_dispatch_system(
             .map(|(t, _)| t);
             let visible_forage = current_vision.nearest_gather_target(
                 MemoryKind::AnyEdible,
-                (cur_tx, cur_ty),
+                detour_dist,
                 actor,
                 viewer_household,
                 viewer_settlement,
@@ -4066,6 +4074,7 @@ pub fn htn_acquire_food_dispatch_system(
                     viewer_household,
                     MemoryKind::AnyEdible,
                     (cur_tx, cur_ty),
+                    ai.current_z,
                     now,
                 )
                 .and_then(|tile| {
@@ -4547,9 +4556,17 @@ pub fn htn_acquire_good_dispatch_system(
                         (t.0, t.1, tz),
                     )
                 };
+                let detour_est = crate::pathfinding::detour::DetourEstimator::new(
+                    &chunk_router,
+                    &chunk_graph,
+                );
+                let detour_dist = |t: (i32, i32)| -> i32 {
+                    let tz = chunk_map.nearest_standable_z(t.0, t.1, ai.current_z as i32) as i8;
+                    detour_est.tiles((cur_tx, cur_ty), ai.current_z, t, tz)
+                };
                 let visible_gather = current_vision.nearest_gather_target(
                     memory_kind,
-                    (cur_tx, cur_ty),
+                    detour_dist,
                     actor,
                     viewer_household,
                     viewer_settlement,
@@ -4564,6 +4581,7 @@ pub fn htn_acquire_good_dispatch_system(
                         viewer_household,
                         memory_kind,
                         (cur_tx, cur_ty),
+                        ai.current_z,
                         now,
                     )
                 });
@@ -4574,7 +4592,7 @@ pub fn htn_acquire_good_dispatch_system(
                 // storage-tile exclusion applied at read time.
                 let scavenge = current_vision.nearest_scavenge_target(
                     memory_kind,
-                    (cur_tx, cur_ty),
+                    detour_dist,
                     |t| storage_tile_map.tiles.contains_key(&t),
                     reach_from_agent,
                 );
@@ -4600,6 +4618,7 @@ pub fn htn_acquire_good_dispatch_system(
                         (t.0, t.1, tz),
                         &chunk_map,
                         &chunk_graph,
+                        &chunk_router,
                         &chunk_connectivity,
                     )
                 });
@@ -4611,6 +4630,7 @@ pub fn htn_acquire_good_dispatch_system(
                         (t.0, t.1, tz),
                         &chunk_map,
                         &chunk_graph,
+                        &chunk_router,
                         &chunk_connectivity,
                     )
                 });
@@ -5276,9 +5296,15 @@ pub fn htn_stockpile_food_dispatch_system(
                     (t.0, t.1, tz),
                 )
             };
+            let detour_est =
+                crate::pathfinding::detour::DetourEstimator::new(&chunk_router, &chunk_graph);
+            let detour_dist = |t: (i32, i32)| -> i32 {
+                let tz = chunk_map.nearest_standable_z(t.0, t.1, ai.current_z as i32) as i8;
+                detour_est.tiles((cur_tx, cur_ty), ai.current_z, t, tz)
+            };
             let scavenge = current_vision.nearest_scavenge_target(
                 MemoryKind::AnyEdible,
-                (cur_tx, cur_ty),
+                detour_dist,
                 |t| storage_tile_map.tiles.contains_key(&t),
                 reach_from_agent,
             );
@@ -5321,6 +5347,7 @@ pub fn htn_stockpile_food_dispatch_system(
                     (t.0, t.1, tz),
                     &chunk_map,
                     &chunk_graph,
+                    &chunk_router,
                     &chunk_connectivity,
                 )
             });
@@ -5353,7 +5380,7 @@ pub fn htn_stockpile_food_dispatch_system(
             let visible_forage = current_vision
                 .nearest_gather_target(
                     MemoryKind::AnyEdible,
-                    (cur_tx, cur_ty),
+                    detour_dist,
                     actor,
                     viewer_household,
                     viewer_settlement,
@@ -5374,6 +5401,7 @@ pub fn htn_stockpile_food_dispatch_system(
                     viewer_household,
                     MemoryKind::AnyEdible,
                     (cur_tx, cur_ty),
+                    ai.current_z,
                     now,
                 )
                 .and_then(|tile| {
@@ -5399,6 +5427,7 @@ pub fn htn_stockpile_food_dispatch_system(
                     (t.0, t.1, tz),
                     &chunk_map,
                     &chunk_graph,
+                    &chunk_router,
                     &chunk_connectivity,
                 )
             });
@@ -7259,6 +7288,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                 household_member.map(|h| h.household_id),
                 MemoryKind::Resource(rid),
                 (cur_tx, cur_ty),
+                ai.current_z,
                 now,
             )
         });
@@ -7773,6 +7803,7 @@ pub fn htn_engage_prey_dispatch_system(
                 household_member.map(|h| h.household_id),
                 MemoryKind::Prey,
                 (cur_tx, cur_ty),
+                cur_z,
                 now,
             ) {
                 for &candidate in spatial.get(tile.0, tile.1) {
@@ -9563,10 +9594,16 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
                 (t.0, t.1, tz),
             )
         };
+        let detour_est =
+            crate::pathfinding::detour::DetourEstimator::new(&chunk_router, &chunk_graph);
+        let detour_dist = |t: (i32, i32)| -> i32 {
+            let tz = chunk_map.nearest_standable_z(t.0, t.1, ai.current_z as i32) as i8;
+            detour_est.tiles((cur_tx, cur_ty), ai.current_z, t, tz)
+        };
         let visible_grain = current_vision
             .nearest_gather_target(
                 MemoryKind::AnyEdible,
-                (cur_tx, cur_ty),
+                detour_dist,
                 actor,
                 viewer_household,
                 viewer_settlement,
@@ -9589,6 +9626,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
                 viewer_household,
                 MemoryKind::AnyEdible,
                 (cur_tx, cur_ty),
+                ai.current_z,
                 now,
             )
             .and_then(|tile| {
@@ -9913,6 +9951,7 @@ pub fn htn_harvest_plant_dispatch_system(
                     household_member.map(|h| h.household_id),
                     MemoryKind::AnyEdible,
                     (cur_tx, cur_ty),
+                    ai.current_z,
                     now,
                 )
                 .and_then(|tile| {

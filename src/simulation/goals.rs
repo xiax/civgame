@@ -529,6 +529,20 @@ fn best_maintenance_score(
     best
 }
 
+fn incumbent_policy_blocks_replacement(
+    incumbent_score: Option<f32>,
+    current_interrupt_policy: crate::simulation::goal_scorers::InterruptPolicy,
+    current_class: crate::simulation::goal_scorers::GoalClass,
+    challenger_class: crate::simulation::goal_scorers::GoalClass,
+) -> bool {
+    incumbent_score.is_some()
+        && !crate::simulation::goal_scorers::interrupt_policy_allows(
+            current_interrupt_policy,
+            current_class,
+            challenger_class,
+        )
+}
+
 pub fn goal_update_system(
     mut commands: Commands,
     clock: Res<SimClock>,
@@ -1225,7 +1239,8 @@ pub fn goal_update_system(
                     (*goal, cur_reason)
                 }
                 Some(best_pick)
-                    if !crate::simulation::goal_scorers::interrupt_policy_allows(
+                    if incumbent_policy_blocks_replacement(
+                        incumbent_score,
                         current_interrupt_policy,
                         current_class,
                         best_pick.score.class,
@@ -1827,5 +1842,23 @@ mod tests {
         assert_eq!(ai.active_method, None);
         assert_eq!(aq.current_task_kind(), UNEMPLOYED_TASK_KIND);
         assert!(aq.queued_is_empty());
+    }
+
+    #[test]
+    fn survival_interrupt_policy_only_blocks_while_incumbent_still_scores() {
+        use crate::simulation::goal_scorers::{GoalClass, InterruptPolicy};
+
+        assert!(incumbent_policy_blocks_replacement(
+            Some(0.8),
+            InterruptPolicy::UninterruptibleExceptSurvival,
+            GoalClass::Survival,
+            GoalClass::Subsistence,
+        ));
+        assert!(!incumbent_policy_blocks_replacement(
+            None,
+            InterruptPolicy::UninterruptibleExceptSurvival,
+            GoalClass::Survival,
+            GoalClass::Subsistence,
+        ));
     }
 }

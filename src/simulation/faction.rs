@@ -1816,6 +1816,12 @@ pub struct StorageTileMap {
 }
 
 impl StorageTileMap {
+    /// Plain Manhattan-nearest storage tile. Kept as the cheap accessor
+    /// for non-routing / bookkeeping callers (SOLO fallback, landlord
+    /// sharecrop deposit, storage backend, tests) where the worker isn't
+    /// about to walk a river-detour to it. Routing-relevant deposit picks
+    /// (the gather → DepositToFactionStorage chain) go through
+    /// `nearest_for_faction_reachable`, which is detour-aware.
     pub fn nearest_for_faction(&self, faction_id: u32, from: (i32, i32)) -> Option<(i32, i32)> {
         self.by_faction
             .get(&faction_id)?
@@ -1842,6 +1848,13 @@ impl StorageTileMap {
     /// filter rejects every tile — better to attempt a (likely-failing)
     /// route than return `None` and have the dispatcher emit nothing at
     /// all.
+    ///
+    /// Ranking is **detour-aware**: among reachable tiles the one cheapest
+    /// to actually *walk* to from `source_tile` wins, not the
+    /// straight-line-nearest. A storage tile across a river scores its
+    /// walk-around cost, so the gather → deposit chain doesn't bake in a
+    /// huge return leg. `from` is retained as the chebyshev tiebreak the
+    /// detour estimate folds in (`max(chebyshev, hop-cost)`).
     pub fn nearest_for_faction_reachable(
         &self,
         faction_id: u32,
@@ -1849,9 +1862,13 @@ impl StorageTileMap {
         source_tile: (i32, i32, i8),
         chunk_map: &crate::world::chunk::ChunkMap,
         chunk_graph: &crate::pathfinding::chunk_graph::ChunkGraph,
+        chunk_router: &crate::pathfinding::chunk_router::ChunkRouter,
         connectivity: &crate::pathfinding::connectivity::ChunkConnectivity,
     ) -> Option<(i32, i32)> {
+        let _ = from;
         let tiles = self.by_faction.get(&faction_id)?;
+        let est =
+            crate::pathfinding::detour::DetourEstimator::new(chunk_router, chunk_graph);
         let pick = |reachable_only: bool| {
             tiles
                 .iter()
@@ -1862,7 +1879,10 @@ impl StorageTileMap {
                     let tz = chunk_map.nearest_standable_z(tx, ty, source_tile.2 as i32) as i8;
                     connectivity.tile_reachable(chunk_graph, source_tile, (tx, ty, tz))
                 })
-                .min_by_key(|&&(tx, ty)| (tx as i32 - from.0).abs() + (ty as i32 - from.1).abs())
+                .min_by_key(|&&(tx, ty)| {
+                    let tz = chunk_map.nearest_standable_z(tx, ty, source_tile.2 as i32) as i8;
+                    est.tiles((source_tile.0, source_tile.1), source_tile.2, (tx, ty), tz)
+                })
                 .copied()
         };
         pick(true).or_else(|| pick(false))
@@ -3965,6 +3985,7 @@ mod tests {
 
         let mut conn = ChunkConnectivity::default();
         populate_connectivity_from_graph(&graph, &mut conn);
+        let router = crate::pathfinding::chunk_router::ChunkRouter::default();
 
         let agent_tile = (5, 5, 0i8);
         let raised_tile = (32, 5); // chunk (1,0) — reachable via stair-step
@@ -3989,8 +4010,9 @@ mod tests {
         stm.tiles.insert(isolated_tile, 7);
         stm.by_faction.insert(7, vec![raised_tile, isolated_tile]);
 
-        let picked =
-            stm.nearest_for_faction_reachable(7, (5, 5), agent_tile, &chunk_map, &graph, &conn);
+        let picked = stm.nearest_for_faction_reachable(
+            7, (5, 5), agent_tile, &chunk_map, &graph, &router, &conn,
+        );
         assert_eq!(
             picked,
             Some(raised_tile),

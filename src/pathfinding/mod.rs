@@ -7,6 +7,7 @@ pub mod astar;
 pub mod chunk_graph;
 pub mod chunk_router;
 pub mod connectivity;
+pub mod detour;
 pub mod flow_field;
 pub mod hotspots;
 pub mod path_request;

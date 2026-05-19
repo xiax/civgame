@@ -20,13 +20,18 @@ Graph node = **`(ChunkCoord, ComponentId)`** — `ComponentId` is a chunk-local 
 
 ## Router (`chunk_router.rs`)
 
-Dijkstra over `RouterNode = (ChunkCoord, ComponentId)`, cached per goal. Three APIs:
+Dijkstra over `RouterNode = (ChunkCoord, ComponentId)`, cached per root node (`ROUTER_CAPACITY = 256`, FIFO, wholesale-dropped on `graph.generation` bump). Four APIs:
 
 - **`compute_route(graph, start, goal) -> Option<Vec<ChunkCoord>>`** — main worker entry; walks the tree's `next_hop` chain. No length cap; finite tree, optimal route.
 - **`first_waypoint_full(graph, start, goal) -> Option<Waypoint>`** — first segment target with exact `(entry_x, entry_y, entry_z, neighbor_component)`.
 - **`first_waypoint(graph, cur, dest, current_z) -> Option<(i32,i32)>`** — legacy compat for callers that don't track component identity. Tries every component at `current_z` in `cur` and `dest`, picks cheapest first hop.
+- **`with_tree_from(graph, origin, f) -> Option<R>`** — build-or-cache the `origin`-rooted tree and run `f` on it under the lock. The chunk graph is **weight-symmetric**, so an origin-rooted tree's `dist[c]` is the optimal chunk-path cost between `origin` and *every* reachable `c` — one Dijkstra answers cost-to-every-candidate in O(1) per candidate. Backs the detour estimator.
 
 Z-mismatch penalty is gone — components are exact, no "wrong z" choice to penalise.
+
+## Detour estimator (`detour.rs`)
+
+`DetourEstimator { router, graph }` — river-aware distance in **chebyshev-equivalent tiles**, a drop-in replacement for the straight-line term every target-selection site used to use. `tiles(o_tile, o_z, c_tile, c_z) = max(chebyshev, round(with_tree_from(o_node).dist[c_node] × ROUTER_UNITS_TO_TILES))`; `ROUTER_UNITS_TO_TILES = CHUNK_SIZE / BASE_STEP_COST` (derived, not hardcoded). Same chunk-component ⇒ plain chebyshev (tree never consulted); any resolution failure (chunk unloaded / not standable / unreachable) ⇒ chebyshev fallback (never 0, never panic — degrades to old behaviour). `from(o_tile, o_z, z_of)` curries the origin for the closure-shaped call sites (mirrors the existing `reach_from_agent` `nearest_standable_z` z-resolution). One agent-rooted Dijkstra per re-planning agent (bucketed 200-tick cadence), shared across spatially-clustered factions, generation-only invalidation — not per-tick recompute. Consumers: `memory.rs` vision/scavenge pickers, `shared_knowledge.rs` cluster picker (via `GatherKnowledge`), `faction.rs::nearest_for_faction_reachable`, `jobs.rs` U_bid `C_action`.
 
 ## Connectivity (`connectivity.rs`)
 

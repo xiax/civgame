@@ -165,6 +165,11 @@ impl CurrentVision {
     /// vision-first short-circuit for gather methods before falling back to
     /// `SharedKnowledge`.
     ///
+    /// `dist` returns the detour-aware distance (in chebyshev-equivalent
+    /// tiles) from the agent to a candidate tile — `DetourEstimator::from`
+    /// at the call site, so a river forcing a long walk-around is priced
+    /// in instead of straight-line distance.
+    ///
     /// `claim_penalty` returns extra cost (in chebyshev tiles) to add for a
     /// candidate tile — typically `GatherClaims::pressure(tile, now, viewer) * 4`
     /// at the call site, mirroring `SharedKnowledge::nearest_target_tile`'s
@@ -172,7 +177,7 @@ impl CurrentVision {
     pub fn nearest_gather_target(
         &self,
         kind: MemoryKind,
-        from: (i32, i32),
+        dist: impl Fn((i32, i32)) -> i32,
         viewer: Entity,
         viewer_household: Option<u32>,
         viewer_settlement: Option<crate::simulation::settlement::SettlementId>,
@@ -197,10 +202,7 @@ impl CurrentVision {
                     )
                 })
                 .filter(|v| !require_reachable || is_reachable(v.tile))
-                .min_by_key(|v| {
-                    let cheb = (v.tile.0 - from.0).abs().max((v.tile.1 - from.1).abs());
-                    cheb + claim_penalty(v.tile)
-                })
+                .min_by_key(|v| dist(v.tile) + claim_penalty(v.tile))
                 .map(|v| v.tile)
         };
         pick(true).or_else(|| pick(false))
@@ -213,7 +215,7 @@ impl CurrentVision {
     pub fn nearest_scavenge_target(
         &self,
         kind: MemoryKind,
-        from: (i32, i32),
+        dist: impl Fn((i32, i32)) -> i32,
         is_storage_tile: impl Fn((i32, i32)) -> bool,
         is_reachable: impl Fn((i32, i32)) -> bool,
     ) -> Option<(Entity, (i32, i32))> {
@@ -225,7 +227,7 @@ impl CurrentVision {
                 .filter_map(|v| v.entity.map(|e| (e, v.tile)))
                 .filter(|(_, tile)| !is_storage_tile(*tile))
                 .filter(|(_, tile)| !require_reachable || is_reachable(*tile))
-                .min_by_key(|(_, tile)| (tile.0 - from.0).abs().max((tile.1 - from.1).abs()))
+                .min_by_key(|(_, tile)| dist(*tile))
         };
         pick(true).or_else(|| pick(false))
     }

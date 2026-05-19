@@ -41,7 +41,13 @@ pub struct Waypoint {
     pub entry_z: i8,
 }
 
-const ROUTER_CAPACITY: usize = 64;
+// Cache now mixes goal-rooted trees (compute_route / is_reachable) with
+// origin-rooted trees (with_tree_from, used by the detour estimator for
+// per-agent cost-to-every-candidate). Trees persist across ticks and are
+// dropped only on a `graph.generation` bump, so a larger cache just means
+// more reuse, not more recompute. Each tree is an AHashMap over loaded
+// router-nodes (chunk-streaming bounded), so 256 is a few MB worst case.
+const ROUTER_CAPACITY: usize = 256;
 
 #[derive(Default)]
 struct RouterState {
@@ -207,6 +213,32 @@ impl ChunkRouter {
             Some(tree) => tree.dist.contains_key(&start),
             None => false,
         }
+    }
+
+    /// Borrow (build-or-cache) the Dijkstra tree rooted at `origin` and
+    /// run `f` against it while the cache lock is held. Because the
+    /// chunk graph is weight-symmetric (every A→B edge has a paired
+    /// B→A produced by the per-chunk border scan), an origin-rooted
+    /// tree's `dist[c]` is the optimal chunk-path cost between `origin`
+    /// and *every* reachable node `c` — so one build answers
+    /// "cost from origin to every candidate" in O(1) per candidate.
+    /// Returns `None` (and never runs `f`) when `origin`'s chunk isn't
+    /// in the graph (chunk unloaded / mid-rebuild).
+    ///
+    /// The closure form keeps the `MutexGuard` from escaping; callers
+    /// extract the scalar they need (e.g. `tree.dist.get(&c).copied()`)
+    /// inside `f`.
+    pub fn with_tree_from<R>(
+        &self,
+        graph: &ChunkGraph,
+        origin: RouterNode,
+        f: impl FnOnce(&ShortestPathTree) -> R,
+    ) -> Option<R> {
+        let mut state = lock_state(&self.state, origin, origin);
+        maybe_invalidate(&mut state, graph);
+        ensure_tree(&mut state, graph, origin)?;
+        let tree = state.trees.get(&origin)?;
+        Some(f(tree))
     }
 
     pub fn cached_destination_count(&self) -> usize {
@@ -399,6 +431,66 @@ mod tests {
             route,
             vec![ChunkCoord(0, 0), ChunkCoord(1, 0), ChunkCoord(2, 0)]
         );
+    }
+
+    #[test]
+    fn origin_rooted_tree_dist_matches_route_cost() {
+        // Same linear 3-chunk graph as compute_route_through_one_intermediate.
+        // Because the graph is weight-symmetric, a tree rooted at the
+        // ORIGIN must report dist[goal] equal to the summed hop cost of
+        // the route origin→goal (2 hops × traverse_cost 100 = 200).
+        let mut graph = ChunkGraph::default();
+        graph
+            .components
+            .insert(ChunkCoord(0, 0), comp_one(ChunkCoord(0, 0), 1));
+        graph
+            .components
+            .insert(ChunkCoord(1, 0), comp_one(ChunkCoord(1, 0), 1));
+        graph
+            .components
+            .insert(ChunkCoord(2, 0), comp_one(ChunkCoord(2, 0), 1));
+        graph.edges.insert(
+            ChunkCoord(0, 0),
+            vec![edge(ChunkCoord(1, 0), 0, 0, (31, 5), 0, 0)],
+        );
+        graph.edges.insert(
+            ChunkCoord(1, 0),
+            vec![
+                edge(ChunkCoord(0, 0), 0, 0, (0, 5), 0, 0),
+                edge(ChunkCoord(2, 0), 0, 0, (31, 5), 0, 0),
+            ],
+        );
+        graph.edges.insert(
+            ChunkCoord(2, 0),
+            vec![edge(ChunkCoord(1, 0), 0, 0, (0, 5), 0, 0)],
+        );
+        graph.generation = 1;
+
+        let router = ChunkRouter::default();
+        let origin = (ChunkCoord(0, 0), ComponentId(0));
+        let goal = (ChunkCoord(2, 0), ComponentId(0));
+
+        let route = router
+            .compute_route(&graph, origin, goal)
+            .expect("route exists");
+        assert_eq!(route.len(), 3, "origin + intermediate + goal");
+
+        let d = router
+            .with_tree_from(&graph, origin, |tree| tree.dist.get(&goal).copied())
+            .flatten();
+        assert_eq!(d, Some(200), "2 hops × traverse_cost 100");
+
+        // Origin distance to itself is zero; an unreachable chunk is absent.
+        let self_d = router
+            .with_tree_from(&graph, origin, |tree| tree.dist.get(&origin).copied())
+            .flatten();
+        assert_eq!(self_d, Some(0));
+        let missing = router.with_tree_from(
+            &graph,
+            (ChunkCoord(9, 9), ComponentId(0)),
+            |tree| tree.dist.len(),
+        );
+        assert_eq!(missing, None, "origin chunk not in graph ⇒ None");
     }
 
     #[test]

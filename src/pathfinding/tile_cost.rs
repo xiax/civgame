@@ -23,7 +23,11 @@ pub fn tile_speed_multiplier(kind: TileKind) -> f32 {
     }
 }
 
-const BASE_STEP_COST: u16 = 100;
+/// Cost of one grass-equivalent step. The chunk-router edge cost is
+/// `BASE_STEP_COST`-scaled per border crossing, so `detour.rs` derives
+/// its router-units→tiles factor from this constant rather than
+/// hardcoding it (keeps the two coherent if step cost is ever retuned).
+pub const BASE_STEP_COST: u16 = 100;
 pub const IMPASSABLE: u16 = u16::MAX;
 
 pub fn tile_step_cost(kind: TileKind) -> u16 {

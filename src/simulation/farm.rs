@@ -14,6 +14,7 @@ use crate::simulation::land::{Plot, PlotId, PlotIndex, Tenure};
 use crate::simulation::person::Profession;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::settlement::ZoneKind;
+use crate::world::terrain::world_to_tile;
 use crate::world::seasons::TICKS_PER_DAY;
 
 /// One-to-one matching of farmer worker entities to state-owned Agricultural
@@ -196,10 +197,13 @@ pub fn seed_starting_farms_system(
     mut commands: Commands,
     options: Res<crate::game_state::GameStartOptions>,
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
-    mut registry: ResMut<crate::simulation::faction::FactionRegistry>,
+    registry: Res<crate::simulation::faction::FactionRegistry>,
     mut plot_index: ResMut<crate::simulation::land::PlotIndex>,
     plot_q: Query<&crate::simulation::land::Plot>,
     chunk_map: Res<crate::world::chunk::ChunkMap>,
+    storage_tiles: Query<(&crate::simulation::faction::FactionStorageTile, &Transform)>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    mut ground_items: Query<&mut crate::simulation::items::GroundItem>,
 ) {
     use crate::simulation::land::Plot;
     use crate::simulation::settlement::TileRect;
@@ -304,14 +308,23 @@ pub fn seed_starting_farms_system(
             }
         }
 
-        // Pre-seed grain seeds into faction storage so the first chief
-        // Farm posting (or private FarmWorkScorer) can dispatch on tick 1.
-        if let Some(faction) = registry.factions.get_mut(&fid) {
-            *faction
-                .storage
-                .totals
-                .entry(crate::economy::core_ids::grain_seed())
-                .or_insert(0) += STARTING_GRAIN_SEEDS;
-        }
+        // Pre-seed physical grain seeds at a faction storage tile. `FactionStorage`
+        // is only a rollup cache and is rebuilt every Economy tick from
+        // `GroundItem`s, so writing it directly would vanish before posting.
+        let storage_tile = storage_tiles
+            .iter()
+            .find_map(|(storage, transform)| {
+                (storage.faction_id == fid).then_some(world_to_tile(transform.translation.truncate()))
+            })
+            .unwrap_or(home);
+        crate::simulation::items::spawn_or_merge_ground_item(
+            &mut commands,
+            &spatial,
+            &mut ground_items,
+            storage_tile.0,
+            storage_tile.1,
+            crate::economy::core_ids::grain_seed(),
+            STARTING_GRAIN_SEEDS,
+        );
     }
 }
