@@ -2913,8 +2913,9 @@ fn parcel_suitability(
     };
     let home_d = cheb(tile, faction.home_tile) as f32;
     let heat = brain.traffic_heat.get(&tile).copied().unwrap_or(0) as f32 / 255.0;
-    let high = (chunk_map.surface_z_at(tile.0, tile.1)
-        - chunk_map.surface_z_at(faction.home_tile.0, faction.home_tile.1))
+    // Terrain elevation delta (solid ground, not water surface).
+    let high = (chunk_map.ground_z_at(tile.0, tile.1)
+        - chunk_map.ground_z_at(faction.home_tile.0, faction.home_tile.1))
     .max(0) as f32;
     let mut s = ParcelSuitability {
         residential: 0.65 + water_bonus * 0.25 + (1.0 / (1.0 + home_d * 0.08)) * 0.5,
@@ -3227,11 +3228,12 @@ fn best_fertile_tile(chunk_map: &ChunkMap, home: (i32, i32), radius: i32) -> Opt
 }
 
 fn best_high_ground(chunk_map: &ChunkMap, home: (i32, i32), radius: i32) -> Option<(i32, i32)> {
-    let home_z = chunk_map.surface_z_at(home.0, home.1);
+    let home_z = chunk_map.ground_z_at(home.0, home.1);
     let mut best: Option<(i32, i32, (i32, i32))> = None;
     for y in (home.1 - radius..=home.1 + radius).step_by(3) {
         for x in (home.0 - radius..=home.0 + radius).step_by(3) {
-            let z = chunk_map.surface_z_at(x, y);
+            // High-ground search ranks real terrain, not water surface.
+            let z = chunk_map.ground_z_at(x, y);
             let gain = z - home_z;
             if gain <= 0 {
                 continue;
@@ -3286,10 +3288,12 @@ fn material_anchor_bonus(brain: &SettlementBrain, tile: (i32, i32)) -> f32 {
 }
 
 fn local_slope(chunk_map: &ChunkMap, tile: (i32, i32)) -> i32 {
-    let z = chunk_map.surface_z_at(tile.0, tile.1);
+    // Terrain slope = bed-height deltas (water surface is flat and would
+    // mask the real grade).
+    let z = chunk_map.ground_z_at(tile.0, tile.1);
     [(1, 0), (-1, 0), (0, 1), (0, -1)]
         .iter()
-        .map(|(dx, dy)| (chunk_map.surface_z_at(tile.0 + dx, tile.1 + dy) - z).abs())
+        .map(|(dx, dy)| (chunk_map.ground_z_at(tile.0 + dx, tile.1 + dy) - z).abs())
         .max()
         .unwrap_or(0)
 }

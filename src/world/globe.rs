@@ -7,7 +7,7 @@ const SAVE_PATH: &str = "world.bin";
 /// On-disk schema version for `world.bin`. Bump whenever `Globe`, `WorldCell`,
 /// or any serialized geo-data layout changes — `load_or_generate` will discard
 /// older caches and regenerate.
-pub const GLOBE_FILE_VERSION: u32 = 7;
+pub const GLOBE_FILE_VERSION: u32 = 8;
 
 /// Climate-sample grid resolution. Each cell holds elevation/climate/biome
 /// samples; per-tile values are bilinearly interpolated. Resolution is
@@ -134,12 +134,107 @@ pub struct WorldCell {
 /// them along the curve. Confluences are coherent because every tributary's
 /// `to_width` equals the trunk's `from_width` at the join cell (both derived
 /// from the same downstream `flow_accum`).
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct RiverEdge {
     pub from: (u32, u32),
     pub to: (u32, u32),
     pub from_width: u8,
     pub to_width: u8,
+    /// Rainfall-weighted upstream discharge at the downstream endpoint.
+    #[serde(default)]
+    pub discharge: f32,
+    /// Strahler stream order at the downstream endpoint (confluence rank).
+    #[serde(default)]
+    pub order: u8,
+    /// Water-surface height (globe height units) at up/down endpoints.
+    /// `to_level <= from_level` always (monotone downstream).
+    #[serde(default)]
+    pub from_level: f32,
+    #[serde(default)]
+    pub to_level: f32,
+    /// Channel depth (sub-z, in globe height units) at up/down endpoints.
+    #[serde(default)]
+    pub from_depth: f32,
+    #[serde(default)]
+    pub to_depth: f32,
+    /// Reservoir this edge drains into (`u32::MAX` = open drainage / none).
+    #[serde(default = "u32_max")]
+    pub reservoir_id: u32,
+}
+
+#[inline]
+fn u32_max() -> u32 {
+    u32::MAX
+}
+
+/// What kind of standing-water body a reservoir is. `Spring`/`Dam` are
+/// runtime-only (springs from dug cells below the water table — Phase 4/6;
+/// dams — Phase 4) and never produced by worldgen.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReservoirKind {
+    Ocean,
+    Lake,
+    Wetland,
+    Endorheic,
+    Spring,
+    Dam,
+}
+
+/// A standing-water body with a single equilibrium surface level.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Reservoir {
+    pub id: u32,
+    pub kind: ReservoirKind,
+    /// Equilibrium water-surface height in globe height units.
+    pub spill_level: f32,
+    /// Downstream cell the body spills through (`u32::MAX` = none, i.e.
+    /// ocean or closed/endorheic basin).
+    pub outlet_cell: u32,
+    /// 0.0 fresh .. 1.0 sea-salt.
+    pub salinity: f32,
+}
+
+/// Per-climate-cell hydrology truth, parallel to `Globe.cells`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct HydroCell {
+    /// Terrain height before pit-fill (the real bed/ground).
+    pub raw_height: f32,
+    /// Terrain height after priority-flood pit-fill (spill surface).
+    pub filled_height: f32,
+    /// D8 downstream cell index (`== self` at a sink).
+    pub flow_to: u32,
+    /// Rainfall-weighted upstream accumulation (runoff proxy).
+    pub discharge: f32,
+    /// Reservoir membership (`u32::MAX` = dry land / open drainage).
+    pub reservoir_id: u32,
+    /// Local water-table height (≤ `filled_height` except wetland/spring).
+    pub aquifer_level: f32,
+}
+
+impl Default for HydroCell {
+    fn default() -> Self {
+        Self {
+            raw_height: 0.0,
+            filled_height: 0.0,
+            flow_to: 0,
+            discharge: 0.0,
+            reservoir_id: u32::MAX,
+            aquifer_level: 0.0,
+        }
+    }
+}
+
+/// Deterministic worldgen hydrology truth. Serialized on `Globe`; the world
+/// map overlay and chunk stamping both read it (no parallel formulas).
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+pub struct HydrologyMap {
+    /// `GLOBE_WIDTH × GLOBE_HEIGHT`, row-major (parallels `Globe.cells`).
+    #[serde(default)]
+    pub cells: Vec<HydroCell>,
+    /// Indexed by `Reservoir::id`.
+    #[serde(default)]
+    pub reservoirs: Vec<Reservoir>,
 }
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
@@ -172,6 +267,12 @@ pub struct Globe {
     pub seed: u64,
     pub rivers: RiverNetwork,
     pub lakes: LakeMap,
+    /// Deterministic hydrology truth (discharge, levels, reservoirs, aquifer).
+    /// Source for chunk water stamping (Phase 2) and the world-map water
+    /// overlay. `#[serde(default)]` so v7 caches deserialize then regenerate
+    /// via the version bump.
+    #[serde(default)]
+    pub hydrology: HydrologyMap,
 }
 
 impl Globe {
@@ -181,7 +282,57 @@ impl Globe {
             seed,
             rivers: RiverNetwork::default(),
             lakes: LakeMap::default(),
+            hydrology: HydrologyMap::default(),
         }
+    }
+
+    /// Globe-cell index for a world tile (X-wrap, Y-clamp). Mirrors
+    /// `sample_climate`'s cell resolution.
+    fn hydro_cell_idx(tile_x: i32, tile_y: i32) -> usize {
+        let tiles_per_cell = (GLOBE_CELL_CHUNKS * super::chunk::CHUNK_SIZE as i32) as f32;
+        let gx = (tile_x as f32 / tiles_per_cell)
+            .floor()
+            .rem_euclid(GLOBE_WIDTH as f32) as i32;
+        let gy = ((tile_y as f32 / tiles_per_cell).floor() as i32).clamp(0, GLOBE_HEIGHT - 1);
+        (gy * GLOBE_WIDTH + gx) as usize
+    }
+
+    /// Hydrology cell at a world tile (X-wrap, Y-clamp).
+    pub fn hydro_cell_at(&self, tile_x: i32, tile_y: i32) -> Option<&HydroCell> {
+        self.hydrology
+            .cells
+            .get(Self::hydro_cell_idx(tile_x, tile_y))
+    }
+
+    /// Reservoir at a world tile, if the cell belongs to one.
+    pub fn reservoir_at(&self, tile_x: i32, tile_y: i32) -> Option<&Reservoir> {
+        let i = Self::hydro_cell_idx(tile_x, tile_y);
+        let rid = self.hydrology.cells.get(i)?.reservoir_id;
+        self.hydrology.reservoirs.get(rid as usize)
+    }
+
+    /// Equilibrium water-surface height (globe units) at a world tile, if the
+    /// cell is wet (reservoir member or carries a river). `None` = dry land.
+    pub fn water_level_at(&self, tile_x: i32, tile_y: i32) -> Option<f32> {
+        let i = Self::hydro_cell_idx(tile_x, tile_y);
+        let hc = self.hydrology.cells.get(i)?;
+        if let Some(r) = self.hydrology.reservoirs.get(hc.reservoir_id as usize) {
+            return Some(r.spill_level);
+        }
+        let cell = self.cells.get(i)?;
+        if cell.is_river {
+            Some(hc.filled_height)
+        } else {
+            None
+        }
+    }
+
+    /// Water salinity at a world tile: reservoir salinity if a member, else
+    /// 0.0 (fresh — rivers/dry). 1.0 = sea.
+    pub fn salinity_at(&self, tile_x: i32, tile_y: i32) -> f32 {
+        self.reservoir_at(tile_x, tile_y)
+            .map(|r| r.salinity)
+            .unwrap_or(0.0)
     }
 
     fn idx(gx: i32, gy: i32) -> Option<usize> {
@@ -563,6 +714,35 @@ pub fn generate_globe(seed: u64) -> Globe {
 
     globe.rivers = rivers;
     globe.lakes = lakes;
+
+    // ── 7. Hydrology truth layer (additive; geometry unchanged) ───────────
+    // Read finalised per-cell rainfall, build the HydrologyMap, and derive
+    // the extended RiverEdge fields. No river/lake geometry moves here —
+    // Phase 2 consumes this for chunk stamping.
+    {
+        let w = GLOBE_WIDTH as usize;
+        let rainfall_norm: Vec<f32> = globe
+            .cells
+            .iter()
+            .map(|c| c.rainfall as f32 / 255.0)
+            .collect();
+        let hydro = hydrology::build_hydrology(&pre_fill_height, &height, &dirs, &rainfall_norm);
+        let order = hydrology::strahler_order(&dirs, &accum, 80);
+        for e in &mut globe.rivers.edges {
+            let fi = e.from.1 as usize * w + e.from.0 as usize;
+            let ti = e.to.1 as usize * w + e.to.0 as usize;
+            let fc = &hydro.cells[fi];
+            let tc = &hydro.cells[ti];
+            e.discharge = tc.discharge;
+            e.order = order[ti].max(order[fi]);
+            e.from_level = fc.filled_height;
+            e.to_level = tc.filled_height.min(fc.filled_height);
+            e.from_depth = hydrology::depth_for_discharge(fc.discharge);
+            e.to_depth = hydrology::depth_for_discharge(tc.discharge);
+            e.reservoir_id = tc.reservoir_id;
+        }
+        globe.hydrology = hydro;
+    }
 
     info!(
         "Globe generated: {}×{} cells, {} river edges, {} lakes",

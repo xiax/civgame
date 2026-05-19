@@ -1816,6 +1816,9 @@ pub fn spawn_blueprint_sprites(
             // Stub: reuse table sprite (planks-over-water suggestion) until
             // a dedicated bridge blueprint sprite ships.
             BuildSiteKind::Bridge => textures.table_ascii.clone(),
+            // Stub: reuse the stone-wall sprite — a dam reads as masonry,
+            // not a timber deck — until dedicated dam art ships.
+            BuildSiteKind::Dam => textures.wall_stone_ascii.clone(),
             BuildSiteKind::Well => sprite_lib
                 .get("building_well")
                 .cloned()

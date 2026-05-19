@@ -38,6 +38,9 @@ pub fn tile_color(kind: TileKind) -> Color {
         // Road (0.55,0.45,0.35), and Loam (0.42,0.30,0.18) so a field reads
         // as a block.
         TileKind::Cropland => Color::srgb(0.62, 0.47, 0.17),
+        // Dam barrier — masonry/earthwork grey, deliberately distinct from
+        // the timber Bridge brown so a dammed cell reads as a wall, not a deck.
+        TileKind::Dam => Color::srgb(0.46, 0.46, 0.48),
     }
 }
 

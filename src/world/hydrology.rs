@@ -4,7 +4,10 @@
 //! cells at-or-below sea level are treated as drainage sinks (the ocean
 //! absorbs all flow without backing up).
 
-use super::globe::{RiverEdge, RiverNetwork, GLOBE_HEIGHT, GLOBE_WIDTH};
+use super::globe::{
+    HydroCell, HydrologyMap, Reservoir, ReservoirKind, RiverEdge, RiverNetwork, GLOBE_HEIGHT,
+    GLOBE_WIDTH,
+};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -227,6 +230,7 @@ pub fn extract_rivers(height: &[f32], dirs: &[u32], accum: &[u32], min_accum: u3
                 to,
                 from_width,
                 to_width,
+                ..Default::default()
             });
             if visited_edge[next] {
                 break;
@@ -339,4 +343,401 @@ pub fn chaikin_river_path(
 /// huge rivers don't overflow.
 pub fn quantise_accum(accum: u32) -> u16 {
     (accum / 16).min(u16::MAX as u32) as u16
+}
+
+// ───────────────────────── Hydrology truth layer ──────────────────────────
+//
+// Pure, deterministic, Bevy-free. `build_hydrology` is the orchestrator;
+// `generate_globe` calls it after the existing extraction and derives the
+// extended `RiverEdge` fields from the returned map. No river geometry moves
+// in this layer — it only computes truth (discharge/order/levels/reservoirs/
+// aquifer). Phase 2 stamps chunks from it.
+
+/// Rainfall-weighted upstream accumulation (runoff proxy) — same topological
+/// propagation as `flow_accum`, but each cell contributes its normalised
+/// rainfall plus a small base so dry headwaters still trickle.
+pub fn weighted_discharge(dirs: &[u32], rainfall_norm: &[f32]) -> Vec<f32> {
+    let n = W * H;
+    debug_assert_eq!(dirs.len(), n);
+    debug_assert_eq!(rainfall_norm.len(), n);
+    let mut indeg = vec![0u32; n];
+    for (i, &d) in dirs.iter().enumerate() {
+        if d as usize != i {
+            indeg[d as usize] += 1;
+        }
+    }
+    let mut q = vec![0.0f32; n];
+    for i in 0..n {
+        q[i] = rainfall_norm[i].clamp(0.0, 1.0) + 0.05;
+    }
+    let mut stack: Vec<u32> = (0..n as u32).filter(|&i| indeg[i as usize] == 0).collect();
+    while let Some(i) = stack.pop() {
+        let d = dirs[i as usize] as usize;
+        if d == i as usize {
+            continue;
+        }
+        q[d] += q[i as usize];
+        indeg[d] -= 1;
+        if indeg[d] == 0 {
+            stack.push(d as u32);
+        }
+    }
+    q
+}
+
+/// Strahler stream order. Processed in increasing-accumulation order
+/// (guaranteed upstream-before-downstream since accumulation is monotone
+/// non-decreasing downstream). A confluence of two equal-max tributaries
+/// increments the order; otherwise the max is carried.
+pub fn strahler_order(dirs: &[u32], accum: &[u32], min_accum: u32) -> Vec<u8> {
+    let n = W * H;
+    let mut order = vec![0u8; n];
+    let mut river_cells: Vec<usize> = (0..n).filter(|&i| accum[i] >= min_accum).collect();
+    river_cells.sort_by_key(|&i| accum[i]);
+    let mut inflow: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &i in &river_cells {
+        let d = dirs[i] as usize;
+        if d != i && accum[d] >= min_accum {
+            inflow[d].push(i);
+        }
+    }
+    for &i in &river_cells {
+        let ins: Vec<u8> = inflow[i]
+            .iter()
+            .map(|&u| order[u])
+            .filter(|&o| o > 0)
+            .collect();
+        order[i] = if ins.is_empty() {
+            1
+        } else {
+            let mx = *ins.iter().max().unwrap();
+            let cnt = ins.iter().filter(|&&o| o == mx).count();
+            if cnt >= 2 {
+                mx.saturating_add(1)
+            } else {
+                mx
+            }
+        };
+    }
+    order
+}
+
+#[inline]
+fn cluster_neighbours(i: usize, out: &mut [usize; 4]) -> usize {
+    let gx = i % W;
+    let gy = i / W;
+    let xm = (gx + W - 1) % W;
+    let xp = (gx + 1) % W;
+    let mut k = 0;
+    out[k] = gy * W + xm;
+    k += 1;
+    out[k] = gy * W + xp;
+    k += 1;
+    if gy > 0 {
+        out[k] = (gy - 1) * W + gx;
+        k += 1;
+    }
+    if gy + 1 < H {
+        out[k] = (gy + 1) * W + gx;
+        k += 1;
+    }
+    k
+}
+
+/// Classify standing water into reservoirs from the pit-fill delta.
+///
+/// Reservoir 0 is always the Ocean (every `filled <= 0` cell). Pit-filled
+/// land cells (`filled - raw > eps`, `filled > 0`) cluster into basins; a
+/// basin that spills to a lower outside neighbour is a `Lake` (or `Wetland`
+/// if very shallow), one with no lower escape is `Endorheic` (evaporative →
+/// brackish). Returns the reservoir table and a per-cell `reservoir_id`
+/// (`u32::MAX` = dry / open drainage).
+pub fn classify_reservoirs(raw: &[f32], filled: &[f32], dirs: &[u32]) -> (Vec<Reservoir>, Vec<u32>) {
+    let n = W * H;
+    debug_assert_eq!(raw.len(), n);
+    debug_assert_eq!(filled.len(), n);
+    let mut rid = vec![u32::MAX; n];
+    let mut reservoirs: Vec<Reservoir> = Vec::new();
+
+    // Reservoir 0 — the ocean.
+    reservoirs.push(Reservoir {
+        id: 0,
+        kind: ReservoirKind::Ocean,
+        spill_level: 0.0,
+        outlet_cell: u32::MAX,
+        salinity: 1.0,
+    });
+    for i in 0..n {
+        if filled[i] <= 0.0 {
+            rid[i] = 0;
+        }
+    }
+
+    const EPS: f32 = 0.02;
+    const SHALLOW: f32 = 0.05;
+    let mut is_water = vec![false; n];
+    for i in 0..n {
+        if filled[i] > 0.0 && filled[i] - raw[i] > EPS {
+            is_water[i] = true;
+        }
+    }
+
+    let mut visited = vec![false; n];
+    // Reusable membership stamp (cluster sequence number); avoids a per-cluster
+    // HashSet alloc. `0` = not in current cluster.
+    let mut stamp = vec![0u32; n];
+    let mut seq = 0u32;
+    let mut nbuf = [0usize; 4];
+    for start in 0..n {
+        if !is_water[start] || visited[start] {
+            continue;
+        }
+        let mut stack = vec![start];
+        let mut cluster = Vec::new();
+        while let Some(i) = stack.pop() {
+            if visited[i] {
+                continue;
+            }
+            visited[i] = true;
+            if !is_water[i] {
+                continue;
+            }
+            cluster.push(i);
+            let k = cluster_neighbours(i, &mut nbuf);
+            for &nb in &nbuf[..k] {
+                if !visited[nb] {
+                    stack.push(nb);
+                }
+            }
+        }
+        if cluster.is_empty() {
+            continue;
+        }
+        seq += 1;
+        for &i in &cluster {
+            stamp[i] = seq;
+        }
+        let mut spill = f32::MIN;
+        let mut min_raw = f32::MAX;
+        for &i in &cluster {
+            spill = spill.max(filled[i]);
+            min_raw = min_raw.min(raw[i]);
+        }
+        // Outlet: lowest outside neighbour the basin can spill to.
+        let mut outlet = u32::MAX;
+        let mut outlet_h = f32::MAX;
+        for &i in &cluster {
+            let k = cluster_neighbours(i, &mut nbuf);
+            for &nb in &nbuf[..k] {
+                if stamp[nb] == seq {
+                    continue;
+                }
+                if filled[nb] < spill && filled[nb] < outlet_h {
+                    outlet_h = filled[nb];
+                    outlet = nb as u32;
+                }
+            }
+        }
+        let _ = dirs; // outlet derived from spill geometry, not D8 here
+        let id = reservoirs.len() as u32;
+        let (kind, salinity) = if outlet == u32::MAX {
+            (ReservoirKind::Endorheic, 0.6) // closed basin → evaporative/brackish
+        } else if spill - min_raw < SHALLOW {
+            (ReservoirKind::Wetland, 0.0) // shallow, marshy
+        } else {
+            (ReservoirKind::Lake, 0.0)
+        };
+        reservoirs.push(Reservoir {
+            id,
+            kind,
+            spill_level: spill,
+            outlet_cell: outlet,
+            salinity,
+        });
+        for &i in &cluster {
+            rid[i] = id;
+        }
+    }
+
+    (reservoirs, rid)
+}
+
+/// Local water-table height. Sits below the pit-filled surface — shallowest
+/// in wet lowlands, deepest in dry highlands — and is pinned to the water
+/// surface inside lake/wetland reservoirs.
+pub fn aquifer_table(
+    filled: &[f32],
+    rainfall_norm: &[f32],
+    rid: &[u32],
+    reservoirs: &[Reservoir],
+) -> Vec<f32> {
+    let n = W * H;
+    let mut a = vec![0.0f32; n];
+    for i in 0..n {
+        let r = rid[i];
+        if let Some(res) = reservoirs.get(r as usize) {
+            if !matches!(res.kind, ReservoirKind::Ocean) {
+                a[i] = res.spill_level; // water table == lake/wetland surface
+                continue;
+            }
+        }
+        let s = filled[i];
+        let wet = rainfall_norm[i].clamp(0.0, 1.0);
+        // depth-to-water: 0.02 (saturated lowland) .. 0.20 (arid)
+        let depth = (0.20 - 0.18 * wet).max(0.0);
+        a[i] = s - depth;
+    }
+    a
+}
+
+/// Orchestrator: assemble the full `HydrologyMap` from the existing extraction
+/// products. `rainfall_norm` is per-cell rainfall in `[0,1]` (read from the
+/// finalised `WorldCell.rainfall`). Pure & deterministic.
+pub fn build_hydrology(
+    raw: &[f32],
+    filled: &[f32],
+    dirs: &[u32],
+    rainfall_norm: &[f32],
+) -> HydrologyMap {
+    let n = W * H;
+    let discharge = weighted_discharge(dirs, rainfall_norm);
+    let (reservoirs, rid) = classify_reservoirs(raw, filled, dirs);
+    let aquifer = aquifer_table(filled, rainfall_norm, &rid, &reservoirs);
+    let mut cells = Vec::with_capacity(n);
+    for i in 0..n {
+        cells.push(HydroCell {
+            raw_height: raw[i],
+            filled_height: filled[i],
+            flow_to: dirs[i],
+            discharge: discharge[i],
+            reservoir_id: rid[i],
+            aquifer_level: aquifer[i],
+        });
+    }
+    HydrologyMap { cells, reservoirs }
+}
+
+/// Channel depth (globe height units, sub-z) from discharge. Log-scaled so a
+/// trickle reads ~0.05 and a major river ~0.6.
+pub fn depth_for_discharge(discharge: f32) -> f32 {
+    (0.06 * discharge.max(0.0).ln_1p()).clamp(0.05, 0.6)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Builds the real globe and exercises the hydrology truth invariants
+    // (mirrors the globe.rs integration-style tests; W*H pure arrays).
+    fn real() -> super::super::globe::Globe {
+        super::super::globe::generate_globe(42)
+    }
+
+    #[test]
+    fn discharge_monotone_downstream() {
+        let g = real();
+        let hy = &g.hydrology;
+        assert_eq!(hy.cells.len(), W * H);
+        for (i, c) in hy.cells.iter().enumerate() {
+            let d = c.flow_to as usize;
+            if d != i {
+                assert!(
+                    hy.cells[d].discharge + 1e-3 >= c.discharge,
+                    "discharge dropped downstream at {i}->{d}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn river_levels_monotone_downstream() {
+        let g = real();
+        for e in &g.rivers.edges {
+            assert!(
+                e.to_level <= e.from_level + 1e-4,
+                "river level rose downstream: {} -> {}",
+                e.from_level,
+                e.to_level
+            );
+        }
+    }
+
+    #[test]
+    fn ocean_reservoir_is_salt_sea_level() {
+        let g = real();
+        let ocean = &g.hydrology.reservoirs[0];
+        assert_eq!(ocean.kind, ReservoirKind::Ocean);
+        assert_eq!(ocean.spill_level, 0.0);
+        assert_eq!(ocean.salinity, 1.0);
+    }
+
+    #[test]
+    fn reservoir_cells_share_spill_level() {
+        let g = real();
+        let hy = &g.hydrology;
+        for (i, c) in hy.cells.iter().enumerate() {
+            if let Some(r) = hy.reservoirs.get(c.reservoir_id as usize) {
+                if r.kind != ReservoirKind::Ocean {
+                    let lv = g
+                        .water_level_at((i % W) as i32 * 64, (i / W) as i32 * 64)
+                        .unwrap_or(f32::NAN);
+                    assert!(
+                        (lv - r.spill_level).abs() < 1e-3,
+                        "reservoir member cell level != spill_level"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn endorheic_is_brackish() {
+        let g = real();
+        for r in &g.hydrology.reservoirs {
+            if r.kind == ReservoirKind::Endorheic {
+                assert!(r.salinity > 0.0, "endorheic basin should be brackish");
+            }
+            if r.kind == ReservoirKind::Lake || r.kind == ReservoirKind::Wetland {
+                assert_eq!(r.salinity, 0.0, "open lake/wetland should be fresh");
+            }
+        }
+    }
+
+    #[test]
+    fn aquifer_not_above_filled_surface_on_dry_land() {
+        let g = real();
+        let hy = &g.hydrology;
+        for c in &hy.cells {
+            if c.reservoir_id == u32::MAX {
+                assert!(
+                    c.aquifer_level <= c.filled_height + 1e-4,
+                    "water table above terrain on dry land"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strahler_increments_at_synthetic_confluence() {
+        // Two order-1 tributaries (cells A, B) flow into C; C flows to D.
+        let n = W * H;
+        let mut dirs: Vec<u32> = (0..n as u32).collect(); // all sinks
+        let a = idx(10, 10);
+        let b = idx(12, 10);
+        let c = idx(11, 11);
+        let d = idx(11, 12);
+        dirs[a] = c as u32;
+        dirs[b] = c as u32;
+        dirs[c] = d as u32;
+        let mut accum = vec![0u32; n];
+        accum[a] = 100;
+        accum[b] = 100;
+        accum[c] = 250;
+        accum[d] = 300;
+        let order = strahler_order(&dirs, &accum, 80);
+        assert_eq!(order[a], 1);
+        assert_eq!(order[b], 1);
+        assert_eq!(order[c], 2, "confluence of two order-1 should be order-2");
+        assert_eq!(order[d], 2, "single-parent carry keeps order-2");
+    }
 }

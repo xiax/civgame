@@ -53,9 +53,31 @@ pub struct Chunk {
     /// channel itself). Populated by `generate_chunk_from_globe` while it
     /// stamps river polylines, so no extra spatial walks at query time.
     pub surface_river_distance: Box<[[u8; CHUNK_SIZE]; CHUNK_SIZE]>,
+    /// Solid bed/ground Z at each (lx, ly). Equals `surface_z` for dry tiles;
+    /// for wet columns it sits below the water surface by the column depth.
+    /// `surface_z` keeps its meaning (rendered top = water surface for wet
+    /// tiles); this is the *additive* solid-ground accessor (Phase 2).
+    pub surface_ground_z: Box<[[i8; CHUNK_SIZE]; CHUNK_SIZE]>,
+    /// Water column depth in Z-units (sub-z `f32`). `0.0` = dry.
+    pub surface_water_depth: Box<[[f32; CHUNK_SIZE]; CHUNK_SIZE]>,
+    /// Hydrology reservoir id this column belongs to (`u32::MAX` = none).
+    pub surface_reservoir_id: Box<[[u32; CHUNK_SIZE]; CHUNK_SIZE]>,
     pub entities: Vec<Entity>,
     pub aggregate: ChunkAggregate,
     pub is_active: bool,
+}
+
+/// Lightweight read-only view of a single water column.
+#[derive(Clone, Copy, Debug)]
+pub struct WaterColumn {
+    /// Rendered water-surface Z (== `surface_z`).
+    pub level_z: i32,
+    /// Solid bed Z (== `ground_z`).
+    pub bed_z: i32,
+    /// Depth in Z-units (`0.0` = dry).
+    pub depth: f32,
+    pub kind: TileKind,
+    pub reservoir_id: u32,
 }
 
 impl Chunk {
@@ -76,11 +98,40 @@ impl Chunk {
         )
     }
 
+    /// Back-compat constructor: derives dry water columns (ground == surface,
+    /// depth 0, no reservoir). Used by tests/fixtures and any caller that
+    /// doesn't materialise hydrology.
     pub fn new_with_rivers(
         surface_z: Box<[[i8; CHUNK_SIZE]; CHUNK_SIZE]>,
         surface_kind: Box<[[TileKind; CHUNK_SIZE]; CHUNK_SIZE]>,
         surface_fertility: Box<[[u8; CHUNK_SIZE]; CHUNK_SIZE]>,
         surface_river_distance: Box<[[u8; CHUNK_SIZE]; CHUNK_SIZE]>,
+    ) -> Self {
+        let surface_ground_z = surface_z.clone();
+        let surface_water_depth = Box::new([[0.0f32; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_reservoir_id = Box::new([[u32::MAX; CHUNK_SIZE]; CHUNK_SIZE]);
+        Self::new_hydro(
+            surface_z,
+            surface_kind,
+            surface_fertility,
+            surface_river_distance,
+            surface_ground_z,
+            surface_water_depth,
+            surface_reservoir_id,
+        )
+    }
+
+    /// Full constructor with explicit water-column data (used by
+    /// `generate_chunk_from_globe`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_hydro(
+        surface_z: Box<[[i8; CHUNK_SIZE]; CHUNK_SIZE]>,
+        surface_kind: Box<[[TileKind; CHUNK_SIZE]; CHUNK_SIZE]>,
+        surface_fertility: Box<[[u8; CHUNK_SIZE]; CHUNK_SIZE]>,
+        surface_river_distance: Box<[[u8; CHUNK_SIZE]; CHUNK_SIZE]>,
+        surface_ground_z: Box<[[i8; CHUNK_SIZE]; CHUNK_SIZE]>,
+        surface_water_depth: Box<[[f32; CHUNK_SIZE]; CHUNK_SIZE]>,
+        surface_reservoir_id: Box<[[u32; CHUNK_SIZE]; CHUNK_SIZE]>,
     ) -> Self {
         Self {
             deltas: AHashMap::new(),
@@ -88,6 +139,9 @@ impl Chunk {
             surface_kind,
             surface_fertility,
             surface_river_distance,
+            surface_ground_z,
+            surface_water_depth,
+            surface_reservoir_id,
             entities: Vec::new(),
             aggregate: ChunkAggregate::default(),
             is_active: true,
@@ -188,10 +242,82 @@ impl Chunk {
             self.surface_z[ly][lx] = new_surf.max(Z_MIN) as i8;
             // Surface kind changes too — but without WorldGen we use Air as placeholder.
             self.surface_kind[ly][lx] = TileKind::Air;
+            // A removed surface re-exposes solid ground: keep the dry
+            // invariant (ground == surface, no water column). Runtime water
+            // (Phase 3) overlays via RuntimeWater, not set_delta.
+            self.surface_ground_z[ly][lx] = self.surface_z[ly][lx];
+            self.surface_water_depth[ly][lx] = 0.0;
+            self.surface_reservoir_id[ly][lx] = u32::MAX;
         } else if data.kind != TileKind::Air && z >= cur_surf {
             self.surface_z[ly][lx] = z as i8;
             self.surface_kind[ly][lx] = data.kind;
+            // A built/dug tile is dry land of its own kind.
+            self.surface_ground_z[ly][lx] = z as i8;
+            self.surface_water_depth[ly][lx] = 0.0;
+            self.surface_reservoir_id[ly][lx] = u32::MAX;
         }
+    }
+
+    /// Solid bed Z at (lx, ly). Equals `surface_z` for dry tiles.
+    pub fn ground_z_at(&self, lx: usize, ly: usize) -> i32 {
+        self.surface_ground_z[ly][lx] as i32
+    }
+
+    /// Water column depth in Z-units at (lx, ly). `0.0` = dry.
+    pub fn water_depth_at(&self, lx: usize, ly: usize) -> f32 {
+        self.surface_water_depth[ly][lx]
+    }
+
+    /// Reservoir id at (lx, ly). `u32::MAX` = none.
+    pub fn reservoir_id_at(&self, lx: usize, ly: usize) -> u32 {
+        self.surface_reservoir_id[ly][lx]
+    }
+
+    /// Read-only water-column view at (lx, ly).
+    pub fn water_column_at(&self, lx: usize, ly: usize) -> WaterColumn {
+        WaterColumn {
+            level_z: self.surface_z[ly][lx] as i32,
+            bed_z: self.surface_ground_z[ly][lx] as i32,
+            depth: self.surface_water_depth[ly][lx],
+            kind: self.surface_tile_kind(lx, ly),
+            reservoir_id: self.surface_reservoir_id[ly][lx],
+        }
+    }
+
+    /// Overlay a persistent runtime water column (Phase 3 `RuntimeWater`,
+    /// Phase 5 fluid sim) at (lx, ly): solid bed at `ground_z`, `depth` (> 0)
+    /// Z-units of water on top, rendered surface = `bed + ceil(depth)` —
+    /// mirroring the Phase 2 worldgen stamp (`bed = water_surf - depth.ceil()`)
+    /// so a runtime-flooded column satisfies the same `bed <= surf, depth > 0`
+    /// invariant a worldgen river does. The surface kind flips to `Water`;
+    /// Phase 6 refines fresh/brackish/salt via `water_kind_at` + salinity.
+    /// `depth <= 0` is a no-op (drained cells are removed from `RuntimeWater`,
+    /// never stamped). Returns `true` iff the column actually changed (caller
+    /// emits `TileChangedEvent` only then).
+    pub fn apply_water_column(
+        &mut self,
+        lx: usize,
+        ly: usize,
+        ground_z: i8,
+        depth: f32,
+        reservoir_id: u32,
+    ) -> bool {
+        if depth <= 0.0 {
+            return false;
+        }
+        let bed = (ground_z as i32).clamp(Z_MIN, Z_MAX);
+        let surf = (bed + depth.ceil() as i32).clamp(Z_MIN, Z_MAX);
+        let changed = self.surface_z[ly][lx] as i32 != surf
+            || self.surface_ground_z[ly][lx] as i32 != bed
+            || (self.surface_water_depth[ly][lx] - depth).abs() > 1e-4
+            || self.surface_reservoir_id[ly][lx] != reservoir_id
+            || self.surface_kind[ly][lx] != TileKind::Water;
+        self.surface_z[ly][lx] = surf as i8;
+        self.surface_ground_z[ly][lx] = bed as i8;
+        self.surface_water_depth[ly][lx] = depth;
+        self.surface_reservoir_id[ly][lx] = reservoir_id;
+        self.surface_kind[ly][lx] = TileKind::Water;
+        changed
     }
 }
 
@@ -216,6 +342,71 @@ impl ChunkMap {
             .get(&coord)
             .map(|c| c.surface_z[ly][lx] as i32)
             .unwrap_or(Z_MIN - 1)
+    }
+
+    /// Solid bed/ground Z at world tile (tx, ty). Equals `surface_z_at` for
+    /// dry tiles; for wet columns it returns the bed below the water surface.
+    /// Returns `Z_MIN - 1` if the chunk is not loaded. Use this (not
+    /// `surface_z_at`) wherever solid terrain elevation is compared — see the
+    /// Phase 0 audit list in `src/world/CLAUDE.md`.
+    pub fn ground_z_at(&self, tile_x: i32, tile_y: i32) -> i32 {
+        let (coord, lx, ly) = Self::coord_and_local(tile_x, tile_y);
+        self.0
+            .get(&coord)
+            .map(|c| c.surface_ground_z[ly][lx] as i32)
+            .unwrap_or(Z_MIN - 1)
+    }
+
+    /// Water column depth (Z-units, sub-z) at (tx, ty). `0.0` = dry / unloaded.
+    pub fn water_depth_at(&self, tile_x: i32, tile_y: i32) -> f32 {
+        let (coord, lx, ly) = Self::coord_and_local(tile_x, tile_y);
+        self.0
+            .get(&coord)
+            .map(|c| c.surface_water_depth[ly][lx])
+            .unwrap_or(0.0)
+    }
+
+    /// Water-surface Z at (tx, ty) if the column is wet, else `None`.
+    pub fn water_level_at(&self, tile_x: i32, tile_y: i32) -> Option<f32> {
+        let (coord, lx, ly) = Self::coord_and_local(tile_x, tile_y);
+        let c = self.0.get(&coord)?;
+        if c.surface_water_depth[ly][lx] > 0.0 {
+            Some(c.surface_z[ly][lx] as f32)
+        } else {
+            None
+        }
+    }
+
+    /// Reservoir id at (tx, ty). `u32::MAX` = none / unloaded.
+    pub fn reservoir_id_at(&self, tile_x: i32, tile_y: i32) -> u32 {
+        let (coord, lx, ly) = Self::coord_and_local(tile_x, tile_y);
+        self.0
+            .get(&coord)
+            .map(|c| c.surface_reservoir_id[ly][lx])
+            .unwrap_or(u32::MAX)
+    }
+
+    /// Read-only water-column view at (tx, ty), if the chunk is loaded.
+    pub fn water_column_at(&self, tile_x: i32, tile_y: i32) -> Option<WaterColumn> {
+        let (coord, lx, ly) = Self::coord_and_local(tile_x, tile_y);
+        self.0.get(&coord).map(|c| c.water_column_at(lx, ly))
+    }
+
+    /// World-tile wrapper over `Chunk::apply_water_column` (Phase 3 restamp,
+    /// Phase 5 fluid sim). Returns `false` (no-op) if the chunk isn't loaded.
+    pub fn apply_water_column(
+        &mut self,
+        tile_x: i32,
+        tile_y: i32,
+        ground_z: i8,
+        depth: f32,
+        reservoir_id: u32,
+    ) -> bool {
+        let (coord, lx, ly) = Self::coord_and_local(tile_x, tile_y);
+        self.0
+            .get_mut(&coord)
+            .map(|c| c.apply_water_column(lx, ly, ground_z, depth, reservoir_id))
+            .unwrap_or(false)
     }
 
     /// Surface tile kind at (tx, ty). Returns None if chunk not loaded.
@@ -536,5 +727,60 @@ mod tests {
             },
         );
         assert_eq!(map.surface_z_at(5, 5), 6);
+    }
+
+    // --- Phase 3: persistent runtime water column overlay ---
+
+    #[test]
+    fn apply_water_column_overlays_wet_column() {
+        // Dry Grass chunk at z=2; flood it 3 Z-units deep (a dam pool).
+        let mut chunk = make_chunk(2);
+        assert!(chunk.apply_water_column(5, 3, 2, 3.0, 7));
+
+        // surface = bed + ceil(depth); the Phase 2 worldgen invariant.
+        assert_eq!(chunk.surface_z[3][5] as i32, 5);
+        assert_eq!(chunk.ground_z_at(5, 3), 2);
+        assert_eq!(chunk.water_depth_at(5, 3), 3.0);
+        assert_eq!(chunk.reservoir_id_at(5, 3), 7);
+        assert_eq!(chunk.surface_tile_kind(5, 3), TileKind::Water);
+
+        let col = chunk.water_column_at(5, 3);
+        assert!(col.bed_z <= col.level_z, "wet bed above surface");
+        assert!(col.depth > 0.0);
+        assert_eq!(col.kind, TileKind::Water);
+        assert_eq!(col.reservoir_id, 7);
+    }
+
+    #[test]
+    fn apply_water_column_idempotent() {
+        let mut chunk = make_chunk(2);
+        assert!(chunk.apply_water_column(5, 3, 2, 3.0, 7));
+        // Re-applying identical state reports no change → caller skips the
+        // TileChangedEvent (sleeping cells stay cheap on every restamp).
+        assert!(!chunk.apply_water_column(5, 3, 2, 3.0, 7));
+        // A real change (deeper pool) re-reports.
+        assert!(chunk.apply_water_column(5, 3, 2, 4.0, 7));
+    }
+
+    #[test]
+    fn apply_water_column_zero_depth_is_noop() {
+        // Drained cells are *removed* from RuntimeWater, never stamped with
+        // depth 0 — apply must leave the dry terrain untouched.
+        let mut chunk = make_chunk(2);
+        assert!(!chunk.apply_water_column(5, 3, 2, 0.0, 7));
+        assert_eq!(chunk.surface_tile_kind(5, 3), TileKind::Grass);
+        assert_eq!(chunk.water_depth_at(5, 3), 0.0);
+        assert_eq!(chunk.reservoir_id_at(5, 3), u32::MAX);
+    }
+
+    #[test]
+    fn apply_water_column_via_chunkmap_and_unloaded() {
+        let mut map = make_map_with_chunk(2);
+        assert!(map.apply_water_column(5, 3, 2, 2.5, 4));
+        assert_eq!(map.water_depth_at(5, 3), 2.5);
+        assert_eq!(map.surface_z_at(5, 3), 2 + 3); // ceil(2.5) = 3
+        assert_eq!(map.ground_z_at(5, 3), 2);
+        // Unloaded chunk: no-op, no panic.
+        assert!(!map.apply_water_column(9999, 9999, 0, 1.0, 0));
     }
 }

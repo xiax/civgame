@@ -115,6 +115,13 @@ pub struct MonumentMap(pub AHashMap<(i32, i32), Entity>);
 #[derive(Resource, Default)]
 pub struct BridgeMap(pub AHashMap<(i32, i32), Entity>);
 
+/// Maps tile positions to dam entities placed there. Mirrors `BridgeMap`:
+/// the `Dam` entity is the durable truth (faction-owned, refundable,
+/// restamped onto fresh chunks by `restamp_runtime_water_on_chunk_load`);
+/// `TileKind::Dam` is its cache projection. One Dam per cell.
+#[derive(Resource, Default)]
+pub struct DamMap(pub AHashMap<(i32, i32), Entity>);
+
 /// Maps tile positions to well entities placed there. Read by the drink
 /// HTN dispatcher (`htn_drink_dispatch_system`) for the well-priority scan,
 /// and by `organic_settlement` for placement scoring + anchor emission.
@@ -138,6 +145,22 @@ pub struct Bridge {
     pub faction_id: u32,
     pub tile: (i32, i32),
     pub restore_tile: TileKind,
+}
+
+/// Constructed dam barrier. Mirrors `Bridge`: the tile slot is mutated to
+/// `TileKind::Dam` at finalize and a hydrology barrier is registered in
+/// `RuntimeWater` at the crest (`crest_z`). On deconstruct we restore
+/// `restore_tile` and clear the barrier so the impounded water drains.
+/// The entity is the durable truth — the chunk's `Dam` tile is restamped
+/// from `DamMap` on every reload.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Dam {
+    pub faction_id: u32,
+    pub tile: (i32, i32),
+    pub restore_tile: TileKind,
+    /// Crest height in Z (the dam tile's surface Z). The fluid sim treats
+    /// the cell as a wall below this level — water pools upstream to it.
+    pub crest_z: i8,
 }
 
 /// Display name for any constructed entity (Wall, Bed, Door, Blueprint, …).
@@ -198,7 +221,12 @@ pub struct FurnitureMaps<'w> {
     pub barracks_map: ResMut<'w, BarracksMap>,
     pub monument_map: ResMut<'w, MonumentMap>,
     pub bridge_map: ResMut<'w, BridgeMap>,
+    pub dam_map: ResMut<'w, DamMap>,
     pub well_map: ResMut<'w, WellMap>,
+    /// Persistent runtime water (Phase 3). Dam finalize registers its crest
+    /// barrier here; deconstruct clears it. Bundled to stay under the
+    /// 16-param system cap.
+    pub runtime_water: ResMut<'w, crate::world::water_runtime::RuntimeWater>,
 }
 
 /// Bed construction tier. Tracks how the bed was built so the upgrade pipeline
@@ -490,6 +518,13 @@ pub enum BuildSiteKind {
     /// the original `River` tile via the `Bridge` component's
     /// `restore_tile`. Tech-gated on `BRIDGE_BUILDING` (Chalcolithic).
     Bridge,
+    /// Dam barrier across a single watercourse (`River`/`Water`) tile.
+    /// Finalisation rewrites the tile to `TileKind::Dam` and registers a
+    /// hydrology barrier in `RuntimeWater` at the crest; deconstruction
+    /// restores the prior tile via `Dam::restore_tile` and clears the
+    /// barrier (impounded water drains). Tech-gated on `BRIDGE_BUILDING`
+    /// (v1 reuses it; a dedicated `DAM_BUILDING` tech is v2).
+    Dam,
     /// Lined public well. 1-tile, impassable — agents drink from a
     /// chebyshev-adjacent tile via `DrinkSource::Well`. Tech-gated on
     /// `WELL_DIGGING` (Neolithic). No tile rewrite on finalize/deconstruct.
@@ -540,6 +575,7 @@ impl BuildSiteKind {
             BuildSiteKind::Yurt => "Yurt",
             BuildSiteKind::Latrine => "Latrine",
             BuildSiteKind::Bridge => "Bridge",
+            BuildSiteKind::Dam => "Dam",
             BuildSiteKind::Well => "Well",
         }
     }
@@ -549,7 +585,7 @@ impl BuildSiteKind {
     /// `Bridge`. Used by `is_clear_footprint`-style checks to bypass the
     /// passability gate, and by `work_stand_for` to route gather/build legs.
     pub fn is_water_anchored(self) -> bool {
-        matches!(self, BuildSiteKind::Bridge)
+        matches!(self, BuildSiteKind::Bridge | BuildSiteKind::Dam)
     }
 }
 
@@ -791,6 +827,8 @@ enum BuildRecipeIdx {
     Latrine,
     Bridge,
     Well,
+    // Appended last so existing discriminants (= vec positions) stay stable.
+    Dam,
 }
 
 fn build_recipes_table() -> Vec<BuildRecipe> {
@@ -982,6 +1020,18 @@ fn build_recipes_table() -> Vec<BuildRecipe> {
             work_ticks: 120,
             tech_gate: Some(WELL_DIGGING),
             deconstruct_refund: vec![(stone, 2), (wood, 1)],
+        },
+        // Dam barrier. Heavier than a bridge — it holds back water, not
+        // foot traffic — so more stone + longer work. v1 reuses
+        // `BRIDGE_BUILDING` (a dedicated `DAM_BUILDING` tech is v2).
+        // Player-deconstruct returns half; drop site is the nearest
+        // passable bank (same as Bridge — see deconstruct path).
+        BuildRecipe {
+            name: "Dam",
+            inputs: vec![(stone, 6), (wood, 4)],
+            work_ticks: 180,
+            tech_gate: Some(BRIDGE_BUILDING),
+            deconstruct_refund: vec![(stone, 3), (wood, 2)],
         },
     ]
 }
@@ -1779,6 +1829,7 @@ pub fn recipe_for(kind: BuildSiteKind) -> &'static BuildRecipe {
         BuildSiteKind::Monument => BuildRecipeIdx::Monument,
         BuildSiteKind::Latrine => BuildRecipeIdx::Latrine,
         BuildSiteKind::Bridge => BuildRecipeIdx::Bridge,
+        BuildSiteKind::Dam => BuildRecipeIdx::Dam,
         BuildSiteKind::Well => BuildRecipeIdx::Well,
     };
     &build_recipes()[idx as usize]
@@ -1851,14 +1902,15 @@ pub fn work_stand_for_bridge(
 /// Count how many of the 4 cardinal directions have a wall (or higher-z terrain)
 /// within 3 tiles. Score range: 0–4.
 pub fn enclosure_score(chunk_map: &ChunkMap, tx: i32, ty: i32) -> u8 {
-    let agent_z = chunk_map.surface_z_at(tx, ty);
+    // Enclosure compares solid terrain heights (cliffs/walls), not water.
+    let agent_z = chunk_map.ground_z_at(tx, ty);
     let mut score = 0u8;
     for (dx, dy) in [(-1i32, 0), (1, 0), (0, -1i32), (0, 1)] {
         for step in 1..=3i32 {
             let nx = tx + dx * step;
             let ny = ty + dy * step;
             let kind_wall = chunk_map.tile_kind_at(nx, ny) == Some(TileKind::Wall);
-            let z_higher = chunk_map.surface_z_at(nx, ny) > agent_z;
+            let z_higher = chunk_map.ground_z_at(nx, ny) > agent_z;
             if kind_wall || z_higher {
                 score += 1;
                 break;
@@ -2422,7 +2474,8 @@ fn footprint_z_stats(chunk_map: &ChunkMap, cx: i32, cy: i32, half_w: i32, half_h
     let mut max_z = i32::MIN;
     for dy in -half_h..=half_h {
         for dx in -half_w..=half_w {
-            let z = chunk_map.surface_z_at(cx + dx, cy + dy);
+            // Parcel flatness = solid-ground spread (bed, not water surface).
+            let z = chunk_map.ground_z_at(cx + dx, cy + dy);
             sum += z;
             count += 1;
             min_z = min_z.min(z);
@@ -6275,6 +6328,46 @@ pub fn construction_system(
                     maps.bridge_map.0.insert(tile, bridge_entity);
                     bridge_entity
                 }
+                BuildSiteKind::Dam => {
+                    // Tile-replacing finalize, mirroring Bridge. The `Dam`
+                    // entity is the durable truth; `TileKind::Dam` is its
+                    // cache projection (restamped from `DamMap` on reload by
+                    // `restamp_runtime_water_on_chunk_load`). The crest
+                    // barrier is registered in `RuntimeWater` so the Phase 5
+                    // fluid sim pools water upstream to it.
+                    let prior = chunk_map.tile_kind_at(tx, ty).unwrap_or(TileKind::River);
+                    let crest_z = bp.target_z;
+                    chunk_map.set_tile(
+                        tx,
+                        ty,
+                        crest_z as i32,
+                        TileData {
+                            kind: TileKind::Dam,
+                            elevation: 0,
+                            fertility: 0,
+                            flags: 0b0001,
+                            ore: 0,
+                        },
+                    );
+                    maps.runtime_water.register_dam(tile, crest_z);
+                    let dam_entity = commands
+                        .spawn((
+                            Dam {
+                                faction_id: bp.faction_id,
+                                tile,
+                                restore_tile: prior,
+                                crest_z,
+                            },
+                            StructureLabel(BuildSiteKind::Dam.label()),
+                            Transform::from_xyz(world_pos.x, world_pos.y, 0.30),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        ))
+                        .id();
+                    maps.dam_map.0.insert(tile, dam_entity);
+                    dam_entity
+                }
                 BuildSiteKind::Well => {
                     let well_entity = commands
                         .spawn((
@@ -6837,6 +6930,7 @@ pub fn deconstruct_system(
     person_home_query: Query<(Entity, &HomeBed)>,
     wall_query: Query<&Wall>,
     bridge_query: Query<&Bridge>,
+    dam_query: Query<&Dam>,
     storage_tile_map: Res<StorageTileMap>,
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
@@ -6889,6 +6983,8 @@ pub fn deconstruct_system(
             removed = Some((e, BuildSiteKind::Monument, false));
         } else if let Some(e) = maps.bridge_map.0.remove(&tile) {
             removed = Some((e, BuildSiteKind::Bridge, false));
+        } else if let Some(e) = maps.dam_map.0.remove(&tile) {
+            removed = Some((e, BuildSiteKind::Dam, false));
         } else if let Some(e) = maps.well_map.0.remove(&tile) {
             removed = Some((e, BuildSiteKind::Well, false));
         } else if let Some(e) = maps.wall_map.0.remove(&tile) {
@@ -6930,14 +7026,29 @@ pub fn deconstruct_system(
             continue;
         };
 
-        // Bridge restores the prior River tile; drop site is the nearest
-        // passable bank tile (refunds dropped at the now-River cell would
-        // be unrecoverable since the tile is impassable again).
-        let bridge_refund_tile: Option<(i32, i32)> = if matches!(kind, BuildSiteKind::Bridge) {
-            let restore = bridge_query
-                .get(target_entity)
-                .map(|b| b.restore_tile)
-                .unwrap_or(TileKind::River);
+        // Water-anchored structures (Bridge, Dam) restore the prior water
+        // tile; the drop site is the nearest passable bank tile (refunds
+        // dropped at the now-impassable water cell would be unrecoverable).
+        // Dam additionally clears its `RuntimeWater` crest barrier so the
+        // impounded water drains on the next Phase 5 solve.
+        let water_anchored_refund_tile: Option<(i32, i32)> = if matches!(
+            kind,
+            BuildSiteKind::Bridge | BuildSiteKind::Dam
+        ) {
+            let restore = match kind {
+                BuildSiteKind::Bridge => bridge_query
+                    .get(target_entity)
+                    .map(|b| b.restore_tile)
+                    .unwrap_or(TileKind::River),
+                BuildSiteKind::Dam => {
+                    maps.runtime_water.clear_dam(tile);
+                    dam_query
+                        .get(target_entity)
+                        .map(|d| d.restore_tile)
+                        .unwrap_or(TileKind::River)
+                }
+                _ => unreachable!(),
+            };
             let surf_z = chunk_map.surface_z_at(tile.0 as i32, tile.1 as i32);
             chunk_map.set_tile(
                 tile.0 as i32,
@@ -6996,7 +7107,8 @@ pub fn deconstruct_system(
                     0
                 };
                 if after_inv > 0 {
-                    let (dx, dy) = bridge_refund_tile.unwrap_or((tile.0 as i32, tile.1 as i32));
+                    let (dx, dy) =
+                        water_anchored_refund_tile.unwrap_or((tile.0 as i32, tile.1 as i32));
                     let pos = tile_to_world(dx, dy);
                     commands.spawn((
                         crate::simulation::items::GroundItem {

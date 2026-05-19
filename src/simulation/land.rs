@@ -449,6 +449,9 @@ fn sample_terrain_factor(
     let mut sum: u32 = 0;
     let mut count: u32 = 0;
     for (x, y) in samples {
+        // Rendered surface: `z` feeds `tile_at_3d` to sample kind/fertility,
+        // so a wet tile must read the water surface (low plot value), not the
+        // dry bed beneath it. Stays on `surface_z_at` (TOP_SURFACE).
         let z = chunk_map.surface_z_at(x, y);
         if z < Z_MIN {
             continue;

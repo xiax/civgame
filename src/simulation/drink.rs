@@ -33,10 +33,10 @@ use crate::simulation::person::{AiState, Drafted, PersonAI, UNEMPLOYED_TASK_KIND
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::typed_task::{ActionQueue, DrinkSource, Task};
-use crate::world::biome::{water_kind_at, WaterKind};
+use crate::world::biome::water_kind_at;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::globe::Globe;
-use crate::world::terrain::TILE_SIZE;
+use crate::world::terrain::{GLOBE_H_TO_Z, TILE_SIZE};
 use crate::world::tile::TileKind;
 
 /// Game-ticks an agent stays in `Working` before the drink completes.
@@ -68,6 +68,7 @@ pub fn perform_drink(
     agent_tile: (i32, i32),
     chunk_map: &ChunkMap,
     well_map: &WellMap,
+    globe: &Globe,
 ) -> DrinkOutcome {
     match source {
         DrinkSource::Inventory => {
@@ -117,6 +118,12 @@ pub fn perform_drink(
             {
                 return DrinkOutcome::SourceGone;
             }
+            // The shaft must still reach the water table. A well over a
+            // deep/arid aquifer reads dry — graceful fail, the agent
+            // re-plans (and the dispatcher already prefers wet wells).
+            if !well_has_water(globe, chunk_map, tile) {
+                return DrinkOutcome::WellDry;
+            }
             // Well water is treated as clean; `SanitationMap` may still
             // mark it contaminated, handled by the caller.
             needs.thirst = (needs.thirst - DRINK_THIRST_REDUCTION).max(0.0);
@@ -134,6 +141,11 @@ pub enum DrinkOutcome {
     Drank { raw: bool },
     /// Source resource / tile no longer valid; caller should `aq.cancel()`.
     SourceGone,
+    /// The well's shaft doesn't reach the water table (arid / deep aquifer).
+    /// Graceful: caller cancels the chain (no thirst reduction) so the agent
+    /// re-plans to another source next dispatch — same handling as
+    /// `SourceGone`, but distinct for clarity/telemetry.
+    WellDry,
 }
 
 /// Radius in chebyshev tiles for the local fresh-water scan. Anchored to
@@ -165,8 +177,8 @@ pub fn nearest_fresh_drinkable_tile(
                 if !kind.is_drinkable_candidate() {
                     continue;
                 }
-                if matches!(water_kind_at(globe, kind, tile.0, tile.1), WaterKind::Salt) {
-                    continue;
+                if !water_kind_at(globe, kind, tile.0, tile.1).is_drinkable() {
+                    continue; // skip Salt and Brackish
                 }
                 return Some(tile);
             }
@@ -183,6 +195,7 @@ pub fn drink_task_system(
     chunk_map: Res<ChunkMap>,
     sanitation: Res<crate::simulation::sanitation::SanitationMap>,
     well_map: Res<WellMap>,
+    globe: Res<Globe>,
     mut commands: Commands,
     mut query: Query<(
         Entity,
@@ -252,12 +265,16 @@ pub fn drink_task_system(
                 agent_tile,
                 &chunk_map,
                 &well_map,
+                &globe,
             ) {
                 DrinkOutcome::Drank { raw } => {
                     sips += 1;
                     last_drank_raw = Some(raw);
                 }
-                DrinkOutcome::SourceGone => break,
+                // Both terminate the sip loop without quenching; the typed
+                // task then cancels and the agent re-plans (river fallback /
+                // another well) on the next dispatch.
+                DrinkOutcome::SourceGone | DrinkOutcome::WellDry => break,
             }
         }
 
@@ -387,7 +404,9 @@ pub fn htn_drink_dispatch_system(
             // `task_interacts_from_adjacent`, so passing the well tile here
             // lands the agent chebyshev-1 off it on the routing layer's
             // pick.
-            if let Some(well_tile) = nearest_well_tile(&well_map, (cur_tx, cur_ty), scan) {
+            if let Some(well_tile) =
+                nearest_well_tile(&well_map, &globe, &chunk_map, (cur_tx, cur_ty), scan)
+            {
                 let routed = assign_task_with_routing(
                     &mut ai,
                     (cur_tx, cur_ty),
@@ -441,10 +460,48 @@ pub fn htn_drink_dispatch_system(
     );
 }
 
-/// Chebyshev-nearest well tile within `max_radius`. The routing layer
-/// (`assign_task_with_routing`) handles adjacency selection because
-/// `task_interacts_from_adjacent(TaskKind::Drink)` is true.
-fn nearest_well_tile(well_map: &WellMap, from: (i32, i32), max_radius: i32) -> Option<(i32, i32)> {
+/// A hand-dug well reaches this many Z-levels below the terrain surface
+/// (≈6 m at 1.5 m/tile). The well yields water only when the local water
+/// table (`HydroCell.aquifer_level`) sits within the dug shaft — a real
+/// physical-reachability condition, not an arbitrary gate.
+const WELL_REACH_Z: f32 = 4.0;
+
+/// True iff a well at `tile` reaches the water table: the aquifer surface
+/// (`HydroCell.aquifer_level` → Z via the single `GLOBE_H_TO_Z` factor) is
+/// at or above the well-shaft bottom (`surface_z − WELL_REACH_Z`). A well
+/// over a deep/arid water table reads dry. Falls back to "has water" when
+/// the chunk/hydrology isn't resolvable (don't strand agents on a missing
+/// cache read — the river fallback still applies downstream).
+pub fn well_has_water(globe: &Globe, chunk_map: &ChunkMap, tile: (i32, i32)) -> bool {
+    let surf = chunk_map.surface_z_at(tile.0, tile.1);
+    if surf < crate::world::chunk::Z_MIN {
+        return true; // chunk not loaded — defer to other drink methods
+    }
+    let Some(hc) = globe.hydro_cell_at(tile.0, tile.1) else {
+        return true;
+    };
+    well_reaches(surf, hc.aquifer_level * GLOBE_H_TO_Z)
+}
+
+/// Pure shaft-vs-watertable test: the well bottom is `WELL_REACH_Z` below
+/// the surface; it yields water iff the aquifer surface is at or above it.
+#[inline]
+pub fn well_reaches(surface_z: i32, aquifer_z: f32) -> bool {
+    aquifer_z >= surface_z as f32 - WELL_REACH_Z
+}
+
+/// Chebyshev-nearest **water-bearing** well tile within `max_radius`. Dry
+/// wells (aquifer below the shaft) are skipped so agents don't fixate on a
+/// well that can't quench them — they fall through to the river method, and
+/// a settlement whose wells are all dry reads as "fresh water far",
+/// which already drives `SettlementPressureKind::WaterAccess`.
+fn nearest_well_tile(
+    well_map: &WellMap,
+    globe: &Globe,
+    chunk_map: &ChunkMap,
+    from: (i32, i32),
+    max_radius: i32,
+) -> Option<(i32, i32)> {
     let mut best: Option<((i32, i32), i32)> = None;
     for &well_tile in well_map.0.keys() {
         let d = (well_tile.0 - from.0)
@@ -453,9 +510,35 @@ fn nearest_well_tile(well_map: &WellMap, from: (i32, i32), max_radius: i32) -> O
         if d > max_radius {
             continue;
         }
+        if !well_has_water(globe, chunk_map, well_tile) {
+            continue;
+        }
         if best.map(|(_, bd)| d < bd).unwrap_or(true) {
             best = Some((well_tile, d));
         }
     }
     best.map(|(t, _)| t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn well_reaches_water_table_within_shaft() {
+        // Surface Z 10, shaft bottom = 10 - 4 = 6.
+        assert!(well_reaches(10, 8.0), "high water table → wet well");
+        assert!(well_reaches(10, 6.0), "table exactly at shaft bottom → wet");
+        assert!(!well_reaches(10, 5.0), "table below shaft → dry well");
+        // Arid: deep negative water table is unreachable.
+        assert!(!well_reaches(0, -10.0), "deep arid aquifer → dry");
+        assert!(well_reaches(0, 0.0), "table at surface → wet");
+    }
+
+    #[test]
+    fn well_dry_is_distinct_graceful_outcome() {
+        // Distinct from SourceGone for telemetry, but the caller treats
+        // both as a non-quenching break (no thirst reduction).
+        assert_ne!(DrinkOutcome::WellDry, DrinkOutcome::SourceGone);
+    }
 }

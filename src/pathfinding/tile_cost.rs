@@ -6,7 +6,7 @@ pub const FURNITURE_SPEED_FACTOR: f32 = 0.5;
 pub fn tile_speed_multiplier(kind: TileKind) -> f32 {
     match kind {
         TileKind::Grass | TileKind::Stone | TileKind::Ramp => 1.0,
-        TileKind::Road | TileKind::Bridge => 1.4,
+        TileKind::Road | TileKind::Bridge | TileKind::Dam => 1.4,
         TileKind::Forest => 0.7,
         TileKind::Dirt => 0.9,
         // New climate surfaces

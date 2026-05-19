@@ -125,6 +125,11 @@ impl TestSim {
         app.insert_resource(crate::world::seasons::Calendar::default());
         app.insert_resource(crate::world::terrain::WorldGen::new());
         app.insert_resource(crate::world::chunk_streaming::ChunkRetention::default());
+        // Phase 3 persistent water. The WorldPlugin restamp system is
+        // Playing-gated (never runs in-fixture), but `FurnitureMaps` —
+        // used by construction/deconstruct — bundles `RuntimeWater`, so
+        // the resource must exist.
+        app.insert_resource(crate::world::water_runtime::RuntimeWater::default());
         app.add_event::<crate::world::chunk_streaming::TileChangedEvent>();
         app.add_event::<crate::world::chunk_streaming::ChunkLoadedEvent>();
         app.add_event::<crate::world::chunk_streaming::ChunkUnloadedEvent>();

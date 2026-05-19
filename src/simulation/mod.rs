@@ -190,6 +190,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::BarracksMap::default())
             .insert_resource(construction::MonumentMap::default())
             .insert_resource(construction::BridgeMap::default())
+            .insert_resource(construction::DamMap::default())
             .insert_resource(construction::WellMap::default())
             .insert_resource(construction::StructureIndex::default())
             .insert_resource(construction::BlueprintMap::default())

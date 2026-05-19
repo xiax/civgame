@@ -42,6 +42,15 @@ pub enum TileKind {
     /// spawn (`is_soil_like`), pathing speed 0.9, and is protected from road
     /// carving (`tile_is_farm_protected`).
     Cropland = 24,
+    /// Constructed dam barrier across a watercourse. The durable truth is the
+    /// `Dam` entity in `DamMap`; this kind is its cache projection for the
+    /// tile-kind-driven pathing/render hot paths (see `BuildSiteKind::Dam`).
+    /// Crest is walkable at road-speed (a dam carries a road), but unlike
+    /// `Bridge` the water is *blocked*, not flowing under: `is_water_like` /
+    /// `is_freshwater` / `is_drinkable_candidate` are all false (the impounded
+    /// reservoir is upstream, registered as a barrier in `RuntimeWater`).
+    /// Restores to the prior tile on deconstruct (stamped on `Dam`).
+    Dam = 25,
 }
 
 impl TileKind {
@@ -347,6 +356,23 @@ mod tests {
         assert!(k.is_water_like(), "bridge should report water below");
         assert!(k.is_freshwater(), "river still flows under a bridge");
         assert!(k.is_drinkable_candidate());
+        assert!(!k.is_solid());
+        assert!(!k.is_opaque());
+        assert!(!k.is_stone_like());
+        assert!(!k.is_soil_like());
+    }
+
+    #[test]
+    fn dam_is_passable_floor_but_not_waterlike() {
+        // A dam crest is walkable (road on top), but unlike a bridge it
+        // *blocks* the water — the cell itself carries no drinkable water
+        // (the impounded reservoir is upstream, tracked in RuntimeWater).
+        let k = TileKind::Dam;
+        assert!(k.is_passable());
+        assert!(k.is_floor());
+        assert!(!k.is_water_like(), "dam blocks water, not water-like");
+        assert!(!k.is_freshwater());
+        assert!(!k.is_drinkable_candidate());
         assert!(!k.is_solid());
         assert!(!k.is_opaque());
         assert!(!k.is_stone_like());

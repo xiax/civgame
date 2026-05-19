@@ -2174,11 +2174,8 @@ pub fn animal_drink_system(
                 if !k.is_drinkable_candidate() {
                     continue;
                 }
-                if matches!(
-                    crate::world::biome::water_kind_at(&globe, k, t.0, t.1),
-                    crate::world::biome::WaterKind::Salt
-                ) {
-                    continue;
+                if !crate::world::biome::water_kind_at(&globe, k, t.0, t.1).is_drinkable() {
+                    continue; // animals reject Salt and Brackish
                 }
                 adj_fresh = Some((t.0, t.1, k));
                 break;

@@ -92,6 +92,7 @@ impl MenuAction {
                 BuildSiteKind::Monument => "Build Monument",
                 BuildSiteKind::Latrine => "Build Latrine",
                 BuildSiteKind::Bridge => "Build Bridge",
+                BuildSiteKind::Dam => "Build Dam",
                 BuildSiteKind::Well => "Build Well",
             },
             MenuAction::DigDown => "Dig Down",
@@ -326,10 +327,21 @@ pub fn right_click_context_menu_system(
                         if matches!(kind, TileKind::Wall | TileKind::Stone) {
                             actions.push(MenuAction::Mine);
                         }
-                        // Bridge build is the only construction option on a
-                        // river tile. Gated on `BRIDGE_BUILDING`.
+                        // Bridge build is offered on a river tile (cross it).
+                        // Gated on `BRIDGE_BUILDING`.
                         if matches!(kind, TileKind::River) && !underground && !already_built {
                             let bk = BuildSiteKind::Bridge;
+                            let unlocked = faction_can_build(bk, &player_techs);
+                            build_options.push((MenuAction::Build(bk), unlocked));
+                        }
+                        // Dam build is offered on any watercourse tile
+                        // (River or Water — impound it). Same tech as
+                        // Bridge in v1 (`BRIDGE_BUILDING`).
+                        if matches!(kind, TileKind::River | TileKind::Water)
+                            && !underground
+                            && !already_built
+                        {
+                            let bk = BuildSiteKind::Dam;
                             let unlocked = faction_can_build(bk, &player_techs);
                             build_options.push((MenuAction::Build(bk), unlocked));
                         }

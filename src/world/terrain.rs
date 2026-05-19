@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use super::biome as biome_mod;
 use super::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_HEIGHT, CHUNK_SIZE, Z_MAX, Z_MIN};
-use super::globe::{Biome, Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
+use super::globe::{Biome, Globe, ReservoirKind, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 use super::tile::{OreKind, TileData, TileKind};
 
 pub const WORLD_CHUNKS_X: i32 = 32;
@@ -498,6 +498,9 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
     let mut surface_z = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
     let mut surface_kind = Box::new([[TileKind::default(); CHUNK_SIZE]; CHUNK_SIZE]);
     let mut surface_river_distance = Box::new([[u8::MAX; CHUNK_SIZE]; CHUNK_SIZE]);
+    let mut surface_ground_z = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
+    let mut surface_water_depth = Box::new([[0.0f32; CHUNK_SIZE]; CHUNK_SIZE]);
+    let mut surface_reservoir_id = Box::new([[u32::MAX; CHUNK_SIZE]; CHUNK_SIZE]);
 
     let chunk_tx0 = coord.0 * CHUNK_SIZE as i32;
     let chunk_ty0 = coord.1 * CHUNK_SIZE as i32;
@@ -521,6 +524,8 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
             let kind = bands.pick(v);
             surface_z[ly][lx] = z as i8;
             surface_kind[ly][lx] = kind;
+            // Dry land: bed == surface (the additive invariant).
+            surface_ground_z[ly][lx] = z as i8;
             v_cache[ly][lx] = v;
             biome_cache[ly][lx] = biome;
         }
@@ -569,6 +574,11 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
             let t1 = lengths[i + 1] / total;
             let w0 = lerp(edge.from_width as f32, edge.to_width as f32, t0);
             let w1 = lerp(edge.from_width as f32, edge.to_width as f32, t1);
+            // Hydrology channel depth (globe units → Z-units), tapered along
+            // the polyline like width. Edges from a v7 cache (no depth) read
+            // 0.0 here and fall back to `MIN_RIVER_DEPTH_Z` in the stamp.
+            let d0 = lerp(edge.from_depth, edge.to_depth, t0) * GLOBE_H_TO_Z;
+            let d1 = lerp(edge.from_depth, edge.to_depth, t1) * GLOBE_H_TO_Z;
             diamond_stamp(
                 ax,
                 ay,
@@ -576,11 +586,17 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
                 by,
                 w0,
                 w1,
+                d0,
+                d1,
+                edge.reservoir_id,
                 chunk_tx0,
                 chunk_ty0,
                 &mut surface_kind,
                 &mut surface_z,
                 &mut surface_river_distance,
+                &mut surface_ground_z,
+                &mut surface_water_depth,
+                &mut surface_reservoir_id,
             );
         }
     }
@@ -632,34 +648,49 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
         }
     }
 
-    // ── Pass 4: lakes stamp on top (overrides river-claimed tiles too) ──
-    for lake in &globe.lakes.lakes {
-        let (cx, cy) = lake.center_tile;
-        let r = lake.radius_tiles as i32;
-        if cx + r < chunk_tx0 || cx - r >= chunk_tx1 || cy + r < chunk_ty0 || cy - r >= chunk_ty1 {
-            continue;
-        }
-        let r2 = r * r;
-        for ly in 0..CHUNK_SIZE {
-            for lx in 0..CHUNK_SIZE {
-                let tx = chunk_tx0 + lx as i32;
-                let ty = chunk_ty0 + ly as i32;
-                let dx = tx - cx;
-                let dy = ty - cy;
-                if dx * dx + dy * dy <= r2 {
-                    surface_kind[ly][lx] = TileKind::Water;
-                    surface_z[ly][lx] = lake.level_z;
-                    surface_fertility[ly][lx] = 0;
-                }
-            }
+    // ── Pass 4: reservoir basin-membership stamp (replaces lake discs) ──
+    // Every wet tile inherits its globe-cell reservoir's equilibrium surface
+    // level + bed. Ocean is left to biome classification (already `Water`
+    // salt); Spring/Dam are runtime-only. Coarse at climate-cell resolution
+    // (~64 tiles) but topologically correct — no arbitrary circles.
+    for ly in 0..CHUNK_SIZE {
+        for lx in 0..CHUNK_SIZE {
+            let tx = chunk_tx0 + lx as i32;
+            let ty = chunk_ty0 + ly as i32;
+            let Some(res) = globe.reservoir_at(tx, ty) else {
+                continue;
+            };
+            let kind = match res.kind {
+                ReservoirKind::Lake | ReservoirKind::Endorheic => TileKind::Water,
+                ReservoirKind::Wetland => TileKind::Marsh,
+                // Ocean handled by biome bands; Spring/Dam are runtime.
+                ReservoirKind::Ocean | ReservoirKind::Spring | ReservoirKind::Dam => continue,
+            };
+            let water_surf =
+                ((res.spill_level * GLOBE_H_TO_Z).round() as i32).clamp(Z_MIN, Z_MAX);
+            let bed = globe
+                .hydro_cell_at(tx, ty)
+                .map(|hc| ((hc.raw_height * GLOBE_H_TO_Z).round() as i32).clamp(Z_MIN, Z_MAX))
+                .unwrap_or(water_surf - 1);
+            let bed = bed.min(water_surf);
+            let depth = ((water_surf - bed) as f32).max(MIN_RIVER_DEPTH_Z);
+            surface_kind[ly][lx] = kind;
+            surface_z[ly][lx] = water_surf as i8;
+            surface_ground_z[ly][lx] = bed as i8;
+            surface_water_depth[ly][lx] = depth;
+            surface_reservoir_id[ly][lx] = res.id;
+            surface_fertility[ly][lx] = 0;
         }
     }
 
-    Chunk::new_with_rivers(
+    Chunk::new_hydro(
         surface_z,
         surface_kind,
         surface_fertility,
         surface_river_distance,
+        surface_ground_z,
+        surface_water_depth,
+        surface_reservoir_id,
     )
 }
 
@@ -792,6 +823,15 @@ fn apply_moisture_boost(
 /// `surface_river_distance` so downstream riparian effects fire without
 /// changing terrain.
 #[allow(clippy::too_many_arguments)]
+/// Minimum river channel depth in Z-units (a half-tile, so even a trickle
+/// reads as a distinct sub-z cut below the water surface).
+const MIN_RIVER_DEPTH_Z: f32 = 0.5;
+/// Globe height units → Z-units (mirrors the legacy `level_z = mean_h * 8`).
+/// `pub` so the Phase 5 water sim converts hydrology truth → Z through the
+/// single source of this factor (no parallel formula).
+pub const GLOBE_H_TO_Z: f32 = 8.0;
+
+#[allow(clippy::too_many_arguments)]
 fn diamond_stamp(
     ax: i32,
     ay: i32,
@@ -799,11 +839,17 @@ fn diamond_stamp(
     by: i32,
     w0: f32,
     w1: f32,
+    d0: f32,
+    d1: f32,
+    edge_reservoir_id: u32,
     chunk_tx0: i32,
     chunk_ty0: i32,
     surface_kind: &mut [[TileKind; CHUNK_SIZE]; CHUNK_SIZE],
     surface_z: &mut [[i8; CHUNK_SIZE]; CHUNK_SIZE],
     surface_river_distance: &mut [[u8; CHUNK_SIZE]; CHUNK_SIZE],
+    surface_ground_z: &mut [[i8; CHUNK_SIZE]; CHUNK_SIZE],
+    surface_water_depth: &mut [[f32; CHUNK_SIZE]; CHUNK_SIZE],
+    surface_reservoir_id: &mut [[u32; CHUNK_SIZE]; CHUNK_SIZE],
 ) {
     let dx_abs = (bx - ax).abs();
     let dy_abs_neg = -(by - ay).abs();
@@ -844,9 +890,18 @@ fn diamond_stamp(
                 // a half_w=0 stamp at least one tile wide.
                 if manhattan <= half_w + 1 {
                     surface_kind[ly as usize][lx as usize] = TileKind::River;
+                    // Water surface stays at the legacy `cur - 1` so nothing
+                    // visually/path-wise moves (water is impassable anyway).
+                    // The *new* data is the solid bed beneath it.
                     let cur = surface_z[ly as usize][lx as usize];
-                    surface_z[ly as usize][lx as usize] = (cur as i32 - 1).max(Z_MIN) as i8;
+                    let water_surf = (cur as i32 - 1).max(Z_MIN);
+                    surface_z[ly as usize][lx as usize] = water_surf as i8;
                     surface_river_distance[ly as usize][lx as usize] = 0;
+                    let depth = lerp(d0, d1, prog).max(MIN_RIVER_DEPTH_Z);
+                    let bed = (water_surf - depth.ceil() as i32).max(Z_MIN);
+                    surface_ground_z[ly as usize][lx as usize] = bed as i8;
+                    surface_water_depth[ly as usize][lx as usize] = depth;
+                    surface_reservoir_id[ly as usize][lx as usize] = edge_reservoir_id;
                     continue;
                 }
 
@@ -958,6 +1013,61 @@ mod tests {
         let g = test_globe();
         let z = surface_height(0, 0, &gen, &g);
         assert!((Z_MIN..=Z_MAX).contains(&z));
+    }
+
+    #[test]
+    fn water_column_invariants_hold() {
+        // Generate the chunk that contains a real river polyline point (so we
+        // deterministically hit wet tiles) plus its 3×3 neighbourhood. Dry
+        // tiles must satisfy the additive invariant (ground == surface,
+        // depth == 0, no reservoir); wet tiles must have a bed at-or-below
+        // the water surface with a real (sub-z) depth.
+        let gen = WorldGen::new();
+        let g = test_globe();
+        let (rtx, rty) = g
+            .rivers
+            .edge_polylines
+            .iter()
+            .flat_map(|p| p.iter().copied())
+            .next()
+            .expect("seed 42 globe has at least one river polyline point");
+        let ccx = rtx.div_euclid(CHUNK_SIZE as i32);
+        let ccy = rty.div_euclid(CHUNK_SIZE as i32);
+        let mut wet_seen = 0;
+        for cy in (ccy - 1)..=(ccy + 1) {
+            for cx in (ccx - 1)..=(ccx + 1) {
+                let c = generate_chunk_from_globe(ChunkCoord(cx, cy), &g, &gen);
+                for ly in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let k = c.surface_kind[ly][lx];
+                        let surf = c.surface_z[ly][lx] as i32;
+                        let bed = c.surface_ground_z[ly][lx] as i32;
+                        let depth = c.surface_water_depth[ly][lx];
+                        let rid = c.surface_reservoir_id[ly][lx];
+                        let wet = matches!(
+                            k,
+                            TileKind::River | TileKind::Water | TileKind::Marsh
+                        ) && depth > 0.0;
+                        if wet {
+                            wet_seen += 1;
+                            assert!(bed <= surf, "wet bed {bed} above surface {surf}");
+                            assert!(
+                                depth >= MIN_RIVER_DEPTH_Z - 1e-4,
+                                "wet depth {depth} below minimum"
+                            );
+                        } else {
+                            assert_eq!(bed, surf, "dry tile bed != surface ({k:?})");
+                            assert_eq!(depth, 0.0, "dry tile has depth ({k:?})");
+                            assert_eq!(rid, u32::MAX, "dry tile has reservoir ({k:?})");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            wet_seen > 0,
+            "river chunk ({ccx},{ccy}) around tile ({rtx},{rty}) had no wet tiles"
+        );
     }
 
     #[test]
