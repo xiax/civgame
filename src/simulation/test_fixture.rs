@@ -5552,6 +5552,148 @@ mod smoke {
             "expected Drink goal to clear once thirst is below trigger"
         );
     }
+
+    fn make_agent_thirsty(sim: &mut TestSim, agent: Entity) {
+        let mut needs = sim.app.world_mut().get_mut::<Needs>(agent).expect("Needs");
+        needs.hunger = 0.0;
+        needs.thirst = crate::simulation::needs::THIRST_SEVERE + 5.0;
+        needs.sleep = 0.0;
+    }
+
+    fn pin_test_chief(sim: &mut TestSim, tile: (i32, i32)) -> Entity {
+        let chief = sim.spawn_person(sim.player_faction_id, tile, |b| {
+            b.goal(AgentGoal::Lead);
+        });
+        sim.app
+            .world_mut()
+            .entity_mut(chief)
+            .insert(crate::simulation::faction::FactionChief);
+        sim.app
+            .world_mut()
+            .resource_mut::<crate::simulation::faction::FactionRegistry>()
+            .factions
+            .get_mut(&sim.player_faction_id)
+            .expect("player faction")
+            .chief_entity = Some(chief);
+        chief
+    }
+
+    fn tick_until_thirst_below_trigger(sim: &mut TestSim, agent: Entity, max_ticks: u32) {
+        for _ in 0..max_ticks {
+            let thirst = sim.app.world().get::<Needs>(agent).unwrap().thirst;
+            if thirst < crate::simulation::needs::THIRST_TRIGGER {
+                return;
+            }
+            sim.tick();
+        }
+
+        let thirst = sim.app.world().get::<Needs>(agent).unwrap().thirst;
+        let ai = person_ai(&sim.app, agent);
+        let task = person_task(&sim.app, agent);
+        assert!(
+            thirst < crate::simulation::needs::THIRST_TRIGGER,
+            "expected drink fallback to quench thirst, got {thirst}; ai={:?} target={:?} dest={:?} task={:?}",
+            ai.state,
+            ai.target_tile,
+            ai.dest_tile,
+            task,
+        );
+    }
+
+    fn spawn_test_well(sim: &mut TestSim, tile: (i32, i32)) {
+        let world_pos = tile_to_world(tile.0, tile.1);
+        let well = sim
+            .app
+            .world_mut()
+            .spawn((
+                crate::simulation::construction::Well {
+                    faction_id: sim.player_faction_id,
+                },
+                Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<crate::simulation::construction::WellMap>()
+            .0
+            .insert(tile, well);
+    }
+
+    fn stamp_surface_tile(sim: &mut TestSim, tile: (i32, i32), kind: TileKind) {
+        {
+            let mut chunk_map = sim.app.world_mut().resource_mut::<ChunkMap>();
+            let z = chunk_map.surface_z_at(tile.0, tile.1);
+            chunk_map.set_tile(
+                tile.0,
+                tile.1,
+                z,
+                crate::world::tile::TileData {
+                    kind,
+                    ..Default::default()
+                },
+            );
+        }
+        let world = sim.app.world_mut();
+        let chunk_map_clone = world.resource::<ChunkMap>().clone();
+        let mut graph = world.resource_mut::<crate::pathfinding::chunk_graph::ChunkGraph>();
+        crate::pathfinding::chunk_graph::rebuild_chunk_graph_sync(&chunk_map_clone, &mut graph);
+    }
+
+    #[test]
+    fn thirsty_worker_far_from_home_drinks_at_home_well() {
+        let mut sim = TestSim::new(0xD12A_0001);
+        sim.flat_world(3, 0, TileKind::Grass);
+        pin_test_chief(&mut sim, (-5, -5));
+        spawn_test_well(&mut sim, (0, 0));
+
+        let agent = sim.spawn_person(sim.player_faction_id, (64, 0), |b| {
+            b.goal(AgentGoal::Drink);
+        });
+        make_agent_thirsty(&mut sim, agent);
+
+        tick_until_thirst_below_trigger(&mut sim, agent, 1_400);
+    }
+
+    #[test]
+    fn thirsty_worker_far_from_home_drinks_at_home_river() {
+        let mut sim = TestSim::new(0xD12A_0002);
+        sim.flat_world(3, 0, TileKind::Grass);
+        pin_test_chief(&mut sim, (-5, -5));
+        stamp_surface_tile(&mut sim, (0, 1), TileKind::River);
+
+        let agent = sim.spawn_person(sim.player_faction_id, (64, 0), |b| {
+            b.goal(AgentGoal::Drink);
+        });
+        make_agent_thirsty(&mut sim, agent);
+
+        tick_until_thirst_below_trigger(&mut sim, agent, 1_400);
+    }
+
+    #[test]
+    fn thirsty_worker_prefers_local_water_over_home_well() {
+        let mut sim = TestSim::new(0xD12A_0003);
+        sim.flat_world(3, 0, TileKind::Grass);
+        pin_test_chief(&mut sim, (-5, -5));
+        spawn_test_well(&mut sim, (0, 0));
+        stamp_surface_tile(&mut sim, (42, 0), TileKind::River);
+
+        let agent = sim.spawn_person(sim.player_faction_id, (40, 0), |b| {
+            b.goal(AgentGoal::Drink);
+        });
+        make_agent_thirsty(&mut sim, agent);
+
+        sim.tick_n(2);
+
+        match person_task(&sim.app, agent) {
+            crate::simulation::typed_task::Task::Drink {
+                source: crate::simulation::typed_task::DrinkSource::Tile { tile },
+            } => assert_eq!(tile, (42, 0), "expected local river to win"),
+            other => panic!("expected local river Drink task, got {other:?}"),
+        }
+    }
 }
 
 /// Behavioural baselines pinned by Phase 0. These fixtures lock in the

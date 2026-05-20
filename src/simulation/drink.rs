@@ -9,6 +9,10 @@
 //!   inland `Water`) via the adjacency-routing path. On arrival, the
 //!   executor verifies the source tile is still water and reduces
 //!   thirst directly without consuming a resource.
+//! - **Home/camp fallback**: if no local source can be routed to, settled
+//!   workers and pitched nomads also scan around their faction home/camp so
+//!   someone who wandered beyond the local radius can still head back to
+//!   reliable water.
 //!
 //! Salt-water tiles never produce a `Drink` dispatch: `DrinkAdjacentFreshTileMethod`
 //! consults `world::biome::water_kind_at` to filter them out.
@@ -25,7 +29,7 @@ use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::carry::Carrier;
 use crate::simulation::construction::WellMap;
-use crate::simulation::faction::FactionMember;
+use crate::simulation::faction::{CampState, FactionMember, FactionRegistry, Lifestyle};
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::{Needs, DRINK_THIRST_REDUCTION, THIRST_SEVERE, THIRST_TRIGGER};
@@ -152,6 +156,16 @@ pub enum DrinkOutcome {
 /// the agent's tile; bigger than camp-radius so a thirsty agent can route
 /// to a near-by stream without globe-wide search.
 pub const DRINK_TILE_SCAN_RADIUS: i32 = 14;
+
+/// Home/camp fallback scan. One chunk is enough to catch seeded wells and
+/// settlement-adjacent rivers without turning Drink into a global water search.
+pub const DRINK_HOME_SCAN_RADIUS: i32 = 32;
+
+#[derive(Clone, Copy)]
+struct DrinkCandidate {
+    source: DrinkSource,
+    target_tile: (i32, i32),
+}
 
 /// Walk a chebyshev ring around `from` and return the closest fresh
 /// (non-salt) drinkable water tile within `max_radius`. Filters out salt
@@ -313,14 +327,15 @@ pub fn drink_task_system(
 
 /// Thirst pipeline dispatcher. Routes any `AgentGoal::Drink + Idle +
 /// UNEMPLOYED` agent into a `Task::Drink`. Tries in-place inventory drink
-/// first, then routes to the nearest fresh-water tile within
-/// `DRINK_TILE_SCAN_RADIUS`. If neither succeeds, agent stays idle and
-/// `goal_update_system` will re-score on its next 200-tick cadence.
+/// first, then routes to ranked water candidates: local wet well, local
+/// fresh water, home/camp wet well, home/camp fresh water. If none can be
+/// routed, the agent stays idle and `goal_update_system` will re-score on
+/// its next 200-tick cadence.
 ///
 /// Phase 2 keeps the dispatcher monolithic (no HTN Method registry walk)
-/// because there are only two viable methods and they don't compete for
-/// scoring nuance. A future phase can lift this into Method entries if
-/// per-method history bias or wage-EV scoring become desirable.
+/// because the drink choices are simple ordered fallbacks rather than
+/// wage-EV work alternatives. A future phase can lift this into Method
+/// entries if per-method history bias becomes desirable.
 pub fn htn_drink_dispatch_system(
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
@@ -328,6 +343,7 @@ pub fn htn_drink_dispatch_system(
     chunk_connectivity: Res<ChunkConnectivity>,
     globe: Res<Globe>,
     well_map: Res<WellMap>,
+    faction_registry: Res<FactionRegistry>,
     mut query: Query<
         (
             &mut PersonAI,
@@ -345,7 +361,7 @@ pub fn htn_drink_dispatch_system(
 ) {
     let clean_water = core_ids::clean_water();
     query.par_iter_mut().for_each(
-        |(mut ai, mut aq, goal, needs, agent, carrier, transform, _member, lod)| {
+        |(mut ai, mut aq, goal, needs, agent, carrier, transform, member, lod)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -397,21 +413,51 @@ pub fn htn_drink_dispatch_system(
                 DRINK_TILE_SCAN_RADIUS
             };
 
-            // Method 2: walk to the nearest well within scan. Wells beat
-            // rivers because the dispatcher checks them first; settlements
-            // with a well don't send their members on a multi-tile hike to
-            // the riverbank for every sip. `TaskKind::Drink` routes via
-            // `task_interacts_from_adjacent`, so passing the well tile here
-            // lands the agent chebyshev-1 off it on the routing layer's
-            // pick.
-            if let Some(well_tile) =
-                nearest_well_tile(&well_map, &globe, &chunk_map, (cur_tx, cur_ty), scan)
+            let local_well =
+                nearest_well_tile(&well_map, &globe, &chunk_map, (cur_tx, cur_ty), scan).map(
+                    |tile| DrinkCandidate {
+                        source: DrinkSource::Well { tile },
+                        target_tile: tile,
+                    },
+                );
+            let local_water =
+                nearest_fresh_drinkable_tile(&chunk_map, &globe, (cur_tx, cur_ty), scan).map(
+                    |tile| DrinkCandidate {
+                        source: DrinkSource::Tile { tile },
+                        target_tile: tile,
+                    },
+                );
+
+            let home_anchor = drink_home_anchor(&faction_registry, member.faction_id);
+            let home_scan = if needs.thirst >= THIRST_SEVERE {
+                DRINK_HOME_SCAN_RADIUS * 2
+            } else {
+                DRINK_HOME_SCAN_RADIUS
+            };
+            let home_well = home_anchor
+                .and_then(|home| nearest_well_tile(&well_map, &globe, &chunk_map, home, home_scan))
+                .map(|tile| DrinkCandidate {
+                    source: DrinkSource::Well { tile },
+                    target_tile: tile,
+                });
+            let home_water = home_anchor
+                .and_then(|home| nearest_fresh_drinkable_tile(&chunk_map, &globe, home, home_scan))
+                .map(|tile| DrinkCandidate {
+                    source: DrinkSource::Tile { tile },
+                    target_tile: tile,
+                });
+
+            // Wells beat rivers locally, then reliable home/camp water is the
+            // escape hatch for workers who got thirsty beyond the local scan.
+            for candidate in [local_well, local_water, home_well, home_water]
+                .into_iter()
+                .flatten()
             {
                 let routed = assign_task_with_routing(
                     &mut ai,
                     (cur_tx, cur_ty),
                     cur_chunk,
-                    well_tile,
+                    candidate.target_tile,
                     TaskKind::Drink,
                     None,
                     &chunk_graph,
@@ -421,43 +467,24 @@ pub fn htn_drink_dispatch_system(
                 );
                 if routed {
                     aq.dispatch(Task::Drink {
-                        source: DrinkSource::Well { tile: well_tile },
+                        source: candidate.source,
                     });
                     return;
                 }
             }
-
-            // Method 3: walk to nearest fresh-water tile.
-            //
-            // Severe-tier thirst widens the scan. Below severe the agent
-            // gives up cleanly when no nearby source is visible; the chief
-            // posting / boiling pipeline (Phase 6) will eventually surface
-            // clean_water in storage.
-            let Some(tile) =
-                nearest_fresh_drinkable_tile(&chunk_map, &globe, (cur_tx, cur_ty), scan)
-            else {
-                return;
-            };
-
-            let routed = assign_task_with_routing(
-                &mut ai,
-                (cur_tx, cur_ty),
-                cur_chunk,
-                tile,
-                TaskKind::Drink,
-                None,
-                &chunk_graph,
-                &chunk_router,
-                &chunk_map,
-                &chunk_connectivity,
-            );
-            if routed {
-                aq.dispatch(Task::Drink {
-                    source: DrinkSource::Tile { tile },
-                });
-            }
         },
     );
+}
+
+fn drink_home_anchor(faction_registry: &FactionRegistry, faction_id: u32) -> Option<(i32, i32)> {
+    let faction = faction_registry.factions.get(&faction_id)?;
+    match faction.lifestyle {
+        Lifestyle::Settled => Some(faction.home_tile),
+        Lifestyle::Nomadic if matches!(faction.camp_state, CampState::Pitched) => {
+            Some(faction.home_tile)
+        }
+        Lifestyle::Nomadic => None,
+    }
 }
 
 /// A hand-dug well reaches this many Z-levels below the terrain surface
@@ -483,8 +510,8 @@ pub fn well_has_water(globe: &Globe, chunk_map: &ChunkMap, tile: (i32, i32)) -> 
     };
     let (elev_u, _, _) = globe.sample_climate(tile.0, tile.1);
     let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
-    let cell_surface_z = crate::world::chunk::Z_MIN as f32
-        + macro_f * crate::world::chunk::CHUNK_HEIGHT as f32;
+    let cell_surface_z =
+        crate::world::chunk::Z_MIN as f32 + macro_f * crate::world::chunk::CHUNK_HEIGHT as f32;
     let aquifer_depth_z = (hc.filled_height - hc.aquifer_level) * GLOBE_H_TO_Z;
     let aquifer_z = cell_surface_z - aquifer_depth_z;
     well_reaches(surf, aquifer_z)
