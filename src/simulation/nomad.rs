@@ -526,9 +526,9 @@ pub fn nomad_survey_completion_system(world: &mut World) {
                     }
                     aq.cancel();
                     ai.state = crate::simulation::person::AiState::Idle;
+                    commands.entity(e).remove::<ScoutAssignment>();
+                    force_reeval.0.insert(e);
                 }
-                commands.entity(e).remove::<ScoutAssignment>();
-                force_reeval.0.insert(e);
             }
         }
         state.apply(world);
@@ -2176,9 +2176,9 @@ pub fn manual_scout_completion_system(world: &mut World) {
                 }
                 aq.cancel();
                 ai.state = crate::simulation::person::AiState::Idle;
+                commands.entity(a.entity).remove::<ScoutAssignment>();
+                force_reeval.0.insert(a.entity);
             }
-            commands.entity(a.entity).remove::<ScoutAssignment>();
-            force_reeval.0.insert(a.entity);
         }
         state.apply(world);
     }
