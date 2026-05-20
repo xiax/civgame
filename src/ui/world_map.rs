@@ -6,10 +6,12 @@ use crate::world::globe::{
     Globe, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH, MEGACHUNK_SIZE_CHUNKS,
 };
 
-/// Pixels per climate cell when rendering the world map. 2× = sub-cell
-/// bilinear biome detail that matches `biome::classify_at_tile`. Bumping
-/// further is purely cosmetic (cell density is the data resolution).
-pub const WORLD_MAP_OVERSAMPLE: u32 = 2;
+/// Pixels per climate cell when rendering the world map. 4× combines with
+/// the surface-biome warp (see `biome::classify_surface_at_tile`) and the
+/// LINEAR-filtered texture upload below so sub-cell biome borders render
+/// organic/feathered at the 10× display scale instead of stair-stepping.
+/// Above 4× is cosmetic — the warp's lattice is the data resolution.
+pub const WORLD_MAP_OVERSAMPLE: u32 = 4;
 
 #[derive(Resource, Default)]
 pub struct WorldMapOpen(pub bool);
@@ -76,7 +78,11 @@ pub fn world_map_system(
         let (pixels, [w, h]) =
             build_globe_image(&globe, true, WORLD_MAP_OVERSAMPLE, view.show_fertility);
         let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
-        let handle = ctx.load_texture("world_map", image, egui::TextureOptions::NEAREST);
+        // LINEAR filtering at 10× display scale lets the surface-biome
+        // warp + oversample-4 buffer read as smooth feathered borders;
+        // 1px grid / river overlays soften slightly (they're already
+        // drawn faintly into the buffer pre-upload).
+        let handle = ctx.load_texture("world_map", image, egui::TextureOptions::LINEAR);
         tex_cache.handle = Some(handle);
         tex_cache.last_explored = explored_count;
         tex_cache.last_show_fertility = view.show_fertility;
@@ -189,7 +195,10 @@ pub fn world_map_system(
                     let mx = mx.clamp(0, mc_grid_w - 1);
                     let my = my.clamp(0, mc_grid_h - 1);
                     let (tx, ty) = MegaChunkCoord::center_tile(mx, my);
-                    let biome = crate::world::biome::classify_at_tile(&globe, tx, ty);
+                    // Surface-biome layer so the tooltip names the biome
+                    // the user sees rendered (canonical `classify_at_tile`
+                    // is reserved for AI / salinity / world-sim).
+                    let biome = crate::world::biome::classify_surface_at_tile(&globe, tx, ty);
                     let fert = average_fertility_in_megachunk(&globe, mx, my);
                     let settled_here = settled.by_megachunk.contains_key(&(mx, my));
                     egui::show_tooltip(
@@ -251,8 +260,9 @@ pub fn world_map_system(
 }
 
 /// Render the globe as an RGBA pixel buffer. `oversample` is pixels per
-/// climate cell (1 = legacy block-colour render, 2+ = bilinear sub-cell
-/// detail matching the in-game `biome::classify_at_tile` field). When
+/// climate cell (1 = legacy block-colour from stored `cell.biome`; 2+ =
+/// per-pixel `biome::classify_surface_at_tile`, the same surface-biome
+/// layer chunk-gen uses, so preview matches generated terrain). When
 /// `respect_fog` is true, unexplored cells render as dark grey
 /// (player-facing in-game map). When `show_fertility` is true, each
 /// mega-chunk is tinted by `average_fertility_in_megachunk` (climate-derived)
@@ -286,12 +296,10 @@ pub fn build_globe_image(
             let rgba = if respect_fog && !cell.explored {
                 [25, 25, 25, 255]
             } else {
-                // Bilinear-classify at oversampled pixel position + sample
-                // the bilinear elevation field for hillshading. The same
-                // climate field as `classify_at_tile`, evaluated at the
-                // pixel's fractional cell location → smooth biome boundaries
-                // that match the actual in-game terrain instead of blocky
-                // per-cell colours.
+                // Surface-biome layer (domain-warped land biomes, true-elev
+                // Ocean/Mountain gates) so preview matches what chunk-gen
+                // would stamp at the same tile. Pure fn of (globe.seed,
+                // tile_x, tile_y) — no `WorldGen` required.
                 let tiles_per_cell =
                     (GLOBE_CELL_CHUNKS * crate::world::chunk::CHUNK_SIZE as i32) as f32;
                 let tile_x = (fx * tiles_per_cell) as i32;
@@ -300,7 +308,7 @@ pub fn build_globe_image(
                 let elev_f = (elev_u / 255.0).clamp(0.0, 1.0);
 
                 let mut c = if oversample > 1 {
-                    crate::world::biome::classify_at_tile(globe, tile_x, tile_y).color()
+                    crate::world::biome::classify_surface_at_tile(globe, tile_x, tile_y).color()
                 } else {
                     cell.biome.color()
                 };
@@ -505,4 +513,46 @@ fn fertility_ramp_color(fert: u8) -> (u8, u8, u8) {
 #[inline]
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::globe::generate_globe;
+
+    #[test]
+    fn world_map_image_dimensions_scale_with_oversample() {
+        let g = generate_globe(42);
+        let (pixels, [w, h]) = build_globe_image(&g, false, WORLD_MAP_OVERSAMPLE, false);
+        assert_eq!(w, (GLOBE_WIDTH as u32 * WORLD_MAP_OVERSAMPLE) as usize);
+        assert_eq!(h, (GLOBE_HEIGHT as u32 * WORLD_MAP_OVERSAMPLE) as usize);
+        assert_eq!(pixels.len(), w * h * 4);
+        // At oversample 4 we expect non-trivial pixel count.
+        assert!(pixels.len() >= 1_000_000);
+    }
+
+    #[test]
+    fn world_map_image_shows_multiple_biome_colors() {
+        // Surface-biome render at oversample > 1 should produce a varied
+        // palette across a globe-sized image. Bucket pixels into RGB
+        // octants and require several distinct buckets — sanity that the
+        // classifier isn't collapsed to a single colour.
+        let g = generate_globe(42);
+        let (pixels, [w, h]) = build_globe_image(&g, false, WORLD_MAP_OVERSAMPLE, false);
+        let mut buckets = std::collections::HashSet::new();
+        // Stride sample so this stays fast.
+        let stride = ((w * h) / 4_000).max(1);
+        for i in (0..(w * h)).step_by(stride) {
+            let idx = i * 4;
+            let r = pixels[idx] / 64;
+            let gg = pixels[idx + 1] / 64;
+            let b = pixels[idx + 2] / 64;
+            buckets.insert((r, gg, b));
+        }
+        assert!(
+            buckets.len() >= 4,
+            "expected several biome colours, got {}",
+            buckets.len()
+        );
+    }
 }

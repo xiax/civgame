@@ -1,48 +1,39 @@
-# Organic Biome Edge Plan
+# Organic Biome Edge
 
-## Summary
-Make biome borders organic in both loaded gameplay terrain and the spawn/world map preview. The fix will keep canonical climate/hydrology logic stable, while adding a separate surface-biome/ecotone layer for visible terrain so borders become wavy, feathered, and patchy instead of square blocks.
+Make biome borders feathered/patchy in **terrain + previews** without touching canonical climate/hydrology. Mirrors the proven `plates::assign_nearest` domain-warp pattern, but as a separate *surface-biome* layer.
 
-## Key Changes
-- Add a surface-biome API in `src/world/biome.rs`:
-  - Keep `classify` and `classify_at_tile` unchanged for canonical climate, water salinity, nomad scoring, and world-sim logic.
-  - Add `SurfaceBiomeSample { base, accent, accent_weight }` plus `surface_biome_sample_at_tile(globe, tx, ty)` and `classify_surface_at_tile(globe, tx, ty)`.
-  - Use seeded low-frequency value noise from `globe.seed` to domain-warp land-biome rainfall/temperature sampling.
-  - Preserve hard hydrology safety gates: clear ocean remains ocean, clear land never randomly becomes ocean, rivers/reservoirs still override terrain after biome selection.
-  - Default constants: warp scale `128` tiles, warp amplitude `24` tiles, ecotone probe radius `18` tiles, max accent weight `0.35`.
+## Approach
 
-- Integrate the surface-biome layer in `src/world/terrain.rs`:
-  - Use `classify_surface_at_tile` for chunk `biome_cache`, `biome_bands`, topsoil kind/depth, and fertility estimates.
-  - Update `surface_v` so `local_detail_amp` comes from the surface biome, avoiding abrupt relief changes at visual borders.
-  - Keep river/riparian/reservoir passes authoritative and later in generation, so water bodies still stamp over the softened terrain.
-  - Update `climate_fertility_estimate_at` to use the same surface-biome selection as chunk generation.
+1. **Stateless hash value-noise** (`src/world/biome.rs`) — pure fn of `(seed, x, y)` smoothstep-bilerped over an integer lattice. Two decorrelated channels for the domain-warp X/Y offsets, a third for ecotone dither. No new crate, no per-call Perlin construction (preview path only has `&Globe`; per-tile/per-pixel call volume forbids `Perlin::set_seed` here).
 
-- Improve ecotone tile texture:
-  - Near a detected biome edge, choose between base and accent biome bands with smooth seeded noise, not per-tile random speckle.
-  - Let transitional biomes naturally appear as fringe materials, such as `Scrub` between grassland/desert, `Grass` between forest/wetland, and rocky foothill patches near mountains.
-  - Do not add new crates.
+2. **Surface-biome API** (`src/world/biome.rs`) — keep `classify` / `classify_at_tile` untouched (canonical). Add:
+   - `surface_warp_offset(seed, tx, ty) -> (f32, f32)` — tiles.
+   - `classify_land(elev_f, temp_f, rain_f) -> Biome` — split out of `classify`, runs the Wetland/Badlands/Steppe/Whittaker logic without the Ocean/Mountain gates.
+   - `classify_surface_at_tile(globe, tx, ty) -> Biome` — true-elev gates (Ocean<0.22, Mountain>0.82) return identical to canonical; otherwise call `classify_land` on **warped** temp/rain (true elev). Structural guarantee: no inland oceans, coasts/water columns/salinity unchanged.
+   - `SurfaceBiomeSample { base, accent, accent_weight }` + `surface_biome_sample_at_tile(globe, tx, ty)`.
 
-- Update map previews in `src/ui/world_map.rs` and `src/ui/spawn_select.rs`:
-  - Render biome colors from `classify_surface_at_tile`, so preview matches generated terrain.
-  - Increase `WORLD_MAP_OVERSAMPLE` from `2` to `4`.
-  - Load spawn/world map textures with linear filtering instead of nearest-neighbor block scaling.
-  - Update spawn-select “dominant biome” sampling to use a small surface-biome tile grid over each mega-chunk instead of raw stored climate-cell biomes.
+3. **O(1) ecotone** (replaces 18-tile spatial probe): `base` from primary warp, `accent` from a second decorrelated warp, `accent_weight = smoothstep(distance-to-nearest-classify_land-threshold)` dithered by a fine hash-noise, capped at **0.35**, 0 deep inside a biome. Band width follows climate-gradient magnitude → naturally lands in ~12–36 tiles. Kind selection picks `accent`'s `biome_bands` vs `base`'s when a per-tile hash sample < `accent_weight` (deterministic, not `fastrand` speckle). Transitional materials emerge from existing palettes (Scrub between Grassland/Desert, etc.) — no new TileKinds.
 
-- Update docs:
-  - Document the new surface-biome/ecotone layer in `AGENTS.md`.
-  - Update `src/world/CLAUDE.md` for terrain generation details.
-  - Update `src/ui/CLAUDE.md` for preview rendering changes.
-  - Do not bump `GLOBE_FILE_VERSION`, because the serialized globe schema and stored cell data remain unchanged.
+4. **Single source of truth** (`src/world/terrain.rs`):
+   - `generate_chunk_from_globe` Pass 1: one `surface_biome_sample_at_tile` per tile → `biome_cache` (base); pick `surface_kind` via the two palettes; pass biome into `surface_v`.
+   - `surface_v` takes biome as a param (no more internal `classify` call) so `local_detail_amp` matches the visible biome.
+   - Pass 3 (riparian), Pass 4 (reservoirs), Pass 4.5 (aquifer) unchanged — water still authoritative and later.
+   - `climate_fertility_estimate_at` and `tile_at_3d` swap to `classify_surface_at_tile`.
+   - **Keep canonical** (do not convert): `globe.rs:721` (stored `cell.biome`), `nomad.rs:2979` (camp scoring), `biome.rs:65` (`water_kind_at` salinity defence).
 
-## Test Plan
-- Add unit tests for deterministic surface-biome sampling across repeated calls and seeds.
-- Add guard tests that clear ocean stays ocean and clear inland land does not become ocean through edge noise.
-- Add a synthetic biome-boundary test proving the surface classifier creates varied, non-straight transition patterns near a land-biome threshold.
-- Add terrain tests that generated chunks remain deterministic and fertility estimates stay in sync with surface-biome selection.
-- Add world-map image tests for oversample dimensions and basic non-empty biome variation.
-- Run `cargo test --bin civgame`.
+5. **Previews** (`src/ui/world_map.rs`, `src/ui/spawn_select.rs`):
+   - `WORLD_MAP_OVERSAMPLE 2→4`; update doc comment.
+   - `egui::TextureOptions::NEAREST → LINEAR` on both uploads (accept slight softening of 1px grid/river overlays).
+   - `build_globe_image` + world-map hover tooltip → `classify_surface_at_tile`.
+   - `sample_dominant_biome` → small `classify_surface_at_tile` tile-grid sample over the megachunk.
 
-## Assumptions
-- The goal is visual/terrain organicness, not changing high-level biome semantics for AI, water salinity, or world simulation.
-- Coastlines should be visually smoother in the preview, but terrain water placement remains governed by elevation, rivers, and reservoirs.
-- Transition bands should be noticeable but conservative: roughly 12-36 tiles wide, with no large random biome islands far from an actual border.
+6. **Docs**: terse bullets in `src/world/CLAUDE.md` + `src/ui/CLAUDE.md`. `GLOBE_FILE_VERSION` not bumped by this layer (no serialized change).
+
+## Tests (`cargo test --bin civgame`)
+
+- Warp determinism + seed-sensitivity + purity.
+- Gate preservation: tiles inside Ocean/Mountain elevation gates classify identically to canonical `classify` (no inland oceans).
+- Preview↔terrain parity: `surface_biome_sample_at_tile(...).base` == `biome_cache` entry for the same `(seed, tx, ty)`.
+- Ecotone: `accent_weight ∈ [0, 0.35]`; 0 deep interior; >0 near a `classify_land` threshold; synthetic sweep shows feathered (not isoline) transition.
+- World-map image dims scale with oversample 4; multi-biome variation on a continental sample.
+- Manual: `cargo run`, open Tab world map + spawn select — borders organic, coasts unchanged, no inland water.

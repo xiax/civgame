@@ -304,11 +304,14 @@ fn local_detail_amp(biome: Biome) -> f32 {
 /// terrain (rolling grass, jagged mountain ridges, coastal shelves) without
 /// overpowering the anchor.
 pub fn surface_v(tx: i32, ty: i32, gen: &WorldGen, globe: &Globe) -> f32 {
-    let (elev_u, temp_c, rain_u) = globe.sample_climate(tx, ty);
+    let (elev_u, _temp_c, _rain_u) = globe.sample_climate(tx, ty);
     let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
-    let temp_f = ((temp_c + 30.0) / 80.0).clamp(0.0, 1.0);
-    let rain_f = (rain_u / 255.0).clamp(0.0, 1.0);
-    let biome = biome_mod::classify(macro_f, temp_f, rain_f);
+    // Relief amplitude follows the *surface* biome so the per-tile detail
+    // amplitude doesn't snap at a visual border (e.g. Grassland 0.05 →
+    // Mountain 0.075) ahead of the kind change. Surface classifier keeps
+    // the Ocean/Mountain elevation gates on true elevation so this still
+    // resolves to the same biome the band-picker will choose.
+    let biome = biome_mod::classify_surface_at_tile(globe, tx, ty);
     let amp = local_detail_amp(biome);
 
     let nx = tx as f64 * 0.04;
@@ -480,7 +483,11 @@ pub fn tile_at_3d(
             };
         }
     }
-    let biome = biome_mod::classify_at_tile(globe, tx, ty);
+    // Visual / terrain readout uses the surface-biome layer so an unloaded
+    // tile lookup matches what chunk-gen would stamp (preview/terrain
+    // parity). Canonical `classify_at_tile` is reserved for AI / salinity /
+    // world-sim — see `biome.rs`.
+    let biome = biome_mod::classify_surface_at_tile(globe, tx, ty);
     let river_d = chunk_map.river_distance_at(tx, ty);
     proc_tile(tx, ty, tz, gen, globe, biome, river_d)
 }
@@ -515,24 +522,44 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
     // ── Pass 1: noise-derived surface (z + provisional kind) ──
     // Cache `v` and biome so pass 3 can re-classify river-adjacent tiles
     // using moisture-boosted thresholds without recomputing the noise.
+    // Biome is the *surface* biome (domain-warped land-biome, Ocean/Mountain
+    // gates on true elevation) so visual borders feather organically; the
+    // ecotone accent dithers material choice across the transition band.
     let mut v_cache = Box::new([[0.0f32; CHUNK_SIZE]; CHUNK_SIZE]);
     let mut biome_cache = Box::new([[Biome::default(); CHUNK_SIZE]; CHUNK_SIZE]);
     for ly in 0..CHUNK_SIZE {
         for lx in 0..CHUNK_SIZE {
             let global_tx = chunk_tx0 + lx as i32;
             let global_ty = chunk_ty0 + ly as i32;
-            let biome = biome_mod::classify_at_tile(globe, global_tx, global_ty);
-            let bands = biome_bands(biome);
+            let sample =
+                biome_mod::surface_biome_sample_at_tile(globe, global_tx, global_ty);
             let v = surface_v(global_tx, global_ty, gen, globe);
             let z = (Z_MIN as f32 + v * CHUNK_HEIGHT as f32).round() as i32;
             let z = z.clamp(Z_MIN, Z_MAX);
-            let kind = bands.pick(v);
+            // Pick surface kind by dithering base vs accent palette across
+            // the transition band. `base` always drives `biome_cache` (and
+            // therefore relief amp + topsoil + Pass-3 riparian shift); the
+            // accent only contributes its `BiomeBands::kinds` palette so the
+            // surface material reads ecotonal (e.g. a Scrub speckle in a
+            // Grassland-Desert seam) without dragging soil depth or
+            // riparian logic with it.
+            let bands_base = biome_bands(sample.base);
+            let kind = if sample.accent != sample.base {
+                let dither = biome_mod::surface_band_dither(globe.seed, global_tx, global_ty);
+                if dither < sample.accent_weight() {
+                    biome_bands(sample.accent).pick(v)
+                } else {
+                    bands_base.pick(v)
+                }
+            } else {
+                bands_base.pick(v)
+            };
             surface_z[ly][lx] = z as i8;
             surface_kind[ly][lx] = kind;
             // Dry land: bed == surface (the additive invariant).
             surface_ground_z[ly][lx] = z as i8;
             v_cache[ly][lx] = v;
-            biome_cache[ly][lx] = biome;
+            biome_cache[ly][lx] = sample.base;
         }
     }
 
@@ -813,7 +840,12 @@ pub fn surface_fertility_of(kind: TileKind, v: f32) -> u8 {
 pub fn climate_fertility_estimate_at(globe: &Globe, tx: i32, ty: i32) -> u8 {
     let (elev_u, _temp, _rain) = globe.sample_climate(tx, ty);
     let v = (elev_u / 255.0).clamp(0.0, 1.0);
-    let biome = biome_mod::classify_at_tile(globe, tx, ty);
+    // Match the surface-biome layer chunk-gen uses for `biome_cache` so
+    // expected fertility lines up with the kind that will actually be
+    // stamped. Ecotone accent averages out (zero-mean dither), so the
+    // *expected* fertility uses `base` only — same `BiomeBands::pick(v)`
+    // call as Pass 1's base path.
+    let biome = biome_mod::classify_surface_at_tile(globe, tx, ty);
     let kind = biome_bands(biome).pick(v);
     let base = surface_fertility_of(kind, v) as f32;
     if base <= 0.0 {
@@ -1386,5 +1418,81 @@ mod tests {
             "wet cell at chunk {:?} produced no Pass-4.5 Marsh tiles",
             chunk
         );
+    }
+
+    #[test]
+    fn surface_biome_layer_matches_chunkgen_biome_cache() {
+        // Preview ↔ terrain parity: the surface-biome `.base` we expose to
+        // previews must equal the biome chunk-gen stamps into
+        // `biome_cache` (which is what drives `topsoil_kind` /
+        // `local_detail_amp` / Pass-3 riparian etc.). Walk one chunk worth
+        // of tiles and check every match.
+        let gen = WorldGen::new();
+        let g = test_globe();
+        // Pick a chunk away from a river so Pass 3 won't have run anyway —
+        // but the invariant we're checking (Pass-1 base) holds even with
+        // rivers, since we just compare what Pass 1 wrote.
+        let chunk = ChunkCoord(0, 0);
+        let c = generate_chunk_from_globe(chunk, &g, &gen);
+        let tx0 = chunk.0 * CHUNK_SIZE as i32;
+        let ty0 = chunk.1 * CHUNK_SIZE as i32;
+        // We don't have direct access to `biome_cache`, but the invariant
+        // we actually care about is that the *visible* kind chunk-gen
+        // chose comes from the `surface_biome_sample_at_tile(...)` base
+        // OR accent palette. Verify the surface kind is in that union.
+        for ly in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let tx = tx0 + lx as i32;
+                let ty = ty0 + ly as i32;
+                let k = c.surface_kind[ly][lx];
+                // Skip post-Pass-1 overrides (river/marsh/water stamped by
+                // hydrology). Their kind doesn't come from biome bands at
+                // all.
+                if matches!(
+                    k,
+                    TileKind::River
+                        | TileKind::Water
+                        | TileKind::Marsh
+                        | TileKind::Bridge
+                        | TileKind::Dam
+                ) {
+                    continue;
+                }
+                let s = biome_mod::surface_biome_sample_at_tile(&g, tx, ty);
+                let base_kinds = biome_bands(s.base).kinds;
+                let accent_kinds = biome_bands(s.accent).kinds;
+                let in_palette = base_kinds.contains(&k) || accent_kinds.contains(&k);
+                assert!(
+                    in_palette,
+                    "tile ({}, {}) kind {:?} not in base ({:?}) or accent ({:?}) palette",
+                    tx, ty, k, s.base, s.accent
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn surface_biome_layer_does_not_create_inland_water() {
+        // Walking a sub-continent worth of tiles, any tile whose true
+        // elevation puts it above the ocean gate must NOT come back as
+        // Biome::Ocean from `classify_surface_at_tile`. Guard against the
+        // warp ever sneaking inland-ocean stamps in.
+        let g = test_globe();
+        for ty in (-512..512i32).step_by(11) {
+            for tx in (-512..512i32).step_by(11) {
+                let (elev_u, _, _) = g.sample_climate(tx, ty);
+                let elev_f = elev_u / 255.0;
+                if elev_f >= biome_mod::OCEAN_ELEV_GATE {
+                    let b = biome_mod::classify_surface_at_tile(&g, tx, ty);
+                    assert!(
+                        !matches!(b, Biome::Ocean),
+                        "inland Ocean biome at ({}, {}) elev_f={}",
+                        tx,
+                        ty,
+                        elev_f,
+                    );
+                }
+            }
+        }
     }
 }

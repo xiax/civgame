@@ -165,8 +165,11 @@ pub fn spawn_select_system(
     if tex_cache.handle.is_none() {
         let (pixels, [w, h]) = build_globe_image(&globe, false, WORLD_MAP_OVERSAMPLE, false);
         let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
+        // LINEAR filter (paired with `WORLD_MAP_OVERSAMPLE=4` and the
+        // surface-biome warp) so biome borders feather at display scale
+        // instead of stair-stepping.
         tex_cache.handle =
-            Some(ctx.load_texture("spawn_select_globe", image, egui::TextureOptions::NEAREST));
+            Some(ctx.load_texture("spawn_select_globe", image, egui::TextureOptions::LINEAR));
     }
     let Some(ref tex) = tex_cache.handle else {
         return;
@@ -365,24 +368,28 @@ pub fn spawn_select_system(
     });
 }
 
-/// Find the most common biome among the climate cells covered by a mega-chunk.
+/// Find the most common surface biome among a tile-grid sample over the
+/// mega-chunk. Samples `classify_surface_at_tile` (not the stored cell
+/// biome) so the tooltip names the biome the user sees rendered.
 fn sample_dominant_biome(globe: &Globe, mx: i32, my: i32) -> Biome {
     // Sized to cover every Biome discriminant (currently 0..=10). Resize if
     // new variants are appended.
     const N_BIOMES: usize = 11;
-    let cell_w = MEGACHUNK_SIZE_CHUNKS / GLOBE_CELL_CHUNKS;
-    let gx0 = mx * cell_w;
-    let gy0 = my * cell_w;
+    // 8×8 tile-grid sample across the mega-chunk: 64 surface-classifies,
+    // similar cost to the old 4×4 cell-count histogram but reflecting the
+    // warped/feathered borders instead of raw cell snapping.
+    const SAMPLES_PER_SIDE: i32 = 8;
+    let (tx0, ty0, tx1, ty1) = MegaChunkCoord::tile_bounds(mx, my);
+    let span_x = (tx1 - tx0).max(1);
+    let span_y = (ty1 - ty0).max(1);
     let mut counts = [0u32; N_BIOMES];
-    for dy in 0..cell_w {
-        for dx in 0..cell_w {
-            let gx = (gx0 + dx).rem_euclid(GLOBE_WIDTH);
-            let gy = (gy0 + dy).clamp(0, GLOBE_HEIGHT - 1);
-            if let Some(c) = globe.cell(gx, gy) {
-                let idx = c.biome as usize;
-                if idx < counts.len() {
-                    counts[idx] += 1;
-                }
+    for sy in 0..SAMPLES_PER_SIDE {
+        for sx in 0..SAMPLES_PER_SIDE {
+            let tx = tx0 + (sx * span_x) / SAMPLES_PER_SIDE + span_x / (2 * SAMPLES_PER_SIDE);
+            let ty = ty0 + (sy * span_y) / SAMPLES_PER_SIDE + span_y / (2 * SAMPLES_PER_SIDE);
+            let idx = crate::world::biome::classify_surface_at_tile(globe, tx, ty) as usize;
+            if idx < counts.len() {
+                counts[idx] += 1;
             }
         }
     }
