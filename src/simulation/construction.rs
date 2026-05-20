@@ -2756,6 +2756,7 @@ pub(crate) fn walled_house_tile_plan(
     door_edge: crate::simulation::land::TileEdge,
     wall_material: WallMaterial,
     interior_beds: &[(i32, i32)],
+    interior_hearth: Option<(i32, i32)>,
 ) -> Vec<(
     BuildSiteKind,
     (i32, i32),
@@ -2769,7 +2770,7 @@ pub(crate) fn walled_house_tile_plan(
     for dy in -half_h..=half_h {
         for dx in -half_w..=half_w {
             if dx.abs() < half_w && dy.abs() < half_h {
-                continue; // interior — beds go via the second loop below
+                continue; // interior — beds + hearth go via the loops below
             }
             let tile = (cx + dx, cy + dy);
             let (kind, edge) = if (dx, dy) == entrance {
@@ -2783,6 +2784,10 @@ pub(crate) fn walled_house_tile_plan(
     for &(bdx, bdy) in interior_beds {
         let tile = (cx + bdx, cy + bdy);
         plan.push((BuildSiteKind::Bed, tile, None));
+    }
+    if let Some((hdx, hdy)) = interior_hearth {
+        let tile = (cx + hdx, cy + hdy);
+        plan.push((BuildSiteKind::Campfire, tile, None));
     }
     plan
 }
@@ -2838,6 +2843,7 @@ fn plan_building(
     faction_id: u32,
     camp_home: (i32, i32),
     interior_beds: &[(i32, i32)],
+    interior_hearth: Option<(i32, i32)>,
     wall_material: WallMaterial,
     door_dir: Option<crate::simulation::land::TileEdge>,
     author: Option<BlueprintAuthor>,
@@ -2876,6 +2882,7 @@ fn plan_building(
         door_edge,
         wall_material,
         interior_beds,
+        interior_hearth,
     );
 
     // Simulated-build reachability gate: validate the house *as it will exist
@@ -3331,6 +3338,8 @@ impl BuildIntent {
                 add(BuildSiteKind::Wall(mat), 8);
                 add(BuildSiteKind::Door, 1);
                 add(BuildSiteKind::Bed, 2);
+                // Interior centre-tile hearth.
+                add(BuildSiteKind::Campfire, 1);
             }
             BuildIntent::PalisadeSegment(mat, _) => add(BuildSiteKind::Wall(mat), 1),
             BuildIntent::CompositeHouse {
@@ -3380,10 +3389,16 @@ impl BuildIntent {
         };
         match self {
             BuildIntent::Single(kind) => push(kind),
-            BuildIntent::Hut(mat) | BuildIntent::Longhouse(mat) => {
+            BuildIntent::Hut(mat) => {
                 push(BuildSiteKind::Wall(mat));
                 push(BuildSiteKind::Door);
                 push(BuildSiteKind::Bed);
+            }
+            BuildIntent::Longhouse(mat) => {
+                push(BuildSiteKind::Wall(mat));
+                push(BuildSiteKind::Door);
+                push(BuildSiteKind::Bed);
+                push(BuildSiteKind::Campfire);
             }
             BuildIntent::PalisadeSegment(mat, _) => push(BuildSiteKind::Wall(mat)),
             BuildIntent::CompositeHouse { wall_material, .. } => {
@@ -3804,6 +3819,12 @@ fn generate_candidates(
         Era::Paleolithic | Era::Mesolithic => {
             crate::simulation::settlement::paleolithic_hearth_count(members)
         }
+        // Bootstrap follow-up: a Neolithic+ seeded village wants ONE civic
+        // hearth at game start (per the original settlement-bootstrap plan).
+        // Extra hearths grow at runtime via the population-driven gate; we
+        // don't want a 20-founder Established start stamping 3 hearths
+        // lined up in the same civic parcel on tick 0.
+        Era::Neolithic if seed_techs.is_some() => 1,
         Era::Neolithic => {
             ((members + NEOLITHIC_BEDS_PER_HEARTH - 1) / NEOLITHIC_BEDS_PER_HEARTH).max(1)
         }
@@ -4512,6 +4533,8 @@ fn spawn_intent(
             bp_map.0.insert(tile, e);
         }
         BuildIntent::Hut(wall_mat) => {
+            // 3×3 hut: single interior tile holds the bed; no room for an
+            // interior hearth. Huts cluster around the civic hearth instead.
             plan_building(
                 commands,
                 bp_map,
@@ -4527,12 +4550,17 @@ fn spawn_intent(
                 faction_id,
                 home,
                 &[(0, 0)],
+                None,
                 wall_mat,
                 door_dir,
                 author,
             );
         }
         BuildIntent::Longhouse(wall_mat) => {
+            // 5×3 longhouse: beds at ±1 along the long axis, interior
+            // hearth at centre. Each kin-group dwelling carries its own
+            // fire — matches the original settlement-bootstrap intent of
+            // "extra hearths come from dwelling templates, not pop math".
             plan_building(
                 commands,
                 bp_map,
@@ -4548,6 +4576,7 @@ fn spawn_intent(
                 faction_id,
                 home,
                 &[(-1, 0), (1, 0)],
+                Some((0, 0)),
                 wall_mat,
                 door_dir,
                 author,
@@ -4700,6 +4729,7 @@ fn seed_walled_house_or_nearby(
     half_w: i32,
     half_h: i32,
     interior_beds: &[(i32, i32)],
+    interior_hearth: Option<(i32, i32)>,
     wall_material: WallMaterial,
     faction_id: u32,
     home: (i32, i32),
@@ -4720,6 +4750,7 @@ fn seed_walled_house_or_nearby(
         half_w,
         half_h,
         interior_beds,
+        interior_hearth,
         wall_material,
         faction_id,
         home,
@@ -4771,6 +4802,7 @@ fn seed_walled_house_or_nearby(
                     half_w,
                     half_h,
                     interior_beds,
+                    interior_hearth,
                     wall_material,
                     faction_id,
                     home,
@@ -4840,6 +4872,7 @@ fn seed_apply_intent(
             1,
             1,
             &[(0, 0)],
+            None,
             wall_mat,
             faction_id,
             home,
@@ -4859,6 +4892,7 @@ fn seed_apply_intent(
             2,
             1,
             &[(-1, 0), (1, 0)],
+            Some((0, 0)),
             wall_mat,
             faction_id,
             home,
@@ -5590,61 +5624,80 @@ pub fn road_carve_system(
     // Drain — re-allocate a fresh empty Vec to release the lock on `queue`.
     let drained: Vec<(u32, (i32, i32), (i32, i32))> = std::mem::take(&mut queue.0);
 
+    // Helper: write a single tile as Road if it's writable + not blueprinted /
+    // bedded / farm-protected. Returns true if the tile was actually flipped.
+    let try_write_road =
+        |chunk_map: &mut ChunkMap,
+         tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+         tile: (i32, i32)|
+         -> bool {
+            if bp_map.0.contains_key(&tile) || bed_map.0.contains_key(&tile) {
+                return false;
+            }
+            let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
+            let cur = chunk_map.tile_kind_at(tile.0, tile.1);
+            let writable = match cur {
+                Some(TileKind::Cropland) => false,
+                Some(TileKind::Grass) => true,
+                Some(TileKind::Scrub) | Some(TileKind::Sand) => true,
+                Some(k) if k.is_soil_like() => true,
+                _ => false,
+            };
+            if !writable
+                || crate::simulation::land::tile_is_farm_protected(&plot_index, &plant_map, tile)
+            {
+                return false;
+            }
+            chunk_map.set_tile(
+                tile.0,
+                tile.1,
+                surf_z as i32,
+                TileData {
+                    kind: TileKind::Road,
+                    ..Default::default()
+                },
+            );
+            tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+                tx: tile.0,
+                ty: tile.1,
+            });
+            true
+        };
+
     for (_faction_id, from, to) in drained {
         let mut x0 = from.0 as i32;
         let mut y0 = from.1 as i32;
         let x1 = to.0 as i32;
         let y1 = to.1 as i32;
-        let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
+        let dx_abs = (x1 - x0).abs();
+        let dy_abs = (y1 - y0).abs();
+        // Widen perpendicular to the dominant axis: horizontal-ish runs get
+        // a +1 row, vertical-ish runs get a +1 column. The widening tile is
+        // best-effort — same writability rules as the main tile; farm /
+        // wall / road / building cells silently stay 1-wide there.
+        let widen_dx = if dy_abs > dx_abs { 1 } else { 0 };
+        let widen_dy = if dy_abs > dx_abs { 0 } else { 1 };
+        let dx = dx_abs;
+        let dy = -dy_abs;
         let sx = if x0 < x1 { 1 } else { -1 };
         let sy = if y0 < y1 { 1 } else { -1 };
         let mut err = dx + dy;
 
         loop {
-            // Skip the endpoint tiles (the building itself, the home tile).
             let is_endpoint =
                 (x0 == from.0 as i32 && y0 == from.1 as i32) || (x0 == x1 && y0 == y1);
             if !is_endpoint {
-                let tile = (x0 as i32, y0 as i32);
-                if !bp_map.0.contains_key(&tile) && !bed_map.0.contains_key(&tile) {
-                    let surf_z = chunk_map.surface_z_at(x0, y0);
-                    let cur = chunk_map.tile_kind_at(x0, y0);
-                    let writable = match cur {
-                        // Never pave tilled fields (universal TileKind guard).
-                        Some(TileKind::Cropland) => false,
-                        Some(TileKind::Grass) => true,
-                        Some(TileKind::Scrub) | Some(TileKind::Sand) => true,
-                        Some(k) if k.is_soil_like() => true,
-                        _ => false,
-                    };
-                    // Plus the runtime chokepoint guard: every RoadCarveQueue
-                    // producer (doormat extension, spine drain, desire path,
-                    // survey) drains here, so guarding this one site protects
-                    // Agricultural-plot tiles and standing crops even before
-                    // they are stamped `Cropland`.
-                    if writable
-                        && !crate::simulation::land::tile_is_farm_protected(
-                            &plot_index,
-                            &plant_map,
-                            tile,
-                        )
-                    {
-                        chunk_map.set_tile(
-                            x0,
-                            y0,
-                            surf_z as i32,
-                            TileData {
-                                kind: TileKind::Road,
-                                ..Default::default()
-                            },
-                        );
-                        tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
-                            tx: tile.0,
-                            ty: tile.1,
-                        });
-                    }
-                }
+                let tile = (x0, y0);
+                try_write_road(&mut chunk_map, &mut tile_changed, tile);
+                // Widen to 2 tiles so the main artery actually fills the
+                // 2-tile gap between facing house frontages — single-tile
+                // Bresenham left a visible strip of unpaved ground next
+                // to every house, which then got wild plants.
+                try_write_road(
+                    &mut chunk_map,
+                    &mut tile_changed,
+                    (x0 + widen_dx, y0 + widen_dy),
+                );
             }
             if x0 == x1 && y0 == y1 {
                 break;
@@ -8107,6 +8160,7 @@ fn seed_walled_house_at(
     half_w: i32,
     half_h: i32,
     interior_beds: &[(i32, i32)],
+    interior_hearth: Option<(i32, i32)>,
     wall_material: WallMaterial,
     faction_id: u32,
     home: (i32, i32),
@@ -8179,6 +8233,7 @@ fn seed_walled_house_at(
         door_edge,
         wall_material,
         interior_beds,
+        interior_hearth,
     );
 
     // Simulated-build reachability gate (runs before any wall is stamped, so
@@ -8294,6 +8349,21 @@ fn seed_walled_house_at(
                     ))
                     .id();
                 maps.bed_map.0.insert(tile, e);
+            }
+            BuildSiteKind::Campfire => {
+                // Interior dwelling hearth (Longhouse centre tile).
+                let tier = SeedConstructionProfile::from_era(current_era(seed_techs)).hearth_tier;
+                let e = commands
+                    .spawn((
+                        Campfire { tier },
+                        StructureLabel(tier.label()),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id();
+                maps.campfire_map.0.insert(tile, e);
             }
             _ => {
                 debug_assert!(
@@ -8995,6 +9065,7 @@ mod tests {
             TileEdge::East,
             WallMaterial::WattleDaub,
             &[(0, 0)],
+            None,
         );
         // 8 perimeter + 1 interior bed = 9 entries.
         assert_eq!(plan.len(), 9);
@@ -9035,6 +9106,7 @@ mod tests {
             TileEdge::East,
             WallMaterial::Mudbrick,
             &[],
+            None,
         );
         let mats: Vec<_> = plan
             .iter()
@@ -9060,6 +9132,7 @@ mod tests {
             TileEdge::East,
             WallMaterial::WattleDaub,
             &[(-1, 0), (1, 0)],
+            None,
         );
         // Perimeter cells: 5*3 - (3*1 interior) = 15 - 3 = 12.
         // Plus 2 bed entries = 14.

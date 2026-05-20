@@ -55,9 +55,9 @@ impl SeedReservation {
 }
 
 /// Rasterise a Bresenham line from `from` to `to` (endpoints inclusive) into
-/// the reservation set. Matches the line walk in `road_carve_system` so
-/// queued-but-uncarved roads are reserved before their tiles flip to
-/// `TileKind::Road`.
+/// the reservation set. Matches the **2-tile-wide** carve in
+/// `road_carve_system` so queued-but-uncarved roads are reserved across
+/// their full footprint, not just the centreline.
 pub fn rasterize_line_into(
     reservation: &mut SeedReservation,
     from: (i32, i32),
@@ -67,13 +67,18 @@ pub fn rasterize_line_into(
     let mut y0 = from.1;
     let x1 = to.0;
     let y1 = to.1;
-    let dx = (x1 - x0).abs();
-    let dy = -(y1 - y0).abs();
+    let dx_abs = (x1 - x0).abs();
+    let dy_abs = (y1 - y0).abs();
+    let widen_dx = if dy_abs > dx_abs { 1 } else { 0 };
+    let widen_dy = if dy_abs > dx_abs { 0 } else { 1 };
+    let dx = dx_abs;
+    let dy = -dy_abs;
     let sx = if x0 < x1 { 1 } else { -1 };
     let sy = if y0 < y1 { 1 } else { -1 };
     let mut err = dx + dy;
     loop {
         reservation.reserve((x0, y0));
+        reservation.reserve((x0 + widen_dx, y0 + widen_dy));
         if x0 == x1 && y0 == y1 {
             break;
         }
@@ -154,10 +159,12 @@ mod tests {
     fn rasterise_horizontal_line_inclusive() {
         let mut r = SeedReservation::default();
         rasterize_line_into(&mut r, (0, 5), (3, 5));
+        // 2-tile-wide: centre row y=5 + widened row y=6 for each x in 0..=3.
         for x in 0..=3 {
-            assert!(r.is_reserved((x, 5)), "missing ({x}, 5)");
+            assert!(r.is_reserved((x, 5)), "missing centre ({x}, 5)");
+            assert!(r.is_reserved((x, 6)), "missing widened ({x}, 6)");
         }
-        assert_eq!(r.len(), 4);
+        assert_eq!(r.len(), 8);
     }
 
     #[test]
