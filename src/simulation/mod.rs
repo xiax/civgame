@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 
+pub mod animal_paths;
 pub mod animals;
 pub mod apprenticeship;
 pub mod archetype;
@@ -173,6 +174,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(method_registry)
             .insert_resource(construction::AutonomousBuildingToggle(true))
             .insert_resource(wild_herd::WildHerdRegistry::default())
+            .insert_resource(animals::HerdClusterGen::default())
+            .insert_resource(animal_paths::HerdClusterRegistry::default())
             .insert_resource(construction::BedMap::default())
             .insert_resource(construction::WallMap::default())
             .insert_resource(construction::CampfireMap::default())
@@ -722,6 +725,20 @@ impl Plugin for SimulationPlugin {
                 animals::animal_drink_system
                     .after(animals::animal_movement_system)
                     .in_set(SimulationSet::Sequential),
+            )
+            // Herd flow-field manager: daily centre recompute (Economy),
+            // lazy field rebuild + per-tick threat scan (ParallelA).
+            .add_systems(
+                FixedUpdate,
+                (
+                    animal_paths::herd_cohesion_field_system,
+                    animal_paths::herd_threat_detect_system,
+                )
+                    .in_set(SimulationSet::ParallelA),
+            )
+            .add_systems(
+                FixedUpdate,
+                animal_paths::herd_cluster_update_system.in_set(SimulationSet::Economy),
             )
             .add_systems(
                 // Phase 5e-xi-a/b: split-off because the main ParallelB tuple

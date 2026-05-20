@@ -106,6 +106,10 @@ pub struct WildHerd {
     /// `aggregate_count` growth to once per `TICKS_PER_SEASON` so a
     /// summer-long camera focus doesn't rapidly overflow `WILD_HERD_AGGREGATE_CAP`.
     pub last_birthed_tick: u32,
+    /// Flow-field cluster id allocated from `HerdClusterGen` at seed time.
+    /// Stamped onto every bloomed member's `HerdMember` so the animal_paths
+    /// cohesion/repulsion fields can group them.
+    pub cluster_id: u32,
 }
 
 #[derive(Resource, Default, Debug)]
@@ -135,7 +139,11 @@ pub struct WildHerdMember {
 /// tile `spawn_animals` pass. Picks random grassland tiles to anchor each
 /// herd's `range_center` and `leader_tile`; collapsed by default until a
 /// camera comes near.
-pub fn seed_wild_herds_system(chunk_map: Res<ChunkMap>, mut registry: ResMut<WildHerdRegistry>) {
+pub fn seed_wild_herds_system(
+    chunk_map: Res<ChunkMap>,
+    mut registry: ResMut<WildHerdRegistry>,
+    mut herd_gen: ResMut<crate::simulation::animals::HerdClusterGen>,
+) {
     if !registry.herds.is_empty() {
         return; // idempotent
     }
@@ -161,6 +169,8 @@ pub fn seed_wild_herds_system(chunk_map: Res<ChunkMap>, mut registry: ResMut<Wil
             WildHerdSpecies::Horse
         };
         let id = registry.alloc_id();
+        let cluster_id = herd_gen.next;
+        herd_gen.next = herd_gen.next.wrapping_add(1);
         registry.herds.insert(
             id,
             WildHerd {
@@ -173,6 +183,7 @@ pub fn seed_wild_herds_system(chunk_map: Res<ChunkMap>, mut registry: ResMut<Wil
                 members: Vec::new(),
                 flee_until_tick: 0,
                 last_birthed_tick: 0,
+                cluster_id,
             },
         );
         info!(
@@ -417,6 +428,7 @@ pub fn wild_herd_bloom_system(
                 &mut commands,
                 &chunk_map,
                 herd.id,
+                herd.cluster_id,
                 herd.species,
                 herd.leader_tile,
                 target_count as u32,
@@ -473,11 +485,13 @@ fn spawn_herd_members(
     commands: &mut Commands,
     chunk_map: &ChunkMap,
     herd_id: u32,
+    cluster_id: u32,
     species: WildHerdSpecies,
     centre: (i32, i32),
     count: u32,
     bucket_slot: &mut u32,
 ) -> Vec<Entity> {
+    use crate::simulation::animals::HerdMember;
     use crate::world::tile::TileKind;
     let mut placed: Vec<Entity> = Vec::with_capacity(count as usize);
     let mut used: AHashSet<(i32, i32)> = AHashSet::new();
@@ -540,7 +554,11 @@ fn spawn_herd_members(
         let entity = match species {
             WildHerdSpecies::Horse => commands
                 .spawn((
-                    (Horse, WildHerdMember { herd_id }),
+                    (
+                        Horse,
+                        WildHerdMember { herd_id },
+                        HerdMember { cluster_id },
+                    ),
                     Transform::from_xyz(pos.x, pos.y, 1.0),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -559,7 +577,11 @@ fn spawn_herd_members(
                 .id(),
             WildHerdSpecies::Cow => commands
                 .spawn((
-                    (Cow, WildHerdMember { herd_id }),
+                    (
+                        Cow,
+                        WildHerdMember { herd_id },
+                        HerdMember { cluster_id },
+                    ),
                     Transform::from_xyz(pos.x, pos.y, 1.0),
                     GlobalTransform::default(),
                     Visibility::Visible,

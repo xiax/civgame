@@ -308,6 +308,21 @@ pub fn following_band_animal_redirect_system(
 #[derive(Component, Clone, Copy)]
 pub struct CarriedBy(pub Entity);
 
+/// Tag on HERD-pattern species (Deer/Horse/Cow) carrying their birth cluster
+/// id. Consumed by `animal_paths::HerdClusterRegistry` to recompute the
+/// herd's center and serve flow-field queries.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct HerdMember {
+    pub cluster_id: u32,
+}
+
+/// Monotonic cluster id generator. Spawn-time herd tagging draws a fresh
+/// id per cluster from this counter; survives `OnEnter(Playing)` reloads.
+#[derive(Resource, Default)]
+pub struct HerdClusterGen {
+    pub next: u32,
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum AnimalState {
@@ -324,12 +339,19 @@ pub enum AnimalState {
     Drinking = 5,
 }
 
-#[derive(Component, Clone, Copy, Default)]
+#[derive(Component, Clone, Default)]
 pub struct AnimalAI {
     pub state: AnimalState,
     pub target_tile: (i32, i32),
     pub target_entity: Option<Entity>,
     pub wander_timer: f32,
+    /// Cached A* or flow-field path in (tx, ty, tz). Empty ⇒ replan next
+    /// tick. `path[0]` is the start tile (already arrived); follow from
+    /// `path[path_cursor]`. See `animal_paths.rs`.
+    pub path: Vec<(i32, i32, i8)>,
+    pub path_cursor: u16,
+    /// Tile this path was computed *to*. Replan when `target_tile` drifts.
+    pub path_goal: (i32, i32),
 }
 
 /// Lightweight biological needs for animals. Separate from the person Needs struct —
@@ -379,28 +401,32 @@ const SOLITARY: SocialPattern = SocialPattern {
 
 /// Pops cluster centers from the (pre-shuffled) `pool` and lays out group
 /// members on tiles inside `biome_set` within `pattern.cluster_radius` of
-/// the center. Returns up to `count` spawn locations in cluster order;
-/// truncates short if `pool` runs out before `count` is satisfied.
+/// the center. Returns up to `count` spawn locations in cluster order
+/// with parallel cluster ids drawn from `next_cluster_id` (one id per
+/// cluster). Truncates short if `pool` runs out before `count` is satisfied.
 fn cluster_spawn_tiles(
     pool: &mut Vec<(i32, i32)>,
     biome_set: &AHashSet<(i32, i32)>,
     pattern: SocialPattern,
     count: u32,
-) -> Vec<(i32, i32)> {
-    let mut out: Vec<(i32, i32)> = Vec::with_capacity(count as usize);
+    next_cluster_id: &mut u32,
+) -> Vec<((i32, i32), u32)> {
+    let mut out: Vec<((i32, i32), u32)> = Vec::with_capacity(count as usize);
     let mut remaining = count;
     while remaining > 0 {
         let center = match pool.pop() {
             Some(t) => t,
             None => break,
         };
+        let cluster_id = *next_cluster_id;
+        *next_cluster_id = next_cluster_id.wrapping_add(1);
         let group_size = if pattern.group_min >= pattern.group_max {
             pattern.group_min
         } else {
             fastrand::u32(pattern.group_min..=pattern.group_max)
         }
         .min(remaining);
-        out.push(center);
+        out.push((center, cluster_id));
         let mut used: Vec<(i32, i32)> = Vec::with_capacity(group_size as usize);
         used.push(center);
         for _ in 1..group_size {
@@ -417,7 +443,7 @@ fn cluster_spawn_tiles(
                 }
             }
             used.push(placed);
-            out.push(placed);
+            out.push((placed, cluster_id));
         }
         remaining = remaining.saturating_sub(group_size);
     }
@@ -428,6 +454,7 @@ pub fn spawn_animals(
     mut commands: Commands,
     chunk_map: Res<ChunkMap>,
     mut clock: ResMut<SimClock>,
+    mut herd_gen: ResMut<HerdClusterGen>,
 ) {
     let now = Instant::now();
 
@@ -473,8 +500,14 @@ pub fn spawn_animals(
     let mut slot = clock.population;
 
     // Wolves: pack predator, forest.
-    let wolf_tiles = cluster_spawn_tiles(&mut forest_tiles, &forest_set, PACK, WOLF_COUNT);
-    for (i, &(tx, ty)) in wolf_tiles.iter().enumerate() {
+    let wolf_tiles = cluster_spawn_tiles(
+        &mut forest_tiles,
+        &forest_set,
+        PACK,
+        WOLF_COUNT,
+        &mut herd_gen.next,
+    );
+    for (i, &((tx, ty), _cid)) in wolf_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
             Wolf,
@@ -507,12 +540,18 @@ pub fn spawn_animals(
     }
 
     // Deer: herd grazer, grass.
-    let deer_tiles = cluster_spawn_tiles(&mut grass_tiles, &grass_set, HERD, DEER_COUNT);
-    for (i, &(tx, ty)) in deer_tiles.iter().enumerate() {
+    let deer_tiles = cluster_spawn_tiles(
+        &mut grass_tiles,
+        &grass_set,
+        HERD,
+        DEER_COUNT,
+        &mut herd_gen.next,
+    );
+    for (i, &((tx, ty), cluster_id)) in deer_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
+            (Deer, HerdMember { cluster_id }),
             (
-                Deer,
                 Transform::from_xyz(pos.x, pos.y, 1.0),
                 GlobalTransform::default(),
                 Visibility::Visible,
@@ -546,11 +585,17 @@ pub fn spawn_animals(
     }
 
     // Horses: herd, grass.
-    let horse_tiles = cluster_spawn_tiles(&mut grass_tiles, &grass_set, HERD, HORSE_COUNT);
-    for (i, &(tx, ty)) in horse_tiles.iter().enumerate() {
+    let horse_tiles = cluster_spawn_tiles(
+        &mut grass_tiles,
+        &grass_set,
+        HERD,
+        HORSE_COUNT,
+        &mut herd_gen.next,
+    );
+    for (i, &((tx, ty), cluster_id)) in horse_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
-            Horse,
+            (Horse, HerdMember { cluster_id }),
             Transform::from_xyz(pos.x, pos.y, 1.0),
             GlobalTransform::default(),
             Visibility::Visible,
@@ -580,11 +625,17 @@ pub fn spawn_animals(
     }
 
     // Cows: herd, grass.
-    let cow_tiles = cluster_spawn_tiles(&mut grass_tiles, &grass_set, HERD, COW_COUNT);
-    for (i, &(tx, ty)) in cow_tiles.iter().enumerate() {
+    let cow_tiles = cluster_spawn_tiles(
+        &mut grass_tiles,
+        &grass_set,
+        HERD,
+        COW_COUNT,
+        &mut herd_gen.next,
+    );
+    for (i, &((tx, ty), cluster_id)) in cow_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
-            Cow,
+            (Cow, HerdMember { cluster_id }),
             Transform::from_xyz(pos.x, pos.y, 1.0),
             GlobalTransform::default(),
             Visibility::Visible,
@@ -613,8 +664,14 @@ pub fn spawn_animals(
     }
 
     // Rabbits: small warrens (pack), grass.
-    let rabbit_tiles = cluster_spawn_tiles(&mut grass_tiles, &grass_set, PACK, RABBIT_COUNT);
-    for (i, &(tx, ty)) in rabbit_tiles.iter().enumerate() {
+    let rabbit_tiles = cluster_spawn_tiles(
+        &mut grass_tiles,
+        &grass_set,
+        PACK,
+        RABBIT_COUNT,
+        &mut herd_gen.next,
+    );
+    for (i, &((tx, ty), _cid)) in rabbit_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
             Rabbit,
@@ -646,8 +703,14 @@ pub fn spawn_animals(
     }
 
     // Pigs: small sounders (pack), forest.
-    let pig_tiles = cluster_spawn_tiles(&mut forest_tiles, &forest_set, PACK, PIG_COUNT);
-    for (i, &(tx, ty)) in pig_tiles.iter().enumerate() {
+    let pig_tiles = cluster_spawn_tiles(
+        &mut forest_tiles,
+        &forest_set,
+        PACK,
+        PIG_COUNT,
+        &mut herd_gen.next,
+    );
+    for (i, &((tx, ty), _cid)) in pig_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
             Pig,
@@ -679,8 +742,14 @@ pub fn spawn_animals(
     }
 
     // Foxes: small family (pack), forest.
-    let fox_tiles = cluster_spawn_tiles(&mut forest_tiles, &forest_set, PACK, FOX_COUNT);
-    for (i, &(tx, ty)) in fox_tiles.iter().enumerate() {
+    let fox_tiles = cluster_spawn_tiles(
+        &mut forest_tiles,
+        &forest_set,
+        PACK,
+        FOX_COUNT,
+        &mut herd_gen.next,
+    );
+    for (i, &((tx, ty), _cid)) in fox_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
             Fox,
@@ -712,8 +781,14 @@ pub fn spawn_animals(
     }
 
     // Cats: solitary, forest.
-    let cat_tiles = cluster_spawn_tiles(&mut forest_tiles, &forest_set, SOLITARY, CAT_COUNT);
-    for (i, &(tx, ty)) in cat_tiles.iter().enumerate() {
+    let cat_tiles = cluster_spawn_tiles(
+        &mut forest_tiles,
+        &forest_set,
+        SOLITARY,
+        CAT_COUNT,
+        &mut herd_gen.next,
+    );
+    for (i, &((tx, ty), _cid)) in cat_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
             Cat,
@@ -752,6 +827,8 @@ pub fn animal_movement_system(
     time: Res<Time>,
     chunk_map: Res<ChunkMap>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
+    herd_registry: Res<crate::simulation::animal_paths::HerdClusterRegistry>,
+    mut pool: ResMut<crate::pathfinding::pool::AStarPool>,
     mut query: Query<
         (
             &mut Transform,
@@ -759,6 +836,10 @@ pub fn animal_movement_system(
             &LodLevel,
             &BucketSlot,
             Option<&CarriedBy>,
+            Option<&HerdMember>,
+            bevy::prelude::Has<Deer>,
+            bevy::prelude::Has<Horse>,
+            bevy::prelude::Has<Cow>,
         ),
         Without<Person>,
     >,
@@ -767,7 +848,9 @@ pub fn animal_movement_system(
     let dt = time.delta_secs();
     let sim_dt = dt * clock.scale_factor();
 
-    for (mut transform, mut ai, lod, slot, carried) in query.iter_mut() {
+    for (mut transform, mut ai, lod, slot, carried, herd_member, is_deer, is_horse, is_cow) in
+        query.iter_mut()
+    {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -780,27 +863,71 @@ pub fn animal_movement_system(
         }
 
         let pos = transform.translation.truncate();
-        let target_world = tile_to_world(ai.target_tile.0 as i32, ai.target_tile.1 as i32);
-        let to_target = target_world - pos;
-        let dist = to_target.length();
+        let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
+        let cur_z = chunk_map.surface_z_at(cur_tx, cur_ty) as i8;
+        let is_herd_species = is_deer || is_horse || is_cow;
 
-        if dist > 2.0 {
-            let dir = to_target.normalize();
-            // Use `dt` for smooth every-frame movement. Simulation timers
-            // use `sim_dt` inside the bucket-active block below.
-            let step = dir * ANIMAL_SPEED * dt;
-            if step.length() >= dist {
-                transform.translation.x = target_world.x;
-                transform.translation.y = target_world.y;
-            } else {
-                let new_pos = pos + step;
-                transform.translation.x = new_pos.x;
-                transform.translation.y = new_pos.y;
+        // Replan when path is empty / stale / consumed.
+        let need_replan = ai.path.is_empty()
+            || ai.path_goal != ai.target_tile
+            || (ai.path_cursor as usize) >= ai.path.len();
+        if need_replan {
+            ai.path.clear();
+            ai.path_cursor = 0;
+            let mut planned = false;
+            // HERD species try the flow field first.
+            if is_herd_species {
+                if let Some(hm) = herd_member {
+                    if crate::simulation::animal_paths::try_replan_via_flow_field(
+                        &herd_registry,
+                        &mut ai,
+                        hm.cluster_id,
+                        (cur_tx, cur_ty),
+                        cur_z,
+                    ) {
+                        planned = true;
+                    }
+                }
             }
-        } else {
-            transform.translation.x = target_world.x;
-            transform.translation.y = target_world.y;
+            if !planned {
+                let goal_z =
+                    chunk_map.surface_z_at(ai.target_tile.0, ai.target_tile.1) as i8;
+                let start = (cur_tx, cur_ty, cur_z);
+                let goal = (ai.target_tile.0, ai.target_tile.1, goal_z);
+                let scratch = pool.scratch(2);
+                if crate::simulation::animal_paths::replan_astar(
+                    scratch,
+                    &chunk_map,
+                    &mut ai,
+                    start,
+                    goal,
+                ) {
+                    planned = true;
+                }
+            }
+            if !planned {
+                // Unreachable. Drop into Wander, stall on current tile,
+                // let wander_timer pick a new step next pass.
+                let tw = tile_to_world(cur_tx, cur_ty);
+                transform.translation.x = tw.x;
+                transform.translation.y = tw.y;
+                ai.state = AnimalState::Wander;
+                ai.target_entity = None;
+                ai.target_tile = (cur_tx, cur_ty);
+                ai.wander_timer = 0.0;
+                continue;
+            }
+        }
 
+        // Follow path: aim at path[cursor]. If we've consumed everything,
+        // fall through to wander pick.
+        if (ai.path_cursor as usize) >= ai.path.len() {
+            let tw = tile_to_world(cur_tx, cur_ty);
+            transform.translation.x = tw.x;
+            transform.translation.y = tw.y;
+            ai.path.clear();
+            ai.path_cursor = 0;
             if matches!(ai.state, AnimalState::Wander | AnimalState::Flee) {
                 if clock.is_active(slot.0) {
                     ai.wander_timer -= sim_dt;
@@ -808,10 +935,6 @@ pub fn animal_movement_system(
                         ai.wander_timer = WANDER_INTERVAL;
                         ai.state = AnimalState::Wander;
                         ai.target_entity = None;
-
-                        let cur_tx = (pos.x / TILE_SIZE).floor() as i32;
-                        let cur_ty = (pos.y / TILE_SIZE).floor() as i32;
-
                         let dirs: [(i32, i32); 8] = [
                             (-1, 0),
                             (1, 0),
@@ -828,10 +951,10 @@ pub fn animal_movement_system(
                             let ntx = cur_tx + dx;
                             let nty = cur_ty + dy;
                             let ntz = chunk_map.surface_z_at(ntx, nty);
-                            if chunk_map.is_passable(ntx, nty)
+                            if chunk_map.passable_at(ntx, nty, ntz)
                                 && !spatial.agent_occupied(ntx, nty, ntz)
                             {
-                                ai.target_tile = (ntx as i32, nty as i32);
+                                ai.target_tile = (ntx, nty);
                                 break;
                             }
                         }
@@ -840,6 +963,44 @@ pub fn animal_movement_system(
             } else if ai.state == AnimalState::Chase {
                 ai.state = AnimalState::Wander;
             }
+            continue;
+        }
+
+        let (nx, ny, nz) = ai.path[ai.path_cursor as usize];
+        // Defense-in-depth: the world may have changed since plan
+        // (a wall finalised, a tile streamed in). Reject and replan.
+        if !chunk_map.passable_at(nx, ny, nz as i32) {
+            let tw = tile_to_world(cur_tx, cur_ty);
+            transform.translation.x = tw.x;
+            transform.translation.y = tw.y;
+            ai.path.clear();
+            ai.path_cursor = 0;
+            ai.state = AnimalState::Wander;
+            ai.target_entity = None;
+            ai.target_tile = (cur_tx, cur_ty);
+            ai.wander_timer = 0.0;
+            continue;
+        }
+
+        let target_world = tile_to_world(nx, ny);
+        let to_target = target_world - pos;
+        let dist = to_target.length();
+        if dist > 2.0 {
+            let dir = to_target.normalize();
+            let step = dir * ANIMAL_SPEED * dt;
+            if step.length() >= dist {
+                transform.translation.x = target_world.x;
+                transform.translation.y = target_world.y;
+                ai.path_cursor = ai.path_cursor.saturating_add(1);
+            } else {
+                let new_pos = pos + step;
+                transform.translation.x = new_pos.x;
+                transform.translation.y = new_pos.y;
+            }
+        } else {
+            transform.translation.x = target_world.x;
+            transform.translation.y = target_world.y;
+            ai.path_cursor = ai.path_cursor.saturating_add(1);
         }
     }
 }
@@ -1699,6 +1860,7 @@ pub fn animal_reproduction_system(
         bevy::prelude::Has<Fox>,
         bevy::prelude::Has<Cat>,
     )>,
+    herd_query: Query<&HerdMember>,
 ) {
     let wolf_pop = wolf_count.iter().count();
     let deer_pop = deer_count.iter().count();
@@ -1836,7 +1998,7 @@ pub fn animal_reproduction_system(
     }
 
     // Phase 3: reset female needs, roll birth, spawn offspring
-    let mut births: Vec<(Vec2, u8)> = Vec::new();
+    let mut births: Vec<(Vec2, u8, Option<u32>)> = Vec::new();
 
     for (female_ent, birth_pos, species) in found_pairs {
         if let Ok((_, _, _, mut needs, mut cooldown, _, _, _, _, _, _, _, _, _, _)) =
@@ -1846,11 +2008,12 @@ pub fn animal_reproduction_system(
             cooldown.0 = ANIMAL_BIRTH_COOLDOWN;
         }
         if fastrand::u32(..10_000) < ANIMAL_BIRTH_CHANCE {
-            births.push((birth_pos, species));
+            let herd_cid = herd_query.get(female_ent).ok().map(|h| h.cluster_id);
+            births.push((birth_pos, species, herd_cid));
         }
     }
 
-    for (pos, species) in births {
+    for (pos, species, herd_cid) in births {
         let slot = clock.population;
         clock.population += 1;
         clock.bucket_size = clock.population.min(10_000);
@@ -1886,7 +2049,7 @@ pub fn animal_reproduction_system(
                 ));
             }
             1 => {
-                commands.spawn((
+                let mut e = commands.spawn((
                     (
                         Deer,
                         transform,
@@ -1908,9 +2071,12 @@ pub fn animal_reproduction_system(
                     ),
                     crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Deer),
                 ));
+                if let Some(cid) = herd_cid {
+                    e.insert(HerdMember { cluster_id: cid });
+                }
             }
             2 => {
-                commands.spawn((
+                let mut e = commands.spawn((
                     Horse,
                     transform,
                     GlobalTransform::default(),
@@ -1927,9 +2093,12 @@ pub fn animal_reproduction_system(
                     sex,
                     crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Horse),
                 ));
+                if let Some(cid) = herd_cid {
+                    e.insert(HerdMember { cluster_id: cid });
+                }
             }
             3 => {
-                commands.spawn((
+                let mut e = commands.spawn((
                     Cow,
                     transform,
                     GlobalTransform::default(),
@@ -1945,6 +2114,9 @@ pub fn animal_reproduction_system(
                     AnimalReproductionCooldown(0),
                     sex,
                 ));
+                if let Some(cid) = herd_cid {
+                    e.insert(HerdMember { cluster_id: cid });
+                }
             }
             4 => {
                 commands.spawn((

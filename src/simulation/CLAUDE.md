@@ -334,7 +334,21 @@ Calendar-driven, season-edge-triggered. `Plant.growth: u16` is a stage-time accu
 
 ## Animal spawn distribution (`animals.rs::spawn_animals`)
 
-Initial-condition only. Per-species `SocialPattern`: `HERD` (Deer/Horse/Cow, 8–15, r=5), `PACK` (Wolf/Pig/Rabbit/Fox, 3–6, r=3), `SOLITARY` (Cat). `cluster_spawn_tiles` pops shuffled centers from species biome pool and lays members within `cluster_radius`. Runtime cohesion not modeled — `animal_movement_system` wanders independently.
+Initial-condition only. Per-species `SocialPattern`: `HERD` (Deer/Horse/Cow, 8–15, r=5), `PACK` (Wolf/Pig/Rabbit/Fox, 3–6, r=3), `SOLITARY` (Cat). `cluster_spawn_tiles` pops shuffled centers from species biome pool and lays members within `cluster_radius` and stamps `HerdMember { cluster_id }` on every HERD member (Deer/Horse/Cow). `HerdClusterGen` issues monotonic ids; `wild_herd::seed_wild_herds_system` also draws cluster ids from it so wild-herd bloomed individuals share the same flow-field plumbing. `animal_reproduction_system` propagates the mother's cluster id to newborn HERD calves; `wild_herd::spawn_herd_members` propagates the wild herd's `cluster_id` at bloom.
+
+## Animal pathfinding (`animal_paths.rs` + `animal_movement_system`)
+
+Per project convention — per-agent local nav is A\*, flow fields reserved for many-agent shared goals.
+
+- **Per-tile crossing gate (always):** `animal_movement_system` consults `chunk_map.passable_at(nx, ny, nz as i32)` before each tile step; on reject (world changed under a cached plan) it clears the path, demotes to `Wander`, snaps to the current tile, and zeroes `wander_timer` so the next bucket-active pass repicks. Replaces the prior obstacle-blind world-space lerp that walked across Water/River/Wall.
+- **Solo + PACK species** (Wolf/Fox/Cat/Pig/Rabbit) — inline short-horizon A\* via `pathfinding::astar::find_path_in` with `ANIMAL_PATH_BUDGET = 256` nodes. Scratch lives in `AStarPool` index `2` (movement worker uses 0, person path worker uses 1). Cached on `AnimalAI.path` + `path_cursor` + `path_goal`; replan triggered by empty path / drifted `target_tile` / consumed cursor. `BudgetExhausted` keeps the partial; `Unreachable` falls into Wander stall.
+- **HERD species** (Deer/Horse/Cow) — per-herd flow fields managed by `animal_paths.rs`:
+  - `HerdClusterRegistry` (Resource) keyed by `cluster_id`. Each entry tracks `center_tile`, `members` (bloomed count), `cohesion_field`, `repulsion_field`, and the active `repulsion_threat_tile`.
+  - `herd_cluster_update_system` (Economy, daily): recomputes `center_tile` as the mean of bloomed member positions; invalidates `cohesion_field` when the centre drifts > `HERD_REBUILD_DRIFT = 4`; evicts clusters with zero bloomed members.
+  - `herd_cohesion_field_system` (ParallelA, per tick, lazy): builds at most one missing cohesion field per tick via `pathfinding::flow_field::build_flow_field` with goal = `center_tile`, no extra cost. Single-chunk field anchored on the centre's chunk; HERD members outside that chunk fall through to A\*.
+  - `herd_threat_detect_system` (ParallelA, every 20 ticks): walks bloomed members; for each cluster picks the nearest Wolf/Fox within `HERD_THREAT_RADIUS = 12` via `SpatialIndex`. On hit, rebuilds `repulsion_field` with goal = a safe anchor projected away from the threat through the herd centre + `extra_cost` penalty of `HERD_REPULSION_PENALTY = 800` within `HERD_REPULSION_RADIUS = 4` of the threat. Repulsion field expires `HERD_THREAT_COOLDOWN = 100` ticks after the last sighting.
+  - **Consumption in `animal_movement_system`:** for HERD species with a `HerdMember`, the replan branch tries `try_replan_via_flow_field` first — `Flee` consumes the repulsion field, `Wander` consumes cohesion, other states fall through to A\*. Cross-chunk targets always fall through to A\*. Path-following loop is identical for both planners.
+- Path storage on `AnimalAI` is `Vec<(i32,i32,i8)>`; the type lost `Copy` (Vec) but keeps `Clone`/`Default`. No callers were relying on Copy.
 
 ## Nomadic mode
 
