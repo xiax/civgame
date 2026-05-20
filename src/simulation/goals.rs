@@ -8,13 +8,13 @@ use super::schedule::{BucketSlot, SimClock};
 use crate::economy::agent::EconomicAgent;
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
-use crate::simulation::animals::{Horse, Tamed};
+use crate::simulation::animals::{Cat, Cow, Horse, Pig, Tamed};
 use crate::simulation::items::{GroundItem, TargetItem};
 use crate::simulation::plants::Plant;
 use crate::simulation::tasks::TaskKind;
 use crate::simulation::technology::{
-    BOW_AND_ARROW, BRONZE_WEAPONS, COPPER_TOOLS, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING,
-    HORSE_TAMING, HUNTING_SPEAR, LOOM_WEAVING,
+    ANIMAL_HUSBANDRY, BOW_AND_ARROW, BRONZE_WEAPONS, COPPER_TOOLS, DOG_DOMESTICATION,
+    FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING, HORSE_TAMING, HUNTING_SPEAR, LOOM_WEAVING,
 };
 use crate::simulation::typed_task::ActionQueue;
 use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
@@ -155,7 +155,9 @@ pub enum AgentGoal {
     Defend = 8,
     Sleep = 9,
     Build = 10,
-    TameHorse = 11,
+    /// Generic taming goal — dispatcher picks the species from the candidate
+    /// scan (Horse / Cow / Pig / Cat) and routes through `Task::TameAnimal`.
+    TameAnimal = 11,
     Craft = 12,
     Lead = 13,
     Rescue = 14,
@@ -290,7 +292,7 @@ impl AgentGoal {
             AgentGoal::Defend => "Defend",
             AgentGoal::Sleep => "Sleep",
             AgentGoal::Build => "Build",
-            AgentGoal::TameHorse => "TameHorse",
+            AgentGoal::TameAnimal => "TameAnimal",
             AgentGoal::Craft => "Craft",
             AgentGoal::Lead => "Lead",
             AgentGoal::Rescue => "Rescue",
@@ -491,6 +493,18 @@ pub struct GoalValidationQueries<'w, 's> {
     pub item_query: Query<'w, 's, (), With<GroundItem>>,
     pub bp_query: Query<'w, 's, &'static Blueprint>,
     pub wild_horse_q: Query<'w, 's, (), (With<Horse>, Without<Tamed>)>,
+    /// Generalised taming candidate detector: any untamed
+    /// Horse / Cow / Pig / Cat eligible for the per-species tech gate. Used
+    /// by the `has_tameable_animal` snapshot consumed by `TameAnimalScorer`.
+    pub wild_tameable_q: Query<
+        'w,
+        's,
+        (),
+        (
+            Or<(With<Horse>, With<Cow>, With<Pig>, With<Cat>)>,
+            Without<Tamed>,
+        ),
+    >,
     pub rescue_q: Query<'w, 's, &'static RescueTarget>,
     pub attacker_alive_q: Query<
         'w,
@@ -824,7 +838,7 @@ pub fn goal_update_system(
                         prioritize_food: false,
                         fallback_gather: AgentGoal::GatherFood,
                         fallback_gather_reason: "General Gathering (Food)",
-                        has_horse_taming: false,
+                        has_tameable_animal: false,
                         has_personal_build_site: false,
                         should_craft: false,
                         injury: scorer_inputs.injury_q.get(entity).ok().copied(),
@@ -1016,13 +1030,22 @@ pub fn goal_update_system(
             80.0
         };
 
-        let has_horse_taming = member.faction_id != SOLO
+        // Generalised taming awareness. Fires when (1) the faction is Aware of
+        // ANY species-tech (`HORSE_TAMING`, `ANIMAL_HUSBANDRY`, or
+        // `DOG_DOMESTICATION`) and (2) there is at least one untamed Horse /
+        // Cow / Pig / Cat reachable in the wild. The dispatcher does the per-
+        // species reconciliation at scan time.
+        let has_tameable_animal = member.faction_id != SOLO
             && registry
                 .factions
                 .get(&member.faction_id)
-                .map(|f| f.techs.has(HORSE_TAMING))
+                .map(|f| {
+                    f.techs.has(HORSE_TAMING)
+                        || f.techs.has(ANIMAL_HUSBANDRY)
+                        || f.techs.has(DOG_DOMESTICATION)
+                })
                 .unwrap_or(false)
-            && !validation.wild_horse_q.is_empty();
+            && !validation.wild_tameable_q.is_empty();
 
         let (faction_food_ratio, can_return_camp) = if member.faction_id != SOLO {
             let per_member: f32 = match calendar.season {
@@ -1158,8 +1181,8 @@ pub fn goal_update_system(
                 (AgentGoal::Sleep, "Tired")
             } else if prioritize_food {
                 (gather_goal, gather_reason)
-            } else if has_horse_taming {
-                (AgentGoal::TameHorse, "Taming Horse")
+            } else if has_tameable_animal {
+                (AgentGoal::TameAnimal, "Taming Animal")
             } else if needs.social > social_threshold {
                 (AgentGoal::Socialize, "Social Need")
             } else if needs.willpower < play_threshold {
@@ -1214,7 +1237,7 @@ pub fn goal_update_system(
                 prioritize_food,
                 fallback_gather: gather_goal,
                 fallback_gather_reason: gather_reason,
-                has_horse_taming,
+                has_tameable_animal,
                 has_personal_build_site,
                 should_craft: should_craft_now,
                 injury: scorer_inputs.injury_q.get(entity).ok().copied(),
@@ -1511,7 +1534,7 @@ pub fn earnincome_goal_override_system(
             prioritize_food: false,
             fallback_gather: AgentGoal::GatherFood,
             fallback_gather_reason: "",
-            has_horse_taming: false,
+            has_tameable_animal: false,
             has_personal_build_site: false,
             should_craft: false,
             injury: None,

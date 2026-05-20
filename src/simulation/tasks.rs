@@ -823,11 +823,11 @@ pub fn goal_dispatch_system(
                     {
                         Some(TaskKind::DepositResource as u16)
                     }
-                    // Phase 5e-iv: HTN-driven TameWildHorse chain runs without
-                    // an ActivePlan under TameHorse. The TameAnimal walk +
-                    // 100-tick adjacency work need to survive across
+                    // HTN-driven TameWildAnimal chain runs without an
+                    // ActivePlan under TameAnimal. The TameAnimal walk +
+                    // 100-tick adjacency work needs to survive across
                     // goal-dispatch ticks until `tame_task_system` finalises.
-                    AgentGoal::TameHorse
+                    AgentGoal::TameAnimal
                         if aq.current_task_kind() == TaskKind::TameAnimal as u16 =>
                     {
                         Some(TaskKind::TameAnimal as u16)

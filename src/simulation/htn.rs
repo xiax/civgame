@@ -128,9 +128,11 @@ pub enum AbstractTask {
     ReturnSurplus,
     /// Agent walks to the nearest visible wild Horse and works adjacent until
     /// it accepts a `Tamed` marker. Single-method registry —
-    /// `TameWildHorseMethod` always wins. Faction-tech-gated on
-    /// `HORSE_TAMING`. Replaces the legacy `TameHorse` plan (PlanId 10).
-    TameWildHorse,
+    /// `TameWildAnimalMethod` always wins. Species candidate is resolved at
+    /// dispatch time (Horse / Cow / Pig / Cat) against the faction's tech
+    /// bitset (HORSE_TAMING / ANIMAL_HUSBANDRY / DOG_DOMESTICATION). The
+    /// executor (`tame_task_system`) re-validates per-species at every tick.
+    TameWildAnimal,
     /// Withdraw one of `resource_id` (a seed) from faction storage and plant it
     /// on the nearest unplanted Farmland tile. Single expansion
     /// `[WithdrawMaterial { seed, 1 }, Planter { tile }]`. `MF_UNINTERRUPTIBLE`
@@ -277,7 +279,7 @@ pub enum AbstractTaskKind {
     Scout,
     EquipHuntingSpear,
     ReturnSurplus,
-    TameWildHorse,
+    TameWildAnimal,
     PlantFromStorage,
     ConstructBlueprint,
     DeliverHuntKill,
@@ -306,7 +308,7 @@ impl AbstractTask {
             AbstractTask::Scout => AbstractTaskKind::Scout,
             AbstractTask::EquipHuntingSpear => AbstractTaskKind::EquipHuntingSpear,
             AbstractTask::ReturnSurplus => AbstractTaskKind::ReturnSurplus,
-            AbstractTask::TameWildHorse => AbstractTaskKind::TameWildHorse,
+            AbstractTask::TameWildAnimal => AbstractTaskKind::TameWildAnimal,
             AbstractTask::PlantFromStorage { .. } => AbstractTaskKind::PlantFromStorage,
             AbstractTask::ConstructBlueprint => AbstractTaskKind::ConstructBlueprint,
             AbstractTask::DeliverHuntKill => AbstractTaskKind::DeliverHuntKill,
@@ -359,7 +361,7 @@ impl MethodId {
     pub const SCOUT_FOR_PREY: MethodId = MethodId(14);
     pub const WITHDRAW_AND_EQUIP_HUNTING_SPEAR: MethodId = MethodId(15);
     pub const DEPOSIT_SURPLUS_AT_STORAGE: MethodId = MethodId(16);
-    pub const TAME_WILD_HORSE: MethodId = MethodId(17);
+    pub const TAME_WILD_ANIMAL: MethodId = MethodId(17);
     pub const WITHDRAW_AND_PLANT_SEED: MethodId = MethodId(18);
     pub const BUILD_CLAIMED_BLUEPRINT: MethodId = MethodId(19);
     pub const DELIVER_HUNT_KILL: MethodId = MethodId(20);
@@ -417,7 +419,7 @@ impl MethodId {
             Self::SCOUT_FOR_PREY => "ScoutForPrey",
             Self::WITHDRAW_AND_EQUIP_HUNTING_SPEAR => "WithdrawAndEquipHuntingSpear",
             Self::DEPOSIT_SURPLUS_AT_STORAGE => "DepositSurplusAtStorage",
-            Self::TAME_WILD_HORSE => "TameWildHorse",
+            Self::TAME_WILD_ANIMAL => "TameWildAnimal",
             Self::WITHDRAW_AND_PLANT_SEED => "WithdrawAndPlantSeed",
             Self::BUILD_CLAIMED_BLUEPRINT => "BuildClaimedBlueprint",
             Self::DELIVER_HUNT_KILL => "DeliverHuntKill",
@@ -1314,8 +1316,8 @@ pub fn register_builtin_methods(reg: &mut MethodRegistry) {
         Box::new(DepositSurplusAtStorageMethod),
     );
     reg.register(
-        AbstractTaskKind::TameWildHorse,
-        Box::new(TameWildHorseMethod),
+        AbstractTaskKind::TameWildAnimal,
+        Box::new(TameWildAnimalMethod),
     );
     reg.register(
         AbstractTaskKind::PlantFromStorage,
@@ -2541,19 +2543,19 @@ impl Method for DepositSurplusAtStorageMethod {
     }
 }
 
-/// Sole method for `AbstractTask::TameWildHorse`. Single-leg expansion
-/// `[Task::TameAnimal { target }]` — agent walks to the wild horse's tile
-/// and works adjacent until `tame_task_system` fires. Reuses the
+/// Sole method for `AbstractTask::TameWildAnimal`. Single-leg expansion
+/// `[Task::TameAnimal { target }]` — agent walks to the candidate's tile and
+/// works adjacent until `tame_task_system` fires. Reuses the
 /// `scavenge_target_entity`/`scavenge_target_tile` ctx fields to carry the
-/// horse entity + tile (semantically "an entity the agent walks to and
-/// interacts with" — same shape regardless of whether the entity is a
-/// GroundItem to scavenge or a wild Horse to tame). Replaces the legacy
-/// `TameHorse` plan (PlanId 10) and its `TameAnimal` step (StepId 11).
-pub struct TameWildHorseMethod;
+/// target entity + tile (semantically "an entity the agent walks to and
+/// interacts with"). The dispatcher does the per-species tech gate at scan
+/// time (Horse → HORSE_TAMING, Cow/Pig → ANIMAL_HUSBANDRY, Cat →
+/// DOG_DOMESTICATION), so this method has no static `tech_gate`.
+pub struct TameWildAnimalMethod;
 
-impl Method for TameWildHorseMethod {
+impl Method for TameWildAnimalMethod {
     fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
-        if !matches!(abstract_task, AbstractTask::TameWildHorse) {
+        if !matches!(abstract_task, AbstractTask::TameWildAnimal) {
             return false;
         }
         ctx.scavenge_target_entity.is_some() && ctx.scavenge_target_tile.is_some()
@@ -2564,7 +2566,7 @@ impl Method for TameWildHorseMethod {
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
-        if !matches!(abstract_task, AbstractTask::TameWildHorse) {
+        if !matches!(abstract_task, AbstractTask::TameWildAnimal) {
             return Vec::new();
         }
         let Some(target) = ctx.scavenge_target_entity else {
@@ -2573,16 +2575,12 @@ impl Method for TameWildHorseMethod {
         vec![Task::TameAnimal { target }]
     }
 
-    fn tech_gate(&self) -> Option<TechId> {
-        Some(crate::simulation::technology::HORSE_TAMING)
-    }
-
     fn name(&self) -> &'static str {
-        "TameWildHorse"
+        "TameWildAnimal"
     }
 
     fn id(&self) -> MethodId {
-        MethodId::TAME_WILD_HORSE
+        MethodId::TAME_WILD_ANIMAL
     }
 }
 
@@ -6319,20 +6317,22 @@ pub fn htn_return_surplus_dispatch_system(
     );
 }
 
-/// `AgentGoal::TameHorse` dispatcher. Replaces the legacy `TameHorse` plan
-/// (PlanId 10). Single-method registry — `TameWildHorseMethod` always wins.
-/// Faction tech-gated on `HORSE_TAMING` (`tame_task_system` re-validates,
-/// but the dispatcher gate avoids dispatching a chain doomed to bail on the
-/// first executor tick).
+/// `AgentGoal::TameAnimal` dispatcher. Single-method registry —
+/// `TameWildAnimalMethod` always wins. Faction tech-gated per-species at
+/// scan time:
+///   Horse → `HORSE_TAMING`
+///   Cow / Pig → `ANIMAL_HUSBANDRY`
+///   Cat → `DOG_DOMESTICATION`
+/// Wolves are **not** auto-tamed via this path; "dog-from-wolf" is a deliberate
+/// player/chief command in v1.
 ///
-/// Scans `SpatialIndex` within `VIEW_RADIUS=15` for the nearest live
-/// `With<Horse> Without<Tamed>` entity, snapshots `(entity, tile)` into the
-/// shared `scavenge_target_entity`/`scavenge_target_tile` ctx slots, and
-/// routes via `assign_task_with_routing(... TaskKind::TameAnimal,
-/// Some(horse_entity) ...)` so the executor can read `target_entity` for
-/// backwards compatibility. The typed `Task::TameAnimal { target }` carries
-/// the same entity for chain-integrity inspection.
-pub fn htn_tame_horse_dispatch_system(
+/// Scans `SpatialIndex` within `VIEW_RADIUS=15` for the nearest live untamed
+/// candidate of any species the faction is Aware of, snapshots `(entity, tile)`
+/// into the shared `scavenge_target_entity`/`scavenge_target_tile` ctx slots,
+/// and routes via `assign_task_with_routing(... TaskKind::TameAnimal, ...)`.
+/// The executor (`tame_task_system`) re-validates the per-species tech at every
+/// tick.
+pub fn htn_tame_animal_dispatch_system(
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
@@ -6345,6 +6345,27 @@ pub fn htn_tame_horse_dispatch_system(
         (),
         (
             With<crate::simulation::animals::Horse>,
+            Without<crate::simulation::animals::Tamed>,
+        ),
+    >,
+    wild_cow_q: Query<
+        (),
+        (
+            With<crate::simulation::animals::Cow>,
+            Without<crate::simulation::animals::Tamed>,
+        ),
+    >,
+    wild_pig_q: Query<
+        (),
+        (
+            With<crate::simulation::animals::Pig>,
+            Without<crate::simulation::animals::Tamed>,
+        ),
+    >,
+    wild_cat_q: Query<
+        (),
+        (
+            With<crate::simulation::animals::Cat>,
             Without<crate::simulation::animals::Tamed>,
         ),
     >,
@@ -6367,21 +6388,27 @@ pub fn htn_tame_horse_dispatch_system(
         if *lod == LodLevel::Dormant {
             continue;
         }
-        if !matches!(*goal, AgentGoal::TameHorse) {
+        if !matches!(*goal, AgentGoal::TameAnimal) {
             continue;
         }
         if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
             continue;
         }
-        // Faction-tech gate. The executor double-checks per-target on each
-        // tick (different species need different techs), but gating up here
-        // avoids dispatching a chain that would immediately bail.
-        let has_tech = faction_registry
+        // Per-species tech awareness. Skip species the faction can't tame so
+        // the candidate scan doesn't waste cycles on doomed targets.
+        let (can_horse, can_cattle_pig, can_cat) = faction_registry
             .factions
             .get(&member.faction_id)
-            .map(|f| f.techs.has(crate::simulation::technology::HORSE_TAMING))
-            .unwrap_or(false);
-        if !has_tech {
+            .map(|f| {
+                (
+                    f.techs.has(crate::simulation::technology::HORSE_TAMING),
+                    f.techs.has(crate::simulation::technology::ANIMAL_HUSBANDRY),
+                    f.techs
+                        .has(crate::simulation::technology::DOG_DOMESTICATION),
+                )
+            })
+            .unwrap_or((false, false, false));
+        if !(can_horse || can_cattle_pig || can_cat) {
             continue;
         }
 
@@ -6392,27 +6419,32 @@ pub fn htn_tame_horse_dispatch_system(
             cur_ty.div_euclid(CHUNK_SIZE as i32),
         );
 
-        // Scan SpatialIndex for the nearest wild horse. Mirrors the legacy
-        // `StepTarget::NearestWildHorse` resolver (chebyshev within
-        // VIEW_RADIUS, manhattan tiebreak).
-        let mut best_horse: Option<(Entity, (i32, i32))> = None;
+        // Scan SpatialIndex for the nearest wild candidate matching any tech the
+        // faction has. Chebyshev within VIEW_RADIUS, manhattan tiebreak (the same
+        // ranking the legacy horse-only dispatcher used).
+        let mut best_target: Option<(Entity, (i32, i32))> = None;
         let mut best_dist = i32::MAX;
         for dy in -VIEW_RADIUS..=VIEW_RADIUS {
             for dx in -VIEW_RADIUS..=VIEW_RADIUS {
                 let tx = cur_tx + dx;
                 let ty = cur_ty + dy;
                 for &candidate in spatial.get(tx, ty) {
-                    if wild_horse_q.get(candidate).is_ok() {
+                    let matches = (can_horse && wild_horse_q.get(candidate).is_ok())
+                        || (can_cattle_pig
+                            && (wild_cow_q.get(candidate).is_ok()
+                                || wild_pig_q.get(candidate).is_ok()))
+                        || (can_cat && wild_cat_q.get(candidate).is_ok());
+                    if matches {
                         let dist = dx.abs() + dy.abs();
                         if dist < best_dist {
                             best_dist = dist;
-                            best_horse = Some((candidate, (tx, ty)));
+                            best_target = Some((candidate, (tx, ty)));
                         }
                     }
                 }
             }
         }
-        let Some((horse_entity, horse_tile)) = best_horse else {
+        let Some((horse_entity, horse_tile)) = best_target else {
             continue;
         };
 
@@ -6433,7 +6465,7 @@ pub fn htn_tame_horse_dispatch_system(
             claimed_blueprint_tile: None,
             gather_target_tile: None,
             // The `scavenge_target_*` ctx slots double as "any entity to walk
-            // to and interact with" — the TameWildHorseMethod reads them.
+            // to and interact with" — the TameWildAnimalMethod reads them.
             scavenge_target_entity: Some(horse_entity),
             scavenge_target_tile: Some(horse_tile),
             scavenge_food_good: None,
@@ -6464,7 +6496,7 @@ pub fn htn_tame_horse_dispatch_system(
             deposit_target_faction_override: None,
         };
 
-        let abstract_task = AbstractTask::TameWildHorse;
+        let abstract_task = AbstractTask::TameWildAnimal;
         let Some(pick) =
             dispatch_for_goal(&method_registry, abstract_task, &ctx, &history, now, None)
         else {
@@ -6537,7 +6569,7 @@ pub fn htn_tame_horse_dispatch_system(
 ///    farmland tile carried in `Task::Planter { tile }`.
 ///
 /// Goal arena: `Farm` only. Faction-tech-gated on `CROP_CULTIVATION` (the
-/// method's `tech_gate`). The dispatcher runs after `htn_tame_horse_dispatch_system`
+/// method's `tech_gate`). The dispatcher runs after `htn_tame_animal_dispatch_system`
 /// in ParallelB; it doesn't compete with food/haul/scout/spear/return-surplus
 /// dispatchers because Farm is a distinct goal arena.
 /// Bundle of farm-planner inputs read by `htn_plant_from_storage_dispatch_system`

@@ -13701,7 +13701,7 @@ mod wage_aware_phase0_phase1 {
             prioritize_food: false,
             fallback_gather: AgentGoal::GatherFood,
             fallback_gather_reason: "",
-            has_horse_taming: false,
+            has_tameable_animal: false,
             has_personal_build_site: false,
             should_craft: false,
             injury: None,

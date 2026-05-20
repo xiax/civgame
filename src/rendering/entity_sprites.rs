@@ -1823,6 +1823,13 @@ pub fn spawn_blueprint_sprites(
                 .get("building_well")
                 .cloned()
                 .unwrap_or_else(|| textures.wall_stone_ascii.clone()),
+            // Husbandry kit reuses palisade (fence-like) until dedicated art
+            // ships. FeedTrough/HitchingPost are tiny so the table sprite
+            // reads better.
+            BuildSiteKind::Pen | BuildSiteKind::Stable => textures.wall_palisade_ascii.clone(),
+            BuildSiteKind::FeedTrough | BuildSiteKind::HitchingPost => {
+                textures.table_ascii.clone()
+            }
         };
 
         let mut ghost_sprite = Sprite::from_image(ghost_img);

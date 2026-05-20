@@ -1520,10 +1520,16 @@ pub fn eat_task_system(
 ///   horse → HORSE_TAMING
 ///   cow / pig → ANIMAL_HUSBANDRY
 ///   cat → DOG_DOMESTICATION (companion-animal tech)
+///
+/// On success, inserts `Tamed { owner_faction }` (single source of truth for
+/// ownership; `DomesticAnimal` is auto-attached by `attach_pack_inventory_system`
+/// next tick). If the target was a `WildHerdMember`, the registry entry is
+/// updated so the bloom/collapse cycle won't restore or despawn it.
 pub fn tame_task_system(
     mut commands: Commands,
     clock: Res<SimClock>,
     faction_registry: Res<FactionRegistry>,
+    mut wild_herd_registry: ResMut<crate::simulation::wild_herd::WildHerdRegistry>,
     mut query: Query<(
         &mut PersonAI,
         &mut crate::simulation::typed_task::ActionQueue,
@@ -1535,6 +1541,7 @@ pub fn tame_task_system(
     untamed_cows: Query<(), (With<Cow>, Without<Tamed>)>,
     untamed_pigs: Query<(), (With<Pig>, Without<Tamed>)>,
     untamed_cats: Query<(), (With<Cat>, Without<Tamed>)>,
+    wild_herd_member_q: Query<&crate::simulation::wild_herd::WildHerdMember>,
 ) {
     const TICKS_TAME: u8 = 100;
 
@@ -1546,9 +1553,8 @@ pub fn tame_task_system(
             continue;
         }
 
-        // Phase 5e-iv: prefer the typed task's target for chain-integrity;
-        // fall back to legacy `ai.target_entity` so the plan-driven path
-        // (still the only producer pre-migration) keeps working.
+        // Prefer the typed task's target for chain-integrity; fall back to
+        // legacy `ai.target_entity` so the plan-driven path keeps working.
         let Some(target) = aq.current.as_tame_animal().or(ai.target_entity) else {
             ai.state = AiState::Idle;
             ai.work_progress = 0;
@@ -1588,6 +1594,16 @@ pub fn tame_task_system(
         }
 
         if ai.work_progress >= TICKS_TAME {
+            // Remove from wild-herd LOD registry first so the bloom/collapse
+            // cycle won't later despawn or restore this entity. The marker is
+            // also removed from the entity so future scans treat it as
+            // domestic-only.
+            if let Ok(member_marker) = wild_herd_member_q.get(target) {
+                wild_herd_registry.remove_member(member_marker.herd_id, target);
+                commands
+                    .entity(target)
+                    .remove::<crate::simulation::wild_herd::WildHerdMember>();
+            }
             commands.entity(target).insert(Tamed {
                 owner_faction: member.faction_id,
             });

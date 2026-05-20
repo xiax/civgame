@@ -124,6 +124,17 @@ impl WildHerdRegistry {
         self.next_id = self.next_id.wrapping_add(1);
         id
     }
+
+    /// Removes `entity` from herd `herd_id`'s `members` list and decrements
+    /// `aggregate_count` so the bloom/collapse churn doesn't restore or
+    /// despawn it. Called by `tame_task_system` when a wild-herd member is
+    /// successfully tamed.
+    pub fn remove_member(&mut self, herd_id: u32, entity: Entity) {
+        if let Some(herd) = self.herds.get_mut(&herd_id) {
+            herd.members.retain(|&e| e != entity);
+            herd.aggregate_count = herd.aggregate_count.saturating_sub(1);
+        }
+    }
 }
 
 /// Phase 10: marker on entities spawned during a wild-herd bloom. Removed
@@ -595,7 +606,7 @@ fn spawn_herd_members(
                     needs,
                     AnimalReproductionCooldown(0),
                     BiologicalSex::random(),
-                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Horse),
+                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Cow),
                 ))
                 .id(),
         };

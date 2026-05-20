@@ -26,6 +26,7 @@ pub mod gather_claims;
 pub mod goal_scorers;
 pub mod goals;
 pub mod htn;
+pub mod husbandry;
 pub mod items;
 pub mod jobs;
 pub mod knowledge;
@@ -137,6 +138,25 @@ impl Plugin for SimulationPlugin {
             .on_add(capital::on_owned_by_add)
             .on_remove(capital::on_owned_by_remove);
 
+        // Husbandry infrastructure: tile-indexed maps follow the same
+        // on_add / on_remove pattern as BedMap / GranaryMap.
+        app.world_mut()
+            .register_component_hooks::<husbandry::Pen>()
+            .on_add(husbandry::on_pen_add)
+            .on_remove(husbandry::on_pen_remove);
+        app.world_mut()
+            .register_component_hooks::<husbandry::Stable>()
+            .on_add(husbandry::on_stable_add)
+            .on_remove(husbandry::on_stable_remove);
+        app.world_mut()
+            .register_component_hooks::<husbandry::FeedTrough>()
+            .on_add(husbandry::on_feed_trough_add)
+            .on_remove(husbandry::on_feed_trough_remove);
+        app.world_mut()
+            .register_component_hooks::<husbandry::HitchingPost>()
+            .on_add(husbandry::on_hitching_post_add)
+            .on_remove(husbandry::on_hitching_post_remove);
+
         app.add_plugins(jobs::JobsPlugin)
             .add_plugins(projects::ProjectsPlugin)
             .add_event::<combat::CombatEvent>()
@@ -198,6 +218,10 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::BridgeMap::default())
             .insert_resource(construction::DamMap::default())
             .insert_resource(construction::WellMap::default())
+            .insert_resource(husbandry::PenMap::default())
+            .insert_resource(husbandry::StableMap::default())
+            .insert_resource(husbandry::FeedTroughMap::default())
+            .insert_resource(husbandry::HitchingPostMap::default())
             .insert_resource(construction::StructureIndex::default())
             .insert_resource(construction::BlueprintMap::default())
             .insert_resource(construction::ConstructionPosterPool::default())
@@ -374,6 +398,16 @@ impl Plugin for SimulationPlugin {
                         .after(clear_obstacle::clear_obstacles_under_seeded_structures)
                         .after(seed_reservation::populate_seed_reservation_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Seed starting tamed animals (dogs / cattle / pigs /
+                    // horses / cats) for every eligible faction based on the
+                    // chief's seeded tech awareness. Runs after the founder
+                    // population + wild fauna spawn so home tiles + tech
+                    // bits are live.
+                    animals::seed_starting_tamed_animals_system
+                        .after(person::spawn_population)
+                        .after(animals::spawn_animals)
+                        .after(faction::sync_faction_techs_from_chief_system)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     // Flip the warmup gate now that the initial survey +
                     // seed have applied. Future systems can opt in via
                     // `.run_if(in_state(SimulationState::Active))`.
@@ -383,6 +417,7 @@ impl Plugin for SimulationPlugin {
                         .after(seed_reservation::populate_seed_reservation_system)
                         .after(settlement_bootstrap::seed_starting_relationships_system)
                         .after(settlement_bootstrap::relocate_stranded_members_system)
+                        .after(animals::seed_starting_tamed_animals_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                 ),
             )
@@ -504,10 +539,10 @@ impl Plugin for SimulationPlugin {
                         .after(htn::htn_acquire_food_dispatch_system),
                     htn::htn_scout_dispatch_system.after(htn::htn_acquire_good_dispatch_system),
                     htn::htn_return_surplus_dispatch_system.after(htn::htn_scout_dispatch_system),
-                    htn::htn_tame_horse_dispatch_system
+                    htn::htn_tame_animal_dispatch_system
                         .after(htn::htn_return_surplus_dispatch_system),
                     htn::htn_plant_from_storage_dispatch_system
-                        .after(htn::htn_tame_horse_dispatch_system),
+                        .after(htn::htn_tame_animal_dispatch_system),
                     htn::htn_build_claimed_blueprint_dispatch_system
                         .after(htn::htn_plant_from_storage_dispatch_system),
                     htn::htn_deliver_hunt_kill_dispatch_system
@@ -542,7 +577,7 @@ impl Plugin for SimulationPlugin {
                     .after(htn::htn_stockpile_food_dispatch_system)
                     .after(htn::htn_scout_dispatch_system)
                     .after(htn::htn_return_surplus_dispatch_system)
-                    .after(htn::htn_tame_horse_dispatch_system)
+                    .after(htn::htn_tame_animal_dispatch_system)
                     .after(htn::htn_plant_from_storage_dispatch_system)
                     .after(htn::htn_build_claimed_blueprint_dispatch_system)
                     .after(htn::htn_deliver_hunt_kill_dispatch_system)
@@ -601,12 +636,28 @@ impl Plugin for SimulationPlugin {
                 )
                     .in_set(SimulationSet::ParallelB),
             )
-            // P8: attach `PackAnimalInventory` to freshly tamed pack
-            // animals (Horse / Cow / Pig). Own add_systems call to dodge
-            // the 20-element ceiling on the Sequential tuple.
+            // Attach `PackAnimalInventory` (Horse / Cow / Pig / tamed-Wolf)
+            // and `DomesticAnimal` to freshly tamed animals. Own add_systems
+            // call to dodge the 20-element Sequential tuple ceiling.
             .add_systems(
                 FixedUpdate,
-                animals::attach_pack_inventory_system.in_set(SimulationSet::Sequential),
+                (
+                    animals::attach_pack_inventory_system,
+                    animals::animal_work_claim_expiry_system,
+                    husbandry::assign_preferred_home_system,
+                )
+                    .in_set(SimulationSet::Sequential),
+            )
+            // Husbandry intent emitter (faction-staggered, daily) + feed
+            // trough consumption (daily). Economy slot mirrors how
+            // bridge/dam emitters land alongside the chief-job pipeline.
+            .add_systems(
+                FixedUpdate,
+                (
+                    husbandry::husbandry_intent_emitter_system,
+                    husbandry::feed_trough_consume_system,
+                )
+                    .in_set(SimulationSet::Economy),
             )
             // Calendar-driven plant lifecycle (replaces the old per-frame
             // tick growth + scatter pair). Edge-triggers on season change;

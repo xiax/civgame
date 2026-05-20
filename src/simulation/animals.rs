@@ -111,11 +111,73 @@ pub struct Fox;
 #[derive(Component)]
 pub struct Cat;
 
-/// Placed on a horse once tamed by a faction.
-/// The horse stops fleeing from persons and can be ridden.
+/// Placed on an animal once tamed by a faction.
+/// The animal stops fleeing from owner-faction persons and (for horses) can be
+/// ridden. Single source of truth for ownership; `DomesticAnimal` carries the
+/// richer husbandry state and is auto-attached alongside this marker by
+/// `attach_pack_inventory_system`.
 #[derive(Component, Clone, Copy)]
 pub struct Tamed {
     pub owner_faction: u32,
+}
+
+/// Animal-husbandry species identity. `Cattle` projects onto the existing `Cow`
+/// Bevy marker; `Dog` projects onto `Wolf` + `Tamed` (tamed-wolf disposition).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DomesticSpecies {
+    Horse,
+    Cattle,
+    Pig,
+    Dog,
+    Cat,
+}
+
+impl DomesticSpecies {
+    pub fn label(self) -> &'static str {
+        match self {
+            DomesticSpecies::Horse => "Horse",
+            DomesticSpecies::Cattle => "Cattle",
+            DomesticSpecies::Pig => "Pig",
+            DomesticSpecies::Dog => "Dog",
+            DomesticSpecies::Cat => "Cat",
+        }
+    }
+}
+
+/// Per-tamed-animal husbandry record. Inserted automatically by
+/// `attach_pack_inventory_system` when `Tamed` is added; never carries
+/// `owner_faction` (that lives on `Tamed`). `preferred_home` points at the
+/// animal's assigned Pen / Stable entity once `assign_preferred_home_system`
+/// runs.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct DomesticAnimal {
+    pub species: DomesticSpecies,
+    pub training: u8,
+    pub preferred_home: Option<Entity>,
+    pub last_cared_tick: u32,
+}
+
+/// Which work role an `AnimalWorkClaim` reserves an animal for. v1 ships with
+/// the variants populated for future v2 wiring (plow / cart); the executor
+/// surfaces are stubbed but `Pack` / `Mount` / `Companion` are already live.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AnimalUse {
+    Pack,
+    Mount,
+    Plow,
+    Cart,
+    Companion,
+    Guard,
+}
+
+/// Reserves a domestic animal for one worker + role. Cleared on task
+/// completion / worker despawn / animal death; otherwise expires after
+/// `expires_tick` (cleanup system runs each Sequential tick).
+#[derive(Component, Clone, Copy, Debug)]
+pub struct AnimalWorkClaim {
+    pub worker: Entity,
+    pub use_kind: AnimalUse,
+    pub expires_tick: u32,
 }
 
 /// Bug-fix #2 (pack animals stranded): marks a tamed animal as
@@ -250,29 +312,74 @@ impl PackAnimalInventory {
     }
 }
 
-/// P8: Per-tick `Added<Tamed>` hook system. Inserts a default
-/// `PackAnimalInventory` sized for the species when an animal is
-/// freshly tamed (no-op if one already exists).
+/// Per-tick `Added<Tamed>` hook system. Inserts a default
+/// `PackAnimalInventory` sized for the species + a `DomesticAnimal` record
+/// (species, training, preferred_home, last_cared_tick) when an animal is
+/// freshly tamed. Idempotent — `Without<PackAnimalInventory>` / `Without<DomesticAnimal>`
+/// gate against double-inserts.
+///
+/// Species mapping:
+/// - `With<Horse>` → `DomesticSpecies::Horse`
+/// - `With<Cow>`   → `DomesticSpecies::Cattle`
+/// - `With<Pig>`   → `DomesticSpecies::Pig`
+/// - `With<Cat>`   → `DomesticSpecies::Cat` (no pack inventory — companion)
+/// - `With<Wolf>`  → `DomesticSpecies::Dog`  (tamed-wolf disposition + small pack)
 pub fn attach_pack_inventory_system(
     mut commands: Commands,
-    horse_q: Query<Entity, (Added<Tamed>, With<Horse>, Without<PackAnimalInventory>)>,
-    cow_q: Query<Entity, (Added<Tamed>, With<Cow>, Without<PackAnimalInventory>)>,
-    pig_q: Query<Entity, (Added<Tamed>, With<Pig>, Without<PackAnimalInventory>)>,
+    clock: Res<SimClock>,
+    horse_q: Query<Entity, (Added<Tamed>, With<Horse>, Without<DomesticAnimal>)>,
+    cow_q: Query<Entity, (Added<Tamed>, With<Cow>, Without<DomesticAnimal>)>,
+    pig_q: Query<Entity, (Added<Tamed>, With<Pig>, Without<DomesticAnimal>)>,
+    cat_q: Query<Entity, (Added<Tamed>, With<Cat>, Without<DomesticAnimal>)>,
+    wolf_q: Query<Entity, (Added<Tamed>, With<Wolf>, Without<DomesticAnimal>)>,
 ) {
+    let now = clock.tick as u32;
+    let mut attach = |e: Entity, species: DomesticSpecies, pack_cap: Option<u32>| {
+        let mut ec = commands.entity(e);
+        ec.insert(DomesticAnimal {
+            species,
+            training: 0,
+            preferred_home: None,
+            last_cared_tick: now,
+        });
+        if let Some(cap) = pack_cap {
+            ec.insert(PackAnimalInventory::for_capacity(cap));
+        }
+    };
     for e in horse_q.iter() {
-        commands
-            .entity(e)
-            .insert(PackAnimalInventory::for_capacity(PACK_CAP_HORSE));
+        attach(e, DomesticSpecies::Horse, Some(PACK_CAP_HORSE));
     }
     for e in cow_q.iter() {
-        commands
-            .entity(e)
-            .insert(PackAnimalInventory::for_capacity(PACK_CAP_COW));
+        attach(e, DomesticSpecies::Cattle, Some(PACK_CAP_COW));
     }
     for e in pig_q.iter() {
-        commands
-            .entity(e)
-            .insert(PackAnimalInventory::for_capacity(PACK_CAP_PIG));
+        attach(e, DomesticSpecies::Pig, Some(PACK_CAP_PIG));
+    }
+    for e in cat_q.iter() {
+        attach(e, DomesticSpecies::Cat, None);
+    }
+    for e in wolf_q.iter() {
+        attach(e, DomesticSpecies::Dog, Some(PACK_CAP_DOG));
+    }
+}
+
+/// Sweeps stale `AnimalWorkClaim`s — expired by `expires_tick` or whose
+/// worker entity no longer exists. Sequential cadence (every 60 ticks).
+pub fn animal_work_claim_expiry_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    persons: Query<(), With<Person>>,
+    claims: Query<(Entity, &AnimalWorkClaim)>,
+) {
+    if clock.tick % 60 != 0 {
+        return;
+    }
+    let now = clock.tick as u32;
+    for (e, claim) in claims.iter() {
+        let worker_alive = persons.get(claim.worker).is_ok();
+        if !worker_alive || now >= claim.expires_tick {
+            commands.entity(e).remove::<AnimalWorkClaim>();
+        }
     }
 }
 
@@ -659,6 +766,7 @@ pub fn spawn_animals(
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Cow),
         ));
         slot += 1;
     }
@@ -737,6 +845,7 @@ pub fn spawn_animals(
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Pig),
         ));
         slot += 1;
     }
@@ -815,6 +924,7 @@ pub fn spawn_animals(
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Cat),
         ));
         slot += 1;
     }
@@ -2113,6 +2223,7 @@ pub fn animal_reproduction_system(
                     AnimalNeeds::default(),
                     AnimalReproductionCooldown(0),
                     sex,
+                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Cow),
                 ));
                 if let Some(cid) = herd_cid {
                     e.insert(HerdMember { cluster_id: cid });
@@ -2152,6 +2263,7 @@ pub fn animal_reproduction_system(
                     AnimalNeeds::default(),
                     AnimalReproductionCooldown(0),
                     sex,
+                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Pig),
                 ));
             }
             6 => {
@@ -2188,6 +2300,7 @@ pub fn animal_reproduction_system(
                     AnimalNeeds::default(),
                     AnimalReproductionCooldown(0),
                     sex,
+                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Cat),
                 ));
             }
         }
@@ -2378,6 +2491,220 @@ pub fn animal_drink_system(
     }
 }
 
+/// Seed starting domestic animals for every eligible non-SOLO faction at
+/// `OnEnter(Playing)`, after `spawn_population` + `spawn_animals` (so the
+/// member count / settlement infrastructure is live) and before
+/// `mark_warmup_complete_system`. Eligibility comes from faction tech
+/// awareness — primed by `sync_faction_techs_from_chief_system` during
+/// OnEnter.
+///
+/// Per faction (counts are floors; scaled +1 per 20 founders, capped 6):
+/// - `DOG_DOMESTICATION` → 2 dogs (Wolf + Tamed + DomesticAnimal{Dog}).
+/// - `ANIMAL_HUSBANDRY` → 2 cattle + 2 pigs (1 M + 1 F each).
+/// - `HORSE_TAMING` → 2 horses (1 M + 1 F).
+/// - `DOG_DOMESTICATION` → 1 cat (companion).
+///
+/// Settled factions spawn within 6 tiles of `home_tile` biased to grass/scrub.
+/// Nomadic factions spawn with `FollowingBand`.
+/// Global cap of 200 seeded animals to bound entity count.
+pub fn seed_starting_tamed_animals_system(
+    mut commands: Commands,
+    mut clock: ResMut<SimClock>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    faction_registry: Res<crate::simulation::faction::FactionRegistry>,
+) {
+    use crate::simulation::faction::SOLO;
+    use crate::simulation::technology::{ANIMAL_HUSBANDRY, DOG_DOMESTICATION, HORSE_TAMING};
+
+    const GLOBAL_CAP: u32 = 200;
+    const PLACEMENT_RADIUS: i32 = 6;
+
+    let mut placed_total: u32 = 0;
+    // Walk factions in id order for determinism.
+    let mut faction_ids: Vec<u32> = faction_registry.factions.keys().copied().collect();
+    faction_ids.sort_unstable();
+
+    for fid in faction_ids {
+        if fid == SOLO {
+            continue;
+        }
+        let Some(faction) = faction_registry.factions.get(&fid) else {
+            continue;
+        };
+        let home = faction.home_tile;
+        let nomadic = faction.caps.home.is_mobile();
+        let has_dog = faction.techs.has(DOG_DOMESTICATION);
+        let has_husbandry = faction.techs.has(ANIMAL_HUSBANDRY);
+        let has_horse = faction.techs.has(HORSE_TAMING);
+        if !(has_dog || has_husbandry || has_horse) {
+            continue;
+        }
+        let scale_bonus = (faction.member_count as i32 / 20).clamp(0, 2);
+        let per_kind = |floor: u32| -> u32 { (floor + scale_bonus as u32).min(6) };
+
+        // Build the seed list: (species, count, both_sexes).
+        let mut seeds: Vec<(DomesticSpecies, u32, bool)> = Vec::new();
+        if has_dog {
+            seeds.push((DomesticSpecies::Dog, per_kind(2), true));
+            seeds.push((DomesticSpecies::Cat, per_kind(1).min(2), false));
+        }
+        if has_husbandry {
+            seeds.push((DomesticSpecies::Cattle, per_kind(2).max(2), true));
+            seeds.push((DomesticSpecies::Pig, per_kind(2).max(2), true));
+        }
+        if has_horse {
+            seeds.push((DomesticSpecies::Horse, per_kind(2).max(2), true));
+        }
+
+        for (species, count, both_sexes) in seeds {
+            for i in 0..count {
+                if placed_total >= GLOBAL_CAP {
+                    return;
+                }
+                let (tx, ty) = pick_seed_animal_tile(home, &chunk_map, &mut clock, i, species);
+                let z = chunk_map.surface_z_at(tx, ty) as i8;
+                let sex = if both_sexes && i < 2 {
+                    // First two are mixed-sex pair: i=0 → Male, i=1 → Female.
+                    if i == 0 {
+                        BiologicalSex::Male
+                    } else {
+                        BiologicalSex::Female
+                    }
+                } else {
+                    BiologicalSex::random()
+                };
+                spawn_seeded_domestic_animal(
+                    &mut commands,
+                    species,
+                    fid,
+                    nomadic,
+                    sex,
+                    (tx, ty),
+                    z,
+                    clock.population,
+                );
+                clock.population = clock.population.saturating_add(1);
+                placed_total = placed_total.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// Pick a tile within `PLACEMENT_RADIUS` of `home` biased to grass/scrub.
+/// Falls back to home_tile itself if no candidate is found.
+fn pick_seed_animal_tile(
+    home: (i32, i32),
+    chunk_map: &crate::world::chunk::ChunkMap,
+    clock: &mut SimClock,
+    bump: u32,
+    species: DomesticSpecies,
+) -> (i32, i32) {
+    const PLACEMENT_RADIUS: i32 = 6;
+    let mut seed = (home.0 as u32)
+        .wrapping_mul(0x9E37_79B9)
+        .wrapping_add(home.1 as u32)
+        .wrapping_add(bump.wrapping_mul(0x85EB_CA6B))
+        .wrapping_add(species as u32);
+    // Tiny deterministic LCG; bounded 80 attempts.
+    for _ in 0..80 {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        let dx = (seed as i32 % (PLACEMENT_RADIUS * 2 + 1)) - PLACEMENT_RADIUS;
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        let dy = (seed as i32 % (PLACEMENT_RADIUS * 2 + 1)) - PLACEMENT_RADIUS;
+        let t = (home.0 + dx, home.1 + dy);
+        let Some(k) = chunk_map.tile_kind_at(t.0, t.1) else {
+            continue;
+        };
+        if !k.is_passable() {
+            continue;
+        }
+        if matches!(
+            k,
+            TileKind::Grass | TileKind::Scrub | TileKind::Cropland | TileKind::Loam | TileKind::Silt
+        ) {
+            // Don't trip a borrow-checker warning on the unused clock.
+            let _ = &mut *clock;
+            return t;
+        }
+    }
+    home
+}
+
+/// Spawn a single tamed domestic animal at `(tx, ty, z)`. Inserts the species
+/// marker (Wolf for Dog, Cow for Cattle, etc.), `Tamed { owner_faction: fid }`,
+/// `Indexed` for the correct `IndexedKind`, AnimalAI/Needs, and `FollowingBand`
+/// if the faction is nomadic. `DomesticAnimal` + `PackAnimalInventory` get
+/// attached by `attach_pack_inventory_system` next tick.
+fn spawn_seeded_domestic_animal(
+    commands: &mut Commands,
+    species: DomesticSpecies,
+    fid: u32,
+    nomadic: bool,
+    sex: BiologicalSex,
+    tile: (i32, i32),
+    _z: i8,
+    slot: u32,
+) {
+    let pos = tile_to_world(tile.0, tile.1);
+    let transform = Transform::from_xyz(pos.x, pos.y, 1.0);
+    let ai = AnimalAI {
+        target_tile: tile,
+        wander_timer: (slot % 60) as f32 * 0.05,
+        ..Default::default()
+    };
+    let needs = AnimalNeeds {
+        hunger: 30.0,
+        sleep: 20.0,
+        reproduction: 40.0,
+        thirst: 30.0,
+        sickness: 0.0,
+    };
+    let hp = match species {
+        DomesticSpecies::Horse => HORSE_HP,
+        DomesticSpecies::Cattle => COW_HP,
+        DomesticSpecies::Pig => PIG_HP,
+        DomesticSpecies::Dog => 30,
+        DomesticSpecies::Cat => CAT_HP,
+    };
+    let indexed_kind = match species {
+        DomesticSpecies::Horse => crate::world::spatial::IndexedKind::Horse,
+        DomesticSpecies::Cattle => crate::world::spatial::IndexedKind::Cow,
+        DomesticSpecies::Pig => crate::world::spatial::IndexedKind::Pig,
+        DomesticSpecies::Dog => crate::world::spatial::IndexedKind::Wolf,
+        DomesticSpecies::Cat => crate::world::spatial::IndexedKind::Cat,
+    };
+    let common = (
+        transform,
+        GlobalTransform::default(),
+        Visibility::Visible,
+        InheritedVisibility::default(),
+        ai,
+        Health::new(hp),
+        CombatTarget::default(),
+        CombatCooldown::default(),
+        LodLevel::Full,
+        BucketSlot(slot),
+        needs,
+        AnimalReproductionCooldown(0),
+        sex,
+        Tamed { owner_faction: fid },
+        crate::world::spatial::Indexed::new(indexed_kind),
+    );
+    let mut e = match species {
+        DomesticSpecies::Horse => commands.spawn((Horse, common)),
+        DomesticSpecies::Cattle => commands.spawn((Cow, common)),
+        DomesticSpecies::Pig => commands.spawn((Pig, common)),
+        DomesticSpecies::Dog => commands.spawn((Wolf, common)),
+        DomesticSpecies::Cat => commands.spawn((Cat, common)),
+    };
+    if nomadic {
+        e.insert(FollowingBand {
+            faction: fid,
+            last_redirect_tick: 0,
+        });
+    }
+}
+
 #[cfg(test)]
 mod pack_tests {
     use super::*;
@@ -2432,5 +2759,100 @@ mod pack_tests {
         assert_eq!(unfit, 0);
         let unfit2 = b.add(yurt, 0);
         assert_eq!(unfit2, 0);
+    }
+
+    #[test]
+    fn domestic_species_label_smoke() {
+        assert_eq!(DomesticSpecies::Horse.label(), "Horse");
+        assert_eq!(DomesticSpecies::Cattle.label(), "Cattle");
+        assert_eq!(DomesticSpecies::Dog.label(), "Dog");
+    }
+}
+
+#[cfg(test)]
+mod husbandry_tests {
+    use super::*;
+    use crate::simulation::test_fixture::TestSim;
+    use crate::world::tile::TileKind;
+
+    #[test]
+    fn tame_animal_inserts_domestic_animal_next_tick() {
+        // Tame a wild horse by spawning a horse + Tamed marker directly,
+        // then tick once so `attach_pack_inventory_system` fires.
+        let mut sim = TestSim::new(0xCAFE);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let horse_e = {
+            let world = sim.app.world_mut();
+            world
+                .spawn((
+                    Horse,
+                    Transform::from_xyz(0.0, 0.0, 1.0),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                    AnimalAI::default(),
+                    crate::simulation::combat::Health::new(40),
+                    crate::simulation::combat::CombatTarget::default(),
+                    crate::simulation::combat::CombatCooldown::default(),
+                    crate::simulation::lod::LodLevel::Full,
+                    crate::simulation::schedule::BucketSlot(0),
+                    AnimalNeeds::default(),
+                    AnimalReproductionCooldown(0),
+                    crate::simulation::reproduction::BiologicalSex::Female,
+                    Tamed { owner_faction: 1 },
+                ))
+                .id()
+        };
+        sim.tick_n(2);
+        // After ticking, DomesticAnimal + PackAnimalInventory should both be
+        // attached automatically.
+        let world = sim.app.world();
+        let domestic = world.get::<DomesticAnimal>(horse_e);
+        assert!(
+            domestic.is_some(),
+            "DomesticAnimal must auto-attach on Tamed"
+        );
+        let pack = world.get::<PackAnimalInventory>(horse_e);
+        assert!(
+            pack.is_some(),
+            "PackAnimalInventory must auto-attach for horse"
+        );
+        assert_eq!(domestic.unwrap().species, DomesticSpecies::Horse);
+    }
+
+    #[test]
+    fn wolf_tamed_becomes_dog_species() {
+        let mut sim = TestSim::new(0xBEEF);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let wolf_e = {
+            let world = sim.app.world_mut();
+            world
+                .spawn((
+                    Wolf,
+                    Transform::from_xyz(0.0, 0.0, 1.0),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                    AnimalAI::default(),
+                    crate::simulation::combat::Health::new(30),
+                    crate::simulation::combat::CombatTarget::default(),
+                    crate::simulation::combat::CombatCooldown::default(),
+                    crate::simulation::lod::LodLevel::Full,
+                    crate::simulation::schedule::BucketSlot(0),
+                    AnimalNeeds::default(),
+                    AnimalReproductionCooldown(0),
+                    crate::simulation::reproduction::BiologicalSex::Male,
+                    Tamed { owner_faction: 1 },
+                ))
+                .id()
+        };
+        sim.tick_n(2);
+        let world = sim.app.world();
+        let domestic = world.get::<DomesticAnimal>(wolf_e).expect("attached");
+        assert_eq!(
+            domestic.species,
+            DomesticSpecies::Dog,
+            "tamed wolf gets Dog species"
+        );
     }
 }

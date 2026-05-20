@@ -169,7 +169,7 @@ pub fn default_class_for_goal(goal: AgentGoal) -> GoalClass {
         | AgentGoal::GatherWood
         | AgentGoal::GatherStone
         | AgentGoal::ReturnCamp
-        | AgentGoal::TameHorse
+        | AgentGoal::TameAnimal
         | AgentGoal::Craft
         | AgentGoal::Farm
         | AgentGoal::Haul
@@ -395,7 +395,11 @@ pub struct GoalScoringContext<'a> {
     pub prioritize_food: bool,
     pub fallback_gather: AgentGoal,
     pub fallback_gather_reason: &'static str,
-    pub has_horse_taming: bool,
+    /// Generalised taming awareness. True when the faction is Aware of any
+    /// taming tech (HORSE_TAMING / ANIMAL_HUSBANDRY / DOG_DOMESTICATION) AND a
+    /// matching wild candidate exists in the world. The dispatcher does the
+    /// per-species reconciliation at scan time.
+    pub has_tameable_animal: bool,
     pub has_personal_build_site: bool,
     pub should_craft: bool,
     /// Heal-pipeline (Heal-2): the agent's own injury, if any. Read
@@ -843,28 +847,30 @@ impl GoalScorer for PlayScorer {
     }
 }
 
-/// Subsistence-class scorer for wild-horse taming. Gated on the
-/// precomputed `has_horse_taming` flag (faction Aware of HORSE_TAMING
-/// + at least one wild horse in range). Curiosity Disposition lifts
-/// the score so curious agents grab the opportunity over crafting.
-pub struct TameHorseScorer;
+/// Subsistence-class scorer for wild-animal taming. Gated on the
+/// precomputed `has_tameable_animal` flag (faction Aware of HORSE_TAMING
+/// / ANIMAL_HUSBANDRY / DOG_DOMESTICATION + at least one matching wild
+/// candidate in range). Curiosity Disposition lifts the score so curious
+/// agents grab the opportunity over crafting. The dispatcher resolves
+/// the actual species per agent at scan time.
+pub struct TameAnimalScorer;
 
-impl GoalScorer for TameHorseScorer {
+impl GoalScorer for TameAnimalScorer {
     fn score(&self, ctx: &GoalScoringContext) -> Option<GoalScore> {
-        if !ctx.has_horse_taming {
+        if !ctx.has_tameable_animal {
             return None;
         }
         let lift = disposition_lift(ctx.disposition.curiosity, 0.5);
         Some(GoalScore::new(
-            AgentGoal::TameHorse,
+            AgentGoal::TameAnimal,
             GoalClass::Subsistence,
             (0.45 * lift).clamp(0.0, 1.0),
-            "Taming Horse",
+            "Taming Animal",
         ))
     }
 
     fn name(&self) -> &'static str {
-        "TameHorseScorer"
+        "TameAnimalScorer"
     }
 }
 
@@ -1085,7 +1091,7 @@ pub fn register_default_scorers(registry: &mut GoalScorerRegistry) {
     registry.scorers.push(Box::new(ReturnSurplusScorer));
     registry.scorers.push(Box::new(SocialScorer));
     registry.scorers.push(Box::new(PlayScorer));
-    registry.scorers.push(Box::new(TameHorseScorer));
+    registry.scorers.push(Box::new(TameAnimalScorer));
     registry.scorers.push(Box::new(PersonalBuildScorer));
     registry.scorers.push(Box::new(CraftDemandScorer));
     // Farm-planner §10: register before StockpileScorer so a private farmer
@@ -1256,7 +1262,7 @@ mod tests {
             prioritize_food: false,
             fallback_gather: AgentGoal::GatherFood,
             fallback_gather_reason: "stub",
-            has_horse_taming: false,
+            has_tameable_animal: false,
             has_personal_build_site: false,
             should_craft: false,
             injury: None,
@@ -1300,7 +1306,7 @@ mod tests {
             prioritize_food: false,
             fallback_gather: AgentGoal::GatherFood,
             fallback_gather_reason: "stub",
-            has_horse_taming: false,
+            has_tameable_animal: false,
             has_personal_build_site: false,
             should_craft: false,
             injury: None,
@@ -1494,13 +1500,13 @@ mod tests {
         let board = JobBoard::default();
         let skills = Skills::default();
         let mut bored_ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
-        bored_ctx.has_horse_taming = true;
+        bored_ctx.has_tameable_animal = true;
         bored_ctx.disposition.curiosity = 20;
         let mut curious_ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
-        curious_ctx.has_horse_taming = true;
+        curious_ctx.has_tameable_animal = true;
         curious_ctx.disposition.curiosity = 230;
-        let bored = TameHorseScorer.score(&bored_ctx).expect("fires");
-        let curious = TameHorseScorer.score(&curious_ctx).expect("fires");
+        let bored = TameAnimalScorer.score(&bored_ctx).expect("fires");
+        let curious = TameAnimalScorer.score(&curious_ctx).expect("fires");
         assert!(curious.score > bored.score);
     }
 
@@ -1655,7 +1661,7 @@ mod tests {
         let skills = Skills::default();
         let mut ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
         ctx.should_craft = true;
-        ctx.has_horse_taming = true;
+        ctx.has_tameable_animal = true;
         ctx.has_personal_build_site = true;
 
         let mut registry = GoalScorerRegistry::default();

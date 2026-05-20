@@ -17,10 +17,10 @@ use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::{
-    current_era, Era, TechId, BRIDGE_BUILDING, BRONZE_CASTING, BRONZE_TOOLS, CITY_STATE_ORG,
-    COPPER_TOOLS, COPPER_WORKING, DAM_BUILDING, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING, GRANARY,
-    LONG_DIST_TRADE, LOOM_WEAVING, MONUMENTAL_BUILDING, PERM_SETTLEMENT, PORTABLE_DWELLINGS,
-    PROFESSIONAL_ARMY, SACRED_RITUAL, TECH_TREE, WELL_DIGGING,
+    current_era, Era, TechId, ANIMAL_HUSBANDRY, BRIDGE_BUILDING, BRONZE_CASTING, BRONZE_TOOLS,
+    CITY_STATE_ORG, COPPER_TOOLS, COPPER_WORKING, DAM_BUILDING, FIRED_POTTERY, FIRE_MAKING,
+    FLINT_KNAPPING, GRANARY, HORSE_TAMING, LONG_DIST_TRADE, LOOM_WEAVING, MONUMENTAL_BUILDING,
+    PERM_SETTLEMENT, PORTABLE_DWELLINGS, PROFESSIONAL_ARMY, SACRED_RITUAL, TECH_TREE, WELL_DIGGING,
 };
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::{Calendar, Season};
@@ -536,6 +536,21 @@ pub enum BuildSiteKind {
     /// chebyshev-adjacent tile via `DrinkSource::Well`. Tech-gated on
     /// `WELL_DIGGING` (Neolithic). No tile rewrite on finalize/deconstruct.
     Well,
+    /// Open-air pen for housing tamed cattle/pigs near agricultural land.
+    /// Tech-gated on `ANIMAL_HUSBANDRY` (Neolithic). Finalises to a `Pen`
+    /// entity with default capacity 4 + species mask for Cattle/Pig.
+    Pen,
+    /// Roofed stable for horses. Tech-gated on `HORSE_TAMING` (Bronze).
+    /// Finalises to a `Stable` entity with capacity 2 + species mask for
+    /// Horse only.
+    Stable,
+    /// Wooden feed trough placed near a Pen or Stable. Stores grain and
+    /// satisfies adjacent housed animals' hunger. Tech-gated on
+    /// `ANIMAL_HUSBANDRY`.
+    FeedTrough,
+    /// Single hitching post — placeholder for v2 cart/plow integration.
+    /// Tech-gate `ANIMAL_HUSBANDRY` (cheap, no functional payload yet).
+    HitchingPost,
 }
 
 /// Marker component on tile entities representing portable shelter.
@@ -584,6 +599,10 @@ impl BuildSiteKind {
             BuildSiteKind::Bridge => "Bridge",
             BuildSiteKind::Dam => "Dam",
             BuildSiteKind::Well => "Well",
+            BuildSiteKind::Pen => "Pen",
+            BuildSiteKind::Stable => "Stable",
+            BuildSiteKind::FeedTrough => "Feed Trough",
+            BuildSiteKind::HitchingPost => "Hitching Post",
         }
     }
 
@@ -836,6 +855,10 @@ enum BuildRecipeIdx {
     Well,
     // Appended last so existing discriminants (= vec positions) stay stable.
     Dam,
+    Pen,
+    Stable,
+    FeedTrough,
+    HitchingPost,
 }
 
 fn build_recipes_table() -> Vec<BuildRecipe> {
@@ -1040,6 +1063,40 @@ fn build_recipes_table() -> Vec<BuildRecipe> {
             work_ticks: 180,
             tech_gate: Some(DAM_BUILDING),
             deconstruct_refund: vec![(stone, 3), (wood, 2)],
+        },
+        // Open-air pen for housing tamed cattle/pigs. Wood-fenced, stone for
+        // corner posts. Tech-gated on `ANIMAL_HUSBANDRY`.
+        BuildRecipe {
+            name: "Pen",
+            inputs: vec![(wood, 6), (stone, 2)],
+            work_ticks: 80,
+            tech_gate: Some(ANIMAL_HUSBANDRY),
+            deconstruct_refund: vec![(wood, 3), (stone, 1)],
+        },
+        // Roofed stable for horses. Heavier than a pen — timber framing +
+        // stone foundation. Tech-gated on `HORSE_TAMING`.
+        BuildRecipe {
+            name: "Stable",
+            inputs: vec![(wood, 10), (stone, 4)],
+            work_ticks: 140,
+            tech_gate: Some(HORSE_TAMING),
+            deconstruct_refund: vec![(wood, 5), (stone, 2)],
+        },
+        // Feed trough. Small wooden block placed near a Pen.
+        BuildRecipe {
+            name: "Feed Trough",
+            inputs: vec![(wood, 3)],
+            work_ticks: 30,
+            tech_gate: Some(ANIMAL_HUSBANDRY),
+            deconstruct_refund: vec![(wood, 2)],
+        },
+        // Hitching post — v2 cart/plow placeholder.
+        BuildRecipe {
+            name: "Hitching Post",
+            inputs: vec![(wood, 2)],
+            work_ticks: 20,
+            tech_gate: Some(ANIMAL_HUSBANDRY),
+            deconstruct_refund: vec![(wood, 1)],
         },
     ]
 }
@@ -1839,6 +1896,10 @@ pub fn recipe_for(kind: BuildSiteKind) -> &'static BuildRecipe {
         BuildSiteKind::Bridge => BuildRecipeIdx::Bridge,
         BuildSiteKind::Dam => BuildRecipeIdx::Dam,
         BuildSiteKind::Well => BuildRecipeIdx::Well,
+        BuildSiteKind::Pen => BuildRecipeIdx::Pen,
+        BuildSiteKind::Stable => BuildRecipeIdx::Stable,
+        BuildSiteKind::FeedTrough => BuildRecipeIdx::FeedTrough,
+        BuildSiteKind::HitchingPost => BuildRecipeIdx::HitchingPost,
     };
     &build_recipes()[idx as usize]
 }
@@ -6725,6 +6786,68 @@ pub fn construction_system(
                     maps.well_map.0.insert(tile, well_entity);
                     well_entity
                 }
+                BuildSiteKind::Pen => commands
+                    .spawn((
+                        crate::simulation::husbandry::Pen {
+                            faction_id: bp.faction_id,
+                            tile,
+                            capacity: 4,
+                            // Cattle / Pig / Dog default — Stables handle horses.
+                            species_mask: crate::simulation::husbandry::SPECIES_CATTLE
+                                | crate::simulation::husbandry::SPECIES_PIG
+                                | crate::simulation::husbandry::SPECIES_DOG,
+                        },
+                        StructureLabel(BuildSiteKind::Pen.label()),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.2),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id(),
+                BuildSiteKind::Stable => commands
+                    .spawn((
+                        crate::simulation::husbandry::Stable {
+                            faction_id: bp.faction_id,
+                            tile,
+                            capacity: 2,
+                            species_mask: crate::simulation::husbandry::SPECIES_HORSE
+                                | crate::simulation::husbandry::SPECIES_CATTLE,
+                        },
+                        StructureLabel(BuildSiteKind::Stable.label()),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id(),
+                BuildSiteKind::FeedTrough => commands
+                    .spawn((
+                        crate::simulation::husbandry::FeedTrough {
+                            faction_id: bp.faction_id,
+                            tile,
+                            stock_g: 0,
+                            capacity_g: 20_000,
+                        },
+                        StructureLabel(BuildSiteKind::FeedTrough.label()),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.2),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id(),
+                BuildSiteKind::HitchingPost => commands
+                    .spawn((
+                        crate::simulation::husbandry::HitchingPost {
+                            faction_id: bp.faction_id,
+                            tile,
+                        },
+                        StructureLabel(BuildSiteKind::HitchingPost.label()),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.2),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id(),
             };
 
             // Emit a TileChangedEvent so pathfinding caches (flow fields,

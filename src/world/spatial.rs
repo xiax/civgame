@@ -23,6 +23,14 @@ pub enum IndexedKind {
     Wolf,
     Deer,
     Horse,
+    /// Cattle (`Cow` Bevy marker). Indexed independently from Horse so wild
+    /// taming candidate scans and herd LOD differentiate by species.
+    Cow,
+    /// Pigs (PACK social pattern). Indexed for the same reasons as Cow.
+    Pig,
+    /// Cats (SOLITARY). Indexed so seeded companion-tier animals participate in
+    /// spatial scans (e.g. the taming dispatcher's species candidate sweep).
+    Cat,
     Plant,
     GroundItem,
     Bed,
@@ -31,7 +39,10 @@ pub enum IndexedKind {
 impl IndexedKind {
     #[inline]
     pub fn is_mobile_agent(self) -> bool {
-        matches!(self, Self::Person | Self::Wolf | Self::Deer | Self::Horse)
+        matches!(
+            self,
+            Self::Person | Self::Wolf | Self::Deer | Self::Horse | Self::Cow | Self::Pig | Self::Cat
+        )
     }
 }
 
