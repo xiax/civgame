@@ -183,6 +183,34 @@ fn chebyshev(a: (i32, i32), b: (i32, i32)) -> i32 {
     (a.0 - b.0).abs().max((a.1 - b.1).abs())
 }
 
+/// Iterator over `(plot_id, rect)` for every state-owned Agricultural plot
+/// belonging to `faction_id`. Reused by `jobs.rs` (multi-open Farm posting
+/// §6) and `faction.rs` (plot-demand-aware Farmer promotion §7) so both
+/// surfaces speak the same definition of "field that needs a farmer".
+/// "Has work" today = existence; the planting dispatcher's per-tile rect
+/// search short-circuits when nothing's left to plant.
+pub fn state_owned_ag_plots_for_faction(
+    faction_id: u32,
+    plot_index: &PlotIndex,
+    plot_q: &Query<&Plot>,
+) -> Vec<(PlotId, crate::simulation::settlement::TileRect)> {
+    let mut out = Vec::new();
+    for (&pid, &ent) in plot_index.by_id.iter() {
+        let Ok(plot) = plot_q.get(ent) else { continue };
+        if plot.faction_id != faction_id {
+            continue;
+        }
+        if plot.zone_kind != ZoneKind::Agricultural {
+            continue;
+        }
+        if !matches!(plot.tenure, Tenure::StateOwned) {
+            continue;
+        }
+        out.push((pid, plot.rect));
+    }
+    out
+}
+
 /// Game-start seeding (farm-planner §15). Runs once at `OnEnter(Playing)`
 /// after `seed_starting_buildings_system`. For every settled, non-SOLO
 /// village faction, ensure at least one 16×16 Agricultural plot exists at a

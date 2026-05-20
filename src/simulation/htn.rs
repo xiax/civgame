@@ -6562,13 +6562,19 @@ pub enum FarmScope {
         plot_rect: crate::simulation::settlement::TileRect,
         source_faction_id: u32,
     },
-    /// Private farmer working their household's Agricultural plot. Seeds
-    /// withdraw from household storage (`source_faction_id == household_id`),
-    /// harvest deposits to household storage (`deposit_override ==
-    /// Some(household_id)`).
+    /// Private worker (Farmer or any household adult, per §4) tending their
+    /// household's Agricultural plot. Seeds withdraw from household storage
+    /// first (`source_faction_id == household_id`); if empty, the planting
+    /// dispatcher falls back to `fallback_source_faction_id` (parent
+    /// village) so a freshly-housed kitchen-garden household isn't
+    /// deadlocked waiting for harvest. Harvest still deposits to household
+    /// storage via `deposit_override == Some(household_id)`.
     Private {
         plot_rect: crate::simulation::settlement::TileRect,
         source_faction_id: u32,
+        /// Parent village faction id — seed lookup falls back here when
+        /// the household's own storage has none.
+        fallback_source_faction_id: u32,
     },
     /// No qualifying plot. Planting falls back to the legacy radius-15
     /// farmland search; harvest falls back to the legacy `MemoryKind::AnyEdible`
@@ -6606,6 +6612,32 @@ impl FarmScope {
                 source_faction_id, ..
             } => Some(*source_faction_id),
             FarmScope::Communal { .. } | FarmScope::Bootstrap { .. } => None,
+        }
+    }
+
+    /// Ordered seed-source candidates: primary first, then any fallback.
+    /// §5: a Private scope tries household storage first, then the parent
+    /// village so a freshly-housed kitchen-garden household isn't
+    /// deadlocked on its empty private storage. Returns `[primary,
+    /// fallback_or_none]`; the dispatcher walks both, skipping `None`.
+    pub fn seed_source_candidates(&self) -> [Option<u32>; 2] {
+        match self {
+            FarmScope::Communal {
+                source_faction_id, ..
+            }
+            | FarmScope::Bootstrap { source_faction_id } => [Some(*source_faction_id), None],
+            FarmScope::Private {
+                source_faction_id,
+                fallback_source_faction_id,
+                ..
+            } => {
+                let fallback = if fallback_source_faction_id != source_faction_id {
+                    Some(*fallback_source_faction_id)
+                } else {
+                    None
+                };
+                [Some(*source_faction_id), fallback]
+            }
         }
     }
 }
@@ -6677,27 +6709,30 @@ pub fn resolve_farm_scope(
         }
     }
 
-    // Path 2: private farmer with a household-held Agricultural plot.
-    let is_farmer = matches!(
-        profession_opt,
-        Some(crate::simulation::person::Profession::Farmer),
-    );
-    if is_farmer {
-        if let Some(hm) = household_member_opt {
-            let hh = hm.household_id;
-            for (_, &ent) in params.plot_index.by_id.iter() {
-                if let Ok(plot) = params.plot_q.get(ent) {
-                    if plot.zone_kind == ZoneKind::Agricultural
-                        && matches!(
-                            plot.holder,
-                            TenureHolder::Household { faction_id } if faction_id == hh
-                        )
-                    {
-                        return FarmScope::Private {
-                            plot_rect: plot.rect,
-                            source_faction_id: hh,
-                        };
-                    }
+    // Path 2: private household tending its own Agricultural plot.
+    // §4: the Farmer-only gate is dropped — any household adult can tend the
+    // household plot. The dispatcher's chain (`Profession::Farmer` lift on
+    // EV + skill XP) still preferentially routes Farmers, but a Mason in a
+    // kitchen-garden household isn't blocked.
+    let _ = profession_opt;
+    if let Some(hm) = household_member_opt {
+        let hh = hm.household_id;
+        for (_, &ent) in params.plot_index.by_id.iter() {
+            if let Ok(plot) = params.plot_q.get(ent) {
+                if plot.zone_kind == ZoneKind::Agricultural
+                    && matches!(
+                        plot.holder,
+                        TenureHolder::Household { faction_id } if faction_id == hh
+                    )
+                {
+                    return FarmScope::Private {
+                        plot_rect: plot.rect,
+                        source_faction_id: hh,
+                        // §5: parent village backstops seed lookup so a
+                        // fresh kitchen-garden household with no harvest
+                        // yet can still plant from `STARTING_GRAIN_SEEDS`.
+                        fallback_source_faction_id: member_faction_id,
+                    };
                 }
             }
         }
@@ -6794,30 +6829,6 @@ pub fn htn_plant_from_storage_dispatch_system(
             profession_opt,
             &farm_plot_params,
         );
-        let source_fid = scope.source_faction_id();
-
-        // Walk PlantKind::ALL for the seed with the highest source-faction
-        // stock. Adding a new plantable seed = new PlantKind::ALL entry +
-        // arm in `PlantKind::seed_resource()`; this loop stays unchanged.
-        let Some(faction) = faction_registry.factions.get(&source_fid) else {
-            continue;
-        };
-        let mut best_seed: Option<(crate::economy::resource_catalog::ResourceId, u32)> = None;
-        for kind in PlantKind::ALL.iter().copied() {
-            let Some(seed_id) = kind.seed_resource() else {
-                continue;
-            };
-            let stock = faction.storage.totals.get(&seed_id).copied().unwrap_or(0);
-            if stock == 0 {
-                continue;
-            }
-            if best_seed.map_or(true, |(_, b)| stock > b) {
-                best_seed = Some((seed_id, stock));
-            }
-        }
-        let Some((seed_id, _)) = best_seed else {
-            continue;
-        };
 
         let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
@@ -6826,37 +6837,73 @@ pub fn htn_plant_from_storage_dispatch_system(
             cur_ty.div_euclid(CHUNK_SIZE as i32),
         );
 
-        // Find nearest storage tile holding the chosen seed (effective after
-        // reservations). Source-faction keyed so Private routes through
-        // household storage, Communal/Bootstrap through village storage.
-        let Some(tiles) = storage_tile_map.by_faction.get(&source_fid) else {
-            continue;
-        };
-        let mut best_tile: Option<(i32, i32)> = None;
-        let mut best_dist = i32::MAX;
-        let mut best_tile_stock: u32 = 0;
-        for &(tx, ty) in tiles {
-            let mut tile_stock: u32 = 0;
-            for &gi_entity in spatial.get(tx, ty) {
-                if let Ok(gi) = item_query.get(gi_entity) {
-                    if gi.item.resource_id == seed_id && gi.qty > 0 {
-                        tile_stock = tile_stock.saturating_add(gi.qty);
-                    }
+        // §5: Probe each candidate seed source in order (Private →
+        // household first, parent village as fallback). Pick the first
+        // (seed_id, storage_tile) pair that resolves to a non-empty tile.
+        // Walks PlantKind::ALL for each source so a household with millet
+        // seeds and no grain still finds something to plant; adding a new
+        // plantable seed = new PlantKind::ALL entry + arm in
+        // `PlantKind::seed_resource()`.
+        let mut resolved: Option<(
+            crate::economy::resource_catalog::ResourceId,
+            (i32, i32),
+            u32,
+        )> = None;
+        'sources: for src_opt in scope.seed_source_candidates() {
+            let Some(source_fid) = src_opt else { continue };
+            let Some(faction) = faction_registry.factions.get(&source_fid) else {
+                continue;
+            };
+            let mut best_seed: Option<(crate::economy::resource_catalog::ResourceId, u32)> = None;
+            for kind in PlantKind::ALL.iter().copied() {
+                let Some(seed_id) = kind.seed_resource() else {
+                    continue;
+                };
+                let stock = faction.storage.totals.get(&seed_id).copied().unwrap_or(0);
+                if stock == 0 {
+                    continue;
+                }
+                if best_seed.map_or(true, |(_, b)| stock > b) {
+                    best_seed = Some((seed_id, stock));
                 }
             }
-            let reserved = storage_reservations.get((tx, ty), seed_id);
-            let effective = tile_stock.saturating_sub(reserved);
-            if effective == 0 {
+            let Some((seed_id, _)) = best_seed else {
                 continue;
+            };
+
+            let Some(tiles) = storage_tile_map.by_faction.get(&source_fid) else {
+                continue;
+            };
+            let mut best_tile: Option<(i32, i32)> = None;
+            let mut best_dist = i32::MAX;
+            let mut best_tile_stock: u32 = 0;
+            for &(tx, ty) in tiles {
+                let mut tile_stock: u32 = 0;
+                for &gi_entity in spatial.get(tx, ty) {
+                    if let Ok(gi) = item_query.get(gi_entity) {
+                        if gi.item.resource_id == seed_id && gi.qty > 0 {
+                            tile_stock = tile_stock.saturating_add(gi.qty);
+                        }
+                    }
+                }
+                let reserved = storage_reservations.get((tx, ty), seed_id);
+                let effective = tile_stock.saturating_sub(reserved);
+                if effective == 0 {
+                    continue;
+                }
+                let dist = (tx - cur_tx).abs() + (ty - cur_ty).abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_tile = Some((tx, ty));
+                    best_tile_stock = effective;
+                }
             }
-            let dist = (tx - cur_tx).abs() + (ty - cur_ty).abs();
-            if dist < best_dist {
-                best_dist = dist;
-                best_tile = Some((tx, ty));
-                best_tile_stock = effective;
+            if let Some(storage_tile) = best_tile {
+                resolved = Some((seed_id, storage_tile, best_tile_stock));
+                break 'sources;
             }
         }
-        let Some(storage_tile) = best_tile else {
+        let Some((seed_id, storage_tile, best_tile_stock)) = resolved else {
             continue;
         };
 

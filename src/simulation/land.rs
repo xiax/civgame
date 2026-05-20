@@ -1151,6 +1151,55 @@ pub fn household_land_acquisition_system(
     let now = clock.tick;
     let mut consumed: AHashSet<PlotId> = AHashSet::new();
 
+    // Spawns a household-private FactionStorageTile the first time a
+    // household lands an Agricultural plot, so private harvest/withdrawal
+    // routes through it. Called from BOTH the direct-Agricultural
+    // acquisition path AND the Residential→child-Ag claim path (the latter
+    // used to be silently skipped, leaving the household with no storage
+    // tile to plant from / deposit into).
+    let ensure_household_storage =
+        |commands: &mut Commands,
+         plot_q: &Query<&mut Plot>,
+         households_with_storage: &mut AHashSet<u32>,
+         household_id: u32,
+         source_pid: PlotId| {
+            if households_with_storage.contains(&household_id) {
+                return;
+            }
+            let mut storage_tile: Option<(i32, i32)> = None;
+            for (&_other_pid, &ent) in plot_index.by_id.iter() {
+                if let Ok(other) = plot_q.get(ent) {
+                    if matches!(other.holder, TenureHolder::Household { faction_id }
+                        if faction_id == household_id)
+                        && other.zone_kind == ZoneKind::Residential
+                    {
+                        storage_tile = other.access_tile.or(Some(other.rect.center()));
+                        break;
+                    }
+                }
+            }
+            if storage_tile.is_none() {
+                if let Some(&ent) = plot_index.by_id.get(&source_pid) {
+                    if let Ok(plot) = plot_q.get(ent) {
+                        storage_tile = plot.access_tile.or(Some(plot.rect.center()));
+                    }
+                }
+            }
+            if let Some((sx, sy)) = storage_tile {
+                let world_pos = crate::world::terrain::tile_to_world(sx, sy);
+                commands.spawn((
+                    crate::simulation::faction::FactionStorageTile {
+                        faction_id: household_id,
+                    },
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
+                    GlobalTransform::default(),
+                    Visibility::Hidden,
+                    InheritedVisibility::default(),
+                ));
+                households_with_storage.insert(household_id);
+            }
+        };
+
     // Are there any Farmer-headed households at all? If not, fall back to any
     // household with treasury for agricultural acquisitions — bootstrapping a
     // fresh village whose adults haven't selected Farmer yet.
@@ -1350,6 +1399,7 @@ pub fn household_land_acquisition_system(
                         }
                     }
                     if let Some((cid, _)) = best_child {
+                        let mut bound = false;
                         if let Some(&cent) = plot_index.by_id.get(&cid) {
                             if let Ok(mut child_plot) = plot_q.get_mut(cent) {
                                 // Mirror parent tenure (already set above).
@@ -1380,52 +1430,39 @@ pub fn household_land_acquisition_system(
                                     .entry(cand.household_id)
                                     .or_default()
                                     .insert(ZoneKind::Agricultural);
+                                bound = true;
                             }
+                        }
+                        if bound {
+                            // BUG fix: this Residential→child-Ag claim path
+                            // marks the household as Ag-holding, which used to
+                            // suppress the storage spawn (gated on the outer
+                            // loop's `target_zone == Agricultural` iteration
+                            // that would now be skipped). Spawn here so the
+                            // household has a storage tile to plant from /
+                            // deposit into for `FarmScope::Private`.
+                            ensure_household_storage(
+                                &mut commands,
+                                &plot_q,
+                                &mut households_with_storage,
+                                cand.household_id,
+                                cid,
+                            );
                         }
                     }
                 }
             }
-            // Spawn a household-private FactionStorageTile when the farmer
-            // household has just acquired its first agricultural plot. The
-            // tile sits at the household's residential plot access_tile if
-            // any, else the agricultural plot's access_tile, else the centre
-            // of whichever plot we have. Only spawn once per household.
-            if matches!(target_zone, ZoneKind::Agricultural)
-                && !households_with_storage.contains(&cand.household_id)
-            {
-                let mut storage_tile: Option<(i32, i32)> = None;
-                // Prefer a residential plot held by the same household.
-                for (&_other_pid, &ent) in plot_index.by_id.iter() {
-                    if let Ok(other) = plot_q.get(ent) {
-                        if matches!(other.holder, TenureHolder::Household { faction_id }
-                            if faction_id == cand.household_id)
-                            && other.zone_kind == ZoneKind::Residential
-                        {
-                            storage_tile = other.access_tile.or(Some(other.rect.center()));
-                            break;
-                        }
-                    }
-                }
-                if storage_tile.is_none() {
-                    if let Some(&ent) = plot_index.by_id.get(&pid) {
-                        if let Ok(plot) = plot_q.get(ent) {
-                            storage_tile = plot.access_tile.or(Some(plot.rect.center()));
-                        }
-                    }
-                }
-                if let Some((sx, sy)) = storage_tile {
-                    let world_pos = crate::world::terrain::tile_to_world(sx, sy);
-                    commands.spawn((
-                        crate::simulation::faction::FactionStorageTile {
-                            faction_id: cand.household_id,
-                        },
-                        Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
-                        GlobalTransform::default(),
-                        Visibility::Hidden,
-                        InheritedVisibility::default(),
-                    ));
-                    households_with_storage.insert(cand.household_id);
-                }
+            // Direct-Agricultural-acquisition storage spawn (the legacy
+            // branch; the child-claim path above also spawns via the same
+            // helper).
+            if matches!(target_zone, ZoneKind::Agricultural) {
+                ensure_household_storage(
+                    &mut commands,
+                    &plot_q,
+                    &mut households_with_storage,
+                    cand.household_id,
+                    pid,
+                );
             }
             // Mark the just-acquired zone as held so the next iteration of
             // `target_zones` skips it for this candidate.

@@ -90,6 +90,15 @@ pub struct ScorerInputs<'w, 's> {
     /// query iterates only injured entities.
     pub injured_faction_q:
         Query<'w, 's, &'static FactionMember, With<crate::simulation::medicine::Injury>>,
+    /// Household membership for the agent. Read once per
+    /// `goal_update_system` cycle to decide `private_farm_available`
+    /// for the FarmWorkScorer household-availability gate.
+    pub household_q:
+        Query<'w, 's, &'static crate::simulation::reproduction::HouseholdMember>,
+    /// All plot components. Walked once per `goal_update_system`
+    /// invocation to build the `households_with_ag_plot` snapshot
+    /// (cheap — plot count is bounded per settlement).
+    pub plot_q: Query<'w, 's, &'static crate::simulation::land::Plot>,
 }
 
 #[repr(u8)]
@@ -593,6 +602,19 @@ pub fn goal_update_system(
     for member in scorer_inputs.injured_faction_q.iter() {
         faction_has_injured.insert(member.faction_id);
     }
+    // Farm §4: snapshot every household that holds an Agricultural plot.
+    // Read by `FarmWorkScorer` via `ctx.private_farm_available` so any
+    // household adult — not only `Profession::Farmer` — can nominate
+    // `AgentGoal::Farm`. Plot count is bounded per settlement so this is
+    // cheap once per `goal_update_system` cycle.
+    let mut households_with_ag_plot: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    for plot in scorer_inputs.plot_q.iter() {
+        if plot.zone_kind == crate::simulation::settlement::ZoneKind::Agricultural {
+            if let crate::simulation::land::TenureHolder::Household { faction_id } = plot.holder {
+                households_with_ag_plot.insert(faction_id);
+            }
+        }
+    }
     for (
         entity,
         mut goal,
@@ -809,6 +831,13 @@ pub fn goal_update_system(
                         faction_has_injured: faction_has_injured.contains(&member.faction_id),
                         time_of_day_bonus,
                         age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
+                        private_farm_available: scorer_inputs
+                            .household_q
+                            .get(entity)
+                            .ok()
+                            .map_or(false, |hm| {
+                                households_with_ag_plot.contains(&hm.household_id)
+                            }),
                     };
                     scorer_inputs.metrics.goal_evaluations =
                         scorer_inputs.metrics.goal_evaluations.saturating_add(1);
@@ -1192,6 +1221,13 @@ pub fn goal_update_system(
                 faction_has_injured: faction_has_injured.contains(&member.faction_id),
                 time_of_day_bonus,
                 age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
+                private_farm_available: scorer_inputs
+                    .household_q
+                    .get(entity)
+                    .ok()
+                    .map_or(false, |hm| {
+                        households_with_ag_plot.contains(&hm.household_id)
+                    }),
             };
             // Hysteresis margin damps single-tick flips around
             // utility crossover; Survival/Subsistence still
@@ -1482,6 +1518,10 @@ pub fn earnincome_goal_override_system(
             faction_has_injured: false,
             time_of_day_bonus: 0.0,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
+            // EarnIncome override only acts on Enterprise+ tier picks; the
+            // private-farm gate is Subsistence and would be filtered out
+            // by `best.class < Enterprise` anyway.
+            private_farm_available: false,
         };
         let Some(best) = scorer_registry.best(&ctx) else {
             continue;

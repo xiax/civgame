@@ -1684,10 +1684,187 @@ fn build_parcels(
             faction, settlement, brain, chunk_map, &occupied, next_id, budget,
         );
         parcels.extend(belt);
+        // Per-residential kitchen-garden pass: emit a small (4×4) Agricultural
+        // parcel behind every Residential parcel that has no belt parcel
+        // within `KITCHEN_PROXIMITY` tiles. The 12-tile child-claim path in
+        // `land_listing_system` then binds it as the household's child plot
+        // when the household acquires the Residential plot. Carving still
+        // flows through `carve_plots_system`; no new Plot construction path.
+        append_kitchen_gardens(faction, settlement, brain, chunk_map, &mut parcels);
         parcels
     } else {
         build_parcels_frontier_driven(faction, settlement, brain, chunk_map)
     }
+}
+
+/// Emits a 4×4 Agricultural parcel behind every Residential parcel that has
+/// no belt parcel within `KITCHEN_PROXIMITY` chebyshev tiles. The kitchen
+/// rect is centred on the parcel's back-edge midpoint and abuts the rear of
+/// the residence; side edges are tried as fallbacks when the rear is
+/// blocked. Gated on the same passability / reachability / footprint
+/// constraints as the belt.
+fn append_kitchen_gardens(
+    faction: &FactionData,
+    settlement: &Settlement,
+    brain: &SettlementBrain,
+    chunk_map: &ChunkMap,
+    parcels: &mut Vec<Parcel>,
+) {
+    const KITCHEN_PROXIMITY: i32 = 12;
+    const KITCHEN_SIZE: u16 = 4;
+    const BELT_CLEARANCE: i32 = 3;
+
+    if parcels.is_empty() {
+        return;
+    }
+    let residential: Vec<(TileRect, Option<TileEdge>)> = parcels
+        .iter()
+        .filter(|p| p.district_hint == Some(DistrictKind::Residential))
+        .map(|p| (p.rect(), p.frontage_edge))
+        .collect();
+    if residential.is_empty() {
+        return;
+    }
+    let belt_centres: Vec<(i32, i32)> = parcels
+        .iter()
+        .filter(|p| p.district_hint == Some(DistrictKind::Agricultural))
+        .map(|p| p.centre())
+        .collect();
+
+    let inflate = |r: TileRect| -> TileRect {
+        TileRect::new(
+            r.x0 - BELT_CLEARANCE,
+            r.y0 - BELT_CLEARANCE,
+            r.w + 2 * BELT_CLEARANCE as u16,
+            r.h + 2 * BELT_CLEARANCE as u16,
+        )
+    };
+    let mut footprint: Vec<TileRect> = parcels.iter().map(|p| inflate(p.rect())).collect();
+    for d in &brain.districts {
+        if matches!(
+            d.kind,
+            DistrictKind::Civic | DistrictKind::Residential | DistrictKind::Crafting
+        ) {
+            let r = d.radius as i32;
+            footprint.push(inflate(TileRect::new(
+                d.centre.0 - r,
+                d.centre.1 - r,
+                (2 * r + 1) as u16,
+                (2 * r + 1) as u16,
+            )));
+        }
+    }
+
+    let home = faction.home_tile;
+    let mut next_id = parcels
+        .iter()
+        .map(|p| p.id)
+        .max()
+        .map(|m| m.wrapping_add(1))
+        .unwrap_or(0);
+    let budget = MAX_PARCELS.saturating_sub(parcels.len());
+    let mut emitted = 0usize;
+
+    for (r_rect, frontage) in residential {
+        if emitted >= budget {
+            break;
+        }
+        let centre = r_rect.center();
+        let near_belt = belt_centres
+            .iter()
+            .any(|b| cheb(*b, centre) <= KITCHEN_PROXIMITY);
+        if near_belt {
+            continue;
+        }
+        let back_edge = frontage
+            .map(opposite_edge)
+            .unwrap_or_else(|| opposite_edge(TileEdge::toward(centre, home)));
+        // Try back edge first; sides fall back when the rear is blocked.
+        let candidates = [
+            back_edge,
+            rotate_edge_cw(back_edge),
+            rotate_edge_ccw(back_edge),
+        ];
+        let mut chosen: Option<TileRect> = None;
+        for &edge in &candidates {
+            let rect = kitchen_rect_for_edge(r_rect, edge, KITCHEN_SIZE);
+            if !rect_clear_for_parcel(chunk_map, rect, &brain.road_tiles) {
+                continue;
+            }
+            if footprint.iter().any(|f| rects_overlap(*f, rect)) {
+                continue;
+            }
+            let max = (rect.x0 + rect.w as i32 - 1, rect.y0 + rect.h as i32 - 1);
+            if !crate::simulation::placement_reachability::rect_reachable_from_home(
+                chunk_map,
+                home,
+                (rect.x0, rect.y0),
+                max,
+            ) {
+                continue;
+            }
+            chosen = Some(rect);
+            break;
+        }
+        let Some(rect) = chosen else { continue };
+        let suitability = parcel_suitability(faction, settlement, brain, chunk_map, rect.center());
+        parcels.push(Parcel {
+            id: next_id,
+            shape: ParcelShape::Rect(rect),
+            frontage_edge: None,
+            access_tile: None,
+            holder: TenureHolder::State {
+                faction_id: settlement.owner_faction,
+            },
+            district_hint: Some(DistrictKind::Agricultural),
+            suitability,
+        });
+        // Add to local footprint so a later residential parcel doesn't
+        // place its kitchen overlapping this one.
+        footprint.push(inflate(rect));
+        next_id = next_id.wrapping_add(1);
+        emitted += 1;
+    }
+}
+
+fn opposite_edge(e: TileEdge) -> TileEdge {
+    match e {
+        TileEdge::North => TileEdge::South,
+        TileEdge::South => TileEdge::North,
+        TileEdge::East => TileEdge::West,
+        TileEdge::West => TileEdge::East,
+    }
+}
+
+fn rotate_edge_cw(e: TileEdge) -> TileEdge {
+    match e {
+        TileEdge::North => TileEdge::East,
+        TileEdge::East => TileEdge::South,
+        TileEdge::South => TileEdge::West,
+        TileEdge::West => TileEdge::North,
+    }
+}
+
+fn rotate_edge_ccw(e: TileEdge) -> TileEdge {
+    match e {
+        TileEdge::North => TileEdge::West,
+        TileEdge::West => TileEdge::South,
+        TileEdge::South => TileEdge::East,
+        TileEdge::East => TileEdge::North,
+    }
+}
+
+fn kitchen_rect_for_edge(parcel: TileRect, back: TileEdge, size: u16) -> TileRect {
+    let pw = parcel.w as i32;
+    let ph = parcel.h as i32;
+    let s = size as i32;
+    let (rx0, ry0) = match back {
+        TileEdge::North => (parcel.x0 + pw / 2 - s / 2, parcel.y0 + ph),
+        TileEdge::South => (parcel.x0 + pw / 2 - s / 2, parcel.y0 - s),
+        TileEdge::East => (parcel.x0 + pw, parcel.y0 + ph / 2 - s / 2),
+        TileEdge::West => (parcel.x0 - s, parcel.y0 + ph / 2 - s / 2),
+    };
+    TileRect::new(rx0, ry0, size, size)
 }
 
 /// Frontier-first parcel allocation. Used for camps and nomadic factions
@@ -2020,7 +2197,15 @@ fn build_ag_belt(
             };
             let suitability = parcel_suitability(faction, settlement, brain, chunk_map, c);
             // `suitability.agricultural` already = fertility*1.4 + water*0.5.
-            let base_score = suitability.agricultural + road_bonus;
+            // Soft chebyshev-distance penalty: prefer fertile near-edge sites
+            // over slightly-more-fertile far-away patches. Max ~0.5 (comparable
+            // to the road bonus + typical fertility deltas) so a 2× fertility
+            // delta still wins, but "very slightly better and far" loses to
+            // "good and adjacent".
+            let near_edge_dist = (cheb(c, home) - fp_extent).max(0) as f32;
+            let reach = (scan - fp_extent).max(bw as i32) as f32;
+            let dist_penalty = 0.5 * (near_edge_dist / reach).min(1.0);
+            let base_score = suitability.agricultural + road_bonus - dist_penalty;
             let tile_hash = ((c.0 as i64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64)
                 ^ c.1 as i64) as u64;
             cands.push(AgCand {

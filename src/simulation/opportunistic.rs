@@ -228,6 +228,8 @@ pub fn opportunistic_interrupt_system(
             faction_has_injured: false,
             time_of_day_bonus,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
+            // FarmWorkScorer isn't an opportunistic challenger — leave false.
+            private_farm_available: false,
         };
         // Ambient-social suppression: a worker with a live ambient
         // work-pairing is already getting social relief + relationships /
@@ -372,6 +374,8 @@ mod tests {
             faction_has_injured: false,
             time_of_day_bonus: 0.0,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
+            // FarmWorkScorer isn't an opportunistic challenger — leave false.
+            private_farm_available: false,
         };
 
         let pick = |ctx: &GoalScoringContext, current: AgentGoal| -> Option<GoalScore> {

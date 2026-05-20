@@ -132,13 +132,13 @@ X - The way pack camp and pitch camp actually works isn't very realistic. The wo
 Stockpile food job posting not tracking collected calories properly
 
 
-And can we add farms to the settlement planner? Farming should be portioned and zoned properly and should be for both communist and capitalist economies. Chief assigns plots for farmers to farm in communist economies and farmers buy plots in capitalist economies.
+X - And can we add farms to the settlement planner? Farming should be portioned and zoned properly and should be for both communist and capitalist economies. Chief assigns plots for farmers to farm in communist economies and farmers buy plots in capitalist economies.
 
-Add bridges to settlement planner
+X - Add bridges to settlement planner
 
-Workers should be able to do more than one task at a time, like work and socialize at the same time.
+X - Workers should be able to do more than one task at a time, like work and socialize at the same time.
 
-Make water actually flow, calculate z levels properly for water level and banks of river and make it more realistic with varying river sizes and stuff. Model water sources and reservoirs properly.
+X - Make water actually flow, calculate z levels properly for water level and banks of river and make it more realistic with varying river sizes and stuff. Model water sources and reservoirs properly.
 
 Make edges between different biomes more organic, right now the edges are these jagged square blocks.
 

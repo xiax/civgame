@@ -1735,12 +1735,30 @@ pub fn faction_profession_system(
             }
         }
         let current_farmers_for_target = current_farmer_set.len() as u32;
+        // §7: plot-demand pressure. Even when per-head food is comfortably
+        // above the demote threshold, communal plots that exist but have
+        // nobody assigned should still recruit a Farmer — otherwise a
+        // village sitting on `per_head = 25` with three unworked plots
+        // promotes zero farmers and the chief postings go unclaimed.
+        let plot_demand = crate::simulation::farm::state_owned_ag_plots_for_faction(
+            faction_id,
+            &plot_index,
+            &plots,
+        )
+        .len() as u32;
+        let plot_target = plot_demand.min((faction.member_count / 3).max(1));
+        let food_target_when_low = (faction.member_count / 5).max(1);
         let target_farmers = if per_head < promote_threshold {
-            (faction.member_count / 5).max(1)
+            // Below promote threshold: emergency food ramp PLUS coverage
+            // for any unworked plots.
+            food_target_when_low.max(plot_target)
         } else if per_head > demote_threshold {
-            0
+            // Reserves abundant: keep enough farmers to cover plots, but
+            // shed the rest. Without this floor, plots stay unworked when
+            // the village happens to be flush.
+            plot_target
         } else {
-            current_farmers_for_target
+            current_farmers_for_target.max(plot_target)
         };
         let current_farmers = current_farmers_for_target;
 

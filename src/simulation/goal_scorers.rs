@@ -406,6 +406,12 @@ pub struct GoalScoringContext<'a> {
     /// faction currently carries an `Injury` component. Read by
     /// `ProvideCareScorer` (Healer-side) to gate `ProvideCare`.
     pub faction_has_injured: bool,
+    /// Farming: true when the agent is a `HouseholdMember` of a household
+    /// that holds a `ZoneKind::Agricultural` plot (with state-Owned or
+    /// household-Owned tenure). Read by `FarmWorkScorer` so any
+    /// household adult — not only `Profession::Farmer` — can nominate
+    /// `AgentGoal::Farm` to work the household's plot.
+    pub private_farm_available: bool,
     /// 0.0 daytime → 1.0 night; lifts `SleepScorer`'s curve so a
     /// moderately-tired agent picks sleep over work after dusk.
     pub time_of_day_bonus: f32,
@@ -1021,16 +1027,19 @@ impl GoalScorer for ProvideCareScorer {
 }
 
 /// Subsistence-class scorer for private (non-chief-allocated) farming.
-/// Fires when a `Profession::Farmer` worker's faction has flipped grain to
-/// `private_actors_allowed=true` (Mixed / Market presets). The actual
-/// "do you have seeds / mature crops on your plot" check happens at HTN
-/// dispatch time — the scorer just nominates `AgentGoal::Farm` so the
-/// dispatcher gets a chance to plan.
+/// Fires for any `HouseholdMember` whose household holds an Agricultural
+/// plot, when the faction's grain policy permits `private_actors_allowed`
+/// (Mixed / Market presets). Farmers are still preferred via the EV/skill
+/// path (higher `expected_wage` competence + skill XP) and via a small
+/// score lift below; non-Farmer household adults can also nominate Farm
+/// so a household with a kitchen garden isn't blocked when its head is a
+/// Mason or Apprentice. The actual "do you have seeds / mature crops"
+/// check happens at HTN dispatch time.
 pub struct FarmWorkScorer;
 
 impl GoalScorer for FarmWorkScorer {
     fn score(&self, ctx: &GoalScoringContext) -> Option<GoalScore> {
-        if !matches!(ctx.profession, Profession::Farmer) {
+        if !ctx.private_farm_available {
             return None;
         }
         // Private farming is gated on grain's `private_actors_allowed`.
@@ -1040,13 +1049,22 @@ impl GoalScorer for FarmWorkScorer {
         if !policy.private_actors_allowed {
             return None;
         }
-        // Score: comfortably above generic stockpile (0.85) but below
-        // survival/subsistence crisis scorers.
+        let base = 0.90;
+        let lift = if matches!(ctx.profession, Profession::Farmer) {
+            0.05
+        } else {
+            0.0
+        };
+        let reason = if lift > 0.0 {
+            "Private Farmer Working Plot"
+        } else {
+            "Household Adult Tending Plot"
+        };
         Some(GoalScore::new(
             AgentGoal::Farm,
             GoalClass::Subsistence,
-            0.90,
-            "Private Farmer Working Plot",
+            base + lift,
+            reason,
         ))
     }
 
@@ -1245,6 +1263,7 @@ mod tests {
             faction_has_injured: false,
             time_of_day_bonus: 0.0,
             age_ticks: 0,
+            private_farm_available: false,
         };
         let best = registry.best(&ctx).expect("at least one stub fires");
         assert_eq!(best.goal, AgentGoal::Sleep);
@@ -1288,6 +1307,7 @@ mod tests {
             faction_has_injured: false,
             time_of_day_bonus: 0.0,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
+            private_farm_available: false,
         }
     }
 

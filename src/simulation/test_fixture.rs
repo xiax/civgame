@@ -13566,6 +13566,7 @@ mod wage_aware_phase0_phase1 {
             faction_has_injured: false,
             time_of_day_bonus: 0.0,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
+            private_farm_available: false,
         };
         let lo = scorer
             .score(&make_ctx(Disposition {
