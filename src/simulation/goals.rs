@@ -99,6 +99,21 @@ pub struct ScorerInputs<'w, 's> {
     /// invocation to build the `households_with_ag_plot` snapshot
     /// (cheap — plot count is bounded per settlement).
     pub plot_q: Query<'w, 's, &'static crate::simulation::land::Plot>,
+    /// Seasonal-farming jellyfish: read to drive the `FarmWorkScorer`
+    /// season gate (Winter ⇒ skip Farm goal entirely).
+    pub calendar: Res<'w, crate::world::seasons::Calendar>,
+    /// Seasonal-farming jellyfish: per-tile nutrient + Cropland state.
+    /// Walked once per goal cycle to compute the
+    /// `households_with_seasonal_work` snapshot.
+    pub field_tiles: Res<'w, crate::simulation::farm::FieldTileIndex>,
+    /// Seasonal-farming jellyfish: live grain crops in the world. Read
+    /// alongside `field_tiles` to detect mature plants in plot rects for
+    /// the `AutumnHarvest` seasonal-work gate.
+    pub plant_map: Res<'w, crate::simulation::plants::PlantMap>,
+    pub plant_view_q: Query<'w, 's, &'static crate::simulation::plants::Plant>,
+    /// Backing `ChunkMap` for the seasonal-work classification (reads
+    /// each plot tile's `TileKind` to decide unprepared / plantable).
+    pub chunk_map_view: Res<'w, crate::world::chunk::ChunkMap>,
 }
 
 #[repr(u8)]
@@ -622,10 +637,73 @@ pub fn goal_update_system(
     // `AgentGoal::Farm`. Plot count is bounded per settlement so this is
     // cheap once per `goal_update_system` cycle.
     let mut households_with_ag_plot: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    // Seasonal-farming jellyfish: also pre-compute which households have
+    // *current-season* work available so `FarmWorkScorer` can skip households
+    // with no plantable / harvestable / unprepared tiles. Computed once per
+    // `goal_update_system` cycle (cheap — plots are small).
+    let mut households_with_seasonal_work: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    let farm_season = crate::simulation::farm::farm_season_phase(&scorer_inputs.calendar);
     for plot in scorer_inputs.plot_q.iter() {
-        if plot.zone_kind == crate::simulation::settlement::ZoneKind::Agricultural {
-            if let crate::simulation::land::TenureHolder::Household { faction_id } = plot.holder {
-                households_with_ag_plot.insert(faction_id);
+        if plot.zone_kind != crate::simulation::settlement::ZoneKind::Agricultural {
+            continue;
+        }
+        if let crate::simulation::land::TenureHolder::Household { faction_id } = plot.holder {
+            households_with_ag_plot.insert(faction_id);
+            // Per-plot tile scan for seasonal-work classification.
+            let rect = plot.rect;
+            let mut has_work = false;
+            'tiles: for ty in rect.y0..rect.y0 + rect.h as i32 {
+                for tx in rect.x0..rect.x0 + rect.w as i32 {
+                    let kind_opt = scorer_inputs.chunk_map_view.tile_kind_at(tx, ty);
+                    let is_cropland =
+                        matches!(kind_opt, Some(crate::world::tile::TileKind::Cropland));
+                    let nut = scorer_inputs
+                        .field_tiles
+                        .by_tile
+                        .get(&(tx, ty))
+                        .map(|s| s.nutrients)
+                        .unwrap_or(0);
+                    match farm_season {
+                        crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant => {
+                            let unprepared = !is_cropland
+                                || nut < crate::simulation::farm::EXHAUSTED_FLOOR;
+                            let plantable = is_cropland
+                                && nut >= crate::simulation::farm::MIN_PLANTABLE_NUTRIENTS
+                                && !scorer_inputs.plant_map.0.contains_key(&(tx, ty));
+                            if unprepared || plantable {
+                                has_work = true;
+                                break 'tiles;
+                            }
+                        }
+                        crate::simulation::farm::FarmSeasonPhase::SummerMaintenance => {
+                            let unprepared = !is_cropland
+                                || nut < crate::simulation::farm::EXHAUSTED_FLOOR;
+                            if unprepared {
+                                has_work = true;
+                                break 'tiles;
+                            }
+                        }
+                        crate::simulation::farm::FarmSeasonPhase::AutumnHarvest => {
+                            if let Some(pent) = scorer_inputs.plant_map.0.get(&(tx, ty)) {
+                                if let Ok(pl) = scorer_inputs.plant_view_q.get(*pent) {
+                                    if matches!(
+                                        pl.kind,
+                                        crate::simulation::plants::PlantKind::Grain
+                                    ) && pl.stage
+                                        == crate::simulation::plants::GrowthStage::Mature
+                                    {
+                                        has_work = true;
+                                        break 'tiles;
+                                    }
+                                }
+                            }
+                        }
+                        crate::simulation::farm::FarmSeasonPhase::WinterDormant => {}
+                    }
+                }
+            }
+            if has_work {
+                households_with_seasonal_work.insert(faction_id);
             }
         }
     }
@@ -851,6 +929,14 @@ pub fn goal_update_system(
                             .ok()
                             .map_or(false, |hm| {
                                 households_with_ag_plot.contains(&hm.household_id)
+                            }),
+                        farm_season,
+                        private_plot_has_seasonal_work: scorer_inputs
+                            .household_q
+                            .get(entity)
+                            .ok()
+                            .map_or(false, |hm| {
+                                households_with_seasonal_work.contains(&hm.household_id)
                             }),
                     };
                     scorer_inputs.metrics.goal_evaluations =
@@ -1251,6 +1337,14 @@ pub fn goal_update_system(
                     .map_or(false, |hm| {
                         households_with_ag_plot.contains(&hm.household_id)
                     }),
+                farm_season,
+                private_plot_has_seasonal_work: scorer_inputs
+                    .household_q
+                    .get(entity)
+                    .ok()
+                    .map_or(false, |hm| {
+                        households_with_seasonal_work.contains(&hm.household_id)
+                    }),
             };
             // Hysteresis margin damps single-tick flips around
             // utility crossover; Survival/Subsistence still
@@ -1545,6 +1639,8 @@ pub fn earnincome_goal_override_system(
             // private-farm gate is Subsistence and would be filtered out
             // by `best.class < Enterprise` anyway.
             private_farm_available: false,
+            farm_season: crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant,
+            private_plot_has_seasonal_work: false,
         };
         let Some(best) = scorer_registry.best(&ctx) else {
             continue;

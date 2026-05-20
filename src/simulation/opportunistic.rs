@@ -230,6 +230,8 @@ pub fn opportunistic_interrupt_system(
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
             // FarmWorkScorer isn't an opportunistic challenger — leave false.
             private_farm_available: false,
+            farm_season: crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant,
+            private_plot_has_seasonal_work: false,
         };
         // Ambient-social suppression: a worker with a live ambient
         // work-pairing is already getting social relief + relationships /
@@ -376,6 +378,8 @@ mod tests {
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
             // FarmWorkScorer isn't an opportunistic challenger — leave false.
             private_farm_available: false,
+            farm_season: crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant,
+            private_plot_has_seasonal_work: false,
         };
 
         let pick = |ctx: &GoalScoringContext, current: AgentGoal| -> Option<GoalScore> {

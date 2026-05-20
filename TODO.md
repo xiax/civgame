@@ -112,7 +112,7 @@ X- Overhaul technology system to be entirely knowledge based, please propose a s
 
 X- settlement creation gates the leader knowing about farming and deciding to farm, technological adoption is on a per agent level baed on their knowledge, technological adoption by governments depends on the knowledge of government officials and bureaucrats.
 
-Add lookout system where an agent standing on high ground can see up to 50 grind vision rather than the standard 15, broken when they move. Add this as a player command and as something agents can naturally do, might be useful when exploring. Can be extended further with telescopes in the future.
+X - Add lookout system where an agent standing on high ground can see up to 50 grind vision rather than the standard 15, broken when they move. Add this as a player command and as something agents can naturally do, might be useful when exploring. Can be extended further with telescopes in the future.
 
 Chief should have a daily quota. He can only post so many jobs a day. Immediate needs first, like getting enough food, then 
 

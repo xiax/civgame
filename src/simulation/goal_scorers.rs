@@ -416,6 +416,14 @@ pub struct GoalScoringContext<'a> {
     /// household adult — not only `Profession::Farmer` — can nominate
     /// `AgentGoal::Farm` to work the household's plot.
     pub private_farm_available: bool,
+    /// Seasonal-farming jellyfish: the current `FarmSeasonPhase`. Read by
+    /// `FarmWorkScorer` to gate `AgentGoal::Farm` (Winter ⇒ never fires).
+    pub farm_season: crate::simulation::farm::FarmSeasonPhase,
+    /// Seasonal-farming jellyfish: true when the agent's household plot has
+    /// at least one tile that needs Prepare/Plant (Spring) or Harvest
+    /// (Autumn) work. Computed once per goal-update tick into a snapshot
+    /// (mirrors `private_farm_available`).
+    pub private_plot_has_seasonal_work: bool,
     /// 0.0 daytime → 1.0 night; lifts `SleepScorer`'s curve so a
     /// moderately-tired agent picks sleep over work after dusk.
     pub time_of_day_bonus: f32,
@@ -1048,6 +1056,17 @@ impl GoalScorer for FarmWorkScorer {
         if !ctx.private_farm_available {
             return None;
         }
+        // Seasonal-farming jellyfish: Winter ⇒ no farm goal (eliminates idle
+        // mid-Winter farm loops); Spring/Autumn require live seasonal work.
+        if matches!(
+            ctx.farm_season,
+            crate::simulation::farm::FarmSeasonPhase::WinterDormant
+        ) {
+            return None;
+        }
+        if !ctx.private_plot_has_seasonal_work {
+            return None;
+        }
         // Private farming is gated on grain's `private_actors_allowed`.
         // Communal villages still fall through chief Farm postings via the
         // claim system; this scorer is the *self-directed* path.
@@ -1270,6 +1289,8 @@ mod tests {
             time_of_day_bonus: 0.0,
             age_ticks: 0,
             private_farm_available: false,
+            farm_season: crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant,
+            private_plot_has_seasonal_work: false,
         };
         let best = registry.best(&ctx).expect("at least one stub fires");
         assert_eq!(best.goal, AgentGoal::Sleep);
@@ -1314,6 +1335,8 @@ mod tests {
             time_of_day_bonus: 0.0,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
             private_farm_available: false,
+            farm_season: crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant,
+            private_plot_has_seasonal_work: false,
         }
     }
 

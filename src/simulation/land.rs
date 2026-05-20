@@ -19,8 +19,10 @@ use crate::simulation::settlement::{
     Settlement, SettlementMap, SettlementPlans, StreetSegment, StreetSpine, TileRect, ZoneKind,
 };
 use crate::world::chunk::{ChunkMap, Z_MIN};
+#[allow(unused_imports)]
 use crate::world::chunk_streaming::TileChangedEvent;
 use crate::world::globe::Globe;
+#[allow(unused_imports)]
 use crate::world::tile::{TileData, TileKind};
 use crate::world::seasons::TICKS_PER_DAY;
 use crate::world::terrain::{tile_at_3d, WorldGen};
@@ -682,11 +684,11 @@ pub fn carve_plots_system(
     settlement_map: Res<SettlementMap>,
     settlement_q: Query<&Settlement>,
     registry: Res<FactionRegistry>,
-    mut chunk_map: ResMut<ChunkMap>,
+    chunk_map: Res<ChunkMap>,
     gen: Res<WorldGen>,
     globe: Res<Globe>,
     mut plot_index: ResMut<PlotIndex>,
-    mut tile_changed: EventWriter<TileChangedEvent>,
+    mut field_tiles: ResMut<crate::simulation::farm::FieldTileIndex>,
 ) {
     // Stage replan inputs first so we don't borrow `plans` while
     // mutating `plot_index`.
@@ -773,6 +775,10 @@ pub fn carve_plots_system(
                 .collect();
             for t in stale_ag {
                 plot_index.ag_tiles.remove(&t);
+                // Drop per-tile field state too — abandoned plots release
+                // their nutrient history. Tile kind (Cropland or natural soil)
+                // stays as-is.
+                field_tiles.remove(t);
             }
             plot_index.by_tile.retain(|_, pid| !stale_set.contains(pid));
         }
@@ -823,64 +829,16 @@ pub fn carve_plots_system(
                             continue;
                         }
                         plot_index.ag_tiles.insert((tx, ty));
-                        // Tile-role variation. Every tile stays in
-                        // `ag_tiles` (road protection) and every variant
-                        // is plantable, so the mosaic is purely visual +
-                        // a per-tile fertility nudge.
+                        // Seasonal-farming jellyfish: the carve pass NO
+                        // LONGER stamps Cropland. Founders pay for tilling
+                        // in Spring 1 via `prepare_field_task_system`. Tile
+                        // role is preserved for visual ordering by callers
+                        // that consult `field_tile_role(...)`, but the
+                        // ChunkMap stays untouched here.
                         let z = chunk_map.surface_z_at(tx, ty);
                         let cur = chunk_map.tile_at(tx, ty, z);
-                        let role = field_tile_role(new_hash, fid, (tx, ty), r);
-                        match role {
-                            FieldTileRole::Cropland => {
-                                let tillable = cur.kind == TileKind::Grass
-                                    || (cur.kind.is_soil_like()
-                                        && cur.kind != TileKind::Cropland);
-                                if tillable {
-                                    chunk_map.set_tile(
-                                        tx,
-                                        ty,
-                                        z,
-                                        TileData {
-                                            kind: TileKind::Cropland,
-                                            elevation: cur.elevation,
-                                            fertility: cur.fertility.max(180),
-                                            flags: cur.flags,
-                                            ore: cur.ore,
-                                        },
-                                    );
-                                    tile_changed.send(TileChangedEvent { tx, ty });
-                                }
-                            }
-                            FieldTileRole::CroplandLow => {
-                                let tillable = cur.kind == TileKind::Grass
-                                    || (cur.kind.is_soil_like()
-                                        && cur.kind != TileKind::Cropland);
-                                if tillable {
-                                    chunk_map.set_tile(
-                                        tx,
-                                        ty,
-                                        z,
-                                        TileData {
-                                            kind: TileKind::Cropland,
-                                            elevation: cur.elevation,
-                                            fertility: cur.fertility.min(110).max(80),
-                                            flags: cur.flags,
-                                            ore: cur.ore,
-                                        },
-                                    );
-                                    tile_changed.send(TileChangedEvent { tx, ty });
-                                }
-                            }
-                            FieldTileRole::SoilFallow => {
-                                // Tilled but uncropped — leave underlying
-                                // soil/Grass kind untouched (no tile write,
-                                // still in `ag_tiles` so road carve skips).
-                            }
-                            FieldTileRole::GrassEdge => {
-                                // Leave underlying terrain. Edge band that
-                                // softens the rect's outline.
-                            }
-                        }
+                        let _ = field_tile_role(new_hash, fid, (tx, ty), r);
+                        field_tiles.ensure_entry((tx, ty), pid, cur.fertility);
                     }
                 }
             }

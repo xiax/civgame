@@ -140,12 +140,15 @@ pub enum JobProgress {
         /// material is scarce-but-procurable for a state-authored blueprint.
         source: HaulSource,
     },
-    /// Farm: tiles successfully planted within the designated area.
-    /// `plot_id` and `assigned_farmer` are populated when the chief posts a
-    /// plot-scoped Farm job (see §7-8 of farm-planner). `None`/`None` is the
-    /// legacy bootstrap posting that uses `home_tile ±5`.
-    Planting {
-        planted: u32,
+    /// Farm: seasonal field labor — prepare unworked soil, plant prepared
+    /// soil, or harvest mature plants — scoped to a plot rect. `phase`
+    /// drives the executor branch (Prepare / Plant / Harvest); `completed`
+    /// counts tiles flipped (Prepare/Plant) or plants reaped (Harvest);
+    /// `plot_id` / `assigned_farmer` populated when chief posts a
+    /// plot-scoped Farm job (see seasonal-farming jellyfish plan).
+    FieldWork {
+        phase: crate::simulation::farm::FarmWorkPhase,
+        completed: u32,
         target: u32,
         area: TileAabb,
         plot_id: Option<crate::simulation::land::PlotId>,
@@ -177,7 +180,7 @@ impl JobProgress {
             JobProgress::Calories { .. } => None,
             JobProgress::Stockpile { resource_id, .. } => Some(*resource_id),
             JobProgress::Haul { resource_id, .. } => Some(*resource_id),
-            JobProgress::Planting { .. } => Some(core_ids::grain_seed()),
+            JobProgress::FieldWork { .. } => Some(core_ids::grain_seed()),
             JobProgress::Crafting { recipe, .. } => crate::simulation::crafting::craft_recipes()
                 .get(*recipe as usize)
                 .map(|r| r.output_resource),
@@ -194,9 +197,9 @@ impl JobProgress {
             JobProgress::Haul {
                 delivered, target, ..
             } => delivered >= target,
-            JobProgress::Planting {
-                planted, target, ..
-            } => planted >= target,
+            JobProgress::FieldWork {
+                completed, target, ..
+            } => completed >= target,
             JobProgress::Crafting {
                 crafted, target, ..
             } => crafted >= target,
@@ -234,13 +237,13 @@ impl JobProgress {
                     (*delivered as f32 / *target as f32).clamp(0.0, 1.0)
                 }
             }
-            JobProgress::Planting {
-                planted, target, ..
+            JobProgress::FieldWork {
+                completed, target, ..
             } => {
                 if *target == 0 {
                     1.0
                 } else {
-                    (*planted as f32 / *target as f32).clamp(0.0, 1.0)
+                    (*completed as f32 / *target as f32).clamp(0.0, 1.0)
                 }
             }
             JobProgress::Crafting {
@@ -854,7 +857,7 @@ pub fn chief_wage_for(progress: &JobProgress) -> f32 {
         JobProgress::Calories { .. } => {
             (CHIEF_FOOD_WAGE_PER_DAY * CHIEF_FOOD_EXPECTED_DAYS).min(40.0)
         }
-        JobProgress::Planting { target, .. } => {
+        JobProgress::FieldWork { target, .. } => {
             let wage = CHIEF_FARM_WAGE_PER_DAY * CHIEF_FARM_EXPECTED_DAYS;
             // Scale up with target tile count, bounded so a 50-tile
             // farm doesn't crater treasury.
@@ -2040,6 +2043,14 @@ pub struct FarmJobPostingParams<'w, 's> {
     /// Plot-level reachability gate for Farm postings (validated once per
     /// posting, not per tile). Bundled here to stay under the 16-param ceiling.
     pub chunk_map: Res<'w, crate::world::chunk::ChunkMap>,
+    /// Seasonal farming jellyfish: per-tile nutrient + last-crop state,
+    /// read by the chief Farm branch to classify each plot's tiles into
+    /// `{unprepared, plantable, mature_grain}` buckets.
+    pub field_tiles: Res<'w, crate::simulation::farm::FieldTileIndex>,
+    /// Read to detect mature Grain plants in plot rects (Autumn harvest
+    /// posting target).
+    pub plant_map: Res<'w, crate::simulation::plants::PlantMap>,
+    pub plant_q: Query<'w, 's, &'static crate::simulation::plants::Plant>,
 }
 
 /// Step 3: rebuild every faction's `procurement_plan` once per chief-posting
@@ -2337,7 +2348,7 @@ pub fn chief_job_posting_system(
                     JobProgress::Haul { .. } => false,
                     JobProgress::Calories { .. }
                     | JobProgress::Stockpile { .. }
-                    | JobProgress::Planting { .. }
+                    | JobProgress::FieldWork { .. }
                     | JobProgress::Crafting { .. } => true,
                 };
                 if drop {
@@ -2825,16 +2836,15 @@ pub fn chief_job_posting_system(
             }
         }
 
-        // 4. Farm posting — capability gated (Agriculture / CROP_CULTIVATION).
-        // Pluralist Economy R6-e: gate on Grain's policy. When the
-        // chief has flipped Grain to `chief_allocates_labor=false`,
-        // private farmers handle planting and selling at the
-        // regional market; no chief Farm posting.
-        // Farm-planner: when communal Agricultural plots exist (and
-        // farmers are assigned), post one plot-scoped Farm job per
-        // assignment whenever plantable seeds are stored. Bootstrap fallback
-        // (`home_tile ±5`, no plot_id) fires only when no agricultural plots
-        // are carved yet so the first season still gets food on the table.
+        // 4. Farm posting — seasonal field labor (jellyfish plan).
+        // Dispatch on `farm_season_phase(&calendar)`:
+        //   Spring     → Prepare (unworked tiles) + Plant (prepared,
+        //                non-exhausted)
+        //   Summer     → Low-priority caretaker Prepare for stragglers
+        //   Autumn     → Harvest postings for mature Grain
+        //   Winter     → No postings
+        // Per-resource policy still gates: `chief_allocates_labor==false`
+        // on Grain ⇒ private farmers run the cycle.
         let farm_chief_allocates = faction
             .policy_for(crate::economy::core_ids::grain())
             .chief_allocates_labor;
@@ -2842,140 +2852,44 @@ pub fn chief_job_posting_system(
             && faction_can_perform(faction, JobKind::Farm)
             && faction.member_count > 0
         {
-            let seed = faction.storage.seed_total();
-            let seed_available = seed > 0;
-
-            // Existing plot-scoped Farm postings (de-dup keyed on plot_id).
-            let posted_plots: ahash::AHashSet<crate::simulation::land::PlotId> = board
-                .faction_postings(faction_id)
-                .iter()
-                .filter_map(|p| {
-                    if matches!(p.kind, JobKind::Farm) {
-                        if let JobProgress::Planting { plot_id, .. } = p.progress {
-                            return plot_id;
+            let phase = crate::simulation::farm::farm_season_phase(&calendar);
+            if !matches!(phase, crate::simulation::farm::FarmSeasonPhase::WinterDormant) {
+                let grain_seed_stock = faction.storage.seed_total();
+                // Map of plots already covered by an open posting of a
+                // particular phase, so we don't double-post.
+                use crate::simulation::farm::FarmWorkPhase;
+                let mut posted_by_phase: ahash::AHashMap<
+                    (crate::simulation::land::PlotId, FarmWorkPhase),
+                    (),
+                > = ahash::AHashMap::default();
+                for p in board.faction_postings(faction_id).iter() {
+                    if !matches!(p.kind, JobKind::Farm) {
+                        continue;
+                    }
+                    if let JobProgress::FieldWork {
+                        phase, plot_id, ..
+                    } = p.progress
+                    {
+                        if let Some(pid) = plot_id {
+                            posted_by_phase.insert((pid, phase), ());
                         }
                     }
-                    None
-                })
-                .collect();
-            // Plot-scoped: walk this faction's farmer→plot assignments.
-            if seed_available {
-                for (&farmer, &pid) in farm_params.assignments.farmer_to_plot.iter() {
-                    if posted_plots.contains(&pid) {
-                        continue;
-                    }
-                    let Some(&plot_ent) = farm_params.plot_index.by_id.get(&pid) else {
-                        continue;
-                    };
-                    let Ok(plot) = farm_params.plot_q.get(plot_ent) else {
-                        continue;
-                    };
-                    if plot.faction_id != faction_id {
-                        continue;
-                    }
-                    let area = TileAabb {
-                        min: (plot.rect.x0, plot.rect.y0),
-                        max: (
-                            plot.rect.x0 + plot.rect.w as i32 - 1,
-                            plot.rect.y0 + plot.rect.h as i32 - 1,
-                        ),
-                    };
-                    // Plot-level reachability — validated once per posting, not
-                    // per tile (a contiguous 16×16 plot is internally
-                    // connected, so the per-tile prefilter would be redundant
-                    // churn). A plot the planner carved across a river from
-                    // home never produces an unreachable Farm posting.
-                    if !crate::simulation::placement_reachability::rect_reachable_from_home(
-                        &farm_params.chunk_map,
-                        faction.home_tile,
-                        area.min,
-                        area.max,
-                    ) {
-                        continue;
-                    }
-                    let plot_tile_count = (plot.rect.w as u32) * (plot.rect.h as u32);
-                    let target = FARM_TILES_PER_POST.min(seed).min(plot_tile_count);
-                    if target == 0 {
-                        continue;
-                    }
-                    let id = board.alloc_id();
-                    let progress = JobProgress::Planting {
-                        planted: 0,
-                        target,
-                        area,
-                        plot_id: Some(pid),
-                        assigned_farmer: Some(farmer),
-                    };
-                    let priority =
-                        compute_priority(faction, faction_id, JobKind::Farm, &progress, &projects);
-                    board.faction_postings_mut(faction_id).push(JobPosting {
-                        id,
-                        faction_id,
-                        kind: JobKind::Farm,
-                        progress,
-                        claimants: Vec::new(),
-                        priority,
-                        source: JobSource::Chief,
-                        posted_tick,
-                        expiry_tick: None,
-                        poster_class: crate::simulation::jobs::PosterClass::Chief,
-                        reward: 0.0,
-                        settlement_id: None,
-                    });
                 }
-            }
 
-            // §6: Open-plot postings — one per uncovered state-owned
-            // Agricultural plot, capped by remaining workforce. The
-            // assigned-posting loop above covers plots whose farmer has
-            // already been matched by `chief_farm_plot_assignment_system`;
-            // this pass picks up the rest (a fresh village with three
-            // unassigned ag plots used to get one bootstrap posting at
-            // `home_tile ±5` — now we post three legitimate plot-scoped
-            // jobs, and any worker (Farmer via EV+skill, non-Farmer via
-            // U_bid) can claim them). NO plot ⇒ NO Farm posting (farming
-            // waits for the belt to carve rather than tilling the town
-            // centre).
-            if seed_available {
-                let assigned_count = posted_plots.len();
-                let members = faction.member_count as usize;
-                let mut open_budget = members
-                    .saturating_sub(assigned_count)
-                    .max(1);
-                // Sort uncovered plots by distance from home so the closest
-                // unassigned field gets the first open posting (deterministic
-                // tiebreak on PlotId).
-                let mut open: Vec<(
+                // Enumerate all state-owned Ag plots for the faction.
+                let plots: Vec<(
                     crate::simulation::land::PlotId,
                     crate::simulation::settlement::TileRect,
                 )> = crate::simulation::farm::state_owned_ag_plots_for_faction(
                     faction_id,
                     &farm_params.plot_index,
                     &farm_params.plot_q,
-                )
-                .into_iter()
-                .filter(|(pid, _)| !posted_plots.contains(pid))
-                .collect();
-                open.sort_by_key(|(pid, r)| {
-                    let cx = r.x0 + r.w as i32 / 2;
-                    let cy = r.y0 + r.h as i32 / 2;
-                    (
-                        (cx - faction.home_tile.0)
-                            .abs()
-                            .max((cy - faction.home_tile.1).abs()),
-                        *pid,
-                    )
-                });
-                for (pid, rect) in open {
-                    if open_budget == 0 {
-                        break;
-                    }
+                );
+
+                for (pid, rect) in &plots {
                     let area = TileAabb {
                         min: (rect.x0, rect.y0),
-                        max: (
-                            rect.x0 + rect.w as i32 - 1,
-                            rect.y0 + rect.h as i32 - 1,
-                        ),
+                        max: (rect.x0 + rect.w as i32 - 1, rect.y0 + rect.h as i32 - 1),
                     };
                     if !crate::simulation::placement_reachability::rect_reachable_from_home(
                         &farm_params.chunk_map,
@@ -2985,42 +2899,162 @@ pub fn chief_job_posting_system(
                     ) {
                         continue;
                     }
-                    let plot_tile_count = (rect.w as u32) * (rect.h as u32);
-                    let target = FARM_TILES_PER_POST.min(seed).min(plot_tile_count);
-                    if target == 0 {
-                        continue;
+
+                    // Tile-state classification.
+                    let mut unprepared = 0u32;
+                    let mut plantable = 0u32;
+                    let mut mature_grain = 0u32;
+                    for ty in rect.y0..rect.y0 + rect.h as i32 {
+                        for tx in rect.x0..rect.x0 + rect.w as i32 {
+                            let kind_opt = farm_params.chunk_map.tile_kind_at(tx, ty);
+                            let state = farm_params.field_tiles.by_tile.get(&(tx, ty));
+                            let is_cropland =
+                                matches!(kind_opt, Some(crate::world::tile::TileKind::Cropland));
+                            let nutrients = state.map(|s| s.nutrients).unwrap_or(0);
+                            let exhausted = nutrients
+                                < crate::simulation::farm::EXHAUSTED_FLOOR;
+                            if !is_cropland || exhausted {
+                                unprepared += 1;
+                            }
+                            if is_cropland
+                                && nutrients
+                                    >= crate::simulation::farm::MIN_PLANTABLE_NUTRIENTS
+                            {
+                                if let Some(pent) =
+                                    farm_params.plant_map.0.get(&(tx, ty))
+                                {
+                                    if let Ok(pl) = farm_params.plant_q.get(*pent) {
+                                        if matches!(
+                                            pl.kind,
+                                            crate::simulation::plants::PlantKind::Grain
+                                        ) && pl.stage
+                                            == crate::simulation::plants::GrowthStage::Mature
+                                        {
+                                            mature_grain += 1;
+                                        }
+                                    }
+                                } else {
+                                    plantable += 1;
+                                }
+                            }
+                            // Mature grain check on Cropland tiles below the
+                            // plantable threshold (eg. tile yield dropped
+                            // mid-season).
+                            if is_cropland
+                                && nutrients
+                                    < crate::simulation::farm::MIN_PLANTABLE_NUTRIENTS
+                            {
+                                if let Some(pent) =
+                                    farm_params.plant_map.0.get(&(tx, ty))
+                                {
+                                    if let Ok(pl) = farm_params.plant_q.get(*pent) {
+                                        if matches!(
+                                            pl.kind,
+                                            crate::simulation::plants::PlantKind::Grain
+                                        ) && pl.stage
+                                            == crate::simulation::plants::GrowthStage::Mature
+                                        {
+                                            mature_grain += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
-                    let id = board.alloc_id();
-                    let progress = JobProgress::Planting {
-                        planted: 0,
-                        target,
-                        area,
-                        plot_id: Some(pid),
-                        assigned_farmer: None,
+
+                    // Per-phase emission.
+                    let mut emit = |progress: JobProgress| {
+                        let id = board.alloc_id();
+                        let priority = compute_priority(
+                            faction,
+                            faction_id,
+                            JobKind::Farm,
+                            &progress,
+                            &projects,
+                        );
+                        board.faction_postings_mut(faction_id).push(JobPosting {
+                            id,
+                            faction_id,
+                            kind: JobKind::Farm,
+                            progress,
+                            claimants: Vec::new(),
+                            priority,
+                            source: JobSource::Chief,
+                            posted_tick,
+                            expiry_tick: None,
+                            poster_class: crate::simulation::jobs::PosterClass::Chief,
+                            reward: 0.0,
+                            settlement_id: None,
+                        });
                     };
-                    let priority = compute_priority(
-                        faction,
-                        faction_id,
-                        JobKind::Farm,
-                        &progress,
-                        &projects,
-                    );
-                    board.faction_postings_mut(faction_id).push(JobPosting {
-                        id,
-                        faction_id,
-                        kind: JobKind::Farm,
-                        progress,
-                        claimants: Vec::new(),
-                        priority,
-                        source: JobSource::Chief,
-                        posted_tick,
-                        expiry_tick: None,
-                        poster_class: crate::simulation::jobs::PosterClass::Chief,
-                        reward: 0.0,
-                        settlement_id: None,
-                    });
-                    open_budget -= 1;
+                    let caretaker = farm_params
+                        .assignments
+                        .assigned_farmer(*pid);
+
+                    match phase {
+                        crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant => {
+                            // Prepare (any worker — assigned_farmer:None).
+                            if unprepared > 0
+                                && !posted_by_phase.contains_key(&(*pid, FarmWorkPhase::Prepare))
+                            {
+                                emit(JobProgress::FieldWork {
+                                    phase: FarmWorkPhase::Prepare,
+                                    completed: 0,
+                                    target: unprepared,
+                                    area,
+                                    plot_id: Some(*pid),
+                                    assigned_farmer: None,
+                                });
+                            }
+                            // Plant (capped by seed stock).
+                            let plant_target = plantable.min(grain_seed_stock);
+                            if plant_target > 0
+                                && !posted_by_phase.contains_key(&(*pid, FarmWorkPhase::Plant))
+                            {
+                                emit(JobProgress::FieldWork {
+                                    phase: FarmWorkPhase::Plant,
+                                    completed: 0,
+                                    target: plant_target,
+                                    area,
+                                    plot_id: Some(*pid),
+                                    assigned_farmer: None,
+                                });
+                            }
+                        }
+                        crate::simulation::farm::FarmSeasonPhase::SummerMaintenance => {
+                            // Caretaker-only Prepare for tiles that didn't
+                            // make it into the Spring rush.
+                            if unprepared > 0
+                                && !posted_by_phase.contains_key(&(*pid, FarmWorkPhase::Prepare))
+                            {
+                                emit(JobProgress::FieldWork {
+                                    phase: FarmWorkPhase::Prepare,
+                                    completed: 0,
+                                    target: unprepared,
+                                    area,
+                                    plot_id: Some(*pid),
+                                    assigned_farmer: caretaker,
+                                });
+                            }
+                        }
+                        crate::simulation::farm::FarmSeasonPhase::AutumnHarvest => {
+                            if mature_grain > 0
+                                && !posted_by_phase.contains_key(&(*pid, FarmWorkPhase::Harvest))
+                            {
+                                emit(JobProgress::FieldWork {
+                                    phase: FarmWorkPhase::Harvest,
+                                    completed: 0,
+                                    target: mature_grain,
+                                    area,
+                                    plot_id: Some(*pid),
+                                    assigned_farmer: None,
+                                });
+                            }
+                        }
+                        crate::simulation::farm::FarmSeasonPhase::WinterDormant => {}
+                    }
                 }
+                let _ = grain_seed_stock; // silence unused if no plots
             }
         }
 
@@ -3553,6 +3587,12 @@ fn posting_target_workers(p: &JobPosting) -> u32 {
             ((*target / 80).max(2)).min(8)
         }
         (JobKind::Haul, _) => 2,
+        // Seasonal Farm postings: scale with target tile/plant count so
+        // Spring prep (256-tile plot) gets up to 12 workers but a 1-tile
+        // caretaker run stays at 3.
+        (JobKind::Farm, JobProgress::FieldWork { target, .. }) => {
+            ((*target / 8).max(3)).min(12)
+        }
         (JobKind::Farm, _) => 3,
         (JobKind::Craft, _) => 1,
         _ => 1,
@@ -3699,7 +3739,7 @@ pub fn job_claim_system(
             // to the assigned farmer entity. Anyone else fails this gate
             // and the post stays open until the assigned farmer picks it
             // up (or the assignment is released by the daily reconciler).
-            if let JobProgress::Planting {
+            if let JobProgress::FieldWork {
                 assigned_farmer: Some(assigned),
                 ..
             } = p.progress
@@ -3833,7 +3873,7 @@ fn posting_target_tile(p: &JobPosting) -> Option<(i32, i32)> {
         JobProgress::Calories { .. } => None,
         JobProgress::Stockpile { .. } => None,
         JobProgress::Haul { .. } => None,
-        JobProgress::Planting { area, .. } => Some((
+        JobProgress::FieldWork { area, .. } => Some((
             (area.min.0 as i32 + area.max.0 as i32) as i32 / 2,
             (area.min.1 as i32 + area.max.1 as i32) as i32 / 2,
         )),
@@ -4111,11 +4151,13 @@ pub fn record_progress_filtered(
                 completed = true;
             }
         }
-        JobProgress::Planting {
-            planted, target, ..
+        JobProgress::FieldWork {
+            completed: progress_completed,
+            target,
+            ..
         } => {
-            *planted = planted.saturating_add(increment);
-            if planted >= target {
+            *progress_completed = progress_completed.saturating_add(increment);
+            if progress_completed >= target {
                 completed = true;
             }
         }
@@ -4160,7 +4202,7 @@ pub fn record_progress_filtered(
 /// falls within a posting's farm area (used by the planter completion hook).
 pub fn planting_area_contains(progress: &JobProgress, tile: (i32, i32)) -> bool {
     match progress {
-        JobProgress::Planting { area, .. } => area.contains(tile),
+        JobProgress::FieldWork { area, .. } => area.contains(tile),
         _ => false,
     }
 }
@@ -4254,7 +4296,7 @@ fn same_target(a: &JobProgress, b: &JobProgress) -> bool {
         (JobProgress::Crafting { recipe: rx, .. }, JobProgress::Crafting { recipe: ry, .. }) => {
             rx == ry
         }
-        (JobProgress::Planting { area: ax, .. }, JobProgress::Planting { area: ay, .. }) => {
+        (JobProgress::FieldWork { area: ax, .. }, JobProgress::FieldWork { area: ay, .. }) => {
             ax == ay
         }
         (JobProgress::Calories { .. }, JobProgress::Calories { .. }) => true,

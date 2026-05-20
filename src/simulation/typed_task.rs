@@ -481,6 +481,13 @@ pub enum Task {
     /// Drafted unit chases the named foe to attack adjacent. The dispatcher
     /// also writes `target_entity` for `combat_system` engagement.
     MilitaryAttack { foe: bevy::prelude::Entity },
+    /// Seasonal farming Phase 1: worker turns an Agricultural plot tile into
+    /// `TileKind::Cropland`. Executor (`farm::prepare_field_task_system`)
+    /// accumulates `FIELD_PREP_WORK_TICKS` then stamps Cropland (preserving
+    /// fertility), emits `TileChangedEvent`, increments the Farm posting's
+    /// `JobProgress::FieldWork { phase: Prepare, completed, .. }`, grants
+    /// Farming XP, and ensures `FieldTileIndex[tile].nutrients >= 30`.
+    PrepareField { tile: (i32, i32) },
 }
 
 /// Source for a `Task::Drink`. Inventory drinks consume one `clean_water`
@@ -820,6 +827,7 @@ pub fn task_kind_for(task: Task) -> u16 {
         Task::Deconstruct { .. } => TK::Deconstruct,
         Task::Terraform { .. } => TK::Terraform,
         Task::MilitaryAttack { .. } => TK::MilitaryAttack,
+        Task::PrepareField { .. } => TK::PrepareField,
     };
     kind as u16
 }
@@ -1197,6 +1205,14 @@ impl Task {
     pub fn as_military_attack(&self) -> Option<bevy::prelude::Entity> {
         match *self {
             Task::MilitaryAttack { foe } => Some(foe),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the PrepareField variant.
+    pub fn as_prepare_field(&self) -> Option<(i32, i32)> {
+        match *self {
+            Task::PrepareField { tile } => Some(tile),
             _ => None,
         }
     }

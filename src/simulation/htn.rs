@@ -6679,7 +6679,7 @@ impl FarmScope {
 /// tenure wins over Person/Bootstrap.
 ///
 /// 1. **Communal** — the worker holds `JobClaim::Farm` whose posting carries
-///    `JobProgress::Planting { plot_id: Some(_), assigned_farmer: Some(self), .. }`.
+///    `JobProgress::FieldWork { plot_id: Some(_), assigned_farmer: Some(self), .. }`.
 ///    Resolves to the plot's live `rect` (falling back to the posting's
 ///    `area` snapshot if the plot vanished).
 /// 2. **Private** — no qualifying communal claim, but the worker is
@@ -6708,7 +6708,7 @@ pub fn resolve_farm_scope(
                 .iter()
                 .find(|p| p.id == claim.job_id)
             {
-                if let JobProgress::Planting {
+                if let JobProgress::FieldWork {
                     plot_id,
                     assigned_farmer,
                     area,
@@ -6789,6 +6789,7 @@ pub fn htn_plant_from_storage_dispatch_system(
     clock: Res<SimClock>,
     item_query: Query<&crate::simulation::items::GroundItem>,
     farm_plot_params: FarmScopeParams,
+    field_tiles: Res<crate::simulation::farm::FieldTileIndex>,
     mut query: Query<
         (
             Entity,
@@ -6939,12 +6940,23 @@ pub fn htn_plant_from_storage_dispatch_system(
             continue;
         };
 
-        // Farm-planner §11: Communal/Private restrict the planting search
-        // to the assigned plot's rect; Bootstrap keeps the radius search.
+        // Seasonal-farming jellyfish: planting is gated on **prepared**
+        // Cropland AND `FieldTileIndex[tile].nutrients >=
+        // MIN_PLANTABLE_NUTRIENTS`. Communal/Private restrict the search to
+        // the assigned plot rect; Bootstrap falls back to the legacy
+        // unplanted-soil search (no prep system runs without a plot).
+        let _ = find_nearest_unplanted_in_rect; // keep symbol referenced
         let plant_tile = if let Some(rect) = scope.plot_rect() {
             let rmin = (rect.x0, rect.y0);
             let rmax = (rect.x0 + rect.w as i32 - 1, rect.y0 + rect.h as i32 - 1);
-            find_nearest_unplanted_in_rect(&chunk_map, &plant_map, (cur_tx, cur_ty), rmin, rmax)
+            crate::simulation::farm::find_nearest_plantable_in_rect(
+                &chunk_map,
+                &plant_map,
+                &field_tiles,
+                (cur_tx, cur_ty),
+                rmin,
+                rmax,
+            )
         } else {
             find_nearest_unplanted_farmland(&chunk_map, &plant_map, (cur_tx, cur_ty), VIEW_RADIUS)
         };
@@ -7063,6 +7075,114 @@ pub fn htn_plant_from_storage_dispatch_system(
         for task in tasks {
             let _ = aq.enqueue(task);
         }
+    }
+}
+
+/// Seasonal-farming jellyfish: direct dispatch for `Task::PrepareField`.
+/// Mirrors `bureaucrat_admin_dispatch_system`'s "no HTN registry" pattern.
+/// Activates for any non-Drafted, idle, non-Dormant agent holding a
+/// `JobClaim::Farm` whose backing posting carries
+/// `JobProgress::FieldWork { phase: Prepare, area, .. }`. Picks the nearest
+/// unprepared tile in `area` (via
+/// `farm::find_nearest_unprepared_in_rect`) and dispatches
+/// `Task::PrepareField { tile }` routed adjacent.
+pub fn htn_prepare_field_dispatch_system(
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    clock: Res<SimClock>,
+    board: Res<crate::simulation::jobs::JobBoard>,
+    field_tiles: Res<crate::simulation::farm::FieldTileIndex>,
+    mut query: Query<
+        (
+            Entity,
+            &mut PersonAI,
+            &mut ActionQueue,
+            &AgentGoal,
+            &Transform,
+            &FactionMember,
+            &LodLevel,
+            &crate::simulation::jobs::JobClaim,
+        ),
+        Without<Drafted>,
+    >,
+) {
+    use crate::simulation::farm::FarmWorkPhase;
+    use crate::simulation::jobs::{JobKind, JobProgress};
+    use crate::simulation::tasks::TaskKind;
+    let _ = clock;
+    for (actor, mut ai, mut aq, goal, transform, member, lod, claim) in query.iter_mut() {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::Farm) {
+            continue;
+        }
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
+            continue;
+        }
+        if member.faction_id == SOLO {
+            continue;
+        }
+        if !matches!(claim.kind, JobKind::Farm) {
+            continue;
+        }
+        let Some(posting) = board
+            .faction_postings(claim.faction_id)
+            .iter()
+            .find(|p| p.id == claim.job_id)
+        else {
+            continue;
+        };
+        let JobProgress::FieldWork {
+            phase,
+            area,
+            assigned_farmer,
+            ..
+        } = posting.progress
+        else {
+            continue;
+        };
+        if phase != FarmWorkPhase::Prepare {
+            continue;
+        }
+        if let Some(assigned) = assigned_farmer {
+            if assigned != actor {
+                continue;
+            }
+        }
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+        let Some(tile) = crate::simulation::farm::find_nearest_unprepared_in_rect(
+            &chunk_map,
+            &field_tiles,
+            (cur_tx, cur_ty),
+            area.min,
+            area.max,
+        ) else {
+            continue;
+        };
+        let dispatched = assign_task_with_routing(
+            &mut ai,
+            (cur_tx, cur_ty),
+            cur_chunk,
+            tile,
+            TaskKind::PrepareField,
+            None,
+            &chunk_graph,
+            &chunk_router,
+            &chunk_map,
+            &chunk_connectivity,
+        );
+        if !dispatched {
+            continue;
+        }
+        aq.dispatch(Task::PrepareField { tile });
     }
 }
 

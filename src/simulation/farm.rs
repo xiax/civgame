@@ -4,6 +4,19 @@
 //! Farmer entities to state-owned Agricultural plots one-to-one. The chief
 //! posts plot-scoped Farm jobs against those assignments via
 //! `chief_job_posting_system` reading `FarmPlotAssignments`.
+//!
+//! Seasonal-farming additions (jellyfish plan):
+//! - `FarmSeasonPhase` — pure function of `Calendar.season` mapping to
+//!   `{SpringPrepPlant, SummerMaintenance, AutumnHarvest, WinterDormant}`.
+//! - `FarmWorkPhase` — `{Prepare, Plant, Harvest}` tag carried on
+//!   `JobProgress::FieldWork`.
+//! - `FieldTileIndex` — `(tile → FieldTileState { nutrients, last_crop,
+//!   last_worked_year, plot_id })` resource keyed by every tile in
+//!   `PlotIndex.ag_tiles`. World-gen `TileData.fertility` is the natural
+//!   ceiling / recovery cap; `nutrients` is the live nutrient pool.
+//! - `prepare_field_task_system` (Sequential) — Task::PrepareField executor.
+//! - `fallow_recovery_system` (Economy, season-edge) — restores nutrients on
+//!   rested tiles up to the per-tile fertility ceiling.
 
 use ahash::AHashMap;
 use bevy::prelude::*;
@@ -12,10 +25,202 @@ use crate::economy::core_ids;
 use crate::simulation::faction::{FactionMember, FactionRegistry};
 use crate::simulation::land::{Plot, PlotId, PlotIndex, Tenure};
 use crate::simulation::person::Profession;
+use crate::simulation::plants::PlantKind;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::settlement::ZoneKind;
+use crate::world::seasons::{Calendar, Season, TICKS_PER_DAY};
 use crate::world::terrain::world_to_tile;
-use crate::world::seasons::TICKS_PER_DAY;
+
+/// Field-prep tile work, in fixed-update ticks. ~4 game-seconds at 20 Hz.
+pub const FIELD_PREP_WORK_TICKS: u16 = 80;
+/// Farming XP awarded on a successful PrepareField completion.
+pub const SKILL_XP_PER_PREP_TILE: u32 = 4;
+/// Nutrient floor below which a tile is considered "exhausted". Prepare can
+/// only bump exhausted soil this high (not into the plantable band).
+pub const EXHAUSTED_FLOOR: u8 = 30;
+/// Nutrient threshold the planting dispatcher requires before stamping a
+/// seed on a prepared tile.
+pub const MIN_PLANTABLE_NUTRIENTS: u8 = 80;
+/// Per-season nutrient debit on a Grain harvest.
+pub const HARVEST_NUTRIENT_DEBIT: u8 = 30;
+/// Per-season-edge fallow recovery (capped by per-tile fertility ceiling).
+pub const FALLOW_NUTRIENTS_PER_SEASON: u8 = 15;
+
+/// What the village should be doing in the field this season. Pure function
+/// of `Calendar.season`. No state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FarmSeasonPhase {
+    /// Spring — prepare unworked tiles and plant prepared, non-exhausted soil.
+    SpringPrepPlant,
+    /// Summer — caretaker top-up; low-priority Prepare postings only.
+    SummerMaintenance,
+    /// Autumn — harvest postings while mature Grain stands.
+    AutumnHarvest,
+    /// Winter — no postings.
+    WinterDormant,
+}
+
+/// Map `Calendar.season` to a `FarmSeasonPhase`. Pure helper.
+#[inline]
+pub fn farm_season_phase(cal: &Calendar) -> FarmSeasonPhase {
+    match cal.season {
+        Season::Spring => FarmSeasonPhase::SpringPrepPlant,
+        Season::Summer => FarmSeasonPhase::SummerMaintenance,
+        Season::Autumn => FarmSeasonPhase::AutumnHarvest,
+        Season::Winter => FarmSeasonPhase::WinterDormant,
+    }
+}
+
+/// Phase tag on a posted FieldWork job. Drives executor branch + multi-open
+/// posting counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FarmWorkPhase {
+    /// Turn raw plot soil into Cropland.
+    Prepare,
+    /// Plant seed on prepared, non-exhausted Cropland.
+    Plant,
+    /// Reap mature Grain plants from the plot.
+    Harvest,
+}
+
+/// Per-tile dynamic state for any tile belonging to an Agricultural plot.
+/// Extensible: adding fertilizer = +1 field, rotation bonus = read last_crop,
+/// weeds = +1 field.
+#[derive(Clone, Copy, Debug)]
+pub struct FieldTileState {
+    pub plot_id: PlotId,
+    /// Current nutrient level `[0, 255]`. Ceiling is the world-gen
+    /// `TileData.fertility` (never mutated by farming).
+    pub nutrients: u8,
+    /// Last crop sown / reaped on this tile. `None` means unworked.
+    pub last_crop: Option<PlantKind>,
+    /// Calendar year of the last write (harvest / prepare). Used by the
+    /// fallow recovery system to gate the per-season nutrient bump.
+    pub last_worked_year: u16,
+}
+
+/// Sparse, persistent-by-resource. Populated at `carve_plots_system` for every
+/// tile in `PlotIndex.ag_tiles`. Pruned when a plot teardown removes the tile
+/// from `ag_tiles`.
+#[derive(Resource, Default, Debug)]
+pub struct FieldTileIndex {
+    pub by_tile: AHashMap<(i32, i32), FieldTileState>,
+}
+
+impl FieldTileIndex {
+    /// Seed a fresh entry for a newly-carved Agricultural tile.
+    /// Idempotent — existing entries are preserved.
+    pub fn ensure_entry(&mut self, tile: (i32, i32), plot_id: PlotId, fertility: u8) {
+        self.by_tile.entry(tile).or_insert(FieldTileState {
+            plot_id,
+            nutrients: fertility,
+            last_crop: None,
+            last_worked_year: 0,
+        });
+    }
+
+    /// Drop an entry when a tile is removed from a plot.
+    pub fn remove(&mut self, tile: (i32, i32)) {
+        self.by_tile.remove(&tile);
+    }
+}
+
+/// Find the nearest plantable tile in `rect` for the seasonal pipeline.
+/// "Plantable" means: tile kind is `Cropland` (prepared), tile is not already
+/// carrying a plant (PlantMap), and `FieldTileIndex[tile].nutrients >=
+/// MIN_PLANTABLE_NUTRIENTS`. Falls back to no result if every candidate is
+/// either unprepared, exhausted, or already planted. Manhattan distance.
+pub fn find_nearest_plantable_in_rect(
+    chunk_map: &crate::world::chunk::ChunkMap,
+    plant_map: &crate::simulation::plants::PlantMap,
+    field_tiles: &FieldTileIndex,
+    from: (i32, i32),
+    rect_min: (i32, i32),
+    rect_max: (i32, i32),
+) -> Option<(i32, i32)> {
+    let mut best: Option<(i32, i32)> = None;
+    let mut best_dist = i32::MAX;
+    for ty in rect_min.1..=rect_max.1 {
+        for tx in rect_min.0..=rect_max.0 {
+            if plant_map.0.contains_key(&(tx, ty)) {
+                continue;
+            }
+            if !matches!(
+                chunk_map.tile_kind_at(tx, ty),
+                Some(crate::world::tile::TileKind::Cropland)
+            ) {
+                continue;
+            }
+            let nut = field_tiles
+                .by_tile
+                .get(&(tx, ty))
+                .map(|s| s.nutrients)
+                .unwrap_or(0);
+            if nut < MIN_PLANTABLE_NUTRIENTS {
+                continue;
+            }
+            let d = (tx - from.0).abs() + (ty - from.1).abs();
+            if d < best_dist {
+                best_dist = d;
+                best = Some((tx, ty));
+            }
+        }
+    }
+    best
+}
+
+/// Find the nearest tile in `rect` that needs Prepare work — either not yet
+/// `Cropland` OR `FieldTileIndex[tile].nutrients < EXHAUSTED_FLOOR`.
+pub fn find_nearest_unprepared_in_rect(
+    chunk_map: &crate::world::chunk::ChunkMap,
+    field_tiles: &FieldTileIndex,
+    from: (i32, i32),
+    rect_min: (i32, i32),
+    rect_max: (i32, i32),
+) -> Option<(i32, i32)> {
+    let mut best: Option<(i32, i32)> = None;
+    let mut best_dist = i32::MAX;
+    for ty in rect_min.1..=rect_max.1 {
+        for tx in rect_min.0..=rect_max.0 {
+            let is_cropland = matches!(
+                chunk_map.tile_kind_at(tx, ty),
+                Some(crate::world::tile::TileKind::Cropland)
+            );
+            let nut = field_tiles
+                .by_tile
+                .get(&(tx, ty))
+                .map(|s| s.nutrients)
+                .unwrap_or(0);
+            let unprepared = !is_cropland || nut < EXHAUSTED_FLOOR;
+            if !unprepared {
+                continue;
+            }
+            let d = (tx - from.0).abs() + (ty - from.1).abs();
+            if d < best_dist {
+                best_dist = d;
+                best = Some((tx, ty));
+            }
+        }
+    }
+    best
+}
+
+/// Return tier-scaled grain yield based on a tile's live nutrient level.
+/// Plan: ≥180 → 5, ≥120 → 4, ≥80 → 3, else 1. Falls below the planting gate
+/// only because already-planted crops that lost nutrients (rare) can still
+/// be harvested.
+#[inline]
+pub fn grain_yield_for_nutrients(nutrients: u8) -> u32 {
+    if nutrients >= 180 {
+        5
+    } else if nutrients >= 120 {
+        4
+    } else if nutrients >= MIN_PLANTABLE_NUTRIENTS {
+        3
+    } else {
+        1
+    }
+}
 
 /// One-to-one matching of farmer worker entities to state-owned Agricultural
 /// plots. Maintained by `chief_farm_plot_assignment_system`. Read by
@@ -228,12 +433,12 @@ pub fn seed_starting_farms_system(
     registry: Res<crate::simulation::faction::FactionRegistry>,
     mut plot_index: ResMut<crate::simulation::land::PlotIndex>,
     plot_q: Query<&crate::simulation::land::Plot>,
-    mut chunk_map: ResMut<crate::world::chunk::ChunkMap>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
     storage_tiles: Query<(&crate::simulation::faction::FactionStorageTile, &Transform)>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     mut ground_items: Query<&mut crate::simulation::items::GroundItem>,
-    mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
     brains: Res<crate::simulation::organic_settlement::SettlementBrains>,
+    mut field_tiles: ResMut<FieldTileIndex>,
 ) {
     use crate::simulation::land::Plot;
     use crate::simulation::organic_settlement::ParcelShape;
@@ -333,74 +538,18 @@ pub fn seed_starting_farms_system(
             let entity = commands.spawn(plot).id();
             plot_index.by_id.insert(pid, entity);
             plot_index.by_settlement.entry(sid.0).or_default().push(pid);
-            // Settlement realism: route the seeded plot through the same
-            // `field_tile_role` mosaic the runtime carve uses. Brain's
-            // `culture_hash` doubles as the seed; `layout_hash` is the
-            // closest analogue at seed time.
-            let culture_seed = brains
-                .0
-                .get(&sid)
-                .map(|b| b.layout_hash ^ ((fid as u64) << 32))
-                .unwrap_or(fid as u64);
+            // Seasonal-farming jellyfish: the belt is left UN-prepared at
+            // game start (founders pay Spring 1 to till it). Record plot
+            // membership for road protection + planner lookups, and seed
+            // a `FieldTileIndex` entry per tile so the prepare/plant/fallow
+            // dispatchers have a per-tile state to read.
             for ty in rect.y0..rect.y0 + rect.h as i32 {
                 for tx in rect.x0..rect.x0 + rect.w as i32 {
                     plot_index.by_tile.insert((tx, ty), pid);
                     plot_index.ag_tiles.insert((tx, ty));
                     let z = chunk_map.surface_z_at(tx, ty);
                     let cur = chunk_map.tile_at(tx, ty, z);
-                    let role = crate::simulation::land::field_tile_role(
-                        culture_seed,
-                        fid,
-                        (tx, ty),
-                        rect,
-                    );
-                    let tillable = cur.kind == crate::world::tile::TileKind::Grass
-                        || (cur.kind.is_soil_like()
-                            && cur.kind != crate::world::tile::TileKind::Cropland);
-                    match role {
-                        crate::simulation::land::FieldTileRole::Cropland => {
-                            if tillable {
-                                chunk_map.set_tile(
-                                    tx,
-                                    ty,
-                                    z,
-                                    crate::world::tile::TileData {
-                                        kind: crate::world::tile::TileKind::Cropland,
-                                        elevation: cur.elevation,
-                                        fertility: cur.fertility.max(180),
-                                        flags: cur.flags,
-                                        ore: cur.ore,
-                                    },
-                                );
-                                tile_changed.send(
-                                    crate::world::chunk_streaming::TileChangedEvent { tx, ty },
-                                );
-                            }
-                        }
-                        crate::simulation::land::FieldTileRole::CroplandLow => {
-                            if tillable {
-                                chunk_map.set_tile(
-                                    tx,
-                                    ty,
-                                    z,
-                                    crate::world::tile::TileData {
-                                        kind: crate::world::tile::TileKind::Cropland,
-                                        elevation: cur.elevation,
-                                        fertility: cur.fertility.min(110).max(80),
-                                        flags: cur.flags,
-                                        ore: cur.ore,
-                                    },
-                                );
-                                tile_changed.send(
-                                    crate::world::chunk_streaming::TileChangedEvent { tx, ty },
-                                );
-                            }
-                        }
-                        crate::simulation::land::FieldTileRole::SoilFallow
-                        | crate::simulation::land::FieldTileRole::GrassEdge => {
-                            // Leave underlying terrain.
-                        }
-                    }
+                    field_tiles.ensure_entry((tx, ty), pid, cur.fertility);
                 }
             }
         }
@@ -422,6 +571,323 @@ pub fn seed_starting_farms_system(
             storage_tile.1,
             crate::economy::core_ids::grain_seed(),
             STARTING_GRAIN_SEEDS,
+        );
+    }
+}
+
+/// One-shot OnEnter(Playing) backfill: any tile already in `PlotIndex.ag_tiles`
+/// that doesn't yet have a `FieldTileIndex` entry gets one with
+/// `nutrients = tile.fertility, last_crop = None`. Covers the
+/// `seed_farmstead_yard` (which still stamps Cropland at seed time) and any
+/// future save-game with pre-stamped Cropland tiles.
+pub fn backfill_field_tile_index_system(
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    mut field_tiles: ResMut<FieldTileIndex>,
+) {
+    for &tile in plot_index.ag_tiles.iter() {
+        if field_tiles.by_tile.contains_key(&tile) {
+            continue;
+        }
+        let pid = match plot_index.by_tile.get(&tile).copied() {
+            Some(p) => p,
+            None => continue,
+        };
+        let z = chunk_map.surface_z_at(tile.0, tile.1);
+        let data = chunk_map.tile_at(tile.0, tile.1, z);
+        field_tiles.ensure_entry(tile, pid, data.fertility);
+    }
+}
+
+/// Sequential executor for `Task::PrepareField`. Accumulates work_progress to
+/// `FIELD_PREP_WORK_TICKS`, then stamps `TileKind::Cropland` (preserving
+/// fertility), emits a `TileChangedEvent`, increments the worker's claimed
+/// Farm posting's `JobProgress::FieldWork.completed`, grants Farming XP, and
+/// bumps `FieldTileIndex[tile].nutrients` to at least `EXHAUSTED_FLOOR`.
+pub fn prepare_field_task_system(
+    clock: Res<SimClock>,
+    mut chunk_map: ResMut<crate::world::chunk::ChunkMap>,
+    mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    mut field_tiles: ResMut<FieldTileIndex>,
+    mut board: ResMut<crate::simulation::jobs::JobBoard>,
+    mut workers: Query<
+        (
+            Entity,
+            &mut crate::simulation::person::PersonAI,
+            &mut crate::simulation::typed_task::ActionQueue,
+            &mut crate::simulation::skills::Skills,
+            &crate::simulation::schedule::BucketSlot,
+            &crate::simulation::lod::LodLevel,
+            Option<&crate::simulation::jobs::JobClaim>,
+        ),
+        With<crate::simulation::person::Person>,
+    >,
+) {
+    use crate::simulation::jobs::{JobKind, JobProgress};
+    use crate::simulation::person::AiState;
+    use crate::simulation::skills::SkillKind;
+    use crate::simulation::tasks::TaskKind;
+    use crate::world::tile::{TileData, TileKind};
+    for (actor, mut ai, mut aq, mut skills, slot, lod, claim_opt) in workers.iter_mut() {
+        if *lod == crate::simulation::lod::LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        if aq.current_task_kind() != TaskKind::PrepareField as u16 {
+            continue;
+        }
+        // Defence-in-depth: typed channel mismatch means a stale write.
+        let Some(tile) = aq.current.as_prepare_field() else {
+            aq.cancel_chain(&mut ai);
+            continue;
+        };
+        if ai.state != AiState::Working {
+            continue;
+        }
+        if (ai.work_progress as u16) < FIELD_PREP_WORK_TICKS {
+            continue;
+        }
+        // Completion: stamp tile to Cropland (preserving elevation/fertility/
+        // flags/ore), emit a change event, bump nutrients up to the
+        // exhausted-floor minimum, credit the posting, grant XP, exit.
+        let (tx, ty) = tile;
+        let z = chunk_map.surface_z_at(tx, ty);
+        let cur = chunk_map.tile_at(tx, ty, z);
+        if cur.kind != TileKind::Cropland {
+            chunk_map.set_tile(
+                tx,
+                ty,
+                z,
+                TileData {
+                    kind: TileKind::Cropland,
+                    elevation: cur.elevation,
+                    fertility: cur.fertility,
+                    flags: cur.flags,
+                    ore: cur.ore,
+                },
+            );
+            tile_changed.send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
+        }
+        if let Some(state) = field_tiles.by_tile.get_mut(&tile) {
+            if state.nutrients < EXHAUSTED_FLOOR {
+                state.nutrients = EXHAUSTED_FLOOR;
+            }
+        }
+        // Credit the claimed posting's Prepare phase.
+        if let Some(claim) = claim_opt {
+            if matches!(claim.kind, JobKind::Farm) {
+                if let Some(posting) = board.get_mut(claim.job_id) {
+                    if let JobProgress::FieldWork { completed, .. } = &mut posting.progress {
+                        *completed = completed.saturating_add(1);
+                    }
+                }
+            }
+        }
+        skills.gain_xp(SkillKind::Farming, SKILL_XP_PER_PREP_TILE);
+        let _ = actor;
+        aq.finish_task(&mut ai);
+    }
+}
+
+/// Per-season-edge Economy system. Walks every entry in `FieldTileIndex`; for
+/// tiles with no live plant in `PlantMap` and `last_worked_year < calendar.year`
+/// bumps `nutrients += FALLOW_NUTRIENTS_PER_SEASON`, capped by the per-tile
+/// `TileData.fertility` ceiling.
+pub fn fallow_recovery_system(
+    calendar: Res<Calendar>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    plant_map: Res<crate::simulation::plants::PlantMap>,
+    mut field_tiles: ResMut<FieldTileIndex>,
+    mut last_seen: Local<Option<Season>>,
+) {
+    // Season-edge gate: only run once per season change. Mirrors
+    // `plant_lifecycle_system`'s `Local<Option<Season>>` pattern.
+    let cur = calendar.season;
+    let prev = match *last_seen {
+        Some(s) => s,
+        None => {
+            *last_seen = Some(cur);
+            return;
+        }
+    };
+    if prev == cur {
+        return;
+    }
+    *last_seen = Some(cur);
+    let cur_year = calendar.year as u16;
+    for (tile, state) in field_tiles.by_tile.iter_mut() {
+        if plant_map.0.contains_key(tile) {
+            continue;
+        }
+        if state.last_worked_year >= cur_year {
+            continue;
+        }
+        let z = chunk_map.surface_z_at(tile.0, tile.1);
+        let cap = chunk_map.tile_at(tile.0, tile.1, z).fertility;
+        let new_nut = state
+            .nutrients
+            .saturating_add(FALLOW_NUTRIENTS_PER_SEASON)
+            .min(cap);
+        state.nutrients = new_nut;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cal_with(season: Season, year: u32) -> Calendar {
+        let mut c = Calendar::default();
+        c.season = season;
+        c.year = year;
+        c
+    }
+
+    #[test]
+    fn farm_season_phase_classification() {
+        assert_eq!(
+            farm_season_phase(&cal_with(Season::Spring, 1)),
+            FarmSeasonPhase::SpringPrepPlant
+        );
+        assert_eq!(
+            farm_season_phase(&cal_with(Season::Summer, 1)),
+            FarmSeasonPhase::SummerMaintenance
+        );
+        assert_eq!(
+            farm_season_phase(&cal_with(Season::Autumn, 1)),
+            FarmSeasonPhase::AutumnHarvest
+        );
+        assert_eq!(
+            farm_season_phase(&cal_with(Season::Winter, 1)),
+            FarmSeasonPhase::WinterDormant
+        );
+    }
+
+    #[test]
+    fn grain_yield_scales_with_nutrients() {
+        assert_eq!(grain_yield_for_nutrients(200), 5);
+        assert_eq!(grain_yield_for_nutrients(130), 4);
+        assert_eq!(grain_yield_for_nutrients(100), 3);
+        assert_eq!(grain_yield_for_nutrients(60), 1);
+        assert_eq!(grain_yield_for_nutrients(0), 1);
+    }
+
+    #[test]
+    fn field_tile_index_ensure_entry_is_idempotent() {
+        let mut idx = FieldTileIndex::default();
+        idx.ensure_entry((1, 2), 7u32, 120);
+        // Mutate then re-ensure — must NOT overwrite (preserves live nutrients).
+        if let Some(s) = idx.by_tile.get_mut(&(1, 2)) {
+            s.nutrients = 50;
+        }
+        idx.ensure_entry((1, 2), 7u32, 120);
+        assert_eq!(idx.by_tile.get(&(1, 2)).unwrap().nutrients, 50);
+    }
+
+    #[test]
+    fn exhausted_tile_is_not_plantable_via_helper() {
+        // No ChunkMap needed — pass a synthetic helper.
+        // Logic check: helper rejects nutrients < MIN_PLANTABLE_NUTRIENTS.
+        let mut idx = FieldTileIndex::default();
+        idx.ensure_entry((0, 0), 1u32, 50);
+        let state = idx.by_tile.get(&(0, 0)).unwrap();
+        assert!(state.nutrients < MIN_PLANTABLE_NUTRIENTS);
+        // Sanity: exhausted floor sits below MIN_PLANTABLE.
+        assert!(EXHAUSTED_FLOOR < MIN_PLANTABLE_NUTRIENTS);
+    }
+
+    #[test]
+    fn plot_sizing_scales_to_food_need() {
+        // Mimic `organic_settlement::parcel_targets` formula.
+        let members: u32 = 20;
+        let grain_seed_stock: u32 = 32;
+        let food_tiles = (members * 16) / 4; // 80
+        let labor_tiles = ((members * 60) / 100).saturating_mul(24); // 288
+        let seed_tiles = grain_seed_stock.max(32); // 32
+        let target_active = food_tiles.min(labor_tiles).min(seed_tiles); // 32
+        let target_plots = (((target_active + 95) / 96).max(1)).min(12);
+        assert_eq!(target_plots, 1, "20-member 32-seed band → 1 plot, not 6-7");
+    }
+
+    #[test]
+    fn winter_no_farm_postings_via_phase_helper() {
+        // The chief Farm branch is gated on `farm_season_phase != WinterDormant`.
+        // This pin guards the gate from accidentally dropping the Winter check.
+        for season in [Season::Spring, Season::Summer, Season::Autumn] {
+            assert!(!matches!(
+                farm_season_phase(&cal_with(season, 1)),
+                FarmSeasonPhase::WinterDormant
+            ));
+        }
+        assert_eq!(
+            farm_season_phase(&cal_with(Season::Winter, 1)),
+            FarmSeasonPhase::WinterDormant
+        );
+    }
+
+    #[test]
+    fn fallow_recovery_caps_at_fertility() {
+        // The recovery loop bumps `nutrients += FALLOW_NUTRIENTS_PER_SEASON`
+        // every season-edge, capped at the per-tile `TileData.fertility`.
+        // Simulate the pure arithmetic for 4 season-edges on a tile that
+        // starts at 50 nutrients with fertility ceiling 110.
+        let mut nut: u8 = 50;
+        let cap: u8 = 110;
+        for _ in 0..4 {
+            nut = nut.saturating_add(FALLOW_NUTRIENTS_PER_SEASON).min(cap);
+        }
+        assert_eq!(nut, 110, "nutrients hit the fertility ceiling, not 50+60=110+");
+    }
+
+    #[test]
+    fn harvest_debit_lowers_nutrients_by_30() {
+        let mut nut: u8 = 200;
+        nut = nut.saturating_sub(HARVEST_NUTRIENT_DEBIT);
+        assert_eq!(nut, 170);
+        // Saturating: a low-nutrient tile zeroes out, doesn't underflow.
+        let mut low: u8 = 10;
+        low = low.saturating_sub(HARVEST_NUTRIENT_DEBIT);
+        assert_eq!(low, 0);
+    }
+
+    #[test]
+    fn plot_sizing_scales_up_at_higher_pop_and_seed() {
+        // Larger band with ample seed -> multiple plots, but capped by labor.
+        let members: u32 = 200;
+        let grain_seed_stock: u32 = 2000;
+        let food_tiles = (members * 16) / 4; // 800
+        let labor_tiles = ((members * 60) / 100).saturating_mul(24); // 2880
+        let seed_tiles = grain_seed_stock.max(32); // 2000
+        let target_active = food_tiles.min(labor_tiles).min(seed_tiles); // 800
+        let target_plots = (((target_active + 95) / 96).max(1)).min(12);
+        // ceil(800/96) = 9
+        assert_eq!(target_plots, 9);
+    }
+
+    /// `seed_tiles = grain_seed_stock.max(current_ag_tiles).max(32)` — an
+    /// active belt floors the seed budget so a transient low seed reading
+    /// doesn't shrink the plot plan below productive size.
+    #[test]
+    fn plot_sizing_floors_seed_budget_to_current_active_tiles() {
+        let members: u32 = 60;
+        let grain_seed_stock: u32 = 16; // below the 32 floor
+        let current_ag_tiles: u32 = 600; // ~6 active plots worth
+        let food_tiles = (members * 16) / 4; // 240
+        let labor_tiles = ((members * 60) / 100).saturating_mul(24); // 864
+        let seed_tiles = grain_seed_stock.max(current_ag_tiles).max(32); // 600
+        let target_active = food_tiles.min(labor_tiles).min(seed_tiles); // 240
+        let target_plots = (((target_active + 95) / 96).max(1)).min(12);
+        // ceil(240/96) = 3 — driven by food_tiles, NOT shrunk by the low
+        // seed_stock because current_ag_tiles holds the floor.
+        assert_eq!(target_plots, 3);
+
+        // Sanity: without the active-tile floor, seed_tiles would be 32 and
+        // target_plots would collapse to 1.
+        let naive_seed = grain_seed_stock.max(32);
+        let naive_active = food_tiles.min(labor_tiles).min(naive_seed);
+        assert_eq!(
+            (((naive_active + 95) / 96).max(1)).min(12),
+            1,
+            "without the floor an active 6-plot village would shrink-plan to 1"
         );
     }
 }

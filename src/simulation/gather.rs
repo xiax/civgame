@@ -183,6 +183,11 @@ pub struct GatherRoutingResources<'w, 's> {
     /// Read by `finish_gather` to release any active gather claim staked at
     /// dispatch time. Mirrors the `release_reservation` plumbing for storage.
     pub gather_claims: Res<'w, GatherClaims>,
+    /// Seasonal-farming jellyfish: per-tile nutrient/last-crop state for
+    /// Grain harvest yield scaling + post-harvest debit. Bundled here so
+    /// `gather_system` stays under Bevy's 16-param ceiling.
+    pub field_tiles: ResMut<'w, crate::simulation::farm::FieldTileIndex>,
+    pub calendar: Res<'w, crate::world::seasons::Calendar>,
 }
 
 /// Phase 5c-ii-c-ii chain handoff: called by every `gather_system` exit path
@@ -383,7 +388,7 @@ pub fn gather_system(
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
     mut faction_registry: ResMut<FactionRegistry>,
     mut shared: ResMut<crate::simulation::shared_knowledge::SharedKnowledge>,
-    routing: GatherRoutingResources,
+    mut routing: GatherRoutingResources,
     mut sharecrop: crate::simulation::land::SharecropResources,
     mut plant_query: Query<&mut crate::simulation::plants::Plant>,
     mut agent_query: Query<(
@@ -594,7 +599,32 @@ pub fn gather_system(
             } else {
                 1.0
             };
-            let qty = (base_qty as f32 * yield_mul).round().max(1.0) as u32;
+            // Seasonal-farming jellyfish: Grain yields scale with the tile's
+            // live nutrient level (debited by `HARVEST_NUTRIENT_DEBIT` here).
+            // Other crops keep `base_qty` (no field state).
+            let scaled_qty = if matches!(kind, crate::simulation::plants::PlantKind::Grain) {
+                let nut = routing
+                    .field_tiles
+                    .by_tile
+                    .get(&(tx, ty))
+                    .map(|s| s.nutrients)
+                    .unwrap_or(0);
+                crate::simulation::farm::grain_yield_for_nutrients(nut)
+            } else {
+                base_qty
+            };
+            let qty = (scaled_qty as f32 * yield_mul).round().max(1.0) as u32;
+            // Apply the per-tile nutrient debit + last-crop tag for Grain.
+            if matches!(kind, crate::simulation::plants::PlantKind::Grain) {
+                let cur_year = routing.calendar.year as u16;
+                if let Some(state) = routing.field_tiles.by_tile.get_mut(&(tx, ty)) {
+                    state.nutrients = state
+                        .nutrients
+                        .saturating_sub(crate::simulation::farm::HARVEST_NUTRIENT_DEBIT);
+                    state.last_crop = Some(crate::simulation::plants::PlantKind::Grain);
+                    state.last_worked_year = cur_year;
+                }
+            }
             let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
 
             // Phase 6 sharecropping: if the harvested tile sits on a

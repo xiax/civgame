@@ -122,6 +122,12 @@ pub enum TaskKind {
     /// `production::buy_material_task_system`. Mirrors `WithdrawMaterial`
     /// (interacts-from-adjacent, labor, Haul-goal preserve-arm).
     BuyMaterialAtMarket = 51,
+    /// Seasonal farming Phase 1: worker stands adjacent to a plot tile and
+    /// turns soil into `TileKind::Cropland` over `FIELD_PREP_WORK_TICKS`.
+    /// Interacts-from-adjacent, requires 1 free hand, counts as labor.
+    /// Executor: `farm::prepare_field_task_system` (Sequential, after
+    /// movement, before gather).
+    PrepareField = 52,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -179,6 +185,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::Heal as u16 => "Healing",
         x if x == TaskKind::SeekCare as u16 => "Seeking Care",
         x if x == TaskKind::Drink as u16 => "Drinking",
+        x if x == TaskKind::PrepareField as u16 => "Preparing Field",
         _ => "Unemployed",
     }
 }
@@ -203,7 +210,8 @@ pub fn task_requires_free_hands(task_id: u16) -> u8 {
             || x == TaskKind::Defend as u16
             || x == TaskKind::MilitaryAttack as u16
             || x == TaskKind::TameAnimal as u16
-            || x == TaskKind::ClearObstacle as u16 =>
+            || x == TaskKind::ClearObstacle as u16
+            || x == TaskKind::PrepareField as u16 =>
         {
             1
         }
@@ -252,6 +260,7 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::PitchStructureAt as u16
         || task_id == TaskKind::Heal as u16
         || task_id == TaskKind::Drink as u16
+        || task_id == TaskKind::PrepareField as u16
 }
 
 /// Tasks that count as productive labor — these drain willpower over time
@@ -281,6 +290,7 @@ pub fn task_is_labor(task_id: u16) -> bool {
         || task_id == TaskKind::PitchStructureAt as u16
         || task_id == TaskKind::HaulCorpse as u16
         || task_id == TaskKind::Butcher as u16
+        || task_id == TaskKind::PrepareField as u16
 }
 
 /// Spiral search outward from `target` for the closest tile that is passable

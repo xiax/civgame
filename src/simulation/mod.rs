@@ -246,6 +246,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(land::PlotIndex::default())
             .insert_resource(land::LandListings::default())
             .insert_resource(farm::FarmPlotAssignments::default())
+            .insert_resource(farm::FieldTileIndex::default())
             .insert_resource(military::ActiveRallyPoints::default())
             .insert_resource(military::MilitaryFormationGroupGen::default())
             .insert_resource(military::PendingFormationSlots::default())
@@ -358,6 +359,12 @@ impl Plugin for SimulationPlugin {
                     farm::seed_starting_farms_system
                         .after(construction::seed_starting_buildings_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Seasonal-farming jellyfish: backfill any pre-stamped
+                    // Cropland tile (kitchen-garden yard + saved games) into
+                    // `FieldTileIndex` with nutrients = tile.fertility.
+                    farm::backfill_field_tile_index_system
+                        .after(farm::seed_starting_farms_system)
+                        .after(construction::seed_starting_buildings_system),
                     // Consolidate every stamped/queued bootstrap tile into
                     // `SeedReservation` so plants streaming in after warmup
                     // can't sprout on a planned doormat / road / ag tile
@@ -807,6 +814,11 @@ impl Plugin for SimulationPlugin {
                     htn::htn_harvest_plant_dispatch_system
                         .after(htn::htn_harvest_grain_for_craft_order_dispatch_system),
                     htn::htn_play_dispatch_system.after(htn::htn_harvest_plant_dispatch_system),
+                    // Seasonal-farming jellyfish: PrepareField direct
+                    // dispatcher — routes Prepare-phase Farm claimants to
+                    // the nearest unprepared plot tile.
+                    htn::htn_prepare_field_dispatch_system
+                        .after(htn::htn_play_dispatch_system),
                 )
                     .in_set(SimulationSet::ParallelB),
             )
@@ -1040,6 +1052,23 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 (jobs::wage_gossip_system.after(knowledge::awareness_gossip_system),)
                     .in_set(SimulationSet::Economy),
+            )
+            .add_systems(
+                FixedUpdate,
+                // Seasonal-farming jellyfish: per-season-edge nutrient
+                // recovery on rested ag tiles. Cheap (`Local<Option<Season>>`
+                // gate, only walks `FieldTileIndex`).
+                (farm::fallow_recovery_system,).in_set(SimulationSet::Economy),
+            )
+            .add_systems(
+                FixedUpdate,
+                // Seasonal-farming jellyfish: PrepareField executor runs in
+                // Sequential after movement (adjacency current) and before
+                // gather (mutually exclusive task). Split into its own block
+                // because the main Sequential tuple is at Bevy's 21-element
+                // ceiling.
+                (farm::prepare_field_task_system.before(gather::gather_system),)
+                    .in_set(SimulationSet::Sequential),
             )
             // Phase 4 (sanitation): emit pass writes `WastePile` intensity
             // into `SanitationMap`; decay pass exponentially shrinks every

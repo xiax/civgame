@@ -3778,7 +3778,13 @@ mod smoke {
                 rent_yield_pct: 0.0,
                 default_share_to_landlord: 0.30,
             };
-            registry.add_member(village_id);
+            // Seasonal-farming jellyfish: the new demand-driven plot sizing
+            // scales with `member_count` (labor_tiles = 0 below 2 members).
+            // Bump to 6 founders so `parcel_targets(...)` allocates at least
+            // one Agricultural plot for the sharecrop listing to fire on.
+            for _ in 0..6 {
+                registry.add_member(village_id);
+            }
             let id = registry.spawn_household(village_id, (0, 0), head, &catalog);
             // Just at the minimum so the candidate gate passes.
             registry.factions.get_mut(&id).unwrap().treasury =
@@ -5019,7 +5025,7 @@ mod smoke {
         // home-centred bootstrap) so farmers plant ON the plot, not the town.
         for p in &farm_postings {
             match p.progress {
-                JobProgress::Planting { plot_id, area, .. } => {
+                JobProgress::FieldWork { plot_id, area, .. } => {
                     assert!(
                         plot_id.is_some(),
                         "chief Farm posting must carry a plot_id (no home±5 bootstrap)"
@@ -5030,9 +5036,363 @@ mod smoke {
                         "Farm job area must be the plot rect, not home±5"
                     );
                 }
-                _ => panic!("Farm posting must be JobProgress::Planting"),
+                _ => panic!("Farm posting must be JobProgress::FieldWork"),
             }
         }
+    }
+
+    /// Seasonal jellyfish integration: a freshly-seeded belt plot lands in
+    /// `FieldTileIndex` with un-prepared tiles (kind != Cropland, nutrients
+    /// pre-loaded from `TileData.fertility`). Founders pay Spring 1 to till.
+    #[test]
+    fn seed_belt_does_not_stamp_cropland_and_seeds_field_tile_index() {
+        use bevy::ecs::system::RunSystemOnce;
+        use crate::simulation::farm::{FieldTileIndex, seed_starting_farms_system};
+        use crate::simulation::land::{PlotIndex, TenureHolder};
+        use crate::simulation::organic_settlement::{
+            DistrictKind, Parcel, ParcelShape, ParcelSuitability, SettlementBrain, SettlementBrains,
+        };
+        use crate::simulation::settlement::{SettlementMap, TileRect};
+
+        let mut sim = TestSim::new(0xCA11_F1E1);
+        sim.flat_world(3, 0, TileKind::Grass);
+        sim.spawn_storage_tile(sim.player_faction_id, (0, 0));
+        sim.tick_n(2);
+
+        let fid = sim.player_faction_id;
+        let belt_rect = TileRect::new(40, 40, 16, 16);
+        {
+            let world = sim.app.world_mut();
+            let sid = world
+                .resource::<SettlementMap>()
+                .first_for_faction(fid)
+                .expect("settlement");
+            let mut brain = SettlementBrain::new(sid, fid, 42);
+            brain.parcels.push(Parcel {
+                id: 0,
+                shape: ParcelShape::Rect(belt_rect),
+                frontage_edge: None,
+                access_tile: None,
+                holder: TenureHolder::State { faction_id: fid },
+                district_hint: Some(DistrictKind::Agricultural),
+                suitability: ParcelSuitability::default(),
+            });
+            world.resource_mut::<SettlementBrains>().0.insert(sid, brain);
+        }
+
+        sim.app
+            .world_mut()
+            .run_system_once(seed_starting_farms_system)
+            .expect("seed_starting_farms_system should run");
+
+        // Every belt tile should be in PlotIndex.ag_tiles AND FieldTileIndex,
+        // but the chunk_map tile kind should NOT be Cropland yet.
+        let world = sim.app.world();
+        let plot_index = world.resource::<PlotIndex>();
+        let field_tiles = world.resource::<FieldTileIndex>();
+        let chunk_map = world.resource::<ChunkMap>();
+        let mut sampled_tiles = 0;
+        let mut sampled_field_entries = 0;
+        for ty in 40..56 {
+            for tx in 40..56 {
+                assert!(
+                    plot_index.ag_tiles.contains(&(tx, ty)),
+                    "belt tile ({tx},{ty}) must be in ag_tiles"
+                );
+                if field_tiles.by_tile.contains_key(&(tx, ty)) {
+                    sampled_field_entries += 1;
+                }
+                let z = chunk_map.surface_z_at(tx, ty);
+                let kind = chunk_map.tile_at(tx, ty, z).kind;
+                assert!(
+                    kind != TileKind::Cropland,
+                    "carve must not stamp Cropland on belt tile ({tx},{ty}); got {kind:?}"
+                );
+                sampled_tiles += 1;
+            }
+        }
+        assert_eq!(sampled_tiles, 256, "must scan entire 16x16 belt");
+        assert_eq!(
+            sampled_field_entries, 256,
+            "every belt tile must seed a FieldTileIndex entry"
+        );
+    }
+
+    /// Winter Calendar → zero Farm postings. Pins the WinterDormant gate end
+    /// to end inside `chief_job_posting_system`.
+    #[test]
+    fn winter_chief_posts_no_farm_jobs() {
+        use crate::economy::core_ids;
+        use crate::simulation::faction::{FactionChief, FactionRegistry};
+        use crate::simulation::jobs::{JobBoard, JobKind};
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::technology::CROP_CULTIVATION;
+        use crate::world::seasons::{Calendar, Season};
+
+        let mut sim = TestSim::new(0x47E_C01D);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let storage_tile = (0, 0);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+        sim.spawn_ground_item(storage_tile, core_ids::grain_seed(), 64);
+
+        let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        {
+            let world = sim.app.world_mut();
+            let mut k = world.get_mut::<PersonKnowledge>(chief).unwrap();
+            k.aware |= 1u64 << CROP_CULTIVATION;
+            k.learned |= 1u64 << CROP_CULTIVATION;
+            world.entity_mut(chief).insert(FactionChief);
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(sim.player_faction_id);
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            f.chief_entity = Some(chief);
+            f.techs.unlock(CROP_CULTIVATION);
+        }
+
+        // Inject a belt plot the same way other Farm tests do.
+        let belt_rect = TileRect::new(40, 40, 16, 16);
+        let fid = sim.player_faction_id;
+        {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let ent = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect: belt_rect,
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                })
+                .id();
+            world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
+        }
+
+        // Pin Calendar to Winter and run a full chief-posting cadence.
+        {
+            let mut cal = sim.app.world_mut().resource_mut::<Calendar>();
+            cal.season = Season::Winter;
+        }
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let farm_count = board
+            .faction_postings(fid)
+            .iter()
+            .filter(|p| matches!(p.kind, JobKind::Farm))
+            .count();
+        assert_eq!(
+            farm_count, 0,
+            "Winter (WinterDormant) must produce zero Farm postings"
+        );
+    }
+
+    /// Spring Calendar → chief posts at least one FieldWork{phase:Prepare}
+    /// (covering un-prepared tiles). With no Cropland yet, Plant postings
+    /// have target 0 and may or may not be emitted; the assertion focuses
+    /// on the Prepare presence end-to-end.
+    #[test]
+    fn spring_chief_posts_prepare_field_jobs() {
+        use crate::economy::core_ids;
+        use crate::simulation::faction::{FactionChief, FactionRegistry};
+        use crate::simulation::farm::{FarmWorkPhase, FieldTileIndex};
+        use crate::simulation::jobs::{JobBoard, JobKind, JobProgress};
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::technology::CROP_CULTIVATION;
+        use crate::world::seasons::{Calendar, Season};
+
+        let mut sim = TestSim::new(0x57_E110);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let storage_tile = (0, 0);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+        sim.spawn_ground_item(storage_tile, core_ids::grain_seed(), 64);
+
+        let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        {
+            let world = sim.app.world_mut();
+            let mut k = world.get_mut::<PersonKnowledge>(chief).unwrap();
+            k.aware |= 1u64 << CROP_CULTIVATION;
+            k.learned |= 1u64 << CROP_CULTIVATION;
+            world.entity_mut(chief).insert(FactionChief);
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(sim.player_faction_id);
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            f.chief_entity = Some(chief);
+            f.techs.unlock(CROP_CULTIVATION);
+        }
+
+        // Plot + per-tile FieldTileIndex entries (un-prepared belt).
+        let belt_rect = TileRect::new(40, 40, 16, 16);
+        let fid = sim.player_faction_id;
+        {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let ent = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect: belt_rect,
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                })
+                .id();
+            world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
+            for ty in 40..56 {
+                for tx in 40..56 {
+                    world
+                        .resource_mut::<PlotIndex>()
+                        .ag_tiles
+                        .insert((tx, ty));
+                    world
+                        .resource_mut::<FieldTileIndex>()
+                        .ensure_entry((tx, ty), pid, 150);
+                }
+            }
+        }
+
+        // Pin Spring + tick a full posting cadence.
+        {
+            let mut cal = sim.app.world_mut().resource_mut::<Calendar>();
+            cal.season = Season::Spring;
+        }
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let mut prepare_count = 0;
+        for p in board.faction_postings(fid) {
+            if !matches!(p.kind, JobKind::Farm) {
+                continue;
+            }
+            if let JobProgress::FieldWork { phase, .. } = p.progress {
+                if matches!(phase, FarmWorkPhase::Prepare) {
+                    prepare_count += 1;
+                }
+            }
+        }
+        assert!(
+            prepare_count >= 1,
+            "Spring must post at least one FieldWork(Prepare); got {prepare_count}"
+        );
+    }
+
+    /// `fallow_recovery_system` bumps nutrients +15 once per season-edge,
+    /// capped at the world-gen `TileData.fertility` ceiling. Uses
+    /// `register_system` + `run_system` so the system's
+    /// `Local<Option<Season>>` retains state across invocations (unlike
+    /// `run_system_once`).
+    #[test]
+    fn fallow_recovery_restores_nutrients_capped_at_fertility() {
+        use crate::simulation::farm::{FieldTileIndex, fallow_recovery_system};
+        use crate::world::seasons::{Calendar, Season};
+
+        let mut sim = TestSim::new(0xFA110);
+        sim.flat_world(1, 0, TileKind::Grass);
+
+        // Flat chunks default to fertility=8 (synthetic). Write a tile
+        // delta with fertility=200 so the recovery cap sits well above the
+        // seeded nutrient level.
+        let tile = (3, 4);
+        {
+            let mut chunk_map = sim.app.world_mut().resource_mut::<ChunkMap>();
+            chunk_map.set_tile(
+                tile.0,
+                tile.1,
+                0,
+                crate::world::tile::TileData {
+                    kind: TileKind::Grass,
+                    elevation: 0,
+                    fertility: 200,
+                    flags: 0,
+                    ore: 0,
+                },
+            );
+        }
+
+        // Seed one FieldTileIndex entry at 50 nutrients.
+        {
+            let mut field = sim.app.world_mut().resource_mut::<FieldTileIndex>();
+            field.by_tile.insert(
+                tile,
+                crate::simulation::farm::FieldTileState {
+                    plot_id: 1,
+                    nutrients: 50,
+                    last_crop: None,
+                    last_worked_year: 0,
+                },
+            );
+        }
+
+        // Register the system once. Local<Option<Season>> persists across
+        // every run_system call against this SystemId.
+        let sys_id = sim
+            .app
+            .world_mut()
+            .register_system(fallow_recovery_system);
+
+        // Run 1: Spring primes the Local.
+        {
+            let mut cal = sim.app.world_mut().resource_mut::<Calendar>();
+            cal.season = Season::Spring;
+        }
+        sim.app.world_mut().run_system(sys_id).ok();
+        let nut_after_prime = sim
+            .app
+            .world()
+            .resource::<FieldTileIndex>()
+            .by_tile
+            .get(&tile)
+            .map(|s| s.nutrients)
+            .unwrap_or(0);
+        assert_eq!(nut_after_prime, 50, "priming run must not bump nutrients");
+
+        // Flip season + run again to trigger the season-edge branch.
+        {
+            let mut cal = sim.app.world_mut().resource_mut::<Calendar>();
+            cal.season = Season::Summer;
+        }
+        sim.app.world_mut().run_system(sys_id).ok();
+
+        let nut = sim
+            .app
+            .world()
+            .resource::<FieldTileIndex>()
+            .by_tile
+            .get(&tile)
+            .map(|s| s.nutrients)
+            .unwrap_or(0);
+        assert!(
+            nut > 50,
+            "season-edge run must increase nutrients past the seeded 50; got {nut}"
+        );
+        assert!(
+            nut <= 200,
+            "must not exceed fertility cap; got {nut} vs cap 200"
+        );
     }
 
     #[test]
@@ -9801,8 +10161,9 @@ mod baseline_behaviour {
                 id,
                 faction_id: sim.player_faction_id,
                 kind: JobKind::Farm,
-                progress: JobProgress::Planting {
-                    planted: 0,
+                progress: JobProgress::FieldWork {
+                    phase: crate::simulation::farm::FarmWorkPhase::Harvest,
+                    completed: 0,
                     target: 1,
                     area: TileAabb {
                         min: (-10, -10),
@@ -13709,6 +14070,8 @@ mod wage_aware_phase0_phase1 {
             time_of_day_bonus: 0.0,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
             private_farm_available: false,
+            farm_season: crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant,
+            private_plot_has_seasonal_work: false,
         };
         let lo = scorer
             .score(&make_ctx(Disposition {

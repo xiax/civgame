@@ -386,9 +386,12 @@ fn progress_label(p: &JobProgress) -> String {
             delivered,
             target
         ),
-        JobProgress::Planting {
-            planted, target, ..
-        } => format!("Tiles planted {}/{}", planted, target),
+        JobProgress::FieldWork {
+            phase,
+            completed,
+            target,
+            ..
+        } => format!("{:?} {}/{}", phase, completed, target),
         JobProgress::Crafting {
             crafted,
             target,
@@ -419,8 +422,9 @@ fn build_player_posting(
             deposited: 0,
             target,
         },
-        JobKind::Farm => JobProgress::Planting {
-            planted: 0,
+        JobKind::Farm => JobProgress::FieldWork {
+            phase: crate::simulation::farm::FarmWorkPhase::Plant,
+            completed: 0,
             target,
             area: TileAabb {
                 min: (home_tile.0 - radius, home_tile.1 - radius),

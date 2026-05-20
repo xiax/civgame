@@ -1878,7 +1878,7 @@ fn build_parcels_frontier_driven(
     let mut parcels = Vec::new();
     let mut occupied: Vec<TileRect> = Vec::new();
     let mut counts: AHashMap<DistrictKind, usize> = AHashMap::default();
-    let targets = parcel_targets(faction, settlement, brain.phase);
+    let targets = parcel_targets(faction, settlement, brain.phase, current_ag_tile_count(brain));
     let road_centred = faction.community_has(PERM_SETTLEMENT) && !brain.road_tiles.is_empty();
     let mut next_id = 0u32;
     for &tile in &brain.frontier {
@@ -1931,7 +1931,7 @@ fn build_parcels_road_driven(
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
 ) -> Vec<Parcel> {
-    let targets = parcel_targets(faction, settlement, brain.phase);
+    let targets = parcel_targets(faction, settlement, brain.phase, current_ag_tile_count(brain));
     if targets.is_empty() {
         return Vec::new();
     }
@@ -2080,7 +2080,7 @@ fn build_ag_belt(
     if budget == 0 {
         return Vec::new();
     }
-    let targets = parcel_targets(faction, settlement, brain.phase);
+    let targets = parcel_targets(faction, settlement, brain.phase, current_ag_tile_count(brain));
     let ag_target = *targets.get(&DistrictKind::Agricultural).unwrap_or(&0);
     if ag_target == 0 {
         return Vec::new();
@@ -3252,10 +3252,27 @@ fn best_district_for_parcel(s: &ParcelSuitability) -> Option<DistrictKind> {
         .map(|(kind, _)| kind)
 }
 
+/// Total tile count of every Agricultural parcel currently on `brain`. Used
+/// by `parcel_targets` as the seed-budget floor so a faction running an
+/// active belt doesn't shrink-plan itself below productive size on a
+/// transient low-seed reading.
+fn current_ag_tile_count(brain: &SettlementBrain) -> u32 {
+    brain
+        .parcels
+        .iter()
+        .filter(|p| matches!(p.district_hint, Some(DistrictKind::Agricultural)))
+        .map(|p| match p.shape {
+            ParcelShape::Rect(r) => (r.w as u32).saturating_mul(r.h as u32),
+            _ => 0,
+        })
+        .sum()
+}
+
 fn parcel_targets(
     faction: &FactionData,
     settlement: &Settlement,
     phase: SettlementPhase,
+    current_ag_tiles: u32,
 ) -> AHashMap<DistrictKind, usize> {
     let members = faction.member_count.max(settlement.peak_population).max(1) as usize;
     let era = current_era(&faction.techs);
@@ -3265,7 +3282,21 @@ fn parcel_targets(
     targets.insert(DistrictKind::Residential, ((members + 3) / 4).clamp(2, 24));
 
     if faction.community_has(CROP_CULTIVATION) {
-        targets.insert(DistrictKind::Agricultural, ((members + 2) / 3).clamp(2, 24));
+        // Seasonal-farming jellyfish: demand-driven plot count based on
+        // (food need ∩ labor cap ∩ seed stock), divided by the average
+        // active-tiles-per-plot (~96, plot is 16×16 = 256 tiles, ~3/8 of
+        // which is plantable Cropland in the new mosaic).
+        let food_tiles = ((members as u32) * 16) / 4; // 16 grain/person/year, 4 grain/tile/year
+        let labor_tiles = (((members as u32) * 60) / 100).saturating_mul(24);
+        let grain_seed_stock = faction.storage.seed_total();
+        // Don't let the seed budget shrink below tiles already in production
+        // — each grain harvest yields its seed cofactor, so an active field
+        // is self-sustaining once it ran its first cycle. The 32-tile floor
+        // covers the first-season case where the band has no harvest yet.
+        let seed_tiles = grain_seed_stock.max(current_ag_tiles).max(32);
+        let target_active = food_tiles.min(labor_tiles).min(seed_tiles);
+        let target_plots = (((target_active + 95) / 96).max(1)).min(12) as usize;
+        targets.insert(DistrictKind::Agricultural, target_plots);
     }
     if faction.community_has(FLINT_KNAPPING) {
         targets.insert(DistrictKind::Crafting, 2);
