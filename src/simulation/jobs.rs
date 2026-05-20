@@ -512,9 +512,11 @@ pub fn total_escrowed_currency(world: &mut World) -> f32 {
 /// `job_payout_system` can find the escrow at completion time without
 /// walking every entity in the world. Populated at posting-creation
 /// sites (post_craft_contract / post_craft_contract_from_treasury /
-/// post_stockpile_self) and drained at completion / cancellation by
-/// the payout system. Chief postings carry no escrow — their JobId
-/// is simply absent from this index.
+/// post_stockpile_self / `chief_post_funding_system` for chief postings
+/// whose faction funds public works or runs market-haul) and drained at
+/// completion / cancellation by `job_payout_system`. Subsistence chief
+/// postings (`chief_wage_for == 0` and no `purchase_pool`) carry no
+/// escrow — their `JobId` is simply absent from this index.
 #[derive(Resource, Default)]
 pub struct JobEscrowIndex(pub AHashMap<JobId, Entity>);
 
@@ -737,6 +739,60 @@ pub fn job_payout_system(world: &mut World) {
             // despawn the escrow; the `on_remove` hook refunds.
             world.entity_mut(escrow_entity).despawn();
         }
+    }
+}
+
+/// Defence-in-depth GC for `JobEscrowIndex`. The primary leak is closed
+/// by emitting `JobCompletedEvent { completed: false }` from every posting
+/// drop path; this sweep catches any future poster path that forgets, and
+/// reaps index entries whose escrow entity has already despawned.
+///
+/// Runs daily in Economy after `job_payout_system`. Walks index entries:
+/// - escrow entity gone but index entry remains → drop the entry.
+/// - escrow entity alive but no posting on any faction board references
+///   the `JobId` → despawn the escrow (the `on_remove` hook refunds) and
+///   drop the entry.
+pub fn escrow_index_gc_system(world: &mut World) {
+    use crate::world::seasons::TICKS_PER_DAY;
+    let tick = world.resource::<SimClock>().tick;
+    if tick % (TICKS_PER_DAY as u64) != 0 {
+        return;
+    }
+    let entries: Vec<(JobId, Entity)> = {
+        let idx = world.resource::<JobEscrowIndex>();
+        idx.0.iter().map(|(k, v)| (*k, *v)).collect()
+    };
+    if entries.is_empty() {
+        return;
+    }
+    let mut stale_ids: Vec<JobId> = Vec::new();
+    let mut orphan_entities: Vec<(JobId, Entity)> = Vec::new();
+    for (job_id, escrow_entity) in entries {
+        let escrow_alive = world.get::<JobEscrow>(escrow_entity).is_some();
+        if !escrow_alive {
+            stale_ids.push(job_id);
+            continue;
+        }
+        let posting_exists = world.resource::<JobBoard>().locate(job_id).is_some();
+        if !posting_exists {
+            orphan_entities.push((job_id, escrow_entity));
+        }
+    }
+    if stale_ids.is_empty() && orphan_entities.is_empty() {
+        return;
+    }
+    {
+        let mut idx = world.resource_mut::<JobEscrowIndex>();
+        for job_id in &stale_ids {
+            idx.0.remove(job_id);
+        }
+        for (job_id, _) in &orphan_entities {
+            idx.0.remove(job_id);
+        }
+    }
+    for (_, escrow_entity) in orphan_entities {
+        // `on_remove` hook refunds wage + purchase_pool to the beneficiary.
+        world.entity_mut(escrow_entity).despawn();
     }
 }
 
@@ -2246,31 +2302,73 @@ pub fn chief_job_posting_system(
                 });
             }
 
-            postings.retain(|p| {
+            // Two-pass: identify chief postings to drop, emit a
+            // `JobCompletedEvent { completed: false }` for each so
+            // `job_payout_system` can despawn any funded escrow (the
+            // `on_remove` hook then refunds wage + purchase_pool to the
+            // beneficiary). Mirrors the Haul-drop pattern above so silent
+            // posting drops can't orphan `JobEscrow` entities or strand
+            // funds in `JobEscrowIndex`.
+            let mut to_drop_silent: Vec<(
+                JobId,
+                JobKind,
+                Vec<Entity>,
+                Option<crate::economy::resource_catalog::ResourceId>,
+            )> = Vec::new();
+            for p in postings.iter() {
                 if !matches!(p.source, JobSource::Chief) {
-                    return true;
+                    continue;
                 }
                 if !p.claimants.is_empty() {
-                    return true;
+                    continue;
                 }
-                match p.progress {
+                let drop = match p.progress {
                     JobProgress::Building { blueprint } => {
                         if bp_query.get(blueprint).is_err() {
-                            return false;
-                        }
-                        match projects.for_blueprint(blueprint) {
-                            Some(project) => project.phase == ProjectPhase::Build,
-                            None => false,
+                            true
+                        } else {
+                            match projects.for_blueprint(blueprint) {
+                                Some(project) => project.phase != ProjectPhase::Build,
+                                None => true,
+                            }
                         }
                     }
                     // Haul postings are already handled by the two-pass above.
-                    JobProgress::Haul { .. } => true,
+                    JobProgress::Haul { .. } => false,
                     JobProgress::Calories { .. }
                     | JobProgress::Stockpile { .. }
                     | JobProgress::Planting { .. }
-                    | JobProgress::Crafting { .. } => false,
+                    | JobProgress::Crafting { .. } => true,
+                };
+                if drop {
+                    to_drop_silent.push((
+                        p.id,
+                        p.kind,
+                        p.claimants.clone(),
+                        p.progress.target_rid(),
+                    ));
                 }
-            });
+            }
+            for (job_id, kind, claimants, target_rid) in to_drop_silent {
+                if let Some(idx) = postings.iter().position(|p| p.id == job_id) {
+                    postings.swap_remove(idx);
+                }
+                // Defensive: non-Haul drops gate on `claimants.is_empty()`
+                // so this is a no-op today, but symmetric with the Haul
+                // path keeps future predicate changes safe.
+                for c in &claimants {
+                    commands.entity(*c).remove::<JobClaim>();
+                    commands.entity(*c).remove::<ClaimTarget>();
+                }
+                completed_events.send(JobCompletedEvent {
+                    job_id,
+                    faction_id,
+                    kind,
+                    claimants,
+                    completed: false,
+                    target_rid,
+                });
+            }
         }
 
         // 1b. Refresh priorities on all chief-source postings still alive so

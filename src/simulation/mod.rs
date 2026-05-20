@@ -960,6 +960,7 @@ impl Plugin for SimulationPlugin {
                     jobs::job_claim_release_system.after(jobs::job_build_completion_system),
                     jobs::chief_post_funding_system.after(jobs::chief_job_posting_system),
                     jobs::job_payout_system.after(jobs::job_claim_release_system),
+                    jobs::escrow_index_gc_system.after(jobs::job_payout_system),
                     jobs::faction_wage_signal_system.after(jobs::job_payout_system),
                     skills::skill_peaks_tracker_system.after(jobs::faction_wage_signal_system),
                     skills::skill_decay_system.after(skills::skill_peaks_tracker_system),

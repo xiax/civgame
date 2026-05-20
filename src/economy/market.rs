@@ -145,7 +145,11 @@ impl SettlementMarket {
 
     /// Agent sells an item. Returns currency earned. Sale always succeeds
     /// (sellers don't crash the price — sale flow is not a price signal).
+    /// `qty == 0` is rejected to keep dead rows out of `listings`.
     pub fn sell_item(&mut self, item: Item, qty: u32) -> f32 {
+        if qty == 0 {
+            return 0.0;
+        }
         let price = self.calculate_price(&item);
         let total_earned = price * qty as f32;
         let id = item.resource_id;
@@ -317,7 +321,11 @@ impl Market {
     }
 
     /// Agent sells an item to the market. Returns currency earned.
+    /// `qty == 0` is rejected to keep dead rows out of `listings`.
     pub fn sell_item(&mut self, item: Item, qty: u32) -> f32 {
+        if qty == 0 {
+            return 0.0;
+        }
         let price = self.calculate_price(&item);
         let total_earned = price * qty as f32;
         let id = item.resource_id;
@@ -412,6 +420,9 @@ fn try_buy_inner(
         if total_cost <= *currency && buy_qty > 0 {
             *currency -= total_cost;
             listings[idx].1 -= buy_qty;
+            if listings[idx].1 == 0 {
+                listings.swap_remove(idx);
+            }
             return BuyOutcome::Cleared { item, qty: buy_qty };
         }
     }
@@ -480,6 +491,7 @@ pub fn price_update_system(
         return;
     }
     market.update_prices();
+    market.listings.retain(|(_, qty)| *qty > 0);
     market.clear_flow();
 }
 
@@ -499,6 +511,7 @@ pub fn settlement_price_update_system(
     }
     for mut settlement in settlements.iter_mut() {
         settlement.market.update_prices();
+        settlement.market.listings.retain(|(_, qty)| *qty > 0);
         settlement.market.clear_flow();
     }
 }
@@ -520,6 +533,7 @@ pub fn camp_price_update_system(
     }
     for mut camp in camps.iter_mut() {
         camp.market.update_prices();
+        camp.market.listings.retain(|(_, qty)| *qty > 0);
         camp.market.clear_flow();
     }
 }
@@ -613,5 +627,53 @@ mod tests {
             m.clear_flow();
         }
         assert_eq!(m.price_of(fruit), initial);
+    }
+
+    /// Performance-leak regression: buying out a manufactured listing
+    /// must remove the zero-qty entry. Before the fix, `listings`
+    /// retained dead rows for the rest of the session.
+    #[test]
+    fn market_listing_buy_out_prunes() {
+        use crate::economy::item::{Item, ItemMaterial, ItemQuality};
+        let mut m = Market::default();
+        let tools = core_ids::tools();
+        let item = Item::new_manufactured(tools, ItemMaterial::Iron, ItemQuality::Normal);
+        m.sell_item(item, 3);
+        assert_eq!(m.listings.len(), 1);
+        let mut wallet = 1_000.0;
+        let (_, bought) = m.try_buy_item(tools, 3, &mut wallet);
+        assert_eq!(bought, 3);
+        assert!(
+            m.listings.is_empty(),
+            "zero-qty listing entry should be pruned; listings={:?}",
+            m.listings
+        );
+    }
+
+    /// `sell_item` with `qty == 0` must not push a dead row.
+    #[test]
+    fn sell_item_rejects_zero_qty() {
+        use crate::economy::item::{Item, ItemMaterial, ItemQuality};
+        let mut m = Market::default();
+        let tools = core_ids::tools();
+        let item = Item::new_manufactured(tools, ItemMaterial::Iron, ItemQuality::Normal);
+        let earned = m.sell_item(item, 0);
+        assert_eq!(earned, 0.0);
+        assert!(m.listings.is_empty());
+    }
+
+    /// `SettlementMarket` shares `try_buy_inner` with `Market`; verify the
+    /// pruning fix reaches the per-settlement vector too.
+    #[test]
+    fn settlement_market_buy_out_prunes() {
+        use crate::economy::item::{Item, ItemMaterial, ItemQuality};
+        let mut m = SettlementMarket::default();
+        let tools = core_ids::tools();
+        let item = Item::new_manufactured(tools, ItemMaterial::Iron, ItemQuality::Normal);
+        m.sell_item(item, 2);
+        let mut wallet = 1_000.0;
+        let (_, bought) = m.try_buy_item(tools, 2, &mut wallet);
+        assert_eq!(bought, 2);
+        assert!(m.listings.is_empty());
     }
 }

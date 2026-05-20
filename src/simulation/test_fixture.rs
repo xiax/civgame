@@ -11244,6 +11244,141 @@ mod baseline_behaviour {
         );
     }
 
+    /// Performance-leak regression: when `chief_job_posting_system` retain-drops
+    /// an unclaimed Chief `Stockpile` posting, the funded `JobEscrow` sidecar
+    /// must be despawned (refunding wage + purchase_pool to the beneficiary)
+    /// and the `JobEscrowIndex` entry must be removed. Before the fix the drop
+    /// emitted no `JobCompletedEvent`, leaving the escrow + index entry
+    /// orphaned.
+    ///
+    /// Drives `chief_job_posting_system` + `job_payout_system` directly via
+    /// `run_system_once` with `SimClock.tick` pre-set to a multiple of
+    /// `CHIEF_POSTING_INTERVAL`. This avoids the claim race: a normally
+    /// ticked sim would let `job_claim_system` claim the posting before the
+    /// retain fires, so `claimants.is_empty()` would short-circuit the drop.
+    #[test]
+    fn chief_stockpile_drop_refunds_escrow() {
+        use bevy::ecs::system::RunSystemOnce;
+        use crate::economy::agent::EconomicAgent;
+        use crate::simulation::jobs::{
+            JobBoard, JobEscrow, JobEscrowIndex, JobKind, JobPosting, JobProgress, JobSource,
+            PosterClass,
+        };
+
+        let mut sim = TestSim::new(2026_05_19);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        // Bare beneficiary — refund target on escrow despawn.
+        const BENEFICIARY_START: f32 = 100.0;
+        const WAGE: f32 = 7.5;
+        let beneficiary = sim
+            .app
+            .world_mut()
+            .spawn(EconomicAgent {
+                currency: BENEFICIARY_START,
+                ..Default::default()
+            })
+            .id();
+
+        // Push an unclaimed Chief Stockpile posting with reward > 0 so the
+        // funding system treats it as already-paid (skips re-funding).
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board
+                .faction_postings_mut(sim.player_faction_id)
+                .push(JobPosting {
+                    id,
+                    faction_id: sim.player_faction_id,
+                    kind: JobKind::Stockpile,
+                    progress: JobProgress::Stockpile {
+                        resource_id: crate::economy::core_ids::wood(),
+                        deposited: 0,
+                        target: 10,
+                    },
+                    claimants: Vec::new(),
+                    priority: 100,
+                    source: JobSource::Chief,
+                    posted_tick: 0,
+                    expiry_tick: None,
+                    poster_class: PosterClass::Chief,
+                    reward: WAGE,
+                    settlement_id: None,
+                });
+            id
+        };
+        let escrow_entity = sim
+            .app
+            .world_mut()
+            .spawn(JobEscrow {
+                amount: WAGE,
+                beneficiary,
+                purchase_pool: 0.0,
+            })
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<JobEscrowIndex>()
+            .0
+            .insert(job_id, escrow_entity);
+
+        // Pre-set SimClock.tick to a multiple of CHIEF_POSTING_INTERVAL = 60
+        // so the system's tick-gate passes when we invoke it directly.
+        {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = 60;
+        }
+
+        // Run the chief posting system once — emits JobCompletedEvent for
+        // the dropped Stockpile posting.
+        sim.app
+            .world_mut()
+            .run_system_once(crate::simulation::jobs::chief_job_posting_system)
+            .expect("chief_job_posting_system should run");
+
+        // Posting is gone after the retain.
+        let board = sim.app.world().resource::<JobBoard>();
+        let still_present = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .any(|p| p.id == job_id);
+        assert!(
+            !still_present,
+            "Chief Stockpile posting should be retain-dropped"
+        );
+
+        // Drain the event by running the payout system.
+        sim.app
+            .world_mut()
+            .run_system_once(crate::simulation::jobs::job_payout_system)
+            .expect("job_payout_system should run");
+
+        // JobEscrowIndex entry is gone.
+        let idx = sim.app.world().resource::<JobEscrowIndex>();
+        assert!(
+            !idx.0.contains_key(&job_id),
+            "JobEscrowIndex entry for the dropped posting should be cleared"
+        );
+
+        // Escrow entity is despawned (despawn → on_remove fires the refund).
+        assert!(
+            sim.app.world().get::<JobEscrow>(escrow_entity).is_none(),
+            "JobEscrow sidecar should be despawned by job_payout_system"
+        );
+
+        // Beneficiary currency restored — wage refunded via the on_remove hook.
+        let final_currency = sim
+            .app
+            .world()
+            .get::<EconomicAgent>(beneficiary)
+            .map(|a| a.currency)
+            .unwrap_or(0.0);
+        assert!(
+            (final_currency - (BENEFICIARY_START + WAGE)).abs() < 1e-3,
+            "beneficiary should gain WAGE on refund: start={BENEFICIARY_START}, final={final_currency}, wage={WAGE}"
+        );
+    }
+
     /// Fix 3a: the Haul-branch dispatcher uses material already in the
     /// agent's hands/inventory and dispatches `HaulToBlueprint` directly,
     /// skipping the redundant `WithdrawMaterial` round-trip to storage.
