@@ -87,6 +87,8 @@ pub fn job_board_panel_system(
                         (JobKind::Farm, _) => 4,
                         (JobKind::Build, _) => 5,
                         (JobKind::Craft, _) => 6,
+                        // Plow rides the Farm bucket in the UI summary.
+                        (JobKind::Plow, _) => 4,
                     };
                     claims[i] += p.claimants.len() as u32;
                     for &e in &p.claimants {
@@ -405,6 +407,11 @@ fn progress_label(p: &JobProgress) -> String {
             format!("{} {}/{}", name, crafted, target)
         }
         JobProgress::Building { .. } => "Build in progress".to_string(),
+        JobProgress::Plow {
+            plowed_tiles,
+            target_tiles,
+            ..
+        } => format!("Plow {}/{}", plowed_tiles, target_tiles),
     }
 }
 
@@ -443,6 +450,9 @@ fn build_player_posting(
         // Build and Haul postings need a concrete blueprint; the Post Job form
         // doesn't pick one yet — disabled at this layer.
         JobKind::Build | JobKind::Haul => return None,
+        // Plow postings need a plot id; player-side ad-hoc post form doesn't
+        // pick one. Chief postings cover plowing automatically.
+        JobKind::Plow => return None,
     };
     Some(JobPosting {
         id: 0, // overwritten by job_board_command_system

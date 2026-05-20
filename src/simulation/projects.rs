@@ -257,6 +257,9 @@ pub fn compute_priority(
         JobKind::Build => BASE_BUILD,
         JobKind::Farm => BASE_FARM,
         JobKind::Craft => BASE_CRAFT,
+        // Draftwork: plowing rides at the Farm pressure base so workers
+        // schedule it alongside other field work.
+        JobKind::Plow => BASE_FARM,
     };
 
     let pressure: u8 = match (posting_kind, progress) {
@@ -268,6 +271,7 @@ pub fn compute_priority(
         (JobKind::Build, JobProgress::Building { .. }) => build_pressure(),
         (JobKind::Farm, _) => farm_pressure(faction),
         (JobKind::Craft, _) => craft_pressure(faction),
+        (JobKind::Plow, _) => farm_pressure(faction),
         _ => 0,
     };
 
@@ -478,6 +482,8 @@ impl WorkforceBudget {
             JobKind::Farm => self.farm,
             JobKind::Build => self.build,
             JobKind::Craft => self.craft,
+            // Plow draws from the Farm slot — it's seasonal field work.
+            JobKind::Plow => self.farm,
         }
     }
 }

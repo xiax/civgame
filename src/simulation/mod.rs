@@ -18,6 +18,7 @@ pub mod corpse;
 pub mod crafting;
 pub mod dig;
 pub mod doormat;
+pub mod draftwork;
 pub mod drink;
 pub mod faction;
 pub mod farm;
@@ -1069,6 +1070,24 @@ impl Plugin for SimulationPlugin {
                 // ceiling.
                 (farm::prepare_field_task_system.before(gather::gather_system),)
                     .in_set(SimulationSet::Sequential),
+            )
+            .add_systems(
+                FixedUpdate,
+                // Draftwork v2: plow executor (Sequential, before gather so
+                // the gather harvest path doesn't race a freshly-stamped
+                // `Plot.plowed_year`) + animal training tick.
+                (
+                    draftwork::plow_task_system.before(gather::gather_system),
+                    draftwork::animal_training_progress_system,
+                )
+                    .in_set(SimulationSet::Sequential),
+            )
+            .add_systems(
+                FixedUpdate,
+                // Plow HTN dispatcher: ParallelB, after the JobBoard claim
+                // pass. Reads `JobClaim::Plow`, picks the next un-plowed
+                // tile, dispatches `Task::Plow`.
+                (draftwork::htn_plow_dispatch_system,).in_set(SimulationSet::ParallelB),
             )
             // Phase 4 (sanitation): emit pass writes `WastePile` intensity
             // into `SanitationMap`; decay pass exponentially shrinks every

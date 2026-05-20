@@ -35,6 +35,13 @@ pub enum JobKind {
     Farm,
     Craft,
     Build,
+    /// Draftwork v2: walk an Agricultural plot tile-by-tile with a draft
+    /// animal (Cattle / Horse), turning unplowed soil over so the year's
+    /// crop carries the `Tilled` marker for a 1.4× harvest bonus. Posted
+    /// by the chief in Spring per un-plowed plot when the faction has
+    /// `ARD_PLOW` tech + an `ard_plow` implement in storage + a trained
+    /// animal. Maps to `AgentGoal::Farm` (piggybacks on the Farm goal).
+    Plow,
 }
 
 impl JobKind {
@@ -45,6 +52,7 @@ impl JobKind {
             JobKind::Farm => "Farm",
             JobKind::Craft => "Craft",
             JobKind::Build => "Build",
+            JobKind::Plow => "Plow",
         }
     }
 
@@ -55,6 +63,9 @@ impl JobKind {
             JobKind::Farm => AgentGoal::Farm,
             JobKind::Craft => AgentGoal::Craft,
             JobKind::Build => AgentGoal::Build,
+            // Plow piggybacks on the Farm goal — workers with `AgentGoal::Farm`
+            // pick up Plow claims via the standard claim flow.
+            JobKind::Plow => AgentGoal::Farm,
         }
     }
 }
@@ -73,6 +84,9 @@ pub fn faction_can_perform(faction: &FactionData, kind: JobKind) -> bool {
         JobKind::Farm => faction.techs.has(CROP_CULTIVATION),
         JobKind::Build => true,
         JobKind::Craft => true,
+        // Plow requires the ard plow tech AND grants `AgentGoal::Farm`, so
+        // gate on both: tech + grain-policy chief_allocates (same as Farm).
+        JobKind::Plow => faction.techs.has(crate::simulation::technology::ARD_PLOW),
     }
 }
 
@@ -167,6 +181,21 @@ pub enum JobProgress {
     },
     /// Build: completes when the named blueprint entity despawns.
     Building { blueprint: Entity },
+    /// Draftwork v2: tile-by-tile plowing of an Agricultural plot. The
+    /// executor (`draftwork::plow_task_system`) accumulates per-tile work,
+    /// bumps `plowed_tiles`, and on completion (`plowed_tiles >= target_tiles`)
+    /// stamps `Plot.plowed_year = Some(calendar.year)`, releases the
+    /// `AnimalWorkClaim`, and emits `JobCompletedEvent { completed: true }`.
+    /// `assigned_worker` restricts claiming to one farmer; `animal` is
+    /// populated by the dispatcher on first dispatch.
+    Plow {
+        plot_id: crate::simulation::land::PlotId,
+        area: TileAabb,
+        plowed_tiles: u32,
+        target_tiles: u32,
+        assigned_worker: Option<Entity>,
+        animal: Option<Entity>,
+    },
 }
 
 impl JobProgress {
@@ -185,6 +214,10 @@ impl JobProgress {
                 .get(*recipe as usize)
                 .map(|r| r.output_resource),
             JobProgress::Building { .. } => None,
+            // Plow's keying target is the ard plow implement (the gating
+            // consumable in faction storage). Drives wage-signal EMA so
+            // `Plow{ard_plow}` is its own bucket distinct from Farm.
+            JobProgress::Plow { .. } => Some(core_ids::ard_plow()),
         }
     }
 
@@ -207,6 +240,11 @@ impl JobProgress {
             // (which removes the posting); this returns false because the
             // posting is removed before this would ever be re-checked.
             JobProgress::Building { .. } => false,
+            JobProgress::Plow {
+                plowed_tiles,
+                target_tiles,
+                ..
+            } => plowed_tiles >= target_tiles,
         }
     }
 
@@ -256,6 +294,17 @@ impl JobProgress {
                 }
             }
             JobProgress::Building { .. } => 0.0,
+            JobProgress::Plow {
+                plowed_tiles,
+                target_tiles,
+                ..
+            } => {
+                if *target_tiles == 0 {
+                    1.0
+                } else {
+                    (*plowed_tiles as f32 / *target_tiles as f32).clamp(0.0, 1.0)
+                }
+            }
         }
     }
 }
@@ -865,6 +914,13 @@ pub fn chief_wage_for(progress: &JobProgress) -> f32 {
         }
         JobProgress::Building { .. } => {
             (CHIEF_BUILD_WAGE_PER_DAY * CHIEF_BUILD_EXPECTED_DAYS).min(CHIEF_BUILD_WAGE_CAP)
+        }
+        JobProgress::Plow { target_tiles, .. } => {
+            // Plow uses the same per-day base as Farm + scales with the
+            // tile count. Cap matches Farm so a 16×16 = 256-tile plot
+            // doesn't run treasury dry.
+            let wage = CHIEF_FARM_WAGE_PER_DAY * CHIEF_FARM_EXPECTED_DAYS;
+            (wage + (*target_tiles as f32) * 0.2).min(40.0)
         }
     }
 }
@@ -2349,7 +2405,8 @@ pub fn chief_job_posting_system(
                     JobProgress::Calories { .. }
                     | JobProgress::Stockpile { .. }
                     | JobProgress::FieldWork { .. }
-                    | JobProgress::Crafting { .. } => true,
+                    | JobProgress::Crafting { .. }
+                    | JobProgress::Plow { .. } => true,
                 };
                 if drop {
                     to_drop_silent.push((
@@ -3058,6 +3115,102 @@ pub fn chief_job_posting_system(
             }
         }
 
+        // 4b. Plow posting — Draftwork v2. Spring-only. Per state-owned
+        // Agricultural plot whose `plowed_year != Some(current_year)`, post
+        // one `JobKind::Plow` if the faction (a) has `ARD_PLOW` tech, (b)
+        // owns at least one `ard_plow` implement in storage, (c) the plot
+        // hasn't already got a live Plow posting. `assigned_worker` is the
+        // plot's `FarmPlotAssignments` farmer when present, else `None`
+        // (open claim — any Farmer can pick it up).
+        //
+        // The dispatcher picks the animal at first-tile dispatch (gates on
+        // species ∈ {Cattle, Horse} and `training >= TRAINING_THRESHOLD_DRAFT`).
+        // The plow implement is NOT consumed by the executor — one implement
+        // serves many seasons.
+        if faction.techs.has(crate::simulation::technology::ARD_PLOW)
+            && faction
+                .storage
+                .stock_of(crate::economy::core_ids::ard_plow())
+                > 0
+            && faction.member_count > 0
+            && matches!(calendar.season, crate::world::seasons::Season::Spring)
+        {
+            let cur_year = calendar.year as u16;
+            let mut plow_already_posted: ahash::AHashSet<crate::simulation::land::PlotId> =
+                ahash::AHashSet::default();
+            for p in board.faction_postings(faction_id).iter() {
+                if let JobProgress::Plow { plot_id, .. } = p.progress {
+                    plow_already_posted.insert(plot_id);
+                }
+            }
+            let plow_plots: Vec<(
+                crate::simulation::land::PlotId,
+                crate::simulation::settlement::TileRect,
+            )> = crate::simulation::farm::state_owned_ag_plots_for_faction(
+                faction_id,
+                &farm_params.plot_index,
+                &farm_params.plot_q,
+            );
+            for (pid, rect) in &plow_plots {
+                if plow_already_posted.contains(pid) {
+                    continue;
+                }
+                // Check `plowed_year` via the plot entity.
+                let plow_done_this_year = farm_params
+                    .plot_index
+                    .by_id
+                    .get(pid)
+                    .and_then(|ent| farm_params.plot_q.get(*ent).ok())
+                    .and_then(|plot| plot.plowed_year)
+                    == Some(cur_year);
+                if plow_done_this_year {
+                    continue;
+                }
+                if !crate::simulation::placement_reachability::rect_reachable_from_home(
+                    &farm_params.chunk_map,
+                    faction.home_tile,
+                    (rect.x0, rect.y0),
+                    (rect.x0 + rect.w as i32 - 1, rect.y0 + rect.h as i32 - 1),
+                ) {
+                    continue;
+                }
+                let area = TileAabb {
+                    min: (rect.x0, rect.y0),
+                    max: (rect.x0 + rect.w as i32 - 1, rect.y0 + rect.h as i32 - 1),
+                };
+                let target_tiles = (rect.w as u32).saturating_mul(rect.h as u32);
+                if target_tiles == 0 {
+                    continue;
+                }
+                let assigned_worker = farm_params.assignments.assigned_farmer(*pid);
+                let progress = JobProgress::Plow {
+                    plot_id: *pid,
+                    area,
+                    plowed_tiles: 0,
+                    target_tiles,
+                    assigned_worker,
+                    animal: None,
+                };
+                let id = board.alloc_id();
+                let priority =
+                    compute_priority(faction, faction_id, JobKind::Plow, &progress, &projects);
+                board.faction_postings_mut(faction_id).push(JobPosting {
+                    id,
+                    faction_id,
+                    kind: JobKind::Plow,
+                    progress,
+                    claimants: Vec::new(),
+                    priority,
+                    source: JobSource::Chief,
+                    posted_tick,
+                    expiry_tick: None,
+                    poster_class: crate::simulation::jobs::PosterClass::Chief,
+                    reward: 0.0,
+                    settlement_id: None,
+                });
+            }
+        }
+
         // 5. Craft posting — pick the available recipe with the largest
         // unmet demand on its output good. One Craft posting per faction at a
         // time; subsequent cycles rotate through recipes as deficits shift.
@@ -3511,6 +3664,7 @@ fn skill_for(kind: JobKind) -> SkillKind {
         JobKind::Farm => SkillKind::Farming,
         JobKind::Build => SkillKind::Building,
         JobKind::Craft => SkillKind::Crafting,
+        JobKind::Plow => SkillKind::Farming,
     }
 }
 
@@ -3595,6 +3749,9 @@ fn posting_target_workers(p: &JobPosting) -> u32 {
         }
         (JobKind::Farm, _) => 3,
         (JobKind::Craft, _) => 1,
+        // Plow is a single-farmer single-animal job — one worker pulls the
+        // ox across the field. Multiple workers can't share the same plow.
+        (JobKind::Plow, _) => 1,
         _ => 1,
     }
 }
@@ -3748,6 +3905,18 @@ pub fn job_claim_system(
                     continue;
                 }
             }
+            // Draftwork v2: Plow postings mirror the assigned-farmer
+            // restriction. The chief picks one farmer per plot at posting
+            // time; only that farmer can claim.
+            if let JobProgress::Plow {
+                assigned_worker: Some(assigned),
+                ..
+            } = p.progress
+            {
+                if assigned != worker {
+                    continue;
+                }
+            }
             // Per-person craft tech-gate: a worker can only claim a Craft
             // posting whose recipe `tech_gate` they have personally Learned.
             // Faction-level posting still uses chief awareness; this filter
@@ -3879,6 +4048,10 @@ fn posting_target_tile(p: &JobPosting) -> Option<(i32, i32)> {
         )),
         JobProgress::Crafting { .. } => None,
         JobProgress::Building { .. } => None,
+        JobProgress::Plow { area, .. } => Some((
+            (area.min.0 + area.max.0) / 2,
+            (area.min.1 + area.max.1) / 2,
+        )),
     }
 }
 
@@ -4172,6 +4345,21 @@ pub fn record_progress_filtered(
         JobProgress::Building { .. } => {
             // Build progress is signalled by Blueprint despawn, not increments.
         }
+        JobProgress::Plow {
+            plowed_tiles,
+            target_tiles,
+            ..
+        } => {
+            // Plow progress comes through `record_progress_filtered(JobKind::Plow,
+            // None, 1)` calls from the executor on each tile finished.
+            if resource_id.is_some() {
+                return;
+            }
+            *plowed_tiles = plowed_tiles.saturating_add(increment);
+            if plowed_tiles >= target_tiles {
+                completed = true;
+            }
+        }
     }
     if completed {
         let job_id = posting.id;
@@ -4320,6 +4508,9 @@ fn same_target(a: &JobProgress, b: &JobProgress) -> bool {
                 ..
             },
         ) => bx == by && rx == ry,
+        (JobProgress::Plow { plot_id: px, .. }, JobProgress::Plow { plot_id: py, .. }) => {
+            px == py
+        }
         _ => false,
     }
 }

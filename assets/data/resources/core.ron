@@ -265,6 +265,23 @@ ResourceFile(
             tags: ["luxury", "currency"],
             sprite_key: Some("resource_gem"),
         ),
+        // Ard plow — wooden draft-animal plow implement. Crafted from
+        // wood + tools at a Workbench, gated on `ARD_PLOW` tech. Held in
+        // faction storage; the chief plow dispatcher gates on a non-zero
+        // count. Plow executor does NOT consume the implement — one plow
+        // serves many seasons (its decay surfaces as a v2.1 follow-up).
+        ResourceDef(
+            key: "ard_plow",
+            display_name: "Ard Plow",
+            class: tool,
+            bulk: two_hand,
+            weight_g: 5000,
+            entertainment_value: 10,
+            storage_class: armoury,
+            trade_base_value: 60,
+            tags: ["tool", "manufactured", "draftwork"],
+            sprite_key: Some("item_hammer"),
+        ),
 
         // ── Knowledge ─────────────────────────────────────────────────
         ResourceDef(

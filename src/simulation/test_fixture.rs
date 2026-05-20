@@ -5004,6 +5004,7 @@ mod smoke {
                     frontage_edge: None,
                     access_tile: None,
                     parent_plot: None,
+                    plowed_year: None,
                 })
                 .id();
             world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
@@ -5175,6 +5176,7 @@ mod smoke {
                     frontage_edge: None,
                     access_tile: None,
                     parent_plot: None,
+                    plowed_year: None,
                 })
                 .id();
             world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
@@ -5259,6 +5261,7 @@ mod smoke {
                     frontage_edge: None,
                     access_tile: None,
                     parent_plot: None,
+                    plowed_year: None,
                 })
                 .id();
             world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
@@ -5297,6 +5300,547 @@ mod smoke {
         assert!(
             prepare_count >= 1,
             "Spring must post at least one FieldWork(Prepare); got {prepare_count}"
+        );
+    }
+
+    /// Draftwork v2: with `ARD_PLOW` Aware + an `ard_plow` implement in
+    /// storage + a state-owned Agricultural plot with `plowed_year == None`,
+    /// chief posts exactly one `JobKind::Plow` per plot in Spring. Sibling
+    /// test of `spring_chief_posts_prepare_field_jobs` — same plot
+    /// scaffolding, additionally seeds the plow implement and ARD_PLOW
+    /// tech.
+    #[test]
+    fn spring_chief_posts_plow_job_when_tech_and_implement_and_unplowed_plot() {
+        use crate::economy::core_ids;
+        use crate::simulation::faction::{FactionChief, FactionRegistry};
+        use crate::simulation::farm::FieldTileIndex;
+        use crate::simulation::jobs::{JobBoard, JobKind, JobProgress};
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::technology::{ARD_PLOW, CROP_CULTIVATION};
+        use crate::world::seasons::{Calendar, Season};
+
+        let mut sim = TestSim::new(0xD7AF7);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let storage_tile = (0, 0);
+        sim.spawn_storage_tile(fid, storage_tile);
+        sim.spawn_ground_item(storage_tile, core_ids::ard_plow(), 1);
+
+        let chief = sim.spawn_person(fid, (0, 0), |_| {});
+        {
+            let world = sim.app.world_mut();
+            let mut k = world.get_mut::<PersonKnowledge>(chief).unwrap();
+            k.aware |= 1u64 << CROP_CULTIVATION;
+            k.learned |= 1u64 << CROP_CULTIVATION;
+            k.aware |= 1u64 << ARD_PLOW;
+            k.learned |= 1u64 << ARD_PLOW;
+            world.entity_mut(chief).insert(FactionChief);
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(fid);
+            let f = registry.factions.get_mut(&fid).unwrap();
+            f.chief_entity = Some(chief);
+            f.techs.unlock(CROP_CULTIVATION);
+            f.techs.unlock(ARD_PLOW);
+        }
+
+        // Plot at the same belt offset used by other farm tests.
+        let belt_rect = TileRect::new(40, 40, 16, 16);
+        {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let ent = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect: belt_rect,
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: None,
+                })
+                .id();
+            world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
+            for ty in 40..56 {
+                for tx in 40..56 {
+                    world
+                        .resource_mut::<PlotIndex>()
+                        .ag_tiles
+                        .insert((tx, ty));
+                    world
+                        .resource_mut::<FieldTileIndex>()
+                        .ensure_entry((tx, ty), pid, 150);
+                }
+            }
+        }
+
+        {
+            let mut cal = sim.app.world_mut().resource_mut::<Calendar>();
+            cal.season = Season::Spring;
+        }
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let mut plow_postings: Vec<_> = board
+            .faction_postings(fid)
+            .iter()
+            .filter(|p| matches!(p.kind, JobKind::Plow))
+            .collect();
+        assert!(
+            !plow_postings.is_empty(),
+            "Spring + ARD_PLOW + ard_plow + un-plowed plot must produce ≥1 Plow posting"
+        );
+        let posting = plow_postings.pop().unwrap();
+        match posting.progress {
+            JobProgress::Plow {
+                target_tiles,
+                plowed_tiles,
+                ..
+            } => {
+                assert_eq!(target_tiles, 16 * 16, "target_tiles should match plot area");
+                assert_eq!(plowed_tiles, 0, "fresh posting starts at 0 tiles plowed");
+            }
+            _ => panic!("Plow posting must carry JobProgress::Plow"),
+        }
+    }
+
+    /// Symmetric guard: same setup but *no* ard_plow implement in storage
+    /// — chief must NOT post a Plow job. Catches a regression where the
+    /// dispatcher's storage gate gets dropped (the plan explicitly calls
+    /// out "no plow implement in storage ⇒ skip plowing").
+    #[test]
+    fn no_plow_posting_when_ard_plow_implement_missing() {
+        use crate::simulation::faction::{FactionChief, FactionRegistry};
+        use crate::simulation::farm::FieldTileIndex;
+        use crate::simulation::jobs::{JobBoard, JobKind};
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::technology::{ARD_PLOW, CROP_CULTIVATION};
+        use crate::world::seasons::{Calendar, Season};
+
+        let mut sim = TestSim::new(0xD7AF8);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        sim.spawn_storage_tile(fid, (0, 0));
+        // Deliberately NO ard_plow in storage.
+
+        let chief = sim.spawn_person(fid, (0, 0), |_| {});
+        {
+            let world = sim.app.world_mut();
+            let mut k = world.get_mut::<PersonKnowledge>(chief).unwrap();
+            k.aware |= 1u64 << CROP_CULTIVATION;
+            k.learned |= 1u64 << CROP_CULTIVATION;
+            k.aware |= 1u64 << ARD_PLOW;
+            k.learned |= 1u64 << ARD_PLOW;
+            world.entity_mut(chief).insert(FactionChief);
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(fid);
+            let f = registry.factions.get_mut(&fid).unwrap();
+            f.chief_entity = Some(chief);
+            f.techs.unlock(CROP_CULTIVATION);
+            f.techs.unlock(ARD_PLOW);
+        }
+
+        let belt_rect = TileRect::new(40, 40, 16, 16);
+        {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let ent = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect: belt_rect,
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: None,
+                })
+                .id();
+            world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
+            for ty in 40..56 {
+                for tx in 40..56 {
+                    world
+                        .resource_mut::<PlotIndex>()
+                        .ag_tiles
+                        .insert((tx, ty));
+                    world
+                        .resource_mut::<FieldTileIndex>()
+                        .ensure_entry((tx, ty), pid, 150);
+                }
+            }
+        }
+
+        {
+            let mut cal = sim.app.world_mut().resource_mut::<Calendar>();
+            cal.season = Season::Spring;
+        }
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let plow_count = board
+            .faction_postings(fid)
+            .iter()
+            .filter(|p| matches!(p.kind, JobKind::Plow))
+            .count();
+        assert_eq!(
+            plow_count, 0,
+            "Plow posting MUST NOT emit without an ard_plow implement"
+        );
+    }
+
+    /// End-to-end executor test: directly create a `JobKind::Plow` posting +
+    /// `JobClaim::Plow` + a `Task::Plow` on a worker, then drive
+    /// `plow_task_system` with enough work_progress to complete every tile.
+    /// Verifies the executor stamps `Plot.plowed_year` on completion and
+    /// despawns the posting + drops the JobClaim + releases the animal claim.
+    /// Bypasses the full claim/dispatcher pipeline (which needs a real
+    /// trained animal + routing) so the per-tile work-credit logic is
+    /// covered.
+    #[test]
+    fn plow_executor_stamps_plowed_year_after_target_tiles() {
+        use crate::economy::core_ids;
+        use crate::simulation::animals::{AnimalUse, AnimalWorkClaim, Tamed};
+        use crate::simulation::draftwork::PLOW_WORK_TICKS_PER_TILE;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass,
+            TileAabb,
+        };
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::person::{AiState, PersonAI};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::tasks::TaskKind;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(0xD7AFA);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        sim.spawn_storage_tile(fid, (0, 0));
+        sim.spawn_ground_item((0, 0), core_ids::ard_plow(), 1);
+
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(fid);
+        }
+
+        // Tiny plot so we don't need to run hundreds of ticks.
+        let belt_rect = TileRect::new(40, 40, 2, 2); // 4 tiles
+        let pid = {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let ent = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect: belt_rect,
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: None,
+                })
+                .id();
+            world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
+            for ty in 40..42 {
+                for tx in 40..42 {
+                    world
+                        .resource_mut::<PlotIndex>()
+                        .ag_tiles
+                        .insert((tx, ty));
+                }
+            }
+            pid
+        };
+        let plot_entity = *sim
+            .app
+            .world()
+            .resource::<PlotIndex>()
+            .by_id
+            .get(&pid)
+            .unwrap();
+
+        // Spawn the worker at origin (camera position) so LOD stays Full
+        // and `clock.is_active(slot.0)` keeps the executor live. Force the
+        // goal to Farm so `goal_dispatch_system`'s stale-reset preserve-arm
+        // for `(Farm, Plow)` keeps the typed task alive across ticks; force
+        // profession to Farmer so `goal_update_system` doesn't flip the goal.
+        let worker = sim.spawn_person(fid, (0, 0), |b| {
+            b.goal(AgentGoal::Farm);
+            b.profession(crate::simulation::person::Profession::Farmer);
+        });
+        let animal = sim
+            .app
+            .world_mut()
+            .spawn((Tamed {
+                owner_faction: fid,
+            },))
+            .id();
+
+        // Post the Plow job to the board.
+        let area = TileAabb {
+            min: (40, 40),
+            max: (41, 41),
+        };
+        let target_tiles = 4u32;
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id,
+                faction_id: fid,
+                kind: JobKind::Plow,
+                progress: JobProgress::Plow {
+                    plot_id: pid,
+                    area,
+                    plowed_tiles: 0,
+                    target_tiles,
+                    assigned_worker: Some(worker),
+                    animal: Some(animal),
+                },
+                claimants: vec![worker],
+                priority: 200,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+            id
+        };
+
+        // Attach claim + animal-work-claim + arm the worker's task.
+        sim.app.world_mut().entity_mut(worker).insert((
+            JobClaim {
+                job_id,
+                faction_id: fid,
+                kind: JobKind::Plow,
+                posted_tick: 0,
+                fail_count: 0,
+            },
+            AnimalWorkClaim {
+                worker,
+                use_kind: AnimalUse::Plow,
+                expires_tick: u32::MAX,
+            },
+        ));
+        sim.app.world_mut().entity_mut(animal).insert(AnimalWorkClaim {
+            worker,
+            use_kind: AnimalUse::Plow,
+            expires_tick: u32::MAX,
+        });
+
+        // Drive the executor directly via register_system so we bypass
+        // any goal-update / dispatcher / preserve-arm interference and
+        // exercise only the executor's per-tile credit + completion logic.
+        let executor_id = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::draftwork::plow_task_system);
+        for iter in 0..target_tiles {
+            {
+                let world = sim.app.world_mut();
+                let mut ai = world.get_mut::<PersonAI>(worker).unwrap();
+                ai.state = AiState::Working;
+                ai.work_progress = PLOW_WORK_TICKS_PER_TILE;
+                let mut aq = world.get_mut::<ActionQueue>(worker).unwrap();
+                aq.current = Task::Plow {
+                    plot_entity,
+                    animal,
+                };
+            }
+            sim.app.world_mut().run_system(executor_id).unwrap();
+            let board = sim.app.world().resource::<JobBoard>();
+            let post = board
+                .faction_postings(fid)
+                .iter()
+                .find(|p| p.id == job_id);
+            if let Some(p) = post {
+                if let JobProgress::Plow { plowed_tiles, .. } = p.progress {
+                    assert!(
+                        plowed_tiles >= iter + 1,
+                        "iter {iter}: expected plowed_tiles >= {} but got {plowed_tiles}",
+                        iter + 1
+                    );
+                }
+            } else if iter + 1 < target_tiles {
+                panic!("iter {iter}: posting vanished before completion");
+            }
+        }
+
+        // Plot must be stamped with the current calendar year on completion.
+        let current_year = sim
+            .app
+            .world()
+            .resource::<crate::world::seasons::Calendar>()
+            .year as u16;
+        let plot = sim
+            .app
+            .world()
+            .get::<Plot>(plot_entity)
+            .expect("plot persisted");
+        assert_eq!(
+            plot.plowed_year,
+            Some(current_year),
+            "Plot.plowed_year must be Some(current_year) after all tiles plowed"
+        );
+
+        // Posting must be gone from the board (record_progress_filtered
+        // despawns it on completion).
+        let board = sim.app.world().resource::<JobBoard>();
+        let remaining = board
+            .faction_postings(fid)
+            .iter()
+            .filter(|p| matches!(p.kind, JobKind::Plow))
+            .count();
+        assert_eq!(remaining, 0, "completed Plow posting must be removed");
+
+        // Worker's JobClaim must be gone (executor removed it on completion).
+        assert!(
+            sim.app.world().get::<JobClaim>(worker).is_none(),
+            "JobClaim removed on plow completion"
+        );
+
+        // Animal's AnimalWorkClaim must be gone (executor released it).
+        assert!(
+            sim.app.world().get::<AnimalWorkClaim>(animal).is_none(),
+            "AnimalWorkClaim released on plow completion"
+        );
+
+        // Task channel must be Idle.
+        let aq = sim.app.world().get::<ActionQueue>(worker).unwrap();
+        assert_eq!(
+            aq.current_task_kind(),
+            crate::simulation::typed_task::UNEMPLOYED_TASK_KIND,
+            "ActionQueue back to Idle after plow completion"
+        );
+        // Suppress unused warning if TaskKind import isn't used elsewhere.
+        let _ = TaskKind::Plow;
+    }
+
+    /// Plot already plowed this year → no duplicate plow posting next Spring
+    /// tick. Verifies the `plowed_year == Some(current_year)` short-circuit
+    /// in the chief Plow branch.
+    #[test]
+    fn no_plow_posting_when_plot_already_plowed_this_year() {
+        use crate::economy::core_ids;
+        use crate::simulation::faction::{FactionChief, FactionRegistry};
+        use crate::simulation::farm::FieldTileIndex;
+        use crate::simulation::jobs::{JobBoard, JobKind};
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::technology::{ARD_PLOW, CROP_CULTIVATION};
+        use crate::world::seasons::{Calendar, Season};
+
+        let mut sim = TestSim::new(0xD7AF9);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        sim.spawn_storage_tile(fid, (0, 0));
+        sim.spawn_ground_item((0, 0), core_ids::ard_plow(), 1);
+
+        let chief = sim.spawn_person(fid, (0, 0), |_| {});
+        {
+            let world = sim.app.world_mut();
+            let mut k = world.get_mut::<PersonKnowledge>(chief).unwrap();
+            k.aware |= 1u64 << CROP_CULTIVATION;
+            k.learned |= 1u64 << CROP_CULTIVATION;
+            k.aware |= 1u64 << ARD_PLOW;
+            k.learned |= 1u64 << ARD_PLOW;
+            world.entity_mut(chief).insert(FactionChief);
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(fid);
+            let f = registry.factions.get_mut(&fid).unwrap();
+            f.chief_entity = Some(chief);
+            f.techs.unlock(CROP_CULTIVATION);
+            f.techs.unlock(ARD_PLOW);
+        }
+
+        let belt_rect = TileRect::new(40, 40, 16, 16);
+        {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            // KEY DIFFERENCE: plowed_year already set to year 0 (== Calendar's default).
+            let ent = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect: belt_rect,
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: Some(0),
+                })
+                .id();
+            world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
+            for ty in 40..56 {
+                for tx in 40..56 {
+                    world
+                        .resource_mut::<PlotIndex>()
+                        .ag_tiles
+                        .insert((tx, ty));
+                    world
+                        .resource_mut::<FieldTileIndex>()
+                        .ensure_entry((tx, ty), pid, 150);
+                }
+            }
+        }
+
+        {
+            let mut cal = sim.app.world_mut().resource_mut::<Calendar>();
+            cal.season = Season::Spring;
+            cal.year = 0;
+        }
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let plow_count = board
+            .faction_postings(fid)
+            .iter()
+            .filter(|p| matches!(p.kind, JobKind::Plow))
+            .count();
+        assert_eq!(
+            plow_count, 0,
+            "An already-plowed-this-year plot must not get a duplicate Plow posting"
         );
     }
 

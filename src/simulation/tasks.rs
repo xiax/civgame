@@ -128,6 +128,13 @@ pub enum TaskKind {
     /// Executor: `farm::prepare_field_task_system` (Sequential, after
     /// movement, before gather).
     PrepareField = 52,
+    /// Draftwork v2: worker walks inside / adjacent to an Agricultural plot
+    /// and plows it with a draft animal. Lump-sum work; on completion stamps
+    /// `Plot.plowed_year` so the next planting carries `Tilled` for a 1.4×
+    /// harvest bonus. Interacts-from-adjacent (the target tile is the plot
+    /// centre — worker doesn't tile-walk in v2.0), 1 free hand, counts as
+    /// labor. Executor: `draftwork::plow_task_system`.
+    Plow = 53,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -186,6 +193,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::SeekCare as u16 => "Seeking Care",
         x if x == TaskKind::Drink as u16 => "Drinking",
         x if x == TaskKind::PrepareField as u16 => "Preparing Field",
+        x if x == TaskKind::Plow as u16 => "Plowing",
         _ => "Unemployed",
     }
 }
@@ -211,7 +219,8 @@ pub fn task_requires_free_hands(task_id: u16) -> u8 {
             || x == TaskKind::MilitaryAttack as u16
             || x == TaskKind::TameAnimal as u16
             || x == TaskKind::ClearObstacle as u16
-            || x == TaskKind::PrepareField as u16 =>
+            || x == TaskKind::PrepareField as u16
+            || x == TaskKind::Plow as u16 =>
         {
             1
         }
@@ -261,6 +270,7 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::Heal as u16
         || task_id == TaskKind::Drink as u16
         || task_id == TaskKind::PrepareField as u16
+        || task_id == TaskKind::Plow as u16
 }
 
 /// Tasks that count as productive labor — these drain willpower over time
@@ -291,6 +301,7 @@ pub fn task_is_labor(task_id: u16) -> bool {
         || task_id == TaskKind::HaulCorpse as u16
         || task_id == TaskKind::Butcher as u16
         || task_id == TaskKind::PrepareField as u16
+        || task_id == TaskKind::Plow as u16
 }
 
 /// Spiral search outward from `target` for the closest tile that is passable
@@ -869,6 +880,14 @@ pub fn goal_dispatch_system(
                         if aq.current_task_kind() == TaskKind::DepositResource as u16 =>
                     {
                         Some(TaskKind::DepositResource as u16)
+                    }
+                    // Draftwork v2: Plow runs under Farm goal (the
+                    // `JobKind::Plow → AgentGoal::Farm` mapping). Each
+                    // Task::Plow is one tile; mid-job ticks must preserve
+                    // the chain so the dispatcher's next pass picks the
+                    // next tile rather than the stale-reset arm wiping it.
+                    AgentGoal::Farm if aq.current_task_kind() == TaskKind::Plow as u16 => {
+                        Some(TaskKind::Plow as u16)
                     }
                     // Phase 5e-vi: HTN-driven ConstructBlueprint chain runs without
                     // an ActivePlan under Build. The Construct walk + on-site

@@ -175,6 +175,12 @@ pub struct Plot {
     /// `land_listing_system` (not separately for sale / lease) and by
     /// `rent_collection_system` (rent flows through the parent's tenure).
     pub parent_plot: Option<PlotId>,
+    /// Draftwork v2: the calendar year this plot was last tilled by a draft
+    /// animal (`Calendar.year as u16`). `Some(y)` means crops planted this same
+    /// year sprout with a `Tilled` marker and harvest at `PLOW_YIELD_MULT`
+    /// (1.4×) of the nutrient-tier base. Reset by re-plow next spring; no
+    /// explicit clear needed since planting checks year equality.
+    pub plowed_year: Option<u16>,
 }
 
 /// What kind of relationship the holder has with the plot.
@@ -817,6 +823,7 @@ pub fn carve_plots_system(
                     frontage_edge,
                     access_tile,
                     parent_plot: None,
+                    plowed_year: None,
                 };
                 let entity = commands.spawn(plot).id();
                 plot_index.by_id.insert(pid, entity);

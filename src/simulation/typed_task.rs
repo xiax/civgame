@@ -488,6 +488,18 @@ pub enum Task {
     /// `JobProgress::FieldWork { phase: Prepare, completed, .. }`, grants
     /// Farming XP, and ensures `FieldTileIndex[tile].nutrients >= 30`.
     PrepareField { tile: (i32, i32) },
+    /// Draftwork v2: worker stands inside the named Agricultural plot and
+    /// plows it with the named draft animal (Cattle / Horse). Executor
+    /// (`draftwork::plow_task_system`) accumulates `plot.area() *
+    /// PLOW_WORK_TICKS_PER_TILE`, then stamps `Plot.plowed_year =
+    /// Some(calendar.year)`, releases the `AnimalWorkClaim`, awards Farming
+    /// XP, and `finish_task`. The animal entity rides on the variant for
+    /// chain-integrity inspection and so the executor knows which claim to
+    /// drop. Produced by `draftwork::chief_plow_dispatch_system`.
+    Plow {
+        plot_entity: bevy::prelude::Entity,
+        animal: bevy::prelude::Entity,
+    },
 }
 
 /// Source for a `Task::Drink`. Inventory drinks consume one `clean_water`
@@ -828,6 +840,7 @@ pub fn task_kind_for(task: Task) -> u16 {
         Task::Terraform { .. } => TK::Terraform,
         Task::MilitaryAttack { .. } => TK::MilitaryAttack,
         Task::PrepareField { .. } => TK::PrepareField,
+        Task::Plow { .. } => TK::Plow,
     };
     kind as u16
 }
@@ -1213,6 +1226,18 @@ impl Task {
     pub fn as_prepare_field(&self) -> Option<(i32, i32)> {
         match *self {
             Task::PrepareField { tile } => Some(tile),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the Plow variant. Returns
+    /// `(plot_entity, animal_entity)`.
+    pub fn as_plow(&self) -> Option<(bevy::prelude::Entity, bevy::prelude::Entity)> {
+        match *self {
+            Task::Plow {
+                plot_entity,
+                animal,
+            } => Some((plot_entity, animal)),
             _ => None,
         }
     }

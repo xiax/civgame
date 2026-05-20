@@ -264,3 +264,52 @@ The prior plan flagged a possible bug: `husbandry_intent_emitter_system` may onl
 ## Open question
 
 Extending `JobProgress::Planting` with a tillage phase grows a pattern-matched enum. Cleaner alternative: keep `Planting` purely about seeding; chief posts a `Plow` job first, and the planting dispatcher blocks until `plot.plowed_year == current_year`. Mechanically equivalent, less enum churn. Default to the **two-posting** approach unless inline reward bonuses materially change worker behaviour.
+
+## Progress
+
+### v2.0 — shipped (2026-05-20)
+
+Plow half end-to-end via the standard `JobBoard` + `JobClaim` + `record_progress_filtered` pipeline. Cart half deferred.
+
+- `Plot.plowed_year: Option<u16>` added to `Plot` (`src/simulation/land.rs:178`). Threaded through all four constructors: `carve_plots_system` (land.rs), `seed_starting_farms_system` (farm.rs), and three test_fixture sites.
+- `Tilled` marker component (`src/simulation/draftwork.rs`).
+- `PLOW_YIELD_MULT_NUMER / DENOM = 7 / 5` (= 1.4×) applied to `grain_yield_for_nutrients(...)` base in `gather_system`'s Grain branch when the harvested Plant entity carries `Tilled`. `GatherRoutingResources` gained a `tilled_q` field to stay under the 16-param ceiling.
+- `production_system`'s Planter branch inserts `Tilled` on freshly-spawned Grain plants when their tile sits inside a plot with `plowed_year == Some(calendar.year)`. Gated to Grain only (other crops have no plow bonus).
+- `Task::Plow { plot_entity, animal }` variant + `as_plow()` accessor + `task_kind_for` arm.
+- `TaskKind::Plow = 53` + `task_kind_label` ("Plowing") + `task_requires_free_hands = 1` + `task_interacts_from_adjacent` + `task_is_labor` arms.
+- `plow_task_system` (Sequential, before `gather_system`): lump-sum work model (`plot.area() * PLOW_WORK_TICKS_PER_TILE`), stamps `plot.plowed_year`, releases `AnimalWorkClaim` via `release_animal_work_claim`, awards 8 Farming XP, defence-in-depth cancel on despawned plot.
+- `chief_plow_dispatch_system` (Economy, daily Spring): per faction with `ARD_PLOW` Aware, matches one un-plowed plot + one trained Cattle/Horse + one idle Farmer; routes worker via `assign_task_with_routing`, dispatches `Task::Plow`, inserts `AnimalWorkClaim { use_kind: Plow, expires_tick: now + 2 days }`.
+- `animal_training_progress_system` (Sequential, `TICKS_PER_DAY/4` cadence): `+1` training per pass while `preferred_home.is_some()`. Cattle/Horse reach threshold 80 in ~80 days. `TRAINING_THRESHOLD_DRAFT = 80` constant.
+- Module registered in `simulation/mod.rs`; systems wired into Sequential / Economy / ParallelB.
+- `src/simulation/CLAUDE.md` updated with the new "Animal husbandry v2 — draftwork (`draftwork.rs`)" section.
+- **`ard_plow` resource** (`assets/data/resources/core.ron` + `core_ids::ard_plow`): tool class, `two_hand`, 5 kg, trade value 60, reuses `item_hammer` sprite.
+- **"Ard Plow" craft recipe** (recipe id 14, `crafting.rs`): Wood×3 + Tools×1 → 1 `ard_plow`, 70 work ticks, `ARD_PLOW`-gated, Workbench-bound.
+- **`JobKind::Plow` + `JobProgress::Plow`** in `jobs.rs`. Posting goes through standard chief posting pipeline: dedupe per pass, reachability check, target_tiles == plot.area, assigned_worker from `FarmPlotAssignments`, animal stamped at first dispatch. `JobKind::to_goal()` maps to `AgentGoal::Farm` (Plow piggybacks on the Farm goal so workers already on Farm pick up Plow claims). `posting_target_workers(Plow) = 1`. `chief_wage_for(Plow)` mirrors Farm. `posting_target_tile` returns plot centre. `same_target` matches by `plot_id`.
+- **Chief posting branch** (`jobs.rs`, ~lines 3117-3210) gates on `ARD_PLOW` tech + `ard_plow` storage stock > 0 + Spring + un-plowed plot + reachable rect.
+- **`job_claim_system` assigned-worker gate** — only the posting's `assigned_worker` (when set) can claim.
+- **`htn_plow_dispatch_system`** (ParallelB) — walks each `JobClaim::Plow` holder, picks next tile via `tile_at_index(area.min, area.max, posting.plowed_tiles)`, picks/reuses animal, routes worker, dispatches `Task::Plow`. First-dispatch stamps animal on posting + inserts `AnimalWorkClaim` with TTL backstop.
+- **`plow_task_system`** (Sequential, before `gather`) — per-tile work model: `PLOW_WORK_TICKS_PER_TILE = 6` per tile, credits `posting.plowed_tiles += 1`, defence-in-depth on vanished plot. On final tile: stamps `plot.plowed_year`, fires `JobCompletedEvent` via `record_progress_filtered`, releases AnimalWorkClaim + JobClaim, grants completion XP.
+- **`goal_dispatch_system` preserve-arm** for `(AgentGoal::Farm, TaskKind::Plow)` keeps the chain alive across mid-job ticks.
+- **`projects::compute_priority` + `WorkforceBudget::share`** arms for `JobKind::Plow` (rides the Farm slot).
+- **`record_progress_filtered`** in `jobs.rs` now handles `JobProgress::Plow` for the completion accounting path so payout flows through the standard `JobEscrow` mechanism.
+- **Unit tests** (`draftwork::tests`): `plow_yield_bonus_applies_seven_fifths_per_tier`, `plow_yield_bonus_is_monotonic_increasing`, `training_threshold_is_reachable`, `plow_total_work_is_bounded_for_default_plot`, `tile_at_index_walks_row_major`.
+- **Fixture tests** (`test_fixture::smoke`): `spring_chief_posts_plow_job_when_tech_and_implement_and_unplowed_plot`, `no_plow_posting_when_ard_plow_implement_missing`, `no_plow_posting_when_plot_already_plowed_this_year`, `plow_executor_stamps_plowed_year_after_target_tiles` (drives the executor through 4 tiles via `register_system` + `run_system`, asserts plot stamped + posting despawned + claims released + queue Idle).
+- **`crafting::tests::craft_recipe_inputs_resolve_to_known_resources`** bumped to 15 recipes + asserts the Ard Plow shape.
+- **885/885 tests pass.**
+
+### Deferred to v2.1+ — what's left
+
+- **Carts.** Full cart entity + composable parts + assembly + `cart_haul_task_system` + faction storage rollup + sprites. Architecture section B/C/E (CartHaul) / F / H / I unimplemented. This is the bulk of v2.1.
+- **`HitchingPost` field extensions** (`reserved_by`, `parked_cart`, `parked_plow`). Still an inert marker; plow dispatcher claims the ox directly. Cart parking needs the slots.
+- **`Hitch`/`UnhitchAndPark` tasks.** No animation pair; the plow executor claims and releases the ox directly. Cart hitch/unhitch flow needs them.
+- **Adaptive plow routing (`decide_plow_route`).** Always-separate (Plow + Farm postings are independent) — never inline. Inline (plow+plant in one chain) is a v2.1 nice-to-have.
+- **Plow durability / repair.** Plow is permanent in v2.0. Adding decay + a `Repair` task is a v2.1 follow-up.
+- **`plant_in_plowed_plot_carries_tilled_marker` / `harvest_tilled_grain_yields_1_4x` fixture tests.** Code paths are exercised end-to-end at runtime; the math is pinned by unit tests; behavioural fixtures for these specific harvest yields wait for the cart pass.
+- **Stables-intent fix** (the v1 flagged potential bug about Stable blueprints requiring an existing horse). Untouched.
+
+### Known follow-up gotchas
+
+- The `animal_work_claim_expiry_system`'s 60-tick TTL sweep covers stranded claims, but the plow executor already explicit-releases on every exit. The 2-day `expires_tick` is the failsafe.
+- `plow_task_system` queries `&mut Plot` mutably; runs in Sequential, no scheduling conflict with the read-only `Query<&Plot>` added to `production_system` (Bevy serialises them, separate systems).
+- Dispatcher gates on `Calendar.season == Spring`. A faction researching `ARD_PLOW` mid-Summer waits until next Spring before the chief schedules plowing.
+- Plowing is currently free labor (no chief-funded escrow). When the cart half adds `JobKind::Plow` postings, funding will land alongside.

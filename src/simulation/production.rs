@@ -87,6 +87,9 @@ pub fn tile_regen_system(clock: Res<SimClock>, mut depletion: ResMut<TileDepleti
 pub fn production_system(
     mut commands: Commands,
     clock: Res<SimClock>,
+    calendar: Res<crate::world::seasons::Calendar>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    plot_q: Query<&crate::simulation::land::Plot>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
     mut faction_registry: ResMut<FactionRegistry>,
@@ -163,6 +166,28 @@ pub fn production_system(
                             plant_kind,
                             GrowthStage::Seed,
                         );
+                        // Draftwork v2: if the tile sits inside a plot whose
+                        // `plowed_year == Some(current_year)`, mark the freshly
+                        // spawned plant as `Tilled` so the harvest path applies
+                        // `PLOW_YIELD_MULT_*`. Grain-only (other crops have no
+                        // plow bonus today).
+                        if let Some(plant_entity) = spawned {
+                            if matches!(plant_kind, PlantKind::Grain) {
+                                if let Some(pid) = plot_index.plot_at(tx, ty) {
+                                    if let Some(&plot_e) = plot_index.by_id.get(&pid) {
+                                        if let Ok(plot) = plot_q.get(plot_e) {
+                                            if plot.plowed_year
+                                                == Some(calendar.year as u16)
+                                            {
+                                                commands
+                                                    .entity(plant_entity)
+                                                    .insert(crate::simulation::draftwork::Tilled);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // Chief Farm posting takes precedence even for household
                         // members — otherwise a household member working a
                         // chief-posted communal plot would silently steal the

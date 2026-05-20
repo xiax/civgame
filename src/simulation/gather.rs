@@ -188,6 +188,11 @@ pub struct GatherRoutingResources<'w, 's> {
     /// `gather_system` stays under Bevy's 16-param ceiling.
     pub field_tiles: ResMut<'w, crate::simulation::farm::FieldTileIndex>,
     pub calendar: Res<'w, crate::world::seasons::Calendar>,
+    /// Draftwork v2: marker filter on Plant entities born inside a plot that
+    /// was plowed this calendar year. Read by the Grain branch of the harvest
+    /// path to apply the `PLOW_YIELD_MULT_*` bonus. Bundled here so
+    /// `gather_system` stays under Bevy's 16-param ceiling.
+    pub tilled_q: Query<'w, 's, (), With<crate::simulation::draftwork::Tilled>>,
 }
 
 /// Phase 5c-ii-c-ii chain handoff: called by every `gather_system` exit path
@@ -602,6 +607,11 @@ pub fn gather_system(
             // Seasonal-farming jellyfish: Grain yields scale with the tile's
             // live nutrient level (debited by `HARVEST_NUTRIENT_DEBIT` here).
             // Other crops keep `base_qty` (no field state).
+            //
+            // Draftwork v2: Grain harvested from a Plant entity that carries
+            // the `Tilled` marker (planted into a plowed-this-year plot) gets
+            // a 1.4× multiplier on the nutrient-tier base. The marker is set
+            // by `production_system`'s Planter branch at planting time.
             let scaled_qty = if matches!(kind, crate::simulation::plants::PlantKind::Grain) {
                 let nut = routing
                     .field_tiles
@@ -609,7 +619,12 @@ pub fn gather_system(
                     .get(&(tx, ty))
                     .map(|s| s.nutrients)
                     .unwrap_or(0);
-                crate::simulation::farm::grain_yield_for_nutrients(nut)
+                let base = crate::simulation::farm::grain_yield_for_nutrients(nut);
+                if routing.tilled_q.get(entity).is_ok() {
+                    crate::simulation::draftwork::apply_plow_yield_bonus(base)
+                } else {
+                    base
+                }
             } else {
                 base_qty
             };

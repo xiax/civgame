@@ -48,8 +48,8 @@ pub struct CraftRecipe {
 }
 
 use crate::simulation::technology::{
-    BOW_AND_ARROW, BRONZE_WEAPONS, COPPER_TOOLS, CUNEIFORM_WRITING, FIRED_POTTERY, FIRE_MAKING,
-    FLINT_KNAPPING, FOOD_SMOKING, HUNTING_SPEAR, LOOM_WEAVING,
+    ARD_PLOW, BOW_AND_ARROW, BRONZE_WEAPONS, COPPER_TOOLS, CUNEIFORM_WRITING, FIRED_POTTERY,
+    FIRE_MAKING, FLINT_KNAPPING, FOOD_SMOKING, HUNTING_SPEAR, LOOM_WEAVING,
 };
 
 /// Lazily-built recipe table. Phase 2d migrated `CraftRecipe` from a
@@ -84,6 +84,7 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
     let preserved_meat = core_ids::preserved_meat();
     let raw_water = core_ids::raw_water();
     let clean_water = core_ids::clean_water();
+    let ard_plow = core_ids::ard_plow();
 
     vec![
         // 0
@@ -259,6 +260,23 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             work_ticks: 30,
             crafting_xp: 2,
             tech_gate: Some(FIRE_MAKING),
+            requires_station: Some(StationKind::Workbench),
+        },
+        // 14 — Draftwork v2: wooden ard plow. Gated on `ARD_PLOW` tech;
+        // 3 wood + 1 tools at a Workbench. The plow is durable — the
+        // `chief_plow_dispatch_system` gates on `faction.storage.stock_of(
+        // ard_plow) > 0` but the plow_task_system does NOT decrement on
+        // completion (one plow serves many seasons; durability/decay is a
+        // v2.1 follow-up).
+        CraftRecipe {
+            name: "Ard Plow",
+            inputs: vec![(wood, 3), (tools, 1)],
+            output_resource: ard_plow,
+            output_qty: 1,
+            output_material: Some(ItemMaterial::Wood),
+            work_ticks: 70,
+            crafting_xp: 6,
+            tech_gate: Some(ARD_PLOW),
             requires_station: Some(StationKind::Workbench),
         },
     ]
@@ -1002,8 +1020,8 @@ mod tests {
         let recipes = craft_recipes();
         assert_eq!(
             recipes.len(),
-            14,
-            "expected 14 recipes; counts feed CraftOrder.recipe_id wire format"
+            15,
+            "expected 15 recipes; counts feed CraftOrder.recipe_id wire format"
         );
 
         // Stone Tools (recipe 0): Stone×2 + Wood×1 → Tools×1
@@ -1024,5 +1042,19 @@ mod tests {
             vec![(core_ids::cloth(), 2), (core_ids::skin(), 1),]
         );
         assert_eq!(book.output_resource, core_ids::book());
+
+        // Ard Plow (recipe 14): Wood×3 + Tools×1 → ard_plow×1, gated on ARD_PLOW.
+        let ard_plow = &recipes[14];
+        assert_eq!(ard_plow.name, "Ard Plow");
+        assert_eq!(
+            ard_plow.inputs,
+            vec![(core_ids::wood(), 3), (core_ids::tools(), 1)]
+        );
+        assert_eq!(ard_plow.output_resource, core_ids::ard_plow());
+        assert_eq!(ard_plow.output_qty, 1);
+        assert_eq!(
+            ard_plow.tech_gate,
+            Some(crate::simulation::technology::ARD_PLOW)
+        );
     }
 }

@@ -534,6 +534,7 @@ pub fn seed_starting_farms_system(
                 frontage_edge: None,
                 access_tile: None,
                 parent_plot: None,
+                plowed_year: None,
             };
             let entity = commands.spawn(plot).id();
             plot_index.by_id.insert(pid, entity);

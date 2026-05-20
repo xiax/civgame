@@ -157,4 +157,5 @@ core_ids! {
     PreservedMeat => "preserved_meat" => preserved_meat,
     CleanWater => "clean_water" => clean_water,
     RawWater => "raw_water" => raw_water,
+    ArdPlow => "ard_plow" => ard_plow,
 }
