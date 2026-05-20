@@ -305,32 +305,73 @@ pub fn seed_starting_farms_system(
             let entity = commands.spawn(plot).id();
             plot_index.by_id.insert(pid, entity);
             plot_index.by_settlement.entry(sid.0).or_default().push(pid);
+            // Settlement realism: route the seeded plot through the same
+            // `field_tile_role` mosaic the runtime carve uses. Brain's
+            // `culture_hash` doubles as the seed; `layout_hash` is the
+            // closest analogue at seed time.
+            let culture_seed = brains
+                .0
+                .get(&sid)
+                .map(|b| b.layout_hash ^ ((fid as u64) << 32))
+                .unwrap_or(fid as u64);
             for ty in rect.y0..rect.y0 + rect.h as i32 {
                 for tx in rect.x0..rect.x0 + rect.w as i32 {
                     plot_index.by_tile.insert((tx, ty), pid);
                     plot_index.ag_tiles.insert((tx, ty));
-                    // Stamp the seeded field as tilled `Cropland` so it is a
-                    // visible block from tick 0 (mirrors `carve_plots_system`).
                     let z = chunk_map.surface_z_at(tx, ty);
                     let cur = chunk_map.tile_at(tx, ty, z);
+                    let role = crate::simulation::land::field_tile_role(
+                        culture_seed,
+                        fid,
+                        (tx, ty),
+                        rect,
+                    );
                     let tillable = cur.kind == crate::world::tile::TileKind::Grass
                         || (cur.kind.is_soil_like()
                             && cur.kind != crate::world::tile::TileKind::Cropland);
-                    if tillable {
-                        chunk_map.set_tile(
-                            tx,
-                            ty,
-                            z,
-                            crate::world::tile::TileData {
-                                kind: crate::world::tile::TileKind::Cropland,
-                                elevation: cur.elevation,
-                                fertility: cur.fertility,
-                                flags: cur.flags,
-                                ore: cur.ore,
-                            },
-                        );
-                        tile_changed
-                            .send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
+                    match role {
+                        crate::simulation::land::FieldTileRole::Cropland => {
+                            if tillable {
+                                chunk_map.set_tile(
+                                    tx,
+                                    ty,
+                                    z,
+                                    crate::world::tile::TileData {
+                                        kind: crate::world::tile::TileKind::Cropland,
+                                        elevation: cur.elevation,
+                                        fertility: cur.fertility.max(180),
+                                        flags: cur.flags,
+                                        ore: cur.ore,
+                                    },
+                                );
+                                tile_changed.send(
+                                    crate::world::chunk_streaming::TileChangedEvent { tx, ty },
+                                );
+                            }
+                        }
+                        crate::simulation::land::FieldTileRole::CroplandLow => {
+                            if tillable {
+                                chunk_map.set_tile(
+                                    tx,
+                                    ty,
+                                    z,
+                                    crate::world::tile::TileData {
+                                        kind: crate::world::tile::TileKind::Cropland,
+                                        elevation: cur.elevation,
+                                        fertility: cur.fertility.min(110).max(80),
+                                        flags: cur.flags,
+                                        ore: cur.ore,
+                                    },
+                                );
+                                tile_changed.send(
+                                    crate::world::chunk_streaming::TileChangedEvent { tx, ty },
+                                );
+                            }
+                        }
+                        crate::simulation::land::FieldTileRole::SoilFallow
+                        | crate::simulation::land::FieldTileRole::GrassEdge => {
+                            // Leave underlying terrain.
+                        }
                     }
                 }
             }

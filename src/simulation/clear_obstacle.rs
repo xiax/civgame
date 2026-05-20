@@ -135,6 +135,7 @@ pub fn clear_obstacle_task_system(
 pub fn clear_obstacles_under_seeded_structures(
     mut commands: Commands,
     structure_index: Res<StructureIndex>,
+    seed_reservation: Res<crate::simulation::seed_reservation::SeedReservation>,
     spatial: Res<SpatialIndex>,
     chunk_map: Res<ChunkMap>,
     blueprint_map: Res<BlueprintMap>,
@@ -144,7 +145,15 @@ pub fn clear_obstacles_under_seeded_structures(
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
     mut transforms: Query<&mut Transform>,
 ) {
-    let tiles: Vec<(i32, i32)> = structure_index.0.keys().copied().collect();
+    // Walk StructureIndex (every stamped seeded structure) PLUS the
+    // SeedReservation (doormats, planned roads, ag tiles) so plants that
+    // streamed in alongside the seed pass don't survive on a reserved tile.
+    let mut tiles: Vec<(i32, i32)> = structure_index.0.keys().copied().collect();
+    for &tile in seed_reservation.0.iter() {
+        if !structure_index.0.contains_key(&tile) {
+            tiles.push(tile);
+        }
+    }
     if tiles.is_empty() {
         return;
     }
@@ -180,6 +189,7 @@ pub fn react_obstacle_under_structure_system(
     mut commands: Commands,
     structure_index: Res<StructureIndex>,
     blueprint_map: Res<BlueprintMap>,
+    seed_reservation: Res<crate::simulation::seed_reservation::SeedReservation>,
     spatial: Res<SpatialIndex>,
     chunk_map: Res<ChunkMap>,
     plants: Query<&Plant>,
@@ -192,13 +202,19 @@ pub fn react_obstacle_under_structure_system(
 ) {
     // Phase 1: snapshot (entity, tile, resolution) for newly-added obstacles
     // that landed on an occupied tile. Drops the read-borrow before mutation.
+    // SeedReservation backstops the StructureIndex / BlueprintMap pair so
+    // late-streamed obstacles on planned-but-uncarved doormat or road tiles
+    // also get cleared.
     let mut hits: Vec<(Entity, (i32, i32), ObstacleResolution)> = Vec::new();
     for (entity, transform, obstacle) in params.p0().iter() {
         let tile = (
             (transform.translation.x / TILE_SIZE).floor() as i32,
             (transform.translation.y / TILE_SIZE).floor() as i32,
         );
-        if !structure_index.0.contains_key(&tile) && !blueprint_map.0.contains_key(&tile) {
+        if !structure_index.0.contains_key(&tile)
+            && !blueprint_map.0.contains_key(&tile)
+            && !seed_reservation.is_reserved(tile)
+        {
             continue;
         }
         hits.push((entity, tile, obstacle.resolution));

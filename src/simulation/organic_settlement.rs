@@ -1309,26 +1309,112 @@ fn build_road_network(
     // 12 tiles (≈ 18 m at 1.5 m/tile) — tight enough for one row of 3×3
     // huts + yards between two parallel streets, anything tighter wouldn't
     // fit a hut.
+    //
+    // Settlement realism: Village + Chiefdom additions are now anchor-
+    // demand-driven instead of blind geometric crosses/parallels. The
+    // spine remains; perpendiculars and secondaries only fire when an
+    // off-spine anchor actually exists.
     match brain.phase {
         SettlementPhase::Camp | SettlementPhase::Hamlet => {
             // Spine only. No grid. Lets a hamlet whose only purpose is its
             // connection to a parent city run a single spine that direction.
         }
         SettlementPhase::Village => {
-            if faction.member_count >= 12 {
-                push_unique_segment(&mut segments, line_through(home, perp, radius));
+            // Conditions for a perpendicular street:
+            //   (a) member_count ≥ 16 (a dense village wants the cross), OR
+            //   (b) a WaterAccess / Field / Market anchor projects off the
+            //       spine axis by > 6 tiles — there is a real off-axis
+            //       destination people walk toward.
+            let dense = faction.member_count >= 16;
+            // Strongest off-axis anchor (by |perp projection|).
+            let mut best_off_axis: Option<(f32, i32, (i32, i32))> = None;
+            for anchor in &brain.anchors {
+                if !matches!(
+                    anchor.kind,
+                    SettlementAnchorKind::WaterAccess
+                        | SettlementAnchorKind::Field
+                        | SettlementAnchorKind::Market
+                ) {
+                    continue;
+                }
+                let dx = anchor.tile.0 - home.0;
+                let dy = anchor.tile.1 - home.1;
+                let perp_proj = dx * px + dy * py;
+                let abs_proj = perp_proj.abs();
+                if abs_proj <= 6 {
+                    continue;
+                }
+                if best_off_axis.map_or(true, |(w, _, _)| anchor.weight > w) {
+                    best_off_axis = Some((anchor.weight, perp_proj, anchor.tile));
+                }
+            }
+            if dense || best_off_axis.is_some() {
+                // Endpoint: the projection of the strongest off-spine
+                // anchor (asymmetric), or the symmetric spine length when
+                // density alone triggers the cross.
+                let cross = if let Some((_, proj, _)) = best_off_axis {
+                    let len = proj.abs().clamp(8, radius);
+                    let sign = proj.signum();
+                    StreetSegment {
+                        start: home,
+                        end: (home.0 + px * sign * len, home.1 + py * sign * len),
+                        tier: StreetTier::Primary,
+                    }
+                } else {
+                    line_through(home, perp, radius)
+                };
+                push_unique_segment(&mut segments, cross);
             }
         }
         SettlementPhase::Chiefdom => {
-            for off in [-18, 18] {
-                let mid = (home.0 + px * off, home.1 + py * off);
-                let mut seg = line_through(mid, axis, radius);
-                seg.tier = StreetTier::Secondary;
-                push_unique_segment(&mut segments, seg);
+            // Top-3 unmet anchors (weight-sorted, dedup-against-spine).
+            // Each emits a Secondary segment from `home` toward the
+            // anchor's tile. No symmetric ±18 parallels.
+            let spine_axis = axis;
+            let already_on_spine = |t: (i32, i32)| -> bool {
+                let dx = t.0 - home.0;
+                let dy = t.1 - home.1;
+                let perp_proj = dx * px + dy * py;
+                // "On spine" = perpendicular projection within 2 tiles.
+                perp_proj.abs() <= 2 && spine_axis as u8 != SpokeAxis::EW as u8 || perp_proj.abs() <= 2
+            };
+            let mut scored: Vec<(f32, (i32, i32))> = Vec::new();
+            for anchor in &brain.anchors {
+                if matches!(anchor.kind, SettlementAnchorKind::CivicCore) {
+                    continue;
+                }
+                if cheb(anchor.tile, home) < 4 {
+                    continue;
+                }
+                if already_on_spine(anchor.tile) {
+                    continue;
+                }
+                if !has_bridges
+                    && !crate::simulation::river_context::same_bank_bfs(
+                        chunk_map,
+                        home,
+                        anchor.tile,
+                    )
+                {
+                    continue;
+                }
+                scored.push((anchor.weight, anchor.tile));
             }
-            let mut cross = line_through(home, perp, radius);
-            cross.tier = StreetTier::Secondary;
-            push_unique_segment(&mut segments, cross);
+            scored.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            for (_, target) in scored.into_iter().take(3) {
+                push_unique_segment(
+                    &mut segments,
+                    StreetSegment {
+                        start: home,
+                        end: target,
+                        tier: StreetTier::Secondary,
+                    },
+                );
+            }
         }
         SettlementPhase::ProtoUrban => {
             for off in [-30, -15, 15, 30] {
@@ -1407,6 +1493,30 @@ fn build_road_network(
                 tier,
             },
         );
+    }
+
+    // Settlement realism: jitter Secondary / Alley endpoints by ±1 tile
+    // keyed on `layout_hash` so anchor spurs aren't perfect cardinals.
+    // Primary spine endpoints stay verbatim — every door doglegs back to
+    // the spine via the connector helper and a jittered primary would
+    // both break that contract and produce broken-stub tests.
+    for (i, seg) in segments.iter_mut().enumerate() {
+        if matches!(seg.tier, StreetTier::Primary) {
+            continue;
+        }
+        let h = brain.layout_hash ^ ((i as u64) << 16);
+        let jx = ((h ^ 0xA5A5_A5A5) >> 8) as i32 % 3 - 1; // {-1,0,1}
+        let jy = ((h ^ 0x5A5A_5A5A) >> 16) as i32 % 3 - 1;
+        if seg.start != home {
+            seg.start.0 += jx;
+            seg.start.1 += jy;
+        }
+        let jx2 = ((h ^ 0xC3C3_C3C3) >> 24) as i32 % 3 - 1;
+        let jy2 = ((h ^ 0x3C3C_3C3C) >> 32) as i32 % 3 - 1;
+        if seg.end != home {
+            seg.end.0 += jx2;
+            seg.end.1 += jy2;
+        }
     }
 
     // Pre-bridge: drop any segment whose Bresenham trace touches a River
@@ -3669,36 +3779,51 @@ mod tests {
         assert!(runs.is_empty());
     }
 
-    /// `SettlementPhase::Village` with `member_count >= 12` must emit BOTH
-    /// a primary-axis spine AND a perpendicular cross at home. Below the
-    /// threshold the cross is suppressed (single-spine hamlet behaviour).
-    /// Verifies the shipped phase-scaled road network.
+    /// Settlement realism: the perpendicular cross fires only when
+    /// (a) member_count ≥ 16 (dense), OR
+    /// (b) a WaterAccess/Field/Market anchor projects > 6 tiles off
+    ///     the spine axis.
+    /// pop=12 with no off-axis anchors stays single-spine — the cross is
+    /// no longer a population-12 freebie.
     #[test]
-    fn village_phase_emits_cross_when_population_reaches_threshold() {
-        let mut faction = dummy_faction((0, 0), 12);
+    fn village_phase_emits_cross_when_dense_or_offaxis_anchor() {
+        let mut faction = dummy_faction((0, 0), 16);
         force_adopt(&mut faction, PERM_SETTLEMENT);
         let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
         brain.phase = SettlementPhase::Village;
         let map = grass_map();
-        let offsets: Vec<(i32, i32)> = (0..12).map(|i| (i - 6, 0)).collect();
+        let offsets: Vec<(i32, i32)> = (0..16).map(|i| (i - 8, 0)).collect();
 
+        // Dense village (pop=16+, no anchors) — cross fires from density.
         let segs = build_road_network(&faction, &brain, &map, &offsets);
-        // With no river and a horizontal member cluster, primary axis is
-        // EW. Village @ pop≥12 should have ≥2 segments (spine + cross).
         assert!(
             segs.len() >= 2,
-            "village @ pop=12 expected ≥2 road segments, got {}",
+            "dense village @ pop=16 expected ≥2 segments (spine + cross), got {}",
             segs.len()
         );
 
-        // Drop to 8 members — Village still (peak_population can stay high
-        // but member_count gates the cross). Confirm cross is suppressed.
-        faction.member_count = 8;
-        let segs_small = build_road_network(&faction, &brain, &map, &offsets[..8]);
+        // Pop=12, no off-axis anchor — single spine, no cross.
+        faction.member_count = 12;
+        let segs_small = build_road_network(&faction, &brain, &map, &offsets[..12]);
         assert_eq!(
             segs_small.len(),
             1,
-            "village @ pop=8 should emit only the primary spine (no cross)"
+            "village @ pop=12 with no off-axis anchor should be spine-only"
+        );
+
+        // Pop=12 + a Field anchor 10 tiles off the EW spine (north of home)
+        // — cross fires from the off-axis demand.
+        faction.member_count = 12;
+        let mut brain2 = brain.clone();
+        brain2.anchors.push(SettlementAnchor {
+            kind: SettlementAnchorKind::Field,
+            tile: (0, 10),
+            weight: 1.0,
+        });
+        let segs_anchor = build_road_network(&faction, &brain2, &map, &offsets[..12]);
+        assert!(
+            segs_anchor.len() >= 2,
+            "pop=12 + off-axis Field anchor should emit a perpendicular spur"
         );
     }
 
@@ -4012,6 +4137,67 @@ mod tests {
         let tiles_a = road_tiles_for_segments(&segs_a);
         let tiles_b = road_tiles_for_segments(&segs_b);
         assert_eq!(tiles_a, tiles_b);
+    }
+
+    /// Settlement realism: Chiefdom drops the symmetric ±18 parallels and
+    /// instead emits secondary spurs toward the top-3 unmet anchors,
+    /// weight-sorted, capped at 3. Anchors already covered by the spine
+    /// (perp projection ≤ 2) are skipped.
+    #[test]
+    fn chiefdom_secondaries_target_anchors_not_symmetric_parallels() {
+        let mut faction = dummy_faction((0, 0), 40);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.phase = SettlementPhase::Chiefdom;
+        // Three off-spine anchors at varying weights.
+        brain.anchors = vec![
+            SettlementAnchor {
+                kind: SettlementAnchorKind::Market,
+                tile: (8, 12),
+                weight: 3.0,
+            },
+            SettlementAnchor {
+                kind: SettlementAnchorKind::Field,
+                tile: (-10, 10),
+                weight: 2.5,
+            },
+            SettlementAnchor {
+                kind: SettlementAnchorKind::WaterAccess,
+                tile: (5, -14),
+                weight: 2.0,
+            },
+        ];
+        let map = grass_map();
+        // Horizontal member cluster → EW primary axis.
+        let offsets: Vec<(i32, i32)> = (0..40).map(|i| (i - 20, 0)).collect();
+
+        let segs = build_road_network(&faction, &brain, &map, &offsets);
+        let secondaries: Vec<&StreetSegment> = segs
+            .iter()
+            .filter(|s| s.tier == StreetTier::Secondary)
+            .collect();
+        // Anchor-driven: cap is 3 secondaries from home.
+        assert!(
+            secondaries.len() <= 3,
+            "chiefdom secondaries capped at 3, got {}",
+            secondaries.len()
+        );
+        // Each secondary starts at home (or jittered home? home preserved).
+        for s in &secondaries {
+            assert_eq!(s.start, faction.home_tile);
+        }
+        // The strongest anchor (Market at weight 3.0) must show up as one
+        // endpoint (modulo ±1 jitter).
+        let target = (8, 12);
+        let hit = secondaries.iter().any(|s| {
+            (s.end.0 - target.0).abs() <= 1 && (s.end.1 - target.1).abs() <= 1
+        });
+        assert!(
+            hit,
+            "expected strongest anchor (Market @ {:?}) among secondary endpoints; got {:?}",
+            target,
+            secondaries.iter().map(|s| s.end).collect::<Vec<_>>()
+        );
     }
 }
 

@@ -39,6 +39,7 @@ impl Plugin for SandboxPlugin {
                 economy: crate::EconomyPreset::Subsistence,
                 seed_buildings: false,
                 lifestyle: crate::simulation::faction::Lifestyle::Settled,
+                maturity: crate::game_state::StartSettlementMaturity::Established,
             })
             .add_systems(Startup, sandbox_auto_skip_spawn_select)
             .add_systems(OnEnter(crate::GameState::Playing), setup_sandbox);

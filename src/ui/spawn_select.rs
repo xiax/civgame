@@ -6,7 +6,8 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::game_state::{
-    EconomyPreset, GameStartOptions, GameState, PendingSpawn, RegenerateWorldRequest, WorldSeed,
+    EconomyPreset, GameStartOptions, GameState, PendingSpawn, RegenerateWorldRequest,
+    StartSettlementMaturity, WorldSeed,
 };
 use crate::simulation::faction::Lifestyle;
 use crate::simulation::region::{average_fertility_in_megachunk, MegaChunkCoord};
@@ -114,6 +115,45 @@ pub fn spawn_select_system(
             ui.label(
                 egui::RichText::new(
                     "No permanent home: tents, bedrolls, pack animals, seasonal migration.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add_space(12.0);
+
+            ui.label(egui::RichText::new("Maturity").strong());
+            ui.radio_value(
+                &mut options.maturity,
+                StartSettlementMaturity::Founder,
+                "Founder",
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Era + population gate civic seeding; small Neolithic bands skip Market/Barracks/Monument.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.radio_value(
+                &mut options.maturity,
+                StartSettlementMaturity::Established,
+                "Established",
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Seed every era-appropriate civic regardless of pop.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.radio_value(
+                &mut options.maturity,
+                StartSettlementMaturity::Developed,
+                "Developed",
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Established + always seed Monument/Barracks/Market once Chalcolithic+.",
                 )
                 .small()
                 .weak(),

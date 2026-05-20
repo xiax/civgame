@@ -227,6 +227,12 @@ pub struct FurnitureMaps<'w> {
     /// barrier here; deconstruct clears it. Bundled to stay under the
     /// 16-param system cap.
     pub runtime_water: ResMut<'w, crate::world::water_runtime::RuntimeWater>,
+    /// Settlement realism: needed by the runtime door finalize so the
+    /// door connector can aim at the planned spine instead of always
+    /// the faction's home tile. Read-only; bundled to stay under the
+    /// 16-param cap.
+    pub settlement_map: Res<'w, crate::simulation::settlement::SettlementMap>,
+    pub brains: Res<'w, crate::simulation::organic_settlement::SettlementBrains>,
 }
 
 /// Bed construction tier. Tracks how the bed was built so the upgrade pipeline
@@ -2951,12 +2957,33 @@ fn plan_building(
     });
 }
 
-/// Phase 1/2: find a single open slot on the rectangular palisade that wraps the
-/// settlement's bed bounding box plus a buffer. Returns None when the palisade is
-/// complete or no beds exist near camp.
+/// Settlement realism: read-only borrow of every map a palisade envelope
+/// needs. Bundled as a struct rather than a SystemParam so both the chief
+/// path (`BuildingMapsRO`) and seed-time callers can construct one from
+/// what they already hold.
+pub struct PalisadeMapsRO<'a> {
+    pub bed_map: &'a BedMap,
+    pub granary_map: &'a GranaryMap,
+    pub shrine_map: &'a ShrineMap,
+    pub well_map: &'a WellMap,
+    pub campfire_map: &'a CampfireMap,
+}
+
+/// Phase 1/2: find a single open slot on the rectangular palisade that
+/// wraps the settlement's *defended core* plus a buffer. Returns None
+/// when the palisade is complete, no defended structures exist near
+/// camp, or every remaining perimeter tile is blocked.
+///
+/// Settlement realism: the envelope is the axis-aligned bbox over
+/// `BedMap ∪ GranaryMap ∪ ShrineMap ∪ WellMap ∪ CampfireMap` filtered to
+/// chebyshev ≤ 25 of `camp_home`, *not* `BedMap` alone — so granaries
+/// and shrines stamped outside the original bed cluster get wrapped too.
+/// Gateways align with spine endpoints from `brain.road_segments` rather
+/// than `hx`/`hy`, so the wall opens where the actual street crosses it.
 fn find_palisade_site(
     chunk_map: &ChunkMap,
-    bed_map: &BedMap,
+    maps: PalisadeMapsRO,
+    brain: Option<&crate::simulation::organic_settlement::SettlementBrain>,
     bp_map: &BlueprintMap,
     doormat: &crate::simulation::doormat::DoormatReservations,
     camp_home: (i32, i32),
@@ -2969,15 +2996,34 @@ fn find_palisade_site(
     let mut max_x = i32::MIN;
     let mut min_y = i32::MAX;
     let mut max_y = i32::MIN;
-    for &pos in bed_map.0.keys() {
-        let (bx, by) = (pos.0 as i32, pos.1 as i32);
+    let mut consider = |pos: (i32, i32),
+                        min_x: &mut i32,
+                        max_x: &mut i32,
+                        min_y: &mut i32,
+                        max_y: &mut i32| {
+        let (bx, by) = pos;
         if (bx - hx).abs() > search || (by - hy).abs() > search {
-            continue;
+            return;
         }
-        min_x = min_x.min(bx);
-        max_x = max_x.max(bx);
-        min_y = min_y.min(by);
-        max_y = max_y.max(by);
+        *min_x = (*min_x).min(bx);
+        *max_x = (*max_x).max(bx);
+        *min_y = (*min_y).min(by);
+        *max_y = (*max_y).max(by);
+    };
+    for &pos in maps.bed_map.0.keys() {
+        consider(pos, &mut min_x, &mut max_x, &mut min_y, &mut max_y);
+    }
+    for &pos in maps.granary_map.0.keys() {
+        consider(pos, &mut min_x, &mut max_x, &mut min_y, &mut max_y);
+    }
+    for &pos in maps.shrine_map.0.keys() {
+        consider(pos, &mut min_x, &mut max_x, &mut min_y, &mut max_y);
+    }
+    for &pos in maps.well_map.0.keys() {
+        consider(pos, &mut min_x, &mut max_x, &mut min_y, &mut max_y);
+    }
+    for &pos in maps.campfire_map.0.keys() {
+        consider(pos, &mut min_x, &mut max_x, &mut min_y, &mut max_y);
     }
     if min_x == i32::MAX {
         return None;
@@ -2988,38 +3034,75 @@ fn find_palisade_site(
     min_y -= buffer;
     max_y += buffer;
 
-    // Top and bottom rows — leave a 3-tile gateway centred on x=hx for each
-    // cardinal axis so the spine has real flow capacity instead of a single-
-    // tile choke. Same width applied below for E/W columns.
-    let gateway_half = 1i32; // half-width: gateway spans [hx-1, hx+1] (3 tiles)
+    // Spine-aligned gateway centres. For each cardinal edge we walk the
+    // planned/carved road segments to find the tile where the spine
+    // crosses the edge; the 3-tile gateway centres on that crossing.
+    // Fallback to `hx`/`hy` when no road meets that edge.
+    let gateway_half = 1i32; // half-width: gateway spans 3 tiles
+    let crossing_on_edge =
+        |fixed_y: Option<i32>, fixed_x: Option<i32>, default: i32| -> i32 {
+            let Some(brain) = brain else { return default };
+            // Walk every planned road tile; the one whose row/column matches
+            // the requested edge and lies inside the rect wins. Take the
+            // tile closest (chebyshev) to the original cardinal centre.
+            let mut best: Option<(i32, i32)> = None;
+            for &tile in brain.road_tiles.iter() {
+                if let Some(yy) = fixed_y {
+                    if tile.1 != yy {
+                        continue;
+                    }
+                    if tile.0 < min_x || tile.0 > max_x {
+                        continue;
+                    }
+                    let d = (tile.0 - default).abs();
+                    if best.map_or(true, |(bd, _)| d < bd) {
+                        best = Some((d, tile.0));
+                    }
+                } else if let Some(xx) = fixed_x {
+                    if tile.0 != xx {
+                        continue;
+                    }
+                    if tile.1 < min_y || tile.1 > max_y {
+                        continue;
+                    }
+                    let d = (tile.1 - default).abs();
+                    if best.map_or(true, |(bd, _)| d < bd) {
+                        best = Some((d, tile.1));
+                    }
+                }
+            }
+            best.map(|(_, v)| v).unwrap_or(default)
+        };
+    let gate_x_north = crossing_on_edge(Some(min_y), None, hx);
+    let gate_x_south = crossing_on_edge(Some(max_y), None, hx);
+    let gate_y_west = crossing_on_edge(None, Some(min_x), hy);
+    let gate_y_east = crossing_on_edge(None, Some(max_x), hy);
+
     for x in min_x..=max_x {
-        for &y in &[min_y, max_y] {
-            if (x - hx).abs() <= gateway_half {
-                continue; // N or S gateway: keep open for cardinal access
+        for &(y, gx) in &[(min_y, gate_x_north), (max_y, gate_x_south)] {
+            if (x - gx).abs() <= gateway_half {
+                continue;
             }
             let tile = (x as i32, y as i32);
             if bp_map.0.contains_key(&tile) {
                 continue;
             }
             if doormat.is_reserved(tile) {
-                continue; // never wall over a door's doormat
+                continue;
             }
             let Some(kind) = chunk_map.tile_kind_at(x, y) else {
                 continue;
             };
-            // Skip Road too — the spine carves Road through the perimeter
-            // band; we don't want a palisade segment paving over a street.
             if !kind.is_passable() || kind == TileKind::Wall || kind == TileKind::Road {
                 continue;
             }
             return Some(tile);
         }
     }
-    // Left and right columns (excluding corners) — 3-tile gateway centred on y=hy.
     for y in (min_y + 1)..max_y {
-        for &x in &[min_x, max_x] {
-            if (y - hy).abs() <= gateway_half {
-                continue; // W or E gateway: keep open for cardinal access
+        for &(x, gy) in &[(min_x, gate_y_west), (max_x, gate_y_east)] {
+            if (y - gy).abs() <= gateway_half {
+                continue;
             }
             let tile = (x as i32, y as i32);
             if bp_map.0.contains_key(&tile) {
@@ -3063,6 +3146,9 @@ pub struct BuildingMapsRO<'w> {
     // sleepy-dove Phase 4: bundled here so `chief_directive_system`
     // stays under Bevy's 16-param ceiling.
     pub poster_pool: Res<'w, ConstructionPosterPool>,
+    // Settlement realism: needed to thread `maturity` into
+    // `generate_candidates`. Bundled here for the same 16-param reason.
+    pub start_options: Res<'w, crate::GameStartOptions>,
 }
 
 /// Read-only borrow of the structure-map set that `generate_candidates` needs.
@@ -3381,6 +3467,15 @@ pub fn chief_directive_system(
         if faction_id == SOLO || faction.member_count == 0 {
             continue;
         }
+        // Household sub-factions (Market one-person + bootstrap P2 communal
+        // kin groups) don't run their own construction agenda — the village
+        // chief owns building. Without this gate, a household with an empty
+        // `FactionTechs` (no chief entity to project from) would be treated
+        // as Paleolithic by `generate_candidates` and emit Paleo crescent
+        // beds when its members' bed_count drops.
+        if faction.parent_faction.is_some() {
+            continue;
+        }
         // Nomadic factions skip the settled chief's build menu entirely:
         // no Hut/Longhouse/Granary/Wall queueing. Their seeded camp from
         // `seed_nomadic_camp` carries them until Phase 8's migration commit
@@ -3465,6 +3560,8 @@ pub fn chief_directive_system(
                     peak_pop,
                     None,
                     available_techs,
+                    maps.start_options.maturity,
+                    brain_for_faction,
                 );
                 if brain_pending_first_survey {
                     candidates.retain(|c| {
@@ -3618,6 +3715,16 @@ fn generate_candidates(
     // the faction-wide `community_adoption_bitset` gate so a band can
     // build whatever a single member learned.
     available_techs: FactionTechs,
+    // Settlement realism: civic-seeding density. Only consulted when
+    // `seed_techs.is_some()` (seed mode); runtime callers can pass
+    // `StartSettlementMaturity::Established` (the value is ignored
+    // because `should_seed_civic` falls through to
+    // `civic_milestone_allows` when `seed_mode == false`).
+    maturity: crate::game_state::StartSettlementMaturity,
+    // Settlement realism: drives `find_palisade_site`'s spine-aligned
+    // gateways. Optional — when `None` (e.g. fixture factions without a
+    // brain) the helper falls back to `home_tile` axes.
+    brain: Option<&crate::simulation::organic_settlement::SettlementBrain>,
 ) -> Vec<BuildCandidate> {
     let pending_of = |k: BuildSiteKind| -> u32 { pending_kinds.get(&k).copied().unwrap_or(0) };
     // Walls are tracked per-material (`Wall(Palisade)`, `Wall(Stone)`, …);
@@ -3902,7 +4009,15 @@ fn generate_candidates(
             // Emergency Bed already emitted above. Suppress the walled house
             // so it can't out-score the fallback or hog the concurrency cap
             // with a blueprint that can never finalize.
-        } else if techs.has(CITY_STATE_ORG) && bed_deficit >= 2.0 {
+        } else if (techs.has(CITY_STATE_ORG) || (seed_mode && bed_deficit >= 2.0))
+            && bed_deficit >= 2.0
+        {
+            // Bootstrap P3: at seed time, allow Longhouses at Neolithic+ once
+            // bed deficit ≥ 2 — kin-group seeding (settlement_bootstrap P2)
+            // partitions founders into ≤4-adult households, and a 6-founder
+            // start with 2 households of 3 should read as multi-bed dwellings,
+            // not 6 identical huts. Post-seed, the CITY_STATE_ORG gate keeps
+            // the runtime ladder unchanged.
             // Frontage-first: prefer vacant residential lots whose access tile
             // sits on the carved spine; fall back to zone-area scoring.
             // Layout-seed roll: Longhouse is the default when bed deficit is
@@ -4103,9 +4218,21 @@ fn generate_candidates(
         let target_walls = (members as i32 * 2 + 8).min(48);
         let defense_deficit = (target_walls - walls_count).max(0) as f32;
         if defense_deficit > 0.0 && bed_count > 0 {
-            if let Some(tile) =
-                find_palisade_site(chunk_map, &maps.bed_map, bp_map, doormat, home, 2)
-            {
+            if let Some(tile) = find_palisade_site(
+                chunk_map,
+                PalisadeMapsRO {
+                    bed_map: maps.bed_map,
+                    granary_map: maps.granary_map,
+                    shrine_map: maps.shrine_map,
+                    well_map: maps.well_map,
+                    campfire_map: maps.campfire_map,
+                },
+                brain,
+                bp_map,
+                doormat,
+                home,
+                2,
+            ) {
                 let def_mult = 0.4 + (culture.defensive as f32 / 255.0) * 1.6;
                 out.push(BuildCandidate {
                     intent: BuildIntent::PalisadeSegment(wall_mat, 2),
@@ -4148,12 +4275,13 @@ fn generate_candidates(
         && count_granaries_near(&maps.granary_map, home, 25)
             + pending_of(BuildSiteKind::Granary) as usize
             == 0
-        && (seed_mode
-            || crate::simulation::civic_milestones::civic_milestone_allows(
-                crate::simulation::civic_milestones::CivicKind::Granary,
-                era,
-                peak_pop,
-            ))
+        && crate::simulation::civic_milestones::should_seed_civic(
+            crate::simulation::civic_milestones::CivicKind::Granary,
+            era,
+            peak_pop,
+            maturity,
+            seed_mode,
+        )
     {
         if let Some(tile) = find_clear_tile_in_zone(
             chunk_map,
@@ -4220,12 +4348,13 @@ fn generate_candidates(
         && count_shrines_near(&maps.shrine_map, home, 25)
             + pending_of(BuildSiteKind::Shrine) as usize
             == 0
-        && (seed_mode
-            || crate::simulation::civic_milestones::civic_milestone_allows(
-                crate::simulation::civic_milestones::CivicKind::Shrine,
-                era,
-                peak_pop,
-            ))
+        && crate::simulation::civic_milestones::should_seed_civic(
+            crate::simulation::civic_milestones::CivicKind::Shrine,
+            era,
+            peak_pop,
+            maturity,
+            seed_mode,
+        )
     {
         if let Some(tile) = find_clear_tile_in_zone(
             chunk_map,
@@ -4249,12 +4378,13 @@ fn generate_candidates(
 
     // 7. Market — LONG_DIST_TRADE + (era, peak_pop) milestone.
     if techs.has(LONG_DIST_TRADE)
-        && (seed_mode
-            || crate::simulation::civic_milestones::civic_milestone_allows(
-                crate::simulation::civic_milestones::CivicKind::Market,
-                era,
-                peak_pop,
-            ))
+        && crate::simulation::civic_milestones::should_seed_civic(
+            crate::simulation::civic_milestones::CivicKind::Market,
+            era,
+            peak_pop,
+            maturity,
+            seed_mode,
+        )
     {
         let target_count = if culture.mercantile > 180 { 2 } else { 1 };
         let market_count = count_markets_near(&maps.market_map, home, 25)
@@ -4286,12 +4416,13 @@ fn generate_candidates(
         && count_barracks_near(&maps.barracks_map, home, 25)
             + pending_of(BuildSiteKind::Barracks) as usize
             == 0
-        && (seed_mode
-            || crate::simulation::civic_milestones::civic_milestone_allows(
-                crate::simulation::civic_milestones::CivicKind::Barracks,
-                era,
-                peak_pop,
-            ))
+        && crate::simulation::civic_milestones::should_seed_civic(
+            crate::simulation::civic_milestones::CivicKind::Barracks,
+            era,
+            peak_pop,
+            maturity,
+            seed_mode,
+        )
     {
         if let Some(tile) = find_clear_tile_in_zone(
             chunk_map,
@@ -4318,12 +4449,13 @@ fn generate_candidates(
         && count_monuments_near(&maps.monument_map, home, 30)
             + pending_of(BuildSiteKind::Monument) as usize
             == 0
-        && (seed_mode
-            || crate::simulation::civic_milestones::civic_milestone_allows(
-                crate::simulation::civic_milestones::CivicKind::Monument,
-                era,
-                peak_pop,
-            ))
+        && crate::simulation::civic_milestones::should_seed_civic(
+            crate::simulation::civic_milestones::CivicKind::Monument,
+            era,
+            peak_pop,
+            maturity,
+            seed_mode,
+        )
     {
         if let Some(tile) = find_clear_tile_in_zone(
             chunk_map,
@@ -4575,6 +4707,7 @@ fn seed_walled_house_or_nearby(
     doormat: &mut crate::simulation::doormat::DoormatReservations,
     road_carve: &mut RoadCarveQueue,
     seed_techs: &FactionTechs,
+    brain: Option<&crate::simulation::organic_settlement::SettlementBrain>,
 ) -> Option<(i32, i32)> {
     if seed_walled_house_at(
         commands,
@@ -4594,6 +4727,7 @@ fn seed_walled_house_or_nearby(
         doormat,
         road_carve,
         seed_techs,
+        brain,
     ) {
         return Some(anchor);
     }
@@ -4644,6 +4778,7 @@ fn seed_walled_house_or_nearby(
                     doormat,
                     road_carve,
                     seed_techs,
+                    brain,
                 ) {
                     return Some(candidate);
                 }
@@ -4667,6 +4802,7 @@ fn seed_apply_intent(
     tile: (i32, i32),
     door_dir: Option<crate::simulation::land::TileEdge>,
     seed_techs: &FactionTechs,
+    brain: Option<&crate::simulation::organic_settlement::SettlementBrain>,
 ) -> Option<(i32, i32)> {
     match intent {
         BuildIntent::Single(kind) => {
@@ -4711,6 +4847,7 @@ fn seed_apply_intent(
             doormat,
             road_carve,
             seed_techs,
+            brain,
         ),
         BuildIntent::Longhouse(wall_mat) => seed_walled_house_or_nearby(
             commands,
@@ -4729,6 +4866,7 @@ fn seed_apply_intent(
             doormat,
             road_carve,
             seed_techs,
+            brain,
         ),
         BuildIntent::PalisadeSegment(wall_mat, _) => seed_apply_wall_tile(
             commands,
@@ -5248,10 +5386,141 @@ where
         .map(|(e, off, dm, _)| (e, off, dm))
 }
 
+/// Settlement realism: where should a freshly-stamped door's connector
+/// carve toward? Each door places one `Road` doormat tile; if no street
+/// is adjacent, we used to draw a Bresenham line from the doormat back
+/// to `home`. With many doors that produced a wagon-wheel of radial
+/// spokes converging on the faction's home tile. The new policy aims
+/// every connector at the nearest reachable *spine* tile (carved or
+/// planned), collapsing the wagon-wheel into a short dogleg tree.
+#[derive(Debug)]
+pub enum DoorConnectorTarget {
+    /// Carve toward this road / planned-road tile. Bresenham endpoint.
+    Road((i32, i32)),
+    /// No road in radius — fall back to the legacy radial line toward
+    /// the faction's home tile (used at runtime when the spine layer
+    /// has not been planned yet).
+    HomeFallback,
+    /// A road already sits chebyshev-1 of the doormat. The doormat
+    /// itself is the connection — no extension carve needed.
+    None,
+}
+
+/// Find the nearest road target a fresh door at `doormat` should connect
+/// to. Walks chebyshev rings 1..=radius. Prefers carved `TileKind::Road`,
+/// falls back to `brain.road_tiles` (planned spine, populated at survey
+/// time before tiles are stamped). Skips tiles that are not walkable
+/// from `doormat` (uses `placement_reachability::path_exists` with a
+/// small cap so a far-but-sealed-off road can't win over a closer
+/// reachable one).
+///
+/// - `radius` defaults to 12 in callers — long enough to bridge a hut to
+///   the spine even when the hut sits at the outer edge of a residential
+///   parcel, short enough that the search is cheap.
+/// - At seed time pass `brain` so planned spine tiles are eligible
+///   targets; runtime call sites may pass `None` if they only care
+///   about carved roads.
+pub fn find_door_connector_target(
+    chunk_map: &ChunkMap,
+    brain: Option<&crate::simulation::organic_settlement::SettlementBrain>,
+    doormat: (i32, i32),
+    radius: i32,
+) -> DoorConnectorTarget {
+    // Fast adjacency check — if any neighbour is already a Road we're
+    // already connected.
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            if chunk_map.tile_kind_at(doormat.0 + dx, doormat.1 + dy) == Some(TileKind::Road) {
+                return DoorConnectorTarget::None;
+            }
+        }
+    }
+
+    let from3 = crate::simulation::placement_reachability::resolve3(chunk_map, doormat);
+
+    let try_tile = |t: (i32, i32)| -> bool {
+        let to3 = crate::simulation::placement_reachability::resolve3(chunk_map, t);
+        crate::simulation::placement_reachability::path_exists(
+            chunk_map,
+            from3,
+            to3,
+            crate::simulation::placement_reachability::ReachOpts::seed()
+                .with_cap(crate::simulation::placement_reachability::DOORMAT_MAX_EXPANSIONS),
+        )
+    };
+
+    // Walk rings; return the first reachable carved road we find.
+    for r in 1..=radius {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs() != r && dy.abs() != r {
+                    continue;
+                }
+                let tile = (doormat.0 + dx, doormat.1 + dy);
+                if chunk_map.tile_kind_at(tile.0, tile.1) != Some(TileKind::Road) {
+                    continue;
+                }
+                if try_tile(tile) {
+                    return DoorConnectorTarget::Road(tile);
+                }
+            }
+        }
+    }
+
+    // No carved road within radius. Fall back to the planned spine.
+    if let Some(b) = brain {
+        if !b.road_tiles.is_empty() {
+            // Walk rings again, this time matching planned-road tiles.
+            for r in 1..=radius {
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        if dx.abs() != r && dy.abs() != r {
+                            continue;
+                        }
+                        let tile = (doormat.0 + dx, doormat.1 + dy);
+                        if !b.road_tiles.contains(&tile) {
+                            continue;
+                        }
+                        if try_tile(tile) {
+                            return DoorConnectorTarget::Road(tile);
+                        }
+                    }
+                }
+            }
+            // Seed-mode policy: prefer planned spine *even if far* — pick
+            // the nearest planned tile by chebyshev that is reachable,
+            // ignoring the `radius` bound. The planned spine is the
+            // settlement's lived-in path; carving a long-but-aligned
+            // connector reads better than another radial spoke.
+            let mut candidates: Vec<(i32, (i32, i32))> = b
+                .road_tiles
+                .iter()
+                .copied()
+                .map(|t| {
+                    let d = (t.0 - doormat.0).abs().max((t.1 - doormat.1).abs());
+                    (d, t)
+                })
+                .collect();
+            candidates.sort_by_key(|&(d, t)| (d, t.0, t.1));
+            for (_, tile) in candidates.into_iter().take(6) {
+                if try_tile(tile) {
+                    return DoorConnectorTarget::Road(tile);
+                }
+            }
+        }
+    }
+
+    DoorConnectorTarget::HomeFallback
+}
+
 /// Is there any `TileKind::Road` tile within `radius` chebyshev of `from`?
 /// Used to gate per-door road-carving so we don't pave the entire settlement
 /// when many doors all push a fresh Bresenham line to home. The doormat tile
 /// itself is always written; only the connection-to-home extension is gated.
+#[allow(dead_code)]
 fn road_within(chunk_map: &ChunkMap, from: (i32, i32), radius: i32) -> bool {
     for dy in -radius..=radius {
         for dx in -radius..=radius {
@@ -6089,19 +6358,36 @@ pub fn construction_system(
                         },
                     );
                     // Carve doormat to Road directly; road_carve_system
-                    // skips both endpoints. Extend toward the faction's home
-                    // tile *only* when no existing road sits within 4 chebyshev
-                    // of the doormat — otherwise the new door already connects
-                    // naturally to the road network and a fresh Bresenham would
-                    // just pave duplicate spokes.
+                    // skips both endpoints. Connector target chosen by
+                    // `find_door_connector_target`: aim every connector at
+                    // the nearest carved or planned spine tile instead of
+                    // always at `home`, so eight doors don't fan eight
+                    // radial spokes into the base.
                     write_road_tile(&mut *chunk_map, &mut tile_changed, doormat_tile);
-                    if !road_within(&chunk_map, doormat_tile, 4) {
-                        if let Some(faction) = registry.factions.get(&bp.faction_id) {
-                            road_carve_queue.0.push((
-                                bp.faction_id,
-                                doormat_tile,
-                                faction.home_tile,
-                            ));
+                    let brain_ref = maps
+                        .settlement_map
+                        .first_for_faction(bp.faction_id)
+                        .and_then(|sid| maps.brains.0.get(&sid));
+                    match find_door_connector_target(
+                        &chunk_map,
+                        brain_ref,
+                        doormat_tile,
+                        12,
+                    ) {
+                        DoorConnectorTarget::None => {}
+                        DoorConnectorTarget::Road(target) => {
+                            road_carve_queue
+                                .0
+                                .push((bp.faction_id, doormat_tile, target));
+                        }
+                        DoorConnectorTarget::HomeFallback => {
+                            if let Some(faction) = registry.factions.get(&bp.faction_id) {
+                                road_carve_queue.0.push((
+                                    bp.faction_id,
+                                    doormat_tile,
+                                    faction.home_tile,
+                                ));
+                            }
                         }
                     }
                     door_entity
@@ -7719,6 +8005,8 @@ pub fn seed_starting_buildings_system(
                 // Ignored in seed mode (seed_techs is Some); pass the
                 // same era profile for clarity.
                 seed_techs,
+                options.maturity,
+                brain_ref,
             );
             if candidates.is_empty() {
                 break;
@@ -7748,6 +8036,7 @@ pub fn seed_starting_buildings_system(
                     tile,
                     door_dir,
                     &seed_techs,
+                    brain_ref,
                 );
                 if let Some(applied_tile) = applied_tile {
                     applied_any = true;
@@ -7761,11 +8050,10 @@ pub fn seed_starting_buildings_system(
                         _ => (0, 0),
                     };
                     if half_w > 0 {
-                        let yard_side = if (era as u8) >= (Era::BronzeAge as u8) {
-                            3
-                        } else {
-                            2
-                        };
+                        let (yard_w, yard_h) = yard_dimensions(era, &intent);
+                        let culture_seed = plan_ref
+                            .map(|p| p.culture_hash)
+                            .unwrap_or(faction_id as u64);
                         seed_farmstead_yard(
                             &mut chunk_map,
                             &mut tile_changed,
@@ -7776,8 +8064,9 @@ pub fn seed_starting_buildings_system(
                             applied_tile.1,
                             half_w,
                             half_h,
-                            yard_side,
-                            yard_side,
+                            yard_w,
+                            yard_h,
+                            culture_seed,
                         );
                     }
                     break;
@@ -7825,6 +8114,7 @@ fn seed_walled_house_at(
     doormat: &mut crate::simulation::doormat::DoormatReservations,
     road_carve: &mut RoadCarveQueue,
     seed_techs: &FactionTechs,
+    brain: Option<&crate::simulation::organic_settlement::SettlementBrain>,
 ) -> bool {
     // Pre-flight: every tile in the footprint must be clear (passable, not a
     // wall/stone/road, not already used, not reserved as another building's
@@ -7941,10 +8231,22 @@ fn seed_walled_house_at(
                     },
                 );
                 // Carve doormat tile directly to Road; the Bresenham
-                // road_carve_system skips both endpoints. Push an extension
-                // from doormat → home so the door connects back to the spine.
+                // road_carve_system skips both endpoints. Connector target
+                // chosen by `find_door_connector_target`: every door aims
+                // at the nearest carved or planned spine tile, falling
+                // back to home only when no spine exists. Replaces the
+                // unconditional `(doormat → home)` push that produced the
+                // wagon-wheel layout.
                 write_road_tile(&mut *chunk_map, tile_changed, doormat_tile);
-                road_carve.0.push((faction_id, doormat_tile, home));
+                match find_door_connector_target(&*chunk_map, brain, doormat_tile, 12) {
+                    DoorConnectorTarget::None => {}
+                    DoorConnectorTarget::Road(target) => {
+                        road_carve.0.push((faction_id, doormat_tile, target));
+                    }
+                    DoorConnectorTarget::HomeFallback => {
+                        road_carve.0.push((faction_id, doormat_tile, home));
+                    }
+                }
             }
             BuildSiteKind::Wall(mat) => {
                 let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
@@ -8021,6 +8323,66 @@ fn seed_walled_house_at(
 /// going through a full `BuildIntent::Composite` refactor. Phase 6's
 /// `Plot.parent_plot` mechanism picks up these yards once a household
 /// acquires the residential lot they sit on.
+/// Settlement realism: yard dimensions vary by dwelling kind and era.
+/// Replaces the old `yard_side = 2 or 3` constant — a Bronze Longhouse
+/// (5×3 footprint) now gets a meaningfully larger yard than a Neolithic
+/// Hut (3×3). All yards stay rectangular so `rect_reachable_from_home`
+/// continues to pass.
+pub fn yard_dimensions(era: Era, intent: &BuildIntent) -> (i32, i32) {
+    match (intent, era) {
+        (BuildIntent::Hut(_), Era::Neolithic) => (3, 4),
+        (BuildIntent::Hut(_), Era::Chalcolithic) => (4, 4),
+        (BuildIntent::Hut(_), _) => (4, 5),
+        (BuildIntent::Longhouse(_), Era::Neolithic) => (4, 5),
+        (BuildIntent::Longhouse(_), Era::Chalcolithic) => (5, 5),
+        (BuildIntent::Longhouse(_), _) => (5, 6),
+        _ => (3, 3),
+    }
+}
+
+/// Settlement realism: deterministic per-tile role within a yard. Keyed
+/// on `(culture_seed, tx, ty)` via splitmix64 so the same world rerolls
+/// identical yards every time. Every variant stays passable so the rect
+/// reachability check still succeeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum YardTileRole {
+    /// Tilled, fertility 200. Planted/visible-Cropland.
+    CroplandRich,
+    /// Tilled, fertility 100. Fallow row.
+    CroplandFallow,
+    /// `Loam` work-yard — walkable, soil-like, not a crop.
+    LoamYard,
+    /// Leave underlying terrain (no tile rewrite).
+    Untouched,
+}
+
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+pub fn yard_tile_role(culture_seed: u64, tile: (i32, i32)) -> YardTileRole {
+    let mix = splitmix64(
+        culture_seed
+            ^ ((tile.0 as u32 as u64) << 32)
+            ^ (tile.1 as u32 as u64),
+    );
+    let roll = (mix as f32 / u64::MAX as f32).clamp(0.0, 1.0);
+    if roll < 0.55 {
+        YardTileRole::CroplandRich
+    } else if roll < 0.75 {
+        YardTileRole::CroplandFallow
+    } else if roll < 0.92 {
+        YardTileRole::LoamYard
+    } else {
+        YardTileRole::Untouched
+    }
+}
+
 fn seed_farmstead_yard(
     chunk_map: &mut ChunkMap,
     tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
@@ -8033,6 +8395,7 @@ fn seed_farmstead_yard(
     half_h: i32,
     yard_w: i32,
     yard_h: i32,
+    culture_seed: u64,
 ) -> u32 {
     // Try directions in order: east, west, south, north. First side
     // where the full yard fits wins.
@@ -8088,28 +8451,72 @@ fn seed_farmstead_yard(
         return 0;
     };
 
-    // Yard tiles are tilled into visible `Cropland` and bumped to fertility
-    // 200 (high-yield plot). `Cropland` is `is_soil_like`, so the soil-aware
-    // planting heuristics still pick it, and road carving never paves it.
+    // Yard tiles are tilled per `yard_tile_role` so a Hut yard reads as
+    // a mixed kitchen-garden (rich rows + fallow + worked loam + a stray
+    // grass edge) instead of a uniform fertility-200 slab. All variants
+    // stay walkable; the reservations in `used` still cover every tile so
+    // the next intent's footprint search avoids them.
     let mut placed = 0u32;
     for ty in y0..y0 + yard_h {
         for tx in x0..x0 + yard_w {
+            let role = yard_tile_role(culture_seed, (tx, ty));
             let z = chunk_map.surface_z_at(tx, ty);
             let cur = chunk_map.tile_at(tx, ty, z as i32);
-            chunk_map.set_tile(
-                tx,
-                ty,
-                z as i32,
-                TileData {
-                    kind: TileKind::Cropland,
-                    elevation: cur.elevation,
-                    fertility: 200,
-                    flags: cur.flags,
-                    ore: cur.ore,
-                },
-            );
+            match role {
+                YardTileRole::CroplandRich => {
+                    chunk_map.set_tile(
+                        tx,
+                        ty,
+                        z as i32,
+                        TileData {
+                            kind: TileKind::Cropland,
+                            elevation: cur.elevation,
+                            fertility: 200,
+                            flags: cur.flags,
+                            ore: cur.ore,
+                        },
+                    );
+                    tile_changed
+                        .send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
+                }
+                YardTileRole::CroplandFallow => {
+                    chunk_map.set_tile(
+                        tx,
+                        ty,
+                        z as i32,
+                        TileData {
+                            kind: TileKind::Cropland,
+                            elevation: cur.elevation,
+                            fertility: 100,
+                            flags: cur.flags,
+                            ore: cur.ore,
+                        },
+                    );
+                    tile_changed
+                        .send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
+                }
+                YardTileRole::LoamYard => {
+                    // Only convert if not already a stone/wall/water tile.
+                    if cur.kind == TileKind::Grass || cur.kind.is_soil_like() {
+                        chunk_map.set_tile(
+                            tx,
+                            ty,
+                            z as i32,
+                            TileData {
+                                kind: TileKind::Loam,
+                                elevation: cur.elevation,
+                                fertility: cur.fertility,
+                                flags: cur.flags,
+                                ore: cur.ore,
+                            },
+                        );
+                        tile_changed
+                            .send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
+                    }
+                }
+                YardTileRole::Untouched => {}
+            }
             used.insert((tx, ty));
-            tile_changed.send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
             placed += 1;
         }
     }
@@ -8967,5 +9374,131 @@ mod tests {
             select_wall_material(&t, Some(&v)),
             WallSelection::EmergencyShelter
         );
+    }
+
+    // ── Settlement realism: yard sizing + tile-role variation ─────────
+
+    #[test]
+    fn yard_dimensions_grow_for_longhouse_and_era() {
+        // Hut yards
+        assert_eq!(
+            yard_dimensions(Era::Neolithic, &BuildIntent::Hut(WallMaterial::Palisade)),
+            (3, 4)
+        );
+        assert_eq!(
+            yard_dimensions(
+                Era::BronzeAge,
+                &BuildIntent::Hut(WallMaterial::Mudbrick),
+            ),
+            (4, 5)
+        );
+        // Longhouse yards bigger than Hut at every era.
+        assert_eq!(
+            yard_dimensions(
+                Era::Neolithic,
+                &BuildIntent::Longhouse(WallMaterial::Palisade),
+            ),
+            (4, 5)
+        );
+        assert_eq!(
+            yard_dimensions(
+                Era::BronzeAge,
+                &BuildIntent::Longhouse(WallMaterial::Mudbrick),
+            ),
+            (5, 6)
+        );
+    }
+
+    #[test]
+    fn yard_tile_role_is_deterministic_and_distributed() {
+        // Same culture_seed + tile → same role.
+        let seed = 0xDEADBEEF_u64;
+        let r1 = yard_tile_role(seed, (5, 7));
+        let r2 = yard_tile_role(seed, (5, 7));
+        assert_eq!(r1, r2, "same input must produce same role");
+
+        // Distribution sanity: across a 16×16 grid, see all 4 variants.
+        use std::collections::HashSet;
+        let mut seen: HashSet<YardTileRole> = HashSet::new();
+        for y in 0..16 {
+            for x in 0..16 {
+                seen.insert(yard_tile_role(seed, (x, y)));
+            }
+        }
+        assert!(
+            seen.len() >= 3,
+            "expected variety across 256 tiles, got {}",
+            seen.len()
+        );
+    }
+
+    // ── Settlement realism: door connector helper ─────────────────────
+
+    #[test]
+    fn door_connector_returns_none_when_road_adjacent() {
+        use crate::world::chunk::{Chunk, ChunkCoord, CHUNK_SIZE};
+        let mut cm = ChunkMap::default();
+        let z = Box::new([[4i8; CHUNK_SIZE]; CHUNK_SIZE]);
+        let kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
+        let fert = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
+        cm.0.insert(ChunkCoord(0, 0), Chunk::new(z, kind, fert));
+        // Plant a Road tile chebyshev-1 from doormat=(5,5).
+        cm.set_tile(
+            6,
+            5,
+            4,
+            TileData {
+                kind: TileKind::Road,
+                ..Default::default()
+            },
+        );
+
+        let target = find_door_connector_target(&cm, None, (5, 5), 12);
+        assert!(
+            matches!(target, DoorConnectorTarget::None),
+            "road adjacent ⇒ no connector needed; got {:?}",
+            target
+        );
+    }
+
+    #[test]
+    fn door_connector_falls_back_to_home_when_no_road() {
+        use crate::world::chunk::{Chunk, ChunkCoord, CHUNK_SIZE};
+        let mut cm = ChunkMap::default();
+        let z = Box::new([[4i8; CHUNK_SIZE]; CHUNK_SIZE]);
+        let kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
+        let fert = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
+        cm.0.insert(ChunkCoord(0, 0), Chunk::new(z, kind, fert));
+        // No roads, no brain ⇒ HomeFallback.
+        let target = find_door_connector_target(&cm, None, (5, 5), 12);
+        assert!(
+            matches!(target, DoorConnectorTarget::HomeFallback),
+            "no road, no brain ⇒ fallback; got {:?}",
+            target
+        );
+    }
+
+    // ── Settlement realism: civic-seeding maturity ────────────────────
+
+    #[test]
+    fn should_seed_civic_founder_skips_market_for_small_neolithic() {
+        use crate::game_state::StartSettlementMaturity;
+        use crate::simulation::civic_milestones::{should_seed_civic, CivicKind};
+        // Founder + Neolithic 20-pop ⇒ Market gated out.
+        assert!(!should_seed_civic(
+            CivicKind::Market,
+            Era::Neolithic,
+            20,
+            StartSettlementMaturity::Founder,
+            true,
+        ));
+        // Established ⇒ seeds.
+        assert!(should_seed_civic(
+            CivicKind::Market,
+            Era::Neolithic,
+            20,
+            StartSettlementMaturity::Established,
+            true,
+        ));
     }
 }

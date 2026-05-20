@@ -27,6 +27,74 @@ use crate::world::terrain::{tile_at_3d, WorldGen};
 
 pub type PlotId = u32;
 
+/// Settlement realism: per-tile role within a 16×16 Agricultural plot.
+/// Keyed deterministically on `(culture_seed, faction_id, tile)` so the
+/// same world rerolls identical field mosaics. Every variant stays in
+/// `PlotIndex.ag_tiles` (so `tile_is_farm_protected` still blocks road
+/// carving over the whole 256-tile rect) and stays plantable
+/// (`plants::seed_target_tile_ok` accepts Grass + soil_like + Cropland).
+///
+/// Distribution targets: 60% Cropland / 15% CroplandLow / 20% SoilFallow
+/// / 5% GrassEdge — perimeter tiles bias toward GrassEdge so the field
+/// silhouette softens from a perfect golden square into a mottled blob
+/// with stubble at the edges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldTileRole {
+    /// Planted rows, fertility 200 if current is lower.
+    Cropland,
+    /// Recently harvested, lower fertility floor (~100).
+    CroplandLow,
+    /// Tilled-but-not-cropped — keep the underlying soil/loam tile.
+    SoilFallow,
+    /// Unimproved field edge — leave Grass / underlying terrain.
+    GrassEdge,
+}
+
+#[inline]
+fn field_splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Returns the deterministic role for a tile inside a plot whose
+/// bounding box is `(x0, y0, w, h)`. Edge tiles (cheb to the perimeter
+/// = 0) bias toward `GrassEdge` so the field outline softens.
+pub fn field_tile_role(
+    culture_seed: u64,
+    faction_id: u32,
+    tile: (i32, i32),
+    rect: TileRect,
+) -> FieldTileRole {
+    let mut mix = field_splitmix64(
+        culture_seed
+            ^ ((faction_id as u64) << 1)
+            ^ ((tile.0 as u32 as u64) << 32)
+            ^ (tile.1 as u32 as u64),
+    );
+    // Stir once more so faction_id contributes to bits other than the LSB.
+    mix = field_splitmix64(mix);
+    let mut roll = (mix as f32 / u64::MAX as f32).clamp(0.0, 1.0);
+    // Perimeter bias: on the outermost ring of the rect, push the roll
+    // higher so the GrassEdge branch (top tail) wins more often.
+    let on_edge_x = tile.0 == rect.x0 || tile.0 == rect.x0 + rect.w as i32 - 1;
+    let on_edge_y = tile.1 == rect.y0 || tile.1 == rect.y0 + rect.h as i32 - 1;
+    if on_edge_x || on_edge_y {
+        roll = (roll + 0.30).min(1.0);
+    }
+    if roll < 0.60 {
+        FieldTileRole::Cropland
+    } else if roll < 0.75 {
+        FieldTileRole::CroplandLow
+    } else if roll < 0.95 {
+        FieldTileRole::SoilFallow
+    } else {
+        FieldTileRole::GrassEdge
+    }
+}
+
 /// Which side of a `Plot.rect` faces a carved street. Phase 2 of the
 /// Construction Overhaul: lot-driven placement (Phase 3) anchors footprints
 /// at the frontage edge so structures face their road. Doubles as the cardinal
@@ -755,28 +823,63 @@ pub fn carve_plots_system(
                             continue;
                         }
                         plot_index.ag_tiles.insert((tx, ty));
-                        // Stamp the field as tilled `Cropland` so it reads as
-                        // a distinct block. Only convert Grass / soil-like
-                        // ground (skip Road/Water/Wall/Cropland) and preserve
-                        // every other `TileData` field.
+                        // Tile-role variation. Every tile stays in
+                        // `ag_tiles` (road protection) and every variant
+                        // is plantable, so the mosaic is purely visual +
+                        // a per-tile fertility nudge.
                         let z = chunk_map.surface_z_at(tx, ty);
                         let cur = chunk_map.tile_at(tx, ty, z);
-                        let tillable = cur.kind == TileKind::Grass
-                            || (cur.kind.is_soil_like() && cur.kind != TileKind::Cropland);
-                        if tillable {
-                            chunk_map.set_tile(
-                                tx,
-                                ty,
-                                z,
-                                TileData {
-                                    kind: TileKind::Cropland,
-                                    elevation: cur.elevation,
-                                    fertility: cur.fertility,
-                                    flags: cur.flags,
-                                    ore: cur.ore,
-                                },
-                            );
-                            tile_changed.send(TileChangedEvent { tx, ty });
+                        let role = field_tile_role(new_hash, fid, (tx, ty), r);
+                        match role {
+                            FieldTileRole::Cropland => {
+                                let tillable = cur.kind == TileKind::Grass
+                                    || (cur.kind.is_soil_like()
+                                        && cur.kind != TileKind::Cropland);
+                                if tillable {
+                                    chunk_map.set_tile(
+                                        tx,
+                                        ty,
+                                        z,
+                                        TileData {
+                                            kind: TileKind::Cropland,
+                                            elevation: cur.elevation,
+                                            fertility: cur.fertility.max(180),
+                                            flags: cur.flags,
+                                            ore: cur.ore,
+                                        },
+                                    );
+                                    tile_changed.send(TileChangedEvent { tx, ty });
+                                }
+                            }
+                            FieldTileRole::CroplandLow => {
+                                let tillable = cur.kind == TileKind::Grass
+                                    || (cur.kind.is_soil_like()
+                                        && cur.kind != TileKind::Cropland);
+                                if tillable {
+                                    chunk_map.set_tile(
+                                        tx,
+                                        ty,
+                                        z,
+                                        TileData {
+                                            kind: TileKind::Cropland,
+                                            elevation: cur.elevation,
+                                            fertility: cur.fertility.min(110).max(80),
+                                            flags: cur.flags,
+                                            ore: cur.ore,
+                                        },
+                                    );
+                                    tile_changed.send(TileChangedEvent { tx, ty });
+                                }
+                            }
+                            FieldTileRole::SoilFallow => {
+                                // Tilled but uncropped — leave underlying
+                                // soil/Grass kind untouched (no tile write,
+                                // still in `ag_tiles` so road carve skips).
+                            }
+                            FieldTileRole::GrassEdge => {
+                                // Leave underlying terrain. Edge band that
+                                // softens the rect's outline.
+                            }
                         }
                     }
                 }
@@ -1700,5 +1803,51 @@ mod tests {
         let (tenant, landlord) = split_sharecrop_yield(10, 0.0);
         assert_eq!(tenant, 10);
         assert_eq!(landlord, 0);
+    }
+
+    // ── Settlement realism: field tile-role variation ───────────────────
+
+    #[test]
+    fn field_tile_role_is_deterministic() {
+        let rect = TileRect::new(0, 0, 16, 16);
+        let a = field_tile_role(0xCAFE, 1, (8, 8), rect);
+        let b = field_tile_role(0xCAFE, 1, (8, 8), rect);
+        assert_eq!(a, b, "same input must produce same role");
+    }
+
+    #[test]
+    fn field_tile_role_perimeter_biases_to_grass_edge() {
+        // Sample the rectangle and check that GrassEdge concentrates on
+        // the perimeter (cheb-1 distance to the rect edge = 0).
+        let rect = TileRect::new(0, 0, 16, 16);
+        let mut perim_grass = 0usize;
+        let mut interior_grass = 0usize;
+        let mut perim_total = 0usize;
+        let mut interior_total = 0usize;
+        for y in 0..16 {
+            for x in 0..16 {
+                let on_edge = x == 0 || x == 15 || y == 0 || y == 15;
+                let role = field_tile_role(0xCAFE, 1, (x, y), rect);
+                if on_edge {
+                    perim_total += 1;
+                    if role == FieldTileRole::GrassEdge {
+                        perim_grass += 1;
+                    }
+                } else {
+                    interior_total += 1;
+                    if role == FieldTileRole::GrassEdge {
+                        interior_grass += 1;
+                    }
+                }
+            }
+        }
+        let perim_frac = perim_grass as f32 / perim_total as f32;
+        let interior_frac = interior_grass as f32 / interior_total as f32;
+        assert!(
+            perim_frac > interior_frac,
+            "perimeter GrassEdge fraction ({}) should exceed interior ({})",
+            perim_frac,
+            interior_frac
+        );
     }
 }

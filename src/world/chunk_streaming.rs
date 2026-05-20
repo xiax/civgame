@@ -95,6 +95,17 @@ pub struct StreamFocusParams<'w> {
     pub view_projection: crate::rendering::projection::ViewProjection<'w>,
 }
 
+/// Bundle of plant-spawn state for `chunk_streaming_system`. Holds the live
+/// `PlantMap`/`PlantSpriteIndex` mutably plus the read-only `SeedReservation`
+/// so the per-chunk plant seeder can skip tiles reserved by the bootstrap
+/// pipeline.
+#[derive(SystemParam)]
+pub struct StreamPlantParams<'w> {
+    pub plant_map: ResMut<'w, PlantMap>,
+    pub plant_sprite_index: ResMut<'w, PlantSpriteIndex>,
+    pub seed_reservation: Res<'w, crate::simulation::seed_reservation::SeedReservation>,
+}
+
 /// Rebuild `SimulationFocus` from camera + every settled region's mega-chunk
 /// centre. Runs each tick before `chunk_streaming_system` so the loader sees
 /// the current focus set.
@@ -688,7 +699,10 @@ pub fn resolve_render_tile(
     }
 }
 
-/// Deterministically seed initial plants for a chunk.
+/// Deterministically seed initial plants for a chunk. Skips any tile the
+/// bootstrap pipeline reserved (footprint, doormat, planned road, ag plot)
+/// — without this gate, a chunk streaming in after warmup would scatter
+/// wild grain/berries onto seeded house roofs or planned roads.
 pub fn spawn_chunk_plants(
     commands: &mut Commands,
     plant_map: &mut PlantMap,
@@ -696,6 +710,7 @@ pub fn spawn_chunk_plants(
     chunk_map: &ChunkMap,
     gen: &WorldGen,
     globe: &Globe,
+    reservation: &crate::simulation::seed_reservation::SeedReservation,
     coord: ChunkCoord,
 ) {
     let Some(chunk) = chunk_map.0.get(&coord) else {
@@ -706,6 +721,9 @@ pub fn spawn_chunk_plants(
         for tx in 0..CHUNK_SIZE {
             let global_tx = coord.0 * CHUNK_SIZE as i32 + tx as i32;
             let global_ty = coord.1 * CHUNK_SIZE as i32 + ty as i32;
+            if reservation.is_reserved((global_tx, global_ty)) {
+                continue;
+            }
             let surf_z = chunk.surface_z[ty][tx] as i32;
             let tile = tile_at_3d(chunk_map, gen, globe, global_tx, global_ty, surf_z);
 
@@ -871,8 +889,7 @@ pub fn chunk_streaming_system(
     mut chunk_map: ResMut<ChunkMap>,
     gen: Res<WorldGen>,
     mut globe: ResMut<Globe>,
-    mut plant_map: ResMut<PlantMap>,
-    mut plant_sprite_index: ResMut<PlantSpriteIndex>,
+    mut plant_params: StreamPlantParams,
     camera_view_z: Res<CameraViewZ>,
     retention: Res<ChunkRetention>,
     mut stream_events: ChunkStreamEvents,
@@ -953,11 +970,12 @@ pub fn chunk_streaming_system(
 
                     spawn_chunk_plants(
                         &mut commands,
-                        &mut plant_map,
-                        &mut plant_sprite_index,
+                        &mut plant_params.plant_map,
+                        &mut plant_params.plant_sprite_index,
                         &chunk_map,
                         &gen,
                         &globe,
+                        &plant_params.seed_reservation,
                         coord,
                     );
 
@@ -1016,9 +1034,9 @@ pub fn chunk_streaming_system(
                 commands.entity(e).despawn_recursive();
             }
         }
-        if let Some(plant_entries) = plant_sprite_index.by_chunk.remove(&coord) {
+        if let Some(plant_entries) = plant_params.plant_sprite_index.by_chunk.remove(&coord) {
             for (e, tile_pos) in plant_entries {
-                plant_map.0.remove(&tile_pos);
+                plant_params.plant_map.0.remove(&tile_pos);
                 commands.entity(e).despawn_recursive();
             }
         }

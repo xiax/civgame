@@ -386,6 +386,7 @@ mod tests {
         app.insert_resource(PlantMap::default());
         app.insert_resource(PlantSpriteIndex::default());
         app.insert_resource(ChunkMap::default());
+        app.insert_resource(crate::simulation::seed_reservation::SeedReservation::default());
         app.add_systems(Update, plant_lifecycle_system);
         app
     }
@@ -686,9 +687,20 @@ pub fn spawn_plant_at(
     Some(entity)
 }
 
-/// Tile predicate for where a scattered seed may land.
-fn seed_target_tile_ok(chunk_map: &ChunkMap, x: i32, y: i32) -> bool {
+/// Tile predicate for where a scattered seed may land. Rejects tiles the
+/// bootstrap pipeline reserved (footprints, doormats, planned roads,
+/// ag plots) so a streaming-time plant can't land on a planned-but-uncarved
+/// road or on a doormat that hasn't yet flipped to `Road`.
+fn seed_target_tile_ok(
+    chunk_map: &ChunkMap,
+    reservation: &crate::simulation::seed_reservation::SeedReservation,
+    x: i32,
+    y: i32,
+) -> bool {
     use crate::world::tile::TileKind as TK;
+    if reservation.is_reserved((x, y)) {
+        return false;
+    }
     match chunk_map.tile_kind_at(x, y) {
         Some(TK::Grass) => true,
         Some(k) if k.is_soil_like() => true,
@@ -704,6 +716,7 @@ fn try_scatter_seed(
     plant_map: &mut PlantMap,
     plant_sprite_index: &mut PlantSpriteIndex,
     chunk_map: &ChunkMap,
+    reservation: &crate::simulation::seed_reservation::SeedReservation,
     parent_tile: (i32, i32),
     parent_kind: PlantKind,
     chance: f32,
@@ -718,7 +731,7 @@ fn try_scatter_seed(
         return;
     }
     let (nx, ny) = (parent_tile.0 + dx, parent_tile.1 + dy);
-    if !seed_target_tile_ok(chunk_map, nx, ny) {
+    if !seed_target_tile_ok(chunk_map, reservation, nx, ny) {
         return;
     }
     spawn_plant_at(
@@ -747,6 +760,7 @@ pub fn plant_lifecycle_system(
     mut commands: Commands,
     calendar: Res<Calendar>,
     chunk_map: Res<ChunkMap>,
+    reservation: Res<crate::simulation::seed_reservation::SeedReservation>,
     mut last_season: Local<Option<Season>>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
@@ -827,6 +841,7 @@ pub fn plant_lifecycle_system(
             &mut plant_map,
             &mut plant_sprite_index,
             &chunk_map,
+            &reservation,
             parent_tile,
             kind,
             chance,
@@ -842,6 +857,7 @@ pub fn plant_lifecycle_system(
                 &mut plant_map,
                 &mut plant_sprite_index,
                 &chunk_map,
+                &reservation,
                 tile,
                 PlantKind::Grain,
                 0.20,

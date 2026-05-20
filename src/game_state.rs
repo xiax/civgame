@@ -54,6 +54,25 @@ impl Default for WorldSeed {
 #[derive(Event)]
 pub struct RegenerateWorldRequest;
 
+/// Civic seeding density at game start. Controls how aggressively
+/// `seed_starting_buildings_system` bypasses the runtime `(Era, peak_pop)`
+/// civic milestone gates.
+///
+/// - `Founder` — gates stay live; Neolithic-20 starts skip Market/Barracks/
+///   Monument until they hit the population thresholds.
+/// - `Established` (default) — current behaviour: every era-appropriate
+///   civic (Granary/Shrine/Market/Barracks/Monument) seeds regardless of
+///   pop, mirroring "society in progress".
+/// - `Developed` — `Established` + explicit override that always emits
+///   Monument/Barracks/Market once `era >= Chalcolithic`, even with a
+///   smaller pop than the Bronze milestones would normally require.
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartSettlementMaturity {
+    Founder,
+    Established,
+    Developed,
+}
+
 /// Economy preset selected at game start; applied to every faction's
 /// `economic_policy` map by `spawn_population`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +102,8 @@ pub struct GameStartOptions {
     /// founding, plot carving, and FactionStorageTile spawn; structures use
     /// the pack/deploy cycle and the band migrates seasonally.
     pub lifestyle: crate::simulation::faction::Lifestyle,
+    /// Civic seeding density. See `StartSettlementMaturity`.
+    pub maturity: StartSettlementMaturity,
 }
 
 impl Default for GameStartOptions {
@@ -93,6 +114,7 @@ impl Default for GameStartOptions {
             economy: EconomyPreset::Subsistence,
             seed_buildings: true,
             lifestyle: crate::simulation::faction::Lifestyle::Settled,
+            maturity: StartSettlementMaturity::Established,
         }
     }
 }

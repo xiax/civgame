@@ -60,7 +60,9 @@ pub mod river_context;
 pub mod sanitation;
 pub mod schedule;
 pub mod sedentary_collapse;
+pub mod seed_reservation;
 pub mod settlement;
+pub mod settlement_bootstrap;
 pub mod shared_knowledge;
 pub mod skills;
 pub mod sleep;
@@ -199,6 +201,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(crafting::CraftOrderMap::default())
             .insert_resource(construction::RoadCarveQueue::default())
             .insert_resource(doormat::DoormatReservations::default())
+            .insert_resource(seed_reservation::SeedReservation::default())
             .insert_resource(construction::RitualState::default())
             .insert_resource(terraform::TerraformMap::default())
             .insert_resource(terraform::PendingFootprints::default())
@@ -321,15 +324,6 @@ impl Plugin for SimulationPlugin {
                         .after(person::spawn_population)
                         .after(organic_settlement::kickoff_initial_survey_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
-                    // Seeded structures (walls, beds, hearths, nomadic shelters)
-                    // bypass the blueprint pipeline, so the per-blueprint
-                    // obstacle scan never runs on them. This one-shot pass
-                    // walks `StructureIndex` and clears obstacles on every
-                    // seeded tile — plants despawn (yields drop on ground),
-                    // loose rocks relocate aside.
-                    clear_obstacle::clear_obstacles_under_seeded_structures
-                        .after(construction::seed_starting_buildings_system)
-                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     // Farm-planner §15: ensure every starting village has at
                     // least one Agricultural plot + seed grain in storage so
                     // farming can start on tick 1 instead of waiting for the
@@ -337,12 +331,55 @@ impl Plugin for SimulationPlugin {
                     farm::seed_starting_farms_system
                         .after(construction::seed_starting_buildings_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Consolidate every stamped/queued bootstrap tile into
+                    // `SeedReservation` so plants streaming in after warmup
+                    // can't sprout on a planned doormat / road / ag tile
+                    // before the structure index catches them. Runs before
+                    // `clear_obstacles_under_seeded_structures` so the
+                    // obstacle pass walks reserved tiles too.
+                    seed_reservation::populate_seed_reservation_system
+                        .after(construction::seed_starting_buildings_system)
+                        .after(farm::seed_starting_farms_system)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Seeded structures (walls, beds, hearths, nomadic shelters)
+                    // bypass the blueprint pipeline, so the per-blueprint
+                    // obstacle scan never runs on them. This one-shot pass
+                    // walks `StructureIndex` ∪ `SeedReservation` and clears
+                    // obstacles on every seeded/reserved tile — plants
+                    // despawn (yields drop on ground), loose rocks relocate
+                    // aside.
+                    clear_obstacle::clear_obstacles_under_seeded_structures
+                        .after(construction::seed_starting_buildings_system)
+                        .after(seed_reservation::populate_seed_reservation_system)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Bootstrap P2: form deterministic kin households +
+                    // spouse/sibling `RelationshipMemory` affinities for
+                    // Subsistence/Mixed founders. Market factions keep the
+                    // one-person path seeded by `spawn_population`.
+                    settlement_bootstrap::seed_starting_relationships_system
+                        .after(person::spawn_population)
+                        .after(construction::seed_starting_buildings_system)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Bootstrap P4 (minimal): relocate any Person whose
+                    // spawn tile collides with a stamped wall/door/bed/
+                    // doormat/road/ag-plot tile to the nearest safe
+                    // reachable-from-home tile. Achieves the observable
+                    // "no founder on stamped tile" invariant without the
+                    // full OnEnter reorder.
+                    settlement_bootstrap::relocate_stranded_members_system
+                        .after(construction::seed_starting_buildings_system)
+                        .after(clear_obstacle::clear_obstacles_under_seeded_structures)
+                        .after(seed_reservation::populate_seed_reservation_system)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     // Flip the warmup gate now that the initial survey +
                     // seed have applied. Future systems can opt in via
                     // `.run_if(in_state(SimulationState::Active))`.
                     mark_warmup_complete_system
                         .after(clear_obstacle::clear_obstacles_under_seeded_structures)
                         .after(farm::seed_starting_farms_system)
+                        .after(seed_reservation::populate_seed_reservation_system)
+                        .after(settlement_bootstrap::seed_starting_relationships_system)
+                        .after(settlement_bootstrap::relocate_stranded_members_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                 ),
             )
