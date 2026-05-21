@@ -502,6 +502,20 @@ pub enum Task {
         plot_entity: bevy::prelude::Entity,
         animal: Option<bevy::prelude::Entity>,
     },
+    /// Animal Husbandry v2.1: a worker drives a draft-animal-hitched `Cart`
+    /// to ferry bulk `resource_id` from faction storage into a construction
+    /// `blueprint`'s deposit slots. Re-dispatched per phase by
+    /// `cart::htn_cart_haul_dispatch_system`: when the cart is empty the
+    /// worker is routed to the source storage tile (load phase); when the
+    /// cart is loaded the worker is routed to the blueprint (deliver phase).
+    /// Executor `cart::cart_haul_task_system` releases the `AnimalWorkClaim`
+    /// and parks the cart once the haul completes.
+    CartHaul {
+        cart: bevy::prelude::Entity,
+        animal: bevy::prelude::Entity,
+        blueprint: bevy::prelude::Entity,
+        resource_id: ResourceId,
+    },
 }
 
 /// Source for a `Task::Drink`. Inventory drinks consume one `clean_water`
@@ -843,6 +857,7 @@ pub fn task_kind_for(task: Task) -> u16 {
         Task::MilitaryAttack { .. } => TK::MilitaryAttack,
         Task::PrepareField { .. } => TK::PrepareField,
         Task::Plow { .. } => TK::Plow,
+        Task::CartHaul { .. } => TK::CartHaul,
     };
     kind as u16
 }
@@ -1243,6 +1258,27 @@ impl Task {
                 plot_entity,
                 animal,
             } => Some((plot_entity, animal)),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the CartHaul variant. Returns
+    /// `(cart, animal, blueprint, resource_id)`.
+    pub fn as_cart_haul(
+        &self,
+    ) -> Option<(
+        bevy::prelude::Entity,
+        bevy::prelude::Entity,
+        bevy::prelude::Entity,
+        ResourceId,
+    )> {
+        match *self {
+            Task::CartHaul {
+                cart,
+                animal,
+                blueprint,
+                resource_id,
+            } => Some((cart, animal, blueprint, resource_id)),
             _ => None,
         }
     }

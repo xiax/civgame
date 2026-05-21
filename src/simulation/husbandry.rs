@@ -68,11 +68,29 @@ pub struct FeedTrough {
     pub capacity_g: u32,
 }
 
-/// Hitching post (v2 cart/plow placeholder).
+/// Hitching post — a parking + tethering spot for draft animals, carts,
+/// and plows. `cart::cart_assembly_system` parks freshly-assembled carts
+/// here; `cart::htn_cart_haul_dispatch_system` reads `parked_cart` to find
+/// an idle cart and `cart_haul_task_system` re-parks on completion.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct HitchingPost {
     pub faction_id: u32,
     pub tile: (i32, i32),
+    /// The `Cart` entity currently parked here, if any.
+    pub parked_cart: Option<Entity>,
+    /// Worker that has reserved this post for a hitch/unhitch operation.
+    pub reserved_by: Option<Entity>,
+}
+
+impl HitchingPost {
+    pub fn new(faction_id: u32, tile: (i32, i32)) -> Self {
+        HitchingPost {
+            faction_id,
+            tile,
+            parked_cart: None,
+            reserved_by: None,
+        }
+    }
 }
 
 /// Tile-indexed map of pens. Mirrors `BedMap` / `GranaryMap` pattern.

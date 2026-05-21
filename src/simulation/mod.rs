@@ -18,6 +18,7 @@ pub mod corpse;
 pub mod crafting;
 pub mod dig;
 pub mod doormat;
+pub mod cart;
 pub mod draftwork;
 pub mod drink;
 pub mod faction;
@@ -84,6 +85,7 @@ pub mod test_fixture;
 pub mod trader;
 pub mod typed_task;
 pub mod utility_curves;
+pub mod well;
 pub mod wild_herd;
 pub mod world_sim;
 
@@ -233,6 +235,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::RitualState::default())
             .insert_resource(terraform::TerraformMap::default())
             .insert_resource(terraform::PendingFootprints::default())
+            .insert_resource(well::WellSiteMap::default())
             .insert_resource(settlement::SettlementPlans::default())
             .insert_resource(settlement::SettlementMap::default())
             .insert_resource(organic_settlement::SettlementBrains::default())
@@ -722,7 +725,10 @@ impl Plugin for SimulationPlugin {
             // gate sees populated pending_clear on the same tick.
             .add_systems(
                 FixedUpdate,
-                obstacle::populate_pending_clear_system
+                (
+                    obstacle::populate_pending_clear_system,
+                    well::convert_well_blueprint_system,
+                )
                     .before(construction::construction_system)
                     .in_set(SimulationSet::Sequential),
             )
@@ -843,9 +849,13 @@ impl Plugin for SimulationPlugin {
                     dig::dig_system.after(gather::gather_system),
                     terraform::terraform_system.after(gather::gather_system),
                     terraform::footprint_completion_system.after(terraform::terraform_system),
-                    construction::construction_system
-                        .after(gather::gather_system)
-                        .after(terraform::footprint_completion_system),
+                    (
+                        construction::construction_system
+                            .after(gather::gather_system)
+                            .after(terraform::footprint_completion_system),
+                        well::well_site_progression_system
+                            .after(construction::construction_system),
+                    ),
                     construction::deconstruct_system.after(construction::construction_system),
                     construction::road_carve_system.after(construction::construction_system),
                     construction::door_proximity_system.after(construction::construction_system),
@@ -1098,6 +1108,31 @@ impl Plugin for SimulationPlugin {
                 // pass. Reads `JobClaim::Plow`, picks the next un-plowed
                 // tile, dispatches `Task::Plow`.
                 (draftwork::htn_plow_dispatch_system,).in_set(SimulationSet::ParallelB),
+            )
+            // Animal Husbandry v2.1: cart pipeline. Dispatcher (ParallelB)
+            // re-fires per haul phase; executor (Sequential) loads / delivers;
+            // cart-follow snaps the cart transform to the hauler after
+            // movement; assembly runs daily in Economy.
+            .add_systems(
+                FixedUpdate,
+                // Runs before the hand-haul dispatcher so a bulky Haul claim
+                // is routed through a cart when one is available; the
+                // hand-haul dispatcher then skips the now-busy worker.
+                (cart::htn_cart_haul_dispatch_system
+                    .before(htn::htn_acquire_good_dispatch_system),)
+                    .in_set(SimulationSet::ParallelB),
+            )
+            .add_systems(
+                FixedUpdate,
+                (
+                    cart::cart_haul_task_system,
+                    cart::cart_follow_system.after(movement::movement_system),
+                )
+                    .in_set(SimulationSet::Sequential),
+            )
+            .add_systems(
+                FixedUpdate,
+                (cart::cart_assembly_system,).in_set(SimulationSet::Economy),
             )
             // Phase 4 (sanitation): emit pass writes `WastePile` intensity
             // into `SanitationMap`; decay pass exponentially shrinks every

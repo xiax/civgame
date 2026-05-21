@@ -40,7 +40,8 @@ use crate::simulation::typed_task::{ActionQueue, DrinkSource, Task};
 use crate::world::biome::water_kind_at;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::globe::Globe;
-use crate::world::terrain::{GLOBE_H_TO_Z, TILE_SIZE};
+use crate::world::terrain::TILE_SIZE;
+use crate::world::water_runtime::RuntimeWater;
 use crate::world::tile::TileKind;
 
 /// Game-ticks an agent stays in `Working` before the drink completes.
@@ -72,7 +73,7 @@ pub fn perform_drink(
     agent_tile: (i32, i32),
     chunk_map: &ChunkMap,
     well_map: &WellMap,
-    globe: &Globe,
+    runtime_water: &mut RuntimeWater,
 ) -> DrinkOutcome {
     match source {
         DrinkSource::Inventory => {
@@ -122,11 +123,17 @@ pub fn perform_drink(
             {
                 return DrinkOutcome::SourceGone;
             }
-            // The shaft must still reach the water table. A well over a
-            // deep/arid aquifer reads dry — graceful fail, the agent
-            // re-plans (and the dispatcher already prefers wet wells).
-            if !well_has_water(globe, chunk_map, tile) {
+            // The shaft must currently hold water. A well drawn down faster
+            // than the aquifer seep recharges it reads dry — graceful fail,
+            // the agent re-plans (the dispatcher already prefers wet wells).
+            if !well_has_water(runtime_water, tile) {
                 return DrinkOutcome::WellDry;
+            }
+            // Draw the physical column down by one sip. The cell is left in
+            // place (depth clamped at 0) so its seep source keeps recharging.
+            if let Some(cell) = runtime_water.cells.get_mut(&tile) {
+                cell.depth =
+                    (cell.depth - crate::simulation::well::WELL_SIP_DRAWDOWN_Z).max(0.0);
             }
             // Well water is treated as clean; `SanitationMap` may still
             // mark it contaminated, handled by the caller.
@@ -145,10 +152,11 @@ pub enum DrinkOutcome {
     Drank { raw: bool },
     /// Source resource / tile no longer valid; caller should `aq.cancel()`.
     SourceGone,
-    /// The well's shaft doesn't reach the water table (arid / deep aquifer).
+    /// The well's shaft column is below the drinkable depth — drawn down
+    /// faster than the aquifer seep recharges it, or a seasonal table drop.
     /// Graceful: caller cancels the chain (no thirst reduction) so the agent
     /// re-plans to another source next dispatch — same handling as
-    /// `SourceGone`, but distinct for clarity/telemetry.
+    /// `SourceGone`, but distinct for clarity/telemetry. The shaft refills.
     WellDry,
 }
 
@@ -209,7 +217,7 @@ pub fn drink_task_system(
     chunk_map: Res<ChunkMap>,
     sanitation: Res<crate::simulation::sanitation::SanitationMap>,
     well_map: Res<WellMap>,
-    globe: Res<Globe>,
+    mut runtime_water: ResMut<crate::world::water_runtime::RuntimeWater>,
     mut commands: Commands,
     mut query: Query<(
         Entity,
@@ -279,7 +287,7 @@ pub fn drink_task_system(
                 agent_tile,
                 &chunk_map,
                 &well_map,
-                &globe,
+                &mut runtime_water,
             ) {
                 DrinkOutcome::Drank { raw } => {
                     sips += 1;
@@ -343,6 +351,7 @@ pub fn htn_drink_dispatch_system(
     chunk_connectivity: Res<ChunkConnectivity>,
     globe: Res<Globe>,
     well_map: Res<WellMap>,
+    runtime_water: Res<crate::world::water_runtime::RuntimeWater>,
     faction_registry: Res<FactionRegistry>,
     mut query: Query<
         (
@@ -414,12 +423,12 @@ pub fn htn_drink_dispatch_system(
             };
 
             let local_well =
-                nearest_well_tile(&well_map, &globe, &chunk_map, (cur_tx, cur_ty), scan).map(
-                    |tile| DrinkCandidate {
+                nearest_well_tile(&well_map, &runtime_water, (cur_tx, cur_ty), scan).map(|tile| {
+                    DrinkCandidate {
                         source: DrinkSource::Well { tile },
                         target_tile: tile,
-                    },
-                );
+                    }
+                });
             let local_water =
                 nearest_fresh_drinkable_tile(&chunk_map, &globe, (cur_tx, cur_ty), scan).map(
                     |tile| DrinkCandidate {
@@ -435,7 +444,7 @@ pub fn htn_drink_dispatch_system(
                 DRINK_HOME_SCAN_RADIUS
             };
             let home_well = home_anchor
-                .and_then(|home| nearest_well_tile(&well_map, &globe, &chunk_map, home, home_scan))
+                .and_then(|home| nearest_well_tile(&well_map, &runtime_water, home, home_scan))
                 .map(|tile| DrinkCandidate {
                     source: DrinkSource::Well { tile },
                     target_tile: tile,
@@ -487,52 +496,34 @@ fn drink_home_anchor(faction_registry: &FactionRegistry, faction_id: u32) -> Opt
     }
 }
 
-/// A hand-dug well reaches this many Z-levels below the terrain surface
-/// (≈6 m at 1.5 m/tile). The well yields water only when the local water
-/// table (`HydroCell.aquifer_level`) sits within the dug shaft — a real
-/// physical-reachability condition, not an arbitrary gate.
-const WELL_REACH_Z: f32 = 4.0;
-
-/// True iff a well at `tile` reaches the water table: the per-cell aquifer
-/// surface is at or above the well-shaft bottom (`surface_z − WELL_REACH_Z`).
-/// The aquifer Z is computed in the same frame as `surface_z` — anchor on the
-/// per-cell macro elevation (jitter-free), subtract `aquifer_depth_z` — so the
-/// shaft-vs-table comparison is apples-to-apples (matches Pass 4.5 + fluid
-/// sim seep gate). Over a deep/arid table the well reads dry. Falls back to
-/// "has water" when the chunk/hydrology isn't resolvable.
-pub fn well_has_water(globe: &Globe, chunk_map: &ChunkMap, tile: (i32, i32)) -> bool {
-    let surf = chunk_map.surface_z_at(tile.0, tile.1);
-    if surf < crate::world::chunk::Z_MIN {
-        return true; // chunk not loaded — defer to other drink methods
-    }
-    let Some(hc) = globe.hydro_cell_at(tile.0, tile.1) else {
-        return true;
-    };
-    let (elev_u, _, _) = globe.sample_climate(tile.0, tile.1);
-    let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
-    let cell_surface_z =
-        crate::world::chunk::Z_MIN as f32 + macro_f * crate::world::chunk::CHUNK_HEIGHT as f32;
-    let aquifer_depth_z = (hc.filled_height - hc.aquifer_level) * GLOBE_H_TO_Z;
-    let aquifer_z = cell_surface_z - aquifer_depth_z;
-    well_reaches(surf, aquifer_z)
+/// Live water-column depth in a well's shaft, read from the physical
+/// `RuntimeWater` cell at the central shaft tile (the `WellMap` key). `0.0`
+/// when the shaft holds no water — drawn down faster than the aquifer seep
+/// recharges it, or a seasonal table drop. A physically-excavated well
+/// reached the table at construction time, so there is no virtual reach
+/// gate any more: the only runtime question is how much water is in the hole.
+pub fn well_water_column(runtime_water: &RuntimeWater, shaft_tile: (i32, i32)) -> f32 {
+    runtime_water
+        .cells
+        .get(&shaft_tile)
+        .map(|c| c.depth)
+        .unwrap_or(0.0)
 }
 
-/// Pure shaft-vs-watertable test: the well bottom is `WELL_REACH_Z` below
-/// the surface; it yields water iff the aquifer surface is at or above it.
-#[inline]
-pub fn well_reaches(surface_z: i32, aquifer_z: f32) -> bool {
-    aquifer_z >= surface_z as f32 - WELL_REACH_Z
+/// True iff a well's shaft currently holds enough water to drink from.
+pub fn well_has_water(runtime_water: &RuntimeWater, shaft_tile: (i32, i32)) -> bool {
+    well_water_column(runtime_water, shaft_tile)
+        >= crate::simulation::well::WELL_MIN_DRINKABLE_DEPTH
 }
 
-/// Chebyshev-nearest **water-bearing** well tile within `max_radius`. Dry
-/// wells (aquifer below the shaft) are skipped so agents don't fixate on a
-/// well that can't quench them — they fall through to the river method, and
-/// a settlement whose wells are all dry reads as "fresh water far",
-/// which already drives `SettlementPressureKind::WaterAccess`.
+/// Chebyshev-nearest **water-bearing** well tile within `max_radius`. Wells
+/// whose shaft column is empty are skipped so agents don't fixate on a dry
+/// well — they fall through to the river method, and a settlement whose wells
+/// are all dry reads as "fresh water far", which drives
+/// `SettlementPressureKind::WaterAccess`.
 fn nearest_well_tile(
     well_map: &WellMap,
-    globe: &Globe,
-    chunk_map: &ChunkMap,
+    runtime_water: &RuntimeWater,
     from: (i32, i32),
     max_radius: i32,
 ) -> Option<(i32, i32)> {
@@ -544,7 +535,7 @@ fn nearest_well_tile(
         if d > max_radius {
             continue;
         }
-        if !well_has_water(globe, chunk_map, well_tile) {
+        if !well_has_water(runtime_water, well_tile) {
             continue;
         }
         if best.map(|(_, bd)| d < bd).unwrap_or(true) {
@@ -559,14 +550,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn well_reaches_water_table_within_shaft() {
-        // Surface Z 10, shaft bottom = 10 - 4 = 6.
-        assert!(well_reaches(10, 8.0), "high water table → wet well");
-        assert!(well_reaches(10, 6.0), "table exactly at shaft bottom → wet");
-        assert!(!well_reaches(10, 5.0), "table below shaft → dry well");
-        // Arid: deep negative water table is unreachable.
-        assert!(!well_reaches(0, -10.0), "deep arid aquifer → dry");
-        assert!(well_reaches(0, 0.0), "table at surface → wet");
+    fn well_water_column_reads_the_physical_shaft() {
+        use crate::world::water_runtime::{RuntimeWater, RuntimeWaterCell};
+        let mut rw = RuntimeWater::default();
+        let shaft = (4, 7);
+        // No cell → dry.
+        assert_eq!(well_water_column(&rw, shaft), 0.0);
+        assert!(!well_has_water(&rw, shaft));
+        // A charged shaft is drinkable.
+        rw.set(
+            shaft,
+            RuntimeWaterCell {
+                ground_z: 2,
+                depth: 1.5,
+                reservoir_id: u32::MAX,
+                salinity: 0.0,
+                source_rate: 0.0,
+            },
+        );
+        assert!(well_has_water(&rw, shaft));
+        // A barely-wet shaft below the drinkable floor reads dry.
+        rw.cells.get_mut(&shaft).unwrap().depth = 0.1;
+        assert!(!well_has_water(&rw, shaft));
     }
 
     #[test]

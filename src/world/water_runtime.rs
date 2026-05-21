@@ -200,7 +200,7 @@ const INLET_BASE_RATE: f32 = 0.035;
 /// rock above the water table. `WATER_SUBSTEPS · this ≪ 1` keeps the
 /// per-task overshoot negligible (re-clamped every snapshot) — no `water.rs`
 /// core change, so the conservation/determinism tests stand.
-const AQUIFER_SEEP_RATE: f32 = 0.004;
+pub const AQUIFER_SEEP_RATE: f32 = 0.004;
 /// Wet/dry passability hysteresis (deadband) so a cell hovering near the
 /// threshold doesn't flip kind — and spam pathfinding — every cadence.
 const WET_ON: f32 = 0.5;

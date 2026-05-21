@@ -21,6 +21,10 @@ pub struct SitesHoverParams<'w, 's> {
     pub structure_index: Res<'w, StructureIndex>,
     pub structure_label_q: Query<'w, 's, &'static StructureLabel>,
     pub deployable_q: Query<'w, 's, &'static crate::simulation::pack_deploy::Deployable>,
+    pub well_q: Query<'w, 's, &'static crate::simulation::construction::Well>,
+    pub well_site_map: Res<'w, crate::simulation::well::WellSiteMap>,
+    pub well_site_q: Query<'w, 's, &'static crate::simulation::well::WellSite>,
+    pub runtime_water: Res<'w, crate::world::water_runtime::RuntimeWater>,
 }
 use crate::simulation::faction::FactionMember;
 use crate::simulation::items::GroundItem;
@@ -253,6 +257,27 @@ pub fn hover_info_system(
                 if let Ok(label) = sites.structure_label_q.get(structure_entity) {
                     ui.separator();
                     ui.label(egui::RichText::new(label.0).strong());
+                    // Physically-excavated well: shaft depth + live water column.
+                    if let Ok(well) = sites.well_q.get(structure_entity) {
+                        ui.label(format!(
+                            "Shaft depth: {} Z",
+                            (surf_z - well.bottom_z as i32).max(0)
+                        ));
+                        let col = crate::simulation::drink::well_water_column(
+                            &sites.runtime_water,
+                            well.shaft_tile,
+                        );
+                        ui.label(format!("Water column: {:.2} Z", col));
+                        if let Some(c) = sites.runtime_water.cells.get(&well.shaft_tile) {
+                            if c.source_rate > 0.0 {
+                                ui.label(
+                                    egui::RichText::new("recharging from aquifer")
+                                        .small()
+                                        .weak(),
+                                );
+                            }
+                        }
+                    }
                     // Surface nomadic-shelter pack/refund semantics on
                     // hover so the player knows what migrating will cost
                     // them. Bedrolls + Yurts pack into inventory; Tents
@@ -279,6 +304,21 @@ pub fn hover_info_system(
                             );
                         }
                     }
+                }
+            }
+
+            // In-progress well (staged excavation → lining → capping).
+            if let Some(&site_entity) = sites.well_site_map.0.get(&(tx as i32, ty as i32)) {
+                if let Ok(site) = sites.well_site_q.get(site_entity) {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Well (under construction)").strong());
+                    let phase = match site.phase {
+                        crate::simulation::well::WellPhase::Excavating => "Excavating shaft",
+                        crate::simulation::well::WellPhase::Lining => "Lining rim walls",
+                        crate::simulation::well::WellPhase::Capping => "Capping wellhead",
+                    };
+                    ui.label(format!("Phase: {}", phase));
+                    ui.label(format!("Planned depth: {} Z", site.depth));
                 }
             }
 

@@ -514,6 +514,25 @@ const BUILDING_WELL: &[&str] = &[
     "XKKkkKkKkKkkKkKk",
     "XSSSSSSSSSSSSSSS",
 ];
+// Animal Husbandry v2.1: side-view draft cart — wooden bed on two wheels.
+const ENTITY_CART: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "....tttttt......",
+    "...tBBBBBBt.....",
+    "...tBbbbbBt.....",
+    "...tBBBBBBt.....",
+    "...DDDDDDDD.....",
+    "...D......D.....",
+    "..XkX....XkX....",
+    ".XkkkX..XkkkX...",
+    ".XkKkX..XkKkX...",
+    ".XkkkX..XkkkX...",
+    "..XkX....XkX....",
+    "................",
+    "................",
+];
 const BUILDING_WATCHTOWER: &[&str] = &[
     "......XXXXXX....",
     ".....XrRrRrRX...",
@@ -5241,6 +5260,7 @@ pub fn setup_sprite_library(mut commands: Commands, mut images: ResMut<Assets<Im
     add!("building_blacksmith", BUILDING_BLACKSMITH);
     add!("building_market", BUILDING_MARKET);
     add!("building_well", BUILDING_WELL);
+    add!("entity_cart", ENTITY_CART);
     add!("building_watchtower", BUILDING_WATCHTOWER);
     add!("building_wall_stone", BUILDING_WALL_STONE);
     add!("building_gate", BUILDING_GATE);

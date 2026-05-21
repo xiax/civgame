@@ -114,6 +114,7 @@ impl Plugin for RenderingPlugin {
                     entity_sprites::spawn_workbench_sprites,
                     entity_sprites::spawn_loom_sprites,
                     entity_sprites::spawn_well_sprites,
+                    entity_sprites::spawn_cart_sprites,
                     entity_sprites::spawn_blueprint_sprites,
                 ),
             )

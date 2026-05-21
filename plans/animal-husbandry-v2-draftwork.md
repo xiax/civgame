@@ -298,15 +298,32 @@ Plow half end-to-end via the standard `JobBoard` + `JobClaim` + `record_progress
 - **`crafting::tests::craft_recipe_inputs_resolve_to_known_resources`** bumped to 15 recipes + asserts the Ard Plow shape.
 - **887/887 tests pass.**
 
-### Deferred to v2.1+ — what's left
+### v2.1 — cart half shipped (2026-05-20)
 
-- **Carts.** Full cart entity + composable parts + assembly + `cart_haul_task_system` + faction storage rollup + sprites. Architecture section B/C/E (CartHaul) / F / H / I unimplemented. This is the bulk of v2.1.
-- **`HitchingPost` field extensions** (`reserved_by`, `parked_cart`, `parked_plow`). Still an inert marker; plow dispatcher claims the ox directly. Cart parking needs the slots.
-- **`Hitch`/`UnhitchAndPark` tasks.** No animation pair; the plow executor claims and releases the ox directly. Cart hitch/unhitch flow needs them.
-- **Adaptive plow routing (`decide_plow_route`).** Always-separate (Plow + Farm postings are independent) — never inline. Inline (plow+plant in one chain) is a v2.1 nice-to-have.
-- **Plow durability / repair.** Plow is permanent in v2.0. Adding decay + a `Repair` task is a v2.1 follow-up.
-- **`plant_in_plowed_plot_carries_tilled_marker` / `harvest_tilled_grain_yields_1_4x` fixture tests.** Code paths are exercised end-to-end at runtime; the math is pinned by unit tests; behavioural fixtures for these specific harvest yields wait for the cart pass.
-- **Stables-intent fix** (the v1 flagged potential bug about Stable blueprints requiring an existing horse). Untouched.
+Cart half end-to-end via the standard `JobBoard` + `JobClaim` (`JobKind::Haul`) pipeline — mirrors how v2.0 shipped the plow. New module `src/simulation/cart.rs`.
+
+- **Cart-part resources** (`assets/data/resources/core.ron` + `core_ids`): `cart_frame_small`, `cart_frame_medium`, `cart_wheel_wood`, `cart_wheel_ironrim` — `material` class, `two_hand` bulk, `draftwork`/`cart_part` tags.
+- **Crafting recipes 15-18** (`crafting.rs`): Cart Wheel (Wood) `ANIMAL_HUSBANDRY`, Cart Wheel (Iron-Rimmed) `BRONZE_CASTING` (3 wood + 1 tools + 1 iron), Cart Frame (Small) `ANIMAL_HUSBANDRY`, Cart Frame (Medium) `OX_CART`. Recipe-count test bumped 15→19.
+- **`Cart` + `CartInventory` + `CartSize` + `CartVisual`** components; `derive_cart_stats(frame, wheels) → (CartSize, capacity_g, durability)`. Handcart 50 kg / OxCart 200 kg base; wooden wheels −10% drag (`9/10`), iron-rimmed none. Composable parts are stored as frame/wheel `ResourceId` data on the `Cart` (not separate child entities — a simplification; `derive_cart_stats` still composes them).
+- **`cart_assembly_system`** (Economy daily): one cart per qualifying settled faction (`ANIMAL_HUSBANDRY` + free `HitchingPost` + no cart). Prefers a pre-crafted `1 frame + 2 wheels` from storage, else raw-timber fallback (Handcart 15 wood + 2 tools / OxCart 30 wood + 4 tools). OxCart frame at `OX_CART`; iron wheels at `BRONZE_CASTING` + iron stock.
+- **`htn_cart_haul_dispatch_system`** (ParallelB): routes `JobClaim::Haul` holders through a cart when the posting needs ≥ `CART_HAUL_MIN_REMAINING = 12` units. Resumes the worker's in-flight cart or hitches a fresh parked cart + trained Cattle/Horse (`AnimalWorkClaim { use_kind: Cart }`). Phase keyed on `CartInventory`: empty → route to storage tile (load); loaded → route to blueprint (deliver). Per-pass animal-claim dedupe set.
+- **`cart_haul_task_system`** (Sequential): load phase fills the cart from `ai.dest_tile` storage capped at `min(blueprint need, capacity_units)`; deliver phase deposits into `bp.deposits`, credits `record_progress_filtered(JobKind::Haul, …)`, decrements durability, and on completion releases the animal claim + re-parks the cart + drops the `JobClaim`. Storage-empty / vanished-blueprint abort cleanly.
+- **`cart_follow_system`** (Sequential after movement) snaps a hitched cart's `Transform` behind its hauler.
+- **`HitchingPost`** extended with `parked_cart` / `reserved_by` (was an inert marker); `HitchingPost::new` constructor; construction spawn site updated.
+- **Faction storage rollup** — fourth pass in `compute_faction_storage_system` folds every `CartInventory` into settled-faction `storage.totals` (conservation-correct across in-flight hauls).
+- **`Task::CartHaul` + `TaskKind::CartHaul = 54`** + `as_cart_haul()` + `task_kind_for` / label / `task_is_labor` / `task_interacts_from_adjacent` arms; `(AgentGoal::Haul, CartHaul)` preserve-arm.
+- **Cart sprite** — `entity_cart` (16×16 side-view cart) in `sprite_library.rs`; `entity_sprites::spawn_cart_sprites` reactive attach; registered in `rendering/mod.rs`.
+- **`Hitch`/`UnhitchAndPark` folded into the `CartHaul` executor** (no separate animation tasks — same precedent as the v2.0 plow's direct ox claim/release).
+- **Tests** — `cart::tests` (5 unit: capacity composition, iron-vs-wood wheels, size classification, capacity units, inventory roundtrip); `test_fixture::smoke::{cart_assembly_builds_cart_from_storage_timber, cart_haul_executor_loads_then_delivers_and_credits_posting}`. **905/905 tests pass.**
+- `src/simulation/CLAUDE.md` updated ("Animal husbandry v2.1 — carts").
+
+### Still deferred (v2.1+)
+
+- **4-wheel Wagon size** + **cart repair task** (durability decrements but never blocks).
+- **Adaptive plow routing (`decide_plow_route`)** — plow + plant stay two separate postings; inline plow+plant is unimplemented.
+- **`plant_in_plowed_plot_carries_tilled_marker` / `harvest_tilled_grain_yields_1_4x` fixture tests** — math pinned by unit tests; behavioural harvest-yield fixtures still unwritten.
+- **Stables-intent fix** (v1-flagged Stable-blueprint-needs-horse bug) — untouched.
+- **Player-direct hitch/unhitch UI command.**
 
 ### Known follow-up gotchas
 

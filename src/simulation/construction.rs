@@ -128,12 +128,18 @@ pub struct DamMap(pub AHashMap<(i32, i32), Entity>);
 #[derive(Resource, Default)]
 pub struct WellMap(pub AHashMap<(i32, i32), Entity>);
 
-/// Lined public well. Drinks fire from a chebyshev-adjacent tile via
-/// `DrinkSource::Well`. No tile rewrite — sits on whatever surface was
-/// underneath.
+/// A finished physically-excavated well. The `WellMap` key is the central
+/// shaft tile; drinks fire from a chebyshev-adjacent rim tile via
+/// `DrinkSource::Well`. Water availability is the live `RuntimeWater` column
+/// at `shaft_tile` — no virtual reach gate. See `simulation::well`.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct Well {
     pub faction_id: u32,
+    /// Central shaft tile — also the `WellMap` key and the `RuntimeWater`
+    /// water-column tile the drink path reads.
+    pub shaft_tile: (i32, i32),
+    /// Z of the carved shaft sump (one below the water table).
+    pub bottom_z: i8,
 }
 
 /// Constructed timber span. The tile slot is mutated to `TileKind::Bridge`
@@ -6771,10 +6777,16 @@ pub fn construction_system(
                     dam_entity
                 }
                 BuildSiteKind::Well => {
+                    // Wells are normally converted to a staged `WellSite` by
+                    // `well::convert_well_blueprint_system` before they reach
+                    // finalize; this arm is a degenerate fallback (flat well,
+                    // shaft == surface).
                     let well_entity = commands
                         .spawn((
                             Well {
                                 faction_id: bp.faction_id,
+                                shaft_tile: tile,
+                                bottom_z: bp.target_z,
                             },
                             StructureLabel(BuildSiteKind::Well.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
@@ -6837,10 +6849,10 @@ pub fn construction_system(
                     .id(),
                 BuildSiteKind::HitchingPost => commands
                     .spawn((
-                        crate::simulation::husbandry::HitchingPost {
-                            faction_id: bp.faction_id,
+                        crate::simulation::husbandry::HitchingPost::new(
+                            bp.faction_id,
                             tile,
-                        },
+                        ),
                         StructureLabel(BuildSiteKind::HitchingPost.label()),
                         Transform::from_xyz(world_pos.x, world_pos.y, 0.2),
                         GlobalTransform::default(),
@@ -7968,9 +7980,29 @@ fn spawn_seeded_structure_at_tile(
             maps.monument_map.0.insert(tile, e);
         }
         BuildSiteKind::Well => {
+            // Seed wells are pre-existing infrastructure — skip the multi-phase
+            // worker pipeline and stamp a finished, water-bearing well: charge
+            // the physical `RuntimeWater` column so the well is drinkable from
+            // tick 0. The descent shaft is not carved (a seed simplification).
+            let surf = _chunk_map.surface_z_at(tile.0, tile.1).clamp(-16, 15) as i8;
+            let bottom_z = (surf as i32 - 3).clamp(-16, 15) as i8;
+            maps.runtime_water.set(
+                tile,
+                crate::world::water_runtime::RuntimeWaterCell {
+                    ground_z: bottom_z,
+                    depth: 2.0,
+                    reservoir_id: u32::MAX,
+                    salinity: 0.0,
+                    source_rate: crate::world::water_runtime::AQUIFER_SEEP_RATE,
+                },
+            );
             let e = commands
                 .spawn((
-                    Well { faction_id },
+                    Well {
+                        faction_id,
+                        shaft_tile: tile,
+                        bottom_z,
+                    },
                     StructureLabel(BuildSiteKind::Well.label()),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                     GlobalTransform::default(),

@@ -113,13 +113,15 @@ restores natural kind on true drain, emits `TileChangedEvent` **only on wet/dry 
 **Salinity + wells (`biome.rs`/`drink.rs`).** `WaterKind::{Fresh,Brackish,Salt}`; `water_kind_at`
 (signature byte-identical) reads `Globe::salinity_at` via pure `classify_salinity` (Endorheic
 brackish, ocean salt, rivers/open lakes fresh; River/Marsh always Fresh). `WaterKind::is_drinkable()`
-(Fresh-only) is the single salt/brackish rejection rule (drink + animal water-seek). Aquifer wells:
-`well_has_water`/`well_reaches` — a well yields only when the per-cell aquifer surface (computed
-in the same shared `cell_surface_z − aquifer_depth_z` frame as Pass 4.5 + the fluid sim seep
-gate) is within the `WELL_REACH_Z=4` shaft below `surface_z`. With the recalibrated depth
-(`~0.5 Z` wet to `~12 Z` arid) the 4 Z shaft only reaches the table in moist climates; arid wells
-go genuinely dry → `DrinkOutcome::WellDry`. Dry wells skipped by
-`nearest_well_tile`, graceful `DrinkOutcome::WellDry`. Settlement/nomad/herd scoring rides
+(Fresh-only) is the single salt/brackish rejection rule (drink + animal water-seek). Physically-
+excavated wells (`simulation::well`): the old virtual `WELL_REACH_Z` gate is **gone**. A well is a
+dug 5×5 stepwell whose central shaft is carved to one Z below the per-cell water table
+(`well::aquifer_z_at`, the same `cell_surface_z − aquifer_depth_z` frame as Pass 4.5 + the fluid sim
+seep gate); `well_spec_at` rejects sites whose table is beyond the `MAX_HAND_DUG_WELL_DEPTH_Z=8`
+shaft cap. The shaft holds a physical `RuntimeWater` column — charged on dig completion, recharged
+by the existing `AQUIFER_SEEP_RATE` source, drawn down per drink sip; `well_has_water` reads that
+column, not a reach gate. A drained shaft → graceful `DrinkOutcome::WellDry`, skipped by
+`nearest_well_tile`, refills from seep. Settlement/nomad/herd scoring rides
 `TileKind::is_freshwater()` / `river_distance_at` (unchanged; `Dam`=false, `Bridge`=true) — they do
 not read salinity, so no constant re-tune was needed (diagnosed, not assumed). Pathfinding is
 unchanged (rides `TileChangedEvent`).

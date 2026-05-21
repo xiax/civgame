@@ -5747,6 +5747,289 @@ mod smoke {
         let _ = TaskKind::Plow;
     }
 
+    /// Animal Husbandry v2.1: `cart_assembly_system` gives a qualifying
+    /// faction (ANIMAL_HUSBANDRY tech + a free HitchingPost + timber in
+    /// storage) exactly one parked `Cart`.
+    #[test]
+    fn cart_assembly_builds_cart_from_storage_timber() {
+        use crate::economy::core_ids;
+        use crate::simulation::cart::Cart;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::husbandry::HitchingPost;
+        use crate::simulation::schedule::SimClock;
+        use crate::simulation::technology::ANIMAL_HUSBANDRY;
+        use crate::world::seasons::TICKS_PER_DAY;
+
+        let mut sim = TestSim::new(0xCA27A);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        sim.spawn_storage_tile(fid, (0, 0));
+        sim.spawn_ground_item((0, 0), core_ids::wood(), 40);
+        sim.spawn_ground_item((0, 0), core_ids::tools(), 6);
+
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(fid);
+            let f = registry.factions.get_mut(&fid).unwrap();
+            f.techs.unlock(ANIMAL_HUSBANDRY);
+        }
+        sim.app
+            .world_mut()
+            .spawn(HitchingPost::new(fid, (2, 0)));
+
+        // Tick so the SpatialIndex registers the storage ground items, then
+        // park the clock on a daily boundary and drive the assembly system.
+        sim.tick_n(10);
+        sim.app.world_mut().resource_mut::<SimClock>().tick =
+            TICKS_PER_DAY as u64;
+        let assembly_id = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::cart::cart_assembly_system);
+        sim.app.world_mut().run_system(assembly_id).unwrap();
+
+        let mut carts = sim.app.world_mut().query::<&Cart>();
+        let cart_count = carts
+            .iter(sim.app.world())
+            .filter(|c| c.owner_faction == fid)
+            .count();
+        assert_eq!(
+            cart_count, 1,
+            "cart_assembly_system must build exactly one cart for the faction"
+        );
+
+        // Running it again must NOT build a second cart (one-cart cap).
+        sim.app.world_mut().run_system(assembly_id).unwrap();
+        let mut carts2 = sim.app.world_mut().query::<&Cart>();
+        let cart_count2 = carts2
+            .iter(sim.app.world())
+            .filter(|c| c.owner_faction == fid)
+            .count();
+        assert_eq!(cart_count2, 1, "cart assembly is capped at one cart per faction");
+    }
+
+    /// Animal Husbandry v2.1: the cart-haul executor loads bulk material at a
+    /// storage tile (load phase) then deposits it into a blueprint and credits
+    /// the `JobKind::Haul` posting (deliver phase), releasing the animal claim
+    /// and dropping the worker's `JobClaim` on completion.
+    #[test]
+    fn cart_haul_executor_loads_then_delivers_and_credits_posting() {
+        use crate::economy::core_ids;
+        use crate::simulation::animals::{AnimalUse, AnimalWorkClaim, Tamed};
+        use crate::simulation::cart::{Cart, CartInventory, CartSize, CART_PHASE_WORK_TICKS};
+        use crate::simulation::construction::{
+            Blueprint, BuildSiteKind, GoodNeed, WallMaterial,
+        };
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::husbandry::HitchingPost;
+        use crate::simulation::jobs::{
+            HaulSource, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+            PosterClass,
+        };
+        use crate::simulation::person::{AiState, PersonAI};
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(0xCA27B);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let storage_tile = (0, 0);
+        sim.spawn_storage_tile(fid, storage_tile);
+        sim.spawn_ground_item(storage_tile, core_ids::stone(), 60);
+
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(fid);
+        }
+
+        // Blueprint that needs 30 stone.
+        let bp_tile = (10, 10);
+        let bp_world = tile_to_world(bp_tile.0, bp_tile.1);
+        let blueprint = sim
+            .app
+            .world_mut()
+            .spawn((
+                Blueprint::new(
+                    fid,
+                    None,
+                    BuildSiteKind::Wall(WallMaterial::Palisade),
+                    bp_tile,
+                    0,
+                ),
+                Transform::from_xyz(bp_world.x, bp_world.y, 0.5),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        {
+            let mut bp = sim.app.world_mut().get_mut::<Blueprint>(blueprint).unwrap();
+            bp.deposits[0] = GoodNeed {
+                resource_id: core_ids::stone(),
+                needed: 30,
+                deposited: 0,
+            };
+            bp.deposit_count = 1;
+        }
+
+        let worker = sim.spawn_person(fid, (0, 0), |b| {
+            b.goal(AgentGoal::Haul);
+        });
+        let animal = sim
+            .app
+            .world_mut()
+            .spawn((
+                Tamed { owner_faction: fid },
+                AnimalWorkClaim {
+                    worker,
+                    use_kind: AnimalUse::Cart,
+                    expires_tick: u32::MAX,
+                },
+            ))
+            .id();
+        let post = sim
+            .app
+            .world_mut()
+            .spawn(HitchingPost::new(fid, (3, 0)))
+            .id();
+        let cart = sim
+            .app
+            .world_mut()
+            .spawn((
+                Cart {
+                    size: CartSize::OxCart,
+                    frame: core_ids::cart_frame_medium(),
+                    wheels: core_ids::cart_wheel_wood(),
+                    capacity_g: 180_000,
+                    durability: 600,
+                    owner_faction: fid,
+                    hitched_to: Some(animal),
+                    hauler: Some(worker),
+                    parked_at: None,
+                },
+                CartInventory::default(),
+                Transform::from_xyz(0.0, 0.0, 0.25),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        let _ = post;
+
+        // Post the Haul job + attach the claim.
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id,
+                faction_id: fid,
+                kind: JobKind::Haul,
+                progress: JobProgress::Haul {
+                    blueprint,
+                    resource_id: core_ids::stone(),
+                    delivered: 0,
+                    target: 30,
+                    source: HaulSource::Storage,
+                },
+                claimants: vec![worker],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+            id
+        };
+        sim.app.world_mut().entity_mut(worker).insert(JobClaim {
+            job_id,
+            faction_id: fid,
+            kind: JobKind::Haul,
+            posted_tick: 0,
+            fail_count: 0,
+        });
+
+        // Populate the SpatialIndex so the load phase can see the storage
+        // tile's stone — drive the indexer once instead of ticking (which
+        // would also fire the dispatcher / movement and disturb the setup).
+        let index_id = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::movement::sync_indexed_after_move_system);
+        sim.app.world_mut().run_system(index_id).unwrap();
+
+        let executor_id = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::cart::cart_haul_task_system);
+
+        // ── Load phase ──────────────────────────────────────────────────
+        {
+            let world = sim.app.world_mut();
+            let mut ai = world.get_mut::<PersonAI>(worker).unwrap();
+            ai.state = AiState::Working;
+            ai.work_progress = CART_PHASE_WORK_TICKS as u8;
+            ai.dest_tile = storage_tile;
+            let mut aq = world.get_mut::<ActionQueue>(worker).unwrap();
+            aq.current = Task::CartHaul {
+                cart,
+                animal,
+                blueprint,
+                resource_id: core_ids::stone(),
+            };
+        }
+        sim.app.world_mut().run_system(executor_id).unwrap();
+        {
+            let inv = sim.app.world().get::<CartInventory>(cart).unwrap();
+            assert_eq!(
+                inv.qty_of(core_ids::stone()),
+                30,
+                "load phase must fill the cart with the blueprint's 30-stone need"
+            );
+        }
+
+        // ── Deliver phase ───────────────────────────────────────────────
+        {
+            let world = sim.app.world_mut();
+            let mut ai = world.get_mut::<PersonAI>(worker).unwrap();
+            ai.state = AiState::Working;
+            ai.work_progress = CART_PHASE_WORK_TICKS as u8;
+            ai.dest_tile = bp_tile;
+            let mut aq = world.get_mut::<ActionQueue>(worker).unwrap();
+            aq.current = Task::CartHaul {
+                cart,
+                animal,
+                blueprint,
+                resource_id: core_ids::stone(),
+            };
+        }
+        sim.app.world_mut().run_system(executor_id).unwrap();
+
+        let bp = sim.app.world().get::<Blueprint>(blueprint).unwrap();
+        assert_eq!(
+            bp.deposits[0].deposited, 30,
+            "deliver phase must deposit all 30 stone into the blueprint"
+        );
+        let board = sim.app.world().resource::<JobBoard>();
+        assert!(
+            board.faction_postings(fid).iter().all(|p| p.id != job_id),
+            "completed Haul posting must be removed from the board"
+        );
+        assert!(
+            sim.app.world().get::<JobClaim>(worker).is_none(),
+            "worker JobClaim released on cart-haul completion"
+        );
+        assert!(
+            sim.app.world().get::<AnimalWorkClaim>(animal).is_none(),
+            "animal AnimalWorkClaim released on cart-haul completion"
+        );
+        let cart_c = sim.app.world().get::<Cart>(cart).unwrap();
+        assert!(
+            cart_c.hauler.is_none() && cart_c.hitched_to.is_none(),
+            "cart un-hitched + re-parked on completion"
+        );
+    }
+
     /// Draftwork v2: human-drawn fallback. With NO trained draft animal in
     /// the faction, the executor still completes the plowing (the dispatcher
     /// dispatches `Task::Plow { animal: None }`, the executor uses
@@ -6849,6 +7132,8 @@ mod smoke {
             .spawn((
                 crate::simulation::construction::Well {
                     faction_id: sim.player_faction_id,
+                    shaft_tile: tile,
+                    bottom_z: 0,
                 },
                 Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                 GlobalTransform::default(),
@@ -6861,6 +7146,20 @@ mod smoke {
             .resource_mut::<crate::simulation::construction::WellMap>()
             .0
             .insert(tile, well);
+        // Physical water model: a usable well holds a `RuntimeWater` column.
+        sim.app
+            .world_mut()
+            .resource_mut::<crate::world::water_runtime::RuntimeWater>()
+            .set(
+                tile,
+                crate::world::water_runtime::RuntimeWaterCell {
+                    ground_z: 0,
+                    depth: 2.0,
+                    reservoir_id: u32::MAX,
+                    salinity: 0.0,
+                    source_rate: crate::world::water_runtime::AQUIFER_SEEP_RATE,
+                },
+            );
     }
 
     fn stamp_surface_tile(sim: &mut TestSim, tile: (i32, i32), kind: TileKind) {

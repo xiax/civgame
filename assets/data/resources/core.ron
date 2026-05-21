@@ -283,6 +283,61 @@ ResourceFile(
             sprite_key: Some("item_hammer"),
         ),
 
+        // ── Cart parts (Animal Husbandry v2.1) ────────────────────────
+        // Composable cart components. Crafted independently at a
+        // Workbench, then `cart::cart_assembly_system` consumes
+        // `1 frame + 2 wheels` from faction storage to spawn a parked
+        // `Cart` entity. Effective capacity / speed derive from the
+        // frame + wheel material combination (`cart::derive_cart_stats`).
+        ResourceDef(
+            key: "cart_frame_small",
+            display_name: "Cart Frame (Small)",
+            class: material,
+            bulk: two_hand,
+            weight_g: 10000,
+            entertainment_value: 0,
+            storage_class: pile,
+            trade_base_value: 35,
+            tags: ["material", "manufactured", "draftwork", "cart_part"],
+            sprite_key: None,
+        ),
+        ResourceDef(
+            key: "cart_frame_medium",
+            display_name: "Cart Frame (Medium)",
+            class: material,
+            bulk: two_hand,
+            weight_g: 25000,
+            entertainment_value: 0,
+            storage_class: pile,
+            trade_base_value: 70,
+            tags: ["material", "manufactured", "draftwork", "cart_part"],
+            sprite_key: None,
+        ),
+        ResourceDef(
+            key: "cart_wheel_wood",
+            display_name: "Cart Wheel (Wood)",
+            class: material,
+            bulk: two_hand,
+            weight_g: 4000,
+            entertainment_value: 0,
+            storage_class: pile,
+            trade_base_value: 18,
+            tags: ["material", "manufactured", "draftwork", "cart_part"],
+            sprite_key: None,
+        ),
+        ResourceDef(
+            key: "cart_wheel_ironrim",
+            display_name: "Cart Wheel (Iron-Rimmed)",
+            class: material,
+            bulk: two_hand,
+            weight_g: 6000,
+            entertainment_value: 0,
+            storage_class: pile,
+            trade_base_value: 40,
+            tags: ["material", "manufactured", "draftwork", "cart_part"],
+            sprite_key: None,
+        ),
+
         // ── Knowledge ─────────────────────────────────────────────────
         ResourceDef(
             key: "clay_tablet",

@@ -158,4 +158,8 @@ core_ids! {
     CleanWater => "clean_water" => clean_water,
     RawWater => "raw_water" => raw_water,
     ArdPlow => "ard_plow" => ard_plow,
+    CartFrameSmall => "cart_frame_small" => cart_frame_small,
+    CartFrameMedium => "cart_frame_medium" => cart_frame_medium,
+    CartWheelWood => "cart_wheel_wood" => cart_wheel_wood,
+    CartWheelIronrim => "cart_wheel_ironrim" => cart_wheel_ironrim,
 }

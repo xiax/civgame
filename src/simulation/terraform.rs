@@ -18,7 +18,7 @@ use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
-use crate::world::chunk_streaming::TileChangedEvent;
+use crate::world::chunk_streaming::{TileCarvedEvent, TileChangedEvent};
 use crate::world::globe::Globe;
 use crate::world::terrain::{tile_to_world, WorldGen, TILE_SIZE};
 
@@ -173,6 +173,7 @@ pub fn terraform_system(
     mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,
     mut tile_changed: EventWriter<TileChangedEvent>,
+    mut tile_carved: EventWriter<TileCarvedEvent>,
     mut terraform_map: ResMut<TerraformMap>,
     site_query: Query<&TerraformSite>,
     clock: Res<SimClock>,
@@ -230,6 +231,15 @@ pub fn terraform_system(
                 target_floor,
                 &mut tile_changed,
             );
+            // Signal a real excavation so `aquifer_seep_emitter_system` can
+            // bootstrap groundwater seep when a dig (e.g. a well shaft) drops
+            // below the water table. The seep emitter gates on the per-cell
+            // table, so above-table footprint leveling stays a no-op.
+            tile_carved.send(TileCarvedEvent {
+                tx,
+                ty,
+                new_floor_z: target_floor,
+            });
             for (resource_id, qty) in drops {
                 if qty == 0 {
                     continue;
