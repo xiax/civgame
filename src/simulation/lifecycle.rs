@@ -175,6 +175,7 @@ fn handle_switch_archetype(
             .resource::<crate::economy::resource_catalog::ResourceCatalog>()
             .clone();
         let archetype_registry = world.resource::<FactionArchetypeRegistry>().clone();
+        let now = world.resource::<crate::simulation::schedule::SimClock>().tick as u32;
         let mut registry = world.resource_mut::<FactionRegistry>();
         let Some(faction) = registry.factions.get_mut(&faction_id) else {
             return;
@@ -216,6 +217,19 @@ fn handle_switch_archetype(
         // phases may pick a fresh spot). Sync `home_tile` to
         // `at_tile`.
         faction.home_tile = at_tile;
+
+        // P4 (settled → nomadic collapse): the freshly-collapsed band
+        // stays in place — it has *not* unpacked for travel. Reset
+        // migration state so it starts `Pitched`/`Idle` and can't
+        // immediately re-survey (`last_migration_tick = now` makes the
+        // capability cooldown run from here). `nomad_autopilot` is left
+        // as-is — AI keeps autopilot, a player faction keeps it off.
+        if new_lifestyle == Lifestyle::Nomadic {
+            faction.camp_state = crate::simulation::faction::CampState::Pitched;
+            faction.migration_phase = crate::simulation::faction::MigrationPhase::Idle;
+            faction.pending_migration = None;
+            faction.last_migration_tick = now;
+        }
 
         // Heads up: the storage backend kind has now changed. The
         // `compute_faction_storage_system` next-tick rollup will pick

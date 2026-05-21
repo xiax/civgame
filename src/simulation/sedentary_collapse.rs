@@ -14,23 +14,72 @@
 
 use bevy::prelude::*;
 
-use crate::simulation::construction::BedMap;
-use crate::simulation::faction::FactionRegistry;
+use crate::simulation::construction::{Bed, BedMap};
+use crate::simulation::faction::{FactionMember, FactionRegistry};
 use crate::simulation::lifecycle::{
     nomadic_variant_of, LifecycleEventQueue, SettlementLifecycleEvent,
 };
-use crate::simulation::nomad::OLD_CAMP_RADIUS;
 use crate::simulation::schedule::SimClock;
 use crate::world::seasons::{TICKS_PER_DAY, TICKS_PER_SEASON};
 
-/// How many consecutive daily failing samples trigger collapse. One
-/// season (~5 in-game days at default `DAYS_PER_SEASON`) of sustained
-/// failure is the threshold.
-pub const COLLAPSE_TRIGGER_TICKS: u32 = TICKS_PER_SEASON;
+/// Seasons of sustained combined failure required before collapse.
+pub const COLLAPSE_TRIGGER_SEASONS: u32 = 2;
 
-/// Settled bands smaller than this can collapse without the population
-/// crash check (a tiny band is barely a settlement).
+/// How many consecutive daily failing samples trigger collapse. Two
+/// seasons (~10 in-game days at default `DAYS_PER_SEASON`) of sustained
+/// *combined* failure — a single weak signal must not uproot a village.
+pub const COLLAPSE_TRIGGER_TICKS: u32 = TICKS_PER_SEASON * COLLAPSE_TRIGGER_SEASONS;
+
+/// Settled bands smaller than this count as a population crash.
 pub const SEDENTARY_COLLAPSE_MIN_MEMBERS: u32 = 6;
+
+/// Per-member days of stored food below which the faction is in a food
+/// deficit (the necessary condition for collapse).
+pub const COLLAPSE_FOOD_DAYS: f32 = 3.0;
+
+/// Fraction of members that must have a bed; below this is shelter loss.
+pub const COLLAPSE_MIN_BED_COVERAGE: f32 = 0.5;
+
+/// Radius (chebyshev) around `home_tile` scanned for faction-owned beds.
+pub const COLLAPSE_BED_FALLBACK_RADIUS: i32 = 32;
+
+/// Combined-failure predicate: a settled faction is "failing" only when a
+/// sustained food deficit coincides with a structural failure (population
+/// crash or shelter loss). A single weak signal is survivable.
+pub fn collapse_failing(food_deficit: bool, pop_crash: bool, shelter_loss: bool) -> bool {
+    food_deficit && (pop_crash || shelter_loss)
+}
+
+/// Count beds within `COLLAPSE_BED_FALLBACK_RADIUS` of `home` that belong
+/// to `faction` — a bed's faction is its assigned occupant's faction; an
+/// unassigned bed in range is counted toward the faction (errs against a
+/// false collapse). Beds owned by a *different* faction are excluded.
+fn usable_beds(
+    faction: u32,
+    home: (i32, i32),
+    bed_map: &BedMap,
+    beds: &Query<&Bed>,
+    members: &Query<&FactionMember>,
+) -> u32 {
+    let mut count = 0u32;
+    for (&tile, &bed_entity) in bed_map.0.iter() {
+        if (tile.0 - home.0).abs().max((tile.1 - home.1).abs()) > COLLAPSE_BED_FALLBACK_RADIUS {
+            continue;
+        }
+        let owner_faction = beds
+            .get(bed_entity)
+            .ok()
+            .and_then(|b| b.owner)
+            .and_then(|p| members.get(p).ok())
+            .map(|m| m.faction_id);
+        match owner_faction {
+            Some(fid) if fid == faction => count += 1,
+            None => count += 1, // unassigned bed in our home radius
+            _ => {}             // belongs to another faction — skip
+        }
+    }
+    count
+}
 
 /// Daily check — Economy schedule, before `process_settlement_lifecycle_system`
 /// so the queued event drains the same tick. Counts beds via `BedMap`
@@ -39,6 +88,8 @@ pub fn sedentary_collapse_system(
     mut registry: ResMut<FactionRegistry>,
     clock: Res<SimClock>,
     bed_map: Res<BedMap>,
+    beds: Query<&Bed>,
+    members: Query<&FactionMember>,
     mut lifecycle_queue: ResMut<LifecycleEventQueue>,
 ) {
     if clock.tick % TICKS_PER_DAY as u64 != 0 {
@@ -68,24 +119,26 @@ pub fn sedentary_collapse_system(
         if faction.member_count == 0 {
             continue;
         }
-        let members = faction.member_count;
+        let member_count = faction.member_count;
         let home = faction.home_tile;
 
-        // Trigger 1: population crash — small faction.
-        let pop_crash = members < SEDENTARY_COLLAPSE_MIN_MEMBERS;
+        // Necessary condition: sustained food deficit (< COLLAPSE_FOOD_DAYS
+        // per-member days of stored food).
+        let food_deficit =
+            faction.storage.food_total() < (member_count as f32 * COLLAPSE_FOOD_DAYS).max(1.0);
 
-        // Trigger 2: sustained food deficit — per-head food < 10.
-        let food_deficit = faction.storage.food_total() < (members as f32 * 10.0).max(10.0);
+        // Population crash — the band is too small to be a settlement.
+        let pop_crash = member_count < SEDENTARY_COLLAPSE_MIN_MEMBERS;
 
-        // Trigger 3: shelter loss — fewer beds than members/3.
-        let bed_count = bed_map
-            .0
-            .keys()
-            .filter(|&&t| (t.0 - home.0).abs().max((t.1 - home.1).abs()) <= OLD_CAMP_RADIUS)
-            .count() as u32;
-        let shelter_loss = bed_count < (members / 3).max(1);
+        // Shelter loss — fewer faction-owned beds than half the members.
+        let bed_count = usable_beds(fid, home, &bed_map, &beds, &members);
+        let needed_beds =
+            ((member_count as f32 * COLLAPSE_MIN_BED_COVERAGE).ceil() as u32).max(1);
+        let shelter_loss = bed_count < needed_beds;
 
-        let failing = pop_crash || food_deficit || shelter_loss;
+        // Combined-failure trigger: a food deficit ALONE is survivable;
+        // collapse needs the deficit AND a structural failure on top.
+        let failing = collapse_failing(food_deficit, pop_crash, shelter_loss);
         let next_streak = if failing {
             faction.collapse_streak.saturating_add(TICKS_PER_DAY)
         } else {
@@ -139,18 +192,39 @@ mod tests {
     /// event. We can't easily run the full system here without an App
     /// context, so we manually walk the streak math.
     #[test]
-    fn collapse_streak_threshold_is_one_season() {
-        // The trigger must fire when the streak reaches `COLLAPSE_TRIGGER_TICKS`.
-        // One sample per day = one bump of TICKS_PER_DAY. So the number of
-        // failing samples needed is `COLLAPSE_TRIGGER_TICKS / TICKS_PER_DAY`.
+    fn collapse_streak_threshold_is_two_seasons() {
+        // The trigger fires when the streak reaches `COLLAPSE_TRIGGER_TICKS`.
+        // One sample per day = one bump of TICKS_PER_DAY.
         let samples_needed = COLLAPSE_TRIGGER_TICKS / TICKS_PER_DAY;
-        // Sanity: at default season length (5 days) this should be 5.
         assert!(samples_needed >= 1, "samples_needed = {samples_needed}");
         assert_eq!(
             samples_needed * TICKS_PER_DAY,
             COLLAPSE_TRIGGER_TICKS,
             "TICKS_PER_SEASON should be a multiple of TICKS_PER_DAY"
         );
+        assert_eq!(COLLAPSE_TRIGGER_TICKS, TICKS_PER_SEASON * 2);
+    }
+
+    #[test]
+    fn single_failure_does_not_collapse() {
+        // Food deficit alone — survivable.
+        assert!(!collapse_failing(true, false, false));
+        // Pop crash alone (no deficit) — survivable.
+        assert!(!collapse_failing(false, true, false));
+        // Shelter loss alone (no deficit) — survivable.
+        assert!(!collapse_failing(false, false, true));
+        // Pop crash + shelter loss but food is fine — survivable.
+        assert!(!collapse_failing(false, true, true));
+    }
+
+    #[test]
+    fn combined_failure_collapses() {
+        // Deficit + pop crash.
+        assert!(collapse_failing(true, true, false));
+        // Deficit + shelter loss.
+        assert!(collapse_failing(true, false, true));
+        // All three.
+        assert!(collapse_failing(true, true, true));
     }
 
     #[test]
