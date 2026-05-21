@@ -71,8 +71,17 @@ list (cardinal pipe edges ∝ surface-Δ + dam-weir over-crest spill), per-giver
 Free cell goes negative, applies. **Conserves volume exactly** and is **bit-for-bit deterministic**
 (both unit-tested, with basin-fill / dam pool→overtop→drain). `water_runtime.rs` wraps it:
 `WaterSim` runs one `AsyncComputeTaskPool` task (20-tick cadence, mirrors the pathfinding
-snapshot→spawn→poll pattern). `spawn` (PostUpdate) snapshots a bounded region (R=28 around dams +
-runtime cells; self-terminating) — ocean/lake/unloaded → Pinned at hydrology Z; **per-cell flow
+snapshot→spawn→poll pattern). `spawn` (PostUpdate) builds the bounded active region — a wide
+`WATER_SIM_RADIUS=28` box around every **dam** plus a small `WATER_CELL_RADIUS=3` box around every
+persisted runtime cell (those are only ever genuinely *disturbed* cells now — see `poll` below) —
+and is self-terminating (no dams + no runtime cells ⇒ no work). It then takes a flat **raw-tile
+snapshot** (`RawTile`: kind/ground_z/water_depth/surface_z, no math) and hands the whole
+classify-and-simulate pass to the task pool, which runs against the snapshot + a cached
+`Arc<Globe>` (cloned once; `Globe` is fixed during `Playing`) — so the per-tile classify math
+(`sample_climate`, hydrology lookups, `dam_impoundment_set`, `edge_crossings_in_bbox`) and the
+fluid sim both run **off the main thread**. The main thread only does flat reads. Defense-in-depth:
+if the region exceeds `WATER_SIM_MAX_REGION_TILES≈30k` a rotating cursor simulates a bounded window
+per cadence. In the classify: ocean/lake/unloaded → Pinned at hydrology Z; **per-cell flow
 routing** via `RiverNetwork::edge_crossings_in_bbox` places real inlets (inject the edge's
 `discharge`) / outlets (Pinned) at the true channel crossings (replaced the old highest-elevation
 boundary guess). **A free-flowing `TileKind::River` cell is Pinned at its chunk-gen column surface
@@ -116,10 +125,18 @@ the same per-cell table — so a natural depression and a dug pit are treated id
 seep when their bed falls below the gate), and a Pass-4.5 marsh pulled into an active region
 keeps its aquifer source instead of draining. Anchoring on per-CELL macro (not per-tile
 `surface_height`) is what makes per-tile jitter count: a per-tile bed anchor would be
-structurally tautological for natural tiles (bed == anchor ⇒ never below). `poll` (PreUpdate) writes `RuntimeWater` (incl. `source_rate`) + live
-`ChunkMap`, keeps a still-fed source cell alive even when drained (so an isolated dug well refills),
-restores natural kind on true drain, emits `TileChangedEvent` **only on wet/dry passability flip**
-(deadband). Main tick never blocks.
+structurally tautological for natural tiles (bed == anchor ⇒ never below). `poll` (PreUpdate)
+writes `RuntimeWater` (incl. `source_rate`) + live `ChunkMap`, restores natural kind on true drain,
+emits `TileChangedEvent` **only on wet/dry passability flip** (deadband). Main tick never blocks.
+**Only *disturbed* cells (`WaterTileOut.disturbed`) are written back** — a cell already tracked in
+`RuntimeWater` (dug well / draining reservoir) or inside a dam's impoundment. A natural marsh /
+depression that merely sits inside an active region is hydraulic context only and is discarded
+(chunk-gen Pass 4.5 owns its column). The dry-but-source-fed branch *updates* an existing cell in
+place but **never creates one** — keeps an isolated dug well refilling (its cell pre-exists via the
+`aquifer_seep_emitter_system` carve bootstrap) without letting every grazed natural tile become a
+fresh region seed. This is what bounds `RuntimeWater.cells` (and hence the active region): without
+it, every wet/source tile the sweep touched persisted and re-seeded a box, snowballing the region
+across a whole wet biome and freezing the main thread once per cadence.
 
 **Salinity + wells (`biome.rs`/`drink.rs`).** `WaterKind::{Fresh,Brackish,Salt}`; `water_kind_at`
 (signature byte-identical) reads `Globe::salinity_at` via pure `classify_salinity` (Endorheic
